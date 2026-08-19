@@ -997,8 +997,14 @@ mod tests {
             ran = true;
             o.copy_from_slice(i);
         });
-        assert!(took && ran, "distinct dense f32 tensors must take the fast path");
-        assert_eq!(dst, src, "the fast-path kernel must have written the output");
+        assert!(
+            took && ran,
+            "distinct dense f32 tensors must take the fast path"
+        );
+        assert_eq!(
+            dst, src,
+            "the fast-path kernel must have written the output"
+        );
     }
 
     #[test]

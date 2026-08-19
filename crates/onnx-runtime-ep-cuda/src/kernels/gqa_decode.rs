@@ -44,7 +44,9 @@ const MAX_DIMS_PER_LANE: usize = 8;
 /// picks the matching specialized entry so a small head keeps its original
 /// register footprint instead of paying for the widest tier.
 fn dims_per_lane(head_dim: usize) -> usize {
-    head_dim.div_ceil(WARP_SIZE as usize).clamp(1, MAX_DIMS_PER_LANE)
+    head_dim
+        .div_ceil(WARP_SIZE as usize)
+        .clamp(1, MAX_DIMS_PER_LANE)
 }
 
 /// Warps grouped into one CTA. Small enough to spread the (few) decode rows
@@ -864,7 +866,9 @@ mod tests {
     #[test]
     fn decode_kernel_matches_reference_softmax_general_head_dims() {
         let Some(runtime) = runtime() else {
-            eprintln!("skipping CUDA GQA decode general head-dim parity test: CUDA runtime unavailable");
+            eprintln!(
+                "skipping CUDA GQA decode general head-dim parity test: CUDA runtime unavailable"
+            );
             return;
         };
 

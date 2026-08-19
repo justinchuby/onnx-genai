@@ -48,6 +48,7 @@ mod nested_autoregressive;
 mod paged_decode;
 mod prefix_reuse;
 mod routing;
+pub use routing::is_missing_required_input;
 mod schedulers;
 #[cfg(feature = "native-backend")]
 pub(crate) use decoder_component::NativePipelineDecoder;
@@ -662,6 +663,11 @@ fn build_native_pipeline_decoder(
             #[cfg(feature = "cuda")]
             governor,
         )?;
+        // #1362: the pipeline's ORT decoders have always honored the declared
+        // chunk size; the native decoder ignored it, so a prompt's prefill ran
+        // as one forward and peak device memory scaled with prompt length.
+        let mut native = native;
+        native.set_prefill_chunk_size(pipeline_metadata_prefill_chunk_size(&models.directory));
         Ok(Box::new(native))
     }
     #[cfg(not(feature = "native-backend"))]

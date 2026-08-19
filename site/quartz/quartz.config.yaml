@@ -6,7 +6,7 @@ configuration:
   enablePopovers: true
   analytics: null
   locale: en-US
-  baseUrl: justinchuby.github.io/onnx-genai
+  baseUrl: www.justinchuby.com/onnx-genai
   ignorePatterns:
     - private
     - templates

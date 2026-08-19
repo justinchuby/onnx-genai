@@ -640,7 +640,13 @@ async fn stream_chat_completion(
                         continue;
                     }
                     let finish_reason = token.finish_reason.clone();
-                    let spelled = tokenizer.decode_with_special_tokens(&[token.token_id]).ok();
+                    // The special-token spelling is only read by an armed gate; a
+                    // model with no private channel discards it, so skip the extra
+                    // per-token decode on that common path.
+                    let spelled = channel_gate
+                        .armed()
+                        .then(|| tokenizer.decode_with_special_tokens(&[token.token_id]).ok())
+                        .flatten();
                     let revealed = channel_gate.push(spelled.as_deref(), &token.text);
                     if !revealed.reasoning.is_empty() {
                         send_stream_chunk(
@@ -2234,6 +2240,12 @@ impl PrivateChannelGate {
         }
     }
 
+    /// Whether the gate withholds private channels, in which case the caller
+    /// must supply each token's special-token spelling for it to read.
+    fn armed(&self) -> bool {
+        self.armed
+    }
+
     /// The visible text this token added, which is empty while the token
     /// belongs to a private channel.
     ///
@@ -3343,6 +3355,22 @@ mod channel_gate_tests {
     fn an_unarmed_gate_reports_no_thinking() {
         let mut gate = PrivateChannelGate::new(false);
         assert_eq!(gate.push(Some(" to=self<|message|>"), "x").reasoning, "");
+    }
+
+    // The streaming loop skips the per-token special-token decode when the gate
+    // is unarmed. That is sound only if an unarmed gate ignores `spelled`, so
+    // pin it: `armed()` reports the state, and an unarmed gate yields the same
+    // delta whether or not the spelling is supplied.
+    #[test]
+    fn an_unarmed_gate_ignores_spelling_so_the_decode_can_be_skipped() {
+        assert!(!PrivateChannelGate::new(false).armed());
+        assert!(PrivateChannelGate::new(true).armed());
+        let mut with = PrivateChannelGate::new(false);
+        let mut without = PrivateChannelGate::new(false);
+        for plain in [" to=self", "weigh", " it", "Hi"] {
+            let spelled = format!("{plain}<|message|>");
+            assert_eq!(with.push(Some(&spelled), plain), without.push(None, plain));
+        }
     }
 }
 

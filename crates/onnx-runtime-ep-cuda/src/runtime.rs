@@ -93,6 +93,7 @@ pub struct CudaDeviceCapabilities {
     max_shared_memory_per_block: u32,
     max_shared_memory_per_block_optin: u32,
     multiprocessor_count: u32,
+    l2_cache_size: u32,
 }
 
 impl CudaDeviceCapabilities {
@@ -102,6 +103,7 @@ impl CudaDeviceCapabilities {
         max_shared_memory_per_block: Option<u32>,
         max_shared_memory_per_block_optin: Option<u32>,
         multiprocessor_count: Option<u32>,
+        l2_cache_size: Option<u32>,
     ) -> Self {
         let max_threads_per_block = max_threads_per_block
             .filter(|&value| value > 0)
@@ -114,12 +116,16 @@ impl CudaDeviceCapabilities {
             .unwrap_or(max_shared_memory_per_block)
             .max(max_shared_memory_per_block);
         let multiprocessor_count = multiprocessor_count.filter(|&value| value > 0).unwrap_or(1);
+        // L2 size is a hint only (Ada L2-residency tiling); 0 means "unknown",
+        // which every consumer must treat as "no L2-residency assumptions".
+        let l2_cache_size = l2_cache_size.filter(|&value| value > 0).unwrap_or(0);
         Self {
             compute_capability,
             max_threads_per_block,
             max_shared_memory_per_block,
             max_shared_memory_per_block_optin,
             multiprocessor_count,
+            l2_cache_size,
         }
     }
 
@@ -137,6 +143,55 @@ impl CudaDeviceCapabilities {
 
     pub fn multiprocessor_count(self) -> u32 {
         self.multiprocessor_count
+    }
+
+    /// Device L2 cache size in bytes, or `0` when the driver did not report it.
+    /// Used as a *hint* for the pending Ada L2-residency tiling lever; a `0`
+    /// here must be treated as "make no L2-residency assumptions".
+    pub fn l2_cache_size(self) -> u32 {
+        self.l2_cache_size
+    }
+
+    /// Arch tier this device maps to (see [`crate::arch::ArchTier`]). The
+    /// mapping is total: every compute capability resolves to a tier without
+    /// panicking, and `sm_90` resolves to [`crate::arch::ArchTier::Hopper`].
+    pub fn arch_tier(self) -> crate::arch::ArchTier {
+        crate::arch::ArchTier::from_compute_capability(self.compute_capability)
+    }
+
+    /// Default, tier-derived kernel configuration hints for this device. This is
+    /// pure scaffolding for the pending RTX/arch kernels: nothing in the live
+    /// kernel-selection path consumes it yet, so it cannot change today's
+    /// behavior on any device (see [`crate::arch::ArchConfig`]).
+    pub fn arch_config(self) -> crate::arch::ArchConfig {
+        crate::arch::ArchConfig::for_capabilities(self)
+    }
+
+    /// Per-SM resident-warp estimate for the int4/accuracy_level=4 decode
+    /// GEMV's one-wave occupancy math, delegated to the arch layer (see
+    /// [`crate::arch::decode_resident_warps_per_sm`]). Byte-identical to the
+    /// ladder the decode selectors used inline before, so consuming it here does
+    /// not change selection on any device (`sm_90` → 64).
+    pub fn decode_resident_warps_per_sm(self) -> u32 {
+        crate::arch::decode_resident_warps_per_sm(self.compute_capability)
+    }
+
+    /// Test-only constructor: synthesize capabilities for an arbitrary arch tier
+    /// so the SM-dispatch scaffolding can be exercised without that hardware.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        compute_capability: (u32, u32),
+        multiprocessor_count: u32,
+        l2_cache_size: u32,
+    ) -> Self {
+        Self::from_reported_limits(
+            compute_capability,
+            None,
+            None,
+            None,
+            Some(multiprocessor_count),
+            Some(l2_cache_size),
+        )
     }
 }
 
@@ -238,6 +293,14 @@ pub struct CudaRuntime {
     /// existing per-step logits sync so a poisoned replay becomes a hard error
     /// before the produced token is consumed.
     capture_error: CUdeviceptr,
+    /// When set, the public [`CudaRuntime::synchronize`] becomes a no-op so the
+    /// redundant trailing per-op eager device syncs (issued by kernels on the
+    /// `!capturing` branch) are elided and launches pipeline on the in-order EP
+    /// stream. Host-visible reads (`dtoh`/`dtod`) call the private
+    /// [`CudaRuntime::force_synchronize`] and are therefore unaffected. On by
+    /// default (eager decode is made consistent with the captured path, which
+    /// already elides these); disable via `ONNX_GENAI_DEFER_EAGER_SYNC=0`.
+    defer_eager_sync: AtomicBool,
 }
 
 impl std::fmt::Debug for CudaRuntime {
@@ -337,6 +400,10 @@ impl CudaRuntime {
                 &context,
                 CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
             ),
+            positive_attribute(
+                &context,
+                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE,
+            ),
         );
         let ptx_arch = ptx_arch_for(major, minor);
         let cubin_arch = cubin_arch_for(major, minor);
@@ -380,6 +447,18 @@ impl CudaRuntime {
             fences: Mutex::new(HashMap::new()),
             next_fence_id: AtomicU64::new(1),
             capture_error: 0,
+            defer_eager_sync: AtomicBool::new(
+                // On by default; only an explicit falsey value restores the old
+                // always-sync eager path (escape hatch for debugging).
+                std::env::var("ONNX_GENAI_DEFER_EAGER_SYNC")
+                    .ok()
+                    .as_deref()
+                    .map(str::trim)
+                    .map(str::to_ascii_lowercase)
+                    .map_or(true, |v| {
+                        !matches!(v.as_str(), "0" | "false" | "off" | "no")
+                    }),
+            ),
         }
         .with_capture_error_word()
     }
@@ -879,10 +958,43 @@ impl CudaRuntime {
     }
 
     /// Block until all submitted work on the EP's dedicated stream completes.
+    ///
+    /// Deferred by default (eager decode is made consistent with the captured
+    /// path); this becomes a no-op unless `ONNX_GENAI_DEFER_EAGER_SYNC=0`
+    /// restores the old always-sync behavior. The trailing per-op eager syncs
+    /// are redundant because (a) kernel→kernel ordering is guaranteed by the
+    /// single in-order EP stream and (b) every host-visible read (`dtoh`/`dtod`)
+    /// issues its own [`force_synchronize`] before the synchronous copy. Eliding
+    /// these lets eager decode pipeline launches the way a captured graph does.
     pub fn synchronize(&self) -> Result<()> {
+        if self.defer_eager_sync.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        self.force_synchronize()
+    }
+
+    /// Unconditional stream drain. Used by host-visible reads (`dtoh`/`dtod`)
+    /// that must observe fully-produced bytes regardless of the eager-sync
+    /// deferral flag.
+    fn force_synchronize(&self) -> Result<()> {
         self.stream
             .synchronize()
             .map_err(|e| driver_err("stream synchronize", e))
+    }
+
+    /// Toggle the eager-sync deferral at runtime (see [`synchronize`]).
+    pub fn set_defer_eager_sync(&self, enabled: bool) {
+        self.defer_eager_sync.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Whether the eager-fast path is active. When true, kernels skip their
+    /// eager-only host-side validation readbacks (index/position bounds checks)
+    /// — these are numerically inert (a correct model never trips them) and the
+    /// captured path already relies on the device error latch instead of a
+    /// per-op D2H. Eliding them removes the blocking scalar D2H that otherwise
+    /// serializes each eager op against the GPU.
+    pub fn eager_sync_deferred(&self) -> bool {
+        self.defer_eager_sync.load(Ordering::Relaxed)
     }
 
     /// Whether the EP's compute stream is currently capturing into a CUDA graph.
@@ -940,7 +1052,7 @@ impl CudaRuntime {
         // Kernels enqueue work on the EP's dedicated non-default stream. Wait
         // before issuing the synchronous driver copy so the host never observes
         // bytes that were still being produced on that stream.
-        self.synchronize()?;
+        self.force_synchronize()?;
         // SAFETY: bound context; `src` covers `dst.len()` bytes per the contract.
         unsafe { cudarc::driver::result::memcpy_dtoh_sync(dst, src) }
             .map_err(|e| driver_err("cuMemcpyDtoH", e))?;
@@ -961,7 +1073,7 @@ impl CudaRuntime {
         // consumer that already queued a read of `dst`). Drain the EP stream
         // first so the synchronous copy always sees fully-produced bytes. This
         // mirrors `dtoh`, which synchronizes for the same reason.
-        self.synchronize()?;
+        self.force_synchronize()?;
         // SAFETY: bound context; both endpoints cover `bytes` per the contract.
         unsafe { cudarc::driver::result::memcpy_dtod_sync(dst, src, bytes) }
             .map_err(|e| driver_err("cuMemcpyDtoD", e))
@@ -1359,7 +1471,7 @@ mod tests {
     #[test]
     fn capability_limits_use_conservative_fallbacks() {
         let capabilities =
-            CudaDeviceCapabilities::from_reported_limits((7, 0), None, None, None, None);
+            CudaDeviceCapabilities::from_reported_limits((7, 0), None, None, None, None, None);
         assert_eq!(capabilities.compute_capability(), (7, 0));
         assert_eq!(capabilities.max_threads_per_block, 256);
         assert_eq!(
@@ -1371,6 +1483,7 @@ mod tests {
             SAFE_SHARED_MEMORY_PER_BLOCK_FALLBACK
         );
         assert_eq!(capabilities.multiprocessor_count(), 1);
+        assert_eq!(capabilities.l2_cache_size(), 0);
     }
 
     #[test]
@@ -1381,9 +1494,11 @@ mod tests {
             Some(64 * 1024),
             Some(48 * 1024),
             Some(200),
+            Some(96 * 1024 * 1024),
         );
         assert_eq!(capabilities.max_shared_memory_per_block_optin(), 64 * 1024);
         assert_eq!(capabilities.multiprocessor_count(), 200);
+        assert_eq!(capabilities.l2_cache_size(), 96 * 1024 * 1024);
     }
 
     #[test]

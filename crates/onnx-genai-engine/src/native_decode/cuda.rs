@@ -255,6 +255,7 @@ struct StepOffloadSnapshot {
     htod_bytes: u64,
     vram_alloc_ns: u64,
     vram_free_ns: u64,
+    vram_free_sync_ns: u64,
 }
 
 impl StepOffloadSnapshot {
@@ -274,6 +275,7 @@ impl StepOffloadSnapshot {
                 htod_bytes: stats.htod_bytes,
                 vram_alloc_ns: stats.vram_alloc_ns,
                 vram_free_ns: stats.vram_free_ns,
+                vram_free_sync_ns: stats.vram_free_sync_ns,
             }
         }
         #[cfg(not(feature = "cuda"))]
@@ -303,6 +305,9 @@ impl StepOffloadSnapshot {
             htod_bytes: self.htod_bytes.saturating_sub(before.htod_bytes),
             vram_alloc_ns: self.vram_alloc_ns.saturating_sub(before.vram_alloc_ns),
             vram_free_ns: self.vram_free_ns.saturating_sub(before.vram_free_ns),
+            vram_free_sync_ns: self
+                .vram_free_sync_ns
+                .saturating_sub(before.vram_free_sync_ns),
         }
     }
 }
@@ -351,6 +356,7 @@ impl CudaStepProfile {
         let admit_sync_ms = ns_to_ms(delta.admit_sync_ns);
         let vram_alloc_ms = ns_to_ms(delta.vram_alloc_ns);
         let vram_free_ms = ns_to_ms(delta.vram_free_ns);
+        let vram_free_sync_ms = ns_to_ms(delta.vram_free_sync_ns);
         let phase_stats = onnx_runtime_session::exec_phase_stats();
         let phase_ms = |phase: &str| -> f64 {
             phase_stats
@@ -362,7 +368,7 @@ impl CudaStepProfile {
         let kernel_host_ms = phase_ms("exec_kernel.compute");
         let build_inputs_ms = phase_ms("exec_kernel.build_inputs");
         let build_inputs_attributed_ms =
-            staging_ms + h2d_ms + admit_sync_ms + vram_alloc_ms + vram_free_ms;
+            staging_ms + h2d_ms + admit_sync_ms + vram_alloc_ms + vram_free_ms + vram_free_sync_ms;
         let build_inputs_unattributed_ms = (build_inputs_ms - build_inputs_attributed_ms).max(0.0);
         let executor_other_ms = wall.run_ms - build_inputs_ms - kernel_host_ms;
         let run_unattributed_ms = build_inputs_unattributed_ms + executor_other_ms;
@@ -372,6 +378,7 @@ impl CudaStepProfile {
             - admit_sync_ms
             - vram_alloc_ms
             - vram_free_ms
+            - vram_free_sync_ms
             - kernel_host_ms
             - build_inputs_unattributed_ms
             - executor_other_ms
@@ -381,11 +388,11 @@ impl CudaStepProfile {
         static HEADER: std::sync::Once = std::sync::Once::new();
         HEADER.call_once(|| {
             eprintln!(
-                "[onnx-genai-cuda-step] path,past_len,total_len,total_ms,staging_fill_ms,h2d_copy_ms,kernel_host_dispatch_ms,admit_sync_ms,vram_alloc_ms,vram_free_ms,build_inputs_unattributed_ms,executor_other_ms,run_unattributed_ms,logits_read_sync_ms,capture_check_ms,finite_check_ms,residual_ms,page_ins,staging_fill_bytes,staging_fill_regions,staging_fill_calls,materialize_fallback_calls,h2d_bytes"
+                "[onnx-genai-cuda-step] path,past_len,total_len,total_ms,staging_fill_ms,h2d_copy_ms,kernel_host_dispatch_ms,admit_sync_ms,vram_alloc_ms,vram_free_ms,vram_free_sync_ms,build_inputs_unattributed_ms,executor_other_ms,run_unattributed_ms,logits_read_sync_ms,capture_check_ms,finite_check_ms,residual_ms,page_ins,staging_fill_bytes,staging_fill_regions,staging_fill_calls,materialize_fallback_calls,h2d_bytes"
             );
         });
         eprintln!(
-            "[onnx-genai-cuda-step] {path},{},{},{total_ms:.3},{staging_ms:.3},{h2d_ms:.3},{kernel_host_ms:.3},{admit_sync_ms:.3},{vram_alloc_ms:.3},{vram_free_ms:.3},{build_inputs_unattributed_ms:.3},{executor_other_ms:.3},{run_unattributed_ms:.3},{:.3},{:.3},{:.3},{residual_ms:.3},{},{},{},{},{},{}",
+            "[onnx-genai-cuda-step] {path},{},{},{total_ms:.3},{staging_ms:.3},{h2d_ms:.3},{kernel_host_ms:.3},{admit_sync_ms:.3},{vram_alloc_ms:.3},{vram_free_ms:.3},{vram_free_sync_ms:.3},{build_inputs_unattributed_ms:.3},{executor_other_ms:.3},{run_unattributed_ms:.3},{:.3},{:.3},{:.3},{residual_ms:.3},{},{},{},{},{},{}",
             self.past_len,
             self.total_len,
             wall.logits_read_ms,
@@ -1861,6 +1868,14 @@ impl NativeDecodeSession {
         // CUDA-graph captured; expose the growing logical mask width (matching the
         // eager token forward) rather than freezing to physical capacity.
         state.extend_mask(if grew { 0 } else { past_len }, total_len, total_len)?;
+        // Re-prepare the governed workspace when the KV bucket grew so the
+        // persistent `::Attention` fp32 score scratch is sized for the new,
+        // larger bucket (Bug 1). #1189 added this to the captured/greedy decode
+        // paths but not to this routed-step eager path, which can rebucket just
+        // the same; without it the first execute past a power-of-two boundary
+        // needs exactly 2× the reserved workspace and trips the prepared-
+        // workspace invariant. Cheap: only fires on the rare `grew` transition.
+        state.prepare_decode_workspace_after_capacity_growth(&mut self.session, grew)?;
 
         self.run_cuda_eager_rows_owned(owned, total_len, "decoder")
     }
@@ -2004,6 +2019,13 @@ impl NativeDecodeSession {
         }
         let grew = state.ensure_capacity(&mut self.session, total_len)?;
         state.extend_mask(if grew { 0 } else { past_len }, total_len, total_len)?;
+        // Re-prepare the governed workspace when the KV bucket grew so the
+        // persistent `::Attention` fp32 score scratch is sized for the new,
+        // larger bucket (Bug 1). #1189 added this guard to the captured/greedy
+        // decode paths but not to this spec-decode verify path, which rebuckets
+        // when `past + K` crosses a power-of-two boundary; without it the verify
+        // forward trips the prepared-workspace invariant. Only fires on `grew`.
+        state.prepare_decode_workspace_after_capacity_growth(&mut self.session, grew)?;
         self.run_cuda_eager_rows(
             token_ids,
             past_len,
@@ -2294,12 +2316,22 @@ impl NativeDecodeSession {
         past_lens: &[usize],
         advances: &[bool],
     ) -> anyhow::Result<Vec<TokenId>> {
+        let profile_past = past_lens.iter().copied().max().unwrap_or(0);
+        let profile_total = profile_past.saturating_add(1);
+        let step_profile = CudaStepProfile::begin(profile_past, profile_total);
+        let mut step_wall = CudaStepWallBreakdown::default();
+
+        let run_start = std::time::Instant::now();
         let valid_lens = self.run_ragged_forward(tokens, past_lens, advances)?;
+        step_wall.run_ms = run_start.elapsed().as_secs_f64() * 1_000.0;
+
         let state = self
             .cuda
             .as_mut()
             .context("CUDA decode state is not initialized")?;
+        let read_start = std::time::Instant::now();
         let rows = state.read_greedy_result_batch()?;
+        step_wall.logits_read_ms = read_start.elapsed().as_secs_f64() * 1_000.0;
         for (sequence, (_, capture_error)) in rows.iter().enumerate() {
             if *capture_error != 0 {
                 let _ = state.invalidate_graph(&mut self.session);
@@ -2312,6 +2344,9 @@ impl NativeDecodeSession {
             }
         }
         self.commit_ragged_advance(&valid_lens, advances)?;
+        if let Some(profile) = step_profile {
+            profile.finish("decode_batch", step_wall);
+        }
         Ok(rows.into_iter().map(|(token, _)| token).collect())
     }
 
@@ -2646,6 +2681,15 @@ impl DecodeCudaState {
     /// kept across growth. Head-major and the legacy realloc path return false.
     fn seq_major_fixed_stride(&self) -> bool {
         self.kv_commits_on_demand && self.kv_layout.is_seq_major()
+    }
+
+    /// Whether this decoder is on the VMM (commit-on-demand) KV path. Exposed so
+    /// a regression test can assert it is *actually* exercising the VMM path
+    /// rather than silently falling back to the eager path (which would make a
+    /// "VMM reservation" assertion prove nothing).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn kv_commits_on_demand(&self) -> bool {
+        self.kv_commits_on_demand
     }
 
     /// A conservative signature of every binding's captured-graph dependencies
@@ -3189,6 +3233,72 @@ impl DecodeCudaState {
         Ok(0..bytes)
     }
 
+    /// Resolve the `usize::MAX` "unbounded" capacity sentinel to a concrete
+    /// upper bound for the **VMM** path's up-front virtual reservation.
+    ///
+    /// The non-VMM path grows KV buckets until the device OOMs, so it never
+    /// needs a concrete `max_len` and `resolve_cuda_kv_capacity` deliberately
+    /// leaves it at `usize::MAX` for a model with no `max_sequence_length`
+    /// metadata (the sentinel from #367). The VMM path, in contrast, reserves
+    /// the full context's *address range* up front, which structurally requires
+    /// a real bound — `usize::MAX` cannot be reserved and today overflows the
+    /// reservation arithmetic (issue #1266).
+    ///
+    /// The largest sequence length the device could *ever* hold is
+    /// `device_free / bytes_per_token`, so reserve exactly that. On the VMM
+    /// path the reservation is **virtual-only** — physical pages are committed
+    /// on demand out of a fixed 64 GiB address arena — so an over-large but
+    /// finite bound is nearly free, and a decode that outgrows it still fails
+    /// at the same physical ceiling the sentinel implied. This resolves the
+    /// bound *only here, only for the VMM reservation*; `capacity.max_len` and
+    /// the non-VMM path that relies on the sentinel are left untouched.
+    ///
+    /// Requires a device free-memory reading. Without one the VMM path has no
+    /// bound to reserve, so this errors with actionable guidance rather than
+    /// overflowing or silently guessing a bound.
+    fn vmm_unbounded_reservation_len(capacity: &CudaKvCapacity) -> anyhow::Result<usize> {
+        // CEILING / KNOWN LIMITATION (tracked in issue #1288):
+        // For a metadata-less model on the VMM path we reserve up-front virtual
+        // address space for `free_bytes / bytes_per_token` tokens. Adding the
+        // per-token mask (8 B/token on top of bytes_per_token) makes the total
+        // carved span ~1.2x device_free. All EP device allocations — decoder
+        // WEIGHTS, KV, and decode SCRATCH — carve from the SAME single VMM arena
+        // of RESERVATION_BYTES = 64 << 30 (see onnx-runtime-ep-cuda provider
+        // `memory()`), and the reservation is virtual-only (only committed
+        // ranges claim physical granules). Measured: loading qwen05b-q4 with VMM
+        // already occupies ~440 MiB across 517 spans in that arena before any KV
+        // reservation. Consequence: on a GPU with ~53 GiB or more free VRAM this
+        // carve can exceed the free virtual span and fail LOUDLY at construction.
+        // That regime is untestable on the RTX 4060 (8 GB) this was developed on,
+        // so we deliberately do NOT clamp here. A correct clamp would need (a) a
+        // public free-VA accessor on the VMM allocator (none exists today; the
+        // free `Spans` are not exposed and `committed_and_reserved()` returns
+        // physical-committed + capacity, not free VA) and (b) a decode-scratch
+        // margin policy, because scratch shares the same arena and an over-tight
+        // clamp would fail later at scratch-carve time instead of loudly here.
+        let device_memory = capacity.device_memory.as_ref().with_context(|| {
+            format!(
+                "cannot size the VMM-backed CUDA KV reservation for a model with no \
+                 max_sequence_length metadata ({}): the device free-memory query is \
+                 unavailable, so there is no bound to reserve up front. Set \
+                 ONNX_GENAI_CUDA_KV_MAX_LEN or load_with_cuda_kv_max_len to a concrete \
+                 length, or run without ONNX_GENAI_CUDA_VMM to use the grow-on-demand path.",
+                capacity.source
+            )
+        })?;
+        // `bytes_per_token` is validated > 0 in `resolve_cuda_kv_capacity`.
+        let bound = device_memory.free_bytes / capacity.bytes_per_token.max(1);
+        if bound == 0 {
+            bail!(
+                "device has too little free memory ({} bytes) to reserve a VMM-backed \
+                 CUDA KV cache at {} bytes/token",
+                device_memory.free_bytes,
+                capacity.bytes_per_token
+            );
+        }
+        Ok(bound)
+    }
+
     fn full_vmm_kv_allocation_bytes(
         physical_shape: &[usize],
         dtype: DataType,
@@ -3339,11 +3449,23 @@ impl DecodeCudaState {
         // The legacy realloc path (no VMM) also keeps the growing-bucket model.
         let seq_major_fixed = kv_commits_on_demand && kv_layout.is_seq_major();
         let initial_bucket_len = onnx_genai_kv::kv_capacity_bucket(0, capacity.max_len);
+        // The VMM path reserves the full context's virtual address range up
+        // front, so it needs a concrete `max_len`. A metadata-less model leaves
+        // `capacity.max_len` at the `usize::MAX` sentinel, which cannot be
+        // reserved (issue #1266); resolve it — only for the VMM reservation —
+        // to the largest token count the device could ever hold. On the non-VMM
+        // path (or a model that declares its max length) this is just
+        // `capacity.max_len`, so behaviour there is unchanged.
+        let vmm_reserved_max_len = if kv_commits_on_demand && capacity.max_len == usize::MAX {
+            Self::vmm_unbounded_reservation_len(&capacity)?
+        } else {
+            capacity.max_len
+        };
         // The capacity reported to the bindings (physical axis-2 / mask island).
         // Seq-major fixed stride pins this at the hard maximum from the start;
         // everything else starts at the initial bucket and grows it.
         let reported_len = if seq_major_fixed {
-            capacity.max_len
+            vmm_reserved_max_len
         } else {
             initial_bucket_len
         };
@@ -3358,17 +3480,17 @@ impl DecodeCudaState {
             .context("initial CUDA mask size overflow")?;
         let mask = if kv_commits_on_demand {
             // The VMM committed-range binding reserves the full logical mask
-            // island (`batch × capacity.max_len`) up front and commits only the
-            // initial bucket. `capacity.max_len` is `usize::MAX` for a model
-            // with no declared max sequence length (the deliberate "unbounded
-            // until growth fails" sentinel), so this reservation multiply is
-            // only meaningful — and only non-overflowing — when a concrete bound
-            // exists. The non-VMM binding below never reserves the full extent,
-            // so it must not compute this value at all (computing it
-            // unconditionally overflowed and aborted construction for any
-            // metadata-less model even though the non-VMM path never uses it).
+            // island (`batch × vmm_reserved_max_len`) up front and commits only
+            // the initial bucket. `vmm_reserved_max_len` is the sentinel
+            // resolved to a concrete device-memory bound for a metadata-less
+            // model (issue #1266), so this reservation multiply is always
+            // bounded on the VMM path. The non-VMM binding below never reserves
+            // the full extent, so it must not compute this value at all
+            // (computing it unconditionally overflowed and aborted construction
+            // for any metadata-less model even though the non-VMM path never
+            // uses it).
             let full_mask_bytes = batch
-                .checked_mul(capacity.max_len)
+                .checked_mul(vmm_reserved_max_len)
                 .and_then(|elements| elements.checked_mul(std::mem::size_of::<i64>()))
                 .context("full CUDA mask reservation size overflow")?;
             // Seq-major fixed stride commits the whole (tiny) mask at
@@ -3438,7 +3560,7 @@ impl DecodeCudaState {
                 let allocation_bytes = Self::full_vmm_kv_allocation_bytes(
                     &physical_shape,
                     meta.dtype,
-                    capacity.max_len,
+                    vmm_reserved_max_len,
                 )
                 .with_context(|| {
                     format!("sizing full VMM-backed CUDA KV reservation for '{past}'")

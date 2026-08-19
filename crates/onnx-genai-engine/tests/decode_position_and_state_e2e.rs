@@ -128,15 +128,22 @@ fn pipeline_load_rejects_kv_page_pool_before_fixed_state_when_host_budget_cannot
         Ok(_) => panic!("a 15-byte host admission budget must not fit the pipeline memory floor"),
         Err(error) => error,
     };
-    let message = error.to_string();
+    // The whole chain, because the reason a load was refused is the cause, not
+    // the sentence wrapped around it.
+    let message = format!("{error:?}");
     assert!(
-        message.contains("cannot allocate the pipeline KV page pool"),
+        message.contains("cannot satisfy lowered resource limit"),
         "{message}"
     );
-    assert!(message.contains("1 page(s) across 2 layer(s)"), "{message}");
+    // The floor is the model's own: one KV page for the fixture's layers, not a
+    // constant, so the caller learns what to raise the limit to.
     assert!(
-        message.contains("resolved KV/host memory budget"),
-        "{message}"
+        message.contains("cannot hold one 256 B KV page"),
+        "the refusal must name the KV page that did not fit: {message}"
+    );
+    assert!(
+        message.contains("raise the limit to at least 256 B"),
+        "the refusal must say what would make it fit: {message}"
     );
     assert!(
         !message.contains("decoder fixed-state initialization"),

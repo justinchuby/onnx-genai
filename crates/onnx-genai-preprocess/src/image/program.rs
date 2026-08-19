@@ -103,6 +103,7 @@ struct ImageTransformMetadata {
     temporal_patch_size: Option<usize>,
     merge_size: Option<usize>,
     channel_order: Option<String>,
+    temporal_order: Option<String>,
     coordinate_order: Option<String>,
     flatten: Option<bool>,
     pad_value: Option<f64>,
@@ -143,6 +144,7 @@ pub(super) struct PatchifySpec {
     pub(super) temporal_patch_size: usize,
     pub(super) merge_size: usize,
     pub(super) channel_order: PatchChannelOrder,
+    pub(super) temporal_order: PatchTemporalOrder,
     pub(super) coordinate_order: CoordinateOrder,
 }
 
@@ -150,6 +152,20 @@ pub(super) struct PatchifySpec {
 pub(super) enum PatchChannelOrder {
     ChannelsFirst,
     ChannelsLast,
+}
+
+/// Where the temporal axis sits relative to the channel axis inside one
+/// flattened `channels_first` patch.
+///
+/// Qwen2-VL repeats each frame inside its channel block, giving `[C, T, H, W]`.
+/// Muse Glimmer keeps whole frames contiguous instead, giving `[T, C, H, W]`.
+/// The two agree only when a model has a single temporal frame, and feeding one
+/// layout to a model trained on the other scrambles colour while leaving spatial
+/// structure intact, so the packer cannot guess.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum PatchTemporalOrder {
+    ChannelMajor,
+    TemporalMajor,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -270,6 +286,7 @@ impl ImagePreprocessor {
             temporal_patch_size: transform.temporal_patch_size,
             merge_size: transform.merge_size,
             channel_order: transform.channel_order.clone(),
+            temporal_order: transform.temporal_order.clone(),
             coordinate_order: transform.coordinate_order.clone(),
             flatten: transform.flatten,
             pad_value: transform.pad_value,
@@ -876,6 +893,17 @@ fn typed_program_from_metadata(
                         "unsupported image patchify channel_order '{other}'; expected channels_first or channels_last"
                     ),
                 };
+                let temporal_order = match transform
+                    .temporal_order
+                    .as_deref()
+                    .unwrap_or("channel_major")
+                {
+                    "channel_major" | "cthw" => PatchTemporalOrder::ChannelMajor,
+                    "temporal_major" | "tchw" => PatchTemporalOrder::TemporalMajor,
+                    other => anyhow::bail!(
+                        "unsupported image patchify temporal_order '{other}'; expected channel_major or temporal_major"
+                    ),
+                };
                 let coordinate_order = match transform.coordinate_order.as_deref().unwrap_or("yx") {
                     "yx" => CoordinateOrder::Yx,
                     "xy" => CoordinateOrder::Xy,
@@ -888,6 +916,7 @@ fn typed_program_from_metadata(
                     temporal_patch_size,
                     merge_size,
                     channel_order,
+                    temporal_order,
                     coordinate_order,
                 });
                 patchified = true;

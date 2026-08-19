@@ -44,6 +44,55 @@ extern "C" __global__ void cumsum_i64(
     }
   }
 }
+
+// Block-per-lane cooperative scan for the decode case where `lanes` is too few
+// to saturate the device (e.g. a batch-1 `position_ids` cumsum, `lanes == 1`),
+// so the one-thread-per-lane `cumsum_i64` above collapses to a single thread
+// walking `width` serially — O(context) and growing every decode step. This
+// variant assigns one block per lane and cooperatively prefix-sums `width` in
+// tiles of `blockDim.x` with a running per-block `base`. It is BYTE-IDENTICAL
+// to the serial kernel: integer addition is associative (and wraps mod 2^64
+// identically regardless of grouping), so the intra-tile Hillis-Steele scan and
+// the serial walk produce the same 64-bit result. Restricted to int64 by the
+// launcher; f32 stays on the serial per-lane kernel because float addition is
+// not associative and a parallel scan would not be byte-identical.
+extern "C" __global__ void cumsum_block_i64(
+    const long long* input, long long* output, unsigned long long lanes,
+    unsigned long long width, unsigned long long inner, int exclusive, int reverse) {
+  extern __shared__ long long cumsum_sm[];
+  const unsigned int tid = threadIdx.x;
+  for (unsigned long long lane = blockIdx.x; lane < lanes; lane += gridDim.x) {
+    const unsigned long long outer = lane / inner, i = lane % inner;
+    long long base = 0;
+    for (unsigned long long tile = 0; tile < width; tile += blockDim.x) {
+      const unsigned long long j = tile + tid;  // logical scan index (serial `n`)
+      long long v = 0;
+      if (j < width) {
+        unsigned long long d = reverse ? width - 1 - j : j;
+        v = input[(outer * width + d) * inner + i];
+      }
+      cumsum_sm[tid] = v;
+      __syncthreads();
+      for (unsigned int off = 1; off < blockDim.x; off <<= 1) {
+        long long add = 0;
+        if (tid >= off) add = cumsum_sm[tid - off];
+        __syncthreads();
+        if (tid >= off) cumsum_sm[tid] += add;
+        __syncthreads();
+      }
+      const long long incl = cumsum_sm[tid];  // inclusive prefix within tile
+      if (j < width) {
+        unsigned long long d = reverse ? width - 1 - j : j;
+        unsigned long long offset = (outer * width + d) * inner + i;
+        output[offset] = exclusive ? (base + incl - v) : (base + incl);
+      }
+      unsigned long long valid = width - tile;
+      if (valid > blockDim.x) valid = blockDim.x;
+      base += cumsum_sm[valid - 1];
+      __syncthreads();
+    }
+  }
+}
 "#;
 
 pub struct CumSumFactory {
@@ -166,7 +215,6 @@ impl Kernel for CumSumKernel {
         } else {
             "cumsum_i64"
         };
-        let func = self.runtime.nvrtc_function("cumsum", SOURCE, entry)?;
         let input_ptr = cuptr(input.data_ptr::<u8>() as *const c_void);
         let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
         let lanes = lanes as u64;
@@ -174,6 +222,49 @@ impl Kernel for CumSumKernel {
         let inner = inner as u64;
         let exclusive = i32::from(self.exclusive);
         let reverse = i32::from(self.reverse);
+        // The per-lane kernel maps one lane to one thread, which saturates the
+        // device only when there are many lanes. At decode a batch-1 sequence
+        // cumsum has `lanes == 1`, collapsing to a single thread scanning
+        // `width` serially (O(context), growing every step). When the lane
+        // count cannot fill the device, run one block per lane and scan `width`
+        // cooperatively instead. Restricted to int64: the block scan is
+        // byte-identical there (integer add is associative) but would reorder
+        // non-associative float additions, so f32 keeps the serial kernel.
+        let sm_count = u64::from(self.runtime.capabilities().multiprocessor_count());
+        let use_block =
+            input.dtype == DataType::Int64 && width > 1 && lanes >= 1 && lanes <= sm_count;
+        if use_block {
+            let func = self
+                .runtime
+                .nvrtc_function("cumsum", SOURCE, "cumsum_block_i64")?;
+            let shared_mem_bytes = u32::from(BLOCK) * std::mem::size_of::<i64>() as u32;
+            let mut builder = self.runtime.stream().launch_builder(&func);
+            builder
+                .arg(&input_ptr)
+                .arg(&output_ptr)
+                .arg(&lanes)
+                .arg(&width)
+                .arg(&inner)
+                .arg(&exclusive)
+                .arg(&reverse);
+            unsafe {
+                builder.launch(LaunchConfig {
+                    grid_dim: (lanes.clamp(1, 65_535) as u32, 1, 1),
+                    block_dim: (BLOCK, 1, 1),
+                    shared_mem_bytes,
+                })
+            }
+            .map_err(|e| driver_err("launch CumSum", e))?;
+            if !capturing {
+                *warmed_signature = Some(CumSumCaptureSignature {
+                    dtype: input.dtype,
+                    shape: input.shape.to_vec(),
+                    axis,
+                });
+            }
+            return Ok(());
+        }
+        let func = self.runtime.nvrtc_function("cumsum", SOURCE, entry)?;
         let mut builder = self.runtime.stream().launch_builder(&func);
         builder
             .arg(&input_ptr)

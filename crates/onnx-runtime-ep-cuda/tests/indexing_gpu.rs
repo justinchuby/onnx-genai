@@ -661,6 +661,87 @@ fn topk_fp16_router_scale_and_non_final_axis_match_cpu() {
     );
 }
 
+/// Regression guard for the block-per-slice decode `TopK` path. At decode a MoE
+/// router `TopK` has `slices == 1` (one token row), which the one-thread-per-slice
+/// kernel runs entirely on a single thread. The launcher now dispatches those
+/// under-saturated shapes to the block-parallel `topk_block_*` kernel. That path
+/// must stay byte-identical to the CPU oracle — top-k selection is exact and the
+/// tree reduction preserves the same `before` total order with a lower-index
+/// tie-break. This locks a tie-dense f32/fp16/bf16 router shape so a future
+/// reduction-order or dispatch change cannot silently flip a selected expert.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn topk_block_decode_path_is_byte_identical_to_cpu_oracle() {
+    // A single 320-expert row (slices == 1 -> the block path) with a `% 13`
+    // repeat so every retained value is a many-way tie: the winners are forced
+    // to be the lowest-index members of each tied group, exactly as the serial
+    // kernel and the CPU oracle resolve them.
+    let width = 320_usize;
+    let k = 8_i64;
+    let f32_data = (0..width)
+        .map(|n| (n % 13) as f32 - 6.0)
+        .collect::<Vec<_>>();
+    let attrs = [("axis", Attribute::Int(-1))];
+    let f32_inputs = [
+        tensor(DataType::Float32, &[1, width], &f32_data),
+        tensor(DataType::Int64, &[], &[k]),
+    ];
+    let f32_outputs = [
+        (DataType::Float32, vec![1, k as usize]),
+        (DataType::Int64, vec![1, k as usize]),
+    ];
+    let gpu = run("TopK", 10, &f32_inputs, &f32_outputs, &attrs);
+    assert_eq!(
+        gpu,
+        run_cpu("TopK", 10, &f32_inputs, &f32_outputs, &attrs),
+        "f32 block-path decode TopK must be byte-identical to the CPU oracle"
+    );
+    // The eight winners are the lowest indices carrying the max value (6).
+    assert_eq!(i64s(&gpu[1]), vec![12, 25, 38, 51, 64, 77, 90, 103]);
+    assert_eq!(f32s(&gpu[0]), vec![6.0; k as usize]);
+
+    // Same shape in fp16 and bf16: the upcast-for-compare block path stays
+    // byte-identical to the CPU oracle at the decode shape as well.
+    let f16_data = f32_data
+        .iter()
+        .map(|&v| f16::from_f32(v))
+        .collect::<Vec<_>>();
+    let f16_inputs = [
+        tensor(DataType::Float16, &[1, width], &f16_data),
+        tensor(DataType::Int64, &[], &[k]),
+    ];
+    let f16_outputs = [
+        (DataType::Float16, vec![1, k as usize]),
+        (DataType::Int64, vec![1, k as usize]),
+    ];
+    assert_eq!(
+        run("TopK", 10, &f16_inputs, &f16_outputs, &attrs),
+        run_cpu("TopK", 10, &f16_inputs, &f16_outputs, &attrs),
+        "fp16 block-path decode TopK must be byte-identical to the CPU oracle"
+    );
+
+    let bf16_data = f32_data
+        .iter()
+        .map(|&v| bf16::from_f32(v))
+        .collect::<Vec<_>>();
+    let bf16_inputs = [
+        tensor(DataType::BFloat16, &[1, width], &bf16_data),
+        tensor(DataType::Int64, &[], &[k]),
+    ];
+    let bf16_outputs = [
+        (DataType::BFloat16, vec![1, k as usize]),
+        (DataType::Int64, vec![1, k as usize]),
+    ];
+    assert_eq!(
+        run("TopK", 10, &bf16_inputs, &bf16_outputs, &attrs),
+        run_cpu("TopK", 10, &bf16_inputs, &bf16_outputs, &attrs),
+        "bf16 block-path decode TopK must be byte-identical to the CPU oracle"
+    );
+}
+
 /// Regression guard for the Qwen3.6-35B-A3B unblock: the model's 40 MoE router
 /// gates are fp16 `TopK`. Before fp16 support the CUDA claim gate rejected them
 /// with `input 0 ('X') dtype Float16 unsupported; expected Float32`, forcing a
@@ -1119,5 +1200,55 @@ fn cumsum_exclusive_reverse_matrix_with_negative_axis() {
             ],
         );
         assert_eq!(f32s(&out[0]), expected);
+    }
+}
+
+// Locks the int64 block-per-lane cumsum path (used at decode when `lanes` is too
+// few to saturate the device, e.g. a batch-1 `position_ids` cumsum) against a
+// serial reference. Width 1000 > BLOCK(256) forces the multi-tile cooperative
+// scan with a running per-block base; lanes == 1 forces the block path. All
+// four (exclusive, reverse) combinations must be byte-identical to the serial
+// walk — integer addition is associative, so the parallel scan cannot diverge.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn cumsum_i64_block_path_matches_serial_reference() {
+    let width = 1000_usize;
+    let input: Vec<i64> = (0..width as i64).map(|n| (n % 7) - 3).collect();
+    for exclusive in [0_i64, 1] {
+        for reverse in [0_i64, 1] {
+            let mut expected = vec![0_i64; width];
+            let mut total = 0_i64;
+            for n in 0..width {
+                let d = if reverse == 1 { width - 1 - n } else { n };
+                if exclusive == 1 {
+                    expected[d] = total;
+                    total = total.wrapping_add(input[d]);
+                } else {
+                    total = total.wrapping_add(input[d]);
+                    expected[d] = total;
+                }
+            }
+            let out = run(
+                "CumSum",
+                11,
+                &[
+                    tensor(DataType::Int64, &[1, width], &input),
+                    tensor(DataType::Int64, &[], &[1_i64]),
+                ],
+                &[(DataType::Int64, vec![1, width])],
+                &[
+                    ("exclusive", Attribute::Int(exclusive)),
+                    ("reverse", Attribute::Int(reverse)),
+                ],
+            );
+            assert_eq!(
+                i64s(&out[0]),
+                expected,
+                "block cumsum mismatch (exclusive={exclusive}, reverse={reverse})"
+            );
+        }
     }
 }

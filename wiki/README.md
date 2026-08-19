@@ -1,6 +1,5 @@
 ---
 title: Wiki
-permalink: index
 aliases:
   - Knowledge Base
 tags:
@@ -16,6 +15,8 @@ updated: 2026-08-17
 This directory is an Obsidian-compatible knowledge base for explanatory notes,
 learning paths, and links between implementation concepts. It does not replace
 the specifications, measured evidence, or accepted designs in `docs/`.
+
+Published readers start at [[index|onnx-genai Knowledge Base]].
 
 > [!important] Source precedence
 > When a wiki note disagrees with formal documentation or code, use this order:
@@ -35,6 +36,7 @@ the specifications, measured evidence, or accepted designs in `docs/`.
 - **CUDA EP:** [[execution/CUDA Execution Provider]]
 - **Plugin EPs:** [[execution/Plugin Execution Providers]]
 - **Memory:** [[memory/Memory Management for Beginners]]
+- **MoE router skew:** [[memory/MoE Router Skew and Always-On Experts]]
 - **Tracing:** [[observability/Tracing and Profiling]]
 - **Performance engineering:** [[performance/Performance Engineering Playbook]]
 - **API design:** [[api/API Design Principles]]

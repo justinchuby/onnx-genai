@@ -15,6 +15,7 @@ use onnx_runtime_session::{
 };
 use onnx_runtime_tracer::{Args, TraceContext, capture_rejected};
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -132,6 +133,22 @@ pub struct NativeDecodeSession {
     /// model with no such `Scan` this latches `Disabled` and every decode step
     /// uses today's Scan child-session executor unchanged (no sibling built).
     decode_inline: DecodeInlineState,
+    /// Prompt tokens per prefill forward, from
+    /// `model.runtime_configurable.chunked_prefill.chunk_size`.
+    ///
+    /// A prefill forward's activations scale with the number of tokens in it,
+    /// while decode's do not. Feeding a whole prompt in one forward therefore
+    /// makes peak device memory a function of prompt length: measured on a 30B
+    /// INT4 model, a 469-token prompt peaked at 38 GiB and a 2757-token prompt
+    /// at 72 GiB, which is the combined mapped ceiling on an 80 GiB card, after
+    /// which unrelated requests began failing (#1362). Chunking bounds that peak
+    /// at a constant independent of prompt length.
+    ///
+    /// The flat ORT pipeline has honored this metadata since it was introduced;
+    /// this backend did not, so a model that declared `chunk_size` got chunked
+    /// prefill on one backend and not the other. `None` preserves the old
+    /// whole-prompt behaviour for models that declare nothing.
+    prefill_chunk_size: Option<NonZeroUsize>,
 }
 
 /// Deep-copy of the native loop-carried tensors at a semantic prefix boundary.
@@ -693,6 +710,44 @@ impl NativeDecodeSession {
             .map(|state| state.debug_stats(&self.session))
     }
 
+    /// Number of captured device-graph segments installed by the most recent
+    /// capture on the main decode graph slot (1 = whole-subgraph capture that
+    /// reaches the zero-host-work replay fast path; >=2 = a segmented capture
+    /// whose replay must interleave eager seam-node execution every step). This
+    /// is the batch-decode `M>=2` cliff signal: batch=1 typically captures as a
+    /// single graph while `M>=2` fragments into segments.
+    pub fn captured_graph_segment_count(&self) -> usize {
+        self.session.captured_graph_segment_count()
+    }
+
+    /// One `op_type[seam_reason]xN` summary per eager seam node that split the
+    /// most recent segmented capture on the main decode graph slot — the root
+    /// cause of a `>1`-segment graph. Empty for a whole-subgraph capture.
+    pub fn captured_graph_seam_summary(&self) -> Option<String> {
+        let mut counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for decline in self.session.capture_segmentation() {
+            let seam = decline
+                .seam_reason
+                .map(|reason| format!("{reason:?}"))
+                .unwrap_or_else(|| "graph".to_string());
+            *counts
+                .entry(format!("{}[{}]", decline.op_type, seam))
+                .or_default() += 1;
+        }
+        if counts.is_empty() {
+            None
+        } else {
+            Some(
+                counts
+                    .into_iter()
+                    .map(|(key, count)| format!("{key}x{count}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        }
+    }
+
     pub fn cuda_graph_fallback_reason(&self) -> Option<&str> {
         self.cuda
             .as_ref()
@@ -1035,6 +1090,41 @@ impl NativeDecodeSession {
                 self.current_len
             );
         }
+        // A step input belongs to specific token positions, so it can only be
+        // chunked when its leading sequence axis matches this step's tokens
+        // (an `inputs_embeds` prefill is exactly that: one row per token). A
+        // step input shaped any other way is not sliceable, so that forward
+        // stays whole rather than being fed a mismatched slice.
+        let chunkable_step_inputs = step_inputs
+            .iter()
+            .all(|(_, tensor)| sequence_aligned_rows(tensor) == Some(token_ids.len()));
+        let Some(chunk) = self
+            .prefill_chunk_size
+            .map(NonZeroUsize::get)
+            .filter(|&chunk| chunkable_step_inputs && token_ids.len() > chunk)
+        else {
+            return self.decode_forward(token_ids, past_len, step_inputs);
+        };
+        // Only the final chunk's logits continue the prompt; the earlier
+        // forwards exist to populate KV.
+        let mut logits = Vec::new();
+        let mut offset = 0usize;
+        for slice in token_ids.chunks(chunk) {
+            let past_len = self.current_len;
+            let sliced = slice_step_inputs(step_inputs, offset, slice.len())?;
+            logits = self.decode_forward(slice, past_len, &sliced)?;
+            offset += slice.len();
+        }
+        Ok(logits)
+    }
+
+    /// One forward over `token_ids`, with no chunking.
+    fn decode_forward(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+        step_inputs: &[(String, Tensor)],
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
         self.maybe_enable_decode_inline(token_ids);
         if self.cuda.is_some() {
             return self.decode_cuda(token_ids, past_len, step_inputs);
@@ -1281,5 +1371,97 @@ impl NativeDecodeSession {
             .iter()
             .find(|binding| binding.source == source)
             .map(|binding| binding.name.as_str())
+    }
+}
+
+/// Rows along a step input's sequence axis, when it has one.
+///
+/// A pipeline step input is laid out `[1, sequence, ...]` (e.g. `inputs_embeds`
+/// is `[1, tokens, hidden]`). Anything else — a scalar, a rank-1 tensor, or a
+/// batch dimension the decode path does not use — has no sequence axis to slice.
+fn sequence_aligned_rows(tensor: &Tensor) -> Option<usize> {
+    match tensor.shape.as_slice() {
+        [1, sequence, ..] => Some(*sequence),
+        _ => None,
+    }
+}
+
+/// Take rows `[offset, offset + len)` of each step input's sequence axis.
+///
+/// The tensors are row-major and contiguous, so a row range is a contiguous byte
+/// range; the slice is copied into a fresh tensor because the callee binds owned
+/// inputs.
+fn slice_step_inputs(
+    step_inputs: &[(String, Tensor)],
+    offset: usize,
+    len: usize,
+) -> anyhow::Result<Vec<(String, Tensor)>> {
+    let mut sliced = Vec::with_capacity(step_inputs.len());
+    for (port, tensor) in step_inputs {
+        let rows = sequence_aligned_rows(tensor)
+            .with_context(|| format!("step input '{port}' has no sequence axis to chunk"))?;
+        if offset + len > rows {
+            bail!("step input '{port}' holds {rows} rows, cannot take {len} from offset {offset}");
+        }
+        let mut shape = tensor.shape.clone();
+        shape[1] = len;
+        let bytes = tensor.as_bytes();
+        let row_bytes = if rows == 0 {
+            0
+        } else {
+            bytes.len() / rows.max(1)
+        };
+        debug_assert_eq!(row_bytes * rows, bytes.len());
+        let start = offset * row_bytes;
+        let end = start + len * row_bytes;
+        let slice = Tensor::from_raw(tensor.dtype, shape, &bytes[start..end])
+            .map_err(|error| anyhow::anyhow!("failed to slice step input '{port}': {error}"))?;
+        sliced.push((port.clone(), slice));
+    }
+    Ok(sliced)
+}
+
+#[cfg(test)]
+mod prefill_chunk_tests {
+    use super::*;
+
+    fn embeds(rows: usize, hidden: usize) -> Tensor {
+        let values: Vec<f32> = (0..rows * hidden).map(|value| value as f32).collect();
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        Tensor::from_raw(DataType::Float32, vec![1, rows, hidden], &bytes).expect("embeds")
+    }
+
+    #[test]
+    fn only_a_leading_batch_of_one_exposes_a_sequence_axis() {
+        assert_eq!(sequence_aligned_rows(&embeds(4, 2)), Some(4));
+        let flat = Tensor::from_raw(DataType::Float32, vec![4], &[0u8; 16]).expect("flat");
+        assert_eq!(sequence_aligned_rows(&flat), None);
+    }
+
+    #[test]
+    fn slicing_a_step_input_takes_exactly_its_row_range() {
+        let hidden = 3;
+        let step_inputs = vec![("inputs_embeds".to_string(), embeds(4, hidden))];
+        let sliced = slice_step_inputs(&step_inputs, 1, 2).expect("slice");
+        let (port, tensor) = &sliced[0];
+        assert_eq!(port, "inputs_embeds");
+        assert_eq!(tensor.shape, vec![1, 2, hidden]);
+        let taken: Vec<f32> = tensor
+            .as_bytes()
+            .chunks_exact(4)
+            .map(|word| f32::from_le_bytes(word.try_into().expect("f32")))
+            .collect();
+        // Rows 1 and 2 of a [1, 4, 3] tensor numbered 0..12.
+        assert_eq!(taken, vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn slicing_past_the_sequence_axis_is_refused() {
+        let step_inputs = vec![("inputs_embeds".to_string(), embeds(4, 3))];
+        let error = slice_step_inputs(&step_inputs, 3, 2).expect_err("out of range");
+        assert!(
+            error.to_string().contains("cannot take"),
+            "unexpected error: {error}"
+        );
     }
 }

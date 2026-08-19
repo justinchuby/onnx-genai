@@ -94,11 +94,163 @@ use crate::runtime::{CudaRuntime, cuptr};
 const BLOCK: u32 = 256;
 /// Threads per block for `attention_row` (one block services one score row).
 const ROW_THREADS: u32 = 128;
+
+/// Threads-per-block for `attention_row`, with an env override for tuning.
+///
+/// `attention_row` launches one block per (batch, q_head, query) row. In the
+/// decode regime (q_seq == 1) the grid is only `batch * q_heads` blocks (16 for
+/// a 16-head model), so the kernel is badly under-occupied and memory-latency
+/// bound on the per-key K/V load chains. Giving each block more warps lets it
+/// hide that latency without changing any reduction order, so the result stays
+/// byte-identical. `ONNX_GENAI_ATTN_ROW_THREADS` overrides the count for tuning.
+fn attention_row_threads(is_decode: bool) -> u32 {
+    use std::sync::OnceLock;
+    static OVERRIDE: OnceLock<Option<u32>> = OnceLock::new();
+    let over = *OVERRIDE.get_or_init(|| {
+        std::env::var("ONNX_GENAI_ATTN_ROW_THREADS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .filter(|&n| (32..=1024).contains(&n) && n % 32 == 0)
+    });
+    if let Some(n) = over {
+        return n;
+    }
+    if is_decode { 256 } else { ROW_THREADS }
+}
+
+/// Upper bound on FlashDecoding key-splits per row (keeps the combine's per-row
+/// loop and the partial-output scratch small while still filling the machine).
+const ATTN_SPLIT_MAX_SPLITS: u64 = 64;
+/// Threads per block for the `attention_split` / `attention_combine` kernels.
+const ATTN_SPLIT_THREADS: u32 = 256;
+/// Adaptive split-KV target: total `attention_split` blocks
+/// (`total_rows * num_splits`) to aim for so the launch fills roughly one full
+/// occupancy wave of the machine (~4 resident CTAs on each of the 132 H200 SMs).
+/// The decode split kernel is memory-latency bound, so an ncu + E2E chunk sweep
+/// on V2-Lite showed the optimum is ~this many blocks (grid ~512 at deep
+/// context), NOT one block per SM: at deep context a grid of 132 blocks
+/// (`chunk`=512) leaves the SMs latency-starved and is ~5% slower than a grid of
+/// 512 (`chunk`=128). Targeting a whole wave keeps enough resident CTAs per SM
+/// to hide the KV-load latency.
+const ATTN_SPLIT_TARGET_BLOCKS: u64 = 512;
+/// Floor on keys per split for the adaptive sizing: never split so finely that a
+/// split covers fewer than this many keys. Also the byte-identity margin — any
+/// live context `<= ATTN_SPLIT_MIN_CHUNK` stays on the single-split bit-exact
+/// fast path (the V2-Lite golden 24-tok decode lock sits well under this).
+const ATTN_SPLIT_MIN_CHUNK: u64 = 128;
+
+/// FlashDecoding split-KV configuration for one decode launch, or `None` when
+/// the monolithic `attention_row` kernel should be used instead.
+///
+/// The decode grid is only `batch*q_heads` blocks (~16), so `attention_row`
+/// leaves ~116 of 132 SMs idle and is memory-latency bound. Splitting each row's
+/// key reduction across `num_splits` blocks fills the machine at wide context,
+/// where `attention_row` is the #1 decode kernel (~40% of decode time).
+///
+/// `num_splits` is derived purely from the fixed physical KV capacity `cap` and
+/// the fixed row count `total_rows` (never the live sequence length), so the
+/// launch geometry — and the decision to split at all — is identical under eager
+/// and CUDA-graph capture. The keys-per-split `chunk` follows from `num_splits`:
+/// when the live `total_seq <= chunk` only split 0 is active and reproduces
+/// `attention_row` bit-for-bit, so short-context decode stays byte-identical;
+/// only genuinely wide context reorders the fp32 accumulation (validated to the
+/// f64 oracle tolerance).
+///
+/// Adaptive sizing: aim for `ATTN_SPLIT_TARGET_BLOCKS` total blocks
+/// (`total_rows * num_splits`) so the launch fills ~one occupancy wave, but never
+/// split a row into pieces smaller than `ATTN_SPLIT_MIN_CHUNK` keys (which would
+/// starve each split of work and lower the byte-identity threshold). For
+/// V2-Lite's 16 decode rows this lands `num_splits` near 32 (grid ~512, the
+/// measured optimum) at deep context and scales down gracefully at shallow
+/// context, where `cap` alone caps the useful split count.
+///
+/// `ONNX_GENAI_ATTN_SPLITKV=0` forces the monolithic path (A/B baseline);
+/// `ONNX_GENAI_ATTN_SPLIT_CHUNK` pins a fixed keys-per-split, overriding the
+/// adaptive sizing (for A/B sweeps and backward compatibility).
+fn attention_split_config(
+    is_decode: bool,
+    dev_length_eligible: bool,
+    want_qk: bool,
+    cap: u64,
+    total_rows: u64,
+    _v_head_size: u64,
+) -> Option<(u64, u64)> {
+    use std::sync::OnceLock;
+    static CFG: OnceLock<(bool, Option<u64>)> = OnceLock::new();
+    let (enabled, chunk_override) = *CFG.get_or_init(|| {
+        let enabled = std::env::var("ONNX_GENAI_ATTN_SPLITKV")
+            .ok()
+            .map(|s| {
+                let s = s.trim();
+                !(s == "0" || s.eq_ignore_ascii_case("off") || s.eq_ignore_ascii_case("false"))
+            })
+            .unwrap_or(true);
+        let chunk_override = std::env::var("ONNX_GENAI_ATTN_SPLIT_CHUNK")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&n| n >= 32);
+        (enabled, chunk_override)
+    });
+    // Split only on the capture-safe fixed-capacity decode route, and never when
+    // the raw QK scores are an observable output (the score scratch is reused as
+    // per-key storage inside the split kernel).
+    if !enabled || !is_decode || !dev_length_eligible || want_qk || cap == 0 {
+        return None;
+    }
+    attention_split_geometry(chunk_override, cap, total_rows)
+}
+
+/// Pure split-KV geometry: map (`chunk_override`, fixed `cap`, fixed
+/// `total_rows`) to `(num_splits, chunk)`, or `None` when a single split (the
+/// monolithic path plus combine overhead) is all that is warranted. Split out
+/// from [`attention_split_config`] so the capture-critical sizing arithmetic is
+/// unit-testable without touching process env.
+fn attention_split_geometry(
+    chunk_override: Option<u64>,
+    cap: u64,
+    total_rows: u64,
+) -> Option<(u64, u64)> {
+    if cap == 0 {
+        return None;
+    }
+    let rows = total_rows.max(1);
+    let num_splits = match chunk_override {
+        // Fixed-chunk mode: split count follows directly from the pinned chunk.
+        Some(chunk) => cap.div_ceil(chunk.max(1)).clamp(1, ATTN_SPLIT_MAX_SPLITS),
+        // Adaptive mode: target ~one occupancy wave of blocks, but never split a
+        // row finer than ATTN_SPLIT_MIN_CHUNK keys.
+        None => {
+            let target_splits = ATTN_SPLIT_TARGET_BLOCKS.div_ceil(rows);
+            let splits_by_cap = cap.div_ceil(ATTN_SPLIT_MIN_CHUNK);
+            target_splits
+                .min(splits_by_cap)
+                .clamp(1, ATTN_SPLIT_MAX_SPLITS)
+        }
+    };
+    // A single split is just the monolithic kernel plus combine overhead.
+    if num_splits < 2 {
+        return None;
+    }
+    // Keys per split; the single-split fast path triggers when total_seq <= chunk.
+    let chunk = cap.div_ceil(num_splits);
+    Some((num_splits, chunk))
+}
+
+/// Floats of split-KV partial scratch for `num_splits` splits over `total_rows`
+/// decode rows: 2 metadata floats (running max + sum) plus `v_head_size`
+/// unnormalized P·V floats per (row, split) partial.
+fn attention_split_scratch_floats(num_splits: u64, total_rows: u64, v_head_size: u64) -> usize {
+    num_splits
+        .saturating_mul(total_rows)
+        .saturating_mul(v_head_size + 2)
+        .min(usize::MAX as u64) as usize
+}
 const ATTENTION_MODULE: &str = "standard_attention_f32_f16_bf16_v3";
 const ATTENTION_SOURCE: &str = r#"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #define NEG_INF __int_as_float(0xff800000)
+#define DERIVE_LEN_THREADS 256
 
 // dtype is 0 for f32, 1 for f16, and 2 for bf16. Keep all computation in fp32;
 // only the externally visible activations and cache use the requested storage
@@ -140,11 +292,21 @@ __device__ __forceinline__ void store_float(void* data, unsigned long long index
 extern "C" __global__ void derive_len(
     const void* mask, int mask_kind, unsigned long long key_len,
     unsigned long long row_base, int* out_len) {
-  if (blockIdx.x != 0 || threadIdx.x != 0) {
-    return;
-  }
-  int total = (int)key_len;
-  for (unsigned long long j = 0; j < key_len; ++j) {
+  // Block-parallel min-index reduction over the mask row: each thread strides
+  // the row and records the first padded position (v < -1000) it encounters;
+  // the block-min of those indices is the overall frontier. Under the single
+  // contiguous right-aligned valid run this ABI assumes, every index < the
+  // frontier is valid and every index >= it is padded, so the block-min equals
+  // the valid length (or `key_len` if no padding is present). This is
+  // byte-identical to the prior single-thread serial scan but replaces its
+  // O(key_len) latency-bound walk (which dominates decode at wide context) with
+  // a coalesced parallel pass. Launched as grid(1,1,1) with DERIVE_LEN_THREADS
+  // threads so the geometry stays fixed and capture-safe.
+  const int nthreads = blockDim.x;
+  const int tid = threadIdx.x;
+  int local = (int)key_len;
+  for (unsigned long long j = (unsigned long long)tid; j < key_len;
+       j += (unsigned long long)nthreads) {
     const unsigned long long idx = row_base + j;
     float v;
     if (mask_kind == 1) {
@@ -157,11 +319,24 @@ extern "C" __global__ void derive_len(
       v = ((const unsigned char*)mask)[idx] != 0 ? 0.0f : NEG_INF;
     }
     if (v < -1000.0f) {
-      total = (int)j;
+      // Indices are scanned in ascending order within this thread's stride, so
+      // the first hit is this thread's smallest padded index.
+      local = (int)j;
       break;
     }
   }
-  out_len[0] = total;
+  __shared__ int red[DERIVE_LEN_THREADS];
+  red[tid] = local;
+  __syncthreads();
+  for (int s = nthreads >> 1; s > 0; s >>= 1) {
+    if (tid < s && red[tid + s] < red[tid]) {
+      red[tid] = red[tid + s];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    out_len[0] = red[0];
+  }
 }
 
 // buffer, applying the 3D->4D head reshape and the past ++ current concat.
@@ -412,6 +587,268 @@ extern "C" __global__ void attention_row(
     store_float(y, ybase + c, acc, dtype);
   }
 }
+
+// FlashDecoding split: one block per (row, split). Each block reduces the
+// contiguous key slice [split*chunk, min((split+1)*chunk, total_seq)) of one
+// query row and writes a partial (max, sum, unnormalized P·V) into split_meta /
+// split_out; `attention_combine` later merges the partials with a log-sum-exp
+// rescale. This spreads a single row's key reduction across `num_splits` blocks
+// so the decode grid (batch*q_heads rows, ~16) fills the machine instead of
+// leaving ~116 SMs idle.
+//
+// Byte-identity fast path: when the whole row fits in one chunk
+// (total_seq <= chunk => only split 0 is active) split 0 runs the EXACT
+// `attention_row` reduction (global max, serial ascending softmax, ascending
+// P·V) and writes the FINAL normalized output with a sentinel (max=0, sum=1) so
+// the combine pass is a bit-exact identity. Only the genuinely multi-split
+// (wide-context) path reorders the fp32 accumulation.
+extern "C" __global__ void attention_split(
+    const void* q, const void* key, const void* value,
+    const void* mask, float* scores, float* split_out, float* split_meta,
+    const long long* offsets, const long long* pad_limits,
+    unsigned long long batch, unsigned long long q_heads, unsigned long long q_seq,
+    unsigned long long kv_heads, unsigned long long total_seq_arg,
+    unsigned long long cap,
+    unsigned long long head_size, unsigned long long v_head_size,
+    unsigned long long group,
+    int dtype, int q_is_3d, int is_causal,
+    float sqrt_scale, float softcap,
+    int mask_kind, int mask_rank,
+    unsigned long long md0, unsigned long long md1,
+    unsigned long long md2, unsigned long long md3,
+    const int* dev_len,
+    unsigned long long num_splits, unsigned long long chunk) {
+  const unsigned long long row = blockIdx.x;
+  const unsigned long long split = blockIdx.y;
+  const unsigned long long total_rows = batch * q_heads * q_seq;
+  if (row >= total_rows || split >= num_splits) {
+    return;
+  }
+  const unsigned long long total_seq =
+      (dev_len != nullptr) ? (unsigned long long)dev_len[0] : total_seq_arg;
+  const unsigned long long i = row % q_seq;
+  unsigned long long rem = row / q_seq;
+  const unsigned long long qh = rem % q_heads;
+  const unsigned long long b = rem / q_heads;
+  const unsigned long long kvh = qh / group;
+  const unsigned long long srow = row * total_seq;
+  const int tid = threadIdx.x;
+  const int nthreads = blockDim.x;
+  const unsigned long long moff = (row * num_splits + split) * 2;
+  const unsigned long long obase = (row * num_splits + split) * v_head_size;
+
+  const unsigned long long chunk_start = split * chunk;
+  unsigned long long chunk_end = chunk_start + chunk;
+  if (chunk_end > total_seq) {
+    chunk_end = total_seq;
+  }
+
+  // Empty split (no keys): emit a neutral partial that never wins the combine.
+  if (chunk_start >= total_seq) {
+    if (tid == 0) {
+      split_meta[moff] = NEG_INF;
+      split_meta[moff + 1] = 0.0f;
+    }
+    for (unsigned long long c = tid; c < v_head_size; c += nthreads) {
+      split_out[obase + c] = 0.0f;
+    }
+    return;
+  }
+
+  const unsigned long long qoff = q_is_3d
+      ? (b * q_seq + i) * (q_heads * head_size) + qh * head_size
+      : ((b * q_heads + qh) * q_seq + i) * head_size;
+  const long long offset = offsets[b];
+  const long long pad_limit = pad_limits[b];
+  const long long causal_limit = (long long)i + offset;
+  const bool single = (total_seq <= chunk);
+
+  // Stage 1: scaled Q·Kᵀ for this chunk's keys, then softcap + mask + frontier,
+  // staged into the score scratch (same values as attention_row stages 1-3).
+  for (unsigned long long j = chunk_start + tid; j < chunk_end; j += nthreads) {
+    const unsigned long long koff = ((b * kv_heads + kvh) * cap + j) * head_size;
+    float acc = 0.0f;
+    for (unsigned long long p = 0; p < head_size; ++p) {
+      acc += (load_float(q, qoff + p, dtype) * sqrt_scale)
+          * (load_float(key, koff + p, dtype) * sqrt_scale);
+    }
+    if (softcap != 0.0f) {
+      acc = softcap * tanhf(acc / softcap);
+    }
+    const long long jj = (long long)j;
+    if (pad_limit >= 0 && jj >= pad_limit) {
+      acc = NEG_INF;
+    } else if (is_causal && jj > causal_limit) {
+      acc = NEG_INF;
+    } else {
+      acc += mask_bias(mask, mask_kind, mask_rank, md0, md1, md2, md3,
+                       b, qh, i, j, total_seq);
+    }
+    scores[srow + j] = acc;
+  }
+  __syncthreads();
+
+  if (single) {
+    // Byte-identical path: reproduce attention_row exactly on the lead thread
+    // (global max, ascending exp/sum, ascending normalize) then write the FINAL
+    // normalized output with a pass-through sentinel for the combine.
+    __shared__ float inv_sum_sh;
+    __shared__ int all_masked_sh;
+    if (tid == 0) {
+      float m = NEG_INF;
+      for (unsigned long long j = 0; j < total_seq; ++j) {
+        m = fmaxf(m, scores[srow + j]);
+      }
+      if (m == NEG_INF) {
+        all_masked_sh = 1;
+        inv_sum_sh = 0.0f;
+      } else {
+        all_masked_sh = 0;
+        float sum = 0.0f;
+        for (unsigned long long j = 0; j < total_seq; ++j) {
+          const float e = expf(scores[srow + j] - m);
+          scores[srow + j] = e;
+          sum += e;
+        }
+        inv_sum_sh = 1.0f / sum;
+      }
+      // Sentinel: combine computes out = split_out * exp(0-0) / 1 = split_out.
+      split_meta[moff] = 0.0f;
+      split_meta[moff + 1] = 1.0f;
+    }
+    __syncthreads();
+    if (all_masked_sh) {
+      for (unsigned long long j = tid; j < total_seq; j += nthreads) {
+        scores[srow + j] = 0.0f;
+      }
+    } else {
+      const float inv = inv_sum_sh;
+      for (unsigned long long j = tid; j < total_seq; j += nthreads) {
+        scores[srow + j] *= inv;
+      }
+    }
+    __syncthreads();
+    for (unsigned long long c = tid; c < v_head_size; c += nthreads) {
+      float acc = 0.0f;
+      for (unsigned long long j = 0; j < total_seq; ++j) {
+        const unsigned long long voff = ((b * kv_heads + kvh) * cap + j) * v_head_size;
+        acc += scores[srow + j] * load_float(value, voff + c, dtype);
+      }
+      split_out[obase + c] = acc;
+    }
+    return;
+  }
+
+  // Multi-split path (wide context): chunk-local online softmax with a
+  // block-parallel max/sum reduction, unnormalized P·V, merged by the combine.
+  __shared__ float red[256];
+  float local_max = NEG_INF;
+  for (unsigned long long j = chunk_start + tid; j < chunk_end; j += nthreads) {
+    local_max = fmaxf(local_max, scores[srow + j]);
+  }
+  red[tid] = local_max;
+  __syncthreads();
+  for (int stride = nthreads / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      red[tid] = fmaxf(red[tid], red[tid + stride]);
+    }
+    __syncthreads();
+  }
+  const float m = red[0];
+  __syncthreads();
+
+  float local_sum = 0.0f;
+  for (unsigned long long j = chunk_start + tid; j < chunk_end; j += nthreads) {
+    const float e = (m == NEG_INF) ? 0.0f : expf(scores[srow + j] - m);
+    scores[srow + j] = e;
+    local_sum += e;
+  }
+  red[tid] = local_sum;
+  __syncthreads();
+  for (int stride = nthreads / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      red[tid] += red[tid + stride];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    split_meta[moff] = m;
+    split_meta[moff + 1] = red[0];
+  }
+  __syncthreads();
+
+  // Unnormalized partial P·V over this chunk (ascending keys per channel).
+  for (unsigned long long c = tid; c < v_head_size; c += nthreads) {
+    float acc = 0.0f;
+    for (unsigned long long j = chunk_start; j < chunk_end; ++j) {
+      const unsigned long long voff = ((b * kv_heads + kvh) * cap + j) * v_head_size;
+      acc += scores[srow + j] * load_float(value, voff + c, dtype);
+    }
+    split_out[obase + c] = acc;
+  }
+}
+
+// FlashDecoding combine: one block per row merges the per-split partials with a
+// numerically-stable log-sum-exp rescale. Uniform for both the single-split
+// (sentinel max=0/sum=1 => bit-exact pass-through) and multi-split partials.
+extern "C" __global__ void attention_combine(
+    const float* split_out, const float* split_meta, void* y,
+    unsigned long long batch, unsigned long long q_heads, unsigned long long q_seq,
+    unsigned long long v_head_size,
+    int dtype, int out_is_3d, unsigned long long num_splits) {
+  const unsigned long long row = blockIdx.x;
+  const unsigned long long total_rows = batch * q_heads * q_seq;
+  if (row >= total_rows) {
+    return;
+  }
+  const int tid = threadIdx.x;
+  const int nthreads = blockDim.x;
+  const unsigned long long i = row % q_seq;
+  unsigned long long rem = row / q_seq;
+  const unsigned long long qh = rem % q_heads;
+  const unsigned long long b = rem / q_heads;
+
+  __shared__ float gmax_sh;
+  __shared__ float gsum_sh;
+  if (tid == 0) {
+    float gmax = NEG_INF;
+    for (unsigned long long s = 0; s < num_splits; ++s) {
+      gmax = fmaxf(gmax, split_meta[(row * num_splits + s) * 2]);
+    }
+    float gsum = 0.0f;
+    if (gmax != NEG_INF) {
+      for (unsigned long long s = 0; s < num_splits; ++s) {
+        const float ms = split_meta[(row * num_splits + s) * 2];
+        const float ls = split_meta[(row * num_splits + s) * 2 + 1];
+        gsum += ls * expf(ms - gmax);
+      }
+    }
+    gmax_sh = gmax;
+    gsum_sh = gsum;
+  }
+  __syncthreads();
+  const float gmax = gmax_sh;
+  const float gsum = gsum_sh;
+  const unsigned long long ybase = out_is_3d
+      ? (b * q_seq + i) * (q_heads * v_head_size) + qh * v_head_size
+      : ((b * q_heads + qh) * q_seq + i) * v_head_size;
+  if (gmax == NEG_INF || gsum == 0.0f) {
+    for (unsigned long long c = tid; c < v_head_size; c += nthreads) {
+      store_float(y, ybase + c, 0.0f, dtype);
+    }
+    return;
+  }
+  const float inv = 1.0f / gsum;
+  for (unsigned long long c = tid; c < v_head_size; c += nthreads) {
+    float acc = 0.0f;
+    for (unsigned long long s = 0; s < num_splits; ++s) {
+      const float ms = split_meta[(row * num_splits + s) * 2];
+      const float w = expf(ms - gmax);
+      acc += split_out[(row * num_splits + s) * v_head_size + c] * w;
+    }
+    store_float(y, ybase + c, acc * inv, dtype);
+  }
+}
 "#;
 
 /// Return the claim-time denial for Attention's positional input contract.
@@ -565,7 +1002,8 @@ const WS_STAGE_KEY: usize = 4;
 const WS_STAGE_VALUE: usize = 5;
 const WS_PRESENT_KEY: usize = 6;
 const WS_PRESENT_VALUE: usize = 7;
-const WS_COUNT: usize = 8;
+const WS_SPLIT: usize = 8;
+const WS_COUNT: usize = 9;
 
 /// Alignment of the governed default-domain `Attention` score buffer (#736),
 /// matching the executor's 256-byte device-allocation granularity.
@@ -1339,7 +1777,7 @@ impl StandardAttentionKernel {
         unsafe {
             builder.launch(LaunchConfig {
                 grid_dim: (1, 1, 1),
-                block_dim: (1, 1, 1),
+                block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             })
         }
@@ -1753,6 +2191,27 @@ impl StandardAttentionKernel {
             let capturing = self.runtime.is_capturing()?;
             let staged_decode_eligible = (stage_key || stage_value) && batch == 1 && q_seq == 1;
             let capture_workspace_eligible = dev_length_eligible || staged_decode_eligible;
+            // FlashDecoding split-KV: engage on the capture-safe fixed-capacity
+            // decode route. `num_splits`/`chunk` derive only from the fixed cap
+            // and row count, so the choice is identical under eager and capture.
+            let total_rows_u = (batch as u64)
+                .saturating_mul(q_heads as u64)
+                .saturating_mul(q_seq as u64);
+            let split_cfg = attention_split_config(
+                q_seq == 1,
+                dev_length_eligible,
+                want_qk,
+                key_cap as u64,
+                total_rows_u,
+                v_head_size as u64,
+            );
+            let split_bytes = match split_cfg {
+                Some((num_splits, _)) => {
+                    attention_split_scratch_floats(num_splits, total_rows_u, v_head_size as u64)
+                        .saturating_mul(std::mem::size_of::<f32>())
+                }
+                None => 0,
+            };
             let mut ws = if capture_workspace_eligible {
                 Some(self.workspace.lock().map_err(|_| {
                     EpError::KernelFailed("Attention: workspace lock poisoned".into())
@@ -1802,6 +2261,18 @@ impl StandardAttentionKernel {
                     Some(ws) => ws.reserve(WS_SCORES, workspace_layout.scores_bytes)?,
                     None => alloc(&self.runtime, &mut owned, workspace_layout.scores_bytes)?,
                 },
+            };
+            // FlashDecoding split-KV partial scratch (`split_meta` then
+            // `split_out`). Served from the retained per-kernel workspace pool
+            // (warmed before capture like the score scratch) so the split route
+            // records no allocation under CUDA-graph capture.
+            let split_base_ptr = if split_bytes > 0 {
+                match ws.as_mut() {
+                    Some(ws) => Some(ws.reserve(WS_SPLIT, split_bytes)?),
+                    None => Some(alloc(&self.runtime, &mut owned, split_bytes)?),
+                }
+            } else {
+                None
             };
             // Present K/V source pointers. A bound output slot supplies the
             // storage directly; otherwise the scratch is served from the
@@ -2059,10 +2530,10 @@ impl StandardAttentionKernel {
                 }
             }
 
-            // Launch the main attention kernel: one block per query row.
-            let func =
-                self.runtime
-                    .nvrtc_function(ATTENTION_MODULE, ATTENTION_SOURCE, "attention_row")?;
+            // Launch the attention kernel. Decode with a fixed-capacity cache
+            // takes the FlashDecoding split-KV path (fills the machine at wide
+            // context); every other shape takes the monolithic one-block-per-row
+            // `attention_row`.
             let total_rows = (batch * q_heads * q_seq) as u64;
             if total_rows > 0 {
                 let batch_u = batch as u64;
@@ -2083,49 +2554,143 @@ impl StandardAttentionKernel {
                 let qk_mode = self.qk_matmul_output_mode as i32;
                 let want_qk_i = i32::from(want_qk);
                 let softcap = self.softcap;
-                let mut builder = self.runtime.stream().launch_builder(&func);
-                builder
-                    .arg(&q_ptr)
-                    .arg(&key_kv_ptr)
-                    .arg(&value_kv_ptr)
-                    .arg(&mask.ptr)
-                    .arg(&scores_ptr)
-                    .arg(&y_ptr)
-                    .arg(&qk_ptr)
-                    .arg(&offsets_ptr)
-                    .arg(&pad_limits_ptr)
-                    .arg(&batch_u)
-                    .arg(&q_heads_u)
-                    .arg(&q_seq_u)
-                    .arg(&kv_heads_u)
-                    .arg(&total_seq_u)
-                    .arg(&kv_cap_u)
-                    .arg(&head_size_u)
-                    .arg(&v_head_size_u)
-                    .arg(&group_u)
-                    .arg(&dtype_code)
-                    .arg(&q_is_3d)
-                    .arg(&out_is_3d)
-                    .arg(&is_causal)
-                    .arg(&sqrt_scale)
-                    .arg(&softcap)
-                    .arg(&mask_kind)
-                    .arg(&mask_rank)
-                    .arg(&md0)
-                    .arg(&md1)
-                    .arg(&md2)
-                    .arg(&md3)
-                    .arg(&qk_mode)
-                    .arg(&want_qk_i)
-                    .arg(&dev_len_ptr);
-                unsafe {
-                    builder.launch(LaunchConfig {
-                        grid_dim: (total_rows.min(u32::MAX as u64).max(1) as u32, 1, 1),
-                        block_dim: (ROW_THREADS, 1, 1),
-                        shared_mem_bytes: 0,
-                    })
+                let grid_x = total_rows.min(u32::MAX as u64).max(1) as u32;
+                if let Some((num_splits, chunk)) = split_cfg {
+                    let split_base = split_base_ptr.ok_or_else(|| {
+                        EpError::KernelFailed(
+                            "Attention: split-KV engaged but partial scratch is unallocated".into(),
+                        )
+                    })?;
+                    let meta_floats = total_rows.saturating_mul(num_splits).saturating_mul(2);
+                    let split_meta_ptr = split_base;
+                    let split_out_ptr =
+                        split_base + meta_floats * std::mem::size_of::<f32>() as u64;
+                    let num_splits_u = num_splits;
+                    let chunk_u = chunk;
+
+                    let split_func = self.runtime.nvrtc_function(
+                        ATTENTION_MODULE,
+                        ATTENTION_SOURCE,
+                        "attention_split",
+                    )?;
+                    let mut builder = self.runtime.stream().launch_builder(&split_func);
+                    builder
+                        .arg(&q_ptr)
+                        .arg(&key_kv_ptr)
+                        .arg(&value_kv_ptr)
+                        .arg(&mask.ptr)
+                        .arg(&scores_ptr)
+                        .arg(&split_out_ptr)
+                        .arg(&split_meta_ptr)
+                        .arg(&offsets_ptr)
+                        .arg(&pad_limits_ptr)
+                        .arg(&batch_u)
+                        .arg(&q_heads_u)
+                        .arg(&q_seq_u)
+                        .arg(&kv_heads_u)
+                        .arg(&total_seq_u)
+                        .arg(&kv_cap_u)
+                        .arg(&head_size_u)
+                        .arg(&v_head_size_u)
+                        .arg(&group_u)
+                        .arg(&dtype_code)
+                        .arg(&q_is_3d)
+                        .arg(&is_causal)
+                        .arg(&sqrt_scale)
+                        .arg(&softcap)
+                        .arg(&mask_kind)
+                        .arg(&mask_rank)
+                        .arg(&md0)
+                        .arg(&md1)
+                        .arg(&md2)
+                        .arg(&md3)
+                        .arg(&dev_len_ptr)
+                        .arg(&num_splits_u)
+                        .arg(&chunk_u);
+                    unsafe {
+                        builder.launch(LaunchConfig {
+                            grid_dim: (grid_x, num_splits.min(u32::MAX as u64).max(1) as u32, 1),
+                            block_dim: (ATTN_SPLIT_THREADS, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                    }
+                    .map_err(|error| driver_err("launch attention_split", error))?;
+
+                    let combine_func = self.runtime.nvrtc_function(
+                        ATTENTION_MODULE,
+                        ATTENTION_SOURCE,
+                        "attention_combine",
+                    )?;
+                    let mut cbuilder = self.runtime.stream().launch_builder(&combine_func);
+                    cbuilder
+                        .arg(&split_out_ptr)
+                        .arg(&split_meta_ptr)
+                        .arg(&y_ptr)
+                        .arg(&batch_u)
+                        .arg(&q_heads_u)
+                        .arg(&q_seq_u)
+                        .arg(&v_head_size_u)
+                        .arg(&dtype_code)
+                        .arg(&out_is_3d)
+                        .arg(&num_splits_u);
+                    unsafe {
+                        cbuilder.launch(LaunchConfig {
+                            grid_dim: (grid_x, 1, 1),
+                            block_dim: (ATTN_SPLIT_THREADS, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                    }
+                    .map_err(|error| driver_err("launch attention_combine", error))?;
+                } else {
+                    let func = self.runtime.nvrtc_function(
+                        ATTENTION_MODULE,
+                        ATTENTION_SOURCE,
+                        "attention_row",
+                    )?;
+                    let mut builder = self.runtime.stream().launch_builder(&func);
+                    builder
+                        .arg(&q_ptr)
+                        .arg(&key_kv_ptr)
+                        .arg(&value_kv_ptr)
+                        .arg(&mask.ptr)
+                        .arg(&scores_ptr)
+                        .arg(&y_ptr)
+                        .arg(&qk_ptr)
+                        .arg(&offsets_ptr)
+                        .arg(&pad_limits_ptr)
+                        .arg(&batch_u)
+                        .arg(&q_heads_u)
+                        .arg(&q_seq_u)
+                        .arg(&kv_heads_u)
+                        .arg(&total_seq_u)
+                        .arg(&kv_cap_u)
+                        .arg(&head_size_u)
+                        .arg(&v_head_size_u)
+                        .arg(&group_u)
+                        .arg(&dtype_code)
+                        .arg(&q_is_3d)
+                        .arg(&out_is_3d)
+                        .arg(&is_causal)
+                        .arg(&sqrt_scale)
+                        .arg(&softcap)
+                        .arg(&mask_kind)
+                        .arg(&mask_rank)
+                        .arg(&md0)
+                        .arg(&md1)
+                        .arg(&md2)
+                        .arg(&md3)
+                        .arg(&qk_mode)
+                        .arg(&want_qk_i)
+                        .arg(&dev_len_ptr);
+                    unsafe {
+                        builder.launch(LaunchConfig {
+                            grid_dim: (grid_x, 1, 1),
+                            block_dim: (attention_row_threads(q_seq == 1), 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                    }
+                    .map_err(|error| driver_err("launch attention_row", error))?;
                 }
-                .map_err(|error| driver_err("launch attention_row", error))?;
             }
             if !self.runtime.is_capturing()? {
                 self.runtime.synchronize()?;
@@ -2217,6 +2782,27 @@ impl Kernel for StandardAttentionKernel {
                 "Attention capture signature is unavailable because its state lock was poisoned",
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod row_threads_tests {
+    //! Locks the decode-vs-prefill launch width for `attention_row`. The decode
+    //! path (`is_decode == true`, i.e. `q_seq == 1`) intentionally launches wider
+    //! blocks (256 threads) so each of the few per-head blocks has enough warps to
+    //! hide the per-key K/V load latency; prefill keeps the base `ROW_THREADS`
+    //! width. The change is byte-identical (more threads, same reduction order).
+    use super::{ROW_THREADS, attention_row_threads};
+
+    #[test]
+    fn decode_uses_wider_blocks_prefill_keeps_base() {
+        // No `ONNX_GENAI_ATTN_ROW_THREADS` override in the test environment, so
+        // the built-in defaults apply.
+        assert_eq!(attention_row_threads(false), ROW_THREADS);
+        assert_eq!(attention_row_threads(true), 256);
+        // Both widths must be positive multiples of a warp.
+        assert_eq!(attention_row_threads(true) % 32, 0);
+        assert_eq!(attention_row_threads(false) % 32, 0);
     }
 }
 
@@ -2728,6 +3314,25 @@ mod alias_tests {
             1,
             "row-0 scan reports 1 for a causal prefill mask (decode-only bug guard)"
         );
+
+        // Wide-context decode spanning many thread strides (key_len > the 256
+        // reduction threads) with an unaligned frontier: locks the block-parallel
+        // min-index reduction against the prior serial scan. The valid run is
+        // [0, wide_total) followed by padding; the derived length must be exactly
+        // wide_total regardless of which thread stride owns the frontier.
+        let wide_cap = 2600u64;
+        for wide_total in [1i32, 255, 256, 257, 617, 2599, 2600] {
+            let mut wide = vec![0.0f32; wide_total as usize];
+            wide.extend(std::iter::repeat_n(
+                NEG,
+                wide_cap as usize - wide_total as usize,
+            ));
+            assert_eq!(
+                derive(&wide, wide_cap, 0),
+                wide_total,
+                "wide decode: parallel frontier must equal valid length {wide_total}"
+            );
+        }
     }
 
     /// Capture eligibility of the default-domain Attention path is gated on a
@@ -2978,6 +3583,48 @@ mod workspace_governance_tests {
         assert_eq!(
             std_attention_workspace_requirement(&bad_inputs, Some(4), Some(4), true, 3).unwrap(),
             WorkspaceRequirement::NONE
+        );
+    }
+
+    #[test]
+    fn adaptive_split_geometry_fills_a_wave_and_stays_capture_safe() {
+        // Adaptive mode (no chunk override): target ~ATTN_SPLIT_TARGET_BLOCKS
+        // blocks = total_rows * num_splits, floored so no split covers fewer than
+        // ATTN_SPLIT_MIN_CHUNK keys. For V2-Lite's 16 decode rows the deep-cap
+        // optimum measured on H200 is num_splits=32 (grid ~512, ~one wave).
+        let rows = 16;
+        // Deep cap: capped by the target-blocks wave, not by cap.
+        let (n, chunk) = attention_split_geometry(None, 4096, rows).unwrap();
+        assert_eq!(n, 32, "deep cap should target ~a full wave of blocks");
+        assert_eq!(chunk, 128, "keys per split at the deep optimum");
+        assert!(rows * n >= ATTN_SPLIT_TARGET_BLOCKS / 2);
+        // Extreme cap: split count is clamped by the wave target (never explodes),
+        // so chunk grows instead — keeps the combine loop + scratch bounded.
+        let (n_hi, chunk_hi) = attention_split_geometry(None, 16384, rows).unwrap();
+        assert_eq!(n_hi, 32);
+        assert_eq!(chunk_hi, 512);
+        // Shallow cap: MIN_CHUNK floor caps useful splits (cap/MIN_CHUNK), so we
+        // scale down gracefully rather than over-splitting tiny rows.
+        let (n_lo, chunk_lo) = attention_split_geometry(None, 512, rows).unwrap();
+        assert_eq!(n_lo, 4);
+        assert_eq!(chunk_lo, 128);
+        // Narrow cap: below 2*MIN_CHUNK there is no useful split — stay monolithic.
+        assert_eq!(attention_split_geometry(None, 128, rows), None);
+        assert_eq!(attention_split_geometry(None, 0, rows), None);
+        // Fixed-chunk override reproduces the pre-adaptive behaviour exactly.
+        assert_eq!(
+            attention_split_geometry(Some(256), 4096, rows),
+            Some((16, 256))
+        );
+        assert_eq!(
+            attention_split_geometry(Some(256), 512, rows),
+            Some((2, 256))
+        );
+        // Same fixed cap/rows always yields the same geometry — the property the
+        // CUDA-graph capture path relies on (no dependence on live seqlen).
+        assert_eq!(
+            attention_split_geometry(None, 4096, rows),
+            attention_split_geometry(None, 4096, rows)
         );
     }
 }

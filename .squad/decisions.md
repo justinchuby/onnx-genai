@@ -1,6 +1,6 @@
 # Decisions — live standing directives
 
-Last consolidated: 2026-08-18T16:44Z (Scribe processed Tycho #1180 CUDA lib-name inbox drop; prior detailed 2026-08 narrative remains archived in `.squad/decisions-archive/2026-08.md` to keep the live ledger below 20KB.)
+Last consolidated: 2026-08-19T00:00Z (Scribe wave-3 merge: 5 inbox notes processed — adaptive split-KV #1350, attention_split launch_bounds NO-GO, derive_len #1357, cumsum_i64 #1366, Wallace GLM fair A/B + splitk_wide profile; 3 claim-integrity retractions added; older 2026-08-18 batch entries (lines 50–719 pre-merge) archived to `.squad/decisions-archive/2026-08.md` at "Archived 2026-08-19 by Scribe" section to keep the live ledger below 50KB.)
 
 Standing governance rules and active directives. Full narrative is archived; keep this file to current decisions plus durable rules.
 
@@ -47,204 +47,86 @@ For int4 GEMV/QMoE reductions, CPU bit-identity is not an oracle when accumulati
 
 The primary Windows development box has a working RTX 4060 CUDA path even though `nvcc`, `CUDA_PATH`, and default PATH probes may fail. A complete CUDA 13 runtime is available under anaconda site-packages; agents must distinguish absent from misconfigured before claiming CUDA is unavailable. On that box, add the `cu13` and `cudnn` bin directories to PATH and build with `--features native-cuda`.
 
-### 2026-08-18: #1180 — single CUDA lib-name table
-**By:** Tycho
-**What:** Moved the CUDA runtime (`cudart`) shared-library candidate names into one canonical, per-platform table in `onnx-genai-cuda-version-guard` (`CUDART_CANDIDATES_LINUX/MACOS/WINDOWS`, `HostOs`, `cudart_candidates_for`, `cudart_candidates`). Both loaders now read it: `onnx-genai-ort::cuda_rt` (deleted its private `CUDART_CANDIDATES` const) and `onnx-runtime-ep-cuda::dynamic_library` (its `Runtime` match arm delegates to the guard). Deleted the #1178 agreement test `every_cuda_major_the_ep_loads_is_also_resolvable_here` and repointed the EP's `generates_linux/windows_cuda_names` tests at the canonical constants. Added `onnx-genai-cuda-version-guard` as a normal (not just build) dependency of both crates.
-**Why:** The two lists had drifted (EP had CUDA 13, `cuda_rt` did not), which made CUDA 13 hosts look CUDA-less (#1178). A test asserting two tables agree is weaker than one table — this makes the duplicate copy unrepresentable (same shape as #1170's prefix-reuse fix). The canonical table preserves the exact union of both prior lists (incl. CUDA 13 and legacy `cudart64_120.dll`), so no host regresses.
+### 2026-08-18: adaptive split-KV sizing for attention_row decode — GO, default-ON (PR #1350, merged)
 
-### 2026-08-18: Reasoning content is sent to the client; the privacy gate is withdrawn
-**By:** Squad (Coordinator), on the owner's instruction (@justinchuby)
-**What:** The server must stream and return reasoning content to callers. The
-"keep it private" gate proposed in #1224 is cancelled. Any test asserting that
-reasoning is *absent* from a response (e.g. `reasoning_never_streams`) is
-asserting the wrong behaviour and must be inverted, covering the streamed
-deltas and the final non-streamed message as separate paths.
-**Why:** Owner decision. Agent clients are expected to see the reasoning turn.
-Note the budget half of #1224 ("give a reasoning turn room to finish") is
-unaffected and still wanted.
+**By:** Deckard
 
-### 2026-08-18: Session-state policy is unified behind one `SessionStore` seam (PR #1255)
+**What:** Sizes `num_splits` adaptively from fixed KV `cap` + fixed row count to target ~one occupancy wave (grid ≈ 512), floored at MIN_CHUNK=128. Replaces fixed `chunk=256` from #1340. `ONNX_GENAI_ATTN_SPLIT_CHUNK` still pins for A/B. Capture-safe (geometry from cap+rows only). Merged origin/main @ 32ee82cb5.
 
-**By:** Coding agent (spawned by Squad coordinator), on the owner's standing
-"no 区别对待" directive.
+**Why:** Deep-ctx re-profile (~2600 tok) revealed split-KV win is +63% over monolithic (not the +10% at shallow ctx). Fixed-256 under-fills at depth (grid 256, waves/SM 0.48, warps 11%). Sweep proved optimum at grid ≈ 512 (one full wave, ~4 CTAs/SM), not grid ≈ SM count. Adaptive targets one wave automatically across head counts.
 
-**What:** `crates/onnx-genai-engine/src/engine/session_state.rs` now owns the
-backend-independent session policy (lookup + "session {id} not found" text, the
-rewind bound-checks and their exact strings, checkpoint arithmetic). Native and
-ORT both route the six public session methods through it via `SessionStore`
-adapters in `runtime.rs`, exactly mirroring the `KvPrefixStore` precedent from
-#1170. Error strings are authored once; rendered text is byte-identical.
+**Key result (H200, eager, medians-of-5):** deep fixed-256 46.37 → adaptive **48.32 tok/s (+4.2%; +70% vs monolithic)**; shallow **60.82 (+4.7%; +17.7% vs mono)**; short capture neutral. Occupancy A/B: monolithic grid16/waves0.02/warps9.8%/DRAM0.8% → fixed-256 grid256/0.48/11%/34% → **adaptive grid512/0.97/24%/48%**. Byte-identical short; f64-tol wide.
 
-**Guard (do not remove):** two-part DRY guard, like `ReusedPrefix` +
-`KV_REWIND_CALLERS`. (1) compile-time `CheckedPosition` newtype — the only way to
-obtain a rewind target is through the one shared bound check; (2) test-time
-tripwire `the_rewind_bound_check_lives_only_in_the_shared_policy` fails if
-`"cannot rewind session"` is open-coded outside `session_state.rs`. A future
-third backend must implement `SessionStore`, not copy the policy. Do NOT widen
-the tripwire allowlist to get a green test.
+---
 
-**Asymmetries deliberately kept:** `create_session` (object construction, not
-policy); ORT `validate_rewind` validates draft/target/paged-KV while native's is
-`Ok(())` (persistent in-process decoder, always admits); ORT token `truncate`
-stays inside `rewind_target_state_to_len` because it is shared with the
-speculative-decode hot path — the shared policy owns the bound check, not the
-truncation.
+### 2026-08-19: attention_split launch_bounds / register pass — NO-GO (latency-bound, not occupancy-bound)
 
-**Why it is trustworthy:** falsified — inverting the single shared bound check
-turns BOTH backends red (3 ORT `failed_rewind_of_*` + native
-`native_session_rewind_by_truncates_logical_length`, a new test added to close a
-real coverage gap); reverting restores green. Verified: 414 lib tests pass,
-clippy clean (default + native), native-backend suite green except a pre-existing
-host-RAM KV-budget test, and CUDA (RTX 4060) native_engine ran on-GPU 16 passed /
-1 pre-existing unrelated failure.
+**By:** Deckard
 
-**Status:** PR #1255 open, not merged, awaiting owner review.
+**What:** Tested `__launch_bounds__(256, minblocks)` pass on `attention_split` to raise resident CTAs/SM. NO change shipped; branch `squad/attention-split-launchbounds` carries no code change.
 
-# CPU EP task runtime replaces raw Rayon fan-out in native kernels
+**Why NO-GO:** lb worked at register level (56→40 reg/thread, occupancy limit 4→6 blk/SM, no spill). But produced no E2E win: at grid 512 all blocks already fit in one wave at 4 blk/SM, so freed occupancy headroom places no new blocks. Denser grid (chunk 96 → grid 688) did raise warps-active 24.2%→33.0%, but deep E2E stayed flat (DRAM actually dropped 47.8%→42.0%). Roofline verdict: `attention_split` at M=1 is bound by per-warp **dependent-load latency chain** (serial Q·K + P·V accumulation), not occupancy. Grid-512 from #1350 already sits at the effective knee. Consistent with QMoE GEMV roofline NO-GOs — moat decode kernels are at the M=1 latency roofline.
 
-**By:** Sebastian (Performance Engineer) — 2026-08-18
-**What:** Native CPU kernels no longer fan out through the global Rayon pool.
-They call `onnx_runtime_ep_cpu::task_runtime`, which dispatches to ORT's
-`KernelContext_ParallelFor` when running inside the plugin EP and to a purpose
--built native pool otherwise. RoPE, Softmax, Transpose and the elementwise
-activation fallback are converted; the remaining raw-Rayon sites are unchanged
-and still work.
+---
 
-**Why:**
+### 2026-08-19: Parallelize `derive_len` mask-frontier scan — GO (PR #1357, merged 354be8fc7)
 
-- Rayon parks its workers between parallel regions. Measured on this host, a
-  fan-out costs 67 µs back-to-back but 226 µs when it follows a 20 µs gap —
-  which is exactly the shape of decode. Documented in
-  `docs/benchmarks/2026-08-15-cpu-ep-vs-ort-attention-moe.md` §26/§27.
-- The new pool holds its workers in an adaptive spin (20 µs → 500 µs, doubling
-  on a catch and halving on a park) so back-to-back and decode-gap dispatch cost
-  the same. Measured p50 4.8 µs at a 0 µs gap and 4.9 µs at a 100 µs gap —
-  14× and 47× better than Rayon's two numbers, and, more importantly, flat.
-- Inside the plugin EP we do not run our own threads at all. Using ORT's own
-  intra-op pool is the only way to avoid oversubscribing a host that has already
-  sized its pool, and it makes our kernels honour the session's
-  `intra_op_num_threads` the way every other ORT kernel does.
+**By:** Deckard
 
-**Consequences / rules this sets:**
+**What:** Replaced single-thread O(key_len) serial mask scan with block-parallel 256-thread min-index reduction. Launch stays grid(1,1,1)/block(256,1,1) → capture-safe. One file: `standard_attention.rs`.
 
-1. **New parallel kernels use `task_runtime`, not `rayon`.** `for_each_range`,
-   `chunk_runs_mut` and `chunks_mut` cover the existing shapes.
-2. **Width is inferred, and SMT-capped only above 8 hardware threads.** An
-   explicit budget (`set_task_thread_budget`, `ONNX_GENAI_CPU_TASK_THREADS`) is
-   honoured exactly. The floor is empirical: below 16 logical CPUs the second
-   SMT sibling still pays for these memory-bound kernels, above it does not.
-3. **No env-var test hooks in production paths.** Determinism comes from
-   `task_runtime::testing` (`force_serial`, `isolated_pool`, `counters`,
-   `planned_backend`).
-4. **Per-vector SIMD helpers that take a closure must be `#[inline(always)]`.**
-   Not a hint: `avx2::map_ps` losing its inline made `Tanh` and `Sigmoid` 2×
-   slower on inputs that never reach the parallel path, and the trigger was an
-   edit in two unrelated files. `codegen-units = 1` does not prevent this.
+**Why:** Deep-ctx re-rank surfaced `derive_len` as 2nd-largest decode kernel at ~2600 tok (143.6µs/call, 5.7% GPU time, fired per-layer per-step, O(context) cost). Root cause: grid(1,1,1)/block(1,1,1) single-thread serial scan. Block-min reduction is byte-identical by construction (integer index, no fp accumulation).
 
-### 2026-08-18: #1223 — workspace re-prepare on rebucket
+**Key result (H200, medians-of-5, DeepSeek-V2-Lite int4):** derive_len kernel 143.6µs → **4.86µs (29.5×)**; E2E deep ctx 46.55 → **56.43 tok/s (+21.2%)**; short ctx +2.7%. Deep win reproduced across two 5-run sets. Win matches roofline prediction (removing ~3.9ms/tok serial scan from 21.5ms/tok decode). Perp-step hoist (b) evaluated and deferred: after (a) the residual 27×4.86µs is ~0.7% of deep-ctx decode — cross-cutting refactor risk not justified.
 
-**By:** Bishop
+---
 
-**What:** Gap is REAL and now fixed. Rebucketing did NOT re-prepare governed
-workspace: `prepare_with_device_bindings` runs once per generation and latches
-`workspace_preparation_required`, after which `execute_kernel` refused to
-(re)allocate a prepared slot. Within one shape bucket #1221 made that safe; a KV
-growth to a new bucket (or a prompt in a different bucket than its decode steps)
-left the reserved `SessionPersistent`/`StepScoped` slot absent or undersized,
-reproducing #1221's two failure modes cross-bucket ("workspace invariant
-mismatch" / "reached execution without prepared workspace"). Fix: allow a
-prepared session to re-prepare (grow) its governed workspace slot **on eager
-(non-capture) dispatch** — exactly the dispatch a rebucket forces (the growing-KV
-decode path declines capture; a capture-eligible model re-warms eagerly after the
-KV-growth graph invalidation before it re-captures). Growth stays forbidden while
-recording a captured segment, so a replayed graph's baked workspace pointer is
-never invalidated under it. The change lives on the shared executor workspace
-path (`dispatch.rs::execute_kernel`), so it is general to every
-governed-workspace operator, not special-cased to `Attention`.
+### 2026-08-19: Block-parallel int64 cumsum for low-lane decode — GO (PR #1366, merged e19697fb0)
 
-**Why:** `Attention`'s route-dependent lifetime classification (decode →
-`SessionPersistent`, prefill → `StepScoped`) is what makes it hit this first, not
-what makes it unique; the correct fix generalizes #1221 rather than adding another
-Attention-specific prepare pass. Gating growth on the eager disposition keeps the
-prepared-workspace invariant intact for capture/replay while letting the one safe
-point (the rebucket re-warm) re-prepare.
+**By:** Deckard
 
-**Evidence:** New executor unit test
-`prepared_session_reprepares_workspace_when_execution_rebuckets` reserves a 2-row
-`SessionPersistent` slot via prepare, then executes a 4-row bucket. Reverting the
-one-line guard fails it with `workspace invariant mismatch: execute requires 4096
-bytes aligned to 512, prepared 2048 bytes aligned to 256`; with the fix it grows
-in place and passes. `cargo test -p onnx-runtime-session --lib` = 186 passed;
-clippy + rustfmt clean.
+**What:** Added `cumsum_block_i64` — block-per-lane cooperative prefix scan (intra-tile Hillis-Steele, tile=blockDim=256, running per-block base) for int64 low-lane calls (`lanes ≤ sm_count`). Launcher routes these to it; fp32 and high-lane (prefill) calls keep the existing serial-per-lane kernel. Two files: `cumsum.rs`, `indexing_gpu.rs`. Byte-identical (int64 only — integer addition is associative; fp32 explicitly excluded to preserve byte-identity). Grid=lanes, block=256 fixed → capture-safe.
 
-## 2026-08-18 — V2-Lite MoE CUDA graph-capture and workspace fixes merged
+**Why:** Post-#1357 deep-ctx re-rank surfaced `cumsum_i64` as the standout: 341µs/call at ~2600 tok (confirmed O(context): 45.8µs at ~640 → 341µs at ~2600). One call per decode step. Derives-len anti-pattern again: batch-1 sequence cumsum (`position_ids = cumsum(attention_mask)`) has lanes==1, collapsing to one thread scanning seqlen serially.
 
-PR #1181 landed on `main` as `c9c7f64c`, unlocking V2-Lite graph capture by fixing the additive-mask `_d1` workspace-planner path; Wallace measured capture ON vs eager OFF byte-identical over 320 tokens, **101.80 vs 56.94 tok/s = 1.79×**.
+**Key result (H200, medians-of-5, DeepSeek-V2-Lite int4, CUDA graphs ON):** cumsum kernel 341.5µs → **18.08µs (18.9×)**; E2E deep ctx CUDA graphs ON: 109.5 → **113.6 tok/s (+3.8%)**, short +1.1% (flat); eager deep +1.7% (launch-bound path, cumsum hid under gaps). CUDA-graph path is the production metric — the ~330µs/token saving lands directly on the critical path.
 
-A separate long-context Engine `Attention` workspace under-plan then surfaced around KV-capacity growth. PR #1189 landed on `main` as `b416a3e0`, fixing Engine/native CUDA single-token decode to re-run governed workspace preparation whenever `ensure_capacity` grows the KV/mask bucket. Leon's A/B on the real V2-Lite path generated 340 token-identical tokens in eager and capture; eager measured 47.32 tok/s, capture 89.69 tok/s with captures=2, replays=336, fallbacks=0. Rachael approved the fix as strictly gated on capacity growth and correctly placed before eager/capture execution.
+---
 
-## 2026-08-18 — DeepSeek-V2-Lite Native-vs-ORT row closed
+### 2026-08-19: GLM-4-9B fair same-export A/B, block-32 prize-bounding, splitk_wide deep-profile
 
-Wallace measured the real 27-layer DeepSeek-V2-Lite int4 QMoE export under pinned ORT CUDA 1.27 and identical base-decode conditions. Native CUDA serves the model on GPU at **57.15 tok/s eager** and **101.68 tok/s captured**. Stock ORT CUDA EP cannot run the 26 `com.microsoft::QMoE` nodes on GPU; with CPU fallback it inserts 104 host/device Memcpy nodes and reaches **0.17 tok/s**, while strict no-fallback refuses the graph. ORT + CUDA graph is categorically N/A because the graph is split across CPU and GPU. Frame the row as a hard capability gap: native is the only measured GPU engine for int4 QMoE here.
+**By:** Wallace (benchmarking / perf-fairness) — read-only measurement; no PR, no kernel edits.
 
-## 2026-08-18 — ORT-fairness dense int4 reconfirmed
+**What (three findings):**
 
-Wallace reconfirmed the 2026-08-17 dense int4 Native-vs-ORT decomposition from the opposite direction by trying to enable ORT CUDA graph mode on the same three production exports. True graph-vs-graph is unattainable: Phi-4-mini hard-rejects ORT graph capture because control-flow nodes cannot be supported by CUDAExecutionProvider; qwen2.5-7b aborts at runtime with `ort_value must contain a constructed tensor`; qwen2.5-14b-zp accepts the flag but effectively no-ops because CPU-assigned shape nodes fragment capture (eager 96.9 vs graph 98.7 tok/s, byte-identical).
+1. **Fair same-export A/B (identical `model.onnx.data` inode):** H200, CUDA-graph both engines, greedy, medians-of-5: native 213.39 tok/s vs ORT-genai **251.37 tok/s = ORT 1.18× faster**. The prior 97.62 tok/s native number (Sapper) does NOT reproduce across 2 binaries × 2 exports × 2 configs — retracted as an unrepresentable contention artifact. GLM is a **~18% native optimization target**, not a moat.
 
-Eager-vs-eager medians again show this is architectural, not a broad per-kernel native win: Phi native/ORT **0.85×**, qwen2.5-7b **0.77×**, qwen2.5-14b-zp **1.19×**. Keep the deployment headline that native captured decode leads ORT eager **1.33× / 1.14× / 1.83×**, but always label it as CUDA-graph capture plus on-GPU argmax that ORT structurally cannot apply on these dynamic-KV int4 exports.
+2. **Block-32 re-export prize-bounding = ≤0.** Re-quanting to block-32 DOES engage the fused fast-path (`select_f16_gemv_variant` returns DownProjection only when block_size==32), confirmed by nsys. But native is **SLOWER** at block-32: −3.4% short (211.64→204.44), −4.2% deep (194.96→186.84). Gain from fusing RMSNorm more than cancelled by 4× scale-metadata DRAM traffic. ORT hurts less (−1.8%/−1.9%). Gap WIDENS at block-32 (1.18→1.20× short, 1.25→1.28× deep). **Do NOT spawn a block-128→32 kernel agent on the fusion rationale.**
 
-## 2026-08-18 — Gate-3 speculative verify remains shelved after Marlin
+3. **splitk_wide is latency-bound at M=1 (DRAM 16.6%, No-Eligible 30.8%).** Root cause: single-column-per-warp accumulation exposes load latency; DRAM idle 83% despite healthy occupancy (59.8%). Native's own `wide_multicol` reaches 37.4% DRAM (1.79 TB/s) on the same GPU at LOWER occupancy — by register-blocking 4 columns/warp. Fix: multicol × split-K hybrid for down_proj/qkv shapes (register-block 2–4 cols AND keep K_SPLIT for grid fill). Predicted native 243–274 tok/s (closing or passing ORT's 249.83). Sebastian implementing.
 
-Luv re-probed Deckard's Gate-3 B\* framework on current `main` `923dc592` after Marlin landed. Captured verify break-even `B*=C_verify(M=K)/C_decode(M=1)` is still **NO-GO**: qwen2.5-14b-zp reports **17.5× / 18.4× / 20.0×** for K=2/4/8, and qwen2.5-7b reports **14.9× / 15.7× / 17.4×**. This is worse than the 2026-08-14 baseline (~8.5×) and far above the ≤~2 GO gate, so n-gram/prompt-lookup, EAGLE/MTP, and model-draft speculative-decode work stays shelved.
+**Depth-scaling finding:** block-128 native loses −7.9% short→deep-2600 vs ORT −2.7%; gap widens 1.18×→1.25×. GQA decode-attention path scales worse than ORT's. Second lever required for deep-ctx parity (post GEMV fix).
 
-This updates the earlier spec-decode arc rather than reopening it: the old #957 cheap GQA/SkipSimplifiedLayerNorm residual seams no longer appear as M>1 `KernelCaptureUnsupported` blockers. The measured blocker is now solely `MatMulNBits` at M>1 launching `matmul_nbits_gemm_f16` eagerly; Marlin's capture-safe M>1 int4 GEMM is not selected for this MatMulNBits path. Reconsider only after a graph-safe M>1 MatMulNBits/Marlin path exists and this exact B\* probe is rerun.
+---
 
-## 2026-08-18 — Gate-3 Marlin M>1 opt-in follow-up still NO-GO
+### 2026-08-19: CLAIM RETRACTION — GLM-4-9B is NOT a moat; it is an ~18% native deficit
 
-Luv re-ran the Gate-3 B\* verify-cost probe with `ONNX_GENAI_MARLIN_M_GT_1=1` and no code changes as a follow-up to the earlier post-Marlin Gate-3 NO-GO. The env gate fixed the capture problem completely: qwen2.5-14b-zp capture segments dropped **96→1**, qwen2.5-7b **29→1**, `KernelCaptureUnsupported` seams disappeared, K=8 byte-identity passed, and the hot path switched to `matmul_nbits_marlin_gemm_f16_splitk`.
+**By:** Wallace / Scribe (claim-integrity)
 
-The decision does **not** change: speculative decode remains shelved. B\* improved but is still NO-GO at **5.19× / 5.19× / 5.79×** for qwen2.5-14b-zp and **4.64× / 4.71× / 5.23×** for qwen2.5-7b at K=2/4/8, above the ≥~4 kill gate and far above the ≤~2 GO target. The spec-decode family — model-draft, n-gram/prompt-lookup, EAGLE/MTP — is now mined out across the three probes. Residual cost is Marlin M>1 GEMM/repack/reduce (`matmul_nbits_marlin_repack` observed in the hot path), not graph fragmentation.
+**What:** The "2.56×" native-over-ORT claim for GLM-4-9B is **RETRACTED**. Sapper's 97.62 tok/s native baseline was an un-reproducible contention artifact (VRAM-limit/weight-streaming in that run). Fair same-export CUDA-graph A/B (identical `model.onnx.data` inode 239679076): **native 213.39 vs ORT-genai 251.37 tok/s = ORT 1.18× faster**. GLM is not a "only-we-can-run" moat — ORT loads and runs it faster on the identical export. Do NOT cite 97.62 or 2.56× anywhere. The native GLM decode gap is real, isolated, and tractable: root cause is `matmul_nbits_gemv_f16_general_bs_splitk_wide` (41% decode, 16.6% DRAM peak, latency-bound at M=1 from single-column accumulation); block-32 re-export was prize-bounded at ≤0. Real lever: register-block the split-K GEMV to match `wide_multicol`'s 37.4% DRAM (Sebastian implementing).
 
-## 2026-08-18 — Marlin M>1 default flip mined out
+---
 
-Luv completed the real prefill/TTFT A/B for `ONNX_GENAI_MARLIN_M_GT_1=1` versus the portable tiled GEMM path, closing the thread opened by the two prior Gate-3 Marlin entries: “Gate-3 speculative verify remains shelved after Marlin” and “Gate-3 Marlin M>1 opt-in follow-up still NO-GO.” The verdict is **NO-GO to flip the default**: Marlin M>1 stays opt-in.
+### 2026-08-19: CLAIM RETRACTION — DeepSeek int4 QMoE is NOT an "ORT-can't-run-it" moat; ORT is FASTER on a fair CUDA export
 
-E2E `profile_native` TTFT showed only marginal-to-neutral qwen2.5-14b-zp movement (**0.976× / 0.988× / 0.999×** Marlin/portable at M=128/512/2048) and neutral-to-worse qwen2.5-7b movement (**1.005× / 1.013× / 1.001×**). Argmax matched every arm, but full-vocab token-0 logprob dumps were not byte-identical (max Δ **0.017** qwen14, **0.168** qwen7), so the silent-default byte-identity bar fails. Treat the Marlin-M>1 vein as mined out: not a spec-decode win, not a prefill/TTFT win, and not eligible for a silent default.
+**By:** Sapper / Scribe (claim-integrity)
 
-## 2026-08-18 — Marlin M>1 now default ON; byte-identity bar relaxed to argmax stability
+**What:** The "598×/0.17 tok/s ORT" claim for DeepSeek-V2-Lite int4 QMoE is **RETRACTED**. Root cause: ORT's CUDA QMoE kernel requires fp16/bf16 activations; our default export emits fp32 → ORT partitioner drops all 26 QMoE nodes to CPU EP silently. The 0.17 tok/s was a CPU-fallback artifact, never an ORT-CUDA-QMoE measurement. ORT 1.27 DOES ship a CUDA QMoE kernel (int4/block128/swiglu/k=6). Fair CUDA-vs-CUDA A/B on an fp16-activation export: **ORT places all 26 QMoE on GPU (0 Memcpy) at 86.78 tok/s vs native fp32-activation 55.15 tok/s = ORT 1.57× faster** at M=1 short decode. Do NOT cite 598× or "ORT can't run QMoE." The export-compat gap (native EP requires fp32 QMoE activations, ORT CUDA QMoE requires fp16/bf16) means no single export currently runs QMoE-on-CUDA in both engines — this is a mutual constraint, not an ORT deficiency. Deep-ctx (~2600) native currently aborts (Attention workspace not resized for large KV — under investigation). Native's #1 lever: fp16-activation QMoE kernel.
 
-Supersedes “Marlin M>1 default flip mined out” (2026-08-18). `ONNX_GENAI_MARLIN_M_GT_1`
-now defaults **ON**, and `ONNX_GENAI_MARLIN_SPLITK` moves to opt-in (default OFF).
+---
 
-The earlier NO-GO rested on two findings. The first — that the win is marginal —
-was measured only on qwen2.5-14b/7b (0.976–1.013x). It does not generalize: on an
-A100-SXM4-80GB (SM80) serving Muse-Glimmer-30B int4, measured end-to-end through
-the server with both arms on one binary, a 3247-token prompt goes **37.5s → 16.1s
-(2.33x)**, prefill 87 → 202 tok/s; 1647 tok 23.7s → 10.4s; 647 tok 9.4s → 4.7s.
-Neutral on some models and 2.33x on others argues for a default plus an opt-out,
-not for hiding the win behind a variable nobody sets.
+### 2026-08-19: Decode per-kernel fp32 shaving is near the floor
 
-The second finding — full-vocab token-0 logprobs are not byte-identical (max Δ
-0.017 qwen14, 0.168 qwen7 at M=128/512/2048) — **stands, and is not attributable
-to split-K**. `choose_split_k` returns 1 for `m > SPLITK_MAX_M` (32), so prefill
-never elected a split; that divergence is the direct tensor-core kernel's
-accumulation order versus the tiled GEMM. An earlier draft of this change claimed
-otherwise and was wrong.
+**By:** Deckard / Scribe (claim-integrity)
 
-So this entry records a deliberate **relaxation of the bar**, not a claim that the
-bar is met: the shipping default is now *argmax-stable* rather than
-*bit-identical*. Greedy token streams match (validated by `marlin_m_gt_1_e2e.rs`
-parity plus an 826-token spot check across the flip: identical answer, one
-sentence reworded at a near-tie). Consumers of the *distribution* rather than the
-selected token — a logprobs API, beam search, spec-decode acceptance ratios —
-should set `ONNX_GENAI_MARLIN_M_GT_1=0`.
-
-Split-K goes opt-in because flipping the parent ON would otherwise newly ship a
-second, independent divergence source (its fixed-order fp32 partial reduction) to
-every default deployment. It is inert for prefill by construction; the shapes it
-governs are M<=32 speculative verify, which is separately shelved. Recover it
-with `ONNX_GENAI_MARLIN_SPLITK=1`.
-
-Not addressed: Marlin is no longer the prefill bottleneck. With it on,
-`MatMulNBits` is ~20% of a prefill forward (GEMMs at ~74 TFLOPS); attention and
-elementwise ops are the other ~80%.
+**What:** The two O(context) single-thread anti-patterns in the decode path are now eliminated: `derive_len` (#1357, 29.5×) and `cumsum_i64` (#1366, 18.9×). The `attention_split` kernel is roofline-NO-GO'd for further per-kernel work (latency-bound at M=1, not occupancy-bound; launch_bounds pass was neutral). QMoE GEMVs are latency-roofline'd and were NO-GO'd twice. **Future decode gains come from structural improvements: fp16-activation QMoE kernel (M=1 tensor-core path), register-blocking the GLM split-K GEMV (multicol×split-K hybrid), and wider CUDA-graph coverage to close the eager CPU-launch gap (eager decode ~17ms/tok wall vs ~9ms/tok graphs).** Per-kernel fp32 shaving of the remaining small kernels (scatter_f32_i64 ~4.4µs, skip_rmsnorm ~2.7µs, build_kv ~1.8µs) is not a productive next lever.
