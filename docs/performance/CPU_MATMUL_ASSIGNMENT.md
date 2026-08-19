@@ -205,6 +205,13 @@ whether we hand the node over.
 | `QLinearMatMul` | i8 x i8 | 512 | 3584 | 8 | **0.42** | 0.43 | **win** |
 | `QLinearMatMul` | i8 x i8 | 512 | 3584 | 16 | **0.42** | 0.47 | **win** |
 
+> **The `QLinearMatMul` rows above are `--features mlas` measurements.** They were taken on the
+> research build, and nothing on this page said so. The build we actually ship had no integer GEMM
+> at all until #1194, and measured **11.9x at M=1 and 11.9x at M=128** rather than the 1.13-1.20x
+> the rows claim. See [section 3](#3-per-call-packing-and-a-missing-native-kernel--qlinearmatmul-fixed)
+> for the corrected native numbers; the rows themselves are left as measured, because they are
+> accurate for the build they describe.
+
 Ranges **outside** the measured region — `K * N < 2^20`, symbolic/dynamic weight shapes, and dense
 dtypes other than f32/f16 — are simply unmeasured. They are claimed like everything else; the note
 is only that no row above characterises them.
@@ -319,7 +326,12 @@ The improvement stands on its own regardless: this EP runs its own f16 kernel in
 #1080 reports that kernel as 2.4x-14.3x faster than its predecessor. That range is ours-before over ours-after, from #1080's own report — it is a different
 quantity from this table's ours/ORT ratios and cannot be re-derived by dividing them.
 
-### 3. Per-call packing — `QLinearMatMul` (**fixed**)
+### 3. Per-call packing and a missing native kernel — `QLinearMatMul` (**fixed**)
+
+#### 3a. The research build
+
+Everything in this subsection is behind `--features mlas` and describes the **reference** build, not
+the one we ship. It is kept because it is the baseline the native kernel in 3b was measured against.
 
 #1058 bound MLAS's integer QGEMM and took u8 x u8 from **27-119x** down to 3-4x. What remained was
 structural: **ORT pre-packed the constant B once at session init; this kernel packed inside every
@@ -362,6 +374,78 @@ The `i8 x i8` "before" ratios above (5.20/4.97/5.22 at 8 threads) were re-measur
 Runtime 1.27.0 for this round on the same host. An earlier round recorded 2.23-3.07 for the same
 scalar path; the kernel side did not change between the two, so the difference is the
 baseline and the harness, not a regression.
+
+#### 3b. The build we ship had no integer GEMM at all (**fixed by #1194**)
+
+Section 3a was written as if it described the product. It did not. Every one of those wins is
+compiled out unless `--features mlas` is set, and the default build fell through to a path that
+had never been optimised at all:
+
+- `read_quantized` widened **both** operands into `Vec<i32>` on every call — 16 MiB for a
+  2048x2048 weight, allocated, filled and dropped per call;
+- the accumulation was a scalar rank-1 update, so each row of `A` re-streamed the entire widened
+  `B`. At M=128 that is 512 MiB of traffic for a 4 MiB weight.
+
+Measured through an ORT session, that was **11.9x ORT at M=1 and 11.9x at M=128** — not the
+1.13-1.20x the matrix above claims, and the largest single loss anywhere in the matmul family.
+
+`kernels::qgemm_native` replaces it with a real integer GEMM on the operand *bytes*. The
+instruction that fits is `vpmaddwd`: eight `i16` pairs multiplied and pairwise-summed into `i32`,
+sixteen multiply-accumulates each. It is exact here, not approximate — a centred `a` is in
+`[-255, 255]` and a raw `b` in `[-128, 255]`, so a pair sum cannot exceed 130050 — and unlike the
+`vpmaddubsw` that section 3a has to work around, it does not saturate, so **no operand has to be
+translated into another sign domain**.
+
+Two kernels, chosen by `M`:
+
+| `M` | strategy | why |
+|---|---|---|
+| `> 4` | `B` packed into 16-column, k-pair-interleaved tiles in a 256 KiB L2-resident panel | the panel is re-read once per row block, so the SIMD pack costs about 1% of the GEMM it feeds |
+| `<= 4` | no pack; the interleave happens in registers, accumulators stay in registers across a `k` block | at one row block a panel would be written once and read once, and `2 * k * n` bytes of stores to serve a GEMV that reads `k * n` **is** the call |
+
+Session A/B, `K = N = 2048`, u8 x u8, same host and harness on both sides, 61 iterations
+(`ratio = ours / ORT`, lower is better):
+
+| M | threads | before | after | our time before | our time after |
+|---|---|---|---|---|---|
+| 1 | 1 | 12.20 | **2.17** | 1.402 ms | 0.226 ms |
+| 128 | 1 | 11.90 | **1.20** | 99.84 ms | 9.99 ms |
+| 1 | 4 | 37.11 | **4.03** | 1.379 ms | 0.170 ms |
+| 128 | 4 | 14.44 | **1.47** | 31.03 ms | 3.14 ms |
+| 1 | 16 | 83.12 | **35.63** | 2.366 ms | 1.336 ms |
+| 128 | 16 | 42.28 | **15.05** | 51.05 ms | 16.55 ms |
+
+ORT's own side moved by under 1.5% between the two arms at one and four threads, which is what
+makes the comparison a comparison. The i8 x i8 win widened too: 0.206 to **0.049** at M=1, one
+thread.
+
+The sixteen-thread rows are directional only. This host's session A/B is not usable at that width —
+ORT's own p50/p90 spread there is 4.8x — and the kernel-level harness
+(`bench_qgemm_ab`, `#[ignore]`) is the reliable instrument for scaling:
+
+| shape | 1 thread | 2 | 4 | 8 | 16 | portable control, 1 thread |
+|---|---|---|---|---|---|---|
+| 1x2048x2048 | 0.229 ms | 0.136 | 0.090 | 0.098 | 0.166 | 4.92 ms (**21x**) |
+| 4x2048x2048 | 0.565 ms | 0.311 | 0.199 | 0.237 | 0.345 | 4.58 ms (**8.1x**) |
+| 128x2048x2048 | 8.911 ms | 4.773 | 2.755 | 2.780 | 1.991 | — |
+| 128x5120x5120 | 53.56 ms | 27.06 | 14.35 | 8.98 | 11.51 | — |
+
+The kernel scales to four threads and then flattens: this host has sixteen physical cores but the
+sweep is pinned to eight of them, so eight and sixteen are SMT siblings. What the table also shows
+is that the **session** does not reach even the four-thread kernel number (0.170 ms against 0.090
+ms), which is EP-level thread plumbing rather than this kernel, and is tracked with the rest of the
+oversubscription work.
+
+Two things are deliberately left open:
+
+1. **The constant-B pack is not cached.** `B` is a graph initializer and its packed panel could be
+   built once per session, which would remove the pack from prefill entirely. That cache is keyed on
+   a weight, so it has to go through `kernels::governed_weight_cache` and a budget; it is a separate
+   change with its own CI gate, not a rider on this one.
+2. **ORT is still ahead at M=1** (2.17x). The gap is now structural rather than sloppy: MLAS reaches
+   32 multiply-accumulates per pair of instructions with `vpmaddubsw`, which *saturates*, and this
+   kernel reaches 32 per four with `vpmaddwd`, which does not. Closing it means giving up exact
+   integer arithmetic, and this EP does not trade determinism for throughput.
 
 ### 4. The decode f32 GEMV was written but never shipped (**fixed**)
 
@@ -532,3 +616,27 @@ LD_LIBRARY_PATH=$ORT_ROOT/lib ./target/release/bench_prec \
 ```
 
 `native/ort` in the result line is the ratio quoted here; `parity` must read `PASS`.
+
+The `QLinearMatMul` numbers in [3b](#3b-the-build-we-ship-had-no-integer-gemm-at-all-fixed-by-1194)
+come from two harnesses instead. The session A/B — the one that counts — is
+
+```sh
+export NXRT_ORT_LIB_DIR=<ort-prebuilt>/lib
+NXRT_REQUIRE_ORT_TESTS=1 NXRT_MM_BENCH=1 NXRT_MM_BENCH_CASE=qlinear \
+  NXRT_MM_BENCH_ITERS=61 NXRT_MM_BENCH_THREADS=1 \
+  ONNX_GENAI_MLAS_THREADPOOL_THREADS=1 RAYON_NUM_THREADS=1 \
+  taskset -c 8-15 cargo test --release -p onnx-runtime-ep-cpu-plugin \
+  --test plugin_ort_e2e plugin_path_ab_vs_plain_ort -- --ignored --nocapture
+```
+
+All three thread knobs must agree or the harness refuses to run: a pinned A/B needs both pools
+pinned. Use `-c 8-15` at one thread and `-c 0-15` above it. The kernel-level scaling table comes
+from
+
+```sh
+QGEMM_AB_ITERS=21 taskset -c 0-15 cargo test --release -p onnx-runtime-ep-cpu --lib \
+  bench_qgemm_ab -- --ignored --nocapture
+```
+
+whose `portable` arm is the control: it is the same arithmetic with none of the blocking, so it must
+not move when a SIMD constant is retuned. If it does, the host was busy and the run says nothing.
