@@ -28,6 +28,7 @@ struct Paths {
     asm: PathBuf,
     amd64_asm: PathBuf,
     arm64_asm: PathBuf,
+    aarch64_asm: PathBuf,
     kai: PathBuf,
     includes: Vec<PathBuf>,
 }
@@ -39,6 +40,9 @@ fn main() {
     let asm = lib.join("x86_64");
     let amd64_asm = lib.join("amd64");
     let arm64_asm = lib.join("arm64");
+    // MSVC assembles `arm64/*.asm` (ARMASM syntax); everything else assembles
+    // `aarch64/*.S` (GAS syntax). Same kernels, two dialects.
+    let aarch64_asm = lib.join("aarch64");
     let kai = root.join("vendor/mlas/kleidiai");
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
@@ -63,6 +67,7 @@ fn main() {
         asm,
         amd64_asm,
         arm64_asm,
+        aarch64_asm,
         kai,
         includes,
     };
@@ -225,6 +230,44 @@ fn main() {
                     "SymQgemmS8KernelNeon.asm",
                     "SymQgemmS8KernelSdot.asm",
                     "SymQgemmS8KernelSdotLd64.asm",
+                ],
+            );
+        } else {
+            // The same kernels in GAS syntax. Without them the C++ above
+            // compiles and the *link* fails: `MlasConvSymS8DispatchNeon` and
+            // friends are data tables of function pointers, so every aarch64
+            // kernel they name is an undefined symbol in the final artifact.
+            // That is a link error in whatever crate happens to produce a
+            // cdylib, far from this file.
+            //
+            // Deliberately the same list as MSVC minus `HalfGemmKernelNeon`:
+            // its GAS form uses fp16 arithmetic that needs a per-file
+            // `-march=armv8.2-a+fp16`, whose accepted spelling differs between
+            // GNU as and Apple's assembler, and nothing compiled here
+            // references `MlasHalfGemmKernelNeon`. Same for the `Smmla`,
+            // `Ummla` and `Bf16` kernels. If a future change compiles a
+            // dispatcher that needs one, the link error names the symbol and
+            // the fix is to add the file with its `-march`.
+            p.compile_aarch64_asm(
+                "mlas_aarch64_asm",
+                &[
+                    "ConvSymS8KernelDot.S",
+                    "ConvSymS8KernelDotLd64.S",
+                    "ConvSymU8KernelDot.S",
+                    "ConvSymS8KernelNeon.S",
+                    "ConvSymU8KernelNeon.S",
+                    "DepthwiseQConvSymS8KernelNeon.S",
+                    "DepthwiseQConvSymU8KernelNeon.S",
+                    "DepthwiseQConvKernelSize9Neon.S",
+                    "QgemmU8X8KernelNeon.S",
+                    "QgemmS8S8KernelNeon.S",
+                    "QgemmU8X8KernelUdot.S",
+                    "QgemmS8S8KernelSdot.S",
+                    "SgemmKernelNeon.S",
+                    "SgemvKernelNeon.S",
+                    "SymQgemmS8KernelNeon.S",
+                    "SymQgemmS8KernelSdot.S",
+                    "SymQgemmS8KernelSdotLd64.S",
                 ],
             );
         }
@@ -556,6 +599,24 @@ impl Paths {
         for f in files {
             let path = self.kai.join(f);
             assert!(path.exists(), "missing KleidiAI asm: {}", path.display());
+            b.file(path);
+        }
+        b.compile(name);
+    }
+
+    /// Assemble `lib/aarch64/*.S` (GAS syntax) for every non-MSVC aarch64 target.
+    fn compile_aarch64_asm(&self, name: &str, files: &[&str]) {
+        let mut b = self.base();
+        // `asmmacro.h` and `AssembleDotProduct.h` sit beside the sources and
+        // are included unqualified.
+        b.include(&self.aarch64_asm);
+        for f in files {
+            let path = self.aarch64_asm.join(f);
+            assert!(
+                path.exists(),
+                "missing vendored aarch64 asm: {}",
+                path.display()
+            );
             b.file(path);
         }
         b.compile(name);

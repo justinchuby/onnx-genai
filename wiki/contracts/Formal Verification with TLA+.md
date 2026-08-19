@@ -9,41 +9,40 @@ tags:
   - formal-methods
   - testing
 status: maintained
+lang: zh-CN
 created: 2026-08-18
-updated: 2026-08-18
+updated: 2026-08-19
 ---
 
 # Formal Verification with TLA+
 
-> [!summary] Question answered
-> Which runtime invariants are model-checked in this repository, and what must
-> still be tested in the implementation?
+> [!summary] 回答的问题
+> 本仓库中哪些运行时 invariant 经过了 model checking,还有哪些必须在实现里测试?
 
-Most tests execute one concrete sequence. A TLA+ model explores every state
-transition within a deliberately small abstract system. This is useful for
-protocols where rare interleavings—not arithmetic—cause the hardest bugs.
+大多数测试只执行一条具体的序列。而一个 TLA+ 模型会在一个刻意保持很小的抽象系统
+内探索每一个状态转移。对那些最难的 bug 由罕见的交错(interleaving)而非算术引起
+的协议来说,这非常有用。
 
-The models live under [`specs/tla/`](../../specs/tla/). They complement the
-type, conformance and runtime checks described in [[contracts/Runtime Contracts]].
+这些模型位于 [`specs/tla/`](../../specs/tla/)。它们是对 [[contracts/Runtime Contracts]]
+中所述类型、conformance 与运行时检查的补充。
 
-## What is modeled
+## 建模了什么
 
-| Model | Main question |
+| 模型 | 主要问题 |
 |---|---|
-| `PressureProtocol.tla` | Can capacity be granted, claimed, cancelled or timed out without leaks or double ownership? |
-| `KvAdmission.tla` | Does KV admission respect capacity while preserving a state from which progress is possible? |
-| `BufferOwnership.tla` | Can readers alias safely while writers remain exclusive and leases stay registry-rooted? |
-| `CoResidency.tla` | Can model/KV residency avoid evicting a model before the request that needs it retires? |
-| `NodeFailure.tla` | Does a failed node stop while survivor-only work drains and every operation settles? |
-| `CollectiveOrdering.tla` | Do participants observe compatible collective-operation ordering? |
+| `PressureProtocol.tla` | 容量能否被授予、认领、取消或超时,而不发生泄漏或双重占有? |
+| `KvAdmission.tla` | KV 准入是否在尊重容量的同时,保留一个仍可推进的状态? |
+| `BufferOwnership.tla` | reader 能否安全地别名,同时 writer 保持独占且 lease 始终以 registry 为根? |
+| `CoResidency.tla` | 模型/KV 常驻能否避免在需要某模型的请求退出之前就将其驱逐? |
+| `NodeFailure.tla` | 失败的节点是否会停止,同时仅存活者的工作被排空,且每个操作都归于稳定? |
+| `CollectiveOrdering.tla` | 各参与者观察到的 collective 操作顺序是否相容? |
 
-These models reduce real objects to the state needed for one contract. A KV
-page may become an identifier plus ownership state; CUDA streams and tensor
-contents may disappear entirely if they are irrelevant to admission.
+这些模型把真实对象缩减为某一个契约所需的状态。一个 KV page 可能变成一个标识符加
+上占有状态;若与准入无关,CUDA stream 和 tensor 内容可能被完全略去。
 
-## Invariants and progress
+## Invariant 与推进性
 
-An **invariant** says something bad never becomes true:
+一个 **invariant** 声明某件坏事永远不会成真:
 
 ```text
 granted capacity never exceeds the pool
@@ -51,47 +50,44 @@ one writable buffer never has two owners
 cancelled work does not retain an allocation
 ```
 
-A **progress property** asks whether the protocol can keep moving. Capacity
-conservation alone is insufficient if every participant can wait forever.
-`KvAdmission.tla`, for example, checks both bounded capacity and
-`ProgressPossible`.
+一个 **progress property(推进性属性)** 则询问协议能否持续前进。若每个参与者都
+可能永远等待,那么仅有容量守恒是不够的。例如 `KvAdmission.tla` 同时检查有界容量
+和 `ProgressPossible`。
 
-> [!important] Safety and progress are different
-> A system can leak nothing and still deadlock. Conversely, a system can always
-> move by incorrectly granting the same bytes twice. Important protocols need
-> both kinds of property.
+> [!important] safety 与 progress 不是一回事
+> 一个系统可以毫无泄漏却依然死锁。反过来,一个系统也可以通过错误地把同一批字节
+> 授予两次而始终保持运动。重要的协议两类属性都需要。
 
-## Why negative models are part of the test
+## 为什么反向模型也是测试的一部分
 
-The suite includes deliberately broken configurations such as
-`KvAdmissionUnguarded.cfg` and `CoResidencyUnguarded.cfg`.
+该套件包含刻意做错的配置,例如 `KvAdmissionUnguarded.cfg` 和
+`CoResidencyUnguarded.cfg`。
 
-The check is expected to find a counterexample:
+预期这项检查会找到一个反例:
 
 ```text
 guarded model      → invariant holds
 unguarded control  → invariant fails
 ```
 
-This proves that the invariant and model are capable of detecting the bug they
-claim to prevent. If both guarded and unguarded variants pass, the verification
-may be vacuous or no longer exercise the important transition.
+这证明该 invariant 与模型确实有能力检测出它们声称要防止的 bug。如果 guarded 与
+unguarded 两个变体都通过,那么该验证可能是空洞的(vacuous),或已不再触及那个重要
+的转移。
 
-This is the formal-methods version of a non-vacuous regression test.
+这是形式化方法版本的非空洞回归测试。
 
-## TLC proves the model, not the Rust code
+## TLC 证明的是模型,而非 Rust 代码
 
-TLC explores the `.tla` specification. It cannot prove that production code:
+TLC 探索的是 `.tla` 规范。它无法证明生产代码:
 
-- emits the same transitions;
-- uses the same identity and capacity rules;
-- records every relevant event;
-- preserves the model's atomic boundaries.
+- 发出相同的转移;
+- 使用相同的 identity 与容量规则;
+- 记录了每一个相关事件;
+- 保持了模型的原子边界。
 
-The refinement bridge is a versioned `ProtocolTraceEvent` stream. Runtime
-events include contract/topology revisions and enough identity/state data for
-an independent replay checker to compare an execution with the model-level
-protocol.
+refinement 桥接是一条带版本的 `ProtocolTraceEvent` 流。运行时事件包含
+contract/topology 修订号,以及足够的 identity/state 数据,供一个独立的 replay
+检查器把一次执行与模型层面的协议进行比对。
 
 ```mermaid
 flowchart LR
@@ -105,49 +101,48 @@ flowchart LR
     Model --> Replay
 ```
 
-This bridge matters because a green TLC run plus an unwired trace emitter says
-nothing about production behavior. See [[observability/Tracing and Profiling]]
-for the broader observability architecture.
+这个桥接之所以重要,是因为一次通过的 TLC 运行,加上一个未接线的 trace 发射器,
+对生产行为什么也说明不了。更广的可观测性架构参见
+[[observability/Tracing and Profiling]]。
 
-## Reading a model responsibly
+## 负责任地阅读一个模型
 
-Start with the model README and ask:
+从模型的 README 开始,并追问:
 
-1. What state has been abstracted away?
-2. Which transitions are atomic in the model?
-3. Which invariants and progress properties are checked?
-4. Is there a negative control that must fail?
-5. What fairness assumptions are enabled?
-6. How does implementation evidence reach the replay checker?
+1. 有哪些状态被抽象掉了?
+2. 模型中哪些转移是原子的?
+3. 检查了哪些 invariant 与 progress property?
+4. 是否有一个必须失败的反向对照?
+5. 启用了哪些公平性(fairness)假设?
+6. 实现层面的证据如何抵达 replay 检查器?
 
-Every model also has explicit non-goals. For example, an admission model may
-prove capacity and progress without proving scheduler priority fairness.
-`NodeFailure.tla` does not automatically prove failure-detection latency.
+每个模型也都有明确的非目标(non-goals)。例如,一个准入模型可以证明容量与推进
+性,却不证明 scheduler 优先级公平性。`NodeFailure.tla` 并不会自动证明故障检测的
+延迟。
 
-> [!warning] Do not silently expand the claim
-> “No capacity leak in the checked state space” does not mean “the distributed
-> runtime is correct.” Report the abstraction, configuration and omitted
-> properties with the result.
+> [!warning] 不要悄悄扩大结论
+> "在被检查的状态空间中没有容量泄漏"并不意味着"这个分布式运行时是正确的"。请
+> 连同结果一并报告所用的抽象、配置以及被省略的属性。
 
-## When to add or change a model
+## 何时新增或修改一个模型
 
-TLA+ is a good fit when a change introduces:
+当一次改动引入以下内容时,TLA+ 是个好选择:
 
-- ownership transfer across components;
-- reserve/commit/cancel/timeout transactions;
-- concurrent teardown and retry;
-- failure recovery with epochs or generations;
-- lock-free or asynchronous protocol ordering.
+- 跨组件的所有权转移;
+- reserve/commit/cancel/timeout 事务;
+- 并发的拆除与重试;
+- 带 epoch 或 generation 的故障恢复;
+- 无锁或异步的协议排序。
 
-A model update should normally include:
+一次模型更新通常应包含:
 
-1. the new state/transition;
-2. the invariant or progress property it affects;
-3. a negative variant that exposes the missing guard when practical;
-4. refinement trace/replay updates;
-5. implementation conformance tests.
+1. 新的状态/转移;
+2. 它所影响的 invariant 或 progress property;
+3. 在可行时,一个暴露缺失守卫的反向变体;
+4. refinement 的 trace/replay 更新;
+5. 实现层面的 conformance 测试。
 
-## Related notes
+## 相关笔记
 
 - [[contracts/Runtime Contracts]]
 - [[memory/Memory Management for Beginners]]
@@ -155,7 +150,7 @@ A model update should normally include:
 - [[observability/Tracing and Profiling]]
 - [[performance/Performance Engineering Playbook]]
 
-## Formal sources
+## 正式来源
 
 - [TLA+ model index](../../specs/tla/README.md)
 - [Refinement contract](../../specs/tla/REFINEMENT.md)
