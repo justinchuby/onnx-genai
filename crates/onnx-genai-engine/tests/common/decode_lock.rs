@@ -116,6 +116,42 @@ pub fn assert_native_matches_golden(
     Ok(())
 }
 
+/// Like [`assert_native_matches_golden`], but pins CUDA-graph capture OFF
+/// (`ONNX_GENAI_CUDA_GRAPH=0`) so the golden is captured/checked on the eager
+/// native CUDA decode path. Used by exports whose graph shape cannot yet be
+/// capture-planned (e.g. the composed Gemma-3n text export, whose merged
+/// present-KV sequence axis is an opaque symbol the prefill workspace planner
+/// cannot upper-bound), while the fused decode kernels themselves are exercised
+/// identically in eager mode. The greedy stream is capture-independent (same
+/// kernels, same reduction order), so this is a faithful lock of the decode
+/// math including any wide (head_dim > 256) attention layers.
+#[allow(dead_code)]
+pub fn assert_native_matches_golden_eager(
+    model_dir_env: &str,
+    prompt: &str,
+    expected_tokens: &[u32],
+) -> anyhow::Result<()> {
+    let Some(model_dir) = cuda_model_dir(model_dir_env) else {
+        return Ok(());
+    };
+    unsafe {
+        std::env::set_var("ONNX_GENAI_CUDA_GRAPH", "0");
+    }
+    let native = generate(
+        &model_dir,
+        EngineDecodeBackend::Native,
+        Some(NativeDecodeDevice::Cuda { index: Some(0) }),
+        DecodePrecision::Model,
+        prompt,
+        expected_tokens.len(),
+    )?;
+    assert_eq!(
+        native, expected_tokens,
+        "{model_dir_env} native CUDA (eager) greedy sequence drifted from its golden lock"
+    );
+    Ok(())
+}
+
 #[allow(dead_code)]
 pub fn assert_native_long_context_eager_and_capture_match_prefix(
     model_dir_env: &str,

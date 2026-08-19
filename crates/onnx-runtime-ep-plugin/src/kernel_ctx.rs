@@ -293,6 +293,7 @@ pub(crate) unsafe fn allocate_output(
     index: usize,
     shape: &[usize],
     dtype: DataType,
+    want_mem_info: bool,
 ) -> Result<OwnedOutput, String> {
     let _probe = crate::dispatch_probe::Phase::Allocate.enter();
     let get_output = api
@@ -329,7 +330,12 @@ pub(crate) unsafe fn allocate_output(
     // Best-effort read of the output's memory info. Used to source a valid
     // device `OrtMemoryInfo` for staging scratch (#982); a null result simply
     // means this output cannot be used as that source.
-    let mem_info = match api.GetTensorMemoryInfo {
+    //
+    // Skipped entirely when the caller has no device staging configured. The
+    // only consumer of this field is `stage_host_boundary_inputs`, which a host
+    // EP never reaches, so on the CPU path this was one ORT FFI call per output
+    // per `Run` whose result was dropped unread.
+    let mem_info = match api.GetTensorMemoryInfo.filter(|_| want_mem_info) {
         Some(get_mem_info) => {
             let mut mi: *const ort::OrtMemoryInfo = std::ptr::null();
             crate::dispatch_probe::ort_call();
@@ -358,6 +364,90 @@ pub(crate) unsafe fn allocate_output(
 mod tests {
     use super::*;
     use onnx_runtime_ir::DataType;
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// How many times the fake ORT below was asked for an output's memory info.
+    static MEM_INFO_CALLS: AtomicUsize = AtomicUsize::new(0);
+    /// Storage the fake `GetTensorMutableData` hands back.
+    static mut FAKE_OUTPUT: [f32; 4] = [0.0; 4];
+
+    /// Stands in for ORT: yields an opaque non-null `OrtValue`.
+    ///
+    /// # Safety
+    ///
+    /// Matches the ABI ORT expects; `out` must be a valid pointer.
+    unsafe extern "C" fn fake_get_output(
+        _ctx: *mut ort::OrtKernelContext,
+        _index: usize,
+        _dims: *const i64,
+        _dim_count: usize,
+        out: *mut *mut ort::OrtValue,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = std::ptr::dangling_mut::<ort::OrtValue>() };
+        std::ptr::null_mut()
+    }
+
+    /// Stands in for ORT: points at `FAKE_OUTPUT`.
+    ///
+    /// # Safety
+    ///
+    /// Matches the ABI ORT expects; `out` must be a valid pointer.
+    unsafe extern "C" fn fake_get_mutable_data(
+        _value: *mut ort::OrtValue,
+        out: *mut *mut c_void,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = (&raw mut FAKE_OUTPUT).cast() };
+        std::ptr::null_mut()
+    }
+
+    /// Stands in for ORT, counting how often placement is queried.
+    ///
+    /// # Safety
+    ///
+    /// Matches the ABI ORT expects; `mem_info` must be a valid pointer.
+    unsafe extern "C" fn counting_get_mem_info(
+        _value: *const ort::OrtValue,
+        mem_info: *mut *const ort::OrtMemoryInfo,
+    ) -> ort::OrtStatusPtr {
+        MEM_INFO_CALLS.fetch_add(1, Ordering::Relaxed);
+        unsafe { *mem_info = std::ptr::null() };
+        std::ptr::null_mut()
+    }
+
+    /// `GetTensorMemoryInfo` is one ORT call per output per `Run`, and its only
+    /// consumer is device staging. A host EP must not pay for it.
+    ///
+    /// Falsifier: make `allocate_output` ignore `want_mem_info` and the first
+    /// assertion fails with 1 call instead of 0 (verified).
+    #[test]
+    fn output_memory_info_is_queried_only_when_the_caller_asked_for_it() {
+        let mut api: ort::OrtApi = unsafe { std::mem::zeroed() };
+        api.KernelContext_GetOutput = Some(fake_get_output);
+        api.GetTensorMutableData = Some(fake_get_mutable_data);
+        api.GetTensorMemoryInfo = Some(counting_get_mem_info);
+        let ctx = std::ptr::dangling_mut::<ort::OrtKernelContext>();
+
+        MEM_INFO_CALLS.store(0, Ordering::Relaxed);
+        let out = unsafe { allocate_output(&api, ctx, 0, &[2, 2], DataType::Float32, false) }
+            .expect("the fake ORT allocates successfully");
+        assert_eq!(
+            MEM_INFO_CALLS.load(Ordering::Relaxed),
+            0,
+            "a caller with no device staging must not query output placement"
+        );
+        assert!(out.mem_info.is_null());
+        assert_eq!(out.shape, vec![2, 2]);
+        assert_eq!(out.strides, vec![2, 1]);
+
+        let _ = unsafe { allocate_output(&api, ctx, 0, &[2, 2], DataType::Float32, true) }
+            .expect("the fake ORT allocates successfully");
+        assert_eq!(
+            MEM_INFO_CALLS.load(Ordering::Relaxed),
+            1,
+            "a staging caller still gets the output's memory info"
+        );
+    }
 
     #[test]
     fn owned_input_view_roundtrip() {
