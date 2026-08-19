@@ -123,10 +123,13 @@ native-alone, ms:
 | `qwen3_0p6b_mlp_t128` | 5.047 | 6.510 |
 | `qwen3_0p6b_mlp_t512` | 20.372 | 24.868 |
 
-`ROWS = 2` is uniformly worst (3.514 on the target cell). 8 leads only on the
-`t8` cells and only just, while 4 leads on the wide prefills by up to 1.31x. A
-`t8` cell is 8's most favourable possible shape — one tile, no remainder — and
-it still does not carry the table, so 4.
+`ROWS = 2` is uniformly worst (3.514 on the target cell). 4 takes eight of the
+twelve cells. 8 takes three `t8` cells — by up to 1.18x on `qwen3_0p6b_qkv_t8` —
+and one wide one, `llama3_8b_qkv_t128`, by 1.15x. That last is not what the
+register-pressure argument predicts and I do not have an explanation for it; it
+is one cell against the seven other wide prefills, which 4 takes by up to 1.31x
+(`qwen3_0p6b_qkv_t512`). A `t8` cell is 8's most favourable possible shape — one
+tile, no remainder — and it still does not carry the table, so 4.
 
 I had written "`ROWS = 8` measured slower" into the constant's documentation
 before measuring it. It is faster on the target cell. The table above is what

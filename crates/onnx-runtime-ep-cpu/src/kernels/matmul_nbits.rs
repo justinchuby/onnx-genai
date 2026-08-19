@@ -6845,10 +6845,13 @@ fn borrowed_int4_prefill_block_enabled() -> bool {
 /// | `qwen3_0p6b_mlp_t128` |  5.047 |   6.510 |
 /// | `qwen3_0p6b_mlp_t512` | 20.372 |  24.868 |
 ///
-/// 8 is ahead only on the `t8` cells and by little; 4 is ahead on the wide
-/// prefills and by up to 1.31x (`qwen3_0p6b_qkv_t512`). Since a `t8` tile at
-/// `ROWS = 8` is a single tile with no remainder, that is 8's most favourable
-/// possible shape and it still does not carry the table. 4 it is.
+/// 4 takes eight of the twelve cells. 8 takes three `t8` cells (by up to 1.18x
+/// on `qwen3_0p6b_qkv_t8`) and one wide one, `llama3_8b_qkv_t128`, by 1.15x —
+/// which the register-pressure argument does not predict and I cannot explain.
+/// 4's wins are the larger ones (up to 1.31x on `qwen3_0p6b_qkv_t512`) and
+/// cover every other wide prefill. Since a `t8` tile at `ROWS = 8` is a single
+/// tile with no remainder, that is 8's most favourable possible shape and it
+/// still does not carry the table. 4 it is.
 #[cfg(target_arch = "x86_64")]
 const PREFILL_ROW_BLOCK: usize = 4;
 
@@ -9186,10 +9189,20 @@ mod tests {
     /// can move a probe counter -- directly, or through a helper that does --
     /// to take the lock. It is pure text analysis, so it holds on every target
     /// including the aarch64 lanes this host cannot execute.
+    ///
+    /// `borrowed_int4_prefill_block_enabled` is in the list for the same
+    /// reason even though it moves no counter: it reads process-global env,
+    /// and a test that pins the int4 prefill route while another test flips
+    /// `ONNX_GENAI_CPU_MM_INT4_PREFILL` reads whichever won the race.
     #[test]
     fn every_probe_perturbing_test_takes_the_dispatch_lock() {
         const SOURCE: &str = include_str!("matmul_nbits.rs");
-        const PERTURBS: [&str; 3] = [".execute(", "kai_sdot_matmul_m1(", "try_mlas_sqnbit("];
+        const PERTURBS: [&str; 4] = [
+            ".execute(",
+            "kai_sdot_matmul_m1(",
+            "try_mlas_sqnbit(",
+            "borrowed_int4_prefill_block_enabled(",
+        ];
 
         // (name, is_test, body) for every fn declared in the tests module.
         let tests_module = SOURCE
@@ -10278,9 +10291,9 @@ mod tests {
     /// pool, cannot change a bit.
     ///
     /// Uses a shape wide enough that the task runtime actually splits it —
-    /// `prefill_matches_per_column_borrowed_path_bit_identical` above covers
-    /// correctness, but its `n <= 16` cells fall under the grain floor and run
-    /// serially, so they never exercise the partition.
+    /// `prefill_matches_per_column_borrowed_path_within_reassociation` above
+    /// covers correctness, but its `n <= 16` cells fall under the grain floor
+    /// and run serially, so they never exercise the partition.
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn prefill_column_fan_out_matches_its_serial_self() {
