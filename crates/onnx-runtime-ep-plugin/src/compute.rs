@@ -1247,22 +1247,35 @@ unsafe fn device_mem_info(
     api: &ort::OrtApi,
     ctx: *mut ort::OrtKernelContext,
     staging: Option<&DeviceStaging>,
-) -> Option<*const ort::OrtMemoryInfo> {
+) -> Option<(*const ort::OrtMemoryInfo, bool)> {
     // A routed subgraph's intermediates must be allocated in *device* memory so
     // the device kernels that produce and consume them dereference valid device
     // pointers. On an interspersed CPU→device partition, kernel-context input 0
     // may be a *host* boundary input (#982), so we must not assume input 0 lives
     // on the device — scan every input for a genuinely device-resident one.
+    //
+    // The scan remembers input 0's memory info as it goes. It used to throw it
+    // away and re-fetch it at the bottom, which cost two more FFI calls on the
+    // path every host EP takes: the scan finds nothing device-resident, and the
+    // fallback then asks ORT again for the value it had already seen first.
+    // Whether the result is a device is returned too, for the same reason — the
+    // one caller immediately asked, which meant a third query for a fact this
+    // function had just established.
+    let mut input0: Option<*const ort::OrtMemoryInfo> = None;
     if let Some(get_count) = api.KernelContext_GetInputCount {
         let mut count: usize = 0;
         crate::dispatch_probe::ort_call();
         let status = unsafe { get_count(ctx, &mut count) };
         if status.is_null() {
             for i in 0..count {
-                if let Some(mi) = unsafe { ort_input_mem_info(api, ctx, i) }
-                    && unsafe { mem_info_is_device(api, mi) }
-                {
-                    return Some(mi);
+                let Some(mi) = (unsafe { ort_input_mem_info(api, ctx, i) }) else {
+                    continue;
+                };
+                if i == 0 {
+                    input0 = Some(mi);
+                }
+                if unsafe { mem_info_is_device(api, mi) } {
+                    return Some((mi, true));
                 }
             }
         }
@@ -1275,13 +1288,22 @@ unsafe fn device_mem_info(
         && let Some(recon) = staging.recon_mem_info.as_ref()
         && !recon.ptr.is_null()
     {
-        return Some(recon.ptr);
+        // Reconstructed from the EP's own device recipe, so device-resident by
+        // construction; the old code asked ORT to confirm it.
+        return Some((recon.ptr, true));
     }
     // Host EP (no device staging context): preserve the historical behavior of
     // using input 0's memory info. For a host EP this is host memory, which is
     // exactly where its intermediates belong, so host-only partitions are
     // unchanged by the #982 device-staging work.
-    unsafe { ort_input_mem_info(api, ctx, 0) }
+    //
+    // The scan above already looked at input 0 unless it failed or there are no
+    // inputs, so this normally costs nothing.
+    match input0 {
+        Some(mi) => Some((mi, false)),
+        None => unsafe { ort_input_mem_info(api, ctx, 0) }
+            .map(|mi| (mi, unsafe { mem_info_is_device(api, mi) })),
+    }
 }
 
 /// Memory info of the `OrtValue` bound to kernel-context input `index`.
@@ -2225,8 +2247,9 @@ unsafe extern "C" fn compute_execute(
         // memory, so multi-node intermediates stay on the GPU (a host buffer
         // would make the next kernel dereference a host pointer as device →
         // CUDA_ERROR_ILLEGAL_ADDRESS). `None` falls back to host buffers.
-        let scratch_mem_info =
+        let scratch_mem_info_and_kind =
             unsafe { device_mem_info(api_ref, kernel_context, exported.device_staging.as_ref()) };
+        let scratch_mem_info = scratch_mem_info_and_kind.map(|(mi, _)| mi);
 
         // Where a routed subgraph's *intermediates* are allocated.
         //
@@ -2244,8 +2267,8 @@ unsafe extern "C" fn compute_execute(
         // difference on identical kernels, against ORT's own 220 us for the
         // same graph. So: device memory when the resolved memory info is a
         // device, host buffers otherwise.
-        let intermediate_scratch = match scratch_mem_info {
-            Some(mem_info) if unsafe { mem_info_is_device(api_ref, mem_info) } => Some(mem_info),
+        let intermediate_scratch = match scratch_mem_info_and_kind {
+            Some((mem_info, true)) => Some(mem_info),
             _ => None,
         };
 
@@ -5793,6 +5816,150 @@ mod workspace_plan_cache_tests {
             planner.calls(),
             1,
             "the cached plan must survive the poisoning"
+        );
+    }
+}
+
+/// Pins the FFI cost of resolving where a routed subgraph's intermediates
+/// should live — a question every `Compute` call asks, before any kernel runs.
+///
+/// A host EP takes the longest path through `device_mem_info`: the scan finds
+/// nothing device-resident, so it runs to completion and then falls back. The
+/// count below is what that costs, and it is the per-`Run` fixed overhead
+/// #1077 measures as ~0.9 us worse than ORT's.
+#[cfg(all(test, feature = "dispatch_probe"))]
+mod mem_info_cost {
+    use super::*;
+    use crate::dispatch_probe::{self, Event};
+
+    const MI: *const ort::OrtMemoryInfo = std::ptr::without_provenance(3);
+    const VALUE: *const ort::OrtValue = std::ptr::without_provenance(4);
+
+    unsafe extern "C" fn count_1(
+        _c: *const ort::OrtKernelContext,
+        out: *mut usize,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = 1 };
+        std::ptr::null_mut()
+    }
+    unsafe extern "C" fn get_input(
+        _c: *const ort::OrtKernelContext,
+        _i: usize,
+        out: *mut *const ort::OrtValue,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = VALUE };
+        std::ptr::null_mut()
+    }
+    unsafe extern "C" fn tensor_mem_info(
+        _v: *const ort::OrtValue,
+        out: *mut *const ort::OrtMemoryInfo,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = MI };
+        std::ptr::null_mut()
+    }
+    /// Always reports host memory — the answer a CPU EP always gets, and the
+    /// branch that makes the scan run to completion.
+    unsafe extern "C" fn device_type_cpu(
+        _m: *const ort::OrtMemoryInfo,
+        out: *mut ort::OrtMemoryInfoDeviceType,
+    ) {
+        unsafe { *out = ort::OrtMemoryInfoDeviceType_CPU };
+    }
+    unsafe extern "C" fn device_type_gpu(
+        _m: *const ort::OrtMemoryInfo,
+        out: *mut ort::OrtMemoryInfoDeviceType,
+    ) {
+        unsafe { *out = ort::OrtMemoryInfoDeviceType_GPU };
+    }
+
+    fn api(host: bool) -> ort::OrtApi {
+        let mut api: ort::OrtApi = unsafe { std::mem::zeroed() };
+        api.KernelContext_GetInputCount = Some(count_1);
+        api.KernelContext_GetInput = Some(get_input);
+        api.GetTensorMemoryInfo = Some(tensor_mem_info);
+        api.MemoryInfoGetDeviceType = Some(if host {
+            device_type_cpu
+        } else {
+            device_type_gpu
+        });
+        api
+    }
+
+    /// Four calls for a one-input host node: the input count, then `GetInput`,
+    /// `GetTensorMemoryInfo` and `MemoryInfoGetDeviceType` for that input.
+    ///
+    /// It was seven. The scan used to discard input 0's memory info and ask ORT
+    /// for it again at the fallback (two calls for a value it had already
+    /// seen), and the caller then asked a third time whether the result was a
+    /// device — a fact this function had just established and thrown away.
+    #[test]
+    fn resolving_host_scratch_costs_four_ort_calls() {
+        let api = api(true);
+        let before = dispatch_probe::snapshot();
+        let got = unsafe { device_mem_info(&api, std::ptr::null_mut(), None) };
+        let d = dispatch_probe::snapshot().since(&before);
+
+        assert_eq!(
+            got,
+            Some((MI, false)),
+            "host memory, reported as not device"
+        );
+        assert_eq!(
+            d.event(Event::OrtFfiCall),
+            4,
+            "FFI cost of resolving scratch placement changed"
+        );
+    }
+
+    /// A device-resident input short-circuits the scan, and the device-ness
+    /// comes back with it rather than costing another query.
+    #[test]
+    fn a_device_input_short_circuits_and_reports_itself() {
+        let api = api(false);
+        let before = dispatch_probe::snapshot();
+        let got = unsafe { device_mem_info(&api, std::ptr::null_mut(), None) };
+        let d = dispatch_probe::snapshot().since(&before);
+
+        assert_eq!(got, Some((MI, true)));
+        assert_eq!(d.event(Event::OrtFfiCall), 4);
+    }
+
+    /// The fallback still works when the scan cannot run at all, which is the
+    /// one case that legitimately needs the extra fetch. Behaviour here is what
+    /// it always was; only the cheap path got cheaper.
+    #[test]
+    fn a_missing_input_count_still_falls_back_to_input_zero() {
+        let mut api = api(true);
+        api.KernelContext_GetInputCount = None;
+        let got = unsafe { device_mem_info(&api, std::ptr::null_mut(), None) };
+        assert_eq!(got, Some((MI, false)));
+    }
+
+    /// A node with no inputs has nothing to scan and nothing to fall back on
+    /// beyond input 0, which does not exist either. It must not invent one.
+    #[test]
+    fn a_node_with_no_inputs_reports_no_memory_info() {
+        unsafe extern "C" fn none(
+            _c: *const ort::OrtKernelContext,
+            out: *mut usize,
+        ) -> ort::OrtStatusPtr {
+            unsafe { *out = 0 };
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn no_value(
+            _c: *const ort::OrtKernelContext,
+            _i: usize,
+            out: *mut *const ort::OrtValue,
+        ) -> ort::OrtStatusPtr {
+            unsafe { *out = std::ptr::null() };
+            std::ptr::null_mut()
+        }
+        let mut api = api(true);
+        api.KernelContext_GetInputCount = Some(none);
+        api.KernelContext_GetInput = Some(no_value);
+        assert_eq!(
+            unsafe { device_mem_info(&api, std::ptr::null_mut(), None) },
+            None
         );
     }
 }
