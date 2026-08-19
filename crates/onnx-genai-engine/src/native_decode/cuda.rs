@@ -872,10 +872,16 @@ const MIN_PREFILL_QUERY_WIDTH: usize = 16;
 /// width down.
 ///
 /// The kernel cache keeps a bounded number of compiled variants per node and
-/// evicts the rest, so a shape set larger than that cap thrashes instead of
-/// caching. Keeping the set small is the whole point; keeping it larger than one
-/// is what stops a short prompt from paying for a full chunk of arithmetic.
-const PREFILL_QUERY_WIDTH_STEPS: usize = 8;
+/// evicts the rest, so a shape set larger than that bound thrashes instead of
+/// caching. Raising the bound is not the answer — a retained variant owns device
+/// scratch, and a bound wide enough for eight prefill widths pushed a
+/// 5.5k-token prompt past the mapped-memory ceiling. So the ladder is sized to
+/// fit the bound that exists: three prefill widths, leaving one slot for the
+/// single-token decode shape.
+///
+/// Keeping it above one is what stops a short prompt from paying for a full
+/// chunk of arithmetic.
+const PREFILL_QUERY_WIDTH_STEPS: usize = 3;
 
 /// The query width a multi-row forward should actually run at.
 ///
@@ -920,9 +926,13 @@ fn prefill_query_width(rows: usize, cap: usize) -> usize {
     }
     // Even steps rather than powers of two: a power-of-two ladder rounds 311
     // rows up to 512, and the 65% of duplicated arithmetic that buys costs more
-    // than the recompile it saves. Eight steps up to the chunk width bound the
+    // than the recompile it saves. Even steps up to the chunk width bound the
     // shape set just as well while capping the waste at one step.
-    let step = (cap / PREFILL_QUERY_WIDTH_STEPS).max(MIN_PREFILL_QUERY_WIDTH);
+    // Round the step up, not down, so the last step lands exactly on the chunk
+    // width instead of just short of it and leaving a stray fourth width above.
+    let step = cap
+        .div_ceil(PREFILL_QUERY_WIDTH_STEPS)
+        .max(MIN_PREFILL_QUERY_WIDTH);
     rows.div_ceil(step).saturating_mul(step).min(cap).max(rows)
 }
 
@@ -6131,18 +6141,15 @@ mod prefill_query_width_tests {
         }
     }
 
-    /// Widths land on an eight-step ladder up to the chunk width, so the shape
-    /// set a stream of assorted prompts produces stays inside the kernel
-    /// cache's per-node bound.
+    /// Widths land on a three-step ladder up to the chunk width, leaving the
+    /// kernel cache's four-variant per-node bound one slot for the single-token
+    /// decode shape.
     #[test]
-    fn widths_round_up_to_an_eight_step_ladder() {
+    fn widths_round_up_to_a_three_step_ladder() {
         let widths: std::collections::BTreeSet<usize> = (2..=512)
             .map(|rows| prefill_query_width(rows, 512))
             .collect();
-        assert_eq!(
-            widths.into_iter().collect::<Vec<_>>(),
-            vec![64, 128, 192, 256, 320, 384, 448, 512]
-        );
+        assert_eq!(widths.into_iter().collect::<Vec<_>>(), vec![171, 342, 512]);
     }
 
     /// Padding never costs more than one step of duplicated rows, and never
@@ -6153,7 +6160,7 @@ mod prefill_query_width_tests {
             let width = prefill_query_width(rows, 512);
             assert!(width >= rows, "{rows} rows must not run at {width}");
             assert!(
-                width - rows < 64,
+                width - rows < 171,
                 "{rows} rows wasted {} rows",
                 width - rows
             );
@@ -6173,6 +6180,22 @@ mod prefill_query_width_tests {
     fn a_tiny_chunk_width_keeps_the_minimum_step() {
         assert_eq!(prefill_query_width(2, 32), 16);
         assert_eq!(prefill_query_width(17, 32), 32);
+    }
+
+    /// The ladder never spends more slots than the kernel cache's per-node
+    /// bound leaves for prefill, whatever chunk width a model declares.
+    #[test]
+    fn the_ladder_never_outgrows_its_step_count() {
+        for cap in [32usize, 128, 256, 512, 1024, 4096] {
+            let widths: std::collections::BTreeSet<usize> = (2..=cap)
+                .map(|rows| prefill_query_width(rows, cap))
+                .collect();
+            assert!(
+                widths.len() <= super::PREFILL_QUERY_WIDTH_STEPS,
+                "chunk width {cap} produced {widths:?}"
+            );
+            assert!(widths.contains(&cap), "chunk width {cap} must be a step");
+        }
     }
 
     /// Padded rows repeat the last real row, so the extra rows carry values in

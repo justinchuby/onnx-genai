@@ -41,8 +41,8 @@ const PROMPT: &str = "The quick brown fox jumps over the lazy dog and then";
 // "... and then runs into the forest, and the fox is the fastest animal in the
 // forest. The fox is the fastest animal in the".
 const EXPECTED_TOKENS: &[u32] = &[
-    13719, 1511, 290, 19458, 11, 326, 290, 68347, 382, 290, 32840, 13983, 306, 290, 19458, 13,
-    623, 68347, 382, 290, 32840, 13983, 306, 290,
+    13719, 1511, 290, 19458, 11, 326, 290, 68347, 382, 290, 32840, 13983, 306, 290, 19458, 13, 623,
+    68347, 382, 290, 32840, 13983, 306, 290,
 ];
 
 #[test]
