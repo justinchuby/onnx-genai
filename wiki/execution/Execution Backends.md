@@ -9,43 +9,44 @@ tags:
   - nxrt
   - architecture
 status: maintained
+lang: zh-CN
 created: 2026-08-17
-updated: 2026-08-17
+updated: 2026-08-19
 ---
 
 # Execution Backends
 
-> [!summary] Question answered
-> What is the difference between the ORT and native backends, and where do execution providers fit?
+> [!summary] 回答的问题
+> ORT 后端与原生(native)后端有什么区别?execution provider 又落在哪里?
 
-## Three concepts that are easy to mix up
+## 三个容易混淆的概念
 
-| Concept | Meaning |
+| 概念 | 含义 |
 |---|---|
-| Generation engine | Owns prompt/decode/sampling/session semantics |
-| Decode backend | Executes the model step through ORT or native nxrt |
-| Execution Provider (EP) | Implements/claims graph operators for a device such as CPU or CUDA |
+| Generation engine | 拥有 prompt/decode/sampling/session 语义 |
+| Decode backend | 通过 ORT 或原生 nxrt 执行模型的单步 |
+| Execution Provider(执行提供者,EP) | 为某类设备(如 CPU 或 CUDA)实现/认领图算子 |
 
-A backend is not the same as a device. Native CUDA means “nxrt backend using the
-CUDA EP”; ORT CUDA means “ONNX Runtime backend configured with its CUDA provider.”
+后端(backend)不等于设备(device)。原生 CUDA 指的是“使用 CUDA EP 的 nxrt
+后端”;ORT CUDA 指的是“配置了其 CUDA provider 的 ONNX Runtime 后端”。
 
-## ORT backend
+## ORT 后端
 
-The ORT path uses ONNX Runtime sessions through `onnx-genai-ort`.
+ORT 路径通过 `onnx-genai-ort` 使用 ONNX Runtime session。
 
-Strengths include:
+其优势包括:
 
-- mature operator and model coverage;
-- existing ORT execution-provider ecosystem;
-- a strong parity/reference path;
-- established graph optimization and runtime behavior.
+- 成熟的算子与模型覆盖;
+- 现有的 ORT execution-provider 生态;
+- 强有力的对齐/参考路径;
+- 成熟的图优化与运行时行为。
 
-The generation engine still owns the outer token loop, scheduling, sampling and
-session semantics; ORT performs graph execution.
+generation engine 仍然拥有外层的 token 循环、调度、sampling 与 session 语义;
+ORT 负责图执行。
 
-## Native nxrt backend
+## 原生 nxrt 后端
 
-The native path uses `onnx-runtime-session` and the `onnx-runtime-*` stack:
+原生路径使用 `onnx-runtime-session` 与 `onnx-runtime-*` 技术栈:
 
 ```text
 ONNX/model package
@@ -59,70 +60,65 @@ memory plan + executor
 CPU, CUDA or plugin EP kernels
 ```
 
-It provides direct control over:
+它对以下方面提供直接控制:
 
-- graph IR and layouts;
-- kernel selection and placement;
+- 图 IR 与 layout;
+- kernel 选择与放置;
 - activation planning;
-- device transfers and fences;
+- 设备传输与 fence;
 - CUDA graph capture;
-- VMM-backed allocations;
-- tracing and per-phase profiling.
+- VMM 支撑的分配;
+- 追踪与分阶段 profiling。
 
-Native does not automatically mean faster. Coverage, kernel quality, graph shape,
-hardware, capture state and memory strategy all matter.
+原生并不自动意味着更快。覆盖度、kernel 质量、图形状、硬件、capture 状态与内存
+策略都会产生影响。
 
-## Execution providers
+## Execution provider
 
-`onnx-runtime-ep-api` defines the native EP/kernel contract. Concrete providers
-include CPU and CUDA. Plugin crates bridge external/dynamic providers.
+`onnx-runtime-ep-api` 定义了原生 EP/kernel 契约。具体的 provider 包括 CPU 与
+CUDA。插件 crate 桥接外部/动态 provider。
 
-An EP typically owns or supplies:
+一个 EP 通常拥有或提供:
 
-- device identity and capabilities;
-- operator support and kernel factories;
-- device context and streams;
-- allocation/copy/commit mechanisms;
-- graph-capture behavior;
-- synchronization and release ordering.
+- 设备身份与能力;
+- 算子支持与 kernel factory;
+- 设备 context 与 stream;
+- 分配/拷贝/提交机制;
+- graph-capture 行为;
+- 同步与释放顺序。
 
-It should not own generation policy, request priority or global eviction choices.
+它不应拥有 generation policy、请求优先级或全局逐出(eviction)选择。
 
-## Backend/device selection
+## 后端/设备选择
 
-The CLI supports separate backend and EP choices. Changing model, backend or EP
-requires reloading because a session is constructed against a graph execution
-strategy and cannot simply move its live state to another provider.
+CLI 支持分别选择后端与 EP。更换模型、后端或 EP 需要重新加载,因为 session 是针对
+某种图执行策略构建的,无法简单地把它的活动状态迁移到另一个 provider。
 
-Environment and CLI configuration can select CPU, CUDA, WebGPU, CoreML or plugin
-providers where compiled/available. Requested unavailable providers fail clearly
-unless explicit fallback is enabled.
+在编译/可用的前提下,环境变量与 CLI 配置可以选择 CPU、CUDA、WebGPU、CoreML 或
+插件 provider。请求了不可用的 provider 会明确失败,除非显式启用了 fallback。
 
-## Why keep both paths
+## 为什么两条路径都保留
 
-1. **Parity:** ORT provides a reference for native correctness investigations.
-2. **Coverage:** unsupported native operators can remain available through ORT or
-   heterogeneous/plugin paths.
-3. **Performance experiments:** nxrt exposes planner, kernel and memory choices.
-4. **Ecosystem compatibility:** plugin EP work protects access to existing hardware
-   backends.
-5. **Incremental migration:** generation features can stay backend-agnostic.
+1. **对齐:** ORT 为原生正确性调查提供参考。
+2. **覆盖:** 原生不支持的算子仍可通过 ORT 或异构/插件路径获得。
+3. **性能实验:** nxrt 暴露 planner、kernel 与内存选择。
+4. **生态兼容:** 插件 EP 工作保护了对既有硬件后端的访问。
+5. **渐进迁移:** generation 特性可保持后端无关。
 
-## Comparing performance correctly
+## 正确地比较性能
 
-> [!warning] Backend labels are not enough
-> “Native vs ORT” is meaningful only when model, precision, EP/device, batch,
-> context, memory strategy, graph capture, threading and system contention are
-> held fixed and reported.
+> [!warning] 只看后端标签是不够的
+> 只有在模型、精度、EP/设备、batch、上下文、内存策略、graph capture、线程与系统
+> 竞争都被固定并报告时,“原生 vs ORT”才有意义。
 
-Start with:
+从这里开始:
 
 - [`docs/benchmarks/README.md`](../../docs/benchmarks/README.md)
 - [`docs/execution/NATIVE_CUDA_DECODE.md`](../../docs/execution/NATIVE_CUDA_DECODE.md)
 - [`docs/execution/CUDA_EP_STATUS.md`](../../docs/execution/CUDA_EP_STATUS.md)
 - [`docs/execution/EP_CONFORMANCE.md`](../../docs/execution/EP_CONFORMANCE.md)
 
-## Related notes
+## 相关笔记
 
 - [[architecture/Crate Architecture]]
 - [[architecture/Inference Request Lifecycle]]
