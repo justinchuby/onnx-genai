@@ -10,8 +10,9 @@ tags:
   - vmm
   - beginner
 status: proposed
+lang: zh-CN
 created: 2026-08-17
-updated: 2026-08-17
+updated: 2026-08-19
 ---
 
 # Memory Management for Beginners

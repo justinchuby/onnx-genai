@@ -146,6 +146,7 @@ unsafe fn ort_parallel_for(host: *mut c_void, total: usize, body: &(dyn Fn(usize
     // wide its pool is, so we hand it enough pieces to fill any pool and let
     // it decide how many to run at once.
     let status = unsafe {
+        crate::dispatch_probe::ort_call();
         (pool.parallel_for)(
             pool.ctx,
             Some(run_index),
@@ -168,6 +169,7 @@ unsafe fn ort_parallel_for(host: *mut c_void, total: usize, body: &(dyn Fn(usize
         // output tensor keeps whatever was in the buffer, so fall back to
         // running them here rather than silently returning short.
         if let Some(release) = pool.release_status {
+            crate::dispatch_probe::ort_call();
             unsafe { release(status) };
         }
         for index in 0..total {
@@ -258,6 +260,7 @@ pub unsafe fn install(
     let (Some(parallel_for), false) = (api.KernelContext_ParallelFor, ctx.is_null()) else {
         return Guard::inert();
     };
+    crate::dispatch_probe::count(crate::dispatch_probe::Event::DispatchAlloc);
     let pool = Box::new(HostPool {
         parallel_for,
         release_status: api.ReleaseStatus,

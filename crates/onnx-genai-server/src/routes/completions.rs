@@ -386,10 +386,13 @@ async fn run_chat_completion(
     let mut prepared = prepare_generate_request(
         &request,
         &handle.tokenizer,
-        handle.chat_template.as_deref(),
         client_session_id.is_some(),
-        placeholder.as_deref(),
-        handle.generation_defaults.as_ref(),
+        &PromptContext {
+            chat_template: handle.chat_template.as_deref(),
+            image_placeholder: placeholder.as_deref(),
+            generation_defaults: handle.generation_defaults.as_ref(),
+            default_reasoning_effort: state.config.default_reasoning_effort,
+        },
         output_budget,
     )
     .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
@@ -556,10 +559,13 @@ async fn stream_chat_completion(
     let mut prepared = prepare_generate_request(
         &request,
         &handle.tokenizer,
-        handle.chat_template.as_deref(),
         client_session_id.is_some(),
-        placeholder.as_deref(),
-        handle.generation_defaults.as_ref(),
+        &PromptContext {
+            chat_template: handle.chat_template.as_deref(),
+            image_placeholder: placeholder.as_deref(),
+            generation_defaults: handle.generation_defaults.as_ref(),
+            default_reasoning_effort: state.config.default_reasoning_effort,
+        },
         output_budget,
     )
     .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
@@ -1460,19 +1466,31 @@ fn positional_image_placeholder(
     (!already_positioned).then_some(placeholder)
 }
 
+/// What the loaded model and the server's configuration contribute to a prompt,
+/// as opposed to what the request itself carries.
+///
+/// These travel together to every prompt that is built, and a request that
+/// dropped one of them would render against the wrong defaults rather than
+/// fail, so they are passed as one value instead of four positional arguments.
+struct PromptContext<'a> {
+    chat_template: Option<&'a ChatTemplate>,
+    image_placeholder: Option<&'a str>,
+    generation_defaults: Option<&'a GenerationDefaults>,
+    /// Applied when the request omits `reasoning_effort`.
+    default_reasoning_effort: Option<ReasoningEffort>,
+}
+
 fn prepare_generate_request(
     request: &ChatCompletionRequest,
     tokenizer: &Tokenizer,
-    chat_template: Option<&ChatTemplate>,
     session: bool,
-    image_placeholder: Option<&str>,
-    generation_defaults: Option<&GenerationDefaults>,
+    context: &PromptContext<'_>,
     output_budget: usize,
 ) -> anyhow::Result<PreparedGenerateRequest> {
     let prompt = if session && !request.has_tool_context() {
-        build_session_prompt(&request.messages, image_placeholder)
+        build_session_prompt(&request.messages, context.image_placeholder)
     } else {
-        render_prompt(request, chat_template, image_placeholder)?
+        render_prompt(request, context)?
     };
     let token_ids = tokenizer
         .encode(&prompt)
@@ -1481,7 +1499,10 @@ fn prepare_generate_request(
     let mut options = build_generate_options_with_tokenizer(request, tokenizer, output_budget);
     // Honor the model's declared sampling regime (e.g. a reasoning model that
     // ships do_sample=true); explicit request fields still win.
-    options.resolve_sampling_defaults(generation_defaults, &chat_sampling_overrides(request));
+    options.resolve_sampling_defaults(
+        context.generation_defaults,
+        &chat_sampling_overrides(request),
+    );
     Ok(PreparedGenerateRequest {
         request: GenerateRequest {
             prompt: GeneratePrompt::TokenIds(token_ids),
@@ -1795,14 +1816,13 @@ fn template_tool_calls(tool_calls: &[ChatMessageToolCall]) -> anyhow::Result<ser
 
 fn render_prompt(
     request: &ChatCompletionRequest,
-    chat_template: Option<&ChatTemplate>,
-    image_placeholder: Option<&str>,
+    context: &PromptContext<'_>,
 ) -> anyhow::Result<String> {
-    if let Some(chat_template) = chat_template {
+    if let Some(chat_template) = context.chat_template {
         let messages = request
             .messages
             .iter()
-            .map(|message| template_message(message, image_placeholder))
+            .map(|message| template_message(message, context.image_placeholder))
             .collect::<anyhow::Result<Vec<_>>>()?;
         let tools_json = tools_offered_to_model(request)
             .map(serde_json::to_string)
@@ -1812,7 +1832,10 @@ fn render_prompt(
                 &messages,
                 tools_json.as_deref(),
                 true,
-                request.reasoning_effort.map(ReasoningEffort::as_str),
+                request
+                    .reasoning_effort
+                    .or(context.default_reasoning_effort)
+                    .map(ReasoningEffort::as_str),
             )
             .map_err(|err| anyhow::anyhow!("chat template render failed: {err}"));
     }
@@ -2037,17 +2060,28 @@ impl ParsedAssistantOutput {
     }
 }
 
-/// Resolve a namespaced call back to the tool the caller offered.
+/// Resolve an over-qualified call back to the tool the caller offered.
 ///
-/// This package's own tool instructions carry a namespaced example
-/// (`example_tool_name.example_function_name`), so a model offered a bare name
-/// sometimes answers with a qualified one. The namespace is the model's
-/// spelling, not the caller's, and a client can only dispatch a name it
-/// offered — it rejects anything else as an unavailable tool. So when the
-/// qualified name is not on offer but its final segment is, the call names that
-/// tool and is resolved to it. Anything else is left untouched for the caller
-/// to reject, because inventing a target it never offered would be worse than
-/// the error it already knows how to report.
+/// A model offered a bare name sometimes answers with a dotted one, and it is
+/// led there from both directions. This package's own tool instructions carry a
+/// namespaced example (`example_tool_name.example_function_name`), which invites
+/// a leading namespace — `functions.read`. The same instructions derive the
+/// valid recipients by splitting each offered name on `.`, so a set of bare
+/// names is advertised back as `read.*`, `bash.*`, which invites a *trailing*
+/// segment instead: a model told to address `read.*` obliges by borrowing the
+/// first thing to hand, usually a parameter name — `read.filePath`.
+///
+/// Either way the extra segment is the model's spelling, not the caller's, and
+/// a client can only dispatch a name it offered — it rejects anything else as an
+/// unavailable tool. So a dotted name that is not itself on offer is resolved to
+/// an offered tool when exactly one of its segments names one.
+///
+/// Requiring exactly one *distinct* target keeps the resolution from being a
+/// guess without punishing a model that merely repeats itself: `glob.glob`
+/// names one tool twice and resolves, while a call whose segments name two
+/// different offered tools has no single intended target and is left alone. Anything else is likewise left untouched for the caller to
+/// reject, because inventing a target it never offered would be worse than the
+/// error it already knows how to report.
 fn align_tool_calls(calls: &mut [ChatMessageToolCall], request: &ChatCompletionRequest) {
     let Some(offered) = tools_offered_to_model(request) else {
         return;
@@ -2058,12 +2092,17 @@ fn align_tool_calls(calls: &mut [ChatMessageToolCall], request: &ChatCompletionR
         if names_a_tool(&call.function.name) {
             continue;
         }
-        let Some((_, suffix)) = call.function.name.rsplit_once('.') else {
+        let targets: std::collections::BTreeSet<&str> = call
+            .function
+            .name
+            .split('.')
+            .filter(|segment| names_a_tool(segment))
+            .collect();
+        let [target] = targets.into_iter().collect::<Vec<_>>()[..] else {
             continue;
         };
-        if names_a_tool(suffix) {
-            call.function.name = suffix.to_string();
-        }
+        let target = target.to_string();
+        call.function.name = target;
     }
 }
 
@@ -2629,6 +2668,20 @@ mod prompt_rendering_tests {
 
     // A reasoning model's template reads the caller's effort; without it the
     // template stays on its own default, which is often maximal.
+    /// A prompt context carrying only a template and an optional server-side
+    /// effort default, which is all these cases vary.
+    fn context<'a>(
+        template: &'a ChatTemplate,
+        default_reasoning_effort: Option<ReasoningEffort>,
+    ) -> PromptContext<'a> {
+        PromptContext {
+            chat_template: Some(template),
+            image_placeholder: None,
+            generation_defaults: None,
+            default_reasoning_effort,
+        }
+    }
+
     #[test]
     fn reasoning_effort_reaches_the_template() {
         let template = ChatTemplate::from_source(
@@ -2646,15 +2699,57 @@ mod prompt_rendering_tests {
         assert_eq!(
             render_prompt(
                 &request(json!({ "reasoning_effort": "low" })),
-                Some(&template),
-                None
+                &context(&template, None),
             )
             .unwrap(),
             "low"
         );
         assert_eq!(
-            render_prompt(&request(json!({})), Some(&template), None).unwrap(),
+            render_prompt(&request(json!({})), &context(&template, None)).unwrap(),
             "default"
+        );
+    }
+
+    // An agent client that never sends `reasoning_effort` would otherwise leave
+    // the model on its own default and can burn a whole token budget thinking
+    // without emitting an answer, so the operator can supply a floor. A client
+    // that does ask still wins.
+    #[test]
+    fn server_default_reasoning_effort_fills_in_only_when_the_request_is_silent() {
+        let template = ChatTemplate::from_source(
+            "{{ reasoning_strength if reasoning_strength is defined and reasoning_strength else 'model-default' }}",
+        );
+        let request = |extra: serde_json::Value| -> ChatCompletionRequest {
+            let mut body = json!({ "model": "m", "messages": [{"role": "user", "content": "hi"}] });
+            let object = body.as_object_mut().unwrap();
+            for (key, value) in extra.as_object().unwrap() {
+                object.insert(key.clone(), value.clone());
+            }
+            serde_json::from_value(body).unwrap()
+        };
+
+        // Silent request takes the server default.
+        assert_eq!(
+            render_prompt(
+                &request(json!({})),
+                &context(&template, Some(ReasoningEffort::Low)),
+            )
+            .unwrap(),
+            "low"
+        );
+        // An explicit request value outranks the server default.
+        assert_eq!(
+            render_prompt(
+                &request(json!({ "reasoning_effort": "high" })),
+                &context(&template, Some(ReasoningEffort::Low)),
+            )
+            .unwrap(),
+            "high"
+        );
+        // No server default configured leaves the model on its own default.
+        assert_eq!(
+            render_prompt(&request(json!({})), &context(&template, None)).unwrap(),
+            "model-default"
         );
     }
 }
@@ -3050,6 +3145,24 @@ mod tool_name_alignment_tests {
     fn a_namespaced_call_resolves_to_the_offered_tool() {
         assert_eq!(aligned("glob.glob", &["glob", "read"]), "glob");
         assert_eq!(aligned("functions.read", &["glob", "read"]), "read");
+    }
+
+    // The instructions advertise a bare tool set back as `read.*`, `bash.*`, so
+    // a model told to address `read.*` supplies a second segment from whatever
+    // is to hand -- usually a parameter name. The tool it means is unambiguous.
+    #[test]
+    fn a_call_qualified_with_a_parameter_name_resolves_to_the_offered_tool() {
+        assert_eq!(aligned("read.filePath", &["read", "bash"]), "read");
+        assert_eq!(aligned("bash.command", &["read", "bash"]), "bash");
+        assert_eq!(aligned("write.filePath.content", &["write"]), "write");
+    }
+
+    // Two segments naming two different offered tools have no single intended
+    // target, so the call is left for the caller to reject rather than resolved
+    // to whichever segment happens to be looked at first.
+    #[test]
+    fn a_call_naming_two_offered_tools_is_not_resolved() {
+        assert_eq!(aligned("read.write", &["read", "write"]), "read.write");
     }
 
     // A name the caller offered is never rewritten, even when it contains a dot.

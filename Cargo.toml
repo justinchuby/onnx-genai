@@ -73,15 +73,15 @@ members = [
     "crates/onnx-runtime-ep-nxrt-testplugin",
 
     # ── Vendored ONNX Runtime MLAS bindings ──
-    # Registered as a member so `cargo build -p mlas-sys` resolves. Crates that
-    # enable the CPU EP's default `mlas` feature pull this in transitively; use
-    # `--no-default-features` on those crates for a pure-Rust fallback build.
+    # Registered as a member so `cargo build -p mlas-sys` resolves. Nothing
+    # reaches it by default: only `--features onnx-runtime-ep-cpu/mlas` pulls it
+    # in, and that build is a research reference, never a shipped artifact.
     "crates/mlas-sys",
 ]
 
-# Bare `cargo build`/`cargo test` operate on this set only. The CPU EP's default
-# features include vendored MLAS; opt out with `--no-default-features` when a
-# C++/asm toolchain is unavailable.
+# Bare `cargo build`/`cargo test` operate on this set only. No member's default
+# features compile the vendored MLAS C++/asm, so this set builds with no C++
+# toolchain; `--features onnx-runtime-ep-cpu/mlas` is what requires one.
 default-members = [
     "crates/onnx-genai",
     "crates/onnx-genai-preprocess",
@@ -231,7 +231,7 @@ tokio-stream = "0.1"
 async-trait = "0.1"
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = "0.9"
 schemars = "1.2"
 tracing = "0.1"

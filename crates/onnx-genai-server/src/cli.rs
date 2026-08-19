@@ -7,13 +7,14 @@
 use std::{net::SocketAddr, path::PathBuf};
 
 use clap::{ArgGroup, Args};
-use onnx_genai_engine::{KvDType, ResourceLimit, parse_resource_limit};
+use onnx_genai_engine::KvDType;
 
-#[cfg(feature = "native-backend")]
-use crate::parse_native_device;
+use crate::types::ReasoningEffort;
 use crate::{
     AppState, ModelSpec, ModelsConfig, ServerConfig, default_node_id, from_models_dir,
-    parse_kv_cache_dtype, serve,
+    parse_kv_cache_dtype,
+    runtime_args::{CpuArgs, EngineArgs},
+    serve,
 };
 
 /// Flags for the OpenAI-compatible HTTP server.
@@ -24,16 +25,17 @@ use crate::{
         .args(["model", "models_dir", "models_config"])
 ))]
 pub struct ServeArgs {
-    /// Single-model mode: path to a model directory containing the ONNX model and tokenizer.
+    /// Single-model mode: path to a model directory containing the ONNX model
+    /// and tokenizer, given positionally as every other subcommand takes it.
     /// Mutually exclusive with --models-dir and --models-config.
     /// Falls back to ONNX_GENAI_MODEL.
-    #[arg(long, env = "ONNX_GENAI_MODEL", group = "model_source")]
+    #[arg(value_name = "MODEL", env = "ONNX_GENAI_MODEL", group = "model_source")]
     pub model: Option<PathBuf>,
 
     /// Model id reported by /v1/models (single-model mode only).
     /// Defaults to the model directory name.
-    /// Ignored when --models-dir or --models-config is used.
-    #[arg(long, requires = "model")]
+    /// Rejected when --models-dir or --models-config is used.
+    #[arg(long)]
     pub model_id: Option<String>,
 
     /// Multi-model mode: parent directory whose immediate subdirectories are each
@@ -44,7 +46,7 @@ pub struct ServeArgs {
     pub models_dir: Option<PathBuf>,
 
     /// Multi-model mode: path to a TOML or JSON config file declaring the model list.
-    /// Mutually exclusive with --model and --models-dir.
+    /// Mutually exclusive with the positional MODEL and --models-dir.
     /// Falls back to ONNX_GENAI_MODELS_CONFIG.
     #[arg(long, env = "ONNX_GENAI_MODELS_CONFIG", group = "model_source")]
     pub models_config: Option<PathBuf>,
@@ -62,6 +64,17 @@ pub struct ServeArgs {
     /// Maximum requested output tokens per chat completion. Falls back to ONNX_GENAI_MAX_OUTPUT_TOKENS.
     #[arg(long, env = "ONNX_GENAI_MAX_OUTPUT_TOKENS", default_value_t = 4096)]
     pub max_output_tokens: usize,
+
+    /// Reasoning effort applied when a request omits `reasoning_effort`.
+    ///
+    /// Reasoning models pick their own default when the template receives no
+    /// effort, and that default is often the maximum. Agent clients frequently
+    /// never send the field at all, so the model can spend an entire token
+    /// budget thinking and emit no answer. Setting this gives the operator a
+    /// floor without overriding clients that do ask. Unset leaves the model's
+    /// own default in place. Falls back to ONNX_GENAI_DEFAULT_REASONING_EFFORT.
+    #[arg(long, env = "ONNX_GENAI_DEFAULT_REASONING_EFFORT", value_enum)]
+    pub default_reasoning_effort: Option<ReasoningEffort>,
 
     /// Maximum concurrent server sessions before least-recently-used eviction. Falls back to ONNX_GENAI_MAX_SESSIONS.
     #[arg(long, env = "ONNX_GENAI_MAX_SESSIONS", default_value_t = 256)]
@@ -108,39 +121,16 @@ pub struct ServeArgs {
     )]
     pub kv_cache_dtype: KvDType,
 
-    /// VRAM ceiling for the engine resource governor. Resolved before model load so
-    /// native CUDA can choose governed weight offload instead of relying on WDDM paging.
-    /// Accepted values: bytes, fractions such as 0.9, byte strings such as 8GiB, or auto.
-    #[arg(long, env = "ONNX_GENAI_VRAM_LIMIT", value_parser = parse_limit)]
-    pub vram_limit: Option<ResourceLimit>,
+    #[command(flatten)]
+    pub engine: EngineArgs,
 
-    /// Device for native decoder execution: cpu, cuda, or cuda:<index>.
-    /// Falls back to ONNX_GENAI_EP when omitted.
-    #[cfg(feature = "native-backend")]
-    #[arg(long, env = "ONNX_GENAI_NATIVE_DEVICE", value_parser = parse_native_device)]
-    pub native_device: Option<onnx_genai_engine::NativeDecodeDevice>,
-}
-
-fn parse_limit(input: &str) -> Result<ResourceLimit, String> {
-    parse_resource_limit(input).map_err(|error| error.to_string())
+    #[command(flatten)]
+    pub cpu: CpuArgs,
 }
 
 fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
-    let mut engine_config = onnx_genai_engine::EngineConfig {
-        kv_cache_dtype: args.kv_cache_dtype,
-        #[cfg(feature = "native-backend")]
-        native_device: args.native_device.clone(),
-        #[cfg(feature = "native-backend")]
-        decode_backend: if args.native_device.is_some() {
-            onnx_genai_engine::EngineDecodeBackend::Native
-        } else {
-            onnx_genai_engine::EngineDecodeBackend::default()
-        },
-        ..Default::default()
-    };
-    if let Some(vram_limit) = args.vram_limit {
-        engine_config.limits.vram_limit = vram_limit;
-    }
+    let mut engine_config = args.engine.to_config();
+    engine_config.kv_cache_dtype = args.kv_cache_dtype;
     // #1064: `--max-batch N` is what *requests* the native persistent decode
     // batch extent. Previously the extent could only be turned on by
     // `ONNX_GENAI_NATIVE_DECODE_BATCH`, so `--max-batch N` was refused at
@@ -156,6 +146,7 @@ fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
     ServerConfig {
         node_id: args.node_id.clone().unwrap_or_else(default_node_id),
         max_output_tokens: args.max_output_tokens,
+        default_reasoning_effort: args.default_reasoning_effort,
         max_sessions: args.max_sessions,
         max_queue_depth: args.max_queue_depth,
         max_batch: args.max_batch,
@@ -168,12 +159,14 @@ fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
 }
 
 /// Build the server state from [`ServeArgs`] and serve until shutdown.
-pub async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
+pub async fn run_serve(mut args: ServeArgs) -> anyhow::Result<()> {
+    args.cpu.apply().map_err(anyhow::Error::msg)?;
     let server_config = server_config_from_args(&args);
+    let model_path = args.model.take();
 
     // Build the model spec list from whichever source flag was provided.
-    // Exactly one of --model / --models-dir / --models-config is required (ArgGroup).
-    let specs: Vec<ModelSpec> = if let Some(model_path) = args.model {
+    // Exactly one model source is required (ArgGroup).
+    let specs: Vec<ModelSpec> = if let Some(model_path) = model_path {
         let model_id = args.model_id.unwrap_or_else(|| {
             model_path
                 .file_name()
@@ -187,12 +180,22 @@ pub async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
             eager: true,
             warmup: false,
         }]
-    } else if let Some(models_dir) = args.models_dir {
-        from_models_dir(&models_dir)?
-    } else if let Some(config_path) = args.models_config {
-        ModelsConfig::from_file(&config_path)?.models
     } else {
-        unreachable!("ArgGroup enforces that exactly one model_source arg is provided")
+        if args.model_id.is_some() {
+            anyhow::bail!(
+                "What: --model-id was given alongside a multi-model source. \
+                 Why: --models-dir and --models-config name every model themselves, \
+                 so there is no single id to override. \
+                 How: drop --model-id, or serve one model with --model."
+            );
+        }
+        if let Some(models_dir) = args.models_dir {
+            from_models_dir(&models_dir)?
+        } else if let Some(config_path) = args.models_config {
+            ModelsConfig::from_file(&config_path)?.models
+        } else {
+            unreachable!("ArgGroup enforces that exactly one model_source arg is provided")
+        }
     };
 
     let state = AppState::load_from_specs(specs, server_config)?;
@@ -204,6 +207,7 @@ pub async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+    use onnx_genai_engine::ResourceLimit;
 
     #[derive(Debug, Parser)]
     struct TestCli {
@@ -211,15 +215,62 @@ mod tests {
         serve: ServeArgs,
     }
 
-    /// #1064: `--max-batch N` must *shape the decode session*, not merely be
-    /// checked against a capability derived from a session built for one
+    /// Every subcommand takes the model as the first positional argument, and
+    /// this one is no exception: a command line learned from `run` works here.
+    #[test]
+    fn the_model_is_given_positionally_like_every_other_subcommand() {
+        let mut args = TestCli::parse_from(["test", "model-dir"]).serve;
+
+        assert_eq!(args.model.take(), Some(PathBuf::from("model-dir")));
+    }
+
+    /// A single-model server serves one model. A second path is a typo or a
+    /// misremembered multi-model flag, and starting anyway serves a model
+    /// nobody asked for.
+    #[test]
+    fn a_second_model_path_is_refused_rather_than_ignored() {
+        TestCli::try_parse_from(["test", "one", "two"])
+            .expect_err("two different models were named");
+    }
+
+    /// `--model-id` names *the* model, so a multi-model source has nothing for
+    /// it to name. Silently ignoring it hid a typo'd invocation.
+    #[tokio::test]
+    async fn a_model_id_is_refused_alongside_a_multi_model_source() {
+        let args =
+            TestCli::parse_from(["test", "--models-dir", "does-not-exist", "--model-id", "x"])
+                .serve;
+
+        let error = run_serve(args).await.expect_err("no single model to name");
+        assert!(error.to_string().contains("--model-id"), "{error}");
+    }
+
+    /// `--device` is the spelling every other subcommand uses, and naming a
+    /// device has always implied the native decoder on this command.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn the_shared_device_flag_selects_the_native_backend() {
+        let cli = TestCli::parse_from(["test", "model-dir", "--device", "cpu"]);
+
+        let config = server_config_from_args(&cli.serve).engine_config;
+        assert_eq!(
+            config.decode_backend,
+            onnx_genai_engine::EngineDecodeBackend::Native
+        );
+        assert_eq!(
+            config.native_device,
+            Some(onnx_genai_engine::NativeDecodeDevice::Cpu)
+        );
+    }
+
+    /// #1064: `--max-batch N` must *shape the decode session*, not merely be    /// checked against a capability derived from a session built for one
     /// sequence. Before this, batch-N could only be enabled by
     /// `ONNX_GENAI_NATIVE_DECODE_BATCH`, so `--max-batch 4` was refused at
     /// startup with "this backend decodes at most 1 sequence(s) concurrently".
     #[cfg(feature = "native-backend")]
     #[test]
     fn serve_max_batch_requests_the_native_decode_batch_extent() {
-        let cli = TestCli::parse_from(["test", "--model", "model-dir", "--max-batch", "4"]);
+        let cli = TestCli::parse_from(["test", "model-dir", "--max-batch", "4"]);
 
         assert_eq!(
             server_config_from_args(&cli.serve)
@@ -235,9 +286,8 @@ mod tests {
     #[cfg(feature = "native-backend")]
     #[test]
     fn serve_leaves_single_sequence_decode_untouched() {
-        let omitted = TestCli::parse_from(["test", "--model", "model-dir"]);
-        let explicit_one =
-            TestCli::parse_from(["test", "--model", "model-dir", "--max-batch", "1"]);
+        let omitted = TestCli::parse_from(["test", "model-dir"]);
+        let explicit_one = TestCli::parse_from(["test", "model-dir", "--max-batch", "1"]);
 
         assert_eq!(
             server_config_from_args(&omitted.serve)
@@ -255,8 +305,7 @@ mod tests {
 
     #[test]
     fn serve_vram_limit_flows_into_engine_config_before_load() {
-        let cli =
-            TestCli::parse_from(["test", "--model", "model-dir", "--vram-limit", "6000000000"]);
+        let cli = TestCli::parse_from(["test", "model-dir", "--vram-limit", "6000000000"]);
 
         let config = server_config_from_args(&cli.serve);
 
@@ -268,8 +317,8 @@ mod tests {
 
     #[test]
     fn serve_vram_limit_accepts_fraction_and_auto() {
-        let fraction = TestCli::parse_from(["test", "--model", "model-dir", "--vram-limit", "0.5"]);
-        let auto = TestCli::parse_from(["test", "--model", "model-dir", "--vram-limit", "auto"]);
+        let fraction = TestCli::parse_from(["test", "model-dir", "--vram-limit", "0.5"]);
+        let auto = TestCli::parse_from(["test", "model-dir", "--vram-limit", "auto"]);
 
         assert_eq!(
             server_config_from_args(&fraction.serve)
@@ -284,19 +333,6 @@ mod tests {
                 .limits
                 .vram_limit,
             ResourceLimit::Auto
-        );
-    }
-
-    #[cfg(feature = "native-backend")]
-    #[test]
-    fn explicit_native_device_selects_native_decode() {
-        let cli = TestCli::parse_from(["test", "--model", "model-dir", "--native-device", "cpu"]);
-
-        assert_eq!(
-            server_config_from_args(&cli.serve)
-                .engine_config
-                .decode_backend,
-            onnx_genai_engine::EngineDecodeBackend::Native
         );
     }
 }
