@@ -108,12 +108,35 @@ use onnx_runtime_ep_api::{Result, TensorMut};
 /// an in-place `y = act(y)` node where the ranges do overlap — falls back to the
 /// owned buffer, which is exactly the situation `write_dense_f32_narrow` exists
 /// to handle. Correctness never depends on which arm runs.
+///
+/// `f` must be a pure elementwise map: `y[i]` may depend on `x[i]` but on no
+/// other index. The narrow-output arm below evaluates it in chunks, so a
+/// closure that reads across lanes — a row-broadcast bias, say — would see a
+/// different window per chunk. Those callers exist ([`write_mapped_reading`]'s
+/// `also_read` cases), and declaring their extra range is what keeps them off
+/// the chunked path; the gate is structural rather than a convention.
 pub(crate) fn write_mapped<F>(op: &str, out: &mut TensorMut, x: &[f32], f: F) -> Result<()>
 where
-    F: FnOnce(&[f32], &mut [f32]),
+    F: Fn(&[f32], &mut [f32]),
 {
     write_mapped_reading(op, out, x, &[], f)
 }
+
+/// Bulk `f32` → 16-bit narrow, as selected by the output's dtype.
+///
+/// # Safety
+/// The caller must have confirmed the corresponding ISA is available and pass
+/// two slices of equal length.
+type NarrowFn = unsafe fn(&[f32], &mut [u16]);
+
+/// Elements of `f32` scratch held between the kernel and the narrow when the
+/// two are fused.
+///
+/// 8192 f32 is 32 KiB, so a chunk's intermediate is still in L1/L2 when the
+/// narrow reads it back. The unfused path allocated one buffer the size of the
+/// whole tensor and made three passes over it — widen, compute, narrow — which
+/// on a 1 Mi tensor is 4 MB streamed twice more than it needs to be.
+const NARROW_CHUNK: usize = 8192;
 
 /// [`write_mapped`] for closures that read a slice *besides* `x`.
 ///
@@ -134,7 +157,7 @@ pub(crate) fn write_mapped_reading<F>(
     f: F,
 ) -> Result<()>
 where
-    F: FnOnce(&[f32], &mut [f32]),
+    F: Fn(&[f32], &mut [f32]),
 {
     let n = x.len();
     let eligible = if also_read.is_empty() {
@@ -157,6 +180,43 @@ where
         let dst = unsafe { std::slice::from_raw_parts_mut(out.data_ptr_mut::<f32>(), n) };
         f(x, dst);
         return Ok(());
+    }
+    // Fuse the kernel and the narrow for a contiguous 16-bit output, the shape
+    // every f16/bf16 activation lands in. Chunking keeps each intermediate in
+    // L1 instead of writing a tensor-sized `f32` buffer out to memory and
+    // reading all of it back. The values are bit-identical to the unfused arm
+    // because the kernel is elementwise and the narrow sees the same f32 bits.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if also_read.is_empty() && n != 0 && out.is_contiguous() && out.numel() == n {
+        use crate::dtype::{bf16x, f16c};
+        use onnx_runtime_ir::DataType;
+        let narrow: Option<NarrowFn> = match out.dtype {
+            DataType::Float16 if f16c::available() => Some(f16c::narrow),
+            DataType::BFloat16 if bf16x::available() => Some(bf16x::narrow),
+            _ => None,
+        };
+        if let Some(narrow) = narrow {
+            out.validate()?;
+            // SAFETY: a validated contiguous 16-bit float output addresses
+            // exactly `n` 2-byte elements, and `half::f16`/`half::bf16` are
+            // `repr(transparent)` over `u16`, so writing `u16` bit patterns is
+            // sound. Each chunk of `x` is consumed into `scratch` before the
+            // matching half of `dst` is written, so even an output that aliases
+            // `x` reads its input before it is overwritten.
+            let dst = unsafe { std::slice::from_raw_parts_mut(out.data_ptr_mut::<u16>(), n) };
+            let mut scratch = vec![0.0f32; NARROW_CHUNK.min(n)];
+            // Serial for the same reason the unfused arm is: see `serial_scope`.
+            serial_scope(|| {
+                for (src, dst) in x.chunks(NARROW_CHUNK).zip(dst.chunks_mut(NARROW_CHUNK)) {
+                    let mid = &mut scratch[..src.len()];
+                    f(src, mid);
+                    // SAFETY: `available()` confirmed the ISA above, and the
+                    // two slices are the same length by construction.
+                    unsafe { narrow(mid, dst) };
+                }
+            });
+            return Ok(());
+        }
     }
     let mut y = vec![0.0f32; n];
     // Serial on purpose: see `serial_scope`. This arm always ends in a full
@@ -4000,6 +4060,90 @@ mod tests {
         let got = narrowed.to_u16_bits();
         for (g, e) in got.iter().zip(&expected) {
             assert_eq!(*g, half::f16::from_f32(*e).to_bits());
+        }
+    }
+
+    /// The fused narrow arm evaluates the kernel `NARROW_CHUNK` elements at a
+    /// time. That is only sound if chunking is unobservable, so this pins the
+    /// output bit-for-bit against a single-shot reference over a length that
+    /// spans several chunks and ends mid-chunk — the case where an off-by-one
+    /// in the chunk/`dst` pairing, a stale `scratch` tail, or a kernel that
+    /// looked across lanes would all show up.
+    #[test]
+    fn fused_narrow_is_bit_identical_across_chunk_boundaries() {
+        let n = NARROW_CHUNK * 2 + 137;
+        assert!(
+            !n.is_multiple_of(NARROW_CHUNK),
+            "the test must end on a partial chunk"
+        );
+        // Straddle the interesting parts of each kernel's domain: the tanh
+        // saturation knees and erf's split boundary.
+        let src: Vec<f32> = (0..n).map(|i| (i as f32 - 8000.0) * 0.0037).collect();
+
+        for (name, kernel) in [
+            ("Tanh", tanh_f32_slice as fn(&[f32], &mut [f32])),
+            ("Erf", erf_f32_slice as fn(&[f32], &mut [f32])),
+            ("Sigmoid", sigmoid_f32_slice as fn(&[f32], &mut [f32])),
+        ] {
+            let mut expected = vec![0.0f32; n];
+            kernel(&src, &mut expected);
+
+            let mut f16_out = Owned::f16(&[n], &vec![0.0f32; n]);
+            write_mapped(name, &mut f16_out.view_mut(), &src, kernel).unwrap();
+            for (i, (g, e)) in f16_out.to_u16_bits().iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    *g,
+                    half::f16::from_f32(*e).to_bits(),
+                    "{name} f16 differs at {i} (x={})",
+                    src[i]
+                );
+            }
+
+            let mut bf16_out = Owned::bf16(&[n], &vec![0.0f32; n]);
+            write_mapped(name, &mut bf16_out.view_mut(), &src, kernel).unwrap();
+            for (i, (g, e)) in bf16_out.to_u16_bits().iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    *g,
+                    half::bf16::from_f32(*e).to_bits(),
+                    "{name} bf16 differs at {i} (x={})",
+                    src[i]
+                );
+            }
+        }
+    }
+
+    /// A closure that reads across lanes must never reach the chunked arm.
+    /// `BiasGelu`/`FastGelu` declare their bias through `also_read`, and that
+    /// declaration is the only thing keeping them on the whole-tensor path —
+    /// so this asserts the row-broadcast result still matches a single-shot
+    /// reference when the output is f16 and the tensor spans several chunks
+    /// with a row width that never divides one.
+    #[test]
+    fn a_row_broadcast_closure_stays_off_the_chunked_arm() {
+        let width = 61;
+        let n = width * 300;
+        assert!(n > NARROW_CHUNK && !NARROW_CHUNK.is_multiple_of(width));
+        let src: Vec<f32> = (0..n).map(|i| (i as f32 - 9000.0) * 0.0021).collect();
+        let bias: Vec<f32> = (0..width).map(|i| (i as f32 - 30.0) * 0.05).collect();
+
+        let mut expected = vec![0.0f32; n];
+        erf_gelu_bias_f32_slice(&src, &bias, width, &mut expected);
+
+        let mut out = Owned::f16(&[n], &vec![0.0f32; n]);
+        write_mapped_reading(
+            "BiasGelu",
+            &mut out.view_mut(),
+            &src,
+            &[crate::dtype::slice_byte_range(&bias)],
+            |x, y| erf_gelu_bias_f32_slice(x, &bias, width, y),
+        )
+        .unwrap();
+        for (i, (g, e)) in out.to_u16_bits().iter().zip(&expected).enumerate() {
+            assert_eq!(
+                *g,
+                half::f16::from_f32(*e).to_bits(),
+                "row-broadcast output differs at {i}"
+            );
         }
     }
 
