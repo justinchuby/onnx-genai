@@ -3119,3 +3119,283 @@ region that the global pool cannot serve, which is the whole thesis of §26.
 
 Nothing in this phase touches it. It is the next target, and the runtime it
 needs already exists.
+
+## 34. Phase 14: the CPU budget was buying hyperthreads, not cores
+
+Phase 13 (§33) built a task runtime and moved four kernels onto it. This phase
+is about the layer underneath all of that, and it is the largest single win in
+the whole document: **`ONNX_GENAI_CPU_DECODE_THREADS=N` was confining the
+process to `N/2` physical cores.**
+
+### 34.1 The measurement that could not be explained by arithmetic
+
+An int4 `MatMulNBits` (4096×6144, 128 tokens) run native-only, 20 runs, on the
+16-core/32-thread EPYC 9V74:
+
+| budget | wall per run | user CPU |
+| ------ | ------------ | -------- |
+| 1      | 79.4 ms      | 2.04 s   |
+| 2      | 81.2 ms      | 4.10 s   |
+| 3      | 40.4 ms      | 2.05 s   |
+| 4      | 53.9 ms      | 3.35 s   |
+
+A budget of 2 was *exactly as slow as a budget of 1* while burning twice the
+CPU. A budget of 3 was twice as fast as a budget of 4. No kernel-arithmetic
+story produces that shape. A scheduler story does, and only one: the second
+thread was the first thread's hyperthread.
+
+`taskset` settles it, same binary, same model, same run count:
+
+| CPU mask     | physical cores | native ms | user CPU |
+| ------------ | -------------- | --------- | -------- |
+| `0`          | 1              | 100.6     | 2.53 s   |
+| `0,1`        | 1              |  81.8     | 4.13 s   |
+| `0,2`        | **2**          |  **50.1** | 2.63 s   |
+| `0,1,2,3`    | 2              |  54.3     | 3.50 s   |
+| `0,2,4,6`    | **4**          |  **33.5** | 2.52 s   |
+
+Two threads on two cores beat two threads on one core by 1.63× *and used 36%
+less CPU*. Four on four beat four on two by 1.62× at 28% less CPU.
+
+### 34.2 Why the mask was wrong
+
+`decode_affinity::choose_budget_cpus` asked the NUMA layer for the
+smallest-index node covering the budget, intersected it with the process cpuset,
+sorted ascending, and truncated to `N`. On this host — and on every AMD EPYC and
+every Intel part since Skylake-SP — the kernel numbers SMT siblings adjacently:
+
+```
+$ cat /sys/devices/system/cpu/cpu{0,1,2,3}/topology/thread_siblings_list
+0-1
+0-1
+2-3
+2-3
+```
+
+So "the lowest `N` CPU indices" is "the first `N/2` cores, both threads each".
+The policy read as locality-aware and was, for NUMA; it had simply never been
+told what a core is.
+
+This is also the missing half of §26. §26 measured that every kernel loses at 8
+and 16 threads and blamed the Rayon park latency. The park latency is real, and
+Phase 11 fixed it — but a second, larger factor was that "8 threads" had been
+4 cores the whole time.
+
+### 34.3 The fix is a ranking, not a widening
+
+`scatter_across_cores` orders the candidate pool with
+`CoreTopology::leaders_within` — one CPU per physical core first, siblings
+after — and truncates *after* ranking. The result is still a subset of the same
+candidate pool, so the process cpuset guarantee is untouched, and a full-width
+budget returns exactly what it returned before.
+
+Two smaller corrections travel with it:
+
+* `smt_scaled_request` sizes the NUMA node search in cores rather than logical
+  CPUs, so a budget that fits on one core-rich node still stays on one node. It
+  falls back to the old logical sizing when no node is that large, so a budget
+  that only fits by spanning nodes behaves as before.
+* the cross-node top-up now happens *before* the ranking. Previously the
+  top-up appended CPUs to a mask that had already been truncated, so a second
+  node's fresh cores could never displace the first node's SMT siblings.
+
+`order_pin_targets` applies the same ordering to the flat decode Rayon pool's
+pin list, because its builder pins worker `i` to `cpus[i % len]` — the order of
+that list, not just its contents, decides whether an 8-worker pool occupies 8
+cores or 4. The persistent SPMD pool and the `numa-split` sub-pools are
+deliberately left compact: their workers *spin*, and spreading spinning workers
+one per core is the experiment already recorded in `core_topology`'s module
+docs, where it measured worse.
+
+### 34.4 The matrix
+
+42 cells (20 GEMM, 22 transform), 6 widths, 5 trials, paired arms in one driver
+invocation, native-only view (the ratio view is not usable here: the mask change
+moves ORT's threads too, so only native-vs-native isolates the change).
+
+Geometric mean of `base_native / new_native`, so >1 is faster:
+
+| width | GEMM | >1.05× | <0.95× | Transforms | >1.05× | <0.95× |
+| ----- | ---- | ------ | ------ | ---------- | ------ | ------ |
+| 1     | 0.996 | 0  | 1 | 0.997 | 1  | 3 |
+| 2     | **1.769** | 19 | **0** | 1.191 | 12 | **0** |
+| 4     | **1.642** | 20 | **0** | 1.095 | 11 | 2 |
+| 8     | **1.441** | 16 | 1 | 0.913 | 4  | 9 |
+| 16    | **1.245** | 15 | 1 | 0.961 | 6  | 9 |
+| 32    | 0.976 | 8  | 6 | 1.062 | 9  | 4 |
+
+The two ends are the control: a budget of 1 cannot be re-ranked, and a budget of
+32 is the whole machine, so both must be flat, and both are (0.996–1.06, inside
+this host's noise). Everything in between moves, and at 2 and 4 threads *not one
+cell out of 42 regressed*.
+
+The biggest individual movements are the decode- and prefill-shaped quantised
+GEMMs, in ms:
+
+| cell | t=2 | t=4 | t=8 | t=16 |
+| ---- | --- | --- | --- | ---- |
+| `gemm_nbits_llama3_8b_mlp_t128` | 187.7→93.3 | 121.3→62.8 | 56.4→33.3 | 37.7→23.3 |
+| `gemm_nbits_llama3_8b_qkv_t512` | 322.6→158.6 | 183.5→100.6 | 92.7→52.7 | 50.3→35.9 |
+| `gemm_nbits_qwen3_0p6b_mlp_t512` | 79.0→40.3 | 52.5→25.1 | 23.3→13.5 | 16.0→10.5 |
+| `gemm_dense_tall_128x4096` | 50.4→25.7 | 25.7→12.9 | 13.0→8.5 | 10.8→8.5 |
+
+### 34.5 The transform "losses" at 8 and 16 are dispersion, not regression
+
+The transform column at t=8/t=16 reads as a loss, and it is not one. Those cells
+are 20 µs to 500 µs, five trials each, on a shared box — the exact regime §31.8
+already flagged as needing fifteen trials. Re-measured properly (40 runs, 5
+warmups, arms strictly interleaved, five repetitions), native ms:
+
+| cell | width | before | after |
+| ---- | ----- | ------ | ----- |
+| `rope_gptj_il_s512` | 8  | 0.111 0.160 0.111 0.111 0.141 | 0.081 0.077 0.083 0.086 0.082 |
+| `rope_gptj_il_s512` | 16 | 0.104 0.082 0.101 0.100 0.105 | 0.088 0.086 0.087 0.138 0.140 |
+| `rope_gptj_il_s128` | 8  | 0.037 0.044 0.045 0.036 0.037 | 0.022 0.027 0.028 0.026 0.026 |
+| `sm_bert_b8_s128`   | 8  | 0.249 0.244 0.246 0.259 0.182 | 0.121 0.121 0.145 0.165 0.138 |
+| `sm_bert_b8_s128`   | 16 | 0.182 0.184 0.187 0.150 0.175 | 0.093 0.092 0.178 0.089 0.104 |
+
+Every one of those is a win once the sample is large enough — `sm_bert_b8_s128`
+by 1.9× at both widths. The five-trial grid is trustworthy for the multi-ms GEMM
+cells and is not trustworthy for these; it is reported above unedited so the
+distinction stays visible rather than being quietly smoothed away.
+
+### 34.6 What is still true after this phase
+
+ORT still scales the small transform kernels better than we do: at t=16 the
+native/ORT ratio for `rope_gptj_il_s128` and `tr_llama3_s512` is still 3–7×, and
+`gemm_nbits_*_t8` at t=32 is still the worst cell in the document. Nothing here
+changed the arithmetic or the grain policy; it changed which CPUs the arithmetic
+runs on. The remaining losses are the ones §31.9 named, and they are still
+`matmul_nbits.rs`'s 64 raw Rayon call sites.
+
+## 35. Phase 15: the prefill fan-out was on the wrong pool (#1238)
+
+`gemm_nbits_*_t8` at t=32 was the worst cell in this document at the end of
+§33 — 22–34× ORT. It is now 2.6–2.8×. Nothing about the arithmetic changed.
+
+### 35.1 A loss that gets worse with every thread you add
+
+The int4 GEMM cells with a small token count degraded monotonically with width,
+which no arithmetic explanation covers:
+
+| cell (native/ORT) | t=1 | t=2 | t=4 | t=8 | t=16 | t=32 |
+| ---- | --- | --- | --- | --- | --- | --- |
+| `gemm_nbits_qwen3_0p6b_qkv_t8` | 1.00 | 1.54 | 3.33 | 3.24 | 4.72 | 24.6 |
+| `gemm_nbits_qwen3_0p6b_mlp_t8` | 1.00 | 1.53 | 2.30 | 2.93 | 4.36 | 18.6 |
+| `gemm_nbits_llama3_8b_qkv_t8`  | 0.96 | 1.49 | 2.32 | 2.50 | 3.60 | 8.00 |
+
+Parity at one thread and 24× at thirty-two is the signature of a scheduler, not
+a kernel.
+
+### 35.2 It only happens when someone else is in the process
+
+Run the same cell with `--native-only`, so no ORT session is ever created, and
+the pathology disappears:
+
+| `gemm_nbits_qwen3_0p6b_qkv_t8`, t=32 | native p50 | native min | user CPU |
+| ---- | ---- | ---- | ---- |
+| native-only  | 0.448 ms | 0.174 ms |  4.87 s |
+| ORT co-resident | 4.104 ms | 0.998 ms | 15.65 s |
+
+The kernel is *fine*. What is not fine is what it does to get threads. The
+`m > 1` MLAS shard tiling in `run_mlas_shards` issued one `tiles.par_iter()`
+fan-out on **global Rayon**, sized by `rayon::current_num_threads()`. Global
+Rayon's workers park, and this document already measured what that costs: 67 µs
+to wake back-to-back, 226 µs after a 20 µs gap (§33.4). Put a live ORT intra-op
+pool — which spins — on the same cores and every one of those wake-ups lands
+behind a spinning thread. A 32-way fan-out over 0.5 ms of arithmetic pays it 32
+times.
+
+### 35.3 The fix, and the one place it is not the fix
+
+Route the tiling through the CPU task runtime built in §33: resident workers,
+adaptive spin/park, dispatch to a resident worker measured at p50 4.8 µs, and a
+width that comes from the topology rather than from whatever global Rayon was
+built with.
+
+That is right everywhere except one case, and the exception is instructive. The
+task runtime's pool is capped to the *physical* cores the process may use
+(§33.3), because spinning workers on SMT siblings measurably hurt the short
+latency-bound strip kernels the pool mostly serves. A prefill tile is the
+opposite workload: a multi-millisecond MLAS call whose dequantise step has
+enough load latency that SMT siblings pay for themselves. Measured on
+`gemm_nbits_llama3_8b_mlp_t512` at t=32, native-only:
+
+| executor | width | native p50 | user CPU |
+| ---- | ---- | ---- | ---- |
+| global Rayon | 32 | 54.1 ms | 28.0 s |
+| task runtime | 16 (SMT-capped) | 66.8 ms | 19.6 s |
+| task runtime | 32 (`ONNX_GENAI_CPU_TASK_THREADS=32`) | 54.8 ms | 27.4 s |
+
+The gap is the cap, not the executor — forced to the same width the runtime
+matches Rayon to within noise. So the split is on *work size*, in
+`prefill_fan_out`: below 512 Mi MACs the task runtime's cheap dispatch wins;
+above it, the fan-out is long enough that a 226 µs wake-up is 0.25% of the run
+and the extra hardware threads are worth more. 512 Mi classifies every measured
+cell correctly, and the wide path is not taken at all when Rayon is not actually
+wider than the pool.
+
+The threshold was chosen from a separate campaign, tabulated in
+`WIDE_PREFILL_MACS`'s doc comment, in which the tiling ran on the task runtime
+*unconditionally* — there was no policy yet, so both of its columns are a real
+measurement of the two executors on the same cell. Those numbers deliberately do
+not match §33.4 below: §33.4 measures the shipped policy, so above the threshold
+both of its arms take the same wide path and any difference there is noise.
+
+`prefill_tile_grain` adds the matching grain floor: the tiling cannot merge
+output-column shards (each owns its own packed weight), so the only lever for a
+too-fine partition is handing several whole tiles to one task, which it does
+below 512 Ki MACs a tile.
+
+### 35.4 The matrix
+
+All 20 `gemm_nbits_*` cells × 6 widths, 3 trials × 10 runs, native/ORT paired in
+a single process, arms interleaved. Speedup is Rayon ÷ task runtime, so >1 is
+this change winning.
+
+| | t=1 | t=2 | t=4 | t=8 | t=16 | t=32 |
+| ---- | --- | --- | --- | --- | --- | --- |
+| geomean, m>1 cells | 1.00× | 1.00× | 0.99× | 1.11× | 1.25× | **1.71×** |
+| cells improved >5% | 0/12 | 1/12 | 3/12 | 4/12 | 9/12 | 4/12 |
+
+The `m = 1` cells are the control: this change cannot reach them (the path is
+gated on `m > 1`), and they came back 0.68×–1.53× with a median of 0.99×. That
+spread *is* the noise floor of a 3-trial grid on this host, and it is why the
+narrow-width cells below are re-measured rather than reported.
+
+Largest movements at t=32:
+
+| cell | Rayon | task runtime | speedup | vs ORT, before → after |
+| ---- | ---- | ---- | ---- | ---- |
+| `gemm_nbits_qwen3_0p6b_qkv_t8`   | 4.041 ms | 0.299 ms | 13.5× | 34.1× → 2.85× |
+| `gemm_nbits_qwen3_0p6b_mlp_t8`   | 4.440 ms | 0.663 ms |  6.7× | 21.8× → 2.60× |
+| `gemm_nbits_llama3_8b_qkv_t8`    | 5.980 ms | 1.908 ms |  3.1× |  8.5× → 2.77× |
+| `gemm_nbits_qwen3_0p6b_qkv_t128` | 6.282 ms | 2.100 ms |  3.0× |  4.4× → 1.27× |
+
+### 35.5 The apparent narrow-width losses are dispersion
+
+Five cells came back below 0.95× in the 3-trial grid. Three of them
+(`qwen3_0p6b_qkv_t512` t=32, `qwen3_0p6b_mlp_t128` t=32, `llama3_8b_qkv_t128`
+t=32) are above the 512 Mi threshold at a width where Rayon is wider, so **both
+arms run byte-identical code** — they are noise by construction. The other two
+were re-measured at 7 trials × 25 runs with 8 warm-ups:
+
+| cell | t | 3×10 grid | 7×25 re-measurement |
+| ---- | - | ---- | ---- |
+| `gemm_nbits_qwen3_0p6b_qkv_t512` | 4 | 12.67 → 16.72 ms | 15.99 → 15.87 ms (tie) |
+| `gemm_nbits_qwen3_0p6b_qkv_t512` | 8 |  7.02 →  9.09 ms |  6.90 →  6.83 ms (tie) |
+| `gemm_nbits_qwen3_0p6b_qkv_t128` | 4 |  3.39 →  3.55 ms |  3.39 →  3.43 ms (tie) |
+| `gemm_nbits_qwen3_0p6b_qkv_t8`   | 4 |  0.54 →  0.59 ms |  0.52 →  0.46 ms (1.13×) |
+| `gemm_nbits_qwen3_0p6b_qkv_t8`   | 8 |  0.56 →  0.55 ms |  0.55 →  0.39 ms (1.41×) |
+
+No reproducible regression survives the larger sample.
+
+### 35.6 What is still true after this phase
+
+`gemm_nbits_*_t8` at t=32 is no longer the worst cell in the document; the small
+transform kernels are, at 3–7× ORT at t=16, and they are a grain and
+arithmetic problem rather than a scheduling one. `matmul_nbits.rs` still holds
+raw Rayon call sites, but the remaining ones are the one-time prepack/dequant
+passes and the decode paths that already route to the persistent SPMD pool when
+a decode scope is active — neither is on the per-token critical path this phase
+was chasing.
