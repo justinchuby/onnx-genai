@@ -4068,14 +4068,14 @@ for a properly controlled multi-threaded experiment to be worth running. That
 experiment — sharing one packed panel across row blocks rather than re-packing
 per block — is the open follow-up, and it now has a method that can answer it.
 
-## 39. Phase 19: the residual was never steady state (a diagnostic, not a kernel)
+## 40. Phase 20: the residual was never steady state (a diagnostic, not a kernel)
 
 §38.7 closed with "the native-alone t=16→t=32 drift on the small shapes (roughly
 1.7×) survives everything above and has no explanation yet. It is the real
 remaining scheduler residual." It had an explanation. It is not a steady-state
 loss at all, and chasing it as one would have been wasted work.
 
-### 39.1 The drift reproduces, and then dissolves
+### 40.1 The drift reproduces, and then dissolves
 
 On latest `main`, native-only, arms interleaved, 9 reps, median ms — the drift is
 real at the harness's run count:
@@ -4097,7 +4097,7 @@ same shapes:
 The wall times are the same to within noise. The CPU is not: t=32 burns almost
 exactly twice as much of it to produce the same answer in the same time.
 
-### 39.2 Splitting fixed from marginal
+### 40.2 Splitting fixed from marginal
 
 Sweeping `--runs` and fitting CPU = fixed + marginal × runs separates the two
 terms cleanly. `gemm_nbits_qwen3_0p6b_qkv_t8`, native-only:
@@ -4121,7 +4121,7 @@ pre-existing. Measured against the phase-16 base binary it is identical — 0.64
 1.67 / 3.54 CPU-s at budgets 8 / 16 / 32, against 0.63 / 1.59 / 3.73 for current
 `main`. Phase 16 neither caused it nor fixed it.
 
-### 39.3 What the fixed cost is
+### 40.3 What the fixed cost is
 
 A single inference with no warmups, on a 512² dense model small enough that the
 arithmetic is irrelevant:
@@ -4138,7 +4138,7 @@ cell — it gets slightly *worse*), so it is not the task runtime either. It is 
 Rayon pools coming up: futex and yield-spin churn while twice as many workers
 race to their loops.
 
-### 39.4 Past the physical core count, nothing is bought
+### 40.4 Past the physical core count, nothing is bought
 
 The obvious question is whether the extra workers earn their construction back on
 larger work. They do not. Steady-state wall, native-only, 25 runs after 10
@@ -4158,7 +4158,7 @@ for the task runtime's lanes, showing up one level out: past one worker per
 physical core, the surplus workers are SMT siblings of workers that already
 exist, and they contend instead of adding throughput.
 
-### 39.5 The default was already right
+### 40.5 The default was already right
 
 The important control, and the one that decides what this phase should change:
 
@@ -4176,7 +4176,7 @@ asks for 32, and the runtime faithfully honours it.
 So the residual is not a runtime defect to fix. It is a request that cannot pay
 for itself, which the runtime accepted silently.
 
-### 39.6 What phase 19 changes
+### 40.6 What phase 20 changes
 
 Two things, both small.
 
@@ -4189,13 +4189,13 @@ is a pure function so the policy is testable without a host, and an unknown
 topology deliberately never warns.
 
 The second is this document. Every `--threads 32` figure in this ledger was taken
-on a configuration that §39.4 shows is strictly worse than `--threads 16` on this
-host, and §39.1 shows was additionally measured inside a warm-up transient that
+on a configuration that §40.4 shows is strictly worse than `--threads 16` on this
+host, and §40.1 shows was additionally measured inside a warm-up transient that
 the 7-run harness never leaves. Combined with §38's finding that the paired
 harness depresses the native arm 2.7–4.8× on long cells, the wide-thread rows of
 this campaign have now had two independent instrument errors found in them.
 
-### 39.7 One caveat, and what is genuinely left
+### 40.7 One caveat, and what is genuinely left
 
 The steady-state numbers above are a *tight loop*: back-to-back inferences with
 no serial work between them. That is the one regime in which Rayon's parking cost
