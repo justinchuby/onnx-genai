@@ -22,7 +22,7 @@ use super::{GenerateArgs, ProfileArgs, decode_backend_name, resolve_model_dir};
 
 pub(super) fn generate(args: GenerateArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
     install_ctrlc_handler();
-    args.cpu.apply()?;
+    args.cpu.apply().map_err(anyhow::Error::msg)?;
     let model_dir = resolve_model_dir(&args.model);
     let profile = RunProfile::new(model_dir.display().to_string());
     let output_kind = generate_output_kind(&args)?;
