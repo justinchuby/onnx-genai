@@ -2428,6 +2428,7 @@ dependencies = [
  "onnx-runtime-ir",
  "onnx-runtime-ort-testkit",
  "onnx-std",
+ "serde_json",
  "serde_yaml",
 ]
 
