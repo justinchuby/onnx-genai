@@ -3323,7 +3323,10 @@ mod alias_tests {
         let wide_cap = 2600u64;
         for wide_total in [1i32, 255, 256, 257, 617, 2599, 2600] {
             let mut wide = vec![0.0f32; wide_total as usize];
-            wide.extend(std::iter::repeat_n(NEG, wide_cap as usize - wide_total as usize));
+            wide.extend(std::iter::repeat_n(
+                NEG,
+                wide_cap as usize - wide_total as usize,
+            ));
             assert_eq!(
                 derive(&wide, wide_cap, 0),
                 wide_total,
