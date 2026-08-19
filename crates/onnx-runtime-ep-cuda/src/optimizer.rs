@@ -8,6 +8,17 @@ use onnx_runtime_optimizer::{
 pub(crate) const SILU_MUL_FUSION_ATTR: &str = "_cuda_silu_mul";
 pub(crate) const DECOMPOSED_SILU_ATTR: &str = "_cuda_decomposed_silu";
 
+/// Private marker set by [`CudaRsqrtFusion`] on a `Reciprocal` node whose input
+/// was a single-consumer `Sqrt`. The fusion rewires the `Reciprocal` to read the
+/// pre-`Sqrt` value and deletes the `Sqrt`; the CUDA unary-math factory
+/// ([`crate::kernels::pointwise::UnaryMathFactory`]) sees this marker and
+/// dispatches the single-kernel `rsqrt_{dtype}` (byte-identical double-round)
+/// instead of the plain `reciprocal_{dtype}`. The node keeps op_type
+/// `Reciprocal` in the default domain so standard unary shape inference and
+/// registry dispatch are unchanged, and the session restores the pre-pass graph
+/// before any non-CUDA fallback so no other EP observes the rewired node.
+pub(crate) const CUDA_RSQRT_ATTR: &str = "_cuda_rsqrt";
+
 /// Private marker set on a `MatMulNBits` node whose trailing bias input came
 /// from folding a *separate* elementwise `Add(MatMulNBits(x), bias)`.
 ///
@@ -90,6 +101,11 @@ pub(crate) struct CudaSiluFusion;
 pub(crate) fn cuda_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
     vec![
         Box::new(CudaSiluFusion),
+        // Collapse the SSM/linear-attention `Reciprocal(Sqrt(x))` normalize-scale
+        // glue into a single byte-identical `rsqrt` kernel (drops the standalone
+        // reciprocal kernel + its fp16 intermediate round-trip, ~1.2% of decode
+        // GPU-kernel time on qwen3.5-0.8b-hybrid; see the profiling drop).
+        Box::new(CudaRsqrtFusion),
         Box::new(CudaFoldConstantTranspose),
         Box::new(CudaFoldConstantCast),
         // Fuse the per-layer Q/K/V projections into one wider MatMulNBits while
@@ -192,6 +208,111 @@ impl OptimizationPass for CudaSiluFusion {
                 .opset_imports
                 .entry(MICROSOFT_DOMAIN.to_string())
                 .or_insert(1);
+            changed = true;
+        }
+
+        if changed {
+            graph.validate().map_err(OptimizerError::from)?;
+        }
+        Ok(())
+    }
+}
+
+/// Collapse an ONNX `Reciprocal(Sqrt(x))` pair into a single fused `rsqrt`
+/// kernel.
+///
+/// ## The pattern
+///
+/// SSM / linear-attention decoders (e.g. qwen3.5-*-hybrid) normalize the SSM
+/// query/key by a sum-of-squares scale, which exporters emit as the primitive
+/// chain `... Add(sumsq, eps) → Sqrt → Reciprocal → Mul(x, scale)`. The `Sqrt`
+/// and `Reciprocal` land as two standalone per-layer kernels
+/// (`sqrt_{dtype}` + `reciprocal_{dtype}`); a captured-graph node trace of
+/// qwen3.5-0.8b-hybrid decode measured the standalone `reciprocal_f16` at ~1.2%
+/// of decode GPU-kernel time (fires 2× per SSM layer), each reading and writing
+/// the full scale tensor.
+///
+/// ## The rewrite
+///
+/// For every `Sqrt` whose single output is consumed *only* by one `Reciprocal`
+/// (and is not a graph output), this pass rewires the `Reciprocal` to read the
+/// `Sqrt`'s input directly, tags it with [`CUDA_RSQRT_ATTR`], and deletes the
+/// `Sqrt`. The node keeps op_type `Reciprocal` in the default domain, so
+/// standard unary shape inference and kernel-registry dispatch are unchanged;
+/// the CUDA unary-math factory reads the marker and launches the fused
+/// `rsqrt_{dtype}` kernel, which reproduces the exact two-kernel rounding
+/// (`Sqrt` rounds `sqrtf(x)` to the storage dtype, then `Reciprocal` reads that
+/// back) so greedy tokens stay byte-identical while the intermediate tensor's
+/// global round-trip and one kernel launch are eliminated.
+///
+/// This is model-agnostic: it matches the structural `Sqrt → Reciprocal` glue
+/// on any shape/dtype the unary kernels support (f32/f16/bf16), not a single
+/// architecture. The single-consumer / no-escape guard guarantees the fusion
+/// never removes a `Sqrt` value another node still observes.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CudaRsqrtFusion;
+
+impl OptimizationPass for CudaRsqrtFusion {
+    fn name(&self) -> &str {
+        "CudaRsqrtFusion"
+    }
+
+    fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> OptimizerResult<()> {
+        let sqrt_ids: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                (node.op_type == "Sqrt"
+                    && node.is_default_domain()
+                    && node.inputs.len() == 1
+                    && node.outputs.len() == 1)
+                    .then_some(id)
+            })
+            .collect();
+        let mut changed = false;
+
+        for sqrt_id in sqrt_ids {
+            let Some(sqrt) = graph.try_node(sqrt_id) else {
+                continue;
+            };
+            let Some(x) = sqrt.inputs[0] else {
+                continue;
+            };
+            // The fused `rsqrt` kernel exists for f32/f16/bf16 and reproduces the
+            // two-op rounding exactly, so restrict the fusion to those dtypes.
+            if !matches!(
+                graph.value(x).dtype,
+                DataType::Float32 | DataType::Float16 | DataType::BFloat16
+            ) {
+                continue;
+            }
+            let sqrt_output = sqrt.outputs[0];
+            if graph.outputs.contains(&sqrt_output) {
+                continue;
+            }
+            let consumers = graph.consumers(sqrt_output);
+            if consumers.len() != 1 {
+                continue;
+            }
+            let recip_id = consumers[0];
+            let recip = graph.node(recip_id);
+            if recip.op_type != "Reciprocal"
+                || !recip.is_default_domain()
+                || recip.inputs.len() != 1
+                || recip.outputs.len() != 1
+                || recip.inputs[0] != Some(sqrt_output)
+                || recip.attr(CUDA_RSQRT_ATTR).is_some()
+            {
+                continue;
+            }
+
+            let mut rsqrt = recip.clone();
+            rsqrt.inputs = vec![Some(x)];
+            rsqrt
+                .attributes
+                .insert(CUDA_RSQRT_ATTR.into(), Attribute::Int(1));
+            graph.replace_node(recip_id, rsqrt);
+            graph.remove_node(sqrt_id);
             changed = true;
         }
 
@@ -3315,6 +3436,107 @@ mod tests {
         assert!(
             graph.nodes.values().all(|node| node.op_type != "Silu"),
             "fp32 has no byte-exact decomposed SiLU kernel; must stay unfused"
+        );
+    }
+
+    // === Rsqrt fusion (Reciprocal(Sqrt(x)) -> tagged Reciprocal) ===
+
+    /// `Add(sumsq, eps) → Sqrt → Reciprocal → Mul(x, scale)`, the SSM
+    /// normalize-scale glue `CudaRsqrtFusion` targets. The `Add` and trailing
+    /// `Mul` bracket the pair so the single-consumer rewrite is observable.
+    /// Returns the graph plus the `denom` (pre-Sqrt) and `root` (Sqrt output)
+    /// value ids for assertions.
+    fn rsqrt_glue_graph(dtype: DataType) -> (Graph, ValueId, ValueId) {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let sumsq = value(&mut graph, "sumsq", dtype, 5);
+        let eps = value(&mut graph, "eps", dtype, 5);
+        let x = value(&mut graph, "x", dtype, 5);
+        let denom = value(&mut graph, "denom", dtype, 5);
+        let root = value(&mut graph, "root", dtype, 5);
+        let scale = value(&mut graph, "scale", dtype, 5);
+        let output = value(&mut graph, "output", dtype, 5);
+        graph.add_input(sumsq);
+        graph.add_input(eps);
+        graph.add_input(x);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(sumsq), Some(eps)],
+            vec![denom],
+        ));
+        graph.insert_node(Node::new(NodeId(0), "Sqrt", vec![Some(denom)], vec![root]));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Reciprocal",
+            vec![Some(root)],
+            vec![scale],
+        ));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(x), Some(scale)],
+            vec![output],
+        ));
+        graph.add_output(output);
+        (graph, denom, root)
+    }
+
+    #[test]
+    fn fuses_fp16_reciprocal_of_sqrt() {
+        let (mut graph, denom, _root) = rsqrt_glue_graph(DataType::Float16);
+        CudaRsqrtFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        // Sqrt removed; Reciprocal retagged and rewired to the pre-sqrt value.
+        assert_eq!(graph.num_nodes(), 3, "Sqrt must be removed");
+        assert!(
+            graph.nodes.values().all(|n| n.op_type != "Sqrt"),
+            "Sqrt node must be gone"
+        );
+        let recip = graph
+            .nodes
+            .values()
+            .find(|n| n.op_type == "Reciprocal")
+            .expect("Reciprocal must remain");
+        assert!(
+            recip.is_default_domain(),
+            "node stays a standard Reciprocal"
+        );
+        assert_eq!(
+            recip.attr(CUDA_RSQRT_ATTR).and_then(Attribute::as_int),
+            Some(1),
+            "fused Reciprocal must carry the rsqrt marker"
+        );
+        // Reciprocal now reads the pre-Sqrt value ("denom"), not the Sqrt output.
+        assert_eq!(recip.inputs[0], Some(denom));
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn does_not_fuse_sqrt_with_extra_consumer() {
+        // Sqrt output feeds both the Reciprocal *and* a second consumer, so the
+        // Sqrt value escapes the pair and must not be removed.
+        let (mut graph, _denom, root) = rsqrt_glue_graph(DataType::Float16);
+        let sink = value(&mut graph, "sink", DataType::Float16, 5);
+        graph.insert_node(Node::new(NodeId(0), "Neg", vec![Some(root)], vec![sink]));
+        graph.add_output(sink);
+
+        CudaRsqrtFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert!(
+            graph.nodes.values().any(|n| n.op_type == "Sqrt"),
+            "Sqrt with a second consumer must be preserved"
+        );
+        assert!(
+            graph
+                .nodes
+                .values()
+                .filter(|n| n.op_type == "Reciprocal")
+                .all(|n| n.attr(CUDA_RSQRT_ATTR).is_none()),
+            "Reciprocal must not be retagged when Sqrt escapes"
         );
     }
 

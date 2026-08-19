@@ -706,6 +706,13 @@ pub fn ort_calls(n: u64) {
 ///
 /// The returned pointer is to a `'static` NUL-terminated string and must not be
 /// freed. It stays valid for the lifetime of the library.
+/// Only compiled under the `dispatch_probe` feature. The shipped cdylib must
+/// export the ORT plugin ABI and nothing else, and a `no_mangle` symbol is not
+/// free just because its body is: it survives `--gc-sections`, it is
+/// interposable, and it lands in every dynamic symbol table. Absence *is* the
+/// "not compiled in" answer, which `libloading`'s `Option`-returning `get`
+/// already models.
+#[cfg(feature = "dispatch_probe")]
 #[unsafe(no_mangle)]
 pub extern "C" fn nxrt_dispatch_probe_phase_name(index: usize) -> *const std::os::raw::c_char {
     const NAMES: [&core::ffi::CStr; ALLOC_BUCKETS] = [
@@ -730,6 +737,13 @@ pub extern "C" fn nxrt_dispatch_probe_phase_name(index: usize) -> *const std::os
 /// writer uses, rather than from a number copied into a test.
 pub const SNAPSHOT_LEN: usize = Phase::COUNT * 2 + ALLOC_BUCKETS * 2 + Event::COUNT;
 
+/// Only compiled under the `dispatch_probe` feature. The shipped cdylib must
+/// export the ORT plugin ABI and nothing else, and a `no_mangle` symbol is not
+/// free just because its body is: it survives `--gc-sections`, it is
+/// interposable, and it lands in every dynamic symbol table. Absence *is* the
+/// "not compiled in" answer, which `libloading`'s `Option`-returning `get`
+/// already models.
+#[cfg(feature = "dispatch_probe")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nxrt_dispatch_probe_snapshot(out: *mut u64, len: usize) -> usize {
     let need = SNAPSHOT_LEN;
@@ -766,6 +780,13 @@ pub unsafe extern "C" fn nxrt_dispatch_probe_snapshot(out: *mut u64, len: usize)
 }
 
 /// Zero this thread's dispatch counters, for cdylib callers.
+/// Only compiled under the `dispatch_probe` feature. The shipped cdylib must
+/// export the ORT plugin ABI and nothing else, and a `no_mangle` symbol is not
+/// free just because its body is: it survives `--gc-sections`, it is
+/// interposable, and it lands in every dynamic symbol table. Absence *is* the
+/// "not compiled in" answer, which `libloading`'s `Option`-returning `get`
+/// already models.
+#[cfg(feature = "dispatch_probe")]
 #[unsafe(no_mangle)]
 pub extern "C" fn nxrt_dispatch_probe_reset() {
     reset();
@@ -775,6 +796,13 @@ pub extern "C" fn nxrt_dispatch_probe_reset() {
 ///
 /// Lets a harness tell "the probe reported zero" apart from "the probe is not
 /// there", which are very different answers to `did we make any FFI calls`.
+/// Only compiled under the `dispatch_probe` feature. The shipped cdylib must
+/// export the ORT plugin ABI and nothing else, and a `no_mangle` symbol is not
+/// free just because its body is: it survives `--gc-sections`, it is
+/// interposable, and it lands in every dynamic symbol table. Absence *is* the
+/// "not compiled in" answer, which `libloading`'s `Option`-returning `get`
+/// already models.
+#[cfg(feature = "dispatch_probe")]
 #[unsafe(no_mangle)]
 pub extern "C" fn nxrt_dispatch_probe_available() -> i32 {
     i32::from(compiled_in())
@@ -906,6 +934,7 @@ mod tests {
     ///
     /// Two sources of truth for the same list is exactly how the harness came
     /// to mislabel two phases; this makes the duplicate a checked one.
+    #[cfg(feature = "dispatch_probe")]
     #[test]
     fn exported_phase_names_match_the_enum() {
         for p in Phase::ALL.into_iter() {
@@ -927,6 +956,7 @@ mod tests {
 
     /// The C entry point is what the cdylib harness uses; it must refuse a
     /// buffer it would overrun rather than writing past the end.
+    #[cfg(feature = "dispatch_probe")]
     #[test]
     fn c_snapshot_refuses_a_short_buffer() {
         let need = SNAPSHOT_LEN;

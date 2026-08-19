@@ -98,7 +98,7 @@ unsafe fn init_host_api(
             .then(|| unsafe { (*fallback_api).CreateStatus })
             .flatten()
         {
-            let msg = c"EP plugin requires ORT API version 27 but host does not support it. \
+            let msg = c"EP plugin requires ORT API version 28 but host does not support it. \
                        Plugin will not load (fail-closed).";
             unsafe {
                 if !out_num.is_null() {
@@ -149,6 +149,13 @@ fn build_factory(
             GetCustomOpDomains: Some(factory_get_custom_op_domains),
             InitGraphicsInterop: Some(factory_init_graphics_interop),
             DeinitGraphicsInterop: Some(factory_deinit_graphics_interop),
+            // Optional, new in ORT 1.28. It only matters for EPs that publish
+            // several compiled variants of one model (e.g. speed- vs
+            // memory-optimised) and need to rank them. We publish a single
+            // variant, so leaving this null makes ORT fall back to
+            // `ValidateCompiledModelCompatibilityInfo`, which we do implement
+            // and which is the correct answer for one candidate.
+            SelectBestModelCandidate: None,
         },
         name_cstr,
         vendor_cstr,

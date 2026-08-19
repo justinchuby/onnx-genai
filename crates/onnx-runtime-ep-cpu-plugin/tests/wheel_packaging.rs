@@ -53,11 +53,16 @@ fn wheel_test_command_names_a_file_that_exists() {
     );
 }
 
-/// Every operating system the wheel enables MLAS for is compiled by a CI lane.
+/// Every operating system the wheel's *research* MLAS opt-in permits is
+/// compiled by a CI lane.
 ///
-/// `MLAS_TARGETS` is a promise that the vendored C++/asm builds there. Nothing
-/// else in the repository checks that promise, and the cost of breaking it is a
-/// release-time wheel failure on that platform.
+/// No shipped wheel enables MLAS — see `default_artifacts_are_mlas_free.rs`.
+/// `MLAS_TARGETS` is the allow-list for `NXRT_EP_CPU_RESEARCH_MLAS=1`, and a
+/// research build that cannot link is not useful either, so the promise that
+/// the vendored C++/asm builds on those systems still has to hold. Nothing else
+/// in the repository checks it, and the cost of breaking it is discovering, at
+/// the moment someone wants a differential number, that the reference does not
+/// compile on their machine.
 ///
 /// The check is structural rather than textual: it reads `ci.yml`, resolves
 /// each job's runner operating systems (including `runs-on: ${{ matrix.os }}`
@@ -75,8 +80,9 @@ fn every_mlas_wheel_target_is_built_by_a_ci_lane() {
     let missing: Vec<&&str> = systems.iter().filter(|os| !built.contains(**os)).collect();
     assert!(
         missing.is_empty(),
-        "setup.py enables MLAS for {systems:?} but no ci.yml lane compiles the \
-         MLAS cdylib on {missing:?}; an unproven target fails at release time \
+        "setup.py permits the MLAS research opt-in on {systems:?} but no ci.yml \
+         lane compiles the MLAS cdylib on {missing:?}; an unproven target only \
+         fails once someone tries to take a differential measurement there \
          (lanes cover {built:?})"
     );
 }

@@ -8,21 +8,21 @@ tags:
   - ep
   - performance
 status: maintained
+lang: zh-CN
 created: 2026-08-17
-updated: 2026-08-17
+updated: 2026-08-19
 ---
 
 # CPU Execution Provider
 
-> [!summary] Question answered
-> How does the native CPU EP balance portability, correctness, SIMD performance, threading and memory?
+> [!summary] 本文回答的问题
+> 原生 CPU EP 如何在可移植性、正确性、SIMD 性能、线程与内存之间取得平衡?
 
-The CPU EP is both a portable execution backend and the native runtime's most
-accessible correctness baseline. It implements the shared
-[[execution/Execution Provider Contract]] and registers kernels by ONNX
-domain/op type.
+CPU EP 既是一个可移植的执行后端,也是原生运行时最易获取的正确性基线。它实现
+了共享的 [[execution/Execution Provider Contract]],并按 ONNX 的 domain/op
+type 注册 kernel。
 
-## Backend strategy
+## 后端策略
 
 ```text
 ONNX node
@@ -33,81 +33,76 @@ CPU kernel
   └── MLAS-backed paths for selected operations/features
 ```
 
-The portable path matters even when an optimized path exists:
+即便存在优化路径,可移植路径依然重要:
 
-- it runs without a vendor toolkit;
-- it provides a correctness comparison;
-- it prevents a missing ISA from becoming a runtime failure;
-- it gives tests a simple mechanism to isolate optimized-path bugs.
+- 它无需厂商 toolkit 即可运行;
+- 它提供了一个正确性对照;
+- 它避免了缺失某个 ISA 变成运行时失败;
+- 它为测试提供了隔离优化路径 bug 的简单手段。
 
-## Runtime capability, not build-machine identity
+## 运行时能力,而非构建机器身份
 
-Fast paths should be selected from runtime CPU capabilities and tensor
-requirements. AVX-512/AVX2/NEON/SVE availability changes speed, not semantics.
-Unsupported instructions must degrade to a correct path.
+快速路径应当依据运行时的 CPU 能力和 tensor 需求来选择。AVX-512/AVX2/NEON/SVE
+是否可用改变的是速度,而非语义。不受支持的指令必须降级到一条正确的路径。
 
-Kernels are shape- and dtype-driven. Model names and fixed hidden dimensions do
-not belong in the EP.
+Kernel 由 shape 和 dtype 驱动。模型名称和固定的 hidden 维度不应出现在 EP 中。
 
-## Hot-path architecture
+## 热路径架构
 
-The CPU EP includes:
+CPU EP 包含:
 
-- blocked/register-tiled GEMM and SIMD backends;
-- quantized matmul and MoE kernels;
-- attention, normalization, indexing and data-movement kernels;
-- EP-specific fusion/optimization passes;
-- host parallelism, decode affinity and NUMA-aware support;
-- weight-offload placement and host-cache mechanisms.
+- 分块/寄存器分片(register-tiled)的 GEMM 与 SIMD 后端;
+- 量化 matmul 与 MoE kernel;
+- attention、normalization、索引与数据搬移 kernel;
+- EP 专属的融合/优化 pass;
+- host 并行、decode 亲和性与 NUMA 感知支持;
+- 权重卸载(offload)放置与 host-cache 机制。
 
-The session should observe a `Kernel`, not which internal GEMM implementation ran.
+session 应当观察到一个 `Kernel`,而不是内部运行了哪一种 GEMM 实现。
 
-## Threading lessons
+## 线程方面的经验
 
-Thread count is part of the algorithm:
+线程数是算法的一部分:
 
-- per-thread scratch multiplied by worker count can become a process-scale memory
-  claim;
-- nested parallelism can oversubscribe cores;
-- decode often benefits from a bounded worker pool rather than all available
-  hardware threads;
-- NUMA placement can dominate arithmetic improvements for large weights;
-- process affinity and runtime thread budgets are different controls.
+- 每线程的 scratch 乘以 worker 数量,可能变成进程规模的内存占用;
+- 嵌套并行可能导致核心超额订阅(oversubscribe);
+- decode 通常受益于一个有界的 worker pool,而非所有可用的硬件线程;
+- 对大权重而言,NUMA 放置可能压过算术层面的改进;
+- 进程亲和性与运行时线程预算是不同的控制项。
 
-Any resident per-thread or per-kernel buffer that scales with model weight or
-thread count must be planned in actual bytes and be declinable.
+任何随模型权重或线程数增长的、常驻的每线程或每 kernel 缓冲区,都必须以实际
+字节数规划,并且可被拒绝(declinable)。
 
-## Persistent caches
+## 持久缓存
 
-CPU performance may use:
+CPU 性能可能会使用:
 
-- transposed weight caches;
-- dense/widened weight caches;
-- quantized packed-B buffers;
-- resident dequantized weights;
-- reusable large host allocations;
-- accumulator scratch pools.
+- 转置后的权重缓存;
+- 稠密/加宽的权重缓存;
+- 量化的 packed-B 缓冲区;
+- 常驻的反量化权重;
+- 可复用的大块 host 分配;
+- accumulator scratch 池。
 
-> [!warning] A cache is a memory policy
-> If it outlives one kernel call and scales with weights or threads, it must be
-> declared before allocation, charged by actual footprint and have a correct
-> fallback when declined.
+> [!warning] 缓存就是一种内存策略
+> 如果它的存活超过一次 kernel 调用,并且随权重或线程数增长,那么它必须在分配
+> 之前声明、按实际占用记账,并在被拒绝时有正确的回退。
 
-## Correctness and performance gates
+## 正确性与性能门槛
 
-An optimization should preserve:
+一次优化应当保持:
 
-- output values within the justified tolerance;
-- byte-identical token IDs where deterministic generation is expected;
-- supported shapes/dtypes/opsets;
-- explicit fallback behavior;
-- bounded persistent memory;
-- portability to machines without the fast ISA.
+- 输出值在有正当理由的容差范围内;
+- 在预期确定性生成之处,token ID 逐字节一致;
+- 受支持的 shape/dtype/opset;
+- 显式的回退行为;
+- 有界的持久内存;
+- 对没有快速 ISA 的机器的可移植性。
 
-Kernel-vs-old-kernel speedup is insufficient evidence. Compare production shapes
-against the relevant ORT CPU EP or another strong baseline.
+kernel 对旧 kernel 的加速不足以作为证据。请以生产环境的 shape 对比相关的
+ORT CPU EP 或另一个强基线。
 
-## Formal sources
+## 形式化来源
 
 - [`onnx-runtime-ep-cpu`](../../crates/onnx-runtime-ep-cpu/src/lib.rs)
 - [`docs/performance/KERNEL_PERF.md`](../../docs/performance/KERNEL_PERF.md)
@@ -115,7 +110,7 @@ against the relevant ORT CPU EP or another strong baseline.
 - [`CPU EP vs ORT benchmark`](../../docs/benchmarks/2026-08-15-cpu-ep-vs-ort-attention-moe.md)
 - [`docs/architecture/CROSS_PLATFORM.md`](../../docs/architecture/CROSS_PLATFORM.md)
 
-## Related notes
+## 相关笔记
 
 - [[execution/Execution Provider Contract]]
 - [[performance/Performance Engineering Playbook]]

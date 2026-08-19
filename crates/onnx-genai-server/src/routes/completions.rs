@@ -2060,17 +2060,28 @@ impl ParsedAssistantOutput {
     }
 }
 
-/// Resolve a namespaced call back to the tool the caller offered.
+/// Resolve an over-qualified call back to the tool the caller offered.
 ///
-/// This package's own tool instructions carry a namespaced example
-/// (`example_tool_name.example_function_name`), so a model offered a bare name
-/// sometimes answers with a qualified one. The namespace is the model's
-/// spelling, not the caller's, and a client can only dispatch a name it
-/// offered — it rejects anything else as an unavailable tool. So when the
-/// qualified name is not on offer but its final segment is, the call names that
-/// tool and is resolved to it. Anything else is left untouched for the caller
-/// to reject, because inventing a target it never offered would be worse than
-/// the error it already knows how to report.
+/// A model offered a bare name sometimes answers with a dotted one, and it is
+/// led there from both directions. This package's own tool instructions carry a
+/// namespaced example (`example_tool_name.example_function_name`), which invites
+/// a leading namespace — `functions.read`. The same instructions derive the
+/// valid recipients by splitting each offered name on `.`, so a set of bare
+/// names is advertised back as `read.*`, `bash.*`, which invites a *trailing*
+/// segment instead: a model told to address `read.*` obliges by borrowing the
+/// first thing to hand, usually a parameter name — `read.filePath`.
+///
+/// Either way the extra segment is the model's spelling, not the caller's, and
+/// a client can only dispatch a name it offered — it rejects anything else as an
+/// unavailable tool. So a dotted name that is not itself on offer is resolved to
+/// an offered tool when exactly one of its segments names one.
+///
+/// Requiring exactly one *distinct* target keeps the resolution from being a
+/// guess without punishing a model that merely repeats itself: `glob.glob`
+/// names one tool twice and resolves, while a call whose segments name two
+/// different offered tools has no single intended target and is left alone. Anything else is likewise left untouched for the caller to
+/// reject, because inventing a target it never offered would be worse than the
+/// error it already knows how to report.
 fn align_tool_calls(calls: &mut [ChatMessageToolCall], request: &ChatCompletionRequest) {
     let Some(offered) = tools_offered_to_model(request) else {
         return;
@@ -2081,12 +2092,17 @@ fn align_tool_calls(calls: &mut [ChatMessageToolCall], request: &ChatCompletionR
         if names_a_tool(&call.function.name) {
             continue;
         }
-        let Some((_, suffix)) = call.function.name.rsplit_once('.') else {
+        let targets: std::collections::BTreeSet<&str> = call
+            .function
+            .name
+            .split('.')
+            .filter(|segment| names_a_tool(segment))
+            .collect();
+        let [target] = targets.into_iter().collect::<Vec<_>>()[..] else {
             continue;
         };
-        if names_a_tool(suffix) {
-            call.function.name = suffix.to_string();
-        }
+        let target = target.to_string();
+        call.function.name = target;
     }
 }
 
@@ -3129,6 +3145,24 @@ mod tool_name_alignment_tests {
     fn a_namespaced_call_resolves_to_the_offered_tool() {
         assert_eq!(aligned("glob.glob", &["glob", "read"]), "glob");
         assert_eq!(aligned("functions.read", &["glob", "read"]), "read");
+    }
+
+    // The instructions advertise a bare tool set back as `read.*`, `bash.*`, so
+    // a model told to address `read.*` supplies a second segment from whatever
+    // is to hand -- usually a parameter name. The tool it means is unambiguous.
+    #[test]
+    fn a_call_qualified_with_a_parameter_name_resolves_to_the_offered_tool() {
+        assert_eq!(aligned("read.filePath", &["read", "bash"]), "read");
+        assert_eq!(aligned("bash.command", &["read", "bash"]), "bash");
+        assert_eq!(aligned("write.filePath.content", &["write"]), "write");
+    }
+
+    // Two segments naming two different offered tools have no single intended
+    // target, so the call is left for the caller to reject rather than resolved
+    // to whichever segment happens to be looked at first.
+    #[test]
+    fn a_call_naming_two_offered_tools_is_not_resolved() {
+        assert_eq!(aligned("read.write", &["read", "write"]), "read.write");
     }
 
     // A name the caller offered is never rewritten, even when it contains a dot.
