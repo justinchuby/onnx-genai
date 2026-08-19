@@ -2527,10 +2527,17 @@ unsafe extern "C" fn compute_execute(
                 // Collect all output views using the per-slot view map so
                 // positions stay aligned even when absent slots are present.
                 let absent_shapes: &[Vec<usize>] = &output_shapes;
-                let absent_strides_storage: Vec<Vec<i64>> = absent_shapes
-                    .iter()
-                    .map(|s| contiguous_strides(s))
-                    .collect();
+                // One entry per *absent* slot, not per output slot. Only
+                // absent slots read these, and a node with an absent output is
+                // the exception, so building them for every output cost an
+                // allocation per output on every node that has none. Each entry
+                // is keyed by the same index that keys `absent_scratch`, where
+                // the slot it belongs to is recorded -- so this stays aligned by
+                // construction rather than by an invariant about emptiness.
+                let absent_strides_storage = absent_slot_strides(
+                    absent_scratch.iter().map(|(slot, _, _)| *slot),
+                    absent_shapes,
+                );
                 let mut all_output_views: Vec<_> = {
                     let mut ort_iter = ort_out_views.drain(..);
                     let mut buf_iter = new_bufs.iter_mut();
@@ -2546,7 +2553,7 @@ unsafe extern "C" fn compute_execute(
                             RoutedSlotKind::Absent(idx) => {
                                 let (_, scratch_buf, dtype) = &mut absent_scratch[*idx];
                                 let shape = &absent_shapes[slot_idx];
-                                let strides = &absent_strides_storage[slot_idx];
+                                let strides = &absent_strides_storage[*idx];
                                 TensorMut::new(
                                     DevicePtrMut(scratch_buf.as_mut_ptr().cast()),
                                     *dtype,
@@ -2759,10 +2766,15 @@ unsafe extern "C" fn compute_execute(
             // Build output views in node-output order so the kernel sees the
             // full arity including absent scratch slots.
             let absent_shapes: &[Vec<usize>] = &output_shapes;
-            let absent_strides_storage: Vec<Vec<i64>> = absent_shapes
-                .iter()
-                .map(|s| contiguous_strides(s))
-                .collect();
+            // See the routed path. `slot_map` pushes `Absent(idx)` with
+            // increasing `idx`, so filtering it in slot order yields the strides
+            // in absent-index order.
+            let absent_strides_storage = absent_slot_strides(
+                slot_map.iter().enumerate().filter_map(|(slot_idx, kind)| {
+                    matches!(kind, SlotKind::Absent(_)).then_some(slot_idx)
+                }),
+                absent_shapes,
+            );
             // First, get mutable views of all ORT outputs in order.
             let mut ort_views: Vec<TensorMut<'_>> =
                 owned_outputs.iter_mut().map(|o| o.view_mut()).collect();
@@ -2777,7 +2789,7 @@ unsafe extern "C" fn compute_execute(
                     SlotKind::Absent(idx) => {
                         let buf = &mut absent_bufs[*idx];
                         let shape = &absent_shapes[slot_idx];
-                        let strides = &absent_strides_storage[slot_idx];
+                        let strides = &absent_strides_storage[*idx];
                         let scratch_dtype = absent_dtypes[*idx];
                         let view = TensorMut::new(
                             DevicePtrMut(buf.as_mut_ptr().cast()),
@@ -3003,6 +3015,29 @@ fn retirements_per_node(
         }
     }
     (starts, items)
+}
+
+/// Contiguous strides for the *absent* output slots only, in absent-index
+/// order.
+///
+/// Absent slots are the exception, so the routed loop used to build a stride
+/// vector for every output of every node and read it only when a slot turned
+/// out to be absent -- an allocation per output, per node, discarded unused.
+///
+/// The result is keyed by absent index, the same key `Absent(idx)` carries, so
+/// callers index it with `idx` rather than the slot number. Both callers pass
+/// absent slots in ascending slot order, which is the order `idx` was assigned
+/// in, so the two agree by construction.
+fn absent_slot_strides(
+    absent_slots: impl Iterator<Item = usize>,
+    shapes: &[Vec<usize>],
+) -> Vec<Vec<i64>> {
+    absent_slots
+        .map(|slot| match shapes.get(slot) {
+            Some(shape) => contiguous_strides(shape),
+            None => Vec::new(),
+        })
+        .collect()
 }
 
 fn contiguous_strides(shape: &[usize]) -> Vec<i64> {
@@ -5018,6 +5053,50 @@ mod tests {
         assert_eq!(seen.len(), items.len(), "a buffer retired twice");
         assert_eq!(items.len(), 20, "every buffer of a chain is read once");
         assert_eq!(starts[sources.len()], items.len());
+    }
+
+    /// Absent strides are keyed by absent index, not slot index.
+    ///
+    /// Getting this wrong is invisible for a node with a single absent output
+    /// at slot 0 -- the two indices coincide -- and silently hands the wrong
+    /// strides to every other shape. It is pinned with absent slots that are
+    /// neither first nor contiguous, and with differing shapes per slot so a
+    /// mis-key produces a different answer rather than the same one twice.
+    #[test]
+    fn absent_strides_are_keyed_by_absent_index_not_slot_index() {
+        let shapes = vec![
+            vec![2usize, 3, 4],
+            vec![5usize, 6],
+            vec![7usize, 8, 9],
+            vec![10usize],
+        ];
+        // Slots 1 and 3 are absent, so absent index 0 is slot 1 and absent
+        // index 1 is slot 3.
+        let got = super::absent_slot_strides([1usize, 3].into_iter(), &shapes);
+        assert_eq!(got.len(), 2, "one entry per absent slot, not per output");
+        assert_eq!(got[0], super::contiguous_strides(&shapes[1]));
+        assert_eq!(got[1], super::contiguous_strides(&shapes[3]));
+        assert_ne!(
+            got[0],
+            super::contiguous_strides(&shapes[0]),
+            "keying by slot index would have produced this"
+        );
+    }
+
+    #[test]
+    fn a_node_with_no_absent_outputs_builds_no_absent_strides() {
+        let shapes = vec![vec![2usize, 3], vec![4usize, 5]];
+        assert!(super::absent_slot_strides(std::iter::empty(), &shapes).is_empty());
+    }
+
+    /// An out-of-range slot must not panic in the middle of a `Run`. It cannot
+    /// arise from a well-formed slot map, but this runs inside ORT's callback
+    /// where a panic crosses an FFI boundary.
+    #[test]
+    fn an_out_of_range_absent_slot_yields_empty_strides() {
+        let shapes = vec![vec![2usize, 3]];
+        let got = super::absent_slot_strides([9usize].into_iter(), &shapes);
+        assert_eq!(got, vec![Vec::<i64>::new()]);
     }
 
     #[test]
