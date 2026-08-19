@@ -430,7 +430,7 @@ fn relu_f32_simd(src: &[f32], dst: &mut [f32]) {
     {
         relu_f32_neon(src, dst);
     }
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if avx2_available() {
             // SAFETY: `avx2_available()` confirmed AVX2; the slices are equal
@@ -470,9 +470,12 @@ fn relu_f32_simd(src: &[f32], dst: &mut [f32]) {
 /// # Safety
 ///
 /// The running CPU must support `avx2`; `src.len() == dst.len()`.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn relu_f32_avx2(src: &[f32], dst: &mut [f32]) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
     debug_assert_eq!(src.len(), dst.len());
     let n = src.len();
@@ -550,7 +553,7 @@ fn clip_f32_simd(src: &[f32], dst: &mut [f32], minimum: f32, maximum: f32) {
     {
         clip_f32_neon(src, dst, minimum, maximum);
     }
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if avx2_available() {
             // SAFETY: `avx2_available()` confirmed AVX2; the slices are equal
@@ -585,9 +588,12 @@ fn clip_f32_simd(src: &[f32], dst: &mut [f32], minimum: f32, maximum: f32) {
 /// # Safety
 ///
 /// The running CPU must support `avx2`; `src.len() == dst.len()`.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn clip_f32_avx2(src: &[f32], dst: &mut [f32], minimum: f32, maximum: f32) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
     debug_assert_eq!(src.len(), dst.len());
     let n = src.len();
@@ -631,14 +637,17 @@ unsafe fn clip_f32_avx2(src: &[f32], dst: &mut [f32], minimum: f32, maximum: f32
 ///
 /// Answers on every architecture so tests can branch on it portably; only the
 /// `x86_64` dispatch arms call it.
-#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_arch = "x86", target_arch = "x86_64")),
+    allow(dead_code)
+)]
 #[inline]
 fn avx2_available() -> bool {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         std::arch::is_x86_feature_detected!("avx2")
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
     {
         false
     }
@@ -887,7 +896,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
 mod x86_vector_parity_tests {
     use super::*;
 
@@ -959,7 +968,7 @@ mod x86_vector_parity_tests {
         let src = special_values();
         // Sweep every length so the bulk / 8-wide / tail boundaries all land
         // on special values rather than only on the padding.
-        for len in 0..src.len() {
+        for len in 0..=src.len() {
             let input = &src[..len];
             let want: Vec<f32> = input.iter().map(|&x| ReluOp.apply_f32_scalar(x)).collect();
             let mut got = vec![f32::from_bits(0xDEAD_BEEF); len];
