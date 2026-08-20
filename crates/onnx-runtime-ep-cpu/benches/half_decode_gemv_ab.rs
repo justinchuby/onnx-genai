@@ -134,6 +134,23 @@ fn main() {
             ("k4096n11008", 4096, 11008),
             ("k896n151936", 896, 151936),
         ],
+        // Rows immediately below, at and above **both** ends of the
+        // `HALF_PREFILL_GEBP_MIN_WEIGHT`/`..._MAX_WEIGHT` band, at three
+        // different `k` so a `k`-dependent effect cannot hide inside a
+        // `k * n` gate: 0.79M, 1.05M, 2.1M, 3.1M, 4.2M, 6.3M, 8.4M.
+        Ok("band") => vec![
+            ("w0.79M", 1024, 768),
+            ("w1.05M_k1024", 1024, 1024),
+            ("w2.1M_k1024", 1024, 2048),
+            ("w2.1M_k2048", 2048, 1024),
+            ("w3.1M_k1024", 1024, 3072),
+            ("w3.1M_k2048", 2048, 1536),
+            ("w4.2M_k1024", 1024, 4096),
+            ("w4.2M_k2048", 2048, 2048),
+            ("w4.2M_k4096", 4096, 1024),
+            ("w6.3M_k2048", 2048, 3072),
+            ("w8.4M_k2048", 2048, 4096),
+        ],
         Ok("sweep") => vec![
             ("w4M", 4096, 1024),
             ("w8M", 4096, 2048),

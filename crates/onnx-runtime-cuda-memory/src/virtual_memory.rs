@@ -205,6 +205,12 @@ impl ReservationTeardownTicket {
     /// that ordering. Nothing here waits on a device.
     pub fn execute_outcome(mut self) -> ReservationTeardownOutcome {
         self.armed = false;
+        // `cuMemUnmap`/`cuMemRelease` synchronize the device, which invalidates
+        // a CUDA graph capture running on *any* thread. See `capture_gate`.
+        // This teardown path did not exist when #1612 added the gate, and it is
+        // the one most likely to run concurrently with a capture: it is driven
+        // by the deferred-release queue rather than by a caller's commit.
+        let _section = crate::capture_gate::synchronizing_section();
         let _ = self.context.bind_to_thread();
         let mut retained_mapped = Vec::new();
         let mut retained_unmapped = std::mem::take(&mut self.quarantined);
@@ -971,6 +977,13 @@ impl CudaVirtualBacking {
         if blocks.is_empty() {
             return SpanReleaseReport::default();
         }
+        // `cuMemUnmap`/`cuMemRelease` synchronize the device, which invalidates
+        // a CUDA graph capture running on *any* thread of this process. See
+        // `capture_gate`. Upstream (#1612) guarded the `VirtualBacking::release`
+        // body; this stack moved those driver calls down here, where they are
+        // reached by four callers rather than one, so the guard belongs at the
+        // syscalls rather than at the trait method.
+        let _section = crate::capture_gate::synchronizing_section();
         if let Err(error) = self.bind("releasing CUDA memory") {
             // Nothing was mutated: without a bound context no driver call was
             // made at all. Every block stays mapped and owned.
@@ -2344,6 +2357,10 @@ unsafe impl VirtualBacking for CudaVirtualBacking {
         offset: usize,
         len: usize,
     ) -> Result<(), VirtualMemoryError> {
+        // `cuMemCreate`/`cuMemMap`/`cuMemSetAccess` synchronize the device, which
+        // invalidates a CUDA graph capture running on *any* thread of this
+        // process. See `capture_gate` for why the exclusion cannot be narrower.
+        let _section = crate::capture_gate::synchronizing_section();
         self.bind("committing CUDA memory")?;
         if self.pool.is_some() {
             self.commit_with_owned_limit(reservation, offset, len, u64::MAX)
