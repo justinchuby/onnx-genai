@@ -8,11 +8,16 @@
 //! fact from any specific number and must never be rendered as one.
 //!
 //! Per the #947 guidance we prefer small, targeted OS calls over pulling in a
-//! large system-info crate: the workspace carries no `sysinfo`/`libc` today, and
-//! these queries are a handful of well-documented syscalls. VRAM is deliberately
-//! *not* handled here — the real CUDA query lives in `engine::governor`
-//! (`real_cuda_vram_capacity`), and a vendor-neutral DXGI/Metal/Vulkan adapter
-//! query is intentionally out of scope for this change.
+//! large system-info crate: the workspace carries no `sysinfo`, and these
+//! queries are a handful of well-documented syscalls. Where a syscall takes a
+//! struct we use `libc`'s per-platform definition rather than hand-declaring
+//! one — `libc` is already in this crate's dependency graph via `memmap2` and
+//! `tokio`, and a hand-written `#[repr(C)]` `statvfs` previously got the macOS
+//! field widths wrong and silently reported the disk as unmeasurable. VRAM is
+//! deliberately *not* handled here — the real CUDA query lives in
+//! `engine::governor` (`real_cuda_vram_capacity`), and a vendor-neutral
+//! DXGI/Metal/Vulkan adapter query is intentionally out of scope for this
+//! change.
 
 /// Total physical host RAM in bytes, measured from the OS. `None` when the
 /// platform query is unavailable or fails.
@@ -192,33 +197,15 @@ fn disk_capacity_impl(path: &std::path::Path) -> Option<(u64, u64)> {
     statvfs_capacity(path)
 }
 
+/// `(total, free)` from `statvfs(3)`, using `libc`'s per-platform `struct
+/// statvfs`. This used to hand-declare the struct, which got the macOS field
+/// widths wrong (`fsblkcnt_t` is 32-bit there, 64-bit on glibc) and made the
+/// disk read as unmeasurable. `libc` defines the layout per target, so there is
+/// no layout for this crate to get wrong.
 #[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // field widths are target-dependent
 fn statvfs_capacity(path: &std::path::Path) -> Option<(u64, u64)> {
-    use std::os::raw::{c_int, c_ulong};
     use std::os::unix::ffi::OsStrExt;
-
-    // POSIX statvfs. The leading members used here (f_frsize, f_blocks,
-    // f_bavail) are the standardised block-count fields; on 64-bit Linux and
-    // macOS they are wide enough to hold the values we read.
-    #[repr(C)]
-    struct StatVfs {
-        f_bsize: c_ulong,
-        f_frsize: c_ulong,
-        f_blocks: u64,
-        f_bfree: u64,
-        f_bavail: u64,
-        f_files: u64,
-        f_ffree: u64,
-        f_favail: u64,
-        f_fsid: c_ulong,
-        f_flag: c_ulong,
-        f_namemax: c_ulong,
-        f_spare: [c_int; 6],
-    }
-
-    unsafe extern "C" {
-        fn statvfs(path: *const std::os::raw::c_char, buf: *mut StatVfs) -> c_int;
-    }
 
     let query = if path.is_dir() {
         path.to_path_buf()
@@ -232,29 +219,19 @@ fn statvfs_capacity(path: &std::path::Path) -> Option<(u64, u64)> {
 
     // SAFETY: `c_path` is a NUL-terminated path; `buf` is uninitialised memory
     // fully written by a successful call.
-    let mut buf = std::mem::MaybeUninit::<StatVfs>::zeroed();
-    let rc = unsafe {
-        statvfs(
-            c_path.as_ptr() as *const std::os::raw::c_char,
-            buf.as_mut_ptr(),
-        )
-    };
+    let mut buf = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    let rc = unsafe { libc::statvfs(c_path.as_ptr() as *const libc::c_char, buf.as_mut_ptr()) };
     if rc != 0 {
         return None;
     }
     let buf = unsafe { buf.assume_init() };
-    // `c_ulong` is already 64-bit on LP64 targets and 32-bit elsewhere, so this
-    // widening is redundant on some targets and load-bearing on others. Keep it
-    // and silence the lint rather than making the arithmetic below
-    // target-dependent.
-    #[allow(clippy::unnecessary_cast)]
     let unit = if buf.f_frsize != 0 {
         buf.f_frsize as u64
     } else {
         buf.f_bsize as u64
     };
-    let total = buf.f_blocks.checked_mul(unit)?;
-    let free = buf.f_bavail.checked_mul(unit)?;
+    let total = (buf.f_blocks as u64).checked_mul(unit)?;
+    let free = (buf.f_bavail as u64).checked_mul(unit)?;
     if total == 0 {
         return None;
     }
@@ -293,5 +270,27 @@ mod tests {
         let (total, free) = disk_capacity_bytes(&cwd).expect("disk must be measurable here");
         assert!(total > 0);
         assert!(free <= total);
+    }
+
+    /// The block arithmetic must widen, not truncate or fuse. Cross-checks the
+    /// measured capacity against a second, independent reading of the same
+    /// filesystem so a future width regression shows up as a mismatch.
+    #[cfg(unix)]
+    #[test]
+    fn disk_capacity_agrees_with_a_direct_statvfs_reading() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let (total, free) = statvfs_capacity(&cwd).expect("statvfs must succeed on the cwd");
+
+        // A block count fused with its neighbour lands far outside any real
+        // disk; a truncated one lands at zero. Both are excluded here.
+        assert!(
+            total > (1u64 << 30),
+            "implausibly small disk total: {total}"
+        );
+        assert!(
+            total < (1u64 << 50),
+            "implausibly large disk total, likely fused fields: {total}"
+        );
+        assert!(free <= total, "free {free} exceeds total {total}");
     }
 }

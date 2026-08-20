@@ -2104,6 +2104,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "half",
+ "libc",
  "llguidance",
  "memmap2",
  "onnx-genai-genai-config",
