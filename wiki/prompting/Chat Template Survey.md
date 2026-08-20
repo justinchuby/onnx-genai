@@ -100,6 +100,8 @@ MiniMax-M2 的 `[e~[\n]~b]` 值得单独看一眼 —— 分隔符里带着字�
 
 ## 三、轴二:推理段 —— channel 与成对标签两派
 
+### 一派:channel(Harmony 系)
+
 gpt-oss 与 Muse Glimmer 用的是**同一族格式**。不是"类似",而是共享同一套骨架:
 
 ```text
@@ -140,8 +142,8 @@ Calls to these tools must go to the commentary channel: 'functions'.
 | `<think>` / `</think>` | Qwen3、QwQ、DeepSeek-R1、DeepSeek-V3.1、GLM-4.5、EXAONE 4.0、MiniMax-M2、Nemotron 系、Baichuan-M2、Ling、Skywork、MiniCPM 4.1 |
 | `<seed:think>` | Seed-OSS |
 | `[THINK]` / `[/THINK]` | Magistral |
-| `<\|channel\|>analysis` | gpt-oss |
-| `to=self` | Muse Glimmer |
+
+### 两派的差别:标记在头上,还是在内容里
 
 两派的差别不是审美。**channel 是结构化的,成对标签是文本内的。**用标签时,运行时要在
 生成的文本流里做字符串匹配才知道推理段在哪结束;用 channel 时,收件人写在消息头上,
