@@ -5991,12 +5991,20 @@ mod tests {
 
     #[test]
     fn output_scratch_hands_back_capacity_it_retired() {
+        // Grow past the capacity a fresh vector reaches on its own. An empty
+        // `Vec::reserve(1)` already yields capacity 4 for these element sizes,
+        // so retiring only 4 would assert nothing: the check would pass whether
+        // or not the capacity came back. Fill to the cap instead.
         let (mut owned, mut slots) = take_output_scratch(1);
-        for _ in 0..4 {
+        for _ in 0..OUTPUT_SCRATCH_MAX_CAPACITY {
             owned.push(dummy_owned_output());
             slots.push(SlotKind::Ort);
         }
         let (owned_cap, slots_cap) = (owned.capacity(), slots.capacity());
+        assert!(
+            owned_cap > 4 && slots_cap > 4,
+            "retired capacity {owned_cap}/{slots_cap} is one a fresh vector reaches anyway"
+        );
         recycle_output_scratch(owned, slots);
 
         let (owned, slots) = take_output_scratch(1);
