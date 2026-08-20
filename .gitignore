@@ -21,6 +21,12 @@ models/
 !tests/fixtures/tiny-diffusion/denoiser_step.onnx
 !tests/fixtures/tiny-dit-diffusion/denoiser.onnx
 !tests/fixtures/tiny-masked-diffusion/lm.onnx
+# Workflow conformance fixtures. Every component and policy graph under this
+# tree is a tiny binary .onnx that the tests load directly, so they must stay
+# tracked. Without this line `git add` silently skips them and a fixture lands
+# in the repository as metadata pointing at files nobody else has; the tests
+# still pass locally because the generator just wrote them.
+!tests/fixtures/onnx_genai_workflows/**/*.onnx
 # `qmoe_weight_offload/model.onnx` intentionally stays binary: its test exercises
 # external-data (`weights.bin`) mmap weight-offload, which requires External
 # weight refs that an inlined textproto cannot represent.

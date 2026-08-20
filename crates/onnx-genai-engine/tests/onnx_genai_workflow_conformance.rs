@@ -486,6 +486,88 @@ fn mobius_euler_diffusion_workflow_executes_batched() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The guided image-diffusion fixture exercises every optional part of the
+/// workflow at once: classifier-free guidance from a negative prompt, a
+/// multistep solver with a carried history cell, per-step trajectory emits, a
+/// latent the workflow draws itself from a seed, and a scaled VAE input.
+#[test]
+fn mobius_guided_diffusion_workflow_executes_complete_path() -> anyhow::Result<()> {
+    let mut engine =
+        Engine::from_pipeline_dir(&root("diffusion_guided")?, EngineConfig::default())?;
+    let request = |seeds: &[i64], prompts: &[i64]| -> anyhow::Result<PipelineGenerateRequest> {
+        let rows = i64::try_from(seeds.len())?;
+        Ok(PipelineGenerateRequest::new(GenerateRequest {
+            prompt: GeneratePrompt::TokenIds(vec![]),
+            options: options(3),
+        })
+        .with_input(
+            "request.input_ids",
+            Value::from_slice_i64(prompts, &[rows, 2])?,
+        )
+        .with_input(
+            "request.negative_input_ids",
+            Value::from_slice_i64(&vec![0; prompts.len()], &[rows, 2])?,
+        )
+        .with_input("request.seed", Value::from_slice_i64(seeds, &[rows])?)
+        .with_input(
+            "package.rng_offset",
+            Value::from_slice_i64(&vec![0; seeds.len()], &[rows])?,
+        )
+        .with_input(
+            "request.guidance_scale",
+            Value::from_slice_f32(&vec![7.5; seeds.len()], &[rows])?,
+        )
+        .with_input(
+            "package.false",
+            Value::from_raw_bytes(vec![0; seeds.len()], &[rows], DataType::Bool)?,
+        ))
+    };
+
+    let output = engine.run_pipeline_outputs(request(&[7, 11], &[1, 2, 3, 4])?)?;
+    assert_eq!(output["latent"].shape(), [2, 4, 4, 4]);
+    assert_eq!(output["image"].shape(), [2, 3, 4, 4]);
+    // Three appended steps of a 4-wide latent concatenate on the last axis.
+    assert_eq!(output["noise_estimate"].shape(), [2, 4, 4, 12]);
+    assert_eq!(output["latent_trajectory"].shape(), [2, 4, 4, 12]);
+    // The workflow returns the counter it advanced, one draw per row.
+    assert_eq!(output["rng_offset"].to_vec_i64()?, vec![1, 1]);
+    let latent = output["latent"].to_vec_f32()?;
+    assert!(latent.iter().all(|value| value.is_finite()));
+
+    // The last trajectory chunk is the state the loop carried out of its final
+    // iteration, so it must equal the latent the workflow returned.
+    let trajectory = output["latent_trajectory"].to_vec_f32()?;
+    let row_elements = latent.len() / 2;
+    for row in 0..2 {
+        for channel in 0..4 {
+            for line in 0..4 {
+                for column in 0..4 {
+                    let carried =
+                        trajectory[((row * 4 + channel) * 4 + line) * 12 + 2 * 4 + column];
+                    let emitted = latent[row * row_elements + (channel * 4 + line) * 4 + column];
+                    assert!(
+                        (carried - emitted).abs() <= 1e-6,
+                        "final trajectory chunk must equal the returned latent"
+                    );
+                }
+            }
+        }
+    }
+
+    // Each row's draw and denoising depend only on that row's seed and prompt.
+    let swapped =
+        engine.run_pipeline_outputs(request(&[11, 7], &[3, 4, 1, 2])?)?["latent"].to_vec_f32()?;
+    assert_eq!(&swapped[row_elements..], &latent[..row_elements]);
+    assert_eq!(&swapped[..row_elements], &latent[row_elements..]);
+
+    // A different seed must move the latent somewhere else.
+    let reseeded =
+        engine.run_pipeline_outputs(request(&[7, 12], &[1, 2, 3, 4])?)?["latent"].to_vec_f32()?;
+    assert_eq!(&reseeded[..row_elements], &latent[..row_elements]);
+    assert_ne!(&reseeded[row_elements..], &latent[row_elements..]);
+    Ok(())
+}
+
 #[test]
 fn mobius_masked_diffusion_workflow_executes() -> anyhow::Result<()> {
     let mut engine = Engine::from_pipeline_dir(&root("masked")?, EngineConfig::default())?;
