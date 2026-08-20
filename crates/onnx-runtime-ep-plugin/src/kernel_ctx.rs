@@ -1053,13 +1053,29 @@ mod tests {
 
         for rank in [0usize, 1, 8, 9, 12] {
             let shape: Vec<usize> = (1..=rank).collect();
-            let _ = unsafe { allocate_output(&api, ctx, 0, &shape, DataType::Float32, false) }
+            let output = unsafe { allocate_output(&api, ctx, 0, &shape, DataType::Float32, false) }
                 .expect("the fake ORT allocates successfully");
             let seen = RECORDED_DIMS.lock().expect("recorded dims lock");
             let expected: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
             assert_eq!(
                 *seen, expected,
                 "rank {rank} must reach ORT with every dimension intact"
+            );
+
+            // Pins the *output path*, not just the arithmetic: if
+            // `allocate_output` ever stopped routing through
+            // `contiguous_strides`, the arithmetic pin below would still pass
+            // and only this would fail. Ranks 9 and 12 spill, so this covers
+            // both representations.
+            assert_eq!(
+                &output.shape[..],
+                &shape[..],
+                "rank {rank} lost dimensions on the way into OwnedOutput"
+            );
+            assert_eq!(
+                &output.strides[..],
+                &onnx_runtime_ir::compute_contiguous_strides(&shape)[..],
+                "rank {rank} strides diverged from the IR crate"
             );
         }
     }
@@ -1098,15 +1114,19 @@ mod tests {
     /// and strides intact, and the view it hands out must still describe it.
     #[test]
     fn owned_output_survives_a_rank_past_the_inline_limit() {
-        let rank = crate::dim_vec::INLINE_RANK + 3;
-        let shape: Vec<usize> = std::iter::repeat_n(1usize, rank).collect();
+        // Deliberately not all ones: with a degenerate shape every stride is 1
+        // and the test could not tell a correct stride build from a reversed
+        // or constant one.
+        let shape: Vec<usize> = vec![2, 1, 3, 1, 2, 1, 3, 1, 2, 1, 3];
+        let rank = shape.len();
+        assert!(rank > crate::dim_vec::INLINE_RANK);
         let strides = contiguous_strides(&shape);
         assert!(
             strides.len() == rank && shape.len() > crate::dim_vec::INLINE_RANK,
             "this test is only meaningful past the inline limit"
         );
 
-        let mut data: [f32; 1] = [0.0];
+        let mut data = vec![0.0f32; shape.iter().product::<usize>()];
         let mut output = OwnedOutput {
             data_ptr: data.as_mut_ptr().cast(),
             dtype: DataType::Float32,
@@ -1118,28 +1138,9 @@ mod tests {
         assert_eq!(view.shape, &shape[..], "spilled shape did not survive");
         assert_eq!(
             view.strides,
-            &vec![1i64; rank][..],
+            &onnx_runtime_ir::compute_contiguous_strides(&shape)[..],
             "spilled strides did not survive"
         );
-    }
-
-    /// The output path builds its strides with the same routine the input path
-    /// uses, which is itself pinned to the IR crate. Without this, the two
-    /// sides could drift and only one of them would be checked.
-    #[test]
-    fn owned_output_strides_match_the_ir_crate() {
-        for shape in [
-            vec![],
-            vec![5usize],
-            vec![2, 3],
-            vec![2, 0, 3],
-            vec![1, 1, 7, 1],
-            std::iter::repeat_n(2usize, crate::dim_vec::INLINE_RANK + 2).collect(),
-        ] {
-            let ours = contiguous_strides(&shape);
-            let theirs = onnx_runtime_ir::compute_contiguous_strides(&shape);
-            assert_eq!(&ours[..], &theirs[..], "shape {shape:?}");
-        }
     }
 
     #[test]
