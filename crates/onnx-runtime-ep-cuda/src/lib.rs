@@ -84,6 +84,7 @@ pub mod cudnn;
 mod dynamic_library;
 pub mod error;
 mod graph;
+pub mod kernel_cache;
 pub mod kernels;
 mod optimizer;
 pub mod pinned_pool;

@@ -189,6 +189,34 @@ like the +8% the archive predicted. Re-measuring the baseline **back to back**
 gave 36.5. The entire "win" was the A100 ramping off its 210 MHz idle clock.
 **A baseline from earlier in the session is not a baseline.**
 
+## Trap 7: profiling a binary that does not contain the code you changed
+
+The CLI has two CUDA feature paths and only one of them is this repo's hand-written
+backend:
+
+| Feature | What you get |
+| --- | --- |
+| `--features native-cuda` | **this repo's CUDA EP** (`onnx-runtime-ep-cuda`) |
+| `--features cuda,native-backend` | ORT's CUDA EP; `onnx-runtime-ep-cuda` is **not in the dependency graph at all** |
+
+Building with the second and editing a kernel produces a `cargo build` that
+finishes in under a second and changes nothing, because the crate you edited is
+not a dependency. `cargo tree -p onnx-genai-cli -i onnx-runtime-ep-cuda` printing
+"nothing to print" is the tell. The measured effect was not subtle -- p50 per-token
+went from 24 ms to 532 ms -- but it reads as "my change caused a 22x regression"
+rather than "I am running a different backend", and the instinct is to go debug
+the change.
+
+**Before quoting any number from a rebuilt binary, prove the binary contains the
+build:**
+
+```bash
+strings -a target/release/onnx-genai | grep -c '<a string only your new code has>'
+```
+
+Zero means you measured the old binary or the wrong feature set. This costs one
+second and removes an entire category of confidently wrong answers.
+
 ## Know your roofline, and what a good fraction actually is
 
 Decode is weight-bandwidth-bound: per token you must read every weight once.
