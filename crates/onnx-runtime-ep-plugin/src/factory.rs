@@ -818,6 +818,12 @@ unsafe extern "C" fn factory_create_ep(
                 exported.kernel_registry_entries.clone(),
             ))
         };
+        // Carry the factory's own placement decision into the EP: this is the
+        // flag `CreateAllocator` above branches on, so a subgraph compiled by
+        // this EP can trust it to say whether ORT's tensors are host-resident.
+        let mut exported_ep = exported_ep;
+        exported_ep.host_accessible = exported.device_support.host_accessible;
+
         let ep_ptr = Box::into_raw(exported_ep);
         unsafe { *out_ep = ep_ptr.cast::<ort::OrtEp>() };
         ok_status()

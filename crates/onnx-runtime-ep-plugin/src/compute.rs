@@ -1253,6 +1253,23 @@ pub struct ExportedComputeInfo {
     /// CPU EP (and any host EP), which uses its inputs verbatim exactly as
     /// before.
     device_staging: Option<DeviceStaging>,
+    /// Whether ORT places this EP's tensors in **host-accessible** memory.
+    ///
+    /// This is the same `DeviceSupport::host_accessible` the plugin factory
+    /// keys allocator registration on (`factory.rs`, `CreateAllocator`): when
+    /// it is true ORT hands out its own default host allocator, so every
+    /// `OrtValue` this EP sees is host-resident and a routed subgraph's
+    /// intermediates belong in host buffers. That lets `Compute` skip the
+    /// per-input `OrtMemoryInfo` scan entirely.
+    ///
+    /// Deliberately **defaults to `false`** — the conservative answer. A
+    /// caller that never sets it gets the full scan, i.e. the historical
+    /// behaviour, so a device EP cannot be mis-served by a forgotten setter.
+    /// Note this must *not* be inferred from `device_staging`: that is set
+    /// from `host_to_device_copier()`, which defaults to `None` and which a
+    /// device EP may legitimately decline (see `provider.rs`), so a device EP
+    /// can have `device_staging == None` and device-resident inputs.
+    host_accessible: bool,
     /// Whether ORT's intra-op pool has ever been seen running our elementwise
     /// chunks, and when to ask again if not.
     ///
@@ -1331,8 +1348,19 @@ impl ExportedComputeInfo {
             routing: None,
             workspace_plans,
             device_staging: None,
+            host_accessible: false,
             host_pool_probe: std::sync::atomic::AtomicU32::new(0),
         }
+    }
+
+    /// Record whether ORT places this EP's tensors in host-accessible memory.
+    ///
+    /// Pass the factory's `DeviceSupport::host_accessible` — the *same* flag
+    /// `CreateAllocator` branches on — so this can never disagree with where
+    /// ORT actually allocates. Leaving it unset means "assume device", which
+    /// is the safe direction: `Compute` then scans as it always did.
+    pub fn set_host_accessible(&mut self, host_accessible: bool) {
+        self.host_accessible = host_accessible;
     }
 
     /// Attach the device staging context (#982) captured at compile time from a
@@ -1401,6 +1429,22 @@ unsafe extern "C" fn compute_create_state(
 /// # Safety
 ///
 /// `api` must be valid and `ctx` a valid `OrtKernelContext*`.
+/// Whether `Compute` must ask ORT where this EP's tensors live before it can
+/// place a routed subgraph's intermediates.
+///
+/// Keyed on `host_accessible` -- the flag the plugin factory registers its
+/// allocator on, so it is the same decision ORT itself made -- and
+/// deliberately **not** on the presence of a device-staging context. `staging`
+/// is taken and ignored on purpose: it comes from `host_to_device_copier()`,
+/// which defaults to `None` and which a device EP may legitimately decline, so
+/// keying on it would classify such an EP as host and place its intermediates
+/// in host memory for a device kernel to dereference. That was a real defect
+/// caught in review; the parameter is kept so the invariant is stated where it
+/// can be tested rather than only in a comment.
+fn must_scan_for_device_placement(host_accessible: bool, _staging: Option<&DeviceStaging>) -> bool {
+    !host_accessible
+}
+
 unsafe fn device_mem_info(
     api: &ort::OrtApi,
     ctx: *mut ort::OrtKernelContext,
@@ -1527,21 +1571,51 @@ struct PlacementSources<'a> {
 }
 
 /// Where [`operand_mem_info`] gets its fallback memory info when a node binds
-/// no ORT inputs at all.
+/// no ORT inputs at all, plus the per-`Run` memo of that resolution.
 ///
 /// Resolving it means walking every kernel-context input and asking ORT for its
-/// `OrtMemoryInfo` (see [`device_mem_info`]) — six FFI calls for a one-input
-/// node. The routed path resolves it once per `Run` and reuses it across the
-/// nodes, so it passes [`Resolved`](Self::Resolved). The single-node path has
-/// exactly one consumer, which reads it only for a node with no ORT-bound
-/// operands at all, so it passes [`Deferred`](Self::Deferred) and an
-/// elementwise dispatch never makes the calls.
+/// `OrtMemoryInfo` (see [`device_mem_info`]) — four FFI calls for a one-input
+/// node. Its only consumer reads it for a node with no ORT-bound operands at
+/// all, and then only past [`prepare_workspace`]'s zero-byte and servability
+/// gates, so an elementwise dispatch never makes the calls at all.
+///
+/// The routed path used to resolve it *eagerly*, once per `Run`, to share it
+/// across nodes — charging every routed `Run` for a value almost no dispatch
+/// reads. Deferring it must not trade that for a resolution *per node*: a fused
+/// subgraph whose nodes each take only intermediates and each request a
+/// non-zero step-scoped workspace would then rescan every input once per node.
+/// `memo` keeps both properties — at most one resolution per `Run`, and none
+/// when nothing reaches the fallback.
 #[derive(Clone, Copy)]
-enum SubgraphFallback<'a> {
-    /// Already resolved by the caller.
-    Resolved(Option<*const ort::OrtMemoryInfo>),
-    /// Resolve from the kernel context on demand, with this staging context.
-    Deferred(Option<&'a DeviceStaging>),
+struct SubgraphFallback<'a> {
+    /// Staging context to resolve against, `None` for an EP without one.
+    staging: Option<&'a DeviceStaging>,
+    /// `None` = not yet resolved this `Run`; `Some(v)` = resolved to `v`.
+    ///
+    /// A `Cell` is sufficient: a `Compute` call resolves on one thread, and
+    /// each `Run` builds a fresh cell, so nothing is shared across `Run`s or
+    /// across sessions.
+    memo: &'a std::cell::Cell<Option<Option<*const ort::OrtMemoryInfo>>>,
+}
+
+impl SubgraphFallback<'_> {
+    /// The fallback memory info, resolving (and memoising) on first use.
+    ///
+    /// # Safety
+    ///
+    /// `api` must be valid and `ctx` a valid `OrtKernelContext*`.
+    unsafe fn resolve(
+        self,
+        api: &ort::OrtApi,
+        ctx: *mut ort::OrtKernelContext,
+    ) -> Option<*const ort::OrtMemoryInfo> {
+        if let Some(cached) = self.memo.get() {
+            return cached;
+        }
+        let resolved = unsafe { device_mem_info(api, ctx, self.staging) }.map(|(mi, _)| mi);
+        self.memo.set(Some(resolved));
+        resolved
+    }
 }
 
 /// The ORT-bound operands of a node, in either of the two shapes a caller
@@ -1707,12 +1781,7 @@ unsafe fn operand_mem_info(
     WORKSPACE_PLACEMENT_QUERIES.fetch_add(1, Ordering::Relaxed);
     let mut rest = sources.ort_inputs.indices();
     let Some(first_idx) = rest.next() else {
-        let fallback = match sources.subgraph_fallback {
-            SubgraphFallback::Resolved(ptr) => ptr,
-            SubgraphFallback::Deferred(staging) => {
-                unsafe { device_mem_info(api, ctx, staging) }.map(|(mi, _)| mi)
-            }
-        };
+        let fallback = unsafe { sources.subgraph_fallback.resolve(api, ctx) };
         return match fallback {
             Some(ptr) => OperandMemInfo::FromIntermediates(ptr),
             None => OperandMemInfo::Unavailable,
@@ -2478,20 +2547,6 @@ unsafe extern "C" fn compute_execute(
 
         if let Some(routing) = &exported.routing {
             // ── Routed multi-node path ────────────────────────────────────
-            // Resolved here rather than before the branch: on the
-            // single-node path nothing below reads it, and resolving it costs
-            // an ORT memory-info query per kernel-context input on every
-            // `Run`. The single-node path's one potential consumer takes it as
-            // `SubgraphFallback::Deferred` instead.
-            // Memory info for intermediate scratch. On a device EP this is device
-            // memory, so multi-node intermediates stay on the GPU (a host buffer
-            // would make the next kernel dereference a host pointer as device →
-            // CUDA_ERROR_ILLEGAL_ADDRESS). `None` falls back to host buffers.
-            let scratch_mem_info_and_kind = unsafe {
-                device_mem_info(api_ref, kernel_context, exported.device_staging.as_ref())
-            };
-            let scratch_mem_info = scratch_mem_info_and_kind.map(|(mi, _)| mi);
-
             // Where a routed subgraph's *intermediates* are allocated.
             //
             // Device memory is not optional: a device kernel handed a host pointer
@@ -2508,9 +2563,57 @@ unsafe extern "C" fn compute_execute(
             // difference on identical kernels, against ORT's own 220 us for the
             // same graph. So: device memory when the resolved memory info is a
             // device, host buffers otherwise.
-            let intermediate_scratch = match scratch_mem_info_and_kind {
-                Some((mem_info, true)) => Some(mem_info),
-                _ => None,
+            //
+            // Resolving this costs an ORT memory-info query *per kernel-context
+            // input* on every `Run` — four fixed FFI calls on the one-input
+            // graphs this path is measured on. When ORT placed this EP's
+            // tensors in **host-accessible** memory the answer is always
+            // `None`, and it is knowable without asking ORT anything: that is
+            // the same flag the factory registers the allocator on, so every
+            // `OrtValue` here is host-resident and the intermediates belong in
+            // host buffers.
+            //
+            // The discriminator is deliberately `host_accessible` and *not*
+            // `device_staging.is_some()`. The latter tracks
+            // `host_to_device_copier()`, which defaults to `None` and which a
+            // device EP may legitimately decline, so it would wrongly classify
+            // such an EP as host and place its intermediates on the wrong side
+            // of the bus. `host_accessible` defaults to the conservative
+            // `false`, so anything that has not explicitly declared itself
+            // host-placed keeps the full scan.
+            //
+            // The `debug_assert` re-derives the full answer in unoptimised
+            // builds, so a host-accessible EP that ever did see a
+            // device-resident input fails loudly in tests instead of silently
+            // mis-placing intermediates.
+            // Memoises the placement fallback for this `Run` (see
+            // `SubgraphFallback`): resolved at most once across all nodes, and
+            // not at all unless some node actually reaches it.
+            let subgraph_fallback_memo = std::cell::Cell::new(None);
+
+            let intermediate_scratch = if must_scan_for_device_placement(
+                exported.host_accessible,
+                exported.device_staging.as_ref(),
+            ) {
+                let scanned = unsafe {
+                    device_mem_info(api_ref, kernel_context, exported.device_staging.as_ref())
+                };
+                // The subgraph fallback wants this very resolution. Seed the
+                // memo so a node that reaches it later reuses this scan
+                // instead of repeating it -- which is what the eager
+                // once-per-`Run` version this replaced effectively did.
+                subgraph_fallback_memo.set(Some(scanned.map(|(mem_info, _)| mem_info)));
+                scanned.and_then(|(mem_info, is_device)| is_device.then_some(mem_info))
+            } else {
+                debug_assert!(
+                    unsafe {
+                        device_mem_info(api_ref, kernel_context, exported.device_staging.as_ref())
+                    }
+                    .is_none_or(|(_, is_device)| !is_device),
+                    "EP declared host-accessible saw a device-resident kernel-context input; \
+                     its routed intermediates would be placed in host memory"
+                );
+                None
             };
 
             if routing.input_sources.len() != exported.entries.len()
@@ -2839,7 +2942,10 @@ unsafe extern "C" fn compute_execute(
                         kernel_context,
                         PlacementSources {
                             ort_inputs: OrtOperands::Resolved(&node_ort_operands),
-                            subgraph_fallback: SubgraphFallback::Resolved(scratch_mem_info),
+                            subgraph_fallback: SubgraphFallback {
+                                staging: exported.device_staging.as_ref(),
+                                memo: &subgraph_fallback_memo,
+                            },
                         },
                         &*entry.kernel,
                         plans,
@@ -3073,6 +3179,7 @@ unsafe extern "C" fn compute_execute(
             // The single-node subgraph's operands are this node's operands, but
             // only the present ones are ORT-bound. Placement is resolved lazily
             // inside `prepare_workspace`, past the zero-byte and lifetime gates.
+            let subgraph_fallback_memo = std::cell::Cell::new(None);
             let lookup2_probe = crate::dispatch_probe::Phase::DispatchLookup.enter();
             let workspace = match unsafe {
                 prepare_workspace(
@@ -3080,9 +3187,10 @@ unsafe extern "C" fn compute_execute(
                     kernel_context,
                     PlacementSources {
                         ort_inputs: OrtOperands::Slots(&entry.input_slots),
-                        subgraph_fallback: SubgraphFallback::Deferred(
-                            exported.device_staging.as_ref(),
-                        ),
+                        subgraph_fallback: SubgraphFallback {
+                            staging: exported.device_staging.as_ref(),
+                            memo: &subgraph_fallback_memo,
+                        },
                     },
                     &*entry.kernel,
                     plans,
@@ -6802,6 +6910,142 @@ mod mem_info_cost {
 
         assert_eq!(got, Some((MI, true)));
         assert_eq!(d.event(Event::OrtFfiCall), 4);
+    }
+
+    /// A routed `Run` must resolve subgraph placement **at most once**, no
+    /// matter how many of its nodes reach the fallback.
+    ///
+    /// Deferring the resolution out of the per-`Run` prologue traded an
+    /// unconditional cost for a lazy one; without the memo it would also have
+    /// traded "once per `Run`" for "once per node", which for a fused subgraph
+    /// whose nodes each request a step-scoped workspace is strictly worse than
+    /// what it replaced.
+    #[test]
+    fn the_subgraph_fallback_resolves_once_per_run_however_many_nodes_ask() {
+        let api = api(true);
+        let memo = std::cell::Cell::new(None);
+        let fallback = SubgraphFallback {
+            staging: None,
+            memo: &memo,
+        };
+
+        let before = dispatch_probe::snapshot();
+        let first = unsafe { fallback.resolve(&api, std::ptr::null_mut()) };
+        let after_first = dispatch_probe::snapshot();
+        for _ in 0..8 {
+            assert_eq!(
+                unsafe { fallback.resolve(&api, std::ptr::null_mut()) },
+                first,
+                "memoised resolution changed its answer"
+            );
+        }
+        let after_rest = dispatch_probe::snapshot();
+
+        assert_eq!(first, Some(MI));
+        assert!(
+            after_first.since(&before).event(Event::OrtFfiCall) > 0,
+            "first resolution should actually query ORT"
+        );
+        assert_eq!(
+            after_rest.since(&after_first).event(Event::OrtFfiCall),
+            0,
+            "nodes after the first must not re-query placement"
+        );
+    }
+
+    /// A node that *does* bind ORT inputs never reaches the fallback, so the
+    /// memo must stay unresolved -- the lazy path has to be lazy, not merely
+    /// cached. This is the case every elementwise dispatch takes.
+    #[test]
+    fn a_node_with_ort_inputs_never_resolves_the_subgraph_fallback() {
+        let api = api(true);
+        let memo = std::cell::Cell::new(None);
+
+        let got = unsafe {
+            operand_mem_info(
+                &api,
+                std::ptr::null_mut(),
+                PlacementSources {
+                    ort_inputs: OrtOperands::Resolved(&[0]),
+                    subgraph_fallback: SubgraphFallback {
+                        staging: None,
+                        memo: &memo,
+                    },
+                },
+            )
+        };
+
+        assert!(
+            !matches!(got, OperandMemInfo::Unavailable),
+            "an operand-backed node should resolve from its own operands"
+        );
+        assert_eq!(
+            memo.get(),
+            None,
+            "the subgraph fallback must not be resolved for a node that binds \
+             ORT inputs"
+        );
+    }
+
+    /// The placement shortcut keys on `host_accessible`, and that flag must
+    /// default to the *conservative* answer.
+    ///
+    /// `host_accessible` is what the factory registers the allocator on, so it
+    /// is the only honest statement about where ORT puts this EP's tensors. It
+    /// must not be inferred from `device_staging`: that tracks
+    /// `host_to_device_copier()`, which defaults to `None` and which a device
+    /// EP may legitimately decline, so a device EP can have no staging *and*
+    /// device-resident inputs -- exactly what
+    /// `a_device_input_short_circuits_and_reports_itself` above demonstrates.
+    /// Defaulting to `false` means a forgotten setter costs FFI calls, not
+    /// correctness.
+    #[test]
+    fn compute_info_assumes_device_placement_until_told_otherwise() {
+        let mut info = ExportedComputeInfo::new(Vec::new());
+        assert!(
+            !info.host_accessible,
+            "default must be the conservative 'assume device', so an unset \
+             flag keeps the full memory-info scan"
+        );
+        assert!(
+            info.device_staging.is_none(),
+            "and staging must stay independent of it"
+        );
+
+        info.set_host_accessible(true);
+        assert!(info.host_accessible);
+    }
+
+    /// The regression test for the defect review caught: a **device** EP that
+    /// declined `host_to_device_copier()` has no staging context, and must
+    /// still scan for device placement.
+    ///
+    /// Keying the shortcut on staging presence -- as the first cut of this
+    /// change did -- classifies exactly this EP as host, so its routed
+    /// subgraph's intermediates get host buffers and its next device kernel
+    /// dereferences a host pointer as device memory.
+    /// `a_device_input_short_circuits_and_reports_itself` shows the scan such
+    /// an EP performs really does report a device input.
+    #[test]
+    fn a_device_ep_that_declined_staging_still_scans_for_placement() {
+        assert!(
+            must_scan_for_device_placement(false, None),
+            "a device EP without a copier must not be mistaken for a host EP"
+        );
+        // ...and staging presence must not sway the decision either way.
+        let staging = staging_with_recon(RECON, true);
+        assert!(must_scan_for_device_placement(false, Some(&staging)));
+        assert!(!must_scan_for_device_placement(true, Some(&staging)));
+        assert!(!must_scan_for_device_placement(true, None));
+    }
+
+    /// The two stock `DeviceSupport` recipes must keep disagreeing about
+    /// placement, since the shortcut above is only sound while they do.
+    #[test]
+    fn stock_device_support_recipes_declare_opposite_placement() {
+        use crate::device::DeviceSupport;
+        assert!(DeviceSupport::cpu_only().host_accessible);
+        assert!(!DeviceSupport::gpu("Gpu", 0).host_accessible);
     }
 
     /// The fallback still works when the scan cannot run at all, which is the
