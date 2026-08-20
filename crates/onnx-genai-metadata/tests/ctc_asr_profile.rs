@@ -64,6 +64,7 @@ profiles:
     kind: transcription
     version: "1.0"
     outputs: { logits: logits, frame_lengths: frame_lengths }
+    batch_invariance: padding_sensitive
     decoding:
       kind: ctc
       blank_id: 0
@@ -385,6 +386,135 @@ pipeline:
             "preprocessing.audio output 'mystery_output' is not produced by adapter \
              'audio_preprocess'"
         )),
+        "{reported:?}"
+    );
+}
+
+#[test]
+fn word_delimiter_absent_from_inline_tokens_is_rejected() {
+    let document = r#"
+profiles:
+  transcription:
+    kind: transcription
+    version: "1.0"
+    decoding:
+      kind: ctc
+      blank_id: 0
+      time_axis: 1
+      class_axis: 2
+      vocabulary:
+        source: inline
+        word_delimiter: "|"
+        tokens: ["<pad>", "a", "b"]
+"#;
+    let reported = errors(document);
+    assert!(
+        reported.iter().any(|error| error.contains(
+            "profiles.transcription.decoding.vocabulary.word_delimiter '|' is not present in \
+             tokens"
+        )),
+        "{reported:?}"
+    );
+}
+
+#[test]
+fn ignored_token_absent_from_inline_tokens_is_rejected() {
+    let document = r#"
+profiles:
+  transcription:
+    kind: transcription
+    version: "1.0"
+    decoding:
+      kind: ctc
+      blank_id: 0
+      time_axis: 1
+      class_axis: 2
+      vocabulary:
+        source: inline
+        ignored_tokens: ["<s>"]
+        tokens: ["<pad>", "a", "b"]
+"#;
+    let reported = errors(document);
+    assert!(
+        reported.iter().any(|error| error.contains(
+            "profiles.transcription.decoding.vocabulary.ignored_tokens entry '<s>' is not \
+             present in tokens"
+        )),
+        "{reported:?}"
+    );
+}
+
+#[test]
+fn blank_id_outside_inline_vocabulary_is_rejected() {
+    let document = r#"
+profiles:
+  transcription:
+    kind: transcription
+    version: "1.0"
+    decoding:
+      kind: ctc
+      blank_id: 7
+      time_axis: 1
+      class_axis: 2
+      vocabulary:
+        source: inline
+        tokens: ["<pad>", "a", "b"]
+"#;
+    let reported = errors(document);
+    assert!(
+        reported.iter().any(|error| error.contains(
+            "profiles.transcription.decoding.blank_id 7 is out of range for a vocabulary of 3 \
+             tokens"
+        )),
+        "{reported:?}"
+    );
+}
+
+#[test]
+fn padding_sensitive_profile_without_lengths_binding_is_rejected() {
+    let document = r#"
+profiles:
+  transcription:
+    kind: transcription
+    version: "1.0"
+    outputs: { logits: logits }
+    batch_invariance: padding_sensitive
+    decoding:
+      kind: ctc
+      blank_id: 0
+      time_axis: 1
+      class_axis: 2
+"#;
+    let reported = errors(document);
+    assert!(
+        reported.iter().any(|error| error.contains(
+            "profiles.transcription.decoding must bind a lengths output role because \
+             profiles.transcription.batch_invariance is 'padding_sensitive'"
+        )),
+        "{reported:?}"
+    );
+}
+
+#[test]
+fn row_independent_profile_without_lengths_binding_is_accepted() {
+    let document = r#"
+profiles:
+  transcription:
+    kind: transcription
+    version: "1.0"
+    outputs: { logits: logits }
+    batch_invariance: row_independent
+    decoding:
+      kind: ctc
+      blank_id: 0
+      time_axis: 1
+      class_axis: 2
+"#;
+    let reported = errors(document);
+    assert!(
+        !reported
+            .iter()
+            .any(|error| error.contains("batch_invariance")),
         "{reported:?}"
     );
 }

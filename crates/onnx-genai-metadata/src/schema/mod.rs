@@ -327,6 +327,14 @@ mod schema_vocabulary {
     );
 
     extensible_string!(
+        /// Dependence of a row's outputs on the rows batched with it.
+        BatchInvariance,
+        batch_invariance,
+        BATCH_INVARIANCE,
+        ["row_independent", "padding_sensitive"]
+    );
+
+    extensible_string!(
         /// Loop-carried state initialization vocabulary.
         StateInitKind,
         state_init_kind,
@@ -510,6 +518,10 @@ mod schema_helpers {
 
     pub(super) fn decoding_vocabulary_source(schema: &mut Schema) {
         extensible_string_enum(schema, super::schema_vocabulary::DECODING_VOCABULARY_SOURCE);
+    }
+
+    pub(super) fn batch_invariance(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::BATCH_INVARIANCE);
     }
 
     pub(super) fn state_init_kind(schema: &mut Schema) {

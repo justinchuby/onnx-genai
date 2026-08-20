@@ -496,6 +496,17 @@ fn validate_profile_decoding(metadata: &InferenceMetadata, errors: &mut Vec<Stri
         let Some(decoding) = &profile.decoding else {
             continue;
         };
+        // When padding perturbs a row's values there is no reliable way to
+        // recover the valid region by re-deriving it from the input length, so
+        // the package must publish the per-row length it actually produced.
+        if profile.batch_invariance.as_deref() == Some("padding_sensitive")
+            && decoding.lengths.is_none()
+        {
+            errors.push(format!(
+                "profiles.{name}.decoding must bind a lengths output role because \
+                 profiles.{name}.batch_invariance is 'padding_sensitive'"
+            ));
+        }
         if decoding.kind == "ctc" && decoding.blank_id.is_none() {
             errors.push(format!(
                 "profiles.{name}.decoding requires blank_id because kind is 'ctc'"
@@ -531,6 +542,36 @@ fn validate_profile_decoding(metadata: &InferenceMetadata, errors: &mut Vec<Stri
                      length {}",
                     vocabulary.tokens.len()
                 ));
+            }
+            // A renderer resolves the delimiter and the ignore list by string
+            // identity against the inline table, so a token that is absent
+            // there can never match and would silently change the transcript.
+            if !vocabulary.tokens.is_empty() {
+                if let Some(delimiter) = &vocabulary.word_delimiter
+                    && !vocabulary.tokens.contains(delimiter)
+                {
+                    errors.push(format!(
+                        "profiles.{name}.decoding.vocabulary.word_delimiter '{delimiter}' is \
+                         not present in tokens"
+                    ));
+                }
+                for ignored in &vocabulary.ignored_tokens {
+                    if !vocabulary.tokens.contains(ignored) {
+                        errors.push(format!(
+                            "profiles.{name}.decoding.vocabulary.ignored_tokens entry \
+                             '{ignored}' is not present in tokens"
+                        ));
+                    }
+                }
+                if let Some(blank_id) = decoding.blank_id
+                    && blank_id as usize >= vocabulary.tokens.len()
+                {
+                    errors.push(format!(
+                        "profiles.{name}.decoding.blank_id {blank_id} is out of range for a \
+                         vocabulary of {} tokens",
+                        vocabulary.tokens.len()
+                    ));
+                }
             }
         }
     }

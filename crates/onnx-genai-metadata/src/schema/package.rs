@@ -163,6 +163,20 @@ pub struct TaskProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoding: Option<SequenceDecodingSpec>,
 
+    /// Whether a row's outputs depend on the other rows batched with it.
+    ///
+    /// `row_independent` means a row produces identical values whether it is
+    /// run alone or co-batched with rows of any other length, so a runtime may
+    /// batch freely. `padding_sensitive` means padding a row to the batch width
+    /// changes its values — for example when a normalization reduces over the
+    /// padded time axis — so a runtime that batches trades accuracy for
+    /// throughput and must not treat batched results as equal to solo results.
+    ///
+    /// Absent means unstated, not `row_independent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<schema_vocabulary::BatchInvariance>")]
+    pub batch_invariance: Option<String>,
+
     /// Whether this profile changes generated output and therefore participates
     /// in cache correctness dependencies.
     #[serde(default)]
@@ -256,11 +270,24 @@ pub struct DecodingVocabulary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<usize>,
 
-    /// Token string that renders as a word boundary (e.g. `|`).
+    /// Token string that separates words when rendering (e.g. `|`).
+    ///
+    /// A delimiter *separates* words, so it never contributes whitespace of its
+    /// own: a reader splits the decoded token run on this token, discards empty
+    /// groups, and joins the remaining groups with a single U+0020. Leading,
+    /// trailing, and repeated delimiters therefore produce no empty words and no
+    /// leading or trailing space. When absent, tokens are concatenated verbatim.
+    ///
+    /// Must be present in `tokens` when `source` is `inline`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub word_delimiter: Option<String>,
 
-    /// Token string ignored during rendering (e.g. `<pad>`).
+    /// Token strings dropped before rendering (e.g. `<pad>`, `<s>`).
+    ///
+    /// Removal happens after CTC collapsing and before word splitting, so an
+    /// ignored token never joins or separates words.
+    ///
+    /// Every entry must be present in `tokens` when `source` is `inline`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ignored_tokens: Vec<String>,
 
