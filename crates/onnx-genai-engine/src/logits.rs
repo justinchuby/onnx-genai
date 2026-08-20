@@ -99,17 +99,16 @@ pub trait LogitProcessor: Send + Sync {
     /// Whether this processor is guaranteed to leave the position of the maximum
     /// logit unchanged, for every possible input.
     ///
-    /// This is what lets greedy decoding skip the chain entirely and take the
-    /// device argmax fast path. Truncation processors qualify: they mask
-    /// candidates *relative to the maximum*, so the maximum is by construction
-    /// never the one masked. A positive temperature qualifies: dividing by a
-    /// positive constant is monotonic.
+    /// This is what lets greedy decoding skip the chain and take the device
+    /// argmax, which never materializes logits on the host at all.
     ///
-    /// Answer `false` -- the default -- for anything that rewrites logits by a
-    /// per-token amount (the penalties), that can mask the top token itself
-    /// (typical-p, XTC), that restricts the vocabulary from outside the
-    /// distribution (constraints), or that carries a `signal` the loop must not
-    /// miss (stop sequences). When in doubt, `false` only costs speed.
+    /// The bar is deliberately "does not touch the logits", not "probably keeps
+    /// the maximum". The sampling warpers are not built for a greedy request in
+    /// the first place (see `build_processor_chain`), so they never need this
+    /// exemption, and claiming one for them would be reasoning nobody exercises.
+    /// What can still appear in a greedy chain is the penalties, DRY,
+    /// constraints, and stop sequences -- and of those only the stop-sequence
+    /// processor leaves logits alone.
     fn preserves_argmax(&self) -> bool {
         false
     }
@@ -147,12 +146,11 @@ impl ProcessorChain {
     /// Whether greedy selection over the raw logits gives the same token as
     /// greedy selection over this chain's output.
     ///
-    /// An empty chain trivially qualifies. So does the chain a typical chat
-    /// model builds from its own `generation` defaults: `top_k` / `top_p` are
-    /// carried on the request even when the caller asked for greedy decoding,
-    /// where they cannot change the answer. Requiring emptiness instead of
-    /// argmax-equivalence silently denied the device argmax to every model that
-    /// ships sampler defaults -- which is nearly all of them.
+    /// An empty chain trivially qualifies, and so does a greedy request that
+    /// only carries stop sequences -- which is what a chat template leaves
+    /// behind once the sampling warpers are dropped. Requiring literal
+    /// emptiness here denied the device argmax to every model shipping a chat
+    /// template, which is nearly all of them.
     pub fn preserves_argmax(&self) -> bool {
         self.processors
             .iter()
@@ -863,13 +861,6 @@ impl LogitProcessor for TemperatureProcessor {
         }
     }
 
-    fn preserves_argmax(&self) -> bool {
-        // Dividing by a positive constant is monotonic. A non-positive
-        // temperature is not applied as a division at all, so it is excluded
-        // here rather than reasoned about.
-        self.temperature > 0.0
-    }
-
     fn name(&self) -> &str {
         "temperature"
     }
@@ -1134,10 +1125,6 @@ impl LogitProcessor for TopKProcessor {
         }
     }
 
-    fn preserves_argmax(&self) -> bool {
-        true
-    }
-
     fn name(&self) -> &str {
         "top_k"
     }
@@ -1234,10 +1221,6 @@ impl LogitProcessor for TopKTopPProcessor {
         }
     }
 
-    fn preserves_argmax(&self) -> bool {
-        true
-    }
-
     fn name(&self) -> &str {
         "top_k_top_p"
     }
@@ -1273,10 +1256,6 @@ impl LogitProcessor for TopPProcessor {
         }
     }
 
-    fn preserves_argmax(&self) -> bool {
-        true
-    }
-
     fn name(&self) -> &str {
         "top_p"
     }
@@ -1305,10 +1284,6 @@ impl LogitProcessor for MinPProcessor {
         }
     }
 
-    fn preserves_argmax(&self) -> bool {
-        true
-    }
-
     fn name(&self) -> &str {
         "min_p"
     }
@@ -1334,10 +1309,6 @@ impl LogitProcessor for TopAProcessor {
                 *logit = f32::NEG_INFINITY;
             }
         }
-    }
-
-    fn preserves_argmax(&self) -> bool {
-        true
     }
 
     fn name(&self) -> &str {

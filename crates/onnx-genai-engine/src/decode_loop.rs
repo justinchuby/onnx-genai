@@ -523,7 +523,7 @@ mod tests {
             seed: Some(17),
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None)?;
+        let chain = build_processor_chain(&options, None, false)?;
         let tokenizer = tokenizer()?;
 
         let mut fallback_backend = MockBackend::new(true);
@@ -567,7 +567,7 @@ mod tests {
                 seed: Some(seed),
                 ..Default::default()
             };
-            let chain = build_processor_chain(&options, None)?;
+            let chain = build_processor_chain(&options, None, false)?;
             let mut backend = MockBackend::with_logits(
                 false,
                 SampledOutcome::HardError,
@@ -608,7 +608,7 @@ mod tests {
             seed: Some(17),
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None)?;
+        let chain = build_processor_chain(&options, None, false)?;
         let tokenizer = tokenizer()?;
 
         let mut na_backend = MockBackend::with_outcome(true, SampledOutcome::NotApplicable);
@@ -662,7 +662,7 @@ mod tests {
             seed: Some(17),
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None)?;
+        let chain = build_processor_chain(&options, None, false)?;
         let tokenizer = tokenizer()?;
 
         // `HardError` outcome would panic-latch if ever reached; assert it isn't.
@@ -693,7 +693,7 @@ mod tests {
             stop_on_eos: false,
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None)?;
+        let chain = build_processor_chain(&options, None, false)?;
         assert!(chain.is_empty());
         let tokenizer = tokenizer()?;
 

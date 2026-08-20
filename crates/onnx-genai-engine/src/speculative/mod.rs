@@ -1170,7 +1170,7 @@ impl Engine {
             // Grammar processors carry per-request parser state; draft/verify
             // would need separate parser branches for speculative candidates.
             && options.constraint.is_none()
-            && (options.greedy || options.temperature == 0.0)
+            && options.selects_greedily()
             && self.kv_model.is_some()
     }
 
