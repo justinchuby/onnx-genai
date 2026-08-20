@@ -20,7 +20,6 @@
 
 use crate::engine::memory_plan::Holder;
 use crate::native_decode::NativeDecodeDevice;
-#[cfg(feature = "cuda")]
 use anyhow::Context;
 use onnx_genai_metadata::{
     ComponentDataType, ComponentError, ComponentIo, ComponentSession, ComponentTensor,
@@ -265,7 +264,7 @@ impl NativeComponentSession {
                 "native CUDA pipeline component fell back to CPU"
             );
         }
-        adopt_governor(&session, path, governor, Holder::PipelineComponentPool);
+        adopt_governor(&session, path, governor, Holder::PipelineComponentPool)?;
         Self::new(session).map_err(anyhow::Error::from)
     }
 }
@@ -277,35 +276,41 @@ impl NativeComponentSession {
 /// things and only the first is redundant for an already-governed provider:
 /// the arena's claim is re-recorded (zero the second time), and the weight
 /// residency cache gets its authority-scoped mapped-byte allowance, which
-/// nothing else creates and without which page-in refuses outright.
+/// nothing else creates.
 ///
-/// Not fatal: a provider that holds no standing pool reports zero, and a
-/// governor that refuses the claim leaves the session exactly as unaccounted as
-/// it was before -- worth saying out loud, not worth failing a load over.
+/// Failure is fatal rather than a warning, which is a deliberate reversal of
+/// what this code did before. Neither way it can fail is survivable: an
+/// authority mismatch (`provider.rs:3234`) is a misconfiguration, and a refused
+/// residency budget (`provider.rs:3266`) means `mapped_allowance` is never set,
+/// so the very first page-in dies at `weight_paging.rs:3632` instead. Warning
+/// and continuing only moved that failure later and made it harder to read.
+/// A provider with nothing to adopt is not an error -- it honestly reports
+/// `Ok(0)`, as CPU and plugin EPs do through the trait default.
 pub(crate) fn adopt_governor(
     session: &InferenceSession,
     path: &Path,
     governor: Option<&dyn onnx_runtime_memory_governor::MemoryGovernor>,
     holder: Holder,
-) {
+) -> anyhow::Result<()> {
     let Some(governor) = governor else {
-        return;
+        return Ok(());
     };
-    match session.adopt_memory_governor(governor, holder.tier(), holder.id()) {
-        Ok(bytes) => tracing::debug!(
-            model = %path.display(),
-            governed_bytes = bytes,
-            holder = holder.name(),
-            "native session device pool adopted by the engine memory governor"
-        ),
-        Err(error) => tracing::warn!(
-            model = %path.display(),
-            holder = holder.name(),
-            %error,
-            "native session device pool could not be charged to the engine memory governor; \
-             admission on this device stays optimistic"
-        ),
-    }
+    let bytes = session
+        .adopt_memory_governor(governor, holder.tier(), holder.id())
+        .with_context(|| {
+            format!(
+                "charge the device pool of '{}' to the engine memory governor as {}",
+                path.display(),
+                holder.name()
+            )
+        })?;
+    tracing::debug!(
+        model = %path.display(),
+        governed_bytes = bytes,
+        holder = holder.name(),
+        "native session device pool adopted by the engine memory governor"
+    );
+    Ok(())
 }
 
 fn to_native_tensor(

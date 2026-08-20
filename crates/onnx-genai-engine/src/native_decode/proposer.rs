@@ -120,7 +120,7 @@ impl NativeProposerSession {
             path,
             governor,
             crate::engine::memory_plan::Holder::DraftModelPool,
-        );
+        )?;
         Self::from_session(session, io)
     }
 

@@ -106,8 +106,16 @@ impl Holder {
     ///
     /// Two hand-copied lists in the tests below drifted apart the moment a
     /// variant was added, and the drift is silent: a uniqueness test that does
-    /// not mention a holder still passes. `all_covers_every_holder_id` ties
-    /// this to the id space so a new variant cannot be left out quietly.
+    /// not mention a holder still passes.
+    ///
+    /// `all_covers_every_holder_id` narrows that, but does **not** close it, and
+    /// the earlier claim here that it did was wrong. It checks the ids in this
+    /// array are exactly `1..=ALL.len()`, so it catches a duplicate or a gap
+    /// among the holders listed -- but a variant added to the enum and never
+    /// added here shortens the very range being checked, and the test still
+    /// passes. Keeping this array complete is a convention the compiler does not
+    /// enforce; making it enforceable needs the variant list to be generated
+    /// rather than written, which is a dependency this crate does not carry.
     ///
     /// Production code matches on holders exhaustively and the compiler
     /// enforces that, so nothing outside the tests iterates this today. It is
@@ -577,15 +585,20 @@ mod tests {
     /// including the uniqueness check below, which would then pass while not
     /// checking the new holder at all.
     ///
-    /// Ids are consecutive from 1, so a gap in that range means a variant is
-    /// missing here.
+    /// Ids in `ALL` are consecutive from 1, so a duplicate or a gap among the
+    /// listed holders shows up here.
+    ///
+    /// What this cannot see: a variant added to the enum and never added to
+    /// `ALL`. Its absence shortens `ALL.len()`, which is the range being
+    /// checked, so the loop simply never asks about it. Do not read a pass here
+    /// as "every variant is covered" -- see the note on [`Holder::ALL`].
     #[test]
     fn all_covers_every_holder_id() {
         for id in 1..=Holder::ALL.len() as u64 {
             assert!(
                 Holder::ALL.iter().any(|holder| holder.id().get() == id),
-                "no holder in Holder::ALL has id {id}; a variant was given an id but not \
-                 added to ALL, so nothing that iterates holders covers it"
+                "no holder in Holder::ALL has id {id}; the listed holders do not occupy a \
+                 consecutive id space, so something that iterates them skips an id in range"
             );
         }
     }
