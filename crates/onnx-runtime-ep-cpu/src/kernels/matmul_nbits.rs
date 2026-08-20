@@ -7286,14 +7286,34 @@ const INT4_PREFILL_GEBP_L2_RESIDENT_BYTES: usize = 4 << 20;
 /// therefore giving up 8.96x at `m = 2` and 14.6x at `m = 3`. Unlike the
 /// 32-element gates this one needs no residency split: both shapes agree.
 ///
-/// Set to 2 rather than 1 deliberately. `m = 1` is decode, and its 2.51x/4.62x
-/// is measured by a single-op prefill bench that cannot see the per-token pool
-/// contention the narrow decode pool exists to avoid -- GEBP returns before
-/// `with_decode_pool` and drives the global pool. That is the same reason
-/// [`borrowed_affine_int4_matmul_prefill`] is itself gated at `m >= 2`. Moving
-/// decode wants a decode-loop measurement, not this one.
+/// Set to 1: decode goes through GEBP too. This gate is *only* reachable at
+/// `block_size = 16`. `MatMulNBits` rejects any block size that is not a power
+/// of two `>= 16`, and the only such size that is not a multiple of 32 is 16
+/// itself, so "unblocked" names exactly one shape.
+///
+/// The value was 2 while the `m = 1` evidence was a single-op prefill bench
+/// that could not see per-token pool contention. Re-measured with a decode-loop
+/// A/B (`int4_decode_loop_ab`, llama3-8B projection chain, `m = 1`, each token
+/// inside one `with_decode_pool_scope` exactly as `native_decode/cpu.rs` drives
+/// a single-token forward), aggregate tokens/s, steady phase, mean of three
+/// interleaved reps:
+///
+/// | sessions | GEBP | scalar dot | speedup | GEBP p90 | dot p90 |
+/// |---|---|---|---|---|---|
+/// | 1 | 97.3 | 30.6 | 3.2x | 10.3 ms | 29.7 ms |
+/// | 2 | 111.5 | 32.3 | 3.5x | 18.4 ms | 30.9 ms |
+/// | 4 | 122.8 | 29.7 | 4.1x | 35.7 ms | 233.3 ms |
+///
+/// The contention objection inverted: the advantage *grows* with session count
+/// and the tail improves 6.5x, because the arm this replaces is a scalar
+/// per-block dot with no vectorized route at all.
+///
+/// The same measurement says the opposite for every block size a column-blocked
+/// kernel accepts, which is why [`INT4_PREFILL_GEBP_MIN_ROWS`] and
+/// [`INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT`] stay above 1: at `m = 1` GEBP is
+/// 9% slower at block 32, 1.8x slower at 64 and 2.1x slower at 128.
 #[cfg(target_arch = "x86_64")]
-const INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED: usize = 2;
+const INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED: usize = 1;
 
 /// The `m` at which the fused-dequant GEBP overtakes the column-blocked
 /// borrowed kernel for this node's weight.
@@ -15601,9 +15621,11 @@ mod tests {
     /// A 16-element block reaches the GEBP prefill through
     /// [`INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED`], a branch neither this test's
     /// 32-element sibling nor any other numeric test used to cover: with the
-    /// threshold at 4 the rows it now owns (`m = 2, 3`) went to the per-block
-    /// dot instead. The block size also exercises a panel whose block boundary
-    /// falls twice inside one `DEQUANT_GROUP`-stepped run.
+    /// threshold at 4 the rows it now owns (`m = 1, 2, 3`) went to the
+    /// per-block dot instead. `m = 1` is decode, so this is also the only
+    /// numeric coverage of a decode row through the packed microkernel. The
+    /// block size also exercises a panel whose block boundary falls twice
+    /// inside one `DEQUANT_GROUP`-stepped run.
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn matmulnbits_int4_prefill_gebp_covers_the_unblocked_block_size() {
@@ -19529,13 +19551,27 @@ mod tests {
             assert!(block_size.is_multiple_of(32));
             assert!(int4_prefill_gebp_min_rows(large, block_size) >= INT4_PREFILL_GEBP_MIN_ROWS);
         }
-        // The measured crossover is below 1, so what holds this threshold up is
-        // not the benchmark but the decision to leave decode alone: GEBP runs
-        // before `with_decode_pool` on the global pool. Dropping this to 1 is a
-        // decode routing change and needs a decode-loop measurement, not the
-        // prefill sweep that set the value.
+        // This gate is reachable at exactly one block size. `MatMulNBits`
+        // rejects block sizes that are not a power of two `>= 16`, and 16 is
+        // the only such size that is not a multiple of 32. If that validation
+        // ever widens, the decode-loop measurement behind the value below
+        // covers block 16 only and has to be re-run for whatever else arrives.
+        for block_size in [16usize, 32, 64, 128, 256, 512] {
+            let unblocked = int4_prefill_gebp_min_rows(large, block_size)
+                == INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED
+                && !block_size.is_multiple_of(32);
+            assert_eq!(
+                unblocked,
+                block_size == 16,
+                "block_size={block_size}: the unblocked gate must name only 16"
+            );
+        }
+        // Decode is included deliberately: measured 3.2x-4.1x faster than the
+        // scalar per-block dot it replaces, growing with session count. Raising
+        // this back above 1 is a decode routing change and needs a decode-loop
+        // measurement (`int4_decode_loop_ab`), not the prefill sweep.
         const {
-            assert!(INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED >= 2);
+            assert!(INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED == 1);
         }
     }
 }
