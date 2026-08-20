@@ -105,7 +105,7 @@ MiniMax-M2 的 `[e~[\n]~b]` 值得单独看一眼 —— 分隔符里带着字�
 gpt-oss 与 Muse Glimmer 用的是**同一族格式**。不是"类似",而是共享同一套骨架:
 
 ```text
-<|start|>{发送者} to={收件人} [<|channel|>{频道}] <|message|>{内容}{终止符}
+<|start|>{sender} to={recipient} [<|channel|>{channel}] <|message|>{content}{stop}
 ```
 
 两者渲染出来的工具调用逐字对比:
