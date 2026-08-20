@@ -2891,7 +2891,10 @@ mod channel_gate_tests {
                 ("assistant", "assistant"),
                 (" to=self<|message|>", " to=self"),
                 ("secret", "secret"),
-                ("<|end|><|start|>assistant to=user<|message|>", "<|end|>assistant to=user"),
+                (
+                    "<|end|><|start|>assistant to=user<|message|>",
+                    "<|end|>assistant to=user",
+                ),
                 ("Hi", "Hi"),
             ]),
             "Hi"
@@ -2914,7 +2917,10 @@ mod channel_gate_tests {
     #[test]
     fn an_unarmed_gate_streams_everything() {
         let mut gate = PrivateChannelGate::new(false);
-        assert_eq!(gate.push(Some(" to=self<|message|>"), " to=self"), " to=self");
+        assert_eq!(
+            gate.push(Some(" to=self<|message|>"), " to=self"),
+            " to=self"
+        );
         assert_eq!(gate.push(None, "raw"), "raw");
         assert_eq!(gate.flush(), "");
     }
