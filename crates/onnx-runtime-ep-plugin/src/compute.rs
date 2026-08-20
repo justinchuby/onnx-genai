@@ -1429,6 +1429,22 @@ unsafe extern "C" fn compute_create_state(
 /// # Safety
 ///
 /// `api` must be valid and `ctx` a valid `OrtKernelContext*`.
+/// Whether `Compute` must ask ORT where this EP's tensors live before it can
+/// place a routed subgraph's intermediates.
+///
+/// Keyed on `host_accessible` -- the flag the plugin factory registers its
+/// allocator on, so it is the same decision ORT itself made -- and
+/// deliberately **not** on the presence of a device-staging context. `staging`
+/// is taken and ignored on purpose: it comes from `host_to_device_copier()`,
+/// which defaults to `None` and which a device EP may legitimately decline, so
+/// keying on it would classify such an EP as host and place its intermediates
+/// in host memory for a device kernel to dereference. That was a real defect
+/// caught in review; the parameter is kept so the invariant is stated where it
+/// can be tested rather than only in a comment.
+fn must_scan_for_device_placement(host_accessible: bool, _staging: Option<&DeviceStaging>) -> bool {
+    !host_accessible
+}
+
 unsafe fn device_mem_info(
     api: &ort::OrtApi,
     ctx: *mut ort::OrtKernelContext,
@@ -2570,7 +2586,25 @@ unsafe extern "C" fn compute_execute(
             // builds, so a host-accessible EP that ever did see a
             // device-resident input fails loudly in tests instead of silently
             // mis-placing intermediates.
-            let intermediate_scratch = if exported.host_accessible {
+            // Memoises the placement fallback for this `Run` (see
+            // `SubgraphFallback`): resolved at most once across all nodes, and
+            // not at all unless some node actually reaches it.
+            let subgraph_fallback_memo = std::cell::Cell::new(None);
+
+            let intermediate_scratch = if must_scan_for_device_placement(
+                exported.host_accessible,
+                exported.device_staging.as_ref(),
+            ) {
+                let scanned = unsafe {
+                    device_mem_info(api_ref, kernel_context, exported.device_staging.as_ref())
+                };
+                // The subgraph fallback wants this very resolution. Seed the
+                // memo so a node that reaches it later reuses this scan
+                // instead of repeating it -- which is what the eager
+                // once-per-`Run` version this replaced effectively did.
+                subgraph_fallback_memo.set(Some(scanned.map(|(mem_info, _)| mem_info)));
+                scanned.and_then(|(mem_info, is_device)| is_device.then_some(mem_info))
+            } else {
                 debug_assert!(
                     unsafe {
                         device_mem_info(api_ref, kernel_context, exported.device_staging.as_ref())
@@ -2580,17 +2614,7 @@ unsafe extern "C" fn compute_execute(
                      its routed intermediates would be placed in host memory"
                 );
                 None
-            } else {
-                unsafe {
-                    device_mem_info(api_ref, kernel_context, exported.device_staging.as_ref())
-                }
-                .and_then(|(mem_info, is_device)| is_device.then_some(mem_info))
             };
-
-            // Memoises the placement fallback for this `Run` (see
-            // `SubgraphFallback`): resolved at most once across all nodes, and
-            // not at all unless some node actually reaches it.
-            let subgraph_fallback_memo = std::cell::Cell::new(None);
 
             if routing.input_sources.len() != exported.entries.len()
                 || routing.output_sinks.len() != exported.entries.len()
@@ -6990,6 +7014,29 @@ mod mem_info_cost {
 
         info.set_host_accessible(true);
         assert!(info.host_accessible);
+    }
+
+    /// The regression test for the defect review caught: a **device** EP that
+    /// declined `host_to_device_copier()` has no staging context, and must
+    /// still scan for device placement.
+    ///
+    /// Keying the shortcut on staging presence -- as the first cut of this
+    /// change did -- classifies exactly this EP as host, so its routed
+    /// subgraph's intermediates get host buffers and its next device kernel
+    /// dereferences a host pointer as device memory.
+    /// `a_device_input_short_circuits_and_reports_itself` shows the scan such
+    /// an EP performs really does report a device input.
+    #[test]
+    fn a_device_ep_that_declined_staging_still_scans_for_placement() {
+        assert!(
+            must_scan_for_device_placement(false, None),
+            "a device EP without a copier must not be mistaken for a host EP"
+        );
+        // ...and staging presence must not sway the decision either way.
+        let staging = staging_with_recon(RECON, true);
+        assert!(must_scan_for_device_placement(false, Some(&staging)));
+        assert!(!must_scan_for_device_placement(true, Some(&staging)));
+        assert!(!must_scan_for_device_placement(true, None));
     }
 
     /// The two stock `DeviceSupport` recipes must keep disagreeing about
