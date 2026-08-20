@@ -1177,7 +1177,10 @@ impl CudaRuntime {
             }
             drained
         };
-        let mut classes = self.raw_pool_classes.lock().unwrap_or_else(|e| e.into_inner());
+        let mut classes = self
+            .raw_pool_classes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for ptr in drained {
             classes.remove(&ptr);
             // SAFETY: every pooled block came from `malloc_sync` on this
@@ -1642,7 +1645,10 @@ mod tests {
                 class >= bytes,
                 "class {class} is smaller than the {bytes}-byte request it must satisfy"
             );
-            assert!(class >= 512, "class {class} is below the minimum block size");
+            assert!(
+                class >= 512,
+                "class {class} is below the minimum block size"
+            );
         }
         // Monotonic, so a larger request can never land in a smaller class and
         // pick up a block that does not fit it.

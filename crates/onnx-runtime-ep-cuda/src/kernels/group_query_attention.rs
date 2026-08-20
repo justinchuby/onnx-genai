@@ -3383,8 +3383,7 @@ mod tests {
         let grown_counts = runtime.allocation_counts();
         assert_eq!(grown_counts.allocations, before.allocations + 2);
         assert!(
-            runtime.raw_pool_retained_bytes() == 4096
-                || grown_counts.frees == before.frees + 1,
+            runtime.raw_pool_retained_bytes() == 4096 || grown_counts.frees == before.frees + 1,
             "the 4096-byte block must be released -- retained by the pool or \
              returned to the driver, but not held by the workspace"
         );
@@ -3393,8 +3392,7 @@ mod tests {
         let after = runtime.allocation_counts();
         assert_eq!(after.allocations, before.allocations + 2);
         assert!(
-            runtime.raw_pool_retained_bytes() == 4096 + 8192
-                || after.frees == before.frees + 2,
+            runtime.raw_pool_retained_bytes() == 4096 + 8192 || after.frees == before.frees + 2,
             "dropping the workspace must release the 8192-byte block too"
         );
     }
