@@ -10289,6 +10289,19 @@ mod tests {
     /// `docs/benchmarks/2026-08-20-int4-nibble-i16-negative.md` -- and rejected
     /// on speed, so the asymmetry is a deliberate standing trade, not an
     /// oversight.)
+    ///
+    /// # Scope
+    ///
+    /// The band is measured for the int8-activation route
+    /// (`prepack_int8_weight` -> `int8_matmul`), which is what every x86 host
+    /// takes here: `supports_int4_direct` requires `!has_zero_points` on
+    /// x86_64 and this fixture quantizes asymmetrically, so the result is
+    /// identical across the whole Scalar/AVX2/VNNI ladder. Non-Apple aarch64
+    /// defaults `ONNX_GENAI_CPU_ARM64_INT4_DIRECT` on and can route
+    /// `accuracy_level = 4` to `kai_sdot_matmul_m1`, a different quantisation
+    /// scheme whose error has not been measured against this band -- so the
+    /// test asserts it did *not* take that route rather than silently pinning
+    /// a number it never measured.
     #[test]
     fn accuracy4_int4_decode_error_envelope_is_pinned_against_f64() {
         let _probe = lock_dispatch_probe();
@@ -10314,6 +10327,7 @@ mod tests {
         assert!(magnitude > 1.0, "reference is degenerate: {magnitude}");
 
         let mut errors = Vec::new();
+        let mut reduced_took_kai_sdot = false;
         for accuracy_level in [0i64, 4] {
             let mut kernel = MatMulNBitsKernel {
                 accuracy_level,
@@ -10328,12 +10342,16 @@ mod tests {
                 .map(|z| Owned::u8(&[n, blocks.div_ceil(2)], z))
                 .expect("asymmetric quantize emits zero points");
             let mut y = Owned::zeros_f32(&[1, n]);
+            let kai_before = KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed);
             kernel
                 .execute(
                     &[a.view(), b.view(), scales_t.view(), zp.view()],
                     &mut [y.view_mut()],
                 )
                 .unwrap();
+            if accuracy_level == 4 {
+                reduced_took_kai_sdot = KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed) > kai_before;
+            }
             let error = y
                 .to_f32()
                 .iter()
@@ -10344,6 +10362,14 @@ mod tests {
             errors.push(error);
         }
         let (exact, reduced) = (errors[0], errors[1]);
+        assert!(
+            !reduced_took_kai_sdot,
+            "the pinned band below was measured for the int8-activation route \
+             (prepack_int8_weight -> int8_matmul); this host dispatched \
+             accuracy_level 4 to the aarch64 kai_sdot direct route instead, \
+             which is a different quantisation scheme and needs its own \
+             measurement before it can share this pin (measured {reduced:e})",
+        );
         assert!(
             exact < 1e-5,
             "accuracy_level 0 promises exact fp32 activations; relative error \

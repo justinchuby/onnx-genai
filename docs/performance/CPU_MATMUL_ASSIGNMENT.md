@@ -1277,10 +1277,14 @@ sections 10 and 11. Full record:
 
 ### 13. Halving the weight bytes at `accuracy_level = 4` made it slower, not faster (**rejected**)
 
-Section 10's diagnosis was that the int4 `accuracy_level = 4` route wastes its advantage by
+The premise recorded in
+[`docs/benchmarks/2026-08-20-int4-acc4-int8-repack.md`](../benchmarks/2026-08-20-int4-acc4-int8-repack.md)
+(landed with #1590) was that the int4 `accuracy_level = 4` route wastes its advantage by
 repacking 4-bit weights up to int8 before the dot: `prepack_int8_weight` doubles the bytes the
 kernel streams, so a kernel reading the ONNX nibbles directly should stream half as much and win.
-That premise was tested by building the kernel it implies, and it is **false on AVX2**.
+That premise was tested by building the kernel it implies, and it is **false on AVX2**. (Note this
+is a different claim from section 10 above, which concerns the `accuracy_level = 0` prefill pack
+and concluded that pack was *not* bandwidth-bound either.)
 
 **What was built.** A complete packed-nibble int4 x int16 kernel: consumes the 0.5 B/weight ONNX
 blob unchanged (no value repack — the layout is already `[n][k_blocks][blob_size]` and
@@ -1311,9 +1315,15 @@ nibble ~14. The nibble unpack itself (~4 ops) is the *smaller* half of the loss.
 group's i32 partial into one `f32x8` block accumulator — the 8-bit kernel's structure — recovered
 only 1-3 pp and cost bit-exactness, so it was reverted too.
 
-**What is kept.** The kernel is deleted, following the precedent already recorded at
-`borrowed_affine_int4_matmul`'s precision contract, where an aarch64 int8-activation diversion was
-removed rather than gated. What survives is the finding the experiment turned up by accident and
+**What is kept.** The kernel is deleted rather than parked behind a default-off flag. The nearest
+precedent — the aarch64 int8-activation diversion removed at `borrowed_affine_int4_matmul`'s
+precision contract — is only a partial analogy, and worth stating precisely: that one was removed
+because it was *semantically* wrong for its only caller, whereas this kernel is correct and in fact
+more accurate, and is being dropped purely on speed. What carries the decision here is that the
+loss is flat across every footprint tested, so no host or model size argues for keeping it, and a
+flag is not free: it is a second prepack cache and a live dispatch arm to keep correct forever. The
+experiment survives as this branch's first commit if anyone wants it back on AVX-512. What survives
+in tree is the finding the experiment turned up by accident and
 `accuracy4_int4_decode_error_envelope_is_pinned_against_f64` now pins: int4 `accuracy_level = 4`
 quantizes activations to **int8** (4.75e-3 relative error) while 8-bit `accuracy_level = 4`
 quantizes to **int16** — the same attribute selecting routes **9,703x** apart in accuracy. Because

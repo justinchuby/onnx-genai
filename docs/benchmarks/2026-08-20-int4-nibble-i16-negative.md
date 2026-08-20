@@ -116,6 +116,12 @@ Achieved weight-stream throughput (weight bytes / median time) against the
 | llama3_8b_mlp b32 | acc4_nibble | 44.1 | 3.616 | 12.2 | 16.1% |
 | llama3_8b_mlp b32 | acc0 | 29.4 | 2.882 | 10.2 | 13.5% |
 
+(The `MB` column is not defined identically across rows: the nibble arm's 44.1 MB
+is its full working set -- packed values plus the two f32 side tables -- while the
+`acc0` row's 29.4 MB is weight bytes alone. The looseness runs *against* the
+thesis being tested, since it flatters the nibble kernel's GB/s, so no conclusion
+below depends on tightening it.)
+
 (The 102.1% is not an error bar -- it is L3 assistance, and it is the reminder
 that a roofline percentage means nothing until you check whether the denominator
 is the binding constraint. That mistake was made earlier in this workstream and
