@@ -4220,15 +4220,24 @@
       "type": "object"
     },
     "WorkflowOutputRole": {
-      "enum": [
-        "tokens",
-        "text",
-        "image",
-        "audio",
-        "tensor",
-        "event"
-      ],
-      "type": "string"
+      "oneOf": [
+        {
+          "enum": [
+            "tokens",
+            "text",
+            "image",
+            "audio",
+            "tensor",
+            "event"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "video",
+          "description": "A frame sequence. Distinct from `Image` because a consumer has to know\nthe value carries a temporal axis and may be published incrementally.",
+          "type": "string"
+        }
+      ]
     },
     "WorkflowSpec": {
       "additionalProperties": false,
@@ -4523,6 +4532,15 @@
         {
           "additionalProperties": false,
           "properties": {
+            "axis": {
+              "description": "Axis along which the output grows; defaults to the final axis.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "kind": {
               "const": "emit",
               "type": "string"

@@ -1404,6 +1404,7 @@ impl PipelineEngine {
                 valid_length,
                 output,
                 mode,
+                axis,
                 ..
             } => {
                 let emit_started = std::time::Instant::now();
@@ -1457,6 +1458,7 @@ impl PipelineEngine {
                         mode,
                         guards.as_deref(),
                         lengths.as_deref(),
+                        *axis,
                         emit_counts,
                         telemetry,
                         symbols,
@@ -1480,7 +1482,7 @@ impl PipelineEngine {
                         .with_context(|| {
                             format!("workflow emit valid_length '{valid_length}' is invalid")
                         })?;
-                    slice_workflow_prefix(&tensor, length)?
+                    slice_workflow_prefix(&tensor, length, *axis)?
                 } else {
                     tensor
                 };
@@ -1493,7 +1495,7 @@ impl PipelineEngine {
                 telemetry.emitted_elements += emitted.numel() as u64;
                 let validation_contract =
                     if valid_length.is_some() || matches!(mode, WorkflowEmitMode::Append) {
-                        emit_chunk_contract(&output_contract.contract, &emitted)?
+                        emit_chunk_contract(&output_contract.contract, &emitted, *axis)?
                     } else {
                         output_contract.contract.clone()
                     };
@@ -1510,7 +1512,7 @@ impl PipelineEngine {
                     }
                     WorkflowEmitMode::Append => {
                         let appended = if let Some(previous) = values.get(output) {
-                            append_workflow_value(previous, &emitted)?
+                            append_workflow_value(previous, &emitted, append_axis(*axis, &emitted))?
                         } else {
                             emitted
                         };
@@ -3120,31 +3122,34 @@ pub(super) fn compile_aliasable_output_values(
     outputs
 }
 
-fn append_workflow_value(previous: &Value, next: &Value) -> anyhow::Result<Value> {
+fn append_workflow_value(previous: &Value, next: &Value, axis: usize) -> anyhow::Result<Value> {
     if previous.dtype() != next.dtype() || previous.shape().len() != next.shape().len() {
         anyhow::bail!("workflow append emit requires matching dtype and rank");
     }
     let mut shape = previous.shape().to_vec();
-    let Some(last) = shape.last_mut() else {
-        anyhow::bail!("workflow append emit requires rank >= 1");
-    };
-    for (left, right) in previous
-        .shape()
-        .iter()
-        .zip(next.shape())
-        .take(previous.shape().len() - 1)
-    {
-        if left != right {
+    anyhow::ensure!(
+        axis < shape.len(),
+        "workflow append emit axis {axis} exceeds rank {}",
+        shape.len()
+    );
+    for (index, (left, right)) in previous.shape().iter().zip(next.shape()).enumerate() {
+        if index != axis && left != right {
             anyhow::bail!("workflow append emit requires equal non-appended dimensions");
         }
     }
-    let left_width = *last as usize;
-    let right_width = next.shape().last().copied().unwrap_or_default() as usize;
-    let outer = previous.shape()[..previous.shape().len() - 1]
+    // Elements per slice of the appended axis, so a non-final axis interleaves
+    // correctly instead of concatenating the wrong dimension.
+    let inner = shape[axis + 1..]
         .iter()
         .map(|dimension| *dimension as usize)
         .product::<usize>();
-    *last += right_width as i64;
+    let left_width = shape[axis] as usize * inner;
+    let right_width = next.shape()[axis] as usize * inner;
+    let outer = shape[..axis]
+        .iter()
+        .map(|dimension| *dimension as usize)
+        .product::<usize>();
+    shape[axis] += next.shape()[axis];
     let dtype = previous.dtype();
     let element_size = dtype.size_of();
     let left = previous.to_raw_bytes()?;
@@ -3161,38 +3166,59 @@ fn append_workflow_value(previous: &Value, next: &Value) -> anyhow::Result<Value
     Value::from_raw_bytes(data, &shape, dtype).map_err(Into::into)
 }
 
+/// Axis an append emit grows along: the declared one, or the final axis.
+fn append_axis(axis: Option<usize>, value: &Value) -> usize {
+    axis.unwrap_or_else(|| value.shape().len().saturating_sub(1))
+}
+
 fn emit_chunk_contract(
     output: &onnx_genai_metadata::TensorContract,
     emitted: &Value,
+    axis: Option<usize>,
 ) -> anyhow::Result<onnx_genai_metadata::TensorContract> {
     let mut contract = output.clone();
     if let Some(shape) = &mut contract.shape {
-        let dimension = shape
-            .last_mut()
-            .context("workflow prefix/append emit requires output rank >= 1")?;
-        *dimension = TensorDimension::Fixed(
-            *emitted
-                .shape()
-                .last()
-                .context("workflow prefix/append emit requires value rank >= 1")?,
+        let index = axis.unwrap_or(shape.len().saturating_sub(1));
+        anyhow::ensure!(
+            index < shape.len() && index < emitted.shape().len(),
+            "workflow prefix/append emit axis {index} exceeds the value rank"
         );
+        shape[index] = TensorDimension::Fixed(emitted.shape()[index]);
     }
     Ok(contract)
 }
 
-fn slice_workflow_prefix(value: &Value, valid_length: usize) -> anyhow::Result<Value> {
+fn slice_workflow_prefix(
+    value: &Value,
+    valid_length: usize,
+    axis: Option<usize>,
+) -> anyhow::Result<Value> {
     let mut shape = value.shape().to_vec();
     let rank = shape.len();
-    let width = shape
-        .last()
-        .context("workflow emit valid_length requires a value with rank >= 1")?;
-    let available = usize::try_from(*width).context("workflow emit has a negative final axis")?;
+    anyhow::ensure!(
+        rank >= 1,
+        "workflow emit valid_length requires a value with rank >= 1"
+    );
+    let index = axis.unwrap_or(rank - 1);
+    anyhow::ensure!(
+        index < rank,
+        "workflow emit valid_length axis {index} exceeds rank {rank}"
+    );
+    let available =
+        usize::try_from(shape[index]).context("workflow emit has a negative growth axis")?;
     if valid_length > available {
         anyhow::bail!(
-            "workflow emit valid_length {valid_length} exceeds final-axis extent {available}"
+            "workflow emit valid_length {valid_length} exceeds growth-axis extent {available}"
         );
     }
-    let outer = shape[..rank - 1]
+    let inner = shape[index + 1..]
+        .iter()
+        .map(|dimension| usize::try_from(*dimension))
+        .collect::<Result<Vec<_>, _>>()
+        .context("workflow emit has a negative dimension")?
+        .into_iter()
+        .product::<usize>();
+    let outer = shape[..index]
         .iter()
         .map(|dimension| usize::try_from(*dimension))
         .collect::<Result<Vec<_>, _>>()
@@ -3202,13 +3228,14 @@ fn slice_workflow_prefix(value: &Value, valid_length: usize) -> anyhow::Result<V
     let dtype = value.dtype();
     let element_size = dtype.size_of();
     let source = value.to_raw_bytes()?;
-    let mut data = Vec::with_capacity(outer * valid_length * element_size);
+    let kept = valid_length * inner;
+    let stride = available * inner;
+    let mut data = Vec::with_capacity(outer * kept * element_size);
     for row in 0..outer {
-        let start = row * available * element_size;
-        data.extend_from_slice(&source[start..start + valid_length * element_size]);
+        let start = row * stride * element_size;
+        data.extend_from_slice(&source[start..start + kept * element_size]);
     }
-    shape[rank - 1] =
-        i64::try_from(valid_length).context("workflow emit valid_length exceeds i64")?;
+    shape[index] = i64::try_from(valid_length).context("workflow emit valid_length exceeds i64")?;
     Value::from_raw_bytes(data, &shape, dtype).map_err(Into::into)
 }
 
@@ -3222,6 +3249,7 @@ fn emit_workflow_rows(
     mode: &WorkflowEmitMode,
     guards: Option<&[bool]>,
     lengths: Option<&[usize]>,
+    axis: Option<usize>,
     emit_counts: &mut HashMap<String, usize>,
     telemetry: &mut WorkflowRunTelemetry,
     symbols: &HashMap<String, i64>,
@@ -3249,9 +3277,9 @@ fn emit_workflow_rows(
             continue;
         }
         let length = lengths.map(|values| values[if values.len() == 1 { 0 } else { row }]);
-        let emitted = slice_workflow_row(tensor, row, length)?;
+        let emitted = slice_workflow_row(tensor, row, length, axis)?;
         let validation_contract = if length.is_some() || matches!(mode, WorkflowEmitMode::Append) {
-            emit_chunk_contract(output_contract, &emitted)?
+            emit_chunk_contract(output_contract, &emitted, axis)?
         } else {
             output_contract.clone()
         };
@@ -3285,7 +3313,7 @@ fn emit_workflow_rows(
             }
             WorkflowEmitMode::Append => {
                 let appended = if let Some(previous) = values.get(&row_output) {
-                    append_workflow_value(previous, &emitted)?
+                    append_workflow_value(previous, &emitted, append_axis(axis, &emitted))?
                 } else {
                     emitted
                 };
@@ -3320,6 +3348,7 @@ fn slice_workflow_row(
     value: &Value,
     row: usize,
     valid_length: Option<usize>,
+    axis: Option<usize>,
 ) -> anyhow::Result<Value> {
     let mut shape = value.shape().to_vec();
     let rows = usize::try_from(
@@ -3342,7 +3371,7 @@ fn slice_workflow_row(
         value.dtype(),
     )?;
     match valid_length {
-        Some(length) => slice_workflow_prefix(&row_value, length),
+        Some(length) => slice_workflow_prefix(&row_value, length, axis),
         None => Ok(row_value),
     }
 }
@@ -3652,6 +3681,7 @@ mod workflow_scalar_tests {
             &WorkflowEmitMode::Replace,
             Some(&[true, false][..]),
             Some(&[2, 1][..]),
+            None,
             &mut counts,
             &mut telemetry,
             &HashMap::new(),
@@ -3687,6 +3717,7 @@ mod workflow_scalar_tests {
             &WorkflowEmitMode::Replace,
             None,
             Some(&[2][..]),
+            None,
             &mut counts,
             &mut telemetry,
             &HashMap::new(),
@@ -3713,6 +3744,7 @@ mod workflow_scalar_tests {
             &contract,
             &WorkflowEmitMode::Replace,
             Some(&[true][..]),
+            None,
             None,
             &mut HashMap::new(),
             &mut WorkflowRunTelemetry::default(),
@@ -3741,6 +3773,7 @@ mod workflow_scalar_tests {
             &WorkflowEmitMode::Append,
             Some(&[true, true]),
             Some(&[1, 1]),
+            None,
             &mut HashMap::new(),
             &mut telemetry,
             &HashMap::new(),
@@ -3775,6 +3808,7 @@ mod workflow_scalar_tests {
             &WorkflowEmitMode::Append,
             Some(&[true]),
             Some(&[0]),
+            None,
             &mut HashMap::new(),
             &mut telemetry,
             &HashMap::new(),
@@ -3885,7 +3919,7 @@ service_group: decoder_cache
             &half_contract,
         )
         .expect("half literal");
-        let appended = append_workflow_value(&left, &right).expect("half append");
+        let appended = append_workflow_value(&left, &right, 0).expect("half append");
         assert_eq!(appended.dtype(), DataType::Float16);
         assert_eq!(appended.shape(), &[4]);
     }
@@ -3913,5 +3947,36 @@ service_group: decoder_cache
             panic!("element count must be checked against the contract");
         };
         assert!(error.to_string().contains("elements"), "{error}");
+    }
+
+    #[test]
+    fn append_interleaves_along_a_non_final_axis() {
+        // Video frames grow along axis 2 of [batch, channels, frames, height],
+        // so appending must interleave per (batch, channel) slice instead of
+        // concatenating at the end of the buffer like a token sequence does.
+        let previous =
+            Value::from_slice_i64(&[1, 2, 3, 4], &[1, 2, 1, 2]).expect("published frames");
+        let next = Value::from_slice_i64(&[5, 6, 7, 8], &[1, 2, 1, 2]).expect("next chunk");
+
+        let appended = append_workflow_value(&previous, &next, 2).expect("temporal append");
+
+        assert_eq!(appended.shape(), &[1, 2, 2, 2]);
+        assert_eq!(
+            appended.to_vec_i64().expect("appended frames"),
+            // channel 0 keeps [1, 2] then [5, 6]; channel 1 keeps [3, 4] then [7, 8]
+            [1, 2, 5, 6, 3, 4, 7, 8]
+        );
+
+        let last_axis = append_workflow_value(&previous, &next, 3).expect("trailing append");
+        assert_eq!(last_axis.shape(), &[1, 2, 1, 4]);
+        assert_eq!(
+            last_axis.to_vec_i64().expect("appended row"),
+            [1, 2, 5, 6, 3, 4, 7, 8]
+        );
+
+        assert!(
+            append_workflow_value(&previous, &next, 4).is_err(),
+            "axis must be within rank"
+        );
     }
 }

@@ -550,6 +550,9 @@ pub enum WorkflowOutputRole {
     Tokens,
     Text,
     Image,
+    /// A frame sequence. Distinct from `Image` because a consumer has to know
+    /// the value carries a temporal axis and may be published incrementally.
+    Video,
     Audio,
     Tensor,
     Event,
@@ -715,6 +718,9 @@ pub enum WorkflowStep {
         valid_length: Option<String>,
         output: String,
         mode: WorkflowEmitMode,
+        /// Axis along which the output grows; defaults to the final axis.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        axis: Option<usize>,
     },
 }
 
@@ -769,10 +775,17 @@ pub enum WorkflowNode {
         /// Optional scalar or rank-one boolean guard. False rows are suppressed.
         when: Option<String>,
         /// Optional scalar or rank-one integer SSA value limiting the emitted prefix
-        /// on the value's final axis, globally or per batch row.
+        /// on the value's growth axis, globally or per batch row.
         valid_length: Option<String>,
         output: String,
         mode: WorkflowEmitMode,
+        /// Axis along which an appended or length-limited output grows.
+        ///
+        /// Defaults to the final axis, which is where a token sequence grows. A
+        /// value whose sequence axis sits elsewhere - video frames in
+        /// `[batch, channels, frames, height, width]`, for instance - names it
+        /// here so incremental publication does not concatenate the wrong axis.
+        axis: Option<usize>,
         effect_name: String,
         effect: EffectTransition,
     },
