@@ -210,6 +210,23 @@ jobs:
           run_miri "onnx-runtime-ep-plugin kernel context" \
             cargo +nightly miri test --locked -p onnx-runtime-ep-plugin --lib kernel_ctx::
 
+          # `host_pool` hands ORT the address of a live Rust allocation and
+          # lets ORT read through it for the length of the compute call, while
+          # this side keeps owning and moving that allocation. That is exactly
+          # the shape Stacked Borrows exists to check, and it was wrong: a
+          # `Box` there asserts uniqueness on every move, ORT's first read
+          # through the alias invalidates the assertion, and the next move --
+          # `Option::take` in `Guard::drop` -- retags from a tag that no longer
+          # exists. Present since the module was written, on both sides of
+          # #1526, and no native run can observe it.
+          #
+          # Two tests in the module assert on wall clock (`PROBE_STALL`) and
+          # are `#[cfg_attr(miri, ignore)]`d: the interpreter is ~1000x slower
+          # than native, so the claim is not one Miri can represent. Everything
+          # that touches the pointer runs.
+          run_miri "onnx-runtime-ep-plugin host pool" \
+            cargo +nightly miri test --locked -p onnx-runtime-ep-plugin --lib host_pool::
+
           run_miri "onnx-runtime-session tensor" \
             env MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test --locked -p onnx-runtime-session --lib tensor::tests
           run_miri "onnx-runtime-session sequence" \
