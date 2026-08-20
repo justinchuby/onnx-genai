@@ -181,7 +181,7 @@ Vulkan 后端就存在只注册 `Conversion` 而不注册 `Buffer` 的 dtype(bf1
 `ONNX_GENAI_EP=cubecl-webgpu` 下,设备缺 `shader-f16` 与 EP 未实现某 dtype 是两条
 不同的拒绝消息,便于区分是硬件限制还是功能缺口。
 
-## MatMul 有两个 kernel
+## MatMul 有三个 kernel
 
 `matmul_tiled` 每个 thread 算一个输出元素,内层是两次 shared 读换一次 FMA——
 算术强度 0.5,瓶颈在 shared memory 而不是 ALU。在足够大的形状上实测只有
@@ -202,6 +202,31 @@ Vulkan 后端就存在只注册 `Conversion` 而不注册 `Buffer` 的 dtype(bf1
 **实测这一项没有可测量收益**(比值 2.04 → 2.06,落在噪声里),留着是因为它不
 慢且在更大 tile 下理论有利,不是因为量到了收益。别把它当成已验证的优化去
 推广。
+
+### `matmul_regtiled_vec4`:第三条路
+
+分块结构和 `matmul_regtiled` 完全一样,只有对全局内存的 A/B 读和 Y 写换成了
+`Vector<F, Const<4>>`,一次搬 16 字节。shared 里的布局、内层循环、累加寄存
+器都没动。
+
+`use_regtile_vec4()` 在 `use_regtile()` 之上再要求 **`K % 4 == 0 && N % 4 == 0`**。
+这个条件不是保守起见加的,它撑起两件事:
+
+1. 按 `/4` 索引是安全的。`lhs_base = batch*m*k`、`gr*k`、`gc` 三项在
+   `K % 4 == 0` 下各自都是 4 的倍数,和自然也是。rhs/out 侧同理靠 `N % 4 == 0`。
+2. `gc + 3 < k` 与 `gc < k` 等价,所以边界 zero-pad 的语义和标量版逐字相同。
+   `gc` 恒为 4 的倍数(`k_base = t*BK` 且 BK=8,加上 `c4*4`)。
+
+不满足对齐时回退标量 regtile,再不满足回退 `matmul_tiled`。三条路算的是同一
+个函数,所以同样需要下面那节的成对测试。
+
+实测把 `xl_gemm/f32` 的 cubecl:official 比值从 1.77x 压到 **1.55x**,纯 kernel
+吞吐 730 → 930 GFLOP/s。
+
+**顺带否定了一个假设**:vec4 之前 `huge_gemm`(1.84x)比 `xl_gemm`(1.77x)差,
+曾猜是 huge 只有 32 个 cube 填不满 40 核。vec4 之后两者收敛到 1.54/1.55,而
+vec4 根本没碰 cube 数——所以那个差是访存效率,不是占用率。按错误假设去做两
+级 tiling 会白花几天。
 
 ### 为什么小形状不走 regtiled
 
@@ -344,7 +369,11 @@ plugin,逐 cell 做 CPU EP 参考对拍,并从 ORT profile 读回节点的实际
 - **形状放大到 GFLOP 量级后,差距换了一个来源。** 比值随工作量单调上升
   (1.64 → 2.56 → 3.34),用增量法消掉固定开销后得到纯 kernel 吞吐:CubeCL
   391 GFLOP/s vs 官方 1400 GFLOP/s。**真正的瓶颈是 GEMM 实现本身。**
-  `matmul_regtiled` 把这个比值压到 **1.77x**,仍未超过官方。
+  `matmul_regtiled` + vec4 把这个比值压到 **1.55x**(纯 kernel 930 GFLOP/s),
+  累计提速 2.2x,**但仍未超过官方**。
+- **这 1.55x 大概率是当前算法的天花板。** double buffering 被 16 KiB shared
+  上限挡死(BK=16 时正好顶满),全局访存已是 vec4。要再进一步得换算法层级
+  (subgroup / cooperative matrix),不是调分块常量能拿到的。
 - **绝对微秒数不可跨运行比较。** 官方 arm 代码不变,同一天中位数从 6441us
   漂到 8807us。只有同一次运行内的 cubecl:official 比值可用。
 - **f16 MatMul 精度优于官方**:我们与 ORT CPU 参考逐元素相等(`max_abs = 0`),
