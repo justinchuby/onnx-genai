@@ -6145,18 +6145,45 @@ fn use_f16_symmetric_splitk(
         .saturating_mul(F16_SYMMETRIC_SPLITK_TARGET_WARPS_PER_SM)
 }
 
-/// Occupancy gate for the ASYMMETRIC (zero-point) block-32 `scales_f16` split-K
-/// int4 decode GEMV. Split-K (`K_SPLIT=2` warps cooperating per output column)
-/// exists only to fill idle SMs on grid-STARVED projections; it costs a
-/// shared-mem cross-warp reduction plus a per-split activation re-read, so it is
-/// a net loss once the single-warp launch (`ceil(N/8)` CTAs) already saturates
-/// the device. The symmetric path already gates on this (`n < SMs * target`);
-/// the asymmetric path historically did not, so wide-N asymmetric projections
-/// (27B-class hybrid gate_up/o/kv, N~5k-17k) wrongly took split-K. This restores
-/// symmetry: keep split-K only when grid-starved, else fall to the byte-identical
-/// single-warp pipe entry. Keys only on N and the live SM count.
+/// Gate for the ASYMMETRIC (zero-point) block-32 `scales_f16` split-K int4
+/// decode GEMV, where `K_SPLIT=2` warps cooperate on each output column.
+///
+/// Split-K pays off for two independent reasons, and this gate covers both.
+///
+/// The first is occupancy: on a grid-STARVED projection the `K_SPLIT=2` fan-out
+/// doubles the grid and fills idle SMs. That is the only reason this gate used
+/// to recognise, mirroring the symmetric path (`n < SMs * target`), on the
+/// argument that split-K must be a net loss once `ceil(N/8)` single-warp CTAs
+/// already fill the device many waves over — so wide-N projections were routed
+/// to the single-warp pipe entry instead.
+///
+/// Measurement does not support that argument. Batch-1 decode of a 26B int4
+/// model (K = 6656 and 19968, N = 5k-20k) on a 108-SM A100-SXM4-80GB is
+/// **faster** with split-K even though its grid is saturated many waves over:
+/// marginal kernel time 48.30 -> 45.90 ms/token (-5.0%) and 4120 -> 3494 kernel
+/// launches/token (-15%), nsys-measured with `--cuda-graph-trace=node` over a
+/// 32-vs-96-token difference, agreeing in direction with wall clock (27.4 ->
+/// 28.5 tok/s over paired runs).
+///
+/// The reason is the second one: a batch-1 decode GEMV is bound by weight
+/// bandwidth, not by the grid. Splitting K halves each column's serial load
+/// chain and so doubles the memory-level parallelism per output column, which
+/// matters precisely when K is large. The occupancy argument prices the cost
+/// (a shared-mem cross-warp reduction plus a per-split activation re-read) but
+/// never priced this benefit; on these shapes the benefit is larger.
+///
+/// So: grid-starved OR large-K. The K threshold is set at the low end of what
+/// has actually been measured rather than extrapolated downwards -- below it the
+/// original occupancy-only rule stands, because no measurement contradicts it
+/// there.
+///
+/// The split changes the reduction ORDER, so results are not bit-identical to
+/// the single-warp pipe entry. That is acceptable for a bf16/fp16 decode path
+/// and was checked end to end: 96 greedy tokens of the 26B model are unchanged.
+///
+/// Keys only on K, N and the live SM count -- no model constants.
 /// `ONNX_GENAI_SCALES_F16_ZP_SPLITK=0|1` forces off/on for A/B measurement.
-fn use_scales_f16_zp_splitk_gate(n: usize, multiprocessor_count: u32) -> bool {
+fn use_scales_f16_zp_splitk_gate(k: usize, n: usize, multiprocessor_count: u32) -> bool {
     match std::env::var("ONNX_GENAI_SCALES_F16_ZP_SPLITK")
         .ok()
         .as_deref()
@@ -6165,9 +6192,18 @@ fn use_scales_f16_zp_splitk_gate(n: usize, multiprocessor_count: u32) -> bool {
         Some("0") | Some("false") | Some("off") => return false,
         _ => {}
     }
-    n < (multiprocessor_count.max(1) as usize)
-        .saturating_mul(F16_SYMMETRIC_SPLITK_TARGET_WARPS_PER_SM)
+    let grid_starved = n
+        < (multiprocessor_count.max(1) as usize)
+            .saturating_mul(F16_SYMMETRIC_SPLITK_TARGET_WARPS_PER_SM);
+    grid_starved || k >= ZP_SPLITK_BANDWIDTH_MIN_K
 }
+
+/// Smallest K at which split-K has been measured to win on a saturated grid.
+///
+/// 6656 is the narrower of the two reduction depths in the 26B measurement
+/// above; 19968 is the other. Nothing below this has been measured, so the
+/// threshold sits on the evidence rather than beneath it.
+const ZP_SPLITK_BANDWIDTH_MIN_K: usize = 6656;
 
 /// Warps-per-CTA (one warp reduces one output column) for the accuracy_level=4
 /// blockwise GEMV, chosen so the `ceil(N / warps)` grid fills the device. The
@@ -9478,17 +9514,13 @@ impl MatMulNBitsKernel {
             // Split-K needs >= K_SPLIT warps/block; the small-shape path uses only
             // 64 threads (2 warps), so restrict to the 256-thread large path.
             && !(self.n <= GEMV_F16_SMALL_N_MAX && self.k <= GEMV_F16_SMALL_N_MAX)
-            // Occupancy gate (mirrors the symmetric split-K path): split-K only
-            // helps when the single-warp launch is grid-STARVED. Its K_SPLIT=2
-            // fan-out doubles the grid to fill idle SMs, but it pays a shared-mem
-            // cross-warp reduction and re-reads the activation per split — a net
-            // LOSS once `ceil(N/8)` single-warp CTAs already fill the device many
-            // waves over. Large-N asymmetric projections (e.g. gate_up N~17k, o/kv
-            // N~5-12k on 27B-class hybrids) are already saturated, so route them to
-            // the byte-identical single-warp pipe entry instead. Keys only on N and
-            // the live SM count — no model constants; `ONNX_GENAI_SCALES_F16_ZP_SPLITK`
-            // forces off/on for A/B.
-            && use_scales_f16_zp_splitk_gate(self.n, capabilities.multiprocessor_count());
+            // Split-K helps for two independent reasons; this gate covers both.
+            // See [`use_scales_f16_zp_splitk_gate`].
+            && use_scales_f16_zp_splitk_gate(
+                self.k,
+                self.n,
+                capabilities.multiprocessor_count(),
+            );
         let use_scales_f16_symmetric_splitk = self.block_size == 32
             && scales_fp16
             && zero_points.is_none()
@@ -14100,6 +14132,47 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         // Degenerate inputs must not divide by zero.
         assert!(scales_f16_pipe_well_occupied(1_000_000, 0, 1));
         assert!(!scales_f16_pipe_well_occupied(1, 8, 0));
+    }
+
+    #[test]
+    /// The asymmetric block-32 split-K gate recognises two separate reasons to
+    /// split, so a saturated grid alone no longer vetoes it.
+    ///
+    /// The wide-N/large-K case is the one that regressed real decode: an
+    /// occupancy-only rule sent a 26B model's N~5k-20k, K=6656/19968 projections
+    /// to the single-warp pipe entry, which measured 5% slower in kernel time
+    /// and issued 15% more launches per token than split-K on a 108-SM A100.
+    #[test]
+    fn asymmetric_splitk_gate_splits_for_bandwidth_as_well_as_for_occupancy() {
+        let a100 = 108u32;
+        let starved_n = 8; // far below SMs * 16
+        let saturated_n = 19968;
+
+        assert!(
+            use_scales_f16_zp_splitk_gate(512, starved_n, a100),
+            "a grid-starved projection must still split to fill idle SMs, \
+             whatever K is"
+        );
+        assert!(
+            use_scales_f16_zp_splitk_gate(6656, saturated_n, a100),
+            "a saturated grid must still split when K is deep enough for the \
+             halved load chain to pay for the extra reduction"
+        );
+        assert!(
+            !use_scales_f16_zp_splitk_gate(512, saturated_n, a100),
+            "a saturated grid with a shallow K keeps the occupancy-only rule, \
+             which nothing has measured against"
+        );
+        assert!(
+            use_scales_f16_zp_splitk_gate(ZP_SPLITK_BANDWIDTH_MIN_K, saturated_n, a100)
+                && !use_scales_f16_zp_splitk_gate(
+                    ZP_SPLITK_BANDWIDTH_MIN_K - 1,
+                    saturated_n,
+                    a100
+                ),
+            "the K threshold is inclusive at the measured depth and does not \
+             extrapolate below it"
+        );
     }
 
     #[test]
@@ -18719,10 +18792,13 @@ extern "C" __global__ void ref_silu_mul_f16(
             return;
         };
 
-        // Shaped to select `matmul_nbits_gemv_f16_scales_f16_zp_splitk`: block 32,
-        // fp16-family scales, per-block zero points, K a multiple of 256, and
-        // both dimensions past the small-shape (64-thread) path.
-        let k = 2048usize;
+        // Shaped to select `matmul_nbits_gemv_f16_scales_f16_zp_splitk`: block
+        // 32, fp16-family scales, per-block zero points, K a multiple of 256,
+        // and both dimensions past the small-shape (64-thread) path. K is at
+        // the gate's measured split-K depth (see `ZP_SPLITK_BANDWIDTH_MIN_K`)
+        // so the routing this test exists to cover is actually taken; the
+        // counter assertion below fails loudly if that ever stops being true.
+        let k = ZP_SPLITK_BANDWIDTH_MIN_K;
         let n = 2048usize;
         let block_size = 32usize;
         let k_blocks = k / block_size;
