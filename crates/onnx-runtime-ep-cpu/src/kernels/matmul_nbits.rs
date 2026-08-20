@@ -19487,9 +19487,11 @@ mod tests {
         }
     }
 
-    /// A 16-element block cannot enter either column-blocked kernel, so raising
-    /// its crossover would drop it from the GEBP prefill straight to a scalar
-    /// per-block dot on the narrow decode pool rather than to a better kernel.
+    /// A 16-element block cannot enter either column-blocked kernel, so below
+    /// its crossover it falls to a scalar per-block dot on the narrow decode
+    /// pool rather than to a rival kernel. That is why its threshold is the
+    /// lowest of the three rather than, as the name once implied, a
+    /// conservative one.
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn int4_prefill_gebp_crossover_holds_for_blocks_the_row_kernels_reject() {
@@ -19512,9 +19514,8 @@ mod tests {
         // before `with_decode_pool` on the global pool. Dropping this to 1 is a
         // decode routing change and needs a decode-loop measurement, not the
         // prefill sweep that set the value.
-        assert!(
-            INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED >= 2,
-            "m == 1 is decode; re-pointing it needs its own measurement"
-        );
+        const {
+            assert!(INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED >= 2);
+        }
     }
 }
