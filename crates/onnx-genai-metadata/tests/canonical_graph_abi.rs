@@ -184,6 +184,36 @@ fn the_decoder_is_recognized_by_structure_not_by_component_name() {
     }
 }
 
+/// The import-only compatibility path stays readable, and stays labelled.
+///
+/// A package produced by the legacy `genai_config.json` importer carries a
+/// `model.io` block and no workflow. It must still resolve — dropping it would
+/// break every already-imported package — but it must resolve through the same
+/// call and announce that it came from the deprecated block, because "the port
+/// this names is wrong" and "the role you declared is wrong" are different
+/// fixes.
+#[test]
+fn a_legacy_bare_package_resolves_through_the_same_call_and_says_it_is_legacy() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/tiny-llm/inference_metadata.yaml");
+    let metadata = load_metadata(&path).expect("legacy package parses");
+    validate_metadata(&metadata).expect("legacy package validates");
+
+    assert!(
+        metadata.pipeline.is_none(),
+        "the legacy fixture must carry no workflow, or it would be rejected"
+    );
+    let io = metadata
+        .decoder_io()
+        .expect("the legacy block resolves through the same call");
+    assert!(
+        metadata.decoder_io_is_legacy(),
+        "a resolved ABI with no workflow must be reported as legacy"
+    );
+    assert_eq!(io.token_input.as_deref(), Some("input_ids"));
+    assert_eq!(io.logits_output.as_deref(), Some("logits"));
+}
+
 /// A component's declared roles name ports the component actually has.
 ///
 /// A role is only worth trusting if it points at a real port; a role naming a
