@@ -279,11 +279,23 @@ impl NativeComponentSession {
 /// nothing else creates.
 ///
 /// Failure is fatal rather than a warning, which is a deliberate reversal of
-/// what this code did before. Neither way it can fail is survivable: an
-/// authority mismatch (`provider.rs:3234`) is a misconfiguration, and a refused
-/// residency budget (`provider.rs:3266`) means `mapped_allowance` is never set,
-/// so the very first page-in dies at `weight_paging.rs:3632` instead. Warning
-/// and continuing only moved that failure later and made it harder to read.
+/// what this code did before. The reason is the accounting contract, not that
+/// the session is always mechanically dead afterwards: a session whose device
+/// pool the ledger does not know about makes every other holder's admission
+/// decision wrong, because the governor keeps sizing ceilings from a
+/// `measured_free` that already excludes bytes nobody told it about. That is
+/// the single-governor invariant this module exists to hold, so it is not
+/// something to log and continue past.
+///
+/// It is often also mechanically fatal, and on the path that matters most it
+/// certainly is: an authority mismatch (`provider.rs:3234`) is a
+/// misconfiguration, and a refused residency budget (`provider.rs:3266`) leaves
+/// physical VMM weight paging with no `mapped_allowance`, so its first page-in
+/// dies at `weight_paging.rs:3632`. But the non-physical branch
+/// (`weight_paging.rs:2985`) only takes an ordinary lease, and the non-VMM
+/// upload paths would have limped on ungoverned -- which is the outcome being
+/// rejected here, not an argument for tolerating it.
+///
 /// A provider with nothing to adopt is not an error -- it honestly reports
 /// `Ok(0)`, as CPU and plugin EPs do through the trait default.
 pub(crate) fn adopt_governor(
