@@ -3676,9 +3676,26 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
 
         provider
             .deallocate(first)
-            .expect("deallocation synchronizes before pooled return");
+            .expect("the pooled return is ordered behind the delayed writer");
+        // `deallocate` enqueues; it does not free. The physical handle only
+        // returns to the pool once the queue's completion events on both
+        // streams have fired, which is also what makes the delayed kernel's
+        // write below observable through the reused mapping. Reading
+        // `pool_hits` -- or allocating again and expecting a hit -- before the
+        // queue settles reads the pool one step too early.
+        assert!(
+            provider
+                .release_queue()
+                .wait_until_idle(std::time::Duration::from_secs(30)),
+            "the deferred release queue must drain before the pool can hand the handle back: {:?}",
+            provider.deferred_release_stats()
+        );
         let second = provider.allocate(4, 256).expect("reused allocation");
-        assert_eq!(stats.snapshot().pool_hits, 1);
+        assert_eq!(
+            stats.snapshot().pool_hits,
+            1,
+            "the drained release must have returned its handle to the pool"
+        );
         let mut value = [0_u8; 4];
         unsafe { runtime.dtoh(&mut value, cuptr(second.as_ptr())) }.expect("read reused mapping");
         assert_eq!(u32::from_ne_bytes(value), 0x736);

@@ -143,13 +143,24 @@ impl DeviceAllocator for StrictSizes {
         let ptr = self.inner.allocate(bytes, align)?;
         self.live
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(ptr.as_ptr() as usize, bytes);
         Ok(ptr)
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, align: usize) {
-        match self.live.lock().unwrap().remove(&(ptr.as_ptr() as usize)) {
+        // Poison-tolerant on purpose. This runs on the deferred-release worker
+        // thread. If the test thread ever panics while holding this lock, an
+        // `unwrap()` here turns that into a *second* panic on an unrelated
+        // thread, and the worker's backtrace then reads like an independent
+        // release-path defect when it is only a cascade of the first failure.
+        // That is precisely how the first hardware run's log was misread.
+        match self
+            .live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&(ptr.as_ptr() as usize))
+        {
             Some(allocated) if allocated == bytes => {}
             Some(allocated) => {
                 self.mismatches.fetch_add(1, Ordering::Relaxed);
@@ -167,6 +178,28 @@ impl DeviceAllocator for StrictSizes {
     fn device(&self) -> DeviceKey {
         self.inner.device()
     }
+}
+
+/// Block until every deferred device release has terminally completed.
+///
+/// `deallocate` no longer frees anything by the time it returns: it enqueues
+/// the release behind completion events on both streams and answers `Ok(0)`,
+/// which its own doc comment calls the truthful answer. An assertion that reads
+/// an allocator-side counter therefore has to *observe the queue* rather than
+/// assume the free already happened -- exactly what the in-crate test at
+/// `provider.rs` (search "the deferred release queue must drain") does.
+///
+/// This waits; it does not sleep. A drain that times out fails loudly, so a
+/// release that never runs still turns the calling test red rather than being
+/// papered over.
+fn drain_releases(provider: &onnx_runtime_ep_cuda::provider::CudaExecutionProvider, what: &str) {
+    assert!(
+        provider
+            .release_queue()
+            .wait_until_idle(std::time::Duration::from_secs(30)),
+        "the deferred release queue must drain before {what} is asserted: {:?}",
+        provider.deferred_release_stats()
+    );
 }
 
 fn require_provider(what: &str) -> onnx_runtime_ep_cuda::provider::CudaExecutionProvider {
@@ -301,6 +334,11 @@ fn an_injected_external_eager_allocator_replaces_the_built_in_arena() {
         );
     }
     provider.deallocate(buffer).expect("free via the injection");
+    // The release is queued behind both stream tails, so the counter below is
+    // read *after* the queue has terminally settled. Nothing here weakens the
+    // assertion: a release routed anywhere other than the injected allocator
+    // leaves `frees()` at zero no matter how long the drain waits.
+    drain_releases(&provider, "the injected allocator's free count");
     assert_eq!(
         injected.frees(),
         1,
@@ -419,6 +457,9 @@ fn a_zero_byte_allocation_is_freed_with_the_size_it_was_allocated_with() {
         .allocate(0, 256)
         .expect("a zero-byte buffer must still be allocatable");
     provider.deallocate(buffer).expect("and freeable");
+    // Same reason as the injection test above: the free is stream-ordered, so
+    // the bookkeeping below is read only after the queue has settled.
+    drain_releases(&provider, "the strict allocator's size bookkeeping");
 
     assert_eq!(
         strict.mismatches.load(Ordering::Relaxed),
@@ -430,5 +471,14 @@ fn a_zero_byte_allocation_is_freed_with_the_size_it_was_allocated_with() {
         0,
         "a pointer was freed that this allocator never handed out"
     );
-    assert_eq!(strict.live.lock().unwrap().len(), 0, "the buffer leaked");
+    // Read the length out before asserting on it. Asserting on
+    // `lock().unwrap().len()` directly keeps the guard alive inside the
+    // `panic!` that `assert_eq!` expands to, which poisons the mutex on
+    // failure and makes the release worker panic too.
+    let live = strict
+        .live
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .len();
+    assert_eq!(live, 0, "the buffer leaked");
 }

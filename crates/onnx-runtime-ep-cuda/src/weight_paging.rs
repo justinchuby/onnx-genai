@@ -4045,8 +4045,9 @@ impl CudaWeightResidency {
             // reading it. The page's release is now handed to the deferred
             // queue, which records a completion event on each stream and only
             // then unmaps — the same ordering, without stalling the admission
-            // that triggered the eviction. When no queue is installed the
-            // release still runs inline, exactly as it did before.
+            // that triggered the eviction. There is no inline fallback: the
+            // guard above refuses the eviction outright when no queue is
+            // installed, because releasing inline is the race this replaced.
             let evict_start = std::time::Instant::now();
             inner.remove_page_after_stream_sync(evicted_key);
             if !queue.wait_until_idle(DEFERRED_RELEASE_WAIT_TIMEOUT) {
@@ -4929,7 +4930,19 @@ mod tests {
         );
         let authority: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync> =
             governor.clone();
+        // Both of these tests evict, and eviction is refused outright unless a
+        // deferred-release queue is installed (see the guard in
+        // `admit_with_eviction`). Production always installs one --
+        // `CudaExecutionProvider::new_*` builds the queue before the residency
+        // and passes it in -- so a residency built without one is a fixture
+        // that does not model the production object.
         let residency = CudaWeightResidency::new(Arc::clone(&runtime), granule as u64)
+            .with_deferred_release_queue(CudaDeferredReleaseQueue::new(
+                Box::new(crate::deferred_release::CudaStreamFences::new(Arc::clone(
+                    &runtime,
+                ))),
+                crate::deferred_release::DEFAULT_DEFERRED_RELEASE_CAPACITY,
+            ))
             .with_vmm_admission(Arc::clone(&allocator), authority)
             .expect("install VMM admission");
         residency
@@ -5142,7 +5155,16 @@ mod tests {
         );
         let authority: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync> =
             governor.clone();
+        // See the note in the admission test above: the evict→repage cycle this
+        // test exists to exercise is refused without a deferred-release queue,
+        // which production always installs.
         let residency = CudaWeightResidency::new(Arc::clone(&runtime), granule as u64)
+            .with_deferred_release_queue(CudaDeferredReleaseQueue::new(
+                Box::new(crate::deferred_release::CudaStreamFences::new(Arc::clone(
+                    &runtime,
+                ))),
+                crate::deferred_release::DEFAULT_DEFERRED_RELEASE_CAPACITY,
+            ))
             .with_vmm_admission(Arc::clone(&allocator), authority)
             .expect("install VMM admission");
         residency

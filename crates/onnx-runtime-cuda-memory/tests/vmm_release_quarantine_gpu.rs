@@ -248,6 +248,24 @@ fn a_refused_handle_release_refunds_the_mapping_but_not_the_ownership() {
 /// afterwards. Asserting on the return value alone would pass for an
 /// implementation that remapped without restoring access, which reads as a
 /// fault rather than data.
+///
+/// # Why this punches a hole first
+///
+/// `unmap_runs_transactional` only has something to roll *back* once at least
+/// one run has already been unmapped, so the fault has to land on the second
+/// unmap or later. But the decommit is issued per **run**, not per granule:
+/// `contiguous_runs` (release.rs) deliberately collapses adjacent granules into
+/// one `cuMemUnmap`, "one driver call rather than one per granule". A fresh
+/// 8 MiB out of a fresh 64 MiB arena is contiguous, so decommitting all of it
+/// is exactly *one* unmap and a fault scheduled for the second one never fires.
+///
+/// Failing the *first* unmap instead is not a fix: nothing would have been
+/// unmapped yet, so there is nothing to map back and the rollback path this
+/// test exists for is never entered. Instead the allocation is given a
+/// granule-sized hole in the middle, which makes the decommit below two
+/// non-adjacent runs and therefore two real unmap calls. The premise is then
+/// asserted rather than assumed, so a device whose granularity defeats the
+/// construction fails loudly and says why.
 #[cfg_attr(
     not(feature = "gpu-tests"),
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
@@ -262,30 +280,65 @@ fn a_rolled_back_decommit_leaves_the_buffer_readable() {
     let before = fill_and_read(&context, address, bytes, 0xA5);
     assert!(before.iter().all(|&byte| byte == 0xA5), "baseline fill");
 
-    // Fail the second unmap so the first granule run is already unmapped and
-    // must be mapped back.
-    install_faults(
-        &mut allocator,
-        Arc::new(DriverFaultPlan::new().fail_nth(DriverOperation::Unmap, 2)),
+    // Punch the hole while every granule is still mapped, and before any fault
+    // plan is installed, so this decommit is an ordinary successful one.
+    let committed_whole = allocator.allocation_committed_bytes(pointer, bytes, 4096);
+    assert_eq!(
+        committed_whole, bytes,
+        "premise: the fresh allocation must be fully committed"
     );
+    let hole_offset = bytes / 2;
+    allocator
+        .decommit_allocation_range_outcome(pointer, bytes, hole_offset, 1)
+        .expect("the hole range is valid");
+    let committed_holed = allocator.allocation_committed_bytes(pointer, bytes, 4096);
+    let granule = committed_whole - committed_holed;
+    assert!(
+        granule > 0 && hole_offset + granule < bytes,
+        "premise: decommitting at offset {hole_offset} must drop exactly the granule starting \
+         there and leave committed bytes on both sides of it, or the decommit below is still one \
+         contiguous run and the injected second-unmap fault can never fire (committed \
+         {committed_whole}, then {committed_holed}, of {bytes} B)"
+    );
+
+    // Fail the second unmap. The first run is unmapped by then and must be
+    // mapped back, which is the rollback under test.
+    let plan = Arc::new(DriverFaultPlan::new().fail_nth(DriverOperation::Unmap, 2));
+    install_faults(&mut allocator, Arc::clone(&plan));
     let outcome = allocator
         .decommit_allocation_range_outcome(pointer, bytes, 0, bytes)
         .expect("the range is valid");
+    let unmap_calls = plan.calls(DriverOperation::Unmap);
+    assert!(
+        unmap_calls >= 2,
+        "premise: the holed decommit must reach a second unmap for the fault to fire, but it made \
+         {unmap_calls}; the outcome below therefore says nothing about rollback: {outcome:?}"
+    );
 
+    let suffix_offset = hole_offset + granule;
+    let suffix_len = bytes - suffix_offset;
     match outcome {
         DecommitOutcome::RolledBack { .. } => {
             assert!(
                 allocator.quarantined_spans().is_empty(),
                 "a successful rollback owes nothing"
             );
-            let after = fill_and_read(&context, address, bytes, 0x5A);
+            // Only the two mapped runs are touched; the hole is unmapped and
+            // reading it would fault for a reason that has nothing to do with
+            // the rollback.
+            let prefix = fill_and_read(&context, address, hole_offset, 0x5A);
             assert!(
-                after.iter().all(|&byte| byte == 0x5A),
-                "a rolled-back decommit must leave every granule mapped *and* accessible"
+                prefix.iter().all(|&byte| byte == 0x5A),
+                "a rolled-back decommit must leave the first run mapped *and* accessible"
+            );
+            let suffix = fill_and_read(&context, address + suffix_offset as u64, suffix_len, 0x5A);
+            assert!(
+                suffix.iter().all(|&byte| byte == 0x5A),
+                "a rolled-back decommit must leave the untouched run mapped *and* accessible"
             );
             assert_eq!(
                 allocator.allocation_committed_bytes(pointer, bytes, 4096),
-                bytes,
+                committed_holed,
                 "the allocation keeps exactly the granules it had"
             );
         }
@@ -314,8 +367,8 @@ fn a_rolled_back_decommit_leaves_the_buffer_readable() {
     // Either way the allocation is not silently half-decommitted.
     let committed = allocator.allocation_committed_bytes(pointer, bytes, 4096);
     assert!(
-        committed == bytes || allocator.quarantined_spans().len() == 1,
-        "a live allocation must never be left with a hole in it"
+        committed == committed_holed || allocator.quarantined_spans().len() == 1,
+        "a live allocation must never be left with a hole it did not ask for"
     );
 }
 

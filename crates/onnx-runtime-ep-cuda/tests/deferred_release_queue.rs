@@ -279,6 +279,50 @@ fn a_release_runs_once_both_fences_have_completed() {
     );
 }
 
+/// `wait_until_idle` is the drain the GPU tests now assert on before reading an
+/// allocator-side counter (#1474). It is only worth anything if it can answer
+/// **no**: a drain that reported idle unconditionally would silently reinstate
+/// the race it was added to remove, and every assertion sitting behind it would
+/// become unfalsifiable — a loud failure traded for a quiet one.
+///
+/// So this pins both answers. It is the portable half of the GPU fix: the
+/// hardware tests can only be run on a CUDA host, but the drain they depend on
+/// is exercised on every machine.
+#[test]
+fn waiting_for_idle_refuses_while_a_fence_is_incomplete_and_settles_after() {
+    let h = harness(8);
+    let executed = Arc::new(AtomicUsize::new(0));
+    let abandoned = Arc::new(AtomicUsize::new(0));
+    h.queue
+        .enqueue(release(&executed, &abandoned))
+        .expect("accepted");
+
+    // One fence complete, one not: the release is still owed.
+    h.compute.store(true, Ordering::Release);
+    assert!(
+        !h.queue.wait_until_idle(Duration::from_millis(20)),
+        "a drain must not report idle while a release is still ordered behind a fence"
+    );
+    assert_eq!(
+        executed.load(Ordering::Acquire),
+        0,
+        "and nothing may have been freed early"
+    );
+    assert_eq!(h.queue.pending(), 1);
+
+    h.copy.store(true, Ordering::Release);
+    assert!(
+        h.queue.wait_until_idle(Duration::from_secs(30)),
+        "once both fences complete the drain must settle the release"
+    );
+    assert_eq!(
+        executed.load(Ordering::Acquire),
+        1,
+        "the drain runs the release itself rather than merely observing it"
+    );
+    assert_eq!(h.queue.pending(), 0);
+}
+
 #[test]
 fn a_bounded_queue_rejects_and_hands_the_exact_request_back() {
     let h = harness(2);

@@ -808,6 +808,70 @@ mod tests {
         );
     }
 
+    /// The premise the hardware rollback fixture rests on (#1474).
+    ///
+    /// `a_rolled_back_decommit_leaves_the_buffer_readable`
+    /// (`tests/vmm_release_quarantine_gpu.rs`) schedules its fault on the
+    /// *second* unmap, because a rollback needs a run that is already unmapped
+    /// — failing the first one leaves nothing to map back and exercises a
+    /// different path entirely. That only works if the decommit issues two
+    /// unmap calls, and [`contiguous_runs`] exists precisely to collapse an
+    /// unbroken range into one. On real hardware the fresh 8 MiB allocation was
+    /// unbroken, so the second fault never fired and the decommit completed;
+    /// the fixture reported that correctly, but its premise was false.
+    ///
+    /// Both halves are anchored here so the hardware fixture's reason for
+    /// punching a hole first is *executed* on every machine rather than argued
+    /// from a doc comment on a GPU-gated path.
+    #[test]
+    fn a_second_unmap_fault_needs_a_hole_because_a_contiguous_range_is_one_call() {
+        let contiguous = blocks(4);
+        assert_eq!(
+            contiguous_runs(contiguous.clone()).len(),
+            1,
+            "premise: an unbroken range is one run, and therefore one unmap call"
+        );
+        let plan = Arc::new(DriverFaultPlan::new().fail_nth(DriverOperation::Unmap, 2));
+        let driver = ScriptedDriver::new(contiguous.clone(), Arc::clone(&plan));
+
+        let outcome = unmap_runs_transactional(&driver, &contiguous_runs(contiguous.clone()));
+
+        assert!(
+            matches!(outcome, TransactionalUnmap::Unmapped { .. }),
+            "a fault scheduled for the second unmap cannot fire when only one is made, so the \
+             decommit completes and no rollback is observed"
+        );
+        assert_eq!(plan.calls(DriverOperation::Unmap), 1);
+
+        // The same range with one granule already decommitted: two runs, two
+        // calls, and the fault now lands with a run behind it to restore.
+        let holed = contiguous
+            .iter()
+            .copied()
+            .filter(|block| block.offset != 2 * 4096)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            contiguous_runs(holed.clone()).len(),
+            2,
+            "the hole is what makes a second unmap call exist at all"
+        );
+        let plan = Arc::new(DriverFaultPlan::new().fail_nth(DriverOperation::Unmap, 2));
+        let driver = ScriptedDriver::new(holed.clone(), Arc::clone(&plan));
+
+        let outcome = unmap_runs_transactional(&driver, &contiguous_runs(holed.clone()));
+
+        assert!(
+            matches!(outcome, TransactionalUnmap::RolledBack { .. }),
+            "with two runs the second-unmap fault must roll the first run back"
+        );
+        assert_eq!(plan.calls(DriverOperation::Unmap), 2);
+        assert_eq!(
+            driver.mapped(),
+            holed,
+            "the rollback restored every block it had unmapped"
+        );
+    }
+
     #[test]
     fn a_failed_rollback_reports_every_residual_and_disposes_nothing() {
         let mapped = blocks(3);
