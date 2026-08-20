@@ -78,13 +78,18 @@ pub(crate) fn load_native_shared_kv_proposer(
     let embedder = LinearEmbedder::new(weights, spec.vocab_size, spec.backbone_hidden_size)
         .context("build native shared-KV target embedding lookup")?;
     #[cfg(feature = "cuda")]
-    let session = crate::native_decode::NativeProposerSession::load_with_cuda_memory(
-        &spec.model,
-        device,
-        Some(&spec.io),
+    let memory = crate::native_component::NativeSessionMemory::GovernedCuda {
         policy,
         governor,
         manager,
+    };
+    #[cfg(not(feature = "cuda"))]
+    let memory = crate::native_component::NativeSessionMemory::SelfProvisioned(None);
+    let session = crate::native_decode::NativeProposerSession::load(
+        &spec.model,
+        device,
+        Some(&spec.io),
+        memory,
     )
     .with_context(|| {
         format!(
@@ -92,15 +97,6 @@ pub(crate) fn load_native_shared_kv_proposer(
             spec.model.display()
         )
     })?;
-    #[cfg(not(feature = "cuda"))]
-    let session =
-        crate::native_decode::NativeProposerSession::load(&spec.model, device, Some(&spec.io))
-            .with_context(|| {
-                format!(
-                    "load native shared-KV proposer graph '{}'",
-                    spec.model.display()
-                )
-            })?;
     let mode = SpeculativeMode::SharedKv(SharedKvProposerConfig {
         assistant_model: spec.model,
         target_hidden_output,

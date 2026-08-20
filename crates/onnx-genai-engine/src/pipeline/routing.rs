@@ -335,7 +335,7 @@ impl PipelineEngine {
         // allowance. Without CUDA there is no device authority to hand over and
         // the component adopts the memory governor directly.
         #[cfg(feature = "cuda")]
-        let memory = crate::native_component::ComponentMemory::GovernedCuda {
+        let memory = crate::native_component::NativeSessionMemory::GovernedCuda {
             policy: crate::engine::cuda_policy_from_memory_strategy_plan(
                 &self.memory_strategy_plan,
             ),
@@ -347,7 +347,7 @@ impl PipelineEngine {
             manager: self.resource_governor.process_memory_manager(),
         };
         #[cfg(not(feature = "cuda"))]
-        let memory = crate::native_component::ComponentMemory::SelfProvisioned(Some(
+        let memory = crate::native_component::NativeSessionMemory::SelfProvisioned(Some(
             self.resource_governor.memory(),
         ));
         let session = crate::native_component::NativeComponentSession::load(path, device, memory)

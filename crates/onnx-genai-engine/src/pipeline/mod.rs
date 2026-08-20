@@ -423,7 +423,7 @@ fn build_native_pipeline_components(
         let session = NativeComponentSession::load(
             path,
             device.clone(),
-            crate::native_component::ComponentMemory::SelfProvisioned(None),
+            crate::native_component::NativeSessionMemory::SelfProvisioned(None),
         )
         .with_context(|| {
             format!("failed to construct pipeline component '{name}' on the native backend")
@@ -540,13 +540,13 @@ fn build_step_component_session<'a>(
             // sized from the models on disk. The lazily loaded prompt components
             // (routing.rs) are the ones that can and do adopt it.
             #[cfg(feature = "cuda")]
-            let memory = crate::native_component::ComponentMemory::GovernedCuda {
+            let memory = crate::native_component::NativeSessionMemory::GovernedCuda {
                 policy,
                 governor,
                 manager,
             };
             #[cfg(not(feature = "cuda"))]
-            let memory = crate::native_component::ComponentMemory::SelfProvisioned(None);
+            let memory = crate::native_component::NativeSessionMemory::SelfProvisioned(None);
             let native = crate::native_component::NativeComponentSession::load(
                 path,
                 native_device.clone(),

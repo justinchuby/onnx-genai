@@ -30,61 +30,97 @@ pub(crate) struct NativeProposerSession {
 }
 
 impl NativeProposerSession {
+    /// Load a proposer graph on the requested device.
+    ///
+    /// The only loader. `memory` says how the execution provider is built, and
+    /// the governor adoption below then happens once regardless of which
+    /// arrangement was chosen, so a new one cannot skip it. This replaced a
+    /// `load` / `load_with_cuda_memory` pair in which only the first adopted --
+    /// meaning the governed CUDA path, the one that actually needs it, was the
+    /// one that went without.
+    ///
+    /// Deliberately does *not* set `release_dead_values`, unlike
+    /// [`crate::native_component::NativeComponentSession`]: a proposer is a
+    /// decode graph re-entered every speculation round with loop-carried KV, so
+    /// its buffers keep their addresses across calls.
     pub(crate) fn load(
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
         io: Option<&ModelIoSpec>,
+        memory: crate::native_component::NativeSessionMemory<'_>,
     ) -> anyhow::Result<Self> {
-        let preference = match device {
+        let path = path.as_ref();
+        let preference = match &device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
-            NativeDecodeDevice::Cuda { index } => DevicePreference::Gpu { index },
+            NativeDecodeDevice::Cuda { index } => DevicePreference::Gpu { index: *index },
             NativeDecodeDevice::Plugin { .. } => DevicePreference::Cpu,
         };
-        let mut builder = InferenceSession::builder().model(path).device(preference);
-        if let NativeDecodeDevice::Plugin {
-            library,
-            registration_name,
-            provider_name,
-        } = device
-        {
-            let ep = onnx_runtime_session::PluginExecutionProvider::new(
+        let build_self_provisioned = || -> anyhow::Result<InferenceSession> {
+            let mut builder = InferenceSession::builder().model(path).device(preference);
+            if let NativeDecodeDevice::Plugin {
                 library,
                 registration_name,
-                provider_name.clone(),
                 provider_name,
-            )
-            .context("initialize native plugin execution provider")?;
-            builder = builder.execution_provider(Arc::new(ep));
-        }
-        let session = builder.build().context("load native proposer model")?;
-        Self::from_session(session, io)
-    }
-
-    #[cfg(feature = "cuda")]
-    pub(crate) fn load_with_cuda_memory(
-        path: impl AsRef<Path>,
-        device: NativeDecodeDevice,
-        io: Option<&ModelIoSpec>,
-        policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
-        governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
-        manager: onnx_runtime_memory_governor::ProcessMemoryManager,
-    ) -> anyhow::Result<Self> {
-        let NativeDecodeDevice::Cuda { index } = device else {
-            return Self::load(path, device, io);
+            } = &device
+            {
+                let ep = onnx_runtime_session::PluginExecutionProvider::new(
+                    library.clone(),
+                    registration_name.clone(),
+                    provider_name.clone(),
+                    provider_name.clone(),
+                )
+                .context("initialize native plugin execution provider")?;
+                builder = builder.execution_provider(Arc::new(ep));
+            }
+            builder.build().context("load native proposer model")
         };
-        let ep = onnx_runtime_ep_cuda::CudaExecutionProvider::
-            initialized_with_offload_policy_governor_and_manager(
-                index.unwrap_or(0),
+        // `owned` keeps a governed arrangement's handle alive until adoption;
+        // `borrowed` carries the self-provisioned case.
+        let (session, owned, borrowed): (
+            InferenceSession,
+            Option<std::sync::Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>>,
+            Option<&dyn onnx_runtime_memory_governor::MemoryGovernor>,
+        ) = match memory {
+            crate::native_component::NativeSessionMemory::SelfProvisioned(governor) => {
+                (build_self_provisioned()?, None, governor)
+            }
+            #[cfg(feature = "cuda")]
+            crate::native_component::NativeSessionMemory::GovernedCuda {
                 policy,
                 governor,
                 manager,
-            )
-            .context("initialize governed native CUDA proposer provider")?;
-        let session = InferenceSession::builder()
-            .model(path)
-            .execution_provider(Arc::new(ep))
-            .build()
-            .context("load governed native CUDA proposer model")?;
+            } => match &device {
+                NativeDecodeDevice::Cuda { index } => {
+                    let ep = onnx_runtime_ep_cuda::CudaExecutionProvider::
+                        initialized_with_offload_policy_governor_and_manager(
+                            index.unwrap_or(0),
+                            policy,
+                            Arc::clone(&governor),
+                            manager,
+                        )
+                        .context("initialize governed native CUDA proposer provider")?;
+                    let session = InferenceSession::builder()
+                        .model(path)
+                        .execution_provider(Arc::new(ep))
+                        .build()
+                        .context("load governed native CUDA proposer model")?;
+                    (session, Some(governor), None)
+                }
+                // No device authority to build a governed provider around, but
+                // the governor still accounts for the proposer's pool.
+                _ => (build_self_provisioned()?, Some(governor), None),
+            },
+        };
+        let governor: Option<&dyn onnx_runtime_memory_governor::MemoryGovernor> = owned
+            .as_deref()
+            .map(|governor| governor as &dyn onnx_runtime_memory_governor::MemoryGovernor)
+            .or(borrowed);
+        crate::native_component::adopt_governor(
+            &session,
+            path,
+            governor,
+            crate::engine::memory_plan::Holder::DraftModelPool,
+        );
         Self::from_session(session, io)
     }
 

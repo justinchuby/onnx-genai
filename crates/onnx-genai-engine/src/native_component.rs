@@ -18,6 +18,7 @@
 //! TTS, iterative diffusion, single-pass, composite) and native cross-attention
 //! / vision KV remain unwired; see [`crate::pipeline`].
 
+use crate::engine::memory_plan::Holder;
 use crate::native_decode::NativeDecodeDevice;
 #[cfg(feature = "cuda")]
 use anyhow::Context;
@@ -104,11 +105,13 @@ pub struct NativeComponentSession {
 
 /// How a component's device memory is arranged.
 ///
-/// This exists so that [`NativeComponentSession::load`] can stay the single
-/// entry point. An earlier split into two loaders let the CUDA one silently
-/// miss configuration the other one performed, which is a defect shape no test
-/// catches -- every symbol survives and only the reachable path changes.
-pub enum ComponentMemory<'a> {
+/// This exists so that a native session type can keep a single entry point.
+/// Splitting a loader in two let the CUDA one silently miss configuration the
+/// other one performed, which is a defect shape no test catches -- every symbol
+/// survives and only the reachable path changes. It happened to both
+/// [`NativeComponentSession`] and [`crate::native_decode::NativeProposerSession`],
+/// so both now take the arrangement as a value instead of having a loader each.
+pub enum NativeSessionMemory<'a> {
     /// The component builds its own execution provider. `governor`, when
     /// present, is the ledger its standing device pool is charged to.
     SelfProvisioned(Option<&'a dyn onnx_runtime_memory_governor::MemoryGovernor>),
@@ -125,13 +128,21 @@ pub enum ComponentMemory<'a> {
 
 impl NativeComponentSession {
     /// Wrap an already-built native [`InferenceSession`] as a neutral component.
-    pub fn new(mut session: InferenceSession) -> Result<Self, ComponentError> {
-        // A component graph is run once per request and never records a device
-        // graph, so its intermediates can be freed as they die. The vision
-        // encoder is why this matters: holding every one of its 2545 node
-        // outputs at once cost ~23 GB at 448px and put full-resolution images
-        // out of reach entirely. This lives here rather than in a loader so no
-        // construction path can be added that forgets it.
+    ///
+    /// Deliberately not public: the only way to obtain one of these from outside
+    /// the crate is [`Self::load`], which is what guarantees every instance went
+    /// through [`Self::finish`]. Leaving a public constructor here would have
+    /// moved the bypass rather than removed it.
+    pub(crate) fn new(mut session: InferenceSession) -> Result<Self, ComponentError> {
+        // A component graph is executed eagerly and never records a device
+        // graph, so its intermediates can be freed as they die. (Not "once per
+        // request": an every_step component runs on every autoregressive step.
+        // What matters is that no execution captures a graph and no output
+        // buffer is reused across calls.) The vision encoder is why this
+        // matters: holding every one of its 2545 node outputs at once cost
+        // ~23 GB at 448px and put full-resolution images out of reach entirely.
+        // This lives here rather than in a loader so no construction path can
+        // be added that forgets it.
         session.set_release_dead_values(true);
         let inputs = session
             .inputs()
@@ -167,7 +178,7 @@ impl NativeComponentSession {
     pub fn load(
         path: &Path,
         device: NativeDecodeDevice,
-        memory: ComponentMemory<'_>,
+        memory: NativeSessionMemory<'_>,
     ) -> anyhow::Result<Self> {
         let requested_cuda = matches!(&device, NativeDecodeDevice::Cuda { .. });
         let preference = match &device {
@@ -194,11 +205,11 @@ impl NativeComponentSession {
             Option<std::sync::Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>>,
             Option<&dyn onnx_runtime_memory_governor::MemoryGovernor>,
         ) = match memory {
-            ComponentMemory::SelfProvisioned(governor) => {
+            NativeSessionMemory::SelfProvisioned(governor) => {
                 (build_self_provisioned()?, None, governor)
             }
             #[cfg(feature = "cuda")]
-            ComponentMemory::GovernedCuda {
+            NativeSessionMemory::GovernedCuda {
                 policy,
                 governor,
                 manager,
@@ -254,34 +265,46 @@ impl NativeComponentSession {
                 "native CUDA pipeline component fell back to CPU"
             );
         }
-        if let Some(governor) = governor {
-            let holder = crate::engine::memory_plan::Holder::PipelineComponentPool;
-            // An already-governed CUDA provider carries the arena's claim, so the
-            // arena half of this records zero rather than double-charging. The
-            // residency half is not redundant: the weight cache's authority-scoped
-            // mapped-byte allowance is created only here, and page-in refuses
-            // outright without it.
-            //
-            // Not fatal: a provider that holds no standing pool reports zero, and
-            // a governor that refuses the claim leaves the component exactly as
-            // unaccounted as it was before -- worth saying out loud, not worth
-            // failing a load over.
-            match session.adopt_memory_governor(governor, holder.tier(), holder.id()) {
-                Ok(bytes) => tracing::debug!(
-                    model = %path.display(),
-                    governed_bytes = bytes,
-                    holder = holder.name(),
-                    "pipeline component device pool adopted by the engine memory governor"
-                ),
-                Err(error) => tracing::warn!(
-                    model = %path.display(),
-                    %error,
-                    "pipeline component device pool could not be charged to the engine memory \
-                     governor; admission on this device stays optimistic"
-                ),
-            }
-        }
+        adopt_governor(&session, path, governor, Holder::PipelineComponentPool);
         Self::new(session).map_err(anyhow::Error::from)
+    }
+}
+
+/// Charge a native session's standing device pool to the engine's ledger.
+///
+/// The one implementation, shared by every native session type, so a new one
+/// cannot arrive with its own subtly different version. Adoption does two
+/// things and only the first is redundant for an already-governed provider:
+/// the arena's claim is re-recorded (zero the second time), and the weight
+/// residency cache gets its authority-scoped mapped-byte allowance, which
+/// nothing else creates and without which page-in refuses outright.
+///
+/// Not fatal: a provider that holds no standing pool reports zero, and a
+/// governor that refuses the claim leaves the session exactly as unaccounted as
+/// it was before -- worth saying out loud, not worth failing a load over.
+pub(crate) fn adopt_governor(
+    session: &InferenceSession,
+    path: &Path,
+    governor: Option<&dyn onnx_runtime_memory_governor::MemoryGovernor>,
+    holder: Holder,
+) {
+    let Some(governor) = governor else {
+        return;
+    };
+    match session.adopt_memory_governor(governor, holder.tier(), holder.id()) {
+        Ok(bytes) => tracing::debug!(
+            model = %path.display(),
+            governed_bytes = bytes,
+            holder = holder.name(),
+            "native session device pool adopted by the engine memory governor"
+        ),
+        Err(error) => tracing::warn!(
+            model = %path.display(),
+            holder = holder.name(),
+            %error,
+            "native session device pool could not be charged to the engine memory governor; \
+             admission on this device stays optimistic"
+        ),
     }
 }
 

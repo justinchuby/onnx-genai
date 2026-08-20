@@ -91,6 +91,14 @@ pub(crate) enum Holder {
     /// 3264-patch vision prefill drove a 30B decoder into `CUDA_ERROR_OUT_OF_MEMORY`
     /// with the card genuinely full.
     PipelineComponentPool,
+    /// The standing device pool held by a speculative proposer's own session.
+    ///
+    /// Distinct from [`Holder::DraftKvPool`], which is the draft model's host
+    /// page pool. This is the device arena and weight-residency cache its
+    /// execution provider builds for itself -- the same blind spot
+    /// [`Holder::PipelineComponentPool`] exists for, on the other co-resident
+    /// session the engine loads next to the decoder.
+    DraftModelPool,
 }
 
 impl Holder {
@@ -108,8 +116,9 @@ impl Holder {
     /// the variants are unconditional even when only one build configuration
     /// constructs them.
     #[allow(dead_code)]
-    pub(crate) const ALL: [Holder; 11] = [
+    pub(crate) const ALL: [Holder; 12] = [
         Holder::PipelineComponentPool,
+        Holder::DraftModelPool,
         Holder::KvPool,
         Holder::PipelineKvPool,
         Holder::DraftKvPool,
@@ -139,6 +148,7 @@ impl Holder {
             Holder::Activations => 6,
             Holder::FixedDeviceReservation => 7,
             Holder::PipelineComponentPool => 11,
+            Holder::DraftModelPool => 12,
         })
     }
 
@@ -158,7 +168,9 @@ impl Holder {
             Holder::FixedDeviceReservation => MemoryRole::Weights,
             // A standing pool the component keeps for as long as the session
             // lives, not a per-step scratch buffer.
-            Holder::PipelineComponentPool => MemoryRole::Workspace { step_scoped: false },
+            Holder::PipelineComponentPool | Holder::DraftModelPool => {
+                MemoryRole::Workspace { step_scoped: false }
+            }
         }
     }
 
@@ -176,6 +188,7 @@ impl Holder {
             Holder::Activations => "activations",
             Holder::FixedDeviceReservation => "fixed device reservation",
             Holder::PipelineComponentPool => "pipeline component device pool",
+            Holder::DraftModelPool => "speculative proposer device pool",
         }
     }
 
@@ -202,7 +215,8 @@ impl Holder {
             | Holder::NativeKvCache
             | Holder::Activations
             | Holder::FixedDeviceReservation
-            | Holder::PipelineComponentPool => Tier::Device,
+            | Holder::PipelineComponentPool
+            | Holder::DraftModelPool => Tier::Device,
         }
     }
 }
