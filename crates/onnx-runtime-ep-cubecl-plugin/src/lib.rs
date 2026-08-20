@@ -59,10 +59,15 @@ pub fn fail_closed_diagnostic() -> Option<String> {
     }
 }
 
-fn kernel_registry_entries() -> Vec<KernelRegistryEntry> {
+/// The op surface to publish for a device that reported `f16_available`.
+///
+/// Taking the probe result as an argument rather than reading a constant is
+/// what keeps the advertised dtypes honest: the same plugin binary runs on
+/// adapters that do and do not expose f16.
+fn kernel_registry_entries(f16_available: bool) -> Vec<KernelRegistryEntry> {
     #[cfg(feature = "webgpu")]
     {
-        onnx_runtime_ep_cubecl::provider::build_cubecl_registry_descriptors()
+        onnx_runtime_ep_cubecl::provider::build_cubecl_registry_descriptors(f16_available)
             .iter()
             .map(|descriptor| KernelRegistryEntry {
                 op_type: descriptor.op_type,
@@ -76,6 +81,7 @@ fn kernel_registry_entries() -> Vec<KernelRegistryEntry> {
     }
     #[cfg(not(feature = "webgpu"))]
     {
+        let _ = f16_available;
         Vec::new()
     }
 }
@@ -84,7 +90,8 @@ fn device_support(backend: CubeclBackend) -> DeviceSupport {
     DeviceSupport::gpu(backend.provider_name(), GENERIC_GPU_VENDOR_ID)
 }
 
-fn construct_backend_ep(backend: CubeclBackend) -> Result<DynEp, String> {
+/// Open a backend, returning the provider and whether its device reported f16.
+fn construct_backend_ep(backend: CubeclBackend) -> Result<(DynEp, bool), String> {
     if let Some(message) = backend.unavailable_message() {
         return Err(message);
     }
@@ -96,17 +103,20 @@ fn construct_backend_ep(backend: CubeclBackend) -> Result<DynEp, String> {
 }
 
 #[cfg(feature = "webgpu")]
-fn construct_webgpu_ep(backend: CubeclBackend) -> Result<DynEp, String> {
+fn construct_webgpu_ep(backend: CubeclBackend) -> Result<(DynEp, bool), String> {
     use onnx_runtime_ep_cubecl::provider::CubeclExecutionProvider;
     use onnx_runtime_ep_cubecl::runtime::WebGpuRuntime;
 
     CubeclExecutionProvider::<WebGpuRuntime>::new(backend, 0)
-        .map(|ep| Box::new(ep) as DynEp)
+        .map(|ep| {
+            let f16 = ep.supports_f16();
+            (Box::new(ep) as DynEp, f16)
+        })
         .map_err(|error| format!("execution provider '{}' device open failed: {error}. Check that a compatible WebGPU/wgpu adapter is visible to this process, or use ONNX_GENAI_EP=cpu.", backend.provider_name()))
 }
 
 #[cfg(not(feature = "webgpu"))]
-fn construct_webgpu_ep(backend: CubeclBackend) -> Result<DynEp, String> {
+fn construct_webgpu_ep(backend: CubeclBackend) -> Result<(DynEp, bool), String> {
     Err(backend.unavailable_message().unwrap_or_else(|| {
         format!(
             "execution provider '{}' is unavailable because the plugin was built without \
@@ -117,17 +127,20 @@ fn construct_webgpu_ep(backend: CubeclBackend) -> Result<DynEp, String> {
 }
 
 #[cfg(all(feature = "vulkan", not(target_os = "macos")))]
-fn construct_vulkan_ep(backend: CubeclBackend) -> Result<DynEp, String> {
+fn construct_vulkan_ep(backend: CubeclBackend) -> Result<(DynEp, bool), String> {
     use onnx_runtime_ep_cubecl::provider::CubeclExecutionProvider;
     use onnx_runtime_ep_cubecl::runtime::VulkanRuntime;
 
     CubeclExecutionProvider::<VulkanRuntime>::new(backend, 0)
-        .map(|ep| Box::new(ep) as DynEp)
+        .map(|ep| {
+            let f16 = ep.supports_f16();
+            (Box::new(ep) as DynEp, f16)
+        })
         .map_err(|error| format!("execution provider '{}' device open failed: {error}. Check that a compatible Vulkan adapter and driver are visible to this process, or use ONNX_GENAI_EP=cpu.", backend.provider_name()))
 }
 
 #[cfg(any(not(feature = "vulkan"), target_os = "macos"))]
-fn construct_vulkan_ep(backend: CubeclBackend) -> Result<DynEp, String> {
+fn construct_vulkan_ep(backend: CubeclBackend) -> Result<(DynEp, bool), String> {
     Err(backend.unavailable_message().unwrap_or_else(|| {
         format!(
             "execution provider '{}' is unavailable in this build. Rebuild with \
@@ -147,10 +160,10 @@ fn prepare_factories() -> (Vec<PreparedFactory>, Vec<String>) {
             continue;
         }
         match construct_backend_ep(backend) {
-            Ok(ep) => factories.push(PreparedFactory {
+            Ok((ep, f16)) => factories.push(PreparedFactory {
                 backend,
                 ep,
-                entries: kernel_registry_entries(),
+                entries: kernel_registry_entries(f16),
                 support: device_support(backend),
             }),
             Err(message) => diagnostics.push(message),
@@ -365,7 +378,7 @@ pub unsafe extern "C" fn NxrtCreateEpFactories(
                     max_factories - written,
                     &mut local_num,
                     move || match construct_backend_ep(backend) {
-                        Ok(ep) => ep as Box<dyn onnx_runtime_ep_api::ExecutionProvider>,
+                        Ok((ep, _f16)) => ep as Box<dyn onnx_runtime_ep_api::ExecutionProvider>,
                         Err(message) => panic!("{message}"),
                     },
                 )

@@ -15,6 +15,8 @@
 //! path or it does not; there is no runtime state in which a provider could
 //! quietly emit the other language.
 
+use cubecl::ir::features::TypeUsage;
+use cubecl::ir::{ElemType, FloatKind};
 use cubecl::prelude::*;
 use cubecl_wgpu::{WgpuDevice, WgpuRuntime, WgslCompiler};
 use onnx_runtime_ep_api::{EpError, Result};
@@ -71,6 +73,25 @@ pub fn open_client<R: Runtime<Device = WgpuDevice>>(
             },
         ))
     })
+}
+
+/// Whether `client`'s device can hold and compute on f16 in buffers.
+///
+/// The check is deliberately stricter than `supports_type`. CubeCL registers
+/// type capabilities per usage, and a backend can legitimately advertise a
+/// float that is only usable for *conversion* — the Vulkan backend does exactly
+/// that for bf16 on adapters without native storage. Claiming f16 on the basis
+/// of "supported in some way" would produce a provider that loads, accepts an
+/// f16 node, and then fails at first dispatch, which is the failure mode rule 5
+/// exists to prevent.
+///
+/// On WGSL this maps to `wgpu::Features::SHADER_F16`, which is optional in the
+/// WebGPU baseline and absent on a meaningful share of adapters, so this must
+/// stay a runtime probe rather than a compile-time assumption.
+pub fn supports_f16<R: Runtime>(client: &ComputeClient<R>) -> bool {
+    let f16 = ElemType::Float(FloatKind::F16);
+    let usage = client.properties().type_usage(f16.into());
+    usage.contains(TypeUsage::Buffer) && usage.contains(TypeUsage::Arithmetic)
 }
 
 /// A short description of the device a client is attached to, for logs and for

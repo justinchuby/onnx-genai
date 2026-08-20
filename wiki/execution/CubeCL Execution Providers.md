@@ -145,18 +145,52 @@ export ONNX_GENAI_EP=cubecl-vulkan
 
 ## 当前算子表面
 
-当前 release 只声明非常小的 f32 surface:
+当前 release 声明一个很小的 surface,f32 与 f16 两种 dtype:
 
 | ONNX op | opset 起点 | dtype | 形状限制 |
 |---|---:|---|---|
-| `Add` | 7 | `Float32` | 相同 shape,或其中一个输入为单元素 scalar |
-| `Mul` | 7 | `Float32` | 相同 shape,或其中一个输入为单元素 scalar |
-| `Relu` | 6 | `Float32` | contiguous tensor |
-| `MatMul` | 9 | `Float32` | `A=[...,M,K]`;`B=[K,N]` 或 batch 与 A 匹配的 `B=[...,K,N]` |
+| `Add` | 7 | `Float32`, `Float16`\* | 相同 shape,或其中一个输入为单元素 scalar |
+| `Mul` | 7 | `Float32`, `Float16`\* | 相同 shape,或其中一个输入为单元素 scalar |
+| `Relu` | 6 | `Float32`, `Float16`\* | contiguous tensor |
+| `MatMul` | 9 | `Float32`, `Float16`\* | `A=[...,M,K]`;`B=[K,N]` 或 batch 与 A 匹配的 `B=[...,K,N]` |
+
+\* f16 取决于设备探测,见下节。
 
 不支持的 dtype、broadcast、rank、batch 或 layout 会被明确拒绝,以便节点落回其他
-EP。虽然 CubeCL/Vulkan 方向未来可能支持更多 dtype,当前代码只认领 `Float32`;这样
-避免在 feature 或设备能力未探测清楚时提前声明 f16/bf16/int 支持。
+EP。一个节点内的所有 float 操作数必须是同一 dtype:kernel 是单态编译的,混合 dtype
+会把一个操作数的字节按另一个类型重新解释。
+
+### f16 取决于运行时探测,不是编译期常量
+
+`shader-f16` 在 WebGPU baseline 里是**可选** feature。因此 f16 的可用性由
+`runtime::supports_f16()` 在打开设备时探测,而不是假设:
+
+```rust
+client.properties().type_usage(ElemType::Float(FloatKind::F16).into())
+```
+
+必须同时包含 `TypeUsage::Buffer` 和 `TypeUsage::Arithmetic`。用
+`supports_type()` 是不够的 —— 它的语义是「以任何方式被支持」,而 cubecl-wgpu 的
+Vulkan 后端就存在只注册 `Conversion` 而不注册 `Buffer` 的 dtype(bf16)。一个只能转换
+不能做 buffer 的类型,对我们毫无用处。
+
+探测结果会一路传到宿主:plugin 的 `kernel_registry_entries(f16_available)` 按探测
+结果选择要 advertise 的 dtype 集合。**同一个 plugin 二进制在支持和不支持 f16 的适配器
+上会声明不同的算子表面**,这样宿主不会先被告知支持 f16、再被节点拒绝打脸。
+
+`ONNX_GENAI_EP=cubecl-webgpu` 下,设备缺 `shader-f16` 与 EP 未实现某 dtype 是两条
+不同的拒绝消息,便于区分是硬件限制还是功能缺口。
+
+### MatMul 用 f32 累加
+
+f16 MatMul 的 staging tile 保持 f16(带宽收益的来源),但累加器是 f32。原因是 f16 的
+running total 超过 2048 之后 ulp 就变成 2,再加 1.0 会 round-to-even 直接掉回去,长
+K 会永久卡住。
+
+这一点有专门的判别性测试 `f16_matmul_accumulates_in_f32`(K=4096,输入全 1.0):f32
+累加精确得到 4096,f16 累加实测卡在 2048。**曾经的一个 K=256 版本经负面对照验证过没有
+判别力** —— 把累加器改回 f16 它照样通过。改测试之前请先确认新版本能在 kernel 退化时
+失败。
 
 ## HandleTable 与合成地址
 
@@ -175,6 +209,45 @@ EP API 的 `DeviceBuffer` 和 `TensorView` 把设备内存表示为非空指针,
 
 这个设计让 EP 契约中的指针算术继续成立,但 host 仍然不能解引用这些指针。它们只是
 CubeCL buffer 的可检查名字。
+
+## 已知成本:形状特化会触发 shader 编译
+
+MatMul kernel 的 `m`/`n`/`k`/`rhs_batched` 是 `#[comptime]` 参数,它们会进入
+CubeCL 的 `KernelId::info`。所以:
+
+- **同一形状重复调用命中 kernel 缓存**,只编译一次;
+- **每出现一个新形状就编译一个新 shader**。
+
+对固定形状的推理这是一次性成本。对 seq 长度变化的 LLM decode 就不是 —— 每个新的
+`M` 都是一次新编译。这是当前实现的一个真实限制,尚未测量其代价。要消除它需要把
+`m`/`n`/`k` 改成运行时参数(放弃 comptime 折叠带来的边界检查消除),或者对形状分桶。
+在有实测数据之前不要假设哪一边更划算。
+
+## 生命周期:provider 从构造起就可用
+
+**ORT 的 plugin EP ABI 没有 `initialize` 钩子。** ORT 拿到 factory 之后直接
+`get_kernel`。所以 provider 的所有设备资源 —— CubeCL client、device handle、f16
+探测结果 —— 全部在构造函数里就绪,`initialize()` 是一个接受但什么都不做的空操作
+(nxrt 路径会调它,调了也不该被惩罚)。
+
+这里踩过一次坑,值得记下来:早期版本有一个 `require_initialized` 门,要求先调
+`initialize()` 才能 dispatch。它保护的东西其实并不存在(资源本来就在构造时就绪),
+但它让**真实 ORT 下每一个节点都失败**:
+
+```text
+Compile: get_kernel failed for node '' (Add): kernel execution failed:
+cubecl_webgpu_ep: get_kernel was called before initialize(); ...
+```
+
+而当时 crate 内的 GPU 测试全绿 —— 因为测试 harness 自己调了 `initialize()`,走了一条
+ORT 永远不会走的路径。
+
+现在的门是 `require_live`,语义反过来:provider 构造即 live,只有 `shutdown()` 之后
+才拒绝调用(那时 client 已经 drain,继续 dispatch 会撞上被回收的 buffer)。
+`shutdown` 之后**不支持**重新 `initialize` 拉起 —— CubeCL client 不可原地重启。
+
+测试 harness 现在**故意不调** `initialize()`,并有一个
+`a_freshly_constructed_provider_dispatches_without_initialize` 直接锁住这个契约。
 
 ## 拷贝与同步限制
 
@@ -204,11 +277,29 @@ NXRT_REQUIRE_GPU_TESTS=1 cargo test -p onnx-runtime-ep-cubecl --features webgpu
 
 Vulkan 测试应在非 macOS 且具备 Vulkan driver 的主机上使用 `--features vulkan`。
 
+### crate 内测试覆盖不到的东西
+
+crate 内的 GPU 测试**不经过 ORT**,它们直接调用 provider。这一层曾经漏掉一个让真实
+ORT 下每个节点都失败的 bug(见「生命周期」一节)。所以改动 provider 的生命周期、
+dtype advertise 或 plugin ABI 表面时,crate 内测试全绿**不构成**端到端证据,需要另外
+用真实 ORT 加载 cdylib 验证:
+
+```bash
+cargo build --release -p onnx-runtime-ep-cubecl-plugin --features webgpu
+python scripts/bench_cubecl_vs_ort_webgpu.py
+```
+
+该脚本会用仓库自带的 ORT 同时注册 CubeCL plugin 与官方 `onnxruntime-ep-webgpu`
+plugin,逐 cell 做 CPU EP 参考对拍,并从 ORT profile 读回节点的实际 provider 归属
+(node count 为 0 的 cell 标为 INVALID,而不是当成「很快」)。
+
 ## 正式来源
 
 - [`onnx-runtime-ep-cubecl`](../../crates/onnx-runtime-ep-cubecl/src/lib.rs)
 - [`backend.rs`](../../crates/onnx-runtime-ep-cubecl/src/backend.rs)
 - [`memory.rs`](../../crates/onnx-runtime-ep-cubecl/src/memory.rs)
+- [`runtime.rs`](../../crates/onnx-runtime-ep-cubecl/src/runtime.rs) — 含 f16 探测
+- [`kernels/mod.rs`](../../crates/onnx-runtime-ep-cubecl/src/kernels/mod.rs) — dtype 分派与算子表
 - [`provider.rs`](../../crates/onnx-runtime-ep-cubecl/src/provider.rs)
 - [`onnx-runtime-ep-cubecl-plugin`](../../crates/onnx-runtime-ep-cubecl-plugin/src/lib.rs)
 - [`ep_compat.rs`](../../crates/onnx-genai-ort/src/session/ep_compat.rs)

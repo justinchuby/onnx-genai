@@ -16,12 +16,12 @@ use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout}
 
 use crate::backend::CubeclBackend;
 use crate::context::CubeclContext;
-use crate::kernels::{self, CubeclOpDescriptor, SUPPORTED_OPS};
+use crate::kernels::{self, CubeclOpDescriptor};
 use crate::memory::HandleTable;
 
 /// Every operator this EP advertises, for the plugin ABIs to publish.
-pub fn build_cubecl_registry_descriptors() -> &'static [CubeclOpDescriptor] {
-    SUPPORTED_OPS
+pub fn build_cubecl_registry_descriptors(f16_available: bool) -> Vec<CubeclOpDescriptor> {
+    kernels::supported_ops_for(f16_available)
 }
 
 /// A CubeCL-backed execution provider.
@@ -30,7 +30,7 @@ pub struct CubeclExecutionProvider<R: Runtime> {
     backend: CubeclBackend,
     context: Arc<CubeclContext<R>>,
     registry: OpRegistry,
-    initialized: bool,
+    live: bool,
 }
 
 impl<R: Runtime<Device = cubecl_wgpu::WgpuDevice>> CubeclExecutionProvider<R> {
@@ -44,11 +44,13 @@ impl<R: Runtime<Device = cubecl_wgpu::WgpuDevice>> CubeclExecutionProvider<R> {
     /// that share one CubeCL client across several components.
     pub fn from_client(backend: CubeclBackend, ordinal: u32, client: ComputeClient<R>) -> Self {
         let device = DeviceId::new(backend.device_type(), ordinal);
+        let f16 = crate::runtime::supports_f16(&client);
         let context = Arc::new(CubeclContext {
             client,
             table: HandleTable::new(),
             device,
             backend,
+            f16,
         });
         let registry = kernels::build_registry(context.clone());
         Self {
@@ -56,7 +58,14 @@ impl<R: Runtime<Device = cubecl_wgpu::WgpuDevice>> CubeclExecutionProvider<R> {
             backend,
             context,
             registry,
-            initialized: false,
+            // Live from construction, not from `initialize`. Every device
+            // resource this provider needs -- the CubeCL client, the device
+            // handle, the f16 probe -- is already open by the time we get here,
+            // so there is nothing for `initialize` to set up. The ORT plugin EP
+            // ABI has no initialize hook at all and dispatches straight into
+            // `get_kernel`; gating on an explicit `initialize` made every node
+            // fail under real ORT while the direct-call tests passed.
+            live: true,
         }
     }
 
@@ -68,16 +77,25 @@ impl<R: Runtime<Device = cubecl_wgpu::WgpuDevice>> CubeclExecutionProvider<R> {
         &self.context
     }
 
-    /// Fail early, with the operation named, when a call arrives before
-    /// `initialize`. Silent tolerance here would turn a host wiring bug into a
-    /// mysterious empty result much later.
-    fn require_initialized(&self, what: &str) -> Result<()> {
-        if self.initialized {
+    /// Whether this provider's device reported usable f16, as probed at open.
+    ///
+    /// Exposed so a host can report the dtype surface it actually got instead of
+    /// discovering it from a rejected node, and so tests can assert the accept
+    /// and refuse paths against the same probe the provider used.
+    pub fn supports_f16(&self) -> bool {
+        self.context.f16
+    }
+
+    /// Fail early, with the operation named, when a call arrives after
+    /// `shutdown`. The client is drained there, so continuing would dispatch
+    /// against buffers that may already have been recycled.
+    fn require_live(&self, what: &str) -> Result<()> {
+        if self.live {
             return Ok(());
         }
         Err(EpError::KernelFailed(format!(
-            "{}: {what} was called before initialize(); the provider must be initialised \
-             before any allocation or dispatch.",
+            "{}: {what} was called after shutdown(); the provider released its device \
+             resources and must be reconstructed before further use.",
             self.name
         )))
     }
@@ -120,7 +138,10 @@ impl<R: Runtime<Device = cubecl_wgpu::WgpuDevice>> ExecutionProvider
     }
 
     fn initialize(&mut self, _config: &EpConfig) -> Result<()> {
-        self.initialized = true;
+        // Idempotent, and not a precondition for anything: the device is opened
+        // in the constructor because the ORT plugin path never calls this.
+        // Re-arming after a `shutdown` is deliberately not offered -- the
+        // CubeCL client is drained there and is not restartable in place.
         Ok(())
     }
 
@@ -128,7 +149,7 @@ impl<R: Runtime<Device = cubecl_wgpu::WgpuDevice>> ExecutionProvider
         // Outstanding work must drain before the client is dropped, otherwise
         // buffers can be recycled underneath an in-flight dispatch.
         self.sync()?;
-        self.initialized = false;
+        self.live = false;
         Ok(())
     }
 
@@ -151,25 +172,33 @@ impl<R: Runtime<Device = cubecl_wgpu::WgpuDevice>> ExecutionProvider
                 self.name, op.op_type
             ));
         }
-        if let Some(bad) = input_dtypes
-            .iter()
-            .find(|dtype| **dtype != DataType::Float32)
-        {
+        // f16 is accepted only when this adapter actually reported f16 buffer
+        // and arithmetic support. The probe result differs between machines
+        // running the same binary, so the refusal names the device feature
+        // rather than implying the EP lacks the kernel.
+        if let Some(bad) = input_dtypes.iter().find(|dtype| {
+            **dtype != DataType::Float32 && !(**dtype == DataType::Float16 && self.context.f16)
+        }) {
+            let detail = if *bad == DataType::Float16 {
+                "this adapter does not report f16 buffer and arithmetic support (WebGPU \
+                 'shader-f16')"
+            } else {
+                "the cubecl backends implement f32 and f16 only"
+            };
             return KernelMatch::unsupported(format!(
-                "{}: {} input dtype {bad:?} is unsupported; the cubecl backends implement f32 \
-                 only in this release",
+                "{}: {} input dtype {bad:?} is unsupported; {detail}",
                 self.name, op.op_type
             ));
         }
         KernelMatch::Supported {
-            cost: dispatch_cost(shapes),
+            cost: dispatch_cost(shapes, input_dtypes),
             required_input_layouts: None,
             output_layouts: vec![TensorLayout::default()],
         }
     }
 
     fn get_kernel(&self, op: &Node, shapes: &[Vec<usize>], opset: u64) -> Result<Box<dyn Kernel>> {
-        self.require_initialized("get_kernel")?;
+        self.require_live("get_kernel")?;
         let factory = self
             .registry
             .lookup(&op.op_type, &op.domain, opset)
@@ -186,7 +215,7 @@ impl<R: Runtime<Device = cubecl_wgpu::WgpuDevice>> ExecutionProvider
     }
 
     fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer> {
-        self.require_initialized("allocate")?;
+        self.require_live("allocate")?;
         // A zero-byte allocation still has to yield a distinct, non-null,
         // freeable address, because callers store and later deallocate it.
         let handle = self.context.client.empty(size.max(1));
@@ -206,7 +235,7 @@ impl<R: Runtime<Device = cubecl_wgpu::WgpuDevice>> ExecutionProvider
     }
 
     fn copy(&self, src: &DeviceBuffer, dst: &mut DeviceBuffer, size: usize) -> Result<()> {
-        self.require_initialized("copy")?;
+        self.require_live("copy")?;
         self.require_own_buffer(src, "copy source")?;
         self.require_own_buffer(dst, "copy destination")?;
         if size == 0 {
@@ -249,7 +278,7 @@ impl<R: Runtime<Device = cubecl_wgpu::WgpuDevice>> ExecutionProvider
     }
 
     fn copy_from_host(&self, src: &[u8], dst: &mut DeviceBuffer) -> Result<()> {
-        self.require_initialized("copy_from_host")?;
+        self.require_live("copy_from_host")?;
         self.require_own_buffer(dst, "copy_from_host destination")?;
         if src.len() > dst.len() {
             return Err(EpError::KernelFailed(format!(
@@ -264,7 +293,7 @@ impl<R: Runtime<Device = cubecl_wgpu::WgpuDevice>> ExecutionProvider
     }
 
     fn copy_to_host(&self, src: &DeviceBuffer, dst: &mut [u8]) -> Result<()> {
-        self.require_initialized("copy_to_host")?;
+        self.require_live("copy_to_host")?;
         self.require_own_buffer(src, "copy_to_host source")?;
         if dst.is_empty() {
             return Ok(());
@@ -362,7 +391,7 @@ const DISPATCH_LATENCY_US: f64 = 30.0;
 /// model would silently mis-place large nodes, whereas an absent one just makes
 /// the planner size-agnostic above the launch threshold. `bytes_moved` is still
 /// reported so a roofline model can be layered on without changing callers.
-fn dispatch_cost(shapes: &[Shape]) -> onnx_runtime_ep_api::Cost {
+fn dispatch_cost(shapes: &[Shape], dtypes: &[DataType]) -> onnx_runtime_ep_api::Cost {
     // A symbolic dimension contributes nothing rather than a guessed extent:
     // under-reporting traffic is recoverable, inventing an extent is not.
     let elements: u64 = shapes
@@ -374,16 +403,23 @@ fn dispatch_cost(shapes: &[Shape]) -> onnx_runtime_ep_api::Cost {
                 .product::<u64>()
         })
         .sum();
+    // f16 halves the traffic for the same element count, which is the whole
+    // reason to run it, so the width comes from the node's dtype rather than a
+    // hardcoded 4.
+    let width = match dtypes.first() {
+        Some(DataType::Float16) => 2,
+        _ => 4,
+    };
     let mut cost = onnx_runtime_ep_api::Cost::ZERO;
     cost.launch_us = DISPATCH_LATENCY_US;
-    cost.bytes_moved = elements.saturating_mul(std::mem::size_of::<f32>() as u64);
+    cost.bytes_moved = elements.saturating_mul(width);
     cost
 }
 
 #[cfg(test)]
 mod tests {
     use super::{DISPATCH_LATENCY_US, dispatch_cost};
-    use onnx_runtime_ir::{Dim, Shape};
+    use onnx_runtime_ir::{DataType, Dim, Shape};
 
     fn static_shape(dims: &[usize]) -> Shape {
         Shape::from(dims.iter().copied().map(Dim::Static).collect::<Vec<_>>())
@@ -391,15 +427,26 @@ mod tests {
 
     #[test]
     fn a_node_always_pays_the_dispatch_latency() {
-        let cost = dispatch_cost(&[static_shape(&[1])]);
+        let cost = dispatch_cost(&[static_shape(&[1])], &[DataType::Float32]);
         assert_eq!(cost.launch_us, DISPATCH_LATENCY_US);
         assert_eq!(cost.bytes_moved, 4);
     }
 
     #[test]
     fn traffic_sums_every_operand() {
-        let cost = dispatch_cost(&[static_shape(&[2, 3]), static_shape(&[3, 4])]);
+        let cost = dispatch_cost(
+            &[static_shape(&[2, 3]), static_shape(&[3, 4])],
+            &[DataType::Float32],
+        );
         assert_eq!(cost.bytes_moved, (2 * 3 + 3 * 4) * 4);
+    }
+
+    #[test]
+    fn f16_moves_half_the_bytes_of_f32() {
+        let shape = [static_shape(&[128])];
+        let f32_cost = dispatch_cost(&shape, &[DataType::Float32]);
+        let f16_cost = dispatch_cost(&shape, &[DataType::Float16]);
+        assert_eq!(f16_cost.bytes_moved * 2, f32_cost.bytes_moved);
     }
 
     #[test]
@@ -408,6 +455,6 @@ mod tests {
             Dim::Symbolic(onnx_runtime_ir::SymbolId(0)),
             Dim::Static(8),
         ]);
-        assert_eq!(dispatch_cost(&[shape]).bytes_moved, 0);
+        assert_eq!(dispatch_cost(&[shape], &[DataType::Float32]).bytes_moved, 0);
     }
 }

@@ -21,7 +21,7 @@ use cubecl::prelude::*;
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
 
-use super::{FnKernel, input_handle, output_handle, require_f32};
+use super::{ElementKind, FnKernel, input_handle, launch_kind, output_handle};
 use crate::context::CubeclContext;
 
 /// Side of the square output tile each cube computes.
@@ -54,7 +54,11 @@ fn matmul_tiled<F: Float>(
     let mut rhs_tile = Shared::new_slice(TILE * TILE);
 
     let local = UNIT_POS_Y as usize * TILE + UNIT_POS_X as usize;
-    let mut acc = F::new(0.0_f32);
+    // Accumulate in f32 even when `F` is f16. A K-long f16 dot product loses
+    // roughly log2(K) bits to rounding, which for a transformer's K in the
+    // thousands is visible in the output; the staging tiles stay f16 so the
+    // bandwidth win — the entire reason to run f16 — is preserved.
+    let mut acc = f32::new(0.0_f32);
     let tiles = k.div_ceil(TILE);
 
     for t in 0..tiles {
@@ -78,15 +82,16 @@ fn matmul_tiled<F: Float>(
         sync_cube();
 
         for i in 0..TILE {
-            acc +=
-                lhs_tile[UNIT_POS_Y as usize * TILE + i] * rhs_tile[i * TILE + UNIT_POS_X as usize];
+            let a = f32::cast_from(lhs_tile[UNIT_POS_Y as usize * TILE + i]);
+            let b = f32::cast_from(rhs_tile[i * TILE + UNIT_POS_X as usize]);
+            acc += a * b;
         }
 
         sync_cube();
     }
 
     if row < m && col < n {
-        out[batch * m * n + row * n + col] = acc;
+        out[batch * m * n + row * n + col] = F::cast_from(acc);
     }
 }
 
@@ -215,30 +220,40 @@ impl<R: Runtime> KernelFactory for MatMulFactory<R> {
                         "cubecl_ep: MatMul expected 1 output at execution, got 0".to_string(),
                     ));
                 };
-                require_f32(lhs.dtype, "MatMul", "A")?;
-                require_f32(rhs.dtype, "MatMul", "B")?;
-                require_f32(out.dtype, "MatMul", "Y")?;
+                let kind = launch_kind(
+                    &[(lhs.dtype, "A"), (rhs.dtype, "B"), (out.dtype, "Y")],
+                    context.f16,
+                    "MatMul",
+                )?;
 
                 let lhs_res = input_handle(&context, lhs, "A")?;
                 let rhs_res = input_handle(&context, rhs, "B")?;
                 let out_res = output_handle(&context, out, "Y")?;
 
-                // SAFETY: the element counts below come from the shapes this kernel
-                // was created for, and `resolve` verified each buffer covers the
-                // bytes those shapes describe.
-                unsafe {
-                    matmul_tiled::launch_unchecked::<f32, R>(
-                        &context.client,
-                        dims.cube_count(),
-                        CubeDim::new_2d(TILE as u32, TILE as u32),
-                        BufferArg::from_raw_parts(lhs_res.handle, dims.lhs_elements()),
-                        BufferArg::from_raw_parts(rhs_res.handle, dims.rhs_elements()),
-                        BufferArg::from_raw_parts(out_res.handle, dims.out_elements()),
-                        dims.m,
-                        dims.n,
-                        dims.k,
-                        dims.rhs_batched,
-                    );
+                macro_rules! dispatch {
+                    ($float:ty) => {
+                        // SAFETY: the element counts below come from the shapes this
+                        // kernel was created for, and `resolve` verified each buffer
+                        // covers the bytes those shapes describe.
+                        unsafe {
+                            matmul_tiled::launch_unchecked::<$float, R>(
+                                &context.client,
+                                dims.cube_count(),
+                                CubeDim::new_2d(TILE as u32, TILE as u32),
+                                BufferArg::from_raw_parts(lhs_res.handle, dims.lhs_elements()),
+                                BufferArg::from_raw_parts(rhs_res.handle, dims.rhs_elements()),
+                                BufferArg::from_raw_parts(out_res.handle, dims.out_elements()),
+                                dims.m,
+                                dims.n,
+                                dims.k,
+                                dims.rhs_batched,
+                            );
+                        }
+                    };
+                }
+                match kind {
+                    ElementKind::F32 => dispatch!(f32),
+                    ElementKind::F16 => dispatch!(half::f16),
                 }
                 Ok(())
             },

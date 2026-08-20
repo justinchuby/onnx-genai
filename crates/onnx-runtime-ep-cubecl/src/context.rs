@@ -17,6 +17,12 @@ pub struct CubeclContext<R: Runtime> {
     pub table: HandleTable,
     pub device: DeviceId,
     pub backend: CubeclBackend,
+    /// Whether this device can store and compute f16, probed once at open.
+    ///
+    /// Probed rather than assumed because f16 is an optional WebGPU feature;
+    /// see [`crate::runtime::supports_f16`]. Cached here so `supports_op` — which
+    /// the planner calls per node — does not re-query device properties.
+    pub f16: bool,
 }
 
 impl<R: Runtime> std::fmt::Debug for CubeclContext<R> {
@@ -24,6 +30,7 @@ impl<R: Runtime> std::fmt::Debug for CubeclContext<R> {
         f.debug_struct("CubeclContext")
             .field("device", &self.device)
             .field("backend", &self.backend)
+            .field("f16", &self.f16)
             .field("live_allocations", &self.table.live_allocations())
             .finish_non_exhaustive()
     }

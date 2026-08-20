@@ -18,7 +18,9 @@ use cubecl::prelude::*;
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
 
-use super::{CUBE_DIM, FnKernel, cube_count, input_handle, output_handle, require_f32};
+use super::{
+    CUBE_DIM, ElementKind, FnKernel, cube_count, input_handle, launch_kind, output_handle,
+};
 use crate::context::CubeclContext;
 
 #[cube(launch_unchecked)]
@@ -152,48 +154,67 @@ impl<R: Runtime> KernelFactory for BinaryFactory<R> {
                         op.op_type()
                     )));
                 };
-                require_f32(lhs.dtype, op.op_type(), "A")?;
-                require_f32(rhs.dtype, op.op_type(), "B")?;
-                require_f32(out.dtype, op.op_type(), "C")?;
+                let kind = launch_kind(
+                    &[(lhs.dtype, "A"), (rhs.dtype, "B"), (out.dtype, "C")],
+                    context.f16,
+                    op.op_type(),
+                )?;
 
                 let lhs_res = input_handle(&context, lhs, "A")?;
                 let rhs_res = input_handle(&context, rhs, "B")?;
                 let out_res = output_handle(&context, out, "C")?;
 
-                // SAFETY: every handle was resolved from a live allocation of this
-                // provider, and `resolve` already checked that each buffer holds at
-                // least the element count passed here, so no launch can index past
-                // the memory it was given.
-                unsafe {
-                    match pairing {
-                        Pairing::SameShape => binary_same_shape::launch_unchecked::<f32, R>(
-                            &context.client,
-                            cube_count(out_len),
-                            CubeDim::new_1d(CUBE_DIM),
-                            BufferArg::from_raw_parts(lhs_res.handle, out_len),
-                            BufferArg::from_raw_parts(rhs_res.handle, out_len),
-                            BufferArg::from_raw_parts(out_res.handle, out_len),
-                            op,
-                        ),
-                        Pairing::ScalarRhs => binary_scalar_rhs::launch_unchecked::<f32, R>(
-                            &context.client,
-                            cube_count(out_len),
-                            CubeDim::new_1d(CUBE_DIM),
-                            BufferArg::from_raw_parts(lhs_res.handle, out_len),
-                            BufferArg::from_raw_parts(rhs_res.handle, 1),
-                            BufferArg::from_raw_parts(out_res.handle, out_len),
-                            op,
-                        ),
-                        Pairing::ScalarLhs => binary_scalar_lhs::launch_unchecked::<f32, R>(
-                            &context.client,
-                            cube_count(out_len),
-                            CubeDim::new_1d(CUBE_DIM),
-                            BufferArg::from_raw_parts(lhs_res.handle, 1),
-                            BufferArg::from_raw_parts(rhs_res.handle, out_len),
-                            BufferArg::from_raw_parts(out_res.handle, out_len),
-                            op,
-                        ),
-                    }
+                // The kernels are generic over `F`, so the element type is a type
+                // parameter and the two arms below are separate monomorphisations
+                // of one body rather than two implementations to keep in sync.
+                macro_rules! dispatch {
+                    ($float:ty) => {
+                        // SAFETY: every handle was resolved from a live allocation of
+                        // this provider, and `resolve` already checked that each buffer
+                        // holds at least the element count passed here, so no launch
+                        // can index past the memory it was given.
+                        unsafe {
+                            match pairing {
+                                Pairing::SameShape => {
+                                    binary_same_shape::launch_unchecked::<$float, R>(
+                                        &context.client,
+                                        cube_count(out_len),
+                                        CubeDim::new_1d(CUBE_DIM),
+                                        BufferArg::from_raw_parts(lhs_res.handle, out_len),
+                                        BufferArg::from_raw_parts(rhs_res.handle, out_len),
+                                        BufferArg::from_raw_parts(out_res.handle, out_len),
+                                        op,
+                                    )
+                                }
+                                Pairing::ScalarRhs => {
+                                    binary_scalar_rhs::launch_unchecked::<$float, R>(
+                                        &context.client,
+                                        cube_count(out_len),
+                                        CubeDim::new_1d(CUBE_DIM),
+                                        BufferArg::from_raw_parts(lhs_res.handle, out_len),
+                                        BufferArg::from_raw_parts(rhs_res.handle, 1),
+                                        BufferArg::from_raw_parts(out_res.handle, out_len),
+                                        op,
+                                    )
+                                }
+                                Pairing::ScalarLhs => {
+                                    binary_scalar_lhs::launch_unchecked::<$float, R>(
+                                        &context.client,
+                                        cube_count(out_len),
+                                        CubeDim::new_1d(CUBE_DIM),
+                                        BufferArg::from_raw_parts(lhs_res.handle, 1),
+                                        BufferArg::from_raw_parts(rhs_res.handle, out_len),
+                                        BufferArg::from_raw_parts(out_res.handle, out_len),
+                                        op,
+                                    )
+                                }
+                            }
+                        }
+                    };
+                }
+                match kind {
+                    ElementKind::F32 => dispatch!(f32),
+                    ElementKind::F16 => dispatch!(half::f16),
                 }
                 Ok(())
             },
@@ -234,22 +255,30 @@ impl<R: Runtime> KernelFactory for ReluFactory<R> {
                         "cubecl_ep: Relu expected 1 output at execution, got 0".to_string(),
                     ));
                 };
-                require_f32(input.dtype, "Relu", "X")?;
-                require_f32(out.dtype, "Relu", "Y")?;
+                let kind =
+                    launch_kind(&[(input.dtype, "X"), (out.dtype, "Y")], context.f16, "Relu")?;
 
                 let input_res = input_handle(&context, input, "X")?;
                 let out_res = output_handle(&context, out, "Y")?;
 
-                // SAFETY: as in the binary kernels, both handles come from live
-                // allocations that `resolve` sized against `len`.
-                unsafe {
-                    relu_kernel::launch_unchecked::<f32, R>(
-                        &context.client,
-                        cube_count(len),
-                        CubeDim::new_1d(CUBE_DIM),
-                        BufferArg::from_raw_parts(input_res.handle, len),
-                        BufferArg::from_raw_parts(out_res.handle, len),
-                    );
+                macro_rules! dispatch {
+                    ($float:ty) => {
+                        // SAFETY: as in the binary kernels, both handles come from
+                        // live allocations that `resolve` sized against `len`.
+                        unsafe {
+                            relu_kernel::launch_unchecked::<$float, R>(
+                                &context.client,
+                                cube_count(len),
+                                CubeDim::new_1d(CUBE_DIM),
+                                BufferArg::from_raw_parts(input_res.handle, len),
+                                BufferArg::from_raw_parts(out_res.handle, len),
+                            );
+                        }
+                    };
+                }
+                match kind {
+                    ElementKind::F32 => dispatch!(f32),
+                    ElementKind::F16 => dispatch!(half::f16),
                 }
                 Ok(())
             },
