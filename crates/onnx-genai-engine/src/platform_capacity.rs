@@ -8,11 +8,18 @@
 //! fact from any specific number and must never be rendered as one.
 //!
 //! Per the #947 guidance we prefer small, targeted OS calls over pulling in a
-//! large system-info crate: the workspace carries no `sysinfo`/`libc` today, and
-//! these queries are a handful of well-documented syscalls. VRAM is deliberately
-//! *not* handled here — the real CUDA query lives in `engine::governor`
-//! (`real_cuda_vram_capacity`), and a vendor-neutral DXGI/Metal/Vulkan adapter
-//! query is intentionally out of scope for this change.
+//! large system-info crate: the workspace carries no `sysinfo`, and these
+//! queries are a handful of well-documented syscalls. `libc` does exist
+//! elsewhere in the workspace (`onnx-runtime-ep-cpu`,
+//! `onnx-runtime-virtual-memory`, `onnx-runtime-tracer`, `onnx-genai-cli`) but
+//! is deliberately not a dependency of this crate — taking one on for a single
+//! FFI struct is not worth it. The trade is real, though: hand-declared
+//! `#[repr(C)]` types must be checked against each platform's ABI rather than
+//! assumed, which is why `StatVfs` below carries compile-time size guards and
+//! field-offset tests. VRAM is deliberately *not* handled here — the real CUDA
+//! query lives in `engine::governor` (`real_cuda_vram_capacity`), and a
+//! vendor-neutral DXGI/Metal/Vulkan adapter query is intentionally out of scope
+//! for this change.
 
 /// Total physical host RAM in bytes, measured from the OS. `None` when the
 /// platform query is unavailable or fails.
