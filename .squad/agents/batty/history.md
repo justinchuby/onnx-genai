@@ -113,3 +113,7 @@ before chasing new kernels; check the dtype gate first.
 ## 2026-08-20T05:50:19+00:00 — Phase-4 q38 int4 GEMV/argmax wins merged
 
 Scribe recorded Batty's Phase-4 contributions after merge to `origin/main`: #1557 added bf16 device-argmax and dtype-aware greedy routing, moving q38 **52.6→54.6 tok/s** (~+3.8%) while proving device token-loop/host-argmax was not the dominant remaining lever. #1561 added the asymmetric int4 block-32 split-K occupancy gate, removing the large-N zero-point split-K mis-route and lifting q38 to ~**59.5 tok/s** standalone; integration later measured q38 **61.32 tok/s** with #1562 stacked. Standing lesson: for Qwen3.8-27B, keep chasing int4 M=1 GEMV occupancy/arithmetic intensity; split-K GEMV nondeterminism still blocks a stable q38 golden oracle.
+
+## 2026-08-20T13:46Z — GEMV latency-hiding floor; projection/GLU fusion ranked #2
+
+Scribe recorded Holden's survey and Batty's GEMV floor result. The current block-32 asymmetric int4 M=1 GEMV has shipped PF=2 at the optimum; deeper prefetch regresses and wide 128-bit loads are not applicable to q38 block-32. External-engine survey ranks **fuse adjacent projections + inline SwiGLU** as lever #2 after the GDN recurrence megakernel, because launch-bound M=1 decode wins by reducing kernel count rather than tuning each kernel.
