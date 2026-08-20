@@ -43,8 +43,8 @@ onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-ir = { workspace = true }
 onnx-std = { workspace = true }
 serde_yaml = { workspace = true }
-# `default_artifacts_are_mlas_free.rs` reads the resolved dependency graph from
-# `cargo metadata`, which is JSON.
+# `default_artifacts_are_mlas_free.rs` deterministically resolves the workspace
+# declarations from `cargo metadata --no-deps`, which is JSON.
 serde_json = { workspace = true }
 
 [lints]

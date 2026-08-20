@@ -221,7 +221,7 @@ pub(crate) fn native_speculation_plan(
         ),
         _ => return None,
     };
-    let greedy = options.greedy || options.temperature == 0.0;
+    let greedy = options.selects_greedily();
     if !greedy || !chain.is_empty() || options.top_logprobs.is_some() {
         return None;
     }

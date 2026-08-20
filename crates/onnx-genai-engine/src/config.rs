@@ -1280,6 +1280,23 @@ pub struct SamplingOverrides {
 }
 
 impl GenerateOptions {
+    /// Whether token selection is greedy: the maximum logit wins, deterministically.
+    ///
+    /// `temperature == 0.0` means the same thing as `greedy` -- a zero-temperature
+    /// softmax is a point mass on the maximum -- and callers use both spellings,
+    /// so every decision that turns on "is this greedy" must ask here rather than
+    /// re-spell the disjunction. Three places had spelled it out inline and one
+    /// of them was already drifting.
+    ///
+    /// This is the predicate that decides whether the sampling warpers
+    /// (temperature, top-k, top-p, min-p, top-a, typical-p, mirostat, XTC) are
+    /// built at all: under greedy selection they cannot affect the outcome that
+    /// the caller asked for, so applying them would be a silent contradiction of
+    /// the request.
+    pub fn selects_greedily(&self) -> bool {
+        self.greedy || self.temperature == 0.0
+    }
+
     /// Resolve sampling controls against a model author's declared generation
     /// defaults, applying a strict precedence.
     ///

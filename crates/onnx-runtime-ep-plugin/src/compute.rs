@@ -4600,6 +4600,61 @@ unsafe extern "C" fn compute_release_state(
 mod tests {
     use super::*;
 
+    /// Return the production portion of a Rust source file, normalised to LF.
+    ///
+    /// Test-only top-level items may be interleaved with production code, so
+    /// truncating at a particular test-module spelling is both incomplete and
+    /// sensitive to checkout line endings.
+    fn production_source(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut skipped_item_depth: Option<i32> = None;
+
+        for line in src.lines() {
+            if let Some(depth) = skipped_item_depth.as_mut() {
+                let opens = line.matches('{').count() as i32;
+                let closes = line.matches('}').count() as i32;
+                *depth += opens - closes;
+                if *depth <= 0 && !(opens == 0 && closes == 0 && line.trim().is_empty()) {
+                    skipped_item_depth = None;
+                }
+                continue;
+            }
+
+            if line.starts_with("#[cfg(") && line.contains("test") {
+                assert!(
+                    line.ends_with(")]"),
+                    "multi-line #[cfg(...test...)] attributes are not supported: {line}"
+                );
+                skipped_item_depth = Some(0);
+                continue;
+            }
+
+            out.push_str(line);
+            out.push('\n');
+        }
+
+        assert!(
+            skipped_item_depth.is_none(),
+            "a #[cfg(test)] item never closed"
+        );
+        out
+    }
+
+    #[test]
+    fn production_source_is_line_ending_agnostic() {
+        let lf = "\
+fn before() {}
+#[cfg(test)]
+fn test_only() {}
+fn after() {}
+";
+        let crlf = lf.replace('\n', "\r\n");
+        let expected = "fn before() {}\nfn after() {}\n";
+
+        assert_eq!(production_source(lf), expected);
+        assert_eq!(production_source(&crlf), expected);
+    }
+
     // ── Matmul-family shape rules ─────────────────────────────────────────────
     //
     // These are the hardware-independent falsifiers for the two shape rules
@@ -6481,10 +6536,8 @@ mod tests {
     /// `RUN_SCRATCH.with` on the `Run` path, and this fails.
     #[test]
     fn a_run_resolves_the_scratch_thread_local_exactly_once() {
-        let src = include_str!("compute.rs");
-        let (prod, _tests) = src
-            .split_once("\n#[cfg(test)]\nmod ")
-            .expect("compute.rs has a test module");
+        let prod = production_source(include_str!("compute.rs"));
+        let prod = prod.as_str();
 
         // Anchor: the thing being counted must exist, or the count is vacuous.
         assert!(
@@ -6518,7 +6571,7 @@ mod tests {
         );
         assert_eq!(
             prod.matches(".with(").count() + prod.matches(".try_with(").count(),
-            4,
+            3,
             "the number of thread-local resolutions in compute.rs changed"
         );
 

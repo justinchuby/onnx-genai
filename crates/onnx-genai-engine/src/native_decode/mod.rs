@@ -175,6 +175,29 @@ impl NativePastSnapshot {
     }
 }
 
+/// Pre-draft snapshot of the destructive recurrent/conv state used to commit a
+/// speculative verify window to the accepted-prefix length.
+///
+/// Unlike [`NativePastSnapshot`] (which clones the whole host past for prefix
+/// caching), this captures *only* the recurrent/conv bindings and works on both
+/// the host past path and the CUDA fixed-state bindings. Exactly one of `host`
+/// (rank-carrying host tensors keyed by past-input name) or `device` (raw
+/// device bytes keyed by fixed-state binding index) is populated, depending on
+/// which decode backend produced it. `len` is the committed length the snapshot
+/// was taken at, asserted against the commit's `base_len`.
+pub(crate) struct RecurrentStateSnapshot {
+    len: usize,
+    host: Option<HashMap<String, Tensor>>,
+    device: Option<Vec<(usize, Vec<u8>)>>,
+}
+
+impl RecurrentStateSnapshot {
+    #[cfg(test)]
+    pub(crate) fn committed_len(&self) -> usize {
+        self.len
+    }
+}
+
 /// State of the Inc-1b PR-2 decode-specialized inlined-body plan for a session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DecodeInlineState {
@@ -453,6 +476,121 @@ impl NativeDecodeSession {
         self.past = restored;
         self.current_len = snapshot.len;
         self.last_hidden = None;
+        Ok(())
+    }
+
+    /// Snapshot the destructive recurrent/conv state as of the last committed
+    /// token, so a speculative verify window can advance it and later be
+    /// committed to exactly the accepted-prefix length (vLLM's no-rollback rule
+    /// for Gated-DeltaNet SSM + conv1d state). See
+    /// [`Self::commit_recurrent_state_to_accepted`].
+    ///
+    /// The recurrent/conv bindings are identified through the existing structural
+    /// detectors ([`is_recurrent_state_shape`] over the declared present→past
+    /// pairs on the host path; `fixed_state_binding_range` on the CUDA path) —
+    /// never a hardcoded layer or dim count. Attention KV is *not* captured here:
+    /// it is a prefix-sliceable append-only cache the ordinary rewind already
+    /// handles.
+    pub(crate) fn snapshot_recurrent_state(&mut self) -> anyhow::Result<RecurrentStateSnapshot> {
+        if !self.has_recurrent_state() {
+            bail!("snapshot_recurrent_state requires a decoder that carries recurrent state");
+        }
+        let len = self.current_len;
+        if let Some(cuda) = self.cuda.as_mut() {
+            let device = cuda.snapshot_fixed_states()?;
+            return Ok(RecurrentStateSnapshot {
+                len,
+                host: None,
+                device: Some(device),
+            });
+        }
+        if self.cpu_kv.is_some() {
+            bail!(
+                "recurrent-state snapshot is unsupported alongside the dense cpu-kv path; \
+                 recurrent decoders keep their loop-carried state in the host past map"
+            );
+        }
+        let recurrent = self.recurrent_past_names();
+        let mut host = HashMap::with_capacity(recurrent.len());
+        for name in &recurrent {
+            let tensor = self.past.get(name).with_context(|| {
+                format!("recurrent state '{name}' is not materialized yet; snapshot it after a step")
+            })?;
+            host.insert(name.clone(), tensor.try_clone().map_err(anyhow::Error::from)?);
+        }
+        Ok(RecurrentStateSnapshot {
+            len,
+            host: Some(host),
+            device: None,
+        })
+    }
+
+    /// Overwrite only the recurrent/conv bindings with a previously captured
+    /// [`RecurrentStateSnapshot`], leaving attention KV and the logical length
+    /// untouched. Used by [`Self::commit_recurrent_state_to_accepted`] between
+    /// the KV rewind and the accepted-token re-advance.
+    pub(crate) fn restore_recurrent_state(
+        &mut self,
+        snapshot: &RecurrentStateSnapshot,
+    ) -> anyhow::Result<()> {
+        if let Some(device) = &snapshot.device {
+            let cuda = self.cuda.as_mut().context(
+                "recurrent snapshot targets the CUDA fixed-state bindings but this session has no CUDA state",
+            )?;
+            cuda.restore_fixed_states(device)?;
+            return Ok(());
+        }
+        if let Some(host) = &snapshot.host {
+            for (name, tensor) in host {
+                let slot = self.past.get_mut(name).with_context(|| {
+                    format!("recurrent state '{name}' is not materialized; cannot restore snapshot")
+                })?;
+                *slot = tensor.try_clone().map_err(anyhow::Error::from)?;
+            }
+            return Ok(());
+        }
+        bail!("recurrent snapshot carried neither host nor device state");
+    }
+
+    /// Commit the recurrent/conv state to exactly `accepted_tokens.len()` tokens
+    /// past the snapshot boundary, the destructive-cache counterpart of the
+    /// attention-KV prefix-slice rewind.
+    ///
+    /// A Gated-DeltaNet recurrent (SSM) state and its conv1d rolling window carry
+    /// no per-step history to slice, so a rejected speculative draft cannot be
+    /// partially rewound. Following vLLM, the committed state is instead rebuilt
+    /// from the pre-draft snapshot: the attention KV is prefix-sliced back to
+    /// `base_len` (the ordinary rewind), the recurrent/conv bindings are restored
+    /// to the snapshot, and exactly the accepted tokens are re-run so the state
+    /// equals what feeding only the accepted continuation from the snapshot would
+    /// produce. `accepted_tokens` re-runs `num_accepted` (0..=k) tokens.
+    pub(crate) fn commit_recurrent_state_to_accepted(
+        &mut self,
+        snapshot: &RecurrentStateSnapshot,
+        base_len: usize,
+        accepted_tokens: &[TokenId],
+    ) -> anyhow::Result<()> {
+        if snapshot.len != base_len {
+            bail!(
+                "recurrent snapshot length {} does not match commit base length {base_len}",
+                snapshot.len
+            );
+        }
+        if base_len > self.current_len {
+            bail!(
+                "cannot commit recurrent state forward from base {base_len} to current {}",
+                self.current_len
+            );
+        }
+        // Attention KV keeps the ordinary prefix-slice rewind (this skips the
+        // recurrent/conv states, which have no sliceable history).
+        self.rewind_inner(base_len)?;
+        // Restore the destructive recurrent/conv states to the pre-draft snapshot,
+        // then deterministically re-advance them by exactly the accepted tokens.
+        self.restore_recurrent_state(snapshot)?;
+        if !accepted_tokens.is_empty() {
+            self.decode_argmax(accepted_tokens, base_len)?;
+        }
         Ok(())
     }
 

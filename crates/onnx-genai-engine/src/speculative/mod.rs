@@ -1170,7 +1170,7 @@ impl Engine {
             // Grammar processors carry per-request parser state; draft/verify
             // would need separate parser branches for speculative candidates.
             && options.constraint.is_none()
-            && (options.greedy || options.temperature == 0.0)
+            && options.selects_greedily()
             && self.kv_model.is_some()
     }
 
@@ -1270,6 +1270,16 @@ impl Engine {
                 },
             )?;
 
+            // Snapshot the pre-draft recurrent/conv state of a hybrid native
+            // target BEFORE the verify window destructively advances it, so the
+            // accept path can commit it to exactly the accepted prefix. Inert for
+            // every non-native / pure-dense target (returns `None`).
+            #[cfg(feature = "native-backend")]
+            let recurrent_snapshot = match state.decode_state.native_recurrent_runner_mut() {
+                Some(native) => Some(native.snapshot_recurrent_state()?),
+                None => None,
+            };
+
             let verified_logits =
                 self.run_target_verification(session_id, state, &draft_tokens, base_len)?;
 
@@ -1289,6 +1299,22 @@ impl Engine {
                 step,
             )?;
             let accepted = accepted_prefix.accepted;
+
+            // Commit the hybrid native target's recurrent/conv state to the
+            // accepted prefix. Attention KV keeps the ordinary prefix-slice rewind
+            // in `assemble_commit_tokens`; this only rebuilds the destructive
+            // rolling caches (snapshot + accepted-token re-advance), then squares
+            // the paged length bookkeeping so that rewind becomes a no-op.
+            #[cfg(feature = "native-backend")]
+            if let Some(snapshot) = recurrent_snapshot.as_ref() {
+                self.commit_native_recurrent_target(
+                    session_id,
+                    state,
+                    base_len,
+                    &draft_tokens[..accepted],
+                    snapshot,
+                )?;
+            }
 
             // Rewind the target KV to the accepted prefix and pick any correction
             // or bonus token. The rewind happens inside assemble_commit_tokens
@@ -1683,6 +1709,45 @@ impl Engine {
             )?
         };
         Ok(verified_logits)
+    }
+
+    /// Commit a hybrid native target's recurrent/conv state to the accepted
+    /// prefix after a verify window advanced it over every draft token.
+    ///
+    /// Gated-DeltaNet SSM + conv1d state is a destructive rolling cache with no
+    /// per-step history to prefix-slice, so — following vLLM — the committed
+    /// state is rebuilt from the pre-draft `snapshot`: attention KV is
+    /// prefix-sliced back to `base_len` and the recurrent/conv bindings are
+    /// restored, then exactly `accepted_tokens` are re-run so the state equals
+    /// feeding only the accepted continuation from the snapshot. The re-run also
+    /// leaves the native attention KV at `base_len + accepted`, so this squares
+    /// the paged length bookkeeping the runner mirrors, letting the ordinary
+    /// rewind in [`Self::assemble_commit_tokens`] become a no-op.
+    #[cfg(feature = "native-backend")]
+    fn commit_native_recurrent_target(
+        &mut self,
+        session_id: SessionId,
+        state: &mut EngineSession,
+        base_len: usize,
+        accepted_tokens: &[TokenId],
+        snapshot: &crate::native_decode::RecurrentStateSnapshot,
+    ) -> anyhow::Result<()> {
+        {
+            let native = state
+                .decode_state
+                .native_recurrent_runner_mut()
+                .context("native recurrent target is no longer available for commit")?;
+            native.commit_recurrent_state_to_accepted(snapshot, base_len, accepted_tokens)?;
+        }
+        let committed = base_len + accepted_tokens.len();
+        self.kv_cache
+            .rewind_to(session_id, committed)
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to rewind KV sequence {session_id} to {committed}: {e}")
+            })?;
+        state.kv_token_count = committed;
+        state.tokens.truncate(committed);
+        Ok(())
     }
 
     /// Select the target token for each proposed position and count the longest

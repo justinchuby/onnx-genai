@@ -221,10 +221,11 @@ fn as_bytes<T: Copy>(values: &[T]) -> Vec<u8> {
     }
 }
 
-fn maybe_cuda() -> Option<CudaExecutionProvider> {
+fn require_cuda() -> CudaExecutionProvider {
     match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
-        Ok(Ok(ep)) => Some(ep),
-        _ => None,
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => panic!("gpu-tests requires a CUDA device: {error}"),
+        Err(_) => panic!("gpu-tests requires a CUDA device; CUDA initialization panicked"),
     }
 }
 
@@ -272,10 +273,7 @@ const BATCH_HEIGHTS: &[usize] = &[1, 2, 4, 8, 16, 32];
 )]
 #[test]
 fn current_path_matches_f64_oracle_group_size_sweep() {
-    let Some(ep) = maybe_cuda() else {
-        eprintln!("[marlin-numerics] skipping: CUDA runtime unavailable");
-        return;
-    };
+    let ep = require_cuda();
     // K=4096, N=896: a whole multiple of the 8-column CTA width and divisible by
     // every group size, deep enough for the K-reduction drift to show.
     let (k, n) = (4096usize, 896usize);
@@ -322,10 +320,7 @@ fn current_path_matches_f64_oracle_group_size_sweep() {
 )]
 #[test]
 fn current_path_matches_f64_oracle_projection_shapes() {
-    let Some(ep) = maybe_cuda() else {
-        eprintln!("[marlin-numerics] skipping: CUDA runtime unavailable");
-        return;
-    };
+    let ep = require_cuda();
     let mut overall = ParityReport {
         all_finite: true,
         ..Default::default()
@@ -400,10 +395,7 @@ const GLM_DECODE_SHAPES: &[(&str, usize, usize)] = &[
 )]
 #[test]
 fn fp16_mixed_gemv_matches_f64_oracle_glm_decode() {
-    let Some(ep) = maybe_cuda() else {
-        eprintln!("[marlin-numerics] skipping: CUDA runtime unavailable");
-        return;
-    };
+    let ep = require_cuda();
     // Pin the wide/multicol entry (not split-K) so both the fp32 reference and
     // the fp16 candidate route through the same wide GEMV family on every GPU.
     // SAFETY: single-threaded test body; restored before returning.
