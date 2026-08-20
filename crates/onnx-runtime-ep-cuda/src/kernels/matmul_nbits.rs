@@ -6228,6 +6228,23 @@ fn scales_f16_pipeline_enabled() -> bool {
     )
 }
 
+/// Opt-out for the SYMMETRIC (no zero-point) int8 decode GEMV split-K grid-fill.
+/// The asymmetric int8 GEMV already routes grid-starved shapes to the split-K
+/// entry; the symmetric path was historically pinned to its single-warp kernel
+/// purely to stay BYTE-IDENTICAL (split-K reassociates the per-column fp32
+/// partial sums). Now that decode correctness is validated on the GREEDY
+/// TOKEN-ID lock (not a byte-exact lock) — and fp32 accumulation is preserved,
+/// so the reassociation is a ULP-level shift that leaves the argmax stable, the
+/// same trade already shipped for the symmetric int4 split-K
+/// ([`use_f16_symmetric_splitk`]) — the symmetric int8 path may take the same
+/// grid-fill split-K on the grid-starved projections. Default-on; set
+/// `ONNX_GENAI_CUDA_DISABLE_INT8_SYMMETRIC_SPLITK=1` (or `true`/`on`) to force
+/// the byte-identical single-warp entry for A/B measurement or de-risking.
+fn int8_symmetric_splitk_enabled() -> bool {
+    !std::env::var_os("ONNX_GENAI_CUDA_DISABLE_INT8_SYMMETRIC_SPLITK")
+        .is_some_and(|value| value != "0" && !value.is_empty())
+}
+
 /// Whether a single-warp block-32 scales-fp16 int4 GEMV launch is WELL-OCCUPIED
 /// enough that it should take the lower-register plain entry
 /// ([`GEMV_F16_SCALES_F16_ENTRY`]) instead of the prefetch-pipelined entry
@@ -8185,12 +8202,30 @@ impl MatMulNBitsKernel {
         // step and the shape uses the 256-thread large path, take the split-K
         // entry (K_SPLIT warps/column, K_SPLIT x larger grid) to fill the SMs.
         // This kernel has no serial prologue, so the extra grid parallelism pays
-        // off directly. Symmetric int8 (no zero points) keeps its byte-identical
-        // single-warp kernel; the small-shape (64-thread) path lacks the warps to
-        // cooperate.
-        let use_splitk = zero_points.is_some()
-            && self.k.is_multiple_of(256)
+        // off directly. Asymmetric int8 (with zero points) fires unconditionally
+        // on the large path; SYMMETRIC int8 (no zero points) opts in only when
+        // the live SM count says the single-warp grid is too narrow (mirrors the
+        // symmetric int4 grid-fill gate [`use_f16_symmetric_splitk`]), so the
+        // already-occupied wide projections keep the byte-identical single-warp
+        // entry and small consumer GPUs are unaffected. The symmetric split-K
+        // reassociates the per-column fp32 partials (near-equal, not
+        // byte-identical) — greedy-token-stable under fp32 accumulation — and is
+        // opt-out via `int8_symmetric_splitk_enabled`.
+        let large_path_eligible = self.k.is_multiple_of(256)
             && !(self.n <= GEMV_F16_SMALL_N_MAX && self.k <= GEMV_F16_SMALL_N_MAX);
+        let capabilities = self.runtime.capabilities();
+        let use_splitk = large_path_eligible
+            && if zero_points.is_some() {
+                true
+            } else {
+                int8_symmetric_splitk_enabled()
+                    && use_f16_symmetric_splitk(
+                        self.k,
+                        self.n,
+                        capabilities.multiprocessor_count(),
+                        capabilities.max_threads_per_block(),
+                    )
+            };
         let entry = if use_splitk {
             GEMV_INT8_F16_SPLITK_ENTRY
         } else {
@@ -13294,6 +13329,46 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         // Degenerate inputs must not divide by zero.
         assert!(scales_f16_pipe_well_occupied(1_000_000, 0, 1));
         assert!(!scales_f16_pipe_well_occupied(1, 8, 0));
+    }
+
+    #[test]
+    fn symmetric_int8_splitk_gate_targets_grid_starved_only() {
+        // The symmetric (no zero-point) int8 decode GEMV reuses the symmetric
+        // int4 grid-fill predicate: split-K fires only when the single-warp grid
+        // is too narrow to fill the device (N < mp_count * 16), so the
+        // already-occupied wide projections keep the byte-identical single-warp
+        // entry. qwen3.5-0.8b int8 shapes on an H200 (132 SMs => threshold 2112):
+        //   N=1024 (down/o)  -> grid-starved  -> split-K
+        //   N=2048           -> grid-starved  -> split-K
+        //   N=3584 / N=6144  -> occupied      -> single-warp
+        let (mp, max_threads) = (132u32, GEMV_F16_LARGE_THREADS);
+        assert!(
+            use_f16_symmetric_splitk(2048, 1024, mp, max_threads),
+            "grid-starved N=1024 symmetric int8 must take split-K"
+        );
+        assert!(
+            use_f16_symmetric_splitk(1024, 2048, mp, max_threads),
+            "grid-starved N=2048 symmetric int8 must take split-K"
+        );
+        assert!(
+            !use_f16_symmetric_splitk(1024, 3584, mp, max_threads),
+            "occupied N=3584 symmetric int8 must keep the single-warp entry"
+        );
+        assert!(
+            !use_f16_symmetric_splitk(1024, 6144, mp, max_threads),
+            "occupied N=6144 symmetric int8 must keep the single-warp entry"
+        );
+        // K < 512 is ineligible (no whole 256-wide split step to spread).
+        assert!(!use_f16_symmetric_splitk(256, 512, mp, max_threads));
+        // Device-derived, not a fixed N: the same width flips with the SM count.
+        assert!(use_f16_symmetric_splitk(1024, 3584, 256, max_threads));
+
+        // The opt-out flag is default-on (enabled) when unset.
+        // (Env-driven; asserted here only for the unset default to avoid racing
+        // other tests that may set process-wide env.)
+        if std::env::var_os("ONNX_GENAI_CUDA_DISABLE_INT8_SYMMETRIC_SPLITK").is_none() {
+            assert!(int8_symmetric_splitk_enabled());
+        }
     }
 
     #[test]
