@@ -1765,55 +1765,54 @@ impl Kernel for QMoEKernel {
                 checked_product(fc2.scales.shape, "fc2 scales element count")?,
             )?);
         }
-        if let Some(fc3) = fc3.as_mut() {
-            if let Some(entry) = float_widen_entry("fc3_scales", fc3.scales.dtype)? {
-                fc3.scales_override = Some(self.widen_to_f32(
-                    &mut scratch,
-                    15,
-                    capturing,
-                    entry,
-                    tensor_ptr(fc3.scales),
-                    checked_product(fc3.scales.shape, "fc3 scales element count")?,
-                )?);
-            }
+        if let Some(fc3) = fc3.as_mut()
+            && let Some(entry) = float_widen_entry("fc3_scales", fc3.scales.dtype)?
+        {
+            fc3.scales_override = Some(self.widen_to_f32(
+                &mut scratch,
+                15,
+                capturing,
+                entry,
+                tensor_ptr(fc3.scales),
+                checked_product(fc3.scales.shape, "fc3 scales element count")?,
+            )?);
         }
-        if let Some(bias) = fc1.bias {
-            if let Some(entry) = float_widen_entry("fc1_experts_bias", bias.dtype)? {
-                fc1.bias_override = Some(self.widen_to_f32(
-                    &mut scratch,
-                    16,
-                    capturing,
-                    entry,
-                    tensor_ptr(bias),
-                    checked_product(bias.shape, "fc1 bias element count")?,
-                )?);
-            }
+        if let Some(bias) = fc1.bias
+            && let Some(entry) = float_widen_entry("fc1_experts_bias", bias.dtype)?
+        {
+            fc1.bias_override = Some(self.widen_to_f32(
+                &mut scratch,
+                16,
+                capturing,
+                entry,
+                tensor_ptr(bias),
+                checked_product(bias.shape, "fc1 bias element count")?,
+            )?);
         }
-        if let Some(bias) = fc2.bias {
-            if let Some(entry) = float_widen_entry("fc2_experts_bias", bias.dtype)? {
-                fc2.bias_override = Some(self.widen_to_f32(
-                    &mut scratch,
-                    17,
-                    capturing,
-                    entry,
-                    tensor_ptr(bias),
-                    checked_product(bias.shape, "fc2 bias element count")?,
-                )?);
-            }
+        if let Some(bias) = fc2.bias
+            && let Some(entry) = float_widen_entry("fc2_experts_bias", bias.dtype)?
+        {
+            fc2.bias_override = Some(self.widen_to_f32(
+                &mut scratch,
+                17,
+                capturing,
+                entry,
+                tensor_ptr(bias),
+                checked_product(bias.shape, "fc2 bias element count")?,
+            )?);
         }
-        if let Some(fc3) = fc3.as_mut() {
-            if let Some(bias) = fc3.bias {
-                if let Some(entry) = float_widen_entry("fc3_experts_bias", bias.dtype)? {
-                    fc3.bias_override = Some(self.widen_to_f32(
-                        &mut scratch,
-                        18,
-                        capturing,
-                        entry,
-                        tensor_ptr(bias),
-                        checked_product(bias.shape, "fc3 bias element count")?,
-                    )?);
-                }
-            }
+        if let Some(fc3) = fc3.as_mut()
+            && let Some(bias) = fc3.bias
+            && let Some(entry) = float_widen_entry("fc3_experts_bias", bias.dtype)?
+        {
+            fc3.bias_override = Some(self.widen_to_f32(
+                &mut scratch,
+                18,
+                capturing,
+                entry,
+                tensor_ptr(bias),
+                checked_product(bias.shape, "fc3 bias element count")?,
+            )?);
         }
 
         self.launch_route(
