@@ -1386,4 +1386,29 @@ what was deleted. Full record:
 
 **Still open here.** `Gemm`'s half fast path remains `f16`-only: `bf16` operands return `None` at
 the dtype check and fall into the portable blocked half GEMM, where `MatMul` serves them from the
-same GEMV. That is a separate, separately mergeable gap.
+same GEMV. That is a separate, separately mergeable gap — **closed in §15.**
+
+### 15. `Gemm` excluded `bf16` decode by dtype, and it cost 3.0x–24x
+
+The gap §14 left open. `GemmKernel::try_half_fast_path` opened with
+`a.dtype != Float16 || b.dtype != Float16 -> None`, so a `bf16` `Gemm` never reached the decode
+GEMV at any shape, while `MatMul` has served `bf16` decode from that same GEMV since the
+2026-08-19 record. The identical decode got a different kernel depending on which op the exporter
+emitted, and `Gemm`'s was the portable blocked half GEMM.
+
+**The measurement.** `bench_gemm_half_decode_route` with `PROBE_DTYPE=bf16`, both arms out of one
+build (`ONNX_GENAI_CPU_MM_HALF_GEMV=0` reproduces the pre-change route), `f32` control divided out.
+It wins at **every shape at both thread counts**: 4.4x–24.1x at 8 threads and 3.0x–22.3x at 32,
+with the model shapes at the top of the range (`llama_mlp` 36.07 → 1.80 ms, `llama_qkv`
+9.85 → 0.47 ms, `qwen_qkv` 9.97 → 0.52 ms at 8 threads). The blocked GEMM holds 2.5–6.0 GB/s of
+weight bandwidth regardless of shape; the GEMV reaches 26–76 GB/s against a 75.8 GB/s ceiling.
+
+**Disposition.** The dtype gate now calls the same `half_storage_format` helper `MatMul` uses, and
+the format is threaded into `simd_available`/`gemv_half_kn` rather than hard-coded. Two defects fell
+out of the same term: `Gemm` also did not honour `ONNX_GENAI_CPU_MM_HALF_GEMV`, so the documented
+field kill-switch for this route silently covered only `MatMul` and the `Gemm` side of the shipped
+binary could not be A/B'd at all. It does now. **Still asymmetric:** a *transposed* `bf16` decode
+declines, because `gemv_f16_nk` reads `f16` bit patterns and has no `bf16` twin — kernel coverage,
+not policy, pinned by a test that checks both the route and the numerics. Mutation-verified in both
+directions. Full record:
+[`docs/benchmarks/2026-08-21-gemm-bf16-decode-gemv.md`](../benchmarks/2026-08-21-gemm-bf16-decode-gemv.md).
