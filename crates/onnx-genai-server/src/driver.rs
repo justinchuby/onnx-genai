@@ -947,6 +947,7 @@ fn run_static_batch_until_idle(
     };
     let mut routes: HashMap<usize, DriverRoute> = HashMap::new();
     let mut abandoned = HashMap::new();
+    let mut reported_occupancy = onnx_genai_engine::BatchOccupancy::default();
     for pending in initial {
         submit_to_continuous_manager(
             &mut manager,
@@ -1043,14 +1044,41 @@ fn run_static_batch_until_idle(
                     kind: failure.kind,
                 }));
             }
+            reported_occupancy = publish_batch_occupancy(manager.occupancy(), reported_occupancy);
             break;
         }
         route_continuous_admissions(manager.poll_admissions(), &mut routes);
         route_continuous_events(manager.poll(), &mut routes, &mut abandoned);
+        reported_occupancy = publish_batch_occupancy(manager.occupancy(), reported_occupancy);
         if manager.is_idle() {
             break;
         }
     }
+    tracing::info!(
+        steps = reported_occupancy.steps,
+        rows_advanced = reported_occupancy.rows_advanced,
+        peak_rows = reported_occupancy.max_rows_in_step,
+        max_batch = reported_occupancy.max_batch,
+        mean_rows_per_step = reported_occupancy.mean_rows_per_step(),
+        "continuous batch group drained"
+    );
+}
+
+/// Publish the forwards issued since the last report to the process metrics.
+///
+/// The manager reports cumulative occupancy for its own lifetime, but the
+/// registry accumulates across batch groups, so only the delta is added.
+fn publish_batch_occupancy(
+    current: onnx_genai_engine::BatchOccupancy,
+    reported: onnx_genai_engine::BatchOccupancy,
+) -> onnx_genai_engine::BatchOccupancy {
+    crate::metrics::batch_forwards_observed(
+        current.steps.saturating_sub(reported.steps),
+        current.rows_advanced.saturating_sub(reported.rows_advanced),
+        current.max_rows_in_step,
+        current.max_batch,
+    );
+    current
 }
 
 /// What the admission loop should do this iteration.

@@ -205,6 +205,54 @@ pub struct ContinuousBatchManager<'a> {
     /// `(all rows) x vocab x 4`.
     routed_stats: onnx_genai_ort::decode::LogitsD2hStats,
     used_device_routing: bool,
+    occupancy: BatchOccupancy,
+}
+
+/// How many sequences actually shared each batched forward pass.
+///
+/// A server can admit many concurrent generations and still decode them one at
+/// a time — an admission gauge counts requests in flight, not rows co-decoded,
+/// so it cannot tell continuous batching from serialization. This counts the
+/// rows carried by each forward the manager issues, so the distinction is
+/// observable rather than inferred from latency.
+///
+/// `steps` counts forwards, not tokens: prompt-context steps advance rows
+/// without emitting a token, and they are batched too.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BatchOccupancy {
+    /// Batched forward passes issued by this manager.
+    pub steps: u64,
+    /// Sum over steps of the rows advanced by that step.
+    pub rows_advanced: u64,
+    /// Largest number of rows advanced by any single step.
+    pub max_rows_in_step: usize,
+    /// Physical decode rows the manager owns.
+    pub max_batch: usize,
+}
+
+impl BatchOccupancy {
+    /// Mean rows per batched forward, or `None` before any forward ran.
+    ///
+    /// Strictly greater than 1.0 exactly when some forward carried more than
+    /// one sequence, which is the property that distinguishes real continuous
+    /// batching from serialized decode.
+    pub fn mean_rows_per_step(&self) -> Option<f64> {
+        (self.steps > 0).then(|| self.rows_advanced as f64 / self.steps as f64)
+    }
+
+    /// Peak fraction of the physical batch that was ever co-decoded, in `0.0..=1.0`.
+    pub fn peak_utilization(&self) -> f64 {
+        if self.max_batch == 0 {
+            return 0.0;
+        }
+        self.max_rows_in_step as f64 / self.max_batch as f64
+    }
+
+    fn record_step(&mut self, rows: usize) {
+        self.steps += 1;
+        self.rows_advanced += rows as u64;
+        self.max_rows_in_step = self.max_rows_in_step.max(rows);
+    }
 }
 
 impl<'a> ContinuousBatchManager<'a> {
@@ -235,6 +283,10 @@ impl<'a> ContinuousBatchManager<'a> {
             next_handle: 0,
             routed_stats: onnx_genai_ort::decode::LogitsD2hStats::default(),
             used_device_routing: false,
+            occupancy: BatchOccupancy {
+                max_batch,
+                ..Default::default()
+            },
         })
     }
 
@@ -355,6 +407,14 @@ impl<'a> ContinuousBatchManager<'a> {
 
     pub fn is_idle(&self) -> bool {
         !self.has_pending_work() && self.events.is_empty()
+    }
+
+    /// Rows actually co-decoded per batched forward so far.
+    ///
+    /// Read this instead of an admitted-request gauge to tell whether the
+    /// backend really advanced several sequences per step.
+    pub fn occupancy(&self) -> BatchOccupancy {
+        self.occupancy
     }
 
     /// Cumulative device→host logits transfer cost of the backend driving this
@@ -580,6 +640,23 @@ impl<'a> ContinuousBatchManager<'a> {
         Ok(())
     }
 
+    /// Record one batched forward and log the rows it carried.
+    ///
+    /// `seam` names which backend entry point issued it, because the two seams
+    /// index their logits buffers differently and a wrong-seam row count would
+    /// otherwise be invisible.
+    fn record_forward(&mut self, rows: usize, seam: &'static str) {
+        self.occupancy.record_step(rows);
+        tracing::debug!(
+            seam,
+            rows,
+            max_batch = self.occupancy.max_batch,
+            queued = self.queue.len(),
+            step = self.occupancy.steps,
+            "continuous batch forward"
+        );
+    }
+
     fn decode_next_pending_rows(&mut self) -> anyhow::Result<()> {
         let advancing_rows = self
             .rows
@@ -593,6 +670,7 @@ impl<'a> ContinuousBatchManager<'a> {
         }
         let active_rows = self.decode.active_rows();
         if advancing_rows.len() == active_rows.len() {
+            self.record_forward(active_rows.len(), "step_active");
             let mut input_ids = vec![0_i64; active_rows.len()];
             let mut position_ids = vec![0_i64; active_rows.len()];
             let mut completes_context = vec![false; active_rows.len()];
@@ -630,6 +708,7 @@ impl<'a> ContinuousBatchManager<'a> {
         let mut position_ids = vec![0_i64; self.max_batch()];
         let mut advance_rows = vec![false; self.max_batch()];
         let mut completes_context = vec![false; self.max_batch()];
+        self.record_forward(advancing_rows.len(), "step_select");
         for row in self.rows.iter().flatten() {
             if row.pending.is_none() {
                 let row_len = self
@@ -2185,5 +2264,179 @@ mod tests {
             "expected device sampling to occur; got {stats:?}"
         );
         assert!(host_manager.logits_d2h_stats().is_none() || !host_manager.used_device_routing);
+    }
+
+    // ---- Co-decoded batch occupancy -------------------------------------
+
+    /// Drive to completion recording, per handle, the tokens it received *and*
+    /// the order they arrived in, so a routing mix-up is detectable.
+    fn drive_recording_rows(
+        manager: &mut ContinuousBatchManager,
+        mut on_step: impl FnMut(&mut ContinuousBatchManager),
+    ) -> HashMap<usize, Vec<TokenId>> {
+        let mut tokens: HashMap<usize, Vec<TokenId>> = HashMap::new();
+        let mut guard = 0;
+        while manager.has_pending_work() {
+            manager.step().unwrap();
+            for event in manager.poll() {
+                if let ContinuousBatchEvent::Token { handle, token } = event {
+                    tokens.entry(handle.id).or_default().push(token.token_id);
+                }
+            }
+            on_step(manager);
+            guard += 1;
+            assert!(guard < 1000, "runaway decode loop");
+        }
+        tokens
+    }
+
+    fn capped_greedy_req(prompt: TokenId, max_new_tokens: usize) -> GenerateRequest {
+        let mut req = greedy_req(prompt);
+        req.options.max_new_tokens = max_new_tokens;
+        req
+    }
+
+    /// The whole point of the counter: a batch of three concurrent requests must
+    /// report forwards that carried three rows, not three forwards of one row.
+    #[test]
+    fn concurrent_rows_are_reported_as_co_decoded_in_one_forward() {
+        let tokenizer = test_tokenizer();
+        let vocab = 8usize;
+        let decode = ScriptedBatchDecode::new(
+            vec![one_hot(vocab, 1), one_hot(vocab, 2), one_hot(vocab, 3)],
+            vocab,
+            false,
+        );
+        let mut manager =
+            ContinuousBatchManager::new(Box::new(decode), &tokenizer, None, 3).unwrap();
+        for _ in 0..3 {
+            manager.submit(capped_greedy_req(1, 4)).unwrap();
+        }
+
+        let tokens = drive_recording_rows(&mut manager, |_| {});
+        let occupancy = manager.occupancy();
+
+        assert_eq!(occupancy.max_batch, 3);
+        assert_eq!(
+            occupancy.max_rows_in_step, 3,
+            "three concurrent requests must share a forward"
+        );
+        assert!(
+            occupancy.mean_rows_per_step().unwrap() > 1.0,
+            "mean rows per forward proves the batch was not serialized: {occupancy:?}"
+        );
+        assert_eq!(occupancy.peak_utilization(), 1.0);
+        // Each row's scripted logits are one-hot on a different token, so
+        // identical streams would mean the demux crossed rows.
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[&0], vec![1; 4]);
+        assert_eq!(tokens[&1], vec![2; 4]);
+        assert_eq!(tokens[&2], vec![3; 4]);
+    }
+
+    /// One request on an eight-row manager must report occupancy 1, so the
+    /// counter cannot be mistaken for "the configured maximum".
+    #[test]
+    fn a_lone_request_reports_occupancy_of_one() {
+        let tokenizer = test_tokenizer();
+        let vocab = 8usize;
+        let decode = ScriptedBatchDecode::new(vec![one_hot(vocab, 1); 8], vocab, false);
+        let mut manager =
+            ContinuousBatchManager::new(Box::new(decode), &tokenizer, None, 8).unwrap();
+        manager.submit(capped_greedy_req(1, 3)).unwrap();
+
+        drive_recording_rows(&mut manager, |_| {});
+        let occupancy = manager.occupancy();
+
+        assert_eq!(occupancy.max_rows_in_step, 1);
+        assert_eq!(occupancy.mean_rows_per_step(), Some(1.0));
+        assert_eq!(occupancy.peak_utilization(), 0.125);
+    }
+
+    /// Ragged rows: when a short row retires early the remaining forwards carry
+    /// fewer rows, so the mean lands strictly between the peak and 1.
+    #[test]
+    fn ragged_rows_shrink_the_batch_as_they_retire() {
+        let tokenizer = test_tokenizer();
+        let vocab = 8usize;
+        let decode = ScriptedBatchDecode::new(
+            vec![one_hot(vocab, 1), one_hot(vocab, 2), one_hot(vocab, 3)],
+            vocab,
+            false,
+        );
+        let mut manager =
+            ContinuousBatchManager::new(Box::new(decode), &tokenizer, None, 3).unwrap();
+        manager.submit(capped_greedy_req(1, 1)).unwrap();
+        manager.submit(capped_greedy_req(1, 2)).unwrap();
+        manager.submit(capped_greedy_req(1, 9)).unwrap();
+
+        let tokens = drive_recording_rows(&mut manager, |_| {});
+        let occupancy = manager.occupancy();
+
+        assert_eq!(tokens[&0].len(), 1, "row 0 stops after its own budget");
+        assert_eq!(tokens[&1].len(), 2);
+        assert_eq!(tokens[&2].len(), 9);
+        assert_eq!(tokens[&2], vec![3; 9], "the long row keeps its own token");
+        assert_eq!(occupancy.max_rows_in_step, 3);
+        let mean = occupancy.mean_rows_per_step().unwrap();
+        assert!(
+            mean > 1.0 && mean < 3.0,
+            "a ragged batch decodes fewer rows once short rows retire: {occupancy:?}"
+        );
+    }
+
+    /// A request queued behind a full batch must be admitted into the slot a
+    /// retired row frees, and must then receive *that physical row's* tokens.
+    #[test]
+    fn a_queued_request_reuses_the_slot_a_retired_row_freed() {
+        let tokenizer = test_tokenizer();
+        let vocab = 8usize;
+        // Physical row 0 emits token 1, row 1 emits token 2.
+        let decode =
+            ScriptedBatchDecode::new(vec![one_hot(vocab, 1), one_hot(vocab, 2)], vocab, false);
+        let mut manager =
+            ContinuousBatchManager::new(Box::new(decode), &tokenizer, None, 2).unwrap();
+        let short = manager.submit(capped_greedy_req(1, 1)).unwrap();
+        let long = manager.submit(capped_greedy_req(1, 6)).unwrap();
+        // Third request cannot be assigned: both physical rows are taken.
+        let late = manager.submit(capped_greedy_req(1, 2)).unwrap();
+        manager.admit_pending();
+        assert_eq!(manager.active_len(), 2);
+        assert_eq!(manager.pending_len(), 1, "the third request must wait");
+
+        let mut admitted_late_while_long_ran = false;
+        let tokens = drive_recording_rows(&mut manager, |manager| {
+            if manager.pending_len() == 0 && manager.active_len() == 2 {
+                admitted_late_while_long_ran = true;
+            }
+        });
+        let occupancy = manager.occupancy();
+
+        assert!(
+            admitted_late_while_long_ran,
+            "the queued request must enter the freed slot while the long row still decodes"
+        );
+        assert_eq!(tokens[&short.id], vec![1]);
+        assert_eq!(tokens[&long.id], vec![2; 6]);
+        assert_eq!(
+            tokens[&late.id],
+            vec![1; 2],
+            "the late request must take over physical row 0 and read its logits"
+        );
+        assert_eq!(occupancy.max_rows_in_step, 2);
+        assert!(occupancy.mean_rows_per_step().unwrap() > 1.0);
+    }
+
+    /// Before any forward there is nothing honest to report.
+    #[test]
+    fn occupancy_is_empty_before_the_first_forward() {
+        let tokenizer = test_tokenizer();
+        let manager =
+            ContinuousBatchManager::new(Box::new(AcceptAssignDecode), &tokenizer, None, 1).unwrap();
+        let occupancy = manager.occupancy();
+        assert_eq!(occupancy.steps, 0);
+        assert_eq!(occupancy.mean_rows_per_step(), None);
+        assert_eq!(occupancy.peak_utilization(), 0.0);
+        assert_eq!(occupancy.max_batch, 1);
     }
 }
