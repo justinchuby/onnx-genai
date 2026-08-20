@@ -3237,13 +3237,13 @@ enum SlotKind {
     Absent(usize), // index into absent_bufs
 }
 
-/// Capacity, in elements, above which per-`Run` output scratch is dropped
-/// instead of kept.
+/// Capacity, in elements, above which per-`Run` scratch is dropped instead of
+/// kept. Shared by the input and output scratch.
 ///
 /// A node with a handful of outputs is the case worth optimising; one with
 /// hundreds is not worth pinning that memory on every worker thread for the
 /// rest of the process.
-const OUTPUT_SCRATCH_MAX_CAPACITY: usize = 16;
+const SCRATCH_MAX_CAPACITY: usize = 16;
 
 thread_local! {
     /// Reusable per-`Run` output bookkeeping, per thread.
@@ -3292,7 +3292,7 @@ pub(crate) fn take_input_scratch(input_count: usize) -> Vec<crate::kernel_ctx::O
 /// Return the input vector for the next `Run` on this thread.
 fn recycle_input_scratch(mut inputs: Vec<crate::kernel_ctx::OwnedInput>) {
     inputs.clear();
-    if inputs.capacity() > OUTPUT_SCRATCH_MAX_CAPACITY {
+    if inputs.capacity() > SCRATCH_MAX_CAPACITY {
         return;
     }
     let _ = INPUT_SCRATCH.try_with(|cell| {
@@ -3335,9 +3335,7 @@ fn recycle_output_scratch(
 ) {
     owned.clear();
     slots.clear();
-    if owned.capacity() > OUTPUT_SCRATCH_MAX_CAPACITY
-        || slots.capacity() > OUTPUT_SCRATCH_MAX_CAPACITY
-    {
+    if owned.capacity() > SCRATCH_MAX_CAPACITY || slots.capacity() > SCRATCH_MAX_CAPACITY {
         return;
     }
     let _ = OUTPUT_SCRATCH.try_with(|cell| {
@@ -6048,7 +6046,7 @@ mod tests {
         // Fill past the capacity an empty `Vec::reserve(1)` reaches on its own,
         // or the assertion below would hold whether or not reuse happened.
         let mut inputs = take_input_scratch(1);
-        for _ in 0..OUTPUT_SCRATCH_MAX_CAPACITY {
+        for _ in 0..SCRATCH_MAX_CAPACITY {
             inputs.push(dummy_owned_input());
         }
         let cap = inputs.capacity();
@@ -6088,14 +6086,14 @@ mod tests {
 
     #[test]
     fn input_scratch_does_not_pin_a_pathological_capacity() {
-        let over = OUTPUT_SCRATCH_MAX_CAPACITY + 1;
+        let over = SCRATCH_MAX_CAPACITY + 1;
         let mut inputs = take_input_scratch(over);
         inputs.push(dummy_owned_input());
         recycle_input_scratch(inputs);
 
         INPUT_SCRATCH.with(|cell| {
             assert!(
-                cell.borrow().capacity() <= OUTPUT_SCRATCH_MAX_CAPACITY,
+                cell.borrow().capacity() <= SCRATCH_MAX_CAPACITY,
                 "oversized scratch was parked: {}",
                 cell.borrow().capacity()
             );
@@ -6122,7 +6120,7 @@ mod tests {
         // so retiring only 4 would assert nothing: the check would pass whether
         // or not the capacity came back. Fill to the cap instead.
         let (mut owned, mut slots) = take_output_scratch(1);
-        for _ in 0..OUTPUT_SCRATCH_MAX_CAPACITY {
+        for _ in 0..SCRATCH_MAX_CAPACITY {
             owned.push(dummy_owned_output());
             slots.push(SlotKind::Ort);
         }
@@ -6172,7 +6170,7 @@ mod tests {
 
     #[test]
     fn output_scratch_does_not_pin_a_pathological_capacity() {
-        let over = OUTPUT_SCRATCH_MAX_CAPACITY + 1;
+        let over = SCRATCH_MAX_CAPACITY + 1;
         let (mut owned, mut slots) = take_output_scratch(over);
         assert!(owned.capacity() >= over);
         owned.push(dummy_owned_output());
@@ -6182,8 +6180,8 @@ mod tests {
         OUTPUT_SCRATCH.with(|cell| {
             let slot = cell.borrow();
             assert!(
-                slot.0.capacity() <= OUTPUT_SCRATCH_MAX_CAPACITY
-                    && slot.1.capacity() <= OUTPUT_SCRATCH_MAX_CAPACITY,
+                slot.0.capacity() <= SCRATCH_MAX_CAPACITY
+                    && slot.1.capacity() <= SCRATCH_MAX_CAPACITY,
                 "oversized scratch was parked: {} / {}",
                 slot.0.capacity(),
                 slot.1.capacity()
@@ -6213,13 +6211,13 @@ mod tests {
         // Park a capacity a fresh `Vec` would not land on by itself: an empty
         // `Vec::reserve(1)` already gives 4 for this element size, so a smaller
         // parked capacity could not tell reuse from a coincidence.
-        let (mut owned, mut slots) = take_output_scratch(OUTPUT_SCRATCH_MAX_CAPACITY);
-        for _ in 0..OUTPUT_SCRATCH_MAX_CAPACITY {
+        let (mut owned, mut slots) = take_output_scratch(SCRATCH_MAX_CAPACITY);
+        for _ in 0..SCRATCH_MAX_CAPACITY {
             owned.push(dummy_owned_output());
             slots.push(SlotKind::Ort);
         }
         let parked = owned.capacity();
-        assert!(parked >= OUTPUT_SCRATCH_MAX_CAPACITY);
+        assert!(parked >= SCRATCH_MAX_CAPACITY);
         recycle_output_scratch(owned, slots);
 
         let other = std::thread::spawn(|| {
