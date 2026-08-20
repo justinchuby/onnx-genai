@@ -6145,6 +6145,30 @@ fn use_f16_symmetric_splitk(
         .saturating_mul(F16_SYMMETRIC_SPLITK_TARGET_WARPS_PER_SM)
 }
 
+/// Occupancy gate for the ASYMMETRIC (zero-point) block-32 `scales_f16` split-K
+/// int4 decode GEMV. Split-K (`K_SPLIT=2` warps cooperating per output column)
+/// exists only to fill idle SMs on grid-STARVED projections; it costs a
+/// shared-mem cross-warp reduction plus a per-split activation re-read, so it is
+/// a net loss once the single-warp launch (`ceil(N/8)` CTAs) already saturates
+/// the device. The symmetric path already gates on this (`n < SMs * target`);
+/// the asymmetric path historically did not, so wide-N asymmetric projections
+/// (27B-class hybrid gate_up/o/kv, N~5k-17k) wrongly took split-K. This restores
+/// symmetry: keep split-K only when grid-starved, else fall to the byte-identical
+/// single-warp pipe entry. Keys only on N and the live SM count.
+/// `ONNX_GENAI_SCALES_F16_ZP_SPLITK=0|1` forces off/on for A/B measurement.
+fn use_scales_f16_zp_splitk_gate(n: usize, multiprocessor_count: u32) -> bool {
+    match std::env::var("ONNX_GENAI_SCALES_F16_ZP_SPLITK")
+        .ok()
+        .as_deref()
+    {
+        Some("1") | Some("true") | Some("on") => return true,
+        Some("0") | Some("false") | Some("off") => return false,
+        _ => {}
+    }
+    n < (multiprocessor_count.max(1) as usize)
+        .saturating_mul(F16_SYMMETRIC_SPLITK_TARGET_WARPS_PER_SM)
+}
+
 /// Warps-per-CTA (one warp reduces one output column) for the accuracy_level=4
 /// blockwise GEMV, chosen so the `ceil(N / warps)` grid fills the device. The
 /// grid-starved tiled `matmul_nbits_accuracy4` fallback issued only
@@ -9441,9 +9465,11 @@ impl MatMulNBitsKernel {
         self.runtime
             .require_nvrtc_half_headers("MatMulNBits fp16 GEMV")?;
         // Split-K routing for standalone block-32, scales-fp16 general GEMVs.
-        // The existing asymmetric path retains its measured gate; symmetric
-        // projections opt in only when the live SM count says their warp grid is
-        // too narrow, so smaller consumer GPUs keep the current single-warp path.
+        // Both the asymmetric (zero-point) and symmetric paths now gate on the
+        // live SM count: split-K only fires when the single-warp warp grid is too
+        // narrow to fill the device, so grid-saturated large-N projections keep
+        // the single-warp (pipe) path and smaller GPUs keep their current path.
+        let capabilities = self.runtime.capabilities();
         let use_scales_f16_zp_splitk = self.block_size == 32
             && scales_fp16
             && zero_points.is_some()
@@ -9451,8 +9477,18 @@ impl MatMulNBitsKernel {
             && self.k.is_multiple_of(256)
             // Split-K needs >= K_SPLIT warps/block; the small-shape path uses only
             // 64 threads (2 warps), so restrict to the 256-thread large path.
-            && !(self.n <= GEMV_F16_SMALL_N_MAX && self.k <= GEMV_F16_SMALL_N_MAX);
-        let capabilities = self.runtime.capabilities();
+            && !(self.n <= GEMV_F16_SMALL_N_MAX && self.k <= GEMV_F16_SMALL_N_MAX)
+            // Occupancy gate (mirrors the symmetric split-K path): split-K only
+            // helps when the single-warp launch is grid-STARVED. Its K_SPLIT=2
+            // fan-out doubles the grid to fill idle SMs, but it pays a shared-mem
+            // cross-warp reduction and re-reads the activation per split — a net
+            // LOSS once `ceil(N/8)` single-warp CTAs already fill the device many
+            // waves over. Large-N asymmetric projections (e.g. gate_up N~17k, o/kv
+            // N~5-12k on 27B-class hybrids) are already saturated, so route them to
+            // the byte-identical single-warp pipe entry instead. Keys only on N and
+            // the live SM count — no model constants; `ONNX_GENAI_SCALES_F16_ZP_SPLITK`
+            // forces off/on for A/B.
+            && use_scales_f16_zp_splitk_gate(self.n, capabilities.multiprocessor_count());
         let use_scales_f16_symmetric_splitk = self.block_size == 32
             && scales_fp16
             && zero_points.is_none()
