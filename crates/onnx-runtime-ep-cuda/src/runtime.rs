@@ -939,10 +939,10 @@ impl CudaRuntime {
             include_paths,
             kind: kernel_cache::ArtifactKind::Ptx,
         };
-        if let Some(bytes) = kernel_cache::load(&key) {
-            if let Ok(text) = String::from_utf8(bytes) {
-                return Ok(cudarc::nvrtc::Ptx::from_src(text));
-            }
+        if let Some(bytes) = kernel_cache::load(&key)
+            && let Ok(text) = String::from_utf8(bytes)
+        {
+            return Ok(cudarc::nvrtc::Ptx::from_src(text));
         }
         let opts = cudarc::nvrtc::CompileOptions {
             include_paths: include_paths.to_vec(),
