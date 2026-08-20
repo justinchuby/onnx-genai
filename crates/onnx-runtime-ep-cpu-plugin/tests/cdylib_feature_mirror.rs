@@ -23,22 +23,39 @@ mod cdylib_resolve;
 /// Hand-rolled rather than pulling in a TOML parser as a dev-dependency: the
 /// `[features]` table is a flat `name = [...]` list, and a parser that only has
 /// to survive that is smaller than the dependency.
+fn clean_key(raw: &str) -> String {
+    // Quoted keys (`"foo-bar" = []`) are legal and would otherwise be compared
+    // with their quotes still attached.
+    raw.trim().trim_matches('"').trim().to_owned()
+}
+
 fn declared_features(manifest: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut in_features = false;
     for raw in manifest.lines() {
         let line = raw.trim();
         if line.starts_with('[') {
-            in_features = line == "[features]";
+            // A trailing comment on the header is legal TOML and used to turn
+            // the whole scan off, returning an empty list.
+            let head = line.split('#').next().unwrap_or("").trim();
+            // `[features.foo]` declares the feature `foo` as its own table.
+            if let Some(rest) = head.strip_prefix("[features.") {
+                if let Some(name) = rest.strip_suffix(']') {
+                    out.push(clean_key(name));
+                }
+                in_features = false;
+                continue;
+            }
+            in_features = head == "[features]";
             continue;
         }
         if !in_features || line.is_empty() || line.starts_with('#') {
             continue;
         }
         if let Some((name, _)) = line.split_once('=') {
-            let name = name.trim();
+            let name = clean_key(name);
             if !name.is_empty() && !name.starts_with('#') {
-                out.push(name.to_owned());
+                out.push(name);
             }
         }
     }
@@ -98,4 +115,31 @@ beta = []
 gamma = { workspace = true }
 ";
     assert_eq!(declared_features(manifest), vec!["alpha", "beta"]);
+}
+
+#[test]
+fn the_parser_survives_the_legal_manifest_forms_that_would_otherwise_hide_a_feature() {
+    // Each of these is legal TOML that an earlier version of this parser
+    // mishandled. A trailing comment on the header switched the whole scan off
+    // and returned an empty list; a quoted key kept its quotes and so never
+    // matched; a `[features.name]` sub-table was skipped entirely. Every one of
+    // them would have dropped a feature out of `declared`, which is the silent
+    // direction -- the guard would then not have demanded it be mirrored.
+    let manifest = "\
+[features]  # knobs that change the cdylib
+alpha = []
+\"quoted-key\" = [\"dep/x\"]
+
+[features.sub]
+inner = []
+
+[dependencies]
+gamma = { workspace = true }
+";
+    let got = declared_features(manifest);
+    assert_eq!(
+        got,
+        vec!["alpha", "quoted-key", "sub"],
+        "a legal manifest form silently dropped a feature: {got:?}"
+    );
 }
