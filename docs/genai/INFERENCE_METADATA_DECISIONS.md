@@ -37,7 +37,7 @@ Section [Conformance](#20-conformance) maps each requirement to its test.
 
 1. **Deployment policy.** Memory budgets, device placement, execution providers,
    allocators, paging, tiering, quality of service, and deadlines are not
-   metadata. See [§5](#5-ownership-layers).
+   metadata. See [§5](#5-ownership-layers-in-the-schema).
 2. **Backward compatibility.** There is no export path to `genai_config.json`
    and no reverse synthesizer. See [§17](#17-legacy-import).
 3. **Integrity and trust.** Signing, provenance, and artifact attestation belong
@@ -286,8 +286,14 @@ contract therefore declares its equivalence class:
 `semantic` is the **default**. A package that says nothing gets the strictest
 treatment, so silence never buys an optimization.
 
+A component that declares **no contract at all** is read as `semantic`. It is
+counted, not skipped: a reader that filtered undeclared components out of the
+check would find the remaining set vacuously permissive, and a package whose
+components declare nothing would be granted exactly the consent it never gave. By
+the same rule, a workflow with no components permits nothing.
+
 This is what makes speculative decoding safe: the runtime auto-enables
-speculation only when every contract in the workflow permits automatic
+speculation only when **every component** in the workflow permits automatic
 substitution. Otherwise the caller must ask for it explicitly. See
 [§13](#13-speculative-execution).
 
@@ -736,10 +742,12 @@ whose effects or state cannot roll back to `max_proposal_width`.
 
 ### 13.5 Automatic enablement
 
-The runtime auto-enables speculation only when every contract in the workflow
-declares `bitwise` or `distribution_preserving` equivalence
-([§7.2](#72-equivalence-classes)). Otherwise the caller must opt in — by naming a
-mode on the request or in the engine configuration.
+The runtime auto-enables speculation only when **every component** in the
+workflow declares `bitwise` or `distribution_preserving` equivalence
+([§7.2](#72-equivalence-classes)). A component with no contract counts as
+`semantic` and withholds consent on its own, as does an empty workflow.
+Otherwise the caller must opt in — by naming a mode on the request or in the
+engine configuration.
 
 ---
 
@@ -954,6 +962,14 @@ cargo run -p onnx-genai-metadata --bin validate_metadata -- <path>
 | Row axis derivable without identity | `redesign_invariants.rs::the_row_axis_is_derivable_without_any_serialized_row_identity` |
 | Row-scoped carriers survive compaction | `redesign_invariants.rs::every_row_scoped_carrier_survives_batch_compaction` |
 | Checkpoint vs. private transfer | `redesign_invariants.rs::portable_checkpoints_are_distinct_from_private_state_transfer` |
+| Speculative region spans the loop body | `redesign_invariants.rs::the_speculative_region_covers_every_component_in_the_loop_body` |
+| State cannot be exported under an alias | `redesign_invariants.rs::runtime_owned_state_cannot_be_exported_under_an_alias` |
+| Identity ignores numeric spelling | `redesign_invariants.rs::semantic_identity_ignores_how_a_number_was_spelled` |
+| Absent contract withholds consent | `crates/onnx-genai-engine/src/speculative/mod.rs::equivalence_gate_tests` |
+
+The last four close bypasses found by review rather than by a failing build.
+Each was written to fail against the implementation it guards, so a regression
+that reopens the bypass fails the suite rather than passing silently.
 
 ### 20.3 Schema sync
 
