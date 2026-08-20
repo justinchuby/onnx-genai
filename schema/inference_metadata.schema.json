@@ -510,6 +510,280 @@
       ],
       "type": "string"
     },
+    "AudioOutputBinding": {
+      "description": "One named tensor output produced by an audio preprocessing program.\n\nThe output binds a processor-local value to a typed workflow SSA name.\nNeither the name nor the content role is inferred from a model identity.",
+      "properties": {
+        "content": {
+          "$ref": "#/$defs/AudioOutputContent",
+          "description": "Generic content role of this output."
+        },
+        "dtype": {
+          "description": "Element type of the emitted tensor.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "name": {
+          "description": "Workflow SSA value this output binds to.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "rank": {
+          "description": "Tensor rank of the emitted tensor.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source": {
+          "description": "Program-local value produced by a transform.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "source",
+        "content",
+        "dtype",
+        "rank"
+      ],
+      "type": "object"
+    },
+    "AudioOutputContent": {
+      "description": "Generic audio-output content-role vocabulary.",
+      "oneOf": [
+        {
+          "enum": [
+            "waveform",
+            "features",
+            "sample_lengths",
+            "frame_lengths",
+            "validity_mask"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "waveform",
+              "features",
+              "sample_lengths",
+              "frame_lengths",
+              "validity_mask"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "AudioPreprocessingProgram": {
+      "description": "Generic audio preprocessing program: an ordered transform pipeline plus the\nnamed workflow SSA tensor outputs it emits.\n\nThe program is expressed entirely as parameterized, architecture-neutral\ndata, mirroring `ImagePreprocessingProgram`. Transform operations are\ngeneric (decode, resample, downmix, rescale, normalize, pad, frame,\nspectrogram). In workflow metadata, outputs are materialized by a\nmanifest-pinned preprocessing adapter invocation and bind processor-local\nvalues to typed SSA names. A package may name an output `input_values`,\n`attention_mask`, or anything else without introducing runtime\nmodel-family dispatch.",
+      "properties": {
+        "outputs": {
+          "description": "Named tensor outputs the program emits, each bound to a workflow SSA value.",
+          "items": {
+            "$ref": "#/$defs/AudioOutputBinding"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "transforms": {
+          "description": "Ordered list of generic transform operations applied to decoded audio.",
+          "items": {
+            "$ref": "#/$defs/AudioTransform"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "outputs"
+      ],
+      "type": "object"
+    },
+    "AudioTransform": {
+      "description": "One generic audio transform operation.\n\n`op` selects the operation from a generic vocabulary; the remaining fields\nare the parameters that operation reads (only the relevant ones are set).\nEvery parameter is model DATA — concrete sample rates, channel counts, and\nso on live in a model's fixture, never as constants baked into this schema.",
+      "properties": {
+        "channels": {
+          "description": "Target channel count for a `downmix` operation.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "epsilon": {
+          "description": "Numerical stabilizer added to the variance for `zero_mean_unit_variance`.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "hop_length": {
+          "description": "Hop length in samples for a spectrogram operation.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "inputs": {
+          "description": "Named values consumed by this transform.\n\nAbsent means the operation consumes the immediately preceding value.\nExplicit names allow branching programs without tensor-name heuristics.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "mode": {
+          "description": "Padding side / resize mode selector — generic string data (e.g. `right`, `left`).",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "n_fft": {
+          "description": "FFT size for a spectrogram operation.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "num_mel_bins": {
+          "description": "Mel filterbank size for a `log_mel_spectrogram` operation.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "op": {
+          "$ref": "#/$defs/AudioTransformOp",
+          "description": "Generic operation selector (e.g. `resample`, `zero_mean_unit_variance`)."
+        },
+        "outputs": {
+          "description": "Named values produced by this transform.\n\nThese names are processor-local data. Final graph bindings select them\nthrough `AudioOutputBinding::source`.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "pad_value": {
+          "description": "Fill value used by a `pad` operation.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "sample_rate": {
+          "description": "Target sample rate in Hz for a `resample` operation.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "scale": {
+          "description": "Scalar multiplier for a `rescale` operation.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "target_length": {
+          "description": "Fixed target length in samples or frames for a `pad`/`trim` operation.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "win_length": {
+          "description": "Analysis window length in samples for a spectrogram operation.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "window": {
+          "description": "Analysis window function — generic string data (e.g. `hann`).",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "op"
+      ],
+      "type": "object"
+    },
+    "AudioTransformOp": {
+      "description": "Generic audio transform-operation vocabulary.",
+      "oneOf": [
+        {
+          "enum": [
+            "decode",
+            "resample",
+            "downmix",
+            "rescale",
+            "zero_mean_unit_variance",
+            "normalize",
+            "pad",
+            "trim",
+            "frame",
+            "log_mel_spectrogram",
+            "emit_sample_lengths",
+            "emit_validity_mask"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "decode",
+              "resample",
+              "downmix",
+              "rescale",
+              "zero_mean_unit_variance",
+              "normalize",
+              "pad",
+              "trim",
+              "frame",
+              "log_mel_spectrogram",
+              "emit_sample_lengths",
+              "emit_validity_mask"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
     "BatchLayout": {
       "description": "Structural relationship between a typed value and the runtime batch.\n\n`shared` values are invariant across requests. `request_aligned` values carry\nexactly one entry per in-flight request along `axis`, so compaction permutes\nthat axis. `token_packed` values are ragged: `offsets` names the\nrequest-aligned exclusive-prefix offset value and `owner` names the\nper-item owner mapping, which together let a runtime split and regroup the\npacked value without any serialized request ID. `runtime_sequence_state`\nmarks a value whose per-sequence storage the runtime owns outright.",
       "oneOf": [
@@ -818,6 +1092,73 @@
               "uint8",
               "int4",
               "uint4"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "DecodingVocabulary": {
+      "additionalProperties": false,
+      "description": "Source of the class-id -> string mapping used to render a transcript.",
+      "properties": {
+        "ignored_tokens": {
+          "description": "Token string ignored during rendering (e.g. `<pad>`).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "size": {
+          "description": "Number of classes in the decoding vocabulary.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/$defs/DecodingVocabularySource",
+          "description": "Generic source selector (e.g. `tokenizer`, `inline`)."
+        },
+        "tokens": {
+          "description": "Inline class-id -> string table, ordered by class id.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "word_delimiter": {
+          "description": "Token string that renders as a word boundary (e.g. `|`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "source"
+      ],
+      "type": "object"
+    },
+    "DecodingVocabularySource": {
+      "description": "Class-id -> string mapping source vocabulary.",
+      "oneOf": [
+        {
+          "enum": [
+            "tokenizer",
+            "inline"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "tokenizer",
+              "inline"
             ]
           },
           "title": "Forward-compatible extension value",
@@ -2682,6 +3023,17 @@
     "PreprocessingSpec": {
       "description": "Declared, architecture-neutral input preprocessing programs.",
       "properties": {
+        "audio": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AudioPreprocessingProgram"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Typed audio preprocessing transform program and its named tensor outputs."
+        },
         "image": {
           "anyOf": [
             {
@@ -2887,6 +3239,89 @@
           "type": "object"
         }
       ]
+    },
+    "SequenceDecodingKind": {
+      "description": "Frame-synchronous sequence-decoding algorithm vocabulary.",
+      "oneOf": [
+        {
+          "enum": [
+            "ctc",
+            "greedy_argmax"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "ctc",
+              "greedy_argmax"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "SequenceDecodingSpec": {
+      "additionalProperties": false,
+      "description": "Frame-synchronous decoding contract for non-autoregressive sequence models.\n\nA CTC acoustic model emits one class distribution per encoder frame. The\ntranscript is recovered by taking the per-frame argmax, collapsing runs of\nrepeated ids, and dropping the blank id — no generation loop and no\nautoregressive state are involved.",
+      "properties": {
+        "blank_id": {
+          "description": "Class id reserved for the CTC blank symbol.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "class_axis": {
+          "description": "Axis of the logits tensor that enumerates classes.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "collapse_repeats": {
+          "default": false,
+          "description": "Whether runs of identical consecutive ids collapse to one id.",
+          "type": "boolean"
+        },
+        "kind": {
+          "$ref": "#/$defs/SequenceDecodingKind",
+          "description": "Generic decoding algorithm selector (e.g. `ctc`)."
+        },
+        "lengths": {
+          "description": "Profile output role naming the per-row count of valid frames.\n\nPresent when the package is batched with padding: rows are decoded only\nover their own valid frame prefix so a padded batch produces the same\ntranscript per row as an unpadded single-row run.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_axis": {
+          "description": "Axis of the logits tensor that enumerates frames.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "vocabulary": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecodingVocabulary"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where the class-id -> string mapping comes from."
+        }
+      },
+      "required": [
+        "kind",
+        "time_axis",
+        "class_axis"
+      ],
+      "type": "object"
     },
     "SequenceInputKind": {
       "description": "Primary autoregressive sequence source for a decoder or proposer graph.",
@@ -3654,6 +4089,17 @@
       "additionalProperties": false,
       "description": "One executable task profile that shares the package's common facts.\n\nGenerative and non-generative tasks live in one document. Each profile\ncarries its own version and a requirement class so a strict reader can skip\nan optional profile it does not understand while still rejecting unknown\ncore fields.",
       "properties": {
+        "decoding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SequenceDecodingSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How a non-generative sequence output is decoded into discrete tokens."
+        },
         "generation_affecting": {
           "default": false,
           "description": "Whether this profile changes generated output and therefore participates\nin cache correctness dependencies.",

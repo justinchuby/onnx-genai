@@ -159,6 +159,10 @@ pub struct TaskProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pooling: Option<PoolingSpec>,
 
+    /// How a non-generative sequence output is decoded into discrete tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoding: Option<SequenceDecodingSpec>,
+
     /// Whether this profile changes generated output and therefore participates
     /// in cache correctness dependencies.
     #[serde(default)]
@@ -196,6 +200,73 @@ pub enum PoolingKind {
     Max,
     Cls,
     LastToken,
+}
+
+/// Frame-synchronous decoding contract for non-autoregressive sequence models.
+///
+/// A CTC acoustic model emits one class distribution per encoder frame. The
+/// transcript is recovered by taking the per-frame argmax, collapsing runs of
+/// repeated ids, and dropping the blank id — no generation loop and no
+/// autoregressive state are involved.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SequenceDecodingSpec {
+    /// Generic decoding algorithm selector (e.g. `ctc`).
+    #[schemars(with = "schema_vocabulary::SequenceDecodingKind")]
+    pub kind: String,
+
+    /// Class id reserved for the CTC blank symbol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blank_id: Option<u32>,
+
+    /// Whether runs of identical consecutive ids collapse to one id.
+    #[serde(default)]
+    pub collapse_repeats: bool,
+
+    /// Axis of the logits tensor that enumerates frames.
+    #[schemars(range(min = 0))]
+    pub time_axis: usize,
+
+    /// Axis of the logits tensor that enumerates classes.
+    #[schemars(range(min = 0))]
+    pub class_axis: usize,
+
+    /// Profile output role naming the per-row count of valid frames.
+    ///
+    /// Present when the package is batched with padding: rows are decoded only
+    /// over their own valid frame prefix so a padded batch produces the same
+    /// transcript per row as an unpadded single-row run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lengths: Option<String>,
+
+    /// Where the class-id -> string mapping comes from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vocabulary: Option<DecodingVocabulary>,
+}
+
+/// Source of the class-id -> string mapping used to render a transcript.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DecodingVocabulary {
+    /// Generic source selector (e.g. `tokenizer`, `inline`).
+    #[schemars(with = "schema_vocabulary::DecodingVocabularySource")]
+    pub source: String,
+
+    /// Number of classes in the decoding vocabulary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<usize>,
+
+    /// Token string that renders as a word boundary (e.g. `|`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub word_delimiter: Option<String>,
+
+    /// Token string ignored during rendering (e.g. `<pad>`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_tokens: Vec<String>,
+
+    /// Inline class-id -> string table, ordered by class id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tokens: Vec<String>,
 }
 
 /// Legal sharding and replication facts for distributed execution.

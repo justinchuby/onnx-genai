@@ -276,6 +276,57 @@ mod schema_vocabulary {
     );
 
     extensible_string!(
+        /// Generic audio transform-operation vocabulary.
+        AudioTransformOp,
+        audio_transform_op,
+        AUDIO_TRANSFORM_OP,
+        [
+            "decode",
+            "resample",
+            "downmix",
+            "rescale",
+            "zero_mean_unit_variance",
+            "normalize",
+            "pad",
+            "trim",
+            "frame",
+            "log_mel_spectrogram",
+            "emit_sample_lengths",
+            "emit_validity_mask"
+        ]
+    );
+
+    extensible_string!(
+        /// Generic audio-output content-role vocabulary.
+        AudioOutputContent,
+        audio_output_content,
+        AUDIO_OUTPUT_CONTENT,
+        [
+            "waveform",
+            "features",
+            "sample_lengths",
+            "frame_lengths",
+            "validity_mask"
+        ]
+    );
+
+    extensible_string!(
+        /// Frame-synchronous sequence-decoding algorithm vocabulary.
+        SequenceDecodingKind,
+        sequence_decoding_kind,
+        SEQUENCE_DECODING_KIND,
+        ["ctc", "greedy_argmax"]
+    );
+
+    extensible_string!(
+        /// Class-id -> string mapping source vocabulary.
+        DecodingVocabularySource,
+        decoding_vocabulary_source,
+        DECODING_VOCABULARY_SOURCE,
+        ["tokenizer", "inline"]
+    );
+
+    extensible_string!(
         /// Loop-carried state initialization vocabulary.
         StateInitKind,
         state_init_kind,
@@ -443,6 +494,22 @@ mod schema_helpers {
 
     pub(super) fn thumbnail_order(schema: &mut Schema) {
         extensible_string_enum(schema, super::schema_vocabulary::THUMBNAIL_ORDER);
+    }
+
+    pub(super) fn audio_transform_op(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::AUDIO_TRANSFORM_OP);
+    }
+
+    pub(super) fn audio_output_content(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::AUDIO_OUTPUT_CONTENT);
+    }
+
+    pub(super) fn sequence_decoding_kind(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::SEQUENCE_DECODING_KIND);
+    }
+
+    pub(super) fn decoding_vocabulary_source(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::DECODING_VOCABULARY_SOURCE);
     }
 
     pub(super) fn state_init_kind(schema: &mut Schema) {

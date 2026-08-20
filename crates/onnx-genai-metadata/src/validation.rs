@@ -234,8 +234,10 @@ pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>
         );
     }
     validate_preprocessing_workflow(metadata, &mut errors);
+    validate_audio_preprocessing_workflow(metadata, &mut errors);
     validate_generation_contract(metadata, &mut errors);
     validate_profiles(metadata, &mut errors);
+    validate_profile_decoding(metadata, &mut errors);
     validate_speculative_rollback(metadata, &mut errors);
 
     if errors.is_empty() {
@@ -426,16 +428,23 @@ fn validate_generation_contract(metadata: &InferenceMetadata, errors: &mut Vec<S
     }
 }
 
+/// Profile kinds this reader can interpret. An unrecognized kind is only
+/// executable by a reader that understands it; here it is either a hard
+/// error (`requirement: required`) or fully skipped (`requirement:
+/// ignorable`), including skipping its `decoding` block in
+/// `validate_profile_decoding`.
+const KNOWN_PROFILE_KINDS: &[&str] = &[
+    "generation",
+    "embedding",
+    "reranking",
+    "classification",
+    "reward",
+    "transcription",
+];
+
 /// A required profile must be executable by this reader; an ignorable profile
 /// may be skipped. Unknown core fields still fail through `deny_unknown_fields`.
 fn validate_profiles(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
-    const KNOWN_PROFILE_KINDS: &[&str] = &[
-        "generation",
-        "embedding",
-        "reranking",
-        "classification",
-        "reward",
-    ];
     let workflow = metadata
         .pipeline
         .as_ref()
@@ -464,6 +473,64 @@ fn validate_profiles(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
                     "profiles.{name}.outputs.{role} requires pipeline.workflow to declare output \
                      '{output}'"
                 )),
+            }
+        }
+    }
+}
+
+/// A CTC (or other frame-synchronous) profile declares how its raw sequence
+/// output becomes discrete tokens. These rules only apply to a `kind` this
+/// reader recognizes: an unknown, ignorable profile is fully skippable, so its
+/// `decoding` block (if any) is never interpreted either.
+fn validate_profile_decoding(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
+    for (name, profile) in &metadata.profiles {
+        if !KNOWN_PROFILE_KINDS.contains(&profile.kind.as_str()) {
+            continue;
+        }
+        if profile.kind == "transcription" && profile.decoding.is_none() {
+            errors.push(format!(
+                "profiles.{name}.decoding is required because profiles.{name}.kind is \
+                 'transcription'"
+            ));
+        }
+        let Some(decoding) = &profile.decoding else {
+            continue;
+        };
+        if decoding.kind == "ctc" && decoding.blank_id.is_none() {
+            errors.push(format!(
+                "profiles.{name}.decoding requires blank_id because kind is 'ctc'"
+            ));
+        }
+        if decoding.time_axis == decoding.class_axis {
+            errors.push(format!(
+                "profiles.{name}.decoding.time_axis and class_axis must not both be axis {}",
+                decoding.time_axis
+            ));
+        }
+        if let Some(role) = &decoding.lengths
+            && !profile.outputs.contains_key(role)
+        {
+            errors.push(format!(
+                "profiles.{name}.decoding references output role '{role}' that the profile does \
+                 not declare"
+            ));
+        }
+        if let Some(vocabulary) = &decoding.vocabulary {
+            if vocabulary.source == "inline" && vocabulary.tokens.is_empty() {
+                errors.push(format!(
+                    "profiles.{name}.decoding.vocabulary requires non-empty tokens because \
+                     source is 'inline'"
+                ));
+            }
+            if let Some(size) = vocabulary.size
+                && !vocabulary.tokens.is_empty()
+                && size != vocabulary.tokens.len()
+            {
+                errors.push(format!(
+                    "profiles.{name}.decoding.vocabulary size {size} disagrees with tokens \
+                     length {}",
+                    vocabulary.tokens.len()
+                ));
             }
         }
     }
@@ -616,6 +683,78 @@ fn validate_preprocessing_workflow(metadata: &InferenceMetadata, errors: &mut Ve
             None => errors.push(format!(
                 "workflow image preprocessing adapter '{adapter_name}' has no output port '{port}'"
             )),
+        }
+    }
+}
+
+/// Mirrors `validate_preprocessing_workflow` for the audio preprocessing ABI.
+///
+/// `AudioOutputBinding` carries no `TensorContract`, so unlike the image
+/// program this only checks that every declared output names one of the
+/// adapter's declared output ports; it does not re-derive or cross-check a
+/// dtype/shape contract.
+fn validate_audio_preprocessing_workflow(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
+    const AUDIO_ABI: &str = "onnx-genai.audio-preprocess";
+    const AUDIO_ABI_VERSION: &str = "1";
+
+    let Some(workflow) = metadata
+        .pipeline
+        .as_ref()
+        .map(|pipeline| &pipeline.workflow)
+    else {
+        return;
+    };
+    let audio = metadata
+        .preprocessing
+        .as_ref()
+        .and_then(|spec| spec.audio.as_ref());
+    let adapters = workflow
+        .components
+        .iter()
+        .filter(|(_, component)| {
+            matches!(
+                &component.implementation,
+                crate::schema::ComponentImplementation::Adapter { abi, version, .. }
+                    if abi == AUDIO_ABI && version == AUDIO_ABI_VERSION
+            )
+        })
+        .collect::<Vec<_>>();
+    if audio.is_none() && !adapters.is_empty() {
+        errors.push(format!(
+            "workflow adapter components using {AUDIO_ABI}@{AUDIO_ABI_VERSION} require \
+                 preprocessing.audio metadata"
+        ));
+        return;
+    }
+    let Some(audio) = audio else {
+        return;
+    };
+    if adapters.len() != 1 {
+        errors.push(format!(
+            "preprocessing.audio requires exactly one workflow adapter component using \
+                 {AUDIO_ABI}@{AUDIO_ABI_VERSION}, found {}",
+            adapters.len()
+        ));
+        return;
+    }
+    let (adapter_name, adapter) = adapters[0];
+    match adapter.ports.inputs.get("encoded") {
+        Some(contract) if contract.dtype == "uint8" && contract.rank == 1 => {}
+        Some(contract) => errors.push(format!(
+            "workflow audio preprocessing adapter '{adapter_name}' input 'encoded' must be uint8 \
+                 rank 1, got {} rank {}",
+            contract.dtype, contract.rank
+        )),
+        None => errors.push(format!(
+            "workflow audio preprocessing adapter '{adapter_name}' must declare input 'encoded'"
+        )),
+    }
+    for output in &audio.outputs {
+        if !adapter.ports.outputs.contains_key(&output.name) {
+            errors.push(format!(
+                "preprocessing.audio output '{}' is not produced by adapter '{adapter_name}'",
+                output.name
+            ));
         }
     }
 }

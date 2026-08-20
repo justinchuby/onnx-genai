@@ -33,6 +33,10 @@ pub struct PreprocessingSpec {
     /// Typed image preprocessing transform program and its named tensor outputs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<ImagePreprocessingProgram>,
+
+    /// Typed audio preprocessing transform program and its named tensor outputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<AudioPreprocessingProgram>,
 }
 
 /// Generic image preprocessing program: an ordered transform pipeline plus the
@@ -268,4 +272,138 @@ pub struct ImageOutputBinding {
     /// Whether the runtime may omit this output when a model does not need it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub optional: Option<bool>,
+}
+
+/// Generic audio preprocessing program: an ordered transform pipeline plus the
+/// named workflow SSA tensor outputs it emits.
+///
+/// The program is expressed entirely as parameterized, architecture-neutral
+/// data, mirroring `ImagePreprocessingProgram`. Transform operations are
+/// generic (decode, resample, downmix, rescale, normalize, pad, frame,
+/// spectrogram). In workflow metadata, outputs are materialized by a
+/// manifest-pinned preprocessing adapter invocation and bind processor-local
+/// values to typed SSA names. A package may name an output `input_values`,
+/// `attention_mask`, or anything else without introducing runtime
+/// model-family dispatch.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+pub struct AudioPreprocessingProgram {
+    /// Ordered list of generic transform operations applied to decoded audio.
+    #[serde(default)]
+    pub transforms: Vec<AudioTransform>,
+
+    /// Named tensor outputs the program emits, each bound to a workflow SSA value.
+    #[schemars(length(min = 1))]
+    pub outputs: Vec<AudioOutputBinding>,
+}
+
+/// One generic audio transform operation.
+///
+/// `op` selects the operation from a generic vocabulary; the remaining fields
+/// are the parameters that operation reads (only the relevant ones are set).
+/// Every parameter is model DATA — concrete sample rates, channel counts, and
+/// so on live in a model's fixture, never as constants baked into this schema.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+pub struct AudioTransform {
+    /// Generic operation selector (e.g. `resample`, `zero_mean_unit_variance`).
+    #[schemars(with = "schema_vocabulary::AudioTransformOp")]
+    pub op: String,
+
+    /// Named values consumed by this transform.
+    ///
+    /// Absent means the operation consumes the immediately preceding value.
+    /// Explicit names allow branching programs without tensor-name heuristics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1), inner(length(min = 1)))]
+    pub inputs: Option<Vec<String>>,
+
+    /// Named values produced by this transform.
+    ///
+    /// These names are processor-local data. Final graph bindings select them
+    /// through `AudioOutputBinding::source`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1), inner(length(min = 1)))]
+    pub outputs: Option<Vec<String>>,
+
+    /// Target sample rate in Hz for a `resample` operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub sample_rate: Option<u32>,
+
+    /// Target channel count for a `downmix` operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub channels: Option<usize>,
+
+    /// Numerical stabilizer added to the variance for `zero_mean_unit_variance`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epsilon: Option<f64>,
+
+    /// Scalar multiplier for a `rescale` operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<f64>,
+
+    /// Padding side / resize mode selector — generic string data (e.g. `right`, `left`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub mode: Option<String>,
+
+    /// Fill value used by a `pad` operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pad_value: Option<f64>,
+
+    /// Fixed target length in samples or frames for a `pad`/`trim` operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub target_length: Option<usize>,
+
+    /// Mel filterbank size for a `log_mel_spectrogram` operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub num_mel_bins: Option<usize>,
+
+    /// FFT size for a spectrogram operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub n_fft: Option<usize>,
+
+    /// Hop length in samples for a spectrogram operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub hop_length: Option<usize>,
+
+    /// Analysis window length in samples for a spectrogram operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub win_length: Option<usize>,
+
+    /// Analysis window function — generic string data (e.g. `hann`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub window: Option<String>,
+}
+
+/// One named tensor output produced by an audio preprocessing program.
+///
+/// The output binds a processor-local value to a typed workflow SSA name.
+/// Neither the name nor the content role is inferred from a model identity.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+pub struct AudioOutputBinding {
+    /// Workflow SSA value this output binds to.
+    #[schemars(length(min = 1))]
+    pub name: String,
+
+    /// Program-local value produced by a transform.
+    #[schemars(length(min = 1))]
+    pub source: String,
+
+    /// Generic content role of this output.
+    #[schemars(with = "schema_vocabulary::AudioOutputContent")]
+    pub content: String,
+
+    /// Element type of the emitted tensor.
+    #[schemars(length(min = 1))]
+    pub dtype: String,
+
+    /// Tensor rank of the emitted tensor.
+    pub rank: usize,
 }
