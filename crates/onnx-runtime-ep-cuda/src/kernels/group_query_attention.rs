@@ -3371,16 +3371,30 @@ mod tests {
         assert_eq!(workspace.reserve(WS_Q_BNSH, 2048).unwrap(), first);
         assert_eq!(runtime.allocation_counts(), allocated);
 
+        // Growing releases the old block and takes a larger one. `frees` counts
+        // *driver* calls, and the runtime's allocation pool retains released
+        // blocks rather than returning them to the driver, so the released
+        // 4096-byte block shows up as retained bytes instead of as a `cuMemFree`.
+        // Asserting on the retained total keeps the property this test exists
+        // for -- the old block is released, not leaked -- without pinning which
+        // side of the pool it ends up on.
         let grown = workspace.reserve(WS_Q_BNSH, 8192).unwrap();
         assert_ne!(grown, first);
         let grown_counts = runtime.allocation_counts();
         assert_eq!(grown_counts.allocations, before.allocations + 2);
-        assert_eq!(grown_counts.frees, before.frees + 1);
+        assert!(
+            runtime.raw_pool_retained_bytes() == 4096 || grown_counts.frees == before.frees + 1,
+            "the 4096-byte block must be released -- retained by the pool or \
+             returned to the driver, but not held by the workspace"
+        );
 
         drop(workspace);
         let after = runtime.allocation_counts();
         assert_eq!(after.allocations, before.allocations + 2);
-        assert_eq!(after.frees, before.frees + 2);
+        assert!(
+            runtime.raw_pool_retained_bytes() == 4096 + 8192 || after.frees == before.frees + 2,
+            "dropping the workspace must release the 8192-byte block too"
+        );
     }
 
     #[test]
