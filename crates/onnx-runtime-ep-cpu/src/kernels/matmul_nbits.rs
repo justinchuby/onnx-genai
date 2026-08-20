@@ -710,6 +710,7 @@ pub struct MatMulNBitsKernel {
     constant_inputs: [bool; 5],
     weight_nk: OnceLock<Vec<f32>>,
     int8_weight: OnceLock<Int8Weight>,
+    int4_i16_weight: OnceLock<Int4I16Weight>,
     packed_int4_weight: OnceLock<PackedInt4Weight>,
     packed_int4_n16_weight: OnceLock<PackedN16SdotWeight>,
     packed_kai_qsi4_weight: OnceLock<PackedKaiSdotWeight>,
@@ -998,6 +999,40 @@ struct PackedInt4Weight {
     scales: Vec<f32>,
 }
 
+/// int4 weight kept in the ONNX packed-nibble layout for the acc4
+/// int16-activation decode GEMV ([`gemv_nk_int4_i16`]).
+///
+/// The point of this representation is what it *does not* do. The incumbent
+/// CompInt8 route ([`Int8Weight`], via `prepack_int8_weight`) expands every
+/// 4-bit weight to a whole `i8` byte so it can feed a `u8 x i8` dot, which
+/// doubles the bytes the decode walks -- and a decode GEMV's cost is per weight
+/// byte touched, not per FLOP (docs/benchmarks/2026-08-20-int4-acc4-int8-repack.md).
+/// `values` here is **byte-identical to the ONNX initializer**: 0.5 bytes per
+/// weight, `[n][k_blocks][block_size/2]`, low nibble first. The kernel unpacks
+/// nibbles in-register instead, so the denser multiply costs no extra traffic.
+///
+/// Only the two small per-block f32 side tables are actually derived, and they
+/// are `n * k_blocks` (three orders of magnitude below the weight), so this
+/// "prepack" is a copy plus O(blocks) work rather than an O(weights) rewrite.
+struct Int4I16Weight {
+    /// Packed nibbles, verbatim ONNX layout `[n][k_blocks][block_size/2]`.
+    values: Vec<u8>,
+    /// Per-block weight scales, `[n][k_blocks]`.
+    scales: Vec<f32>,
+    /// Per-block `scale * zero_point`, `[n][k_blocks]`.
+    ///
+    /// Folding the scale in here is what lets the kernel apply the zero point
+    /// as a single `f32` correction against the block's *exact* activation sum
+    /// (`- scale*zp * sum(a)`), so the zero point never enters the integer dot
+    /// and cannot interact with int16 activation rounding.
+    ///
+    /// An absent `zero_points` input means the implicit midpoint 8, which is
+    /// also how a *signed* nibble interpretation is expressed: `q - 8` maps
+    /// `0..=15` onto `-8..=7`. There is therefore no separate signed path --
+    /// the unsigned-nibble-plus-zero-point form subsumes it exactly.
+    scaled_zero_points: Vec<f32>,
+}
+
 const N16_SDOT_OUTPUTS: usize = 16;
 const N16_SDOT_K_GROUP: usize = 4;
 
@@ -1079,6 +1114,11 @@ static INT8_PREFILL_GEBP_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// [`x86_sgemm::quant_prefill_gebp`] with an [`x86_sgemm::Int4Weight`].
 #[cfg(all(test, target_arch = "x86_64"))]
 static INT4_PREFILL_GEBP_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
+/// Counts entries into [`gemv_nk_int4_i16`], so a test can assert that acc4
+/// int4 decode reaches the packed-nibble int16 kernel -- and, critically, that
+/// acc0 never does.
+#[cfg(all(test, target_arch = "x86_64"))]
+static INT4_I16_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// Counts entries into [`with_decode_pool_lazy`], so a test can assert *which*
 /// shapes defer building the decode pool and which still install it eagerly.
 #[cfg(test)]
@@ -1315,6 +1355,7 @@ impl KernelFactory for MatMulNBitsFactory {
             constant_inputs: [false; 5],
             weight_nk: OnceLock::new(),
             int8_weight: OnceLock::new(),
+            int4_i16_weight: OnceLock::new(),
             packed_int4_weight: OnceLock::new(),
             packed_int4_n16_weight: OnceLock::new(),
             packed_kai_qsi4_weight: OnceLock::new(),
@@ -1763,6 +1804,47 @@ impl Kernel for MatMulNBitsKernel {
                     );
                 })?;
             }
+        } else if self.bits == 4
+            && self.accuracy_level == 4
+            && group_indices.is_none()
+            && reduced_precision_activation_allowed(self.accuracy_level)
+            && int4_i16_enabled()
+            && m <= INT4_I16_MAX_ROWS
+            && self.block_size.is_multiple_of(2)
+            && int4_i16_host_supported()
+        {
+            // Packed-nibble int4 x int16 decode. Same accuracy contract as the
+            // int8 branch below (both are reduced-precision, acc4-only), but it
+            // streams the weight at 0.5 B/weight instead of repacking to 1 B.
+            // Restricted to small `m`: above that the weight stream is already
+            // amortized across rows and the int8/AMX prefill kernels win.
+            let owned_weight;
+            let weight = if can_prepack {
+                if let Some(weight) = self.int4_i16_weight.get() {
+                    weight
+                } else {
+                    let weight =
+                        self.prepack_int4_i16_weight(&inputs[1], &inputs[2], zero_points)?;
+                    let _ = self.int4_i16_weight.set(weight);
+                    self.int4_i16_weight
+                        .get()
+                        .expect("constant MatMulNBits int4 i16 prepack was just initialized")
+                }
+            } else {
+                owned_weight = self.prepack_int4_i16_weight(&inputs[1], &inputs[2], zero_points)?;
+                &owned_weight
+            };
+            with_decode_pool(|| {
+                gemv_nk_int4_i16(
+                    &activations,
+                    m,
+                    weight,
+                    result,
+                    self.k,
+                    self.n,
+                    self.block_size,
+                );
+            })?;
         } else if self.bits == 4 && self.accuracy_level == 4 && group_indices.is_none() {
             let owned_weight;
             let int8_weight = if can_prepack {
@@ -3166,6 +3248,59 @@ impl MatMulNBitsKernel {
             values,
             scales,
             block_sums,
+        })
+    }
+
+    /// Materialize the acc4 int16-activation int4 weight ([`Int4I16Weight`]).
+    ///
+    /// Unlike [`Self::prepack_int8_weight`], which rewrites every weight into
+    /// its own `i8` byte, this copies the packed nibbles unchanged and derives
+    /// only the two `n * k_blocks` side tables. The ONNX initializer already
+    /// pads its final block, so the copied buffer needs no padding pass and its
+    /// length is exactly `n * k_blocks * (block_size / 2)`.
+    fn prepack_int4_i16_weight(
+        &self,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+    ) -> Result<Int4I16Weight> {
+        debug_assert_eq!(self.bits, 4);
+        let packed = to_dense_bytes(packed)?;
+        let scales = to_dense_compute_f32(scales)?;
+        let packed_zero_points = zero_points.map(to_dense_bytes).transpose()?;
+        let k_blocks = self.k.div_ceil(self.block_size);
+        let blob_size = self.block_size / 2;
+        let zp_row_bytes = k_blocks.div_ceil(2);
+        let expected = self.n * k_blocks * blob_size;
+        if packed.len() < expected || scales.len() < self.n * k_blocks {
+            return Err(error(format!(
+                "MatMulNBits int4 weight is {} packed bytes and {} scales, need {expected} and {}",
+                packed.len(),
+                scales.len(),
+                self.n * k_blocks
+            )));
+        }
+        let mut scaled_zero_points = vec![0.0f32; self.n * k_blocks];
+        for output in 0..self.n {
+            for block in 0..k_blocks {
+                // An absent zero-point input is the implicit midpoint 8, which
+                // is also the signed-nibble reading of the same bits.
+                let zero_point = packed_zero_points.as_ref().map_or(8u8, |points| {
+                    let byte = points[output * zp_row_bytes + block / 2];
+                    if block.is_multiple_of(2) {
+                        byte & 0x0f
+                    } else {
+                        byte >> 4
+                    }
+                });
+                let index = output * k_blocks + block;
+                scaled_zero_points[index] = scales[index] * zero_point as f32;
+            }
+        }
+        Ok(Int4I16Weight {
+            values: packed[..expected].to_vec(),
+            scales,
+            scaled_zero_points,
         })
     }
 
@@ -9317,6 +9452,54 @@ fn eight_bit_int16_activation() -> bool {
     })
 }
 
+/// Row ceiling for the packed-nibble int4 x int16 route.
+///
+/// The kernel's advantage is that it streams the weight once at 0.5 B/weight,
+/// so it wins exactly while the weight stream dominates. Past this many
+/// activation rows the stream is amortized, arithmetic dominates, and the
+/// blocked int8/AMX prefill kernels take over. The value is measured, not
+/// assumed -- see the m-sweep in the accompanying benchmark doc.
+const INT4_I16_MAX_ROWS: usize = 8;
+
+/// Whether this host can execute the packed-nibble int4 x int16 kernel
+/// profitably.
+///
+/// The kernel has an exact scalar fallback, so correctness never depends on
+/// this. But on a host without AVX2 the scalar nibble unpack is slower than the
+/// incumbent int8 repack, so the route falls through instead and those hosts
+/// see no change at all.
+fn int4_i16_host_supported() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Whether the acc4 int4 decode may use the packed-nibble int16 kernel
+/// ([`gemv_nk_int4_i16`]) instead of the CompInt8 int8 repack.
+///
+/// Default **on**, but strictly subordinate to
+/// [`reduced_precision_activation_allowed`]: this is the measurement/kill
+/// switch, not the precision policy. Setting it off (`ONNX_GENAI_CPU_MM_INT4_I16=0`,
+/// also `off`/`false`/`fp32`) restores the previous int8-repack route for A/B.
+/// It can never *enable* a reduced-precision route that the accuracy level
+/// forbids -- the accuracy gate is checked first and independently, so acc0
+/// stays on its exact fp32-activation path with this variable set to anything.
+fn int4_i16_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("ONNX_GENAI_CPU_MM_INT4_I16") {
+        Ok(value) => {
+            let value = value.trim().to_ascii_lowercase();
+            !matches!(value.as_str(), "fp32" | "f32" | "0" | "off" | "false")
+        }
+        Err(_) => true,
+    })
+}
+
 /// Quantize one K-block of `f32` activations to symmetric int16 with a single
 /// per-block scale, returning that scale.
 ///
@@ -9431,6 +9614,291 @@ fn gemv_nk_u8_i16(
     } else {
         compute(0, result);
     }
+}
+
+/// Packed-nibble int4 decode GEMM with an int16-quantized activation (acc4).
+///
+/// Structurally identical to [`gemv_nk_u8_i16`] -- same activation quantizer,
+/// same per-block `weight_scale * (q . a) - scale*zp * sum(a)` affine dequant,
+/// same one-reduction-per-block grouping -- but it reads the weight in the
+/// ONNX packed layout at 0.5 B/weight instead of the CompInt8 repack's 1 B, and
+/// unpacks nibbles in-register. For a decode GEMV, whose cost is dominated by
+/// weight bytes streamed rather than FLOPs, that byte ratio *is* the speedup.
+///
+/// `rows` activation rows share one prepacked weight; each row re-quantizes its
+/// own activation (cheap, `O(k)`) and then streams the weight. The weight stream
+/// is the expensive part, so batching rows here amortizes it -- which is why
+/// this covers m=1 decode and small-m (2..8) speculative/beam batches with the
+/// same code rather than falling back to a separate path.
+fn gemv_nk_int4_i16(
+    activation: &[f32],
+    rows: usize,
+    weight: &Int4I16Weight,
+    result: &mut [f32],
+    k: usize,
+    n: usize,
+    block_size: usize,
+) {
+    #[cfg(all(test, target_arch = "x86_64"))]
+    INT4_I16_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
+    debug_assert_eq!(activation.len(), rows * k);
+    debug_assert_eq!(result.len(), rows * n);
+    let k_blocks = k.div_ceil(block_size);
+    let blob_size = block_size / 2;
+    let row_bytes = k_blocks * blob_size;
+    debug_assert_eq!(weight.values.len(), n * row_bytes);
+    debug_assert_eq!(weight.scales.len(), n * k_blocks);
+    debug_assert_eq!(weight.scaled_zero_points.len(), n * k_blocks);
+    let group = activation_quant_group().min(block_size.max(1));
+    let k_groups = k.div_ceil(group);
+    let dot_kernel = host_dot_kernel();
+
+    let mut quantized = vec![0i16; k];
+    let mut group_scales = vec![0.0f32; k_groups];
+    let mut block_activation_sums = vec![0.0f32; k_blocks];
+    for row in 0..rows {
+        let row_activation = &activation[row * k..row * k + k];
+        // These index parallel activation and output arrays by the shared group.
+        #[allow(clippy::needless_range_loop)]
+        for grp in 0..k_groups {
+            let start = grp * group;
+            let end = (start + group).min(k);
+            group_scales[grp] =
+                quantize_block_i16(&row_activation[start..end], &mut quantized[start..end]);
+        }
+        // These index parallel activation and output arrays by the shared block.
+        #[allow(clippy::needless_range_loop)]
+        for block in 0..k_blocks {
+            let start = block * block_size;
+            let end = (start + block_size).min(k);
+            block_activation_sums[block] = row_activation[start..end].iter().sum();
+        }
+
+        let quantized = &quantized[..];
+        let group_scales = &group_scales[..];
+        let block_activation_sums = &block_activation_sums[..];
+        let compute = |output_start: usize, outputs: &mut [f32]| {
+            for (index, output) in outputs.iter_mut().enumerate() {
+                let column = output_start + index;
+                let packed = &weight.values[column * row_bytes..column * row_bytes + row_bytes];
+                let scale_row = &weight.scales[column * k_blocks..column * k_blocks + k_blocks];
+                let zp_row =
+                    &weight.scaled_zero_points[column * k_blocks..column * k_blocks + k_blocks];
+                let mut acc = 0.0f32;
+                for block in 0..k_blocks {
+                    let block_start = block * block_size;
+                    let block_end = (block_start + block_size).min(k);
+                    let first_group = block_start / group;
+                    let last_group = (block_end - 1) / group;
+                    let block_partial = block_dot_int4_i16(
+                        &packed[block * blob_size..(block + 1) * blob_size],
+                        &quantized[block_start..block_end],
+                        &group_scales[first_group..=last_group],
+                        group,
+                        dot_kernel,
+                    );
+                    acc += scale_row[block] * block_partial
+                        - zp_row[block] * block_activation_sums[block];
+                }
+                *output = acc;
+            }
+        };
+        let row_result = &mut result[row * n..row * n + n];
+        let chunk = output_chunk_len(n, k);
+        if chunk < n {
+            parallel_output_rows(row_result, k, compute);
+        } else {
+            compute(0, row_result);
+        }
+    }
+}
+
+/// Exact scalar reference for [`block_dot_int4_i16`]: unpack each nibble and
+/// accumulate `group_scale * (q . a)` in f32, one group at a time.
+///
+/// This is the contract every vector path must reproduce. It is deliberately
+/// written as the most literal possible reading of the ONNX layout -- element
+/// `i` of a block is the low nibble of byte `i/2` when `i` is even and the high
+/// nibble when odd -- so that a disagreement is a bug in the vector code and
+/// never an ambiguity about what the packed format means.
+fn block_dot_int4_i16_scalar(
+    packed: &[u8],
+    activation: &[i16],
+    group_scales: &[f32],
+    group: usize,
+) -> f32 {
+    let valid = activation.len();
+    let mut total = 0.0f32;
+    let mut position = 0usize;
+    let mut group_index = 0usize;
+    while position < valid {
+        let group_end = (position + group).min(valid);
+        let mut acc = 0i32;
+        for offset in position..group_end {
+            let byte = packed[offset / 2];
+            let quantized = if offset.is_multiple_of(2) {
+                byte & 0x0f
+            } else {
+                byte >> 4
+            };
+            acc += quantized as i32 * activation[offset] as i32;
+        }
+        total += group_scales[group_index] * acc as f32;
+        position = group_end;
+        group_index += 1;
+    }
+    total
+}
+
+/// Weighted sum over activation-quant groups of one packed int4 weight block:
+/// `sum_group group_scale * (q_nibble . a_i16)`, with the raw unsigned nibbles.
+///
+/// The zero point is **not** applied here. The caller subtracts
+/// `scale*zp * sum(a)` against the block's exact f32 activation sum, using the
+/// identity `sum (q - zp)*a = sum q*a - zp * sum a`. Keeping the zero point out
+/// of the integer dot means it never interacts with int16 activation rounding,
+/// and it is why the nibbles can stay unsigned in `0..=15` -- which in turn is
+/// what makes a single `_mm256_madd_epi16` legal without a sign-correction pass.
+///
+/// ## Overflow
+///
+/// `q <= 15` and `|a| <= 32767` (the int16 quantizer's range), so each product
+/// is at most `491_505` and each `_mm256_madd_epi16` lane holds at most
+/// `983_010`. An `i32` lane can therefore absorb `4_369` products before it can
+/// overflow, while a lane accumulates only `group / 16` of them -- so any group
+/// up to `69_904` elements is safe. Weight blocks are at most a few hundred
+/// elements, so the margin is four orders of magnitude and no rescaling is
+/// needed inside a group.
+#[inline]
+fn block_dot_int4_i16(
+    packed: &[u8],
+    activation: &[i16],
+    group_scales: &[f32],
+    group: usize,
+    dot_kernel: DotKernel,
+) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if matches!(
+            dot_kernel,
+            DotKernel::Avx2 | DotKernel::AvxVnni | DotKernel::Avx512Vnni
+        ) && is_x86_feature_detected!("avx2")
+        {
+            // SAFETY: AVX2 was just detected at runtime, and the slice
+            // invariants (`packed` holds `activation.len()` nibbles, one
+            // `group_scales` entry per group) are the same ones the scalar
+            // reference relies on.
+            return unsafe { block_dot_int4_i16_avx2(packed, activation, group_scales, group) };
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = dot_kernel;
+    block_dot_int4_i16_scalar(packed, activation, group_scales, group)
+}
+
+/// AVX2 packed-nibble int4 x int16 block dot.
+///
+/// Unpacks 32 nibbles per 16-byte load and reduces them with
+/// `_mm256_madd_epi16`, the same instruction the 8-bit path uses and one that
+/// needs **no VNNI**. Against the acc0 f32 kernel this replaces 8 widening
+/// converts + 4 `fmadd_ps` per 32 weights with 2 widens + 2 madds, and against
+/// the acc4 int8 repack it reads half the bytes.
+///
+/// The 32-element main loop is followed by a 16-element step so that
+/// `block_size == 16` -- the smallest block ONNX allows, and the one the
+/// column-blocked kernels reject outright -- still vectorizes, then an exact
+/// scalar tail for a partial final block or an odd `K`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn block_dot_int4_i16_avx2(
+    packed: &[u8],
+    activation: &[i16],
+    group_scales: &[f32],
+    group: usize,
+) -> f32 {
+    use std::arch::x86_64::*;
+
+    let valid = activation.len();
+    let mask = _mm_set1_epi8(0x0f);
+    let mut total = 0.0f32;
+    let mut position = 0usize;
+    let mut group_index = 0usize;
+    while position < valid {
+        let group_end = (position + group).min(valid);
+        let group_scale = group_scales[group_index];
+        let mut acc = _mm256_setzero_si256();
+        let mut inner = position;
+
+        // 32 nibbles (16 packed bytes) per iteration.
+        while inner + 32 <= group_end {
+            debug_assert!(inner.is_multiple_of(2));
+            // SAFETY: inner + 32 <= group_end <= valid, and `packed` holds
+            // `valid` nibbles, so bytes inner/2 .. inner/2+16 are in bounds.
+            let bytes = unsafe { _mm_loadu_si128(packed.as_ptr().add(inner / 2).cast()) };
+            let low = _mm_and_si128(bytes, mask);
+            let high = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask);
+            // Interleave so lanes come out in element order w0=lo(b0),
+            // w1=hi(b0), w2=lo(b1), ... exactly as the scalar reference reads
+            // them.
+            let inter_lo = _mm_unpacklo_epi8(low, high); // elements 0..=15
+            let inter_hi = _mm_unpackhi_epi8(low, high); // elements 16..=31
+            // SAFETY: 16 i16 = 32 bytes, twice, within the same bound.
+            let act_lo = unsafe { _mm256_loadu_si256(activation.as_ptr().add(inner).cast()) };
+            let act_hi = unsafe { _mm256_loadu_si256(activation.as_ptr().add(inner + 16).cast()) };
+            acc = _mm256_add_epi32(
+                acc,
+                _mm256_madd_epi16(_mm256_cvtepu8_epi16(inter_lo), act_lo),
+            );
+            acc = _mm256_add_epi32(
+                acc,
+                _mm256_madd_epi16(_mm256_cvtepu8_epi16(inter_hi), act_hi),
+            );
+            inner += 32;
+        }
+
+        // 16-nibble step: this is the whole loop when block_size == 16.
+        if inner + 16 <= group_end {
+            debug_assert!(inner.is_multiple_of(2));
+            // SAFETY: 8 packed bytes hold the 16 nibbles inner..inner+16.
+            let bytes = unsafe { _mm_loadl_epi64(packed.as_ptr().add(inner / 2).cast()) };
+            let low = _mm_and_si128(bytes, mask);
+            let high = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask);
+            let inter = _mm_unpacklo_epi8(low, high); // elements 0..=15
+            // SAFETY: 16 i16 within `activation`.
+            let act = unsafe { _mm256_loadu_si256(activation.as_ptr().add(inner).cast()) };
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_cvtepu8_epi16(inter), act));
+            inner += 16;
+        }
+
+        // Reduce this group's i32 lanes and scale into the block total. The
+        // reduction is per group rather than folded into one f32x8 block
+        // accumulator (the shape the 8-bit kernel uses) because folding costs
+        // bit-exactness against the scalar reference -- it scales eight lanes
+        // separately instead of one exact i32 sum -- and measurement put the
+        // saving at 1-3%, which does not buy an exact contract.
+        let lo = _mm256_castsi256_si128(acc);
+        let hi = _mm256_extracti128_si256(acc, 1);
+        let sum4 = _mm_add_epi32(lo, hi);
+        let sum2 = _mm_add_epi32(sum4, _mm_shuffle_epi32(sum4, 0b1110));
+        let sum1 = _mm_add_epi32(sum2, _mm_shuffle_epi32(sum2, 0b0001));
+        let mut group_total = _mm_cvtsi128_si32(sum1);
+
+        // Exact scalar tail: a partial trailing block, or an odd K where the
+        // final byte contributes only its low nibble.
+        for offset in inner..group_end {
+            let byte = packed[offset / 2];
+            let quantized = if offset.is_multiple_of(2) {
+                byte & 0x0f
+            } else {
+                byte >> 4
+            };
+            group_total += quantized as i32 * activation[offset] as i32;
+        }
+        total += group_scale * group_total as f32;
+        position = group_end;
+        group_index += 1;
+    }
+    total
 }
 
 /// Weighted sum over activation-quant groups of a single weight block:
@@ -9921,6 +10389,7 @@ mod tests {
             "kai_sdot_matmul_m1(",
             "n16_sdot_matmul_m1(",
             "n16_sdot_u8_i16_matmul_m1(",
+            "gemv_nk_int4_i16(",
         ]
         .iter()
         .map(|name| (*name).to_string())
@@ -10189,6 +10658,7 @@ mod tests {
             constant_inputs: [false; 5],
             weight_nk: OnceLock::new(),
             int8_weight: OnceLock::new(),
+            int4_i16_weight: OnceLock::new(),
             packed_u8_weight: OnceLock::new(),
             packed_int4_weight: OnceLock::new(),
             packed_int4_n16_weight: OnceLock::new(),
@@ -10218,6 +10688,451 @@ mod tests {
             accuracy_level: 4,
             ..test_kernel(k, n, block_size)
         }
+    }
+
+    /// Reference dequant of one packed int4 block in `f64`, reading the nibbles
+    /// exactly as the ONNX layout defines them.
+    ///
+    /// This is the *contract*, deliberately independent of every production
+    /// helper: it does not call `block_dot_int4_i16_scalar`, does not use the
+    /// int16 activation quantizer, and accumulates in `f64`. A kernel that
+    /// matches this within the int16 rounding budget is correct; one that
+    /// matches only `block_dot_int4_i16_scalar` has merely reproduced its own
+    /// possible mistake.
+    fn int4_f64_reference(
+        activation: &[f32],
+        packed: &[u8],
+        scales: &[f32],
+        zero_points: Option<&[u8]>,
+        n: usize,
+        k: usize,
+        block_size: usize,
+    ) -> Vec<f64> {
+        let k_blocks = k.div_ceil(block_size);
+        let blob = block_size / 2;
+        let zp_row_bytes = k_blocks.div_ceil(2);
+        let mut out = vec![0.0f64; n];
+        for (column, value) in out.iter_mut().enumerate() {
+            let mut acc = 0.0f64;
+            for block in 0..k_blocks {
+                let scale = scales[column * k_blocks + block] as f64;
+                let zero_point = zero_points.map_or(8u8, |points| {
+                    let byte = points[column * zp_row_bytes + block / 2];
+                    if block.is_multiple_of(2) {
+                        byte & 0x0f
+                    } else {
+                        byte >> 4
+                    }
+                }) as f64;
+                let base = (column * k_blocks + block) * blob;
+                for offset in 0..block_size {
+                    let depth = block * block_size + offset;
+                    if depth >= k {
+                        break;
+                    }
+                    let byte = packed[base + offset / 2];
+                    let quantized = if offset.is_multiple_of(2) {
+                        byte & 0x0f
+                    } else {
+                        byte >> 4
+                    } as f64;
+                    acc += (quantized - zero_point) * scale * activation[depth] as f64;
+                }
+            }
+            *value = acc;
+        }
+        out
+    }
+
+    /// The AVX2 packed-nibble kernel must be **bit-exact** against its scalar
+    /// reference, not merely close.
+    ///
+    /// Both sides accumulate the same products into `i32` (exact, and integer
+    /// addition is associative, so the lane-parallel reduction cannot diverge)
+    /// and then apply the same per-group `f32` scale in the same group order.
+    /// Anything less than equality means the nibble unpack, the interleave order
+    /// or the tail handling is wrong. Every nibble value 0..=15 appears in every
+    /// lane position, block sizes cover 16 (the smallest ONNX allows, which only
+    /// the 16-wide step reaches) through 128, and the lengths include partial
+    /// blocks and an odd count so the scalar tail runs.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn int4_i16_avx2_block_dot_is_bit_exact_against_the_scalar_reference() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut checked = 0usize;
+        for &block_size in &[16usize, 32, 64, 128] {
+            let group = activation_quant_group().min(block_size);
+            // Lengths: the full block, a partial that leaves a sub-16 tail, and
+            // an odd length so the final byte contributes only its low nibble.
+            for &valid in &[block_size, block_size - 1, block_size / 2 + 1, 1] {
+                if valid == 0 || valid > block_size {
+                    continue;
+                }
+                for phase in 0..16usize {
+                    let packed: Vec<u8> = (0..block_size / 2)
+                        .map(|i| {
+                            let low = ((i * 7 + phase) % 16) as u8;
+                            let high = ((i * 11 + phase * 3 + 5) % 16) as u8;
+                            low | (high << 4)
+                        })
+                        .collect();
+                    let activation: Vec<i16> = (0..valid)
+                        .map(|i| {
+                            // Include both saturation extremes so a product that
+                            // would overflow a narrower accumulator is exercised.
+                            match (i + phase) % 5 {
+                                0 => i16::MAX,
+                                1 => i16::MIN,
+                                2 => 0,
+                                3 => -1,
+                                _ => ((i * 313 + phase * 97) % 65536) as i32 as i16,
+                            }
+                        })
+                        .collect();
+                    let groups = valid.div_ceil(group);
+                    let group_scales: Vec<f32> =
+                        (0..groups).map(|g| (g as f32 * 0.5 + 1.0) * 1e-4).collect();
+                    let scalar =
+                        block_dot_int4_i16_scalar(&packed, &activation, &group_scales, group);
+                    // SAFETY: AVX2 was detected above.
+                    let vector = unsafe {
+                        block_dot_int4_i16_avx2(&packed, &activation, &group_scales, group)
+                    };
+                    assert_eq!(
+                        scalar.to_bits(),
+                        vector.to_bits(),
+                        "AVX2 packed-nibble dot diverged from scalar \
+                         (block_size={block_size}, valid={valid}, phase={phase})",
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 100, "non-vacuous: only {checked} cases ran");
+    }
+
+    /// Every one of the 256 possible packed bytes must unpack to the right pair
+    /// of nibbles in the right order.
+    ///
+    /// This is the exhaustive half of requirement 5's "exhaustive/sampled nibble
+    /// values": rather than sampling, it isolates each byte with a unit
+    /// activation on one element at a time, so a swapped low/high nibble or a
+    /// bad interleave shows up as a specific wrong integer rather than a
+    /// statistical drift that a tolerance test could absorb.
+    #[test]
+    fn int4_i16_scalar_unpacks_every_byte_in_onnx_nibble_order() {
+        for byte in 0u16..=255 {
+            let byte = byte as u8;
+            let packed = vec![byte; 16];
+            for element in 0..32usize {
+                let mut activation = vec![0i16; 32];
+                activation[element] = 1;
+                let dot = block_dot_int4_i16_scalar(&packed, &activation, &[1.0], 32);
+                let expected = if element.is_multiple_of(2) {
+                    byte & 0x0f
+                } else {
+                    byte >> 4
+                };
+                assert_eq!(
+                    dot, expected as f32,
+                    "byte {byte:#04x} element {element}: low nibble must be the \
+                     even element and high nibble the odd one",
+                );
+            }
+        }
+    }
+
+    /// The full acc4 route must reproduce the `f64` affine-dequant contract
+    /// within the int16 activation quantizer's budget, across every block size,
+    /// symmetric and asymmetric, and both K tails.
+    ///
+    /// The tolerance is relative to the reference's own magnitude scale, not
+    /// absolute, and the test also asserts the result is *not* trivially zero --
+    /// a kernel that returned all zeros would otherwise pass any tolerance.
+    #[test]
+    fn int4_i16_gemv_matches_the_f64_dequant_contract() {
+        let _probe = lock_dispatch_probe();
+        for &block_size in &[16usize, 32, 64, 128] {
+            for &(k, n) in &[(256usize, 32usize), (255, 17)] {
+                for &asymmetric in &[false, true] {
+                    let k = if block_size > k { block_size * 2 } else { k };
+                    let weights: Vec<f32> = (0..n * k)
+                        .map(|i| (i as f32 * 0.013).sin() * 0.8 + (i as f32 * 0.0007).cos() * 0.3)
+                        .collect();
+                    let activation: Vec<f32> = (0..k)
+                        .map(|i| (i as f32 * 0.023 + 0.3).cos() * 0.6)
+                        .collect();
+                    let (packed, scales, zero_points, _) =
+                        quantize(&weights, n, k, block_size, asymmetric);
+                    let kernel = accuracy4_kernel(k, n, block_size);
+                    let blocks = k.div_ceil(block_size);
+                    let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
+                    let scales_t = Owned::f32(&[n, blocks], &scales);
+                    let zp_t = zero_points
+                        .as_ref()
+                        .map(|z| Owned::u8(&[n, blocks.div_ceil(2)], z));
+                    let weight = kernel
+                        .prepack_int4_i16_weight(
+                            &b.view(),
+                            &scales_t.view(),
+                            zp_t.as_ref().map(|z| z.view()).as_ref(),
+                        )
+                        .expect("prepack accepts a well-formed int4 weight");
+                    let mut out = vec![0.0f32; n];
+                    gemv_nk_int4_i16(&activation, 1, &weight, &mut out, k, n, block_size);
+                    let reference = int4_f64_reference(
+                        &activation,
+                        &packed,
+                        &scales,
+                        zero_points.as_deref(),
+                        n,
+                        k,
+                        block_size,
+                    );
+                    let magnitude = reference.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+                    assert!(
+                        magnitude > 1e-3,
+                        "reference is degenerate, the tolerance would be vacuous \
+                         (block_size={block_size}, k={k}, n={n})",
+                    );
+                    for (column, (&got, &want)) in out.iter().zip(reference.iter()).enumerate() {
+                        assert!(
+                            (got as f64 - want).abs() <= 2e-3 * magnitude,
+                            "acc4 int4 i16 diverged from the f64 contract at column \
+                             {column}: got {got}, want {want} (block_size={block_size}, \
+                             k={k}, n={n}, asymmetric={asymmetric})",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn roy_probe_bench_geometry() {
+        let _probe = lock_dispatch_probe();
+        let (k, n, block_size) = (4096usize, 256usize, 32usize);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 2654435761usize) % 1000) as f32 / 500.0 - 1.0)
+            .collect();
+        let activation: Vec<f32> = (0..k)
+            .map(|i| ((i * 40503usize) % 1000) as f32 / 500.0 - 1.0)
+            .collect();
+        let (packed, scales, zps, _) = quantize(&weights, n, k, block_size, true);
+        let kernel = accuracy4_kernel(k, n, block_size);
+        let blocks = k.div_ceil(block_size);
+        let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
+        let scales_t = Owned::f32(&[n, blocks], &scales);
+        let zp_t = zps.as_ref().map(|z| Owned::u8(&[n, blocks.div_ceil(2)], z));
+        let w = kernel
+            .prepack_int4_i16_weight(
+                &b.view(),
+                &scales_t.view(),
+                zp_t.as_ref().map(|z| z.view()).as_ref(),
+            )
+            .unwrap();
+        let mut out = vec![0.0f32; n];
+        gemv_nk_int4_i16(&activation, 1, &w, &mut out, k, n, block_size);
+        let refr = int4_f64_reference(
+            &activation,
+            &packed,
+            &scales,
+            zps.as_deref(),
+            n,
+            k,
+            block_size,
+        );
+        let mag = refr.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        let err = out
+            .iter()
+            .zip(&refr)
+            .map(|(a, b)| (*a as f64 - b).abs())
+            .fold(0.0, f64::max);
+        eprintln!(
+            "ROYPROBE i16 mag={mag:.6e} max_abs_err={err:.6e} rel={:.6e}",
+            err / mag
+        );
+        let i8w = kernel
+            .prepack_int8_weight(
+                &b.view(),
+                &scales_t.view(),
+                zp_t.as_ref().map(|z| z.view()).as_ref(),
+            )
+            .unwrap();
+        let mut out8 = vec![0.0f32; n];
+        int8_matmul(
+            &activation,
+            &i8w,
+            &mut out8,
+            1,
+            k,
+            n,
+            block_size,
+            host_dot_kernel(),
+        );
+        let err8 = out8
+            .iter()
+            .zip(&refr)
+            .map(|(a, b)| (*a as f64 - b).abs())
+            .fold(0.0, f64::max);
+        eprintln!(
+            "ROYPROBE int8 max_abs_err={err8:.6e} rel={:.6e}",
+            err8 / mag
+        );
+        let cross = out
+            .iter()
+            .zip(&out8)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!("ROYPROBE cross i16-vs-int8 max_abs={cross:.6e}");
+    }
+
+    /// An absent `zero_points` input must mean the implicit midpoint 8, which is
+    /// exactly the signed-nibble reading of the same bits.
+    ///
+    /// This is the evidence for the claim in [`Int4I16Weight`]'s docs that there
+    /// is no separate signed path to test: supplying an explicit all-8 zero-point
+    /// table must produce a **bit-identical** result to supplying none.
+    #[test]
+    fn int4_i16_absent_zero_points_are_bit_identical_to_an_explicit_midpoint() {
+        let _probe = lock_dispatch_probe();
+        let (k, n, block_size) = (256usize, 24usize, 32usize);
+        let weights: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.017).sin()).collect();
+        let activation: Vec<f32> = (0..k).map(|i| (i as f32 * 0.031).cos()).collect();
+        let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+        let blocks = k.div_ceil(block_size);
+        let kernel = accuracy4_kernel(k, n, block_size);
+        let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
+        let scales_t = Owned::f32(&[n, blocks], &scales);
+        // 0x88 packs the midpoint 8 into both nibbles of each zero-point byte.
+        let explicit = vec![0x88u8; n * blocks.div_ceil(2)];
+        let zp_t = Owned::u8(&[n, blocks.div_ceil(2)], &explicit);
+
+        let mut absent_out = vec![0.0f32; n];
+        let absent = kernel
+            .prepack_int4_i16_weight(&b.view(), &scales_t.view(), None)
+            .expect("prepack accepts a symmetric int4 weight");
+        gemv_nk_int4_i16(&activation, 1, &absent, &mut absent_out, k, n, block_size);
+
+        let mut explicit_out = vec![0.0f32; n];
+        let explicit = kernel
+            .prepack_int4_i16_weight(&b.view(), &scales_t.view(), Some(&zp_t.view()))
+            .expect("prepack accepts an asymmetric int4 weight");
+        gemv_nk_int4_i16(
+            &activation,
+            1,
+            &explicit,
+            &mut explicit_out,
+            k,
+            n,
+            block_size,
+        );
+
+        assert_eq!(
+            absent.scaled_zero_points, explicit.scaled_zero_points,
+            "an absent zero-point table must fold to the same scale*8",
+        );
+        for (column, (&absent, &explicit)) in absent_out.iter().zip(explicit_out.iter()).enumerate()
+        {
+            assert_eq!(
+                absent.to_bits(),
+                explicit.to_bits(),
+                "absent vs explicit midpoint diverged at column {column}",
+            );
+        }
+    }
+
+    /// Requirement-2 gate: acc4 int4 decode reaches the packed-nibble int16
+    /// kernel, and **no** other accuracy level can.
+    ///
+    /// This is the non-vacuity proof the reachability lint demands (it reads
+    /// `INT4_I16_TEST_CALLS`) and simultaneously the runtime half of the
+    /// acc0-exclusion proof. Levels 0..=4 are all exercised through the real
+    /// `execute` dispatch, so an accidental widening of the arm -- dropping the
+    /// `accuracy_level == 4` test, or replacing the reduced-precision gate with
+    /// something weaker -- makes a level that must stay exact start incrementing
+    /// the counter and fails here.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn int4_i16_route_is_reached_only_at_accuracy_level_four() {
+        let _probe = lock_dispatch_probe();
+        if !int4_i16_host_supported() || !int4_i16_enabled() {
+            return;
+        }
+        let (k, n, block_size) = (256usize, 32usize, 32usize);
+        let weights: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.021).sin()).collect();
+        let a: Vec<f32> = (0..k).map(|i| (i as f32 * 0.037).cos()).collect();
+        let mut reached = Vec::new();
+        for accuracy_level in 0i64..=4 {
+            let (b, scales_t, a_t, zp_t) = cache_probe_inputs(&weights, &a, n, k, block_size, true);
+            let mut kernel = MatMulNBitsKernel {
+                accuracy_level,
+                ..test_kernel(k, n, block_size)
+            };
+            kernel.set_constant_inputs(&[true; 5]);
+            let mut inputs = vec![a_t.view(), b.view(), scales_t.view()];
+            if let Some(zp) = &zp_t {
+                inputs.push(zp.view());
+            }
+            let mut y = Owned::zeros_f32(&[1, n]);
+            let before = INT4_I16_TEST_CALLS.load(Ordering::Relaxed);
+            kernel.execute(&inputs, &mut [y.view_mut()]).unwrap();
+            if INT4_I16_TEST_CALLS.load(Ordering::Relaxed) > before {
+                reached.push(accuracy_level);
+            }
+        }
+        assert_eq!(
+            reached,
+            vec![4],
+            "the packed-nibble int16 route must be reachable at accuracy_level 4 \
+             and at no other level; reached {reached:?}",
+        );
+    }
+
+    /// Requirement-2 mutation guard, source level: the dispatch arm that selects
+    /// the packed-nibble int16 kernel must literally carry the accuracy-contract
+    /// predicate.
+    ///
+    /// The runtime test above proves today's dispatch behaves; this proves the
+    /// *reason* it behaves is the contract and not a coincidence of some other
+    /// condition. Deleting `reduced_precision_activation_allowed` from the arm
+    /// while leaving `accuracy_level == 4` would keep the runtime test green (the
+    /// two agree today) yet silently discard the policy hook that every other
+    /// reduced-precision route in this file is gated on -- so the next change to
+    /// that policy would not reach this kernel. That is exactly the class of
+    /// regression the precision contract at `borrowed_affine_int4_matmul` was
+    /// written to prevent.
+    #[test]
+    fn int4_i16_dispatch_arm_carries_the_accuracy_contract() {
+        const SOURCE: &str = include_str!("matmul_nbits.rs");
+        let arm = SOURCE
+            .split_once("&& int4_i16_enabled()")
+            .expect("the int4 i16 dispatch arm names its kill switch")
+            .0;
+        let arm = &arm[arm
+            .rfind("} else if self.bits == 4")
+            .expect("arm starts an else-if")..];
+        for required in [
+            "self.accuracy_level == 4",
+            "reduced_precision_activation_allowed(self.accuracy_level)",
+            "group_indices.is_none()",
+        ] {
+            assert!(
+                arm.contains(required),
+                "the packed-nibble int16 dispatch arm must keep `{required}`; \
+                 dropping it would let a route that promised exact fp32 \
+                 activations be served by a reduced-precision kernel",
+            );
+        }
+        // The kill switch must not be able to *enable* the route: it is ANDed
+        // after the accuracy predicate, never ORed with it.
+        assert!(
+            !arm.contains("||"),
+            "the dispatch arm must be a pure conjunction so no single condition \
+             can widen it",
+        );
     }
 
     /// Serializes the tests that toggle a process-global dispatch flag
@@ -10407,6 +11322,9 @@ mod tests {
             return Some(w as *const _ as *const ());
         }
         if let Some(w) = kernel.int8_weight.get() {
+            return Some(w as *const _ as *const ());
+        }
+        if let Some(w) = kernel.int4_i16_weight.get() {
             return Some(w as *const _ as *const ());
         }
         if let Some(w) = kernel.packed_int4_weight.get() {
@@ -11632,11 +12550,23 @@ mod tests {
         let scales = vec![1.0; n];
         let dequantized = dequantize_reference(&packed, &scales, None, n, k, block_size);
 
-        // max_abs=127 makes the accuracy-4 activation scale exactly 1.0. Thus
-        // 0.49 rounds to 0 and 0.51 rounds to 1: the exact margin
-        // 7*0.49 - 6*0.51 = +0.37 becomes -6 after activation quantization.
+        // The activation grid at accuracy_level 4 is `max_abs / 32767`, because
+        // int4 decode now quantizes activations to **int16** (the packed-nibble
+        // `gemv_nk_int4_i16` kernel) rather than the int8 that the CompInt8
+        // repack used. With max_abs=127 the step is 127/32767, so the margin that
+        // separates the two outputs has to be built on that grid to still break.
+        //
+        // The historical version of this test used 0.49/0.51 against an int8
+        // step of exactly 1.0. int16 resolves those to within 0.0004 and keeps
+        // the correct ordering, so that pair no longer demonstrates anything --
+        // asserting on it would have quietly become a test that the kernel is
+        // *inaccurate*, and would have failed the moment precision improved.
+        // The margin below is the same construction scaled onto the finer grid:
+        // 12.49 rounds down to 12, 14.51 rounds up to 15, so the exact margin
+        // `step * (7*12.49 - 6*14.51) = +0.37*step` becomes `-6*step`.
+        let step = 127.0f32 / 32767.0;
         let mut activations = vec![0.0; k];
-        activations[..3].copy_from_slice(&[127.0, 0.49, 0.51]);
+        activations[..3].copy_from_slice(&[127.0, 12.49 * step, 14.51 * step]);
         let expected = reference(&activations, &dequantized, 1, k, n);
         let absent = run_decode_case(&activations, &packed, &scales, n, block_size, None);
         let level1 = run_decode_case(&activations, &packed, &scales, n, block_size, Some(1));
@@ -11646,7 +12576,10 @@ mod tests {
         assert_close(&level1, &expected);
         assert!(absent[0].total_cmp(&absent[1]).is_gt());
         assert!(level1[0].total_cmp(&level1[1]).is_gt());
-        assert!(level4[1].total_cmp(&level4[0]).is_gt());
+        assert!(
+            level4[1].total_cmp(&level4[0]).is_gt(),
+            "accuracy_level 4 is a reduced-precision contract: a margin below its              activation step must still invert (got {level4:?})",
+        );
         let fp32_error = absent
             .iter()
             .zip(&expected)
@@ -11658,17 +12591,42 @@ mod tests {
             .map(|(actual, expected)| (actual - expected).abs())
             .fold(0.0, f32::max);
         assert!(
-            accuracy4_error > fp32_error + 1.0,
-            "accuracy-4 error {accuracy4_error} must materially exceed fp32 error {fp32_error}"
+            accuracy4_error > fp32_error + 6.0 * step,
+            "accuracy-4 error {accuracy4_error} must materially exceed fp32 error              {fp32_error} by at least the inverted margin"
         );
 
-        let mut on_grid = vec![0.0; k];
-        on_grid[..3].copy_from_slice(&[127.0, 1.0, 1.0]);
-        let on_grid_expected = reference(&on_grid, &dequantized, 1, k, n);
-        assert_close(
-            &run_decode_case(&on_grid, &packed, &scales, n, block_size, Some(4)),
-            &on_grid_expected,
+        // The coarse pair the int8 repack used to fail on: int16 activations
+        // resolve it, so int4 decode now keeps the correct ordering here. This is
+        // the improvement, asserted rather than assumed -- if int4 acc4 ever
+        // regresses to int8 activations this flips back and fails.
+        let mut coarse = vec![0.0; k];
+        coarse[..3].copy_from_slice(&[127.0, 0.49, 0.51]);
+        let coarse_expected = reference(&coarse, &dequantized, 1, k, n);
+        let coarse_level4 = run_decode_case(&coarse, &packed, &scales, n, block_size, Some(4));
+        assert!(
+            coarse_level4[0].total_cmp(&coarse_level4[1]).is_gt(),
+            "int16 activations must resolve the 0.49/0.51 margin that int8              inverted (got {coarse_level4:?}, expected ordering of              {coarse_expected:?})",
         );
+
+        // On-grid activations (exact multiples of the int16 step) carry no
+        // quantization error at all, so accuracy_level 4 reduces to plain f32
+        // arithmetic. The tolerance is relative rather than the absolute 1e-5
+        // `assert_close` uses because a multiple of 127/32767 is not a
+        // terminating binary fraction: the reference and the kernel reassociate
+        // the same products differently and land a few ulp apart at magnitude
+        // 128, which an absolute 1e-5 (about 1.3 ulp there) would flag as a
+        // precision failure it is not.
+        let mut on_grid = vec![0.0; k];
+        on_grid[..3].copy_from_slice(&[127.0, 258.0 * step, 258.0 * step]);
+        let on_grid_expected = reference(&on_grid, &dequantized, 1, k, n);
+        let on_grid_level4 = run_decode_case(&on_grid, &packed, &scales, n, block_size, Some(4));
+        for (index, (&got, &want)) in on_grid_level4.iter().zip(&on_grid_expected).enumerate() {
+            assert!(
+                (got - want).abs() <= 1e-6 * want.abs().max(1.0),
+                "on-grid accuracy-4 must be exact up to f32 reassociation at \
+                 index {index}: got {got}, want {want}",
+            );
+        }
     }
 
     #[test]
@@ -11741,7 +12699,29 @@ mod tests {
                 },
             direct_int4
         );
-        assert_eq!(kernel.int8_weight.get().is_some(), !direct_int4);
+        // Without a direct int4 kernel, accuracy-4 decode builds exactly one
+        // reduced-precision weight: the packed-nibble int16 format where this
+        // host can run it, otherwise the int8 repack. Asserting *exactly one*
+        // is stronger than the old single-format check -- it catches a dispatch
+        // that starts a second prepack it never uses, which would double the
+        // resident weight footprint while every output stayed correct.
+        let int4_i16 = kernel.int4_i16_weight.get().is_some();
+        let int8 = kernel.int8_weight.get().is_some();
+        assert_eq!(
+            int4_i16 as usize + int8 as usize,
+            usize::from(!direct_int4),
+            "accuracy-4 must build exactly one reduced-precision weight when it \
+             owns decode and none when a direct int4 kernel does \
+             (int4_i16={int4_i16}, int8={int8}, direct_int4={direct_int4})",
+        );
+        if !direct_int4 {
+            assert_eq!(
+                int4_i16,
+                int4_i16_host_supported() && int4_i16_enabled(),
+                "the packed-nibble int16 format must be chosen exactly when the \
+                 host supports it and the kill switch allows it",
+            );
+        }
     }
 
     #[cfg(all(
