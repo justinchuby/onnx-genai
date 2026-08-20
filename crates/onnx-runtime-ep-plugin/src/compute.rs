@@ -6481,7 +6481,13 @@ mod tests {
     /// `RUN_SCRATCH.with` on the `Run` path, and this fails.
     #[test]
     fn a_run_resolves_the_scratch_thread_local_exactly_once() {
-        let src = include_str!("compute.rs");
+        // A Windows checkout can materialise this file with CRLF endings, and
+        // every pattern below is anchored on `\n` — the `split_once` here, and
+        // the `"\n}\n"` that finds the end of `compute_execute`. The subject of
+        // this test is the structure of the code, not its byte encoding, so
+        // normalise first. The sibling introspection tests in `dispatch_probe`
+        // escape this because `str::lines` already strips the `\r`.
+        let src = include_str!("compute.rs").replace("\r\n", "\n");
         let (prod, _tests) = src
             .split_once("\n#[cfg(test)]\nmod ")
             .expect("compute.rs has a test module");
