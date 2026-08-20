@@ -1189,6 +1189,58 @@ mod tests {
         assert_eq!(byte_len, 4);
     }
 
+    /// The reason `contiguous_strides` is allowed to exist alongside
+    /// `onnx_runtime_ir::compute_contiguous_strides`: it must agree with it
+    /// exactly, for every rank on both sides of the spill boundary and for the
+    /// shapes that make stride arithmetic interesting — a zero dim, a unit
+    /// dim, and a rank of 0 or 1 where the reduction loop does not run.
+    ///
+    /// Without this the duplication is just a second implementation waiting to
+    /// drift. With it, either one can be changed and the other will object.
+    #[test]
+    fn contiguous_strides_matches_the_ir_crate() {
+        let mut cases: Vec<Vec<usize>> = vec![
+            vec![],
+            vec![7],
+            vec![1],
+            vec![0],
+            vec![2, 3, 4],
+            vec![3, 0, 5],
+            vec![1, 1, 1, 1],
+            vec![5, 1, 7, 1, 9],
+        ];
+        // Every rank across the inline/heap boundary, including the exact
+        // rank where `push` spills.
+        for rank in 0..=(crate::dim_vec::INLINE_RANK + 3) {
+            cases.push((0..rank).map(|k| k % 4 + 1).collect());
+        }
+        // A spilled rank that also contains a zero, so the spill path is
+        // exercised with a degenerate shape rather than only a tidy one.
+        let mut zero_at_depth = vec![2usize; crate::dim_vec::INLINE_RANK + 2];
+        zero_at_depth[crate::dim_vec::INLINE_RANK] = 0;
+        cases.push(zero_at_depth);
+
+        for shape in cases {
+            let ours = super::contiguous_strides(&shape);
+            let theirs = onnx_runtime_ir::compute_contiguous_strides(&shape);
+            assert_eq!(
+                ours.as_slice(),
+                theirs.as_slice(),
+                "strides diverged for shape {shape:?}"
+            );
+            assert_eq!(
+                ours.len(),
+                shape.len(),
+                "one stride per dimension, for shape {shape:?}"
+            );
+            assert_eq!(
+                ours.is_spilled(),
+                shape.len() > crate::dim_vec::INLINE_RANK,
+                "shape {shape:?} took the wrong representation"
+            );
+        }
+    }
+
     #[test]
     fn validate_dims_normal_shape() {
         let dims = [2i64, 3, 4];
