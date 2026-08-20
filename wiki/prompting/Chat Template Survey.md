@@ -98,7 +98,7 @@ out = env.from_string(src).render(
 MiniMax-M2 的 `[e~[\n]~b]` 值得单独看一眼 —— 分隔符里带着字面的换行转义,这提醒一件事:
 **不要假设分隔符是"看起来像标记"的字符串**,它只是训练时用过的一串 token 而已。
 
-## 三、轴二:推理段 —— 你的观察是对的
+## 三、轴二:推理段 —— channel 与成对标签两派
 
 gpt-oss 与 Muse Glimmer 用的是**同一族格式**。不是"类似",而是共享同一套骨架:
 
@@ -150,7 +150,7 @@ Calls to these tools must go to the commentary channel: 'functions'.
 ### 一个更要紧的差别:谁负责丢掉历史推理段
 
 推理段不应该回填进后续轮次(见 [[prompting/Chat Templates]])。但**这件事由谁来做,
-各家不一样**,而这直接决定了你的转接层要不要自己动手。
+各家不一样**,而这直接决定了转接层要不要自己动手。
 
 实测:同一段带 `reasoning_content` 与 `thinking` 的历史,渲染后哨兵串还在不在 ——
 49 份可渲染的模板里,只有 **2 份**保留了它:`ByteDance-Seed/Seed-OSS-36B-Instruct` 和
@@ -161,7 +161,7 @@ Calls to these tools must go to the commentary channel: 'functions'.
 - **绝大多数模板自己就把历史推理段丢了。**gpt-oss 的模板里甚至写着注释
   *"CoT is dropped during all previous turns, so we never render it for inference"*。
   你传了也白传,不会有副作用。
-- **Seed-OSS 和 Muse Glimmer 会忠实渲染你给的推理段。**对这两个模型,"不回填历史推理"
+- **Seed-OSS 和 Muse Glimmer 会忠实渲染传入的推理段。**对这两个模型,"不回填历史推理"
   是**调用方的责任**;照着"反正模板会丢"的假设写代码,在这两个模型上就会把历史思考
   全部塞回 context。
 
@@ -418,8 +418,8 @@ Gemma 2 连 system 角色都不支持(*"System role not supported"*)。用 Gemma
 
 1. **不存在通用的 `arguments` 形状。**按模型转 dict / JSON 字符串。
 2. **不存在通用的工具结果角色。**至少要能表达 `tool` 以外的自定义角色。
-3. **不要假设模板会用你的 `tools` 参数。**DeepSeek 系不会。
-4. **不要假设模板会渲染你的 `tool_calls`。**Granite 3.3、SmolLM3、GLM-4-9B 不会,且不报错。
+3. **不要假设模板会用传入的 `tools` 参数。**DeepSeek 系不会。
+4. **不要假设模板会渲染传入的 `tool_calls`。**Granite 3.3、SmolLM3、GLM-4-9B 不会,且不报错。
 5. **接入验收 = 渲染一遍并检查哨兵串在不在**,不是"没抛异常"。
 6. **`tool_call_id` 尽量用 9 位字母数字**,可以避开老 Mistral 的检查,对别家无害。
 7. **推理段在调用方就丢掉**,别指望模板。
