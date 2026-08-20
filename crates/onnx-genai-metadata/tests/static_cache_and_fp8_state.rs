@@ -1042,3 +1042,66 @@ fn the_write_cursor_and_the_valid_length_may_be_one_cell() {
         "the cursor and the length are the same quantity in this package"
     );
 }
+
+/// A cache ABI is refused when it is declared halfway.
+///
+/// A group whose ports carry key/value roles is advertising the per-layer
+/// buffers a direct driver binds positionally. Dropping the length port leaves
+/// that advertisement unsatisfiable: destinations without a valid prefix cannot
+/// tell a graph how much of a capacity-sized buffer to attend over. The failure
+/// mode this prevents is the quiet one — `decoder_io()` returning no static
+/// cache and the package looking merely unfeatured rather than faulty.
+#[test]
+fn a_cache_abi_missing_its_length_port_is_refused() {
+    let document = MOBIUS_STATIC_CACHE.replace("DTYPE", "float16").replace(
+        "              kv_length_ports:\n                model: nonpad_kv_seqlen\n",
+        "",
+    );
+    let errors = errors(&document);
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("declares no kv_length port")),
+        "{errors:?}"
+    );
+}
+
+/// Per-layer buffers must say which layer they are.
+///
+/// The binding label is producer-chosen and its lexicographic order is not the
+/// layer order, so a second key port with no layer index would be placed by
+/// position. Two transposed caches have identical shapes and dtypes, so nothing
+/// downstream detects the swap — the model just produces subtly wrong tokens.
+#[test]
+fn several_ports_of_one_role_must_declare_their_layers() {
+    let document = MOBIUS_STATIC_CACHE.replace("DTYPE", "float16").replace(
+        "                key_cache: {input: key_cache.0, output: updated_key_cache.0, role: key, layer: 0}",
+        "                key_cache: {input: key_cache.0, output: updated_key_cache.0, role: key}\n                \
+         key_cache_1: {input: key_cache.1, output: updated_key_cache.1, role: key}",
+    );
+    let errors = errors(&document);
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("declare no layer")),
+        "{errors:?}"
+    );
+}
+
+/// Two buffers may not claim one layer.
+///
+/// Positional binding would keep whichever the sort happened to place last, so
+/// one layer's cache would silently shadow the other's.
+#[test]
+fn two_ports_may_not_claim_the_same_layer() {
+    let document = MOBIUS_STATIC_CACHE.replace("DTYPE", "float16").replace(
+        "                key_cache: {input: key_cache.0, output: updated_key_cache.0, role: key, layer: 0}",
+        "                key_cache: {input: key_cache.0, output: updated_key_cache.0, role: key, layer: 0}\n                \
+         key_cache_1: {input: key_cache.1, output: updated_key_cache.1, role: key, layer: 0}",
+    );
+    let errors = errors(&document);
+    assert!(
+        errors.iter().any(|error| error.contains("already claims")),
+        "{errors:?}"
+    );
+}

@@ -1862,6 +1862,7 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                 );
             }
             validate_state_update(group_name, group, workflow, errors);
+            validate_state_port_layers(group_name, group, errors);
             for cascade in &group.capabilities.cascade {
                 if !state_service.groups.contains_key(cascade) {
                     errors.push(format!(
@@ -3471,6 +3472,30 @@ fn validate_state_update(
                  cannot be recovered from the step graph"
             ));
         }
+        // The destinations say where the next write lands; only the length says
+        // how much of the buffer is live. A group whose ports carry explicit
+        // key/value roles is advertising the per-layer ABI that a direct driver
+        // binds positionally, and that ABI is unbindable without the length —
+        // `decoder_io()` would return no static cache at all, silently
+        // downgrading the package rather than reporting a fault. Roleless
+        // groups are exempt: they bound-check scatters for the engine and never
+        // claim to expose the driver ABI.
+        let advertises_kv_abi = group.ports.get(component_name).is_some_and(|bindings| {
+            bindings.values().any(|alias| {
+                matches!(
+                    alias.role,
+                    Some(crate::schema::StatePortRole::Key | crate::schema::StatePortRole::Value)
+                )
+            })
+        });
+        if advertises_kv_abi && !kv_length_ports.contains_key(component_name) {
+            errors.push(format!(
+                "state service group '{group_name}' gives component '{component_name}' \
+                 key/value cache ports but declares no kv_length port for it; the valid prefix \
+                 of a capacity-sized buffer is not recoverable from its shape, so the cache ABI \
+                 it advertises cannot be bound"
+            ));
+        }
     }
 
     // A fixed-capacity buffer that also changes shape is a contradiction: the
@@ -3488,6 +3513,64 @@ fn validate_state_update(
                  declares a varying shape; a scattered buffer's capacity is constant, and its \
                  length is carried by logical_lengths"
             ));
+        }
+    }
+}
+
+/// Layer indices must be explicit wherever a group binds several ports of the
+/// same role.
+///
+/// Consumers build per-layer lists positionally, and the binding label is a
+/// producer-chosen string whose lexicographic order is not the layer order
+/// (`layer.10` sorts before `layer.2`). Two transposed caches still have
+/// identical shapes and dtypes, so nothing downstream can detect the swap: the
+/// model simply produces subtly wrong tokens. Roleless ports are exempt because
+/// each alias carries its own input/output pair and is never placed
+/// positionally.
+fn validate_state_port_layers(
+    group_name: &str,
+    group: &crate::schema::StateGroupContract,
+    errors: &mut Vec<String>,
+) {
+    for (component_name, bindings) in &group.ports {
+        let mut by_role: BTreeMap<crate::schema::StatePortRole, Vec<(&String, Option<usize>)>> =
+            BTreeMap::new();
+        for (label, alias) in bindings {
+            if let Some(role) = alias.role {
+                by_role.entry(role).or_default().push((label, alias.layer));
+            }
+        }
+        for (role, aliases) in by_role {
+            if aliases.len() < 2 {
+                continue;
+            }
+            let role = format!("{role:?}").to_lowercase();
+            let missing = aliases
+                .iter()
+                .filter(|(_, layer)| layer.is_none())
+                .map(|(label, _)| label.as_str())
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                errors.push(format!(
+                    "state service group '{group_name}' binds {} '{role}' ports for component \
+                     '{component_name}' but {} declare no layer; per-layer buffers are paired by \
+                     position and label order is not layer order",
+                    aliases.len(),
+                    missing.join(", ")
+                ));
+                continue;
+            }
+            let mut seen = BTreeSet::new();
+            for (label, layer) in &aliases {
+                let Some(layer) = layer else { continue };
+                if !seen.insert(*layer) {
+                    errors.push(format!(
+                        "state service group '{group_name}' binds '{label}' to layer {layer} for \
+                         component '{component_name}', which another '{role}' port already \
+                         claims; one buffer would shadow the other"
+                    ));
+                }
+            }
         }
     }
 }
