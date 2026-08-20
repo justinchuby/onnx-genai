@@ -103,6 +103,9 @@ unsafe impl Sync for CublasLt {}
 impl CublasLt {
     /// Create a cuBLASLt handle (dlopen's `libcublasLt` on first use).
     pub fn new() -> Result<Self> {
+        // Handle creation initializes cuBLASLt state on the device; see the
+        // matmul sites.
+        let _section = onnx_runtime_cuda_memory::capture_gate::synchronizing_section();
         let handle = result::create_handle().map_err(|e| cublas_err("cublasLtCreate", e))?;
         Ok(Self { handle })
     }
@@ -406,6 +409,12 @@ unsafe fn launch_planned_gemm(
     // SAFETY: layouts/desc/algo are live; a/b/c/workspace are caller-guaranteed
     // live device allocations of the right size; stream is valid.
     unsafe {
+        // cuBLASLt picks and runs an algorithm here, allocating its own
+        // workspace and synchronizing internally on its own schedule. Those are
+        // calls this crate never makes and so cannot gate individually; gating
+        // the whole invocation is what keeps them out of another thread's CUDA
+        // graph capture. See `onnx_runtime_cuda_memory::capture_gate`.
+        let _section = onnx_runtime_cuda_memory::capture_gate::synchronizing_section();
         result::matmul(
             handle.handle,
             plan._desc.0,
@@ -694,6 +703,12 @@ unsafe fn launch_planned_gemm_ex(
     // SAFETY: layouts/desc/algo live; a/b/c/workspace are caller-guaranteed
     // live device allocations of the right size; stream is valid.
     unsafe {
+        // cuBLASLt picks and runs an algorithm here, allocating its own
+        // workspace and synchronizing internally on its own schedule. Those are
+        // calls this crate never makes and so cannot gate individually; gating
+        // the whole invocation is what keeps them out of another thread's CUDA
+        // graph capture. See `onnx_runtime_cuda_memory::capture_gate`.
+        let _section = onnx_runtime_cuda_memory::capture_gate::synchronizing_section();
         result::matmul(
             handle.handle,
             plan._desc.0,

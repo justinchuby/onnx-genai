@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use cudarc::driver::sys::{CUdevice_attribute, CUdeviceptr, CUfunction_attribute_enum};
 use cudarc::driver::{CudaContext, CudaEvent, CudaFunction, CudaModule, CudaStream, LaunchConfig};
@@ -21,6 +22,8 @@ use crate::cudnn::CudnnBackend;
 use crate::dynamic_library::{CudaLibrary, require, wheel_cuda_include_paths};
 use crate::error::{driver_err, nvrtc_err};
 use crate::graph::CudaGraphLifecycle;
+use crate::kernel_cache;
+use onnx_runtime_cuda_memory::capture_gate;
 
 /// Counts explicit device allocation/free calls made through a runtime.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -195,6 +198,36 @@ impl CudaDeviceCapabilities {
     }
 }
 
+/// The process-wide CUDA context for `ordinal`, created at most once.
+///
+/// `CudaContext::new` retains the device's **primary** context, so every
+/// `CudaRuntime` on a device already shares one `CUcontext` — caching the
+/// `Arc` changes no semantics. What it removes is the retain/release churn:
+/// when the last `Arc` for a device dropped, cudarc released the primary
+/// context, and a primary-context teardown synchronizes the device. That
+/// invalidates any CUDA graph capture in progress on another thread, which is
+/// how a test doing nothing but constructing and dropping a runtime could break
+/// an unrelated test's capture. Holding one reference for the life of the
+/// process keeps the refcount off zero and takes the teardown off the table.
+///
+/// The entries are intentionally never evicted. A released primary context is
+/// exactly the hazard being avoided, and a handful of per-device contexts is
+/// bounded by the machine's device count.
+fn shared_context(ordinal: u32) -> Result<Arc<CudaContext>> {
+    static CONTEXTS: OnceLock<Mutex<HashMap<u32, Arc<CudaContext>>>> = OnceLock::new();
+    let contexts = CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut contexts = contexts.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(context) = contexts.get(&ordinal) {
+        return Ok(Arc::clone(context));
+    }
+    // Creating a context synchronizes the device; see `CudaRuntime::alloc_raw`.
+    let _section = capture_gate::synchronizing_section();
+    let context =
+        CudaContext::new(ordinal as usize).map_err(|e| driver_err("CudaContext::new", e))?;
+    contexts.insert(ordinal, Arc::clone(&context));
+    Ok(context)
+}
+
 fn positive_attribute(context: &CudaContext, attribute: CUdevice_attribute) -> Option<u32> {
     context
         .attribute(attribute)
@@ -345,6 +378,15 @@ pub struct CudaRuntime {
     /// default (eager decode is made consistent with the captured path, which
     /// already elides these); disable via `ONNX_GENAI_DEFER_EAGER_SYNC=0`.
     defer_eager_sync: AtomicBool,
+    /// Capture-gate section covering this runtime's teardown, acquired in
+    /// [`Drop::drop`] rather than at construction.
+    ///
+    /// **This field must stay last.** Fields drop in declaration order *after*
+    /// the `drop` body returns, so a guard bound as a local inside that body is
+    /// released too early -- before the modules and streams whose destruction is
+    /// the hazard. Declared last, it is released last, and every earlier field's
+    /// teardown happens while it is still held.
+    teardown_section: Option<capture_gate::SynchronizingSection>,
 }
 
 impl std::fmt::Debug for CudaRuntime {
@@ -402,8 +444,7 @@ impl CudaRuntime {
         // `nvidia/cuda_runtime/include`. That is a *header* dependency, checked
         // where those kernels are built, not a reason to demand the DLL here.
         let _ = require(CudaLibrary::Runtime);
-        let context =
-            CudaContext::new(ordinal as usize).map_err(|e| driver_err("CudaContext::new", e))?;
+        let context = shared_context(ordinal)?;
         let major = context
             .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
             .map_err(|e| driver_err("querying CUDA compute capability major", e))?;
@@ -507,6 +548,7 @@ impl CudaRuntime {
                         !matches!(v.as_str(), "0" | "false" | "off" | "no")
                     }),
             ),
+            teardown_section: None,
         }
         .with_capture_error_word()
     }
@@ -819,6 +861,12 @@ impl CudaRuntime {
     /// compilation is retried for the matching real SM architecture and the
     /// resulting CUBIN is loaded instead. An NVRTC failure surfaces the compiler
     /// log via [`nvrtc_err`] (RULES.md #1).
+    ///
+    /// Compiler output is also persisted by [`crate::kernel_cache`], so only the
+    /// first process to see a given kernel pays NVRTC for it. That matters most
+    /// for decode-only kernels: they are first launched inside the first decode
+    /// step, where the compile lands as a single multi-hundred-millisecond
+    /// inter-token stall.
     pub fn nvrtc_function(
         &self,
         module_key: &'static str,
@@ -837,17 +885,17 @@ impl CudaRuntime {
                 m.clone()
             } else {
                 let include_paths = nvrtc_include_paths();
+                // Loading a module into the context synchronizes the device,
+                // invalidating a CUDA graph capture in progress on another
+                // thread. Held across the whole compile-and-load block: the
+                // NVRTC half is host work, but splitting the section would only
+                // add a second gate acquisition for no benefit. See
+                // `alloc_raw`.
+                let _section = capture_gate::synchronizing_section();
                 let m = if self.nvrtc_cubin_fallback.load(Ordering::Relaxed) {
                     self.load_nvrtc_cubin(module_key, src, &include_paths)?
                 } else {
-                    let opts = cudarc::nvrtc::CompileOptions {
-                        include_paths: include_paths.clone(),
-                        options: vec![format!("--gpu-architecture={}", self.ptx_arch)],
-                        ..Default::default()
-                    };
-                    let ptx = cudarc::nvrtc::compile_ptx_with_opts(src, opts).map_err(|e| {
-                        nvrtc_err(&format!("compiling NVRTC module '{module_key}'"), e)
-                    })?;
+                    let ptx = self.nvrtc_ptx(module_key, src, &include_paths)?;
                     match self.context.load_module(ptx) {
                         Ok(module) => module,
                         Err(error)
@@ -874,12 +922,82 @@ impl CudaRuntime {
             .map_err(|e| driver_err(&format!("loading NVRTC function '{entry}'"), e))
     }
 
+    /// PTX for `module_key`, from the on-disk cache when possible.
+    ///
+    /// A cached hit is returned as PTX source rather than a compiled image;
+    /// both load through the same driver entry point, and the driver keeps its
+    /// own PTX→SASS cache, so the only work skipped here is the NVRTC frontend.
+    /// That frontend is the expensive half for this crate's templated kernels.
+    fn nvrtc_ptx(
+        &self,
+        module_key: &'static str,
+        src: &str,
+        include_paths: &[String],
+    ) -> Result<cudarc::nvrtc::Ptx> {
+        let key = kernel_cache::CacheKey {
+            module_key,
+            source: src,
+            arch: &self.ptx_arch,
+            include_paths,
+            kind: kernel_cache::ArtifactKind::Ptx,
+        };
+        if let Some(bytes) = kernel_cache::load(&key) {
+            if let Ok(text) = String::from_utf8(bytes) {
+                return Ok(cudarc::nvrtc::Ptx::from_src(text));
+            }
+        }
+        let opts = cudarc::nvrtc::CompileOptions {
+            include_paths: include_paths.to_vec(),
+            options: vec![format!("--gpu-architecture={}", self.ptx_arch)],
+            ..Default::default()
+        };
+        let started = Instant::now();
+        let ptx = cudarc::nvrtc::compile_ptx_with_opts(src, opts)
+            .map_err(|e| nvrtc_err(&format!("compiling NVRTC module '{module_key}'"), e))?;
+        kernel_cache::record_compile(started.elapsed());
+        kernel_cache::store(&key, ptx.to_src().as_bytes());
+        Ok(ptx)
+    }
+
     fn load_nvrtc_cubin(
         &self,
         module_key: &'static str,
         src: &str,
         include_paths: &[String],
     ) -> Result<Arc<CudaModule>> {
+        let key = kernel_cache::CacheKey {
+            module_key,
+            source: src,
+            arch: &self.cubin_arch,
+            include_paths,
+            kind: kernel_cache::ArtifactKind::Cubin,
+        };
+        let image = match kernel_cache::load(&key) {
+            Some(image) => image,
+            None => {
+                let started = Instant::now();
+                let image = self.compile_nvrtc_cubin(module_key, src, include_paths)?;
+                kernel_cache::record_compile(started.elapsed());
+                kernel_cache::store(&key, &image);
+                image
+            }
+        };
+        self.context
+            .load_module(cudarc::nvrtc::Ptx::from_binary(image))
+            .map_err(|error| {
+                driver_err(
+                    &format!("loading NVRTC CUBIN fallback module '{module_key}'"),
+                    error,
+                )
+            })
+    }
+
+    fn compile_nvrtc_cubin(
+        &self,
+        module_key: &'static str,
+        src: &str,
+        include_paths: &[String],
+    ) -> Result<Vec<u8>> {
         let source = CString::new(src).map_err(|_| {
             EpError::KernelFailed(format!(
                 "cuda_ep: compiling NVRTC module '{module_key}': source contains a NUL byte"
@@ -948,14 +1066,7 @@ impl CudaRuntime {
                 "cuda_ep: destroying NVRTC CUBIN program '{module_key}': {error:?}"
             ))
         })?;
-        self.context
-            .load_module(cudarc::nvrtc::Ptx::from_binary(image))
-            .map_err(|error| {
-                driver_err(
-                    &format!("loading NVRTC CUBIN fallback module '{module_key}'"),
-                    error,
-                )
-            })
+        Ok(image)
     }
 
     pub fn require_nvrtc_half_headers(&self, op: &str) -> Result<()> {
@@ -1089,6 +1200,11 @@ impl CudaRuntime {
             self.raw_pool_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(ptr);
         }
+        // Past the pool: this path makes a real `cuMemAlloc`, which
+        // synchronizes the device and would invalidate a CUDA graph capture
+        // running on another thread. Pool hits returned above take no lock, so
+        // decode's steady state stays entirely off the gate.
+        let _section = capture_gate::synchronizing_section();
         // SAFETY: `malloc_sync` returns a fresh device allocation on the current
         // (bound) context; we own it and free it exactly once via `free_raw`.
         let mut allocated = unsafe { cudarc::driver::result::malloc_sync(class) };
@@ -1177,6 +1293,9 @@ impl CudaRuntime {
             }
             drained
         };
+        // Draining the pool issues one real `cuMemFree` per block; see
+        // `alloc_raw`.
+        let _section = capture_gate::synchronizing_section();
         let mut classes = self
             .raw_pool_classes
             .lock()
@@ -1203,6 +1322,8 @@ impl CudaRuntime {
         if self.retain_pooled(ptr) {
             return Ok(());
         }
+        // A real `cuMemFree` follows; see `alloc_raw`.
+        let _section = capture_gate::synchronizing_section();
         self.raw_pool_classes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1220,6 +1341,8 @@ impl CudaRuntime {
     /// `dst` is a live device allocation of at least `src.len()` bytes.
     pub unsafe fn htod(&self, src: &[u8], dst: CUdeviceptr) -> Result<()> {
         self.bind()?;
+        // A synchronous copy on the null stream; see `alloc_raw`.
+        let _section = capture_gate::synchronizing_section();
         // SAFETY: bound context; `dst` covers `src.len()` bytes per the contract.
         unsafe { cudarc::driver::result::memcpy_htod_sync(dst, src) }
             .map_err(|e| driver_err("cuMemcpyHtoD", e))?;
@@ -1233,6 +1356,9 @@ impl CudaRuntime {
     /// `src` is a live device allocation of at least `dst.len()` bytes.
     pub unsafe fn dtoh(&self, dst: &mut [u8], src: CUdeviceptr) -> Result<()> {
         self.bind()?;
+        // A stream drain plus a synchronous copy on the null stream; see
+        // `alloc_raw`.
+        let _section = capture_gate::synchronizing_section();
         // Kernels enqueue work on the EP's dedicated non-default stream. Wait
         // before issuing the synchronous driver copy so the host never observes
         // bytes that were still being produced on that stream.
@@ -1257,6 +1383,7 @@ impl CudaRuntime {
         // consumer that already queued a read of `dst`). Drain the EP stream
         // first so the synchronous copy always sees fully-produced bytes. This
         // mirrors `dtoh`, which synchronizes for the same reason.
+        let _section = capture_gate::synchronizing_section();
         self.force_synchronize()?;
         // SAFETY: bound context; both endpoints cover `bytes` per the contract.
         unsafe { cudarc::driver::result::memcpy_dtod_sync(dst, src, bytes) }
@@ -1483,6 +1610,8 @@ impl CudaRuntime {
     /// makes the transfer genuinely asynchronous and overlappable.
     pub fn alloc_pinned(&self, bytes: usize) -> Result<PinnedStaging> {
         self.bind()?;
+        // Page-locking host memory synchronizes the device; see `alloc_raw`.
+        let _section = capture_gate::synchronizing_section();
         // SAFETY: `malloc_host` returns a fresh page-locked host allocation on
         // the bound context; `PinnedStaging` owns it and frees it once on drop.
         let ptr = unsafe { cudarc::driver::result::malloc_host(bytes.max(1), 0) }
@@ -1582,6 +1711,8 @@ impl std::fmt::Debug for PinnedStaging {
 impl Drop for PinnedStaging {
     fn drop(&mut self) {
         let _ = self.context.bind_to_thread();
+        // Unpinning synchronizes the device; see `CudaRuntime::alloc_raw`.
+        let _section = capture_gate::synchronizing_section();
         // SAFETY: `ptr` came from `malloc_host` on this context and is freed
         // exactly once here.
         let _ = unsafe { cudarc::driver::result::free_host(self.ptr.cast::<c_void>()) };
@@ -1590,6 +1721,17 @@ impl Drop for PinnedStaging {
 
 impl Drop for CudaRuntime {
     fn drop(&mut self) {
+        // Tearing a runtime down unloads its modules and destroys its streams.
+        // `cuModuleUnload` and `cuStreamDestroy` synchronize the device, so a
+        // runtime going out of scope on one thread can invalidate a CUDA graph
+        // capture on another. Those calls are made by `cudarc` as the fields
+        // drop, not by this crate, so the section has to cover the whole
+        // teardown rather than any individual call.
+        //
+        // Stored in the last-declared field instead of a local: locals are
+        // released when this body returns, which is *before* the fields drop.
+        // See `teardown_section`.
+        self.teardown_section = capture_gate::synchronizing_section();
         if self.capture_error != 0 {
             // SAFETY: `capture_error` was allocated by this runtime's `alloc_raw`
             // in `with_capture_error_word` and is freed exactly once here.
@@ -1861,6 +2003,101 @@ mod tests {
         std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
             .ok()
             .flatten()
+    }
+
+    /// The on-disk kernel cache stores PTX *text* and restores it through a
+    /// different driver entry point than a freshly compiled image uses.
+    ///
+    /// This is the property the whole cache rests on: if a restored module ever
+    /// computed something different from a compiled one, every second run of
+    /// every model would be silently wrong. A pure round-trip test of the bytes
+    /// would not catch that — the module has to actually run.
+    #[test]
+    fn a_module_restored_from_cached_ptx_computes_what_a_compiled_one_does() {
+        const MODULE: &str = "kernel_cache_roundtrip_v1";
+        const SOURCE: &str = r#"
+extern "C" __global__ void add_seven(float* out, unsigned long long n) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = (float)i + 7.0f;
+}
+"#;
+        let Some(runtime) = maybe_runtime() else {
+            eprintln!("skipping cached-PTX equivalence: CUDA runtime unavailable");
+            return;
+        };
+        runtime.bind().unwrap();
+        let include_paths = nvrtc_include_paths();
+        let before = crate::kernel_cache::kernel_compile_stats();
+        let ptx = runtime.nvrtc_ptx(MODULE, SOURCE, &include_paths).unwrap();
+        let after = crate::kernel_cache::kernel_compile_stats();
+
+        // The accounting must be wired to the real path. A counter that never
+        // moves is worse than no counter: it reports "nothing was compiled",
+        // which is exactly the answer a warm cache is supposed to give.
+        //
+        // The bound is `>= 1`, not `== 1`. These counters are process-global
+        // and the harness runs several hundred tests as parallel threads, so
+        // other threads resolve their own modules between the two reads. An
+        // exact count would be asserting that no other test was running, which
+        // is not a property of the code under test. What still holds -- and is
+        // what this guards -- is that a counter moved at all.
+        assert!(
+            (after.compiled - before.compiled) + (after.cache_hits - before.cache_hits) >= 1,
+            "resolving a module must advance the compiled or cache-hit counter: \
+             {before:?} -> {after:?}"
+        );
+        if after.compiled > before.compiled {
+            assert!(
+                after.compile_time > before.compile_time,
+                "a recorded compile must carry time: {before:?} -> {after:?}"
+            );
+        }
+
+        // Whatever the first resolution did, a second one for the same key is a
+        // hit: the negative control that separates "the cache is wired up" from
+        // "some counter happens to be moving".
+        let warm_before = crate::kernel_cache::kernel_compile_stats();
+        runtime.nvrtc_ptx(MODULE, SOURCE, &include_paths).unwrap();
+        let warm_after = crate::kernel_cache::kernel_compile_stats();
+        assert!(
+            warm_after.cache_hits > warm_before.cache_hits,
+            "re-resolving an already cached module must count a cache hit: \
+             {warm_before:?} -> {warm_after:?}"
+        );
+
+        // Exactly the bytes `kernel_cache::store` writes, read back exactly the
+        // way `nvrtc_ptx` reads them on a hit.
+        let stored = ptx.to_src().into_bytes();
+        let restored = cudarc::nvrtc::Ptx::from_src(String::from_utf8(stored).unwrap());
+
+        let n = 1024usize;
+        let bytes = n * std::mem::size_of::<f32>();
+        let run = |ptx: cudarc::nvrtc::Ptx| -> Vec<f32> {
+            let module = runtime.context.load_module(ptx).unwrap();
+            let function = module.load_function("add_seven").unwrap();
+            let out = runtime.alloc_raw(bytes).unwrap();
+            let mut builder = runtime.stream().launch_builder(&function);
+            let n_u64 = n as u64;
+            builder.arg(&out).arg(&n_u64);
+            unsafe {
+                builder
+                    .launch(LaunchConfig::for_num_elems(n as u32))
+                    .unwrap();
+            }
+            runtime.synchronize().unwrap();
+            let mut host = vec![0.0f32; n];
+            let host_bytes =
+                unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr().cast::<u8>(), bytes) };
+            unsafe { runtime.dtoh(host_bytes, out) }.unwrap();
+            unsafe { runtime.free_raw(out) };
+            host
+        };
+
+        let fresh = run(ptx);
+        let cached = run(restored);
+
+        assert_eq!(fresh[0], 7.0, "the kernel must have actually run");
+        assert_eq!(fresh, cached, "cached PTX must not change the result");
     }
 
     // Regression guard for the DeepSeek-V2-Lite garbage-decode race: kernels run

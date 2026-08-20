@@ -156,6 +156,9 @@ impl DeviceAllocator for CudaDeviceAllocator {
         // implementation rely on. `cuMemAlloc(0)` fails, and a null pointer is
         // not a valid allocation.
         let request = bytes.max(1);
+        // `cuMemAlloc` synchronizes the device, which invalidates a CUDA graph
+        // capture in progress on any other thread. See `crate::capture_gate`.
+        let _section = crate::capture_gate::synchronizing_section();
         // SAFETY: `malloc_sync` returns a fresh device allocation on the bound
         // context; this allocator owns it and frees it exactly once.
         let dptr = unsafe { cudarc::driver::result::malloc_sync(request) }.map_err(|error| {
@@ -189,6 +192,8 @@ impl DeviceAllocator for CudaDeviceAllocator {
             self.leaked_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
             return;
         }
+        // `cuMemFree` synchronizes the device; see `allocate`.
+        let _section = crate::capture_gate::synchronizing_section();
         // SAFETY: delegated to this method's contract -- the pointer came from
         // `allocate` on this allocator and is freed once.
         let freed = unsafe {
