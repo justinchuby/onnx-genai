@@ -1721,7 +1721,22 @@ mod admission_tests {
                 requested: 4096,
                 available: 0,
                 role: onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
-                detail: "physical handle pool lease refused".into(),
+                detail: "cuMemMap could not grow the physical handle pool".into(),
+                // Shaped the way the allocator actually reports this: the
+                // governor's refusal is carried whole, so classification must
+                // not depend on the wording of `detail`.
+                source: Some(Box::new(
+                    onnx_runtime_memory_governor::MemoryError::TierExhausted {
+                        tier: "device",
+                        requested: 4096,
+                        used: 0,
+                        limit: 0,
+                        available: 0,
+                        role: onnx_runtime_memory_governor::MemoryRole::Workspace {
+                            step_scoped: false,
+                        },
+                    },
+                )),
             }
             .into();
         assert_eq!(

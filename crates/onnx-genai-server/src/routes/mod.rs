@@ -663,6 +663,7 @@ mod overload_tests {
             available: 0,
             role: onnx_runtime_memory_governor::MemoryRole::KvCache,
             detail: "mapped holder could not reach its tentative reclaim target".into(),
+            source: None,
         }
         .into();
         let response = generation_failure(DriverFailure::from_engine_error(&error)).into_response();

@@ -227,7 +227,11 @@ impl std::fmt::Display for HolderId {
 }
 
 /// Why a reservation could not be granted.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+///
+/// Not `Clone`/`PartialEq`: a refusal that carries the cause underneath it
+/// cannot be meaningfully duplicated or compared, and keeping the cause is
+/// worth more than either. Match on the variant instead.
+#[derive(Debug, thiserror::Error)]
 pub enum MemoryError {
     /// The tier does not have room, and no holder released enough.
     #[error(
@@ -289,7 +293,24 @@ pub enum MemoryError {
         requested: u64,
         available: u64,
         role: MemoryRole,
+        /// What this layer can say about the shortfall on its own.
+        ///
+        /// Names the operation that came up short; the refusal underneath it,
+        /// when there was one, belongs in `source` rather than being folded in
+        /// here, so that a caller can still match on it and a reader is not
+        /// shown the same sentence twice.
         detail: String,
+        /// The refusal this one is reporting, when it is reporting one.
+        ///
+        /// `None` when this layer decided on its own, as when a reclaim target
+        /// simply was not reached. Typed as `dyn Error` rather than a boxed
+        /// [`MemoryError`] both because the layer underneath is not always a
+        /// governor and because `#[source]` on a `Box<ConcreteError>` hands
+        /// callers a chain node whose concrete type is the *box*, so
+        /// `downcast_ref::<MemoryError>()` would miss it -- which is the whole
+        /// thing this field exists to make possible.
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
 }
 
@@ -1267,6 +1288,9 @@ impl MappedGrowthAuthority {
                     available: report.reclaimed_bytes,
                     role: requester.role(),
                     detail: "mapped holder could not reach its tentative reclaim target".into(),
+                    // This layer reached the conclusion itself; no lower
+                    // refusal to report.
+                    source: None,
                 });
             }
             grant.transferred_bytes = grant.transferred_bytes.saturating_add(transfer);
@@ -2100,6 +2124,62 @@ impl MemoryGovernor for LedgerGovernor {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
+
+    /// `CapacityUnavailable` exists to report someone else's refusal, so the
+    /// refusal has to survive being reported: admission callers tell "we
+    /// declined, ask for less" from "the driver failed, give up" by matching
+    /// the variant, and they cannot match a string.
+    ///
+    /// This pins a specific trap. `#[source]` on a `Box<ConcreteError>` yields
+    /// a chain node whose concrete type is the *box*, so `downcast_ref` for the
+    /// error itself silently misses -- the message still reads correctly, which
+    /// is what makes it easy to reintroduce while "simplifying" the field back
+    /// to `Option<Box<MemoryError>>`.
+    #[test]
+    fn capacity_unavailable_keeps_the_refusal_underneath_it_downcastable() {
+        let error = MemoryError::CapacityUnavailable {
+            tier: Tier::Device.name(),
+            requested: 2 << 20,
+            available: 0,
+            role: MemoryRole::Workspace { step_scoped: false },
+            detail: "cuMemMap could not grow the physical handle pool".into(),
+            source: Some(Box::new(MemoryError::TierExhausted {
+                tier: Tier::Device.name(),
+                requested: 2 << 20,
+                used: 22531,
+                limit: 22531,
+                available: 0,
+                role: MemoryRole::Workspace { step_scoped: false },
+            })),
+        };
+
+        let cause = std::error::Error::source(&error).expect("the refusal must be reachable");
+        assert!(
+            matches!(
+                cause.downcast_ref::<MemoryError>(),
+                Some(MemoryError::TierExhausted {
+                    role: MemoryRole::Workspace { step_scoped: false },
+                    ..
+                })
+            ),
+            "the cause must arrive as a MemoryError, not as a box around one: {cause}"
+        );
+    }
+
+    /// A layer that reached its own conclusion has nothing to report
+    /// underneath, and must not invent one.
+    #[test]
+    fn capacity_unavailable_reports_no_cause_when_it_decided_alone() {
+        let error = MemoryError::CapacityUnavailable {
+            tier: Tier::Device.name(),
+            requested: 4096,
+            available: 0,
+            role: MemoryRole::KvCache,
+            detail: "mapped holder could not reach its tentative reclaim target".into(),
+            source: None,
+        };
+        assert!(std::error::Error::source(&error).is_none());
+    }
 
     struct TestMappedHolder {
         allowance: MappedAllowance,
