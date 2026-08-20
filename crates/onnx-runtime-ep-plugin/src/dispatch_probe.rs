@@ -846,6 +846,46 @@ mod tests {
         assert_eq!(snapshot_global(), Counters::default());
     }
 
+    /// The module doc promises the probe is not a default feature, which is
+    /// what makes every "production carries none of this" claim in this file
+    /// true. That promise lives in the manifest, so it is only worth anything
+    /// if something reads the manifest — a `#[cfg]` test cannot see it, because
+    /// a build that wrongly defaulted the feature on would simply compile the
+    /// other branch and still pass.
+    ///
+    /// Deliberately not `env!("CARGO_FEATURE_...")`-based for the same reason:
+    /// that reports how *this* build was configured, not what the default is.
+    #[test]
+    fn dispatch_probe_is_not_a_default_feature() {
+        let manifest = include_str!("../Cargo.toml");
+        let features = manifest
+            .split("\n[")
+            .find(|section| section.starts_with("features]"))
+            .expect("the crate must still have a [features] table");
+
+        // Non-vacuous: if the feature were renamed or removed, the scan below
+        // would pass against a section that no longer describes the probe.
+        assert!(
+            features.contains("dispatch_probe"),
+            "the probe feature vanished from the manifest; this test is now \
+             pinning nothing: {features}"
+        );
+
+        for line in features.lines() {
+            let line = line.trim();
+            if let Some(default) = line.strip_prefix("default") {
+                let default = default.trim_start();
+                if let Some(list) = default.strip_prefix('=') {
+                    assert!(
+                        !list.contains("dispatch_probe"),
+                        "`dispatch_probe` is enabled by default, so production \
+                         builds carry the counters: {line}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     #[cfg(feature = "dispatch_probe")]
     fn counters_are_exact_and_composable() {

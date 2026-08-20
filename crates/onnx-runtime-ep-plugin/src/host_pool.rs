@@ -253,6 +253,17 @@ thread_local! {
     /// from and the box never escapes that thread. `Cell` rather than
     /// `RefCell`: the only operations are take and replace, so there is
     /// nothing to borrow and no way to panic while holding it.
+    ///
+    /// # The invariant reuse rests on
+    ///
+    /// No one may hold the `void*` handle past the compute call that installed
+    /// it. That was already required, but freeing the box made a violation
+    /// loud: the stale handle pointed at freed memory, which a sanitiser
+    /// catches. Reuse makes it quiet instead — a stale handle would now find a
+    /// live box belonging to a *later* `Run` and silently compute against the
+    /// wrong context. Every consumer today takes the handle from
+    /// `host_parallel::current()` and uses it synchronously, within the
+    /// compute extent; keep it that way.
     static POOL_CACHE: std::cell::Cell<Option<Box<HostPool>>> =
         const { std::cell::Cell::new(None) };
 }
