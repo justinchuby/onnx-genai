@@ -117,26 +117,48 @@ fn device_total_memory_bytes(ordinal: u32) -> Option<usize> {
     }
 }
 
+/// Explicit operator override for the arena reservation, in bytes.
+///
+/// `ONNX_GENAI_CUDA_VMM_RESERVATION_BYTES` lets an operator pin the top of the
+/// reservation ladder regardless of what the device reports — an escape hatch
+/// for platforms whose driver mis-reports VRAM or where a specific address-space
+/// budget is wanted. Ignored when unset, empty, unparseable, or zero.
+fn reservation_override_bytes() -> Option<usize> {
+    std::env::var("ONNX_GENAI_CUDA_VMM_RESERVATION_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|&bytes| bytes > 0)
+}
+
 /// Arena reservation sizes to try, largest first.
 ///
 /// Reserving address space is close to free — an unmapped range claims no
 /// physical granules — and the driver is generous with it: on an A100 a single
 /// `cuMemAddressReserve` of 64 TiB succeeds, as do eight simultaneous 128 GiB
-/// reservations. So the first entry is sized for headroom, not fitted, and the
-/// ladder exists only so a platform with a tighter address space still gets a
-/// ledgered arena instead of silently dropping to the unaccounted `cuMemAlloc`
-/// fallback.
-fn reservation_ladder(ordinal: u32) -> Vec<usize> {
-    reservation_ladder_from_total(device_total_memory_bytes(ordinal))
-}
-
-/// The pure half of [`reservation_ladder`], separated so it can be tested
-/// without a device present.
-fn reservation_ladder_from_total(device_total: Option<usize>) -> Vec<usize> {
-    let desired = device_total
-        .and_then(|total| total.checked_mul(RESERVATION_VRAM_MULTIPLE))
-        .unwrap_or(RESERVATION_FLOOR_BYTES)
-        .max(RESERVATION_FLOOR_BYTES);
+/// reservations. So the first entry is sized for the actual device (a multiple
+/// of its reported VRAM, or an explicit operator override), not a constant, and
+/// the ladder exists only so a platform with a tighter address space still gets
+/// a ledgered arena instead of silently dropping to the unaccounted
+/// `cuMemAlloc` fallback.
+///
+/// The pure half of the reservation-size computation, separated so both the
+/// device-derived size and an explicit override can be tested without a device
+/// present.
+fn reservation_ladder_from_total_and_override(
+    device_total: Option<usize>,
+    override_bytes: Option<usize>,
+) -> Vec<usize> {
+    let desired = match override_bytes {
+        // An explicit operator budget leads the ladder verbatim (never below the
+        // minimum so the ladder still terminates on a ledgered arena).
+        Some(bytes) => bytes.max(RESERVATION_MIN_BYTES),
+        // Otherwise size from the device: a generous multiple of its VRAM,
+        // floored so even a tiny card gets a roomy arena (address space is free).
+        None => device_total
+            .and_then(|total| total.checked_mul(RESERVATION_VRAM_MULTIPLE))
+            .unwrap_or(RESERVATION_FLOOR_BYTES)
+            .max(RESERVATION_FLOOR_BYTES),
+    };
     let mut ladder = Vec::new();
     let mut size = desired;
     while size > RESERVATION_MIN_BYTES {
@@ -354,9 +376,12 @@ impl CudaExecutionProvider {
             // after which nothing will ask it for memory (#659).
             //
             // Address space is free, so the reservation is generous rather than
-            // fitted: 64 GiB comfortably exceeds any single accelerator we
-            // target, and running out of *reservation* is a hard failure while
-            // leaving it unmapped costs nothing.
+            // fitted: it is sized from the device's own reported VRAM (a large
+            // multiple, floored so small cards still get headroom) or from an
+            // explicit ONNX_GENAI_CUDA_VMM_RESERVATION_BYTES override, so it
+            // adapts to whatever accelerator is present instead of a constant.
+            // Running out of *reservation* is a hard failure while leaving it
+            // unmapped costs nothing.
             vmm: {
                 let cell = std::sync::OnceLock::new();
                 if crate::vmm_allocator::vmm_enabled() || auto_dynamic_lending {
@@ -413,7 +438,12 @@ impl CudaExecutionProvider {
                     // Walk the ladder largest-first and keep the first arena the
                     // driver actually hands us, so a tighter address space costs
                     // reservation headroom rather than the whole ledgered path.
-                    let ladder = reservation_ladder(ordinal);
+                    let device_total = device_total_memory_bytes(ordinal);
+                    let reservation_override = reservation_override_bytes();
+                    let ladder = reservation_ladder_from_total_and_override(
+                        device_total,
+                        reservation_override,
+                    );
                     let mut installed = None;
                     let mut last_fallback = None;
                     for reservation_bytes in ladder {
@@ -435,8 +465,20 @@ impl CudaExecutionProvider {
                         Some((arena, reservation_bytes)) => {
                             eprintln!(
                                 "cuda_ep: device allocations go through a VMM arena over \
-                                 {reservation_bytes} bytes of reserved address space; physical \
-                                 granules are mapped on demand; strategy={}{}",
+                                 {reservation_bytes} bytes of reserved address space ({}); \
+                                 physical granules are mapped on demand; strategy={}{}",
+                                match (reservation_override, device_total) {
+                                    (Some(bytes), _) => format!(
+                                        "explicit ONNX_GENAI_CUDA_VMM_RESERVATION_BYTES={bytes} \
+                                         override"
+                                    ),
+                                    (None, Some(total)) => format!(
+                                        "device-derived from {total} bytes of reported device VRAM"
+                                    ),
+                                    (None, None) => String::from(
+                                        "device VRAM unavailable, using reservation floor"
+                                    ),
+                                },
                                 if auto_dynamic_lending {
                                     "vram-limit dynamic KV/weight lending"
                                 } else {
@@ -1721,7 +1763,7 @@ mod tests {
     #[test]
     fn reservation_ladder_leads_with_a_large_multiple_of_device_vram() {
         let a100_80gb = 85_094_825_984usize;
-        let ladder = reservation_ladder_from_total(Some(a100_80gb));
+        let ladder = reservation_ladder_from_total_and_override(Some(a100_80gb), None);
         assert_eq!(ladder[0], a100_80gb * RESERVATION_VRAM_MULTIPLE);
         assert!(
             ladder[0] > a100_80gb * 2,
@@ -1738,14 +1780,34 @@ mod tests {
     fn reservation_ladder_floors_small_cards_and_unknown_vram() {
         let rtx_4060_8gb = 8usize << 30;
         assert_eq!(
-            reservation_ladder_from_total(Some(rtx_4060_8gb))[0],
+            reservation_ladder_from_total_and_override(Some(rtx_4060_8gb), None)[0],
             RESERVATION_FLOOR_BYTES
         );
         assert_eq!(
-            reservation_ladder_from_total(None)[0],
+            reservation_ladder_from_total_and_override(None, None)[0],
             RESERVATION_FLOOR_BYTES,
             "a driver that will not report VRAM must not collapse the arena"
         );
+    }
+
+    /// An explicit `ONNX_GENAI_CUDA_VMM_RESERVATION_BYTES` override leads the
+    /// ladder verbatim regardless of the device's reported VRAM, but never
+    /// below the minimum so the ladder still terminates on a ledgered arena.
+    #[test]
+    fn reservation_override_leads_the_ladder_and_respects_the_minimum() {
+        let h200_140gb = 143_771usize * 1024 * 1024;
+        let big_override = 256usize << 30;
+        let ladder =
+            reservation_ladder_from_total_and_override(Some(h200_140gb), Some(big_override));
+        assert_eq!(
+            ladder[0], big_override,
+            "an explicit override must lead the ladder verbatim"
+        );
+        // A sub-minimum override still yields a valid, terminating ladder.
+        let tiny_override = 1usize << 30;
+        let floored =
+            reservation_ladder_from_total_and_override(Some(h200_140gb), Some(tiny_override));
+        assert_eq!(floored, vec![RESERVATION_MIN_BYTES]);
     }
 
     /// The ladder exists so a platform with a tighter address space still lands
@@ -1753,7 +1815,7 @@ mod tests {
     /// which means it has to descend and it has to terminate.
     #[test]
     fn reservation_ladder_descends_by_halves_to_the_minimum() {
-        let ladder = reservation_ladder_from_total(Some(85_094_825_984));
+        let ladder = reservation_ladder_from_total_and_override(Some(85_094_825_984), None);
         assert!(
             ladder.windows(2).all(|pair| pair[0] > pair[1]),
             "ladder must be strictly descending: {ladder:?}"
