@@ -328,6 +328,27 @@ impl PipelineEngine {
                  slower than the decoder that follows them"
             );
         }
+        // Under CUDA the component is built on a provider that already answers
+        // to the engine's device authority and process manager, so it is
+        // governed at construction rather than adopting a standing pool after
+        // the fact. Without CUDA there is no device authority to hand over and
+        // the component adopts the memory governor directly.
+        #[cfg(feature = "cuda")]
+        let session = crate::native_component::NativeComponentSession::load_with_cuda_memory(
+            path,
+            device,
+            crate::engine::cuda_policy_from_memory_strategy_plan(&self.memory_strategy_plan),
+            std::sync::Arc::new(
+                self.native_cuda_authority
+                    .clone()
+                    .unwrap_or_else(|| self.resource_governor.device_authority()),
+            ),
+            self.resource_governor.process_memory_manager(),
+        )
+        .with_context(|| {
+            format!("failed to load native pipeline prompt component '{component}'")
+        })?;
+        #[cfg(not(feature = "cuda"))]
         let session = crate::native_component::NativeComponentSession::load(
             path,
             device,

@@ -25,12 +25,9 @@
 //!
 //! # What is here
 //!
-//! [`device_allocator::CudaDeviceAllocator`] is `cuMemAlloc`: it takes virtual
-//! and physical memory together, which is simple and is what the runtime has
-//! always done.
-//!
-//! [`vmm_allocator::CudaVmmAllocator`] separates them, reserving one address
-//! range and mapping granules under it on demand. That is the mechanism
+//! [`vmm_allocator::CudaVmmAllocator`] is the **sole built-in CUDA memory
+//! mechanism**. It separates virtual from physical memory, reserving one
+//! address range and mapping granules under it on demand. That is the mechanism
 //! vAttention ([arXiv 2405.04437](https://arxiv.org/abs/2405.04437)) is built
 //! on, and it is also what makes charging *every* physical byte to the ledger
 //! affordable: granules are 2 MiB, so the allocations that dominate by count
@@ -41,6 +38,22 @@
 //! buffer works over host or device memory.
 //!
 //! [`VirtualBacking`]: onnx_runtime_virtual_memory::VirtualBacking
+//!
+//! # What is deliberately *not* here
+//!
+//! There is no built-in eager `cuMemAlloc` allocator. It was removed once the
+//! VMM arena covered every path that used it, because a second built-in
+//! mechanism is a second thing every accounting, capture and teardown invariant
+//! has to hold for, and a fallback that is never measured is a fallback nobody
+//! can vouch for.
+//!
+//! That is a statement about the *built-in* mechanism only. The
+//! [`DeviceAllocator`] contract is untouched: a caller who wants `cuMemAlloc`,
+//! a BFC arena, or anything else writes it and injects it through
+//! `CudaExecutionProvider::with_memory`, exactly as the CPU EP and ONNX
+//! Runtime's governed allocator already allow.
+//!
+//! [`DeviceAllocator`]: onnx_runtime_memory_governor::DeviceAllocator
 //!
 //! # Building without CUDA
 //!
@@ -56,7 +69,7 @@
 //! a machine with no GPU. The `cuda` feature exists to match the execution
 //! provider's, not to hide the source.
 
-pub mod device_allocator;
+pub mod release;
 pub mod virtual_memory;
 pub mod vmm_allocator;
 

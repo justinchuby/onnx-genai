@@ -260,6 +260,7 @@ impl NativePipelineDecoder {
         #[cfg(feature = "cuda")] governor: std::sync::Arc<
             dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync,
         >,
+        #[cfg(feature = "cuda")] manager: onnx_runtime_memory_governor::ProcessMemoryManager,
     ) -> anyhow::Result<Self> {
         #[cfg(feature = "cuda")]
         let session = crate::native_decode::NativeDecodeSession::load_with_io_and_cuda_governor(
@@ -269,6 +270,7 @@ impl NativePipelineDecoder {
             metadata_max_len,
             offload_policy,
             governor,
+            manager,
         )
         .with_context(|| {
             format!(

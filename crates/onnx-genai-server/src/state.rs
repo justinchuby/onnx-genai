@@ -10,7 +10,7 @@ use onnx_genai::{Engine, EngineConfig};
 use onnx_genai_engine::NativeDecodeDevice;
 use onnx_genai_engine::{
     DeviceCompatibilityDomain, DeviceMemoryAuthority, KvDType, MappedGrowthMetrics,
-    MemoryAuthorityProvider, ResourceLimit,
+    MemoryAuthorityProvider, ProcessMemoryManager, ResourceLimit,
 };
 use onnx_genai_ort::{ChatTemplate, ModelDirectory, PipelineModelDirectory, Tokenizer};
 
@@ -33,6 +33,7 @@ const DEFAULT_MAX_BATCH: usize = 4;
 pub(crate) struct ServerMemoryAuthorities {
     effective_limit: Mutex<ResourceLimit>,
     authorities: Mutex<HashMap<DeviceCompatibilityDomain, DeviceMemoryAuthority>>,
+    process_memory_manager: ProcessMemoryManager,
 }
 
 impl ServerMemoryAuthorities {
@@ -40,6 +41,8 @@ impl ServerMemoryAuthorities {
         Self {
             effective_limit: Mutex::new(configured_limit),
             authorities: Mutex::new(HashMap::new()),
+            process_memory_manager: ProcessMemoryManager::new()
+                .expect("process memory manager identity is available"),
         }
     }
 
@@ -220,6 +223,10 @@ impl ServerMemoryAuthorities {
 }
 
 impl MemoryAuthorityProvider for ServerMemoryAuthorities {
+    fn process_memory_manager(&self) -> ProcessMemoryManager {
+        self.process_memory_manager.clone()
+    }
+
     fn validate_limit(
         &self,
         domain: &DeviceCompatibilityDomain,

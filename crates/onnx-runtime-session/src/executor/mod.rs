@@ -52,7 +52,8 @@ use onnx_runtime_ep_api::{
     CaptureRegionShapeStatus, DeviceBuffer, DevicePtr, DevicePtrMut, EpError, ExecutionProvider,
     ExternalMmapRegion, Kernel, KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary,
     ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMetadata, TensorMut, TensorView,
-    WeightHandle, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView, lazy_weight_candidates,
+    WeightHandle, WorkspaceAllocation, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+    lazy_weight_candidates,
 };
 
 type OptionalTensorSpecs = Vec<Option<(DataType, Vec<usize>)>>;
@@ -719,10 +720,10 @@ impl Drop for Executor {
             let _ = self.ep.deallocate(buf);
         }
         if let Some(workspace) = self.persistent_workspace.take() {
-            let _ = self.ep.deallocate(workspace.buffer);
+            let _ = self.ep.deallocate_workspace(workspace.buffer);
         }
         if let Some(workspace) = self.step_workspace.take() {
-            let _ = self.ep.deallocate(workspace.buffer);
+            let _ = self.ep.deallocate_workspace(workspace.buffer);
         }
         self.shared_buffers.clear();
     }

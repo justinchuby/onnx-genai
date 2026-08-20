@@ -23,6 +23,11 @@ pub(crate) fn load_native_shared_kv_proposer(
     metadata: &InferenceMetadata,
     model_dir: &Path,
     device: crate::native_decode::NativeDecodeDevice,
+    #[cfg(feature = "cuda")] policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
+    #[cfg(feature = "cuda")] governor: Arc<
+        dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync,
+    >,
+    #[cfg(feature = "cuda")] manager: onnx_runtime_memory_governor::ProcessMemoryManager,
 ) -> anyhow::Result<(Option<NativeSharedKvProposerModel>, SpeculativeMode)> {
     let Some(config) = metadata.speculative.as_ref() else {
         return Ok((None, SpeculativeMode::None));
@@ -72,6 +77,22 @@ pub(crate) fn load_native_shared_kv_proposer(
     let weights = read_f32_weights(&spec.input_embedding)?;
     let embedder = LinearEmbedder::new(weights, spec.vocab_size, spec.backbone_hidden_size)
         .context("build native shared-KV target embedding lookup")?;
+    #[cfg(feature = "cuda")]
+    let session = crate::native_decode::NativeProposerSession::load_with_cuda_memory(
+        &spec.model,
+        device,
+        Some(&spec.io),
+        policy,
+        governor,
+        manager,
+    )
+    .with_context(|| {
+        format!(
+            "load native shared-KV proposer graph '{}'",
+            spec.model.display()
+        )
+    })?;
+    #[cfg(not(feature = "cuda"))]
     let session =
         crate::native_decode::NativeProposerSession::load(&spec.model, device, Some(&spec.io))
             .with_context(|| {

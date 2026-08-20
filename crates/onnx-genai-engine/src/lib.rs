@@ -86,6 +86,7 @@ pub use onnx_genai_scheduler::{
 #[cfg(feature = "native-backend")]
 pub use onnx_runtime_ep_cpu::set_decode_thread_budget as set_cpu_decode_thread_budget;
 pub use onnx_runtime_memory_governor::MappedGrowthMetrics;
+pub use onnx_runtime_memory_governor::ProcessMemoryManager;
 
 /// Executor phase costs from the native runtime, as `(phase, total_ns, calls)`.
 ///

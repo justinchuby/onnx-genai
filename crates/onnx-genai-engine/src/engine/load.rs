@@ -675,6 +675,8 @@ impl Engine {
                     cuda_offload_policy,
                     #[cfg(feature = "cuda")]
                     cuda_memory_governor: std::sync::Arc::new(governor.device_authority()),
+                    #[cfg(feature = "cuda")]
+                    process_memory_manager: governor.process_memory_manager(),
                     io: metadata.model.as_ref().and_then(|model| model.io.as_ref()),
                     metadata_max_len: metadata
                         .model
@@ -922,8 +924,17 @@ impl Engine {
         if let Some(trace) = trace {
             native_session.set_trace_context(trace);
         }
-        let (native_shared_kv_proposer, speculative_mode) =
-            load_native_shared_kv_proposer(&metadata, &model_directory.root, native_device)?;
+        let (native_shared_kv_proposer, speculative_mode) = load_native_shared_kv_proposer(
+            &metadata,
+            &model_directory.root,
+            native_device,
+            #[cfg(feature = "cuda")]
+            cuda_offload_policy.unwrap_or_else(onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env),
+            #[cfg(feature = "cuda")]
+            std::sync::Arc::new(governor.device_authority()),
+            #[cfg(feature = "cuda")]
+            governor.process_memory_manager(),
+        )?;
         let environment = {
             let _span = onnx_genai_ort::prof_span!("engine.ort_environment");
             Environment::new("onnx-genai-engine")

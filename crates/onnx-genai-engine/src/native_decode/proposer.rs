@@ -60,6 +60,34 @@ impl NativeProposerSession {
         Self::from_session(session, io)
     }
 
+    #[cfg(feature = "cuda")]
+    pub(crate) fn load_with_cuda_memory(
+        path: impl AsRef<Path>,
+        device: NativeDecodeDevice,
+        io: Option<&ModelIoSpec>,
+        policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
+        governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
+        manager: onnx_runtime_memory_governor::ProcessMemoryManager,
+    ) -> anyhow::Result<Self> {
+        let NativeDecodeDevice::Cuda { index } = device else {
+            return Self::load(path, device, io);
+        };
+        let ep = onnx_runtime_ep_cuda::CudaExecutionProvider::
+            initialized_with_offload_policy_governor_and_manager(
+                index.unwrap_or(0),
+                policy,
+                governor,
+                manager,
+            )
+            .context("initialize governed native CUDA proposer provider")?;
+        let session = InferenceSession::builder()
+            .model(path)
+            .execution_provider(Arc::new(ep))
+            .build()
+            .context("load governed native CUDA proposer model")?;
+        Self::from_session(session, io)
+    }
+
     pub(crate) fn from_session(
         session: InferenceSession,
         io: Option<&ModelIoSpec>,

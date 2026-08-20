@@ -36,7 +36,7 @@ use onnx_runtime_cuda_memory::vmm_allocator::{
 };
 use onnx_runtime_memory_governor::{
     DeviceAllocator, DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole,
-    Tier,
+    Tier, VirtualBacking,
 };
 
 const HOLDER: HolderId = HolderId::new(777);
@@ -246,7 +246,9 @@ fn n_sequences_share_one_pinned_prefix_charged_once_alive_until_last() {
         let ptr = allocate_sequence(&allocator, granule, SEQ_GRANULES);
         let owned_before = governor.used(Tier::Device);
         assert_eq!(
-            allocator.incremental_owned_bytes_for_shared_prefix(&prefix),
+            allocator
+                .incremental_owned_bytes_for_shared_prefix(&prefix)
+                .expect("same-device same-authority prefix"),
             0,
             "admitting sharer {n} must need zero incremental owned bytes for the prefix"
         );
@@ -370,7 +372,9 @@ fn admitting_a_sharer_costs_only_private_bytes() {
 
     // Mapping the shared prefix at offset 0 is free on the owned axis.
     assert_eq!(
-        allocator.incremental_owned_bytes_for_shared_prefix(&prefix),
+        allocator
+            .incremental_owned_bytes_for_shared_prefix(&prefix)
+            .expect("same-device same-authority prefix"),
         0
     );
     allocator
@@ -571,6 +575,14 @@ fn unsupported_shared_prefix_requests_error_rather_than_mismap() {
         detached.create_shared_prefix(granule).is_err(),
         "a shared prefix requires the production physical-handle pool"
     );
+    assert!(
+        DeviceAllocator::as_shared_mapping(&detached).is_none(),
+        "a detached/pool-less allocator must not advertise SharedMapping"
+    );
+    assert!(
+        DeviceAllocator::as_shared_mapping(&allocator).is_some(),
+        "a pooled allocator must advertise SharedMapping"
+    );
 
     // SAFETY: live pointers from this allocator, no CUDA work in flight.
     unsafe {
@@ -579,4 +591,71 @@ fn unsupported_shared_prefix_requests_error_rather_than_mismap() {
         allocator.deallocate(c, bytes, granule);
     }
     drop(prefix);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn foreign_device_and_authority_prefixes_are_not_free_and_are_rejected() {
+    set_pool_env();
+    let context = require_cuda();
+    context.bind_to_thread().expect("bind CUDA context");
+    let granule = granularity(0);
+
+    let governor_a = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
+    let allocator_a = allocator(&governor_a, 64 << 20);
+    let mapping_a = DeviceAllocator::as_shared_mapping(&allocator_a)
+        .expect("production allocator has shared mapping");
+    let prefix = mapping_a
+        .create_shared_prefix(granule)
+        .expect("prefix on allocator a");
+
+    let governor_b = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
+    let wrong_device = CudaVmmAllocator::new(
+        context,
+        DeviceKey::device(1),
+        0,
+        64 << 20,
+        &governor_b,
+        HOLDER,
+        MemoryRole::KvCache,
+    )
+    .expect("logical device-one allocator");
+    let wrong_device_mapping = DeviceAllocator::as_shared_mapping(&wrong_device)
+        .expect("wrong-device allocator still has its own pool");
+    assert!(
+        wrong_device_mapping
+            .incremental_owned_bytes_for_shared_prefix(prefix.as_ref())
+            .is_err(),
+        "a wrong-device prefix must be rejected before a cost is reported"
+    );
+    assert!(
+        wrong_device_mapping
+            .commit_shared_prefix(prefix.as_ref(), NonNull::dangling(), granule, 0)
+            .is_err(),
+        "wrong-device mapping must be rejected"
+    );
+
+    let governor_c = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
+    let wrong_authority = allocator(&governor_c, 64 << 20);
+    assert_ne!(
+        allocator_a.physical_pool_authority(),
+        wrong_authority.physical_pool_authority()
+    );
+    let wrong_authority_mapping = DeviceAllocator::as_shared_mapping(&wrong_authority)
+        .expect("wrong-authority allocator has its own pool");
+    assert!(
+        wrong_authority_mapping
+            .incremental_owned_bytes_for_shared_prefix(prefix.as_ref())
+            .is_err(),
+        "a wrong-authority prefix must be rejected before a cost is reported"
+    );
+    assert!(
+        wrong_authority_mapping
+            .commit_shared_prefix(prefix.as_ref(), NonNull::dangling(), granule, 0)
+            .is_err(),
+        "wrong-authority mapping must be rejected"
+    );
 }

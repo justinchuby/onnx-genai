@@ -69,13 +69,23 @@ fn an_execution_provider_allocation_is_visible_in_the_reported_counts() {
     );
 
     ep.deallocate(buffer).expect("the buffer is returned");
+    // The free is ordered behind both stream tails now, so the count moves when
+    // the release actually completes rather than when `deallocate` returns.
+    // Waiting on the queue is what makes the assertion observe the real event
+    // instead of a hopeful one.
+    assert!(
+        ep.release_queue()
+            .wait_until_idle(std::time::Duration::from_secs(30)),
+        "the deferred release must complete: {:?}",
+        ep.deferred_release_stats()
+    );
     let after_free = ep
         .device_allocation_counts()
         .expect("counts remain available");
     assert_eq!(
         after_free.1,
         before.1 + 1,
-        "freeing through the EP must move the free count it reports"
+        "a completed release through the EP must move the free count it reports"
     );
     assert_eq!(
         after_free.0, after_allocate.0,
