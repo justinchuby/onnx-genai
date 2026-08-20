@@ -273,7 +273,11 @@ impl GenAiConfig {
         insert_some(&mut defaults, "temperature", search.temperature);
         insert_some(&mut defaults, "top_k", search.top_k);
         insert_some(&mut defaults, "top_p", search.top_p);
-        insert_some(&mut defaults, "repetition_penalty", search.repetition_penalty);
+        insert_some(
+            &mut defaults,
+            "repetition_penalty",
+            search.repetition_penalty,
+        );
         insert_some(&mut defaults, "num_beams", search.num_beams);
         insert_some(
             &mut defaults,

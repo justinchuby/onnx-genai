@@ -2915,7 +2915,10 @@ fn time_first_token(
         Ok(())
     };
     let result = engine
-        .generate_with_callback(pipeline_request(args, 1, prompt_tokens)?, Some(&mut callback))
+        .generate_with_callback(
+            pipeline_request(args, 1, prompt_tokens)?,
+            Some(&mut callback),
+        )
         .context("prefill sweep generation")?;
     let elapsed = first.context("generation emitted no tokens")?;
     Ok((elapsed.as_secs_f64() * 1_000.0, result.prefix_cache_hit_len))

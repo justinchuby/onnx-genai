@@ -2512,10 +2512,7 @@ fn workflow_request_value(
     }
 }
 
-fn literal_element_bytes(
-    scalar: &ScalarValue,
-    dtype: &str,
-) -> anyhow::Result<(Vec<u8>, DataType)> {
+fn literal_element_bytes(scalar: &ScalarValue, dtype: &str) -> anyhow::Result<(Vec<u8>, DataType)> {
     match scalar {
         ScalarValue::Integer(value) => match dtype {
             "int64" => Ok((value.to_le_bytes().to_vec(), DataType::Int64)),
@@ -2573,16 +2570,17 @@ fn literal_element_bytes(
                 DataType::Float16,
             )),
             "bfloat16" | "bf16" => Ok((
-                half::bf16::from_f64(*value).to_bits().to_le_bytes().to_vec(),
+                half::bf16::from_f64(*value)
+                    .to_bits()
+                    .to_le_bytes()
+                    .to_vec(),
                 DataType::BFloat16,
             )),
             _ => anyhow::bail!(
                 "floating-point workflow literal is incompatible with declared dtype '{dtype}'"
             ),
         },
-        ScalarValue::Bool(value) if dtype == "bool" => {
-            Ok((vec![u8::from(*value)], DataType::Bool))
-        }
+        ScalarValue::Bool(value) if dtype == "bool" => Ok((vec![u8::from(*value)], DataType::Bool)),
         ScalarValue::String(_) => {
             anyhow::bail!("string literal workflow inputs require an adapter binding")
         }
@@ -2633,8 +2631,7 @@ fn workflow_literal_value_with_shape(
                 }
                 bytes.extend_from_slice(&encoded);
             }
-            let dtype = element_dtype
-                .context("workflow literal element list must not be empty")?;
+            let dtype = element_dtype.context("workflow literal element list must not be empty")?;
             Value::from_raw_bytes(bytes, &shape, dtype).map_err(Into::into)
         }
     }

@@ -1148,7 +1148,10 @@ fn resolve_metadata_and_decode_path(
 /// capacity known at load time is the one the package declares as its context
 /// window. Without that bound the runtime declines to reserve rather than
 /// guessing a size.
-fn shared_kv_offer(session: &Session, metadata: &InferenceMetadata) -> crate::decode::SharedKvOffer {
+fn shared_kv_offer(
+    session: &Session,
+    metadata: &InferenceMetadata,
+) -> crate::decode::SharedKvOffer {
     crate::decode::SharedKvOffer {
         present_binding_supported: session.supports_fixed_capacity_present_binding(),
         max_len: metadata

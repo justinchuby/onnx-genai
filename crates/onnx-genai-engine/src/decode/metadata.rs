@@ -282,8 +282,8 @@ mod aliasing_tests {
         // Silence means forbidden. A capable deployment must not alias a graph
         // that never stated the aliasing is safe -- doing so would corrupt KV for
         // any graph that reads `past` after writing `present`.
-        let path = detect_model_decode_path(Some(&kv_io(None)), None, 0, capable())
-            .expect("decode path");
+        let path =
+            detect_model_decode_path(Some(&kv_io(None)), None, 0, capable()).expect("decode path");
         assert!(matches!(
             path,
             ModelDecodePath::PastPresent {
@@ -307,9 +307,13 @@ mod aliasing_tests {
                 max_len: None,
             },
         ] {
-            let path =
-                detect_model_decode_path(Some(&kv_io(Some(StateAliasing::Permitted))), None, 0, offer)
-                    .expect("decode path");
+            let path = detect_model_decode_path(
+                Some(&kv_io(Some(StateAliasing::Permitted))),
+                None,
+                0,
+                offer,
+            )
+            .expect("decode path");
             assert!(
                 matches!(
                     path,
