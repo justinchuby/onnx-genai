@@ -6399,6 +6399,23 @@ mod tests {
             "the number of thread-local resolutions in compute.rs changed"
         );
 
+        // Scoping these counts to `compute_execute`'s body is not enough: a
+        // helper defined outside it that takes and recycles, called from inside
+        // the per-node loop, regresses the optimisation while the body contains
+        // neither name. Review found exactly that bypass. So the call sites are
+        // counted over the whole production source instead -- there must be one
+        // of each in the crate, and it must be the one in `compute_execute`.
+        let take_calls = prod.matches("take_run_scratch()").count()
+            - prod.matches("fn take_run_scratch()").count();
+        let recycle_calls = prod.matches("recycle_run_scratch(").count()
+            - prod.matches("fn recycle_run_scratch(").count();
+        assert_eq!(
+            (take_calls, recycle_calls),
+            (1, 1),
+            "the scratch is taken/recycled somewhere other than the one place \
+             on the `Run` path; a second site costs another __tls_get_addr"
+        );
+
         let start = prod
             .find("unsafe extern \"C\" fn compute_execute(")
             .expect("compute_execute exists");

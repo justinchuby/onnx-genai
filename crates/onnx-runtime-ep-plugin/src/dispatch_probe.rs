@@ -1068,21 +1068,44 @@ mod ffi_coverage {
     /// rustfmt lays out every top-level item in this crate.
     fn production_source(src: &str) -> String {
         let mut out = String::with_capacity(src.len());
-        let mut skipping = false;
+        // `None` = emitting. `Some(depth)` = inside a `#[cfg(test)]` item, with
+        // the running brace depth of that item.
+        let mut skip: Option<i32> = None;
         for line in src.lines() {
-            if skipping {
-                if line == "}" {
-                    skipping = false;
+            if let Some(depth) = skip.as_mut() {
+                // An item is over when its braces balance. A non-brace item --
+                // `#[cfg(test)] use ...;`, or a `const` -- balances on its own
+                // first line and ends there. Scanning instead for the next
+                // column-0 `}` swallowed every line up to some unrelated item's
+                // close, which is the same silent drop this function exists to
+                // prevent, just one case narrower.
+                let opens = line.matches('{').count() as i32;
+                let closes = line.matches('}').count() as i32;
+                *depth += opens - closes;
+                if *depth <= 0 && !(opens == 0 && closes == 0 && line.trim_end().is_empty()) {
+                    skip = None;
                 }
                 continue;
             }
-            if line.starts_with("#[cfg(") && line.ends_with(")]") && line.contains("test") {
-                skipping = true;
+            if line.starts_with("#[cfg(") && line.contains("test") {
+                // A `#[cfg(...)]` that does not close on its own line would
+                // leave the item unrecognised, so refuse rather than guess.
+                assert!(
+                    line.ends_with(")]"),
+                    "multi-line #[cfg(...test...)] attribute is not supported \
+                     by this audit; keep it on one line: {line}"
+                );
+                skip = Some(0);
                 continue;
             }
             out.push_str(line);
             out.push('\n');
         }
+        assert!(
+            skip.is_none(),
+            "a #[cfg(test)] item never closed; the audit would have silently \
+             dropped the rest of the file"
+        );
         out
     }
 
@@ -1111,6 +1134,81 @@ mod ffi_coverage {
         out.sort();
         out.dedup();
         out
+    }
+
+    /// A `#[cfg(test)]` item that has no braces -- a `use`, a `const` -- must
+    /// end at its own line. Skipping to the next column-0 `}` instead swallowed
+    /// every production line in between, silently dropping real FFI call sites
+    /// from this audit while it still reported a pass. Found in review.
+    #[test]
+    fn a_brace_less_cfg_test_item_does_not_swallow_the_code_after_it() {
+        let src = [
+            "#[cfg(test)]",
+            "use crate::testkit::FakeApi;",
+            "pub unsafe fn read_thing(api: &ort::OrtApi) {",
+            "    dispatch_probe::ort_call();",
+            "    let _ = api.GetTensorData;",
+            "}",
+            "fn other() {}",
+        ]
+        .join("\n");
+        let prod = production_source(&src);
+        assert!(
+            !prod.contains("FakeApi"),
+            "the test-only `use` was not excluded: {prod}"
+        );
+        assert!(
+            prod.contains("read_thing") && prod.contains("fn other"),
+            "production code after a brace-less #[cfg(test)] item was dropped: {prod}"
+        );
+        assert_eq!(
+            prod.matches("dispatch_probe::ort_call()").count(),
+            1,
+            "the audit lost a real FFI call site: {prod}"
+        );
+        assert_eq!(ort_members(&prod), vec!["GetTensorData".to_string()]);
+    }
+
+    /// The ordinary case: a `#[cfg(test)] mod` and everything in it goes, and
+    /// production code on the far side of it stays.
+    #[test]
+    fn a_cfg_test_module_is_excluded_without_truncating_the_file() {
+        let src = [
+            "fn before(api: &ort::OrtApi) { let _ = api.GetTensorData; }",
+            "#[cfg(test)]",
+            "mod tests {",
+            "    fn fake(api: &ort::OrtApi) { let _ = api.KernelContext_GetInput; }",
+            "}",
+            "fn after(api: &ort::OrtApi) { let _ = api.GetTensorMutableData; }",
+        ]
+        .join("\n");
+        let prod = production_source(&src);
+        assert_eq!(
+            ort_members(&prod),
+            vec![
+                "GetTensorData".to_string(),
+                "GetTensorMutableData".to_string()
+            ],
+            "got {prod}"
+        );
+    }
+
+    /// `#[cfg(all(test, feature = "..."))]` is a test item too, and must be
+    /// excluded on the same terms.
+    #[test]
+    fn a_feature_gated_test_module_is_also_excluded() {
+        let src = [
+            "fn before(api: &ort::OrtApi) { let _ = api.GetTensorData; }",
+            "#[cfg(all(test, feature = \"dispatch_probe\"))]",
+            "mod dispatch_cost {",
+            "    fn fake(api: &ort::OrtApi) { let _ = api.KernelContext_GetInput; }",
+            "}",
+            "fn after(api: &ort::OrtApi) { let _ = api.GetTensorMutableData; }",
+        ]
+        .join("\n");
+        let prod = production_source(&src);
+        assert!(!prod.contains("KernelContext_GetInput"), "got {prod}");
+        assert!(prod.contains("fn after"), "got {prod}");
     }
 
     #[test]
