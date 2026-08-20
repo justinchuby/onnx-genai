@@ -920,6 +920,21 @@ impl OperandKey {
             && self.present == metadata.present
             && self.shape.as_slice() == metadata.shape
     }
+
+    /// Same comparison as [`OperandKey::matches`], against the `TensorView` the
+    /// metadata would have been built from.
+    ///
+    /// This exists so the lock-free fast path in
+    /// [`WorkspacePlanCache::get_or_plan`] can verify a hit without first
+    /// materialising the `Vec<TensorMetadata>` — that allocation is only worth
+    /// paying on a miss. It must stay field-for-field identical to `matches`
+    /// composed with `TensorMetadata::new(v.dtype, v.shape, !v.is_absent())`,
+    /// which `the_view_and_metadata_comparisons_agree` pins.
+    fn matches_view(&self, view: &TensorView<'_>) -> bool {
+        self.dtype == view.dtype
+            && self.present == !view.is_absent()
+            && self.shape.as_slice() == view.shape
+    }
 }
 
 /// Owned copy of the metadata a [`WorkspaceRequirement`] was computed from.
@@ -1020,15 +1035,131 @@ const WORKSPACE_PLAN_CACHE_CAPACITY: usize = 8;
 /// re-derive their requirement in `execute_with_workspace` and reject a
 /// workspace that is too small (`governed_workspace_ptr`, `std_attention_carve`,
 /// `gqa` sub-range carving) rather than reading past the end.
+/// A signature that has been observed more than once, published for lock-free
+/// reads (#1077 lever 3).
+///
+/// Written at most once per node, through [`OnceLock`], and only for a
+/// signature that has already been served from the locked cache — that is, one
+/// that recurs. Reading it costs an acquire load and an operand-wise compare;
+/// it takes no lock and allocates nothing.
+#[derive(Debug)]
+struct HotPlan {
+    operands: Box<[OperandKey]>,
+    requirement: WorkspaceRequirement,
+}
+
 struct WorkspacePlanCache {
+    /// Lock-free fast path. See [`HotPlan`].
+    ///
+    /// Publishing on the *second* sighting rather than the first is deliberate:
+    /// a decoder's first `Run` is a prefill whose shape may never recur, and
+    /// pinning that one would leave every later decode `Run` on the locked
+    /// path. Waiting for a repeat costs one extra locked `Run` at startup and
+    /// picks the recurring shape in both the static and the prefill/decode
+    /// case.
+    ///
+    /// Exactly one signature is ever pinned, and it is never rotated. That
+    /// covers the shapes we care about (static graphs, and prefill-then-decode
+    /// where only the decode extent recurs), but a node that genuinely
+    /// alternates between two equally-recurring signatures keeps roughly half
+    /// its dispatches on the locked path. That is a missed optimisation, not a
+    /// correctness problem: a miss simply falls through to [`Self::lookup`].
+    hot: std::sync::OnceLock<HotPlan>,
+    /// Test-only: keep every dispatch on the locked path.
+    ///
+    /// The lock-free slot would otherwise answer the repeat access in
+    /// `a_repeatedly_used_signature_survives_eviction`, which would let that
+    /// test pass with move-to-front deleted — it would stop measuring what it
+    /// names. Tests of the locked cache opt out through
+    /// [`WorkspacePlanCache::locked_only`].
+    #[cfg(test)]
+    suppress_hot: bool,
     plans: Mutex<Vec<(WorkspaceSignature, WorkspaceRequirement)>>,
 }
 
 impl WorkspacePlanCache {
     fn new() -> Self {
         Self {
+            hot: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            suppress_hot: false,
             plans: Mutex::new(Vec::new()),
         }
+    }
+
+    /// A cache that never publishes to the lock-free slot, so every dispatch
+    /// exercises the locked path. See `suppress_hot`.
+    #[cfg(test)]
+    fn locked_only() -> Self {
+        Self {
+            suppress_hot: true,
+            ..Self::new()
+        }
+    }
+
+    /// The lock-free hit test, against already-built metadata.
+    fn hot_hit(&self, metadata: &[TensorMetadata<'_>]) -> Option<WorkspaceRequirement> {
+        let hot = self.hot.get()?;
+        (hot.operands.len() == metadata.len()
+            && hot
+                .operands
+                .iter()
+                .zip(metadata)
+                .all(|(key, meta)| key.matches(meta)))
+        .then_some(hot.requirement)
+    }
+
+    /// The lock-free hit test, against the views the metadata would describe.
+    ///
+    /// Identical in effect to [`WorkspacePlanCache::hot_hit`] on the metadata
+    /// built from `inputs`, but it does not build that `Vec`.
+    fn hot_hit_views(&self, inputs: &[TensorView<'_>]) -> Option<WorkspaceRequirement> {
+        let hot = self.hot.get()?;
+        (hot.operands.len() == inputs.len()
+            && hot
+                .operands
+                .iter()
+                .zip(inputs)
+                .all(|(key, view)| key.matches_view(view)))
+        .then_some(hot.requirement)
+    }
+
+    /// Publish a recurring signature to the lock-free slot, if it is still
+    /// empty. Losing the race is harmless: the winner is equally valid, and
+    /// this dispatch already has its answer.
+    fn publish_hot(&self, metadata: &[TensorMetadata<'_>], requirement: WorkspaceRequirement) {
+        #[cfg(test)]
+        if self.suppress_hot {
+            return;
+        }
+        if self.hot.get().is_some() {
+            return;
+        }
+        let _ = self.hot.set(HotPlan {
+            operands: signature_of(metadata).into_boxed_slice(),
+            requirement,
+        });
+    }
+
+    /// Look up the plan for `inputs`, computing and remembering it on a miss.
+    ///
+    /// The fast path takes no lock and makes no allocation. The metadata `Vec`
+    /// is built only when the lock-free slot does not already answer the
+    /// question, because it is needed only by the locked cache and by
+    /// `Kernel::workspace_requirement`.
+    fn get_or_plan_views(
+        &self,
+        inputs: &[TensorView<'_>],
+        plan: impl FnOnce(&[TensorMetadata<'_>]) -> Result<WorkspaceRequirement, String>,
+    ) -> Result<WorkspaceRequirement, String> {
+        if let Some(hit) = self.hot_hit_views(inputs) {
+            return Ok(hit);
+        }
+        let metadata: Vec<TensorMetadata<'_>> = inputs
+            .iter()
+            .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
+            .collect();
+        self.get_or_plan(&metadata, || plan(&metadata))
     }
 
     /// Look up the plan for `metadata`, computing and remembering it on a miss.
@@ -1037,7 +1168,13 @@ impl WorkspacePlanCache {
         metadata: &[TensorMetadata<'_>],
         plan: impl FnOnce() -> Result<WorkspaceRequirement, String>,
     ) -> Result<WorkspaceRequirement, String> {
+        if let Some(hit) = self.hot_hit(metadata) {
+            return Ok(hit);
+        }
         if let Some(hit) = self.lookup(metadata) {
+            // Second sighting: this signature recurs, so it is the one worth
+            // publishing.
+            self.publish_hot(metadata, hit);
             return Ok(hit);
         }
         let requirement = plan()?;
@@ -2086,13 +2223,9 @@ unsafe fn prepare_workspace(
     inputs: &[TensorView<'_>],
     node_label: impl std::fmt::Display + Copy,
 ) -> Result<Option<WorkspaceView>, String> {
-    let metadata: Vec<TensorMetadata<'_>> = inputs
-        .iter()
-        .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
-        .collect();
-    let requirement: WorkspaceRequirement = plans.get_or_plan(&metadata, || {
+    let requirement: WorkspaceRequirement = plans.get_or_plan_views(inputs, |metadata| {
         kernel
-            .workspace_requirement(&metadata)
+            .workspace_requirement(metadata)
             .map_err(|e| format!("{node_label}: workspace_requirement failed: {e}"))
     })?;
     if requirement.bytes == 0 {
@@ -5798,9 +5931,10 @@ mod workspace_plan_cache_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use onnx_runtime_ep_api::kernel::{TensorMetadata, WorkspaceRequirement};
+    use onnx_runtime_ep_api::tensor::{DevicePtr, TensorView};
     use onnx_runtime_ir::DataType;
 
-    use super::{WORKSPACE_PLAN_CACHE_CAPACITY, WorkspacePlanCache};
+    use super::{OperandKey, WORKSPACE_PLAN_CACHE_CAPACITY, WorkspacePlanCache};
 
     fn requirement(bytes: u64) -> WorkspaceRequirement {
         WorkspaceRequirement {
@@ -5856,7 +5990,9 @@ mod workspace_plan_cache_tests {
     /// state.
     #[test]
     fn a_repeatedly_used_signature_survives_eviction() {
-        let cache = WorkspacePlanCache::new();
+        // Locked path on purpose: the lock-free slot would serve the repeat
+        // access below and the assertion would hold with move-to-front gone.
+        let cache = WorkspacePlanCache::locked_only();
         let planner = CountingPlanner::new();
 
         let hot_shape = vec![1usize];
@@ -6231,6 +6367,305 @@ mod workspace_plan_cache_tests {
             1,
             "the cached plan must survive the poisoning"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Lock-free fast path (#1077 lever 3)
+    // ──────────────────────────────────────────────────────────────────────
+
+    fn view<'a>(
+        data: &'a [u8],
+        dtype: DataType,
+        shape: &'a [usize],
+        strides: &'a [i64],
+    ) -> TensorView<'a> {
+        TensorView::new(
+            DevicePtr(data.as_ptr().cast()),
+            dtype,
+            shape,
+            strides,
+            onnx_runtime_ir::DeviceId::cpu(),
+        )
+    }
+
+    /// The fast path compares against `TensorView`s to avoid building the
+    /// metadata `Vec`, so its comparison must be indistinguishable from the
+    /// metadata one. Falsifier: drop any field from `matches_view` and a
+    /// disagreement appears here.
+    #[test]
+    fn the_view_and_metadata_comparisons_agree() {
+        let data = [0u8; 64];
+        let strides = [1i64; 3];
+        let shapes: [&[usize]; 3] = [&[8], &[2, 3], &[]];
+        for dtype in [DataType::Float32, DataType::Float16] {
+            for shape in shapes {
+                for absent in [false, true] {
+                    let v = if absent {
+                        TensorView::absent(dtype)
+                    } else {
+                        view(&data, dtype, shape, &strides[..shape.len()])
+                    };
+                    let m = TensorMetadata::new(v.dtype, v.shape, !v.is_absent());
+                    let exact = OperandKey {
+                        dtype: m.dtype,
+                        present: m.present,
+                        shape: m.shape.to_vec(),
+                    };
+                    assert_eq!(
+                        exact.matches(&m),
+                        exact.matches_view(&v),
+                        "view and metadata comparison disagree on a matching key"
+                    );
+                    for wrong in [
+                        OperandKey {
+                            dtype: m.dtype,
+                            present: !m.present,
+                            shape: m.shape.to_vec(),
+                        },
+                        OperandKey {
+                            dtype: m.dtype,
+                            present: m.present,
+                            shape: vec![99],
+                        },
+                    ] {
+                        assert_eq!(
+                            wrong.matches(&m),
+                            wrong.matches_view(&v),
+                            "view and metadata comparison disagree on a mismatching key"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A signature is published only once it recurs, and the published plan is
+    /// then served without re-planning.
+    #[test]
+    fn a_recurring_signature_is_published_to_the_lock_free_slot() {
+        let cache = WorkspacePlanCache::new();
+        let planner = CountingPlanner::new();
+        let data = [0u8; 64];
+        let shape = [8usize];
+        let strides = [1i64];
+        let inputs = [view(&data, DataType::Float32, &shape, &strides)];
+
+        cache
+            .get_or_plan_views(&inputs, |m| planner.plan(m))
+            .expect("plan");
+        assert!(
+            cache.hot.get().is_none(),
+            "a signature seen once must not be published: a prefill shape may never recur"
+        );
+
+        cache
+            .get_or_plan_views(&inputs, |m| planner.plan(m))
+            .expect("plan");
+        assert!(
+            cache.hot.get().is_some(),
+            "a signature seen twice must be published"
+        );
+
+        let before = planner.calls();
+        let got = cache
+            .get_or_plan_views(&inputs, |_| {
+                panic!("the published plan must not be re-planned")
+            })
+            .expect("served from the lock-free slot");
+        assert_eq!(got.bytes, 8 * 4);
+        assert_eq!(planner.calls(), before);
+    }
+
+    /// The published plan must be readable while the cache lock is held by
+    /// someone else — that is what "lock-free" means here. Falsifier: make the
+    /// fast path take `plans.lock()` and this times out.
+    #[test]
+    fn a_published_plan_is_served_while_the_lock_is_held() {
+        let cache = Arc::new(WorkspacePlanCache::new());
+        let planner = CountingPlanner::new();
+        let data = [0u8; 64];
+        let shape = [8usize];
+        let strides = [1i64];
+        let inputs = [view(&data, DataType::Float32, &shape, &strides)];
+        for _ in 0..2 {
+            cache
+                .get_or_plan_views(&inputs, |m| planner.plan(m))
+                .expect("plan");
+        }
+        assert!(cache.hot.get().is_some(), "signature must be published");
+
+        let held = cache.plans.lock().expect("lock");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = {
+            let cache = Arc::clone(&cache);
+            std::thread::spawn(move || {
+                let data = [0u8; 64];
+                let shape = [8usize];
+                let strides = [1i64];
+                let inputs = [view(&data, DataType::Float32, &shape, &strides)];
+                let got = cache
+                    .get_or_plan_views(&inputs, |_| panic!("must not re-plan"))
+                    .expect("served");
+                let _ = tx.send(got.bytes);
+            })
+        };
+        let bytes = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the fast path blocked on the cache lock");
+        assert_eq!(bytes, 8 * 4);
+        drop(held);
+        reader.join().expect("reader thread");
+    }
+
+    /// Publication must pick the *recurring* signature, not merely the first
+    /// one: a decoder's first `Run` is a prefill whose shape may never return.
+    #[test]
+    fn the_published_plan_is_the_recurring_shape_not_the_first_one() {
+        let cache = WorkspacePlanCache::new();
+        let planner = CountingPlanner::new();
+        let data = [0u8; 512];
+        let strides = [1i64];
+        let prefill = [32usize];
+        let decode = [1usize];
+
+        let p = [view(&data, DataType::Float32, &prefill, &strides)];
+        cache
+            .get_or_plan_views(&p, |m| planner.plan(m))
+            .expect("plan");
+        let d = [view(&data, DataType::Float32, &decode, &strides)];
+        for _ in 0..2 {
+            cache
+                .get_or_plan_views(&d, |m| planner.plan(m))
+                .expect("plan");
+        }
+
+        let published = cache.hot.get().expect("a recurring signature must publish");
+        assert_eq!(
+            published.operands[0].shape.as_slice(),
+            &decode[..],
+            "the one-off prefill shape was pinned instead of the recurring decode shape"
+        );
+        assert_eq!(published.requirement.bytes, 4);
+    }
+
+    /// Falsification of fast-path bypass: once a signature is published, every
+    /// *other* signature must still be planned on its own terms. Deleting any
+    /// field from the fast-path comparison makes one of these serve a stale
+    /// plan.
+    #[test]
+    fn the_lock_free_slot_is_never_served_for_a_different_signature() {
+        let data = [0u8; 512];
+        let strides = [1i64; 2];
+        let hot_shape = [8usize];
+
+        // Each case: (label, the differing operand list, the bytes its own
+        // plan must produce).
+        let publish = |cache: &WorkspacePlanCache, planner: &CountingPlanner| {
+            let inputs = [view(&data, DataType::Float32, &hot_shape, &strides[..1])];
+            for _ in 0..2 {
+                cache
+                    .get_or_plan_views(&inputs, |m| planner.plan(m))
+                    .expect("plan");
+            }
+            assert!(cache.hot.get().is_some(), "publication precondition failed");
+        };
+
+        // Changed shape.
+        {
+            let cache = WorkspacePlanCache::new();
+            let planner = CountingPlanner::new();
+            publish(&cache, &planner);
+            let other_shape = [4usize];
+            let other = [view(&data, DataType::Float32, &other_shape, &strides[..1])];
+            let got = cache
+                .get_or_plan_views(&other, |m| planner.plan(m))
+                .expect("plan");
+            assert_eq!(
+                got.bytes,
+                4 * 4,
+                "a changed shape was served the published plan"
+            );
+        }
+        // Changed dtype.
+        {
+            let cache = WorkspacePlanCache::new();
+            let planner = CountingPlanner::new();
+            publish(&cache, &planner);
+            let other = [view(&data, DataType::Float16, &hot_shape, &strides[..1])];
+            let got = cache
+                .get_or_plan_views(&other, |m| planner.plan(m))
+                .expect("plan");
+            assert_eq!(
+                got.bytes,
+                8 * 2,
+                "a changed dtype was served the published plan"
+            );
+        }
+        // Changed presence: an omitted optional slot.
+        {
+            let cache = WorkspacePlanCache::new();
+            let planner = CountingPlanner::new();
+            publish(&cache, &planner);
+            let other = [TensorView::absent(DataType::Float32)];
+            let got = cache
+                .get_or_plan_views(&other, |m| planner.plan(m))
+                .expect("plan");
+            assert_eq!(
+                got.bytes, 1,
+                "an absent optional slot was served the present operand's plan"
+            );
+        }
+        // Changed arity.
+        {
+            let cache = WorkspacePlanCache::new();
+            let planner = CountingPlanner::new();
+            publish(&cache, &planner);
+            let other = [
+                view(&data, DataType::Float32, &hot_shape, &strides[..1]),
+                view(&data, DataType::Float32, &hot_shape, &strides[..1]),
+            ];
+            let got = cache
+                .get_or_plan_views(&other, |m| planner.plan(m))
+                .expect("plan");
+            assert_eq!(
+                got.bytes,
+                8 * 4 * 2,
+                "a longer operand list was served the shorter signature's plan"
+            );
+        }
+    }
+
+    /// Concurrent dispatches of interleaved signatures must each receive their
+    /// own plan, whichever one wins publication.
+    #[test]
+    fn concurrent_dispatches_never_receive_another_signatures_plan() {
+        let cache = Arc::new(WorkspacePlanCache::new());
+        let planner = Arc::new(CountingPlanner::new());
+        let mut handles = Vec::new();
+        for t in 0..8usize {
+            let cache = Arc::clone(&cache);
+            let planner = Arc::clone(&planner);
+            handles.push(std::thread::spawn(move || {
+                let data = [0u8; 512];
+                let strides = [1i64];
+                for i in 0..250usize {
+                    let n = 1 + ((t + i) % 5);
+                    let shape = [n * 2];
+                    let inputs = [view(&data, DataType::Float32, &shape, &strides)];
+                    let got = cache
+                        .get_or_plan_views(&inputs, |m| planner.plan(m))
+                        .expect("plan");
+                    assert_eq!(
+                        got.bytes as usize,
+                        n * 2 * 4,
+                        "a concurrent dispatch received another signature's plan"
+                    );
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread");
+        }
     }
 }
 

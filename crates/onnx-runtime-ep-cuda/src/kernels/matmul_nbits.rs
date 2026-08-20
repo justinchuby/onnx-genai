@@ -10305,9 +10305,66 @@ mod tests {
 
     use super::*;
 
-    /// Serializes the env-mutating dispatch selection in the interleaved-dequant
-    /// byte-identity test so parallel test threads never observe a half-set flag.
-    static INTERLEAVE_TEST_ENV_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    /// Guards the `ONNX_GENAI_INTERLEAVE_DEQUANT` / `ONNX_GENAI_GEMV_PIPELINE`
+    /// levers, which the interleaved-dequant byte-identity test flips by writing
+    /// the PROCESS environment.
+    ///
+    /// A plain mutex is not enough here, and used to be the bug: it only excludes
+    /// other lock *holders*, while an env var is visible to every thread in the
+    /// binary. Any parity test running concurrently would silently pick up the
+    /// lever, route through `ensure_interleaved`, allocate the interleaved
+    /// weights on first sight and therefore report that call capture-UNSAFE —
+    /// failing an assertion about a kernel it never meant to exercise, at a
+    /// timing that depended on the harness's thread interleaving.
+    ///
+    /// So the writer takes the exclusive side and every helper that depends on
+    /// the levers being at their default (OFF) takes the shared side.
+    static INTERLEAVE_TEST_ENV_LOCK: std::sync::OnceLock<std::sync::RwLock<()>> =
+        std::sync::OnceLock::new();
+
+    /// Exclusive guard that clears the dispatch levers when it drops.
+    ///
+    /// Restoring the environment on the normal path only is not enough: these
+    /// helpers `unwrap()` their kernel runs, so a failing assertion unwinds past
+    /// the cleanup and leaves the lever set. The `RwLock` is then poisoned, and
+    /// readers — which recover with `into_inner` rather than cascade the
+    /// failure — would run with a lever nobody asked for, turning one real
+    /// failure into a run of unrelated ones. Clearing from `Drop` makes the
+    /// restore unwind-safe.
+    struct LeverEnvGuard(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+
+    impl LeverEnvGuard {
+        fn acquire() -> Self {
+            Self(
+                INTERLEAVE_TEST_ENV_LOCK
+                    .get_or_init(Default::default)
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
+        }
+    }
+
+    impl Drop for LeverEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: still inside the exclusive section, so no other thread is
+            // reading the environment concurrently.
+            unsafe {
+                std::env::remove_var("ONNX_GENAI_INTERLEAVE_DEQUANT");
+                std::env::remove_var("ONNX_GENAI_GENERAL_SPLITK");
+                std::env::remove_var("ONNX_GENAI_GEMV_PIPELINE");
+                std::env::remove_var("ONNX_GENAI_GATEUP_VEC");
+                std::env::remove_var("ONNX_GENAI_GATEUP_OCC");
+            }
+        }
+    }
+
+    /// Shared guard for a test that requires the dispatch levers to be OFF.
+    fn default_levers_guard() -> std::sync::RwLockReadGuard<'static, ()> {
+        INTERLEAVE_TEST_ENV_LOCK
+            .get_or_init(Default::default)
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 
     // Qwen2.5-0.5B down-projection shape (K=intermediate, N=hidden). Used as a
     // test fixture for the tall-skinny down variant and, transposed, as the
@@ -10403,13 +10460,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
 "#;
 
     fn runtime() -> Option<Arc<CudaRuntime>> {
-        let previous_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let runtime = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
-            .ok()
-            .flatten();
-        std::panic::set_hook(previous_hook);
-        runtime
+        crate::test_support::maybe_runtime()
     }
 
     fn as_bytes<T: Copy>(values: &[T]) -> &[u8] {
@@ -11425,6 +11476,14 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
+        // The default decode GEMV launch is a static grid that allocates
+        // nothing, so it is capture-safe on the very first call. That only holds
+        // with the dispatch levers OFF: `ONNX_GENAI_INTERLEAVE_DEQUANT` routes
+        // through `ensure_interleaved`, which allocates and interleaves the
+        // packed weights on first sight and correctly reports that call
+        // capture-unsafe. Hold the shared guard so the env-mutating interleave
+        // test cannot flip the lever underneath this kernel run.
+        let _levers = default_levers_guard();
         kernel.run(&inputs, &mut outputs, None).unwrap();
         runtime.synchronize().unwrap();
 
@@ -11432,6 +11491,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             kernel.last_call_capture_safe.load(Ordering::Relaxed),
             "fp16 decode GEMV must report capture-safe"
         );
+        drop(_levers);
 
         let mut got_f16 = vec![f16::ZERO; n];
         // SAFETY: `output_dev` holds `n` fp16 values.
@@ -11614,14 +11674,11 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
 
-        // Serialize the env-mutating dispatch selection across the two phases so
-        // parallel test threads never observe a half-set flag. SAFETY: the env
-        // writes are confined to this critical section and restored before the
-        // lock is released.
-        let _guard = INTERLEAVE_TEST_ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap();
+        // Take the EXCLUSIVE side: the env writes below are visible to every
+        // thread in the binary, so they must not overlap any test that expects
+        // the levers at their default. SAFETY: the writes are confined to this
+        // critical section and restored before the lock is released.
+        let _guard = LeverEnvGuard::acquire();
         unsafe {
             match general_splitk {
                 Some(true) => std::env::set_var("ONNX_GENAI_GENERAL_SPLITK", "on"),
@@ -11641,11 +11698,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         }
         kernel.run(&inputs, &mut outputs, None).unwrap();
         runtime.synchronize().unwrap();
-        unsafe {
-            std::env::remove_var("ONNX_GENAI_INTERLEAVE_DEQUANT");
-            std::env::remove_var("ONNX_GENAI_GENERAL_SPLITK");
-            std::env::remove_var("ONNX_GENAI_GEMV_PIPELINE");
-        }
+        // `_guard` clears the levers as it drops, on the unwind path too.
         drop(_guard);
 
         let mut got_f16 = vec![f16::ZERO; n];
@@ -15402,16 +15455,51 @@ extern "C" __global__ void ref_silu_mul_f16(
                 runtime.free_raw(fused_out_dev).unwrap();
             }
 
+            let marlin_prefill = m > 1
+                && marlin_gemm::marlin_m_gt_1_enabled()
+                && marlin_gemm::device_supports_marlin(runtime.capabilities().compute_capability())
+                && k.is_multiple_of(16)
+                && k.is_multiple_of(block_size);
+            let mut max_ulp = 0i64;
+            let mut worst = 0usize;
             for index in 0..output_elements {
-                assert_eq!(
-                    fused[index].to_bits(),
-                    reference[index].to_bits(),
-                    "paired gate/up SwiGLU diverged at M={m}, K={k}, N={n}, row={}, column={}: \
-                     fused={:?} reference={:?}",
-                    index / n,
-                    index % n,
-                    fused[index],
-                    reference[index]
+                let ulp = f16_ulp_diff(fused[index].to_bits(), reference[index].to_bits());
+                if ulp > max_ulp {
+                    max_ulp = ulp;
+                    worst = index;
+                }
+                if !marlin_prefill {
+                    assert_eq!(
+                        fused[index].to_bits(),
+                        reference[index].to_bits(),
+                        "paired gate/up SwiGLU diverged at M={m}, K={k}, N={n}, row={}, \
+                         column={}: fused={:?} reference={:?}",
+                        index / n,
+                        index % n,
+                        fused[index],
+                        reference[index]
+                    );
+                }
+            }
+            if marlin_prefill {
+                // On SM80+ the default M>1 gate/up dispatch is the Marlin
+                // `mma.sync.aligned.m16n8k16` tensor-core GEMM, while the
+                // two-op reference above is the portable 16x16 CUDA-core tiled
+                // GEMM. Those are different reduction trees (tensor-core K=16
+                // fragments, with per-group scaling around the mma accumulator,
+                // vs scalar CUDA-core accumulation), so byte identity is not a
+                // valid contract for this branch. Keep this sentinel tight: the
+                // deterministic Marlin-vs-tiled gate/up cases covered here are
+                // expected to stay within two fp16 representable values.
+                assert!(
+                    max_ulp <= 2,
+                    "paired gate/up SwiGLU Marlin prefill exceeded the measured 2-ULP \
+                     sentinel bound at M={m}, K={k}, N={n}, row={}, column={}: fused={:?} \
+                     reference={:?}, max_ulp={max_ulp}",
+                    worst / n,
+                    worst % n,
+                    fused[worst],
+                    reference[worst]
                 );
             }
         }
@@ -16270,10 +16358,11 @@ extern "C" __global__ void ref_silu_mul_f16(
     /// NOT that the rmsnorm loop matches a genuine two-op path. This sweep
     /// compares the fused rmsnorm loop against a real two-op reference (prefill
     /// normalize + standalone projections + silu_mul), across gamma dtypes,
-    /// shapes, seeds, and M. ANSWER: byte-identical (0 ULP) at M==1, so the
-    /// rmsnorm half is a byte-safe substitute for the two-op decode path and is
-    /// the half that landed; a few ULP at M>1 is pure GEMV-vs-GEMM reduction
-    /// order, not a batching-contract violation.
+    /// shapes, seeds, and M. ANSWER: byte-identical (0 ULP) at M==1 only when
+    /// the standalone projections use the same single-warp block-32 reduction as
+    /// the paired fused kernel. On many-SM devices the standalone general GEMV
+    /// may select its grid-fill split-K variant for narrow N; that intentionally
+    /// reassociates the K reduction and is bounded separately below.
     #[test]
     fn fp16_gate_up_swiglu_rmsnorm_two_op_ulp_bound_sweep() {
         let Some(runtime) = runtime() else {
@@ -16309,11 +16398,21 @@ extern "C" __global__ void ref_silu_mul_f16(
 
         let mut global_max = 0i64;
         let mut m1_max = 0i64;
+        let mut m1_single_warp_max = 0i64;
+        let mut m1_splitk_max = 0i64;
         let mut m1_nonzero_cases = 0usize;
         let mut m1_cases = 0usize;
+        let mut m1_worst = (0usize, 0usize, 0u64, DataType::Float16);
         let mut worst = (0usize, 0usize, 0usize, 0u64, DataType::Float16);
+        let caps = runtime.capabilities();
         for gamma in gammas {
             for (k, n) in shapes {
+                let reference_uses_splitk = use_f16_symmetric_splitk(
+                    k,
+                    n,
+                    caps.multiprocessor_count(),
+                    caps.max_threads_per_block(),
+                );
                 for m in ms {
                     for seed in seeds {
                         let (max_ulp, nonzero, total) =
@@ -16326,6 +16425,12 @@ extern "C" __global__ void ref_silu_mul_f16(
                             }
                             if max_ulp > m1_max {
                                 m1_max = max_ulp;
+                                m1_worst = (k, n, seed, gamma);
+                            }
+                            if reference_uses_splitk {
+                                m1_splitk_max = m1_splitk_max.max(max_ulp);
+                            } else {
+                                m1_single_warp_max = m1_single_warp_max.max(max_ulp);
                             }
                         }
                         if max_ulp > global_max {
@@ -16340,22 +16445,43 @@ extern "C" __global__ void ref_silu_mul_f16(
         eprintln!(
             "gate/up SwiGLU rmsnorm two-op ULP sweep: max_ulp={global_max} \
              (worst: M={} K={} N={} seed={:#018x} gamma={:?}); \
-             M==1: max_ulp={m1_max}, {m1_nonzero_cases}/{m1_cases} cases had >=1 ULP divergence",
-            worst.0, worst.1, worst.2, worst.3, worst.4
+             M==1: max_ulp={m1_max} (worst: K={} N={} seed={:#018x} gamma={:?}), \
+             {m1_nonzero_cases}/{m1_cases} cases had >=1 ULP divergence",
+            worst.0,
+            worst.1,
+            worst.2,
+            worst.3,
+            worst.4,
+            m1_worst.0,
+            m1_worst.1,
+            m1_worst.2,
+            m1_worst.3
         );
 
         // DECISION-RULE OUTPUT: at M==1 — the apples-to-apples decode
         // comparison — the fused rmsnorm decode GEMV is BYTE-IDENTICAL to the
-        // two-op reference (0 ULP). This is the property that made the rmsnorm
-        // half landable where the plain half was hard-stopped: routing M>1
-        // rmsnorm decode through the per-row loop is byte-exact to running each
-        // row alone as an M==1 decode (the batching contract), and each such
-        // row is byte-exact to the two-op path. Asserted strictly at 0 so any
-        // future divergence at M==1 fails loudly.
+        // two-op reference only when the two standalone projections use the same
+        // single-warp block-32 reduction shape. On this A100/sm_80, the
+        // device-property selector routes narrow standalone projections
+        // (`N < SM_count * F16_SYMMETRIC_SPLITK_TARGET_WARPS_PER_SM`, e.g.
+        // 896/1536 < 108*16) to `matmul_nbits_gemv_f16_scales_f16_splitk`:
+        // two warps own disjoint K-block ranges for one column and reduce their
+        // fp32 partials through shared memory. The paired gate/up RMS kernel has
+        // no split-K sibling; it keeps one warp per column and therefore cannot
+        // be byte-identical to that reference reduction tree on such shapes.
+        // Preserve the strict invariant where the reduction shape matches, and
+        // separately bound the named split-K reassociation observed on sm_80.
         assert_eq!(
-            m1_max, 0,
+            m1_single_warp_max, 0,
             "rmsnorm fused gate/up SwiGLU decode GEMV must be byte-identical to \
-             the two-op reference at M==1, but observed {m1_max} ULP"
+             the two-op reference at M==1 when both use the single-warp reduction, \
+             but observed {m1_single_warp_max} ULP"
+        );
+        assert!(
+            m1_splitk_max <= 3,
+            "rmsnorm fused gate/up SwiGLU decode GEMV exceeded the measured 3-ULP \
+             bound vs the standalone split-K two-op reference at M==1: \
+             max_ulp={m1_splitk_max}"
         );
         // M>1 compares the per-row decode GEMV loop against a tiled two-op GEMM
         // reference; they differ by a few ULP purely from GEMV-vs-GEMM reduction
@@ -17007,10 +17133,11 @@ extern "C" __global__ void ref_silu_mul_f16(
 
                         let run_once = |vec_on: bool, occ_on: bool| -> Vec<u16> {
                             let out_dev = runtime.alloc_raw(output_elements * 2).unwrap();
-                            let lock = INTERLEAVE_TEST_ENV_LOCK.get_or_init(|| Mutex::new(()));
-                            let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-                            // SAFETY: the env write is confined to this critical
-                            // section and removed before the lock is released.
+                            // Exclusive: this env write is process-wide, and the
+                            // guard clears it on drop so an unwinding `unwrap`
+                            // below cannot leak the lever to other tests.
+                            let _guard = LeverEnvGuard::acquire();
+                            // SAFETY: confined to the exclusive section.
                             unsafe {
                                 std::env::set_var(
                                     "ONNX_GENAI_GATEUP_VEC",
