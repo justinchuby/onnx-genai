@@ -3165,6 +3165,33 @@ mod tests {
 
     const LOG_BOUND: f64 = 2e-7;
 
+    fn log_sweep_inputs() -> Vec<f32> {
+        // Spread over the whole positive exponent range, not just [0,1]: the
+        // exponent reconstruction is the part most likely to be wrong.
+        let mut values: Vec<f32> = (0..200_003)
+            .map(|i| {
+                let t = i as f32 / 200_002.0;
+                (t * 176.0 - 88.0).exp2()
+            })
+            .collect();
+        values.extend(grid(1e-6, 20.0, 100_003, &[]));
+        values.extend(grid(0.9, 1.1, 50_003, &[]));
+        values
+    }
+
+    fn check_log_sweep(values: &[f32], got: &[f32]) -> (usize, f64) {
+        let mut checked = 0;
+        let mut worst = 0.0f64;
+        for (&xi, &got) in values.iter().zip(got) {
+            let want = xi.ln();
+            let e = log_err(got, want);
+            checked += 1;
+            worst = worst.max(e);
+            assert!(e <= LOG_BOUND, "log({xi:e}) = {got}, want {want}");
+        }
+        (checked, worst)
+    }
+
     #[test]
     fn log_special_values() {
         let mut x = special_inputs();
@@ -3212,27 +3239,69 @@ mod tests {
 
     #[test]
     fn log_dense_sweep_matches_scalar() {
-        // Spread over the whole positive exponent range, not just [0,1]: the
-        // exponent reconstruction is the part most likely to be wrong.
-        let mut x: Vec<f32> = (0..200_003)
-            .map(|i| {
-                let t = i as f32 / 200_002.0;
-                (t * 176.0 - 88.0).exp2()
-            })
-            .collect();
-        x.extend(grid(1e-6, 20.0, 100_003, &[]));
-        x.extend(grid(0.9, 1.1, 50_003, &[]));
+        let x = log_sweep_inputs();
         let mut o = vec![0.0f32; x.len()];
-        log_f32_slice(&x, &mut o);
-        let mut worst = 0.0f64;
-        for (&xi, &got) in x.iter().zip(&o) {
-            let e = log_err(got, xi.ln());
-            if e > worst {
-                worst = e;
-            }
-            assert!(e <= LOG_BOUND, "log({xi:e}) = {got}, want {}", xi.ln());
+
+        #[cfg(target_arch = "x86_64")]
+        let simd_exercised = if vector_path_available() {
+            // SAFETY: guarded by the runtime AVX2+FMA detection above. Calling
+            // the kernel directly keeps this a SIMD-vs-scalar test even if the
+            // public dispatch policy changes.
+            unsafe { log_avx2(&x, &mut o) };
+            true
+        } else {
+            log_f32_slice(&x, &mut o);
+            false
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let simd_exercised = {
+            log_f32_slice(&x, &mut o);
+            false
+        };
+
+        let (checked, worst) = check_log_sweep(&x, &o);
+        assert_eq!(checked, x.len(), "sweep did not exercise every sample");
+        assert!(checked > 0, "sweep did not exercise anything");
+        if simd_exercised {
+            assert!(
+                worst > 0.0,
+                "SIMD sweep unexpectedly matched scalar at every sample"
+            );
+        } else {
+            // Non-x86 targets currently dispatch Log to the exact scalar
+            // implementation, so zero error is expected rather than evidence
+            // that the sweep accepted no samples.
+            assert_eq!(worst, 0.0);
         }
-        assert!(worst > 0.0, "sweep did not exercise anything");
+    }
+
+    /// ARM currently takes `log_scalar`, but keep the shared sweep suitable
+    /// for a four-lane NEON implementation and verify that independently on
+    /// hosts where the ARM dispatch cannot be executed.
+    #[test]
+    fn log_sweep_generates_full_arm_vector_batches() {
+        const ARM_F32_LANES: usize = 4;
+        let x = log_sweep_inputs();
+        let full_batches = x.chunks_exact(ARM_F32_LANES);
+        let covered = full_batches.len() * ARM_F32_LANES;
+
+        assert!(covered > 0, "ARM sweep did not generate a full SIMD batch");
+        assert!(
+            x[..covered].iter().all(|v| v.is_finite() && *v > 0.0),
+            "ARM sweep generated values outside log's scalar/SIMD domain"
+        );
+        assert!(
+            x[..covered].iter().any(|v| *v < 1.0) && x[..covered].iter().any(|v| *v > 1.0),
+            "ARM sweep did not cover both signs of the log result"
+        );
+        for batch in x[..covered].chunks_exact(ARM_F32_LANES) {
+            for &value in batch {
+                assert!(
+                    value.ln().is_finite(),
+                    "ARM sweep produced an unusable sample"
+                );
+            }
+        }
     }
 
     /// The four activations that moved off the generic scalar path together.
