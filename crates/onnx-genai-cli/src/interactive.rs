@@ -367,6 +367,7 @@ pub(super) struct PipelineBackend {
     engine: PipelineEngine,
     tokenizer: Tokenizer,
     multimodal: MultimodalSpecs,
+    generation_defaults: Option<GenerationDefaults>,
 }
 
 /// Everything that decides how a model is loaded, so an interactive session can
@@ -583,6 +584,7 @@ impl Backend {
                     engine,
                     tokenizer,
                     multimodal: setup.multimodal,
+                    generation_defaults: setup.generation_defaults,
                 })))
             }
             None => Ok(Self::Text(Box::new(Engine::from_dir_with_session_options(
@@ -773,9 +775,24 @@ impl Backend {
         }
     }
 
-    /// Legacy hook retained while callers migrate to request-provided policy inputs.
+    /// The package's declared generation defaults, when it declared any.
+    ///
+    /// A package states its sampling regime (a reasoning model shipping
+    /// `do_sample: true`, or a legacy `search` block imported into
+    /// `generation.defaults`) as part of what the model *is*. Discarding it
+    /// silently reinterprets every such package as greedy, which is not a
+    /// neutral default: a model tuned to sample can degenerate into repetition
+    /// under argmax. Explicit CLI flags still win — this only supplies the
+    /// values the caller left unstated.
     pub(super) fn generation_defaults(&self) -> Option<&GenerationDefaults> {
-        None
+        match self {
+            Self::Text(engine) => engine
+                .metadata()
+                .generation
+                .as_ref()
+                .and_then(|generation| generation.defaults.as_ref()),
+            Self::Pipeline(pipeline) => pipeline.generation_defaults.as_ref(),
+        }
     }
 
     pub(super) fn generate(

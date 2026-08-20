@@ -216,6 +216,11 @@ pub fn expansion_token_budget(
 pub struct PipelineSetup {
     pub tokenizer_path: PathBuf,
     pub multimodal: MultimodalSpecs,
+    /// Sampling regime the package declares for itself, if any.
+    ///
+    /// Carried here because the package's own metadata is the only place that
+    /// states it; the execution engine is loaded separately and never sees it.
+    pub generation_defaults: Option<onnx_genai_metadata::GenerationDefaults>,
 }
 
 /// Resolve the prompt tokenizer and multimodal input contracts for `model_dir`,
@@ -242,6 +247,11 @@ pub fn load(model_dir: &Path) -> anyhow::Result<Option<PipelineSetup>> {
         )
     })?;
     Ok(Some(PipelineSetup {
+        generation_defaults: directory
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.generation.as_ref())
+            .and_then(|generation| generation.defaults.clone()),
         tokenizer_path: tokenizer_path(model_dir, &directory)?,
         multimodal: build(&directory, &models)?,
     }))

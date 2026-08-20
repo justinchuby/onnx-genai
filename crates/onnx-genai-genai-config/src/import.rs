@@ -452,6 +452,71 @@ mod tests {
     }
 
     #[test]
+    fn declared_search_defaults_reach_the_generation_contract() {
+        // `search.*` is listed in CONSUMED_KEYS, so the import claims to read it.
+        // Before the generation contract was wired up, only `search.max_length`
+        // was actually read and every sampling field the package author declared
+        // was silently discarded -- a package asking for temperature 1.0 / top-k
+        // 40 got greedy decoding and no diagnostic. This pins the claim.
+        let mut raw = minimal();
+        raw["search"]["do_sample"] = serde_json::json!(true);
+        raw["search"]["temperature"] = serde_json::json!(1.0);
+        raw["search"]["top_k"] = serde_json::json!(40);
+        raw["search"]["top_p"] = serde_json::json!(0.8);
+        raw["search"]["repetition_penalty"] = serde_json::json!(1.1);
+        let config: GenAiConfig = serde_json::from_value(raw.clone()).expect("config");
+        let (metadata, report) =
+            import(&config, &raw, None, None, ImportOptions::default()).expect("import");
+        assert!(!report.is_lossy());
+        let defaults = metadata
+            .generation
+            .as_ref()
+            .and_then(|generation| generation.defaults.as_ref())
+            .expect("generation defaults");
+        assert_eq!(defaults.do_sample, Some(true));
+        assert_eq!(defaults.temperature, Some(1.0));
+        assert_eq!(defaults.top_k, Some(40));
+        assert_eq!(defaults.top_p, Some(0.8));
+        assert_eq!(defaults.repetition_penalty, Some(1.1));
+    }
+
+    #[test]
+    fn undeclared_sampling_policy_is_not_invented() {
+        // Absence must stay absent. `max_length` is carried because the author
+        // wrote it, but every field they did NOT write stays `None` rather than
+        // acquiring a plausible-looking default -- a fabricated `temperature`
+        // would be indistinguishable from a declared one downstream.
+        let mut raw = minimal();
+        raw["search"] = serde_json::json!({ "max_length": 4096 });
+        let config: GenAiConfig = serde_json::from_value(raw.clone()).expect("config");
+        let (metadata, _) =
+            import(&config, &raw, None, None, ImportOptions::default()).expect("import");
+        let defaults = metadata
+            .generation
+            .as_ref()
+            .and_then(|generation| generation.defaults.as_ref())
+            .expect("declared max_length is a generation default");
+        assert_eq!(defaults.max_length, Some(4096));
+        assert_eq!(
+            *defaults,
+            onnx_genai_metadata::GenerationDefaults {
+                max_length: Some(4096),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_config_that_declares_nothing_gets_no_generation_section() {
+        let mut raw = minimal();
+        raw.as_object_mut().expect("object").remove("search");
+        let config: GenAiConfig = serde_json::from_value(raw.clone()).expect("config");
+        let (metadata, _) =
+            import(&config, &raw, None, None, ImportOptions::default()).expect("import");
+        assert!(metadata.generation.is_none());
+    }
+
+    #[test]
     fn there_is_no_reverse_synthesizer() {
         // The import direction is one-way by construction: this crate exposes no
         // function that turns metadata back into a legacy config. Guarding it in

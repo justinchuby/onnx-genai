@@ -249,8 +249,51 @@ impl GenAiConfig {
         let mut root = Map::new();
         root.insert("schema_version".into(), json!(SCHEMA_VERSION));
         root.insert("model".into(), Value::Object(model));
+        if let Some(generation) = self.generation_json() {
+            root.insert("generation".into(), generation);
+        }
 
         Ok(serde_json::from_value(Value::Object(root))?)
+    }
+
+    /// Carry the legacy `search` block into `generation.defaults`.
+    ///
+    /// `search` is the author's declared generation policy, not deployment
+    /// policy: `do_sample`, `temperature`, `top_k`, `top_p` and the beam fields
+    /// decide what the package *means* when a caller supplies no overrides.
+    /// `GenerationDefaults` is field-for-field the same contract, so the
+    /// conversion is exact rather than approximate.
+    ///
+    /// `past_present_share_buffer` is deliberately absent here: it is a graph ABI
+    /// fact, not a generation default, and is carried by `model.io.aliasing`.
+    fn generation_json(&self) -> Option<Value> {
+        let search = &self.search;
+        let mut defaults = Map::new();
+        insert_some(&mut defaults, "do_sample", search.do_sample);
+        insert_some(&mut defaults, "temperature", search.temperature);
+        insert_some(&mut defaults, "top_k", search.top_k);
+        insert_some(&mut defaults, "top_p", search.top_p);
+        insert_some(&mut defaults, "repetition_penalty", search.repetition_penalty);
+        insert_some(&mut defaults, "num_beams", search.num_beams);
+        insert_some(
+            &mut defaults,
+            "num_return_sequences",
+            search.num_return_sequences,
+        );
+        insert_some(&mut defaults, "min_length", search.min_length);
+        insert_some(&mut defaults, "max_length", search.max_length);
+        insert_some(&mut defaults, "length_penalty", search.length_penalty);
+        insert_some(
+            &mut defaults,
+            "no_repeat_ngram_size",
+            search.no_repeat_ngram_size,
+        );
+        insert_some(&mut defaults, "diversity_penalty", search.diversity_penalty);
+        insert_some(&mut defaults, "early_stopping", search.early_stopping);
+        if defaults.is_empty() {
+            return None;
+        }
+        Some(json!({ "defaults": Value::Object(defaults) }))
     }
 
     fn attention_json(&self) -> Value {

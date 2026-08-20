@@ -49,3 +49,17 @@ pub(crate) fn insert_usize(map: &mut Map<String, Value>, key: &str, value: Optio
         map.insert(key.into(), json!(value));
     }
 }
+
+/// Insert `value` under `key` when the author declared it, dropping `None`.
+///
+/// Generic over the scalar type so a declared-only-if-present block (such as
+/// `generation.defaults`) never fabricates a value the source did not state.
+pub(crate) fn insert_some<T: Into<Value>>(
+    map: &mut Map<String, Value>,
+    key: &str,
+    value: Option<T>,
+) {
+    if let Some(value) = value {
+        map.insert(key.into(), value.into());
+    }
+}
