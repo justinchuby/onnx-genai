@@ -229,7 +229,7 @@ pub(crate) unsafe fn read_inputs(
     if input_count > 0 {
         crate::dispatch_probe::count(crate::dispatch_probe::Event::DispatchAlloc);
     }
-    let mut inputs = Vec::with_capacity(input_count);
+    let mut inputs = crate::compute::take_input_scratch(input_count);
     for i in 0..input_count {
         let mut value: *const ort::OrtValue = std::ptr::null();
         crate::dispatch_probe::ort_call();
