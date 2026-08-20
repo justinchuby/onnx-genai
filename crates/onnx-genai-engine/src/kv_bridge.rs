@@ -1096,7 +1096,7 @@ pub(crate) fn kv_model_past_is_f32(session: &Session, kv_model: &KvModelInfo) ->
 mod tests {
     use super::*;
     use crate::decode::{
-        DecodeState, ModelDecodePath, detect_model_decode_path,
+        DecodeState, ModelDecodePath, SharedKvOffer, detect_model_decode_path,
         extract_next_token_logits_from_outputs, run_decode_session_logits, run_decode_step,
     };
     use onnx_genai_kv::{KvCacheOps, MaterializedLayerKv};
@@ -1820,7 +1820,7 @@ mod tests {
         let _guard = model_test_lock();
         let (_environment, session) = load_session("tiny-llm")?;
         let io = fixture_io("tiny-llm")?;
-        let path = detect_model_decode_path(Some(&io), Some(2), 0)?;
+        let path = detect_model_decode_path(Some(&io), Some(2), 0, SharedKvOffer::default())?;
         assert!(matches!(
             path,
             ModelDecodePath::PastPresent {
@@ -1842,7 +1842,7 @@ mod tests {
         // Sliding-window attention always takes bounded functional
         // past/present dataflow; storage hints cannot override it.
         assert!(matches!(
-            detect_model_decode_path(Some(&io), Some(2), 0)?,
+            detect_model_decode_path(Some(&io), Some(2), 0, SharedKvOffer::default())?,
             ModelDecodePath::PastPresent {
                 shared_buffer: false,
                 max_len: None,

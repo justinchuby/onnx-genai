@@ -216,10 +216,11 @@ impl Engine {
         };
 
         // Stage: metadata and decode-path resolution.
+        let shared_kv = shared_kv_offer(&session, &metadata);
         let MetadataResolution {
             metadata,
             decode_path,
-        } = resolve_metadata_and_decode_path(metadata)?;
+        } = resolve_metadata_and_decode_path(metadata, shared_kv)?;
 
         let tokenizer = {
             let _span = onnx_genai_ort::prof_span!("engine.tokenizer_load");
@@ -1116,6 +1117,7 @@ fn load_inference_metadata(model_directory: &ModelDirectory) -> anyhow::Result<I
 
 fn resolve_metadata_and_decode_path(
     metadata: InferenceMetadata,
+    shared_kv: crate::decode::SharedKvOffer,
 ) -> anyhow::Result<MetadataResolution> {
     // Validate capabilities
     let runtime_caps = onnx_genai_metadata::RuntimeCapabilities::default();
@@ -1131,12 +1133,29 @@ fn resolve_metadata_and_decode_path(
             metadata.model.as_ref().and_then(|model| model.io.as_ref()),
             sliding_window,
             sink_tokens,
+            shared_kv,
         )?
     };
     Ok(MetadataResolution {
         metadata,
         decode_path,
     })
+}
+
+/// Resolve what this deployment can offer for an aliased KV buffer.
+///
+/// A shared buffer is a fixed reservation, so it needs a capacity, and the only
+/// capacity known at load time is the one the package declares as its context
+/// window. Without that bound the runtime declines to reserve rather than
+/// guessing a size.
+fn shared_kv_offer(session: &Session, metadata: &InferenceMetadata) -> crate::decode::SharedKvOffer {
+    crate::decode::SharedKvOffer {
+        present_binding_supported: session.supports_fixed_capacity_present_binding(),
+        max_len: metadata
+            .model
+            .as_ref()
+            .and_then(|model| model.max_sequence_length),
+    }
 }
 
 fn build_governor_and_scheduler(
@@ -1300,7 +1319,7 @@ fn load_draft_model(
             // path were introduced without explicitly loading draft metadata.
             // If a draft model needs its own SWA + sinks, load its
             // inference_metadata.yaml and pass the values from there.
-            detect_model_decode_path(None, None, 0)?;
+            detect_model_decode_path(None, None, 0, crate::decode::SharedKvOffer::default())?;
         let draft_kv_model = infer_kv_model_info(
             &draft_session,
             draft_io.as_ref(),

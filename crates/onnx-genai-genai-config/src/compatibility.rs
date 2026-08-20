@@ -439,6 +439,16 @@ impl GenAiConfig {
             }
         }
 
+        // Alias legality is a graph ABI fact, so it belongs to `model.io`, not to
+        // the generation defaults. Legacy `past_present_share_buffer: true` is
+        // exactly the author's statement that `present.*` may be written over
+        // `past_key_values.*` in one buffer; it is carried here so the runtime can
+        // still choose the shared-buffer decode path (and therefore continuous
+        // batching) for a legacy package. Silence stays `forbidden` by omission.
+        if self.search.past_present_share_buffer == Some(true) {
+            io.insert("aliasing".into(), json!("permitted"));
+        }
+
         io
     }
 }
@@ -718,6 +728,12 @@ impl GenAiConfig {
             hidden_output: None,
             kv_inputs: (!derived.kv_inputs.is_empty()).then_some(derived.kv_inputs),
             kv_outputs: (!derived.kv_outputs.is_empty()).then_some(derived.kv_outputs),
+            // Alias legality is an author's statement about the graph ABI, not
+            // something the graph interface reveals: identically-shaped past and
+            // present tensors do not prove the graph tolerates them being the
+            // same buffer. This derivation sees only shapes, so it stays silent
+            // (= forbidden) and leaves the declaration to the config.
+            aliasing: None,
             encoder_hidden_states_input: None,
             audio_features_input: None,
             cross_kv_inputs: None,

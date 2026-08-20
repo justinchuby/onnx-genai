@@ -130,6 +130,19 @@ pub struct ModelIoSpec {
     #[schemars(inner(length(min = 1)))]
     pub kv_outputs: Option<Vec<String>>,
 
+    /// Whether the graph permits, requires, or forbids the runtime aliasing a
+    /// `present` output onto its paired `past` input.
+    ///
+    /// This is the graph ABI fact that replaced the old `shared_buffer` policy
+    /// flag: the package states what aliasing its graph is CORRECT under, and
+    /// the runtime alone decides whether to exploit it (execution provider
+    /// capability, buffer capacity, and batching are runtime concerns). A graph
+    /// that reads a `past` region after the paired `present` write would touch
+    /// it must declare `forbidden`, which is the default when the package is
+    /// silent — silence never grants an optimization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aliasing: Option<StateAliasing>,
+
     /// Encoder-hidden-states input for an encoder-decoder (cross-attention)
     /// decoder graph (e.g. `encoder_hidden_states`).
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -900,10 +900,14 @@ impl Engine {
             },
             ModelDecodePath::PastPresent { .. } => BatchingCapability {
                 max_concurrent_sequences: Some(1),
-                reason: "this past/present model is not using a shared KV buffer: \
-                         the execution provider did not report fixed-capacity \
-                         present binding, or it was not opted into at launch, so \
-                         only one sequence can be decoded at a time"
+                reason: "this past/present model is not using a shared KV buffer, \
+                         so only one sequence can be decoded at a time. A shared \
+                         buffer needs three things to agree: the package must \
+                         declare `model.io.aliasing` as `permitted` or `required` \
+                         (silence means forbidden), the package must declare \
+                         `model.max_sequence_length` to size the reservation, and \
+                         the execution provider must report fixed-capacity \
+                         present binding"
                     .to_string(),
             },
             ModelDecodePath::Generic => BatchingCapability {
@@ -1020,19 +1024,22 @@ impl Engine {
             }
             // These two refusals are reported separately because they have
             // OPPOSITE operator remedies. A past/present model reaching here has
-            // `shared_buffer: false`, which is decided by
-            // `supports_fixed_capacity_present_binding()` -- an execution-provider
-            // capability plus an explicit opt-in -- so the same model on the same
-            // disk can batch or not depending on how the server was launched. A
-            // legacy model cannot batch under any launch. Collapsing them emits
-            // one sentence that tells an operator to change the model when the
-            // real fix may be an environment variable, and vice versa.
+            // `shared_buffer: false`, which is decided jointly by the PACKAGE
+            // (`model.io.aliasing`, plus a declared `model.max_sequence_length`
+            // to size the reservation) and by the DEPLOYMENT
+            // (`supports_fixed_capacity_present_binding()`), so the same model
+            // may batch or not depending on both the package's declaration and
+            // the execution provider. A legacy model cannot batch under any
+            // launch. Collapsing them emits one sentence that tells an operator
+            // to change the model when the real fix may be the provider, and
+            // vice versa.
             ModelDecodePath::PastPresent { .. } => {
                 anyhow::bail!(
                     "continuous batching requires a shared KV buffer, and this \
-                     past/present model is not using one: the execution provider \
-                     did not report fixed-capacity present binding, or it was not \
-                     opted into at launch"
+                     past/present model is not using one: the package must declare \
+                     `model.io.aliasing: permitted` (silence means forbidden) and a \
+                     `model.max_sequence_length`, and the execution provider must \
+                     report fixed-capacity present binding"
                 );
             }
             ModelDecodePath::Generic => {

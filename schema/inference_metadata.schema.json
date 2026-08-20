@@ -2748,6 +2748,17 @@
       "additionalProperties": false,
       "description": "Explicit binding of the graph ports the decode step reads and writes.\n\nEvery field is optional so a model package can declare only the ports its\ngraph exposes. A port left unset is resolved ONLY from an unambiguous\ndtype/shape signal; when the shape cannot disambiguate the port, the runtime\nfails with an actionable error naming the key to declare rather than\ninterpreting a tensor name. A declared port is always authoritative.",
       "properties": {
+        "aliasing": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StateAliasing"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Whether the graph permits, requires, or forbids the runtime aliasing a\n`present` output onto its paired `past` input.\n\nThis is the graph ABI fact that replaced the old `shared_buffer` policy\nflag: the package states what aliasing its graph is CORRECT under, and\nthe runtime alone decides whether to exploit it (execution provider\ncapability, buffer capacity, and batching are runtime concerns). A graph\nthat reads a `past` region after the paired `present` write would touch\nit must declare `forbidden`, which is the default when the package is\nsilent — silence never grants an optimization."
+        },
         "attention_mask_input": {
           "description": "Attention-mask input, if the graph takes one.",
           "minLength": 1,

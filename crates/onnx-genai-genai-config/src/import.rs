@@ -517,6 +517,54 @@ mod tests {
     }
 
     #[test]
+    fn shared_buffer_declaration_becomes_permitted_aliasing() {
+        // `past_present_share_buffer: true` is the legacy author's statement that
+        // aliasing present onto past is legal for this graph. The new contract
+        // spells that `model.io.aliasing`, and it is the only thing that can let
+        // an imported package take the shared-buffer decode path.
+        let raw = minimal();
+        let config: GenAiConfig = serde_json::from_value(raw.clone()).expect("config");
+        let (metadata, _) =
+            import(&config, &raw, None, None, ImportOptions::default()).expect("import");
+        assert_eq!(
+            metadata
+                .model
+                .as_ref()
+                .and_then(|model| model.io.as_ref())
+                .and_then(|io| io.aliasing),
+            Some(onnx_genai_metadata::StateAliasing::Permitted)
+        );
+    }
+
+    #[test]
+    fn silence_about_sharing_stays_forbidden() {
+        // Omission is not permission. A config that never claimed its graph
+        // tolerates aliasing must not acquire that claim through import.
+        for value in [serde_json::Value::Bool(false), serde_json::Value::Null] {
+            let mut raw = minimal();
+            if value.is_null() {
+                raw["search"]
+                    .as_object_mut()
+                    .expect("search object")
+                    .remove("past_present_share_buffer");
+            } else {
+                raw["search"]["past_present_share_buffer"] = value;
+            }
+            let config: GenAiConfig = serde_json::from_value(raw.clone()).expect("config");
+            let (metadata, _) =
+                import(&config, &raw, None, None, ImportOptions::default()).expect("import");
+            assert_eq!(
+                metadata
+                    .model
+                    .as_ref()
+                    .and_then(|model| model.io.as_ref())
+                    .and_then(|io| io.aliasing),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn there_is_no_reverse_synthesizer() {
         // The import direction is one-way by construction: this crate exposes no
         // function that turns metadata back into a legacy config. Guarding it in

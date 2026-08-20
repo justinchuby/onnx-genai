@@ -41,7 +41,8 @@ pub(crate) use logits::extract_next_token_logits_from_outputs;
 #[cfg(feature = "native-backend")]
 pub(crate) use metadata::{KeySequenceLengthsPolicy, key_sequence_lengths_policy};
 pub(crate) use metadata::{
-    detect_model_decode_path, sink_tokens_from_metadata, sliding_window_from_metadata,
+    SharedKvOffer, detect_model_decode_path, sink_tokens_from_metadata,
+    sliding_window_from_metadata,
 };
 pub(crate) use state::DecodeState;
 #[cfg(feature = "native-backend")]

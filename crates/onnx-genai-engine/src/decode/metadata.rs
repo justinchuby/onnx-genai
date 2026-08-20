@@ -117,10 +117,25 @@ pub(crate) fn graph_accepts_padded_past(graph: &onnx_runtime_ir::Graph) -> bool 
     !graph.nodes.values().any(node_rejects_padded_past)
 }
 
+/// What the runtime is able to offer for a single aliased ("shared") KV buffer.
+///
+/// Deployment policy, resolved by the runtime and never serialized into a
+/// package: whether this execution provider consumes a fixed-capacity present
+/// binding, and what sequence capacity the buffer may be sized to.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SharedKvOffer {
+    /// Whether the execution provider accepts a pre-bound, fixed-capacity
+    /// `present` output (the mechanism a shared KV buffer needs).
+    pub(crate) present_binding_supported: bool,
+    /// Sequence capacity the runtime is willing to reserve, if bounded.
+    pub(crate) max_len: Option<usize>,
+}
+
 pub(crate) fn detect_model_decode_path(
     io: Option<&onnx_genai_metadata::ModelIoSpec>,
     sliding_window: Option<usize>,
     sink_tokens: usize,
+    shared_kv: SharedKvOffer,
 ) -> anyhow::Result<ModelDecodePath> {
     let has_kv_inputs = io
         .and_then(|io| io.kv_inputs.as_ref())
@@ -142,6 +157,43 @@ pub(crate) fn detect_model_decode_path(
                 sliding_window,
                 sink_tokens: (sink_tokens > 0).then_some(sink_tokens),
             });
+        }
+        // Two independent facts must agree before a single aliased KV buffer is
+        // used. The PACKAGE states whether aliasing `present` onto `past` is
+        // legal for its graph (`io.aliasing`); the RUNTIME states whether this
+        // deployment can exploit it (execution-provider fixed-capacity present
+        // binding, plus a capacity to size the buffer to). Neither may decide
+        // alone: a package cannot demand a deployment, and a runtime must not
+        // alias a graph that never said it was safe.
+        let aliasing = io
+            .and_then(|io| io.aliasing)
+            .unwrap_or(onnx_genai_metadata::StateAliasing::Forbidden);
+        if aliasing != onnx_genai_metadata::StateAliasing::Forbidden
+            && shared_kv.present_binding_supported
+            && let Some(max_len) = shared_kv.max_len
+        {
+            return Ok(ModelDecodePath::PastPresent {
+                shared_buffer: true,
+                max_len: Some(max_len),
+                sliding_window: None,
+                sink_tokens: None,
+            });
+        }
+        if aliasing == onnx_genai_metadata::StateAliasing::Required {
+            anyhow::bail!(
+                "model.io.aliasing is 'required', but this deployment cannot alias present onto \
+                 past: execution-provider fixed-capacity present binding is {}, and the resolved \
+                 KV capacity is {}. Lower the requirement to 'permitted', or run on a provider \
+                 that supports the shared KV buffer with a bounded max context",
+                if shared_kv.present_binding_supported {
+                    "available"
+                } else {
+                    "unavailable"
+                },
+                shared_kv
+                    .max_len
+                    .map_or_else(|| "unknown".to_owned(), |len| len.to_string()),
+            );
         }
         return Ok(ModelDecodePath::PastPresent {
             shared_buffer: false,
@@ -178,4 +230,136 @@ pub(crate) fn sink_tokens_from_metadata(metadata: &InferenceMetadata) -> usize {
         .and_then(|model| model.attention.as_ref())
         .and_then(|attention| attention.sink_tokens)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod aliasing_tests {
+    use onnx_genai_metadata::{ModelIoSpec, StateAliasing};
+
+    use super::{ModelDecodePath, SharedKvOffer, detect_model_decode_path};
+
+    /// A minimal past/present port contract, optionally declaring alias legality.
+    fn kv_io(aliasing: Option<StateAliasing>) -> ModelIoSpec {
+        let mut declared = serde_json::json!({
+            "kv_inputs": ["past_key_values.0.key"],
+            "kv_outputs": ["present.0.key"],
+        });
+        if let Some(aliasing) = aliasing {
+            declared["aliasing"] = serde_json::to_value(aliasing).expect("aliasing");
+        }
+        serde_json::from_value(declared).expect("io spec")
+    }
+
+    fn capable() -> SharedKvOffer {
+        SharedKvOffer {
+            present_binding_supported: true,
+            max_len: Some(4096),
+        }
+    }
+
+    #[test]
+    fn permitted_aliasing_plus_a_capable_deployment_shares_the_buffer() {
+        let path = detect_model_decode_path(
+            Some(&kv_io(Some(StateAliasing::Permitted))),
+            None,
+            0,
+            capable(),
+        )
+        .expect("decode path");
+        assert!(matches!(
+            path,
+            ModelDecodePath::PastPresent {
+                shared_buffer: true,
+                max_len: Some(4096),
+                sliding_window: None,
+                sink_tokens: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn an_undeclared_package_never_gets_an_aliased_buffer() {
+        // Silence means forbidden. A capable deployment must not alias a graph
+        // that never stated the aliasing is safe -- doing so would corrupt KV for
+        // any graph that reads `past` after writing `present`.
+        let path = detect_model_decode_path(Some(&kv_io(None)), None, 0, capable())
+            .expect("decode path");
+        assert!(matches!(
+            path,
+            ModelDecodePath::PastPresent {
+                shared_buffer: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_permitting_package_on_an_incapable_deployment_falls_back() {
+        // `permitted` is permission, not a demand: both an unsupported provider
+        // and an unknown capacity fall back silently to the unshared path.
+        for offer in [
+            SharedKvOffer {
+                present_binding_supported: false,
+                max_len: Some(4096),
+            },
+            SharedKvOffer {
+                present_binding_supported: true,
+                max_len: None,
+            },
+        ] {
+            let path =
+                detect_model_decode_path(Some(&kv_io(Some(StateAliasing::Permitted))), None, 0, offer)
+                    .expect("decode path");
+            assert!(
+                matches!(
+                    path,
+                    ModelDecodePath::PastPresent {
+                        shared_buffer: false,
+                        ..
+                    }
+                ),
+                "offer {offer:?} must not alias"
+            );
+        }
+    }
+
+    #[test]
+    fn a_requiring_package_fails_loudly_on_an_incapable_deployment() {
+        // `required` means the graph is only correct with aliasing, so quietly
+        // taking the unshared path would produce wrong output. Refuse instead.
+        let error = detect_model_decode_path(
+            Some(&kv_io(Some(StateAliasing::Required))),
+            None,
+            0,
+            SharedKvOffer {
+                present_binding_supported: false,
+                max_len: Some(4096),
+            },
+        )
+        .expect_err("required aliasing must not be silently downgraded");
+        let message = error.to_string();
+        assert!(message.contains("model.io.aliasing"), "{message}");
+        assert!(message.contains("unavailable"), "{message}");
+    }
+
+    #[test]
+    fn sliding_window_keeps_the_bounded_paged_path_regardless_of_aliasing() {
+        // Windowed models evict KV, which the aliased fixed buffer cannot express.
+        let path = detect_model_decode_path(
+            Some(&kv_io(Some(StateAliasing::Permitted))),
+            Some(2),
+            0,
+            capable(),
+        )
+        .expect("decode path");
+        assert!(matches!(
+            path,
+            ModelDecodePath::PastPresent {
+                shared_buffer: false,
+                max_len: None,
+                sliding_window: Some(2),
+                sink_tokens: None,
+            }
+        ));
+    }
 }
