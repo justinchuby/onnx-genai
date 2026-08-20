@@ -3425,16 +3425,15 @@ fn matmul_dense_into_with_backend(
         && accelerate_gemm::thin_m_gemm_eligible(m, k, n)
         && numel(&geom.batch_shape) <= 1
         && geom.b_promoted_rank == 2
+        && let Some(bt) = prepack.and_then(|p| p.transposed_b(b_dense, k, n))
     {
-        if let Some(bt) = prepack.and_then(|p| p.transposed_b(b_dense, k, n)) {
-            #[cfg(all(test, target_arch = "aarch64"))]
-            THIN_M_GEMM_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // Column-parallel thin-M GEMM: process strips of 4 B_T columns at
-            // a time, computing all M rows per strip while data is L1-hot.
-            // This is ~2.6× faster than cblas_sgemm for these shapes.
-            accelerate_gemm::neon_thin_m_gemm_col_parallel(a_dense, bt, out, m, k, n);
-            return Ok(());
-        }
+        #[cfg(all(test, target_arch = "aarch64"))]
+        THIN_M_GEMM_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Column-parallel thin-M GEMM: process strips of 4 B_T columns at
+        // a time, computing all M rows per strip while data is L1-hot.
+        // This is ~2.6× faster than cblas_sgemm for these shapes.
+        accelerate_gemm::neon_thin_m_gemm_col_parallel(a_dense, bt, out, m, k, n);
+        return Ok(());
     }
 
     // A batch product of 1 (e.g. batch_shape = [1] from a [1,1,K] activation

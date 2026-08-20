@@ -2539,9 +2539,9 @@ mod tests {
         // Decode shape: q_seq=1, head_size=64, kv_seq=64 → 4096 ≤ 8192 → NEON
         let (batch, num_heads, num_kv_heads, q_seq, kv_seq, dh, dv) =
             (1usize, 14usize, 2usize, 1usize, 64usize, 64usize, 64usize);
-        let q = deterministic_values(batch * num_heads * q_seq * dh, 0xDEC0DE_A, 0.5);
-        let k = deterministic_values(batch * num_kv_heads * kv_seq * dh, 0xDEC0DE_B, 0.5);
-        let v = deterministic_values(batch * num_kv_heads * kv_seq * dv, 0xDEC0DE_C, 0.5);
+        let q = deterministic_values(batch * num_heads * q_seq * dh, 0xDEC_0DEA, 0.5);
+        let k = deterministic_values(batch * num_kv_heads * kv_seq * dh, 0xDEC_0DEB, 0.5);
+        let v = deterministic_values(batch * num_kv_heads * kv_seq * dv, 0xDEC_0DEC, 0.5);
         let tensors = SdpaTensors {
             q: &q,
             k: &k,
@@ -2584,9 +2584,9 @@ mod tests {
         // Shape that hits the NEON decode path: kv_seq×head_size=64×64=4096 ≤ 8192
         let (batch, num_heads, num_kv_heads, q_seq, kv_seq, dh, dv) =
             (1usize, 14usize, 2usize, 1usize, 64usize, 64usize, 64usize);
-        let q = deterministic_values(batch * num_heads * q_seq * dh, 0xA1CE_0A, 0.5);
-        let k = deterministic_values(batch * num_kv_heads * kv_seq * dh, 0xA1CE_0B, 0.5);
-        let v = deterministic_values(batch * num_kv_heads * kv_seq * dv, 0xA1CE_0C, 0.5);
+        let q = deterministic_values(batch * num_heads * q_seq * dh, 0xA1_CE0A, 0.5);
+        let k = deterministic_values(batch * num_kv_heads * kv_seq * dh, 0xA1_CE0B, 0.5);
+        let v = deterministic_values(batch * num_kv_heads * kv_seq * dv, 0xA1_CE0C, 0.5);
         let tensors = SdpaTensors {
             q: &q,
             k: &k,
