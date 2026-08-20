@@ -4836,9 +4836,7 @@ impl DecodeCudaState {
             }
         }
         self.set_logical_len(seq_len)?;
-        for row_len in &mut self.row_lens {
-            *row_len = seq_len;
-        }
+        self.row_lens.fill(seq_len);
         let expose = self.decode_mask_expose_len(seq_len);
         self.extend_mask(0, seq_len, expose)?;
         Ok(())
@@ -4861,9 +4859,7 @@ impl DecodeCudaState {
         self.bindings[0].set_logical_shape(vec![self.batch, target_len])?;
         // Ragged per-row lengths collapse back to the uniform rewind target
         // (stage 3a, #750): after a rewind every row shares `target_len`.
-        for row_len in &mut self.row_lens {
-            *row_len = target_len;
-        }
+        self.row_lens.fill(target_len);
         if target_len == 0 {
             // Fixed-size recurrent/conv states are unmasked rolling caches: a
             // reused session would otherwise inherit the previous generation's
@@ -4905,9 +4901,9 @@ impl DecodeCudaState {
                         binding.physical_shape()
                     )
                 })?;
-            let host = binding.read_bytes_range(0, bytes).with_context(|| {
-                format!("read device recurrent/conv state for binding {index}")
-            })?;
+            let host = binding
+                .read_bytes_range(0, bytes)
+                .with_context(|| format!("read device recurrent/conv state for binding {index}"))?;
             snapshot.push((index, host));
         }
         Ok(snapshot)
@@ -4937,9 +4933,9 @@ impl DecodeCudaState {
                     host.len()
                 );
             }
-            binding
-                .write_bytes(0, host)
-                .with_context(|| format!("restore device recurrent/conv state for binding {index}"))?;
+            binding.write_bytes(0, host).with_context(|| {
+                format!("restore device recurrent/conv state for binding {index}")
+            })?;
         }
         Ok(())
     }

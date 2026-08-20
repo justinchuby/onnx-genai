@@ -162,6 +162,12 @@ half = { workspace = true, features = ["use-intrinsics"] }
 llguidance = "1.7.6"
 toktrie_hf_tokenizers = "1.7.6"
 
+[target.'cfg(unix)'.dependencies]
+# statvfs(3) for the disk-capacity probe. `libc` is already in this crate's
+# dependency graph via memmap2/tokio, and its `struct statvfs` is defined
+# per-platform upstream -- hand-declaring it got the macOS field widths wrong.
+libc = "0.2"
+
 [dev-dependencies]
 onnx-genai-preprocess = { workspace = true }
 async-trait = { workspace = true }

@@ -755,6 +755,101 @@ fn compare(case: Case, dtype: DataType) -> (f32, u32) {
     error_metrics(&actual, &expected)
 }
 
+/// Read the f32 values back out of an f32-encoded [`HostTensor`].
+fn f32_values(tensor: &HostTensor) -> Vec<f32> {
+    tensor
+        .bytes
+        .chunks_exact(4)
+        .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+        .collect()
+}
+
+/// Re-encode an f32 [`HostTensor`] as a half (fp16/bf16) tensor, matching how a
+/// real all-`T` fp16/bf16 QMoE graph stores its router probs, scales and biases.
+fn to_half_tensor(tensor: &HostTensor, dtype: DataType) -> HostTensor {
+    HostTensor::activation(dtype, &tensor.shape, &f32_values(tensor))
+}
+
+/// Round an f32 [`HostTensor`] through fp16/bf16 back to f32, so the CPU
+/// reference dequantizes with the same values the GPU sees after widening.
+fn round_through_half(tensor: &HostTensor, dtype: DataType) -> HostTensor {
+    let rounded: Vec<f32> = f32_values(tensor)
+        .into_iter()
+        .map(|value| match dtype {
+            DataType::Float16 => f16::from_f32(value).to_f32(),
+            DataType::BFloat16 => bf16::from_f32(value).to_f32(),
+            _ => value,
+        })
+        .collect();
+    HostTensor::f32(&tensor.shape, &rounded)
+}
+
+/// Build an all-half QMoE input set (input, router_probs, all scales, all
+/// biases and the aggregation weights are fp16/bf16) plus a matching CPU
+/// reference input set whose float operands are the same values rounded through
+/// the half type. The uint8 packed weights and zero points stay untouched.
+fn all_half_inputs(
+    case: Case,
+    dtype: DataType,
+) -> (Vec<Option<HostTensor>>, Vec<Option<HostTensor>>) {
+    let base = case_inputs(case, dtype);
+    let mut gpu = base.clone();
+    let mut cpu = rounded_cpu_inputs(&base, dtype);
+    // Indices of the T-typed float operands: router_probs, fc1/fc2/fc3 scales,
+    // fc1/fc2/fc3 biases and the aggregation weights.
+    for index in [1usize, 3, 4, 6, 7, 9, 10, 14] {
+        if let Some(tensor) = base[index].clone() {
+            gpu[index] = Some(to_half_tensor(&tensor, dtype));
+            cpu[index] = Some(round_through_half(&tensor, dtype));
+        }
+    }
+    (gpu, cpu)
+}
+
+/// The all-`T` fp16/bf16 QMoE path: router_probs, scales, biases and the
+/// aggregation weights all carry the input's half type (matching ORT's single
+/// type parameter `T`, e.g. the fused Mobius fp16 QMoE export). The GPU widens
+/// each to f32 and must match a CPU reference dequantized with the same
+/// half-rounded values.
+fn compare_all_half(case: Case, dtype: DataType) {
+    let ep = require_cuda();
+    let (gpu_inputs, cpu_inputs) = all_half_inputs(case, dtype);
+    let expected = run_cpu(case, &cpu_inputs);
+    let actual = run_gpu(&ep, case, &gpu_inputs, dtype).unwrap();
+    assert_conforms(&actual, &expected, case, dtype);
+}
+
+fn all_half_rich_case(rows: usize) -> Case {
+    Case {
+        experts: 4,
+        rows,
+        hidden: 16,
+        inter: 16,
+        bits: 4,
+        top_k: 2,
+        activation: "silu",
+        swiglu_fusion: 0,
+        affine: true,
+        fc3: true,
+        biases: true,
+        normalize: true,
+        router_weights: true,
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn qmoe_all_half_router_scales_bias_match_rounded_cpu() {
+    // rows=1 exercises the decode/fused path; rows=6 exercises prefill grouping.
+    for rows in [1, 6] {
+        compare_all_half(all_half_rich_case(rows), DataType::Float16);
+        compare_all_half(all_half_rich_case(rows), DataType::BFloat16);
+    }
+}
+
 fn qmoe_64expert_case(rows: usize) -> Case {
     Case {
         experts: 64,
