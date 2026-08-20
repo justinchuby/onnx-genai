@@ -29,6 +29,7 @@ mod models_config;
 pub mod multimodal;
 mod registry;
 mod routes;
+pub mod runtime_args;
 mod session;
 mod sse;
 mod state;
@@ -41,6 +42,9 @@ pub use registry::EvictionPolicy;
 pub use routes::{
     ParsedAssistantOutput, build_generate_request, build_prompt, parse_assistant_output,
     parse_tool_calls,
+};
+pub use runtime_args::{
+    CpuArgs, DeviceChoice, EngineArgs, decode_backend_name, parse_decode_backend, parse_device,
 };
 #[cfg(feature = "native-backend")]
 pub use state::parse_native_device;

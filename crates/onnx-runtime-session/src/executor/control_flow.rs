@@ -58,6 +58,7 @@ impl ChildExecutor {
             builds: 0,
             runs: 0,
             trace: TraceContext::noop(),
+            release_dead_values: false,
         })
     }
 
@@ -75,6 +76,15 @@ impl ChildExecutor {
             plan.exec.set_trace_context(trace.clone());
         }
         self.trace = trace;
+    }
+
+    /// Mirror of [`Self::set_trace_context`] for dead-value release: applied to
+    /// already-compiled child plans and remembered for plans compiled later.
+    pub(crate) fn set_release_dead_values(&mut self, enabled: bool) {
+        for plan in &mut self.compiled {
+            plan.exec.set_release_dead_values(enabled);
+        }
+        self.release_dead_values = enabled;
     }
 
     pub(super) fn compile(&self, externals: &[&Tensor]) -> Result<CompiledChildPlan> {
@@ -124,6 +134,7 @@ impl ChildExecutor {
             exec: {
                 let mut exec = Executor::build(graph, self.weights.clone(), self.ep.clone())?;
                 exec.set_trace_context(self.trace.clone());
+                exec.set_release_dead_values(self.release_dead_values);
                 exec
             },
             signature: externals
@@ -623,6 +634,7 @@ impl Executor {
                 self.ep.clone(),
             )?;
             child.set_trace_context(self.trace.clone());
+            child.set_release_dead_values(self.release_dead_values_enabled);
             self.subgraph_execs.insert(prepared.key.clone(), child);
         }
 

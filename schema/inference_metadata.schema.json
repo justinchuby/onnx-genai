@@ -929,6 +929,14 @@
             "null"
           ]
         },
+        "patch_order": {
+          "description": "Order patches are emitted in (`merge_groups`, the default, or `raster`).\nIndependent of `merge_size`, which only sets how many patches collapse\ninto one image token.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "patch_size": {
           "description": "Edge length of a square patch for a `patchify` operation.",
           "format": "uint",
@@ -992,6 +1000,14 @@
           "minimum": 1,
           "type": [
             "integer",
+            "null"
+          ]
+        },
+        "temporal_order": {
+          "description": "Relative nesting of the temporal and channel axes inside a flattened\n`channels_first` patch (`channel_major` or `temporal_major`).",
+          "minLength": 1,
+          "type": [
+            "string",
             "null"
           ]
         },

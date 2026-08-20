@@ -20,7 +20,8 @@ See [`docs/architecture/ORT2.md` §35](docs/architecture/ORT2.md#35-error-recove
 **Runtime behavior is driven by model metadata, ONNX semantics, registries, capabilities, and explicit configuration—not hardcoded identities or hidden guesses.**
 
 - Kernels are shape-driven, dtype-parameterized, and architecture-gated; model dimensions and attention parameters are runtime data.
-- **No hardcoded model architecture, anywhere.** Neither inference metadata nor runtime code may bake in layer counts, hidden/intermediate sizes, head counts, exact tensor shapes, or model-specific dimension constants.
+- **No hardcoded model architecture, anywhere.** Neither inference metadata nor runtime code may bake in layer counts, hidden/intermediate sizes, head counts, head sizes (head dims), exact tensor shapes, or model-specific dimension constants.
+- **Head size is a fully runtime, per-attention-op parameter.** Loader, attention kernel, GEMV, and KV-cache allocation resolve each op's head size from graph/metadata — never from a fixed value (e.g. 128/256), a fixed count of distinct sizes, or a `dual`-specific branch. Support arbitrary and mixed per-layer/per-component head sizes generally, so a model with three or more distinct head sizes requires no new special case.
 - Generic loader, IR, session, optimizer, and dispatch code must not special-case model families, op attributes, vendors, or EPs.
 - Architectural assumptions such as KV layout, RoPE variant, block-quant size, attention scheme, or sliding window are explicit, inspectable metadata; missing metadata fails clearly.
 - EP selection and fusion use declared capabilities and structural op/topology patterns, never model identity; unsupported matches fail rather than guess or silently fall back.

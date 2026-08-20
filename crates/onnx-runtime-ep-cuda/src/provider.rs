@@ -78,6 +78,75 @@ pub const DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES: u64 = 4 << 30;
 /// physical memory, so it cannot leak without bound.
 pub const DEFAULT_STANDALONE_PHYSICAL_POOL_BYTES: usize = 256 << 20;
 
+/// How many times the device's own VRAM the VMM arena reserves in address
+/// space.
+///
+/// The arena is the single address range that weights, the KV carve and decode
+/// scratch all sub-allocate from, so it has to cover their sum *plus* whatever
+/// fragmentation they leave behind. Every one of those scales with the card:
+/// the metadata-less KV path alone asks for ~1.2x *device free* (#1288). A
+/// multiple of VRAM therefore stays correct across accelerators in a way that
+/// any constant does not.
+const RESERVATION_VRAM_MULTIPLE: usize = 16;
+
+/// Floor for the arena reservation, used as-is when the device's VRAM cannot be
+/// queried.
+const RESERVATION_FLOOR_BYTES: usize = 1 << 40;
+
+/// Smallest reservation the descending ladder will still accept.
+const RESERVATION_MIN_BYTES: usize = 64 << 30;
+
+/// Total VRAM of CUDA device `ordinal`, or `None` if the driver will not say.
+///
+/// Uses `cuDeviceTotalMem`, which needs only a device handle — no current
+/// context — so it is safe to call while the provider is still being built.
+fn device_total_memory_bytes(ordinal: u32) -> Option<usize> {
+    use cudarc::driver::sys as cu;
+    let mut device = 0;
+    // SAFETY: the driver is initialized (a `CudaRuntime` for this ordinal
+    // already exists); both calls only write through the out-pointers below.
+    unsafe {
+        if cu::cuDeviceGet(&mut device, ordinal as i32) != cu::CUresult::CUDA_SUCCESS {
+            return None;
+        }
+        let mut bytes = 0usize;
+        if cu::cuDeviceTotalMem_v2(&mut bytes, device) != cu::CUresult::CUDA_SUCCESS {
+            return None;
+        }
+        (bytes > 0).then_some(bytes)
+    }
+}
+
+/// Arena reservation sizes to try, largest first.
+///
+/// Reserving address space is close to free — an unmapped range claims no
+/// physical granules — and the driver is generous with it: on an A100 a single
+/// `cuMemAddressReserve` of 64 TiB succeeds, as do eight simultaneous 128 GiB
+/// reservations. So the first entry is sized for headroom, not fitted, and the
+/// ladder exists only so a platform with a tighter address space still gets a
+/// ledgered arena instead of silently dropping to the unaccounted `cuMemAlloc`
+/// fallback.
+fn reservation_ladder(ordinal: u32) -> Vec<usize> {
+    reservation_ladder_from_total(device_total_memory_bytes(ordinal))
+}
+
+/// The pure half of [`reservation_ladder`], separated so it can be tested
+/// without a device present.
+fn reservation_ladder_from_total(device_total: Option<usize>) -> Vec<usize> {
+    let desired = device_total
+        .and_then(|total| total.checked_mul(RESERVATION_VRAM_MULTIPLE))
+        .unwrap_or(RESERVATION_FLOOR_BYTES)
+        .max(RESERVATION_FLOOR_BYTES);
+    let mut ladder = Vec::new();
+    let mut size = desired;
+    while size > RESERVATION_MIN_BYTES {
+        ladder.push(size);
+        size /= 2;
+    }
+    ladder.push(RESERVATION_MIN_BYTES);
+    ladder
+}
+
 fn dynamic_lending_enabled() -> bool {
     dynamic_lending_enabled_for(
         std::env::var("ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING")
@@ -291,7 +360,6 @@ impl CudaExecutionProvider {
             vmm: {
                 let cell = std::sync::OnceLock::new();
                 if crate::vmm_allocator::vmm_enabled() || auto_dynamic_lending {
-                    const RESERVATION_BYTES: usize = 64 << 30;
                     let synchronization_runtime = Arc::clone(&runtime);
                     let teardown_synchronizer: crate::virtual_memory::TeardownSynchronizer =
                         Arc::new(move || {
@@ -303,13 +371,14 @@ impl CudaExecutionProvider {
                                 .synchronize()
                                 .map_err(|error| error.to_string())
                         });
-                    let arena = match governor.as_deref() {
+                    let build_arena = |reservation_bytes: usize| {
+                        match governor.as_deref() {
                         Some(governor) => {
                             crate::vmm_allocator::CudaVmmAllocator::new_with_teardown_synchronizer(
                             runtime.cuda_context(),
                             onnx_runtime_memory_governor::DeviceKey::device(ordinal),
                             ordinal as i32,
-                            RESERVATION_BYTES,
+                            reservation_bytes,
                             governor,
                             onnx_runtime_memory_governor::HolderId::new(64),
                             onnx_runtime_memory_governor::MemoryRole::Workspace {
@@ -323,12 +392,12 @@ impl CudaExecutionProvider {
                             runtime.cuda_context(),
                             onnx_runtime_memory_governor::DeviceKey::device(ordinal),
                             ordinal as i32,
-                            RESERVATION_BYTES,
+                            reservation_bytes,
                             onnx_runtime_memory_governor::HolderId::new(64),
                             onnx_runtime_memory_governor::MemoryRole::Workspace {
                                 step_scoped: false,
                             },
-                            teardown_synchronizer,
+                            Arc::clone(&teardown_synchronizer),
                             // Standalone (plugin, no-governor) VMM path: retain a
                             // pool of physical granules by default so repeated
                             // same-size ORT scratch requests reuse committed
@@ -339,16 +408,34 @@ impl CudaExecutionProvider {
                             // which already passes a default pool bound.
                             Some(DEFAULT_STANDALONE_PHYSICAL_POOL_BYTES),
                         ),
+                    }
                     };
-                    match resolve_vmm_initialization(
-                        auto_dynamic_lending,
-                        offload_policy.managed_limit_bytes,
-                        arena,
-                    )? {
-                        VmmInitialization::Installed(arena) => {
+                    // Walk the ladder largest-first and keep the first arena the
+                    // driver actually hands us, so a tighter address space costs
+                    // reservation headroom rather than the whole ledgered path.
+                    let ladder = reservation_ladder(ordinal);
+                    let mut installed = None;
+                    let mut last_fallback = None;
+                    for reservation_bytes in ladder {
+                        match resolve_vmm_initialization(
+                            auto_dynamic_lending,
+                            offload_policy.managed_limit_bytes,
+                            build_arena(reservation_bytes),
+                        )? {
+                            VmmInitialization::Installed(arena) => {
+                                installed = Some((arena, reservation_bytes));
+                                break;
+                            }
+                            VmmInitialization::CompatibilityFallback(error) => {
+                                last_fallback = Some(error);
+                            }
+                        }
+                    }
+                    match installed {
+                        Some((arena, reservation_bytes)) => {
                             eprintln!(
                                 "cuda_ep: device allocations go through a VMM arena over \
-                                 {RESERVATION_BYTES} bytes of reserved address space; physical \
+                                 {reservation_bytes} bytes of reserved address space; physical \
                                  granules are mapped on demand; strategy={}{}",
                                 if auto_dynamic_lending {
                                     "vram-limit dynamic KV/weight lending"
@@ -363,10 +450,14 @@ impl CudaExecutionProvider {
                             );
                             let _ = cell.set(Arc::new(arena));
                         }
-                        VmmInitialization::CompatibilityFallback(error) => eprintln!(
-                            "cuda_ep: WARNING: could not build the VMM arena, falling back to \
-                             cuMemAlloc; device allocations will not be charged to the ledger: \
-                             {error}"
+                        None => eprintln!(
+                            "cuda_ep: WARNING: could not build the VMM arena at any reservation \
+                             size, falling back to cuMemAlloc; device allocations will not be \
+                             charged to the ledger: {}",
+                            last_fallback.map_or_else(
+                                || String::from("no reservation size was attempted"),
+                                |error| error.to_string()
+                            )
                         ),
                     }
                 }
@@ -1622,6 +1713,57 @@ impl ExecutionProvider for CudaExecutionProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bug behind #1288/#1514 was a fixed 64 GiB reservation on a card
+    /// whose VRAM is 80 GiB, so the arena could not even span the device it
+    /// served. Whatever else the ladder does, its first rung must leave room
+    /// for the metadata-less KV carve's ~1.2x *device free*.
+    #[test]
+    fn reservation_ladder_leads_with_a_large_multiple_of_device_vram() {
+        let a100_80gb = 85_094_825_984usize;
+        let ladder = reservation_ladder_from_total(Some(a100_80gb));
+        assert_eq!(ladder[0], a100_80gb * RESERVATION_VRAM_MULTIPLE);
+        assert!(
+            ladder[0] > a100_80gb * 2,
+            "an arena must span far more than the card it serves, got {} for {a100_80gb} bytes of \
+             VRAM",
+            ladder[0]
+        );
+    }
+
+    /// A card small enough that a multiple of its VRAM would be *less* headroom
+    /// than the floor must still get the floor: address space is close to free,
+    /// so there is no reason to hand a small card a small arena.
+    #[test]
+    fn reservation_ladder_floors_small_cards_and_unknown_vram() {
+        let rtx_4060_8gb = 8usize << 30;
+        assert_eq!(
+            reservation_ladder_from_total(Some(rtx_4060_8gb))[0],
+            RESERVATION_FLOOR_BYTES
+        );
+        assert_eq!(
+            reservation_ladder_from_total(None)[0],
+            RESERVATION_FLOOR_BYTES,
+            "a driver that will not report VRAM must not collapse the arena"
+        );
+    }
+
+    /// The ladder exists so a platform with a tighter address space still lands
+    /// on a *ledgered* arena rather than the unaccounted `cuMemAlloc` fallback,
+    /// which means it has to descend and it has to terminate.
+    #[test]
+    fn reservation_ladder_descends_by_halves_to_the_minimum() {
+        let ladder = reservation_ladder_from_total(Some(85_094_825_984));
+        assert!(
+            ladder.windows(2).all(|pair| pair[0] > pair[1]),
+            "ladder must be strictly descending: {ladder:?}"
+        );
+        assert_eq!(*ladder.last().unwrap(), RESERVATION_MIN_BYTES);
+        assert!(
+            ladder.iter().all(|&size| size >= RESERVATION_MIN_BYTES),
+            "no rung may drop below the minimum: {ladder:?}"
+        );
+    }
 
     #[test]
     fn dynamic_lending_is_on_by_default_with_behavior_safe_opt_outs() {

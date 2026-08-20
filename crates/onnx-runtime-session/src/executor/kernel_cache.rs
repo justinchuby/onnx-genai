@@ -626,24 +626,121 @@ pub struct CacheStats {
     pub misses: u64,
     /// Lookups served via the pre-bound fast path (zero-alloc).
     pub prebind_hits: u64,
+    /// Entries dropped by the per-node variant bound (issue #1362).
+    pub evictions: u64,
 }
 
 /// Shape-keyed kernel cache (§11.1). Owns the compiled kernels for the session.
 #[derive(Default)]
 pub(crate) struct KernelCache {
     pub(super) entries: HashMap<KernelKey, Box<dyn onnx_runtime_ep_api::Kernel>>,
+    /// Logical time each entry was last served, for the per-node bound below.
+    /// Kept beside `entries` rather than inside them so a shared-reference hit
+    /// can record its use without the map itself becoming interior-mutable.
+    pub(super) last_used: HashMap<KernelKey, AtomicU64>,
+    /// Monotonic tick handed out to `last_used`.
+    pub(super) clock: AtomicU64,
     pub(super) hits: u64,
     pub(super) misses: u64,
+    /// Entries dropped by the per-node bound.
+    pub(super) evictions: u64,
     pub(super) prebind_hits: AtomicU64,
 }
 
+/// How many shape variants of one node the cache keeps (issue #1362).
+///
+/// The cache is keyed by node **and input shapes**, so every distinct prompt
+/// length compiles a fresh kernel for every node in the graph. A compiled kernel
+/// owns device workspaces (attention scratch, dequantization scratch, broadcast
+/// metadata), so an unbounded cache turns "each request has a new prompt length"
+/// into VRAM that grows without limit until the device is exhausted — memory the
+/// resource governor never sees, because it belongs to the kernels rather than
+/// to any binding or KV pool.
+///
+/// A per-node bound rather than a global one keeps the eviction proportional to
+/// what actually varies: a graph keeps its hot decode and prefill variants, and
+/// only a node that has genuinely seen many shapes gives one up.
+///
+/// The bound is small on purpose. A retained variant owns device scratch, so
+/// raising it raises the floor under every long-context request: measured on a
+/// 30B decoder, a bound of 10 pushed a 5.5k-token prompt past the mapped-memory
+/// ceiling that a bound of 4 cleared with 20 GB to spare. The bound is the cap
+/// on that scratch, and widening it defeats its own purpose.
+///
+/// Four is only enough because the shapes a request cycles through are kept
+/// deliberately few: the native CUDA decoder rounds its prefill widths onto a
+/// three-step ladder (`PREFILL_QUERY_WIDTH_STEPS`) so that a prompt's leftover
+/// final chunk cannot invent a fresh width per request, which leaves exactly one
+/// slot for the single-token decode shape.
+const DEFAULT_VARIANTS_PER_NODE: usize = 4;
+
+fn variants_per_node() -> usize {
+    static RESOLVED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        std::env::var("ONNX_RUNTIME_KERNEL_CACHE_VARIANTS_PER_NODE")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|variants| *variants > 0)
+            .unwrap_or(DEFAULT_VARIANTS_PER_NODE)
+    })
+}
+
 impl KernelCache {
+    /// Next logical tick.
+    fn tick(&self) -> u64 {
+        self.clock.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Record that `key` was just served, so eviction can tell the hot variants
+    /// of a node from the ones a single past prompt length left behind.
+    fn touch(&self, key: &KernelKey) {
+        if let Some(slot) = self.last_used.get(key) {
+            slot.store(self.tick(), Ordering::Relaxed);
+        }
+    }
+
+    /// Drop the least recently used variants of `node` beyond the per-node bound.
+    ///
+    /// A kernel's device workspaces are freed by its `Drop`, so the EP's captured
+    /// device graph is reset first: a capture can have baked the pointer of a
+    /// workspace this eviction is about to free, and replaying it afterwards
+    /// would read freed device memory. Resetting is what the device-binding drop
+    /// path already does for the same reason.
+    fn evict_surplus_variants(&mut self, node: u32, ep: &dyn ExecutionProvider) {
+        let bound = variants_per_node();
+        let mut variants = self
+            .entries
+            .keys()
+            .filter(|key| key.node == node)
+            .map(|key| {
+                let used = self
+                    .last_used
+                    .get(key)
+                    .map(|slot| slot.load(Ordering::Relaxed))
+                    .unwrap_or(0);
+                (used, key.clone())
+            })
+            .collect::<Vec<_>>();
+        if variants.len() <= bound {
+            return;
+        }
+        variants.sort_by_key(|(used, _)| *used);
+        let surplus = variants.len() - bound;
+        let _ = ep.reset_device_graph();
+        for (_, key) in variants.into_iter().take(surplus) {
+            self.entries.remove(&key);
+            self.last_used.remove(&key);
+            self.evictions += 1;
+        }
+    }
+
     pub(super) fn stats(&self) -> CacheStats {
         CacheStats {
             entries: self.entries.len(),
             hits: self.hits,
             misses: self.misses,
             prebind_hits: self.prebind_hits.load(Ordering::Relaxed),
+            evictions: self.evictions,
         }
     }
 
@@ -665,6 +762,7 @@ impl KernelCache {
             return None;
         }
         let kernel = self.entries.get(binding)?.as_ref();
+        self.touch(binding);
         self.prebind_hits.fetch_add(1, Ordering::Relaxed);
         #[cfg(test)]
         PREBIND_FAST_PATH_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -739,8 +837,12 @@ impl KernelCache {
             kernel.set_constant_inputs(constant_inputs);
             kernel.set_capture_seq_independent(capture_seq_independent);
             self.entries.insert(key.clone(), kernel);
+            self.last_used
+                .insert(key.clone(), AtomicU64::new(self.tick()));
             self.misses += 1;
+            self.evict_surplus_variants(key.node, ep);
         }
+        self.touch(&key);
         #[cfg(test)]
         PREBIND_FALLBACK_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let kernel_ref = self.entries.get(&key).expect("just inserted").as_ref();

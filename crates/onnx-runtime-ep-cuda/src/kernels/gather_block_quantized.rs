@@ -75,6 +75,7 @@ extern "C" __global__ void gather_block_quantized(
     long long n,
     int index_is_i64,
     int scales_fp16,
+    int data_signed,
     unsigned int* capture_error) {
   const int elems_per_byte = 8 / bits;
   const unsigned int mask = (1u << bits) - 1u;
@@ -96,15 +97,21 @@ extern "C" __global__ void gather_block_quantized(
         idx_before * gather_axis_dim * after_gather_dim + idx_at_g * after_gather_dim + idx_after;
     const long long block_id = in_idx / block_size;
 
-    const int weight = gbq_get_val(data, in_idx, bits, elems_per_byte, mask);
-    // When the optional zero_points input is absent, ONNX Runtime / the CPU
-    // reference dequantize against the symmetric midpoint `1 << (bits - 1)`
-    // (e.g. 8 for int4), NOT zero. Leaving offset=0 here mis-dequantizes any
-    // table packed without explicit zero points (GGUF-style embeddings), which
-    // is what produced empty / non-finite CUDA output on converted models.
-    int offset = 1 << (bits - 1);
+    // Unpack the quantized code. ONNX `Int4` data is SIGNED: sign-extend the
+    // nibble so codes land in [-8, 7]. `uint8`-packed data is unsigned.
+    int weight = gbq_get_val(data, in_idx, bits, elems_per_byte, mask);
+    if (data_signed && (weight & (1 << (bits - 1)))) weight -= (1 << bits);
+    // Default zero point (no zero_points input): signed int4 is symmetric about
+    // 0, so the offset is 0; ONNX Runtime's uint8 path instead dequantizes
+    // against the midpoint `1 << (bits - 1)` (e.g. 8 for 4-bit), which is what
+    // GGUF-style uint8 embedding tables expect. When present, zero_points share
+    // the data's signedness.
+    int offset;
     if (zero_points) {
       offset = gbq_get_val(zero_points, block_id, bits, elems_per_byte, mask);
+      if (data_signed && (offset & (1 << (bits - 1)))) offset -= (1 << bits);
+    } else {
+      offset = data_signed ? 0 : (1 << (bits - 1));
     }
     const int diff = weight - offset;
 
@@ -125,10 +132,7 @@ pub struct GatherBlockQuantizedFactory {
 
 impl KernelFactory for GatherBlockQuantizedFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let bits = node
-            .attr("bits")
-            .and_then(|a| a.as_int())
-            .ok_or_else(|| not_implemented("GatherBlockQuantized requires a 'bits' attribute"))?;
+        let bits = node.attr("bits").and_then(|a| a.as_int()).unwrap_or(4);
         if !matches!(bits, 2 | 4 | 8) {
             return Err(not_implemented(
                 "GatherBlockQuantized CUDA supports uint8 data with bits in {2, 4, 8}",
@@ -193,12 +197,28 @@ impl Kernel for GatherBlockQuantizedKernel {
         let zero_points = inputs.get(3).filter(|z| !z.is_absent());
         let output = &mut outputs[0];
 
-        if data.dtype != DataType::Uint8 {
+        let data_signed = data.dtype == DataType::Int4;
+        if !matches!(data.dtype, DataType::Uint8 | DataType::Int4) {
             return Err(not_implemented(
-                "GatherBlockQuantized CUDA supports uint8 packed data only",
+                "GatherBlockQuantized CUDA supports uint8 or signed int4 packed data only",
             ));
         }
-        if let Some(zp) = zero_points
+        if data_signed {
+            if self.bits != 4 {
+                return Err(not_implemented(
+                    "GatherBlockQuantized CUDA int4 data requires bits == 4",
+                ));
+            }
+            // ONNX Runtime addresses int4 zero points by the (global) scale
+            // index; supporting them would need a dedicated signed path and no
+            // shipped int4 export carries them, so decline rather than risk a
+            // silent mis-dequant.
+            if zero_points.is_some() {
+                return Err(not_implemented(
+                    "GatherBlockQuantized CUDA int4 data with zero_points is not supported",
+                ));
+            }
+        } else if let Some(zp) = zero_points
             && zp.dtype != DataType::Uint8
         {
             return Err(not_implemented(
@@ -265,7 +285,14 @@ impl Kernel for GatherBlockQuantizedKernel {
             ));
         }
 
-        let components = (8 / self.bits) as usize;
+        let components = if data_signed {
+            // Native ONNX `Int4` tensors already carry the full logical element
+            // count in their shape (no uint8-style packing factor), matching
+            // ORT's `components = 1` for the int4/uint4 data path.
+            1
+        } else {
+            (8 / self.bits) as usize
+        };
         let gather_axis_dim = data.shape[gather_axis];
         let after_gather_packed =
             checked_product(&data.shape[gather_axis + 1..], "after-gather size")?;
@@ -381,6 +408,7 @@ impl Kernel for GatherBlockQuantizedKernel {
         let n_i64 = n as i64;
         let index_is_i64 = i32::from(indices.dtype == DataType::Int64);
         let scales_fp16_flag = i32::from(scales_fp16);
+        let data_signed_flag = i32::from(data_signed);
         let capture_error = if capturing {
             self.runtime.capture_error_ptr()
         } else {
@@ -414,6 +442,7 @@ impl Kernel for GatherBlockQuantizedKernel {
             .arg(&n_i64)
             .arg(&index_is_i64)
             .arg(&scales_fp16_flag)
+            .arg(&data_signed_flag)
             .arg(&capture_error);
         // SAFETY: argument types and order match `gather_block_quantized`; all
         // pointers refer to live contiguous device allocations validated above.
@@ -580,13 +609,7 @@ mod tests {
     use super::*;
 
     fn runtime() -> Option<Arc<CudaRuntime>> {
-        let previous_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let runtime = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
-            .ok()
-            .flatten();
-        std::panic::set_hook(previous_hook);
-        runtime
+        crate::test_support::maybe_runtime()
     }
 
     fn as_bytes<T: Copy>(values: &[T]) -> &[u8] {
@@ -876,16 +899,19 @@ mod tests {
 
     #[test]
     fn gather_block_quantized_source_uses_symmetric_default_zero_point() {
-        // Guards the #702 fix: when zero_points is absent the device kernel must
-        // dequantize against the symmetric midpoint `1 << (bits - 1)` (matching
-        // the CPU reference), never leave offset at 0. This runs without a GPU.
+        // Guards the #702 fix AND the signed-int4 addition: when zero_points is
+        // absent, the UNSIGNED (uint8) path must dequantize against the symmetric
+        // midpoint `1 << (bits - 1)` (matching the CPU reference), while the
+        // SIGNED (ONNX Int4) path uses 0 (int4 is already symmetric about 0).
+        // Runs without a GPU.
         assert!(
-            SOURCE.contains("int offset = 1 << (bits - 1);"),
-            "kernel must default to symmetric midpoint zero-point when absent"
+            SOURCE.contains("offset = data_signed ? 0 : (1 << (bits - 1));"),
+            "kernel must default to midpoint for unsigned data and 0 for signed int4 when \
+             zero_points is absent"
         );
         assert!(
-            !SOURCE.contains("int offset = 0;"),
-            "kernel must not default the dequant offset to 0 when zero_points is absent"
+            SOURCE.contains("weight -= (1 << bits)"),
+            "kernel must sign-extend signed int4 codes"
         );
     }
 }

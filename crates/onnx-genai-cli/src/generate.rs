@@ -20,21 +20,25 @@ use super::output::{
 use super::profile::{self, RunProfile};
 use super::{GenerateArgs, ProfileArgs, decode_backend_name, resolve_model_dir};
 
-pub(super) fn generate(args: GenerateArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
+pub(super) fn generate(
+    args: GenerateArgs,
+    prompt: String,
+    profiling: &ProfileArgs,
+) -> anyhow::Result<()> {
     install_ctrlc_handler();
-    args.cpu.apply()?;
+    args.cpu.apply().map_err(anyhow::Error::msg)?;
     let model_dir = resolve_model_dir(&args.model);
     let profile = RunProfile::new(model_dir.display().to_string());
     let output_kind = generate_output_kind(&args)?;
     let input_mode = repl_input_mode(io::stdin().is_terminal(), io::stdout().is_terminal());
     let show_stats = initial_generate_show_stats(input_mode, args.no_stats, output_kind);
     if matches!(output_kind, GenerateOutputKind::Image) {
-        return generate_image(&model_dir, args, profiling, profile);
+        return generate_image(&model_dir, args, prompt, profiling, profile);
     }
     if matches!(output_kind, GenerateOutputKind::Audio) {
-        return generate_audio(&model_dir, args, profiling, profile);
+        return generate_audio(&model_dir, args, prompt, profiling, profile);
     }
-    generate_text(&model_dir, args, profiling, profile, show_stats)
+    generate_text(&model_dir, args, prompt, profiling, profile, show_stats)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +76,7 @@ fn initial_generate_show_stats(
 fn generate_text(
     model_dir: &Path,
     args: GenerateArgs,
+    prompt: String,
     profiling: &ProfileArgs,
     mut profile: RunProfile,
     show_stats: bool,
@@ -79,7 +84,7 @@ fn generate_text(
     let options = args.sampling.to_options();
 
     let template = load_chat_template(model_dir, args.sampling.raw);
-    let history = vec![ChatMessage::user(args.prompt)];
+    let history = vec![ChatMessage::user(prompt)];
     let prompt = build_turn_prompt(template.as_ref(), &history)?;
     let mut turn = TurnInput {
         prompt,
@@ -374,6 +379,7 @@ fn emit_cuda_offload_counters(
 fn generate_image(
     model_dir: &Path,
     args: GenerateArgs,
+    prompt: String,
     profiling: &ProfileArgs,
     mut profile: RunProfile,
 ) -> anyhow::Result<()> {
@@ -382,7 +388,7 @@ fn generate_image(
         .output_image
         .clone()
         .expect("image output path checked by the caller");
-    let request = args.image_output.to_request(args.prompt.clone());
+    let request = args.image_output.to_request(prompt);
     let load_started = std::time::Instant::now();
     let mut engine = PipelineEngine::from_dir_with_config(model_dir, args.engine.to_config())
         .map_err(|error| {
@@ -449,6 +455,7 @@ fn generate_image(
 fn generate_audio(
     model_dir: &Path,
     args: GenerateArgs,
+    prompt: String,
     profiling: &ProfileArgs,
     mut profile: RunProfile,
 ) -> anyhow::Result<()> {
@@ -479,9 +486,7 @@ fn generate_audio(
     profile.decode_backend = Some(decode_backend_name(engine.decode_backend()).to_string());
     profile.phase("model load", load_started.elapsed());
 
-    let request = args
-        .audio_output
-        .to_request(args.prompt.clone(), &args.sampling);
+    let request = args.audio_output.to_request(prompt, &args.sampling);
     let synthesis_started = std::time::Instant::now();
     let audio = text_to_audio::synthesize(&mut engine, &tokenizer, &request)?;
     let synthesis_elapsed = synthesis_started.elapsed();

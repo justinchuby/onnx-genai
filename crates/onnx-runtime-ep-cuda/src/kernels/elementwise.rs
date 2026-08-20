@@ -1339,13 +1339,7 @@ mod tests {
 
     #[test]
     fn silu_mul_f16_matches_reference_with_half2_tail() {
-        let previous_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let runtime = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
-            .ok()
-            .flatten();
-        std::panic::set_hook(previous_hook);
-        let Some(runtime) = runtime else {
+        let Some(runtime) = crate::test_support::maybe_runtime() else {
             eprintln!("skipping fused SiluMul fp16 parity test: CUDA runtime unavailable");
             return;
         };
@@ -1439,13 +1433,7 @@ mod tests {
 
     #[test]
     fn decomposed_silu_mul_bf16_is_byte_exact_vs_two_op_bf16_reference() {
-        let previous_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let runtime = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
-            .ok()
-            .flatten();
-        std::panic::set_hook(previous_hook);
-        let Some(runtime) = runtime else {
+        let Some(runtime) = crate::test_support::maybe_runtime() else {
             eprintln!("skipping decomposed SiluMul bf16 parity test: CUDA runtime unavailable");
             return;
         };
@@ -1655,13 +1643,7 @@ mod claim_probes {
     use crate::CudaRuntime;
 
     fn maybe_runtime() -> Option<Arc<CudaRuntime>> {
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let rt = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
-            .ok()
-            .flatten();
-        std::panic::set_hook(previous);
-        rt
+        crate::test_support::maybe_runtime()
     }
 
     fn run_i32_binary(runtime: &Arc<CudaRuntime>, op: BinaryOp, a: &[i32], b: &[i32]) -> Vec<i32> {

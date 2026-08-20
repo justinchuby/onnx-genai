@@ -256,7 +256,7 @@ impl Kernel for GatherNdKernel {
         }
 
         let capturing = self.runtime.is_capturing()?;
-        if !capturing {
+        if !capturing && !self.runtime.eager_sync_deferred() {
             let mut bytes = vec![0u8; indices.dtype.storage_bytes(indices.numel())];
             unsafe {
                 self.runtime

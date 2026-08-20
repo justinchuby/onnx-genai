@@ -119,14 +119,25 @@ impl NativeComponentSession {
     }
 
     /// Load an ONNX model on the requested native device as a neutral component.
-    pub fn load(path: &Path, device: NativeDecodeDevice) -> anyhow::Result<Self> {
+    ///
+    /// `governor`, when present, is the ledger the rest of the engine admits
+    /// against on this device. A component session builds its own execution
+    /// provider, which sizes any standing device pool for itself; adopting the
+    /// governor turns that pool into a claim the decoder's admission control can
+    /// see. Without it two co-resident sessions each measure the same free VRAM
+    /// and each conclude they may use ~90% of it.
+    pub fn load(
+        path: &Path,
+        device: NativeDecodeDevice,
+        governor: Option<&dyn onnx_runtime_memory_governor::MemoryGovernor>,
+    ) -> anyhow::Result<Self> {
         let requested_cuda = matches!(&device, NativeDecodeDevice::Cuda { .. });
         let preference = match device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
             NativeDecodeDevice::Cuda { index } => DevicePreference::Gpu { index },
             NativeDecodeDevice::Plugin { .. } => DevicePreference::Cpu,
         };
-        let session = InferenceSession::builder()
+        let mut session = InferenceSession::builder()
             .model(path)
             .device(preference)
             .build()
@@ -136,12 +147,39 @@ impl NativeComponentSession {
                     path.display()
                 )
             })?;
+        // A component graph is run once per request and never records a device
+        // graph, so its intermediates can be freed as they die. The vision
+        // encoder is why this matters: holding every one of its 2545 node
+        // outputs at once cost ~23 GB at 448px and put full-resolution images
+        // out of reach entirely.
+        session.set_release_dead_values(true);
         if requested_cuda && let Some(report) = session.execution_provider_fallback_report() {
             tracing::warn!(
                 model = %path.display(),
                 fallback = %report,
                 "native CUDA pipeline component fell back to CPU"
             );
+        }
+        if let Some(governor) = governor {
+            let holder = crate::engine::memory_plan::Holder::PipelineComponentPool;
+            // Not fatal: a provider that holds no standing pool reports zero, and
+            // a governor that refuses the claim leaves the component exactly as
+            // unaccounted as it was before -- worth saying out loud, not worth
+            // failing a load over.
+            match session.adopt_memory_governor(governor, holder.tier(), holder.id()) {
+                Ok(bytes) => tracing::debug!(
+                    model = %path.display(),
+                    governed_bytes = bytes,
+                    holder = holder.name(),
+                    "pipeline component device pool adopted by the engine memory governor"
+                ),
+                Err(error) => tracing::warn!(
+                    model = %path.display(),
+                    %error,
+                    "pipeline component device pool could not be charged to the engine memory \
+                     governor; admission on this device stays optimistic"
+                ),
+            }
         }
         Self::new(session).map_err(anyhow::Error::from)
     }

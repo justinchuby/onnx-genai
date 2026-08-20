@@ -198,3 +198,96 @@ fn report_latency_under_concurrent_sessions() {
         counters.slot_exhausted, counters.dispatches
     );
 }
+
+/// How many outer Rayon workers to probe nesting with.
+#[cfg(not(miri))]
+const NEST_DISPATCHERS: &[usize] = &[1, 2, 4, 8, 16];
+
+/// Under Miri this test is run for soundness, not for measurement, and the
+/// interpreter is thousands of times slower than native. Keep the *shape* --
+/// more than one dispatcher, so tasks from different rows are live against each
+/// other and a too-wide retag is a real conflict -- and drop the scale.
+#[cfg(miri)]
+const NEST_DISPATCHERS: &[usize] = &[1, 4];
+
+/// Inner fan-out size for the nesting probe, in `u64` elements.
+#[cfg(not(miri))]
+const NEST_INNER: usize = 4096;
+
+/// Still several times the 64-element grain, so a row is split across multiple
+/// concurrent tasks and the aliasing shape survives the shrink.
+#[cfg(miri)]
+const NEST_INNER: usize = 256;
+
+/// Nesting: several Rayon workers dispatching into the task pool at once.
+///
+/// This is the shape `packed_nbits_output_row` and `int8_row` take for `m > 1`
+/// with `parallel_columns` set -- an outer `par_chunks_mut` over rows, and an
+/// inner column fan-out inside each row. The pool has a fixed number of job
+/// slots, so past some number of concurrent dispatchers the surplus is declined
+/// and runs inline on the caller. That is correct and bounded, and until now it
+/// was only ever an argument. This measures it.
+///
+/// The assertion is correctness, not speed: under nesting every element must
+/// still be written exactly once, and nothing may deadlock.
+#[test]
+#[ignore = "measurement; run deliberately on a quiet machine"]
+fn nested_dispatch_slot_pressure() {
+    use rayon::prelude::*;
+
+    let width = task_runtime::testing::pool_width();
+    println!("\nnested dispatch into a {width}-lane pool");
+    println!(
+        "{:>12}  {:>10}  {:>12}  {:>10}  {:>9}",
+        "dispatchers", "wall", "dispatches", "declined", "inline"
+    );
+
+    for &outer in NEST_DISPATCHERS {
+        let mut rows = vec![0u64; outer * NEST_INNER];
+        let before = task_runtime::testing::counters();
+        let started = Instant::now();
+
+        rows.par_chunks_mut(NEST_INNER).for_each(|row| {
+            let base = row.as_mut_ptr() as usize;
+            task_runtime::for_each_range(NEST_INNER, 64, |start, end| {
+                // SAFETY: `for_each_range` visits `start..end` in exactly one
+                // task, so narrowing *before* the retag makes this `&mut`
+                // unique for its lifetime. Reconstructing the whole row and
+                // then indexing would retag the full `NEST_INNER` range in
+                // every task, and under Stacked Borrows the conflict is the
+                // retag rather than the store — the writes being disjoint
+                // would not save it. `parallel_output_rows_repeated` uses this
+                // same narrow-first shape in production.
+                let slots = unsafe {
+                    std::slice::from_raw_parts_mut((base as *mut u64).add(start), end - start)
+                };
+                for slot in slots {
+                    *slot += 1;
+                }
+            });
+        });
+
+        let elapsed = started.elapsed();
+        let after = task_runtime::testing::counters();
+        let dispatches = after.dispatches - before.dispatches;
+        let declined = after.slot_exhausted - before.slot_exhausted;
+        let inline = after.tasks_by_dispatcher - before.tasks_by_dispatcher;
+
+        assert!(
+            rows.iter().all(|&v| v == 1),
+            "nested fan-out did not cover every element exactly once at {outer} dispatchers"
+        );
+        assert_eq!(after.panics, before.panics, "a nested task body panicked");
+
+        println!(
+            "{outer:>12}  {:>8.1}us  {dispatches:>12}  {declined:>10}  {inline:>9}",
+            as_us(elapsed)
+        );
+    }
+
+    let counters = task_runtime::testing::counters();
+    println!(
+        "totals: {} of {} dispatches declined for want of a slot",
+        counters.slot_exhausted, counters.dispatches
+    );
+}
