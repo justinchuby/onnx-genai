@@ -2978,7 +2978,8 @@ fn run_prefill_sweep(args: &Args, engine: &mut PipelineEngine, lengths: &[usize]
     Ok(())
 }
 
-fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {    if args.synthetic {
+fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
+    if args.synthetic {
         bail!("--pipeline cannot be combined with --synthetic");
     }
     if !model_dir.is_dir() {
@@ -3080,7 +3081,10 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {    if args.synthe
                 Ok(())
             };
             let result = engine
-                .generate_with_callback(pipeline_request(args, args.tokens, &prompt), Some(&mut callback))
+                .generate_with_callback(
+                    pipeline_request(args, args.tokens, &prompt),
+                    Some(&mut callback),
+                )
                 .context("steady pipeline measured generation")?;
             let cache_hit = result.prefix_cache_hit_len;
             if token_times.len() <= args.decode_skip {

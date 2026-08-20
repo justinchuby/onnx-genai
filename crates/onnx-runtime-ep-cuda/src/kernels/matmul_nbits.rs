@@ -12705,8 +12705,14 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             // SAFETY: this ignored GPU test runs serially; no other thread reads
             // these flags concurrently.
             unsafe {
-                std::env::set_var("ONNX_GENAI_DEQUANT_F16_GEMM", if dequant_f16 { "1" } else { "0" });
-                std::env::set_var("ONNX_GENAI_MARLIN_M_GT_1", if dequant_f16 { "0" } else { "1" });
+                std::env::set_var(
+                    "ONNX_GENAI_DEQUANT_F16_GEMM",
+                    if dequant_f16 { "1" } else { "0" },
+                );
+                std::env::set_var(
+                    "ONNX_GENAI_MARLIN_M_GT_1",
+                    if dequant_f16 { "0" } else { "1" },
+                );
             }
             let mut outputs = [TensorMut::new(
                 device_ptr_mut(output_dev),
