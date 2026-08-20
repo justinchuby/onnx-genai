@@ -1262,8 +1262,15 @@ constraint was found.
 the same run: the 32/64/128 rows above are the direct evidence that lowering them to 1 would be a
 regression of 1.08x-2.1x.
 
+**Confirmed end to end.** The paired-ORT production A/B, run at `--block-size 16 --tokens 1` — the
+first time that harness has contained a row any int4 row gate controls — improves **all 20 cells**,
+1.86x-3.43x, parity PASS on every one. Against ORT the shape goes from 6.66x-13.44x to
+**3.44x-5.30x**.
+
 **What this does not fix.** Block-16 decode is now 97-123 tokens/s where block 128 reaches 256, so
-this closes a 3-8x outlier and leaves the ordinary case alone. `m = 1` at blocks 32/64/128 keeps
+this closes a 3-8x outlier and leaves the ordinary case alone. The residual 3.4x-5.3x is still worse
+than the 2.3x-3.0x band the 32-element weights sit in, worst at `t = 8`, where GEBP fans out on the
+global pool while the persistent-SPMD workers spin. `m = 1` at blocks 32/64/128 keeps
 today's route. The residual 2.3x-3.0x to ORT is untouched and remains the CompInt8/VNNI gap of
 sections 10 and 11. Full record:
 [`docs/benchmarks/2026-08-20-int4-decode-loop.md`](../benchmarks/2026-08-20-int4-decode-loop.md).

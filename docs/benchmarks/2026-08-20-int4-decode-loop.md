@@ -117,6 +117,53 @@ unblocked branch claims 16 and only 16.
 decode now takes the packed microkernel, with the same tolerance check on the numerics. Verified
 non-vacuous by mutation: with `ONNX_GENAI_CPU_MM_INT4_GEBP=0` it fails at exactly `m = 1`.
 
+## Production A/B (paired ORT, end to end)
+
+The decode-loop bench above is a kernel harness. This is the shipped `bench_generic` path on
+generated `MatMulNBits` models, `--block-size 16 --tokens 1` — the first time the production A/B has
+ever contained a row that any int4 prefill row gate controls (the default token grid steps 1 -> 8,
+straddling every gate the last four PRs moved). Both arms are the same binary;
+`ONNX_GENAI_CPU_MM_INT4_GEBP=0` reproduces base exactly because the grid is `m = 1` only. 11 trials
+x 40 runs, median.
+
+| model | t | base ms | head ms | speedup | ORT base | ORT head |
+|---|---|---|---|---|---|---|
+| llama3_8b_mlp | 1 | 63.50 | 34.18 | 1.86x | 6.66x | **3.55x** |
+| llama3_8b_mlp | 2 | 36.58 | 17.30 | 2.11x | 7.47x | **3.55x** |
+| llama3_8b_mlp | 4 | 18.45 | 8.90 | 2.07x | 7.45x | **3.63x** |
+| llama3_8b_mlp | 8 | 15.43 | 5.57 | 2.77x | 11.78x | **4.48x** |
+| llama3_8b_qkv | 1 | 27.23 | 14.38 | 1.89x | 6.78x | **3.57x** |
+| llama3_8b_qkv | 2 | 15.68 | 6.85 | 2.29x | 7.75x | **3.58x** |
+| llama3_8b_qkv | 4 | 8.02 | 3.53 | 2.27x | 8.24x | **3.62x** |
+| llama3_8b_qkv | 8 | 6.79 | 2.40 | 2.83x | 12.87x | **4.83x** |
+| qwen3_0p6b_mlp | 1 | 6.92 | 3.23 | 2.14x | 7.35x | **3.48x** |
+| qwen3_0p6b_mlp | 2 | 4.05 | 1.63 | 2.49x | 8.48x | **3.47x** |
+| qwen3_0p6b_mlp | 4 | 3.28 | 0.96 | 3.42x | 12.47x | **3.50x** |
+| qwen3_0p6b_mlp | 8 | 1.89 | 0.72 | 2.61x | 12.77x | **5.09x** |
+| qwen3_0p6b_qkv | 1 | 3.52 | 1.61 | 2.18x | 7.45x | **3.44x** |
+| qwen3_0p6b_qkv | 2 | 2.09 | 0.83 | 2.51x | 8.41x | **3.44x** |
+| qwen3_0p6b_qkv | 4 | 1.72 | 0.50 | 3.43x | 12.07x | **3.63x** |
+| qwen3_0p6b_qkv | 8 | 1.06 | 0.40 | 2.65x | 13.21x | **5.23x** |
+| qwen3_8b_square | 1 | 13.92 | 6.82 | 2.04x | 6.96x | **3.48x** |
+| qwen3_8b_square | 2 | 8.09 | 3.35 | 2.41x | 8.03x | **3.47x** |
+| qwen3_8b_square | 4 | 4.14 | 1.69 | 2.46x | 8.31x | **3.44x** |
+| qwen3_8b_square | 8 | 3.61 | 1.43 | 2.53x | 13.44x | **5.30x** |
+
+**All 20 cells improve**, 1.86x-3.43x, parity PASS on every one. The spread between trials is
+negligible — llama3_8b_mlp t=1 read 34.00-34.61 ms across 11 head trials against 63.18-63.64 base —
+so unlike most cells in this file no re-measurement at higher trial counts was needed to separate
+the result from noise.
+
+The improvement is smaller here (1.86x-3.43x) than in the decode-loop bench (3.2x-4.1x) because this
+harness runs one op per model rather than a five-projection chain, so the packed weight is not
+re-read across projections. Same direction, same magnitude class, different denominators.
+
+**The ORT gap at this shape is not closed.** Block-16 `m = 1` goes from 6.7x-13.4x to 3.4x-5.3x,
+which is still worse than the 2.3x-3.0x band the 32-element weights sit in. `t = 8` is the worst
+column (4.5x-5.3x) and is where the oversubscription the Opus review identified would show up: under
+the persistent-SPMD path GEBP fans out on the global pool while the SPMD workers spin. That is a
+real cost, it is priced into every number above, and it is the next thing to attack for this shape.
+
 ## What this does not fix
 
 Block-16 decode reaches 97-123 tok/s where block 128 reaches 256, so this closes a 3-8x outlier
