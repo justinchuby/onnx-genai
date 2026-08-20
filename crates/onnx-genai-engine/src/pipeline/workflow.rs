@@ -642,7 +642,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
         } = request;
         let workflow = &engine.workflow;
         validate_component_overrides(workflow, &component_overrides)?;
-        let values = engine.bind_workflow_inputs(workflow, &request, inputs)?;
+        let (mut values, from_literal) = engine.bind_workflow_inputs(workflow, &request, inputs)?;
         let dynamic_symbols = workflow
             .state
             .values()
@@ -661,7 +661,15 @@ impl<'a> WorkflowExecutionPlan<'a> {
             })
             .collect::<std::collections::HashSet<_>>();
         let mut initial_symbols = HashMap::new();
+        // Two passes: caller/request-supplied values bind the workflow's symbolic
+        // axes first, then literal-materialized defaults are re-shaped to the
+        // extents those bindings imply. `literal_shape` can only guess a
+        // singleton for a symbolic axis, so binding literals first would pin a
+        // shared symbol such as `batch` to 1 and reject every batched request.
         for (name, input) in &workflow.inputs {
+            if from_literal.contains(name) {
+                continue;
+            }
             if let Some(value) = values.get(name) {
                 validate_workflow_value(
                     name,
@@ -671,6 +679,33 @@ impl<'a> WorkflowExecutionPlan<'a> {
                     &dynamic_symbols,
                 )?;
             }
+        }
+        for (name, input) in &workflow.inputs {
+            if !from_literal.contains(name) {
+                continue;
+            }
+            let Some(value) = values.get(name) else {
+                continue;
+            };
+            let resolved = resolve_workflow_shape(&input.contract, &initial_symbols)
+                .unwrap_or_else(|_| value.shape().to_vec());
+            if resolved != value.shape()
+                && let Some(literal) = input.default.as_ref()
+            {
+                let rebuilt =
+                    workflow_literal_value_with_shape(literal, &input.contract, &resolved)?;
+                values.insert(name.clone(), rebuilt);
+            }
+            let value = values
+                .get(name)
+                .expect("literal workflow input was just materialized");
+            validate_workflow_value(
+                name,
+                value,
+                &input.contract,
+                &mut initial_symbols,
+                &dynamic_symbols,
+            )?;
         }
         let input_names = values.keys().cloned().collect::<Vec<_>>();
         let input_aliases = workflow
@@ -2208,8 +2243,9 @@ impl PipelineEngine {
         workflow: &WorkflowSpec,
         request: &GenerateRequest,
         mut provided: PipelineTensors,
-    ) -> anyhow::Result<PipelineTensors> {
+    ) -> anyhow::Result<(PipelineTensors, std::collections::HashSet<String>)> {
         let mut values = HashMap::new();
+        let mut from_literal = std::collections::HashSet::new();
         for (name, input) in &workflow.inputs {
             let supplied = provided.remove(name).or_else(|| match &input.source {
                 WorkflowInputSource::Application { name } => provided.remove(name),
@@ -2229,16 +2265,22 @@ impl PipelineEngine {
                             )
                         }
                     },
-                    WorkflowInputSource::Literal => input
-                        .default
-                        .as_ref()
-                        .map(|value| workflow_literal_value(value, &input.contract))
-                        .transpose()?,
-                    WorkflowInputSource::Application { .. } => input
-                        .default
-                        .as_ref()
-                        .map(|value| workflow_literal_value(value, &input.contract))
-                        .transpose()?,
+                    WorkflowInputSource::Literal => {
+                        from_literal.insert(name.clone());
+                        input
+                            .default
+                            .as_ref()
+                            .map(|value| workflow_literal_value(value, &input.contract))
+                            .transpose()?
+                    }
+                    WorkflowInputSource::Application { .. } => {
+                        from_literal.insert(name.clone());
+                        input
+                            .default
+                            .as_ref()
+                            .map(|value| workflow_literal_value(value, &input.contract))
+                            .transpose()?
+                    }
                     WorkflowInputSource::Artifact { path } => {
                         anyhow::bail!(
                             "workflow input '{name}' requires artifact binding '{path}', which \
@@ -2270,7 +2312,7 @@ impl PipelineEngine {
                 provided.keys().collect::<Vec<_>>()
             );
         }
-        Ok(values)
+        Ok((values, from_literal))
     }
 }
 
@@ -2414,6 +2456,20 @@ fn workflow_literal_value(
     contract: &TensorContract,
 ) -> anyhow::Result<Value> {
     let shape = literal_shape(contract)?;
+    workflow_literal_value_with_shape(literal, contract, &shape)
+}
+
+/// Materialize a literal across an explicitly resolved shape.
+///
+/// Split out from [`workflow_literal_value`] so a literal whose contract has
+/// symbolic axes can be re-materialized once request inputs have bound those
+/// symbols, instead of being frozen at the singleton `literal_shape` guess.
+fn workflow_literal_value_with_shape(
+    literal: &LiteralValue,
+    contract: &TensorContract,
+    shape: &[i64],
+) -> anyhow::Result<Value> {
+    let shape = shape.to_vec();
     let numel = shape_numel(&shape);
     match literal {
         // One scalar broadcasts to the whole tensor.

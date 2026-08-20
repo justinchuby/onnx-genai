@@ -459,6 +459,33 @@ fn mobius_euler_diffusion_workflow_executes_complete_path() -> anyhow::Result<()
     Ok(())
 }
 
+/// A literal-sourced input whose contract carries the shared `batch` symbol must
+/// not pin that symbol to the singleton `literal_shape` guess: the diffusion
+/// package's `package.false` is declared `bool[batch]`, so binding it before the
+/// request's own tensors would reject every batch larger than one.
+#[test]
+fn mobius_euler_diffusion_workflow_executes_batched() -> anyhow::Result<()> {
+    let mut engine = Engine::from_pipeline_dir(&root("diffusion")?, EngineConfig::default())?;
+    let request = PipelineGenerateRequest::new(GenerateRequest {
+        prompt: GeneratePrompt::TokenIds(vec![1, 2]),
+        options: options(2),
+    })
+    .with_input(
+        "request.input_ids",
+        Value::from_slice_i64(&[1, 2, 3, 4], &[2, 2])?,
+    )
+    .with_input("latent", Value::from_slice_f32(&[1.0; 128], &[2, 4, 4, 4])?);
+    let output = engine.run_pipeline_outputs(request)?;
+    assert_eq!(output["image"].shape(), [2, 3, 4, 4]);
+    assert!(
+        output["image"]
+            .to_vec_f32()?
+            .iter()
+            .all(|value| value.is_finite())
+    );
+    Ok(())
+}
+
 #[test]
 fn mobius_masked_diffusion_workflow_executes() -> anyhow::Result<()> {
     let mut engine = Engine::from_pipeline_dir(&root("masked")?, EngineConfig::default())?;
