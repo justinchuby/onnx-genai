@@ -1299,8 +1299,18 @@ impl Value {
                 owner.numel()
             )));
         }
-        let data = tensor_data_ptr(owner.ptr.as_ptr())?;
         let memory_info = tensor_memory_info(owner.ptr.as_ptr())?;
+        // A zero-element alias borrows no bytes, and ORT is entitled to report a
+        // null data pointer for a tensor that owns none. Such an alias is still
+        // a real tensor -- a workflow's growing state starts empty and an
+        // island's outputs are aliased before anything has been appended -- so
+        // give ORT an aligned address it will never dereference instead of
+        // asking the owner for one.
+        let data = if alias_numel == 0 {
+            dangling_aligned(owner.dtype)
+        } else {
+            tensor_data_ptr(owner.ptr.as_ptr())?
+        };
         let ptr = create_tensor_with_data_at(
             memory_info,
             data,
@@ -1680,6 +1690,15 @@ fn argmax_bf16_bits(bits: &[u16]) -> usize {
     argmax_half_bits(halves)
 }
 
+/// A non-null, correctly aligned address for a tensor that owns no bytes.
+///
+/// ORT requires a non-null data pointer even when the tensor has zero elements,
+/// and every reader casts that pointer to the element type, so it has to carry
+/// the element alignment even though nothing may dereference it.
+fn dangling_aligned(dtype: DataType) -> *mut std::ffi::c_void {
+    std::ptr::without_provenance_mut::<u8>(dtype.size_of().max(1)).cast()
+}
+
 fn tensor_data_ptr(value: *mut onnx_genai_ort_sys::OrtValue) -> Result<*mut std::ffi::c_void> {
     let api = crate::error::api()?;
     let get_data = api
@@ -1698,6 +1717,19 @@ fn tensor_data_ptr(value: *mut onnx_genai_ort_sys::OrtValue) -> Result<*mut std:
 #[cfg(test)]
 mod host_residency_tests {
     use super::*;
+
+    #[test]
+    fn an_empty_tensor_can_be_aliased_and_read_back() {
+        // Workflow state that grows along an axis starts at length zero, and the
+        // engine aliases every island output before running it. Both have to
+        // work for a tensor that owns no bytes.
+        let owner = Value::empty(&[1, 4, 0, 2, 2], DataType::Float32).expect("empty tensor");
+        let alias = Value::into_alias_with_shape(owner, &[1, 4, 0, 2, 2]).expect("alias");
+        assert_eq!(alias.shape(), [1, 4, 0, 2, 2]);
+        assert_eq!(alias.numel(), 0);
+        assert!(alias.to_vec_f32().expect("read back").is_empty());
+        assert!(alias.as_raw_bytes().expect("borrow bytes").is_empty());
+    }
 
     #[test]
     fn a_host_tensor_reports_host_residency_and_lends_its_bytes() {
