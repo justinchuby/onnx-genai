@@ -1666,6 +1666,53 @@ impl PipelineEngine {
             .with_context(|| format!("no tokenizer available for '{}'", self.tokenizer_component))
     }
 
+    /// Drop every reusable prefix this pipeline is holding, so the next
+    /// generation recomputes its prompt from scratch. Returns how many KV pages
+    /// were freed from the paged prefix cache, if any.
+    ///
+    /// Two things are cleared, because a pipeline reuses prefixes through
+    /// whichever is active: the paged [`PrefixCache`], and the `retained`
+    /// context that carries a native decoder's device-resident KV from one
+    /// sequential request to the next.
+    ///
+    /// Benchmarks need this. A harness that replays one prompt — which is what
+    /// warmup runs do — otherwise answers each measured generation almost
+    /// entirely out of a retained prefix, and reports a "prefill" that processed
+    /// a single token and does not vary with prompt length (#1529).
+    pub fn clear_prefix_cache(&mut self) -> usize {
+        self.retained = None;
+        let Some(paged) = self.paged.as_mut() else {
+            return 0;
+        };
+        paged
+            .prefix
+            .evict_lru(usize::MAX, &mut paged.cache.page_table)
+            .len()
+    }
+
+    /// Encode text with the same tokenizer this pipeline uses for prompts.
+    ///
+    /// The public seam benchmarks need to report how many prompt tokens a
+    /// generation actually processed, and to build prompts of an exact token
+    /// length. Without it a harness has to re-open `tokenizer.json` itself and
+    /// hope it picked the same component this pipeline routes prompts through.
+    pub fn tokenize(&self, text: &str) -> anyhow::Result<Vec<TokenId>> {
+        self.tokenizer()?.encode(text).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to tokenize input text with the pipeline's tokenizer: {e}; \
+                 verify the model directory contains a valid tokenizer.json"
+            )
+        })
+    }
+
+    /// Decode token ids back to text with this pipeline's tokenizer, the
+    /// inverse seam of [`Pipeline::tokenize`].
+    pub fn detokenize(&self, tokens: &[TokenId]) -> anyhow::Result<String> {
+        self.tokenizer()?
+            .decode(tokens)
+            .map_err(|e| anyhow::anyhow!("failed to detokenize token ids: {e}"))
+    }
+
     /// KV page counters, when the decoder's KV is paged.
     ///
     /// `None` for a decoder whose KV cannot be paged, rather than zeros, which
