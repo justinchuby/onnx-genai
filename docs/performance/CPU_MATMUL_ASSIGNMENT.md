@@ -353,6 +353,45 @@ host has no model corpus to run the session-level A/B against, so the table stan
 this note is only about the native-vs-native change. Full record:
 `docs/benchmarks/2026-08-19-half-prefill-fused-widen-pack-gebp.md`.
 
+#### `bf16` decode had no GEMV at all, and `f16` decode kept a GEMV past its crossover (**both fixed natively**)
+
+The same audit found the mirror-image hole at `M = 1`. `f16` decode has had a dedicated GEMV since
+#1082 — at one row no packed panel is reused, so packing looked like pure overhead on a
+memory-bound problem — but `bf16` had none, and a single decode token widened and packed the whole
+weight to multiply it by one row.
+
+`half_gemv` now serves both formats (`bf16` widens by an AVX2 shift, so it does not require the
+`f16c` conversion unit the `f16` path needs). Measuring the GEMV against the fused prefill GEBP
+then **inverted the assumption behind the work**, and inverted it further than the first attempt
+recognised. A GEMV is the floor only while the weight is too small for the GEBP to accept at all.
+Above `HALF_PREFILL_GEBP_MIN_WEIGHT` the packed route is ahead in both formats at every shape
+measured, once the shared host's `f32` control row is divided out — at the very first weight above
+the gate (1024x1024) it is already 2.0x/2.1x ahead. So decode does not get a threshold of its own:
+it takes the GEMV exactly when the GEBP declines the weight.
+
+| dtype | `K x N` | elements | before | after | gain (control-corrected) |
+|---|---|---:|---:|---:|---:|
+| bf16 | 1024x768 | 0.79M | blocked 0.252 ms | GEMV 0.086 ms | **3.0x** |
+| bf16 | 512x512 | 0.26M | blocked 0.078 ms | GEMV 0.014 ms | **5.6x** |
+| f16 | 2048x2048 | 4.19M | GEMV 0.223 ms | GEBP 0.177 ms | **1.27x** |
+| f16 | 4096x11008 | 45.1M | GEMV 2.441 ms | GEBP 2.029 ms | **1.23x** |
+| f16 | 896x151936 | 136M | GEMV 6.172 ms | GEBP 4.611 ms | **1.34x** |
+
+Median of the per-run steady p50, two binaries interleaved rep by rep, 5 repetitions each, against
+`main` at `d4cb7341d`; the `f32` control rows of the same runs agree between the binaries to within
+3%, and every gain above is quoted after dividing that control out. The `bf16` rows at and above
+the weight gate are **unchanged** — `main` already routed them through the fused GEBP (#1365) —
+which is the honest scope of the `bf16` half of this work: it fixes decode *below* the gate, where
+there was no vectorised route, not above it.
+
+An earlier revision of this change split decode at 33.6M weight elements instead, on a sweep that
+varied only `n` at `k = 4096`. Across both axes that threshold is wrong in one direction
+everywhere it applies, worst of all for `bf16` at 2048x2048, where it moved decode off the GEBP
+`main` already used and onto the GEMV — a 2.1x regression against `main`. It was retired rather
+than retuned. Full record, including that retraction and the noisier earlier sweep kept as the
+disclosure of this shared host's worst case:
+`docs/benchmarks/2026-08-19-bf16-decode-gemv.md`.
+
 ### 3. Per-call packing and a missing native kernel — `QLinearMatMul` (**fixed**)
 
 #### 3a. The research build
