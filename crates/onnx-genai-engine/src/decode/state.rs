@@ -455,6 +455,17 @@ impl DecodeState {
         Ok(true)
     }
 
+    /// Borrow the active native runner iff it carries recurrent (GDN SSM /
+    /// conv1d) state, so the speculative loop can snapshot/commit that state
+    /// around a verify window. `None` for every non-native or pure-dense target,
+    /// keeping the commit path inert elsewhere.
+    #[cfg(feature = "native-backend")]
+    pub(crate) fn native_recurrent_runner_mut(
+        &mut self,
+    ) -> Option<&mut crate::native_decode::NativeDecodeSession> {
+        self.runner.as_mut().and_then(DecodeRunner::native_recurrent_mut)
+    }
+
     pub(crate) fn rewind_runner(&mut self, target_len: usize) -> anyhow::Result<()> {
         if target_len != 0 && !self.loop_state.is_empty() {
             anyhow::bail!(

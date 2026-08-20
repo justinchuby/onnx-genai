@@ -174,8 +174,11 @@ impl NativeDecodeSession {
             .collect();
         for (name, tensor) in &mut self.past {
             // Recurrent states are destructive rolling caches with no per-step
-            // history to slice; leave them intact (greedy decode never rewinds,
-            // and speculative rewind of a recurrent state is unsupported).
+            // history to slice; leave them intact here. Greedy decode never
+            // rewinds, and a speculative rewind commits them out-of-band via
+            // `snapshot_recurrent_state` + `commit_recurrent_state_to_accepted`
+            // (snapshot the pre-draft state, then re-advance by the accepted
+            // tokens) rather than prefix-slicing them.
             if recurrent_names.contains(name) {
                 continue;
             }
