@@ -181,6 +181,46 @@ Vulkan 后端就存在只注册 `Conversion` 而不注册 `Buffer` 的 dtype(bf1
 `ONNX_GENAI_EP=cubecl-webgpu` 下,设备缺 `shader-f16` 与 EP 未实现某 dtype 是两条
 不同的拒绝消息,便于区分是硬件限制还是功能缺口。
 
+## MatMul 有两个 kernel
+
+`matmul_tiled` 每个 thread 算一个输出元素,内层是两次 shared 读换一次 FMA——
+算术强度 0.5,瓶颈在 shared memory 而不是 ALU。在足够大的形状上实测只有
+391 GFLOP/s,是官方 WebGPU EP 的 1/3.6。
+
+`matmul_regtiled` 让每个 thread 在寄存器里持有 8x8 的累加块:一轮内层循环读
+`TM + TN = 16` 个值、发 `TM * TN = 64` 个 FMA,强度 4.0。分块参数受 WebGPU
+可移植 baseline 卡死,改任何一个之前请先核对这四行:
+
+| 约束 | 值 | 上限 |
+|---|---|---|
+| workgroup `(BN/TN) x (BM/TM)` | 16x16 = 256 | 256(可移植上限) |
+| shared `BM*BK + BK*BN` | 2048 elem = 8 KiB(f32) | 16 KiB |
+| staging `BM*BK/256`、`BK*BN/256` | 4、4 | 必须整除,否则要加边界检查 |
+| 累加寄存器 `TM*TN` | 64 个 f32 | 太大会掉 occupancy |
+
+`lhs_tile` 按 `[BK][BM]` 转置存放,让内层对 A 的读和对 B 的读一样连续。
+**实测这一项没有可测量收益**(比值 2.04 → 2.06,落在噪声里),留着是因为它不
+慢且在更大 tile 下理论有利,不是因为量到了收益。别把它当成已验证的优化去
+推广。
+
+### 为什么小形状不走 regtiled
+
+`REGTILE_MIN_M = 128`。128x128 的输出块在 `M = 1` 的 GEMV(decode step 就是
+这个形状)上有 127/128 是 padding,cube 数也会塌到填不满 GPU。阈值只看 `M`,
+因为我们在意的形状里 `N`/`K` 都大,`M` 才是会塌的那一维。
+
+### 测这两个 kernel 时的陷阱
+
+两个 kernel 计算的是**同一个函数**,所以一个数值正确性测试无法区分它走了哪
+条路——dispatch 若静默回退,测试照样绿。因此测试是成对的:
+`gpu_test_shapes_select_the_register_tiled_path` 钉住路径选择,
+`regtiled_matmul_*` 验证数值。改 `REGTILE_MIN_M` 或分块常量会让前者失败,这
+是**故意的**,提醒你同步更新 GPU 测试的形状。
+
+另外记一个**没有判别力**的对照,免得再走一遍:去掉 lhs staging 的 `gc < k`
+边界检查,整套测试仍然全绿——因为 rhs 那一侧的 zero-pad 把污染吃掉了。两侧
+zero-pad 是冗余的。有判别力的对照是往累加里加常量。
+
 ### MatMul 用 f32 累加
 
 f16 MatMul 的 staging tile 保持 f16(带宽收益的来源),但累加器是 f32。原因是 f16 的
@@ -296,14 +336,49 @@ plugin,逐 cell 做 CPU EP 参考对拍,并从 ORT profile 读回节点的实际
 ## 与官方 WebGPU EP 的实测对比
 
 见 [`docs/benchmarks/2026-08-20-cubecl-webgpu-vs-ort-webgpu.md`](../../docs/benchmarks/2026-08-20-cubecl-webgpu-vs-ort-webgpu.md)。
-两条要点:
+要点:
 
-- **端到端每次 `Run` 比官方慢约 1.3–2.1x**,但这个差距**与工作量无关**(从
-  add/small 到 add/large 工作量差几个数量级,比值不变),而 warmed profile 显示
-  node dur 只有 8–9 us 而 wall 是 ~962 us。**优化目标是每次 Run 的固定路径,不是
-  shader**。那张表几乎没测到 kernel。
+- **小形状(≤16.8 MFLOP)下比官方慢约 1.3–2.1x,但那张表几乎没测到 kernel。**
+  warmed profile 显示 node dur 只有 8–9 us 而 wall 是 ~962 us,且比值在工作量
+  差几个数量级时不变 —— 这是 per-Run 固定开销主导的特征。
+- **形状放大到 GFLOP 量级后,差距换了一个来源。** 比值随工作量单调上升
+  (1.64 → 2.56 → 3.34),用增量法消掉固定开销后得到纯 kernel 吞吐:CubeCL
+  391 GFLOP/s vs 官方 1400 GFLOP/s。**真正的瓶颈是 GEMM 实现本身。**
+  `matmul_regtiled` 把这个比值压到 **1.77x**,仍未超过官方。
+- **绝对微秒数不可跨运行比较。** 官方 arm 代码不变,同一天中位数从 6441us
+  漂到 8807us。只有同一次运行内的 cubecl:official 比值可用。
 - **f16 MatMul 精度优于官方**:我们与 ORT CPU 参考逐元素相等(`max_abs = 0`),
   官方最高 1.19。原因就是上面的 f32 累加 —— 这是一个用速度换精度的明确取舍。
+- **provider option 的 key 不带 `ep.<provider>.` 前缀。** 走 plugin EP API 时
+  带前缀的 key 会被静默忽略。benchmark 脚本里有哨兵自检强制这一点。
+
+## 跑 ResNet 还缺什么
+
+调研过 ResNet-50 v2(ONNX Model Zoo,opset 7)。**只补 Conv 是不够的**:按当前
+`SUPPORTED_OPS` 做 dataflow partition 模拟,原始图会碎成 54 个 GPU island,
+补上 Conv 后仍有 35 个,而官方 WebGPU EP 是 110/110 节点单段、零 CPU fallback。
+碎成几十段之后 GPU↔CPU 往返会淹没任何 kernel 层面的改进。
+
+要让 ResNet 端到端数字有意义,至少需要:
+
+| 算子 | 出现次数(ORT 优化后) | 备注 |
+|---|---|---|
+| `Conv` / `com.microsoft::FusedConv` | 53 | 36 个是 1x1,建议直接走 GEMM;3x3/7x7 走 implicit GEMM |
+| `BatchNormalization` | 18 | ORT 只折叠掉 33 个,剩下的仍要实现 |
+| `Add` | 16 | 已有 |
+| `Relu` | 17 | 已有 |
+| `Gemm` | 1 | 可复用 MatMul,需 `transB` 和 bias |
+| `MaxPool` / `GlobalAveragePool` / `Reshape` | 各 1 | |
+
+另外官方 WebGPU EP 的优化图走 `com.ms.internal.nhwc` 布局并插了 2 个
+`Transpose`;若要对齐它的布局口径还需额外考虑。
+
+**graph capture 的口径问题**:官方 EP 支持 `enableGraphCapture`,在 ResNet 上
+粗测 steady-state 从 ~0.84ms 降到 ~0.38ms。它省的是 CPU 侧每 Run 的 per-node
+录制成本(bind group 创建、command 组装、dispatch validation),不省 GPU kernel
+时间。要正确使用必须走 `OrtIoBinding` + 常驻 GPU 的输入输出,否则 capture 会
+replay 到固定 buffer 上而读不到新输入(实测 `max_abs = 115.281`)。做 ResNet
+对比时这一项必须两边口径一致。
 
 ## 正式来源
 
