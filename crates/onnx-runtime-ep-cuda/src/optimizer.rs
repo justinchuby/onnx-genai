@@ -3882,11 +3882,6 @@ mod tests {
         );
     }
 
-    /// Serializes the RMSNorm-fold floor tests that mutate the process-wide
-    /// `RMSNORM_FUSION_MIN_HIDDEN_ENV` against the ones that read it through the
-    /// pass, so a concurrent env override cannot flip an unrelated floor test.
-    static RMSNORM_FLOOR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn value(graph: &mut Graph, name: &str, dtype: DataType, width: usize) -> ValueId {
         graph.create_named_value(name, dtype, vec![Dim::Static(1), Dim::Static(width)])
     }
@@ -5986,6 +5981,9 @@ mod tests {
 
     #[test]
     fn fusion_benefit_gate_is_device_derived() {
+        // Serialise against the parallel harness: this reads the real
+        // `ONNX_GENAI_RMSNORM_MIN_HIDDEN` default through `fusion_benefit_is_positive`.
+        let _env = EnvVarGuard::without_var(RMSNORM_FUSION_MIN_HIDDEN_ENV);
         let h200 = CudaDeviceCapabilities::for_test((9, 0), 132, 0);
         let rtx4060 = CudaDeviceCapabilities::for_test((8, 9), 24, 0);
         // Hidden 896 (== qwen 0.5B, granite-1B MoE is 1024): below the H200 floor
@@ -6006,6 +6004,9 @@ mod tests {
 
     #[test]
     fn device_aware_gate_folds_small_hidden_on_consumer_gpu() {
+        // Serialise against the parallel harness: the pass reads the real
+        // `ONNX_GENAI_RMSNORM_MIN_HIDDEN` default through `fusion_benefit_is_positive`.
+        let _env = EnvVarGuard::without_var(RMSNORM_FUSION_MIN_HIDDEN_ENV);
         // A fully fusable hidden-896 chain that the H200 floor (and the None
         // fallback) keep unfused, but a 24-SM consumer GPU folds — capturing the
         // M>=2 structural win on the exact small models (#1421). The fold changes
@@ -6040,24 +6041,24 @@ mod tests {
 
     #[test]
     fn rmsnorm_min_hidden_env_override_wins_over_device_derivation() {
-        let _serial = RMSNORM_FLOOR_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // `fusion_benefit_is_positive` resolves its floor as
         // `env_usize(RMSNORM_FUSION_MIN_HIDDEN_ENV, derived_min_hidden(sm))`, so the
         // override precedence is exactly `env_usize`'s: a set value replaces the
         // derived default. Exercise that mechanism through a dedicated throwaway
-        // var so this test cannot perturb the real floor other tests read.
+        // var so this test cannot perturb the real floor other tests read. The
+        // EnvVarGuard serialises on the process-global env lock and restores the
+        // probe var on drop, so it cannot race the parallel harness.
         const PROBE: &str = "ONNX_GENAI_TEST_RMSNORM_OVERRIDE_PROBE";
+        let mut env = EnvVarGuard::without_var(PROBE);
         let derived = derived_min_hidden(24); // 256, the RTX 4060 default
         assert_eq!(
             env_usize(PROBE, derived),
             derived,
             "unset -> derived default"
         );
-        unsafe { std::env::set_var(PROBE, "4096") };
+        env.set(PROBE, "4096");
         assert_eq!(env_usize(PROBE, derived), 4096, "set -> override wins");
-        unsafe { std::env::remove_var(PROBE) };
+        env.unset(PROBE);
         assert_eq!(
             env_usize(PROBE, derived),
             derived,
