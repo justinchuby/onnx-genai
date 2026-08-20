@@ -1792,6 +1792,20 @@
         }
       ]
     },
+    "LiteralValue": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ScalarValue"
+        },
+        {
+          "items": {
+            "$ref": "#/$defs/ScalarValue"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "A literal tensor initializer.\n\nA single scalar broadcasts to every element of the declared contract, which\ncovers flags, counters, and zero-filled buffers. Workflows whose constants\nare genuinely per-position -- interleaved stream delay patterns, per-stream\ninitial tokens, fixed schedule tables -- declare the elements explicitly in\nrow-major order instead, so the value stays inside the metadata document and\ndoes not become an out-of-band artifact."
+    },
     "LoopStatePair": {
       "description": "One fixed-shape loop-carried recurrent-state port pair.\n\nGeneric and architecture-neutral: the runtime zero/other-initializes `input`\non the first step, runs the graph, and copies `output` back into `input` for\nthe next step (`replace` update). This models any fixed recurrent tensor\n(convolution state, linear-attention recurrent state, and so on) without\nreferencing a model family. It is intentionally distinct from growing KV\nstate, whose logical cells and storage service are declared by a workflow.",
       "properties": {
@@ -4024,7 +4038,7 @@
         "default": {
           "anyOf": [
             {
-              "$ref": "#/$defs/ScalarValue"
+              "$ref": "#/$defs/LiteralValue"
             },
             {
               "type": "null"

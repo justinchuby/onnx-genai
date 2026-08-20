@@ -13,9 +13,9 @@ use crate::{
 };
 use anyhow::Context;
 use onnx_genai_metadata::{
-    CompiledWorkflow, ComponentImplementation, DeviceKind, PreprocessingSpec, RuntimeInputRole,
-    ScalarValue, TensorContract, TensorDimension, WorkflowEmitMode, WorkflowInputSource,
-    WorkflowNode, WorkflowSpec,
+    CompiledWorkflow, ComponentImplementation, DeviceKind, LiteralValue, PreprocessingSpec,
+    RuntimeInputRole, ScalarValue, TensorContract, TensorDimension, WorkflowEmitMode,
+    WorkflowInputSource, WorkflowNode, WorkflowSpec,
 };
 use onnx_genai_ort::{
     DataType, PipelineModelDirectory, PipelineModels, SessionOptions, Tokenizer, Value,

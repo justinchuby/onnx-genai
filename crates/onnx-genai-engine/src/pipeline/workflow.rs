@@ -2331,107 +2331,117 @@ fn workflow_request_value(
     }
 }
 
-fn workflow_literal_value(
+fn literal_element_bytes(
     scalar: &ScalarValue,
-    contract: &TensorContract,
-) -> anyhow::Result<Value> {
-    let shape = literal_shape(contract)?;
-    let numel = shape_numel(&shape);
+    dtype: &str,
+) -> anyhow::Result<(Vec<u8>, DataType)> {
     match scalar {
-        ScalarValue::Integer(value) => {
-            let (bytes, dtype) = match contract.dtype.as_str() {
-                "int64" => (value.to_le_bytes().repeat(numel), DataType::Int64),
-                "int32" => (
-                    i32::try_from(*value)
-                        .context("integer literal exceeds int32")?
-                        .to_le_bytes()
-                        .repeat(numel),
-                    DataType::Int32,
-                ),
-                "int16" => (
-                    i16::try_from(*value)
-                        .context("integer literal exceeds int16")?
-                        .to_le_bytes()
-                        .repeat(numel),
-                    DataType::Int16,
-                ),
-                "int8" => (
-                    vec![
-                        i8::try_from(*value).context("integer literal exceeds int8")? as u8;
-                        numel
-                    ],
-                    DataType::Int8,
-                ),
-                "uint64" => (
-                    u64::try_from(*value)
-                        .context("integer literal is negative")?
-                        .to_le_bytes()
-                        .repeat(numel),
-                    DataType::Uint64,
-                ),
-                "uint32" => (
-                    u32::try_from(*value)
-                        .context("integer literal exceeds uint32")?
-                        .to_le_bytes()
-                        .repeat(numel),
-                    DataType::Uint32,
-                ),
-                "uint16" => (
-                    u16::try_from(*value)
-                        .context("integer literal exceeds uint16")?
-                        .to_le_bytes()
-                        .repeat(numel),
-                    DataType::Uint16,
-                ),
-                "uint8" => (
-                    vec![u8::try_from(*value).context("integer literal exceeds uint8")?; numel],
-                    DataType::Uint8,
-                ),
-                _ => anyhow::bail!(
-                    "integer workflow literal is incompatible with declared dtype '{}'",
-                    contract.dtype
-                ),
-            };
-            Value::from_raw_bytes(bytes, &shape, dtype).map_err(Into::into)
-        }
-        ScalarValue::Float(value) => {
-            let (bytes, dtype) = match contract.dtype.as_str() {
-                "float32" | "fp32" => (
-                    (*value as f32).to_le_bytes().repeat(numel),
-                    DataType::Float32,
-                ),
-                "float16" | "fp16" => (
-                    half::f16::from_f64(*value)
-                        .to_bits()
-                        .to_le_bytes()
-                        .repeat(numel),
-                    DataType::Float16,
-                ),
-                "bfloat16" | "bf16" => (
-                    half::bf16::from_f64(*value)
-                        .to_bits()
-                        .to_le_bytes()
-                        .repeat(numel),
-                    DataType::BFloat16,
-                ),
-                _ => anyhow::bail!(
-                    "floating-point workflow literal is incompatible with declared dtype '{}'",
-                    contract.dtype
-                ),
-            };
-            Value::from_raw_bytes(bytes, &shape, dtype).map_err(Into::into)
-        }
-        ScalarValue::Bool(value) if contract.dtype == "bool" => {
-            Value::from_raw_bytes(vec![u8::from(*value); numel], &shape, DataType::Bool)
-                .map_err(Into::into)
+        ScalarValue::Integer(value) => match dtype {
+            "int64" => Ok((value.to_le_bytes().to_vec(), DataType::Int64)),
+            "int32" => Ok((
+                i32::try_from(*value)
+                    .context("integer literal exceeds int32")?
+                    .to_le_bytes()
+                    .to_vec(),
+                DataType::Int32,
+            )),
+            "int16" => Ok((
+                i16::try_from(*value)
+                    .context("integer literal exceeds int16")?
+                    .to_le_bytes()
+                    .to_vec(),
+                DataType::Int16,
+            )),
+            "int8" => Ok((
+                vec![i8::try_from(*value).context("integer literal exceeds int8")? as u8],
+                DataType::Int8,
+            )),
+            "uint64" => Ok((
+                u64::try_from(*value)
+                    .context("integer literal is negative")?
+                    .to_le_bytes()
+                    .to_vec(),
+                DataType::Uint64,
+            )),
+            "uint32" => Ok((
+                u32::try_from(*value)
+                    .context("integer literal exceeds uint32")?
+                    .to_le_bytes()
+                    .to_vec(),
+                DataType::Uint32,
+            )),
+            "uint16" => Ok((
+                u16::try_from(*value)
+                    .context("integer literal exceeds uint16")?
+                    .to_le_bytes()
+                    .to_vec(),
+                DataType::Uint16,
+            )),
+            "uint8" => Ok((
+                vec![u8::try_from(*value).context("integer literal exceeds uint8")?],
+                DataType::Uint8,
+            )),
+            _ => anyhow::bail!(
+                "integer workflow literal is incompatible with declared dtype '{dtype}'"
+            ),
+        },
+        ScalarValue::Float(value) => match dtype {
+            "float32" | "fp32" => Ok(((*value as f32).to_le_bytes().to_vec(), DataType::Float32)),
+            "float16" | "fp16" => Ok((
+                half::f16::from_f64(*value).to_bits().to_le_bytes().to_vec(),
+                DataType::Float16,
+            )),
+            "bfloat16" | "bf16" => Ok((
+                half::bf16::from_f64(*value).to_bits().to_le_bytes().to_vec(),
+                DataType::BFloat16,
+            )),
+            _ => anyhow::bail!(
+                "floating-point workflow literal is incompatible with declared dtype '{dtype}'"
+            ),
+        },
+        ScalarValue::Bool(value) if dtype == "bool" => {
+            Ok((vec![u8::from(*value)], DataType::Bool))
         }
         ScalarValue::String(_) => {
             anyhow::bail!("string literal workflow inputs require an adapter binding")
         }
-        _ => anyhow::bail!(
-            "workflow literal is incompatible with declared dtype '{}'",
-            contract.dtype
-        ),
+        _ => anyhow::bail!("workflow literal is incompatible with declared dtype '{dtype}'"),
+    }
+}
+
+fn workflow_literal_value(
+    literal: &LiteralValue,
+    contract: &TensorContract,
+) -> anyhow::Result<Value> {
+    let shape = literal_shape(contract)?;
+    let numel = shape_numel(&shape);
+    match literal {
+        // One scalar broadcasts to the whole tensor.
+        LiteralValue::Scalar(scalar) => {
+            let (bytes, dtype) = literal_element_bytes(scalar, contract.dtype.as_str())?;
+            Value::from_raw_bytes(bytes.repeat(numel), &shape, dtype).map_err(Into::into)
+        }
+        // Explicit elements are laid out row-major and must fill the contract.
+        LiteralValue::Elements(elements) => {
+            if elements.len() != numel {
+                anyhow::bail!(
+                    "workflow literal declares {} elements but its contract holds {numel}",
+                    elements.len()
+                );
+            }
+            let mut bytes = Vec::new();
+            let mut element_dtype = None;
+            for element in elements {
+                let (encoded, dtype) = literal_element_bytes(element, contract.dtype.as_str())?;
+                if *element_dtype.get_or_insert(dtype) != dtype {
+                    anyhow::bail!("workflow literal mixes element types");
+                }
+                bytes.extend_from_slice(&encoded);
+            }
+            let dtype = element_dtype
+                .context("workflow literal element list must not be empty")?;
+            Value::from_raw_bytes(bytes, &shape, dtype).map_err(Into::into)
+        }
     }
 }
 
@@ -3800,18 +3810,52 @@ service_group: decoder_cache
     fn literals_and_append_support_declared_runtime_dtypes() {
         let int_contract: TensorContract =
             serde_yaml::from_str("{ dtype: int16, rank: 1, shape: [2] }").expect("contract");
-        let integer =
-            workflow_literal_value(&ScalarValue::Integer(7), &int_contract).expect("int16 literal");
+        let integer = workflow_literal_value(
+            &LiteralValue::Scalar(ScalarValue::Integer(7)),
+            &int_contract,
+        )
+        .expect("int16 literal");
         assert_eq!(integer.dtype(), DataType::Int16);
 
         let half_contract: TensorContract =
             serde_yaml::from_str("{ dtype: float16, rank: 1, shape: [2] }").expect("contract");
-        let left =
-            workflow_literal_value(&ScalarValue::Float(1.0), &half_contract).expect("half literal");
-        let right =
-            workflow_literal_value(&ScalarValue::Float(2.0), &half_contract).expect("half literal");
+        let left = workflow_literal_value(
+            &LiteralValue::Scalar(ScalarValue::Float(1.0)),
+            &half_contract,
+        )
+        .expect("half literal");
+        let right = workflow_literal_value(
+            &LiteralValue::Scalar(ScalarValue::Float(2.0)),
+            &half_contract,
+        )
+        .expect("half literal");
         let appended = append_workflow_value(&left, &right).expect("half append");
         assert_eq!(appended.dtype(), DataType::Float16);
         assert_eq!(appended.shape(), &[4]);
+    }
+
+    #[test]
+    fn element_literals_carry_per_position_constants() {
+        // Interleaved full-duplex models publish a per-stream delay pattern; it
+        // is a tensor constant, not a broadcast scalar.
+        let contract: TensorContract =
+            serde_yaml::from_str("{ dtype: int64, rank: 1, shape: [5] }").expect("contract");
+        let delays = LiteralValue::Elements(vec![
+            ScalarValue::Integer(0),
+            ScalarValue::Integer(0),
+            ScalarValue::Integer(1),
+            ScalarValue::Integer(1),
+            ScalarValue::Integer(1),
+        ]);
+        let value = workflow_literal_value(&delays, &contract).expect("delay literal");
+        assert_eq!(value.dtype(), DataType::Int64);
+        assert_eq!(value.shape(), &[5]);
+        assert_eq!(value.to_vec_i64().expect("elements"), vec![0, 0, 1, 1, 1]);
+
+        let short = LiteralValue::Elements(vec![ScalarValue::Integer(0)]);
+        let Err(error) = workflow_literal_value(&short, &contract) else {
+            panic!("element count must be checked against the contract");
+        };
+        assert!(error.to_string().contains("elements"), "{error}");
     }
 }

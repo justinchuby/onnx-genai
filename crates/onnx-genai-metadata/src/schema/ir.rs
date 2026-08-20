@@ -112,6 +112,21 @@ pub enum ScalarValue {
     String(String),
 }
 
+/// A literal tensor initializer.
+///
+/// A single scalar broadcasts to every element of the declared contract, which
+/// covers flags, counters, and zero-filled buffers. Workflows whose constants
+/// are genuinely per-position -- interleaved stream delay patterns, per-stream
+/// initial tokens, fixed schedule tables -- declare the elements explicitly in
+/// row-major order instead, so the value stays inside the metadata document and
+/// does not become an out-of-band artifact.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum LiteralValue {
+    Scalar(ScalarValue),
+    Elements(Vec<ScalarValue>),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DeviceKind {
@@ -464,7 +479,7 @@ pub struct WorkflowInput {
     #[schemars(default = "default_true")]
     pub required: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default: Option<ScalarValue>,
+    pub default: Option<LiteralValue>,
     /// Initial scalar bool SSA value indicating whether the caller supplied this input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub present_as: Option<String>,
