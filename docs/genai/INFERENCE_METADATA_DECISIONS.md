@@ -1170,6 +1170,26 @@ The remaining steps, in order, each independently shippable:
 graph and is unchanged here: it describes a model with no workflow component of
 its own, so it needs a canonical component before it can follow this path.
 
+#### The `ModelIoSpec` type is not the `model.io` key
+
+These two share a name and are routinely mistaken for each other, including by
+a downstream producer who read `StaticCacheDecodeSession::new(.., io: Option<&ModelIoSpec>)`
+as proof that the scatter driver *requires* a serialized `model.io.static_cache`
+block, and concluded that the driver and the coexistence rule were jointly
+unsatisfiable. They are not. The parameter is the **resolved** decode ABI —
+whatever `decoder_io()` returned — and for a workflow package that value is
+synthesized from the `state_service` group's `indexed_scatter` update and the
+decoder component's port roles. Nothing reads the serialized key.
+
+A type signature cannot show this, so it is pinned against a real graph instead.
+`crates/onnx-genai-ort/tests/workflow_derived_static_cache.rs` loads
+`tests/fixtures/tiny-llm-scatter-workflow/`, a package with **no `model:` block
+at all**, resolves its ABI through `decoder_io()`, and drives the ONNX scatter
+fixture through `StaticCacheDecodeSession`: the graph classifies, prefill runs,
+and a decode step advances the write cursor by exactly one row position. The
+sibling `tests/fixtures/tiny-llm-scatter/` keeps the legacy `model.io` form so
+the import-only path stays covered, and the two are exercised separately.
+
 ---
 
 ## 19. Invariants
