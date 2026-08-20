@@ -533,7 +533,10 @@ mod l2_faithful_tests {
             eprintln!("skipping faithful L2-normalize parity test: CUDA runtime unavailable");
             return;
         };
-        if runtime.require_nvrtc_half_headers("LpNormalization").is_err() {
+        if runtime
+            .require_nvrtc_half_headers("LpNormalization")
+            .is_err()
+        {
             eprintln!("skipping faithful L2-normalize parity test: bf16 headers unavailable");
             return;
         }
@@ -545,7 +548,9 @@ mod l2_faithful_tests {
             let got = run_kernel(&runtime, true, groups, axis_length, &data);
             let mut expected = Vec::with_capacity(data.len());
             for g in 0..groups {
-                expected.extend(chain_reference(&data[g * axis_length..(g + 1) * axis_length]));
+                expected.extend(chain_reference(
+                    &data[g * axis_length..(g + 1) * axis_length],
+                ));
             }
             assert_eq!(
                 got, expected,
@@ -561,7 +566,10 @@ mod l2_faithful_tests {
             eprintln!("skipping faithful-vs-fp32 divergence test: CUDA runtime unavailable");
             return;
         };
-        if runtime.require_nvrtc_half_headers("LpNormalization").is_err() {
+        if runtime
+            .require_nvrtc_half_headers("LpNormalization")
+            .is_err()
+        {
             eprintln!("skipping faithful-vs-fp32 divergence test: bf16 headers unavailable");
             return;
         }
