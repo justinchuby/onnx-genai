@@ -795,6 +795,26 @@ Preprocessing uses typed semantic contracts. Implementations **MAY** be ONNX or
 native. A runtime **MUST NOT** infer preprocessing behavior from a model-family
 name.
 
+`preprocessing.image` and `preprocessing.audio` are the two declared programs.
+Both have the same shape — an ordered list of generic `transforms` plus named
+`outputs` that bind program-local values to workflow SSA names — and both draw
+their operation names and content roles from one open vocabulary per modality,
+so a new family adds a fixture, not a runtime branch. Every parameter is model
+**data**: a mel-bin count, an FFT size, a sample rate, and a target window all
+live in the package. A CTC acoustic model declares
+`resample`/`downmix`/`zero_mean_unit_variance` over raw samples; an
+encoder-decoder speech model declares `resample`/`pad`/`log_mel` over a fixed
+window. The runtime reads the same fields either way and never dispatches on
+which one it is.
+
+In workflow metadata each program is materialized by exactly one
+manifest-pinned adapter invocation (`onnx-genai.image-preprocess@1` or
+`onnx-genai.audio-preprocess@1`) that takes a `uint8` rank-1 `encoded` input,
+and every declared output **MUST** carry a `TensorContract` compatible with the
+adapter port it binds to. A package **MAY** instead hand the server an
+already-featurized media tensor by declaring a `media` runtime input with the
+full contract and no program; there the input's own shape states the geometry.
+
 Application policy inputs — a grammar, a JSON Schema, a regex — are **request
 data**, not metadata. What metadata carries is everything needed to interpret
 that request data correctly:

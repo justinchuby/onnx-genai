@@ -7,8 +7,7 @@ The decoder, VLM, diffusion, guided diffusion, masked diffusion, speculative,
 codec, video, and adapter packages contain executable synthetic models. The
 adapter package includes portable JSON and PEFT/safetensors artifacts. The TTS
 fixture uses the real tiny Qwen3-TTS producer graphs with deterministic
-synthetic weights. No
-downloaded model weights are included.
+synthetic weights. No downloaded model weights are included.
 
 ## Video diffusion fixture
 
