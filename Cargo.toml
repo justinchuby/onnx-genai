@@ -173,6 +173,22 @@ unsafe_op_in_unsafe_fn = "warn"
 [workspace.lints.clippy]
 # Widely-satisfied hygiene lints only.
 uninlined_format_args = "warn"
+# rustc/clippy 1.98.0 (2026-08-18) added `chunks_exact_to_as_chunks`, a warn-by-default
+# lint that fires at 201 call sites across 12 crates here and so turns every
+# `-D warnings` gate red the moment a runner picks up the new stable. This repo pins no
+# toolchain, so that is not opt-in.
+#
+# It is also not uniformly auto-fixable: where the chunk size is an associated const of
+# a type parameter (`onnx-runtime-ir::read_vec_le` uses `T::BYTE_SIZE`), the suggested
+# `as_chunks::<T::BYTE_SIZE>()` fails to compile — "generic parameters may not be used
+# in const operations". Verified directly against rustc 1.98.0.
+#
+# Allowed centrally so a toolchain bump cannot gate unrelated work. Migrating the sites
+# that do benefit (`as_chunks` yields `&[T; N]`, dropping fallible `try_into` and helping
+# codegen) is worth doing per-crate by each owner, not as one 201-site emergency rewrite:
+# tracked in #1606, which also owns deleting this line. #1605 covers pinning the toolchain
+# so the next new stable lint is not an outage.
+chunks_exact_to_as_chunks = "allow"
 
 [workspace.dependencies]
 # Internal crates
