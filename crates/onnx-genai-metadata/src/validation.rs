@@ -234,7 +234,6 @@ pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>
         );
     }
     validate_preprocessing_workflow(metadata, &mut errors);
-    validate_audio_preprocessing_workflow(metadata, &mut errors);
     validate_generation_contract(metadata, &mut errors);
     validate_profiles(metadata, &mut errors);
     validate_profile_decoding(metadata, &mut errors);
@@ -577,10 +576,19 @@ fn validate_profile_decoding(metadata: &InferenceMetadata, errors: &mut Vec<Stri
     }
 }
 
-fn validate_preprocessing_workflow(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
-    const IMAGE_ABI: &str = "onnx-genai.image-preprocess";
-    const IMAGE_ABI_VERSION: &str = "1";
+/// One preprocessing output binding, viewed independently of its modality.
+///
+/// Image and audio programs bind processor-local values to typed SSA names
+/// under identical rules, so the workflow checks below are written once against
+/// this view rather than duplicated per modality.
+struct PreprocessingOutputView<'a> {
+    name: &'a str,
+    dtype: &'a str,
+    contract: Option<&'a crate::schema::TensorContract>,
+    optional: bool,
+}
 
+fn validate_preprocessing_workflow(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
     let Some(workflow) = metadata
         .pipeline
         .as_ref()
@@ -588,35 +596,83 @@ fn validate_preprocessing_workflow(metadata: &InferenceMetadata, errors: &mut Ve
     else {
         return;
     };
-    let image = metadata
-        .preprocessing
-        .as_ref()
-        .and_then(|spec| spec.image.as_ref());
+    let preprocessing = metadata.preprocessing.as_ref();
+    validate_preprocessing_program(
+        workflow,
+        "image",
+        "onnx-genai.image-preprocess",
+        preprocessing
+            .and_then(|spec| spec.image.as_ref())
+            .map(|program| {
+                program
+                    .outputs
+                    .iter()
+                    .map(|output| PreprocessingOutputView {
+                        name: &output.name,
+                        dtype: &output.dtype,
+                        contract: output.contract.as_ref(),
+                        optional: output.optional.unwrap_or(false),
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        errors,
+    );
+    validate_preprocessing_program(
+        workflow,
+        "audio",
+        "onnx-genai.audio-preprocess",
+        preprocessing
+            .and_then(|spec| spec.audio.as_ref())
+            .map(|program| {
+                program
+                    .outputs
+                    .iter()
+                    .map(|output| PreprocessingOutputView {
+                        name: &output.name,
+                        dtype: &output.dtype,
+                        contract: output.contract.as_ref(),
+                        optional: output.optional.unwrap_or(false),
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        errors,
+    );
+}
+
+fn validate_preprocessing_program(
+    workflow: &crate::schema::WorkflowSpec,
+    kind: &str,
+    abi: &str,
+    program_outputs: Option<Vec<PreprocessingOutputView<'_>>>,
+    errors: &mut Vec<String>,
+) {
+    const ABI_VERSION: &str = "1";
+
     let adapters = workflow
         .components
         .iter()
         .filter(|(_, component)| {
             matches!(
                 &component.implementation,
-                crate::schema::ComponentImplementation::Adapter { abi, version, .. }
-                    if abi == IMAGE_ABI && version == IMAGE_ABI_VERSION
+                crate::schema::ComponentImplementation::Adapter { abi: component_abi, version, .. }
+                    if component_abi == abi && version == ABI_VERSION
             )
         })
         .collect::<Vec<_>>();
-    if image.is_none() && !adapters.is_empty() {
+    if program_outputs.is_none() && !adapters.is_empty() {
         errors.push(format!(
-            "workflow adapter components using {IMAGE_ABI}@{IMAGE_ABI_VERSION} require \
-                 preprocessing.image metadata"
+            "workflow adapter components using {abi}@{ABI_VERSION} require \
+                 preprocessing.{kind} metadata"
         ));
         return;
     }
-    let Some(image) = image else {
+    let Some(program_outputs) = program_outputs else {
         return;
     };
     if adapters.len() != 1 {
         errors.push(format!(
-            "preprocessing.image requires exactly one workflow adapter component using \
-                 {IMAGE_ABI}@{IMAGE_ABI_VERSION}, found {}",
+            "preprocessing.{kind} requires exactly one workflow adapter component using \
+                 {abi}@{ABI_VERSION}, found {}",
             adapters.len()
         ));
         return;
@@ -625,12 +681,12 @@ fn validate_preprocessing_workflow(metadata: &InferenceMetadata, errors: &mut Ve
     match adapter.ports.inputs.get("encoded") {
         Some(contract) if contract.dtype == "uint8" && contract.rank == 1 => {}
         Some(contract) => errors.push(format!(
-            "workflow image preprocessing adapter '{adapter_name}' input 'encoded' must be uint8 \
+            "workflow {kind} preprocessing adapter '{adapter_name}' input 'encoded' must be uint8 \
                  rank 1, got {} rank {}",
             contract.dtype, contract.rank
         )),
         None => errors.push(format!(
-            "workflow image preprocessing adapter '{adapter_name}' must declare input 'encoded'"
+            "workflow {kind} preprocessing adapter '{adapter_name}' must declare input 'encoded'"
         )),
     }
 
@@ -675,40 +731,40 @@ fn validate_preprocessing_workflow(metadata: &InferenceMetadata, errors: &mut Ve
     collect_invocations(&compiled.graph, adapter_name, &mut invocations);
     if invocations.len() != 1 {
         errors.push(format!(
-            "workflow image preprocessing adapter '{adapter_name}' must be invoked exactly once, \
+            "workflow {kind} preprocessing adapter '{adapter_name}' must be invoked exactly once, \
                  found {} invocations",
             invocations.len()
         ));
         return;
     }
     let invocation_outputs = invocations[0];
-    for output in &image.outputs {
-        if output.optional.unwrap_or(false) {
+    for output in &program_outputs {
+        if output.optional {
             errors.push(format!(
-                "preprocessing.image output '{}' cannot be optional in a workflow; every declared \
+                "preprocessing.{kind} output '{}' cannot be optional in a workflow; every declared \
                  adapter SSA output must be materialized",
                 output.name
             ));
         }
-        let Some(contract) = &output.contract else {
+        let Some(contract) = output.contract else {
             errors.push(format!(
-                "preprocessing.image output '{}' must declare a TensorContract for workflow use",
+                "preprocessing.{kind} output '{}' must declare a TensorContract for workflow use",
                 output.name
             ));
             continue;
         };
         if contract.dtype != output.dtype {
             errors.push(format!(
-                "preprocessing.image output '{}' dtype '{}' disagrees with its TensorContract '{}'",
+                "preprocessing.{kind} output '{}' dtype '{}' disagrees with its TensorContract '{}'",
                 output.name, output.dtype, contract.dtype
             ));
         }
         let port = invocation_outputs
             .iter()
-            .find_map(|(port, value)| (value == &output.name).then_some(port));
+            .find_map(|(port, value)| (value == output.name).then_some(port));
         let Some(port) = port else {
             errors.push(format!(
-                "preprocessing.image output '{}' must be a declared SSA output of adapter \
+                "preprocessing.{kind} output '{}' must be a declared SSA output of adapter \
                      invocation '{adapter_name}'",
                 output.name
             ));
@@ -718,84 +774,12 @@ fn validate_preprocessing_workflow(metadata: &InferenceMetadata, errors: &mut Ve
             Some(port_contract) => require_compatible_tensor_contracts(
                 contract,
                 port_contract,
-                &format!("preprocessing.image output '{}'", output.name),
+                &format!("preprocessing.{kind} output '{}'", output.name),
                 errors,
             ),
             None => errors.push(format!(
-                "workflow image preprocessing adapter '{adapter_name}' has no output port '{port}'"
+                "workflow {kind} preprocessing adapter '{adapter_name}' has no output port '{port}'"
             )),
-        }
-    }
-}
-
-/// Mirrors `validate_preprocessing_workflow` for the audio preprocessing ABI.
-///
-/// `AudioOutputBinding` carries no `TensorContract`, so unlike the image
-/// program this only checks that every declared output names one of the
-/// adapter's declared output ports; it does not re-derive or cross-check a
-/// dtype/shape contract.
-fn validate_audio_preprocessing_workflow(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
-    const AUDIO_ABI: &str = "onnx-genai.audio-preprocess";
-    const AUDIO_ABI_VERSION: &str = "1";
-
-    let Some(workflow) = metadata
-        .pipeline
-        .as_ref()
-        .map(|pipeline| &pipeline.workflow)
-    else {
-        return;
-    };
-    let audio = metadata
-        .preprocessing
-        .as_ref()
-        .and_then(|spec| spec.audio.as_ref());
-    let adapters = workflow
-        .components
-        .iter()
-        .filter(|(_, component)| {
-            matches!(
-                &component.implementation,
-                crate::schema::ComponentImplementation::Adapter { abi, version, .. }
-                    if abi == AUDIO_ABI && version == AUDIO_ABI_VERSION
-            )
-        })
-        .collect::<Vec<_>>();
-    if audio.is_none() && !adapters.is_empty() {
-        errors.push(format!(
-            "workflow adapter components using {AUDIO_ABI}@{AUDIO_ABI_VERSION} require \
-                 preprocessing.audio metadata"
-        ));
-        return;
-    }
-    let Some(audio) = audio else {
-        return;
-    };
-    if adapters.len() != 1 {
-        errors.push(format!(
-            "preprocessing.audio requires exactly one workflow adapter component using \
-                 {AUDIO_ABI}@{AUDIO_ABI_VERSION}, found {}",
-            adapters.len()
-        ));
-        return;
-    }
-    let (adapter_name, adapter) = adapters[0];
-    match adapter.ports.inputs.get("encoded") {
-        Some(contract) if contract.dtype == "uint8" && contract.rank == 1 => {}
-        Some(contract) => errors.push(format!(
-            "workflow audio preprocessing adapter '{adapter_name}' input 'encoded' must be uint8 \
-                 rank 1, got {} rank {}",
-            contract.dtype, contract.rank
-        )),
-        None => errors.push(format!(
-            "workflow audio preprocessing adapter '{adapter_name}' must declare input 'encoded'"
-        )),
-    }
-    for output in &audio.outputs {
-        if !adapter.ports.outputs.contains_key(&output.name) {
-            errors.push(format!(
-                "preprocessing.audio output '{}' is not produced by adapter '{adapter_name}'",
-                output.name
-            ));
         }
     }
 }
@@ -814,9 +798,13 @@ fn require_compatible_tensor_contracts(
             other => other,
         }
     }
+    // batch_layout is part of the contract: a preprocessing output that claims a
+    // different row correspondence than the port it feeds would let per-request
+    // rows drift out of alignment with the rest of the workflow.
     if normalize(&source.dtype) != normalize(&target.dtype)
         || source.rank != target.rank
         || source.shape != target.shape
+        || source.batch_layout != target.batch_layout
     {
         errors.push(format!(
             "{path} has a contract incompatible with its adapter output port"

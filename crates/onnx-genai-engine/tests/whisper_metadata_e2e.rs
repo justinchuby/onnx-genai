@@ -103,7 +103,10 @@ fn transcribe_request(
         "request.max_iterations",
         Value::from_slice_i64(&[i64::try_from(max_new_tokens)?], &[1])?,
     )
-    .with_input("package.slot_ids", Value::from_slice_i64(&slot_ids, &[rows])?)
+    .with_input(
+        "package.slot_ids",
+        Value::from_slice_i64(&slot_ids, &[rows])?,
+    )
     .with_input(
         "request.prompt_lengths",
         Value::from_slice_i64(&vec![prompt_len; batch], &[rows])?,
@@ -156,10 +159,7 @@ fn transcribe_request(
         "request.min_p",
         Value::from_slice_f32(&vec![0.0_f32; batch], &[rows])?,
     )
-    .with_input(
-        "request.seed",
-        Value::from_slice_i64(&slot_ids, &[rows])?,
-    )
+    .with_input("request.seed", Value::from_slice_i64(&slot_ids, &[rows])?)
     .with_input(
         "request.rng_counter",
         Value::from_slice_i64(&vec![0_i64; batch], &[rows])?,
@@ -228,7 +228,8 @@ fn imported_whisper_workflow_keeps_rows_aligned_across_lengths() -> anyhow::Resu
     long_then_short.extend_from_slice(&short);
     let mut short_then_long = short.clone();
     short_then_long.extend_from_slice(&long);
-    let forward_output = engine.run_pipeline_outputs(transcribe_request(&long_then_short, 2, 64)?)?;
+    let forward_output =
+        engine.run_pipeline_outputs(transcribe_request(&long_then_short, 2, 64)?)?;
     let forward = rows_of(&engine, &forward_output)?;
     let reversed_output =
         engine.run_pipeline_outputs(transcribe_request(&short_then_long, 2, 64)?)?;

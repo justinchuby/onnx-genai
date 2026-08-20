@@ -277,6 +277,12 @@ mod schema_vocabulary {
 
     extensible_string!(
         /// Generic audio transform-operation vocabulary.
+        ///
+        /// One vocabulary spans every declared audio program. A CTC acoustic
+        /// model normalizes raw samples and never builds a spectrogram; a
+        /// speech-to-text encoder pads to a fixed window and takes a log-mel.
+        /// Both are the same kind of declaration, so both draw their operation
+        /// names from here rather than from a per-family list.
         AudioTransformOp,
         audio_transform_op,
         AUDIO_TRANSFORM_OP,
@@ -290,7 +296,11 @@ mod schema_vocabulary {
             "pad",
             "trim",
             "frame",
+            "spectrogram",
+            "log_mel",
             "log_mel_spectrogram",
+            "emit_valid_frames",
+            "emit_valid_samples",
             "emit_sample_lengths",
             "emit_validity_mask"
         ]
@@ -304,6 +314,9 @@ mod schema_vocabulary {
         [
             "waveform",
             "features",
+            "audio_features",
+            "valid_frames",
+            "valid_samples",
             "sample_lengths",
             "frame_lengths",
             "validity_mask"
@@ -500,16 +513,16 @@ mod schema_helpers {
         extensible_string_enum(schema, super::schema_vocabulary::IMAGE_OUTPUT_CONTENT);
     }
 
-    pub(super) fn thumbnail_order(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::THUMBNAIL_ORDER);
-    }
-
     pub(super) fn audio_transform_op(schema: &mut Schema) {
         extensible_string_enum(schema, super::schema_vocabulary::AUDIO_TRANSFORM_OP);
     }
 
     pub(super) fn audio_output_content(schema: &mut Schema) {
         extensible_string_enum(schema, super::schema_vocabulary::AUDIO_OUTPUT_CONTENT);
+    }
+
+    pub(super) fn thumbnail_order(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::THUMBNAIL_ORDER);
     }
 
     pub(super) fn sequence_decoding_kind(schema: &mut Schema) {

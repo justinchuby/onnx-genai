@@ -53,12 +53,12 @@ preprocessing:
         source: audio.transform_4
         content: waveform
         dtype: float32
-        rank: 2
+        contract: { dtype: float32, rank: 2, shape: [batch, samples] }
       - name: attention_mask
         source: audio.output_validity_mask
         content: validity_mask
         dtype: int64
-        rank: 2
+        contract: { dtype: int64, rank: 2, shape: [batch, samples] }
 profiles:
   transcription:
     kind: transcription
@@ -364,12 +364,17 @@ preprocessing:
         source: audio.transform_0
         content: waveform
         dtype: float32
-        rank: 2
+        contract: { dtype: float32, rank: 2, shape: [batch, samples] }
 pipeline:
   workflow:
     manifest:
       ir_version: "1.0"
       capabilities: [workflow_ssa]
+    inputs:
+      request.audio:
+        contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+        role: { kind: runtime, version: "1.0", role: media }
+        source: { kind: request }
     components:
       audio_preprocess:
         implementation: { kind: adapter, abi: onnx-genai.audio-preprocess, version: "1" }
@@ -378,13 +383,17 @@ pipeline:
             encoded: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
           outputs:
             input_values: { dtype: float32, rank: 2, shape: [batch, samples] }
-    steps: []
+    steps:
+      - kind: invoke
+        component: audio_preprocess
+        inputs: { encoded: request.audio }
+        outputs: { input_values: input_values }
 "#;
     let reported = errors(document);
     assert!(
         reported.iter().any(|error| error.contains(
-            "preprocessing.audio output 'mystery_output' is not produced by adapter \
-             'audio_preprocess'"
+            "preprocessing.audio output 'mystery_output' must be a declared SSA output of \
+             adapter invocation 'audio_preprocess'"
         )),
         "{reported:?}"
     );

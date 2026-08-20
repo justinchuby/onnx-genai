@@ -1198,3 +1198,170 @@ fn semantic_identity_ignores_how_a_number_was_spelled() {
         "a different temperature is a different contract"
     );
 }
+
+/// An encoder-conditioned audio workflow: encoded bytes enter as a request
+/// input, a declarative audio program turns them into a feature tensor, and the
+/// encoder consumes that tensor. The program is data — no model-family name and
+/// no runtime branch appears anywhere in the document.
+const AUDIO_PREPROCESSING_WORKFLOW: &str = r#"
+schema_version: v1
+preprocessing:
+  audio:
+    transforms:
+      - op: decode
+        outputs: [samples]
+      - op: resample
+        inputs: [samples]
+        outputs: [resampled]
+        sample_rate: 16000
+      - op: pad
+        inputs: [resampled]
+        outputs: [windowed]
+        mode: fixed_window
+        target_length: 480000
+        pad_value: 0.0
+      - op: log_mel
+        inputs: [windowed]
+        outputs: [mel]
+        num_mel_bins: 80
+        n_fft: 400
+        hop_length: 160
+        window: hann
+        mel_scale: slaney
+        sample_rate: 16000
+      - op: normalize
+        inputs: [mel]
+        outputs: [features]
+        mode: whisper_log_mel
+    outputs:
+      - source: features
+        name: audio.input_features
+        content: audio_features
+        dtype: float32
+        contract:
+          dtype: float32
+          rank: 3
+          shape: [batch, 80, audio_seq_len]
+          batch_layout: { kind: request_aligned, axis: 0 }
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 24 }
+      adapter_abis: { onnx-genai.audio-preprocess: "1" }
+      capabilities: [workflow_ssa, typed_emit, audio_preprocessing_program]
+    inputs:
+      request.audio:
+        contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+        role: { kind: opaque }
+        source: { kind: application, name: audio }
+    outputs:
+      encoder_states:
+        contract: { dtype: float32, rank: 3, shape: [batch, 1500, 384], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: tensor
+        stage: pre_adapter
+    components:
+      audio_preprocess:
+        implementation: { kind: adapter, abi: onnx-genai.audio-preprocess, version: "1" }
+        ports:
+          inputs:
+            encoded: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+          outputs:
+            input_features: { dtype: float32, rank: 3, shape: [batch, 80, audio_seq_len], batch_layout: { kind: request_aligned, axis: 0 } }
+      encoder:
+        implementation: { kind: onnx, artifact: encoder.onnx }
+        ports:
+          inputs:
+            input_features: { dtype: float32, rank: 3, shape: [batch, 80, audio_seq_len], batch_layout: { kind: request_aligned, axis: 0 } }
+          outputs:
+            encoder_hidden_states: { dtype: float32, rank: 3, shape: [batch, 1500, 384], batch_layout: { kind: request_aligned, axis: 0 } }
+    steps:
+      - kind: invoke
+        component: audio_preprocess
+        inputs: { encoded: request.audio }
+        outputs: { input_features: audio.input_features }
+      - kind: invoke
+        component: encoder
+        inputs: { input_features: audio.input_features }
+        outputs: { encoder_hidden_states: states }
+      - kind: emit
+        value: states
+        output: encoder_states
+        mode: replace
+"#;
+
+#[test]
+fn a_declarative_audio_program_is_expressible_in_a_workflow() {
+    validate_metadata(&parse(AUDIO_PREPROCESSING_WORKFLOW))
+        .expect("a typed audio preprocessing program is a valid workflow document");
+}
+
+#[test]
+fn an_audio_adapter_without_a_program_is_rejected() {
+    let document = AUDIO_PREPROCESSING_WORKFLOW
+        .split("pipeline:")
+        .nth(1)
+        .map(|rest| format!("schema_version: v1\npipeline:{rest}"))
+        .expect("the fixture declares a pipeline");
+
+    let errors = errors(&document);
+
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("require preprocessing.audio metadata")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn an_audio_output_without_a_contract_is_rejected() {
+    let document = AUDIO_PREPROCESSING_WORKFLOW.replace(
+        "        contract:\n          dtype: float32\n          rank: 3\n          shape: \
+         [batch, 80, audio_seq_len]\n          batch_layout: { kind: request_aligned, axis: 0 }\n",
+        "",
+    );
+
+    let errors = errors(&document);
+
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("must declare a TensorContract")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn an_audio_output_that_no_invocation_produces_is_rejected() {
+    let document =
+        AUDIO_PREPROCESSING_WORKFLOW.replace("name: audio.input_features", "name: audio.unbound");
+
+    let errors = errors(&document);
+
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("must be a declared SSA output")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn an_audio_feature_tensor_must_stay_request_aligned() {
+    let document = AUDIO_PREPROCESSING_WORKFLOW.replace(
+        "          batch_layout: { kind: request_aligned, axis: 0 }\n",
+        "          batch_layout: { kind: shared }\n",
+    );
+
+    let errors = errors(&document);
+
+    // A shared feature tensor would let encoder states drift away from the
+    // decoder rows that consume them, so the contract mismatch must fail closed.
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("preprocessing.audio output 'audio.input_features'")),
+        "{errors:?}"
+    );
+}

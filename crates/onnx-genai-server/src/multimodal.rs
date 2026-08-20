@@ -6,6 +6,7 @@ use anyhow::Context;
 use onnx_genai_engine::PipelineGenerateRequest;
 use onnx_genai_metadata::{RuntimeInputRole, SemanticInputRole};
 use onnx_genai_ort::{DataType, PipelineModelDirectory, PipelineModels, Tokenizer, Value};
+use onnx_genai_preprocess::audio::WHISPER_N_FRAMES;
 
 pub use crate::audio_input::{AudioInputSpec, AudioTensor, preprocess_samples, preprocess_wav};
 pub use crate::image_input::MAX_EXPANDED_PROMPT_TOKENS;
@@ -87,6 +88,10 @@ enum PreparedTensor {
         name: String,
         bytes: Vec<u8>,
     },
+    EncodedAudio {
+        name: String,
+        bytes: Vec<u8>,
+    },
     Audio {
         name: String,
         data: Vec<f32>,
@@ -116,6 +121,14 @@ impl MultimodalInput {
     }
 
     pub fn from_wav(spec: &AudioInputSpec, bytes: &[u8]) -> anyhow::Result<Self> {
+        if spec.encoded {
+            return Ok(Self {
+                tensors: vec![PreparedTensor::EncodedAudio {
+                    name: spec.endpoint.clone(),
+                    bytes: bytes.to_vec(),
+                }],
+            });
+        }
         let tensor = preprocess_wav(bytes, spec)?;
         Ok(Self {
             tensors: vec![PreparedTensor::Audio {
@@ -131,6 +144,17 @@ impl MultimodalInput {
         samples: &[f32],
         sample_rate: u32,
     ) -> anyhow::Result<Self> {
+        if spec.encoded {
+            // The package's own program decodes a container, so a caller that
+            // holds bare samples has to hand one back.
+            let bytes = crate::audio_input::encode_samples_wav(samples, sample_rate)?;
+            return Ok(Self {
+                tensors: vec![PreparedTensor::EncodedAudio {
+                    name: spec.endpoint.clone(),
+                    bytes,
+                }],
+            });
+        }
         let tensor = preprocess_samples(samples, sample_rate, spec)?;
         Ok(Self {
             tensors: vec![PreparedTensor::Audio {
@@ -149,6 +173,12 @@ impl MultimodalInput {
             let (name, value) = match tensor {
                 PreparedTensor::EncodedImage { name, bytes } => {
                     let shape = [i64::try_from(bytes.len()).context("encoded image is too large")?];
+                    let value = Value::from_raw_bytes(bytes, &shape, DataType::Uint8)?;
+                    (name, value)
+                }
+
+                PreparedTensor::EncodedAudio { name, bytes } => {
+                    let shape = [i64::try_from(bytes.len()).context("encoded audio is too large")?];
                     let value = Value::from_raw_bytes(bytes, &shape, DataType::Uint8)?;
                     (name, value)
                 }
@@ -277,15 +307,16 @@ pub fn build(
             )
         })
         .collect::<Vec<_>>();
+    let encoded_media = media_inputs
+        .iter()
+        .find(|(_, input)| input.contract.dtype == "uint8" && input.contract.rank == 1);
     let vision = if directory
         .preprocessing
         .as_ref()
         .and_then(|p| p.image.as_ref())
         .is_some()
     {
-        let (name, _input) = media_inputs
-            .iter()
-            .find(|(_, input)| input.contract.dtype == "uint8" && input.contract.rank == 1)
+        let (name, _input) = encoded_media
             .context("preprocessing.image requires a uint8 rank-1 media workflow input")?;
         Some(VisionInputSpec {
             input: (*name).clone(),
@@ -293,8 +324,58 @@ pub fn build(
     } else {
         None
     };
-    Ok(MultimodalSpecs {
-        vision,
-        audio: None,
-    })
+    // An audio program declares its own feature geometry, so the server reads
+    // the mel bins and window length off the program's output contract instead
+    // of guessing them from a model input it is no longer given.
+    let audio = match directory
+        .preprocessing
+        .as_ref()
+        .and_then(|p| p.audio.as_ref())
+    {
+        Some(program) if vision.is_none() => {
+            let (name, _input) = encoded_media
+                .context("preprocessing.audio requires a uint8 rank-1 media workflow input")?;
+            let features = program
+                .outputs
+                .iter()
+                .find(|output| output.content == "audio_features")
+                .context("preprocessing.audio must declare an audio_features output")?;
+            let contract = features.contract.as_ref().with_context(|| {
+                format!(
+                    "preprocessing.audio output '{}' must declare a TensorContract",
+                    features.name
+                )
+            })?;
+            if contract.rank != 3 {
+                anyhow::bail!(
+                    "preprocessing.audio output '{}' must be rank 3 [batch, mel, frames]",
+                    features.name
+                );
+            }
+            let dimension = |index: usize| {
+                contract
+                    .shape
+                    .as_ref()
+                    .and_then(|shape| shape.get(index))
+                    .and_then(|value| match value {
+                        onnx_genai_metadata::TensorDimension::Fixed(size) => {
+                            usize::try_from(*size).ok()
+                        }
+                        onnx_genai_metadata::TensorDimension::Symbol(_) => None,
+                    })
+            };
+            let n_mels = dimension(1).context(
+                "preprocessing.audio must declare a concrete mel-bin count in its feature contract",
+            )?;
+            let n_frames = dimension(2).unwrap_or(WHISPER_N_FRAMES);
+            Some(AudioInputSpec::from_encoded_input(
+                (*name).clone(),
+                n_mels,
+                n_frames,
+                None,
+            ))
+        }
+        _ => None,
+    };
+    Ok(MultimodalSpecs { vision, audio })
 }

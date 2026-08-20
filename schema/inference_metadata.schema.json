@@ -517,21 +517,52 @@
           "$ref": "#/$defs/AudioOutputContent",
           "description": "Generic content role of this output."
         },
+        "contract": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TensorContract"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Full workflow tensor contract. Required when `pipeline.workflow` is present."
+        },
         "dtype": {
-          "description": "Element type of the emitted tensor.",
-          "minLength": 1,
-          "type": "string"
+          "$ref": "#/$defs/TensorDType",
+          "description": "Element type of the emitted tensor."
         },
         "name": {
           "description": "Workflow SSA value this output binds to.",
+          "examples": [
+            "audio.input_features"
+          ],
           "minLength": 1,
           "type": "string"
         },
+        "optional": {
+          "description": "Whether the runtime may omit this output when a model does not need it.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "pad_value": {
+          "description": "Optional sentinel/pad value for padded entries.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
         "rank": {
-          "description": "Tensor rank of the emitted tensor.",
+          "description": "Tensor rank of the emitted tensor.\n\nRedundant with `contract.rank` and retained only for programs that\ndeclare no full contract; workflow packages declare `contract`.",
           "format": "uint",
           "minimum": 0,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "source": {
           "description": "Program-local value produced by a transform.",
@@ -543,8 +574,7 @@
         "name",
         "source",
         "content",
-        "dtype",
-        "rank"
+        "dtype"
       ],
       "type": "object"
     },
@@ -555,6 +585,9 @@
           "enum": [
             "waveform",
             "features",
+            "audio_features",
+            "valid_frames",
+            "valid_samples",
             "sample_lengths",
             "frame_lengths",
             "validity_mask"
@@ -566,6 +599,9 @@
             "enum": [
               "waveform",
               "features",
+              "audio_features",
+              "valid_frames",
+              "valid_samples",
               "sample_lengths",
               "frame_lengths",
               "validity_mask"
@@ -578,7 +614,7 @@
       "type": "string"
     },
     "AudioPreprocessingProgram": {
-      "description": "Generic audio preprocessing program: an ordered transform pipeline plus the\nnamed workflow SSA tensor outputs it emits.\n\nThe program is expressed entirely as parameterized, architecture-neutral\ndata, mirroring `ImagePreprocessingProgram`. Transform operations are\ngeneric (decode, resample, downmix, rescale, normalize, pad, frame,\nspectrogram). In workflow metadata, outputs are materialized by a\nmanifest-pinned preprocessing adapter invocation and bind processor-local\nvalues to typed SSA names. A package may name an output `input_values`,\n`attention_mask`, or anything else without introducing runtime\nmodel-family dispatch.",
+      "description": "Generic audio preprocessing program: an ordered transform pipeline plus the\nnamed workflow SSA tensor outputs it emits.\n\nThe program is expressed entirely as parameterized, architecture-neutral\ndata, mirroring `ImagePreprocessingProgram`. Transform operations are\ngeneric (decode, resample, downmix, rescale, normalize, pad, frame,\nspectrogram, log_mel). In workflow metadata, outputs are materialized by a\nmanifest-pinned preprocessing adapter invocation and bind processor-local\nvalues to typed SSA names. A package may name an output `input_values`,\n`input_features`, `attention_mask`, or anything else without introducing\nruntime model-family dispatch.\n\nOne program type covers every audio family. A CTC acoustic model declares\nresample/downmix/zero_mean_unit_variance over raw samples; an\nencoder-decoder speech model declares resample/pad/log_mel over a fixed\nwindow. The runtime reads the same fields either way.",
       "properties": {
         "outputs": {
           "description": "Named tensor outputs the program emits, each bound to a workflow SSA value.",
@@ -602,7 +638,7 @@
       "type": "object"
     },
     "AudioTransform": {
-      "description": "One generic audio transform operation.\n\n`op` selects the operation from a generic vocabulary; the remaining fields\nare the parameters that operation reads (only the relevant ones are set).\nEvery parameter is model DATA — concrete sample rates, channel counts, and\nso on live in a model's fixture, never as constants baked into this schema.",
+      "description": "One generic audio transform operation.\n\n`op` selects the operation from a generic vocabulary; the remaining fields\nare the parameters that operation reads (only the relevant ones are set).\nEvery parameter is model DATA — concrete sample rates, channel counts, mel\nbin counts, and so on live in a model's fixture, never as constants baked\ninto this schema.",
       "properties": {
         "channels": {
           "description": "Target channel count for a `downmix` operation.",
@@ -642,8 +678,16 @@
             "null"
           ]
         },
+        "mel_scale": {
+          "description": "Mel scale convention — generic string data (e.g. `slaney`, `htk`).",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
-          "description": "Padding side / resize mode selector — generic string data (e.g. `right`, `left`).",
+          "description": "Padding side / normalization mode selector — generic string data\n(e.g. `right`, `left`, `fixed_window`).",
           "minLength": 1,
           "type": [
             "string",
@@ -660,7 +704,7 @@
           ]
         },
         "num_mel_bins": {
-          "description": "Mel filterbank size for a `log_mel_spectrogram` operation.",
+          "description": "Mel filterbank size for a `log_mel`/`log_mel_spectrogram` operation.",
           "format": "uint",
           "minimum": 1,
           "type": [
@@ -670,7 +714,7 @@
         },
         "op": {
           "$ref": "#/$defs/AudioTransformOp",
-          "description": "Generic operation selector (e.g. `resample`, `zero_mean_unit_variance`)."
+          "description": "Generic operation selector (e.g. `resample`, `zero_mean_unit_variance`,\n`log_mel`)."
         },
         "outputs": {
           "description": "Named values produced by this transform.\n\nThese names are processor-local data. Final graph bindings select them\nthrough `AudioOutputBinding::source`.",
@@ -693,7 +737,7 @@
           ]
         },
         "sample_rate": {
-          "description": "Target sample rate in Hz for a `resample` operation.",
+          "description": "Target sample rate in Hz for a `resample` operation, and the analysis\nrate a mel filterbank is built for.",
           "format": "uint32",
           "minimum": 1,
           "type": [
@@ -742,7 +786,7 @@
       "type": "object"
     },
     "AudioTransformOp": {
-      "description": "Generic audio transform-operation vocabulary.",
+      "description": "Generic audio transform-operation vocabulary.\n\nOne vocabulary spans every declared audio program. A CTC acoustic\nmodel normalizes raw samples and never builds a spectrogram; a\nspeech-to-text encoder pads to a fixed window and takes a log-mel.\nBoth are the same kind of declaration, so both draw their operation\nnames from here rather than from a per-family list.",
       "oneOf": [
         {
           "enum": [
@@ -755,7 +799,11 @@
             "pad",
             "trim",
             "frame",
+            "spectrogram",
+            "log_mel",
             "log_mel_spectrogram",
+            "emit_valid_frames",
+            "emit_valid_samples",
             "emit_sample_lengths",
             "emit_validity_mask"
           ],
@@ -773,7 +821,11 @@
               "pad",
               "trim",
               "frame",
+              "spectrogram",
+              "log_mel",
               "log_mel_spectrogram",
+              "emit_valid_frames",
+              "emit_valid_samples",
               "emit_sample_lengths",
               "emit_validity_mask"
             ]

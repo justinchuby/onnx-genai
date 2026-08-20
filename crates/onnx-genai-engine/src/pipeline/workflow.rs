@@ -304,6 +304,10 @@ fn workflow_adapter_registry()
                 PipelineEngine::run_image_preprocess_adapter as WorkflowAdapterExecutor,
             ),
             (
+                ("onnx-genai.audio-preprocess", "1"),
+                PipelineEngine::run_audio_preprocess_adapter as WorkflowAdapterExecutor,
+            ),
+            (
                 ("onnx-genai.grammar-guidance", "1"),
                 PipelineEngine::run_grammar_guidance_adapter as WorkflowAdapterExecutor,
             ),
@@ -2001,6 +2005,94 @@ impl PipelineEngine {
         Ok(())
     }
 
+    fn run_audio_preprocess_adapter(
+        &self,
+        component: &str,
+        inputs: &std::collections::BTreeMap<String, String>,
+        outputs: &std::collections::BTreeMap<String, String>,
+        declaration: &onnx_genai_metadata::WorkflowComponent,
+        values: &mut PipelineTensors,
+        _package_symbols: &HashMap<String, i64>,
+        component_symbols: &mut HashMap<String, i64>,
+    ) -> anyhow::Result<()> {
+        let program = self
+            .preprocessing
+            .as_ref()
+            .and_then(|spec| spec.audio.as_ref())
+            .with_context(|| {
+                format!(
+                    "workflow audio preprocessing adapter '{component}' requires \
+                     preprocessing.audio metadata"
+                )
+            })?;
+        let encoded_ref = inputs.get("encoded").with_context(|| {
+            format!("workflow audio preprocessing adapter '{component}' requires input 'encoded'")
+        })?;
+        let encoded = values
+            .get(encoded_ref)
+            .with_context(|| format!("workflow value '{encoded_ref}' is unavailable"))?;
+        let encoded_contract = declaration.ports.inputs.get("encoded").with_context(|| {
+            format!(
+                "workflow audio preprocessing adapter '{component}' has no declared input \
+                 port 'encoded'"
+            )
+        })?;
+        let component_dynamic_symbols = std::collections::HashSet::new();
+        validate_workflow_value(
+            encoded_ref,
+            encoded,
+            encoded_contract,
+            component_symbols,
+            &component_dynamic_symbols,
+        )?;
+        if encoded.dtype() != DataType::Uint8 || encoded.shape().len() != 1 {
+            anyhow::bail!(
+                "workflow audio preprocessing adapter '{component}' input 'encoded' must be \
+                 uint8 rank 1"
+            );
+        }
+        let executable = onnx_genai_preprocess::audio::AudioProgram::from_program(program)?;
+        let encoded_bytes = encoded.as_raw_bytes()?;
+        let mut tensors = executable
+            .run(&[encoded_bytes])?
+            .into_iter()
+            .map(|tensor| (tensor.name.clone(), tensor))
+            .collect::<HashMap<_, _>>();
+        for (port, value_ref) in outputs {
+            let tensor = tensors.remove(value_ref).with_context(|| {
+                format!(
+                    "audio preprocessing adapter '{component}' did not produce declared SSA \
+                     output '{value_ref}'"
+                )
+            })?;
+            let contract = declaration.ports.outputs.get(port).with_context(|| {
+                format!(
+                    "workflow audio preprocessing adapter '{component}' has no declared output \
+                     port '{port}'"
+                )
+            })?;
+            let value = audio_tensor_to_value(tensor)?;
+            validate_workflow_value(
+                value_ref,
+                &value,
+                contract,
+                component_symbols,
+                &component_dynamic_symbols,
+            )?;
+            values.insert(value_ref.clone(), value);
+        }
+        if !tensors.is_empty() {
+            let mut unbound = tensors.into_keys().collect::<Vec<_>>();
+            unbound.sort();
+            anyhow::bail!(
+                "audio preprocessing adapter '{component}' produced outputs without workflow \
+                 bindings: {}",
+                unbound.join(", ")
+            );
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_grammar_guidance_adapter(
         &self,
@@ -2639,6 +2731,18 @@ fn workflow_iteration_value(
             Value::from_vec_i64(vec![index; elements], &shape).map_err(Into::into)
         }
         rank => anyhow::bail!("workflow loop iteration requires rank 0 or rank 1, got rank {rank}"),
+    }
+}
+
+fn audio_tensor_to_value(
+    tensor: onnx_genai_preprocess::audio::NamedAudioTensor,
+) -> anyhow::Result<Value> {
+    use onnx_genai_preprocess::audio::AudioTensorData;
+
+    let shape = &tensor.shape;
+    match tensor.data {
+        AudioTensorData::Fp32(data) => Value::from_vec_f32(data, shape).map_err(Into::into),
+        AudioTensorData::Int64(data) => Value::from_vec_i64(data, shape).map_err(Into::into),
     }
 }
 
