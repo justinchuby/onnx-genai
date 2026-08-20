@@ -78,10 +78,21 @@ pub const CPU_EP_SUPPORTED_DTYPES: &[DataType] = &[
 fn contiguous_strides(shape: &[usize]) -> DimVec<i64> {
     let n = shape.len();
     let mut strides = DimVec::zeroed(n);
+    // Take the storage once. Indexing a `DimVec` goes through `DerefMut`, which
+    // re-matches `Inline` against `Heap` on every access; the loop below reads
+    // and writes twice per element, so the representation was being resolved
+    // four times per dimension to fill a buffer whose length is known here.
+    // Carrying the running product in a register also removes the read of
+    // `strides[i + 1]`, which was a loop-carried memory dependency.
+    let out = strides.as_mut_slice();
     if n > 0 {
-        strides[n - 1] = 1;
+        out[n - 1] = 1;
+        let mut acc: i64 = 1;
         for i in (0..n - 1).rev() {
-            strides[i] = strides[i + 1] * shape[i + 1] as i64;
+            // Same products in the same order as reading back `strides[i + 1]`,
+            // so this overflows for exactly the inputs the previous form did.
+            acc *= shape[i + 1] as i64;
+            out[i] = acc;
         }
     }
     strides
@@ -96,8 +107,11 @@ pub(crate) fn validate_dims(
     dtype: DataType,
     context: impl std::fmt::Display,
 ) -> Result<(DimVec<usize>, usize, usize), String> {
-    let mut shape: DimVec<usize> = DimVec::with_capacity(dims.len());
-    for (dim_idx, &d) in dims.iter().enumerate() {
+    // `zeroed` + fill rather than `with_capacity` + `push`: the length is known
+    // here, and `push` re-matches the representation on every element. This is
+    // the case `DimVec::zeroed` was introduced for.
+    let mut shape: DimVec<usize> = DimVec::zeroed(dims.len());
+    for (dim_idx, (slot, &d)) in shape.as_mut_slice().iter_mut().zip(dims).enumerate() {
         if d < 0 {
             return Err(format!(
                 "{context} dim[{dim_idx}] is {d} — negative dimensions are \
@@ -105,7 +119,7 @@ pub(crate) fn validate_dims(
                  resolved before execution)"
             ));
         }
-        shape.push(d as usize);
+        *slot = d as usize;
     }
 
     let element_count: usize = shape
@@ -1276,6 +1290,72 @@ mod tests {
     ///
     /// Without this the duplication is just a second implementation waiting to
     /// drift. With it, either one can be changed and the other will object.
+    /// `validate_dims` builds its shape by filling a pre-sized `DimVec` rather
+    /// than pushing one element at a time. The two constructions take different
+    /// paths through `DimVec` -- `zeroed` allocates `vec![0; n]` up front where
+    /// `with_capacity` + `push` grew into reserved space -- so the resulting
+    /// value has to be checked for content, length *and* representation across
+    /// the inline/heap boundary, not just content.
+    #[test]
+    fn validate_dims_shape_matches_a_direct_construction() {
+        let mut cases: Vec<Vec<i64>> = vec![
+            vec![],
+            vec![0],
+            vec![1],
+            vec![8],
+            vec![1, 8],
+            vec![2, 0, 5],
+            vec![1, 1, 1, 1, 1],
+        ];
+        // Every rank across the spill boundary in both directions.
+        for rank in 0..=(crate::dim_vec::INLINE_RANK + 3) {
+            cases.push((0..rank).map(|k| (k % 3 + 1) as i64).collect());
+        }
+        // A spilled rank containing a zero extent.
+        let mut zero_deep = vec![2i64; crate::dim_vec::INLINE_RANK + 2];
+        zero_deep[crate::dim_vec::INLINE_RANK + 1] = 0;
+        cases.push(zero_deep);
+
+        for dims in cases {
+            let (shape, count, bytes) =
+                super::validate_dims(&dims, DataType::Float32, format_args!("t")).unwrap();
+
+            let expected: Vec<usize> = dims.iter().map(|&d| d as usize).collect();
+            assert_eq!(shape.as_slice(), expected.as_slice(), "dims {dims:?}");
+            assert_eq!(shape.len(), dims.len(), "one entry per dim, dims {dims:?}");
+            assert_eq!(
+                shape.is_spilled(),
+                dims.len() > crate::dim_vec::INLINE_RANK,
+                "dims {dims:?} took the wrong representation"
+            );
+
+            let want: usize = expected.iter().product();
+            assert_eq!(count, want, "element count for {dims:?}");
+            assert_eq!(bytes, want * 4, "byte length for {dims:?}");
+        }
+    }
+
+    /// A negative dimension is reported even when an earlier pair of dimensions
+    /// would overflow the element count.
+    ///
+    /// The negative check runs during the shape fill and the overflow check runs
+    /// after it, so negatives win regardless of position. Pinned because fusing
+    /// those two passes -- the obvious next optimization here -- would silently
+    /// swap the precedence and change which error a malformed graph reports.
+    #[test]
+    fn a_negative_dim_outranks_an_earlier_overflow() {
+        let dims = [i64::MAX / 2, 4, -1];
+        let err = super::validate_dims(&dims, DataType::Float32, format_args!("t")).unwrap_err();
+        assert!(
+            err.contains("dim[2] is -1"),
+            "expected the negative dim to be reported, got: {err}"
+        );
+        assert!(
+            !err.contains("overflow"),
+            "the overflow must not pre-empt the negative dim: {err}"
+        );
+    }
+
     #[test]
     fn contiguous_strides_matches_the_ir_crate() {
         let mut cases: Vec<Vec<usize>> = vec![
