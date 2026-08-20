@@ -19596,9 +19596,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             };
             let packed: Vec<u8> = (0..n * k_blocks * blob_size).map(|_| next_byte()).collect();
             let zp: Vec<u8> = (0..n * zp_row_bytes).map(|_| next_byte()).collect();
-            let scales: Vec<f16> = (0..n * k_blocks)
-                .map(|_| f16::from_f32(0.02))
-                .collect();
+            let scales: Vec<f16> = (0..n * k_blocks).map(|_| f16::from_f32(0.02)).collect();
             let activation: Vec<f16> = (0..k).map(|_| f16::from_f32(0.01)).collect();
 
             let activation_dev = runtime.alloc_raw(activation.len() * 2).unwrap();
@@ -19753,5 +19751,4 @@ extern "C" __global__ void ref_silu_mul_f16(
             "GEMV bandwidth probe produced no usable timing"
         );
     }
-
 }
