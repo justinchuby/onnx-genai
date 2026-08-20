@@ -1344,7 +1344,23 @@ mod tests {
     /// swap the precedence and change which error a malformed graph reports.
     #[test]
     fn a_negative_dim_outranks_an_earlier_overflow() {
-        let dims = [i64::MAX / 2, 4, -1];
+        // The prefix must genuinely overflow, or this test pins nothing: a fused
+        // single-pass version would agree with the two-pass version simply because
+        // no overflow was ever reachable. The control below proves the overflow is
+        // live, so the assertion above it is about precedence and not about luck.
+        let overflowing_prefix = [i64::MAX / 2, 8];
+        let control = super::validate_dims(
+            &overflowing_prefix,
+            DataType::Float32,
+            format_args!("control"),
+        )
+        .unwrap_err();
+        assert!(
+            control.contains("overflow"),
+            "the prefix must actually overflow for this test to mean anything, got: {control}"
+        );
+
+        let dims = [i64::MAX / 2, 8, -1];
         let err = super::validate_dims(&dims, DataType::Float32, format_args!("t")).unwrap_err();
         assert!(
             err.contains("dim[2] is -1"),
