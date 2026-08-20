@@ -1346,6 +1346,10 @@ unsafe impl VirtualBacking for CudaVirtualBacking {
         offset: usize,
         len: usize,
     ) -> Result<(), VirtualMemoryError> {
+        // `cuMemCreate`/`cuMemMap`/`cuMemSetAccess` synchronize the device, which
+        // invalidates a CUDA graph capture running on *any* thread of this
+        // process. See `capture_gate` for why the exclusion cannot be narrower.
+        let _section = crate::capture_gate::synchronizing_section();
         self.bind("committing CUDA memory")?;
         if self.pool.is_some() {
             self.commit_with_owned_limit(reservation, offset, len, u64::MAX)?;
@@ -1420,6 +1424,8 @@ unsafe impl VirtualBacking for CudaVirtualBacking {
         offset: usize,
         requested_len: usize,
     ) -> Result<(), VirtualMemoryError> {
+        // `cuMemUnmap`/`cuMemRelease` synchronize the device; see `commit`.
+        let _section = crate::capture_gate::synchronizing_section();
         self.bind("releasing CUDA memory")?;
         let end = offset.saturating_add(requested_len);
         let mut blocks = reservation

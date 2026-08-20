@@ -7,6 +7,7 @@ use cudarc::driver::sys::{
     CUgraph, CUgraphExec, CUgraphInstantiate_flags, CUstreamCaptureMode, CUstreamCaptureStatus,
 };
 use cudarc::driver::{CudaStream, result};
+use onnx_runtime_cuda_memory::capture_gate::CaptureExclusion;
 use onnx_runtime_ep_api::{EpError, Result};
 
 use crate::error::driver_err;
@@ -119,6 +120,10 @@ pub(crate) struct CudaGraphLifecycle {
 /// The capture flag and the ordered list of installed segment executables.
 struct LifecycleState {
     capture: CaptureState,
+    /// Held for the whole capture region so no other thread performs a
+    /// device-synchronizing memory operation that would invalidate it. Set in
+    /// `begin`, cleared on every exit from capture (`end`, `abort`, reset).
+    exclusion: Option<CaptureExclusion>,
     segments: Vec<CapturedGraph>,
 }
 
@@ -135,6 +140,7 @@ impl CudaGraphLifecycle {
             stream,
             state: Mutex::new(LifecycleState {
                 capture: CaptureState::Idle,
+                exclusion: None,
                 segments: Vec::new(),
             }),
         }
@@ -161,10 +167,17 @@ impl CudaGraphLifecycle {
             }
         }
 
+        // Acquire *before* `cuStreamBeginCapture`: taking it afterwards leaves a
+        // window in which the capture is live and unprotected. THREAD_LOCAL mode
+        // relaxes CUDA's legality check on unsafe calls, not the fact that a
+        // device-wide synchronization anywhere in the process invalidates this
+        // capture.
+        let exclusion = CaptureExclusion::acquire();
         self.stream
             .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
             .map_err(|error| driver_err("begin CUDA graph stream capture", error))?;
         state.capture = CaptureState::Capturing(std::thread::current().id());
+        state.exclusion = Some(exclusion);
         Ok(())
     }
 
@@ -191,6 +204,10 @@ impl CudaGraphLifecycle {
         // Clear the capture flag even when end/instantiate fails. CUDA has ended
         // or invalidated the capture at that point, and no executable is usable.
         state.capture = CaptureState::Idle;
+        // Bind rather than clear: the stream is still capturing until
+        // `end_capture` returns, and `?` below must not skip the release. As a
+        // local, it drops at every exit from this function and never earlier.
+        let _exclusion = state.exclusion.take();
         let graph = CapturedGraph::end_capture(
             &self.stream,
             CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY,
@@ -271,6 +288,9 @@ impl CudaGraphLifecycle {
         // Clear the flag unconditionally: once we call end_capture the stream is
         // no longer capturing regardless of whether a usable graph came back.
         state.capture = CaptureState::Idle;
+        // Released once this function returns, i.e. after `end_capture` has
+        // taken the stream out of capture mode. See `end`.
+        let _exclusion = state.exclusion.take();
         // End the stream capture to drain the half-recorded graph, then drop it.
         // A mid-capture failure invalidates the capture, so end_capture may
         // report an error — but it still takes the stream out of capture mode,

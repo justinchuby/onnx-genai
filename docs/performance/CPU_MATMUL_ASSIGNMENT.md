@@ -1274,3 +1274,141 @@ global pool while the persistent-SPMD workers spin. `m = 1` at blocks 32/64/128 
 today's route. The residual 2.3x-3.0x to ORT is untouched and remains the CompInt8/VNNI gap of
 sections 10 and 11. Full record:
 [`docs/benchmarks/2026-08-20-int4-decode-loop.md`](../benchmarks/2026-08-20-int4-decode-loop.md).
+
+### 13. Halving the weight bytes at `accuracy_level = 4` made it slower, not faster (**rejected**)
+
+The premise recorded in
+[`docs/benchmarks/2026-08-20-int4-acc4-int8-repack.md`](../benchmarks/2026-08-20-int4-acc4-int8-repack.md)
+(landed with #1590) was that the int4 `accuracy_level = 4` route wastes its advantage by
+repacking 4-bit weights up to int8 before the dot: `prepack_int8_weight` doubles the bytes the
+kernel streams, so a kernel reading the ONNX nibbles directly should stream half as much and win.
+That premise was tested by building the kernel it implies, and it is **false on AVX2**. (Note this
+is a different claim from section 10 above, which concerns the `accuracy_level = 0` prefill pack
+and concluded that pack was *not* bandwidth-bound either.)
+
+**What was built.** A complete packed-nibble int4 x int16 kernel: consumes the 0.5 B/weight ONNX
+blob unchanged (no value repack — the layout is already `[n][k_blocks][blob_size]` and
+block-padded), unsigned nibbles with per-block zero points folded out of the integer dot via
+`sum((q - zp) * a) = sum(q * a) - zp * sum(a)` so absent zero points are bit-identical to an
+explicit midpoint, per-group f32 scales, block sizes 16/32/64/128 with exact scalar tails, and
+`_mm256_madd_epi16` accumulation with four orders of magnitude of i32 overflow headroom. It was
+bit-exact against a scalar reference over every nibble value in every lane position, exhaustive
+over all 256 byte values x 32 element positions, and matched an independent f64 dequant contract.
+Three mutation guards were verified to fail loud.
+
+**The measurement.** It lost in **every cell**, 1.5x-2.2x, against the int8 route it was meant to
+replace. Three independent falsifications of the byte thesis, not one noisy result:
+
+- The `nibble/int8` ratio is **flat** (~1.6 at block 32, ~2.1 at block 128) across an 18x weight
+  footprint range, 1.6 MB to 29.4 MB. A byte-bound kernel's ratio would improve with size.
+- In the one cell where the int8 arm spills the 64 MiB L3 (73.4 MB) and the nibble arm does not
+  (44.1 MB) — the best case the thesis can construct — the nibble kernel is still **1.63x slower**.
+- The incumbent already runs at **74-77 GB/s, 98-102% of this host's 75.8 GB/s DRAM ceiling**, at
+  block 128; the nibble kernel reaches 16% of it. Fewer bytes cannot help a kernel that cannot
+  saturate the bus it already owns.
+
+**The mechanism.** `_mm256_madd_epi16` retires 16 products per instruction where
+`_mm256_maddubs_epi16` retires 32, so an int16-activation kernel needs twice the multiply
+instructions at the same width; and int16 activations are 2 B, so a fixed 32-weight step reads twice
+the activation bytes and needs two loads where int8 needs one. Per 32 weights: int8 ~5 vector ops,
+nibble ~14. The nibble unpack itself (~4 ops) is the *smaller* half of the loss. Folding each
+group's i32 partial into one `f32x8` block accumulator — the 8-bit kernel's structure — recovered
+only 1-3 pp and cost bit-exactness, so it was reverted too.
+
+**What is kept.** The kernel is deleted rather than parked behind a default-off flag. The nearest
+precedent — the aarch64 int8-activation diversion removed at `borrowed_affine_int4_matmul`'s
+precision contract — is only a partial analogy, and worth stating precisely: that one was removed
+because it was *semantically* wrong for its only caller, whereas this kernel is correct and in fact
+more accurate, and is being dropped purely on speed. What carries the decision here is that the
+loss is flat across every footprint tested, so no host or model size argues for keeping it, and a
+flag is not free: it is a second prepack cache and a live dispatch arm to keep correct forever. The
+experiment survives as this branch's first commit if anyone wants it back on AVX-512. What survives
+in tree is the finding the experiment turned up by accident and
+`accuracy4_int4_decode_error_envelope_is_pinned_against_f64` now pins: int4 `accuracy_level = 4`
+quantizes activations to **int8** (4.75e-3 relative error) while 8-bit `accuracy_level = 4`
+quantizes to **int16** — the same attribute selecting routes **9,703x** apart in accuracy. Because
+`accuracy_level = 4` is a contract to be *less* accurate, no output-comparison test can fail when
+that error drifts, so it was untracked; the pin's lower bound is the important half, failing if the
+asymmetry ever closes so the record gets revisited instead of rotting.
+
+**Bearing on the remaining gap.** ORT does `llama3_8b_qkv` at `accuracy_level = 4`, `m = 1` in
+0.18 ms against our 0.361 ms, and our int8 arm is already at 98-102% of DRAM — so ORT is not
+streaming faster. It must touch fewer bytes per output row or reuse more from cache. Weight byte
+*width* is now excluded as the lever, which is what this experiment bought. Full record:
+[`docs/benchmarks/2026-08-20-int4-nibble-i16-negative.md`](../benchmarks/2026-08-20-int4-nibble-i16-negative.md).
+
+### 14. The half decode's handover to the fused GEBP was measured on one thread count and one `k` (**retired**)
+
+`MatMul` sent every `m == 1` `f16`/`bf16` decode with `k * n >= HALF_PREFILL_GEBP_MIN_WEIGHT`
+(1 048 576) to the fused widen-pack GEBP. `Gemm` did not — its `m == 1` `f16` path stayed on the
+decode GEMV at every weight. That is the divergence #1381 recorded, and the obvious reading was
+that `Gemm` was missing a gate. Re-measured, it was `MatMul` that was carrying a bad one.
+
+**What the original evidence missed.** Its sweep was 32 threads and `k <= 2048`. Run through the
+same production harness (`benches/half_decode_gemv_ab.rs`, arms selected by
+`ONNX_GENAI_CPU_MM_HALF_GEMV/GEBP`, `f32` control divided out) at **8 threads**, the handover is a
+loss at every `full`-set shape at or above the gate (`/ctl` 0.26–0.76) and in 20 of the 22 `f16`
+cells of the `band` set over two independent repetitions (`/ctl` 0.20–1.14) — up to **5.0x**
+slower — with the GEBP's weight bandwidth pinned at 20–34 GB/s independent of shape while the GEMV
+reaches 24–155 GB/s. The two `band` cells that do exceed 1.00 sit *exactly* at the retired
+threshold at `k = 1024` and do not hold across repetitions (1.14 then 0.89). At 32
+threads it is still a loss at every shape a 7B-class decode issues: `k = 4096` qkv/mlp 0.51–0.89,
+a 136M `lm_head` 0.86. The corner it does win — `k = 1024`, 1.05M–4.2M, 32 threads, `/ctl`
+0.95–1.49 — is real but is not a shape any such model emits, and its `k = 2048` rows are not
+reproducible run to run (6.3M measured 1.31 then 0.70 from the same binary).
+
+**Why there was nothing to retune.** The GEBP earns its packing by reusing a `KC x NR` panel of
+`B` across the rows of `A`. At `m == 1`, `m_panels` is 1 — every panel is consumed by exactly one
+microkernel pass, so none of the packing is repaid. Stated where the cost actually lands: the
+widen-pack writes `k*n` `f32` and reads it back, but per strip that is a `bpack` of at most
+`KC * 16 * NR * 4 B` = 256 KiB, which is **L2-resident on this host** and so is not a DRAM story;
+what does reach DRAM is line amplification, because `pack_b_half` walks `B` column-strip-major and
+at the usual one panel per strip touches `NR * 2` = 32 bytes of each 64-byte line, roughly **2x**
+the GEMV's read traffic. The rest is L2 bandwidth, the widening work itself, and a fork/join over
+strips that a single row of `A` cannot amortise. The two axes follow: the pack work per unit of
+reuse rises with `k`, and it can only be overlapped if there are workers to overlap it with, which
+is why the arm collapses at 8 threads and merely loses at 32. A decode-specialised GEBP that skips
+packing `B` **is** the GEMV, so the finding is structural rather than a threshold.
+
+**Disposition.** `half_decode_prefers_gebp`/`_when` deleted, the `!half_decode_prefers_gebp(..)`
+term removed from `MatMul`'s decode arm, and #1381 closed with `MatMul` adopting `Gemm`'s route
+rather than the reverse — the third time this file records an in-tree gate whose evidence was
+narrower than the region it governed (cf. §11, §12). `HALF_PREFILL_GEBP_MIN_WEIGHT` and
+`half_prefill_gebp_selected` are untouched: they are the **prefill** gate, and they still serve a
+*batched* `m == 1` half MatMul, which the non-batched GEMV declines and whose only alternative is
+the row-blocked half GEMM at 16x–21x. Coverage was repaired in the same change:
+`PROBE_SHAPE=band` puts 11 rows immediately below, at and above the retired threshold at three
+different `k`, so a `k`-dependent effect cannot hide inside a `k * n` gate again, and the pins are
+by execution (`no_half_decode_is_diverted_off_the_gemv_on_weight`,
+`gemm_and_matmul_take_the_same_decode_route`) rather than by asking a predicate — the predicate is
+what was deleted. Full record:
+[`docs/benchmarks/2026-08-21-half-decode-gebp-retired.md`](../benchmarks/2026-08-21-half-decode-gebp-retired.md).
+
+**Still open here.** `Gemm`'s half fast path remains `f16`-only: `bf16` operands return `None` at
+the dtype check and fall into the portable blocked half GEMM, where `MatMul` serves them from the
+same GEMV. That is a separate, separately mergeable gap — **closed in §15.**
+
+### 15. `Gemm` excluded `bf16` decode by dtype, and it cost 3.0x–24x
+
+The gap §14 left open. `GemmKernel::try_half_fast_path` opened with
+`a.dtype != Float16 || b.dtype != Float16 -> None`, so a `bf16` `Gemm` never reached the decode
+GEMV at any shape, while `MatMul` has served `bf16` decode from that same GEMV since the
+2026-08-19 record. The identical decode got a different kernel depending on which op the exporter
+emitted, and `Gemm`'s was the portable blocked half GEMM.
+
+**The measurement.** `bench_gemm_half_decode_route` with `PROBE_DTYPE=bf16`, both arms out of one
+build (`ONNX_GENAI_CPU_MM_HALF_GEMV=0` reproduces the pre-change route), `f32` control divided out.
+It wins at **every shape at both thread counts**: 4.4x–24.1x at 8 threads and 3.0x–22.3x at 32,
+with the model shapes at the top of the range (`llama_mlp` 36.07 → 1.80 ms, `llama_qkv`
+9.85 → 0.47 ms, `qwen_qkv` 9.97 → 0.52 ms at 8 threads). The blocked GEMM holds 2.5–6.0 GB/s of
+weight bandwidth regardless of shape; the GEMV reaches 26–76 GB/s against a 75.8 GB/s ceiling.
+
+**Disposition.** The dtype gate now calls the same `half_storage_format` helper `MatMul` uses, and
+the format is threaded into `simd_available`/`gemv_half_kn` rather than hard-coded. Two defects fell
+out of the same term: `Gemm` also did not honour `ONNX_GENAI_CPU_MM_HALF_GEMV`, so the documented
+field kill-switch for this route silently covered only `MatMul` and the `Gemm` side of the shipped
+binary could not be A/B'd at all. It does now. **Still asymmetric:** a *transposed* `bf16` decode
+declines, because `gemv_f16_nk` reads `f16` bit patterns and has no `bf16` twin — kernel coverage,
+not policy, pinned by a test that checks both the route and the numerics. Mutation-verified in both
+directions. Full record:
+[`docs/benchmarks/2026-08-21-gemm-bf16-decode-gemv.md`](../benchmarks/2026-08-21-gemm-bf16-decode-gemv.md).

@@ -10216,6 +10216,188 @@ mod tests {
         }
     }
 
+    /// Reference dequant of a packed int4 weight against `f32` activations, in
+    /// `f64`.
+    ///
+    /// Independent of every production helper on purpose: it reads the ONNX
+    /// nibble layout literally (element `2i` is the low nibble of byte `i`) and
+    /// accumulates in `f64`, so it is a statement about what the operator
+    /// *means* rather than about how any kernel computes it.
+    fn int4_f64_reference(
+        activation: &[f32],
+        packed: &[u8],
+        scales: &[f32],
+        zero_points: Option<&[u8]>,
+        n: usize,
+        k: usize,
+        block_size: usize,
+    ) -> Vec<f64> {
+        let k_blocks = k.div_ceil(block_size);
+        let blob = block_size / 2;
+        let zp_row_bytes = k_blocks.div_ceil(2);
+        let mut out = vec![0.0f64; n];
+        for (column, value) in out.iter_mut().enumerate() {
+            let mut acc = 0.0f64;
+            for block in 0..k_blocks {
+                let scale = scales[column * k_blocks + block] as f64;
+                let zero_point = zero_points.map_or(8u8, |points| {
+                    let byte = points[column * zp_row_bytes + block / 2];
+                    if block.is_multiple_of(2) {
+                        byte & 0x0f
+                    } else {
+                        byte >> 4
+                    }
+                }) as f64;
+                let base = (column * k_blocks + block) * blob;
+                for offset in 0..block_size {
+                    let depth = block * block_size + offset;
+                    if depth >= k {
+                        break;
+                    }
+                    let byte = packed[base + offset / 2];
+                    let quantized = if offset.is_multiple_of(2) {
+                        byte & 0x0f
+                    } else {
+                        byte >> 4
+                    } as f64;
+                    acc += (quantized - zero_point) * scale * activation[depth] as f64;
+                }
+            }
+            *value = acc;
+        }
+        out
+    }
+
+    /// Pin how much accuracy `accuracy_level = 4` actually costs int4 decode,
+    /// measured against an `f64` reading of the operator rather than against
+    /// another kernel.
+    ///
+    /// # Why this is worth a test
+    ///
+    /// `accuracy_level = 4` is a *contract to be less accurate*, so no
+    /// output-comparison test can fail when it drifts: every existing check
+    /// either compares acc4 to itself or uses a tolerance wide enough to admit
+    /// it. That makes its real error a number nobody was tracking. Measuring it
+    /// found that int4 acc4 decode carries ~3e-3 relative error because it
+    /// quantizes activations to **int8**, while 8-bit acc4 decode quantizes to
+    /// **int16** (`gemv_nk_u8_i16`) and lands near 1e-5 -- a ~2 order-of-magnitude
+    /// asymmetry between two routes selected by the same attribute.
+    ///
+    /// The bounds are two-sided on purpose. The upper bound catches a silent
+    /// precision regression. The **lower** bound is what stops this test from
+    /// rotting into a tautology: if int4 acc4 ever becomes as accurate as the
+    /// 8-bit route, this test fails and forces the asymmetry above to be
+    /// re-documented rather than quietly closed. (A packed-nibble int16 kernel
+    /// that would have closed it was built and measured -- see
+    /// `docs/benchmarks/2026-08-20-int4-nibble-i16-negative.md` -- and rejected
+    /// on speed, so the asymmetry is a deliberate standing trade, not an
+    /// oversight.)
+    ///
+    /// # Scope
+    ///
+    /// The band is measured for the int8-activation route
+    /// (`prepack_int8_weight` -> `int8_matmul`), which is what every x86 host
+    /// takes here: `supports_int4_direct` requires `!has_zero_points` on
+    /// x86_64 and this fixture quantizes asymmetrically, so the result is
+    /// identical across the whole Scalar/AVX2/VNNI ladder. Non-Apple aarch64
+    /// defaults `ONNX_GENAI_CPU_ARM64_INT4_DIRECT` on and routes
+    /// `accuracy_level = 4` to `kai_sdot_matmul_m1`, a different quantisation
+    /// scheme. That route has now been measured against this fixture and lands
+    /// at `2.839095278992024e-3` -- inside the band, and bit-identical on
+    /// Windows ARM64 (from the `Rust (Windows ARM64)` job log) and on Apple
+    /// aarch64 with `ONNX_GENAI_CPU_ARM64_INT4_DIRECT=1`. So the band is
+    /// asserted on both routes and the message names which one it measured.
+    ///
+    /// This previously asserted that the kai_sdot route was *not* taken, which
+    /// was a guaranteed failure on `Rust (Windows ARM64)` -- that job runs
+    /// these tests on exactly the default that selects it. The intent was right
+    /// (do not pin a number nobody measured); the resolution is to measure it.
+    #[test]
+    fn accuracy4_int4_decode_error_envelope_is_pinned_against_f64() {
+        let _probe = lock_dispatch_probe();
+        let (k, n, block_size) = (1024usize, 128usize, 32usize);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 2654435761usize) % 1000) as f32 / 500.0 - 1.0)
+            .collect();
+        let activations: Vec<f32> = (0..k)
+            .map(|i| ((i * 40503usize) % 1000) as f32 / 500.0 - 1.0)
+            .collect();
+        let (packed, scales, zero_points, _) = quantize(&weights, n, k, block_size, true);
+        let blocks = k.div_ceil(block_size);
+        let reference = int4_f64_reference(
+            &activations,
+            &packed,
+            &scales,
+            zero_points.as_deref(),
+            n,
+            k,
+            block_size,
+        );
+        let magnitude = reference.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        assert!(magnitude > 1.0, "reference is degenerate: {magnitude}");
+
+        let mut errors = Vec::new();
+        let mut reduced_took_kai_sdot = false;
+        for accuracy_level in [0i64, 4] {
+            let mut kernel = MatMulNBitsKernel {
+                accuracy_level,
+                ..test_kernel(k, n, block_size)
+            };
+            kernel.set_constant_inputs(&[false, true, true, true]);
+            let a = Owned::f32(&[1, k], &activations);
+            let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
+            let scales_t = Owned::f32(&[n, blocks], &scales);
+            let zp = zero_points
+                .as_ref()
+                .map(|z| Owned::u8(&[n, blocks.div_ceil(2)], z))
+                .expect("asymmetric quantize emits zero points");
+            let mut y = Owned::zeros_f32(&[1, n]);
+            let kai_before = KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed);
+            kernel
+                .execute(
+                    &[a.view(), b.view(), scales_t.view(), zp.view()],
+                    &mut [y.view_mut()],
+                )
+                .unwrap();
+            if accuracy_level == 4 {
+                reduced_took_kai_sdot = KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed) > kai_before;
+            }
+            let error = y
+                .to_f32()
+                .iter()
+                .zip(&reference)
+                .map(|(actual, want)| (*actual as f64 - want).abs())
+                .fold(0.0, f64::max)
+                / magnitude;
+            errors.push(error);
+        }
+        let (exact, reduced) = (errors[0], errors[1]);
+        assert!(
+            exact < 1e-5,
+            "accuracy_level 0 promises exact fp32 activations; relative error \
+             {exact:e} is too large to be rounding",
+        );
+        assert!(
+            reduced > 10.0 * exact,
+            "accuracy_level 4 must be measurably less accurate than level 0, \
+             otherwise this test is not measuring the trade it claims to \
+             (level0={exact:e}, level4={reduced:e})",
+        );
+        let route = if reduced_took_kai_sdot {
+            "aarch64 kai_sdot direct"
+        } else {
+            "int8-activation (prepack_int8_weight -> int8_matmul)"
+        };
+        assert!(
+            (1e-4..1e-2).contains(&reduced),
+            "int4 accuracy_level 4 relative error {reduced:e} left its pinned \
+             band on the {route} route; it quantizes activations to int8 \
+             (~3e-3). Below the band means the int8/int16 asymmetry with the \
+             8-bit route closed and the docs need updating; above means a \
+             precision regression",
+        );
+    }
+
     fn accuracy4_kernel(k: usize, n: usize, block_size: usize) -> MatMulNBitsKernel {
         MatMulNBitsKernel {
             accuracy_level: 4,

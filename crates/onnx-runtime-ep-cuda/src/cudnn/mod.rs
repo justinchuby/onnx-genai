@@ -468,6 +468,9 @@ impl CudnnHandle<'_> {
         // alpha/beta are f32), and the cached workspace is at least the queried
         // size for this signature with indices disabled.
         unsafe {
+            // cuDNN allocates and synchronizes internally; gate the whole
+            // invocation. See `onnx_runtime_cuda_memory::capture_gate`.
+            let _section = onnx_runtime_cuda_memory::capture_gate::synchronizing_section();
             result::reduce_tensor(
                 self.reduce_handle,
                 reduce.0,
@@ -521,6 +524,8 @@ impl CudnnHandle<'_> {
             cache.workspace_bytes = 0;
         }
 
+        // `cuMemAlloc` synchronizes the device; see `CudaRuntime::alloc_raw`.
+        let _section = onnx_runtime_cuda_memory::capture_gate::synchronizing_section();
         // SAFETY: a fresh device allocation the cache owns and frees exactly once.
         let workspace = unsafe {
             cudarc::driver::result::malloc_sync(workspace_bytes.max(1))
@@ -898,6 +903,8 @@ impl Drop for RawReductionDescriptor {
 /// (as produced by [`CudnnHandle::repopulate_reduce_cache`]) that has not been
 /// freed, and no in-flight launch may still reference it.
 unsafe fn free_reduce_workspace(ptr: CUdeviceptr) -> Result<()> {
+    // `cuMemFree` synchronizes the device; see `CudaRuntime::alloc_raw`.
+    let _section = onnx_runtime_cuda_memory::capture_gate::synchronizing_section();
     // SAFETY: the caller upholds the single-free / no-live-use contract.
     unsafe { cudarc::driver::result::free_sync(ptr) }
         .map_err(|e| driver_err("freeing cuDNN reduce workspace", e))
