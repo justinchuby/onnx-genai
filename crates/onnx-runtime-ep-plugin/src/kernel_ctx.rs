@@ -151,8 +151,8 @@ impl OwnedInput {
 pub(crate) struct OwnedOutput {
     pub data_ptr: *mut c_void,
     pub dtype: DataType,
-    pub shape: Vec<usize>,
-    pub strides: Vec<i64>,
+    pub shape: DimVec<usize>,
+    pub strides: DimVec<i64>,
     /// Memory info ORT placed this output on. For a boundary GPU node ORT
     /// places the output on the device, so this is a *valid device*
     /// `OrtMemoryInfo` the executor can reuse to allocate staging scratch for
@@ -447,12 +447,18 @@ pub(crate) unsafe fn allocate_output(
         None => std::ptr::null(),
     };
 
-    crate::dispatch_probe::count_n(crate::dispatch_probe::Event::DispatchAlloc, 2);
-    let strides = onnx_runtime_ir::compute_contiguous_strides(shape);
+    // An ordinary rank keeps both of these inline, so the common output costs
+    // the allocator nothing. `count_n` charges only the ranks that spill.
+    let shape: DimVec<usize> = DimVec::from_slice(shape);
+    let strides = contiguous_strides(&shape);
+    crate::dispatch_probe::count_n(
+        crate::dispatch_probe::Event::DispatchAlloc,
+        2 * u64::from(shape.len() > crate::dim_vec::INLINE_RANK),
+    );
     Ok(OwnedOutput {
         data_ptr: data,
         dtype,
-        shape: shape.to_vec(),
+        shape,
         strides,
         mem_info,
     })
@@ -1047,13 +1053,29 @@ mod tests {
 
         for rank in [0usize, 1, 8, 9, 12] {
             let shape: Vec<usize> = (1..=rank).collect();
-            let _ = unsafe { allocate_output(&api, ctx, 0, &shape, DataType::Float32, false) }
+            let output = unsafe { allocate_output(&api, ctx, 0, &shape, DataType::Float32, false) }
                 .expect("the fake ORT allocates successfully");
             let seen = RECORDED_DIMS.lock().expect("recorded dims lock");
             let expected: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
             assert_eq!(
                 *seen, expected,
                 "rank {rank} must reach ORT with every dimension intact"
+            );
+
+            // Pins the *output path*, not just the arithmetic: if
+            // `allocate_output` ever stopped routing through
+            // `contiguous_strides`, the arithmetic pin below would still pass
+            // and only this would fail. Ranks 9 and 12 spill, so this covers
+            // both representations.
+            assert_eq!(
+                &output.shape[..],
+                &shape[..],
+                "rank {rank} lost dimensions on the way into OwnedOutput"
+            );
+            assert_eq!(
+                &output.strides[..],
+                &onnx_runtime_ir::compute_contiguous_strides(&shape)[..],
+                "rank {rank} strides diverged from the IR crate"
             );
         }
     }
@@ -1078,13 +1100,47 @@ mod tests {
         let mut output = OwnedOutput {
             data_ptr: data.as_mut_ptr().cast(),
             dtype: DataType::Float32,
-            shape: vec![2, 3],
-            strides: vec![3, 1],
+            shape: DimVec::from_slice(&[2, 3]),
+            strides: DimVec::from_slice(&[3, 1]),
             mem_info: std::ptr::null(),
         };
         let view = output.view_mut();
         assert_eq!(view.shape, &[2, 3]);
         assert_eq!(view.dtype, DataType::Float32);
+    }
+
+    /// Rank 8 is where the *fast* representation ends, not where support ends.
+    /// An output past the inline limit has to survive the spill with its shape
+    /// and strides intact, and the view it hands out must still describe it.
+    #[test]
+    fn owned_output_survives_a_rank_past_the_inline_limit() {
+        // Deliberately not all ones: with a degenerate shape every stride is 1
+        // and the test could not tell a correct stride build from a reversed
+        // or constant one.
+        let shape: Vec<usize> = vec![2, 1, 3, 1, 2, 1, 3, 1, 2, 1, 3];
+        let rank = shape.len();
+        assert!(rank > crate::dim_vec::INLINE_RANK);
+        let strides = contiguous_strides(&shape);
+        assert!(
+            strides.len() == rank && shape.len() > crate::dim_vec::INLINE_RANK,
+            "this test is only meaningful past the inline limit"
+        );
+
+        let mut data = vec![0.0f32; shape.iter().product::<usize>()];
+        let mut output = OwnedOutput {
+            data_ptr: data.as_mut_ptr().cast(),
+            dtype: DataType::Float32,
+            shape: DimVec::from_slice(&shape),
+            strides,
+            mem_info: std::ptr::null(),
+        };
+        let view = output.view_mut();
+        assert_eq!(view.shape, &shape[..], "spilled shape did not survive");
+        assert_eq!(
+            view.strides,
+            &onnx_runtime_ir::compute_contiguous_strides(&shape)[..],
+            "spilled strides did not survive"
+        );
     }
 
     #[test]
