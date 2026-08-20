@@ -48,5 +48,5 @@ nested speech/codec generation, and world-model rollout all lower to the same no
 state cells, effects, and ONNX policy components. Adding a workload requires metadata
 and artifacts; a runtime code change is justified only by a new generic capability.
 
-See [MODEL_METADATA.md](MODEL_METADATA.md) and
-[WORKFLOW_POLICY_COMPONENTS.md](WORKFLOW_POLICY_COMPONENTS.md).
+See [MODEL_METADATA.md](../genai/MODEL_METADATA.md) and
+[WORKFLOW_POLICY_COMPONENTS.md](../WORKFLOW_POLICY_COMPONENTS.md).

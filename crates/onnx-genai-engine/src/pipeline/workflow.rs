@@ -24,6 +24,53 @@ impl Drop for ActiveAdapterContextGuard<'_> {
     }
 }
 
+/// Prefix of the error a workflow raises when a required package input was
+/// never supplied.
+///
+/// A front end turns this into advice about the attachment the caller most
+/// likely forgot, so the wording is shared rather than matched by hand: the
+/// message and its recognizer cannot drift apart if they name the same
+/// constant.
+pub const MISSING_REQUIRED_INPUT: &str = "required workflow package input ";
+
+/// True when `error`, or anything it wraps, is a required package input the
+/// request never supplied.
+pub fn is_missing_required_input(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().starts_with(MISSING_REQUIRED_INPUT))
+}
+
+#[cfg(test)]
+mod missing_input_tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_required_input_is_recognized_through_the_context_wrapped_around_it() {
+        let raw =
+            anyhow::anyhow!("{MISSING_REQUIRED_INPUT}'encoder.pixel_values' was not supplied");
+        assert!(is_missing_required_input(&raw));
+        assert!(is_missing_required_input(
+            &raw.context("decoder forward failed")
+        ));
+    }
+
+    #[test]
+    fn an_unrelated_failure_is_not_mistaken_for_a_missing_input() {
+        let oom = anyhow::anyhow!("cuda_ep: cuMemAlloc: CUDA_ERROR_OUT_OF_MEMORY")
+            .context("decoder forward failed");
+        assert!(!is_missing_required_input(&oom));
+
+        // An input the request supplied but the workflow never declared is a
+        // caller/package mismatch, not a forgotten attachment, so it must not be
+        // advised as one.
+        let undeclared = anyhow::anyhow!(
+            "workflow request supplied undeclared application inputs: [\"encoder.pixel_values\"]"
+        );
+        assert!(!is_missing_required_input(&undeclared));
+    }
+}
+
 pub(crate) fn compile_device_bridge_components(
     graph: &WorkflowNode,
     island_components: &HashSet<String>,
@@ -2212,7 +2259,7 @@ impl PipelineEngine {
                     values.insert(name.clone(), value);
                 }
                 None if input.required => {
-                    anyhow::bail!("required workflow package input '{name}' was not supplied")
+                    anyhow::bail!("{MISSING_REQUIRED_INPUT}'{name}' was not supplied")
                 }
                 None => {}
             }

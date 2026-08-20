@@ -345,6 +345,134 @@ impl From<OrtError> for SessionAttemptError {
     }
 }
 
+/// Create one ORT session, trying the requested execution-provider chain and its
+/// declared fallbacks in order.
+///
+/// Shared by the from-path and from-bytes constructors so an execution island
+/// linked in memory selects its provider exactly like a package component loaded
+/// from disk. Returns the session pointer, the options that actually succeeded,
+/// whether the whole session fell back to CPU, and every provider that was tried
+/// and rejected along the way.
+fn create_session_with_provider_fallback(
+    options: &SessionOptions,
+    create_session: impl Fn(
+        &SessionOptions,
+    ) -> std::result::Result<
+        *mut onnx_genai_ort_sys::OrtSession,
+        SessionAttemptError,
+    >,
+) -> Result<(
+    *mut onnx_genai_ort_sys::OrtSession,
+    SessionOptions,
+    bool,
+    Vec<SkippedExecutionProvider>,
+)> {
+    let mut candidates = execution_provider_candidates(options);
+    let mut skipped_providers: Vec<SkippedExecutionProvider> = Vec::new();
+    let mut last_error = None;
+    let mut loaded = None;
+    let mut index = 0;
+
+    while index < candidates.len() {
+        if candidates[index].providers.is_empty() {
+            index += 1;
+            continue;
+        }
+        let candidate_plan = candidates[index].clone();
+        let candidate = options.for_execution_providers(
+            candidate_plan.providers.clone(),
+            candidate_plan.allow_cpu_nodes,
+        );
+        match create_session(&candidate) {
+            Ok(ptr) => {
+                loaded = Some((ptr, candidate, candidate_plan.whole_session_cpu_fallback));
+                break;
+            }
+            Err(err)
+                if candidate_plan
+                    .providers
+                    .iter()
+                    .any(ResolvedEp::is_unsupported_name) =>
+            {
+                return Err(err.into_ort_error());
+            }
+            Err(SessionAttemptError::ProviderAppend(append_error)) => {
+                let failed_provider = append_error.provider_name.clone();
+                let failed_position = append_error.provider_index + 1;
+                let reason = append_error.source.to_string();
+                tracing::warn!(
+                    "ORT session creation failed while appending execution provider {failed_provider} (position {failed_position}) in requested chain {}; removing only that provider and retrying the remaining explicitly requested alternatives: {}",
+                    provider_names(&candidate_plan.providers),
+                    reason
+                );
+                if !skipped_providers
+                    .iter()
+                    .any(|provider| provider.name == failed_provider)
+                {
+                    skipped_providers.push(SkippedExecutionProvider {
+                        name: failed_provider.clone(),
+                        reason: reason.clone(),
+                    });
+                }
+                prune_failed_provider_from_candidates(&mut candidates[index..], &failed_provider);
+                if candidates[index].providers.is_empty() {
+                    index += 1;
+                }
+                last_error = Some(append_error.source);
+            }
+            Err(err)
+                if candidates[index + 1..]
+                    .iter()
+                    .any(|plan| !plan.providers.is_empty()) =>
+            {
+                let err = err.into_ort_error();
+                let current_first = candidate_plan
+                    .providers
+                    .first()
+                    .map(|provider| provider.selection.name.as_str());
+                let next_first = candidates[index + 1..]
+                    .iter()
+                    .find(|plan| !plan.providers.is_empty())
+                    .and_then(|plan| {
+                        plan.providers
+                            .first()
+                            .map(|provider| provider.selection.name.as_str())
+                    });
+                tracing::warn!(
+                    "ORT session creation failed for requested execution provider chain {}; trying the next explicitly requested provider alternative: {err}",
+                    provider_names(&candidate_plan.providers)
+                );
+                if current_first != next_first
+                    && let Some(skipped) = current_first
+                    && !skipped_providers
+                        .iter()
+                        .any(|provider| provider.name == skipped)
+                {
+                    skipped_providers.push(SkippedExecutionProvider {
+                        name: skipped.to_string(),
+                        reason: err.to_string(),
+                    });
+                }
+                last_error = Some(err);
+                index += 1;
+            }
+            Err(err) => {
+                last_error = Some(err.into_ort_error());
+                break;
+            }
+        }
+    }
+
+    let (ptr, effective_options, cpu_fallback_used) = if let Some(loaded) = loaded {
+        loaded
+    } else {
+        return Err(last_error.unwrap_or_else(|| {
+            OrtError::InvalidArgument("no execution provider was available to try".into())
+        }));
+    };
+    Ok((ptr, effective_options, cpu_fallback_used, skipped_providers))
+}
+
 /// An ORT inference session (a loaded model).
 pub struct Session {
     ptr: NonNull<onnx_genai_ort_sys::OrtSession>,
@@ -399,109 +527,94 @@ impl Session {
         options: SessionOptions,
     ) -> Result<Self> {
         let api = crate::error::api()?;
-        let create_session =
-            |opts: &SessionOptions| -> Result<*mut onnx_genai_ort_sys::OrtSession> {
-                let session_options = RawSessionOptions::new(env, opts)?;
-                if !external_files.is_empty() {
-                    let add = api.AddExternalInitializersFromFilesInMemory.ok_or(
-                        OrtError::ApiUnavailable("AddExternalInitializersFromFilesInMemory"),
-                    )?;
-                    #[cfg(not(windows))]
-                    let names = external_files
-                        .iter()
-                        .map(|(name, _)| {
-                            CString::new(name.as_str()).map_err(|_| {
-                                OrtError::InvalidArgument(format!(
-                                    "external initializer file name contains NUL: {name}"
-                                ))
-                            })
+        let create_session = |opts: &SessionOptions| -> std::result::Result<
+            *mut onnx_genai_ort_sys::OrtSession,
+            SessionAttemptError,
+        > {
+            let session_options = RawSessionOptions::new(env, opts)?;
+            if !external_files.is_empty() {
+                let add = api.AddExternalInitializersFromFilesInMemory.ok_or(
+                    OrtError::ApiUnavailable("AddExternalInitializersFromFilesInMemory"),
+                )?;
+                #[cfg(not(windows))]
+                let names = external_files
+                    .iter()
+                    .map(|(name, _)| {
+                        CString::new(name.as_str()).map_err(|_| {
+                            OrtError::InvalidArgument(format!(
+                                "external initializer file name contains NUL: {name}"
+                            ))
                         })
-                        .collect::<Result<Vec<_>>>()?;
-                    #[cfg(windows)]
-                    let names = external_files
-                        .iter()
-                        .map(|(name, _)| {
-                            if name.contains('\0') {
-                                return Err(OrtError::InvalidArgument(format!(
-                                    "external initializer file name contains NUL: {name}"
-                                )));
-                            }
-                            Ok(name
-                                .encode_utf16()
-                                .chain(std::iter::once(0))
-                                .collect::<Vec<_>>())
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    let name_ptrs = names.iter().map(|name| name.as_ptr()).collect::<Vec<_>>();
-                    let buffers = external_files
-                        .iter()
-                        .map(|(_, bytes)| bytes.as_ptr().cast_mut().cast())
-                        .collect::<Vec<_>>();
-                    let lengths = external_files
-                        .iter()
-                        .map(|(_, bytes)| bytes.len())
-                        .collect::<Vec<_>>();
-                    // SAFETY: all arrays contain `external_files.len()` entries
-                    // and their strings/buffers remain live through the call.
-                    crate::error::check_status(unsafe {
-                        add(
-                            session_options.as_ptr().cast_mut(),
-                            name_ptrs.as_ptr(),
-                            buffers.as_ptr(),
-                            lengths.as_ptr(),
-                            external_files.len(),
-                        )
-                    })?;
-                }
-                let create = api
-                    .CreateSessionFromArray
-                    .ok_or(OrtError::ApiUnavailable("CreateSessionFromArray"))?;
-                let mut ptr = std::ptr::null_mut();
-                // SAFETY: `env` and `session_options` are live handles, `bytes`
-                // remains valid for the call, and `ptr` is an out-parameter.
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                #[cfg(windows)]
+                let names = external_files
+                    .iter()
+                    .map(|(name, _)| {
+                        if name.contains('\0') {
+                            return Err(OrtError::InvalidArgument(format!(
+                                "external initializer file name contains NUL: {name}"
+                            )));
+                        }
+                        Ok(name
+                            .encode_utf16()
+                            .chain(std::iter::once(0))
+                            .collect::<Vec<_>>())
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let name_ptrs = names.iter().map(|name| name.as_ptr()).collect::<Vec<_>>();
+                let buffers = external_files
+                    .iter()
+                    .map(|(_, bytes)| bytes.as_ptr().cast_mut().cast())
+                    .collect::<Vec<_>>();
+                let lengths = external_files
+                    .iter()
+                    .map(|(_, bytes)| bytes.len())
+                    .collect::<Vec<_>>();
+                // SAFETY: all arrays contain `external_files.len()` entries
+                // and their strings/buffers remain live through the call.
                 crate::error::check_status(unsafe {
-                    create(
-                        env.as_ptr(),
-                        bytes.as_ptr().cast(),
-                        bytes.len(),
-                        session_options.as_ptr(),
-                        &mut ptr,
+                    add(
+                        session_options.as_ptr().cast_mut(),
+                        name_ptrs.as_ptr(),
+                        buffers.as_ptr(),
+                        lengths.as_ptr(),
+                        external_files.len(),
                     )
                 })?;
-                Ok(ptr)
-            };
-        let allow_cpu_fallback = options.auto_selected
-            || (requested_non_cpu_provider(&options) && !requested_strict_provider(&options));
-        let (ptr, effective_providers) = match create_session(&options) {
-            Ok(ptr) => (ptr, options.execution_providers.clone()),
-            Err(err) if allow_cpu_fallback => {
-                tracing::warn!(
-                    "ORT in-memory session creation failed with requested execution \
-                     provider(s): {err}; retrying with CPU"
-                );
-                let cpu_options = SessionOptions::cpu();
-                let ptr = create_session(&cpu_options)?;
-                (ptr, cpu_options.execution_providers)
             }
-            Err(err) => return Err(err),
+            let create = api
+                .CreateSessionFromArray
+                .ok_or(OrtError::ApiUnavailable("CreateSessionFromArray"))?;
+            let mut ptr = std::ptr::null_mut();
+            // SAFETY: `env` and `session_options` are live handles, `bytes`
+            // remains valid for the call, and `ptr` is an out-parameter.
+            crate::error::check_status(unsafe {
+                create(
+                    env.as_ptr(),
+                    bytes.as_ptr().cast(),
+                    bytes.len(),
+                    session_options.as_ptr(),
+                    &mut ptr,
+                )
+            })?;
+            Ok(ptr)
         };
-        let ptr = NonNull::new(ptr).ok_or(OrtError::NullPointer)?;
-        let inputs = query_io(ptr.as_ptr(), IoKind::Input)?;
-        let outputs = query_io(ptr.as_ptr(), IoKind::Output)?;
-        let input_names = inputs.iter().map(|info| info.name.clone()).collect();
-        let output_names = outputs.iter().map(|info| info.name.clone()).collect();
+        // An in-memory model picks its execution provider exactly like a model
+        // loaded from disk: an execution island is linked package components, so
+        // it must not silently land on a different provider than the components
+        // it replaces.
+        let (ptr, effective_options, cpu_fallback_used, skipped_providers) =
+            create_session_with_provider_fallback(&options, create_session)?;
         let model_name = model_name.into();
         tracing::info!("Loading in-memory model: {model_name}");
-        Ok(Self {
+        Self::from_created_session(
             ptr,
-            _model_path: model_name,
-            input_names,
-            output_names,
-            inputs,
-            outputs,
-            execution_providers: effective_providers,
-            graph_capture: options.graph_capture,
-        })
+            model_name,
+            &effective_options,
+            cpu_fallback_used,
+            skipped_providers,
+        )
     }
 
     /// Load a model from an ONNX file.
@@ -591,115 +704,30 @@ impl Session {
             Ok(ptr)
         };
 
-        let mut candidates = execution_provider_candidates(&options);
-        let mut skipped_providers: Vec<SkippedExecutionProvider> = Vec::new();
-        let mut last_error = None;
-        let mut loaded = None;
-        let mut index = 0;
+        let (ptr, effective_options, cpu_fallback_used, skipped_providers) =
+            create_session_with_provider_fallback(&options, create_session)?;
+        tracing::info!("Loading model: {}", path.display());
 
-        while index < candidates.len() {
-            if candidates[index].providers.is_empty() {
-                index += 1;
-                continue;
-            }
-            let candidate_plan = candidates[index].clone();
-            let candidate = options.for_execution_providers(
-                candidate_plan.providers.clone(),
-                candidate_plan.allow_cpu_nodes,
-            );
-            match create_session(&candidate) {
-                Ok(ptr) => {
-                    loaded = Some((ptr, candidate, candidate_plan.whole_session_cpu_fallback));
-                    break;
-                }
-                Err(err)
-                    if candidate_plan
-                        .providers
-                        .iter()
-                        .any(ResolvedEp::is_unsupported_name) =>
-                {
-                    return Err(err.into_ort_error());
-                }
-                Err(SessionAttemptError::ProviderAppend(append_error)) => {
-                    let failed_provider = append_error.provider_name.clone();
-                    let failed_position = append_error.provider_index + 1;
-                    let reason = append_error.source.to_string();
-                    tracing::warn!(
-                        "ORT session creation failed while appending execution provider {failed_provider} (position {failed_position}) in requested chain {}; removing only that provider and retrying the remaining explicitly requested alternatives: {}",
-                        provider_names(&candidate_plan.providers),
-                        reason
-                    );
-                    if !skipped_providers
-                        .iter()
-                        .any(|provider| provider.name == failed_provider)
-                    {
-                        skipped_providers.push(SkippedExecutionProvider {
-                            name: failed_provider.clone(),
-                            reason: reason.clone(),
-                        });
-                    }
-                    prune_failed_provider_from_candidates(
-                        &mut candidates[index..],
-                        &failed_provider,
-                    );
-                    if candidates[index].providers.is_empty() {
-                        index += 1;
-                    }
-                    last_error = Some(append_error.source);
-                }
-                Err(err)
-                    if candidates[index + 1..]
-                        .iter()
-                        .any(|plan| !plan.providers.is_empty()) =>
-                {
-                    let err = err.into_ort_error();
-                    let current_first = candidate_plan
-                        .providers
-                        .first()
-                        .map(|provider| provider.selection.name.as_str());
-                    let next_first = candidates[index + 1..]
-                        .iter()
-                        .find(|plan| !plan.providers.is_empty())
-                        .and_then(|plan| {
-                            plan.providers
-                                .first()
-                                .map(|provider| provider.selection.name.as_str())
-                        });
-                    tracing::warn!(
-                        "ORT session creation failed for requested execution provider chain {}; trying the next explicitly requested provider alternative: {err}",
-                        provider_names(&candidate_plan.providers)
-                    );
-                    if current_first != next_first
-                        && let Some(skipped) = current_first
-                        && !skipped_providers
-                            .iter()
-                            .any(|provider| provider.name == skipped)
-                    {
-                        skipped_providers.push(SkippedExecutionProvider {
-                            name: skipped.to_string(),
-                            reason: err.to_string(),
-                        });
-                    }
-                    last_error = Some(err);
-                    index += 1;
-                }
-                Err(err) => {
-                    last_error = Some(err.into_ort_error());
-                    break;
-                }
-            }
-        }
+        Self::from_created_session(
+            ptr,
+            path.display().to_string(),
+            &effective_options,
+            cpu_fallback_used,
+            skipped_providers,
+        )
+    }
 
-        let (ptr, effective_options, cpu_fallback_used) = if let Some(loaded) = loaded {
-            loaded
-        } else {
-            return Err(last_error.unwrap_or_else(|| {
-                OrtError::InvalidArgument("no execution provider was available to try".into())
-            }));
-        };
+    /// Record a freshly created ORT session together with the provider outcome
+    /// that produced it, querying the graph I/O and CPU-fallback placement once.
+    fn from_created_session(
+        ptr: *mut onnx_genai_ort_sys::OrtSession,
+        model_path: String,
+        effective_options: &SessionOptions,
+        cpu_fallback_used: bool,
+        skipped_providers: Vec<SkippedExecutionProvider>,
+    ) -> Result<Self> {
         let node_cpu_fallback_allowed =
-            requested_non_cpu_provider(&effective_options) && effective_options.allow_cpu_fallback;
-        let effective_providers = effective_options.execution_providers.clone();
+            requested_non_cpu_provider(effective_options) && effective_options.allow_cpu_fallback;
         let ptr = NonNull::new(ptr).ok_or(OrtError::NullPointer)?;
         let node_cpu_fallback_used = query_node_cpu_fallback_used(ptr, node_cpu_fallback_allowed);
         let inputs = query_io(ptr.as_ptr(), IoKind::Input)?;
@@ -707,16 +735,14 @@ impl Session {
         let input_names = inputs.iter().map(|info| info.name.clone()).collect();
         let output_names = outputs.iter().map(|info| info.name.clone()).collect();
 
-        tracing::info!("Loading model: {}", path.display());
-
         Ok(Self {
             ptr,
-            _model_path: path.display().to_string(),
+            _model_path: model_path,
             input_names,
             output_names,
             inputs,
             outputs,
-            execution_providers: effective_providers,
+            execution_providers: effective_options.execution_providers.clone(),
             graph_capture: effective_options.graph_capture,
             cpu_fallback_used,
             skipped_providers,

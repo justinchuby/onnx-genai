@@ -188,13 +188,32 @@ pub struct PipelineSetup {
     pub multimodal: MultimodalSpecs,
 }
 
+/// Resolve the prompt tokenizer and multimodal input contracts for `model_dir`,
+/// or `None` when the package does not structurally declare a pipeline.
+///
+/// This reads the pipeline components' declared graph I/O without creating ORT
+/// sessions or materializing weights; callers load the execution engine
+/// separately with their selected backend.
 pub fn load(model_dir: &Path) -> anyhow::Result<Option<PipelineSetup>> {
     let Some(directory) = PipelineModelDirectory::load_if_declared(model_dir)? else {
         return Ok(None);
     };
+    let models = PipelineModels::load_with_ort_session_filter(
+        model_dir,
+        onnx_genai_ort::SessionOptions::default(),
+        |_| false,
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "What: the pipeline components at {} could not be inspected. \
+             Why: {error}. \
+             How: verify every component file named in pipeline.workflow.components exists and is a valid ONNX model.",
+            model_dir.display()
+        )
+    })?;
     Ok(Some(PipelineSetup {
         tokenizer_path: tokenizer_path(model_dir, &directory)?,
-        multimodal: build(&directory, &PipelineModels::load(model_dir)?)?,
+        multimodal: build(&directory, &models)?,
     }))
 }
 

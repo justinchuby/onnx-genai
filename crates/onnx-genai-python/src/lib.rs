@@ -68,11 +68,9 @@ impl GenerateResult {
 /// The caller's *explicit* sampling selections, for
 /// [`GenerateOptions::resolve_sampling_defaults`].
 ///
-/// Each argument is `None` when the Python caller omitted the keyword, so the
-/// model's declared `do_sample`/`temperature`/`top_p`/`top_k` can drive that
-/// control (and the runtime greedy fallback applies only when the model is also
-/// silent). An explicit `temperature=0` forces greedy; any other explicit
-/// sampling control requests sampling.
+/// Each argument is `None` when the Python caller omitted the keyword, leaving
+/// that control to the runtime greedy fallback. An explicit `temperature=0`
+/// forces greedy; any other explicit sampling control requests sampling.
 fn sampling_overrides(
     temperature: Option<f32>,
     top_p: Option<f32>,
@@ -126,9 +124,8 @@ fn build_options(
         ));
     }
     // Sampling controls (temperature/top_p/top_k/greedy) are intentionally left
-    // at their defaults here and resolved later against the model's declared
-    // generation defaults in `resolve_sampling_defaults`, once the engine (and
-    // therefore its metadata) is available.
+    // at their defaults here and resolved later from the caller's explicit
+    // keyword arguments in `resolve_sampling_defaults`.
     Ok(GenerateOptions {
         max_new_tokens: max_tokens,
         seed,
@@ -256,12 +253,10 @@ impl Engine {
             request(prompt, max_tokens, temperature, top_p, top_k, seed, stop)?;
         py.detach(|| {
             let mut engine = try_lock_engine(&self.inner)?;
-            // Honor the model's declared sampling regime (e.g. a reasoning model
-            // that ships do_sample=true); explicit keyword arguments still win.
-            let declared = engine.metadata().generation.clone();
-            request
-                .options
-                .resolve_sampling_defaults(declared.as_ref(), &overrides);
+            // Inference metadata no longer carries generation defaults, so only
+            // the caller's explicit keyword arguments select sampling; the
+            // runtime greedy default applies to everything they omitted.
+            request.options.resolve_sampling_defaults(None, &overrides);
             engine
                 .generate(request)
                 .map(GenerateResult::from)
@@ -318,12 +313,10 @@ impl Engine {
             // invocations. Re-entry is safe because every method uses try_lock
             // and therefore fails immediately instead of waiting on this mutex.
             let mut engine = try_lock_engine(&self.inner)?;
-            // Honor the model's declared sampling regime (e.g. a reasoning model
-            // that ships do_sample=true); explicit keyword arguments still win.
-            let declared = engine.metadata().generation.clone();
-            request
-                .options
-                .resolve_sampling_defaults(declared.as_ref(), &overrides);
+            // Inference metadata no longer carries generation defaults, so only
+            // the caller's explicit keyword arguments select sampling; the
+            // runtime greedy default applies to everything they omitted.
+            request.options.resolve_sampling_defaults(None, &overrides);
             let callback_fn: &mut onnx_genai_engine::GenerateTokenCallback<'_> = &mut callback_fn;
             let result = engine.generate_with_callback(request, Some(callback_fn));
             if let Some(err) = callback_error {

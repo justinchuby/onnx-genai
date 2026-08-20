@@ -1303,12 +1303,13 @@ fn build_execution_island(
     let linked_path = (!linked.external_files.is_empty())
         .then(|| materialize_linked_model(&linked))
         .transpose()?;
+    let environment = models.environment()?;
     let create_session = |options| {
         if let Some(path) = &linked_path {
-            Session::new(models.environment(), path, options)
+            Session::new(environment, path, options)
         } else {
             Session::from_model_bytes(
-                models.environment(),
+                environment,
                 format!("workflow-island-{id}"),
                 &linked.bytes,
                 options,

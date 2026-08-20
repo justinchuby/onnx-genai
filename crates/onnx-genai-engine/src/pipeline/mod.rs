@@ -4,12 +4,12 @@ use crate::decode::clone_value;
 use crate::engine::{
     Engine, EngineConfig, EngineResourceGovernor, MemoryStrategyPlanInput, analyze_model_memory,
     build_memory_strategy_plan, combine_graph_memory, component_governor, log_memory_strategy_plan,
-    requested_decode_backend, resolve_vram_limit_bytes,
+    requested_decode_backend, resolve_memory_strategy_hot_tier_bytes, resolve_vram_limit_bytes,
 };
 use crate::memory_authority::{MemoryAuthorityProvider, SharedMemoryAuthorityProvider};
 use crate::{
     EngineDecodeBackend, FinishReason, GeneratePrompt, GenerateRequest, GenerateResult,
-    GenerateToken, GenerateTokenCallback, MemoryStrategyPlan,
+    GenerateToken, GenerateTokenCallback, MemoryStrategyPlan, TokenId,
 };
 use anyhow::Context;
 use onnx_genai_metadata::{
@@ -17,7 +17,9 @@ use onnx_genai_metadata::{
     ScalarValue, TensorContract, TensorDimension, WorkflowEmitMode, WorkflowInputSource,
     WorkflowNode, WorkflowSpec,
 };
-use onnx_genai_ort::{DataType, PipelineModelDirectory, PipelineModels, SessionOptions, Value};
+use onnx_genai_ort::{
+    DataType, PipelineModelDirectory, PipelineModels, SessionOptions, Tokenizer, Value,
+};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -287,7 +289,16 @@ impl PipelineEngine {
             .map(|layer| layer.bytes)
             .max()
             .unwrap_or(0);
+        // The workflow runtime executes every component through ORT sessions
+        // (the native decoder backend is rejected above), so there is no native
+        // CUDA ordinal to resolve the VRAM fraction against. The device (VRAM)
+        // capacity stays honestly `None` when it cannot be measured (#947): it
+        // is reported verbatim as `resolved_device_budget` and never borrows the
+        // host tier. The residency verdict is a separate fact, sized against the
+        // measured host-RAM ceiling, so a fitting model reads `FullResident`
+        // instead of `Unknown` without fabricating a device number.
         let resolved_vram_bytes = resolve_vram_limit_bytes(&config.limits, None)?;
+        let residency_ceiling_bytes = resolve_memory_strategy_hot_tier_bytes(&config.limits, None)?;
         #[cfg(feature = "native-cuda")]
         let memory_strategy_overrides = crate::engine::memory_strategy_overrides_from_cuda_env(
             onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env(),
@@ -300,6 +311,10 @@ impl PipelineEngine {
             resolved_vram_bytes,
             residency_ceiling_bytes,
             model_weight_bytes: model_weights_bytes,
+            // #971: the resident dequantised f32 MatMulNBits cache is a native
+            // CPU EP kernel behaviour. Workflow components run on ORT sessions,
+            // which use their own kernels, so there is no expansion here.
+            resident_f32_cache_bytes: 0,
             kv_config: crate::engine::governor_no_paged_kv_config(&config)?,
             graph: graph_memory,
             required_device_non_weight_bytes: 0,
@@ -319,6 +334,8 @@ impl PipelineEngine {
             force_managed_weight_streaming: crate::engine::force_managed_weight_streaming_enabled(),
         });
         log_memory_strategy_plan(&memory_strategy_plan, "workflow");
+        // Reserve every component's package bytes before constructing the first
+        // session.
         let resource_governor = component_governor(
             &config,
             None,
@@ -402,6 +419,36 @@ impl PipelineEngine {
         &self.models
     }
 
+    /// Effective context limit for a request, combining the package metadata
+    /// with an explicit per-request override.
+    pub fn effective_max_context(&self, options: &crate::GenerateOptions) -> Option<usize> {
+        options.max_context.or_else(|| {
+            self.models
+                .directory
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.model.as_ref())
+                .and_then(|model| model.max_sequence_length)
+        })
+    }
+
+    /// Execution-provider placement reported by the loaded component sessions.
+    pub fn execution_provider_status(&self) -> String {
+        let mut summaries = self
+            .models
+            .sessions
+            .values()
+            .map(|session| session.execution_provider_status().summary())
+            .collect::<Vec<_>>();
+        summaries.sort();
+        summaries.dedup();
+        if summaries.is_empty() {
+            "native".to_string()
+        } else {
+            summaries.join("; ")
+        }
+    }
+
     pub fn adapter_lifecycle_diagnostic(&self) -> AdapterLifecycleDiagnostic {
         self.adapter_cache.borrow().diagnostic()
     }
@@ -423,6 +470,53 @@ impl PipelineEngine {
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
         self.run_workflow(request)
+    }
+
+    /// Drop every reusable execution result this pipeline is holding, so the
+    /// next generation recomputes its workflow from scratch. Returns how many
+    /// memoized entries were dropped.
+    ///
+    /// The workflow engine reuses work through two caches: memoized component
+    /// outputs (deterministic components replayed across requests) and
+    /// session-scoped workflow state. Benchmarks need to drop both. A harness
+    /// that replays one prompt — which is what warmup runs do — otherwise
+    /// answers each measured generation almost entirely out of retained state,
+    /// and reports a "prefill" that does not vary with prompt length (#1529).
+    pub fn clear_prefix_cache(&mut self) -> usize {
+        let dropped =
+            self.component_outputs.get_mut().len() + self.workflow_session_state.get_mut().len();
+        self.component_outputs.get_mut().clear();
+        self.workflow_session_state.get_mut().clear();
+        dropped
+    }
+
+    /// Encode text with the same tokenizer this pipeline uses for prompts.
+    ///
+    /// The public seam benchmarks need to report how many prompt tokens a
+    /// generation actually processed, and to build prompts of an exact token
+    /// length. Without it a harness has to re-open `tokenizer.json` itself and
+    /// hope it picked the same component this pipeline routes prompts through.
+    pub fn tokenize(&self, text: &str) -> anyhow::Result<Vec<TokenId>> {
+        self.tokenizer()?.encode(text).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to tokenize input text with the pipeline's tokenizer: {e}; \
+                 verify the model directory contains a valid tokenizer.json"
+            )
+        })
+    }
+
+    /// Decode token ids back to text with this pipeline's tokenizer, the
+    /// inverse seam of [`PipelineEngine::tokenize`].
+    pub fn detokenize(&self, tokens: &[TokenId]) -> anyhow::Result<String> {
+        self.tokenizer()?
+            .decode(tokens)
+            .map_err(|e| anyhow::anyhow!("failed to detokenize token ids: {e}"))
+    }
+
+    fn tokenizer(&self) -> anyhow::Result<&Tokenizer> {
+        self.models
+            .tokenizer_for("")
+            .context("no tokenizer available for this workflow package")
     }
 
     pub fn run_pipeline_outputs(

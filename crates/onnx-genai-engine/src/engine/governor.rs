@@ -748,7 +748,8 @@ pub(crate) fn fallback_capacity_providers(limits: &ResourceLimits) -> CapacityPr
 ///
 /// Returns `(total_bytes, free_bytes)` on success. Returns `None` when the
 /// query is unavailable (no driver, query failure, or a nonsense zero total)
-/// so the caller falls back to the provisional capacity constant.
+/// so the caller reports the device tier as *unknown* rather than fabricating a
+/// capacity.
 #[cfg(feature = "native-cuda")]
 pub(crate) fn real_cuda_vram_capacity(device_index: u32) -> Option<(u64, u64)> {
     let device_id = i32::try_from(device_index).ok()?;
@@ -757,7 +758,7 @@ pub(crate) fn real_cuda_vram_capacity(device_index: u32) -> Option<(u64, u64)> {
         Ok(_) => {
             tracing::warn!(
                 device_index,
-                "cudaMemGetInfo reported zero total VRAM; falling back to provisional capacity"
+                "cudaMemGetInfo reported zero total VRAM; reporting the device tier as unknown"
             );
             None
         }
@@ -765,7 +766,7 @@ pub(crate) fn real_cuda_vram_capacity(device_index: u32) -> Option<(u64, u64)> {
             tracing::warn!(
                 device_index,
                 error = %err,
-                "could not query real CUDA device memory; falling back to provisional VRAM capacity"
+                "could not query real CUDA device memory; reporting the device tier as unknown"
             );
             None
         }
@@ -775,37 +776,169 @@ pub(crate) fn real_cuda_vram_capacity(device_index: u32) -> Option<(u64, u64)> {
 /// Capacity providers with the VRAM tier resolved against the *real* device
 /// total when the decode targets a CUDA device.
 ///
-/// The provisional `PROVISIONAL_VRAM_CAPACITY_BYTES` (8 GiB) is a portability
-/// hazard: a `Fraction(0.90)` limit resolved against it caps device leases at
-/// ~7.2 GiB on *every* machine, so any model larger than that fails to load
-/// resident even on a 143 GiB H200. When the native device is CUDA we query
-/// the driver for the true capacity so the default fraction "just works"; the
-/// 8 GiB constant survives only as a last-resort fallback for CPU-only builds
-/// or a failed query.
+/// Without a real device query the VRAM tier is [`UnknownCapacity`]: a
+/// `Fraction(0.90)` limit against an *8 GiB constant* used to cap device leases
+/// at ~7.2 GiB on every machine (a portability hazard that also fabricated a
+/// ceiling on machines with no such device at all — #947). When the native
+/// device is CUDA we query the driver for the true capacity so the default
+/// fraction "just works"; otherwise the tier stays honestly unknown and a
+/// fraction of it resolves to `None`, not a manufactured number.
 pub(crate) fn capacity_providers_for_device(
     limits: &ResourceLimits,
     cuda_device_index: Option<u32>,
 ) -> CapacityProviders {
-    #[cfg_attr(not(feature = "native-cuda"), allow(unused_mut))]
     let mut providers = fallback_capacity_providers(limits);
+    providers.vram = device_vram_capacity(cuda_device_index);
+    providers
+}
+
+/// Environment override for the combined mapped-physical safe fraction (#1295).
+/// A finite value in `(0, 1]`; anything else is ignored with a warning.
+pub(crate) const VMM_MAPPED_FRACTION_ENV: &str = "ONNX_GENAI_VMM_MAPPED_FRACTION";
+
+/// Default fraction of *usable* (measured-free) device VRAM the combined mapped
+/// physical ceiling — weights + KV + activations — is held to (#1295).
+///
+/// Sourced from measured *free*, not nominal *total*, so a device's standing
+/// reserve is already excluded before the fraction applies: on the RTX 4060
+/// Laptop 8 GB box (driver 591.55, CUDA 13.1, WDDM) `cuMemGetInfo` reports
+/// ~7959 MiB free of a nominal 8188, the ~229 MiB delta being the desktop
+/// compositor. The remaining 10 % is headroom against WDDM fault-in / eviction
+/// variance: #1295 measured the page-in cliff onset at ~0.97x nominal ≈ the
+/// usable boundary, past which `vram_free` cost becomes unpredictable (median
+/// ~33 ms with non-deterministic multi-hundred-ms storms). Holding to 0.90 of
+/// *free* keeps a margin below that measured onset, converting the cliff into a
+/// graceful refusal.
+///
+/// It is not a magic constant tuned on one machine (cf #1261): the concrete
+/// ceiling is `measured_free * fraction`, recomputed per device at load from the
+/// driver's own query. Raise it toward 1.0 on a headless box (no compositor
+/// reserve, steadier WDDM); lower it if a device shows eviction storms below the
+/// boundary. That is what the [`VMM_MAPPED_FRACTION_ENV`] override is for.
+pub(crate) const DEFAULT_VMM_MAPPED_FRACTION: f64 = 0.90;
+
+/// Resolve the combined mapped-physical safe fraction from the environment,
+/// falling back to [`DEFAULT_VMM_MAPPED_FRACTION`]. A malformed or out-of-range
+/// value is ignored with a warning rather than silently changing admission.
+pub(crate) fn usable_mapped_safe_fraction() -> f64 {
+    match std::env::var(VMM_MAPPED_FRACTION_ENV) {
+        Ok(raw) if !raw.trim().is_empty() => match raw.trim().parse::<f64>() {
+            Ok(value) if value.is_finite() && value > 0.0 && value <= 1.0 => value,
+            _ => {
+                tracing::warn!(
+                    value = %raw,
+                    "ignoring {VMM_MAPPED_FRACTION_ENV}: expected a finite fraction in (0, 1]; \
+                     using default {DEFAULT_VMM_MAPPED_FRACTION}"
+                );
+                DEFAULT_VMM_MAPPED_FRACTION
+            }
+        },
+        _ => DEFAULT_VMM_MAPPED_FRACTION,
+    }
+}
+
+/// Clamp a configured device ceiling to the combined mapped-physical cap derived
+/// from *usable* (measured-free) VRAM (#1295).
+///
+/// Returns `(effective_ceiling, Some(cap))` when the usable cap actually bound
+/// the ceiling (for logging), or `(configured, None)` when it did not — either
+/// because no device free was measured (a fraction of an unknown is unknown,
+/// #947) or because the configured ceiling was already the tighter bound. The
+/// cap is never *raised* above the configured ceiling: it is a safety bound, not
+/// a grant.
+pub(crate) fn clamp_ceiling_to_usable_vram(
+    configured_ceiling_bytes: u64,
+    measured_free_bytes: Option<u64>,
+    fraction: f64,
+) -> (u64, Option<u64>) {
+    let Some(free) = measured_free_bytes else {
+        return (configured_ceiling_bytes, None);
+    };
+    let usable_cap = ((free as f64) * fraction).floor() as u64;
+    if usable_cap < configured_ceiling_bytes {
+        (usable_cap, Some(usable_cap))
+    } else {
+        (configured_ceiling_bytes, None)
+    }
+}
+
+/// The VRAM capacity tier for a device: the real `cudaMemGetInfo` query when the
+/// decode targets a known CUDA index, and [`UnknownCapacity`] otherwise.
+///
+/// This is the single point where the engine decides whether a device capacity
+/// is *measured* or *unknown*, so every consumer — the decode governor and the
+/// server's device-limit resolution alike — shares one honest answer (#947).
+pub(crate) fn device_vram_capacity(cuda_device_index: Option<u32>) -> Arc<dyn CapacityProvider> {
     #[cfg(feature = "native-cuda")]
     if let Some(index) = cuda_device_index
         && let Some((total, free)) = real_cuda_vram_capacity(index)
     {
-        providers.vram = Arc::new(FixedCapacity::new(total, free));
+        return Arc::new(FixedCapacity::new(total, free));
     }
     #[cfg(not(feature = "native-cuda"))]
     let _ = cuda_device_index;
-    providers
+    Arc::new(onnx_genai_scheduler::UnknownCapacity)
 }
 
+/// Resolve a device VRAM limit to a concrete byte budget using the same capacity
+/// resolution the decode governor uses: the real device query when the device is
+/// a known CUDA index, and *unknown* otherwise. A fraction of unknown capacity
+/// resolves to `None` ("a fraction of an unknown is unknown, not a number"); an
+/// explicit `--vram-limit <bytes>` is always honoured, measurable device or not.
+///
+/// Exposed at the crate root so the server's multi-device limit path resolves
+/// through the real query / unknown machinery instead of fabricating an 8 GiB
+/// `FixedCapacity` — the second copy of the #947 constant.
+pub fn resolve_device_vram_limit_bytes(
+    limit: ResourceLimit,
+    cuda_device_index: Option<u32>,
+) -> anyhow::Result<Option<u64>> {
+    let vram = device_vram_capacity(cuda_device_index);
+    onnx_genai_scheduler::resolve_limit(limit, vram.as_ref(), "vram").map_err(anyhow::Error::new)
+}
+
+/// Resolve the configured VRAM limit to a concrete byte budget, or `None` when
+/// the device capacity could not be measured and the limit was a fraction —
+/// "a fraction of an unknown is unknown, not a number" (#947). An explicit
+/// `--vram-limit <bytes>` is always honoured, measurable device or not.
 pub(crate) fn resolve_vram_limit_bytes(
     limits: &ResourceLimits,
     cuda_device_index: Option<u32>,
-) -> anyhow::Result<u64> {
-    let capacities = capacity_providers_for_device(limits, cuda_device_index);
-    onnx_genai_scheduler::resolve_limit(limits.vram_limit, capacities.vram.as_ref(), "vram")
-        .map_err(anyhow::Error::new)
+) -> anyhow::Result<Option<u64>> {
+    resolve_device_vram_limit_bytes(limits.vram_limit, cuda_device_index)
+}
+
+/// Resolve the hot-tier ceiling the memory-strategy planner sizes weight
+/// residency against: the measured device (VRAM) budget when a device capacity
+/// is available, otherwise the *measured host-RAM* ceiling the weights
+/// physically occupy on a device-less / ORT-CPU load.
+///
+/// #947 made an unmeasured device **capacity** resolve to `None` so nothing
+/// fabricates a VRAM ceiling. But residency is a different fact from capacity:
+/// on a box with no queryable device the weights still demonstrably live in
+/// host RAM, and whether they fit *there* is knowable. Sizing the strategy
+/// against the physical host tier -- exactly as the KV byte budget already is,
+/// via the scheduler's `kv_hot_tier_ceiling` -- lets a fitting model report
+/// `FullResident` instead of `Unknown`, without reintroducing a fabricated
+/// device number. An explicit `--vram-limit <bytes>` still wins (it resolves to
+/// `Some` above), and if host RAM itself could not be measured this stays `None`
+/// (honestly unknown). Nothing here aliases a device lease onto host memory: the
+/// device authority is sized separately, this only picks the ceiling for the
+/// residency verdict.
+pub(crate) fn resolve_memory_strategy_hot_tier_bytes(
+    limits: &ResourceLimits,
+    cuda_device_index: Option<u32>,
+) -> anyhow::Result<Option<u64>> {
+    if let Some(vram_bytes) = resolve_vram_limit_bytes(limits, cuda_device_index)? {
+        return Ok(Some(vram_bytes));
+    }
+    let providers = fallback_capacity_providers(limits);
+    onnx_genai_scheduler::resolve_limit(
+        limits.host_ram_limit,
+        providers.host_ram.as_ref(),
+        "host RAM",
+    )
+    .map_err(anyhow::Error::new)
 }
 
 pub(crate) fn governor_kv_config(
@@ -1003,49 +1136,191 @@ mod tests {
     }
 
     #[test]
-    fn fallback_vram_fraction_resolves_against_provisional_capacity() {
-        // CPU-only / no-CUDA path: `cuda_device_index = None` must resolve a
-        // `Fraction` against the provisional 8 GiB tier (documented last-resort
-        // fallback), never a zero or a panic.
+    fn fraction_over_unmeasured_vram_is_unknown_not_a_number() {
+        // #947 regression: on the reported machine (no NVIDIA GPU) the no-CUDA
+        // path resolved `Fraction(0.90)` against a fabricated 8 GiB constant,
+        // yielding a specific-looking 7,730,940,928 that a real user mistook for
+        // a device that did not exist. It must now resolve to `None` (unknown).
+        //
+        // This test *fails on `main`* — there `resolve_vram_limit_bytes` returns
+        // `Ok(7_730_940_928)` — which is the whole point: it pins the fix, not a
+        // tautology that both versions pass.
         let limits = ResourceLimits {
             vram_limit: ResourceLimit::Fraction(0.90),
             host_ram_limit: ResourceLimit::Fraction(0.90),
             disk_spill_limit: None,
         };
-        let resolved = resolve_vram_limit_bytes(&limits, None).unwrap();
-        let expected = (PROVISIONAL_VRAM_CAPACITY_BYTES as f64 * 0.90) as u64;
-        // The resolver applies the fraction in f32, so allow a few ULP of slack.
-        assert!(
-            resolved.abs_diff(expected) <= 4096,
-            "resolved {resolved} should be ~0.9 * 8 GiB ({expected})"
+        assert_eq!(
+            resolve_vram_limit_bytes(&limits, None).unwrap(),
+            None,
+            "a fraction of an unmeasured device capacity must be unknown, not a number"
         );
     }
 
     #[test]
-    fn no_cuda_device_uses_provisional_vram_provider() {
+    fn explicit_vram_byte_limit_is_honoured_without_a_device_query() {
+        // An explicit limit is the caller's own assertion and must survive even
+        // when no device capacity can be measured.
+        let limits = ResourceLimits {
+            vram_limit: ResourceLimit::Bytes(12_345_678),
+            host_ram_limit: ResourceLimit::Fraction(0.90),
+            disk_spill_limit: None,
+        };
+        assert_eq!(
+            resolve_vram_limit_bytes(&limits, None).unwrap(),
+            Some(12_345_678)
+        );
+    }
+
+    #[test]
+    fn usable_mapped_fraction_defaults_and_rejects_out_of_range() {
+        // Pure derivation logic, no env dependence for the default. The env
+        // override path is exercised by callers; here we pin the default and the
+        // clamp arithmetic that the whole cap rests on (#1295).
+        assert_eq!(usable_mapped_safe_fraction(), DEFAULT_VMM_MAPPED_FRACTION);
+        assert_eq!(DEFAULT_VMM_MAPPED_FRACTION, 0.90);
+    }
+
+    #[test]
+    fn usable_cap_binds_only_when_below_configured_and_sources_from_free() {
+        // Nominal total 8188 MiB, usable free 7959 MiB — the measured RTX 4060
+        // Laptop 8 GB idle figures (#1295). At 0.90 the cap is 0.90 * free, which
+        // is strictly below both the nominal total and 0.90 * total: this is the
+        // exact discrimination that proves the cap is drawn from *usable* VRAM,
+        // not the nominal number a `Fraction` would otherwise resolve against.
+        const MIB: u64 = 1 << 20;
+        let total = 8188 * MIB;
+        let free = 7959 * MIB;
+        let (ceiling, bound) = clamp_ceiling_to_usable_vram(total, Some(free), 0.90);
+        let expected = ((free as f64) * 0.90).floor() as u64;
+        assert_eq!(ceiling, expected);
+        assert_eq!(bound, Some(expected));
+        assert!(ceiling < total, "cap must sit below nominal total");
+        assert!(
+            ceiling < ((total as f64) * 0.90) as u64,
+            "cap must sit below 0.90 * total, proving it is sourced from free not total"
+        );
+
+        // A configured ceiling already tighter than the usable cap wins, and the
+        // cap reports it did not bind (so nothing is logged as a change).
+        let tight = 4 * (1u64 << 30);
+        let (ceiling, bound) = clamp_ceiling_to_usable_vram(tight, Some(free), 0.90);
+        assert_eq!(ceiling, tight);
+        assert_eq!(bound, None);
+
+        // An unmeasured device: a fraction of an unknown is unknown (#947), so
+        // the cap does not bind and the configured ceiling passes through.
+        let (ceiling, bound) = clamp_ceiling_to_usable_vram(total, None, 0.90);
+        assert_eq!(ceiling, total);
+        assert_eq!(bound, None);
+    }
+
+    #[test]
+    fn device_authority_ceiling_is_usable_free_and_refuses_growth_past_it() {
+        // End-to-end, non-vacuous (#8): build a real governor whose device tier
+        // is the measured RTX 4060 idle capacity with a configured ceiling of the
+        // *whole* device (Fraction 1.0). The resulting authority ceiling must be
+        // the usable-free cap, and a Device-tier reservation one byte past it
+        // must be refused (G3) — the admission refusal that converts the #1295
+        // oversubscription cliff into a plateau.
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor, MemoryRole, Tier};
+        const MIB: u64 = 1 << 20;
+        let total = 8188 * MIB;
+        let free = 7959 * MIB;
+        let capacities = CapacityProviders {
+            vram: Arc::new(FixedCapacity::new(total, free)),
+            host_ram: Arc::new(FixedCapacity::new(64u64 << 30, 32u64 << 30)),
+            disk_spill: None,
+        };
+        let limits = ResourceLimits {
+            // Ask for the entire device; the usable cap must still bind.
+            vram_limit: ResourceLimit::Fraction(1.0),
+            host_ram_limit: ResourceLimit::Fraction(0.90),
+            disk_spill_limit: None,
+        };
+        let kv_config = governor_no_paged_kv_config(&EngineConfig::default()).unwrap();
+        let domain = DeviceCompatibilityDomain::Cuda(0);
+        let governor = EngineResourceGovernor::new_with_capacities_and_authority(
+            limits,
+            false,
+            capacities,
+            kv_config,
+            (0, 0),
+            None,
+            Some(&domain),
+        )
+        .expect("governor construction with a measured device capacity");
+
+        let authority = governor.device_authority();
+        let ceiling = authority.limit_bytes();
+        let expected = ((free as f64) * DEFAULT_VMM_MAPPED_FRACTION).floor() as u64;
+        assert_eq!(
+            ceiling, expected,
+            "device authority ceiling must be floor(usable_free * safe_fraction)"
+        );
+        assert!(
+            ceiling < ((total as f64) * DEFAULT_VMM_MAPPED_FRACTION) as u64,
+            "ceiling must be below 0.90 * nominal total, i.e. sourced from free"
+        );
+
+        // Non-vacuous precondition: a reservation of the whole ceiling succeeds,
+        // establishing the state in which the next byte must be refused.
+        let lease = authority
+            .reserve(Tier::Device, ceiling, MemoryRole::Weights, HolderId::new(1))
+            .expect("a reservation up to the ceiling must be admitted");
+        assert_eq!(authority.available(Tier::Device), 0);
+        // The (N+1)th byte over the usable cap is refused rather than allowed to
+        // oversubscribe the device — the plateau, not the cliff.
+        assert!(
+            authority
+                .reserve(Tier::Device, 1, MemoryRole::KvCache, HolderId::new(2))
+                .is_err(),
+            "growth past the usable-VRAM cap must be refused (G3)"
+        );
+        drop(lease);
+    }
+
+    #[test]
+    fn no_cuda_device_reports_unknown_vram_capacity() {
+        // The device tier must report *unknown*, not a manufactured 8 GiB total,
+        // when there is no execution provider to query.
         let limits = ResourceLimits::default();
         let providers = capacity_providers_for_device(&limits, None);
-        assert_eq!(
-            providers.vram.total_bytes(),
-            PROVISIONAL_VRAM_CAPACITY_BYTES
-        );
+        assert_eq!(providers.vram.total_bytes(), None);
+        assert_eq!(providers.vram.free_bytes(), None);
+    }
+
+    #[test]
+    fn host_ram_capacity_is_measured_not_fabricated() {
+        // Host RAM is queryable on every supported platform, so the tier must
+        // carry a real number — not the old fabricated 16 GiB constant.
+        let limits = ResourceLimits::default();
+        let providers = capacity_providers_for_device(&limits, None);
+        let total = providers
+            .host_ram
+            .total_bytes()
+            .expect("host RAM must be measurable on this platform");
+        assert!(total > (1u64 << 30), "implausibly small host RAM: {total}");
+        assert_ne!(total, 16u64 << 30, "looks like the old fabricated constant");
     }
 
     // The real-capacity path is what fixes the portability bug: on a CUDA build
     // with a visible device, a `Fraction(0.90)` must resolve against the true
-    // device total, not the 8 GiB provisional cap — otherwise any model larger
-    // than ~7.2 GiB fails to load resident even on a 143 GiB H200.
+    // device total, not a provisional cap — otherwise any model larger than
+    // ~7.2 GiB fails to load resident even on a 143 GiB H200.
     #[cfg(feature = "native-cuda")]
     #[test]
     fn real_cuda_capacity_lifts_fraction_above_provisional_cap() {
+        // Historic 8 GiB provisional cap this test guards against regressing to.
+        const LEGACY_PROVISIONAL_VRAM_CAP: u64 = 8 << 30;
         let Some((total, _free)) = real_cuda_vram_capacity(0) else {
             eprintln!("no CUDA device 0 visible; skipping real-capacity assertion");
             return;
         };
-        // Only meaningful when the device is larger than the provisional tier
+        // Only meaningful when the device is larger than the historic cap
         // (true for every modern datacenter GPU, e.g. H200 = 143 GiB).
-        if total <= PROVISIONAL_VRAM_CAPACITY_BYTES {
-            eprintln!("device 0 total {total} <= provisional cap; skipping");
+        if total <= LEGACY_PROVISIONAL_VRAM_CAP {
+            eprintln!("device 0 total {total} <= legacy provisional cap; skipping");
             return;
         }
         let limits = ResourceLimits {
@@ -1053,8 +1328,10 @@ mod tests {
             host_ram_limit: ResourceLimit::Fraction(0.90),
             disk_spill_limit: None,
         };
-        let resolved = resolve_vram_limit_bytes(&limits, Some(0)).unwrap();
-        let provisional_cap = (PROVISIONAL_VRAM_CAPACITY_BYTES as f64 * 0.90) as u64;
+        let resolved = resolve_vram_limit_bytes(&limits, Some(0))
+            .unwrap()
+            .expect("a visible CUDA device has a measured capacity");
+        let provisional_cap = (LEGACY_PROVISIONAL_VRAM_CAP as f64 * 0.90) as u64;
         assert!(
             resolved > provisional_cap,
             "resolved {resolved} must exceed provisional cap {provisional_cap}"

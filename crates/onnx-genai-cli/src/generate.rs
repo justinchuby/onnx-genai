@@ -23,12 +23,11 @@ pub(super) fn generate(
     install_ctrlc_handler();
     args.cpu.apply().map_err(anyhow::Error::msg)?;
     let model_dir = resolve_model_dir(&args.model);
-    let mut profile = RunProfile::new(model_dir.display().to_string());
-    profile.execution_provider = resolved_default_providers();
+    let profile = RunProfile::new(model_dir.display().to_string());
     let output_kind = GenerateOutputKind::Text;
     let input_mode = repl_input_mode(io::stdin().is_terminal(), io::stdout().is_terminal());
     let show_stats = initial_generate_show_stats(input_mode, args.no_stats, output_kind);
-    generate_text(&model_dir, args, profiling, profile, show_stats)
+    generate_text(&model_dir, args, prompt, profiling, profile, show_stats)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

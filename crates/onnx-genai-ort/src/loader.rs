@@ -2,8 +2,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-use onnx_genai_metadata::{PipelineSpec, PreprocessingSpec, load_metadata};
+use onnx_genai_metadata::{InferenceMetadata, PipelineSpec, PreprocessingSpec, load_metadata};
 use onnx_model_package::{ModelPackage, SelectionRequest, is_model_package_directory};
 
 use crate::{
@@ -73,14 +74,7 @@ impl ModelDirectory {
         }
 
         let model_path = resolve_model_path(root)?;
-        let metadata_path = [
-            "inference_metadata.yaml",
-            "inference_metadata.yml",
-            "inference_metadata.json",
-        ]
-        .iter()
-        .map(|name| root.join(name))
-        .find(|path| path.is_file());
+        let metadata_path = find_metadata_path(root);
         let genai_config_path = onnx_genai_genai_config::find_in_dir(root);
 
         Ok(Self {
@@ -262,6 +256,15 @@ pub struct PipelineModelDirectory {
     pub spec: PipelineSpec,
     /// Package-level adapter catalog and request-selection ABI.
     pub adapters: Option<onnx_genai_metadata::AdapterServiceContract>,
+    /// The package's parsed inference metadata.
+    ///
+    /// Resolving the directory already reads and validates this file, so every
+    /// setting it declares -- context length, chunked prefill, EOS ids,
+    /// sampling defaults -- is served from here rather than re-read. A reader
+    /// that re-opened the file could disagree with the spec built beside it,
+    /// and a reader that swallowed the parse error would silently see a model
+    /// that declares nothing.
+    pub metadata: Option<InferenceMetadata>,
     /// Typed preprocessing synthesized from compatibility config or loaded natively.
     pub preprocessing: Option<PreprocessingSpec>,
     pub model_paths: BTreeMap<String, PathBuf>,
@@ -328,8 +331,8 @@ impl PipelineModelDirectory {
         })?;
         onnx_genai_metadata::validate_metadata(&metadata)
             .map_err(|errors| OrtError::InvalidArgument(errors.join("; ")))?;
-        let preprocessing = metadata.preprocessing;
-        let adapters = metadata.adapters;
+        let preprocessing = metadata.preprocessing.clone();
+        let adapters = metadata.adapters.clone();
 
         let mut model_paths = BTreeMap::new();
         for (name, component) in &spec.workflow.components {
@@ -366,11 +369,21 @@ impl PipelineModelDirectory {
             metadata_path: Some(metadata_path),
             spec,
             adapters,
+            metadata: Some(metadata),
             preprocessing,
             model_paths,
             tokenizer_paths,
         })
     }
+}
+
+/// The one ORT environment a pipeline's sessions share, created on first use.
+fn lazy_environment(cell: &OnceLock<Environment>) -> Result<&Environment> {
+    if let Some(environment) = cell.get() {
+        return Ok(environment);
+    }
+    let created = Environment::new("onnx-genai-pipeline")?;
+    Ok(cell.get_or_init(|| created))
 }
 
 /// Loaded ORT sessions and tokenizer assets for a pipeline model directory.
@@ -385,7 +398,10 @@ pub struct PipelineModels {
     pub shared_tokenizer: Option<Tokenizer>,
     pub directory: PipelineModelDirectory,
     session_options: SessionOptions,
-    _environment: Environment,
+    /// Created on first use so a package inspected without ORT sessions never
+    /// initializes the ORT runtime, while generated execution islands can still
+    /// obtain the one environment their sessions share.
+    environment: OnceLock<Environment>,
 }
 
 impl PipelineModels {
@@ -437,16 +453,16 @@ impl PipelineModels {
 
         let mut sessions = BTreeMap::new();
         let mut graph_io_metadata = BTreeMap::new();
-        let mut environment = None;
+        let environment = OnceLock::new();
         for (name, path) in &directory.model_paths {
             if build_ort_session(name) {
-                let environment = match environment.as_ref() {
-                    Some(environment) => environment,
-                    None => environment.insert(Environment::new("onnx-genai-pipeline")?),
-                };
                 sessions.insert(
                     name.clone(),
-                    Session::new(&environment, path, component_options.clone())?,
+                    Session::new(
+                        lazy_environment(&environment)?,
+                        path,
+                        component_options.clone(),
+                    )?,
                 );
             } else {
                 graph_io_metadata.insert(name.clone(), graph_io_from_model_path(path)?);
@@ -473,7 +489,7 @@ impl PipelineModels {
             shared_tokenizer,
             directory,
             session_options: generated_options,
-            _environment: environment,
+            environment,
         })
     }
 
@@ -504,9 +520,14 @@ impl PipelineModels {
             .map(|graph| graph as &dyn GraphIo)
     }
 
-    /// Environment shared by package sessions and generated execution islands.
-    pub fn environment(&self) -> &Environment {
-        &self._environment
+    /// Environment shared by package sessions and generated execution islands,
+    /// created on first use.
+    ///
+    /// A package whose components all run on the native backend never builds an
+    /// ORT session, so the environment stays uncreated until an execution island
+    /// actually needs one.
+    pub fn environment(&self) -> Result<&Environment> {
+        lazy_environment(&self.environment)
     }
 
     /// Session options used to load package components.

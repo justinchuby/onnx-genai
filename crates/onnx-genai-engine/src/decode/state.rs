@@ -4,7 +4,9 @@
 
 use super::resolved_io::ResolvedIo;
 use super::step::stable_session_ref;
-use super::values::{concat_value_axis, slice_value_axis, validate_fixed_state_budget};
+use super::values::{
+    concat_value_axis, slice_value_axis, sole_axis_with_extent, validate_fixed_state_budget,
+};
 use super::*;
 
 pub(crate) struct DecodeState {
@@ -311,6 +313,12 @@ impl DecodeState {
     /// runner (which owns its own cursor); every other state tracks the length
     /// next to the `past` tensors it describes, so the pipeline no longer has
     /// to thread it in from the retained context.
+    ///
+    /// No production caller today: the generic workflow still threads `past_len`
+    /// into each decode step, and the composite prefix-reuse component that read
+    /// this was retired. Kept (and exercised by the tests below) because it is
+    /// the read side of the `past`/`kv_len` invariant `set_past` maintains.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn current_kv_len(&self) -> usize {
         match self.runner {
             Some(_) => self.runner_len(),
@@ -319,10 +327,14 @@ impl DecodeState {
     }
 
     /// Drop the KV for everything past `target`, reusing the shared prefix a
-    /// diverging prompt still has in common. Same name and signature as
-    /// [`PipelineDecoderComponent::rewind_kv`](crate::pipeline::PipelineDecoderComponent::rewind_kv),
-    /// so both backends' `KvPrefixStore` adapters are the same shape: the state
-    /// owns its length, so it is not told `current_len` from outside.
+    /// diverging prompt still has in common. The state owns its length, so it is
+    /// not told `current_len` from outside.
+    ///
+    /// No production caller today: the composite pipeline's prefix-reuse
+    /// component was retired, and the generic workflow has not yet declared a
+    /// rollback capability. Kept as the tested primitive that a future rollback
+    /// step will drive.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn rewind_kv(&mut self, target: usize) -> anyhow::Result<bool> {
         self.truncate_past(self.current_kv_len(), target)
     }
@@ -426,6 +438,45 @@ impl DecodeState {
         self.runner
             .as_mut()
             .and_then(DecodeRunner::native_recurrent_mut)
+    }
+
+    /// Length-aware primitive behind [`rewind_kv`](Self::rewind_kv). Private:
+    /// production callers go through `rewind_kv`, which passes
+    /// `self.current_kv_len()` so `current_len` can never disagree with the
+    /// tracked length. On every successful outcome `self.kv_len` is updated in
+    /// lockstep with `self.past`, so the two cannot drift apart.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn truncate_past(
+        &mut self,
+        current_len: usize,
+        target_len: usize,
+    ) -> anyhow::Result<bool> {
+        if !self.use_kv || target_len > current_len {
+            return Ok(false);
+        }
+        if target_len == current_len {
+            self.kv_len = target_len;
+            return Ok(true);
+        }
+        // Fixed loop-carried state advances with the sequence but exposes no
+        // position to rewind to; `rewind_runner` refuses this for the same
+        // reason.
+        if !self.loop_state.is_empty() || self.runner.is_some() {
+            return Ok(false);
+        }
+        let mut truncated = HashMap::with_capacity(self.past.len());
+        for (name, value) in &self.past {
+            let Some(axis) = sole_axis_with_extent(value.shape(), current_len) else {
+                return Ok(false);
+            };
+            truncated.insert(name.clone(), slice_value_axis(value, axis, 0, target_len)?);
+        }
+        self.past = truncated;
+        self.kv_len = target_len;
+        // Positions are rebuilt from the absolute past length on the next step;
+        // a carried value would describe tokens that no longer exist.
+        self.next_positions = None;
+        Ok(true)
     }
 
     pub(crate) fn rewind_runner(&mut self, target_len: usize) -> anyhow::Result<()> {
@@ -596,5 +647,161 @@ impl DecodeState {
         self.retained_kv_len = new_retained;
         self.kv_len = target_len;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Truncation is what lets a forked or edited conversation keep the head it
+    /// still shares, and a wrong slice silently corrupts attention rather than
+    /// failing, so the mechanics are pinned directly here.
+    mod truncate_past_tests {
+        use super::super::DecodeState;
+        use onnx_genai_ort::Value;
+        use std::collections::HashMap;
+
+        /// A state holding one `[1, 2, seq, 2]` past tensor whose elements count up,
+        /// so a slice along the wrong axis is visible in the values.
+        fn state_with_past(seq: usize) -> DecodeState {
+            let data: Vec<f32> = (0..(4 * seq)).map(|value| value as f32).collect();
+            let mut past = HashMap::new();
+            past.insert(
+                "past_key_values.0.key".to_string(),
+                Value::from_vec_f32(data, &[1, 2, seq as i64, 2]).expect("build a past tensor"),
+            );
+            DecodeState::for_test_with_past(past)
+        }
+
+        /// The whole point of making `past` private and pairing it with `kv_len`:
+        /// the owned length can never describe a different number of tokens than
+        /// the tensors physically hold. `set_past` writes both, `rewind_kv` moves
+        /// both, and there is no way to touch one without the other.
+        ///
+        /// This is falsifiable: drop the `self.kv_len = target_len` write in
+        /// `truncate_past` (or make `set_past` ignore its `kv_len` argument) and
+        /// this goes red because `current_kv_len()` reports a length the sequence
+        /// axis no longer matches.
+        #[test]
+        fn the_owned_kv_length_cannot_diverge_from_the_past_tensors() {
+            let data: Vec<f32> = (0..12).map(|value| value as f32).collect();
+            let mut past = HashMap::new();
+            past.insert(
+                "past_key_values.0.key".to_string(),
+                Value::from_vec_f32(data, &[1, 2, 3, 2]).expect("build a past tensor"),
+            );
+            let mut state = DecodeState::for_test_with_past(HashMap::new());
+
+            // A write sets the length alongside the tensors.
+            state.set_past(past, 3);
+            assert_eq!(state.current_kv_len(), 3);
+            assert_eq!(
+                state.past()["past_key_values.0.key"].shape()[2],
+                3,
+                "the reported length must match the sequence axis extent"
+            );
+
+            // A rewind moves both in lockstep.
+            assert!(state.rewind_kv(2).expect("rewind succeeds"));
+            assert_eq!(state.current_kv_len(), 2);
+            assert_eq!(
+                state.past()["past_key_values.0.key"].shape()[2],
+                2,
+                "after a rewind the length must still match the sequence axis extent"
+            );
+        }
+
+        #[test]
+        fn truncating_keeps_the_leading_positions_of_the_sequence_axis() {
+            let mut state = state_with_past(3);
+            assert!(state.truncate_past(3, 2).expect("truncation succeeds"));
+
+            let kept = &state.past()["past_key_values.0.key"];
+            assert_eq!(
+                kept.shape(),
+                &[1, 2, 2, 2],
+                "only the sequence axis shrinks"
+            );
+            assert_eq!(
+                kept.to_vec_f32().expect("read the truncated tensor"),
+                // Head 0 keeps positions 0-1 (0,1,2,3); head 1 keeps its own
+                // positions 0-1 (6,7,8,9). Slicing the wrong axis would not produce
+                // this.
+                vec![0.0, 1.0, 2.0, 3.0, 6.0, 7.0, 8.0, 9.0]
+            );
+        }
+
+        #[test]
+        fn truncating_to_the_current_length_is_a_no_op() {
+            let mut state = state_with_past(3);
+            assert!(state.truncate_past(3, 3).expect("no-op succeeds"));
+            assert_eq!(state.past()["past_key_values.0.key"].shape(), &[1, 2, 3, 2]);
+        }
+
+        #[test]
+        fn an_ambiguous_sequence_axis_declines_rather_than_guesses() {
+            // [1, 3, 3, 2]: both the head axis and the sequence axis are 3, so
+            // "the axis whose extent is the KV length" has two answers. Picking
+            // either would silently scramble attention.
+            let data: Vec<f32> = (0..18).map(|value| value as f32).collect();
+            let mut past = HashMap::new();
+            past.insert(
+                "past_key_values.0.key".to_string(),
+                Value::from_vec_f32(data, &[1, 3, 3, 2]).expect("build a past tensor"),
+            );
+            let mut state = DecodeState::for_test_with_past(past);
+
+            assert!(
+                !state
+                    .truncate_past(3, 2)
+                    .expect("declining is not an error"),
+                "an ambiguous axis must decline"
+            );
+            assert_eq!(
+                state.past()["past_key_values.0.key"].shape(),
+                &[1, 3, 3, 2],
+                "a declined truncation must leave the KV untouched"
+            );
+        }
+
+        #[test]
+        fn fixed_loop_carried_state_cannot_be_truncated() {
+            let mut state = state_with_past(3);
+            state.loop_state.insert(
+                "state".to_string(),
+                Value::from_slice_f32(&[1.0], &[1]).unwrap(),
+            );
+            assert!(
+                !state
+                    .truncate_past(3, 2)
+                    .expect("declining is not an error")
+            );
+        }
+
+        #[test]
+        fn a_state_without_kv_declines() {
+            let mut state = state_with_past(3);
+            state.use_kv = false;
+            assert!(
+                !state
+                    .truncate_past(3, 2)
+                    .expect("declining is not an error")
+            );
+        }
+
+        #[test]
+        fn the_sole_matching_axis_is_found_and_ambiguity_is_rejected() {
+            assert_eq!(
+                crate::decode::values::sole_axis_with_extent(&[1, 2, 5, 4], 5),
+                Some(2)
+            );
+            assert_eq!(
+                crate::decode::values::sole_axis_with_extent(&[1, 5, 5, 4], 5),
+                None
+            );
+            assert_eq!(
+                crate::decode::values::sole_axis_with_extent(&[1, 2, 3], 9),
+                None
+            );
+        }
     }
 }

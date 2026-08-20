@@ -12,7 +12,8 @@ use onnx_genai_engine::logits::{
 use onnx_genai_engine::{
     DecodePrecision, Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GeneratePrompt,
     GenerateRequest, NativeDecodeDevice, NativeDecodeSession, PipelineEngine,
-    PipelineGenerateRequest, ProcessorChain, parse_resource_limit,
+    PipelineGenerateRequest, ProcessorChain, SpeculativeMode, SpeculativeStats,
+    parse_resource_limit,
 };
 use onnx_genai_ort::{DataType, Tokenizer, Value, available_execution_providers, profile};
 use onnx_runtime_session::InferenceSession;
@@ -454,6 +455,31 @@ fn request_with_prompt(args: &Args, tokens: usize, prompt: &str) -> GenerateRequ
     apply_sampling_options(&mut request.options, args);
     apply_speculative_options(&mut request.options, args);
     request
+}
+
+/// Wire the prompt-lookup speculative mode into the request options. A no-op for
+/// `--speculative none`, so the default greedy fast path is untouched.
+fn apply_speculative_options(options: &mut GenerateOptions, args: &Args) {
+    match args.speculative {
+        SpeculativeArg::None => {}
+        SpeculativeArg::PromptLookup => {
+            options.speculative_mode = Some(SpeculativeMode::PromptLookup {
+                ngram: args.spec_ngram,
+                max_tokens: args.spec_tokens,
+            });
+            options.num_speculative_tokens = Some(args.spec_tokens);
+        }
+    }
+}
+
+fn describe_speculative(args: &Args) -> String {
+    match args.speculative {
+        SpeculativeArg::None => "speculative: OFF (plain M=1 greedy)".to_string(),
+        SpeculativeArg::PromptLookup => format!(
+            "speculative: prompt-lookup ngram={} K={}",
+            args.spec_ngram, args.spec_tokens
+        ),
+    }
 }
 
 fn pipeline_request(
@@ -2878,7 +2904,7 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
 fn time_first_token(
     args: &Args,
     engine: &mut PipelineEngine,
-    prompt: &str,
+    prompt_tokens: &[u32],
 ) -> Result<(f64, usize)> {
     let start = Instant::now();
     let mut first: Option<std::time::Duration> = None;
@@ -2889,7 +2915,7 @@ fn time_first_token(
         Ok(())
     };
     let result = engine
-        .generate_with_callback(pipeline_request(args, 1, prompt), Some(&mut callback))
+        .generate_with_callback(pipeline_request(args, 1, prompt_tokens)?, Some(&mut callback))
         .context("prefill sweep generation")?;
     let elapsed = first.context("generation emitted no tokens")?;
     Ok((elapsed.as_secs_f64() * 1_000.0, result.prefix_cache_hit_len))
@@ -2900,12 +2926,16 @@ fn time_first_token(
 /// The prefix cache is cleared before every point. Without that, each point is
 /// a prefix of the next and the sweep answers almost every generation out of
 /// cache, reporting a prefill that does not vary with prompt length at all.
-fn run_prefill_sweep(args: &Args, engine: &mut PipelineEngine, lengths: &[usize]) -> Result<()> {
+fn run_prefill_sweep(
+    args: &Args,
+    engine: &mut PipelineEngine,
+    ids: &[u32],
+    lengths: &[usize],
+) -> Result<()> {
     if lengths.is_empty() {
         bail!("--prefill-sweep needs at least one length");
     }
     const WARMUP_TOKENS: usize = 64;
-    let ids = engine.tokenize(&args.prompt).context("tokenize prompt")?;
     let longest = lengths.iter().copied().max().unwrap_or(0);
     if ids.len() < longest {
         bail!(
@@ -2917,30 +2947,31 @@ fn run_prefill_sweep(args: &Args, engine: &mut PipelineEngine, lengths: &[usize]
 
     // One throwaway generation absorbs process startup so the first measured
     // point does not carry it.
-    let warmup = engine.detokenize(&ids[..WARMUP_TOKENS.min(ids.len())])?;
-    time_first_token(args, engine, &warmup).context("prefill sweep warmup")?;
+    time_first_token(args, engine, &ids[..WARMUP_TOKENS.min(ids.len())])
+        .context("prefill sweep warmup")?;
 
     let mut points: Vec<(f64, f64)> = Vec::with_capacity(lengths.len());
     for &len in lengths {
-        let text = engine.detokenize(&ids[..len])?;
-        // Re-encoding the detokenized window is not always length-preserving,
-        // so report the count the engine will really see rather than the request.
-        let actual = engine.tokenize(&text)?.len();
+        // Prompts are submitted as token ids, so the measured window is exactly
+        // `len` tokens; there is no detokenize/re-encode round trip to distort
+        // the count the engine really sees.
+        let window = &ids[..len];
         engine.clear_prefix_cache();
-        let (ms, hit) = time_first_token(args, engine, &text)?;
+        let (ms, hit) = time_first_token(args, engine, window)?;
         if hit > 0 {
             bail!(
                 "prefill sweep measured a {hit}-token prefix cache hit after clearing the \
                  cache; the measurement would not reflect prompt processing"
             );
         }
-        let processed = actual.saturating_sub(hit);
+        let processed = window.len().saturating_sub(hit);
         println!(
-            "prefill_sweep: prompt_tokens={actual} prefix_cache_hit={hit} prefill={ms:.3} ms \
+            "prefill_sweep: prompt_tokens={} prefix_cache_hit={hit} prefill={ms:.3} ms \
              throughput={:.1} tok/s",
+            window.len(),
             processed as f64 * 1_000.0 / ms
         );
-        points.push((actual as f64, ms));
+        points.push((window.len() as f64, ms));
     }
 
     if points.len() >= 2 {
@@ -3015,7 +3046,11 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
         .with_context(|| format!("load pipeline engine {}", model_dir.display()))?;
     let tokenizer =
         Tokenizer::from_file(tokenizer_file(model_dir)).context("load pipeline tokenizer.json")?;
-    let prompt_tokens = if let Some(ids_path) = args.prompt_ids.as_ref() {
+    // Resolve the prompt against the package's own tokenizer, then report the
+    // length. Prefill numbers are meaningless without the token count they were
+    // measured over, and a harness-side tokenizer is not guaranteed to be the
+    // one this pipeline routes prompts through.
+    let mut prompt_tokens = if let Some(ids_path) = args.prompt_ids.as_ref() {
         let raw = std::fs::read_to_string(ids_path)
             .with_context(|| format!("read prompt ids from {}", ids_path.display()))?;
         serde_json::from_str::<Vec<u32>>(raw.trim())
@@ -3028,6 +3063,22 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
     if prompt_tokens.is_empty() {
         bail!("pipeline prompt tokenized to an empty sequence");
     }
+    if let Some(want) = args.prompt_tokens {
+        if prompt_tokens.len() < want {
+            bail!(
+                "--prompt-tokens {want} exceeds the {} tokens available in the prompt; \
+                 supply a longer --prompt-file (testdata/long-prompt.txt has ~21.7k)",
+                prompt_tokens.len()
+            );
+        }
+        prompt_tokens.truncate(want);
+    }
+    println!("profile_native: prompt_tokens={}", prompt_tokens.len());
+
+    if let Some(lengths) = args.prefill_sweep.clone() {
+        return run_prefill_sweep(args, &mut engine, &prompt_tokens, &lengths);
+    }
+
     for _ in 0..args.warmups {
         std::hint::black_box(
             engine
@@ -3096,6 +3147,29 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
             let decode_wall = Duration::from_nanos(u64::try_from(decode_ns)?);
             let ms_per_token = decode_ns as f64 / 1_000_000.0 / decode_tokens as f64;
             let tok_per_s = decode_tokens as f64 * 1_000_000_000.0 / decode_ns as f64;
+            // A measured prefill that reused workflow state did not process
+            // those tokens, so reporting it as prompt-processing throughput
+            // overstates prefill by however much it reused. This is easy to hit
+            // by accident: --warmups replays the *same* prompt, so the measured
+            // run reads back a fully cached prefix and reports a prefill that is
+            // independent of prompt length (#1529).
+            let prompt_token_count = prompt_tokens.len();
+            let prefill_new_tokens = prompt_token_count.saturating_sub(cache_hit);
+            let prefill_note = if cache_hit > 0 {
+                format!(
+                    " prefix_cache_hit={cache_hit}/{prompt_token_count} \
+                     WARNING: only {prefill_new_tokens} tokens were actually processed; \
+                     this is NOT prompt-processing throughput (re-run with --warmups 0 \
+                     or a distinct prompt per run)"
+                )
+            } else if prefill_new_tokens > 0 {
+                format!(
+                    " prefill_throughput={:.1} tok/s ({prefill_new_tokens} tokens)",
+                    prefill_new_tokens as f64 * 1_000.0 / prefill_ms
+                )
+            } else {
+                String::new()
+            };
             println!(
                 "steady_run {run}: prefill={prefill_ms:.3} ms{prefill_note} \
                  decode_tokens={decode_tokens} \

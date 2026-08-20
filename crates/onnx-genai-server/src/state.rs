@@ -536,6 +536,7 @@ impl AppState {
             id: model_id,
             // Test-only constructor: the model was handed in already loaded, so
             // there is no package directory to resolve files against.
+            model_dir: std::path::PathBuf::new(),
             engine: engine_driver,
             tokenizer: Arc::new(tokenizer),
             chat_template: chat_template.map(Arc::new),
@@ -660,7 +661,13 @@ pub(crate) fn build_handle_with_authorities(
         .map_err(|e| anyhow::anyhow!("Failed to discover pipeline directory: {e}"))?
     {
         onnx_genai_engine::validate_pipeline_backend_request(config.engine_config.decode_backend)?;
-        let model_max_context = load_model_max_context(directory.metadata_path.as_deref())?;
+        // The directory already parsed this package's metadata; re-reading it
+        // here could disagree with the pipeline built from it.
+        let model_max_context = directory
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.model.as_ref())
+            .and_then(|model| model.max_sequence_length);
         return build_pipeline_handle(
             model_dir,
             model_id,
@@ -692,6 +699,7 @@ pub(crate) fn build_handle_with_authorities(
     let engine_driver = EngineDriver::start(engine, requested_max_batch, config.max_queue_depth);
     Ok(ModelHandle::new(ModelHandleParts {
         id: model_id,
+        model_dir: model_dir.to_path_buf(),
         engine: engine_driver,
         tokenizer: Arc::new(tokenizer),
         chat_template: chat_template.map(Arc::new),
@@ -722,13 +730,13 @@ fn build_pipeline_handle(
         authorities,
     )?;
     let multimodal = crate::multimodal::build(&directory, engine.models())?;
-    // The package's own `generation` block is the pipeline's declared sampling
-    // regime, so honor it exactly as the CLI does. Without it every request
-    // decodes greedily at the OpenAI schema defaults, and a model that ships
-    // `do_sample: true` degenerates into repetition.
-    let generation_defaults = engine.generation_defaults().cloned();
+    // The declared `generation` block was retired along with the rest of the
+    // superseded generation metadata surfaces, so the pipeline path resolves
+    // sampling from request options only — same as the non-pipeline path above.
+    let generation_defaults = None;
     Ok(ModelHandle::new(ModelHandleParts {
         id: model_id,
+        model_dir: model_dir.to_path_buf(),
         engine: EngineDriver::start_pipeline(engine, config.max_queue_depth),
         tokenizer: Arc::new(tokenizer),
         chat_template: chat_template.map(Arc::new),

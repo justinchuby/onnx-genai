@@ -17,7 +17,7 @@ use axum::{
 use onnx_genai::engine::EngineDecodeBackend;
 use onnx_genai::{Engine, EngineConfig};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, fs, io::Cursor, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, io::Cursor, path::PathBuf, time::Duration};
 use tokio::{sync::mpsc, time::timeout};
 use tower::ServiceExt;
 

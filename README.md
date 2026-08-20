@@ -28,11 +28,10 @@ A Rust inference runtime for generative AI models, built on ONNX Runtime.
 - **Pipelines and models:** metadata-declared multi-model pipelines, a tested
   tiny vision-language pipeline fixture, and real Qwen2.5-0.5B-Instruct and
   TinyStories generation built through Mobius.
-- **Execution providers:** select CPU, WebGPU, CUDA, CoreML, or configured ORT
-  plugin EPs with `ONNX_GENAI_EP` — a comma-separated priority list is
-  supported so several providers (including multiple plugins) can be composed;
-  unavailable requested providers fail clearly unless `ONNX_GENAI_EP_FALLBACK=1`
-  explicitly opts into a visible CPU retry.
+- **Execution providers:** select CPU, WebGPU, CUDA, CoreML, or any ORT plugin
+  EP with `ONNX_GENAI_EP` — a comma-separated priority list is supported so
+  several providers (including multiple plugins) can be composed; unavailable
+  providers warn and fall back to CPU.
 - **Extensibility:** public `Sampler`, `SpeculativeProposer`, logit processor
   registry, and KV/pipeline APIs, plus an internal `DecodeBackend` seam shared
   by dynamic and static-cache decoding.
@@ -87,10 +86,10 @@ cargo build --release -p onnx-genai-cli
 
 ./target/release/onnx-genai generate \
   models/qwen2.5-0.5b \
-  "Write a short Rust hello-world program." \
   --max-new-tokens 64 \
   --temperature 0 \
-  --stream
+  --stream \
+  --prompt "Write a short Rust hello-world program."
 ```
 
 When `--max-new-tokens` is omitted, `generate` and `run` use whatever budget
@@ -187,11 +186,13 @@ inference metadata (`preprocessing.image` + `pipeline.vision` for images, an
 modalities on any package that declares one:
 
 ```bash
-./target/release/onnx-genai generate models/tiny-vlm "What is in this image?" \
-  --image ./cat.png
+./target/release/onnx-genai generate models/tiny-vlm \
+  --image ./cat.png \
+  --prompt "What is in this image?"
 
-./target/release/onnx-genai generate models/whisper-tiny "" \
-  --audio ./speech.wav
+./target/release/onnx-genai generate models/whisper-tiny \
+  --audio ./speech.wav \
+  --prompt ""
 ```
 
 Audio is transcription: the model's own decoder prompt replaces the typed text,
@@ -202,17 +203,17 @@ You do not have to know a model's image placeholder token. Pass the images and
 write the prompt normally — one placeholder per image is prepended for you:
 
 ```bash
-onnx-genai generate models/my-vlm "What changed between these two photos?" \
-  --image left.png --image right.png
+onnx-genai generate models/my-vlm \
+  --image left.png --image right.png \
+  --prompt "What changed between these two photos?"
 ```
 
 To control where each image sits in the sentence, write the placeholders
 yourself and they are honored verbatim:
 
 ```bash
-onnx-genai generate models/my-vlm \
-  "The first <image> is a cat and the second <image> is a dog. Compare them." \
-  --image cat.png --image dog.png
+onnx-genai generate models/my-vlm --image cat.png --image dog.png \
+  --prompt "The first <image> is a cat and the second <image> is a dog. Compare them."
 ```
 
 A *partial* set is rejected rather than topped up: once you start positioning
@@ -257,7 +258,7 @@ ONNX fixtures in `tests/fixtures/`; see
 `--profile` reports where the time went. It works on every subcommand:
 
 ```bash
-onnx-genai --profile generate models/qwen2.5-0.5b "..." --max-new-tokens 40
+onnx-genai --profile generate models/qwen2.5-0.5b --prompt "..." --max-new-tokens 40
 ```
 
 ```text
@@ -367,10 +368,10 @@ absent line means "not accounted here", never "nothing was used".
 
 ```bash
 # Machine-readable, for diffing runs or plotting in CI (`-` writes to stdout)
-onnx-genai --profile-json bench.json generate models/qwen2.5-0.5b "..."
+onnx-genai --profile-json bench.json generate models/qwen2.5-0.5b --prompt "..."
 
 # Chrome Trace Event timeline, viewable at https://ui.perfetto.dev
-onnx-genai --profile-trace trace.json generate models/qwen2.5-0.5b "..."
+onnx-genai --profile-trace trace.json generate models/qwen2.5-0.5b --prompt "..."
 ```
 
 ### Generate images
@@ -380,7 +381,7 @@ onnx-genai --profile-trace trace.json generate models/qwen2.5-0.5b "..."
 
 ```bash
 ./target/release/onnx-genai generate models/stable-diffusion-1.5 \
-  "an astronaut riding a horse" \
+  --prompt "an astronaut riding a horse" \
   --negative-prompt "blurry, low quality" \
   --steps 25 --guidance-scale 7.5 --seed 0 \
   --width 512 --height 512 \

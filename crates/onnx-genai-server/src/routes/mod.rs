@@ -46,7 +46,7 @@ use crate::{
         ChatMessageToolCallFunction, ChatTokenLogprob, ChatTool, ChatTopLogprob, CompletionChoice,
         CompletionLogprobs, CompletionRequest, CompletionResponse, EmbeddingData, EmbeddingInput,
         EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, InputAudio,
-        ResponseFormat, StopInput, ToolChoice, ToolChoiceMode, Usage,
+        ReasoningEffort, ResponseFormat, StopInput, ToolChoice, ToolChoiceMode, Usage,
     },
 };
 

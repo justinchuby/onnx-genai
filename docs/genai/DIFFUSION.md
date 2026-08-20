@@ -10,5 +10,5 @@ RNG counter state, guidance inputs, and termination are ordinary typed SSA value
 Masked diffusion replaces the solver with a masked-update policy component and carries
 both state and mask. No diffusion algorithm or family name is implemented in the host.
 
-See [WORKFLOW_POLICY_COMPONENTS.md](WORKFLOW_POLICY_COMPONENTS.md) for exact solver and
+See [WORKFLOW_POLICY_COMPONENTS.md](../WORKFLOW_POLICY_COMPONENTS.md) for exact solver and
 masked-update ONNX port contracts.

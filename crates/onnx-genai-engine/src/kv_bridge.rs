@@ -1838,7 +1838,7 @@ mod tests {
 
         run_decode_step(&session, &mut state, &[3], 2)?;
         assert_eq!(state.retained_kv_len(3), 2);
-        assert!(state.past.values().all(|value| value.shape()[2] == 2));
+        assert!(state.past().values().all(|value| value.shape()[2] == 2));
         // Sliding-window attention always takes bounded functional
         // past/present dataflow; storage hints cannot override it.
         assert!(matches!(

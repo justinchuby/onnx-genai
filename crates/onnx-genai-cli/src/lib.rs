@@ -55,8 +55,15 @@ use interactive::{
 use model_inspection::{list, show, version};
 #[cfg(test)]
 use onnx_genai::engine::EngineDecodeBackend;
-use onnx_genai::{EngineConfig, GenerateOptions, SamplingOverrides, StopSequence};
-use onnx_genai_server::{ServeArgs, run_serve};
+#[cfg(all(test, feature = "native-backend"))]
+use onnx_genai::engine::native_decode_device::NativeDecodeDevice;
+use onnx_genai::{GenerateOptions, SamplingOverrides, StopSequence};
+#[cfg(test)]
+use onnx_genai_server::runtime_args::DeviceChoice;
+use onnx_genai_server::{
+    ServeArgs, run_serve,
+    runtime_args::{CpuArgs, EngineArgs, decode_backend_name},
+};
 use output::write_merged_trace;
 use profile::RunProfile;
 use transcribe::transcribe;

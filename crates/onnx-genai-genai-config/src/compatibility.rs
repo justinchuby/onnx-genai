@@ -679,7 +679,7 @@ impl GenAiConfig {
             audio_features_input: None,
             cross_kv_inputs: None,
             cross_kv_outputs: None,
-            state_pairs: Some(state_pairs),
+            state_pairs,
             optional_inputs: std::collections::BTreeMap::new(),
             static_cache: None,
         })

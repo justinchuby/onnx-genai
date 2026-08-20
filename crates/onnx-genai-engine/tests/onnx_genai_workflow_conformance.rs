@@ -6,8 +6,8 @@
 #![allow(clippy::field_reassign_with_default)]
 
 use onnx_genai_engine::{
-    AdapterActivation, AdapterSelection, Engine, EngineConfig, GenerateOptions,
-    GeneratePrompt, GenerateRequest, PipelineGenerateRequest,
+    AdapterActivation, AdapterSelection, Engine, EngineConfig, GenerateOptions, GeneratePrompt,
+    GenerateRequest, PipelineGenerateRequest,
     pipeline::{PipelineEngine, WorkflowOutputRole},
 };
 use onnx_genai_ort::{DataType, Value};
@@ -78,10 +78,7 @@ fn adapter_request(
             DataType::Bool,
         )?,
     )
-    .with_input(
-        "activations",
-        Value::from_slice_f32(values, &[batch, 2])?,
-    ))
+    .with_input("activations", Value::from_slice_f32(values, &[batch, 2])?))
 }
 
 #[test]

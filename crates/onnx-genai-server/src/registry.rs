@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     fmt,
+    path::{Path, PathBuf},
     sync::{
         Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -38,8 +39,6 @@ pub enum EvictionPolicy {
 /// by Axum's `State` extractor.
 pub(crate) struct ModelHandle {
     pub(crate) id: String,
-    /// Directory the model was loaded from, needed by routes that resolve
-    /// package-relative files (the diffusion tokenizer and prompt encoder).
     pub(crate) engine: EngineDriver,
     pub(crate) tokenizer: Arc<Tokenizer>,
     pub(crate) chat_template: Option<Arc<ChatTemplate>>,
@@ -56,6 +55,10 @@ pub(crate) struct ModelHandle {
     /// Declared image/audio input contracts, or `None` for a single decoder
     /// graph. Shared with the CLI so both front ends admit the same inputs.
     pub(crate) multimodal: Option<MultimodalSpecs>,
+    /// Whether the package declares a channel whose content the caller must not
+    /// be shown, i.e. whether a generated turn carries private reasoning that
+    /// has to be filtered out of everything this server returns.
+    pub(crate) private_channels: bool,
     /// Epoch-millisecond timestamp of the last call to `ModelRegistry::resolve`.
     /// Initialised to construction time; updated on every resolve for LRU eviction.
     pub(crate) last_request_at: AtomicU64,
@@ -70,6 +73,10 @@ pub(crate) struct ModelHandle {
 /// optional and same-typed, so positional construction was easy to get wrong.
 pub(crate) struct ModelHandleParts {
     pub(crate) id: String,
+    /// Directory the model was loaded from. Read once at construction to decide
+    /// whether the package declares a private reasoning channel; not retained
+    /// on the handle, which has no other package-relative file to resolve.
+    pub(crate) model_dir: PathBuf,
     pub(crate) engine: EngineDriver,
     pub(crate) tokenizer: Arc<Tokenizer>,
     pub(crate) chat_template: Option<Arc<ChatTemplate>>,
@@ -84,6 +91,7 @@ impl ModelHandle {
     pub(crate) fn new(parts: ModelHandleParts) -> Self {
         let ModelHandleParts {
             id,
+            model_dir,
             engine,
             tokenizer,
             chat_template,
@@ -104,6 +112,7 @@ impl ModelHandle {
             fim_config,
             pipeline,
             multimodal,
+            private_channels,
             last_request_at: AtomicU64::new(now_millis()),
             warmed: AtomicBool::new(false),
             warmup_lock: std::sync::Mutex::new(()),
@@ -779,6 +788,45 @@ mod tests {
     use super::*;
     use crate::driver::EngineDriver;
 
+    // Only a package that declares a private reasoning channel needs its output
+    // filtered, so the flag is read from the package rather than guessed at.
+    #[test]
+    fn a_declared_reasoning_channel_arms_filtering() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            serde_json::json!({
+                "response_template": {
+                    "fields": {
+                        "content": {"open_pattern": "to=user<\\|message\\|>"},
+                        "reasoning_content": {"open_pattern": "to=self<\\|message\\|>"}
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write config");
+
+        assert!(declares_private_channels(dir.path()));
+    }
+
+    // A model that declares no private channel, or ships no template at all,
+    // must stream exactly what it generated.
+    #[test]
+    fn an_undeclared_reasoning_channel_leaves_output_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        assert!(!declares_private_channels(dir.path()));
+
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            serde_json::json!({"response_template": {"fields": {"content": {}}}}).to_string(),
+        )
+        .expect("write config");
+
+        assert!(!declares_private_channels(dir.path()));
+    }
+
     /// Build a minimal `ModelHandle` stub backed by the tiny-llm tokenizer fixture.
     /// The stub has a dead command channel (no engine thread); it is only used to
     /// exercise registry ordering / eviction — never for actual generation.
@@ -821,6 +869,7 @@ mod tests {
             fim_config: None,
             pipeline: false,
             multimodal: None,
+            private_channels: false,
             last_request_at: AtomicU64::new(last_request_at),
             warmed: AtomicBool::new(false),
             warmup_lock: std::sync::Mutex::new(()),
