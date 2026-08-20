@@ -37,7 +37,7 @@ use crate::status::fail_status;
 /// Maps our internal `DeviceType` to ORT's `OrtHardwareDeviceType`.
 ///
 /// Returns `None` for device types that have no ORT hardware representation
-/// (e.g. WebGpu, custom).
+/// (e.g. WebGpu, Vulkan, custom).
 pub fn device_type_to_ort_hardware(dt: DeviceType) -> Option<ort::OrtHardwareDeviceType> {
     match dt {
         DeviceType::Cpu => Some(ort::OrtHardwareDeviceType_CPU),
@@ -46,7 +46,7 @@ pub fn device_type_to_ort_hardware(dt: DeviceType) -> Option<ort::OrtHardwareDev
         // CoreML/MLX run on Apple silicon which ORT classifies as NPU
         DeviceType::CoreMl | DeviceType::Mlx => Some(ort::OrtHardwareDeviceType_NPU),
         DeviceType::OpenVino => Some(ort::OrtHardwareDeviceType_NPU),
-        DeviceType::WebGpu | DeviceType::Custom(_) => None,
+        DeviceType::WebGpu | DeviceType::Vulkan | DeviceType::Custom(_) => None,
     }
 }
 
@@ -969,6 +969,11 @@ mod tests {
     #[test]
     fn webgpu_has_no_hardware_mapping() {
         assert_eq!(device_type_to_ort_hardware(DeviceType::WebGpu), None);
+    }
+
+    #[test]
+    fn vulkan_has_no_hardware_mapping() {
+        assert_eq!(device_type_to_ort_hardware(DeviceType::Vulkan), None);
     }
 
     #[test]

@@ -11,7 +11,7 @@ tags:
 status: maintained
 lang: zh-CN
 created: 2026-08-17
-updated: 2026-08-19
+updated: 2026-08-20
 ---
 
 # Execution Backends
@@ -25,7 +25,7 @@ updated: 2026-08-19
 |---|---|
 | Generation engine | 拥有 prompt/decode/sampling/session 语义 |
 | Decode backend | 通过 ORT 或原生 nxrt 执行模型的单步 |
-| Execution Provider(执行提供者,EP) | 为某类设备(如 CPU 或 CUDA)实现/认领图算子 |
+| Execution Provider(执行提供者,EP) | 为某类设备(如 CPU、CUDA 或 CubeCL)实现/认领图算子 |
 
 后端(backend)不等于设备(device)。原生 CUDA 指的是“使用 CUDA EP 的 nxrt
 后端”;ORT CUDA 指的是“配置了其 CUDA provider 的 ONNX Runtime 后端”。
@@ -57,7 +57,7 @@ placement / EP claims / kernel compilation
     ↓
 memory plan + executor
     ↓
-CPU, CUDA or plugin EP kernels
+CPU、CUDA、CubeCL 或 plugin EP kernels
 ```
 
 它对以下方面提供直接控制:
@@ -75,8 +75,8 @@ CPU, CUDA or plugin EP kernels
 
 ## Execution provider
 
-`onnx-runtime-ep-api` 定义了原生 EP/kernel 契约。具体的 provider 包括 CPU 与
-CUDA。插件 crate 桥接外部/动态 provider。
+`onnx-runtime-ep-api` 定义了原生 EP/kernel 契约。具体的 provider 包括 CPU、CUDA 与
+CubeCL。插件 crate 桥接外部/动态 provider。
 
 一个 EP 通常拥有或提供:
 
@@ -94,7 +94,7 @@ CUDA。插件 crate 桥接外部/动态 provider。
 CLI 支持分别选择后端与 EP。更换模型、后端或 EP 需要重新加载,因为 session 是针对
 某种图执行策略构建的,无法简单地把它的活动状态迁移到另一个 provider。
 
-在编译/可用的前提下,环境变量与 CLI 配置可以选择 CPU、CUDA、WebGPU、CoreML 或
+在编译/可用的前提下,环境变量与 CLI 配置可以选择 CPU、CUDA、WebGPU、CubeCL、CoreML 或
 插件 provider。请求了不可用的 provider 会明确失败,除非显式启用了 fallback。
 
 ## 为什么两条路径都保留
@@ -122,4 +122,5 @@ CLI 支持分别选择后端与 EP。更换模型、后端或 EP 需要重新加
 
 - [[architecture/Crate Architecture]]
 - [[architecture/Inference Request Lifecycle]]
+- [[execution/CubeCL Execution Providers]]
 - [[memory/Memory Management for Beginners]]

@@ -12,6 +12,15 @@ fn recognizes_cuda_provider_names() {
 }
 
 #[test]
+fn known_provider_values_list_cubecl_names() {
+    let values = ep_compat::known_execution_provider_values();
+    assert!(values.contains("cubecl-webgpu"), "{values}");
+    assert!(values.contains("cubecl_webgpu"), "{values}");
+    assert!(values.contains("cubecl-vulkan"), "{values}");
+    assert!(values.contains("cubecl_vulkan"), "{values}");
+}
+
+#[test]
 fn fixed_capacity_present_binding_uses_capabilities_or_opt_in() {
     let resolve = |name: &str| resolve_execution_provider(&ep_selection(name));
     assert!(fixed_capacity_present_binding_supported(
@@ -114,6 +123,89 @@ fn resolves_qnn_to_conservative_plugin_npu() {
 }
 
 #[test]
+fn resolves_cubecl_to_conservative_plugin_gpu() {
+    let cases = [
+        (
+            "cubecl-webgpu",
+            "cubecl-webgpu",
+            "onnxruntime_cubecl_webgpu_ep",
+        ),
+        (
+            "cubecl_webgpu",
+            "cubecl-webgpu",
+            "onnxruntime_cubecl_webgpu_ep",
+        ),
+        (
+            "cubecl-vulkan",
+            "cubecl-vulkan",
+            "onnxruntime_cubecl_vulkan_ep",
+        ),
+        (
+            "cubecl_vulkan",
+            "cubecl-vulkan",
+            "onnxruntime_cubecl_vulkan_ep",
+        ),
+    ];
+
+    for (requested, provider_name, expected_registration) in cases {
+        let mut selection = ep_selection(requested);
+        selection.options.insert(
+            "arena_extend_strategy".to_string(),
+            "kSameAsRequested".to_string(),
+        );
+
+        let resolved = resolve_execution_provider(&selection);
+
+        assert_eq!(resolved.caps.name, provider_name);
+        assert_eq!(resolved.caps.hardware, HardwareKind::Gpu);
+        assert!(!resolved.transitional_webgpu);
+        assert!(!resolved.graph_capture_env);
+        assert!(resolved.is_strict());
+        for flag in [
+            capability::FIXED_CAPACITY_PRESENT_BINDING,
+            capability::GRAPH_CAPTURE,
+            capability::DEVICE_KV,
+            capability::DEVICE_SAMPLING,
+        ] {
+            assert!(
+                !resolved.caps.has(flag),
+                "{provider_name} must not advertise unimplemented capability {flag}"
+            );
+        }
+        match &resolved.strategy {
+            ep_compat::AppendStrategy::PluginLibrary {
+                lib,
+                registration_name,
+                options,
+                device,
+            } => {
+                let expected_plugin = if cfg!(windows) {
+                    "onnx_runtime_ep_cubecl_plugin.dll"
+                } else if cfg!(target_os = "macos") {
+                    "libonnx_runtime_ep_cubecl_plugin.dylib"
+                } else {
+                    "libonnx_runtime_ep_cubecl_plugin.so"
+                };
+                assert_eq!(
+                    lib.file_name().and_then(|name| name.to_str()),
+                    Some(expected_plugin)
+                );
+                assert_eq!(registration_name, expected_registration);
+                assert_eq!(device.as_deref(), Some("GPU"));
+                assert_eq!(
+                    options.as_slice(),
+                    [(
+                        "arena_extend_strategy".to_string(),
+                        "kSameAsRequested".to_string()
+                    )]
+                );
+            }
+            other => panic!("expected CubeCL PluginLibrary, got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn resolves_cuda_to_nvidia_gpu_capabilities() {
     let resolved = resolve_execution_provider(&ep_selection("cuda"));
     assert!(resolved.caps.is_gpu());
@@ -198,6 +290,8 @@ fn rejects_unrecognized_ep_names_without_conservative_append() {
     let message = error.to_string();
     assert!(message.contains("Unrecognized ONNX_GENAI_EP value 'openvino'"));
     assert!(message.contains("Known values are"));
+    assert!(message.contains("cubecl-webgpu"));
+    assert!(message.contains("cubecl-vulkan"));
     assert!(message.contains("plugin:<library>"));
 }
 
@@ -641,7 +735,7 @@ fn unavailable_cuda_error_is_actionable() {
 fn auto_default_providers_are_macos_only() {
     // MLX/Metal auto-selection is gated to macOS; every other platform keeps
     // the plain CPU default regardless of environment.
-    assert!(super::auto_default_execution_providers().is_none());
+    assert!(auto_default_execution_providers().is_none());
 }
 
 #[cfg(not(feature = "cuda"))]

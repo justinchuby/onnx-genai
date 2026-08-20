@@ -235,12 +235,25 @@ pub fn selectable_execution_providers() -> Vec<&'static str> {
     {
         names.push("qnn");
     }
+    if runtime_config()
+        .cubecl_ep_lib
+        .as_ref()
+        .is_some_and(|library| library.is_file())
+    {
+        names.push("cubecl-webgpu");
+        // The SPIR-V compiler the Vulkan backend needs is not built on macOS, so
+        // the plugin advertises no Vulkan factory there. Listing it anyway would
+        // hand the caller a name that always fails to append.
+        if !cfg!(target_os = "macos") {
+            names.push("cubecl-vulkan");
+        }
+    }
     names
 }
 
 #[must_use]
 pub(crate) fn known_execution_provider_values() -> &'static str {
-    "cpu, cuda, webgpu (aliases: web-gpu, web_gpu), coreml (aliases: core-ml, core_ml), metal, qnn (aliases: qnn-htp, qnn_htp), plugin:<library>|name=<registration>|device=<CPU|GPU|NPU>|opt.<key>=<value>"
+    "cpu, cuda, webgpu (aliases: web-gpu, web_gpu), coreml (aliases: core-ml, core_ml), metal, qnn (aliases: qnn-htp, qnn_htp), cubecl-webgpu (alias: cubecl_webgpu), cubecl-vulkan (alias: cubecl_vulkan), plugin:<library>|name=<registration>|device=<CPU|GPU|NPU>|opt.<key>=<value>"
 }
 
 /// Resolve an [`EpSelection`] into capabilities and an append strategy.
@@ -377,6 +390,38 @@ pub fn resolve_execution_provider(selection: &EpSelection) -> ResolvedEp {
             graph_capture_env: false,
             transitional_webgpu: false,
         },
+        "cubecl-webgpu" | "cubecl_webgpu" => ResolvedEp {
+            selection: selection.clone(),
+            caps: EpCapabilities::new("cubecl-webgpu", HardwareKind::Gpu, None, None, &[]),
+            strategy: AppendStrategy::PluginLibrary {
+                lib: cubecl_plugin_library_path(),
+                registration_name: "onnxruntime_cubecl_webgpu_ep".to_string(),
+                options: selection
+                    .options
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+                device: Some("GPU".to_string()),
+            },
+            graph_capture_env: false,
+            transitional_webgpu: false,
+        },
+        "cubecl-vulkan" | "cubecl_vulkan" => ResolvedEp {
+            selection: selection.clone(),
+            caps: EpCapabilities::new("cubecl-vulkan", HardwareKind::Gpu, None, None, &[]),
+            strategy: AppendStrategy::PluginLibrary {
+                lib: cubecl_plugin_library_path(),
+                registration_name: "onnxruntime_cubecl_vulkan_ep".to_string(),
+                options: selection
+                    .options
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+                device: Some("GPU".to_string()),
+            },
+            graph_capture_env: false,
+            transitional_webgpu: false,
+        },
         other => ResolvedEp {
             selection: selection.clone(),
             caps: EpCapabilities::new(selection.name.clone(), HardwareKind::Other, None, None, &[]),
@@ -386,6 +431,30 @@ pub fn resolve_execution_provider(selection: &EpSelection) -> ResolvedEp {
             graph_capture_env: false,
             transitional_webgpu: false,
         },
+    }
+}
+
+/// Where the CubeCL plugin cdylib lives.
+///
+/// Unlike the vendor EPs there is no ORT-provided directory to discover this in
+/// — the plugin is built out of this workspace — so an unconfigured deployment
+/// falls back to the bare library name and lets the dynamic loader's search path
+/// decide. That fallback is deliberately *not* treated as "present" by
+/// [`selectable_execution_providers`], which requires a configured file.
+fn cubecl_plugin_library_path() -> PathBuf {
+    runtime_config()
+        .cubecl_ep_lib
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(cubecl_plugin_library_name()))
+}
+
+fn cubecl_plugin_library_name() -> &'static str {
+    if cfg!(windows) {
+        "onnx_runtime_ep_cubecl_plugin.dll"
+    } else if cfg!(target_os = "macos") {
+        "libonnx_runtime_ep_cubecl_plugin.dylib"
+    } else {
+        "libonnx_runtime_ep_cubecl_plugin.so"
     }
 }
 

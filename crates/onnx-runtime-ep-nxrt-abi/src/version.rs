@@ -32,7 +32,7 @@ use crate::status::{NxrtStatus, NxrtStatusCode};
 pub const NXRT_ABI_VERSION_MAJOR: u32 = 1;
 
 /// Current nxrt ABI minor version. Bump on additive changes.
-pub const NXRT_ABI_VERSION_MINOR: u32 = 0;
+pub const NXRT_ABI_VERSION_MINOR: u32 = 1;
 
 /// A version range a side (host or plugin) supports.
 #[repr(C)]

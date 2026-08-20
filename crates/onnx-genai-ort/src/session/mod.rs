@@ -43,7 +43,7 @@ use cuda::{
     cuda_library_search_path, cuda_provider_library_name, cuda_provider_options,
     cuda_provider_unavailable_error,
 };
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 use options::auto_default_execution_providers;
 #[cfg(test)]
 use providers::{append_execution_provider, named_provider_options, provider_is_available};

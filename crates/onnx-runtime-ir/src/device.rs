@@ -12,6 +12,11 @@ pub enum DeviceType {
     CoreMl,
     Mlx,
     WebGpu,
+    /// Vulkan compute, distinct from [`DeviceType::WebGpu`]: the Vulkan backend
+    /// consumes SPIR-V and exposes dtypes (bf16, i8/u8) and subgroup operations
+    /// that the WGSL/WebGPU path does not. Keeping them apart lets placement and
+    /// traces name the backend that actually ran a node.
+    Vulkan,
     Qnn,
     OpenVino,
     /// Vendor / experimental backend keyed by an opaque id.
@@ -33,6 +38,7 @@ impl DeviceType {
             DeviceType::CoreMl => "coreml".into(),
             DeviceType::Mlx => "mlx".into(),
             DeviceType::WebGpu => "webgpu".into(),
+            DeviceType::Vulkan => "vulkan".into(),
             DeviceType::Qnn => "qnn".into(),
             DeviceType::OpenVino => "openvino".into(),
             DeviceType::Custom(id) => format!("custom:{id}").into(),
@@ -57,6 +63,7 @@ impl DeviceType {
             // class it runs on is MLX.
             "mlx" | "metal" => DeviceType::Mlx,
             "webgpu" => DeviceType::WebGpu,
+            "vulkan" => DeviceType::Vulkan,
             "qnn" => DeviceType::Qnn,
             "openvino" => DeviceType::OpenVino,
             other => {
@@ -124,5 +131,24 @@ mod tests {
         assert!(DeviceId::cpu().is_host_accessible());
         assert!(DeviceId::new(DeviceType::Mlx, 0).is_host_accessible());
         assert!(!DeviceId::cuda(0).is_host_accessible());
+        assert!(!DeviceId::new(DeviceType::Vulkan, 0).is_host_accessible());
+    }
+
+    #[test]
+    fn trace_name_round_trips() {
+        for (name, device_type) in [
+            ("cpu", DeviceType::Cpu),
+            ("cuda", DeviceType::Cuda),
+            ("rocm", DeviceType::Rocm),
+            ("coreml", DeviceType::CoreMl),
+            ("mlx", DeviceType::Mlx),
+            ("webgpu", DeviceType::WebGpu),
+            ("vulkan", DeviceType::Vulkan),
+            ("qnn", DeviceType::Qnn),
+            ("openvino", DeviceType::OpenVino),
+        ] {
+            assert_eq!(DeviceType::from_trace_name(name), Some(device_type));
+            assert_eq!(device_type.trace_name(), name);
+        }
     }
 }

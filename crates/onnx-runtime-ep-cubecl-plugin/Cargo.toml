@@ -1,0 +1,35 @@
+[package]
+name = "onnx-runtime-ep-cubecl-plugin"
+description = "CubeCL WebGPU/Vulkan execution providers exported as an ORT plugin-EP and nxrt cdylib"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "cubecl", "webgpu", "vulkan", "cdylib"]
+categories = ["science", "hardware-support"]
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+# Without a backend feature the cdylib still builds and exports its symbols,
+# but advertises zero factories with an actionable status. This keeps the
+# workspace buildable on hosts with no GPU stack, exactly like the CUDA plugin.
+default = []
+webgpu = ["onnx-runtime-ep-cubecl/webgpu"]
+vulkan = ["webgpu", "onnx-runtime-ep-cubecl/vulkan"]
+
+[dependencies]
+onnx-runtime-ep-cubecl = { workspace = true }
+onnx-runtime-ep-plugin = { workspace = true }
+onnx-runtime-ep-nxrt-abi = { workspace = true }
+onnx-runtime-ep-api = { workspace = true }
+onnx-runtime-ir = { workspace = true }
+
+[dev-dependencies]
+onnx-genai-ort-sys = { workspace = true }
+onnx-runtime-ep-nxrt-host = { workspace = true }
+onnx-runtime-ort-testkit = { workspace = true }
+
+[lints]
+workspace = true

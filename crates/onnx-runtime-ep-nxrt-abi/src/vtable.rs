@@ -40,6 +40,7 @@ fn device_type_to_u32(dt: onnx_runtime_ir::DeviceType) -> u32 {
         DeviceType::WebGpu => 5,
         DeviceType::Qnn => 6,
         DeviceType::OpenVino => 7,
+        DeviceType::Vulkan => 8,
         DeviceType::Custom(id) => 0x1000 | id,
     }
 }
@@ -429,6 +430,22 @@ mod tests {
     fn factory_vtable_has_struct_size() {
         let size = std::mem::size_of::<NxrtEpFactoryVtable>();
         assert!(size > 0);
+    }
+
+    #[test]
+    fn device_type_codes_are_stable_and_vulkan_is_appended() {
+        use onnx_runtime_ir::DeviceType;
+
+        assert_eq!(device_type_to_u32(DeviceType::Cpu), 0);
+        assert_eq!(device_type_to_u32(DeviceType::Cuda), 1);
+        assert_eq!(device_type_to_u32(DeviceType::Rocm), 2);
+        assert_eq!(device_type_to_u32(DeviceType::CoreMl), 3);
+        assert_eq!(device_type_to_u32(DeviceType::Mlx), 4);
+        assert_eq!(device_type_to_u32(DeviceType::WebGpu), 5);
+        assert_eq!(device_type_to_u32(DeviceType::Qnn), 6);
+        assert_eq!(device_type_to_u32(DeviceType::OpenVino), 7);
+        assert_eq!(device_type_to_u32(DeviceType::Vulkan), 8);
+        assert_eq!(device_type_to_u32(DeviceType::Custom(7)), 0x1007);
     }
 
     #[test]

@@ -23,6 +23,21 @@ use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout}
 use crate::error::NxrtHostError;
 use crate::loader::NxrtPlugin;
 
+fn abi_device_type_to_ir(dt: u32) -> DeviceType {
+    match dt {
+        0 => DeviceType::Cpu,
+        1 => DeviceType::Cuda,
+        2 => DeviceType::Rocm,
+        3 => DeviceType::CoreMl,
+        4 => DeviceType::Mlx,
+        5 => DeviceType::WebGpu,
+        6 => DeviceType::Qnn,
+        7 => DeviceType::OpenVino,
+        8 => DeviceType::Vulkan,
+        other => DeviceType::Custom(other & 0xFFF),
+    }
+}
+
 /// A loaded nxrt plugin exposed as a native `ExecutionProvider`.
 ///
 /// # Lifetime invariant
@@ -196,17 +211,7 @@ impl ExecutionProvider for NxrtExecutionProvider {
             return DeviceType::Custom(0);
         }
         let dt = unsafe { (*self.ep_vtable).device_type };
-        match dt {
-            0 => DeviceType::Cpu,
-            1 => DeviceType::Cuda,
-            2 => DeviceType::Rocm,
-            3 => DeviceType::CoreMl,
-            4 => DeviceType::Mlx,
-            5 => DeviceType::WebGpu,
-            6 => DeviceType::Qnn,
-            7 => DeviceType::OpenVino,
-            other => DeviceType::Custom(other & 0xFFF),
-        }
+        abi_device_type_to_ir(dt)
     }
 
     fn device_id(&self) -> DeviceId {
@@ -284,5 +289,24 @@ impl ExecutionProvider for NxrtExecutionProvider {
 
     fn sync(&self) -> Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn abi_device_type_codes_are_symmetric_with_abi_crate() {
+        assert_eq!(abi_device_type_to_ir(0), DeviceType::Cpu);
+        assert_eq!(abi_device_type_to_ir(1), DeviceType::Cuda);
+        assert_eq!(abi_device_type_to_ir(2), DeviceType::Rocm);
+        assert_eq!(abi_device_type_to_ir(3), DeviceType::CoreMl);
+        assert_eq!(abi_device_type_to_ir(4), DeviceType::Mlx);
+        assert_eq!(abi_device_type_to_ir(5), DeviceType::WebGpu);
+        assert_eq!(abi_device_type_to_ir(6), DeviceType::Qnn);
+        assert_eq!(abi_device_type_to_ir(7), DeviceType::OpenVino);
+        assert_eq!(abi_device_type_to_ir(8), DeviceType::Vulkan);
+        assert_eq!(abi_device_type_to_ir(0x1007), DeviceType::Custom(7));
     }
 }

@@ -12,7 +12,7 @@ tags:
 status: maintained
 lang: zh-CN
 created: 2026-08-17
-updated: 2026-08-19
+updated: 2026-08-20
 ---
 
 # Plugin Execution Providers
@@ -91,9 +91,10 @@ parity 测试应同时覆盖肯定的情形与刻意拒绝(decline)的情形。
 ## 外部 provider
 
 CPU 和 CUDA 有原生的树内(in-tree)实现。产品配置暴露的其他 provider 名称——例如
-WebGPU、CoreML、QNN 或 OpenVINO——在没有对应代码存在时,不得被描述为原生的树内
-实现。它们一般通过 ONNX Runtime 或 plugin 路径抵达,并继承那些路径的
-host/版本/平台约束。
+WebGPU、CoreML、QNN、OpenVINO 或 CubeCL 的 `cubecl-webgpu`/`cubecl-vulkan`——
+在没有对应代码存在时,不得被描述为原生的树内实现。它们一般通过 ONNX Runtime
+或 plugin 路径抵达,并继承那些路径的 host/版本/平台约束。CubeCL plugin 是本仓库
+提供的双 ABI cdylib,但仍然通过同一 plugin 加载纪律进入 ORT/nxrt。
 
 ## 正式来源
 
@@ -102,9 +103,11 @@ host/版本/平台约束。
 - [`onnx-runtime-ep-plugin`](../../crates/onnx-runtime-ep-plugin/src/lib.rs)
 - [`onnx-runtime-ep-nxrt-abi`](../../crates/onnx-runtime-ep-nxrt-abi/src/lib.rs)
 - [`onnx-runtime-ep-nxrt-host`](../../crates/onnx-runtime-ep-nxrt-host/src/lib.rs)
+- [`onnx-runtime-ep-cubecl-plugin`](../../crates/onnx-runtime-ep-cubecl-plugin/src/lib.rs)
 
 ## 相关笔记
 
 - [[execution/Execution Provider Contract]]
+- [[execution/CubeCL Execution Providers]]
 - [[contracts/Runtime Contracts]]
 - [[api/API Design Principles]]

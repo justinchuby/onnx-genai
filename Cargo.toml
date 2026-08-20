@@ -72,6 +72,12 @@ members = [
     "crates/onnx-runtime-ep-nxrt-host",
     "crates/onnx-runtime-ep-nxrt-testplugin",
 
+    # ── CubeCL-backed EP (WebGPU/WGSL + Vulkan/SPIR-V) ──
+    # Not in default-members: the backends pull the wgpu stack, which is a large
+    # dependency tree that a bare `cargo build` should not pay for.
+    "crates/onnx-runtime-ep-cubecl",
+    "crates/onnx-runtime-ep-cubecl-plugin",
+
     # ── Vendored ONNX Runtime MLAS bindings ──
     # Registered as a member so `cargo build -p mlas-sys` resolves. Nothing
     # reaches it by default: only `--features onnx-runtime-ep-cpu/mlas` pulls it
@@ -213,8 +219,12 @@ onnx-runtime-ep-plugin = { path = "crates/onnx-runtime-ep-plugin", version = "=0
 onnx-runtime-ep-cpu-plugin = { path = "crates/onnx-runtime-ep-cpu-plugin", version = "=0.1.0-dev.5" }
 onnx-runtime-ep-cuda-plugin = { path = "crates/onnx-runtime-ep-cuda-plugin", version = "=0.1.0-dev.5" }
 onnx-runtime-ep-nxrt-abi = { path = "crates/onnx-runtime-ep-nxrt-abi", version = "=0.1.0-dev.5" }
-onnx-runtime-ep-nxrt-host = { path = "crates/onnx-runtime-ep-nxrt-host", version = "=0.1.0-dev.5" }
+# Path-only: this crate is `publish = false` and carries its own version, so a
+# pin here would only be a second place to keep in sync (and was already stale).
+onnx-runtime-ep-nxrt-host = { path = "crates/onnx-runtime-ep-nxrt-host" }
 onnx-runtime-ep-nxrt-testplugin = { path = "crates/onnx-runtime-ep-nxrt-testplugin", version = "=0.1.0-dev.5" }
+onnx-runtime-ep-cubecl = { path = "crates/onnx-runtime-ep-cubecl", version = "=0.1.0-dev.5" }
+onnx-runtime-ep-cubecl-plugin = { path = "crates/onnx-runtime-ep-cubecl-plugin", version = "=0.1.0-dev.5" }
 
 # Test-only helper crate (publish = false, no version pin needed).
 onnx-runtime-ort-testkit = { path = "crates/onnx-runtime-ort-testkit" }
@@ -249,3 +259,9 @@ image = { version = "0.25", default-features = false }
 libloading = "0.8"
 memmap2 = "0.9"
 prost-reflect = { version = "0.14" }
+
+# CubeCL GPU compute language, backing the `cubecl-webgpu` / `cubecl-vulkan`
+# EPs. Pinned exactly: CubeCL is pre-release and its `#[cube]` frontend changes
+# between pre-releases, so a caret range would silently break the kernels.
+cubecl = { version = "=0.11.0-pre.2", default-features = false }
+cubecl-wgpu = { version = "=0.11.0-pre.2", default-features = false }

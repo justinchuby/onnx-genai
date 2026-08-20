@@ -158,6 +158,13 @@ pub struct RuntimeConfig {
     /// `ONNX_GENAI_METAL_EP_LIB` (`PathBuf`, default: unset): points to the external Metal EP dynamic library.
     /// Also accepts the alias `ONNX_GENAI_MLX_EP_LIBRARY` (set by the Python packages).
     pub metal_ep_lib: Option<PathBuf>,
+    /// `ONNX_GENAI_CUBECL_EP_LIB` (`PathBuf`, default: unset): points to the
+    /// CubeCL plugin library that provides both the `cubecl-webgpu` and
+    /// `cubecl-vulkan` execution providers. The plugin is not shipped inside the
+    /// ORT distribution, so unlike the vendor EPs there is no directory it can be
+    /// discovered in; without this the providers can be requested but never
+    /// listed as selectable.
+    pub cubecl_ep_lib: Option<PathBuf>,
     /// `ONNX_GENAI_QNN_EP_LIB` (`PathBuf`, default: unset): points to the
     /// Qualcomm QNN ORT plugin library (`onnxruntime_providers_qnn.dll`).
     pub qnn_ep_lib: Option<PathBuf>,
@@ -347,6 +354,8 @@ impl RuntimeConfig {
             metal_ep_lib: env_path(&lookup, "ONNX_GENAI_METAL_EP_LIB")
                 .filter(|path| !path.as_os_str().is_empty())
                 .or_else(|| env_path(&lookup, "ONNX_GENAI_MLX_EP_LIBRARY"))
+                .filter(|path| !path.as_os_str().is_empty()),
+            cubecl_ep_lib: env_path(&lookup, "ONNX_GENAI_CUBECL_EP_LIB")
                 .filter(|path| !path.as_os_str().is_empty()),
             qnn_ep_lib: env_path(&lookup, "ONNX_GENAI_QNN_EP_LIB")
                 .filter(|path| !path.as_os_str().is_empty()),
@@ -831,6 +840,7 @@ mod tests {
         assert!(!actual.device_kv);
         assert!(!actual.shared_kv_present_binding);
         assert_eq!(actual.metal_ep_lib, None);
+        assert_eq!(actual.cubecl_ep_lib, None);
         assert_eq!(actual.qnn_ep_lib, None);
         assert_eq!(actual.qnn_backend_path, None);
         assert_eq!(actual.qnn_backend_type, None);

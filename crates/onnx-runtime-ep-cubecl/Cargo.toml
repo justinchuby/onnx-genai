@@ -1,0 +1,39 @@
+[package]
+name = "onnx-runtime-ep-cubecl"
+description = "CubeCL-backed execution provider for WebGPU (WGSL) and Vulkan (SPIR-V)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "cubecl", "webgpu", "vulkan", "execution-provider"]
+categories = ["science", "hardware-support"]
+
+[features]
+# No backend is on by default: without one the crate still compiles (so
+# workspace-wide `cargo check` stays cheap and toolchain-free) but every
+# constructor fails closed with an actionable message naming the missing
+# feature. Mirrors how `onnx-runtime-ep-cuda` gates the CUDA toolkit.
+default = []
+
+# WGSL compiler over whatever native wgpu backend the host exposes
+# (Metal on macOS, Vulkan on Linux, DX12 on Windows) plus browser WebGPU.
+# This is the portable backend and the one `cubecl-webgpu` selects.
+webgpu = ["dep:cubecl", "dep:cubecl-wgpu"]
+
+# SPIR-V compiler pinned to the Vulkan wgpu backend. Adds bf16/i8/u8 and
+# subgroup coverage that WGSL does not have. `cubecl-spirv` is cfg'd out on
+# macOS upstream, so this feature is a compile error there by construction;
+# `cubecl-vulkan` therefore reports unavailable on macOS rather than silently
+# degrading to WGSL.
+vulkan = ["webgpu", "cubecl-wgpu/spirv"]
+
+[dependencies]
+onnx-runtime-ep-api = { workspace = true }
+onnx-runtime-ir = { workspace = true }
+half = { workspace = true }
+tracing = { workspace = true }
+cubecl = { workspace = true, optional = true, features = ["std"] }
+cubecl-wgpu = { workspace = true, optional = true, features = ["std"] }
+
+[lints]
+workspace = true
