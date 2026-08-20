@@ -160,6 +160,15 @@ jobs:
         run: python scripts/benchmark_muse_native_local.py --self-test --require-numpy
       - name: Check formatting
         run: cargo fmt --all -- --check
+      # This lane builds a subset of the workspace, so only that subset's
+      # packages land in the registry cache. The MLAS-free merge gate in
+      # onnx-runtime-ep-cpu-plugin asks `cargo metadata --offline` for the
+      # *whole* workspace resolve, and fails loud rather than skipping when it
+      # cannot read one — so a package no built crate happens to need (via
+      # tokenizers, say) turns that gate red for a reason unrelated to MLAS.
+      # Fetching the locked graph first keeps the gate hermetic and honest.
+      - name: Fetch the locked dependency graph
+        run: cargo fetch --locked
       - name: Build Linux offline crates
         run: >-
           cargo build --locked
@@ -486,6 +495,11 @@ jobs:
           else
             cargo install cargo-llvm-cov --version "$CARGO_LLVM_COV_VERSION" --locked --force
           fi
+      # Same reason as the fast-linux lane: the MLAS-free gate reads the whole
+      # workspace resolve with `cargo metadata --offline`, so every package in
+      # the lockfile has to be present before the subset build starts.
+      - name: Fetch the locked dependency graph
+        run: cargo fetch --locked
       # Never replace these explicit packages with bare `cargo test` or
       # `--workspace`: that selects onnx-genai-ort-sys, whose build script
       # downloads a native ONNX Runtime distribution. The package list is

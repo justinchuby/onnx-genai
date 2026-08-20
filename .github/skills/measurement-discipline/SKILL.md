@@ -17,6 +17,11 @@ corrections were each worth more than the original claims, but they cost real
 time and they are avoidable. Below is the checklist, with the incident behind
 each item, because the abstract rule is forgettable and the incident is not.
 
+> **On the CUDA backend, pair this with
+> [`cuda-perf-measurement`](../cuda-perf-measurement/SKILL.md).** This skill tells
+> you whether a number means what you think; that one tells you which instrument
+> to use and how each of them lies on this hardware.
+
 ## The failure modes, and what catches them
 
 ### 1. A knob you set produced the number you then interpreted
