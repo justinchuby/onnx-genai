@@ -3247,6 +3247,10 @@ mod tests {
         // is a real property: `log_avx2` is an approximation, so it must differ
         // from `ln` somewhere in a sweep this wide. If it did not, the sweep
         // never reached it.
+
+        // A short output buffer would let `zip` drop the tail silently.
+        // `log_f32_slice` debug-asserts the same thing, so this only carries
+        // signal in a release test build, where that assertion is compiled out.
         assert_eq!(
             o.len(),
             x.len(),
