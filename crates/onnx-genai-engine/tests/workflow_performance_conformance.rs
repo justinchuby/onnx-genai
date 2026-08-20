@@ -702,14 +702,16 @@ fn real_muse_policy_chain_matches_direct_ort() -> anyhow::Result<()> {
     );
 
     let mut run_workflow = || -> anyhow::Result<(Vec<i64>, f64, f64)> {
-        let mut options = GenerateOptions::default();
-        options.max_new_tokens = 128;
-        options.greedy = true;
-        options.temperature = 1.0;
-        options.top_k = 1;
-        options.top_p = 1.0;
-        options.seed = Some(0);
-        options.stop_on_eos = false;
+        let options = GenerateOptions {
+            max_new_tokens: 128,
+            greedy: true,
+            temperature: 1.0,
+            top_k: 1,
+            top_p: 1.0,
+            seed: Some(0),
+            stop_on_eos: false,
+            ..Default::default()
+        };
         let output =
             engine.run_pipeline_outputs(PipelineGenerateRequest::new(GenerateRequest {
                 prompt: GeneratePrompt::TokenIds(prompt_ids.clone()),

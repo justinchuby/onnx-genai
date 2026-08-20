@@ -1573,6 +1573,11 @@ impl PipelineEngine {
         Ok(())
     }
 
+    // The stable-binding cache hands out `Arc<Value>` because that is the owner
+    // type `Value::alias_from_shared_owner` requires. ORT values and allocators
+    // are `!Send`/`!Sync` raw handles, and this cache lives behind a `RefCell`
+    // on a single-threaded pipeline, so the refcount is never contended.
+    #[allow(clippy::arc_with_non_send_sync)]
     #[allow(clippy::too_many_arguments)]
     fn run_stable_component(
         &self,
@@ -1901,6 +1906,10 @@ impl PipelineEngine {
         Ok(())
     }
 
+    // Adapter invocations carry the full component context: its declaration,
+    // both port maps, the tensor pool, and the two symbol scopes it resolves
+    // shapes against. Bundling them would only rename the same seven facts.
+    #[allow(clippy::too_many_arguments)]
     fn run_image_preprocess_adapter(
         &self,
         component: &str,
@@ -2005,6 +2014,8 @@ impl PipelineEngine {
         Ok(())
     }
 
+    // Same component context as the image adapter above.
+    #[allow(clippy::too_many_arguments)]
     fn run_audio_preprocess_adapter(
         &self,
         component: &str,

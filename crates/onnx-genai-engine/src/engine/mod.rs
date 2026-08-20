@@ -601,6 +601,7 @@ mod tests {
             state_pairs: None,
             optional_inputs: BTreeMap::new(),
             static_cache: None,
+            aliasing: None,
         }
     }
 

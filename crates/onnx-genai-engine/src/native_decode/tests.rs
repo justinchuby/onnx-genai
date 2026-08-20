@@ -1247,6 +1247,7 @@ fn target_io(sequence_source: SequenceInputKind) -> ModelIoSpec {
         state_pairs: None,
         optional_inputs: BTreeMap::new(),
         static_cache: None,
+        aliasing: None,
     }
 }
 
@@ -1273,6 +1274,7 @@ fn tiny_decoder_io() -> ModelIoSpec {
         state_pairs: None,
         optional_inputs: BTreeMap::new(),
         static_cache: None,
+        aliasing: None,
     }
 }
 
@@ -1419,6 +1421,7 @@ fn proposer_io(sequence_source: SequenceInputKind, kv_ownership: KvOwnership) ->
         state_pairs: None,
         optional_inputs: std::collections::BTreeMap::new(),
         static_cache: None,
+        aliasing: None,
     }
 }
 
