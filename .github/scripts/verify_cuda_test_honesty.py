@@ -62,6 +62,30 @@ TEST_DIRS = tuple(crate / "tests" for crate in CUDA_CRATES)
 # It still runs on the CPU lane via a dedicated
 # `cargo test ... --test matmul_nbits_marlin_oracle` CI step (#1177).
 #
+# `deferred_release_queue`, `vmm_release_quarantine` and
+# `no_built_in_eager_allocator` are the #1186 memory refactor's CPU-side
+# probes, and they are the same case as `dummy_fill_and_crossover` above rather
+# than three more awkward GPU tests.
+#
+# The first two exist because the rules they check are state machines, not
+# driver calls: the deferred release queue's ordering, bounding, exactly-once
+# execution and device-loss behaviour are expressed over the `ReleaseFence` and
+# `DeferredReleaseAction` contracts, and the rule deciding whether a partially
+# released VMM address may be reused lives in `onnx_runtime_cuda_memory::release`
+# with no CUDA symbol in it. Both are driven by fakes -- a scripted fence, a
+# scripted driver that fails the Nth `cuMemUnmap` on demand -- so they issue no
+# CUDA calls and legitimately pass on a CPU host. #636 is the reason they were
+# written this way: it measured 44 tests silently skipped for months because the
+# rules had been left inside `*_gpu.rs`. Ignoring them here would put them back
+# in exactly that position.
+#
+# `no_built_in_eager_allocator` is a static source audit like
+# `capture_sync_contract`: it reads the two crates' sources and pins the exact
+# set of eager `malloc_sync`/`free_sync` sites outside the allocator seam. Its
+# whole value is proving a negative that the GPU tests structurally cannot --
+# a new eager site on a path they do not exercise would not turn them red -- so
+# it must run on the CPU-only lane or it checks nothing at all.
+#
 # Anything added here needs the same argument: not "this one is awkward" but
 # "this one is checking the checker" (or otherwise a genuine CPU-only probe that
 # issues no CUDA calls).
@@ -71,6 +95,9 @@ ALWAYS_RUN = frozenset(
         "capture_sync_contract",
         "dummy_fill_and_crossover",
         "matmul_nbits_marlin_oracle",
+        "deferred_release_queue",
+        "vmm_release_quarantine",
+        "no_built_in_eager_allocator",
     }
 )
 SUMMARY = re.compile(

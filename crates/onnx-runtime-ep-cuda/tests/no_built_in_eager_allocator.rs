@@ -262,11 +262,20 @@ fn the_removal_stays_explained_in_prose_and_the_code_scan_can_tell_the_differenc
 /// kernel-metadata upload and the cuDNN workspace, and Phase 7 does not claim
 /// to have removed them. Pinning the exact set is what stops the claim from
 /// quietly widening: a third site, or a fourth, goes red here.
+///
+/// The counts are textual occurrences, not seams, and `runtime.rs` is two of
+/// each for one seam. `alloc_raw` calls `malloc_sync`, and on failure drains
+/// the raw pool and calls it again rather than reporting out-of-memory while
+/// still holding device memory back from everyone else; the frees are that
+/// drain and `free_raw`. That retry arrived on `main` while this file was
+/// being written on the memory-refactor stack, which expected one of each, so
+/// the merge of the two produced a red that is a genuine reconciliation and
+/// not a widened claim -- the seam count is still two.
 #[test]
 fn the_eager_sites_outside_the_allocator_seam_are_exactly_the_two_disclosed_ones() {
     let ep = crate_src("onnx-runtime-ep-cuda");
     let expected_allocs: BTreeMap<String, usize> = [
-        (String::from("runtime.rs"), 1usize),
+        (String::from("runtime.rs"), 2usize),
         (String::from("cudnn/mod.rs"), 1usize),
     ]
     .into_iter()
