@@ -738,10 +738,22 @@ fn gate_must_run() -> bool {
 /// failure mode as measuring a configuration nobody ships. Where the gate is
 /// required, an unusable probe is therefore a failure and not a skip.
 fn gate_probe_failed(why: &str) -> Option<String> {
+    // A lane that builds only a subset of the workspace caches only that
+    // subset's packages, but the resolve probe reads every manifest in the
+    // lockfile. That shows up here as an `--offline` download failure for some
+    // crate with no connection to MLAS, which reads like a mystery unless the
+    // remedy is named at the point of failure.
+    let hint = if why.contains("--offline was specified") {
+        "\nhint: this is a missing package in the local registry, not an MLAS \
+         finding. A lane that builds part of the workspace must run \
+         `cargo fetch --locked` before the probe reads the whole resolve."
+    } else {
+        ""
+    };
     assert!(
         !gate_must_run(),
         "the MLAS-free gate could not run its probe on the configuration it \
-         exists to check ({why}); passing here would prove nothing"
+         exists to check ({why}); passing here would prove nothing{hint}"
     );
     eprintln!("⏭ skipped — {why}");
     None
