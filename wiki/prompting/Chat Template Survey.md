@@ -140,8 +140,9 @@ Calls to these tools must go to the commentary channel: 'functions'.
 | `<think>` / `</think>` | Qwen3、QwQ、DeepSeek-R1、DeepSeek-V3.1、GLM-4.5、EXAONE 4.0、MiniMax-M2、Nemotron 系、Baichuan-M2、Ling、Skywork、MiniCPM 4.1 |
 | `<seed:think>` | Seed-OSS |
 | `[THINK]` / `[/THINK]` | Magistral |
-| `<\|channel\|>analysis` | gpt-oss |
-| `to=self` | Muse Glimmer |
+
+Harmony 系不在这张表里,因为它们根本不往内容里插标签:gpt-oss 靠消息头上的
+`<|channel|>analysis` 划出推理段,Muse Glimmer 靠 `to=self`。
 
 两派的差别不是审美。**channel 是结构化的,成对标签是文本内的。**用标签时,运行时要在
 生成的文本流里做字符串匹配才知道推理段在哪结束;用 channel 时,收件人写在消息头上,
