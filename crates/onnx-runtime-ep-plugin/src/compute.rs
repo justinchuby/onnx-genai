@@ -1530,19 +1530,14 @@ struct PlacementSources<'a> {
 /// no ORT inputs at all.
 ///
 /// Resolving it means walking every kernel-context input and asking ORT for its
-/// `OrtMemoryInfo` (see [`device_mem_info`]) — six FFI calls for a one-input
-/// node. The routed path resolves it once per `Run` and reuses it across the
-/// nodes, so it passes [`Resolved`](Self::Resolved). The single-node path has
-/// exactly one consumer, which reads it only for a node with no ORT-bound
-/// operands at all, so it passes [`Deferred`](Self::Deferred) and an
-/// elementwise dispatch never makes the calls.
-#[derive(Clone, Copy)]
-enum SubgraphFallback<'a> {
-    /// Already resolved by the caller.
-    Resolved(Option<*const ort::OrtMemoryInfo>),
-    /// Resolve from the kernel context on demand, with this staging context.
-    Deferred(Option<&'a DeviceStaging>),
-}
+/// `OrtMemoryInfo` (see [`device_mem_info`]) — four FFI calls for a one-input
+/// node. *Both* dispatch paths therefore defer it: its only consumer reads it
+/// for a node with no ORT-bound operands at all, and then only past
+/// [`prepare_workspace`]'s zero-byte and servability gates, so an elementwise
+/// dispatch never makes the calls. The routed path used to resolve it eagerly
+/// once per `Run` to share it across nodes, which charged every routed `Run`
+/// for a value almost no dispatch reads.
+type SubgraphFallback<'a> = Option<&'a DeviceStaging>;
 
 /// The ORT-bound operands of a node, in either of the two shapes a caller
 /// already has them in.
@@ -1707,12 +1702,8 @@ unsafe fn operand_mem_info(
     WORKSPACE_PLACEMENT_QUERIES.fetch_add(1, Ordering::Relaxed);
     let mut rest = sources.ort_inputs.indices();
     let Some(first_idx) = rest.next() else {
-        let fallback = match sources.subgraph_fallback {
-            SubgraphFallback::Resolved(ptr) => ptr,
-            SubgraphFallback::Deferred(staging) => {
-                unsafe { device_mem_info(api, ctx, staging) }.map(|(mi, _)| mi)
-            }
-        };
+        let fallback =
+            unsafe { device_mem_info(api, ctx, sources.subgraph_fallback) }.map(|(mi, _)| mi);
         return match fallback {
             Some(ptr) => OperandMemInfo::FromIntermediates(ptr),
             None => OperandMemInfo::Unavailable,
@@ -2478,20 +2469,6 @@ unsafe extern "C" fn compute_execute(
 
         if let Some(routing) = &exported.routing {
             // ── Routed multi-node path ────────────────────────────────────
-            // Resolved here rather than before the branch: on the
-            // single-node path nothing below reads it, and resolving it costs
-            // an ORT memory-info query per kernel-context input on every
-            // `Run`. The single-node path's one potential consumer takes it as
-            // `SubgraphFallback::Deferred` instead.
-            // Memory info for intermediate scratch. On a device EP this is device
-            // memory, so multi-node intermediates stay on the GPU (a host buffer
-            // would make the next kernel dereference a host pointer as device →
-            // CUDA_ERROR_ILLEGAL_ADDRESS). `None` falls back to host buffers.
-            let scratch_mem_info_and_kind = unsafe {
-                device_mem_info(api_ref, kernel_context, exported.device_staging.as_ref())
-            };
-            let scratch_mem_info = scratch_mem_info_and_kind.map(|(mi, _)| mi);
-
             // Where a routed subgraph's *intermediates* are allocated.
             //
             // Device memory is not optional: a device kernel handed a host pointer
@@ -2508,9 +2485,31 @@ unsafe extern "C" fn compute_execute(
             // difference on identical kernels, against ORT's own 220 us for the
             // same graph. So: device memory when the resolved memory info is a
             // device, host buffers otherwise.
-            let intermediate_scratch = match scratch_mem_info_and_kind {
-                Some((mem_info, true)) => Some(mem_info),
-                _ => None,
+            //
+            // Resolving this costs an ORT memory-info query *per kernel-context
+            // input* on every `Run` — four fixed FFI calls on the one-input
+            // graphs this path is measured on. For a **host** EP the answer is
+            // always `None`, and it is knowable without asking ORT anything: a
+            // host EP registered no device allocator, so its kernels dereference
+            // host pointers and ORT hands it host tensors. Only a device EP can
+            // have device-resident intermediates, so only a device EP pays for
+            // the scan. The `debug_assert` keeps the shortcut honest by
+            // re-deriving the full answer in unoptimised builds, so a host EP
+            // that ever did see a device-resident input fails loudly in tests
+            // rather than silently placing intermediates on the wrong side.
+            let intermediate_scratch = if exported.device_staging.is_some() {
+                unsafe {
+                    device_mem_info(api_ref, kernel_context, exported.device_staging.as_ref())
+                }
+                .and_then(|(mem_info, is_device)| is_device.then_some(mem_info))
+            } else {
+                debug_assert!(
+                    unsafe { device_mem_info(api_ref, kernel_context, None) }
+                        .is_none_or(|(_, is_device)| !is_device),
+                    "host EP (no device staging) saw a device-resident kernel-context input; \
+                     its kernels would dereference device memory as host memory"
+                );
+                None
             };
 
             if routing.input_sources.len() != exported.entries.len()
@@ -2839,7 +2838,7 @@ unsafe extern "C" fn compute_execute(
                         kernel_context,
                         PlacementSources {
                             ort_inputs: OrtOperands::Resolved(&node_ort_operands),
-                            subgraph_fallback: SubgraphFallback::Resolved(scratch_mem_info),
+                            subgraph_fallback: exported.device_staging.as_ref(),
                         },
                         &*entry.kernel,
                         plans,
@@ -3080,9 +3079,7 @@ unsafe extern "C" fn compute_execute(
                     kernel_context,
                     PlacementSources {
                         ort_inputs: OrtOperands::Slots(&entry.input_slots),
-                        subgraph_fallback: SubgraphFallback::Deferred(
-                            exported.device_staging.as_ref(),
-                        ),
+                        subgraph_fallback: exported.device_staging.as_ref(),
                     },
                     &*entry.kernel,
                     plans,
