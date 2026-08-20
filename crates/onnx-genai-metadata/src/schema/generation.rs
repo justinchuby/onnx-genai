@@ -4,7 +4,7 @@ use super::*;
 ///
 /// Mirrors the `search` section of an onnxruntime-genai `genai_config.json`.
 /// Every field is optional so only values the author declared are carried over.
-#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
 pub struct GenerationDefaults {
     /// Whether to randomize sampling through `top_k`/`top_p` (else greedy).
     #[serde(default, skip_serializing_if = "Option::is_none")]

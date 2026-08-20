@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::schema::{InferenceMetadata, PipelineSpec, WorkflowNode, WorkflowSpec};
+use crate::schema::{InferenceMetadata, PipelineSpec, WorkflowNode, WorkflowSpec, WorkflowStep};
 
 struct ContractObligation {
     id: &'static str,
@@ -196,10 +196,7 @@ fn collect_workflow_capabilities(node: &WorkflowNode, capabilities: &mut BTreeSe
             }
         }
         WorkflowNode::Emit {
-            mode,
-            valid_length,
-            row_ids,
-            ..
+            mode, valid_length, ..
         } => {
             capabilities.insert("typed_emit".to_string());
             if matches!(mode, crate::schema::WorkflowEmitMode::Event) {
@@ -207,9 +204,6 @@ fn collect_workflow_capabilities(node: &WorkflowNode, capabilities: &mut BTreeSe
             }
             if valid_length.is_some() {
                 capabilities.insert("emit_valid_length".to_string());
-            }
-            if row_ids.is_some() {
-                capabilities.insert("emit_row_identity".to_string());
             }
         }
         WorkflowNode::Transfer { .. } => {
@@ -240,11 +234,238 @@ pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>
         );
     }
     validate_preprocessing_workflow(metadata, &mut errors);
+    validate_generation_contract(metadata, &mut errors);
+    validate_profiles(metadata, &mut errors);
+    validate_speculative_rollback(metadata, &mut errors);
 
     if errors.is_empty() {
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+/// Generation overrides must be structural: every overridable field binds a
+/// request-sourced typed workflow input. A caller override of anything else has
+/// no representation and must fail loudly instead of being silently dropped.
+/// Components that execute inside the speculative region.
+///
+/// The region is the innermost loop body that invokes both the proposer and the
+/// target, because that is the body re-run per speculated position. When the two
+/// are not invoked inside a common loop there is no iterated region, and only
+/// the named components are constrained.
+fn speculative_region_components(
+    steps: &[WorkflowStep],
+    proposer: &str,
+    target: &str,
+) -> BTreeSet<String> {
+    let mut region = BTreeSet::new();
+    for step in steps {
+        if find_speculative_region(step, proposer, target, &mut region) {
+            return region;
+        }
+    }
+    region.insert(proposer.to_string());
+    region.insert(target.to_string());
+    region
+}
+
+/// Walk for the innermost loop invoking both roles, collecting its components.
+///
+/// Returns true once the region has been found so the caller stops descending.
+fn find_speculative_region(
+    step: &WorkflowStep,
+    proposer: &str,
+    target: &str,
+    region: &mut BTreeSet<String>,
+) -> bool {
+    match step {
+        WorkflowStep::Loop { setup, steps, .. } => {
+            // Prefer the innermost enclosing loop: a nested loop that still
+            // invokes both roles is the tighter region.
+            for nested in steps.iter().chain(setup) {
+                if find_speculative_region(nested, proposer, target, region) {
+                    return true;
+                }
+            }
+            let mut invoked = BTreeSet::new();
+            for nested in steps.iter().chain(setup) {
+                collect_invoked_components(nested, &mut invoked);
+            }
+            if invoked.contains(proposer) && invoked.contains(target) {
+                region.extend(invoked);
+                return true;
+            }
+            false
+        }
+        WorkflowStep::Sequence { steps } => steps
+            .iter()
+            .any(|nested| find_speculative_region(nested, proposer, target, region)),
+        WorkflowStep::Branch { cases, default, .. } => cases
+            .values()
+            .chain(default.iter().map(AsRef::as_ref))
+            .any(|nested| find_speculative_region(nested, proposer, target, region)),
+        WorkflowStep::Invoke { .. } | WorkflowStep::Emit { .. } => false,
+    }
+}
+
+/// Every component invoked anywhere beneath a step.
+fn collect_invoked_components(step: &WorkflowStep, invoked: &mut BTreeSet<String>) {
+    match step {
+        WorkflowStep::Invoke { component, .. } => {
+            invoked.insert(component.clone());
+        }
+        WorkflowStep::Sequence { steps } => {
+            for nested in steps {
+                collect_invoked_components(nested, invoked);
+            }
+        }
+        WorkflowStep::Loop { setup, steps, .. } => {
+            for nested in steps.iter().chain(setup) {
+                collect_invoked_components(nested, invoked);
+            }
+        }
+        WorkflowStep::Branch { cases, default, .. } => {
+            for nested in cases.values().chain(default.iter().map(AsRef::as_ref)) {
+                collect_invoked_components(nested, invoked);
+            }
+        }
+        WorkflowStep::Emit { .. } => {}
+    }
+}
+
+/// Workflow state cells whose value leaves the package through an `emit`.
+///
+/// An emit names an SSA value and an output key that need not match, so a state
+/// cell can reach a package output under an entirely different name. Publication
+/// has to be detected on the emitted value, never on the output key.
+fn emitted_state_cells(steps: &[WorkflowStep], state: &BTreeSet<&str>) -> BTreeSet<String> {
+    let mut emitted = BTreeSet::new();
+    for step in steps {
+        collect_emitted_state_cells(step, state, &mut emitted);
+    }
+    emitted
+}
+
+fn collect_emitted_state_cells(
+    step: &WorkflowStep,
+    state: &BTreeSet<&str>,
+    emitted: &mut BTreeSet<String>,
+) {
+    match step {
+        WorkflowStep::Emit { value, .. } => {
+            if state.contains(value.as_str()) {
+                emitted.insert(value.clone());
+            }
+        }
+        WorkflowStep::Sequence { steps } => {
+            for nested in steps {
+                collect_emitted_state_cells(nested, state, emitted);
+            }
+        }
+        WorkflowStep::Loop { setup, steps, .. } => {
+            // A loop republishes each carried cell into the enclosing scope
+            // under the cell's own name, so an emit of that alias is already
+            // caught by the Emit arm above.
+            for nested in steps.iter().chain(setup) {
+                collect_emitted_state_cells(nested, state, emitted);
+            }
+        }
+        WorkflowStep::Branch { cases, default, .. } => {
+            for nested in cases.values().chain(default.iter().map(AsRef::as_ref)) {
+                collect_emitted_state_cells(nested, state, emitted);
+            }
+        }
+        WorkflowStep::Invoke { .. } => {}
+    }
+}
+
+fn validate_generation_contract(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
+    let Some(generation) = &metadata.generation else {
+        return;
+    };
+    let workflow = metadata
+        .pipeline
+        .as_ref()
+        .map(|pipeline| &pipeline.workflow);
+    for (field, over) in &generation.overrides {
+        if field.trim().is_empty() {
+            errors.push("generation.overrides contains an empty field name".to_string());
+        }
+        let Some(workflow) = workflow else {
+            errors.push(format!(
+                "generation.overrides.{field} requires pipeline.workflow to declare the \
+                 request-sourced input '{}'",
+                over.input
+            ));
+            continue;
+        };
+        match workflow.inputs.get(&over.input) {
+            Some(input)
+                if matches!(input.source, crate::schema::WorkflowInputSource::Request)
+                    && matches!(input.role, crate::schema::SemanticInputRole::Runtime { .. }) => {}
+            Some(_) => errors.push(format!(
+                "generation.overrides.{field} input '{}' must be a request-sourced workflow input \
+                 with a versioned runtime role",
+                over.input
+            )),
+            None => errors.push(format!(
+                "generation.overrides.{field} references undeclared workflow input '{}'",
+                over.input
+            )),
+        }
+        if let Some(constraint) = &over.constraint
+            && let (Some(minimum), Some(maximum)) = (constraint.minimum, constraint.maximum)
+            && minimum > maximum
+        {
+            errors.push(format!(
+                "generation.overrides.{field} constraint minimum {minimum} exceeds maximum \
+                 {maximum}"
+            ));
+        }
+    }
+}
+
+/// A required profile must be executable by this reader; an ignorable profile
+/// may be skipped. Unknown core fields still fail through `deny_unknown_fields`.
+fn validate_profiles(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
+    const KNOWN_PROFILE_KINDS: &[&str] = &[
+        "generation",
+        "embedding",
+        "reranking",
+        "classification",
+        "reward",
+    ];
+    let workflow = metadata
+        .pipeline
+        .as_ref()
+        .map(|pipeline| &pipeline.workflow);
+    for (name, profile) in &metadata.profiles {
+        let known = KNOWN_PROFILE_KINDS.contains(&profile.kind.as_str());
+        if !known && profile.requirement == crate::schema::ProfileRequirement::Required {
+            errors.push(format!(
+                "profiles.{name} declares required kind '{}', which this reader cannot execute; \
+                 declare requirement 'ignorable' to let strict readers skip it",
+                profile.kind
+            ));
+            continue;
+        }
+        if !known {
+            continue;
+        }
+        for (role, output) in &profile.outputs {
+            match workflow {
+                Some(workflow) if workflow.outputs.contains_key(output) => {}
+                Some(_) => errors.push(format!(
+                    "profiles.{name}.outputs.{role} references undeclared workflow output \
+                     '{output}'"
+                )),
+                None => errors.push(format!(
+                    "profiles.{name}.outputs.{role} requires pipeline.workflow to declare output \
+                     '{output}'"
+                )),
+            }
+        }
     }
 }
 
@@ -498,6 +719,8 @@ fn validate_adapter_selection_input(
             if input.contract.dtype == dtype
                 && input.contract.rank == rank
                 && input.contract.shape.as_deref().is_some_and(expected_shape)
+                && input.contract.batch_layout
+                    == crate::schema::BatchLayout::RequestAligned { axis: 0 }
                 && input.required
                 && matches!(
                     &input.source,
@@ -513,14 +736,15 @@ fn validate_adapter_selection_input(
                 }) => {}
         Some(_) => errors.push(format!(
             "adapters.selection.{field} '{name}' must reference a required \
-             request/application-sourced {dtype}{} workflow input{}",
+             request/application-sourced {dtype}{} workflow input with \
+             batch_layout request_aligned on axis 0{}",
             if let Some(extent) = second_dimension {
                 format!("[batch,{extent}]")
             } else {
                 "[batch]".to_string()
             },
             expected_role
-                .map(|role| format!(" with runtime role {role:?}@1.0"))
+                .map(|role| format!(" and runtime role {role:?}@1.0"))
                 .unwrap_or_default()
         )),
         None => errors.push(format!(
@@ -556,34 +780,6 @@ fn validate_adapter_service(
         errors.push("adapters.artifacts must not be empty".into());
     }
     if let Some(workflow) = workflow {
-        if let Some(serving) = &workflow.serving
-            && service.selection.slot_ids != serving.slot_ids
-        {
-            errors.push(format!(
-                "adapters.selection.slot_ids must reference serving slot_ids '{}'",
-                serving.slot_ids
-            ));
-        }
-        validate_adapter_selection_input(
-            workflow,
-            &service.selection.slot_ids,
-            "int64",
-            1,
-            None,
-            None,
-            "slot_ids",
-            errors,
-        );
-        validate_adapter_selection_input(
-            workflow,
-            &service.selection.request_epochs,
-            "int64",
-            1,
-            None,
-            Some(crate::schema::RuntimeInputRole::RequestEpochs),
-            "request_epochs",
-            errors,
-        );
         validate_adapter_selection_input(
             workflow,
             &service.selection.segments,
@@ -628,8 +824,6 @@ fn validate_adapter_service(
         }
     } else {
         for (field, value) in [
-            ("slot_ids", service.selection.slot_ids.as_str()),
-            ("request_epochs", service.selection.request_epochs.as_str()),
             ("segments", service.selection.segments.as_str()),
             ("adapter_counts", service.selection.adapter_counts.as_str()),
             ("scales", service.selection.scales.as_str()),
@@ -1361,24 +1555,33 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
             let group = workflow
                 .serving
                 .as_ref()
-                .and_then(|serving| serving.kv_service.groups.get(group_name));
+                .and_then(|serving| serving.state_service.groups.get(group_name));
             let Some(group) = group else {
                 errors.push(format!(
-                    "workflow state '{name}' binds unknown KV service group '{group_name}'"
+                    "workflow state '{name}' binds unknown state service group '{group_name}'"
                 ));
                 continue;
             };
             if group.sequence_axis >= state.contract.rank {
                 errors.push(format!(
-                    "KV service group '{group_name}' sequence_axis {} is outside state '{name}' rank {}",
+                    "state service group '{group_name}' sequence_axis {} is outside state '{name}' rank {}",
                     group.sequence_axis, state.contract.rank
                 ));
             }
             if dynamic_axis.is_some_and(|axis| axis != group.sequence_axis) {
                 errors.push(format!(
-                    "workflow state '{name}' recurrence axis {dynamic_axis:?} disagrees with KV \
+                    "workflow state '{name}' recurrence axis {dynamic_axis:?} disagrees with state \
                      service group '{group_name}' sequence_axis {}",
                     group.sequence_axis
+                ));
+            }
+            // Row-scoped model state must remain permutable: without a declared
+            // request axis a runtime cannot compact the batch correctly.
+            if state.contract.batch_layout.request_axis().is_none() {
+                errors.push(format!(
+                    "workflow state '{name}' binds state service group '{group_name}' but its \
+                     contract does not declare a request_aligned batch_layout; compaction would \
+                     be underivable"
                 ));
             }
             if let crate::schema::ShapeRecurrence::Growing { increment, .. } = &state.recurrence
@@ -1386,54 +1589,80 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                 && serving.accepted_len.as_deref() != Some(increment)
             {
                 errors.push(format!(
-                    "KV service state '{name}' grows by '{increment}', but serving.accepted_len \
+                    "state service state '{name}' grows by '{increment}', but serving.accepted_len \
                      does not bind that per-row value"
                 ));
             }
         }
     }
 
-    if let Some(kv_service) = workflow.serving.as_ref().map(|serving| &serving.kv_service) {
-        for (group_name, group) in &kv_service.groups {
+    if let Some(state_service) = workflow
+        .serving
+        .as_ref()
+        .map(|serving| &serving.state_service)
+    {
+        for (group_name, group) in &state_service.groups {
             if group.layout.trim().is_empty() {
                 errors.push(format!(
-                    "KV service group '{group_name}' layout must not be empty"
+                    "state service group '{group_name}' layout must not be empty"
                 ));
             }
-            match workflow.state.get(&group.logical_lengths) {
-                Some(lengths) => {
-                    validate_integer_control_contract(
-                        &lengths.contract,
-                        &format!(
-                            "KV service group '{group_name}' logical_lengths state '{}'",
-                            group.logical_lengths
-                        ),
-                        errors,
-                    );
-                    if lengths.contract.rank != 1 {
-                        errors.push(format!(
-                            "KV service group '{group_name}' logical_lengths state '{}' must be \
-                             rank one with one value per row",
-                            group.logical_lengths
-                        ));
+            if let Some(logical_lengths) = &group.logical_lengths {
+                match workflow.state.get(logical_lengths) {
+                    Some(lengths) => {
+                        validate_integer_control_contract(
+                            &lengths.contract,
+                            &format!(
+                                "state service group '{group_name}' logical_lengths state \
+                                 '{logical_lengths}'"
+                            ),
+                            errors,
+                        );
+                        if lengths.contract.rank != 1 {
+                            errors.push(format!(
+                                "state service group '{group_name}' logical_lengths state \
+                                 '{logical_lengths}' must be rank one with one value per row"
+                            ));
+                        }
+                        if lengths.class != crate::schema::WorkflowStateClass::Semantic {
+                            errors.push(format!(
+                                "state service group '{group_name}' logical_lengths state \
+                                 '{logical_lengths}' must be semantic for checkpoint/replay"
+                            ));
+                        }
                     }
-                    if lengths.class != crate::schema::WorkflowStateClass::Semantic {
-                        errors.push(format!(
-                            "KV service group '{group_name}' logical_lengths state '{}' must be \
-                             semantic for checkpoint/replay",
-                            group.logical_lengths
-                        ));
-                    }
+                    None => errors.push(format!(
+                        "state service group '{group_name}' references unknown logical_lengths \
+                         state '{logical_lengths}'"
+                    )),
                 }
-                None => errors.push(format!(
-                    "KV service group '{group_name}' references unknown logical_lengths state '{}'",
-                    group.logical_lengths
-                )),
+            }
+            if let Some(total_length) = &group.total_length {
+                require_workflow_value(
+                    total_length,
+                    &workflow.state.keys().cloned().collect(),
+                    &format!("state service group '{group_name}' total_length"),
+                    errors,
+                );
+            }
+            for cascade in &group.capabilities.cascade {
+                if !state_service.groups.contains_key(cascade) {
+                    errors.push(format!(
+                        "state service group '{group_name}' cascades to unknown group '{cascade}'"
+                    ));
+                }
+            }
+            if group.capabilities.rollback_positions == Some(0) {
+                errors.push(format!(
+                    "state service group '{group_name}' rollback_positions must be greater than \
+                     zero when present; omit it to declare that rollback is impossible"
+                ));
             }
             for (component_name, cells) in &group.ports {
                 let Some(component) = workflow.components.get(component_name) else {
                     errors.push(format!(
-                        "KV service group '{group_name}' binds unknown component '{component_name}'"
+                        "state service group '{group_name}' binds unknown component \
+                         '{component_name}'"
                     ));
                     continue;
                 };
@@ -1448,25 +1677,25 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                         Some(state)
                             if state.service_group.as_deref() == Some(group_name.as_str()) => {}
                         Some(_) => errors.push(format!(
-                            "KV service group '{group_name}' port alias references state \
+                            "state service group '{group_name}' port alias references state \
                              '{cell_name}' bound to another service group"
                         )),
                         None => errors.push(format!(
-                            "KV service group '{group_name}' port alias references unknown state \
-                             '{cell_name}'"
+                            "state service group '{group_name}' port alias references unknown \
+                             state '{cell_name}'"
                         )),
                     }
                     if !inferred_ports && !component.ports.inputs.contains_key(&alias.input) {
                         errors.push(format!(
-                            "KV service group '{group_name}' component '{component_name}' input \
-                             alias '{}' is not a declared port",
+                            "state service group '{group_name}' component '{component_name}' \
+                             input alias '{}' is not a declared port",
                             alias.input
                         ));
                     }
                     if !inferred_ports && !component.ports.outputs.contains_key(&alias.output) {
                         errors.push(format!(
-                            "KV service group '{group_name}' component '{component_name}' output \
-                             alias '{}' is not a declared port",
+                            "state service group '{group_name}' component '{component_name}' \
+                             output alias '{}' is not a declared port",
                             alias.output
                         ));
                     }
@@ -1491,6 +1720,7 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                     rank: 0,
                     shape: Some(Vec::new()),
                     optional: false,
+                    batch_layout: crate::schema::BatchLayout::Shared,
                 },
             );
         }
@@ -1507,27 +1737,33 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
         "pipeline.workflow.steps",
         errors,
     );
-    validate_emit_identity_consistency(&compiled.graph, &mut BTreeMap::new(), errors);
+    validate_emit_batch_layout_consistency(
+        &compiled.graph,
+        &value_contracts,
+        &mut BTreeMap::new(),
+        errors,
+    );
+    validate_compaction_derivability(
+        &compiled.graph,
+        workflow,
+        &value_contracts,
+        "pipeline.workflow.steps",
+        errors,
+    );
+    validate_effect_declarations(workflow, errors);
+    validate_row_scoped_components(workflow, errors);
+    validate_state_lifetimes(workflow, errors);
     if let Some(serving) = &workflow.serving {
-        if serving.kv_service.compaction {
-            validate_compacted_emit_identity(
-                &compiled.graph,
-                &serving.slot_ids,
-                "pipeline.workflow.steps",
-                false,
-                errors,
-            );
-        }
-        if serving.kv_service.groups.is_empty() {
+        if serving.state_service.groups.is_empty() {
             errors.push(
-                "pipeline.workflow.serving.kv_service.groups must declare at least one bound \
+                "pipeline.workflow.serving.state_service.groups must declare at least one bound \
                  state group"
                     .to_string(),
             );
         }
-        if !serving.kv_service.groups.is_empty() && serving.accepted_len.is_none() {
+        if !serving.state_service.groups.is_empty() && serving.accepted_len.is_none() {
             errors.push(
-                "pipeline.workflow.serving.accepted_len is required when KV service groups are \
+                "pipeline.workflow.serving.accepted_len is required when state service groups are \
                  declared"
                     .to_string(),
             );
@@ -1536,7 +1772,6 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
             ("active", Some(&serving.active)),
             ("done", Some(&serving.done)),
             ("accepted_len", serving.accepted_len.as_ref()),
-            ("slot_ids", Some(&serving.slot_ids)),
         ] {
             let Some(value) = value else {
                 continue;
@@ -1560,6 +1795,15 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                         &format!("pipeline.workflow.serving.{role}"),
                         errors,
                     );
+                }
+                // Serving control values steer one request each. Without a
+                // request-aligned layout a runtime cannot permute them when it
+                // compacts the batch.
+                if contract.rank > 0 && contract.batch_layout.request_axis() != Some(0) {
+                    errors.push(format!(
+                        "pipeline.workflow.serving.{role} '{value}' must declare a \
+                         request_aligned batch_layout on axis 0"
+                    ));
                 }
             }
         }
@@ -1674,41 +1918,354 @@ fn workflow_state_results(node: &WorkflowNode) -> BTreeMap<String, String> {
     }
 }
 
+/// Every effect domain a component declares must have declared semantics.
+///
+/// Retry class and speculation safety are independent: a `transactional` effect
+/// is still unsafe to speculate unless it also declares clonable or rewindable
+/// speculation safety.
+fn validate_effect_declarations(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
+    for (name, component) in &workflow.components {
+        for domain in &component.effects {
+            if domain.trim().is_empty() {
+                errors.push(format!(
+                    "workflow component '{name}' declares an empty effect domain"
+                ));
+            } else if !workflow.effects.contains_key(domain) {
+                errors.push(format!(
+                    "workflow component '{name}' declares effect domain '{domain}' that \
+                     pipeline.workflow.effects does not describe; every effect must declare its \
+                     retry class and speculation safety"
+                ));
+            }
+        }
+    }
+    for (domain, contract) in &workflow.effects {
+        if domain.trim().is_empty() {
+            errors.push("pipeline.workflow.effects contains an empty domain name".to_string());
+        }
+        if matches!(
+            contract.speculation_safety,
+            crate::schema::SpeculationSafety::Rewindable { max_depth: 0 }
+        ) {
+            errors.push(format!(
+                "pipeline.workflow.effects.{domain}.speculation_safety rewindable max_depth must \
+                 be greater than zero; use kind 'none' to forbid speculation"
+            ));
+        }
+    }
+}
+
+/// Row-scoped components must expose a derivable row axis on every row-scoped
+/// port. The mandatory `compact(selection)`/`release(row)` ABI operates on that
+/// axis, so an out-of-range declaration is unexecutable.
+fn validate_row_scoped_components(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
+    for (name, component) in &workflow.components {
+        let request_axes = component
+            .ports
+            .inputs
+            .values()
+            .chain(component.ports.outputs.values())
+            .filter_map(|contract| contract.batch_layout.request_axis())
+            .collect::<BTreeSet<_>>();
+        let Some(row_scope) = &component.row_scope else {
+            // A component that carries per-request state across invocations —
+            // which is exactly what a declared effect domain or a declared
+            // cache-affecting state means — must say which axis its rows lie on.
+            // Row identities are never serialized, so without this the runtime
+            // has nothing to drive compact/release with when the batch changes.
+            if !request_axes.is_empty()
+                && (!component.effects.is_empty() || !component.cache_affects_state.is_empty())
+            {
+                errors.push(format!(
+                    "workflow component '{name}' holds per-request state and has request-aligned \
+                     ports but declares no row_scope; the runtime cannot compact or release its \
+                     rows without a declared row axis"
+                ));
+            }
+            continue;
+        };
+        for (direction, ports) in [
+            ("input", &component.ports.inputs),
+            ("output", &component.ports.outputs),
+        ] {
+            for (port, contract) in ports {
+                if !contract.batch_layout.is_row_scoped() {
+                    continue;
+                }
+                if row_scope.axis >= contract.rank {
+                    errors.push(format!(
+                        "workflow component '{name}' declares row_scope axis {} but {direction} \
+                         port '{port}' has rank {}",
+                        row_scope.axis, contract.rank
+                    ));
+                }
+                if contract
+                    .batch_layout
+                    .request_axis()
+                    .is_some_and(|axis| axis != row_scope.axis)
+                {
+                    errors.push(format!(
+                        "workflow component '{name}' {direction} port '{port}' is request-aligned \
+                         on a different axis than the declared row_scope axis {}",
+                        row_scope.axis
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// State the runtime or an external service owns must say when it may be freed.
+///
+/// An ordinary tensor's lifetime is SSA liveness: the runtime frees it when
+/// nothing can read it again. Runtime-managed and external state has no such
+/// bound — nothing in the dataflow says the last reader has run — so the
+/// document must name the boundary at which it becomes releasable.
+fn validate_state_lifetimes(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
+    // Runtime-owned state is private: its storage layout, paging and precision
+    // are the runtime's business and are not part of any contract. Such a cell
+    // may only become a package output through its group's versioned checkpoint
+    // adapter, which is the single portable, cross-build state path. Private
+    // prefill/decode and encoder/decoder transfers are a different mechanism
+    // entirely: they are fast because they require a matching runtime protocol
+    // and build on both ends, and exporting one as if it were portable is how a
+    // rolling upgrade corrupts state. Workflow-owned cells are exempt: they are
+    // ordinary typed tensors with a graph-visible representation, so publishing
+    // one carries no cross-build hazard.
+    let checkpointed_groups = workflow
+        .serving
+        .as_ref()
+        .map(|serving| {
+            serving
+                .state_service
+                .groups
+                .iter()
+                .filter(|(_, group)| group.checkpoint.is_some())
+                .map(|(name, _)| name.as_str())
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    // Publication is detected on the emitted value, never on the output key: an
+    // emit names an SSA value and an output key that need not match, so keying
+    // off the output name lets `emit { value: cache, output: cache_dump }`
+    // export runtime-owned state under an alias.
+    let state_names = workflow
+        .state
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let published = emitted_state_cells(&workflow.steps, &state_names);
+    for (name, cell) in &workflow.state {
+        let externally_owned = matches!(
+            cell.management,
+            crate::schema::StateManagement::Runtime | crate::schema::StateManagement::External
+        );
+        if externally_owned && (workflow.outputs.contains_key(name) || published.contains(name)) {
+            let exportable = cell
+                .service_group
+                .as_deref()
+                .is_some_and(|group| checkpointed_groups.contains(group));
+            if !exportable {
+                errors.push(format!(
+                    "pipeline.workflow.state.{name} is published as a package output but its \
+                     state group declares no checkpoint adapter; runtime-owned state is private \
+                     and leaves the process portably only through a versioned checkpoint"
+                ));
+            }
+        }
+        // Binding a cell to a state service group hands its storage to the
+        // runtime, so the declared management must say so.
+        if cell.service_group.is_some()
+            && cell.management != crate::schema::StateManagement::Runtime
+        {
+            errors.push(format!(
+                "pipeline.workflow.state.{name} binds a state service group but is not declared \
+                 management: runtime; the group is the runtime's storage"
+            ));
+        }
+        if externally_owned && cell.release_boundary.is_none() {
+            errors.push(format!(
+                "pipeline.workflow.state.{name} is {} but declares no release_boundary; \
+                 externally owned state has no SSA liveness to free it",
+                match cell.management {
+                    crate::schema::StateManagement::External => "external",
+                    _ => "runtime-managed",
+                }
+            ));
+        }
+        if !externally_owned && cell.release_boundary.is_some() {
+            errors.push(format!(
+                "pipeline.workflow.state.{name} declares a release_boundary but is workflow-owned; \
+                 workflow state is freed by SSA liveness"
+            ));
+        }
+        if cell.release_boundary == Some(crate::schema::StateReleaseBoundary::Session)
+            && cell.scope != crate::schema::WorkflowStateScope::Session
+        {
+            errors.push(format!(
+                "pipeline.workflow.state.{name} releases at a session boundary but is not \
+                 session-scoped"
+            ));
+        }
+    }
+}
+
+/// Speculative regions may only contain effects and state that can be undone to
+/// the declared maximum proposal width.
+///
+/// This deliberately checks `speculation_safety`, never the retry class: an
+/// idempotent effect can be safely retried and still be impossible to rewind.
+fn validate_speculative_rollback(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
+    let Some(speculative) = &metadata.speculative else {
+        return;
+    };
+    let Some(workflow) = metadata
+        .pipeline
+        .as_ref()
+        .map(|pipeline| &pipeline.workflow)
+    else {
+        errors.push(
+            "speculative metadata requires pipeline.workflow to declare the proposer and target"
+                .to_string(),
+        );
+        return;
+    };
+    for (role, component) in [
+        ("proposer", &speculative.proposer),
+        ("target", &speculative.target),
+    ] {
+        if !workflow.components.contains_key(component) {
+            errors.push(format!(
+                "speculative.{role} '{component}' is not a declared workflow component"
+            ));
+        }
+    }
+    let declared_groups = workflow
+        .serving
+        .as_ref()
+        .map(|serving| &serving.state_service.groups);
+    // rollback_state names workflow state cells: state is SSA-visible at the
+    // cell level, so that is the unit a rejected proposal is undone at. A cell
+    // bound to a runtime state group inherits that group's rollback bound, and
+    // cascading groups must roll back together.
+    let proposal_width = speculative.max_proposal_width;
+    let mut required_groups = BTreeSet::new();
+    for cell_name in &speculative.rollback_state {
+        let Some(cell) = workflow.state.get(cell_name) else {
+            errors.push(format!(
+                "speculative.rollback_state references unknown workflow state '{cell_name}'"
+            ));
+            continue;
+        };
+        if let Some(group) = &cell.service_group {
+            required_groups.insert(group.clone());
+        }
+    }
+    let mut pending = required_groups.iter().cloned().collect::<Vec<_>>();
+    while let Some(group) = pending.pop() {
+        let Some(contract) = declared_groups.and_then(|groups| groups.get(&group)) else {
+            errors.push(format!(
+                "speculative.rollback_state reaches unknown state service group '{group}'"
+            ));
+            continue;
+        };
+        for cascade in &contract.capabilities.cascade {
+            if required_groups.insert(cascade.clone()) {
+                pending.push(cascade.clone());
+            }
+        }
+    }
+    for group in &required_groups {
+        let Some(contract) = declared_groups.and_then(|groups| groups.get(group)) else {
+            continue;
+        };
+        match contract.capabilities.rollback_positions {
+            None => errors.push(format!(
+                "speculative.rollback_state group '{group}' declares no rollback_positions; a \
+                 rejected proposal could not be undone"
+            )),
+            Some(positions) if positions < proposal_width => errors.push(format!(
+                "speculative.rollback_state group '{group}' rolls back {positions} positions but \
+                 the declared maximum proposal width is {proposal_width}"
+            )),
+            Some(_) => {}
+        }
+    }
+    // Only components that actually execute speculatively are constrained. The
+    // check reads speculation_safety, never the retry class: an idempotent
+    // effect can be safe to retry and still impossible to rewind.
+    //
+    // The region is the whole enclosing loop body, not just the two named
+    // components. A grammar sidecar or a routing head invoked between the
+    // proposer and the target runs on every speculated position too, and an
+    // unrewindable effect there is just as fatal to a rejected proposal.
+    let speculative_components =
+        speculative_region_components(&workflow.steps, &speculative.proposer, &speculative.target);
+    let speculative_domains = speculative_components
+        .iter()
+        .filter_map(|component| workflow.components.get(component.as_str()))
+        .flat_map(|component| component.effects.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    for domain in &speculative_domains {
+        let Some(contract) = workflow.effects.get(domain) else {
+            continue;
+        };
+        match &contract.speculation_safety {
+            crate::schema::SpeculationSafety::None => errors.push(format!(
+                "workflow effect '{domain}' runs inside the speculative region but declares \
+                 speculation_safety none; a rejected proposal could not be undone"
+            )),
+            crate::schema::SpeculationSafety::Rewindable { max_depth }
+                if *max_depth < proposal_width =>
+            {
+                errors.push(format!(
+                    "workflow effect '{domain}' rewinds {max_depth} positions but the declared \
+                     maximum proposal width is {proposal_width}"
+                ));
+            }
+            crate::schema::SpeculationSafety::Clonable
+            | crate::schema::SpeculationSafety::Rewindable { .. } => {}
+        }
+    }
+}
+
 // Recursive validation threads each independent symbol/effect table explicitly.
-#[allow(clippy::too_many_arguments)]
-fn validate_emit_identity_consistency(
+fn validate_emit_batch_layout_consistency(
     node: &WorkflowNode,
-    outputs: &mut BTreeMap<String, bool>,
+    value_contracts: &BTreeMap<String, crate::schema::TensorContract>,
+    outputs: &mut BTreeMap<String, crate::schema::BatchLayout>,
     errors: &mut Vec<String>,
 ) {
     match node {
         WorkflowNode::Sequence { nodes } => {
             for node in nodes {
-                validate_emit_identity_consistency(node, outputs, errors);
+                validate_emit_batch_layout_consistency(node, value_contracts, outputs, errors);
             }
         }
         WorkflowNode::Loop { setup, body, .. } => {
-            validate_emit_identity_consistency(setup, outputs, errors);
-            validate_emit_identity_consistency(body, outputs, errors);
+            validate_emit_batch_layout_consistency(setup, value_contracts, outputs, errors);
+            validate_emit_batch_layout_consistency(body, value_contracts, outputs, errors);
         }
         WorkflowNode::Branch { cases, default, .. } => {
             for case in cases.values() {
-                validate_emit_identity_consistency(case, outputs, errors);
+                validate_emit_batch_layout_consistency(case, value_contracts, outputs, errors);
             }
             if let Some(default) = default {
-                validate_emit_identity_consistency(default, outputs, errors);
+                validate_emit_batch_layout_consistency(default, value_contracts, outputs, errors);
             }
         }
-        WorkflowNode::Emit {
-            output, row_ids, ..
-        } => {
-            let row_wise = row_ids.is_some();
-            if let Some(previous) = outputs.insert(output.clone(), row_wise)
-                && previous != row_wise
+        WorkflowNode::Emit { output, value, .. } => {
+            let Some(contract) = value_contracts.get(value) else {
+                return;
+            };
+            let layout = contract.batch_layout.clone();
+            if let Some(previous) = outputs.insert(output.clone(), layout.clone())
+                && previous != layout
             {
                 errors.push(format!(
-                    "pipeline.workflow output '{output}' mixes aggregate and row-wise emits; \
-                     every emit for one output must agree on row_ids"
+                    "pipeline.workflow output '{output}' mixes batch layouts across emits; every \
+                     emit for one output must agree so the runtime can associate result rows with \
+                     requests"
                 ));
             }
         }
@@ -1718,88 +2275,117 @@ fn validate_emit_identity_consistency(
     }
 }
 
-fn validate_compacted_emit_identity(
+/// Every row-scoped value a serving workflow produces must carry a derivable
+/// row axis. Row identities are never serialized, so the declared batch layout
+/// is the only thing that lets a runtime compact, split, or drop result rows.
+fn validate_compaction_derivability(
     node: &WorkflowNode,
-    slot_ids: &str,
+    workflow: &WorkflowSpec,
+    value_contracts: &BTreeMap<String, crate::schema::TensorContract>,
     path: &str,
-    inside_loop: bool,
     errors: &mut Vec<String>,
 ) {
     match node {
         WorkflowNode::Sequence { nodes } => {
             for (index, node) in nodes.iter().enumerate() {
-                validate_compacted_emit_identity(
+                validate_compaction_derivability(
                     node,
-                    slot_ids,
+                    workflow,
+                    value_contracts,
                     &format!("{path}[{index}]"),
-                    inside_loop,
                     errors,
                 );
             }
         }
-        WorkflowNode::Loop {
-            setup,
-            body,
-            carried,
-            ..
-        } => {
-            // Compaction happens between workflow runs, so the outer lifecycle loop must retain
-            // semantic row identity. Nested control loops operate within that fixed permutation.
-            if !inside_loop
-                && !carried
-                    .iter()
-                    .any(|carry| carry.cell == slot_ids && carry.body_output == slot_ids)
-            {
-                errors.push(format!(
-                    "{path}.carried must preserve serving slot_ids '{slot_ids}' when compaction \
-                     is enabled; its next value must be the carried slot_ids value"
-                ));
-            }
-            validate_compacted_emit_identity(
+        WorkflowNode::Loop { setup, body, .. } => {
+            validate_compaction_derivability(
                 setup,
-                slot_ids,
+                workflow,
+                value_contracts,
                 &format!("{path}.setup"),
-                true,
                 errors,
             );
-            validate_compacted_emit_identity(body, slot_ids, &format!("{path}.body"), true, errors);
+            validate_compaction_derivability(
+                body,
+                workflow,
+                value_contracts,
+                &format!("{path}.body"),
+                errors,
+            );
         }
         WorkflowNode::Branch { cases, default, .. } => {
             for (case, node) in cases {
-                validate_compacted_emit_identity(
+                validate_compaction_derivability(
                     node,
-                    slot_ids,
+                    workflow,
+                    value_contracts,
                     &format!("{path}.cases.{case}"),
-                    inside_loop,
                     errors,
                 );
             }
             if let Some(default) = default {
-                validate_compacted_emit_identity(
+                validate_compaction_derivability(
                     default,
-                    slot_ids,
+                    workflow,
+                    value_contracts,
                     &format!("{path}.default"),
-                    inside_loop,
                     errors,
                 );
             }
         }
         WorkflowNode::Emit {
-            row_ids: Some(row_ids),
+            value,
+            output,
+            valid_length,
+            when,
             ..
-        } if row_ids != slot_ids => {
-            errors.push(format!(
-                "{path}.row_ids must reference serving slot_ids '{slot_ids}' when compaction is \
-                 enabled"
-            ));
+        } => {
+            let Some(declared) = workflow.outputs.get(output) else {
+                return;
+            };
+            // A per-row valid_length or guard makes the emission ragged:
+            // different rows contribute different amounts, so the result cannot
+            // be one dense tensor. That is exactly the case a runtime must split
+            // into per-request rows, and it can only do so from a declared row
+            // axis, since row identities are no longer serialized. This is
+            // checked from the declared output alone, so an emit whose value
+            // contract could not be inferred cannot slip past it.
+            if (valid_length.is_some() || when.is_some())
+                && declared.contract.batch_layout.request_axis().is_none()
+            {
+                errors.push(format!(
+                    "{path} emits '{value}' into output '{output}' with a per-row valid_length or \
+                     guard, but '{output}' does not declare request_aligned; ragged emission needs \
+                     a declared row axis so the runtime can associate result rows with requests"
+                ));
+            }
+            let Some(contract) = value_contracts.get(value) else {
+                return;
+            };
+            if declared.contract.batch_layout != contract.batch_layout {
+                errors.push(format!(
+                    "{path} emits '{value}' into output '{output}' with a different batch_layout; \
+                     the emitted value and the declared output must agree"
+                ));
+            }
+            if contract.rank > 0
+                && matches!(contract.batch_layout, crate::schema::BatchLayout::Shared)
+                && workflow.serving.is_some()
+            {
+                errors.push(format!(
+                    "{path} emits per-request value '{value}' without a declared batch_layout; a \
+                     serving workflow must declare request_aligned or token_packed so the runtime \
+                     can associate result rows with requests"
+                ));
+            }
         }
-        WorkflowNode::Emit { .. }
-        | WorkflowNode::Invoke { .. }
+        WorkflowNode::Invoke { .. }
         | WorkflowNode::Transfer { .. }
         | WorkflowNode::ExecutionIsland { .. } => {}
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_workflow_node(
     node: &WorkflowNode,
     workflow: &WorkflowSpec,
@@ -2395,7 +2981,6 @@ fn validate_workflow_node(
             value,
             when,
             valid_length,
-            row_ids,
             output,
             effect_name,
             effect,
@@ -2423,26 +3008,13 @@ fn validate_workflow_node(
                     );
                 }
             }
-            if let Some(row_ids) = row_ids {
-                require_workflow_value(row_ids, values, &format!("{path}.row_ids"), errors);
-                if let Some(contract) = value_contracts.get(row_ids) {
-                    if contract.dtype != "int64" || contract.rank != 1 {
-                        errors.push(format!("{path}.row_ids must be int64[B]"));
-                    }
-                    if let (Some(row_batch), Some(value_batch)) = (
-                        contract.shape.as_deref().and_then(|shape| shape.first()),
-                        value_contracts
-                            .get(value)
-                            .and_then(|contract| contract.shape.as_deref())
-                            .and_then(|shape| shape.first()),
-                    ) && row_batch != value_batch
-                    {
-                        errors.push(format!(
-                            "{path}.row_ids batch dimension must match {path}.value"
-                        ));
-                    }
-                }
-            } else {
+            // A row-wise guard or prefix length only has meaning when the
+            // emitted value declares a request-aligned axis, because that is
+            // what the runtime uses to associate result rows with requests.
+            let emitted_request_axis = value_contracts
+                .get(value)
+                .and_then(|contract| contract.batch_layout.request_axis());
+            if emitted_request_axis.is_none() {
                 for (field, control) in [
                     ("when", when.as_ref()),
                     ("valid_length", valid_length.as_ref()),
@@ -2458,7 +3030,8 @@ fn validate_workflow_node(
                             ));
                     if !singleton {
                         errors.push(format!(
-                            "{path}.{field} is row-wise and requires explicit row_ids"
+                            "{path}.{field} is row-wise but {path}.value declares no \
+                             request_aligned batch_layout"
                         ));
                     }
                 }
@@ -2724,7 +3297,6 @@ fn validate_optional_input_guards(
             value,
             when,
             valid_length,
-            row_ids,
             ..
         } => {
             check(value, &format!("{path}.value"), errors);
@@ -2733,9 +3305,6 @@ fn validate_optional_input_guards(
             }
             if let Some(valid_length) = valid_length {
                 check(valid_length, &format!("{path}.valid_length"), errors);
-            }
-            if let Some(row_ids) = row_ids {
-                check(row_ids, &format!("{path}.row_ids"), errors);
             }
         }
         WorkflowNode::Transfer {

@@ -2090,17 +2090,16 @@ pipeline:
       ir_version: "1.0"
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit, emit_valid_length, emit_row_identity]
+      capabilities: [workflow_ssa, typed_emit, emit_valid_length]
     inputs:
       target: { contract: { dtype: float32, rank: 3, shape: [batch, draft, vocabulary] }, role: { kind: opaque },
                 source: { kind: application, name: target }, required: true }
       proposed: { contract: { dtype: int64, rank: 2, shape: [batch, draft] }, role: { kind: opaque },
                   source: { kind: application, name: proposed }, required: true }
-      row_ids: { contract: { dtype: int64, rank: 1, shape: [batch] }, role: { kind: opaque },
-                 source: { kind: application, name: row_ids }, required: true }
     outputs:
       accepted_len: { contract: { dtype: int64, rank: 1, shape: [batch] }, role: tensor, stage: pre_adapter }
-      accepted_tokens: { contract: { dtype: int64, rank: 2, shape: [batch, accepted] },
+      accepted_tokens: { contract: { dtype: int64, rank: 2, shape: [batch, accepted],
+                                     batch_layout: { kind: request_aligned, axis: 0 } },
                          role: tokens, stage: pre_adapter }
     components:
       verifier:
@@ -2110,7 +2109,8 @@ pipeline:
             target_scores: { dtype: float32, rank: 3, shape: [batch, draft, vocabulary] }
             proposed_tokens: { dtype: int64, rank: 2, shape: [batch, draft] }
           outputs:
-            accepted_tokens: { dtype: int64, rank: 2, shape: [batch, draft] }
+            accepted_tokens: { dtype: int64, rank: 2, shape: [batch, draft],
+                               batch_layout: { kind: request_aligned, axis: 0 } }
             accepted_count: { dtype: int64, rank: 1, shape: [batch] }
             done: { dtype: bool, rank: 1, shape: [batch] }
         contract:
@@ -2130,7 +2130,6 @@ pipeline:
         - kind: emit
           value: accepted
           valid_length: count
-          row_ids: row_ids
           output: accepted_tokens
           mode: replace
         - kind: emit
@@ -2150,8 +2149,7 @@ pipeline:
                 "target",
                 Value::from_slice_f32(&[0.1, 0.9, 0.8, 0.2, 0.7, 0.3], &[1, 3, 2])?,
             )
-            .with_input("proposed", Value::from_slice_i64(&[1, 1, 0], &[1, 3])?)
-            .with_input("row_ids", Value::from_slice_i64(&[0], &[1])?);
+            .with_input("proposed", Value::from_slice_i64(&[1, 1, 0], &[1, 3])?);
     let outputs = engine.run_pipeline(request)?;
     assert_eq!(outputs["accepted_len"].to_vec_i64()?, [2]);
     assert_eq!(outputs["accepted_tokens.row.0"].shape(), [1, 2]);
@@ -2169,8 +2167,7 @@ pipeline:
             .with_input(
                 "proposed",
                 Value::from_slice_i64(&[1, 1, 0, 1, 1, 0], &[2, 3])?,
-            )
-            .with_input("row_ids", Value::from_slice_i64(&[0, 1], &[2])?);
+            );
     let outputs = engine.run_pipeline(batched_request)?;
     assert_eq!(outputs["accepted_tokens.row.0"].to_vec_i64()?, [1, 1]);
     assert_eq!(outputs["accepted_tokens.row.1"].to_vec_i64()?, [1, 1]);
@@ -2366,16 +2363,18 @@ pipeline:
       iterations: { contract: { dtype: int64, rank: 0, shape: [] },
                     role: { kind: opaque }, source: { kind: application, name: iterations },
                     required: true }
-      row_ids: { contract: { dtype: int64, rank: 1, shape: [batch] },
-                 role: { kind: opaque }, source: { kind: application, name: row_ids },
-                 required: true }
     outputs:
-      tokens: { contract: { dtype: int64, rank: 2, shape: [batch, generated] },
+      tokens: { contract: { dtype: int64, rank: 2, shape: [batch, generated],
+                            batch_layout: { kind: request_aligned, axis: 0 } },
                 role: tokens, stage: pre_adapter }
       next_k: { contract: { dtype: int64, rank: 1, shape: [batch] },
                 role: tensor, stage: pre_adapter }
       final_grammar_state: { contract: { dtype: int64, rank: 1, shape: [batch] },
                              role: tensor, stage: pre_adapter }
+    effects:
+      grammar:
+        retry: idempotent
+        speculation_safety: { kind: rewindable, max_depth: 8 }
     components:
       bind_grammar:
         implementation: { kind: binding }
@@ -2612,12 +2611,10 @@ pipeline:
               - kind: emit
                 value: accepted.tokens
                 valid_length: committed.length
-                row_ids: row_ids
                 output: tokens
                 mode: append
               - kind: emit
                 value: grammar.token
-                row_ids: row_ids
                 output: tokens
                 mode: append
           continue_when: continue
@@ -2697,8 +2694,7 @@ pipeline:
                     "continue",
                     Value::from_raw_bytes(vec![1], &[], onnx_genai_ort::DataType::Bool)?,
                 )
-                .with_input("iterations", Value::from_slice_i64(&[1], &[])?)
-                .with_input("row_ids", Value::from_slice_i64(&[0], &[1])?),
+                .with_input("iterations", Value::from_slice_i64(&[1], &[])?),
         )
     };
     let output = engine.run_pipeline(request(2, 1.0, 2.0)?)?;
@@ -2755,6 +2751,10 @@ pipeline:
     outputs:
       elapsed_ms: { contract: { dtype: float32, rank: 0, shape: [] },
                     role: tensor, stage: pre_adapter }
+    effects:
+      telemetry:
+        retry: idempotent
+        speculation_safety: { kind: rewindable, max_depth: 8 }
     components:
       clock_start:
         implementation: { kind: adapter, abi: onnx-genai.telemetry, version: "1" }
@@ -3325,6 +3325,16 @@ pipeline:
         contract: { dtype: int64, rank: 1, shape: [batch] }
         role: tokens
         stage: pre_adapter
+    effects:
+      speculative:
+        retry: idempotent
+        speculation_safety: { kind: rewindable, max_depth: 8 }
+      kv:
+        retry: idempotent
+        speculation_safety: { kind: rewindable, max_depth: 8 }
+      rng:
+        retry: idempotent
+        speculation_safety: { kind: rewindable, max_depth: 8 }
     components:
       token_binding:
         implementation: { kind: binding }

@@ -1517,7 +1517,37 @@ impl Engine {
             .unwrap_or_else(|| self.speculative_mode.clone())
     }
 
+    /// Whether the package permits the runtime to turn speculation on by itself.
+    ///
+    /// Speculation replaces one implementation of a contract with an equivalent
+    /// one, so the package's declared equivalence class decides whether the swap
+    /// is silently allowed. Only a `bitwise` or `distribution_preserving`
+    /// contract may be substituted without the caller asking: a merely
+    /// `semantic` equivalence is free to change the output distribution, which
+    /// is exactly what a caller who did not ask for speculation did not agree to.
+    ///
+    /// A component that declares nothing is treated as `semantic` — the schema
+    /// default — so silence never buys an automatic optimization. Note that an
+    /// absent contract must be *counted* as semantic rather than skipped:
+    /// filtering undeclared components out would make `all` vacuously true for a
+    /// package whose components declare no contracts at all.
+    pub(crate) fn permits_automatic_speculation(&self) -> bool {
+        let Some(pipeline) = &self.metadata.pipeline else {
+            return false;
+        };
+        components_permit_automatic_speculation(&pipeline.workflow.components)
+    }
+
     pub(crate) fn should_use_speculative(&self, options: &GenerateOptions) -> bool {
+        // Naming a mode — on the request or in the engine configuration — is an
+        // explicit opt-in. Anything else is the runtime substituting a different
+        // implementation of the same contract on its own, which only a
+        // bitwise or distribution-preserving equivalence class permits.
+        let opted_in = options.speculative_mode.is_some()
+            || !matches!(self.speculative_mode, SpeculativeMode::None);
+        if !opted_in && !self.permits_automatic_speculation() {
+            return false;
+        }
         let mode_available = match self.speculative_mode(options) {
             SpeculativeMode::None => false,
             SpeculativeMode::DraftModel => self.draft.is_some(),
@@ -2449,6 +2479,28 @@ pub(crate) fn shared_kv_slices_from_materialized(
     Ok(slices)
 }
 
+/// Whether every component may be silently swapped for an equivalent one.
+///
+/// An absent contract counts as `EquivalenceClass::Semantic` — the schema
+/// default — rather than being skipped. Filtering undeclared components out
+/// would make the `all` vacuously true for a package whose components declare no
+/// contracts at all, which is precisely the package that promised nothing.
+fn components_permit_automatic_speculation(
+    components: &std::collections::BTreeMap<String, onnx_genai_metadata::WorkflowComponent>,
+) -> bool {
+    if components.is_empty() {
+        return false;
+    }
+    components.values().all(|component| {
+        component
+            .contract
+            .as_ref()
+            .map(|contract| contract.equivalence)
+            .unwrap_or_default()
+            .permits_automatic_speculation()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3141,5 +3193,70 @@ mod tests {
             SpeculativeMode::None => "none",
         };
         assert_eq!(selected, "eagle3");
+    }
+}
+
+#[cfg(test)]
+mod equivalence_gate_tests {
+    use super::components_permit_automatic_speculation;
+    use onnx_genai_metadata::WorkflowComponent;
+    use std::collections::BTreeMap;
+
+    fn component(equivalence: Option<&str>) -> WorkflowComponent {
+        let contract = equivalence
+            .map(|class| {
+                format!(
+                    "\ncontract:\n  id: onnx-genai.decoder\n  version: \"1\"\n  \
+                     equivalence: {class}\n"
+                )
+            })
+            .unwrap_or_default();
+        serde_yaml::from_str(&format!(
+            "implementation: {{ kind: onnx, artifact: decoder.onnx }}\nports: {{}}{contract}"
+        ))
+        .expect("component parses")
+    }
+
+    fn gate(components: &[(&str, Option<&str>)]) -> bool {
+        let map = components
+            .iter()
+            .map(|(name, class)| ((*name).to_string(), component(*class)))
+            .collect::<BTreeMap<_, _>>();
+        components_permit_automatic_speculation(&map)
+    }
+
+    /// Silence must never buy an automatic optimization. A package whose
+    /// components declare no contract at all promised nothing, so it must be
+    /// read as `semantic` — not skipped, which would make `all` vacuously true.
+    #[test]
+    fn a_package_that_declares_no_contracts_permits_nothing() {
+        assert!(!gate(&[("decoder", None)]));
+        assert!(!gate(&[("decoder", None), ("draft", None)]));
+        assert!(!gate(&[]), "an empty package promised nothing either");
+    }
+
+    /// One undeclared component is enough to withhold consent, even when every
+    /// component that did declare one is distribution-preserving.
+    #[test]
+    fn one_undeclared_component_withholds_consent() {
+        assert!(gate(&[("decoder", Some("distribution_preserving"))]));
+        assert!(!gate(&[
+            ("decoder", Some("distribution_preserving")),
+            ("draft", None),
+        ]));
+    }
+
+    /// Only bitwise and distribution-preserving equivalence permit a silent
+    /// swap; merely semantic equivalence is free to change the output
+    /// distribution, which an unasking caller did not agree to.
+    #[test]
+    fn only_distribution_preserving_classes_permit_a_silent_swap() {
+        assert!(gate(&[("decoder", Some("bitwise"))]));
+        assert!(gate(&[("decoder", Some("distribution_preserving"))]));
+        assert!(!gate(&[("decoder", Some("semantic"))]));
+        assert!(!gate(&[
+            ("decoder", Some("bitwise")),
+            ("draft", Some("semantic")),
+        ]));
     }
 }

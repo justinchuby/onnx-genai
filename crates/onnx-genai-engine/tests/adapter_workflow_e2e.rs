@@ -21,44 +21,31 @@ fn package(metadata: &str, red: &[u8], blue: &[u8]) -> anyhow::Result<PathBuf> {
 
 fn run(
     engine: &mut PipelineEngine,
-    slot_ids: &[i64],
-    request_epochs: &[i64],
     values: &[f32],
     selection: AdapterSelection,
 ) -> anyhow::Result<Vec<f32>> {
-    let batch = i64::try_from(slot_ids.len())?;
-    let mut segments = vec![-1i64; slot_ids.len() * 2];
-    let mut adapter_counts = vec![0i64; slot_ids.len()];
-    let mut adapter_scales = vec![0.0f32; slot_ids.len() * 2];
-    for (row, (&slot_id, &request_epoch)) in slot_ids.iter().zip(request_epochs).enumerate() {
-        let identity = onnx_genai_engine::AdapterSlotIdentity {
-            slot_id,
-            request_epoch,
-        };
-        if let Some(activations) = selection.rows.get(&identity) {
-            adapter_counts[row] = i64::try_from(activations.len())?;
-            for (slot, activation) in activations.iter().enumerate() {
-                segments[row * 2 + slot] = match activation.adapter.as_str() {
-                    "red" => 0,
-                    "blue" => 1,
-                    other => anyhow::bail!("unknown test adapter {other}"),
-                };
-                adapter_scales[row * 2 + slot] = activation.scale;
-            }
+    // Rows are identified by their position in the batch the caller submits.
+    // No slot id or epoch travels through the metadata contract.
+    let rows = selection.rows.len();
+    let batch = i64::try_from(rows)?;
+    let mut segments = vec![-1i64; rows * 2];
+    let mut adapter_counts = vec![0i64; rows];
+    let mut adapter_scales = vec![0.0f32; rows * 2];
+    for (row, activations) in selection.rows.iter().enumerate() {
+        adapter_counts[row] = i64::try_from(activations.len())?;
+        for (slot, activation) in activations.iter().enumerate() {
+            segments[row * 2 + slot] = match activation.adapter.as_str() {
+                "red" => 0,
+                "blue" => 1,
+                other => anyhow::bail!("unknown test adapter {other}"),
+            };
+            adapter_scales[row * 2 + slot] = activation.scale;
         }
     }
     let request = PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![]),
         options: Default::default(),
     })
-    .with_input(
-        "request.slot_ids",
-        Value::from_slice_i64(slot_ids, &[batch])?,
-    )
-    .with_input(
-        "request.request_epochs",
-        Value::from_slice_i64(request_epochs, &[batch])?,
-    )
     .with_input(
         "request.adapter_segments",
         Value::from_slice_i64(&segments, &[batch, 2])?,
@@ -98,8 +85,6 @@ adapters:
         rank: 1
         alpha: 1.0
   selection:
-    slot_ids: request.slot_ids
-    request_epochs: request.request_epochs
     segments: request.adapter_segments
     adapter_counts: request.adapter_counts
     scales: request.adapter_scales
@@ -142,33 +127,25 @@ pipeline:
       adapter_abis: {{ onnx-genai.parameter-overlay: "1" }}
       capabilities: [workflow_ssa, typed_emit, parameter_adapters, heterogeneous_adapter_batching]
     inputs:
-      request.slot_ids:
-        contract: {{ dtype: int64, rank: 1, shape: [batch] }}
-        role: {{ kind: opaque }}
-        source: {{ kind: application, name: serving.slot_ids }}
-      request.request_epochs:
-        contract: {{ dtype: int64, rank: 1, shape: [batch] }}
-        role: {{ kind: runtime, version: "1.0", role: request_epochs }}
-        source: {{ kind: request }}
       request.adapter_segments:
-        contract: {{ dtype: int64, rank: 2, shape: [batch, 2] }}
+        contract: {{ dtype: int64, rank: 2, shape: [batch, 2], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
         role: {{ kind: runtime, version: "1.0", role: adapter_segments }}
         source: {{ kind: request }}
       request.adapter_counts:
-        contract: {{ dtype: int64, rank: 1, shape: [batch] }}
+        contract: {{ dtype: int64, rank: 1, shape: [batch], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
         role: {{ kind: runtime, version: "1.0", role: adapter_counts }}
         source: {{ kind: request }}
       request.adapter_scales:
-        contract: {{ dtype: float32, rank: 2, shape: [batch, 2] }}
+        contract: {{ dtype: float32, rank: 2, shape: [batch, 2], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
         role: {{ kind: runtime, version: "1.0", role: adapter_scales }}
         source: {{ kind: request }}
       activations:
-        contract: {{ dtype: float32, rank: 2, shape: [batch, 2] }}
+        contract: {{ dtype: float32, rank: 2, shape: [batch, 2], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
         role: {{ kind: opaque }}
         source: {{ kind: application, name: activations }}
     outputs:
       result:
-        contract: {{ dtype: float32, rank: 2, shape: [batch, 2] }}
+        contract: {{ dtype: float32, rank: 2, shape: [batch, 2], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
         role: tensor
         stage: pre_adapter
     components:
@@ -180,11 +157,12 @@ pipeline:
           kind: adapter
           abi: onnx-genai.parameter-overlay
           version: "1"
+        row_scope: {{ axis: 0, stateful: false }}
         ports:
           inputs:
-            input: {{ dtype: float32, rank: 2, shape: [batch, 2] }}
+            input: {{ dtype: float32, rank: 2, shape: [batch, 2], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
           outputs:
-            output: {{ dtype: float32, rank: 2, shape: [batch, 2] }}
+            output: {{ dtype: float32, rank: 2, shape: [batch, 2], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
         contract:
           id: onnx-genai.parameter-overlay
           version: "1"
@@ -200,68 +178,72 @@ pipeline:
         output: result
         mode: replace
 "#,
-        red_sha = format!("{:x}", Sha256::digest(red)),
-        blue_sha = format!("{:x}", Sha256::digest(blue)),
+        red_sha = Sha256::digest(red)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+        blue_sha = Sha256::digest(blue)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
     );
     let root = package(&metadata, red, blue)?;
     let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
-    let selection = AdapterSelection::default()
-        .with_slot(10, 0, [AdapterActivation::new("red", 1.0)])
-        .with_slot(
-            30,
-            0,
-            [
-                AdapterActivation::new("red", 0.5),
-                AdapterActivation::new("blue", 1.0),
-            ],
-        );
+    let red_only = [AdapterActivation::new("red", 1.0)];
+    let none: [AdapterActivation; 0] = [];
+    let composed = [
+        AdapterActivation::new("red", 0.5),
+        AdapterActivation::new("blue", 1.0),
+    ];
 
+    // Heterogeneous batching: three rows, three different adapter selections,
+    // associated purely by batch position.
+    let selection = AdapterSelection::default()
+        .with_row(red_only.clone())
+        .with_row(none.clone())
+        .with_row(composed.clone());
     assert_eq!(
-        run(
-            &mut engine,
-            &[10, 20, 30],
-            &[0, 0, 0],
-            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            selection.clone(),
-        )?,
+        run(&mut engine, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], selection)?,
         vec![2.0, 4.0, 3.0, 4.0, 25.5, 35.0]
     );
-    for (slot_id, input, expected) in [
-        (10, [1.0, 2.0], [2.0, 4.0]),
-        (20, [3.0, 4.0], [3.0, 4.0]),
-        (30, [5.0, 6.0], [25.5, 35.0]),
+
+    // The same rows submitted alone reproduce the same values.
+    for (activations, input, expected) in [
+        (red_only.to_vec(), [1.0, 2.0], [2.0, 4.0]),
+        (none.to_vec(), [3.0, 4.0], [3.0, 4.0]),
+        (composed.to_vec(), [5.0, 6.0], [25.5, 35.0]),
     ] {
-        assert_eq!(
-            run(&mut engine, &[slot_id], &[0], &input, selection.clone())?,
-            expected
-        );
+        let selection = AdapterSelection::default().with_row(activations);
+        assert_eq!(run(&mut engine, &input, selection)?, expected);
     }
+
+    // Reordering the batch reorders the selection with it: the association is
+    // positional, so nothing carries over from the previous submission.
+    let reordered = AdapterSelection::default()
+        .with_row(composed.clone())
+        .with_row(red_only.clone());
     assert_eq!(
-        run(
-            &mut engine,
-            &[30, 10],
-            &[0, 0],
-            &[5.0, 6.0, 1.0, 2.0],
-            selection.clone(),
-        )?,
+        run(&mut engine, &[5.0, 6.0, 1.0, 2.0], reordered)?,
         vec![25.5, 35.0, 2.0, 4.0]
     );
 
-    // Reusing slot 10 at a new epoch cannot inherit its prior adapter selection.
+    // A row that reuses a batch position with a different selection gets the
+    // new selection; there is no identity to inherit a stale one from.
+    let blue_only = AdapterSelection::default().with_row([AdapterActivation::new("blue", 1.0)]);
     assert_eq!(
-        run(&mut engine, &[10], &[1], &[1.0, 2.0], selection.clone(),)?,
+        run(
+            &mut engine,
+            &[1.0, 2.0],
+            AdapterSelection::default().with_row(none)
+        )?,
         vec![1.0, 2.0]
     );
-    let reused =
-        AdapterSelection::default().with_slot(10, 1, [AdapterActivation::new("blue", 1.0)]);
     assert_eq!(
-        run(&mut engine, &[10], &[1], &[1.0, 2.0], reused.clone())?,
+        run(&mut engine, &[1.0, 2.0], blue_only.clone())?,
         vec![7.0, 10.0]
     );
-    assert_eq!(
-        run(&mut engine, &[10], &[1], &[1.0, 2.0], reused)?,
-        vec![7.0, 10.0]
-    );
+    assert_eq!(run(&mut engine, &[1.0, 2.0], blue_only)?, vec![7.0, 10.0]);
+
     let diagnostic = engine.adapter_lifecycle_diagnostic();
     assert_eq!(diagnostic.loads, 2);
     assert!(diagnostic.cache_hits > 0);

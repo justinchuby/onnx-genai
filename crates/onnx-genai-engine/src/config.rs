@@ -2,7 +2,7 @@
 
 use crate::logits::{StopSequence, TokenId};
 use onnx_genai_kv::{CachePriority, DEFAULT_CHUNK_SIZE, KvDType, LocalTieredConfig, SequenceId};
-use onnx_genai_metadata::GenerationDefaults;
+use onnx_genai_metadata::{GenerationContract, GenerationDefaults};
 use onnx_genai_ort::{Eagle3DraftKvMode, MtpDraftKvMode};
 use onnx_genai_scheduler::{Priority, ResourceLimit, ResourceLimits, SchedulerConfig};
 use serde::Deserialize;
@@ -1325,6 +1325,97 @@ impl GenerateOptions {
             self.greedy = true;
         }
     }
+
+    /// Resolve sampling controls against a package's generation *contract*.
+    ///
+    /// The contract's defaults are authoritative. A caller may override only the
+    /// fields the package structurally exposes as request-sourced workflow
+    /// inputs, within the bounds those inputs declare. Every other override is
+    /// rejected here rather than silently dropped: a request that asks for a
+    /// temperature the package never wired to an input would otherwise decode at
+    /// the package default while the caller believed their value took effect.
+    ///
+    /// A package with no generation contract at all has no declared override
+    /// surface, so this behaves exactly like
+    /// [`Self::resolve_sampling_defaults`] with no declared defaults — callers
+    /// keep the runtime fallbacks, and nothing is silently discarded.
+    pub fn resolve_generation_contract(
+        &mut self,
+        contract: Option<&GenerationContract>,
+        overrides: &SamplingOverrides,
+    ) -> anyhow::Result<()> {
+        if let Some(contract) = contract {
+            for (field, requested) in requested_overrides(overrides) {
+                let Some(declared) = contract.overrides.get(field) else {
+                    anyhow::bail!(
+                        "generation override '{field}' is not supported by this package. \
+                         Why: a package may only be overridden through fields it declares as \
+                         request-sourced workflow inputs, and this one declares {}. How to fix: \
+                         drop the override, or re-export the package with a workflow input for \
+                         '{field}' listed under generation.overrides",
+                        describe_supported(contract)
+                    );
+                };
+                if let (Some(value), Some(constraint)) = (requested, &declared.constraint)
+                    && (constraint.minimum.is_some_and(|minimum| value < minimum)
+                        || constraint.maximum.is_some_and(|maximum| value > maximum))
+                {
+                    anyhow::bail!(
+                        "generation override '{field}' = {value} is outside the range this \
+                             package declares ({}..={}). Why: the request-sourced workflow input \
+                             '{}' declares bounds the runtime enforces before execution. How to \
+                             fix: choose a value inside the declared range",
+                        constraint
+                            .minimum
+                            .map_or_else(|| "-inf".to_owned(), |bound| bound.to_string()),
+                        constraint
+                            .maximum
+                            .map_or_else(|| "+inf".to_owned(), |bound| bound.to_string()),
+                        declared.input,
+                    );
+                }
+            }
+        }
+        self.resolve_sampling_defaults(
+            contract.and_then(|contract| contract.defaults.as_ref()),
+            overrides,
+        );
+        Ok(())
+    }
+}
+
+/// The generation fields a caller actually asked to override, with the numeric
+/// value when the field has one (`do_sample` is a flag, so it has none).
+fn requested_overrides(overrides: &SamplingOverrides) -> Vec<(&'static str, Option<f64>)> {
+    let mut requested = Vec::new();
+    if overrides.greedy.is_some() {
+        requested.push(("do_sample", None));
+    }
+    if let Some(temperature) = overrides.temperature {
+        requested.push(("temperature", Some(f64::from(temperature))));
+    }
+    if let Some(top_p) = overrides.top_p {
+        requested.push(("top_p", Some(f64::from(top_p))));
+    }
+    if let Some(top_k) = overrides.top_k {
+        requested.push(("top_k", Some(top_k as f64)));
+    }
+    requested
+}
+
+fn describe_supported(contract: &GenerationContract) -> String {
+    if contract.overrides.is_empty() {
+        return "no overridable fields".to_owned();
+    }
+    format!(
+        "only {}",
+        contract
+            .overrides
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 /// Built-in constrained decoding grammars.
@@ -1852,5 +1943,111 @@ mod sampling_defaults_tests {
             &SamplingOverrides::default(),
         );
         assert!(options.greedy, "model do_sample=false must select greedy");
+    }
+}
+
+#[cfg(test)]
+mod generation_contract_tests {
+    use super::*;
+    use onnx_genai_metadata::{GenerationOverride, GenerationOverrideConstraint};
+
+    fn contract() -> GenerationContract {
+        GenerationContract {
+            defaults: Some(GenerationDefaults {
+                do_sample: Some(true),
+                temperature: Some(0.6),
+                ..GenerationDefaults::default()
+            }),
+            overrides: [(
+                "temperature".to_owned(),
+                GenerationOverride {
+                    input: "request.temperature".to_owned(),
+                    constraint: Some(GenerationOverrideConstraint {
+                        minimum: Some(0.0),
+                        maximum: Some(2.0),
+                    }),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    #[test]
+    fn a_declared_override_within_its_declared_bounds_is_applied() {
+        let mut options = GenerateOptions::default();
+        options
+            .resolve_generation_contract(
+                Some(&contract()),
+                &SamplingOverrides {
+                    temperature: Some(1.25),
+                    ..SamplingOverrides::default()
+                },
+            )
+            .expect("declared override");
+        assert_eq!(options.temperature, 1.25);
+        assert!(!options.greedy);
+    }
+
+    #[test]
+    fn an_undeclared_override_fails_loudly_instead_of_being_dropped() {
+        let mut options = GenerateOptions::default();
+        let error = options
+            .resolve_generation_contract(
+                Some(&contract()),
+                &SamplingOverrides {
+                    top_k: Some(40),
+                    ..SamplingOverrides::default()
+                },
+            )
+            .expect_err("top_k is not wired to a request input");
+        let message = error.to_string();
+        assert!(message.contains("top_k"), "{message}");
+        assert!(message.contains("only temperature"), "{message}");
+    }
+
+    #[test]
+    fn an_override_outside_its_declared_range_fails_loudly() {
+        let mut options = GenerateOptions::default();
+        let error = options
+            .resolve_generation_contract(
+                Some(&contract()),
+                &SamplingOverrides {
+                    temperature: Some(9.0),
+                    ..SamplingOverrides::default()
+                },
+            )
+            .expect_err("9.0 exceeds the declared maximum");
+        let message = error.to_string();
+        assert!(message.contains("request.temperature"), "{message}");
+        assert!(message.contains("0..=2"), "{message}");
+    }
+
+    #[test]
+    fn package_defaults_are_authoritative_when_the_caller_is_silent() {
+        let mut options = GenerateOptions::default();
+        options
+            .resolve_generation_contract(Some(&contract()), &SamplingOverrides::default())
+            .expect("no override requested");
+        assert_eq!(options.temperature, 0.6);
+        assert!(
+            !options.greedy,
+            "declared do_sample: true must win over the runtime fallback"
+        );
+    }
+
+    #[test]
+    fn a_package_without_a_contract_keeps_the_runtime_fallbacks() {
+        let mut options = GenerateOptions::default();
+        options
+            .resolve_generation_contract(
+                None,
+                &SamplingOverrides {
+                    temperature: Some(0.9),
+                    ..SamplingOverrides::default()
+                },
+            )
+            .expect("no contract to violate");
+        assert_eq!(options.temperature, 0.9);
     }
 }

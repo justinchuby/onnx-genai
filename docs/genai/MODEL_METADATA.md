@@ -13,16 +13,20 @@ role and whether they are pre- or post-adapter.
 
 ## Components and graph
 
-`workflow.components` declares ONNX artifacts or manifest-pinned adapter ABIs with
-typed ports. The graph is recursive SSA control flow:
+`workflow.components` declares ONNX artifacts, native implementations, runtime bindings,
+or manifest-pinned adapter ABIs with typed ports. Each contract declares an equivalence
+class (`bitwise | distribution_preserving | semantic`, defaulting to `semantic`) that
+decides whether the runtime may substitute an equivalent implementation on its own. The graph is recursive SSA control flow:
 
 - `invoke` binds named values to component ports;
 - `sequence` orders nodes;
 - `loop` declares setup, body, condition, maximum iterations, induction value, and
   carried state;
 - `branch` selects one case and exports only declared phi results/effect joins;
-- `transfer` makes placement changes explicit;
 - `emit` publishes streaming or final package outputs.
+
+`transfer` is internal lowered IR only: the planner introduces it when it assigns
+placement, and metadata must not serialize one.
 
 There are no strategies or phases. Control-flow location defines lifecycle. Policy
 math—sampling, termination, scheduler/solver steps, masked updates, speculative
@@ -31,17 +35,22 @@ acceptance, and state updates—is supplied as ONNX components.
 ## Effects, state, and serving
 
 State cells have typed contracts, invocation/session scope, an initializer ValueRef,
-and explicit loop recurrence. Reads, writes, RNG, and emits thread linear effect
-tokens. Session state is lease-protected. Serving contracts declare generic admission,
-compaction, row activity, accepted length, and KV slot values without model-family
-logic.
+and explicit loop recurrence. A cell bound to a runtime state service group declares
+`management: runtime` and a `release_boundary`; ordinary tensors use SSA liveness.
+Reads, writes, RNG, and emits thread linear effect tokens through declared effect
+domains, each carrying an independent `retry` class and `speculation_safety` bound.
+Session state is lease-protected. Serving contracts declare generic admission,
+compaction, row activity, and accepted length without model-family logic and without
+any serialized row identity — state groups declare semantic kind, geometry, graph ABI
+`aliasing`, reuse, and rollback/snapshot/fork bounds, never a storage mode.
 
 Top-level `adapters` migrates the durable `InferenceMetadata.adapters` and
 `LoraTargetManifest` contracts from LoRA PRs #318/#374 into
 `onnx-genai.adapters@1`. It supports PEFT+safetensors and ORT `.onnx_adapter`
 sources, an authoritative architecture-neutral target manifest, Phase-1 optional
 graph inputs, Phase-2 segment routing generalized to ordered composition, exact
-SHA-256 verification, and `(slot_id, request_epoch)` compaction identity. The
+SHA-256 verification, and identity-free request-aligned selection that compacts with
+every other row-scoped value. The
 normative ABI and reuse/adapt/retire matrix are specified in
 [WORKFLOW_POLICY_COMPONENTS.md](WORKFLOW_POLICY_COMPONENTS.md#parameter-adapters-lora).
 
@@ -52,4 +61,5 @@ versions. Capabilities are derived from used features and checked at load. Unkno
 unsupported, unresolved, unordered, or ill-typed documents fail before execution.
 
 Policy artifact port contracts and minimal workflows are specified in
-[WORKFLOW_POLICY_COMPONENTS.md](WORKFLOW_POLICY_COMPONENTS.md).
+[WORKFLOW_POLICY_COMPONENTS.md](WORKFLOW_POLICY_COMPONENTS.md). The normative contract
+is [INFERENCE_METADATA_DECISIONS.md](INFERENCE_METADATA_DECISIONS.md).

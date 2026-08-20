@@ -90,6 +90,10 @@ fn empty_metadata() -> InferenceMetadata {
         pipeline: None,
         adapters: None,
         hardware_requirements: None,
+        package: None,
+        generation: None,
+        profiles: Default::default(),
+        speculative: None,
     }
 }
 
@@ -117,6 +121,7 @@ fn model_capabilities(
         attention: Some(attention),
         max_sequence_length,
         runtime_configurable,
+        sharding: None,
         mixture_of_experts: None,
     }
 }

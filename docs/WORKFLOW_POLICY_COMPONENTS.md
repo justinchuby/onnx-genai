@@ -86,18 +86,22 @@ roles, whose absence is observable; application-sourced tensors may use it gener
 VLM requests, the absent branch should produce the embedding graph's supported zero-image feature
 tensor; clients do not pass sentinel or fake image bytes.
 
-`emit.row_ids` explicitly selects row emission and binds each physical tensor row to an
-`int64[B]` semantic identity. `emit.when` optionally suppresses a row event, while
-`emit.valid_length` slices that row's final axis. A true guard with length zero emits an empty row;
-a false guard emits nothing. Guards and lengths may be singleton-broadcast or per-row, but row IDs
-must have exactly one unique identity per active physical row.
+Row emission is derived, not declared. An emit is row-wise when its output is ragged — when
+`emit.valid_length` slices that row's final axis or `emit.when` guards it. `emit.when` optionally
+suppresses a row event: a true guard with length zero emits an empty row; a false guard emits
+nothing. Guards and lengths may be singleton-broadcast or per-row.
 
-Aggregate emits omit `row_ids` and retain one tensor under the declared output. Ragged compatibility
-keys use `output.row.<semantic-id>`, but consumers use the structured output API rather than parsing
-those names. Under serving compaction, `row_ids` is the carried `serving.slot_ids` value: it is the
-scheduler's semantic identity for the request in that slot, not the current physical batch index.
-Compaction applies one permutation to slot IDs and every carried KV/token/RNG/length state. Slot
-reuse starts a new request epoch and therefore a new output stream.
+Row-wise-ness is a property of the OUTPUT, not of one emit. If any emit of an output is ragged,
+every emit of that output publishes rows, so an append loop that mixes a ragged accept step with a
+single forced token yields one consistent stream. A row-wise output must have a
+`request_aligned` batch layout; the validator rejects one that does not.
+
+Aggregate outputs retain one tensor under the declared output. Rows are published positionally:
+compatibility keys use `output.row.<position>`, but consumers use the structured output API rather
+than parsing those names. Metadata never serializes a row identity — no `row_ids`, no `slot_ids`,
+no `request_epochs`. Under compaction the runtime applies one permutation to every request-aligned
+value and every row-scoped component, and associates output rows with requests through its own API.
+See [INFERENCE_METADATA_DECISIONS.md](genai/INFERENCE_METADATA_DECISIONS.md#8-batching-varlen-and-paged-attention).
 
 ONNX port contracts may be omitted when the artifact is authoritative. Declare only semantic
 bindings, bounds/overrides, cross-component constraints, or adapter ports that ONNX cannot describe.
@@ -312,8 +316,6 @@ adapters:
           scale: lora.layers.0.q_proj.scale # optional dynamic scale
   discovery_fallback: disabled        # or tooling_only; execution never guesses
   selection:
-    slot_ids: request.slot_ids          # int64[batch]
-    request_epochs: request.epochs     # int64[batch]
     segments: request.lora_segments    # int64[batch,max_adapters]
     adapter_counts: request.lora_counts # int64[batch]
     scales: request.lora_scales        # float32[batch,max_adapters]
@@ -418,9 +420,10 @@ equivalent grouped plan; both must preserve the same accumulation order:
 `base(x) + Σ scale[k] * (alpha[k] / rank[k]) * B[k] * (A[k] * x)`
 
 Per-binding rank/alpha override artifact defaults. Adapters missing a manifest target contribute
-zero. The immutable routing identity is `(slot_id,request_epoch)`. Compaction applies one
-permutation to slot IDs, epochs, segments, counts, scales, active flags, and model state. Epochs
-change on slot reuse. Inactive rows are base-only and do not load or mutate adapter state.
+zero. Routing carries no serialized identity: selection is request-aligned, so compaction applies
+one permutation to segments, counts, scales, active flags, and model state, and the runtime
+associates rows with requests through its own request table. Inactive rows are base-only and do not
+load or mutate adapter state.
 
 ### Lifecycle, capability, and capture
 
@@ -499,30 +502,40 @@ serving:
   active: active
   done: done
   accepted_len: accepted_len
-  slot_ids: slot_ids
-  kv_service:
-    paging: paged
-    allocation: runtime
-    compaction: true
+  state_service:
     groups:
       decoder_cache:
+        kind: full_attention
         sequence_axis: 2
         layout: bnsh
         logical_lengths: cache_lengths
-        storage: shared_buffer
+        aliasing: permitted
+        reuse: { prefix_reusable: true, evictable_prefix: false }
+        capabilities: { rollback_positions: 32, snapshot: true, fork: true }
+        # Optional. Absent means the group's state is private: it may still move
+        # over a private runtime protocol that needs a matching build on both
+        # ends, but it is not a package output.
+        checkpoint: { adapter: onnx-genai.kv-checkpoint, version: "1" }
         ports:
           decoder:
             cache: { input: past_key_values, output: present_key_values }
 ```
 
-The service group is the allocation contract: `active`, `accepted_len`, and the semantic
-`logical_lengths: int64[B]` cell drive paging, slots, per-row growth/rollback, compaction, and
-permitted past/present aliasing. Both cache and length cells are loop-carried; inactive rows retain
-their prior lengths. The workflow carry remains logical decoder dataflow. A separate state-update
-ONNX component is used only for real tensor transforms such as gather or truncation.
+The service group is the SEMANTIC contract, not an allocation contract. It declares what the state
+means (`kind`), the real graph ABI facts (`sequence_axis`, `layout`, graph-visible
+`logical_lengths: int64[B]`, past/present `aliasing`, total-length semantics), reuse semantics, and
+the rollback/snapshot/fork bounds within which the runtime may operate. `active` and `accepted_len`
+drive per-row growth and rollback. Both cache and length cells are loop-carried; inactive rows
+retain their prior lengths. The workflow carry remains logical decoder dataflow. A separate
+state-update ONNX component is used only for real tensor transforms such as gather or truncation.
 
-The service binding is the only serialized storage-selection contract. Legacy top-level
-`kv_cache`, `model.runtime_configurable.kv_cache`, and `model.io.kv_update` hints are rejected.
+Metadata does NOT select a storage mode. `paging`, `allocation`, `storage`, `shared_buffer`, and
+slot-allocation policy are runtime deployment decisions and are rejected if serialized. `aliasing`
+replaces `shared_buffer`: it states whether the graph is correct when past and present share
+memory — a property of the graph, not a request to use one buffer — and defaults to `forbidden`.
+Legacy top-level `kv_cache`, `model.runtime_configurable.kv_cache`, and `model.io.kv_update` hints
+are rejected. See
+[INFERENCE_METADATA_DECISIONS.md](genai/INFERENCE_METADATA_DECISIONS.md#12-state).
 Bare decoder documents use ordinary functional past/present dataflow; metadata attention family,
 dtype strings, or artifact custom-metadata tags never select shared-buffer execution. Explicit
 low-level ORT shared-buffer and static-cache APIs remain available as generic mechanisms, but are
@@ -615,14 +628,19 @@ SSA, recurrence, KV service-group, contract-binding, and capability invariants.
 
 1. Replace loop `condition` with pre-test `continue_when`. Initialize it before loop entry; carry
    the next activity value when the body changes it. A false initial value is a valid zero-trip.
-2. Emit per-row prefixes with `row_ids: int64[B]` and `valid_length: int64[B]`; do not reduce
-   across rows. Consume structured results by `(output, semantic_id)`; flattened
-   `output.row.<semantic-id>` keys (plus event suffixes) are compatibility-only.
-3. Declare serving `active: bool[B]`, `done: bool[B]`, `accepted_len: int64[B]`, and
-   `slot_ids: int64[B]`. Inactive rows retain prior logical carry values.
-4. Bind each cache tensor state through `service_group`. Each KV group declares
-   `sequence_axis`, `layout`, semantic `logical_lengths: int64[B]`, storage mode, and
-   component/cell past-present port aliases. Use `shared_buffer` to permit physical aliasing.
+2. Emit per-row prefixes with `valid_length: int64[B]`; do not reduce across rows. Row emission
+   follows from raggedness — there is no `row_ids`. Consume structured results through the output
+   API; flattened `output.row.<position>` keys (plus event suffixes) are compatibility-only.
+3. Declare serving `active: bool[B]`, `done: bool[B]`, and `accepted_len: int64[B]`. Inactive rows
+   retain prior logical carry values. Do not declare `slot_ids`: row identity is runtime-private.
+4. Bind each cache tensor state through `service_group`, and declare the cell
+   `management: runtime` with a `release_boundary`. Each state group declares its semantic `kind`,
+   `sequence_axis`, `layout`, graph-visible `logical_lengths: int64[B]`, past/present `aliasing`,
+   reuse semantics, rollback/snapshot/fork capabilities, and component/cell port aliases. Declare
+   `aliasing: permitted` (or `required`) when the graph is correct with a shared buffer; it
+   defaults to `forbidden`.
+   Every row-scoped native or stateful component declares `row_scope` and any
+   `cache_affects_state` facts, and must implement the mandatory `compact`/`release` row ABI.
 5. Keep ONNX ports omitted when artifact inference is sufficient. Request inputs use
    `source: { kind: request }`; the versioned runtime `role` is the sole request-field identity.
 6. Run `validate_metadata` on every generated package directory. JSON Schema alone is not

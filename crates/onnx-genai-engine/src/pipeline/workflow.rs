@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use super::*;
 use crate::decode::clone_value;
-use onnx_genai_metadata::KvStorageMode;
+use onnx_genai_metadata::StateAliasing;
 use onnx_genai_ort::{IoBinding, Session};
 
 type ResolvedComponentInvocation<'a> = (
@@ -135,7 +135,7 @@ fn stable_component_outputs(
     stable
         .output_order
         .iter()
-        .filter_map(|name| {
+        .map(|name| {
             let value = if let Some((_, value)) =
                 stable.outputs.iter().find(|(output, _)| output == name)
             {
@@ -148,18 +148,16 @@ fn stable_component_outputs(
                 {
                     Some((_, input_index)) => *input_index,
                     None => {
-                        return Some(Err(anyhow::anyhow!(
+                        return Err(anyhow::anyhow!(
                             "stable component output '{name}' is unavailable"
-                        )));
+                        ));
                     }
                 };
                 &stable.inputs[input_index].1
             };
-            Some(
-                Value::alias_from_shared_owner(Arc::clone(value), value.shape())
-                    .map(|value| (name.clone(), value))
-                    .map_err(Into::into),
-            )
+            Value::alias_from_shared_owner(Arc::clone(value), value.shape())
+                .map(|value| (name.clone(), value))
+                .map_err(Into::into)
         })
         .collect()
 }
@@ -226,7 +224,7 @@ struct WorkflowRunTelemetry {
     emitted_elements: u64,
     stage_runs: BTreeMap<String, u64>,
     stage_elapsed_ns: BTreeMap<String, u128>,
-    row_outputs: BTreeMap<String, BTreeMap<i64, String>>,
+    row_outputs: BTreeMap<String, Vec<String>>,
 }
 
 impl WorkflowRunTelemetry {
@@ -507,7 +505,7 @@ impl PipelineEngine {
     fn package_outputs(
         &self,
         mut values: PipelineTensors,
-        row_outputs: BTreeMap<String, BTreeMap<i64, String>>,
+        row_outputs: BTreeMap<String, Vec<String>>,
     ) -> anyhow::Result<PipelineOutputs> {
         let mut outputs = PipelineTensors::new();
         for output in self.workflow.outputs.keys() {
@@ -712,56 +710,48 @@ impl<'a> WorkflowExecutionPlan<'a> {
                         service.application_capability
                     );
                 }
-                let slot_ids = values
-                    .get(&service.selection.slot_ids)
+                // Adapter rows are positional: row i of the request-aligned
+                // selection tensors belongs to batch row i. The runtime, not
+                // the package, associates a batch row with a request.
+                let adapter_counts = values
+                    .get(&service.selection.adapter_counts)
                     .with_context(|| {
                         format!(
-                            "adapter service slot_ids input '{}' is unavailable",
-                            service.selection.slot_ids
+                            "adapter service counts input '{}' is unavailable",
+                            service.selection.adapter_counts
                         )
                     })?
                     .to_vec_i64()
                     .with_context(|| {
                         format!(
-                            "adapter service slot_ids input '{}' must be host int64",
-                            service.selection.slot_ids
+                            "adapter service counts input '{}' must be host int64",
+                            service.selection.adapter_counts
                         )
                     })?;
-                let request_epochs = values
-                    .get(&service.selection.request_epochs)
-                    .with_context(|| {
-                        format!(
-                            "adapter service request_epochs input '{}' is unavailable",
-                            service.selection.request_epochs
-                        )
-                    })?
-                    .to_vec_i64()
-                    .with_context(|| {
-                        format!(
-                            "adapter service request_epochs input '{}' must be host int64",
-                            service.selection.request_epochs
-                        )
-                    })?;
+                let batch_rows = adapter_counts.len();
                 let active_rows = if let Some(active) = &service.selection.active {
                     workflow_bool_rows(&values, active)?
                 } else {
-                    vec![true; slot_ids.len()]
+                    vec![true; batch_rows]
                 };
-                let selection = super::adapters::selection_from_inputs(
-                    service,
-                    &values,
-                    &slot_ids,
-                    &request_epochs,
-                )?;
+                let selection =
+                    super::adapters::selection_from_inputs(service, &values, batch_rows)?;
                 let context = engine.adapter_cache.borrow_mut().prepare(
                     &engine.package_root,
                     service,
                     &selection,
-                    &slot_ids,
-                    &request_epochs,
                     &active_rows,
                 )?;
                 *engine.active_adapter_context.borrow_mut() = Some(context);
+                // A runtime-minted row selection expands or compacts the batch
+                // (beam search, speculative row cloning). It carries source
+                // positions within the current batch, never scheduler IDs, so
+                // every row-scoped component follows through the same ABI.
+                if let Some(selection) = workflow_row_selection(workflow, &values)?
+                    && let Some(context) = engine.active_adapter_context.borrow_mut().as_mut()
+                {
+                    context.compact(&selection)?;
+                }
             }
             Ok(())
         })();
@@ -1273,7 +1263,7 @@ impl PipelineEngine {
                         values.insert(output.clone(), clone_value(value)?);
                     }
                     if let Some(rows) = telemetry.row_outputs.get(&output) {
-                        for row_output in rows.values() {
+                        for row_output in rows {
                             if let Some(value) = branch_values.get(row_output) {
                                 values.insert(row_output.clone(), clone_value(value)?);
                             }
@@ -1330,7 +1320,6 @@ impl PipelineEngine {
                 value,
                 when,
                 valid_length,
-                row_ids,
                 output,
                 mode,
                 ..
@@ -1341,9 +1330,6 @@ impl PipelineEngine {
                 }
                 if let Some(valid_length) = valid_length {
                     self.materialize_workflow_value(values, valid_length)?;
-                }
-                if let Some(row_ids) = row_ids {
-                    self.materialize_workflow_value(values, row_ids)?;
                 }
                 let tensor = {
                     let source = values
@@ -1368,11 +1354,18 @@ impl PipelineEngine {
                     .as_deref()
                     .map(|length| workflow_usize_rows(values, length))
                     .transpose()?;
-                let identities = row_ids
-                    .as_deref()
-                    .map(|ids| workflow_i64_rows(values, ids))
-                    .transpose()?;
-                if let Some(identities) = identities.as_deref() {
+                // Row-wise emission is derived from structure, never from
+                // serialized row identities: an output is row-wise when some
+                // emit into it is ragged, and the declared request axis says
+                // which axis the rows lie on. A dense request-aligned output
+                // with no ragged emit is still emitted as one tensor.
+                if self.row_wise_outputs.contains(output)
+                    && output_contract
+                        .contract
+                        .batch_layout
+                        .request_axis()
+                        .is_some()
+                {
                     emit_workflow_rows(
                         values,
                         &tensor,
@@ -1382,7 +1375,6 @@ impl PipelineEngine {
                         mode,
                         guards.as_deref(),
                         lengths.as_deref(),
-                        identities,
                         emit_counts,
                         telemetry,
                         symbols,
@@ -1519,10 +1511,10 @@ impl PipelineEngine {
             .as_ref()
             .map(|serving| {
                 serving
-                    .kv_service
+                    .state_service
                     .groups
                     .values()
-                    .filter(|group| group.storage == KvStorageMode::SharedBuffer)
+                    .filter(|group| group.aliasing != StateAliasing::Forbidden)
                     .filter_map(|group| group.ports.get(component))
                     .flat_map(|aliases| aliases.values())
                     .map(|alias| (alias.output.clone(), alias.input.clone()))
@@ -1789,39 +1781,22 @@ impl PipelineEngine {
         let source = input
             .to_vec_f32()
             .context("portable parameter overlay requires host float32 input")?;
-        let service = self
-            .adapter_service
-            .as_ref()
-            .context("parameter overlay executed without an adapter service")?;
-        let slot_ids = values
-            .get(&service.selection.slot_ids)
-            .with_context(|| {
-                format!(
-                    "adapter slot IDs '{}' are unavailable",
-                    service.selection.slot_ids
-                )
-            })?
-            .to_vec_i64()
-            .context("adapter slot IDs must be host int64")?;
-        let request_epochs = values
-            .get(&service.selection.request_epochs)
-            .with_context(|| {
-                format!(
-                    "adapter request epochs '{}' are unavailable",
-                    service.selection.request_epochs
-                )
-            })?
-            .to_vec_i64()
-            .context("adapter request epochs must be host int64")?;
         let context = self.active_adapter_context.borrow();
         let context = context
             .as_ref()
             .context("parameter overlay executed without a request adapter context")?;
-        let context = context.reordered(&slot_ids, &request_epochs)?;
+        // The adapter context is already in physical batch-row order, so the
+        // overlay indexes it positionally. A scheduler that compacts the batch
+        // moves it through the mandatory RowScopedState ABI instead.
+        anyhow::ensure!(
+            context.rows() == batch,
+            "adapter context holds {} rows but the overlay input has batch {batch}",
+            context.rows()
+        );
         let cache = self.adapter_cache.borrow();
         let (result, output_features) = super::adapters::apply_parameter_overlay(
             &cache,
-            &context,
+            context,
             target_component,
             target_parameter,
             &source,
@@ -2301,8 +2276,7 @@ fn workflow_request_value(
         RuntimeInputRole::Media
         | RuntimeInputRole::Constraint
         | RuntimeInputRole::SessionId
-        | RuntimeInputRole::RowIds
-        | RuntimeInputRole::RequestEpochs
+        | RuntimeInputRole::RowSelection
         | RuntimeInputRole::AdapterSegments
         | RuntimeInputRole::AdapterCounts
         | RuntimeInputRole::AdapterScales
@@ -2824,6 +2798,55 @@ fn workflow_emitted_outputs(node: &WorkflowNode) -> std::collections::HashSet<St
     outputs
 }
 
+/// Outputs the workflow fills one request row at a time.
+///
+/// This is derived from structure, never from serialized row identities. An
+/// emit is ragged when it carries a per-row `valid_length` or a per-row guard:
+/// the rows then contribute different amounts and cannot share one dense
+/// tensor. Raggedness is a property of the *output*, not of the individual
+/// emit, so an output that is ragged anywhere is row-wise everywhere; that is
+/// what lets an append loop mix a ragged accept step with a single-token
+/// forced step and still produce one row per request.
+pub(super) fn workflow_row_wise_outputs(node: &WorkflowNode) -> std::collections::HashSet<String> {
+    fn collect(node: &WorkflowNode, outputs: &mut std::collections::HashSet<String>) {
+        match node {
+            WorkflowNode::Sequence { nodes } => {
+                for node in nodes {
+                    collect(node, outputs);
+                }
+            }
+            WorkflowNode::Loop { setup, body, .. } => {
+                collect(setup, outputs);
+                collect(body, outputs);
+            }
+            WorkflowNode::Branch { cases, default, .. } => {
+                for case in cases.values() {
+                    collect(case, outputs);
+                }
+                if let Some(default) = default {
+                    collect(default, outputs);
+                }
+            }
+            WorkflowNode::Emit {
+                output,
+                valid_length,
+                when,
+                ..
+            } => {
+                if valid_length.is_some() || when.is_some() {
+                    outputs.insert(output.clone());
+                }
+            }
+            WorkflowNode::Invoke { .. }
+            | WorkflowNode::Transfer { .. }
+            | WorkflowNode::ExecutionIsland { .. } => {}
+        }
+    }
+    let mut outputs = std::collections::HashSet::new();
+    collect(node, &mut outputs);
+    outputs
+}
+
 pub(super) fn compile_movable_emit_values(
     node: &WorkflowNode,
     workflow: &WorkflowSpec,
@@ -2885,7 +2908,6 @@ pub(super) fn compile_movable_emit_values(
                 value,
                 when,
                 valid_length,
-                row_ids,
                 ..
             } => {
                 used(value);
@@ -2893,9 +2915,6 @@ pub(super) fn compile_movable_emit_values(
                     used(value);
                 }
                 if let Some(value) = valid_length {
-                    used(value);
-                }
-                if let Some(value) = row_ids {
                     used(value);
                 }
             }
@@ -3090,7 +3109,6 @@ fn emit_workflow_rows(
     mode: &WorkflowEmitMode,
     guards: Option<&[bool]>,
     lengths: Option<&[usize]>,
-    identities: &[i64],
     emit_counts: &mut HashMap<String, usize>,
     telemetry: &mut WorkflowRunTelemetry,
     symbols: &HashMap<String, i64>,
@@ -3102,11 +3120,6 @@ fn emit_workflow_rows(
         .copied()
         .context("per-row workflow emit requires rank >= 1")?;
     let rows = usize::try_from(rows).context("workflow emit has a negative batch dimension")?;
-    anyhow::ensure!(
-        identities.len() == rows,
-        "workflow emit row_ids has {} values for batch {rows}",
-        identities.len()
-    );
     for cardinality in [guards.map(<[bool]>::len), lengths.map(<[usize]>::len)]
         .into_iter()
         .flatten()
@@ -3116,17 +3129,12 @@ fn emit_workflow_rows(
             "workflow emit row control has {cardinality} values for batch {rows}"
         );
     }
-    let mut active_ids = HashSet::new();
+    let mut row_names = vec![String::new(); rows];
     for row in 0..rows {
         let active = guards.is_none_or(|values| values[if values.len() == 1 { 0 } else { row }]);
         if !active {
             continue;
         }
-        let identity = identities[row];
-        anyhow::ensure!(
-            active_ids.insert(identity),
-            "workflow emit row identity {identity} is duplicated among active rows"
-        );
         let length = lengths.map(|values| values[if values.len() == 1 { 0 } else { row }]);
         let emitted = slice_workflow_row(tensor, row, length)?;
         let validation_contract = if length.is_some() || matches!(mode, WorkflowEmitMode::Append) {
@@ -3156,12 +3164,8 @@ fn emit_workflow_rows(
         }
         telemetry.emit_events += 1;
         telemetry.emitted_elements += emitted.numel() as u64;
-        let row_output = format!("{output}.row.{identity}");
-        telemetry
-            .row_outputs
-            .entry(output.to_string())
-            .or_default()
-            .insert(identity, row_output.clone());
+        let row_output = format!("{output}.row.{row}");
+        row_names[row] = row_output.clone();
         match mode {
             WorkflowEmitMode::Replace => {
                 values.insert(row_output, emitted);
@@ -3180,6 +3184,20 @@ fn emit_workflow_rows(
                 *index += 1;
                 values.insert(row_output, emitted);
             }
+        }
+    }
+    // Row names are positional, so an inactive row keeps its slot and the
+    // runtime can still map result row i onto its own request table.
+    let entry = telemetry
+        .row_outputs
+        .entry(output.to_string())
+        .or_insert_with(|| vec![String::new(); rows]);
+    if entry.len() < rows {
+        entry.resize(rows, String::new());
+    }
+    for (row, name) in row_names.into_iter().enumerate() {
+        if !name.is_empty() {
+            entry[row] = name;
         }
     }
     Ok(())
@@ -3333,15 +3351,43 @@ fn workflow_usize_rows(values: &PipelineTensors, name: &str) -> anyhow::Result<V
         .collect()
 }
 
-fn workflow_i64_rows(values: &PipelineTensors, name: &str) -> anyhow::Result<Vec<i64>> {
-    let value = values
-        .get(name)
-        .with_context(|| format!("workflow row identity '{name}' is unavailable"))?;
-    anyhow::ensure!(
-        value.dtype() == DataType::Int64 && value.shape().len() == 1,
-        "workflow row identity '{name}' must be int64[B]"
-    );
-    value.to_vec_i64().map_err(Into::into)
+/// Read the runtime-minted row selection, if the workflow declares one.
+///
+/// The selection is a gather of source positions within the current batch. It
+/// is minted by the runtime scheduler each step and is deliberately opaque:
+/// nothing in it identifies a request, a slot, or an epoch.
+fn workflow_row_selection(
+    workflow: &onnx_genai_metadata::WorkflowSpec,
+    values: &PipelineTensors,
+) -> anyhow::Result<Option<Vec<usize>>> {
+    let Some(name) = workflow
+        .inputs
+        .iter()
+        .find(|(_, input)| {
+            matches!(
+                &input.role,
+                onnx_genai_metadata::SemanticInputRole::Runtime { role, .. }
+                    if *role == RuntimeInputRole::RowSelection
+            )
+        })
+        .map(|(name, _)| name.as_str())
+    else {
+        return Ok(None);
+    };
+    let Some(value) = values.get(name) else {
+        return Ok(None);
+    };
+    let rows = value
+        .to_vec_i64()
+        .with_context(|| format!("row selection input '{name}' must be host int64"))?;
+    rows.into_iter()
+        .map(|row| {
+            usize::try_from(row).with_context(|| {
+                format!("row selection input '{name}' contains negative source row {row}")
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map(Some)
 }
 
 fn workflow_scalar_usize(values: &PipelineTensors, name: &str) -> anyhow::Result<usize> {
@@ -3493,7 +3539,6 @@ mod workflow_scalar_tests {
             &WorkflowEmitMode::Replace,
             Some(&[true, false][..]),
             Some(&[2, 1][..]),
-            &[10, 20],
             &mut counts,
             &mut telemetry,
             &HashMap::new(),
@@ -3502,7 +3547,7 @@ mod workflow_scalar_tests {
         .expect("row emit");
 
         assert_eq!(
-            values["tokens.row.10"]
+            values["tokens.row.0"]
                 .to_vec_i64()
                 .expect("first row values"),
             [10, 11]
@@ -3529,7 +3574,6 @@ mod workflow_scalar_tests {
             &WorkflowEmitMode::Replace,
             None,
             Some(&[2][..]),
-            &[7],
             &mut counts,
             &mut telemetry,
             &HashMap::new(),
@@ -3537,7 +3581,7 @@ mod workflow_scalar_tests {
         )
         .expect("row emit");
         assert_eq!(
-            values["tokens.row.7"].to_vec_i64().expect("row values"),
+            values["tokens.row.0"].to_vec_i64().expect("row values"),
             [10, 11]
         );
         assert!(!values.contains_key("tokens"));
@@ -3557,7 +3601,6 @@ mod workflow_scalar_tests {
             &WorkflowEmitMode::Replace,
             Some(&[true][..]),
             None,
-            &[0],
             &mut HashMap::new(),
             &mut WorkflowRunTelemetry::default(),
             &HashMap::new(),
@@ -3569,13 +3612,15 @@ mod workflow_scalar_tests {
     }
 
     #[test]
-    fn row_emit_rejects_duplicate_active_identities() {
+    fn row_emit_keeps_every_active_row_in_its_own_positional_slot() {
         let tensor = Value::from_slice_i64(&[10, 20], &[2, 1]).expect("row tensor");
         let contract: TensorContract =
             serde_yaml::from_str("{ dtype: int64, rank: 2, shape: [batch, sequence] }")
                 .expect("contract");
-        let error = emit_workflow_rows(
-            &mut PipelineTensors::new(),
+        let mut values = PipelineTensors::new();
+        let mut telemetry = WorkflowRunTelemetry::default();
+        emit_workflow_rows(
+            &mut values,
             &tensor,
             "token",
             "tokens",
@@ -3583,14 +3628,21 @@ mod workflow_scalar_tests {
             &WorkflowEmitMode::Append,
             Some(&[true, true]),
             Some(&[1, 1]),
-            &[7, 7],
             &mut HashMap::new(),
-            &mut WorkflowRunTelemetry::default(),
+            &mut telemetry,
             &HashMap::new(),
             &std::collections::HashSet::new(),
         )
-        .expect_err("active identities must be unique");
-        assert!(error.to_string().contains("identity 7 is duplicated"));
+        .expect("row emit");
+        // Two rows that would previously have collided on a duplicated identity
+        // now occupy distinct positions, so no identity uniqueness check is
+        // needed and none can be violated.
+        assert_eq!(values["tokens.row.0"].to_vec_i64().expect("row 0"), [10]);
+        assert_eq!(values["tokens.row.1"].to_vec_i64().expect("row 1"), [20]);
+        assert_eq!(
+            telemetry.row_outputs["tokens"],
+            vec!["tokens.row.0".to_string(), "tokens.row.1".to_string()]
+        );
     }
 
     #[test]
@@ -3610,17 +3662,16 @@ mod workflow_scalar_tests {
             &WorkflowEmitMode::Append,
             Some(&[true]),
             Some(&[0]),
-            &[42],
             &mut HashMap::new(),
             &mut telemetry,
             &HashMap::new(),
             &std::collections::HashSet::new(),
         )
         .expect("zero-length emit");
-        assert_eq!(values["tokens.row.42"].shape(), [1, 0]);
+        assert_eq!(values["tokens.row.0"].shape(), [1, 0]);
         assert_eq!(
-            telemetry.row_outputs["tokens"].get(&42).map(String::as_str),
-            Some("tokens.row.42")
+            telemetry.row_outputs["tokens"].first().map(String::as_str),
+            Some("tokens.row.0")
         );
     }
 

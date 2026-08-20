@@ -20,6 +20,7 @@ pub fn compile_workflow(workflow: &WorkflowSpec) -> Result<CompiledWorkflow, Str
     for component in workflow.components.values() {
         domains.extend(component.effects.iter().cloned());
     }
+    domains.extend(workflow.effects.keys().cloned());
     domains.extend(workflow.state.keys().map(|cell| format!("state:{cell}")));
     if workflow.steps.iter().any(contains_emit) {
         domains.insert("stream".to_string());
@@ -229,14 +230,12 @@ impl Compiler<'_> {
                 value,
                 when,
                 valid_length,
-                row_ids,
                 output,
                 mode,
             } => Ok(WorkflowNode::Emit {
                 value: value.clone(),
                 when: when.clone(),
                 valid_length: valid_length.clone(),
-                row_ids: row_ids.clone(),
                 output: output.clone(),
                 mode: mode.clone(),
                 effect_name: "stream".to_string(),

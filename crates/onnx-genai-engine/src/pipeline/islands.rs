@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use anyhow::{Context, bail};
 use onnx_genai_metadata::{
-    ComponentImplementation, KvStorageMode, WorkflowComponent, WorkflowNode, WorkflowSpec,
+    ComponentImplementation, StateAliasing, WorkflowComponent, WorkflowNode, WorkflowSpec,
 };
 use onnx_genai_ort::{Allocator, IoBinding, Session, Value};
 use onnx_runtime_loader::proto::onnx::{
@@ -963,6 +963,7 @@ fn session_tensor_contract(
         rank: tensor.shape.len(),
         shape: Some(shape),
         optional: false,
+        batch_layout: onnx_genai_metadata::BatchLayout::Shared,
     }
 }
 
@@ -1196,7 +1197,6 @@ fn collect_value_uses(node: &WorkflowNode, uses: &mut HashMap<String, usize>) {
             value,
             when,
             valid_length,
-            row_ids,
             ..
         } => {
             use_value(value);
@@ -1205,9 +1205,6 @@ fn collect_value_uses(node: &WorkflowNode, uses: &mut HashMap<String, usize>) {
             }
             if let Some(valid_length) = valid_length {
                 use_value(valid_length);
-            }
-            if let Some(row_ids) = row_ids {
-                use_value(row_ids);
             }
         }
         WorkflowNode::Transfer { input, .. } => use_value(input),
@@ -1257,11 +1254,13 @@ fn build_execution_island(
     }
     let mut shared_buffer_inputs = HashMap::new();
     if let Some(serving) = &workflow.serving {
+        // The package declares whether writing `present` into the `past`
+        // buffer is legal; the runtime decides whether to actually do it.
         for group in serving
-            .kv_service
+            .state_service
             .groups
             .values()
-            .filter(|group| group.storage == KvStorageMode::SharedBuffer)
+            .filter(|group| group.aliasing != StateAliasing::Forbidden)
         {
             for invocation in &invocations {
                 let Some(aliases) = group.ports.get(&invocation.component) else {
@@ -2119,6 +2118,8 @@ mod tests {
             contract: None,
             application_overridable: false,
             effects: Vec::new(),
+            row_scope: None,
+            cache_affects_state: Default::default(),
         }
     }
 
@@ -2135,6 +2136,7 @@ mod tests {
                     .collect(),
             ),
             optional: false,
+            batch_layout: onnx_genai_metadata::BatchLayout::RequestAligned { axis: 0 },
         }
     }
 
@@ -2144,6 +2146,7 @@ mod tests {
             rank: 1,
             shape: Some(vec![onnx_genai_metadata::TensorDimension::Fixed(1)]),
             optional: false,
+            batch_layout: onnx_genai_metadata::BatchLayout::Shared,
         }
     }
 
@@ -2299,6 +2302,7 @@ mod tests {
                 ("token".into(), "token".into()),
             ]),
             parameters: BTreeMap::new(),
+            equivalence: Default::default(),
         });
         assert!(!is_fusible_component(&sampler));
 
@@ -2483,6 +2487,7 @@ mod tests {
             .map(|role| (role.into(), role.into()))
             .collect(),
             parameters: parameters.clone(),
+            equivalence: Default::default(),
         });
         termination
             .ports
@@ -2567,6 +2572,7 @@ mod tests {
                 .map(|role| (role.into(), role.into()))
                 .collect(),
             parameters,
+            equivalence: Default::default(),
         });
         assert!(is_fusible_component(&state));
         state

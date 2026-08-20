@@ -213,26 +213,16 @@
           "minimum": 0,
           "type": "integer"
         },
-        "request_epochs": {
-          "description": "Int64[batch] request generation; changes whenever a slot is reused.",
-          "type": "string"
-        },
         "scales": {
           "description": "Float32[batch,max_adapters] effective request scales.",
           "type": "string"
         },
         "segments": {
-          "description": "Int64[batch,max_adapters] Phase-2-compatible segment IDs in composition order.",
-          "type": "string"
-        },
-        "slot_ids": {
-          "description": "Int64[batch] semantic row/slot identities.",
+          "description": "Int64[batch,max_adapters] segment IDs in composition order.",
           "type": "string"
         }
       },
       "required": [
-        "slot_ids",
-        "request_epochs",
         "segments",
         "adapter_counts",
         "scales",
@@ -520,6 +510,86 @@
       ],
       "type": "string"
     },
+    "BatchLayout": {
+      "description": "Structural relationship between a typed value and the runtime batch.\n\n`shared` values are invariant across requests. `request_aligned` values carry\nexactly one entry per in-flight request along `axis`, so compaction permutes\nthat axis. `token_packed` values are ragged: `offsets` names the\nrequest-aligned exclusive-prefix offset value and `owner` names the\nper-item owner mapping, which together let a runtime split and regroup the\npacked value without any serialized request ID. `runtime_sequence_state`\nmarks a value whose per-sequence storage the runtime owns outright.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "shared",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "axis": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "request_aligned",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "axis"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "axis": {
+              "description": "Packed axis of this value.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "token_packed",
+              "type": "string"
+            },
+            "offsets": {
+              "description": "Request-aligned value holding the exclusive prefix offset of each request's items.",
+              "type": "string"
+            },
+            "owner": {
+              "description": "Item-aligned value mapping each packed item to its owning request row.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "offsets",
+            "owner",
+            "axis"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "runtime_sequence_state",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "ChunkedPrefillConfig": {
       "description": "Runtime chunked-prefill preference.",
       "properties": {
@@ -545,6 +615,11 @@
           "default": {},
           "description": "Semantic role to concrete component port name.",
           "type": "object"
+        },
+        "equivalence": {
+          "$ref": "#/$defs/EquivalenceClass",
+          "default": "semantic",
+          "description": "How closely a substituted implementation must reproduce this contract.\n\nA runtime may freely choose any equivalent implementation, but the\ndeclared class bounds what \"equivalent\" means. Only a\n`distribution_preserving` (or `bitwise`) contract may be optimized\nspeculatively without caller opt-in."
         },
         "id": {
           "description": "Versioned semantic capability identifier. It never selects execution behavior.",
@@ -650,6 +725,54 @@
       },
       "type": "object"
     },
+    "ComponentRowScope": {
+      "additionalProperties": false,
+      "description": "Row scope of a component's runtime-private state.",
+      "properties": {
+        "axis": {
+          "description": "Batch axis of the component's row-scoped ports.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "stateful": {
+          "default": false,
+          "description": "Whether the component retains state between invocations for each row.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "axis"
+      ],
+      "type": "object"
+    },
+    "ConstraintLanguageFacts": {
+      "additionalProperties": false,
+      "description": "A constraint language the package's parser accepts.\n\nThe parser implementation may be native; only the dialect and version are\nportable facts. A request carries the grammar or JSON Schema itself.",
+      "properties": {
+        "component": {
+          "description": "Workflow component that interprets this dialect.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "dialect": {
+          "description": "Dialect identifier, e.g. `json_schema`, `ebnf`, `regex`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "version": {
+          "description": "Exact dialect version, e.g. `2020-12` for JSON Schema.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "dialect",
+        "version",
+        "component"
+      ],
+      "type": "object"
+    },
     "DType": {
       "description": "Scalar dtype vocabulary with common ONNX and runtime aliases.",
       "oneOf": [
@@ -702,6 +825,287 @@
         }
       ],
       "type": "string"
+    },
+    "EffectContract": {
+      "additionalProperties": false,
+      "description": "Declared semantics of one external effect domain.\n\nRetry class and speculation safety are independent axes. A transactional\neffect may still be unsafe to speculate, and an idempotent effect is not\nautomatically rewindable.",
+      "properties": {
+        "retry": {
+          "$ref": "#/$defs/EffectRetryClass",
+          "description": "Minimum retry-relevant class for runtime/server recovery orchestration."
+        },
+        "speculation_safety": {
+          "$ref": "#/$defs/SpeculationSafety",
+          "default": {
+            "kind": "none"
+          },
+          "description": "Whether and how far this effect can participate in speculative execution."
+        }
+      },
+      "required": [
+        "retry"
+      ],
+      "type": "object"
+    },
+    "EffectRetryClass": {
+      "description": "Retry-relevant classification of an external effect.",
+      "oneOf": [
+        {
+          "const": "pure",
+          "description": "No observable external effect; replay is always safe.",
+          "type": "string"
+        },
+        {
+          "const": "idempotent",
+          "description": "Repeating the effect with the same inputs is observationally equivalent.",
+          "type": "string"
+        },
+        {
+          "const": "transactional",
+          "description": "The effect participates in an external transaction that can be aborted.",
+          "type": "string"
+        },
+        {
+          "const": "non_retryable",
+          "description": "The effect must never be repeated or rolled back.",
+          "type": "string"
+        }
+      ]
+    },
+    "EquivalenceClass": {
+      "description": "Correctness bound on substituting an equivalent component implementation.",
+      "oneOf": [
+        {
+          "const": "bitwise",
+          "description": "Every substituted implementation must produce bit-identical outputs.",
+          "type": "string"
+        },
+        {
+          "const": "distribution_preserving",
+          "description": "Outputs may differ numerically but must preserve the output distribution.",
+          "type": "string"
+        },
+        {
+          "const": "semantic",
+          "description": "Only the declared semantics are preserved; the distribution may change.",
+          "type": "string"
+        }
+      ]
+    },
+    "ExpertShardFacts": {
+      "additionalProperties": false,
+      "description": "Expert identity and routing facts for expert parallelism.",
+      "properties": {
+        "contiguous_groups_only": {
+          "default": false,
+          "description": "Whether experts may be split across ranks in arbitrary contiguous groups.",
+          "type": "boolean"
+        },
+        "expert_count": {
+          "description": "Total number of experts per sparse layer.",
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "replicated": {
+          "description": "Values replicated on every expert-parallel rank, such as the router.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "expert_count"
+      ],
+      "type": "object"
+    },
+    "GenerationContract": {
+      "additionalProperties": false,
+      "description": "Authoritative generation defaults and the structural override surface.",
+      "properties": {
+        "defaults": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GenerationDefaults"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Authoritative package defaults."
+        },
+        "overrides": {
+          "additionalProperties": {
+            "$ref": "#/$defs/GenerationOverride"
+          },
+          "description": "Overridable fields, each bound to a request-sourced workflow input.\n\nA caller may override exactly these fields and no others. An override of\nany unlisted field must fail loudly rather than being silently dropped.",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "GenerationDefaults": {
+      "description": "Author-declared text-generation defaults (sampling and beam search).\n\nMirrors the `search` section of an onnxruntime-genai `genai_config.json`.\nEvery field is optional so only values the author declared are carried over.",
+      "properties": {
+        "diversity_penalty": {
+          "description": "Diversity penalty for diverse beam groups.",
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "do_sample": {
+          "description": "Whether to randomize sampling through `top_k`/`top_p` (else greedy).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "early_stopping": {
+          "description": "Whether beam search stops once enough beams have finished.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "length_penalty": {
+          "description": "Exponential length penalty used with beam search.",
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "max_length": {
+          "description": "Maximum final sequence length.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "min_length": {
+          "description": "Minimum final sequence length.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "no_repeat_ngram_size": {
+          "description": "Disallow repeating n-grams of this size (`0` = disabled).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "num_beams": {
+          "description": "Number of beams for beam search (`1` = no beam search).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "num_return_sequences": {
+          "description": "Number of sequences returned after search.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "repetition_penalty": {
+          "description": "Penalty applied to already-generated tokens (`1.0` = no penalty).",
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "temperature": {
+          "description": "Softmax temperature applied before sampling.",
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "top_k": {
+          "description": "Number of highest-probability tokens kept for top-k filtering.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "top_p": {
+          "description": "Nucleus (top-p) cumulative-probability threshold.",
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "GenerationOverride": {
+      "additionalProperties": false,
+      "description": "One caller-overridable generation field.",
+      "properties": {
+        "constraint": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GenerationOverrideConstraint"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Declared bounds the runtime enforces before executing the request."
+        },
+        "input": {
+          "description": "Request-sourced workflow input that carries the override value.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "input"
+      ],
+      "type": "object"
+    },
+    "GenerationOverrideConstraint": {
+      "additionalProperties": false,
+      "description": "Declared bounds on one overridable generation field.",
+      "properties": {
+        "maximum": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "minimum": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
     },
     "HardwareRequirements": {
       "description": "Model-side hardware requirements and distribution-matching hints.",
@@ -1340,101 +1744,6 @@
         }
       ]
     },
-    "KvPagingMode": {
-      "enum": [
-        "none",
-        "paged"
-      ],
-      "type": "string"
-    },
-    "KvPortAlias": {
-      "additionalProperties": false,
-      "properties": {
-        "input": {
-          "type": "string"
-        },
-        "output": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "input",
-        "output"
-      ],
-      "type": "object"
-    },
-    "KvServiceContract": {
-      "additionalProperties": false,
-      "properties": {
-        "allocation": {
-          "$ref": "#/$defs/SlotAllocationMode"
-        },
-        "compaction": {
-          "default": false,
-          "type": "boolean"
-        },
-        "groups": {
-          "additionalProperties": {
-            "$ref": "#/$defs/KvServiceGroupContract"
-          },
-          "default": {},
-          "type": "object"
-        },
-        "paging": {
-          "$ref": "#/$defs/KvPagingMode"
-        }
-      },
-      "required": [
-        "paging",
-        "allocation"
-      ],
-      "type": "object"
-    },
-    "KvServiceGroupContract": {
-      "additionalProperties": false,
-      "properties": {
-        "layout": {
-          "type": "string"
-        },
-        "logical_lengths": {
-          "description": "Semantic state cell containing the current logical sequence length for each row.",
-          "type": "string"
-        },
-        "ports": {
-          "additionalProperties": {
-            "additionalProperties": {
-              "$ref": "#/$defs/KvPortAlias"
-            },
-            "type": "object"
-          },
-          "default": {},
-          "type": "object"
-        },
-        "sequence_axis": {
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "storage": {
-          "$ref": "#/$defs/KvStorageMode",
-          "default": "separate"
-        }
-      },
-      "required": [
-        "sequence_axis",
-        "layout",
-        "logical_lengths"
-      ],
-      "type": "object"
-    },
-    "KvStorageMode": {
-      "enum": [
-        "separate",
-        "shared_buffer",
-        "paged"
-      ],
-      "type": "string"
-    },
     "KvStrideDescriptor": {
       "description": "A fully explicit KV-cache stride descriptor.\n\nThis is the general form the two named layouts expand into, and the shape a\nfuture layout (e.g. token-major) is expressed in without adding an enum\nvariant. The `reservation_*` fields describe a binding that is a **view into\na larger reservation** rather than the owner of its whole buffer:\ntoken-major stores every layer's tokens in one reservation and hands each\n`(layer, side)` a sub-view, so its per-token (seq) stride is taken over the\nreservation's total token count and its data starts at a non-zero offset.\nBoth historical layouts are whole-buffer bindings: `offset == 0` and no\nreservation override.",
       "properties": {
@@ -1982,6 +2291,17 @@
           ],
           "description": "Features that a serving runtime may configure at load time."
         },
+        "sharding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ShardingContract"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Legal tensor, pipeline, and expert sharding facts.\n\nThe caller and runtime choose degree, device mapping, and collective\nbackend. Portable metadata never standardizes a cross-runtime KV or\ncache wire format."
+        },
         "vocab_size": {
           "description": "Vocabulary size (rows of the token-embedding / logits table).",
           "format": "uint",
@@ -2197,6 +2517,31 @@
       ],
       "type": "string"
     },
+    "PackageFacts": {
+      "additionalProperties": false,
+      "description": "Exact package facts required to interpret request data correctly.",
+      "properties": {
+        "constraint_languages": {
+          "description": "Constraint/grammar dialects this package's parser can interpret.",
+          "items": {
+            "$ref": "#/$defs/ConstraintLanguageFacts"
+          },
+          "type": "array"
+        },
+        "tokenizer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TokenizerFacts"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Exact tokenizer, vocabulary, and special-token facts."
+        }
+      },
+      "type": "object"
+    },
     "PipelineSpec": {
       "additionalProperties": false,
       "description": "Executable package described by the universal typed workflow IR.",
@@ -2208,6 +2553,74 @@
       },
       "required": [
         "workflow"
+      ],
+      "type": "object"
+    },
+    "PipelineStageFacts": {
+      "additionalProperties": false,
+      "description": "One legal pipeline stage boundary.",
+      "properties": {
+        "components": {
+          "description": "Workflow components executed by this stage, in order.",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "outputs": {
+          "description": "Typed values crossing into the next stage.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "state_groups": {
+          "description": "State groups this stage owns.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "components"
+      ],
+      "type": "object"
+    },
+    "PoolingKind": {
+      "description": "Pooling reduction kind.",
+      "enum": [
+        "mean",
+        "max",
+        "cls",
+        "last_token"
+      ],
+      "type": "string"
+    },
+    "PoolingSpec": {
+      "additionalProperties": false,
+      "description": "Pooling reduction applied to a sequence-valued task output.",
+      "properties": {
+        "axis": {
+          "description": "Axis reduced by the pooling operation.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kind": {
+          "$ref": "#/$defs/PoolingKind"
+        },
+        "normalize": {
+          "default": false,
+          "description": "Whether the pooled vector is L2-normalized.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "kind",
+        "axis"
       ],
       "type": "object"
     },
@@ -2268,6 +2681,21 @@
         }
       },
       "type": "object"
+    },
+    "ProfileRequirement": {
+      "description": "Whether a reader may ignore a profile it does not understand.",
+      "oneOf": [
+        {
+          "const": "required",
+          "description": "A reader that cannot execute this profile must refuse to load the package.",
+          "type": "string"
+        },
+        {
+          "const": "ignorable",
+          "description": "A reader that does not understand this profile may skip it.",
+          "type": "string"
+        }
+      ]
     },
     "QuantizationIntent": {
       "description": "Runtime-independent model-weight quantization intent.",
@@ -2361,27 +2789,34 @@
       "type": "object"
     },
     "RuntimeInputRole": {
-      "enum": [
-        "prompt_text",
-        "prompt_tokens",
-        "media",
-        "max_iterations",
-        "max_output_tokens",
-        "seed",
-        "sampling_temperature",
-        "sampling_top_k",
-        "sampling_top_p",
-        "sampling_min_p",
-        "constraint",
-        "session_id",
-        "row_ids",
-        "request_epochs",
-        "adapter_segments",
-        "adapter_counts",
-        "adapter_scales",
-        "adapter_active"
-      ],
-      "type": "string"
+      "oneOf": [
+        {
+          "enum": [
+            "prompt_text",
+            "prompt_tokens",
+            "media",
+            "max_iterations",
+            "max_output_tokens",
+            "seed",
+            "sampling_temperature",
+            "sampling_top_k",
+            "sampling_top_p",
+            "sampling_min_p",
+            "constraint",
+            "session_id",
+            "adapter_segments",
+            "adapter_counts",
+            "adapter_scales",
+            "adapter_active"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "row_selection",
+          "description": "Runtime-minted gather of source batch positions for beam or speculative\nrow expansion. Values are positions inside the current batch, never\nscheduler slots, request IDs, or epochs.",
+          "type": "string"
+        }
+      ]
     },
     "ScalarValue": {
       "anyOf": [
@@ -2479,18 +2914,15 @@
         "done": {
           "type": "string"
         },
-        "kv_service": {
-          "$ref": "#/$defs/KvServiceContract"
-        },
-        "slot_ids": {
-          "type": "string"
+        "state_service": {
+          "$ref": "#/$defs/StateServiceContract",
+          "description": "Semantic state groups whose graph ABI the runtime must honor."
         }
       },
       "required": [
         "active",
         "done",
-        "slot_ids",
-        "kv_service"
+        "state_service"
       ],
       "type": "object"
     },
@@ -2591,12 +3023,394 @@
         }
       ]
     },
-    "SlotAllocationMode": {
-      "enum": [
-        "static",
-        "runtime"
+    "ShardingContract": {
+      "additionalProperties": false,
+      "description": "Legal sharding and replication facts for distributed execution.\n\nThe caller and runtime choose degree, device mapping, placement, and\ncollective backend. Metadata only declares what is legal.",
+      "properties": {
+        "expert_parallel": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExpertShardFacts"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Legal expert-parallel facts for sparse mixture-of-experts layers."
+        },
+        "pipeline_parallel": {
+          "description": "Legal pipeline-parallel stage boundaries and their cross-stage state.",
+          "items": {
+            "$ref": "#/$defs/PipelineStageFacts"
+          },
+          "type": "array"
+        },
+        "tensor_parallel": {
+          "additionalProperties": {
+            "$ref": "#/$defs/TensorShardFacts"
+          },
+          "description": "Legal tensor-parallel shard axes by logical parameter group.",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "SpecialTokenFact": {
+      "additionalProperties": false,
+      "description": "One special token, pinned by id and exact surface bytes.",
+      "properties": {
+        "content": {
+          "description": "Exact UTF-8 surface form of the token.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "id": {
+          "description": "Vocabulary id of the token.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "content"
       ],
-      "type": "string"
+      "type": "object"
+    },
+    "SpeculationSafety": {
+      "description": "Whether an effect may be executed inside a speculative region.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The effect must not run speculatively.",
+          "properties": {
+            "kind": {
+              "const": "none",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The effect's observable state can be cloned before a speculative region.",
+          "properties": {
+            "kind": {
+              "const": "clonable",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The effect can be rewound by at most `max_depth` proposed positions.",
+          "properties": {
+            "kind": {
+              "const": "rewindable",
+              "type": "string"
+            },
+            "max_depth": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "max_depth"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SpeculativeContract": {
+      "additionalProperties": false,
+      "description": "Portable compatibility facts for speculative decoding.\n\nProposal width, tree shape, scheduling, kernels, and whether speculation is\nenabled at all are runtime decisions.",
+      "properties": {
+        "distribution_preserving": {
+          "default": false,
+          "description": "Whether accepting proposals preserves the target's output distribution.\n\nA runtime may auto-enable speculation only when this is true; otherwise\nthe caller must opt in explicitly.",
+          "type": "boolean"
+        },
+        "max_proposal_width": {
+          "description": "Maximum number of proposed positions this package can undo.\n\nThis is a rollback bound, not a choice of proposal width: the runtime\npicks any K up to this bound. A validator rejects a package whose state\nor speculative effects cannot be undone this far.",
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "port_bindings": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Proposer ports bound to target-owned values, by semantic role.",
+          "type": "object"
+        },
+        "proposer": {
+          "description": "Workflow component that proposes tokens.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "rollback_state": {
+          "description": "State groups that must roll back when a proposal is rejected.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "shared_state": {
+          "description": "State groups the proposer shares with the target.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "shared_weights": {
+          "description": "Target initializers the proposer borrows.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "target": {
+          "description": "Workflow component that verifies proposals.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "vocabulary": {
+          "$ref": "#/$defs/SpeculativeVocabulary",
+          "description": "How the proposer's vocabulary relates to the target's."
+        }
+      },
+      "required": [
+        "proposer",
+        "target",
+        "vocabulary",
+        "max_proposal_width"
+      ],
+      "type": "object"
+    },
+    "SpeculativeVocabulary": {
+      "description": "Vocabulary relationship between a proposer and its target.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Proposer and target share one identical vocabulary.",
+          "properties": {
+            "kind": {
+              "const": "identical",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The proposer's vocabulary is a prefix-compatible subset of the target's.",
+          "properties": {
+            "kind": {
+              "const": "subset",
+              "type": "string"
+            },
+            "proposer_vocab_size": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "proposer_vocab_size"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A declared mapping artifact translates proposer ids into target ids.",
+          "properties": {
+            "artifact": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "mapped",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "artifact"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "StateAliasing": {
+      "description": "Legality of aliasing a component's `present` output onto its `past` input.",
+      "oneOf": [
+        {
+          "const": "permitted",
+          "description": "The runtime may alias input and output buffers but need not.",
+          "type": "string"
+        },
+        {
+          "const": "required",
+          "description": "The component only works correctly when input and output alias.",
+          "type": "string"
+        },
+        {
+          "const": "forbidden",
+          "description": "Aliasing input and output buffers is incorrect for this component.",
+          "type": "string"
+        }
+      ]
+    },
+    "StateCheckpointContract": {
+      "additionalProperties": false,
+      "description": "The only portable, cross-build path for a state group's contents.\n\nThis is deliberately not a wire format: metadata names the adapter and its\nversion, and the adapter owns the encoding. A portable checkpoint is slow and\nsurvives a version change; a private transfer is fast and does not.",
+      "properties": {
+        "adapter": {
+          "description": "Versioned adapter identifier, for example `onnx-genai.kv-checkpoint`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "version": {
+          "description": "Adapter version this group's checkpoints are written against.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "adapter",
+        "version"
+      ],
+      "type": "object"
+    },
+    "StateGroupCapabilities": {
+      "additionalProperties": false,
+      "description": "Rollback, snapshot, and fork bounds declared for one state group.",
+      "properties": {
+        "cascade": {
+          "description": "Other groups that must be rolled back, snapshotted, or forked together.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "fork": {
+          "default": false,
+          "description": "Whether the runtime can fork this group into an independent row.",
+          "type": "boolean"
+        },
+        "rollback_positions": {
+          "description": "Maximum number of trailing positions that can be discarded correctly.\n\nAbsent means the group cannot be rolled back at all.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "snapshot": {
+          "default": false,
+          "description": "Whether the runtime can snapshot and restore this group.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "StateGroupContract": {
+      "additionalProperties": false,
+      "description": "One semantic group of model state sharing a kind, geometry, and graph ABI.",
+      "properties": {
+        "aliasing": {
+          "$ref": "#/$defs/StateAliasing",
+          "default": "forbidden",
+          "description": "Whether the component may write `present` into the `past` buffer."
+        },
+        "capabilities": {
+          "$ref": "#/$defs/StateGroupCapabilities",
+          "default": {
+            "fork": false,
+            "snapshot": false
+          },
+          "description": "Rollback, snapshot, and fork bounds usable by the runtime."
+        },
+        "checkpoint": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StateCheckpointContract"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The versioned checkpoint adapter through which this group's state may\nleave the process portably.\n\nAbsent means the group's state is private: it may still move between\nprocesses, but only through a private runtime protocol that requires a\nmatching protocol and build on both ends (prefill/decode disaggregation,\nencoder/decoder interchange). Those transfers are fast precisely because\nthey are not portable, and treating one as a portable export is how a\ncluster silently corrupts state across a rolling upgrade."
+        },
+        "kind": {
+          "$ref": "#/$defs/StateKind",
+          "description": "Semantic kind of the state in this group."
+        },
+        "layout": {
+          "description": "Graph-visible element layout of the state tensors.",
+          "type": "string"
+        },
+        "logical_lengths": {
+          "description": "Semantic state cell holding the current logical length of each row.\n\nRequired only when the logical length is graph-visible. Absent means the\nruntime derives length from its private sequence table.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ports": {
+          "additionalProperties": {
+            "additionalProperties": {
+              "$ref": "#/$defs/StatePortAlias"
+            },
+            "type": "object"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "reuse": {
+          "$ref": "#/$defs/StateReuse",
+          "default": {
+            "evictable_prefix": false,
+            "prefix_reusable": false
+          },
+          "description": "Prefix reuse and eviction semantics of this group."
+        },
+        "sequence_axis": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total_length": {
+          "description": "Graph-visible total-length input, when the component reads one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "sequence_axis",
+        "layout"
+      ],
+      "type": "object"
     },
     "StateInitKind": {
       "description": "Loop-carried state initialization vocabulary.",
@@ -2618,6 +3432,128 @@
         }
       ],
       "type": "string"
+    },
+    "StateKind": {
+      "description": "Semantic kind of a model state group.",
+      "oneOf": [
+        {
+          "const": "full_attention",
+          "description": "Dense causal attention over the full sequence.",
+          "type": "string"
+        },
+        {
+          "const": "sliding_attention",
+          "description": "Causal attention restricted to a sliding window.",
+          "type": "string"
+        },
+        {
+          "const": "multi_latent_attention",
+          "description": "Compressed latent attention state (MLA).",
+          "type": "string"
+        },
+        {
+          "const": "recurrent",
+          "description": "Fixed-size recurrent or state-space carry.",
+          "type": "string"
+        },
+        {
+          "const": "cross_attention",
+          "description": "Cross-attention state keyed by an encoder result.",
+          "type": "string"
+        },
+        {
+          "const": "encoder",
+          "description": "Encoder output retained across decoder steps.",
+          "type": "string"
+        }
+      ]
+    },
+    "StateManagement": {
+      "description": "Storage ownership of one workflow state cell.",
+      "oneOf": [
+        {
+          "const": "workflow",
+          "description": "Ordinary SSA-managed value; liveness is derived from the workflow graph.",
+          "type": "string"
+        },
+        {
+          "const": "runtime",
+          "description": "The runtime owns the physical storage and its allocation policy.",
+          "type": "string"
+        },
+        {
+          "const": "external",
+          "description": "An external service owns the storage; only the typed handle is portable.",
+          "type": "string"
+        }
+      ]
+    },
+    "StatePortAlias": {
+      "additionalProperties": false,
+      "properties": {
+        "input": {
+          "type": "string"
+        },
+        "output": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
+    },
+    "StateReleaseBoundary": {
+      "description": "Logical boundary after which a managed or external state cell is releasable.",
+      "oneOf": [
+        {
+          "const": "invocation",
+          "description": "Releasable when the invocation that created it completes.",
+          "type": "string"
+        },
+        {
+          "const": "session",
+          "description": "Releasable when the session that owns it ends.",
+          "type": "string"
+        },
+        {
+          "const": "row",
+          "description": "Releasable when its owning batch row is released.",
+          "type": "string"
+        }
+      ]
+    },
+    "StateReuse": {
+      "additionalProperties": false,
+      "description": "Semantic reuse and eviction legality of a state group.",
+      "properties": {
+        "evictable_prefix": {
+          "default": false,
+          "description": "Whether dropping the oldest positions preserves declared semantics.",
+          "type": "boolean"
+        },
+        "prefix_reusable": {
+          "default": false,
+          "description": "Whether a shared token prefix produces identical state that may be reused.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "StateServiceContract": {
+      "additionalProperties": false,
+      "description": "Semantic model-state contract.\n\nThis declares what the state *means* and which graph ABI facts constrain the\nruntime. It never selects paged, shared-buffer, or separate storage, a slot\nallocation algorithm, a compaction algorithm, or a device.",
+      "properties": {
+        "groups": {
+          "additionalProperties": {
+            "$ref": "#/$defs/StateGroupContract"
+          },
+          "default": {},
+          "type": "object"
+        }
+      },
+      "type": "object"
     },
     "StateUpdateKind": {
       "description": "Loop-carried state update-semantics vocabulary.",
@@ -2700,10 +3636,63 @@
       ],
       "type": "object"
     },
+    "TaskProfile": {
+      "additionalProperties": false,
+      "description": "One executable task profile that shares the package's common facts.\n\nGenerative and non-generative tasks live in one document. Each profile\ncarries its own version and a requirement class so a strict reader can skip\nan optional profile it does not understand while still rejecting unknown\ncore fields.",
+      "properties": {
+        "generation_affecting": {
+          "default": false,
+          "description": "Whether this profile changes generated output and therefore participates\nin cache correctness dependencies.",
+          "type": "boolean"
+        },
+        "kind": {
+          "description": "Task kind identifier, e.g. `generation`, `embedding`, `reranking`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "outputs": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Workflow outputs this profile consumes, by semantic role.",
+          "type": "object"
+        },
+        "pooling": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PoolingSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Pooling applied to a sequence-valued output, when the task needs it."
+        },
+        "requirement": {
+          "$ref": "#/$defs/ProfileRequirement",
+          "default": "required",
+          "description": "Whether a reader that does not understand this profile may skip it."
+        },
+        "version": {
+          "description": "Version of this profile's own contract.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "version"
+      ],
+      "type": "object"
+    },
     "TensorContract": {
       "additionalProperties": false,
       "description": "Typed tensor contract used at package and component boundaries.",
       "properties": {
+        "batch_layout": {
+          "$ref": "#/$defs/BatchLayout",
+          "description": "How this value relates to the runtime's private request/sequence table.\n\nThis is a structural batching fact, never a row identity. It is the only\ninformation a runtime needs to move, split, or drop this value during\ncompaction; scheduler slots, epochs, block tables, and sequence handles\nstay runtime-private."
+        },
         "dtype": {
           "$ref": "#/$defs/TensorDType"
         },
@@ -2795,6 +3784,37 @@
       ],
       "description": "One fixed or runtime-resolved tensor-shape dimension."
     },
+    "TensorShardFacts": {
+      "additionalProperties": false,
+      "description": "Shard axis and replication facts of one logical parameter group.",
+      "properties": {
+        "max_shards": {
+          "description": "Largest legal shard count; the caller may choose any divisor.",
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "replicated": {
+          "description": "Values that must be replicated identically on every rank.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "shard_axis": {
+          "description": "Axis of the parameter that may be split across ranks.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "shard_axis",
+        "max_shards"
+      ],
+      "type": "object"
+    },
     "ThumbnailOrder": {
       "description": "Optional-thumbnail ordering vocabulary.",
       "oneOf": [
@@ -2819,6 +3839,70 @@
         }
       ],
       "type": "string"
+    },
+    "TokenizerArtifact": {
+      "additionalProperties": false,
+      "description": "One tokenizer artifact pinned to its exact bytes.",
+      "properties": {
+        "location": {
+          "description": "Package-relative path of the artifact.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "sha256": {
+          "description": "Lowercase SHA-256 of the exact artifact bytes.",
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "string"
+        }
+      },
+      "required": [
+        "location",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "TokenizerFacts": {
+      "additionalProperties": false,
+      "description": "Byte-exact tokenizer facts.\n\nA request carries text, tokens, grammars, and JSON Schemas. Interpreting any\nof them requires the exact vocabulary the package was built against, so the\nartifact bytes are pinned rather than described by a family name.",
+      "properties": {
+        "algorithm": {
+          "description": "Tokenizer algorithm identifier, e.g. `bpe`, `unigram`, `wordpiece`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "artifacts": {
+          "description": "Package-relative tokenizer artifacts pinned by exact content hash.",
+          "items": {
+            "$ref": "#/$defs/TokenizerArtifact"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "byte_level": {
+          "default": false,
+          "description": "Whether the tokenizer operates on raw bytes rather than Unicode scalars.",
+          "type": "boolean"
+        },
+        "special_tokens": {
+          "additionalProperties": {
+            "$ref": "#/$defs/SpecialTokenFact"
+          },
+          "description": "Special tokens by semantic role, e.g. `bos`, `eos`, `pad`.",
+          "type": "object"
+        },
+        "vocab_size": {
+          "description": "Number of entries in the vocabulary, including added tokens.",
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "algorithm",
+        "vocab_size"
+      ],
+      "type": "object"
     },
     "WorkflowBranchOutput": {
       "additionalProperties": false,
@@ -2871,6 +3955,14 @@
           "description": "Allow an application to select another declared component with the same\nversioned contract ABI for this invocation.",
           "type": "boolean"
         },
+        "cache_affects_state": {
+          "description": "Non-dataflow facts that change this component's observable state.\n\nCache correctness dependencies of ONNX components are derived from the\nworkflow SSA graph. Native and external components must declare any\nadditional state they read that is not visible as a typed input.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
         "contract": {
           "anyOf": [
             {
@@ -2897,6 +3989,17 @@
             "inputs": {},
             "outputs": {}
           }
+        },
+        "row_scope": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ComponentRowScope"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Declared per-request row scope of this component's private state.\n\nA component with row scope must implement the mandatory row ABI\n(`compact(selection)` and `release(row)`). This is an ABI invariant, not\na negotiated capability: a runtime may not load a package whose\nrow-scoped component cannot be compacted."
         }
       },
       "required": [
@@ -2927,6 +4030,10 @@
               "type": "null"
             }
           ]
+        },
+        "externally_suppliable": {
+          "description": "Whether an application may supply a previously computed typed value in\nplace of recomputing it, such as a cached encoder result.\n\nTransport, remote caching, and identity of the supplied value remain\nruntime-owned; metadata only declares that the substitution is legal.",
+          "type": "boolean"
         },
         "present_as": {
           "description": "Initial scalar bool SSA value indicating whether the caller supplied this input.",
@@ -3119,6 +4226,14 @@
           },
           "type": "object"
         },
+        "effects": {
+          "additionalProperties": {
+            "$ref": "#/$defs/EffectContract"
+          },
+          "default": {},
+          "description": "Retry and speculation semantics of every declared external effect domain.",
+          "type": "object"
+        },
         "inputs": {
           "additionalProperties": {
             "$ref": "#/$defs/WorkflowInput"
@@ -3180,8 +4295,24 @@
         "initializer": {
           "type": "string"
         },
+        "management": {
+          "$ref": "#/$defs/StateManagement",
+          "default": "workflow",
+          "description": "Who owns the physical storage of this cell.\n\nWorkflow-managed cells follow ordinary SSA liveness. Runtime-managed and\nexternal cells must also declare a logical release boundary so a runtime\nknows when the semantic value stops being reachable."
+        },
         "recurrence": {
           "$ref": "#/$defs/ShapeRecurrence"
+        },
+        "release_boundary": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StateReleaseBoundary"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Logical point at which the runtime may release this cell's storage."
         },
         "scope": {
           "$ref": "#/$defs/WorkflowStateScope"
@@ -3388,12 +4519,6 @@
             "output": {
               "type": "string"
             },
-            "row_ids": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
             "valid_length": {
               "type": [
                 "string",
@@ -3454,6 +4579,17 @@
       ],
       "description": "Runtime-managed LoRA adapters for bare or composite model packages.\n\nThis is the migrated `InferenceMetadata.adapters` contract from native\nLoRA phases 1 and 2. Composite execution references workflow SSA inputs,\nbut artifact identity, target resolution, and lifecycle remain package\nmetadata rather than workflow control-flow nodes."
     },
+    "generation": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GenerationContract"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Authoritative generation defaults and the structural override surface."
+    },
     "hardware_requirements": {
       "anyOf": [
         {
@@ -3476,6 +4612,17 @@
       ],
       "description": "Build-time model properties and runtime-configurable capabilities."
     },
+    "package": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PackageFacts"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Exact package facts needed to interpret request data correctly.\n\nTokenizer bytes, vocabulary size, special tokens, and the constraint\ndialects the package's parser accepts. Grammars and JSON Schemas\nthemselves are request data, not package metadata."
+    },
     "pipeline": {
       "anyOf": [
         {
@@ -3497,6 +4644,13 @@
         }
       ],
       "description": "Declared, architecture-neutral input preprocessing programs.\n\nCarries the typed multimodal preprocessing contract (currently the image\ntransform program and its named tensor outputs). Every operation and\noutput is generic, parameterized data — never a model family, vendor\nstring, or baked-in shape. Absent means the model declares no native\npreprocessing program and a runtime must obtain it elsewhere or fail."
+    },
+    "profiles": {
+      "additionalProperties": {
+        "$ref": "#/$defs/TaskProfile"
+      },
+      "description": "Executable task profiles sharing this package's common facts.\n\nEvery profile carries its own version and requirement class. A strict\nreader may skip an `ignorable` profile it does not understand; unknown\ncore fields still fail.",
+      "type": "object"
     },
     "quantization": {
       "anyOf": [
@@ -3530,6 +4684,17 @@
         "string",
         "null"
       ]
+    },
+    "speculative": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SpeculativeContract"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Portable speculative-decoding compatibility facts."
     }
   },
   "title": "ONNX Inference Metadata",

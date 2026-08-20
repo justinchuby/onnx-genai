@@ -370,6 +370,19 @@ pub fn load_metadata(path: &Path) -> Result<InferenceMetadata, crate::MetadataEr
     Ok(metadata)
 }
 
+/// Load inference metadata together with its canonical semantic identity.
+///
+/// The identity binds disposable artifacts -- compiled plans, memory plans,
+/// state checkpoints -- to the metadata semantics they were produced against.
+/// It is not integrity, not provenance, and not a trust decision.
+pub fn load_metadata_with_identity(
+    path: &Path,
+) -> Result<(InferenceMetadata, String), crate::MetadataError> {
+    let content = std::fs::read_to_string(path).map_err(crate::MetadataError::Io)?;
+    let identity = crate::identity::semantic_identity_of_str(&content)?;
+    Ok((load_metadata(path)?, identity))
+}
+
 /// Load and semantically validate a metadata document or package directory.
 ///
 /// Package-relative artifact references are checked for existence and may not

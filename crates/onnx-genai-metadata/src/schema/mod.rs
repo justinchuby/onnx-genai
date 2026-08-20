@@ -20,12 +20,14 @@ mod generation;
 mod hardware;
 mod ir;
 mod model_io;
+mod package;
 mod pipeline;
 
 pub use generation::*;
 pub use hardware::*;
 pub use ir::*;
 pub use model_io::*;
+pub use package::*;
 pub use pipeline::*;
 
 /// ONNX inference metadata consumed by runtimes and emitted by model builders.
@@ -93,6 +95,30 @@ pub struct InferenceMetadata {
     /// preprocessing program and a runtime must obtain it elsewhere or fail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preprocessing: Option<PreprocessingSpec>,
+
+    /// Exact package facts needed to interpret request data correctly.
+    ///
+    /// Tokenizer bytes, vocabulary size, special tokens, and the constraint
+    /// dialects the package's parser accepts. Grammars and JSON Schemas
+    /// themselves are request data, not package metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package: Option<PackageFacts>,
+
+    /// Authoritative generation defaults and the structural override surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<GenerationContract>,
+
+    /// Executable task profiles sharing this package's common facts.
+    ///
+    /// Every profile carries its own version and requirement class. A strict
+    /// reader may skip an `ignorable` profile it does not understand; unknown
+    /// core fields still fail.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub profiles: BTreeMap<String, TaskProfile>,
+
+    /// Portable speculative-decoding compatibility facts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speculative: Option<SpeculativeContract>,
 }
 
 mod schema_vocabulary {
@@ -180,22 +206,6 @@ mod schema_vocabulary {
             "bool",
             "string"
         ]
-    );
-
-    extensible_string!(
-        /// Quantization scaling-axis vocabulary.
-        QuantizationAxis,
-        quantization_axis,
-        QUANTIZATION_AXIS,
-        ["per_tensor", "per_channel", "per_token", "per_head"]
-    );
-
-    extensible_string!(
-        /// KV fork-precision policy vocabulary.
-        ForkPrecisionPolicy,
-        fork_precision_policy,
-        FORK_PRECISION_POLICY,
-        ["inherit", "highest", "independent"]
     );
 
     extensible_string!(
@@ -417,14 +427,6 @@ mod schema_helpers {
 
     pub(super) fn tensor_dtype(schema: &mut Schema) {
         extensible_string_enum(schema, super::schema_vocabulary::TENSOR_DTYPE);
-    }
-
-    pub(super) fn quantization_axis(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::QUANTIZATION_AXIS);
-    }
-
-    pub(super) fn fork_precision_policy(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::FORK_PRECISION_POLICY);
     }
 
     pub(super) fn precision(schema: &mut Schema) {

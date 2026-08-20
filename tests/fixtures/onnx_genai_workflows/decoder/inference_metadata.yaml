@@ -11,7 +11,6 @@ pipeline:
       - nested_control_flow
       - typed_emit
       - emit_valid_length
-      - emit_row_identity
       - loop_induction_values
       - serving_service_contract
       - bounded_state_recurrence
@@ -23,6 +22,9 @@ pipeline:
           shape:
           - batch
           - sequence
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: runtime
           version: '1.0'
@@ -61,6 +63,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: opaque
         source:
@@ -85,6 +90,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: opaque
         source:
@@ -99,6 +107,9 @@ pipeline:
           shape:
           - batch
           - num_eos
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: opaque
         source:
@@ -112,6 +123,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: opaque
         source:
@@ -125,6 +139,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: opaque
         source:
@@ -138,6 +155,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: runtime
           version: '1.0'
@@ -152,6 +172,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: runtime
           version: '1.0'
@@ -166,6 +189,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: runtime
           version: '1.0'
@@ -180,6 +206,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: runtime
           version: '1.0'
@@ -194,6 +223,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: runtime
           version: '1.0'
@@ -208,6 +240,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: opaque
         source:
@@ -221,6 +256,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: opaque
         source:
@@ -233,30 +271,24 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: opaque
         source:
           kind: literal
         required: false
         default: false
-      package.slot_ids:
-        contract:
-          dtype: int64
-          rank: 1
-          shape:
-          - batch
-        role:
-          kind: opaque
-        source:
-          kind: application
-          name: serving.slot_ids
-        required: true
       package.cache_lengths:
         contract:
           dtype: int64
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: opaque
         source:
@@ -269,6 +301,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: opaque
         source:
@@ -283,6 +318,9 @@ pipeline:
           shape:
           - batch
           - generated_sequence
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role: tokens
         stage: pre_adapter
     components:
@@ -302,57 +340,90 @@ pipeline:
               shape:
               - batch
               - vocabulary
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             temperature:
               dtype: float32
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             top_k:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             top_p:
               dtype: float32
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             min_p:
               dtype: float32
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             seed:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             counter:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             active:
               dtype: bool
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             done:
               dtype: bool
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
           outputs:
             token:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             next_counter:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
         contract:
           id: onnx-genai.token-sampler
           version: '2'
@@ -384,17 +455,26 @@ pipeline:
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             eos_ids:
               dtype: int64
               rank: 2
               shape:
               - batch
               - num_eos
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             eos_lengths:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             iteration:
               dtype: int64
               rank: 1
@@ -405,22 +485,34 @@ pipeline:
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             active:
               dtype: bool
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
           outputs:
             done:
               dtype: bool
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             next_active:
               dtype: bool
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             continue:
               dtype: bool
               rank: 1
@@ -454,22 +546,34 @@ pipeline:
               shape:
               - batch
               - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             update:
               dtype: int64
               rank: 2
               shape:
               - batch
               - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             active:
               dtype: bool
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             done:
               dtype: bool
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
           outputs:
             next:
               dtype: int64
@@ -477,6 +581,9 @@ pipeline:
               shape:
               - batch
               - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
         contract:
           id: onnx-genai.state-update
           version: '2'
@@ -502,6 +609,9 @@ pipeline:
               - batch
               - sequence
               - vocabulary
+              batch_layout:
+                kind: request_aligned
+                axis: 0
           outputs:
             last_logits:
               dtype: float32
@@ -509,6 +619,9 @@ pipeline:
               shape:
               - batch
               - vocabulary
+              batch_layout:
+                kind: request_aligned
+                axis: 0
       decoder_state_initializer:
         implementation:
           kind: onnx
@@ -521,11 +634,17 @@ pipeline:
               shape:
               - batch
               - prompt_sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             prompt_lengths:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             max_iterations:
               dtype: int64
               rank: 1
@@ -538,40 +657,61 @@ pipeline:
               shape:
               - batch
               - capacity
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             position_ids:
               dtype: int64
               rank: 2
               shape:
               - batch
               - sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             body_attention_mask:
               dtype: int64
               rank: 2
               shape:
               - batch
               - capacity
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             body_position_ids:
               dtype: int64
               rank: 2
               shape:
               - batch
               - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             token_slot:
               dtype: int64
               rank: 2
               shape:
               - batch
               - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             generated_lengths:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             cache_lengths:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             past_key_values.0.key:
               dtype: float32
               rank: 4
@@ -580,6 +720,9 @@ pipeline:
               - 2
               - capacity
               - 8
+              batch_layout:
+                kind: request_aligned
+                axis: 0
       decoder_step_update:
         implementation:
           kind: onnx
@@ -592,17 +735,26 @@ pipeline:
               shape:
               - batch
               - context
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             logical_length:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             position_ids:
               dtype: int64
               rank: 2
               shape:
               - batch
               - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
           outputs:
             next_attention_mask:
               dtype: int64
@@ -610,12 +762,18 @@ pipeline:
               shape:
               - batch
               - context
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             next_position_ids:
               dtype: int64
               rank: 2
               shape:
               - batch
               - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
       cache_length_update:
         implementation:
           kind: onnx
@@ -627,27 +785,42 @@ pipeline:
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             right:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             active:
               dtype: bool
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             done:
               dtype: bool
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
           outputs:
             total:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
       termination_batch_initializer:
         implementation:
           kind: onnx
@@ -660,16 +833,25 @@ pipeline:
               shape:
               - batch
               - num_eos
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             input_eos_lengths:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             input_max_iterations:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             fallback_max_iterations:
               dtype: int64
               rank: 1
@@ -680,6 +862,9 @@ pipeline:
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
           outputs:
             row_eos_ids:
               dtype: int64
@@ -687,16 +872,25 @@ pipeline:
               shape:
               - batch
               - num_eos
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             eos_lengths:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             max_iterations:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
       token_to_slot:
         implementation:
           kind: onnx
@@ -708,6 +902,9 @@ pipeline:
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
           outputs:
             slot:
               dtype: int64
@@ -715,6 +912,9 @@ pipeline:
               shape:
               - batch
               - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
       generated_length_update:
         implementation:
           kind: onnx
@@ -726,27 +926,42 @@ pipeline:
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             right:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             active:
               dtype: bool
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             done:
               dtype: bool
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
           outputs:
             total:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
     state:
       token:
         contract:
@@ -755,6 +970,9 @@ pipeline:
           shape:
           - batch
           - 1
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         scope: invocation
         initializer: initializer.token_slot
         recurrence:
@@ -766,6 +984,9 @@ pipeline:
           shape:
           - batch
           - 128
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         scope: invocation
         initializer: decoder.setup.last_logits
         recurrence:
@@ -776,6 +997,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         class: semantic
         scope: invocation
         initializer: initializer.generated_lengths
@@ -787,6 +1011,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         class: semantic
         scope: invocation
         initializer: package.active
@@ -798,6 +1025,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         class: semantic
         scope: invocation
         initializer: package.not_done
@@ -809,20 +1039,12 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         class: semantic
         scope: invocation
         initializer: package.zero_batch
-        recurrence:
-          kind: invariant
-      slot_ids:
-        contract:
-          dtype: int64
-          rank: 1
-          shape:
-          - batch
-        class: semantic
-        scope: invocation
-        initializer: package.slot_ids
         recurrence:
           kind: invariant
       cache_lengths:
@@ -831,6 +1053,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         class: semantic
         scope: invocation
         initializer: initializer.cache_lengths
@@ -842,6 +1067,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         scope: invocation
         class: semantic
         initializer: request.rng_counter
@@ -854,6 +1082,9 @@ pipeline:
           shape:
           - batch
           - context
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         scope: invocation
         initializer: initializer.attention_mask
         recurrence:
@@ -865,6 +1096,9 @@ pipeline:
           shape:
           - batch
           - 1
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         scope: invocation
         initializer: initializer.body_position_ids
         recurrence:
@@ -878,6 +1112,9 @@ pipeline:
           - 2
           - past_sequence
           - 8
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         scope: invocation
         initializer: decoder.setup.present.0.key
         recurrence:
@@ -885,21 +1122,27 @@ pipeline:
           axis: 2
           max: package.max_context
         service_group: decoder_cache
+        management: runtime
+        release_boundary: invocation
     serving:
       active: active
       done: done
       accepted_len: accepted_len
-      slot_ids: slot_ids
-      kv_service:
-        paging: none
-        allocation: runtime
-        compaction: true
+      state_service:
         groups:
           decoder_cache:
+            kind: full_attention
             sequence_axis: 2
             layout: bnsh
             logical_lengths: cache_lengths
-            storage: shared_buffer
+            aliasing: permitted
+            reuse:
+              prefix_reusable: true
+              evictable_prefix: false
+            capabilities:
+              rollback_positions: 32
+              snapshot: true
+              fork: true
             ports:
               model:
                 cache_0:
@@ -1037,7 +1280,6 @@ pipeline:
         mode: append
         valid_length: token.emitted_length
         when: active
-        row_ids: slot_ids
       - kind: invoke
         component: decoder_step_update
         inputs:
@@ -1080,8 +1322,6 @@ pipeline:
         next: cache_lengths.next
       - cell: accepted_len
         next: accepted_len.next
-      - cell: slot_ids
-        next: slot_ids
       - cell: rng_counter
         next: sample.next_counter
       - cell: attention_mask
@@ -1098,3 +1338,32 @@ pipeline:
           rank: 1
           shape:
           - 1
+package:
+  tokenizer:
+    algorithm: bpe
+    vocab_size: 32000
+    byte_level: true
+    artifacts:
+    - location: tokenizer.json
+      sha256: '0000000000000000000000000000000000000000000000000000000000000000'
+    special_tokens:
+      bos:
+        id: 1
+        content: <s>
+      eos:
+        id: 2
+        content: </s>
+generation:
+  overrides:
+    max_output_tokens:
+      input: request.max_iterations
+    temperature:
+      input: request.temperature
+    top_k:
+      input: request.top_k
+    top_p:
+      input: request.top_p
+    min_p:
+      input: request.min_p
+    seed:
+      input: request.seed

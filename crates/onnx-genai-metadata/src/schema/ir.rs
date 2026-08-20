@@ -13,6 +13,61 @@ pub struct TensorContract {
     pub shape: Option<Vec<TensorDimension>>,
     #[serde(default)]
     pub optional: bool,
+    /// How this value relates to the runtime's private request/sequence table.
+    ///
+    /// This is a structural batching fact, never a row identity. It is the only
+    /// information a runtime needs to move, split, or drop this value during
+    /// compaction; scheduler slots, epochs, block tables, and sequence handles
+    /// stay runtime-private.
+    #[serde(default, skip_serializing_if = "BatchLayout::is_shared")]
+    pub batch_layout: BatchLayout,
+}
+
+/// Structural relationship between a typed value and the runtime batch.
+///
+/// `shared` values are invariant across requests. `request_aligned` values carry
+/// exactly one entry per in-flight request along `axis`, so compaction permutes
+/// that axis. `token_packed` values are ragged: `offsets` names the
+/// request-aligned exclusive-prefix offset value and `owner` names the
+/// per-item owner mapping, which together let a runtime split and regroup the
+/// packed value without any serialized request ID. `runtime_sequence_state`
+/// marks a value whose per-sequence storage the runtime owns outright.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BatchLayout {
+    #[default]
+    Shared,
+    RequestAligned {
+        axis: usize,
+    },
+    TokenPacked {
+        /// Request-aligned value holding the exclusive prefix offset of each request's items.
+        offsets: String,
+        /// Item-aligned value mapping each packed item to its owning request row.
+        owner: String,
+        /// Packed axis of this value.
+        axis: usize,
+    },
+    RuntimeSequenceState,
+}
+
+impl BatchLayout {
+    pub fn is_shared(&self) -> bool {
+        matches!(self, Self::Shared)
+    }
+
+    /// Axis permuted when the runtime compacts the batch, if any.
+    pub fn request_axis(&self) -> Option<usize> {
+        match self {
+            Self::RequestAligned { axis } => Some(*axis),
+            Self::Shared | Self::TokenPacked { .. } | Self::RuntimeSequenceState => None,
+        }
+    }
+
+    /// Whether the runtime must move this value when it compacts or releases rows.
+    pub fn is_row_scoped(&self) -> bool {
+        !matches!(self, Self::Shared)
+    }
 }
 
 /// Explicit input/output ports of one executable component.
@@ -80,9 +135,54 @@ pub struct WorkflowSpec {
     pub components: BTreeMap<String, WorkflowComponent>,
     #[serde(default)]
     pub state: BTreeMap<String, WorkflowStateCell>,
+    /// Retry and speculation semantics of every declared external effect domain.
+    #[serde(default)]
+    pub effects: BTreeMap<String, EffectContract>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serving: Option<ServingServiceContract>,
     pub steps: Vec<WorkflowStep>,
+}
+
+/// Declared semantics of one external effect domain.
+///
+/// Retry class and speculation safety are independent axes. A transactional
+/// effect may still be unsafe to speculate, and an idempotent effect is not
+/// automatically rewindable.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EffectContract {
+    /// Minimum retry-relevant class for runtime/server recovery orchestration.
+    pub retry: EffectRetryClass,
+    /// Whether and how far this effect can participate in speculative execution.
+    #[serde(default)]
+    pub speculation_safety: SpeculationSafety,
+}
+
+/// Retry-relevant classification of an external effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectRetryClass {
+    /// No observable external effect; replay is always safe.
+    Pure,
+    /// Repeating the effect with the same inputs is observationally equivalent.
+    Idempotent,
+    /// The effect participates in an external transaction that can be aborted.
+    Transactional,
+    /// The effect must never be repeated or rolled back.
+    NonRetryable,
+}
+
+/// Whether an effect may be executed inside a speculative region.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SpeculationSafety {
+    /// The effect must not run speculatively.
+    #[default]
+    None,
+    /// The effect's observable state can be cloned before a speculative region.
+    Clonable,
+    /// The effect can be rewound by at most `max_depth` proposed positions.
+    Rewindable { max_depth: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
@@ -112,11 +212,7 @@ pub struct AdapterServiceContract {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AdapterSelectionContract {
-    /// Int64[batch] semantic row/slot identities.
-    pub slot_ids: String,
-    /// Int64[batch] request generation; changes whenever a slot is reused.
-    pub request_epochs: String,
-    /// Int64[batch,max_adapters] Phase-2-compatible segment IDs in composition order.
+    /// Int64[batch,max_adapters] segment IDs in composition order.
     pub segments: String,
     /// Int64[batch] number of valid adapter IDs in each row.
     pub adapter_counts: String,
@@ -372,6 +468,13 @@ pub struct WorkflowInput {
     /// Initial scalar bool SSA value indicating whether the caller supplied this input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub present_as: Option<String>,
+    /// Whether an application may supply a previously computed typed value in
+    /// place of recomputing it, such as a cached encoder result.
+    ///
+    /// Transport, remote caching, and identity of the supplied value remain
+    /// runtime-owned; metadata only declares that the substitution is legal.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub externally_suppliable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
@@ -399,8 +502,10 @@ pub enum RuntimeInputRole {
     SamplingMinP,
     Constraint,
     SessionId,
-    RowIds,
-    RequestEpochs,
+    /// Runtime-minted gather of source batch positions for beam or speculative
+    /// row expansion. Values are positions inside the current batch, never
+    /// scheduler slots, request IDs, or epochs.
+    RowSelection,
     AdapterSegments,
     AdapterCounts,
     AdapterScales,
@@ -456,6 +561,32 @@ pub struct WorkflowComponent {
     pub application_overridable: bool,
     #[serde(default)]
     pub effects: Vec<String>,
+    /// Declared per-request row scope of this component's private state.
+    ///
+    /// A component with row scope must implement the mandatory row ABI
+    /// (`compact(selection)` and `release(row)`). This is an ABI invariant, not
+    /// a negotiated capability: a runtime may not load a package whose
+    /// row-scoped component cannot be compacted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_scope: Option<ComponentRowScope>,
+    /// Non-dataflow facts that change this component's observable state.
+    ///
+    /// Cache correctness dependencies of ONNX components are derived from the
+    /// workflow SSA graph. Native and external components must declare any
+    /// additional state they read that is not visible as a typed input.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub cache_affects_state: BTreeSet<String>,
+}
+
+/// Row scope of a component's runtime-private state.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ComponentRowScope {
+    /// Batch axis of the component's row-scoped ports.
+    pub axis: usize,
+    /// Whether the component retains state between invocations for each row.
+    #[serde(default)]
+    pub stateful: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
@@ -464,12 +595,46 @@ pub struct ComponentContract {
     /// Versioned semantic capability identifier. It never selects execution behavior.
     pub id: String,
     pub version: String,
+    /// How closely a substituted implementation must reproduce this contract.
+    ///
+    /// A runtime may freely choose any equivalent implementation, but the
+    /// declared class bounds what "equivalent" means. Only a
+    /// `distribution_preserving` (or `bitwise`) contract may be optimized
+    /// speculatively without caller opt-in.
+    #[serde(default)]
+    pub equivalence: EquivalenceClass,
     /// Semantic role to concrete component port name.
     #[serde(default)]
     pub bindings: BTreeMap<String, String>,
     /// Contract parameters that are not tensor ports, such as adapter actions.
     #[serde(default)]
     pub parameters: BTreeMap<String, ScalarValue>,
+}
+
+/// Correctness bound on substituting an equivalent component implementation.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EquivalenceClass {
+    /// Every substituted implementation must produce bit-identical outputs.
+    Bitwise,
+    /// Outputs may differ numerically but must preserve the output distribution.
+    DistributionPreserving,
+    /// Only the declared semantics are preserved; the distribution may change.
+    #[default]
+    Semantic,
+}
+
+impl EquivalenceClass {
+    /// Whether a runtime may auto-enable speculative optimization of this contract.
+    ///
+    /// Semantic equivalence permits an implementation whose output distribution
+    /// differs, so speculation would silently change results and requires an
+    /// explicit caller opt-in.
+    pub fn permits_automatic_speculation(self) -> bool {
+        matches!(self, Self::Bitwise | Self::DistributionPreserving)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
@@ -533,8 +698,6 @@ pub enum WorkflowStep {
         when: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         valid_length: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        row_ids: Option<String>,
         output: String,
         mode: WorkflowEmitMode,
     },
@@ -593,8 +756,6 @@ pub enum WorkflowNode {
         /// Optional scalar or rank-one integer SSA value limiting the emitted prefix
         /// on the value's final axis, globally or per batch row.
         valid_length: Option<String>,
-        /// Explicit semantic identity for every physical batch row.
-        row_ids: Option<String>,
         output: String,
         mode: WorkflowEmitMode,
         effect_name: String,
@@ -676,10 +837,45 @@ pub struct WorkflowStateCell {
     pub scope: WorkflowStateScope,
     pub initializer: String,
     pub recurrence: ShapeRecurrence,
+    /// Who owns the physical storage of this cell.
+    ///
+    /// Workflow-managed cells follow ordinary SSA liveness. Runtime-managed and
+    /// external cells must also declare a logical release boundary so a runtime
+    /// knows when the semantic value stops being reachable.
+    #[serde(default)]
+    pub management: StateManagement,
+    /// Logical point at which the runtime may release this cell's storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_boundary: Option<StateReleaseBoundary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionLeaseContract>,
+}
+
+/// Storage ownership of one workflow state cell.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StateManagement {
+    /// Ordinary SSA-managed value; liveness is derived from the workflow graph.
+    #[default]
+    Workflow,
+    /// The runtime owns the physical storage and its allocation policy.
+    Runtime,
+    /// An external service owns the storage; only the typed handle is portable.
+    External,
+}
+
+/// Logical boundary after which a managed or external state cell is releasable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StateReleaseBoundary {
+    /// Releasable when the invocation that created it completes.
+    Invocation,
+    /// Releasable when the session that owns it ends.
+    Session,
+    /// Releasable when its owning batch row is released.
+    Row,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
@@ -739,60 +935,146 @@ pub struct ServingServiceContract {
     pub done: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepted_len: Option<String>,
-    pub slot_ids: String,
-    pub kv_service: KvServiceContract,
+    /// Semantic state groups whose graph ABI the runtime must honor.
+    pub state_service: StateServiceContract,
 }
 
+/// Semantic model-state contract.
+///
+/// This declares what the state *means* and which graph ABI facts constrain the
+/// runtime. It never selects paged, shared-buffer, or separate storage, a slot
+/// allocation algorithm, a compaction algorithm, or a device.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct KvServiceContract {
-    pub paging: KvPagingMode,
-    pub allocation: SlotAllocationMode,
+pub struct StateServiceContract {
     #[serde(default)]
-    pub compaction: bool,
-    #[serde(default)]
-    pub groups: BTreeMap<String, KvServiceGroupContract>,
+    pub groups: BTreeMap<String, StateGroupContract>,
 }
 
+/// One semantic group of model state sharing a kind, geometry, and graph ABI.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct KvServiceGroupContract {
+pub struct StateGroupContract {
+    /// Semantic kind of the state in this group.
+    pub kind: StateKind,
     pub sequence_axis: usize,
+    /// Graph-visible element layout of the state tensors.
     pub layout: String,
-    /// Semantic state cell containing the current logical sequence length for each row.
-    pub logical_lengths: String,
+    /// Semantic state cell holding the current logical length of each row.
+    ///
+    /// Required only when the logical length is graph-visible. Absent means the
+    /// runtime derives length from its private sequence table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_lengths: Option<String>,
+    /// Whether the component may write `present` into the `past` buffer.
     #[serde(default)]
-    pub storage: KvStorageMode,
+    pub aliasing: StateAliasing,
+    /// Graph-visible total-length input, when the component reads one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_length: Option<String>,
+    /// Prefix reuse and eviction semantics of this group.
     #[serde(default)]
-    pub ports: BTreeMap<String, BTreeMap<String, KvPortAlias>>,
+    pub reuse: StateReuse,
+    /// Rollback, snapshot, and fork bounds usable by the runtime.
+    #[serde(default)]
+    pub capabilities: StateGroupCapabilities,
+    /// The versioned checkpoint adapter through which this group's state may
+    /// leave the process portably.
+    ///
+    /// Absent means the group's state is private: it may still move between
+    /// processes, but only through a private runtime protocol that requires a
+    /// matching protocol and build on both ends (prefill/decode disaggregation,
+    /// encoder/decoder interchange). Those transfers are fast precisely because
+    /// they are not portable, and treating one as a portable export is how a
+    /// cluster silently corrupts state across a rolling upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<StateCheckpointContract>,
+    #[serde(default)]
+    pub ports: BTreeMap<String, BTreeMap<String, StatePortAlias>>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+/// The only portable, cross-build path for a state group's contents.
+///
+/// This is deliberately not a wire format: metadata names the adapter and its
+/// version, and the adapter owns the encoding. A portable checkpoint is slow and
+/// survives a version change; a private transfer is fast and does not.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StateCheckpointContract {
+    /// Versioned adapter identifier, for example `onnx-genai.kv-checkpoint`.
+    #[schemars(length(min = 1))]
+    pub adapter: String,
+    /// Adapter version this group's checkpoints are written against.
+    #[schemars(length(min = 1))]
+    pub version: String,
+}
+
+/// Semantic kind of a model state group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum KvStorageMode {
+pub enum StateKind {
+    /// Dense causal attention over the full sequence.
+    FullAttention,
+    /// Causal attention restricted to a sliding window.
+    SlidingAttention,
+    /// Compressed latent attention state (MLA).
+    MultiLatentAttention,
+    /// Fixed-size recurrent or state-space carry.
+    Recurrent,
+    /// Cross-attention state keyed by an encoder result.
+    CrossAttention,
+    /// Encoder output retained across decoder steps.
+    Encoder,
+}
+
+/// Legality of aliasing a component's `present` output onto its `past` input.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StateAliasing {
+    /// The runtime may alias input and output buffers but need not.
+    Permitted,
+    /// The component only works correctly when input and output alias.
+    Required,
+    /// Aliasing input and output buffers is incorrect for this component.
     #[default]
-    Separate,
-    SharedBuffer,
-    Paged,
+    Forbidden,
+}
+
+/// Semantic reuse and eviction legality of a state group.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StateReuse {
+    /// Whether a shared token prefix produces identical state that may be reused.
+    #[serde(default)]
+    pub prefix_reusable: bool,
+    /// Whether dropping the oldest positions preserves declared semantics.
+    #[serde(default)]
+    pub evictable_prefix: bool,
+}
+
+/// Rollback, snapshot, and fork bounds declared for one state group.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StateGroupCapabilities {
+    /// Maximum number of trailing positions that can be discarded correctly.
+    ///
+    /// Absent means the group cannot be rolled back at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_positions: Option<usize>,
+    /// Whether the runtime can snapshot and restore this group.
+    #[serde(default)]
+    pub snapshot: bool,
+    /// Whether the runtime can fork this group into an independent row.
+    #[serde(default)]
+    pub fork: bool,
+    /// Other groups that must be rolled back, snapshotted, or forked together.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub cascade: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct KvPortAlias {
+pub struct StatePortAlias {
     pub input: String,
     pub output: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum KvPagingMode {
-    None,
-    Paged,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum SlotAllocationMode {
-    Static,
-    Runtime,
 }

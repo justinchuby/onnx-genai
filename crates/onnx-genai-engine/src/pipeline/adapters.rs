@@ -1,3 +1,4 @@
+use super::row_state::{RowScopedState, gather_rows};
 use anyhow::Context;
 use onnx_genai_metadata::{
     AdapterArtifact, AdapterScaleEncoding, AdapterServiceContract, AdapterWeightFormat,
@@ -5,7 +6,7 @@ use onnx_genai_metadata::{
 use onnx_genai_ort::Value;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::Path;
 
@@ -24,32 +25,21 @@ impl AdapterActivation {
     }
 }
 
+/// Adapter composition for each row of the current batch, in row order.
+///
+/// Rows are positional. The runtime associates a batch row with a request
+/// through its own private request table; no scheduler slot ID or request epoch
+/// is serialized into metadata or carried through this type.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AdapterSelection {
-    /// Immutable composition keyed by semantic slot and its current request epoch.
-    pub rows: BTreeMap<AdapterSlotIdentity, Vec<AdapterActivation>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct AdapterSlotIdentity {
-    pub slot_id: i64,
-    pub request_epoch: i64,
+    /// Immutable composition per batch row, indexed by row position.
+    pub rows: Vec<Vec<AdapterActivation>>,
 }
 
 impl AdapterSelection {
-    pub fn with_slot(
-        mut self,
-        slot_id: i64,
-        request_epoch: i64,
-        adapters: impl IntoIterator<Item = AdapterActivation>,
-    ) -> Self {
-        self.rows.insert(
-            AdapterSlotIdentity {
-                slot_id,
-                request_epoch,
-            },
-            adapters.into_iter().collect(),
-        );
+    /// Append the composition for the next batch row.
+    pub fn with_row(mut self, adapters: impl IntoIterator<Item = AdapterActivation>) -> Self {
+        self.rows.push(adapters.into_iter().collect());
         self
     }
 }
@@ -57,17 +47,10 @@ impl AdapterSelection {
 pub(super) fn selection_from_inputs(
     service: &AdapterServiceContract,
     values: &HashMap<String, Value>,
-    slot_ids: &[i64],
-    request_epochs: &[i64],
+    batch_rows: usize,
 ) -> anyhow::Result<AdapterSelection> {
     let selection = &service.selection;
     let max_adapters = selection.max_adapters;
-    anyhow::ensure!(
-        request_epochs.len() == slot_ids.len(),
-        "adapter request_epochs has {} rows but slot_ids has {}",
-        request_epochs.len(),
-        slot_ids.len()
-    );
     let segments = values
         .get(&selection.segments)
         .with_context(|| format!("adapter segments input '{}' is absent", selection.segments))?
@@ -103,8 +86,7 @@ pub(super) fn selection_from_inputs(
                 selection.scales
             )
         })?;
-    let expected_slots = slot_ids
-        .len()
+    let expected_slots = batch_rows
         .checked_mul(max_adapters)
         .context("adapter selection shape overflows usize")?;
     anyhow::ensure!(
@@ -112,19 +94,18 @@ pub(super) fn selection_from_inputs(
         "adapter segments and scales must each contain batch * max_adapters = {expected_slots} values"
     );
     anyhow::ensure!(
-        adapter_counts.len() == slot_ids.len(),
-        "adapter counts has {} rows but slot_ids has {}",
-        adapter_counts.len(),
-        slot_ids.len()
+        adapter_counts.len() == batch_rows,
+        "adapter counts has {} rows but the batch has {batch_rows}",
+        adapter_counts.len()
     );
     let aliases = service
         .artifacts
         .iter()
         .map(|(alias, artifact)| (artifact.index as i64, alias.as_str()))
         .collect::<HashMap<_, _>>();
-    let mut rows = BTreeMap::new();
-    for physical_row in 0..slot_ids.len() {
-        let count = usize::try_from(adapter_counts[physical_row]).with_context(|| {
+    let mut rows = Vec::with_capacity(batch_rows);
+    for (physical_row, declared_count) in adapter_counts.iter().enumerate().take(batch_rows) {
+        let count = usize::try_from(*declared_count).with_context(|| {
             format!("adapter count for row {physical_row} must be non-negative")
         })?;
         anyhow::ensure!(
@@ -147,13 +128,7 @@ pub(super) fn selection_from_inputs(
                 );
             }
         }
-        rows.insert(
-            AdapterSlotIdentity {
-                slot_id: slot_ids[physical_row],
-                request_epoch: request_epochs[physical_row],
-            },
-            activations,
-        );
+        rows.push(activations);
     }
     Ok(AdapterSelection { rows })
 }
@@ -208,36 +183,34 @@ pub(super) struct AdapterCache {
     diagnostic: AdapterLifecycleDiagnostic,
 }
 
+/// Resolved adapter composition for each batch row, in row order.
+///
+/// This is row-scoped native state, so it implements the mandatory
+/// [`RowScopedState`] ABI: a scheduler that compacts the batch moves adapter
+/// compositions with it, and a finished request releases its row.
 #[derive(Debug, Clone, Default)]
 pub(super) struct AdapterRunContext {
-    pub rows: Vec<(AdapterSlotIdentity, Vec<(String, f32)>)>,
+    pub rows: Vec<Vec<(String, f32)>>,
 }
 
-impl AdapterRunContext {
-    pub fn reordered(&self, slot_ids: &[i64], request_epochs: &[i64]) -> anyhow::Result<Self> {
+impl RowScopedState for AdapterRunContext {
+    fn rows(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn compact(&mut self, selection: &[usize]) -> anyhow::Result<()> {
+        self.rows = gather_rows(&self.rows, selection).context("adapter run context compaction")?;
+        Ok(())
+    }
+
+    fn release(&mut self, row: usize) -> anyhow::Result<()> {
         anyhow::ensure!(
-            slot_ids.len() == request_epochs.len(),
-            "adapter slot_ids and request_epochs must have equal length"
+            row < self.rows.len(),
+            "cannot release adapter row {row}; only {} rows exist",
+            self.rows.len()
         );
-        let by_identity = self.rows.iter().cloned().collect::<HashMap<_, _>>();
-        let rows = slot_ids
-            .iter()
-            .copied()
-            .zip(request_epochs.iter().copied())
-            .map(|(slot_id, request_epoch)| {
-                let identity = AdapterSlotIdentity {
-                    slot_id,
-                    request_epoch,
-                };
-                let activations = by_identity.get(&identity).cloned().with_context(|| {
-                    format!(
-                        "adapter selection has no immutable entry for row {slot_id} epoch {request_epoch}"
-                    )
-                })?;
-                Ok((identity, activations))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(Self { rows })
+        self.rows.remove(row);
+        Ok(())
     }
 }
 
@@ -253,54 +226,21 @@ impl AdapterCache {
         root: &Path,
         service: &AdapterServiceContract,
         selection: &AdapterSelection,
-        slot_ids: &[i64],
-        request_epochs: &[i64],
         active_rows: &[bool],
     ) -> anyhow::Result<AdapterRunContext> {
-        if request_epochs.len() != slot_ids.len() {
+        if active_rows.len() != selection.rows.len() {
             anyhow::bail!(
-                "adapter request_epochs has {} rows but slot_ids has {}",
-                request_epochs.len(),
-                slot_ids.len()
-            );
-        }
-        if let Some(epoch) = request_epochs.iter().find(|epoch| **epoch < 0) {
-            anyhow::bail!("adapter request epoch {epoch} must be non-negative");
-        }
-        if active_rows.len() != slot_ids.len() {
-            anyhow::bail!(
-                "adapter active mask has {} rows but slot_ids has {}",
+                "adapter active mask has {} rows but the selection has {}",
                 active_rows.len(),
-                slot_ids.len()
+                selection.rows.len()
             );
         }
-        let request_rows = slot_ids
-            .iter()
-            .copied()
-            .collect::<std::collections::HashSet<_>>();
-        if request_rows.len() != slot_ids.len() {
-            anyhow::bail!("adapter semantic slot_ids must be unique within a request");
-        }
-        let identities = slot_ids
-            .iter()
-            .copied()
-            .zip(request_epochs.iter().copied())
-            .map(|(slot_id, request_epoch)| AdapterSlotIdentity {
-                slot_id,
-                request_epoch,
-            })
-            .collect::<Vec<_>>();
-        let active_request_rows = identities
-            .iter()
-            .copied()
-            .zip(active_rows)
-            .filter_map(|(identity, active)| active.then_some(identity))
-            .collect::<std::collections::HashSet<_>>();
         let requested = selection
             .rows
             .iter()
-            .filter(|(identity, _)| active_request_rows.contains(identity))
-            .flat_map(|(_, activations)| activations)
+            .zip(active_rows)
+            .filter(|(_, active)| **active)
+            .flat_map(|(activations, _)| activations)
             .map(|activation| activation.adapter.as_str())
             .collect::<std::collections::HashSet<_>>();
         if requested.len() > service.cache.max_entries {
@@ -310,11 +250,11 @@ impl AdapterCache {
                 service.cache.max_entries
             );
         }
-        let mut rows = Vec::with_capacity(slot_ids.len());
-        let mut plan_parts = Vec::with_capacity(slot_ids.len());
-        for (physical_row, identity) in identities.iter().copied().enumerate() {
+        let mut rows = Vec::with_capacity(selection.rows.len());
+        let mut plan_parts = Vec::with_capacity(selection.rows.len());
+        for (physical_row, row_selection) in selection.rows.iter().enumerate() {
             let activations = if active_rows[physical_row] {
-                selection.rows.get(&identity).cloned().unwrap_or_default()
+                row_selection.clone()
             } else {
                 Vec::new()
             };
@@ -324,9 +264,8 @@ impl AdapterCache {
             for activation in activations {
                 if !row_adapters.insert(activation.adapter.clone()) {
                     anyhow::bail!(
-                        "adapter selection for row {} epoch {} contains duplicate adapter '{}'",
-                        identity.slot_id,
-                        identity.request_epoch,
+                        "adapter selection for batch row {physical_row} contains duplicate \
+                         adapter '{}'",
                         activation.adapter
                     );
                 }
@@ -335,10 +274,10 @@ impl AdapterCache {
                     || activation.scale > 16.0
                 {
                     anyhow::bail!(
-                        "adapter '{}' scale {} for row {slot_id} must be finite and within [-16, 16]",
+                        "adapter '{}' scale {} for batch row {physical_row} must be finite and \
+                         within [-16, 16]",
                         activation.adapter,
-                        activation.scale,
-                        slot_id = identity.slot_id
+                        activation.scale
                     );
                 }
                 let artifact = service
@@ -346,25 +285,25 @@ impl AdapterCache {
                     .get(&activation.adapter)
                     .with_context(|| {
                         format!(
-                            "adapter selection for row {slot_id} references undeclared adapter '{}'",
-                            activation.adapter,
-                            slot_id = identity.slot_id
+                            "adapter selection for batch row {physical_row} references \
+                             undeclared adapter '{}'",
+                            activation.adapter
                         )
                     })?;
                 self.ensure_loaded(root, service, &activation.adapter, artifact)?;
                 let scale = activation.scale;
                 if !scale.is_finite() || !(-16.0..=16.0).contains(&scale) {
                     anyhow::bail!(
-                        "adapter '{}' effective scale {scale} for row {slot_id} must be finite and within [-16, 16]",
-                        activation.adapter,
-                        slot_id = identity.slot_id
+                        "adapter '{}' effective scale {scale} for batch row {physical_row} must \
+                         be finite and within [-16, 16]",
+                        activation.adapter
                     );
                 }
                 row_key.push(format!("{}:{scale:.8}", activation.adapter));
                 resolved.push((activation.adapter, scale));
             }
             plan_parts.push(format!("[{}]", row_key.join(",")));
-            rows.push((identity, resolved));
+            rows.push(resolved);
         }
         let plan_key = format!(
             "{}|{}",
@@ -453,13 +392,13 @@ pub(super) fn apply_parameter_overlay(
         );
     }
     let mut output_features = input_features;
-    for (_, activations) in &context.rows {
+    for activations in &context.rows {
         for (adapter, _) in activations {
             output_features = cache.target(adapter, component, parameter)?.output_features;
         }
     }
     let mut result = vec![0.0_f32; batch * output_features];
-    for (row, (_, activations)) in context.rows.iter().enumerate() {
+    for (row, activations) in context.rows.iter().enumerate() {
         if activations.is_empty() {
             if output_features != input_features {
                 anyhow::bail!(
@@ -677,8 +616,6 @@ mod tests {
             },
             discovery_fallback: AdapterDiscoveryFallback::Disabled,
             selection: AdapterSelectionContract {
-                slot_ids: "request.slot_ids".to_string(),
-                request_epochs: "request.request_epochs".to_string(),
                 segments: "request.adapter_segments".to_string(),
                 adapter_counts: "request.adapter_counts".to_string(),
                 scales: "request.adapter_scales".to_string(),
@@ -687,7 +624,7 @@ mod tests {
             },
             application_capability: "onnx-genai.adapters@1".to_string(),
             portable_fallback: true,
-            artifacts: BTreeMap::from([
+            artifacts: std::collections::BTreeMap::from([
                 (
                     "red".to_string(),
                     artifact("red", "adapters/red/adapter.json", red),
@@ -742,11 +679,10 @@ mod tests {
             alpha: Some(6.0),
         });
 
-        let selection =
-            AdapterSelection::default().with_slot(10, 0, [AdapterActivation::new("red", 1.0)]);
+        let selection = AdapterSelection::default().with_row([AdapterActivation::new("red", 1.0)]);
         let mut cache = AdapterCache::default();
         let context = cache
-            .prepare(&root, &service, &selection, &[10], &[0], &[true])
+            .prepare(&root, &service, &selection, &[true])
             .expect("load heterogeneous-rank artifact under one alias");
         let (rank_one, _) =
             apply_parameter_overlay(&cache, &context, "decoder", "projection", &[1.0, 2.0], 1, 2)
@@ -781,26 +717,18 @@ mod tests {
         fs::write(root.join("adapters/blue/adapter.json"), blue).expect("write blue adapter");
 
         let service = service_contract(red, blue, 2);
+        // Rows are positional: row 0 runs red, row 1 runs the base model, and
+        // row 2 composes red and blue.
         let selection = AdapterSelection::default()
-            .with_slot(10, 0, [AdapterActivation::new("red", 1.0)])
-            .with_slot(
-                30,
-                0,
-                [
-                    AdapterActivation::new("red", 0.5),
-                    AdapterActivation::new("blue", 1.0),
-                ],
-            );
+            .with_row([AdapterActivation::new("red", 1.0)])
+            .with_row([])
+            .with_row([
+                AdapterActivation::new("red", 0.5),
+                AdapterActivation::new("blue", 1.0),
+            ]);
         let mut cache = AdapterCache::default();
         let context = cache
-            .prepare(
-                &root,
-                &service,
-                &selection,
-                &[10, 20, 30],
-                &[0, 0, 0],
-                &[true, true, true],
-            )
+            .prepare(&root, &service, &selection, &[true, true, true])
             .expect("prepare heterogeneous adapters");
         let (output, width) = apply_parameter_overlay(
             &cache,
@@ -814,13 +742,15 @@ mod tests {
         .expect("apply heterogeneous adapters");
         assert_eq!(width, 2);
         assert_eq!(output, vec![2.0, 4.0, 3.0, 4.0, 25.5, 35.0]);
-        for (slot_id, row_input, expected) in [
-            (10, [1.0, 2.0], [2.0, 4.0]),
-            (20, [3.0, 4.0], [3.0, 4.0]),
-            (30, [5.0, 6.0], [25.5, 35.0]),
+        for (row, row_input, expected) in [
+            (0, [1.0, 2.0], [2.0, 4.0]),
+            (1, [3.0, 4.0], [3.0, 4.0]),
+            (2, [5.0, 6.0], [25.5, 35.0]),
         ] {
+            let isolated =
+                AdapterSelection::default().with_row(selection.rows[row].iter().cloned());
             let single = cache
-                .prepare(&root, &service, &selection, &[slot_id], &[0], &[true])
+                .prepare(&root, &service, &isolated, &[true])
                 .expect("prepare independent row");
             let (single_output, _) =
                 apply_parameter_overlay(&cache, &single, "decoder", "projection", &row_input, 1, 2)
@@ -828,10 +758,9 @@ mod tests {
             assert_eq!(single_output, expected);
         }
 
-        let dynamic =
-            AdapterSelection::default().with_slot(10, 0, [AdapterActivation::new("red", 0.5)]);
+        let dynamic = AdapterSelection::default().with_row([AdapterActivation::new("red", 0.5)]);
         let dynamic_context = cache
-            .prepare(&root, &service, &dynamic, &[10], &[0], &[true])
+            .prepare(&root, &service, &dynamic, &[true])
             .expect("prepare dynamic scale");
         let (dynamic_output, _) = apply_parameter_overlay(
             &cache,
@@ -845,17 +774,13 @@ mod tests {
         .expect("apply dynamic scale");
         assert_eq!(dynamic_output, vec![1.5, 3.0]);
 
-        // The semantic row IDs carry adapter identity through physical-row compaction.
-        let compacted = cache
-            .prepare(
-                &root,
-                &service,
-                &selection,
-                &[30, 10],
-                &[0, 0],
-                &[true, true],
-            )
-            .expect("prepare compacted adapters");
+        // Compaction is a positional permutation through the mandatory
+        // RowScopedState ABI: no adapter identity is ever serialized, and the
+        // composition follows its row to the new position.
+        let mut compacted = context.clone();
+        compacted
+            .compact(&[2, 0])
+            .expect("compaction keeps each row's composition");
         let (compacted_output, _) = apply_parameter_overlay(
             &cache,
             &compacted,
@@ -868,9 +793,27 @@ mod tests {
         .expect("apply compacted adapters");
         assert_eq!(compacted_output, vec![25.5, 35.0, 2.0, 4.0]);
 
+        // Releasing a finished row leaves the survivors in order.
+        let mut released = context.clone();
+        released.release(1).expect("release the base row");
+        assert_eq!(released.rows(), 2);
+        let (released_output, _) = apply_parameter_overlay(
+            &cache,
+            &released,
+            "decoder",
+            "projection",
+            &[1.0, 2.0, 5.0, 6.0],
+            2,
+            2,
+        )
+        .expect("apply after release");
+        assert_eq!(released_output, vec![2.0, 4.0, 25.5, 35.0]);
+
         let mut inactive_cache = AdapterCache::default();
+        let inactive_selection =
+            AdapterSelection::default().with_row([AdapterActivation::new("red", 1.0)]);
         let inactive = inactive_cache
-            .prepare(&root, &service, &selection, &[10], &[0], &[false])
+            .prepare(&root, &service, &inactive_selection, &[false])
             .expect("prepare inactive adapter row");
         let (inactive_output, _) = apply_parameter_overlay(
             &inactive_cache,
@@ -885,30 +828,23 @@ mod tests {
         assert_eq!(inactive_output, vec![1.0, 2.0]);
         assert_eq!(inactive_cache.diagnostic().loads, 0);
 
-        let duplicate = AdapterSelection::default().with_slot(
-            10,
-            0,
-            [
-                AdapterActivation::new("red", 1.0),
-                AdapterActivation::new("red", 0.5),
-            ],
-        );
+        let duplicate = AdapterSelection::default().with_row([
+            AdapterActivation::new("red", 1.0),
+            AdapterActivation::new("red", 0.5),
+        ]);
         let error = cache
-            .prepare(&root, &service, &duplicate, &[10], &[0], &[true])
+            .prepare(&root, &service, &duplicate, &[true])
             .expect_err("duplicate row adapter must fail");
         assert!(error.to_string().contains("duplicate adapter"));
 
         // A one-entry cache evicts, reloads, and invalidates captured plan variants.
         let service = service_contract(red, blue, 1);
         let mut cache = AdapterCache::default();
-        for (slot_id, adapter) in [(1, "red"), (2, "blue"), (3, "red")] {
-            let selection = AdapterSelection::default().with_slot(
-                slot_id,
-                0,
-                [AdapterActivation::new(adapter, 1.0)],
-            );
+        for adapter in ["red", "blue", "red"] {
+            let selection =
+                AdapterSelection::default().with_row([AdapterActivation::new(adapter, 1.0)]);
             cache
-                .prepare(&root, &service, &selection, &[slot_id], &[0], &[true])
+                .prepare(&root, &service, &selection, &[true])
                 .expect("prepare adapter lifecycle request");
         }
         let diagnostic = cache.diagnostic();
@@ -939,20 +875,10 @@ mod tests {
                 Value::from_slice_f32(&[0.5, 0.0, 1.0, -0.25], &[2, 2]).expect("adapter scales"),
             ),
         ]);
-        let selection =
-            selection_from_inputs(&service, &values, &[10, 20], &[0, 3]).expect("selection");
+        let selection = selection_from_inputs(&service, &values, 2).expect("selection");
+        assert_eq!(selection.rows[0], [AdapterActivation::new("red", 0.5)]);
         assert_eq!(
-            selection.rows[&AdapterSlotIdentity {
-                slot_id: 10,
-                request_epoch: 0
-            }],
-            [AdapterActivation::new("red", 0.5)]
-        );
-        assert_eq!(
-            selection.rows[&AdapterSlotIdentity {
-                slot_id: 20,
-                request_epoch: 3
-            }],
+            selection.rows[1],
             [
                 AdapterActivation::new("blue", 1.0),
                 AdapterActivation::new("red", -0.25),
@@ -973,7 +899,7 @@ mod tests {
                 Value::from_slice_f32(&[1.0, 0.0], &[1, 2]).expect("adapter scales"),
             ),
         ]);
-        let error = selection_from_inputs(&service, &invalid_padding, &[10], &[0])
+        let error = selection_from_inputs(&service, &invalid_padding, 1)
             .expect_err("non-canonical padding must fail");
         assert!(error.to_string().contains("must be padded with ID -1"));
     }
@@ -991,10 +917,9 @@ mod tests {
             .expect("write corrupt adapter");
         fs::write(root.join("adapters/blue/adapter.json"), valid).expect("write blue adapter");
         let service = service_contract(valid, valid, 2);
-        let selection =
-            AdapterSelection::default().with_slot(1, 0, [AdapterActivation::new("red", 1.0)]);
+        let selection = AdapterSelection::default().with_row([AdapterActivation::new("red", 1.0)]);
         let error = AdapterCache::default()
-            .prepare(&root, &service, &selection, &[1], &[0], &[true])
+            .prepare(&root, &service, &selection, &[true])
             .expect_err("checksum mismatch must fail");
         assert!(error.to_string().contains("checksum mismatch"));
 
@@ -1003,7 +928,7 @@ mod tests {
             .expect("write malformed adapter");
         let service = service_contract(malformed, valid, 2);
         let error = AdapterCache::default()
-            .prepare(&root, &service, &selection, &[1], &[0], &[true])
+            .prepare(&root, &service, &selection, &[true])
             .expect_err("shape mismatch must fail");
         assert!(error.to_string().contains("shape mismatch"));
         fs::remove_dir_all(root).expect("remove adapter test directory");

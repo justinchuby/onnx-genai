@@ -24,8 +24,6 @@ adapters:
           rank: 1
           alpha: 1.0
   selection:
-    slot_ids: request.slot_ids
-    request_epochs: request.request_epochs
     segments: request.adapter_segments
     adapter_counts: request.adapter_counts
     scales: request.adapter_scales
@@ -64,24 +62,16 @@ pipeline:
       adapter_abis: { onnx-genai.parameter-overlay: "1" }
       capabilities: [workflow_ssa, parameter_adapters, heterogeneous_adapter_batching]
     inputs:
-      request.slot_ids:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
-        role: { kind: runtime, version: "1.0", role: row_ids }
-        source: { kind: request }
-      request.request_epochs:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
-        role: { kind: runtime, version: "1.0", role: request_epochs }
-        source: { kind: request }
       request.adapter_segments:
-        contract: { dtype: int64, rank: 2, shape: [batch, 2] }
+        contract: { dtype: int64, rank: 2, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: runtime, version: "1.0", role: adapter_segments }
         source: { kind: request }
       request.adapter_counts:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
+        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: runtime, version: "1.0", role: adapter_counts }
         source: { kind: request }
       request.adapter_scales:
-        contract: { dtype: float32, rank: 2, shape: [batch, 2] }
+        contract: { dtype: float32, rank: 2, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: runtime, version: "1.0", role: adapter_scales }
         source: { kind: request }
     components:
@@ -430,15 +420,31 @@ fn removed_top_level_execution_surfaces_are_rejected() {
     for field in [
         "strategy",
         "structured_output",
-        "generation",
         "tokens",
-        "speculative",
         "speculator_config",
     ] {
         let document = format!("{field}: {{}}\n");
         let error = serde_yaml::from_str::<InferenceMetadata>(&document)
             .expect_err("removed top-level execution metadata must not deserialize");
         assert!(error.to_string().contains("unknown field"), "{error}");
+    }
+
+    // `generation` and `speculative` exist again, but as typed declarations of
+    // facts, not as runtime knobs. The legacy free-form shapes still fail.
+    for (document, expected) in [
+        ("generation:\n  do_sample: true\n", "unknown field"),
+        (
+            "speculative:\n  num_speculative_tokens: 4\n",
+            "unknown field",
+        ),
+        ("speculative: {}\n", "missing field"),
+    ] {
+        let error = serde_yaml::from_str::<InferenceMetadata>(document)
+            .expect_err("legacy execution knobs must not deserialize");
+        assert!(
+            error.to_string().contains(expected),
+            "expected {expected}: {error}"
+        );
     }
 }
 
@@ -533,13 +539,8 @@ pipeline:
 }
 
 #[test]
-fn row_emit_requires_explicit_int64_identities() {
-    fn validate(
-        row_ids: &str,
-        ids_batch: &str,
-        capabilities: &str,
-        extra: &str,
-    ) -> Result<(), Vec<String>> {
+fn row_wise_emit_requires_a_request_aligned_batch_layout() {
+    fn validate(batch_layout: &str, extra: &str) -> Result<(), Vec<String>> {
         let metadata: InferenceMetadata = serde_yaml::from_str(&format!(
             r#"
 pipeline:
@@ -547,10 +548,14 @@ pipeline:
     manifest:
       ir_version: "1.0"
       onnx_opsets: {{ ai.onnx: 24 }}
-      capabilities: [workflow_ssa, typed_emit, emit_valid_length{capabilities}]
+      capabilities: [workflow_ssa, typed_emit, emit_valid_length]
     inputs:
       value:
-        contract: {{ dtype: int64, rank: 2, shape: [batch, sequence] }}
+        contract:
+          dtype: int64
+          rank: 2
+          shape: [batch, sequence]
+          {batch_layout}
         role: {{ kind: opaque }}
         source: {{ kind: application, name: value }}
         required: true
@@ -559,14 +564,13 @@ pipeline:
         role: {{ kind: opaque }}
         source: {{ kind: application, name: length }}
         required: true
-      ids:
-        contract: {{ dtype: int64, rank: 1, shape: [{ids_batch}] }}
-        role: {{ kind: opaque }}
-        source: {{ kind: application, name: ids }}
-        required: true
     outputs:
       result:
-        contract: {{ dtype: int64, rank: 2, shape: [batch, generated] }}
+        contract:
+          dtype: int64
+          rank: 2
+          shape: [batch, generated]
+          {batch_layout}
         role: tokens
         stage: pre_adapter
     components: {{}}
@@ -574,7 +578,6 @@ pipeline:
       - kind: emit
         value: value
         valid_length: length
-        {row_ids}
         output: result
         mode: append
 {extra}
@@ -584,79 +587,104 @@ pipeline:
         validate_metadata(&metadata)
     }
 
-    let errors = validate("", "batch", "", "").expect_err("implicit row identity must fail");
-    assert!(
-        errors
-            .iter()
-            .any(|error| error.contains("requires explicit row_ids"))
-    );
-    validate("row_ids: ids", "batch", ", emit_row_identity", "")
-        .expect("explicit row identity is valid");
-    let errors = validate("row_ids: ids", "1", ", emit_row_identity", "")
-        .expect_err("row identity batch must match the emitted tensor");
-    assert!(
-        errors
-            .iter()
-            .any(|error| error.contains("batch dimension must match"))
-    );
-    let errors = validate(
-        "row_ids: ids",
-        "batch",
-        ", emit_row_identity",
-        "      - kind: emit\n        value: value\n        output: result\n        mode: append",
-    )
-    .expect_err("one output cannot mix aggregate and row-wise emits");
-    assert!(
-        errors
-            .iter()
-            .any(|error| error.contains("mixes aggregate and row-wise emits"))
-    );
-}
-
-#[test]
-fn serving_compaction_keeps_emit_identity_in_the_carried_slot_permutation() {
-    let fixture = include_str!(
-        "../../../tests/fixtures/onnx_genai_workflows/decoder/inference_metadata.yaml"
-    );
-    let compacted = fixture.to_owned();
-    let mismatched = compacted.replacen("row_ids: slot_ids", "row_ids: active", 1);
-    let metadata: InferenceMetadata =
-        serde_yaml::from_str(&mismatched).expect("modified decoder metadata parses");
-    let errors = validate_metadata(&metadata).expect_err("compacted identity must use slot_ids");
-    assert!(
-        errors
-            .iter()
-            .any(|error| { error.contains("row_ids must reference serving slot_ids 'slot_ids'") })
-    );
-
-    let uncarried = compacted.replacen("      - cell: slot_ids\n        next: slot_ids\n", "", 1);
-    let metadata: InferenceMetadata =
-        serde_yaml::from_str(&uncarried).expect("modified decoder metadata parses");
-    let errors = validate_metadata(&metadata).expect_err("compacted slot IDs must be carried");
-    assert!(
-        errors
-            .iter()
-            .any(|error| { error.contains("carried must preserve serving slot_ids 'slot_ids'") })
-    );
-
-    let corrupted = compacted.replacen(
-        "      - cell: slot_ids\n        next: slot_ids\n",
-        "      - cell: slot_ids\n        next: cache_lengths.next\n",
-        1,
-    );
-    let metadata: InferenceMetadata =
-        serde_yaml::from_str(&corrupted).expect("modified decoder metadata parses");
+    // A row-wise prefix length has no meaning without a request-aligned axis:
+    // the runtime would have no derivable way to attach result rows to requests.
     let errors =
-        validate_metadata(&metadata).expect_err("compacted slot identity cannot change provenance");
+        validate("", "").expect_err("row-wise emit without a request axis must fail closed");
     assert!(
         errors
             .iter()
-            .any(|error| error.contains("next value must be the carried slot_ids value"))
+            .any(|error| error.contains("declares no request_aligned batch_layout")),
+        "{errors:?}"
+    );
+
+    validate("batch_layout: { kind: request_aligned, axis: 0 }", "")
+        .expect("a request-aligned emitted value is valid");
+
+    // Two emits into one output must agree, or the runtime cannot tell whether
+    // the accumulated output is row-scoped.
+    let errors = validate(
+        "batch_layout: { kind: request_aligned, axis: 0 }",
+        "      - kind: emit\n        value: length\n        output: result\n        mode: append",
+    )
+    .expect_err("one output cannot mix batch layouts across emits");
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("mixes batch layouts across emits")
+                || error.contains("incompatible dtype or rank")
+        }),
+        "{errors:?}"
     );
 }
 
 #[test]
-fn nested_control_loops_inherit_the_outer_compaction_permutation() {
+fn removed_row_identity_fields_are_rejected_fail_closed() {
+    // Row identity is never serialized. A package that still ships the retired
+    // fields must fail to parse rather than have them silently ignored.
+    for retired in [
+        "      - kind: emit\n        value: value\n        row_ids: ids\n        output: result\n        mode: append",
+        "      - kind: emit\n        value: value\n        output: result\n        mode: append\n        row_ids: ids",
+    ] {
+        let document = format!(
+            r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: {{ ai.onnx: 24 }}
+      capabilities: [workflow_ssa]
+    inputs:
+      value:
+        contract: {{ dtype: int64, rank: 2, shape: [batch, sequence] }}
+        role: {{ kind: opaque }}
+        source: {{ kind: application, name: value }}
+        required: true
+    outputs:
+      result:
+        contract: {{ dtype: int64, rank: 2, shape: [batch, generated] }}
+        role: tokens
+        stage: pre_adapter
+    components: {{}}
+    steps:
+{retired}
+"#
+        );
+        let parsed = serde_yaml::from_str::<InferenceMetadata>(&document);
+        assert!(
+            parsed.is_err(),
+            "retired emit.row_ids must be rejected, not ignored"
+        );
+    }
+
+    // The retired serving and adapter row-identity fields are likewise closed.
+    for retired in [
+        "    serving:\n      slot_ids: slot_ids\n",
+        "    adapters:\n      selection:\n        slot_ids: slot_ids\n",
+    ] {
+        let document = format!(
+            r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: {{ ai.onnx: 24 }}
+      capabilities: [workflow_ssa]
+    inputs: {{}}
+    outputs: {{}}
+    components: {{}}
+    steps: []
+{retired}
+"#
+        );
+        assert!(
+            serde_yaml::from_str::<InferenceMetadata>(&document).is_err(),
+            "retired row-identity field must be rejected: {retired}"
+        );
+    }
+}
+
+#[test]
+fn nested_control_loops_preserve_the_request_aligned_emit() {
     let metadata: InferenceMetadata = serde_yaml::from_str(
         r#"
 pipeline:
@@ -670,36 +698,50 @@ pipeline:
         - nested_control_flow
         - typed_emit
         - emit_valid_length
-        - emit_row_identity
         - serving_service_contract
     inputs:
       value:
-        contract: { dtype: int64, rank: 2, shape: [batch, sequence] }
+        contract:
+          dtype: int64
+          rank: 2
+          shape: [batch, sequence]
+          batch_layout: { kind: request_aligned, axis: 0 }
         role: { kind: opaque }
         source: { kind: application, name: value }
         required: true
       valid_length:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
+        contract:
+          dtype: int64
+          rank: 1
+          shape: [batch]
+          batch_layout: { kind: request_aligned, axis: 0 }
         role: { kind: opaque }
         source: { kind: application, name: valid_length }
         required: true
       active.initial:
-        contract: { dtype: bool, rank: 1, shape: [batch] }
+        contract:
+          dtype: bool
+          rank: 1
+          shape: [batch]
+          batch_layout: { kind: request_aligned, axis: 0 }
         role: { kind: opaque }
         source: { kind: application, name: active }
         required: true
       done.initial:
-        contract: { dtype: bool, rank: 1, shape: [batch] }
+        contract:
+          dtype: bool
+          rank: 1
+          shape: [batch]
+          batch_layout: { kind: request_aligned, axis: 0 }
         role: { kind: opaque }
         source: { kind: application, name: done }
         required: true
-      slot_ids.initial:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
-        role: { kind: opaque }
-        source: { kind: application, name: slot_ids }
-        required: true
       cache.initial:
-        contract: { dtype: float32, rank: 2, shape: [batch, capacity] }
+        contract:
+          dtype: float32
+          rank: 2
+          shape: [batch, capacity]
+          batch_layout: { kind: request_aligned, axis: 0 }
         role: { kind: opaque }
         source: { kind: application, name: cache }
         required: true
@@ -710,52 +752,68 @@ pipeline:
         required: true
     outputs:
       result:
-        contract: { dtype: int64, rank: 2, shape: [batch, generated] }
+        contract:
+          dtype: int64
+          rank: 2
+          shape: [batch, generated]
+          batch_layout: { kind: request_aligned, axis: 0 }
         role: tokens
         stage: pre_adapter
     components: {}
     state:
       active:
-        contract: { dtype: bool, rank: 1, shape: [batch] }
+        contract:
+          dtype: bool
+          rank: 1
+          shape: [batch]
+          batch_layout: { kind: request_aligned, axis: 0 }
         scope: invocation
         initializer: active.initial
         recurrence: { kind: invariant }
       done:
-        contract: { dtype: bool, rank: 1, shape: [batch] }
+        contract:
+          dtype: bool
+          rank: 1
+          shape: [batch]
+          batch_layout: { kind: request_aligned, axis: 0 }
         scope: invocation
         initializer: done.initial
         recurrence: { kind: invariant }
-      slot_ids:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
-        scope: invocation
-        initializer: slot_ids.initial
-        recurrence: { kind: invariant }
       accepted_len:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
+        contract:
+          dtype: int64
+          rank: 1
+          shape: [batch]
+          batch_layout: { kind: request_aligned, axis: 0 }
         scope: invocation
         initializer: valid_length
         recurrence: { kind: invariant }
       cache:
-        contract: { dtype: float32, rank: 2, shape: [batch, capacity] }
+        contract:
+          dtype: float32
+          rank: 2
+          shape: [batch, capacity]
+          batch_layout: { kind: request_aligned, axis: 0 }
         scope: invocation
         initializer: cache.initial
         recurrence: { kind: invariant }
         service_group: cache
+        management: runtime
+        release_boundary: invocation
     serving:
       active: active
       done: done
       accepted_len: accepted_len
-      slot_ids: slot_ids
-      kv_service:
-        paging: none
-        allocation: runtime
-        compaction: true
+      state_service:
         groups:
           cache:
+            kind: full_attention
             sequence_axis: 1
             layout: batch_sequence
             logical_lengths: accepted_len
-            storage: shared_buffer
+            aliasing: permitted
+            capabilities:
+              rollback_positions: 8
     steps:
       - kind: loop
         continue_when: active
@@ -763,7 +821,6 @@ pipeline:
         carried:
           - { cell: active, next: active }
           - { cell: done, next: done }
-          - { cell: slot_ids, next: slot_ids }
           - { cell: accepted_len, next: accepted_len }
           - { cell: cache, next: cache }
         steps:
@@ -774,16 +831,14 @@ pipeline:
               - kind: emit
                 value: value
                 valid_length: accepted_len
-                row_ids: slot_ids
                 output: result
                 mode: append
 "#,
     )
-    .expect("nested compaction workflow parses");
-    validate_metadata(&metadata)
-        .expect("nested loops may use the invariant slot permutation carried by the outer loop");
+    .expect("nested workflow parses");
+    validate_metadata(&metadata).expect("nested loops may emit request-aligned rows");
     let graph = compile_workflow(&metadata.pipeline.expect("pipeline").workflow)
-        .expect("nested compaction workflow lowers")
+        .expect("nested workflow lowers")
         .graph;
     let WorkflowNode::Sequence { nodes } = graph else {
         panic!("workflow must lower to a sequence");
@@ -797,14 +852,15 @@ pipeline:
     let WorkflowNode::Loop { body, carried, .. } = &nodes[0] else {
         panic!("nested control loop must be preserved");
     };
-    assert!(carried.is_empty(), "nested loop must not redefine slot_ids");
+    assert!(carried.is_empty(), "nested loop must not redefine state");
     let WorkflowNode::Sequence { nodes } = body.as_ref() else {
         panic!("nested loop body must be a sequence");
     };
-    let WorkflowNode::Emit { row_ids, .. } = &nodes[0] else {
+    let WorkflowNode::Emit { value, output, .. } = &nodes[0] else {
         panic!("nested row-wise emit must be preserved");
     };
-    assert_eq!(row_ids.as_deref(), Some("slot_ids"));
+    assert_eq!(value, "value");
+    assert_eq!(output, "result");
 }
 
 #[test]
@@ -845,7 +901,7 @@ pipeline:
 }
 
 #[test]
-fn kv_state_binds_named_runtime_service_group() {
+fn state_service_declares_semantics_not_allocator_policy() {
     let metadata: InferenceMetadata = serde_yaml::from_str(
         r#"
 pipeline:
@@ -856,27 +912,23 @@ pipeline:
       capabilities: [workflow_ssa, serving_service_contract]
     inputs:
       active:
-        contract: { dtype: bool, rank: 1, shape: [batch] }
+        contract: { dtype: bool, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: active }
       done:
-        contract: { dtype: bool, rank: 1, shape: [batch] }
+        contract: { dtype: bool, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: done }
-      slot_ids:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
-        role: { kind: opaque }
-        source: { kind: application, name: slot_ids }
       accepted_len:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
+        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: accepted_len }
       cache_lengths:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
+        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: cache_lengths }
       empty_cache:
-        contract: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim] }
+        contract: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: empty_cache }
     components:
@@ -885,14 +937,16 @@ pipeline:
         ports: {}
     state:
       cache:
-        contract: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim] }
+        contract: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }
         class: semantic
         scope: invocation
         initializer: empty_cache
         recurrence: { kind: invariant }
         service_group: decoder_cache
+        management: runtime
+        release_boundary: invocation
       cache_lengths:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
+        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         class: semantic
         scope: invocation
         initializer: cache_lengths
@@ -901,16 +955,16 @@ pipeline:
       active: active
       done: done
       accepted_len: accepted_len
-      slot_ids: slot_ids
-      kv_service:
-        paging: paged
-        allocation: runtime
+      state_service:
         groups:
           decoder_cache:
+            kind: full_attention
             sequence_axis: 2
             layout: bnsh
             logical_lengths: cache_lengths
-            storage: shared_buffer
+            aliasing: permitted
+            reuse: { prefix_reusable: true, evictable_prefix: true }
+            capabilities: { rollback_positions: 32, snapshot: true, fork: true }
             ports:
               decoder:
                 cache: { input: past_key_values, output: present_key_values }
@@ -919,8 +973,32 @@ pipeline:
         component: decoder
 "#,
     )
-    .expect("KV service metadata parses");
-    validate_metadata(&metadata).expect("KV service group is executable and bound");
+    .expect("state service metadata parses");
+    validate_metadata(&metadata).expect("state group is executable and bound");
+
+    // The retired allocator-policy keys are runtime-owned and must not reappear.
+    for retired in [
+        "        paging: paged\n",
+        "        allocation: runtime\n",
+        "            storage: shared_buffer\n",
+        "            compaction: slot_permutation\n",
+    ] {
+        let document = serde_yaml::to_string(
+            &serde_yaml::from_str::<serde_yaml::Value>(
+                "pipeline:\n  workflow:\n    serving:\n      state_service:\n        groups: {}\n",
+            )
+            .expect("skeleton"),
+        )
+        .expect("skeleton text");
+        let injected = document.replace(
+            "        groups: {}",
+            &format!("{retired}        groups: {{}}"),
+        );
+        assert!(
+            serde_yaml::from_str::<InferenceMetadata>(&injected).is_err(),
+            "retired allocator policy must be rejected: {retired}"
+        );
+    }
 
     let mut missing_lengths = metadata.clone();
     missing_lengths

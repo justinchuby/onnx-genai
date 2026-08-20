@@ -31,43 +31,33 @@ fn options(max_new_tokens: usize) -> GenerateOptions {
 }
 
 fn adapter_request(
-    slot_ids: &[i64],
-    request_epochs: &[i64],
     active: &[bool],
     values: &[f32],
     selection: AdapterSelection,
 ) -> anyhow::Result<PipelineGenerateRequest> {
-    let batch = i64::try_from(slot_ids.len())?;
-    let mut segments = vec![-1i64; slot_ids.len() * 2];
-    let mut adapter_counts = vec![0i64; slot_ids.len()];
-    let mut adapter_scales = vec![0.0f32; slot_ids.len() * 2];
-    for (row, (&slot_id, &request_epoch)) in slot_ids.iter().zip(request_epochs).enumerate() {
-        let identity = onnx_genai_engine::AdapterSlotIdentity {
-            slot_id,
-            request_epoch,
-        };
-        if let Some(activations) = selection.rows.get(&identity) {
-            adapter_counts[row] = i64::try_from(activations.len())?;
-            for (slot, activation) in activations.iter().enumerate() {
-                segments[row * 2 + slot] = match activation.adapter.as_str() {
-                    "blue" => 0,
-                    "green" => 1,
-                    "red" => 3,
-                    other => anyhow::bail!("unknown test adapter {other}"),
-                };
-                adapter_scales[row * 2 + slot] = activation.scale;
-            }
+    // Rows are identified by batch position. The package carries no slot ids or
+    // epochs, so the caller's row order is the only association there is.
+    let rows = selection.rows.len();
+    let batch = i64::try_from(rows)?;
+    let mut segments = vec![-1i64; rows * 2];
+    let mut adapter_counts = vec![0i64; rows];
+    let mut adapter_scales = vec![0.0f32; rows * 2];
+    for (row, activations) in selection.rows.iter().enumerate() {
+        adapter_counts[row] = i64::try_from(activations.len())?;
+        for (slot, activation) in activations.iter().enumerate() {
+            segments[row * 2 + slot] = match activation.adapter.as_str() {
+                "blue" => 0,
+                "green" => 1,
+                "red" => 3,
+                other => anyhow::bail!("unknown test adapter {other}"),
+            };
+            adapter_scales[row * 2 + slot] = activation.scale;
         }
     }
     Ok(PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![]),
         options: Default::default(),
     })
-    .with_input("request.slot_ids", Value::from_slice_i64(slot_ids, &[batch])?)
-    .with_input(
-        "request.request_epochs",
-        Value::from_slice_i64(request_epochs, &[batch])?,
-    )
     .with_input(
         "request.adapter_segments",
         Value::from_slice_i64(&segments, &[batch, 2])?,
@@ -95,88 +85,72 @@ fn adapter_request(
 }
 
 #[test]
-fn mobius_parameter_adapters_preserve_order_rows_compaction_and_epochs() -> anyhow::Result<()> {
+fn mobius_parameter_adapters_preserve_order_rows_and_compaction() -> anyhow::Result<()> {
     let mut engine = Engine::from_pipeline_dir(&root("adapter")?, EngineConfig::default())?;
+    let red = [AdapterActivation::new("red", 1.0)];
+    let blue = [AdapterActivation::new("blue", 1.0)];
+    let green = [AdapterActivation::new("green", 1.0)];
+    let composed = [
+        AdapterActivation::new("red", 0.5),
+        AdapterActivation::new("blue", 1.0),
+    ];
+
+    // Three heterogeneous rows in one batch, associated by position.
     let selection = AdapterSelection::default()
-        .with_slot(10, 0, [AdapterActivation::new("red", 1.0)])
-        .with_slot(
-            20,
-            0,
-            [AdapterActivation::new("blue", 1.0)],
-        )
-        .with_slot(
-            30,
-            0,
-            [
-                AdapterActivation::new("red", 0.5),
-                AdapterActivation::new("blue", 1.0),
-            ],
-        );
+        .with_row(red.clone())
+        .with_row(blue.clone())
+        .with_row(composed.clone());
     let output = engine.run_pipeline(adapter_request(
-        &[10, 20, 30],
-        &[0, 0, 0],
         &[true, false, true],
         &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-        selection.clone(),
+        selection,
     )?)?;
     assert_eq!(
         output["result"].to_vec_f32()?,
         vec![2.0, 4.0, 3.0, 4.0, 25.5, 35.0]
     );
+
+    // Compaction: the caller drops a row and reorders the survivors. The
+    // selection is compacted with the batch, so each row keeps its adapters.
     let compacted = engine.run_pipeline(adapter_request(
-        &[30, 10],
-        &[0, 0],
         &[true, true],
         &[5.0, 6.0, 1.0, 2.0],
-        selection,
+        AdapterSelection::default()
+            .with_row(composed)
+            .with_row(red.clone()),
     )?)?;
     assert_eq!(
         compacted["result"].to_vec_f32()?,
         vec![25.5, 35.0, 2.0, 4.0]
     );
-    let reused =
-        AdapterSelection::default().with_slot(10, 1, [AdapterActivation::new("blue", 1.0)]);
+
+    // Reusing batch position 0 for a different selection applies the new
+    // selection: there is no identity for a stale one to attach to.
     let stale = engine.run_pipeline(adapter_request(
-        &[10],
-        &[1],
         &[true],
         &[1.0, 2.0],
-        AdapterSelection::default().with_slot(
-            10,
-            0,
-            [AdapterActivation::new("red", 1.0)],
-        ),
+        AdapterSelection::default().with_row([]),
     )?)?;
     assert_eq!(stale["result"].to_vec_f32()?, vec![1.0, 2.0]);
     for _ in 0..2 {
         let output = engine.run_pipeline(adapter_request(
-            &[10],
-            &[1],
             &[true],
             &[1.0, 2.0],
-            reused.clone(),
+            AdapterSelection::default().with_row(blue.clone()),
         )?)?;
         assert_eq!(output["result"].to_vec_f32()?, vec![7.0, 10.0]);
     }
-    let green =
-        AdapterSelection::default().with_slot(40, 0, [AdapterActivation::new("green", 1.0)]);
     let output = engine.run_pipeline(adapter_request(
-        &[40],
-        &[0],
         &[true],
         &[1.0, 2.0],
-        green,
+        AdapterSelection::default().with_row(green),
     )?)?;
     assert_eq!(output["result"].to_vec_f32()?, vec![4.0, 5.0]);
-    let red =
-        AdapterSelection::default().with_slot(50, 0, [AdapterActivation::new("red", 1.0)]);
     for _ in 0..2 {
         let output = engine.run_pipeline(adapter_request(
-            &[50],
-            &[0],
             &[true],
             &[1.0, 2.0],
-            red.clone(),
+            AdapterSelection::default().with_row(red.clone()),
         )?)?;
         assert_eq!(output["result"].to_vec_f32()?, vec![2.0, 4.0]);
     }
@@ -229,34 +203,15 @@ fn decoder_batch_request(
     active: &[bool],
     max_new_tokens: usize,
 ) -> anyhow::Result<PipelineGenerateRequest> {
-    let slot_ids = (0..batch).collect::<Vec<_>>();
-    decoder_batch_request_with_slots(
-        input_ids,
-        batch,
-        sequence,
-        prompt_lengths,
-        active,
-        &slot_ids,
-        max_new_tokens,
-    )
-}
-
-fn decoder_batch_request_with_slots(
-    input_ids: &[i64],
-    batch: i64,
-    sequence: i64,
-    prompt_lengths: &[i64],
-    active: &[bool],
-    slot_ids: &[i64],
-    max_new_tokens: usize,
-) -> anyhow::Result<PipelineGenerateRequest> {
     let bool_bytes = active.iter().map(|value| u8::from(*value)).collect();
     let zeros = vec![0_i64; usize::try_from(batch)?];
     let ones = vec![1_i64; usize::try_from(batch)?];
     let negative_ones = vec![-1_i64; usize::try_from(batch)?];
     let floats_zero = vec![0.0_f32; usize::try_from(batch)?];
     let floats_one = vec![1.0_f32; usize::try_from(batch)?];
-    assert_eq!(slot_ids.len(), usize::try_from(batch)?);
+    // Rows are the batch positions the caller submits; the package carries no
+    // slot identity to seed anything from, so the row index seeds the RNG.
+    let row_indices = (0..batch).collect::<Vec<_>>();
     Ok(PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![0]),
         options: options(max_new_tokens),
@@ -278,10 +233,6 @@ fn decoder_batch_request_with_slots(
         Value::from_raw_bytes(vec![0; usize::try_from(batch)?], &[batch], DataType::Bool)?,
     )
     .with_input("package.one_token", Value::from_slice_i64(&ones, &[batch])?)
-    .with_input(
-        "package.slot_ids",
-        Value::from_slice_i64(slot_ids, &[batch])?,
-    )
     .with_input(
         "request.eos_ids",
         Value::from_slice_i64(&vec![2_i64; usize::try_from(batch)?], &[batch, 1])?,
@@ -307,7 +258,10 @@ fn decoder_batch_request_with_slots(
         "request.min_p",
         Value::from_slice_f32(&floats_zero, &[batch])?,
     )
-    .with_input("request.seed", Value::from_slice_i64(slot_ids, &[batch])?)
+    .with_input(
+        "request.seed",
+        Value::from_slice_i64(&row_indices, &[batch])?,
+    )
     .with_input(
         "request.rng_counter",
         Value::from_slice_i64(&zeros, &[batch])?,
@@ -325,13 +279,10 @@ fn decoder_batch_request_with_slots(
 #[test]
 fn mobius_decoder_workflow_executes() -> anyhow::Result<()> {
     let mut engine = Engine::from_pipeline_dir(&root("decoder")?, EngineConfig::default())?;
-    let output = engine.run_pipeline_outputs(
-        PipelineGenerateRequest::new(GenerateRequest {
-            prompt: GeneratePrompt::TokenIds(vec![4, 5]),
-            options: options(3),
-        })
-        .with_input("package.slot_ids", Value::from_slice_i64(&[0], &[1])?),
-    )?;
+    let output = engine.run_pipeline_outputs(PipelineGenerateRequest::new(GenerateRequest {
+        prompt: GeneratePrompt::TokenIds(vec![4, 5]),
+        options: options(3),
+    }))?;
     assert_eq!(
         engine
             .structured_output_for_role(&output, WorkflowOutputRole::Tokens)
@@ -403,28 +354,22 @@ fn mobius_decoder_rows_match_independent_runs_and_dynamic_batch_replay() -> anyh
         .iter()
         .map(|island| island.stable_binding_runs)
         .sum::<u64>();
-    let compacted = decoder_batch_request_with_slots(
-        &[6, 0, 4, 5],
-        2,
-        2,
-        &[1, 2],
-        &[true, true],
-        &[1, 0],
-        3,
-    )?;
+    // A compacted batch submits the surviving rows in a new order. Because rows
+    // are positional, the result rows come back in the submitted order: the
+    // caller, which owns the permutation, maps them back to its requests.
+    let compacted = decoder_batch_request(&[6, 0, 4, 5], 2, 2, &[1, 2], &[true, true], 3)?;
     let compacted_output = engine.run_pipeline_outputs(compacted)?;
-    let compacted_rows =
-        engine.output_rows_for_role(&compacted_output, WorkflowOutputRole::Tokens);
-    let compacted_row = |semantic_id| {
+    let compacted_rows = engine.output_rows_for_role(&compacted_output, WorkflowOutputRole::Tokens);
+    let compacted_row = |position: usize| {
         compacted_rows
             .iter()
-            .find(|(row_id, _)| *row_id == semantic_id)
-            .expect("compacted semantic row must be present")
+            .find(|(row, _)| *row == position)
+            .expect("compacted row must be present")
             .1
             .to_vec_i64()
     };
-    assert_eq!(compacted_row(0)?, first_tokens);
-    assert_eq!(compacted_row(1)?, second_tokens);
+    assert_eq!(compacted_row(0)?, second_tokens);
+    assert_eq!(compacted_row(1)?, first_tokens);
     let stable_after = engine
         .execution_island_diagnostics()
         .iter()
@@ -485,8 +430,7 @@ fn mobius_vlm_workflow_executes_complete_image_path() -> anyhow::Result<()> {
     .with_input(
         "request.image",
         Value::from_raw_bytes(png, &[png_len], DataType::Uint8)?,
-    )
-    .with_input("package.slot_ids", Value::from_slice_i64(&[0], &[1])?);
+    );
     let output = engine.run_pipeline_outputs(request)?;
     assert_eq!(
         engine
@@ -549,59 +493,48 @@ fn mobius_codec_workflow_executes() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn tts_request(
-    prompt_tokens: &[i64],
-    batch: i64,
-    slot_ids: &[i64],
-) -> anyhow::Result<PipelineGenerateRequest> {
+fn tts_request(prompt_tokens: &[i64], batch: i64) -> anyhow::Result<PipelineGenerateRequest> {
     let rows = usize::try_from(batch)?;
     assert_eq!(prompt_tokens.len(), rows * 2);
-    assert_eq!(slot_ids.len(), rows);
-    Ok(
-        PipelineGenerateRequest::new(GenerateRequest {
-            prompt: GeneratePrompt::TokenIds(vec![0]),
-            options: options(1),
-        })
-        .with_input(
-            "request.prompt_tokens",
-            Value::from_slice_i64(prompt_tokens, &[batch, 2])?,
-        )
-        .with_input(
-            "package.false",
-            Value::from_raw_bytes(vec![0; rows], &[batch], DataType::Bool)?,
-        )
-        .with_input(
-            "package.zero_batch",
-            Value::from_slice_i64(&vec![0; rows], &[batch])?,
-        )
-        .with_input(
-            "package.one_batch",
-            Value::from_slice_i64(&vec![1; rows], &[batch])?,
-        )
-        .with_input(
-            "package.true",
-            Value::from_raw_bytes(vec![1; rows], &[batch], DataType::Bool)?,
-        )
-        .with_input(
-            "package.slot_ids",
-            Value::from_slice_i64(slot_ids, &[batch])?,
-        ),
+    Ok(PipelineGenerateRequest::new(GenerateRequest {
+        prompt: GeneratePrompt::TokenIds(vec![0]),
+        options: options(1),
+    })
+    .with_input(
+        "request.prompt_tokens",
+        Value::from_slice_i64(prompt_tokens, &[batch, 2])?,
     )
+    .with_input(
+        "package.false",
+        Value::from_raw_bytes(vec![0; rows], &[batch], DataType::Bool)?,
+    )
+    .with_input(
+        "package.zero_batch",
+        Value::from_slice_i64(&vec![0; rows], &[batch])?,
+    )
+    .with_input(
+        "package.one_batch",
+        Value::from_slice_i64(&vec![1; rows], &[batch])?,
+    )
+    .with_input(
+        "package.true",
+        Value::from_raw_bytes(vec![1; rows], &[batch], DataType::Bool)?,
+    ))
 }
 
 #[test]
 fn mobius_tts_workflow_executes_real_producer_graphs() -> anyhow::Result<()> {
     let mut engine = Engine::from_pipeline_dir(&root("tts")?, EngineConfig::default())?;
-    let output = engine.run_pipeline_outputs(tts_request(&[1, 2], 1, &[0])?)?;
+    let output = engine.run_pipeline_outputs(tts_request(&[1, 2], 1)?)?;
     assert_eq!(output["waveform"].shape()[..2], [1, 1]);
     let first = output["waveform"].to_vec_f32()?;
     assert!(!first.is_empty());
 
     let mut independent = Engine::from_pipeline_dir(&root("tts")?, EngineConfig::default())?;
-    let second_output = independent.run_pipeline_outputs(tts_request(&[3, 4], 1, &[1])?)?;
+    let second_output = independent.run_pipeline_outputs(tts_request(&[3, 4], 1)?)?;
     let second = second_output["waveform"].to_vec_f32()?;
 
-    let batched = engine.run_pipeline_outputs(tts_request(&[1, 2, 3, 4], 2, &[0, 1])?)?;
+    let batched = engine.run_pipeline_outputs(tts_request(&[1, 2, 3, 4], 2)?)?;
     let frames = first.len();
     assert_eq!(batched["waveform"].shape(), [2, 1, i64::try_from(frames)?]);
     let batched_waveform = batched["waveform"].to_vec_f32()?;
@@ -613,7 +546,7 @@ fn mobius_tts_workflow_executes_real_producer_graphs() -> anyhow::Result<()> {
         .iter()
         .map(|island| island.stable_binding_runs)
         .sum::<u64>();
-    let compacted = engine.run_pipeline_outputs(tts_request(&[3, 4, 1, 2], 2, &[1, 0])?)?;
+    let compacted = engine.run_pipeline_outputs(tts_request(&[3, 4, 1, 2], 2)?)?;
     let compacted_waveform = compacted["waveform"].to_vec_f32()?;
     assert_eq!(&compacted_waveform[..frames], second);
     assert_eq!(&compacted_waveform[frames..], first);
@@ -627,7 +560,7 @@ fn mobius_tts_workflow_executes_real_producer_graphs() -> anyhow::Result<()> {
         "same-shape nested TTS compaction must preserve stable bindings"
     );
 
-    let reused = engine.run_pipeline_outputs(tts_request(&[3, 4], 1, &[0])?)?;
+    let reused = engine.run_pipeline_outputs(tts_request(&[3, 4], 1)?)?;
     assert_eq!(reused["waveform"].to_vec_f32()?, second);
     Ok(())
 }
@@ -639,7 +572,6 @@ fn mobius_speculative_workflow_executes_rejection_and_correction() -> anyhow::Re
         prompt: GeneratePrompt::TokenIds(vec![1, 2, 3, 4]),
         options: options(1),
     })
-    .with_input("serving.slot_ids", Value::from_slice_i64(&[0], &[1])?)
     .with_input(
         "verifier.past_key_values.0.key",
         Value::from_slice_f32(&[], &[1, 2, 0, 8])?,

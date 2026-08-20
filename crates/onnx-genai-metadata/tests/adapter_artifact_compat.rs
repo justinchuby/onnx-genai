@@ -51,8 +51,6 @@ adapters:
         graph_inputs: {{ a: lora.projection.a, b: lora.projection.b }}
   discovery_fallback: tooling_only
   selection:
-    slot_ids: request.slot_ids
-    request_epochs: request.epochs
     segments: request.lora_segments
     adapter_counts: request.lora_counts
     scales: request.lora_scales
@@ -99,24 +97,19 @@ pipeline:
       onnx_opsets: {{ ai.onnx: 24 }}
       capabilities: [workflow_ssa, parameter_adapters]
     inputs:
-      request.slot_ids:
-        contract: {{ dtype: int64, rank: 1, shape: [batch] }}
-        role: {{ kind: runtime, version: "1.0", role: row_ids }}
-        source: {{ kind: request }}
-      request.epochs:
-        contract: {{ dtype: int64, rank: 1, shape: [batch] }}
-        role: {{ kind: runtime, version: "1.0", role: request_epochs }}
-        source: {{ kind: request }}
       request.lora_segments:
-        contract: {{ dtype: int64, rank: 2, shape: [batch, 2] }}
+        contract: {{ dtype: int64, rank: 2, shape: [batch, 2],
+                     batch_layout: {{ kind: request_aligned, axis: 0 }} }}
         role: {{ kind: runtime, version: "1.0", role: adapter_segments }}
         source: {{ kind: request }}
       request.lora_counts:
-        contract: {{ dtype: int64, rank: 1, shape: [batch] }}
+        contract: {{ dtype: int64, rank: 1, shape: [batch],
+                     batch_layout: {{ kind: request_aligned, axis: 0 }} }}
         role: {{ kind: runtime, version: "1.0", role: adapter_counts }}
         source: {{ kind: request }}
       request.lora_scales:
-        contract: {{ dtype: float32, rank: 2, shape: [batch, 2] }}
+        contract: {{ dtype: float32, rank: 2, shape: [batch, 2],
+                     batch_layout: {{ kind: request_aligned, axis: 0 }} }}
         role: {{ kind: runtime, version: "1.0", role: adapter_scales }}
         source: {{ kind: request }}
     components:

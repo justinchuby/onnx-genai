@@ -29,6 +29,7 @@
 
 mod compatibility;
 mod graph_io;
+mod import;
 mod json_builders;
 mod loading;
 mod wire_types;
@@ -37,6 +38,10 @@ pub(crate) use compatibility::incomplete;
 pub use compatibility::{DerivedDecoderIo, DerivedStatePair};
 pub(crate) use graph_io::*;
 pub use graph_io::{GraphTensorInfo, ModelGraphInfo};
+pub use import::{
+    CONSUMED_KEYS, ImportOptions, ImportReport, KNOWN_DROPPED_KEYS, drop_reason, import,
+    import_from_dir, import_from_path, unrepresentable_keys,
+};
 pub(crate) use json_builders::*;
 pub use loading::*;
 pub use wire_types::*;
@@ -62,6 +67,23 @@ pub enum GenAiConfigError {
     /// The file was not valid JSON or did not match the expected shape.
     #[error("failed to parse genai_config.json: {0}")]
     Parse(#[from] serde_json::Error),
+    /// The legacy config carries facts the new metadata contract does not.
+    ///
+    /// Import is one-way and fail-closed: dropping a key silently would let a
+    /// package claim semantics its metadata no longer states. Pass
+    /// `--allow-lossy` (`ImportOptions::allow_lossy`) to accept the loss and
+    /// receive the dropped keys in the import report.
+    #[error(
+        "genai_config.json carries facts the inference-metadata contract does not represent: \
+         {keys}. Why: import is one-way and fail-closed, so a dropped key never silently \
+         changes what a package means. How to fix: re-export the package with a native \
+         inference_metadata.yaml that declares these facts, or re-run the import with \
+         --allow-lossy to accept and record the loss"
+    )]
+    LossyImport {
+        /// Dropped key paths, each with its reason when one is recorded.
+        keys: String,
+    },
     /// A compatibility package omitted semantics needed by the typed pipeline.
     #[error(
         "cannot synthesize compatibility pipeline metadata: missing required semantics: {missing}. \

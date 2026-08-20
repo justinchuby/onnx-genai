@@ -8,3 +8,48 @@ packages contain executable synthetic models. The adapter package includes
 portable JSON and PEFT/safetensors artifacts. The TTS fixture uses the real
 tiny Qwen3-TTS producer graphs with deterministic synthetic weights. No
 downloaded model weights are included.
+
+## Metadata redesign migration
+
+The `inference_metadata.yaml` documents were regenerated in-tree against the
+redesigned contract described in `docs/genai/INFERENCE_METADATA_DECISIONS.md`.
+The producer script in the Mobius repository still emits the previous shape and
+must be updated before the next regeneration; until then these documents are the
+normative conformance expectation.
+
+What changed in every document:
+
+- Serialized row identity is gone: `serving.slot_ids`, the `slot_ids` state cell
+  and its carry, `emit.row_ids`, `adapters.selection.slot_ids`, and
+  `adapters.selection.request_epochs` were removed, along with the retired
+  `emit_row_identity` manifest capability.
+- Every request-scoped tensor contract declares
+  `batch_layout: { kind: request_aligned, axis: 0 }`, which is what makes
+  compaction derivable without those identities.
+- `serving.kv_service` became `serving.state_service`. Runtime storage policy
+  (`paging`, `allocation`, `compaction`, `storage`) was dropped; the semantic
+  `kind`, graph-visible `aliasing` legality, `reuse`, and rollback/snapshot/fork
+  `capabilities` took its place.
+- Row-scoped native components declare `row_scope`, and their contracts declare
+  an `equivalence` class.
+- Declared effect domains appear in `pipeline.workflow.effects` with a retry
+  class and a separate speculation-safety bound.
+- `package` records exact tokenizer and constraint-language facts; `generation`
+  records the structurally overridable fields; the speculative fixture records
+  its `speculative` proposer/target facts.
+- Every state cell bound to a state service group declares `management: runtime`
+  and a `release_boundary`, because runtime-owned state has no SSA liveness to
+  free it.
+
+SHA-256 of the migrated documents:
+
+| fixture | sha256 |
+| --- | --- |
+| adapter | `a9c692cebe9b4a8eb515027eb8e8fb75b5d0bfe88f450b9d950bf6ee496fca02` |
+| codec | `469a036d8f47135e2940a603dcaaca7102e919cf459e27ed24df97c9d664590c` |
+| decoder | `e100c0eff83c029a6e8081062080afac564ef3dbdf7bbf67264f34fc478c22d2` |
+| diffusion | `28dc52fea94216441a192f94446f42763b76ef80902b9c75296610ee0a16f440` |
+| masked | `741f3443b9154a2fccbf3006c94f73975bc098c5076f875167b468ccb7e1824c` |
+| speculative | `8246d5333656d1e24a137f7005be2afbc28a7f93661103a7b1a21c5050cbc1c7` |
+| tts | `7b044ab3af8ddc41a0ad32d828aed3efa877f04fbbcd19a8e4a97c3cb882ecff` |
+| vlm | `575049d14a09a764cbeadf89d579f78bee98e43f036deff0ca685a9666bf1393` |

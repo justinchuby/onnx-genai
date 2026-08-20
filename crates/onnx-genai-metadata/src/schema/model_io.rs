@@ -35,6 +35,14 @@ pub struct ModelCapabilities {
     /// node names, initializer shapes, or architecture strings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mixture_of_experts: Option<MixtureOfExpertsSpec>,
+
+    /// Legal tensor, pipeline, and expert sharding facts.
+    ///
+    /// The caller and runtime choose degree, device mapping, and collective
+    /// backend. Portable metadata never standardizes a cross-runtime KV or
+    /// cache wire format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sharding: Option<ShardingContract>,
 }
 
 /// Explicit binding of the graph ports the decode step reads and writes.
@@ -649,74 +657,6 @@ pub struct ChunkedPrefillConfig {
     /// Preferred number of prompt tokens processed in each prefill chunk.
     #[schemars(range(min = 1))]
     pub chunk_size: Option<usize>,
-}
-
-/// KV-cache storage, precision tolerance, and operational guarantees.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct KvCacheSpec {
-    /// Native KV scalar dtype produced by the model before optional compression.
-    #[schemars(with = "Option<schema_vocabulary::DType>")]
-    pub native_dtype: Option<String>,
-
-    /// Independent precision tolerance for key and value tensors.
-    pub quantization_tolerance: Option<KvQuantTolerance>,
-
-    /// Layer indices that should retain high precision; negative indices count from the end.
-    pub sensitive_layers: Option<Vec<i32>>,
-
-    /// Cache mutation and persistence operations known to be safe for this model.
-    pub operations: Option<KvCacheOperations>,
-}
-
-/// Precision tolerance for key and value cache components.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct KvQuantTolerance {
-    /// Key-cache precision tolerance.
-    pub key: Option<KvComponentTolerance>,
-
-    /// Value-cache precision tolerance.
-    pub value: Option<KvComponentTolerance>,
-}
-
-/// Quantization tolerance for one KV-cache component.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct KvComponentTolerance {
-    /// Default minimum acceptable scalar dtype for this component.
-    #[schemars(with = "Option<schema_vocabulary::DType>")]
-    pub default: Option<String>,
-
-    /// Layer-specific minimum-precision overrides.
-    pub per_layer: Option<Vec<LayerPrecisionOverride>>,
-
-    /// Quantization scaling axis, such as `per_tensor`, `per_channel`, or `per_token`.
-    #[schemars(with = "Option<schema_vocabulary::QuantizationAxis>")]
-    pub quantization_axis: Option<String>,
-}
-
-/// Minimum precision required by a set of model layers.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct LayerPrecisionOverride {
-    /// Non-empty layer-index list; negative indices count from the final layer.
-    #[schemars(length(min = 1))]
-    pub layers: Vec<i32>,
-
-    /// Minimum acceptable scalar dtype for the listed layers.
-    #[schemars(with = "schema_vocabulary::DType")]
-    pub min_precision: String,
-}
-
-/// Operational guarantees for mutable KV-cache state.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct KvCacheOperations {
-    /// Whether truncating cache state to an earlier token position is correctness-preserving.
-    pub rewind_safe: Option<bool>,
-
-    /// Precision policy for a copy-on-write fork, such as `inherit` or `highest`.
-    #[schemars(with = "Option<schema_vocabulary::ForkPrecisionPolicy>")]
-    pub fork_precision_policy: Option<String>,
-
-    /// Whether checkpoints can be serialized for suspend/resume or migration.
-    pub checkpoint_serializable: Option<bool>,
 }
 
 /// Runtime-independent model-weight quantization intent.

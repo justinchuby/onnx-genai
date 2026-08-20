@@ -26,22 +26,29 @@ use std::sync::Arc;
 mod adapters;
 mod arg_reduce;
 mod islands;
+mod row_state;
 mod workflow;
 
-pub use adapters::{
-    AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection, AdapterSlotIdentity,
-};
+pub use adapters::{AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection};
 pub use arg_reduce::{ArgReduceRewrites, WideArgReduceLowering, lower_degenerate_arg_reductions};
 pub use islands::ExecutionIslandDiagnostic;
 pub use onnx_genai_metadata::WorkflowOutputRole;
-pub use workflow::{WorkflowExecutionPlan, WorkflowPerformanceDiagnostic};
+pub use row_state::{RowScopedState, RowTable, check_selection, gather_rows};
+pub use workflow::{
+    MISSING_REQUIRED_INPUT, WorkflowExecutionPlan, WorkflowPerformanceDiagnostic,
+    is_missing_required_input,
+};
 
 pub type PipelineTensors = HashMap<String, Value>;
 
-/// Structured workflow outputs with explicit semantic row identities.
+/// Structured workflow outputs with request-aligned rows.
+///
+/// Rows are positional: row `i` of a request-aligned output belongs to batch
+/// row `i`. The runtime associates a batch row with a request through its own
+/// private request table, so no scheduler identity is serialized here.
 pub struct PipelineOutputs {
     tensors: PipelineTensors,
-    rows: BTreeMap<String, BTreeMap<i64, String>>,
+    rows: BTreeMap<String, Vec<String>>,
 }
 
 impl PipelineOutputs {
@@ -57,12 +64,14 @@ impl PipelineOutputs {
         self.tensors.get(output)
     }
 
-    pub fn rows(&self, output: &str) -> Vec<(i64, &Value)> {
+    /// Request-aligned rows of one output, in batch-row order.
+    pub fn rows(&self, output: &str) -> Vec<(usize, &Value)> {
         self.rows
             .get(output)
             .into_iter()
-            .flat_map(|rows| rows.iter())
-            .filter_map(|(identity, name)| self.tensors.get(name).map(|value| (*identity, value)))
+            .flatten()
+            .enumerate()
+            .filter_map(|(row, name)| self.tensors.get(name).map(|value| (row, value)))
             .collect()
     }
 }
@@ -138,6 +147,9 @@ pub struct PipelineEngine {
     decode_backend: EngineDecodeBackend,
     workflow: WorkflowSpec,
     compiled_workflow: CompiledWorkflow,
+    /// Outputs this workflow fills one request row at a time, derived once from
+    /// the compiled graph so every emit into one output agrees.
+    row_wise_outputs: HashSet<String>,
     movable_emit_values: HashSet<String>,
     execution_islands: Vec<islands::ExecutionIsland>,
     device_bridge_components: HashSet<String>,
@@ -330,6 +342,7 @@ impl PipelineEngine {
         let workflow = directory.spec.workflow;
         let mut compiled_workflow = onnx_genai_metadata::compile_workflow(&workflow)
             .map_err(|error| anyhow::anyhow!("Failed to lower workflow metadata: {error}"))?;
+        let row_wise_outputs = workflow::workflow_row_wise_outputs(&compiled_workflow.graph);
         let movable_emit_values =
             workflow::compile_movable_emit_values(&compiled_workflow.graph, &workflow);
         let aliasable_output_values =
@@ -356,6 +369,7 @@ impl PipelineEngine {
             decode_backend,
             workflow,
             compiled_workflow,
+            row_wise_outputs,
             movable_emit_values,
             execution_islands,
             device_bridge_components,
@@ -453,12 +467,16 @@ impl PipelineEngine {
         })
     }
 
-    /// Return explicit row-wise outputs for a semantic role, ordered by row index.
+    /// Return request-aligned rows for a semantic role, in batch-row order.
+    ///
+    /// Row indices are positional. The caller maps a row onto its request
+    /// through the runtime's own request table, not through any identity the
+    /// package serialized.
     pub fn output_rows_for_role<'a>(
         &self,
         outputs: &'a PipelineOutputs,
         role: WorkflowOutputRole,
-    ) -> Vec<(i64, &'a Value)> {
+    ) -> Vec<(usize, &'a Value)> {
         let Some(name) = self
             .workflow
             .outputs
