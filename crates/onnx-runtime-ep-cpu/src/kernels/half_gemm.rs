@@ -690,10 +690,14 @@ const TRANSPOSED_PACK_GROUP: usize = 4;
 /// `TRANSPOSED_PACK_GROUP` at a time so the transposing stores are contiguous
 /// too.
 ///
-/// On x86 this moves transposed `B` from scalar `half::f16::to_f32` onto F16C,
-/// the same converter the row-major path already used. `f16 -> f32` is exact
-/// for every finite value, subnormal and infinity, so the only inputs on which
-/// the two converters can disagree are NaNs, and only in the payload bits.
+/// This also switches transposed `B` from the scalar `to_f32` onto the same
+/// widening the row-major path already used, so the two paths now agree
+/// bit-for-bit. Both widenings are exact for every finite value, subnormal and
+/// infinity, so only NaN encodings can differ, and only for `bf16`: sweeping
+/// all 65536 patterns, `f16` scalar and F16C agree everywhere, while scalar
+/// `bf16::to_f32` quiets the 126 signalling NaNs (`0x7f81 -> 0x7fc1_0000`)
+/// where the `<< 16` widening preserves the signalling bit. The result is NaN
+/// either way; the change makes transposed `B` match row-major `B`.
 #[allow(clippy::too_many_arguments)]
 fn pack_b_transposed<T: HalfElement>(
     source: &[u16],

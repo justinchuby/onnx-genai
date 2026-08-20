@@ -132,13 +132,16 @@ execution path including `Scalar`. End-to-end `parity=PASS` against ORT on the p
 path cannot quietly become the only column-strided route.
 
 One behaviour genuinely does change, and it is worth stating rather than leaving to be discovered:
-on x86, transposed `B` now converts through F16C `_mm256_cvtph_ps` instead of scalar
-`half::f16::to_f32`. `f16 -> f32` is exact for every finite value, subnormal and infinity — `f32`
-strictly contains `f16` — so the two can differ only in the *payload bits of a NaN*. That cannot
-affect a GEMM result beyond NaN-ness, and it makes the transposed path agree with the row-major
-path, which has always used F16C. The bit-identity test's `sin`/`cos` data never generates NaN, so
-the test does not cover this; the claim it makes is the fill-order one, which is the claim that
-matters for the change.
+transposed `B` now converts through the same SIMD widening as the row-major path instead of the
+scalar `to_f32`. Both are exact for every finite value, subnormal and infinity, so they can differ
+only on NaN encodings — and sweeping all 65536 patterns on this host, `f16` scalar and F16C
+`_mm256_cvtph_ps` agree on **every** pattern including all NaNs, so the f16 path is bit-identical
+outright. The one real divergence is `bf16`, on **126** signalling NaNs: scalar `bf16::to_f32`
+quiets them (`0x7f81 -> 0x7fc1_0000`) where the `<< 16` widening preserves the signalling bit. The
+result is NaN either way, no numeric contract is affected, and the change makes transposed `B`
+agree with the row-major path, which has always used the shift. The bit-identity test's `sin`/`cos`
+data never generates NaN, so the test does not cover this; the claim it makes is the fill-order
+one, which is the claim that matters for the change.
 
 ## Results
 
