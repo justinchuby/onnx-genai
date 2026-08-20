@@ -1830,10 +1830,12 @@ mod tests {
     /// before touching it. Replace that with a write to the borrowed slice and
     /// this test fails.
     ///
-    /// The borrow counter is asserted too, because the property is only under
-    /// test when the call really did borrow: if `dense_bytes` ever stopped
+    /// Non-vacuity is asserted too, because the property is only under test
+    /// when the call really did borrow `A`: if `dense_bytes` ever stopped
     /// borrowing, the input would trivially survive and the test would pass
-    /// while proving nothing.
+    /// while proving nothing. That is asserted on `A` itself rather than on a
+    /// count of borrows across all operands, because how many *other* operands
+    /// a route borrows is a routing detail this test does not fix.
     #[cfg(feature = "mlas")]
     #[test]
     fn the_sign_flip_route_never_writes_through_to_the_callers_input() {
@@ -1850,6 +1852,10 @@ mod tests {
         let b_zero = Owned::u8(&[], &[130]);
         let y_scale = Owned::f32(&[], &[0.125]);
         let y_zero = i8(&[], &[-2]);
+        assert!(
+            matches!(dense_bytes(&a.view()).unwrap(), Cow::Borrowed(_)),
+            "A is no longer borrowed, so this test proves nothing"
+        );
         let borrows_before = BORROWED_INPUT_CALLS.with(|calls| calls.get());
         let _ = execute(
             [
@@ -1858,10 +1864,9 @@ mod tests {
             DataType::Int8,
             &[8, 8],
         );
-        assert_eq!(
-            BORROWED_INPUT_CALLS.with(|calls| calls.get()),
-            borrows_before + 1,
-            "the flip route no longer borrows A, so this test proves nothing"
+        assert!(
+            BORROWED_INPUT_CALLS.with(|calls| calls.get()) > borrows_before,
+            "the flip route borrowed nothing, so this test proves nothing"
         );
         assert_eq!(
             a.bytes, untouched,
