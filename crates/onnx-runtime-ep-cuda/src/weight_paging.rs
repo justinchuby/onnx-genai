@@ -4638,6 +4638,97 @@ impl ResidencyInner {
 mod tests {
     use super::*;
 
+    /// `reset_global_offload_stats` clears the window counters and leaves every
+    /// live gauge alone -- including the process-lifetime peak, which it must
+    /// not write at all.
+    ///
+    /// This contract had been asserted only inside a GPU-gated residency test,
+    /// where it was collateral damage when that test's exact before/after
+    /// deltas were relaxed for being racy against other residency tests sharing
+    /// these process-global atomics. The relaxation was right; losing the reset
+    /// semantics with it was not, because they are orthogonal to residency and
+    /// need no device. Asserted here instead, so the contract is covered on
+    /// every machine rather than only on one with a GPU.
+    ///
+    /// Written against sentinels rather than exact equality so it stays true
+    /// while other tests in this binary move the same atomics. Each assertion
+    /// is still falsified by the defect it guards: a counter the reset failed
+    /// to clear cannot drop below a sentinel no other writer approaches, and a
+    /// reset that wrote *anything* to the peak -- zero, or a sampled live value
+    /// -- cannot leave it at or above a planted high-water that exceeds current
+    /// residency.
+    #[test]
+    fn reset_clears_window_counters_and_preserves_live_gauges() {
+        // Far above anything the rest of this binary accumulates, so a
+        // concurrent increment can never be mistaken for a failure to reset.
+        const SENTINEL: u64 = 1 << 40;
+
+        GLOBAL_PAGE_INS.fetch_add(SENTINEL, Ordering::Relaxed);
+        GLOBAL_HITS.fetch_add(SENTINEL, Ordering::Relaxed);
+        GLOBAL_EVICTIONS.fetch_add(SENTINEL, Ordering::Relaxed);
+
+        GLOBAL_BUDGET_BYTES.fetch_add(SENTINEL, Ordering::Relaxed);
+        GLOBAL_CONTENT_RESIDENT_BYTES.fetch_add(SENTINEL, Ordering::Relaxed);
+        GLOBAL_WEIGHT_MAPPED_BYTES.fetch_add(SENTINEL, Ordering::Relaxed);
+
+        // Model an earlier lifetime high-water strictly above current
+        // residency. `fetch_max` is the only way production raises this, so a
+        // peak still at or above it cannot have been rewritten by the reset.
+        let planted_peak = GLOBAL_CONTENT_RESIDENT_BYTES
+            .load(Ordering::Relaxed)
+            .saturating_add(SENTINEL);
+        GLOBAL_PEAK_RESIDENT_BYTES.fetch_max(planted_peak, Ordering::Relaxed);
+
+        reset_global_offload_stats();
+        let after = global_offload_stats();
+
+        assert!(
+            after.page_ins < SENTINEL,
+            "reset left page_ins at {}, above the planted sentinel",
+            after.page_ins
+        );
+        assert!(
+            after.hits < SENTINEL,
+            "reset left hits at {}, above the planted sentinel",
+            after.hits
+        );
+        assert!(
+            after.evictions < SENTINEL,
+            "reset left evictions at {}, above the planted sentinel",
+            after.evictions
+        );
+
+        assert!(
+            after.budget_bytes >= SENTINEL,
+            "reset dropped budget_bytes to {}, but it is a live gauge",
+            after.budget_bytes
+        );
+        assert!(
+            after.content_resident_bytes >= SENTINEL,
+            "reset dropped content_resident_bytes to {}, but it is a live gauge",
+            after.content_resident_bytes
+        );
+        assert!(
+            after.mapped_physical_bytes >= SENTINEL,
+            "reset dropped mapped_physical_bytes to {}, but it is a live gauge",
+            after.mapped_physical_bytes
+        );
+
+        assert!(
+            after.peak_resident_bytes >= planted_peak,
+            "reset wrote {} over a lifetime peak of {}; it must not write the \
+             peak at all",
+            after.peak_resident_bytes,
+            planted_peak
+        );
+
+        // Hand the live gauges back, so this test leaves the process as it
+        // found it for anything running alongside it.
+        GLOBAL_BUDGET_BYTES.fetch_sub(SENTINEL, Ordering::Relaxed);
+        GLOBAL_CONTENT_RESIDENT_BYTES.fetch_sub(SENTINEL, Ordering::Relaxed);
+        GLOBAL_WEIGHT_MAPPED_BYTES.fetch_sub(SENTINEL, Ordering::Relaxed);
+    }
+
     #[test]
     fn device_policy_defaults_to_disabled() {
         let policy = DeviceOffloadPolicy::default();
