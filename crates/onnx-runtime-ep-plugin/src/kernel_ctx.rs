@@ -77,9 +77,12 @@ pub const CPU_EP_SUPPORTED_DTYPES: &[DataType] = &[
 /// duplication honest.
 fn contiguous_strides(shape: &[usize]) -> DimVec<i64> {
     let n = shape.len();
-    let mut strides = DimVec::filled(n, 1i64);
-    for i in (0..n.saturating_sub(1)).rev() {
-        strides[i] = strides[i + 1] * shape[i + 1] as i64;
+    let mut strides = DimVec::zeroed(n);
+    if n > 0 {
+        strides[n - 1] = 1;
+        for i in (0..n - 1).rev() {
+            strides[i] = strides[i + 1] * shape[i + 1] as i64;
+        }
     }
     strides
 }
@@ -290,7 +293,7 @@ pub(crate) unsafe fn read_inputs(
                     unsafe { release_type_shape(type_shape) };
                     return Err(format!("GetDimensionsCount failed for input {i}"));
                 }
-                owned_dims = DimVec::filled(ndim, 0i64);
+                owned_dims = DimVec::zeroed(ndim);
                 crate::dispatch_probe::count_n(
                     crate::dispatch_probe::Event::DispatchAlloc,
                     u64::from(ndim > crate::dim_vec::INLINE_RANK),

@@ -88,19 +88,25 @@ impl<T: Copy + Default> DimVec<T> {
         }
     }
 
-    /// `len` copies of `value`, chosen representation up front.
+    /// `len` copies of `T::default()` — zero for the integer dims and strides
+    /// this holds.
     ///
-    /// The stride path wants exactly this and used to build it one `push` at a
-    /// time, which re-matched the representation on every element for a value
-    /// that cannot change mid-loop.
+    /// This is the bulk path for builders that immediately overwrite every
+    /// element. It exists instead of a `filled(len, value)` because the inline
+    /// array is already `T::default()`-initialised by construction, so seeding
+    /// it with a caller-chosen value costs a second pass over the buffer that
+    /// those builders then throw away. Building one `push` at a time is worse
+    /// still: it re-matches the representation on every element for a length
+    /// that is known up front.
     #[inline]
-    pub(crate) fn filled(len: usize, value: T) -> Self {
+    pub(crate) fn zeroed(len: usize) -> Self {
         if len <= INLINE_RANK {
-            let mut buf = [T::default(); INLINE_RANK];
-            buf[..len].fill(value);
-            Self::Inline { buf, len }
+            Self::Inline {
+                buf: [T::default(); INLINE_RANK],
+                len,
+            }
         } else {
-            Self::Heap(vec![value; len])
+            Self::Heap(vec![T::default(); len])
         }
     }
 
@@ -311,16 +317,16 @@ mod tests {
         assert!(v.is_spilled());
     }
 
-    /// `filled` is the bulk path the stride builder uses; it must agree with
-    /// the `push` loop it replaced at every length, including across the spill
-    /// boundary and at zero.
+    /// `zeroed` is the bulk path the stride and dims builders use; it must
+    /// agree with the `push` loop it replaced at every length, including across
+    /// the spill boundary and at zero.
     #[test]
-    fn filled_agrees_with_pushing_one_at_a_time() {
+    fn zeroed_agrees_with_pushing_one_at_a_time() {
         for len in 0..(INLINE_RANK + 4) {
-            let bulk = DimVec::filled(len, 3i64);
+            let bulk = DimVec::<i64>::zeroed(len);
             let mut one_at_a_time = DimVec::<i64>::with_capacity(len);
             for _ in 0..len {
-                one_at_a_time.push(3i64);
+                one_at_a_time.push(0i64);
             }
             assert_eq!(bulk, one_at_a_time, "len {len}");
             assert_eq!(bulk.len(), len, "len {len}");
