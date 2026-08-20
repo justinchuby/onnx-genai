@@ -130,7 +130,7 @@ mod tests {
         let result = out.to_f32();
         approx(&result[..3], &expected);
         approx(&result[3..], &expected);
-        for row in result.chunks_exact(3) {
+        for row in result.as_chunks::<3>().0 {
             assert!((row.iter().map(|v| v.exp()).sum::<f32>() - 1.0).abs() < 1e-6);
         }
     }

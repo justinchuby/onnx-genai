@@ -2450,8 +2450,10 @@ mod tests {
         embedder.embed(7, &mut embedded)?;
         let raw_embedding = std::fs::read(fixture.join("embedding.f32"))?;
         let expected_embedding = raw_embedding
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four bytes")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
             .collect::<Vec<_>>();
         assert_eq!(embedded, expected_embedding[7 * 16..8 * 16]);
 
@@ -2461,8 +2463,10 @@ mod tests {
         let raw_lm_head = std::fs::read(fixture.join("lm_head.f32"))?;
         let linear_lm_head = LinearLmHead::new(
             raw_lm_head
-                .chunks_exact(4)
-                .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four bytes")))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| f32::from_le_bytes(*bytes))
                 .collect(),
             16,
             32,

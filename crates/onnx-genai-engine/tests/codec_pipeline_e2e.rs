@@ -43,7 +43,9 @@ fn composite_codec_pipeline_runs_encoder_then_vocoder() -> anyhow::Result<()> {
 
     // Intermediate encoder codes are visible in the shared pool: mean of pairs.
     let expected_codes: Vec<f32> = waveform
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| (pair[0] + pair[1]) / 2.0)
         .collect();
     let codes = outputs
@@ -58,7 +60,9 @@ fn composite_codec_pipeline_runs_encoder_then_vocoder() -> anyhow::Result<()> {
     // Vocoder reconstructs the waveform: each code doubled into an adjacent pair,
     // so audio[2i] == audio[2i+1] == w[2i] + w[2i+1].
     let expected_audio: Vec<f32> = waveform
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .flat_map(|pair| {
             let sum = pair[0] + pair[1];
             [sum, sum]

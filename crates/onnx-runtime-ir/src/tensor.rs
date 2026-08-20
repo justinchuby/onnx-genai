@@ -70,6 +70,14 @@ pub fn read_scalar_le<T: FromLeBytes>(bytes: &[u8]) -> Result<T, RawBytesError> 
 }
 
 /// Decode primitive numeric values from a little-endian byte slice.
+// `as_chunks::<N>()` needs a const generic argument, and `T::BYTE_SIZE` is an
+// associated const of a generic parameter, which is not permitted in that
+// position on stable. The chunk size here is not statically known per
+// monomorphisation site the way the lint assumes, so `chunks_exact` stays.
+#[allow(
+    clippy::chunks_exact_to_as_chunks,
+    reason = "chunk size is an associated const of a generic parameter"
+)]
 pub fn read_vec_le<T: FromLeBytes>(bytes: &[u8]) -> Result<Vec<T>, RawBytesError> {
     if !bytes.len().is_multiple_of(T::BYTE_SIZE) {
         return Err(RawBytesError::VectorLength {

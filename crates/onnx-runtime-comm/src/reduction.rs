@@ -58,9 +58,14 @@ fn float_combine(lhs: f32, rhs: f32, op: ReduceOp) -> f32 {
 fn reduce_f32(inputs: &[Vec<u8>], op: ReduceOp) -> CommResult<Vec<u8>> {
     let mut output = inputs[0].clone();
     for input in &inputs[1..] {
-        for (out, rhs) in output.chunks_exact_mut(4).zip(input.chunks_exact(4)) {
-            let lhs = f32::from_le_bytes(out.try_into().expect("four-byte chunk"));
-            let rhs = f32::from_le_bytes(rhs.try_into().expect("four-byte chunk"));
+        for (out, rhs) in output
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(input.as_chunks::<4>().0.iter())
+        {
+            let lhs = f32::from_le_bytes(*out);
+            let rhs = f32::from_le_bytes(*rhs);
             out.copy_from_slice(&float_combine(lhs, rhs, op).to_le_bytes());
         }
     }
@@ -70,9 +75,14 @@ fn reduce_f32(inputs: &[Vec<u8>], op: ReduceOp) -> CommResult<Vec<u8>> {
 fn reduce_f16(inputs: &[Vec<u8>], op: ReduceOp) -> CommResult<Vec<u8>> {
     let mut output = inputs[0].clone();
     for input in &inputs[1..] {
-        for (out, rhs) in output.chunks_exact_mut(2).zip(input.chunks_exact(2)) {
-            let lhs = f16::from_le_bytes(out.try_into().expect("two-byte chunk")).to_f32();
-            let rhs = f16::from_le_bytes(rhs.try_into().expect("two-byte chunk")).to_f32();
+        for (out, rhs) in output
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip(input.as_chunks::<2>().0.iter())
+        {
+            let lhs = f16::from_le_bytes(*out).to_f32();
+            let rhs = f16::from_le_bytes(*rhs).to_f32();
             out.copy_from_slice(&f16::from_f32(float_combine(lhs, rhs, op)).to_le_bytes());
         }
     }
@@ -82,9 +92,14 @@ fn reduce_f16(inputs: &[Vec<u8>], op: ReduceOp) -> CommResult<Vec<u8>> {
 fn reduce_bf16(inputs: &[Vec<u8>], op: ReduceOp) -> CommResult<Vec<u8>> {
     let mut output = inputs[0].clone();
     for input in &inputs[1..] {
-        for (out, rhs) in output.chunks_exact_mut(2).zip(input.chunks_exact(2)) {
-            let lhs = bf16::from_le_bytes(out.try_into().expect("two-byte chunk")).to_f32();
-            let rhs = bf16::from_le_bytes(rhs.try_into().expect("two-byte chunk")).to_f32();
+        for (out, rhs) in output
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip(input.as_chunks::<2>().0.iter())
+        {
+            let lhs = bf16::from_le_bytes(*out).to_f32();
+            let rhs = bf16::from_le_bytes(*rhs).to_f32();
             out.copy_from_slice(&bf16::from_f32(float_combine(lhs, rhs, op)).to_le_bytes());
         }
     }

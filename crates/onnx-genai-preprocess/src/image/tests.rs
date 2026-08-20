@@ -1562,7 +1562,9 @@ preprocessing:
         };
         (
             values
-                .chunks_exact(12)
+                .as_chunks::<12>()
+                .0
+                .iter()
                 .map(|patch| patch[0])
                 .collect::<Vec<_>>(),
             bundle.images[0].expansion_count,
