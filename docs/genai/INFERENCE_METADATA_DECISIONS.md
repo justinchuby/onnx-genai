@@ -780,6 +780,43 @@ session fails to load with a type error naming `ScatterND` and
 `tensor(float8e4m3fn)`. That is an execution-provider blocker, not a metadata
 limitation, and it moves on its own when a provider registers the kernel.
 
+Measured on the CUDA provider (onnxruntime-gpu 1.29.0, H200): the blocker is real
+there too, but it surfaces in a **different shape**, and the difference matters to
+whoever has to read the error. FP8 KV is reachable only through
+`GroupQueryAttention`, whose `k_scale`/`v_scale` arrive as node inputs 12 and 13.
+With FP8 KV the node matches no registered kernel, so graph partitioning leaves it
+unassigned and session creation fails during initialization:
+
+```
+transformer_memcpy.cc:253 IsNodeCompatibleWithProvider
+  Provider type for GroupQueryAttention node 'node_GroupQueryAttention_9' is not set
+```
+
+Note what that message does **not** say: it names neither FP8 nor the element
+type. Read alone it looks like a malformed graph, which is precisely the
+misreading §12.2c exists to prevent. A three-way split attributes it exactly:
+
+| Node | KV element type | Result |
+| --- | --- | --- |
+| 14-input GQA, scales at 12/13, quant attributes set | `float` | loads and runs |
+| same node, unchanged arity and attributes | `float8_e4m3fn` | node unassigned, init fails |
+| no FP8 pass at all | `float16` | loads and runs |
+
+Holding arity and attributes fixed and moving only the element type isolates the
+cause to the **KV type constraint** — `tensor(float8e4m3fn)` is absent from the
+CUDA GQA `past`/`present` type list in 1.29.0. It is not the scale-input arity,
+not the quantization attributes, and it is not a CUDA illegal memory access: no
+kernel is ever launched. So this is a missing kernel registration, which is the
+same class of blocker as the CPU `ScatterND` gap and moves the same way.
+
+One consequence for producers: a fixed-capacity export built from `TensorScatter`
+plus the ai.onnx `Attention` operator has no GQA node at all, so it has nowhere to
+carry `k_scale`/`v_scale` and cannot express FP8 KV regardless of the type list.
+A producer that is asked for both should fail closed with that diagnosis rather
+than silently emit 16-bit floats — the request was for something the operator set
+cannot represent, and a quiet dtype substitution turns an unsatisfiable request
+into a plausible wrong answer.
+
 Two runtime storage paths remain narrower than the format, and say so by name
 rather than by refusing the document: the **paged KV cache** stores fp32 and
 16-bit float pages only, and **host-side KV growth** materializes buffers through
@@ -1633,7 +1670,7 @@ The current evidence is:
 | Speculative decoding | yes | yes | synthetic | yes | Accept, reject, rollback, correction |
 | LoRA composition | yes | yes | artifact parity | yes | Ordered adapters survive row compaction |
 | Embedding/classification/reranking | yes | trivial sequence | model-dependent | ordinary batching | Task profile plus invoke and emit |
-| Fixed-capacity (static) cache | yes | yes | synthetic | yes | Indexed scatter, per-row cursors, unequal lengths, inactive-row freeze, rewind |
+| Fixed-capacity (static) cache | yes | yes | real weights | yes | Indexed scatter, per-row cursors, unequal lengths, inactive-row freeze, rewind |
 | FP8 cache state | yes | provider-dependent | no | n/a | Declared, validated, allocated, and bound; compute awaits an FP8 kernel |
 
 “Partial” and “pending” are deliberate. They identify runtime or upstream
@@ -1652,8 +1689,21 @@ limitations without weakening the representability claim. In particular:
 - FP8 state is representable, validated, allocatable, and bindable, and its
   “provider-dependent” execution level is a measurement, not a hedge: the CPU
   provider has no FP8 `ScatterND` kernel, so a static FP8 cache fails to load
-  there with the provider's own type error. §12.2c records why that must not be
-  turned into a validation error.
+  there with the provider's own type error, and the CUDA provider (1.29.0) has
+  no `float8_e4m3fn` in its GQA `past`/`present` type list, so the node is left
+  unassigned at partitioning and initialization fails without ever launching a
+  kernel. §12.2c records both shapes, why the CUDA message is the more
+  misleading of the two, and why neither must be turned into a validation error.
+- The fixed-capacity cache row claims **real weights** on the strength of a CUDA
+  run of a real static-cache export (onnxruntime-gpu 1.29.0, H200), not of an
+  upstream comparison: a `B=2` prefill reproduces the per-row `B=1` result
+  exactly (max |Δ| = 0), `TensorScatter` writes land inside the declared
+  `[0, nonpad)` prefix and nowhere else, decode with divergent per-row cursors
+  (one row advancing while another has finished) holds max |Δ| ≤ 3.1e-6 against
+  the single-row reference across three steps, and a finished row reclaims its
+  own last slot on each subsequent write without ever leaking past it. That is
+  the `indexed_scatter` discipline of §12.2b executing as specified on a real
+  export, including the inactive-row behaviour the declaration promises.
 
 The canonical executable packages cover decoder, VLM, image diffusion, guided
 diffusion, masked diffusion, speculative decoding, codec, TTS, video, and

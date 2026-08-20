@@ -81,6 +81,16 @@ fn fp8_kv_ports_load_and_round_trip_through_a_session() -> Result<(), Box<dyn st
 /// type, which is a diagnosis ("this EP has no FP8 ScatterND") rather than a
 /// verdict on the document. If a future provider registers the kernel, this
 /// test starts failing and the boundary moves — which is the intended signal.
+///
+/// The two assertions below describe *this* provider, not every provider. A
+/// refusal is allowed to be less informative: on CUDA (onnxruntime-gpu 1.29.0)
+/// the FP8 KV path runs through GroupQueryAttention, `float8_e4m3fn` is absent
+/// from that kernel's past/present type list, and the node is simply left
+/// unassigned at graph partitioning — so initialization fails with "Provider
+/// type for GroupQueryAttention node '...' is not set", naming neither FP8 nor
+/// the element type. Both are missing-kernel blockers; only one says so. Do not
+/// generalize these assertions into a cross-provider contract, and do not read
+/// the CUDA message as evidence that the document is malformed.
 #[test]
 fn fp8_scatter_is_refused_by_the_provider_not_by_the_format()
 -> Result<(), Box<dyn std::error::Error>> {
