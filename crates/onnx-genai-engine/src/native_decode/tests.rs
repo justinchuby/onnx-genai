@@ -885,7 +885,10 @@ fn mutating_hybrid_decoder() -> InferenceSession {
         "ReduceSum",
         vec![cast],
         token_sum,
-        &[("axes", Attribute::Ints(vec![1])), ("keepdims", Attribute::Int(1))],
+        &[
+            ("axes", Attribute::Ints(vec![1])),
+            ("keepdims", Attribute::Int(1)),
+        ],
     );
     let current_kv = graph.create_value(
         DataType::Float32,

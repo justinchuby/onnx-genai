@@ -3294,7 +3294,7 @@ mod tests {
             x[..covered].iter().any(|v| *v < 1.0) && x[..covered].iter().any(|v| *v > 1.0),
             "ARM sweep did not cover both signs of the log result"
         );
-        for batch in x[..covered].chunks_exact(ARM_F32_LANES) {
+        for batch in x[..covered].as_chunks::<ARM_F32_LANES>().0 {
             for &value in batch {
                 assert!(
                     value.ln().is_finite(),
