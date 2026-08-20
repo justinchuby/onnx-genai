@@ -413,12 +413,25 @@ impl CudaExecutionProvider {
                     // Walk the ladder largest-first and keep the first arena the
                     // driver actually hands us, so a tighter address space costs
                     // reservation headroom rather than the whole ledgered path.
+                    //
+                    // Every rung is resolved in *fallback* mode (`managed_no_spill
+                    // = false`) so a failure records the error and lets the loop
+                    // try the next, smaller rung. Under managed no-spill the arena
+                    // is required, so exhausting the ladder is fatal — but that
+                    // verdict is deferred to after the loop. Resolving each rung
+                    // in no-spill mode instead turned the *first* rung's failure
+                    // into a hard error, which defeated the ladder in exactly the
+                    // configuration that needs it most: an 8 GiB card floors the
+                    // first reservation at `RESERVATION_FLOOR_BYTES` (1 TiB), the
+                    // driver refuses it with CUDA_ERROR_OUT_OF_MEMORY, and the
+                    // 512/256/128/64 GiB rungs that would have succeeded were
+                    // never attempted.
                     let ladder = reservation_ladder(ordinal);
                     let mut installed = None;
                     let mut last_fallback = None;
                     for reservation_bytes in ladder {
                         match resolve_vmm_initialization(
-                            auto_dynamic_lending,
+                            false,
                             offload_policy.managed_limit_bytes,
                             build_arena(reservation_bytes),
                         )? {
@@ -430,6 +443,19 @@ impl CudaExecutionProvider {
                                 last_fallback = Some(error);
                             }
                         }
+                    }
+                    if installed.is_none() && auto_dynamic_lending {
+                        // Re-raise the last rung's failure through the shared
+                        // no-spill formatter so the message and error kind stay
+                        // identical to the pre-ladder behaviour.
+                        let error = last_fallback
+                            .clone()
+                            .unwrap_or_else(|| String::from("no reservation size was attempted"));
+                        resolve_vmm_initialization::<(), String>(
+                            true,
+                            offload_policy.managed_limit_bytes,
+                            Err(error),
+                        )?;
                     }
                     match installed {
                         Some((arena, reservation_bytes)) => {
