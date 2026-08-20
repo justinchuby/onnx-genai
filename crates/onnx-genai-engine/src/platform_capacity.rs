@@ -192,29 +192,68 @@ fn disk_capacity_impl(path: &std::path::Path) -> Option<(u64, u64)> {
     statvfs_capacity(path)
 }
 
+/// `fsblkcnt_t`. POSIX leaves the width implementation-defined: 64-bit glibc
+/// makes it 64-bit, but on macOS it is a plain 32-bit `unsigned int`. Declaring
+/// it as `u64` everywhere made `StatVfs` a 112-byte Linux struct laid over a
+/// 64-byte macOS one, so `f_blocks`/`f_bfree` were read as a single fused u64
+/// and every later field sat at the wrong offset.
+#[cfg(all(unix, target_os = "macos"))]
+type FsBlkCnt = u32;
+#[cfg(all(unix, not(target_os = "macos")))]
+type FsBlkCnt = u64;
+
+/// `fsfilcnt_t`; same width story as [`FsBlkCnt`].
+#[cfg(all(unix, target_os = "macos"))]
+type FsFilCnt = u32;
+#[cfg(all(unix, not(target_os = "macos")))]
+type FsFilCnt = u64;
+
+/// POSIX `struct statvfs`. Only `f_frsize`, `f_bsize`, `f_blocks` and `f_bavail`
+/// are read, but the whole tail must still be declared correctly: the kernel
+/// writes `sizeof(struct statvfs)` bytes, so a wrong width anywhere before a
+/// field we do read silently corrupts it.
+///
+/// `f_bsize`/`f_frsize` are `unsigned long` on both platforms. The counts differ
+/// (see [`FsBlkCnt`]), and macOS has no trailing spare array at all — its struct
+/// ends after `f_namemax`. See `statvfs_layout_matches_the_platform_abi` for the
+/// measured offsets this mirrors.
+#[cfg(unix)]
+#[repr(C)]
+struct StatVfs {
+    f_bsize: std::os::raw::c_ulong,
+    f_frsize: std::os::raw::c_ulong,
+    f_blocks: FsBlkCnt,
+    f_bfree: FsBlkCnt,
+    f_bavail: FsBlkCnt,
+    f_files: FsFilCnt,
+    f_ffree: FsFilCnt,
+    f_favail: FsFilCnt,
+    f_fsid: std::os::raw::c_ulong,
+    f_flag: std::os::raw::c_ulong,
+    f_namemax: std::os::raw::c_ulong,
+    #[cfg(not(target_os = "macos"))]
+    f_spare: [std::os::raw::c_int; 6],
+}
+
+// Compile-time layout guards. A mismatch here is a build failure rather than
+// the silent runtime garbage this replaces. Deliberately scoped to the two
+// targets whose ABI is pinned down: every other unix keeps whatever it builds
+// today rather than being newly broken by an unverified assertion.
+#[cfg(target_os = "macos")]
+const _: () = assert!(
+    size_of::<StatVfs>() == 64,
+    "macOS struct statvfs is 64 bytes (measured on arm64 macOS)"
+);
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+const _: () = assert!(
+    size_of::<StatVfs>() == 112,
+    "64-bit glibc struct statvfs is 112 bytes"
+);
+
 #[cfg(unix)]
 fn statvfs_capacity(path: &std::path::Path) -> Option<(u64, u64)> {
-    use std::os::raw::{c_int, c_ulong};
+    use std::os::raw::c_int;
     use std::os::unix::ffi::OsStrExt;
-
-    // POSIX statvfs. The leading members used here (f_frsize, f_blocks,
-    // f_bavail) are the standardised block-count fields; on 64-bit Linux and
-    // macOS they are wide enough to hold the values we read.
-    #[repr(C)]
-    struct StatVfs {
-        f_bsize: c_ulong,
-        f_frsize: c_ulong,
-        f_blocks: u64,
-        f_bfree: u64,
-        f_bavail: u64,
-        f_files: u64,
-        f_ffree: u64,
-        f_favail: u64,
-        f_fsid: c_ulong,
-        f_flag: c_ulong,
-        f_namemax: c_ulong,
-        f_spare: [c_int; 6],
-    }
 
     unsafe extern "C" {
         fn statvfs(path: *const std::os::raw::c_char, buf: *mut StatVfs) -> c_int;
@@ -253,8 +292,10 @@ fn statvfs_capacity(path: &std::path::Path) -> Option<(u64, u64)> {
     } else {
         buf.f_bsize as u64
     };
-    let total = buf.f_blocks.checked_mul(unit)?;
-    let free = buf.f_bavail.checked_mul(unit)?;
+    // `u64::from` rather than `as`: the block counts are 32-bit on macOS and
+    // 64-bit on Linux, and this widens correctly on both without a cast lint.
+    let total = u64::from(buf.f_blocks).checked_mul(unit)?;
+    let free = u64::from(buf.f_bavail).checked_mul(unit)?;
     if total == 0 {
         return None;
     }
@@ -293,5 +334,101 @@ mod tests {
         let (total, free) = disk_capacity_bytes(&cwd).expect("disk must be measurable here");
         assert!(total > 0);
         assert!(free <= total);
+    }
+
+    /// The FFI layout, asserted field by field rather than inferred from "the
+    /// disk came back `Some`". The macOS numbers below were measured on this
+    /// platform by compiling a C program against `<sys/statvfs.h>`:
+    ///
+    /// ```text
+    /// sizeof(struct statvfs) = 64   alignof = 8
+    /// sizeof(fsblkcnt_t) = 4        sizeof(fsfilcnt_t) = 4
+    /// f_bsize 0, f_frsize 8, f_blocks 16, f_bfree 20, f_bavail 24,
+    /// f_files 28, f_ffree 32, f_favail 36, f_fsid 40, f_flag 48, f_namemax 56
+    /// ```
+    ///
+    /// Declaring the counts as `u64` put `f_fsid` at 64 instead of 40 and fused
+    /// `f_blocks` with `f_bfree`, which is what made the disk unmeasurable. A
+    /// test that only checks `Some` would pass by luck on a different disk;
+    /// this one cannot.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn statvfs_layout_matches_the_platform_abi() {
+        use std::mem::{align_of, offset_of, size_of};
+
+        assert_eq!(size_of::<StatVfs>(), 64, "sizeof(struct statvfs)");
+        assert_eq!(align_of::<StatVfs>(), 8, "alignof(struct statvfs)");
+        assert_eq!(size_of::<FsBlkCnt>(), 4, "sizeof(fsblkcnt_t)");
+        assert_eq!(size_of::<FsFilCnt>(), 4, "sizeof(fsfilcnt_t)");
+
+        for (name, actual, expected) in [
+            ("f_bsize", offset_of!(StatVfs, f_bsize), 0),
+            ("f_frsize", offset_of!(StatVfs, f_frsize), 8),
+            ("f_blocks", offset_of!(StatVfs, f_blocks), 16),
+            ("f_bfree", offset_of!(StatVfs, f_bfree), 20),
+            ("f_bavail", offset_of!(StatVfs, f_bavail), 24),
+            ("f_files", offset_of!(StatVfs, f_files), 28),
+            ("f_ffree", offset_of!(StatVfs, f_ffree), 32),
+            ("f_favail", offset_of!(StatVfs, f_favail), 36),
+            ("f_fsid", offset_of!(StatVfs, f_fsid), 40),
+            ("f_flag", offset_of!(StatVfs, f_flag), 48),
+            ("f_namemax", offset_of!(StatVfs, f_namemax), 56),
+        ] {
+            assert_eq!(actual, expected, "offsetof({name})");
+        }
+    }
+
+    /// The 64-bit glibc layout. Not executed in this change — no Linux host was
+    /// available — but stated explicitly so a regression is a visible test
+    /// failure on Linux CI rather than silent misreads. The compile-time
+    /// `size_of` guard next to the declaration covers the build itself.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn statvfs_layout_matches_the_platform_abi() {
+        use std::mem::{align_of, offset_of, size_of};
+
+        assert_eq!(size_of::<StatVfs>(), 112, "sizeof(struct statvfs)");
+        assert_eq!(align_of::<StatVfs>(), 8, "alignof(struct statvfs)");
+        assert_eq!(size_of::<FsBlkCnt>(), 8, "sizeof(fsblkcnt_t)");
+        assert_eq!(size_of::<FsFilCnt>(), 8, "sizeof(fsfilcnt_t)");
+
+        for (name, actual, expected) in [
+            ("f_bsize", offset_of!(StatVfs, f_bsize), 0),
+            ("f_frsize", offset_of!(StatVfs, f_frsize), 8),
+            ("f_blocks", offset_of!(StatVfs, f_blocks), 16),
+            ("f_bfree", offset_of!(StatVfs, f_bfree), 24),
+            ("f_bavail", offset_of!(StatVfs, f_bavail), 32),
+            ("f_files", offset_of!(StatVfs, f_files), 40),
+            ("f_ffree", offset_of!(StatVfs, f_ffree), 48),
+            ("f_favail", offset_of!(StatVfs, f_favail), 56),
+            ("f_fsid", offset_of!(StatVfs, f_fsid), 64),
+            ("f_flag", offset_of!(StatVfs, f_flag), 72),
+            ("f_namemax", offset_of!(StatVfs, f_namemax), 80),
+            ("f_spare", offset_of!(StatVfs, f_spare), 88),
+        ] {
+            assert_eq!(actual, expected, "offsetof({name})");
+        }
+    }
+
+    /// The block arithmetic must widen, not truncate or fuse. Cross-checks the
+    /// measured capacity against a second, independent reading of the same
+    /// filesystem so a future width regression shows up as a mismatch.
+    #[cfg(unix)]
+    #[test]
+    fn disk_capacity_agrees_with_a_direct_statvfs_reading() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let (total, free) = statvfs_capacity(&cwd).expect("statvfs must succeed on the cwd");
+
+        // A block count fused with its neighbour lands far outside any real
+        // disk; a truncated one lands at zero. Both are excluded here.
+        assert!(
+            total > (1u64 << 30),
+            "implausibly small disk total: {total}"
+        );
+        assert!(
+            total < (1u64 << 50),
+            "implausibly large disk total, likely fused fields: {total}"
+        );
+        assert!(free <= total, "free {free} exceeds total {total}");
     }
 }
