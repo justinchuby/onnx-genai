@@ -1368,6 +1368,42 @@ fn preferred_norm_block_threads(norm_size: usize, max_threads_per_block: u32) ->
     useful_threads.min(device_limit)
 }
 
+/// Threads per block for a norm reduction, widened when the launch is
+/// grid-starved.
+///
+/// The grid is one block per group, so decode (`num_groups == 1`) puts a whole
+/// row's reduction on a *single SM*. On Muse-Glimmer-30B (hidden 6656) that is
+/// 209 launches per decode step, each measured at 13.4 us on one of an A100's
+/// 108 SMs — ~9% of the step spent moving 13 KB. Nothing about that is
+/// bandwidth; it is one block's worth of memory parallelism strided over 26
+/// elements per thread at `NORM_BLOCK` threads.
+///
+/// Widening only helps while the grid cannot already fill the device: once
+/// there is at least a block per SM, more threads per block would trade
+/// block-level parallelism for thread-level and change the summation order for
+/// no gain, so the starved case is the only one that moves.
+///
+/// The result is a pure function of shape and device, which is what lets the
+/// two launch sites that must agree bit-for-bit (`rmsnorm` and the dense
+/// skip-rmsnorm) keep agreeing: both size their block from here, so for a given
+/// shape they still share one summation order.
+fn norm_block_threads(
+    norm_size: usize,
+    num_groups: usize,
+    multiprocessor_count: u32,
+    max_threads_per_block: u32,
+) -> u32 {
+    let cap = if num_groups < multiprocessor_count.max(1) as usize {
+        max_threads_per_block.max(NORM_BLOCK)
+    } else {
+        NORM_BLOCK
+    };
+    let reported_limit = max_threads_per_block.clamp(32, cap);
+    let device_limit = 1 << (31 - reported_limit.leading_zeros());
+    let useful_threads = norm_size.max(32).next_power_of_two().min(cap as usize) as u32;
+    useful_threads.min(device_limit)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SkipRmsnormVariant {
     F32Dense,
@@ -1942,10 +1978,16 @@ impl RmsNormKernel {
         let func = self
             .runtime
             .nvrtc_function(RMSNORM_MODULE, RMSNORM_SRC, entry)?;
+        let caps = self.runtime.capabilities();
         let cfg = self.runtime.reduction_launch_config(
             &func,
             groups_u,
-            NORM_BLOCK,
+            norm_block_threads(
+                norm_size,
+                groups_u as usize,
+                caps.multiprocessor_count(),
+                caps.max_threads_per_block(),
+            ),
             std::mem::size_of::<f32>() as u32,
         )?;
         let stream = self.runtime.stream();
@@ -2442,12 +2484,20 @@ impl SkipSimplifiedLayerNormKernel {
             .arg(&bias_is_bf16)
             .arg(&stat_is_bf16)
             .arg(&self.epsilon);
-        // Match `rmsnorm_bf16` exactly (same NORM_BLOCK block-tree reduction and
-        // f32 shared-memory bytes/thread) so the summation order is bit-identical.
+        // Match `rmsnorm_bf16` exactly (same block-tree reduction and f32
+        // shared-memory bytes/thread) so the summation order is bit-identical:
+        // both sides size their block from `norm_block_threads`, which is a pure
+        // function of shape and device.
+        let caps = self.runtime.capabilities();
         let cfg = self.runtime.reduction_launch_config(
             &func,
             groups_u,
-            NORM_BLOCK,
+            norm_block_threads(
+                norm_size,
+                groups_u as usize,
+                caps.multiprocessor_count(),
+                caps.max_threads_per_block(),
+            ),
             std::mem::size_of::<f32>() as u32,
         )?;
         // SAFETY: all pointers reference validated device buffers; metadata holds
@@ -3275,6 +3325,35 @@ mod tests {
         assert_eq!(preferred_norm_block_threads(96, 1024), 128);
         assert_eq!(preferred_norm_block_threads(3584, 128), 128);
         assert_eq!(preferred_norm_block_threads(17, 1024), 32);
+    }
+
+    #[test]
+    fn norm_block_widens_only_when_the_grid_cannot_fill_the_device() {
+        // Decode: one group, so 107 of an A100's 108 SMs sit idle no matter how
+        // the block is sized. Spend the row on threads instead of leaving a
+        // 6656-wide reduction at 26 elements per thread.
+        assert_eq!(norm_block_threads(6656, 1, 108, 1024), 1024);
+        // Prefill: the grid already covers the device, so widening would only
+        // trade block parallelism for thread parallelism. Stay where we were.
+        assert_eq!(norm_block_threads(6656, 108, 108, 1024), NORM_BLOCK);
+        assert_eq!(norm_block_threads(6656, 4096, 108, 1024), NORM_BLOCK);
+        // Exactly one block per SM is already "full": the boundary is inclusive
+        // on the non-widening side.
+        assert_eq!(norm_block_threads(6656, 107, 108, 1024), 1024);
+    }
+
+    #[test]
+    fn norm_block_never_exceeds_what_the_shape_or_the_device_can_use() {
+        // A narrow row cannot use more threads than it has elements, starved or
+        // not: qk-norm at head_dim 128 stays at 128 even with 107 idle SMs.
+        assert_eq!(norm_block_threads(128, 32, 108, 1024), 128);
+        assert_eq!(norm_block_threads(17, 1, 108, 1024), 32);
+        // A device that refuses 1024-thread blocks caps the widening.
+        assert_eq!(norm_block_threads(6656, 1, 108, 512), 512);
+        // Non-power-of-two device limits round down, since the block tree halves.
+        assert_eq!(norm_block_threads(6656, 1, 108, 768), 512);
+        // A device reporting no SM count must not divide by zero or widen wildly.
+        assert_eq!(norm_block_threads(6656, 1, 0, 1024), NORM_BLOCK);
     }
 
     fn skip_rmsnorm_residuals(hidden: usize) -> (Vec<f16>, Vec<f16>) {
