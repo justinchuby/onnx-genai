@@ -144,4 +144,9 @@ and research write-ups.
    it from verification.
 
 See [`.github/skills/measurement-discipline/SKILL.md`](../.github/skills/measurement-discipline/SKILL.md)
-for the failure modes behind these rules.
+for the failure modes behind these rules, and
+[`.github/skills/cuda-perf-measurement/SKILL.md`](../.github/skills/cuda-perf-measurement/SKILL.md)
+for which instrument to reach for on the CUDA backend — including the three
+device-specific traps (nsys hiding CUDA-graph internals, load cost read as
+per-token cost, wall clock that cannot resolve 10%) that have each produced a
+confidently backwards answer here.
