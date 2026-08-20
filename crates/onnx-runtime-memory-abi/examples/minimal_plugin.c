@@ -31,6 +31,24 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+ * C11 `aligned_alloc` is not part of the Windows C runtime: MSVC never shipped
+ * it, and MinGW inherits that gap from msvcrt. Windows offers `_aligned_malloc`
+ * instead, whose result MUST be released with `_aligned_free` -- passing it to
+ * plain `free` is undefined behaviour, so the pairing is part of the shim
+ * rather than something the call sites are trusted to remember.
+ *
+ * Note the reversed argument order: `_aligned_malloc` takes (size, alignment).
+ */
+#if defined(_WIN32)
+#include <malloc.h>
+#define NXMEM_ALIGNED_ALLOC(align, size) _aligned_malloc((size), (align))
+#define NXMEM_ALIGNED_FREE(ptr) _aligned_free(ptr)
+#else
+#define NXMEM_ALIGNED_ALLOC(align, size) aligned_alloc((align), (size))
+#define NXMEM_ALIGNED_FREE(ptr) free(ptr)
+#endif
+
 /* ─── status helpers ───────────────────────────────────────────────────── */
 
 static NxmemStatus nxmem_status(uint32_t code, const char *message) {
@@ -108,14 +126,15 @@ static NxmemStatus minimal_allocate(void *ctx, const NxmemAllocRequest *request,
   if (align < sizeof(void *)) {
     align = sizeof(void *);
   }
-  /* aligned_alloc requires a size that is a multiple of the alignment. */
+  /* The size must be a multiple of the alignment; C11 `aligned_alloc`
+     requires it, and rounding keeps the two platforms' behaviour identical. */
   bytes = (size_t)request->bytes;
   if (bytes == 0) {
     bytes = align;
   }
   bytes = ((bytes + align - 1) / align) * align;
 
-  ptr = aligned_alloc(align, bytes);
+  ptr = NXMEM_ALIGNED_ALLOC(align, bytes);
   if (ptr == NULL) {
     return nxmem_status(NXMEM_STATUS_OUT_OF_MEMORY,
                         "minimal: the host allocator refused the request");
@@ -147,7 +166,7 @@ static NxmemStatus minimal_deallocate(void *ctx,
     return status;
   }
 
-  free(allocation->ptr);
+  NXMEM_ALIGNED_FREE(allocation->ptr);
   *unmapped_bytes_out = allocation->bytes;
   if (g_live_allocations > 0) {
     g_live_allocations -= 1;
