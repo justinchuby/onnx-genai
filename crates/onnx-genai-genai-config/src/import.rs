@@ -175,6 +175,30 @@ pub const KNOWN_DROPPED_KEYS: &[(&str, &str)] = &[
         "model.decoder.inputs.rnn_states",
         "RNN decoder state has no declared state kind in this contract yet",
     ),
+    (
+        "model.decoder.hidden_size",
+        "hidden width is a graph-visible tensor dimension; the contract declares attention shape \
+         and reads widths from the model's own ONNX ABI",
+    ),
+    (
+        "model.encoder.hidden_size",
+        "hidden width is a graph-visible tensor dimension; the contract declares attention shape \
+         and reads widths from the model's own ONNX ABI",
+    ),
+    (
+        "model.encoder.head_size",
+        "encoder self-attention shape stays inside the encoder graph; the contract declares only \
+         the attention shape that sizes the KV state a decoder carries",
+    ),
+    (
+        "model.encoder.num_key_value_heads",
+        "encoder self-attention shape stays inside the encoder graph; the contract declares only \
+         the attention shape that sizes the KV state a decoder carries",
+    ),
+    (
+        "model.vision.tokens_per_second",
+        "video temporal sampling rate has no declared field in this contract yet",
+    ),
 ];
 
 /// How strict an import should be.
@@ -562,6 +586,71 @@ mod tests {
                 None
             );
         }
+    }
+
+    /// Every real Foundry Local package carries `model.decoder.hidden_size`, so
+    /// an unexplained drop there made every one of them lossy for a reason the
+    /// operator could not read. Classifying it does not make the import any less
+    /// strict -- a classified drop is still a drop -- it only means the WARN says
+    /// why.
+    #[test]
+    fn the_structural_size_keys_real_packages_carry_all_state_their_reason() {
+        for key in [
+            "model.decoder.hidden_size",
+            "model.encoder.hidden_size",
+            "model.encoder.head_size",
+            "model.encoder.num_key_value_heads",
+            "model.vision.tokens_per_second",
+        ] {
+            assert!(
+                drop_reason(key).is_some(),
+                "'{key}' is dropped without a recorded reason"
+            );
+        }
+    }
+
+    /// Classifying a key must not smuggle it past the fail-closed gate.
+    #[test]
+    fn a_classified_drop_is_still_lossy() {
+        let raw = serde_json::json!({
+            "model": {
+                "type": "llama",
+                "context_length": 128,
+                "vocab_size": 32,
+                "eos_token_id": 2,
+                "decoder": {
+                    "filename": "model.onnx",
+                    "hidden_size": 64,
+                    "head_size": 8,
+                    "num_attention_heads": 8,
+                    "num_key_value_heads": 8,
+                    "num_hidden_layers": 2,
+                    "inputs": {"input_ids": "input_ids"},
+                    "outputs": {"logits": "logits"}
+                }
+            },
+            "search": {"max_length": 128}
+        });
+        let dropped = unrepresentable_keys(&raw);
+        assert_eq!(dropped, vec!["model.decoder.hidden_size".to_string()]);
+
+        let config: GenAiConfig = serde_json::from_value(raw.clone()).expect("config");
+        let strict = import(&config, &raw, None, None, ImportOptions::default());
+        assert!(
+            strict.is_err(),
+            "a documented drop must still fail a strict import"
+        );
+
+        let (_, report) = import(
+            &config,
+            &raw,
+            None,
+            None,
+            ImportOptions { allow_lossy: true },
+        )
+        .expect("lossy import");
+        assert!(report.is_lossy());
+        assert_eq!(report.dropped_keys, dropped);
     }
 
     #[test]
