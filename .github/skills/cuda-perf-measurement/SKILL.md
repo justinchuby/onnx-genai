@@ -156,6 +156,27 @@ story could explain it — which meant the instrument was wrong, not the kernel.
 Build that kind of internal cross-check into any probe you add. A microbenchmark
 with no self-contradicting case is a microbenchmark you cannot debug.
 
+## Trap 6: an optimization that ships, is tested, and never runs
+
+The device argmax was implemented, GPU-tested, benchmarked at +8%, and made
+"default on" -- and then ran for months on exactly zero real requests. Two
+independent gates, each innocuous on its own, closed the path:
+
+1. `PipelineDecodeLoopBackend` never overrode `greedy_fastpath_supported()`, so
+   it inherited the trait default of `false`. Nothing failed; the pipeline just
+   read 404 KB of logits per token forever.
+2. The eligibility test was `chain.is_empty()`, but every real model ships
+   `top_k` / `top_p` in its `generation` defaults and every chat template adds a
+   stop sequence. None of those can move an argmax. The tests all used bare
+   `GenerateOptions::default()`, so the chain was empty in tests and never in
+   production.
+
+**A default-`false` capability query and a test that only exercises the default
+config are a matched pair that will hide any fast path.** When a lever is
+supposed to be on, prove it fires on the real model -- `--profile` and look for
+the span that should have *disappeared* (`loop.sampling`), not just at tok/s,
+which was inside the noise band here.
+
 ## Know your roofline, and what a good fraction actually is
 
 Decode is weight-bandwidth-bound: per token you must read every weight once.

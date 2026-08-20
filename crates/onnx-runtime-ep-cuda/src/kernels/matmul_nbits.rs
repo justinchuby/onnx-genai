@@ -239,6 +239,17 @@ const GEMV_F16_SCALES_F16_SPLITK_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16
 /// near-equal — not byte-identical — to the plain `_zp` kernel; the asymmetric-zp
 /// parity tests track a dequant reference to tolerance.
 const GEMV_F16_SCALES_F16_ZP_SPLITK_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_zp_splitk";
+/// Prefetch-pipelined siblings of the block-32 scales-fp16 split-K int4 GEMVs.
+/// Same K_SPLIT geometry, lane->nibble mapping and per-split accumulation order,
+/// so they are bit-identical to the non-`_pf` split-K entries; the only change
+/// is that each lane keeps `PF` weight-word loads in flight (a register-resident
+/// shift register) to hide the Long-Scoreboard weight-load latency that the
+/// split-K loop otherwise stalls on. Selected by [`use_scales_f16_zp_splitk_pf`]
+/// (default-on; `ONNX_GENAI_ZP_SPLITK_PREFETCH=0` forces the plain split-K entry
+/// for A/B).
+const GEMV_F16_SCALES_F16_SPLITK_PF_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_splitk_pf";
+const GEMV_F16_SCALES_F16_ZP_SPLITK_PF_ENTRY: &str =
+    "matmul_nbits_gemv_f16_scales_f16_zp_splitk_pf";
 /// Warps cooperating per output column in the split-K asymmetric int4 GEMV. Must
 /// match `K_SPLIT` in `matmul_nbits_gemv_f16_scales_f16_splitk`. A block keeps
 /// its `blockDim.x / 32` warps but now covers `warps / K_SPLIT` columns, so the
@@ -248,6 +259,11 @@ const GEMV_F16_SCALES_F16_ZP_SPLITK: usize = 2;
 /// [`GEMV_F16_SCALES_F16_ZP_SPLITK`]. See
 /// [`scales_f16_zp_split_factor`] for when it is chosen.
 const GEMV_F16_SCALES_F16_ZP_SPLITK8_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_zp_splitk8";
+/// Prefetch-pipelined sibling of [`GEMV_F16_SCALES_F16_ZP_SPLITK8_ENTRY`]
+/// (default-on; `ONNX_GENAI_ZP_SPLITK_PREFETCH=0` forces the plain deep-split
+/// entry for A/B).
+const GEMV_F16_SCALES_F16_ZP_SPLITK8_PF_ENTRY: &str =
+    "matmul_nbits_gemv_f16_scales_f16_zp_splitk8_pf";
 /// Warps per output column in [`GEMV_F16_SCALES_F16_ZP_SPLITK8_ENTRY`]. Must
 /// match the `K_SPLIT` template argument of that entry, and must not exceed the
 /// 8 warps of the 256-thread launch (at equality each CTA covers one column).
@@ -3430,6 +3446,228 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_zp_splitk8(
         bias_post_round, out_bf16);
 }
 
+// Prefetch-pipelined sibling of `matmul_nbits_gemv_f16_scales_f16_splitk_tpl`.
+// The split-K kernel fills idle SMs and adds per-COLUMN memory-level parallelism
+// (K_SPLIT warps per column), but each lane still walks its weight-word chain
+// with a single 32-bit global load in flight -> a load->accumulate->load
+// dependency that stalls on the ~Long-Scoreboard weight-load latency the pipe
+// kernel diagnosed (DRAM ~24% of an H200's 4.8 TB/s, math not the bottleneck).
+// This variant adds per-LANE MLP on top of split-K by holding PF prefetched
+// weight words in a register-resident shift register (manual rotation, no
+// dynamic-indexed array -> no local spill), so PF independent global loads stay
+// in flight per lane while the fp16 dequant/FMA of the current word proceeds.
+//
+// The lane->nibble mapping, the `accumulate_int4x8_f16_zp` calls, the per-split
+// accumulation order and the shared-mem cross-split reduction are UNCHANGED, so
+// the output is bit-identical to `matmul_nbits_gemv_f16_scales_f16_splitk_tpl`
+// (which is already near-equal, not byte-identical, to the single-warp pipe
+// entry). Only the timing of the weight loads changes.
+template <bool HasZp, int K_SPLIT>
+__device__ __forceinline__ void matmul_nbits_gemv_f16_scales_f16_splitk_pf_tpl(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    void* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round,
+    const int out_bf16)
+{
+    (void)block_size;
+    (void)scales_fp16;
+    constexpr int PF = 3;  // weight words in flight per lane
+    const __half* __restrict__ scales =
+        reinterpret_cast<const __half*>(scales_raw);
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int cols_per_block = warps_per_block / K_SPLIT;
+    const int col_local = warp / K_SPLIT;
+    const int ks = warp % K_SPLIT;
+    const int column = (int)blockIdx.x * cols_per_block + col_local;
+
+    __shared__ float partials[8][K_SPLIT];
+
+    __half2 sum0 = __float2half2_rn(0.0f);
+    __half2 sum1 = __float2half2_rn(0.0f);
+    __half2 sum2 = __float2half2_rn(0.0f);
+    __half2 sum3 = __float2half2_rn(0.0f);
+    float tail = 0.0f;
+    if (column < n) {
+        const int lane_depth = lane * 8;
+        // Depth this (lane, split) touches at step i is
+        // `depth_start + i * K_SPLIT * 256`; the weight word stride is
+        // `K_SPLIT * 128` packed bytes (256 depth = 128 bytes for block-32 int4).
+        const int depth_start = ks * 256 + lane_depth;
+        const unsigned char* packed_base =
+            packed + (long)column * k_blocks * blob_size +
+            (long)((ks * 256) >> 5) * blob_size + lane * 4;
+        // Full 8-nibble steps this (lane, split) walks (step i valid iff
+        // `depth_start + i*K_SPLIT*256 + 8 <= k`), identical to the scalar bound.
+        const int nfull =
+            (depth_start + 8 <= k) ? ((k - depth_start - 8) / (K_SPLIT * 256) + 1) : 0;
+        auto load_step = [&](int s) -> unsigned int {
+            return *reinterpret_cast<const unsigned int*>(
+                packed_base + (long)s * (K_SPLIT * 128));
+        };
+        // Prime the shift register; out-of-range slots are zero (never consumed).
+        unsigned int wbuf[PF];
+#pragma unroll
+        for (int s = 0; s < PF; ++s) {
+            wbuf[s] = (s < nfull) ? load_step(s) : 0u;
+        }
+
+        const __half* activation_ptr = activation + depth_start;
+        const __half* scale_ptr =
+            scales + (long)column * k_blocks + ((ks * 256) >> 5) + (lane >> 2);
+        int block = (int)(((ks * 256) >> 5) + (lane >> 2));
+        for (int i = 0; i < nfull; ++i) {
+            const unsigned int packed_word = wbuf[0];
+            // Rotate and issue the load PF steps ahead BEFORE consuming, so PF
+            // independent loads stay in flight.
+            const int pf = i + PF;
+#pragma unroll
+            for (int s = 0; s < PF - 1; ++s) {
+                wbuf[s] = wbuf[s + 1];
+            }
+            wbuf[PF - 1] = (pf < nfull) ? load_step(pf) : 0u;
+
+            const unsigned int sub2 =
+                block_sub2<HasZp>(zero_points, column, block, zp_row_bytes);
+            accumulate_int4x8_f16_zp(
+                packed_word, activation_ptr, *scale_ptr, sub2, sum0, sum1, sum2, sum3);
+            activation_ptr += K_SPLIT * 256;
+            scale_ptr += K_SPLIT * 8;
+            block += K_SPLIT * 8;
+        }
+        const int tail_depth = depth_start + nfull * (K_SPLIT * 256);
+        if (tail_depth < k) {
+            const unsigned int packed_word = load_step(nfull);
+            const float scale = __half2float(*scale_ptr);
+            const int zero_point =
+                block_zp<HasZp>(zero_points, column, block, zp_row_bytes);
+            const int valid = k - tail_depth;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                if (i < valid) {
+                    const int q =
+                        (int)((packed_word >> (i * 4)) & 15u) - zero_point;
+                    tail += (float)q * __half2float(activation_ptr[i]) * scale;
+                }
+            }
+        }
+    }
+    const float2 value04 = __half22float2(sum0);
+    const float2 value15 = __half22float2(sum1);
+    const float2 value26 = __half22float2(sum2);
+    const float2 value37 = __half22float2(sum3);
+    float value = tail + value04.x;
+    value += value15.x;
+    value += value26.x;
+    value += value37.x;
+    value += value04.y;
+    value += value15.y;
+    value += value26.y;
+    value += value37.y;
+    value = warp_sum(value);
+    if (lane == 0) {
+        partials[col_local][ks] = (column < n) ? value : 0.0f;
+    }
+    __syncthreads();
+    if (ks == 0 && lane == 0 && column < n) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int s = 0; s < K_SPLIT; ++s) {
+            acc += partials[col_local][s];
+        }
+        matmul_nbits_store_narrowed(
+            output, column, fold_bias_f16(acc, bias, column, bias_post_round),
+            out_bf16);
+    }
+}
+
+extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_splitk_pf(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    void* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round,
+    const int out_bf16)
+{
+    matmul_nbits_gemv_f16_scales_f16_splitk_pf_tpl<false, 2>(
+        activation, packed, scales_raw, zero_points, bias, output, k, n,
+        block_size, k_blocks, blob_size, zp_row_bytes, scales_fp16,
+        bias_post_round, out_bf16);
+}
+
+extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_zp_splitk_pf(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    void* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round,
+    const int out_bf16)
+{
+    matmul_nbits_gemv_f16_scales_f16_splitk_pf_tpl<true, 2>(
+        activation, packed, scales_raw, zero_points, bias, output, k, n,
+        block_size, k_blocks, blob_size, zp_row_bytes, scales_fp16,
+        bias_post_round, out_bf16);
+}
+
+// Prefetch-pipelined sibling of the K_SPLIT=8 deep-split GQA k/v entry
+// (`matmul_nbits_gemv_f16_scales_f16_zp_splitk8`). Same PF register shift-
+// register transform as the K_SPLIT=2 `_pf` entries, just a deeper split, so it
+// stays bit-identical to the plain `_splitk8` entry while hiding the per-lane
+// weight-load latency that persists even after the grid is deepened.
+extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_zp_splitk8_pf(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    void* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round,
+    const int out_bf16)
+{
+    matmul_nbits_gemv_f16_scales_f16_splitk_pf_tpl<true, 8>(
+        activation, packed, scales_raw, zero_points, bias, output, k, n,
+        block_size, k_blocks, blob_size, zp_row_bytes, scales_fp16,
+        bias_post_round, out_bf16);
+}
+
 // Half4 view matching `skip_rmsnorm_f16_warp_half4` so the fused prologue below
 // reduces the activation with the exact same chunking and rounding.
 union MatMulNBitsSkipHalf4 {
@@ -6039,6 +6277,21 @@ fn interleave_dequant_enabled() -> bool {
             .ok()
             .as_deref(),
         Some("1") | Some("true") | Some("on")
+    )
+}
+
+/// Default-on gate for the prefetch-pipelined block-32 scales-fp16 split-K int4
+/// GEMV. The `_pf` entries are bit-identical drop-ins for the plain split-K
+/// entries (same launch geometry and accumulation order), differing only in that
+/// each lane keeps several weight-word loads in flight to hide the
+/// Long-Scoreboard weight-load latency the split-K loop otherwise stalls on.
+/// `ONNX_GENAI_ZP_SPLITK_PREFETCH=0` forces the plain entry for A/B measurement.
+fn use_scales_f16_zp_splitk_pf() -> bool {
+    !matches!(
+        std::env::var("ONNX_GENAI_ZP_SPLITK_PREFETCH")
+            .ok()
+            .as_deref(),
+        Some("0") | Some("false") | Some("off")
     )
 }
 
@@ -9778,6 +10031,24 @@ impl MatMulNBitsKernel {
         } else {
             (entry, orig_packed_ptr)
         };
+        // Prefetch-pipelined split-K swap: the `_pf` entries are bit-identical
+        // drop-ins (same K_SPLIT geometry, ABI and accumulation order) that keep
+        // several weight-word loads in flight per lane to hide the weight-load
+        // latency the plain split-K loop stalls on. Default-on;
+        // `ONNX_GENAI_ZP_SPLITK_PREFETCH=0` keeps the plain entry for A/B.
+        let entry = if use_scales_f16_zp_splitk_pf() {
+            if entry == GEMV_F16_SCALES_F16_ZP_SPLITK_ENTRY {
+                GEMV_F16_SCALES_F16_ZP_SPLITK_PF_ENTRY
+            } else if entry == GEMV_F16_SCALES_F16_SPLITK_ENTRY {
+                GEMV_F16_SCALES_F16_SPLITK_PF_ENTRY
+            } else if entry == GEMV_F16_SCALES_F16_ZP_SPLITK8_ENTRY {
+                GEMV_F16_SCALES_F16_ZP_SPLITK8_PF_ENTRY
+            } else {
+                entry
+            }
+        } else {
+            entry
+        };
         let function = self
             .runtime
             .nvrtc_function(GEMV_F16_MODULE, GEMV_F16_SRC, entry)?;
@@ -9789,12 +10060,16 @@ impl MatMulNBitsKernel {
         let bias_ptr = bias
             .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
             .unwrap_or(0);
-        // These two entries narrow their fp16 epilogue through
+        // These entries narrow their fp16 epilogue through
         // `matmul_nbits_store_narrowed`, so they can write a bf16 consumer
         // buffer directly and let `run_bf16` drop its per-node staging cast.
+        // The prefetch `_pf` siblings share the identical narrowing epilogue.
         let bf16_direct_capable = entry == GEMV_F16_SCALES_F16_SPLITK_ENTRY
             || entry == GEMV_F16_SCALES_F16_ZP_SPLITK_ENTRY
-            || entry == GEMV_F16_SCALES_F16_ZP_SPLITK8_ENTRY;
+            || entry == GEMV_F16_SCALES_F16_SPLITK_PF_ENTRY
+            || entry == GEMV_F16_SCALES_F16_ZP_SPLITK_PF_ENTRY
+            || entry == GEMV_F16_SCALES_F16_ZP_SPLITK8_ENTRY
+            || entry == GEMV_F16_SCALES_F16_ZP_SPLITK8_PF_ENTRY;
         let staging_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
         let direct_bf16_ptr = bf16_direct_capable
             .then(|| take_bf16_direct_out(staging_ptr, self.n))
@@ -12185,6 +12460,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         interleave: bool,
         general_splitk: Option<bool>,
         pipeline: Option<bool>,
+        prefetch: Option<bool>,
     ) -> Option<Vec<f16>> {
         let runtime = runtime()?;
         if runtime
@@ -12337,6 +12613,11 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 Some(false) => std::env::set_var("ONNX_GENAI_GEMV_PIPELINE", "0"),
                 None => std::env::remove_var("ONNX_GENAI_GEMV_PIPELINE"),
             }
+            match prefetch {
+                Some(true) => std::env::set_var("ONNX_GENAI_ZP_SPLITK_PREFETCH", "1"),
+                Some(false) => std::env::set_var("ONNX_GENAI_ZP_SPLITK_PREFETCH", "0"),
+                None => std::env::remove_var("ONNX_GENAI_ZP_SPLITK_PREFETCH"),
+            }
         }
         kernel.run(&inputs, &mut outputs, None).unwrap();
         runtime.synchronize().unwrap();
@@ -12383,18 +12664,33 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             (8192, 512, 128, true),
             (4096, 256, 64, true),
         ] {
-            let Some(base) =
-                run_symmetric_block_raw(k, n, block_size, scales_fp16, false, Some(false), None)
-            else {
+            let Some(base) = run_symmetric_block_raw(
+                k,
+                n,
+                block_size,
+                scales_fp16,
+                false,
+                Some(false),
+                None,
+                None,
+            ) else {
                 eprintln!(
                     "skipping interleaved dequant byte-identity test: CUDA runtime/headers \
                      unavailable"
                 );
                 return;
             };
-            let inter =
-                run_symmetric_block_raw(k, n, block_size, scales_fp16, true, Some(false), None)
-                    .unwrap();
+            let inter = run_symmetric_block_raw(
+                k,
+                n,
+                block_size,
+                scales_fp16,
+                true,
+                Some(false),
+                None,
+                None,
+            )
+            .unwrap();
             ran = true;
             let mismatches = base
                 .iter()
@@ -12428,18 +12724,33 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             (4096, 70, 128, true),
             (8192, 128, 128, true),
         ] {
-            let Some(base) =
-                run_symmetric_block_raw(k, n, block_size, scales_fp16, false, Some(true), None)
-            else {
+            let Some(base) = run_symmetric_block_raw(
+                k,
+                n,
+                block_size,
+                scales_fp16,
+                false,
+                Some(true),
+                None,
+                None,
+            ) else {
                 eprintln!(
                     "skipping split-K wide interleaved byte-identity test: CUDA runtime/headers \
                      unavailable"
                 );
                 return;
             };
-            let inter =
-                run_symmetric_block_raw(k, n, block_size, scales_fp16, true, Some(true), None)
-                    .unwrap();
+            let inter = run_symmetric_block_raw(
+                k,
+                n,
+                block_size,
+                scales_fp16,
+                true,
+                Some(true),
+                None,
+                None,
+            )
+            .unwrap();
             ran = true;
             let mismatches = base
                 .iter()
@@ -12489,7 +12800,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                     "K={k} N={n} scales_fp16={scales_fp16} must select the General variant"
                 );
                 let Some(scalar) =
-                    run_symmetric_block_raw(k, n, 32, scales_fp16, false, None, Some(false))
+                    run_symmetric_block_raw(k, n, 32, scales_fp16, false, None, Some(false), None)
                 else {
                     eprintln!(
                         "skipping scales-fp16 pipeline byte-identity test: CUDA runtime/headers \
@@ -12497,8 +12808,9 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                     );
                     return;
                 };
-                let pipe = run_symmetric_block_raw(k, n, 32, scales_fp16, false, None, Some(true))
-                    .unwrap();
+                let pipe =
+                    run_symmetric_block_raw(k, n, 32, scales_fp16, false, None, Some(true), None)
+                        .unwrap();
                 ran = true;
                 let mismatches = scalar
                     .iter()
@@ -12516,6 +12828,64 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         assert!(
             ran,
             "scales-fp16 pipeline byte-identity test did not execute any case"
+        );
+    }
+
+    /// The prefetch-pipelined block-32 scales-fp16 split-K int4 GEMV
+    /// (`ONNX_GENAI_ZP_SPLITK_PREFETCH`, default-on) keeps several weight-word
+    /// loads in flight per lane to hide the Long-Scoreboard weight-load latency,
+    /// but keeps the EXACT lane->nibble mapping, per-split accumulation order and
+    /// K_SPLIT shared-memory reduction of the plain split-K kernel — so every
+    /// fp16 output must match the plain split-K entry bit-for-bit. A single
+    /// differing bit means the prefetch reschedule reassociated the reduction.
+    /// Uses tiny-N, large-K shapes that are grid-starved on any GPU, so the
+    /// symmetric split-K entry is provably selected (asserted below).
+    #[test]
+    fn scales_f16_zp_splitk_prefetch_is_bit_identical_to_splitk() {
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping split-K prefetch byte-identity test: CUDA runtime unavailable");
+            return;
+        };
+        let sm = runtime.capabilities().multiprocessor_count();
+        let max_threads = runtime.capabilities().max_threads_per_block();
+        let mut ran = false;
+        for (k, n) in [(5120usize, 8usize), (13824, 16), (5120, 64)] {
+            for scales_fp16 in [true, false] {
+                // Guard that these dims actually select the split-K entry the
+                // prefetch swap targets; otherwise the comparison is vacuous.
+                assert!(
+                    use_f16_symmetric_splitk(k, n, sm, max_threads),
+                    "K={k} N={n} must select the symmetric split-K entry (sm={sm})"
+                );
+                let Some(plain) =
+                    run_symmetric_block_raw(k, n, 32, scales_fp16, false, None, None, Some(false))
+                else {
+                    eprintln!(
+                        "skipping split-K prefetch byte-identity test: CUDA runtime/headers \
+                         unavailable"
+                    );
+                    return;
+                };
+                let pf =
+                    run_symmetric_block_raw(k, n, 32, scales_fp16, false, None, None, Some(true))
+                        .unwrap();
+                ran = true;
+                let mismatches = plain
+                    .iter()
+                    .zip(pf.iter())
+                    .filter(|(s, p)| s.to_bits() != p.to_bits())
+                    .count();
+                assert_eq!(
+                    mismatches, 0,
+                    "prefetch-pipelined split-K GEMV diverged from the plain split-K entry at \
+                     block-32 K={k} N={n} scales_fp16={scales_fp16}: {mismatches}/{n} fp16 \
+                     outputs differ"
+                );
+            }
+        }
+        assert!(
+            ran,
+            "split-K prefetch byte-identity test did not execute any case"
         );
     }
 

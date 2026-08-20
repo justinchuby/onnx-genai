@@ -1,9 +1,122 @@
 //! Shared helpers for this crate's GPU-gated unit tests.
 
+use std::ffi::OsString;
 use std::panic;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crate::runtime::CudaRuntime;
+
+/// Process-global lock serialising every test that reads or writes an
+/// environment variable that gates production behaviour.
+///
+/// `cargo test` runs tests as parallel threads inside a **single process**, and
+/// `std::env` is process-wide mutable state. A test that calls `set_var`/
+/// `remove_var` therefore mutates state that *every other thread* observes. The
+/// subtle half is the reader: a test that runs an env-gated code path and
+/// asserts the **default** behaviour is just as exposed — it can observe another
+/// thread's temporary `set_var` and fail — even though it never touches the
+/// environment itself. Both writers and default-readers must serialise on the
+/// same lock for the guard to close the race structurally rather than merely
+/// shrink its window.
+fn env_lock() -> &'static Mutex<()> {
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    ENV_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// RAII guard that serialises environment-variable access across the crate's
+/// unit tests and restores every variable it touched to its prior value on
+/// drop.
+///
+/// Hold it for the **entire body** of any test that depends on an env-gated
+/// code path — whether it mutates the variable or relies on its default. The
+/// guard takes [`env_lock`] on construction and releases it on drop, so no two
+/// such tests run concurrently and no mutation ever leaks past the test that
+/// made it (the prior value is restored even if the test panics).
+///
+/// ```ignore
+/// // A test that toggles a variable:
+/// let mut env = EnvVarGuard::acquire();
+/// env.set("MY_FLAG", "1");
+/// // ... assertions ...
+/// // drop restores MY_FLAG to whatever it was before.
+///
+/// // A test that depends on the *default* (unset) value must still lock:
+/// let _env = EnvVarGuard::without_var("MY_FLAG");
+/// ```
+#[must_use = "the guard must outlive the env-dependent code; binding it to `_` drops it immediately"]
+pub(crate) struct EnvVarGuard {
+    _lock: MutexGuard<'static, ()>,
+    saved: Vec<(String, Option<OsString>)>,
+}
+
+impl EnvVarGuard {
+    /// Acquire the global env lock without changing anything. Use in tests that
+    /// depend on a variable's *default* value so they serialise against tests
+    /// that set it.
+    pub(crate) fn acquire() -> Self {
+        let lock = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self {
+            _lock: lock,
+            saved: Vec::new(),
+        }
+    }
+
+    /// Acquire the lock and set `key` to `value`, restoring the prior value on
+    /// drop.
+    pub(crate) fn with_var(key: &str, value: &str) -> Self {
+        let mut guard = Self::acquire();
+        guard.set(key, value);
+        guard
+    }
+
+    /// Acquire the lock and ensure `key` is unset for the guard's lifetime,
+    /// restoring the prior value on drop. Use when a test asserts the behaviour
+    /// of a variable's absence.
+    pub(crate) fn without_var(key: &str) -> Self {
+        let mut guard = Self::acquire();
+        guard.unset(key);
+        guard
+    }
+
+    /// Set `key` to `value` while the lock is held, remembering the prior value
+    /// so drop can restore it.
+    pub(crate) fn set(&mut self, key: &str, value: &str) -> &mut Self {
+        self.remember(key);
+        // SAFETY: the process-global env lock is held for this guard's lifetime,
+        // so no other test thread reads or writes the environment concurrently.
+        unsafe { std::env::set_var(key, value) };
+        self
+    }
+
+    /// Remove `key` while the lock is held, remembering the prior value so drop
+    /// can restore it.
+    pub(crate) fn unset(&mut self, key: &str) -> &mut Self {
+        self.remember(key);
+        // SAFETY: see `set`.
+        unsafe { std::env::remove_var(key) };
+        self
+    }
+
+    fn remember(&mut self, key: &str) {
+        self.saved.push((key.to_string(), std::env::var_os(key)));
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        // Restore in reverse so repeated touches of the same key end on the
+        // earliest recorded value.
+        for (key, previous) in self.saved.drain(..).rev() {
+            match previous {
+                // SAFETY: the lock is still held until this guard is fully dropped.
+                Some(value) => unsafe { std::env::set_var(&key, value) },
+                None => unsafe { std::env::remove_var(&key) },
+            }
+        }
+    }
+}
 
 /// Whether this host can construct a [`CudaRuntime`], probed exactly once.
 ///

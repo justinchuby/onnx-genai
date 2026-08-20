@@ -2073,6 +2073,83 @@ impl NativeDecodeSession {
         Ok(logits)
     }
 
+    /// [`Self::decode_cuda_captured_step_inputs`], but selecting the greedy token
+    /// with the device argmax instead of returning host logits.
+    ///
+    /// The forward pass is the identical captured replay; only the epilogue
+    /// differs, and that epilogue is where the cost was. Reading logits moves the
+    /// whole vocabulary to the host every token — 404 KB for this repo's 202048
+    /// -entry vocabulary — drains the stream to do it, and then walks all 202048
+    /// values on the CPU for the finiteness check. Reading the greedy result
+    /// moves eight bytes.
+    ///
+    /// Tie-breaking is `device_argmax`'s lowest-index rule, which is the same
+    /// rule the host `sample_greedy` uses, so the token stream is unchanged.
+    /// The device argmax also returns the shared capture-error word, so the
+    /// detection-before-consumption check is preserved without a second sync
+    /// (this is why there is no separate `check_device_capture_error` call).
+    ///
+    /// The dropped non-finite check is not a loss of safety here: a NaN logit
+    /// cannot win an argmax whose comparison is a strict `>` seeded from
+    /// negative infinity, and the capture-error word still catches a device-side
+    /// violation. The host path keeps its check, since it is the path that hands
+    /// raw logits to processors.
+    pub(crate) fn decode_cuda_captured_step_inputs_greedy(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+        total_len: usize,
+        supplied: &[(String, Tensor)],
+    ) -> anyhow::Result<TokenId> {
+        debug_assert_eq!(
+            token_ids.len(),
+            1,
+            "captured step-input path is single-token"
+        );
+        super::NATIVE_DECODER_CAPTURED_STEP_INPUT_DECODES
+            .fetch_add(1, super::AtomicOrdering::Relaxed);
+        let position = past_len;
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        if total_len > state.capacity.max_len {
+            bail!("{}", state.capacity_exceeded_error(total_len));
+        }
+        let grew = state.ensure_capacity(&mut self.session, total_len)?;
+        let mask_expose = state.decode_mask_expose_len(total_len);
+        state.extend_mask(if grew { 0 } else { past_len }, total_len, mask_expose)?;
+        state.write_captured_step_inputs(supplied, position)?;
+        state.prepare_decode_workspace_after_capacity_growth(&mut self.session, grew)?;
+
+        if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
+            let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
+            return Err(error.context(format!(
+                "native CUDA decoder forward pass failed{diagnosis}"
+            )));
+        }
+        let (token_id, capture_error) = state.read_greedy_result()?;
+        if capture_error != 0 {
+            let _ = state.invalidate_graph(&mut self.session);
+            bail!(
+                "native CUDA decoder aborted: device capture validation violation (flags=0x{capture_error:x}) detected during captured graph replay of a per-step-input greedy decode; the produced token was rejected before consumption and the decode graph was invalidated"
+            );
+        }
+        state.set_logical_len(total_len)?;
+        self.current_len = total_len;
+        Ok(token_id)
+    }
+
+    /// Whether a single-token step carrying routed per-step ports can take the
+    /// captured device-argmax epilogue above.
+    pub(crate) fn captured_step_input_greedy_supported(&self) -> bool {
+        self.has_eager_step_inputs()
+            && self
+                .cuda
+                .as_ref()
+                .is_some_and(|state| state.capture_step_inputs && state.greedy_fastpath_supported())
+    }
+
     /// Generic eager CUDA decode step for decoders with `inputs_embeds` and/or
     /// arbitrary `Routed` ports (Inc3a embeds, generalized in Inc3b). Builds the
     /// owned per-step upload set from **every** declared non-KV step input the
