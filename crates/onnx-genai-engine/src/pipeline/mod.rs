@@ -420,10 +420,14 @@ fn build_native_pipeline_components(
     let mut components: std::collections::BTreeMap<String, Box<dyn ComponentSession>> =
         std::collections::BTreeMap::new();
     for (name, path) in &directory.model_paths {
-        let session =
-            NativeComponentSession::load(path, device.clone(), None).with_context(|| {
-                format!("failed to construct pipeline component '{name}' on the native backend")
-            })?;
+        let session = NativeComponentSession::load(
+            path,
+            device.clone(),
+            crate::native_component::ComponentMemory::SelfProvisioned(None),
+        )
+        .with_context(|| {
+            format!("failed to construct pipeline component '{name}' on the native backend")
+        })?;
         components.insert(name.clone(), Box::new(session));
     }
     Ok(components)
@@ -529,25 +533,24 @@ fn build_step_component_session<'a>(
             // round-trips host<->device per step; the decoder's KV never does.
             // Under CUDA the governor and process manager are threaded into this
             // builder, so the component's provider is constructed already
-            // governed rather than adopting a standing pool after the fact.
+            // governed; the loader still adopts the governor afterwards, which
+            // is what creates the weight cache's mapped-byte allowance.
             // Without CUDA there is no governor in scope here at all: every_step
             // components are built before the resource governor, which is itself
             // sized from the models on disk. The lazily loaded prompt components
             // (routing.rs) are the ones that can and do adopt it.
             #[cfg(feature = "cuda")]
-            let native = crate::native_component::NativeComponentSession::load_with_cuda_memory(
-                path,
-                native_device.clone(),
+            let memory = crate::native_component::ComponentMemory::GovernedCuda {
                 policy,
                 governor,
                 manager,
-            )
-            .with_context(|| format!("failed to load native every_step component '{component}'"))?;
+            };
             #[cfg(not(feature = "cuda"))]
+            let memory = crate::native_component::ComponentMemory::SelfProvisioned(None);
             let native = crate::native_component::NativeComponentSession::load(
                 path,
                 native_device.clone(),
-                None,
+                memory,
             )
             .with_context(|| format!("failed to load native every_step component '{component}'"))?;
             return Ok(Box::new(native));

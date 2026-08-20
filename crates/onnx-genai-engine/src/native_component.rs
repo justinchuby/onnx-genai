@@ -102,9 +102,37 @@ pub struct NativeComponentSession {
     outputs: Vec<ComponentIo>,
 }
 
+/// How a component's device memory is arranged.
+///
+/// This exists so that [`NativeComponentSession::load`] can stay the single
+/// entry point. An earlier split into two loaders let the CUDA one silently
+/// miss configuration the other one performed, which is a defect shape no test
+/// catches -- every symbol survives and only the reachable path changes.
+pub enum ComponentMemory<'a> {
+    /// The component builds its own execution provider. `governor`, when
+    /// present, is the ledger its standing device pool is charged to.
+    SelfProvisioned(Option<&'a dyn onnx_runtime_memory_governor::MemoryGovernor>),
+    /// The engine's shared CUDA authority builds an already-governed provider.
+    /// Falls back to a self-provisioned session on a non-CUDA device, where
+    /// there is no device authority to build one around.
+    #[cfg(feature = "cuda")]
+    GovernedCuda {
+        policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
+        governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
+        manager: onnx_runtime_memory_governor::ProcessMemoryManager,
+    },
+}
+
 impl NativeComponentSession {
     /// Wrap an already-built native [`InferenceSession`] as a neutral component.
-    pub fn new(session: InferenceSession) -> Result<Self, ComponentError> {
+    pub fn new(mut session: InferenceSession) -> Result<Self, ComponentError> {
+        // A component graph is run once per request and never records a device
+        // graph, so its intermediates can be freed as they die. The vision
+        // encoder is why this matters: holding every one of its 2545 node
+        // outputs at once cost ~23 GB at 448px and put full-resolution images
+        // out of reach entirely. This lives here rather than in a loader so no
+        // construction path can be added that forgets it.
+        session.set_release_dead_values(true);
         let inputs = session
             .inputs()
             .iter()
@@ -124,39 +152,101 @@ impl NativeComponentSession {
 
     /// Load an ONNX model on the requested native device as a neutral component.
     ///
-    /// `governor`, when present, is the ledger the rest of the engine admits
-    /// against on this device. A component session builds its own execution
-    /// provider, which sizes any standing device pool for itself; adopting the
-    /// governor turns that pool into a claim the decoder's admission control can
-    /// see. Without it two co-resident sessions each measure the same free VRAM
-    /// and each conclude they may use ~90% of it.
+    /// This is the only loader. `memory` chooses how the execution provider is
+    /// built, but everything done to the session afterwards happens once, in
+    /// [`Self::finish`], so a new arrangement cannot be added that quietly skips
+    /// a step -- which is exactly how the CUDA path once lost both the dead-value
+    /// release and the residency budget while every symbol involved survived.
+    ///
+    /// The governor, however it arrives, is the ledger the rest of the engine
+    /// admits against on this device. A component session's provider sizes any
+    /// standing device pool for itself; adopting the governor turns that pool
+    /// into a claim the decoder's admission control can see. Without it two
+    /// co-resident sessions each measure the same free VRAM and each conclude
+    /// they may use ~90% of it.
     pub fn load(
         path: &Path,
         device: NativeDecodeDevice,
-        governor: Option<&dyn onnx_runtime_memory_governor::MemoryGovernor>,
+        memory: ComponentMemory<'_>,
     ) -> anyhow::Result<Self> {
         let requested_cuda = matches!(&device, NativeDecodeDevice::Cuda { .. });
-        let preference = match device {
+        let preference = match &device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
-            NativeDecodeDevice::Cuda { index } => DevicePreference::Gpu { index },
+            NativeDecodeDevice::Cuda { index } => DevicePreference::Gpu { index: *index },
             NativeDecodeDevice::Plugin { .. } => DevicePreference::Cpu,
         };
-        let mut session = InferenceSession::builder()
-            .model(path)
-            .device(preference)
-            .build()
-            .map_err(|err| {
-                anyhow::anyhow!(
-                    "failed to load pipeline component '{}' on the native backend: {err}",
-                    path.display()
-                )
-            })?;
-        // A component graph is run once per request and never records a device
-        // graph, so its intermediates can be freed as they die. The vision
-        // encoder is why this matters: holding every one of its 2545 node
-        // outputs at once cost ~23 GB at 448px and put full-resolution images
-        // out of reach entirely.
-        session.set_release_dead_values(true);
+        let build_self_provisioned = || {
+            InferenceSession::builder()
+                .model(path)
+                .device(preference)
+                .build()
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "failed to load pipeline component '{}' on the native backend: {err}",
+                        path.display()
+                    )
+                })
+        };
+        // `owned` keeps a governed arrangement's handle alive long enough for the
+        // adoption in `finish`; `borrowed` carries the self-provisioned case.
+        let (session, owned, borrowed): (
+            InferenceSession,
+            Option<std::sync::Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>>,
+            Option<&dyn onnx_runtime_memory_governor::MemoryGovernor>,
+        ) = match memory {
+            ComponentMemory::SelfProvisioned(governor) => {
+                (build_self_provisioned()?, None, governor)
+            }
+            #[cfg(feature = "cuda")]
+            ComponentMemory::GovernedCuda {
+                policy,
+                governor,
+                manager,
+            } => match &device {
+                NativeDecodeDevice::Cuda { index } => {
+                    let ep = onnx_runtime_ep_cuda::CudaExecutionProvider::
+                        initialized_with_offload_policy_governor_and_manager(
+                            index.unwrap_or(0),
+                            policy,
+                            Arc::clone(&governor),
+                            manager,
+                        )
+                        .context("initialize governed native CUDA component provider")?;
+                    let session = InferenceSession::builder()
+                        .model(path)
+                        .execution_provider(Arc::new(ep))
+                        .build()
+                        .map_err(|err| {
+                            anyhow::anyhow!(
+                                "failed to load pipeline component '{}' on the governed native \
+                                 CUDA backend: {err}",
+                                path.display()
+                            )
+                        })?;
+                    (session, Some(governor), None)
+                }
+                // No device authority to build a governed provider around, but
+                // the governor still accounts for the component's pool, so it is
+                // handed over rather than dropped.
+                _ => (build_self_provisioned()?, Some(governor), None),
+            },
+        };
+        let governor: Option<&dyn onnx_runtime_memory_governor::MemoryGovernor> = owned
+            .as_deref()
+            .map(|governor| governor as &dyn onnx_runtime_memory_governor::MemoryGovernor)
+            .or(borrowed);
+        Self::finish(session, path, requested_cuda, governor)
+    }
+
+    /// Everything applied to a component's session after it is built. Every
+    /// memory arrangement passes through here, so this is the one place a step
+    /// can be added without auditing the loaders.
+    fn finish(
+        session: InferenceSession,
+        path: &Path,
+        requested_cuda: bool,
+        governor: Option<&dyn onnx_runtime_memory_governor::MemoryGovernor>,
+    ) -> anyhow::Result<Self> {
         if requested_cuda && let Some(report) = session.execution_provider_fallback_report() {
             tracing::warn!(
                 model = %path.display(),
@@ -166,6 +256,12 @@ impl NativeComponentSession {
         }
         if let Some(governor) = governor {
             let holder = crate::engine::memory_plan::Holder::PipelineComponentPool;
+            // An already-governed CUDA provider carries the arena's claim, so the
+            // arena half of this records zero rather than double-charging. The
+            // residency half is not redundant: the weight cache's authority-scoped
+            // mapped-byte allowance is created only here, and page-in refuses
+            // outright without it.
+            //
             // Not fatal: a provider that holds no standing pool reports zero, and
             // a governor that refuses the claim leaves the component exactly as
             // unaccounted as it was before -- worth saying out loud, not worth
@@ -185,59 +281,6 @@ impl NativeComponentSession {
                 ),
             }
         }
-        Self::new(session).map_err(anyhow::Error::from)
-    }
-
-    /// Load a component through the engine's shared CUDA authority and process
-    /// manager instead of automatic provider construction.
-    #[cfg(feature = "cuda")]
-    pub(crate) fn load_with_cuda_memory(
-        path: &Path,
-        device: NativeDecodeDevice,
-        policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
-        governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
-        manager: onnx_runtime_memory_governor::ProcessMemoryManager,
-    ) -> anyhow::Result<Self> {
-        let NativeDecodeDevice::Cuda { index } = device else {
-            // Not a CUDA device, so there is no device authority to build a
-            // governed provider around -- but the governor still accounts for
-            // the component's pool, so it is handed over rather than dropped.
-            return Self::load(path, device, Some(governor.as_ref()));
-        };
-        let ep = onnx_runtime_ep_cuda::CudaExecutionProvider::
-            initialized_with_offload_policy_governor_and_manager(
-                index.unwrap_or(0),
-                policy,
-                governor,
-                manager,
-            )
-            .context("initialize governed native CUDA component provider")?;
-        let mut session = InferenceSession::builder()
-            .model(path)
-            .execution_provider(Arc::new(ep))
-            .build()
-            .map_err(|err| {
-                anyhow::anyhow!(
-                    "failed to load pipeline component '{}' on the governed native CUDA backend: \
-                     {err}",
-                    path.display()
-                )
-            })?;
-        // Same reasoning as `load`: a component graph runs once per request and
-        // records no device graph, so its intermediates can die as they go. This
-        // path must set it too -- it is the loader every CUDA component actually
-        // takes, so leaving it out puts the ~23 GB vision-encoder retention back.
-        session.set_release_dead_values(true);
-        if let Some(report) = session.execution_provider_fallback_report() {
-            tracing::warn!(
-                model = %path.display(),
-                fallback = %report,
-                "governed native CUDA pipeline component fell back to CPU"
-            );
-        }
-        // No `adopt_memory_governor` here on purpose: the provider above was
-        // built already governed, so charging the pool a second time through the
-        // component holder would double-count the same bytes.
         Self::new(session).map_err(anyhow::Error::from)
     }
 }
