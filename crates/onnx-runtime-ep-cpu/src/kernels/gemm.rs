@@ -84,7 +84,7 @@ impl GemmKernel {
         // No weight diverts this to the fused GEBP. `MatMul` used to divert at
         // `k * n >= 1M` and `Gemm` never did -- the divergence #1381 recorded.
         // Re-measured through both production kernels the divert is a loss
-        // (1.3x-6.7x at 8 threads), so it was retired from `MatMul` rather
+        // (1.3x-5.0x at 8 threads), so it was retired from `MatMul` rather
         // than copied here, and the two ops now take the same **f16** route at
         // every weight -- `half_decode_route_tests` pins that. `bf16` is a
         // separate, still-open gap: the dtype check above admits `Float16`

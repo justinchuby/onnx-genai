@@ -1347,8 +1347,11 @@ that `Gemm` was missing a gate. Re-measured, it was `MatMul` that was carrying a
 **What the original evidence missed.** Its sweep was 32 threads and `k <= 2048`. Run through the
 same production harness (`benches/half_decode_gemv_ab.rs`, arms selected by
 `ONNX_GENAI_CPU_MM_HALF_GEMV/GEBP`, `f32` control divided out) at **8 threads**, the handover is a
-loss at every shape tested — `/ctl` 0.15–0.76, i.e. 1.3x–6.7x slower — with the GEBP's weight
-bandwidth pinned at 20–34 GB/s independent of shape while the GEMV reaches 24–155 GB/s. At 32
+loss at every `full`-set shape at or above the gate (`/ctl` 0.26–0.76) and in 20 of the 22 `f16`
+cells of the `band` set over two independent repetitions (`/ctl` 0.20–1.14) — up to **5.0x**
+slower — with the GEBP's weight bandwidth pinned at 20–34 GB/s independent of shape while the GEMV
+reaches 24–155 GB/s. The two `band` cells that do exceed 1.00 sit *exactly* at the retired
+threshold at `k = 1024` and do not hold across repetitions (1.14 then 0.89). At 32
 threads it is still a loss at every shape a 7B-class decode issues: `k = 4096` qkv/mlp 0.51–0.89,
 a 136M `lm_head` 0.86. The corner it does win — `k = 1024`, 1.05M–4.2M, 32 threads, `/ctl`
 0.95–1.49 — is real but is not a shape any such model emits, and its `k = 2048` rows are not

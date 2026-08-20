@@ -2323,7 +2323,7 @@ impl MatMulKernel {
         // handover existed (`half_decode_prefers_gebp`, `k * n >= 1M`) and was
         // retired: re-measured through this kernel with
         // `benches/half_decode_gemv_ab.rs` it is a loss at every shape at 8
-        // threads (1.3x-6.7x) and a loss at the model shapes even at 32
+        // threads (1.3x-5.0x) and a loss at the model shapes even at 32
         // (k = 4096 1.1x-2.4x, a 136M lm_head 1.16x).
         //
         // The GEBP earns its packing by reusing a `KC x NR` panel across the
@@ -2963,7 +2963,7 @@ fn half_gemm_tile(
 /// here at all -- the GEMV in `try_matmul` takes it at every weight, because
 /// the panel this kernel packs is reused across rows of `A` and at `m == 1`
 /// there is one row (`docs/benchmarks/2026-08-21-half-decode-gebp-retired.md`;
-/// the handover this doc used to cite was measured a 1.3x-6.7x loss at 8
+/// the handover this doc used to cite was measured a 1.3x-5.0x loss at 8
 /// threads). What still arrives at `m == 1` is a *batched* half MatMul, which
 /// the GEMV declines and whose only other destination is the row-blocked
 /// GEMM -- so this gate keeps accepting it.
@@ -5419,7 +5419,7 @@ mod tests {
     /// widen-pack GEBP; re-measured through this kernel
     /// (`benches/half_decode_gemv_ab.rs`, arms selected by
     /// `ONNX_GENAI_CPU_MM_HALF_GEMV/GEBP`, `f32` control divided out) that
-    /// divert is a 1.3x-6.7x loss at 8 threads and still a loss at the model
+    /// divert is a 1.3x-5.0x loss at 8 threads and still a loss at the model
     /// shapes at 32 -- `k = 4096` 1.1x-2.4x, a 136M `lm_head` 1.16x. The
     /// mechanism is not tuning: the GEBP earns its packing by reusing a `B`
     /// panel across rows of `A`, and at `m == 1` `m_panels` is 1, so every

@@ -52,10 +52,48 @@ move, so it separates a route difference from machine drift.
     not as GEBP evidence; the conclusion rests on the eight rows at or above
     1M.
 
-Every shape at or above the threshold is a loss, by 1.3x to 3.0x (`/ctl` 0.30
-down to 0.76). The `PROBE_SHAPE=band` set (11 shapes, 0.79M-8.4M, `k` in
-{1024, 2048, 4096}) agrees and reaches further: `/ctl` runs 0.15-0.75 there,
-i.e. up to 6.7x, with no row above 1.00.
+Every shape at or above the threshold is a loss, by 1.3x to 3.8x (`/ctl` 0.26
+to 0.76).
+
+### 8 threads, `PROBE_SHAPE=band` -- the threshold neighbourhood, twice
+
+`band` exists because the retired gate was a `k * n` gate: it puts rows
+immediately below, at and above 1 048 576 elements at three different `k`, so a
+`k`-dependent effect cannot hide inside the product. Both arms were run twice,
+end to end, as four separate processes.
+
+| shape | `k` | elements | f16 run 1 | f16 run 2 | bf16 run 1 | bf16 run 2 |
+|---|---|---|---|---|---|---|
+| `w0.79M` [^1] | 1024 | 0.79M | 0.23 | 0.25 | 0.27 | 0.31 |
+| `w1.05M_k1024` | 1024 | 1.05M | **1.14** | 0.89 | **1.29** | **1.05** |
+| `w2.1M_k1024` | 1024 | 2.10M | 0.53 | 0.86 | 0.54 | **1.01** |
+| `w2.1M_k2048` | 2048 | 2.10M | 0.70 | 0.49 | 0.79 | 0.58 |
+| `w3.1M_k1024` | 1024 | 3.15M | 0.57 | 0.48 | 0.69 | 0.96 |
+| `w3.1M_k2048` | 2048 | 3.15M | 0.96 | 0.92 | 0.98 | **1.05** |
+| `w4.2M_k1024` | 1024 | 4.19M | 0.26 | 0.26 | 0.39 | 0.53 |
+| `w4.2M_k2048` | 2048 | 4.19M | 0.41 | 0.30 | 0.42 | 0.52 |
+| `w4.2M_k4096` | 4096 | 4.19M | 0.57 | 0.82 | 0.69 | **1.05** |
+| `w6.3M_k2048` | 2048 | 6.29M | 0.41 | 0.55 | 0.42 | 0.57 |
+| `w8.4M_k2048` | 2048 | 8.39M | 0.20 | 0.41 | 0.24 | 0.37 |
+
+Read this honestly. **20 of 22 `f16` cells are losses**, the worst reproducibly
+so (`w8.4M_k2048` 0.20/0.41, `w4.2M_k1024` 0.26/0.26), and the `full` set above
+agrees. But two things this set shows that a one-shot sweep would not:
+
+- The one `f16` cell above 1.00 sits **exactly at the retired threshold** and at
+  `k = 1024` -- `w1.05M_k1024`, 1.14 then 0.89. It is the same non-model corner
+  the 32-thread sweep found, and it does not hold across repetitions.
+- The five `bf16` cells at or above 1.00 are **not usable evidence**: their
+  `f32` controls drifted to 0.55-0.94 (against 0.86-1.19 elsewhere), i.e. the
+  machine moved 30-45% underneath those rows. That is exactly what the control
+  is there to expose, and I am reporting them rather than dropping them.
+
+So the earlier claim that no band row exceeds 1.00 at 8 threads **does not
+reproduce**, and the earlier 6.7x figure (a `/ctl` of 0.15) does not either --
+the supported worst case here is 5.0x (`/ctl` 0.20). The conclusion is not
+affected: everything at `k >= 2048` above the threshold loses reproducibly, and
+the only cells that ever win are at `k = 1024` within a factor of two of 1M,
+which is neither a shape a model issues nor a region a `k * n` gate can isolate.
 
 The GEBP's weight bandwidth at 8 threads is pinned at **20-34 GB/s regardless
 of shape**, while the GEMV reaches 24-155 GB/s. The GEBP does not degrade
@@ -86,7 +124,7 @@ At 32 threads with `k = 1024` and 1.05M-4.2M elements the GEBP is genuinely
 ahead -- `/ctl` 0.95-1.49 over two independent repetitions. That corner is
 real, and it is what the original sweep sampled. It is not worth keeping:
 
-- the same shapes lose 1.3x-6.7x at 8 threads, and the loss magnitudes dwarf
+- the same shapes lose 1.3x-5.0x at 8 threads, and the loss magnitudes dwarf
   the gains;
 - no shape in the corner is one a 7B-class model issues;
 - `k = 2048` inside the corner is not reproducible (6.3M measured `/ctl` 1.31
