@@ -828,42 +828,61 @@ impl Int4Weight<'_> {
         while p < whole {
             let depth = pc + p;
             let block = depth / block_size;
-            let offset_in_block = depth % block_size;
-            let mut vecs = [_mm256_setzero_ps(); DEQUANT_GROUP];
-            for (lane, vec) in vecs.iter_mut().enumerate() {
+            // Scale and zero point are constant across a whole block, but the
+            // group is only eight depths, so looking them up per group repeats
+            // each one `block_size / 8` times -- and for int4 the zero point
+            // lookup is itself a nibble extract. Hoist them to the block.
+            let mut scales = [0.0f32; DEQUANT_GROUP];
+            let mut zeros = [0.0f32; DEQUANT_GROUP];
+            for lane in 0..DEQUANT_GROUP {
                 let col = jcol + slot + lane;
-                let scale = scale_at(col * self.block_count + block);
-                let zero_point = self.zero_point(col, block);
-                let byte_at = col * row_len + block * blob + offset_in_block / 2;
-                // Eight nibbles of one column are four whole packed bytes,
-                // because the block size is a multiple of the group. Taken as
-                // one slice rather than four indexes: four separate
-                // bounds-checked byte loads and the shifts to reassemble them
-                // cost 18% of this pack (fixed 2.16 ms -> 1.78 ms at
-                // 4096x11008), where the slice compiles to a single unaligned
-                // 32-bit load with one bounds check.
-                let raw = u32::from_le_bytes(self.packed[byte_at..byte_at + 4].try_into().unwrap());
-                let packed4 = _mm_cvtsi32_si128(raw as i32);
-                let low = _mm_and_si128(packed4, _mm_set1_epi8(0x0f));
-                // A 16-bit shift drags the neighbouring byte's low nibble into
-                // the top half of each lane; the mask drops it again.
-                let high = _mm_and_si128(_mm_srli_epi16(packed4, 4), _mm_set1_epi8(0x0f));
-                // Back into depth order: low nibble of each byte comes first.
-                let ordered = _mm_unpacklo_epi8(low, high);
-                let widened = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(ordered));
-                *vec = _mm256_mul_ps(
-                    _mm256_sub_ps(widened, _mm256_set1_ps(zero_point)),
-                    _mm256_set1_ps(scale),
-                );
+                scales[lane] = scale_at(col * self.block_count + block);
+                zeros[lane] = self.zero_point(col, block);
             }
-            // SAFETY: AVX2 is this function's own contract.
-            unsafe { transpose8x8_ps(&mut vecs) };
-            for (step, vec) in vecs.iter().enumerate() {
-                // SAFETY: `(p + step) * NR + slot + DEQUANT_GROUP <= kc * NR`,
-                // since `p + step < kc` and `slot + DEQUANT_GROUP <= NR`.
-                unsafe { _mm256_storeu_ps(dst.as_mut_ptr().add((p + step) * NR + slot), *vec) };
+            let run = (block_size - depth % block_size).min(whole - p);
+            let mut q = 0usize;
+            while q < run {
+                let offset_in_block = (depth + q) % block_size;
+                let mut vecs = [_mm256_setzero_ps(); DEQUANT_GROUP];
+                for (lane, vec) in vecs.iter_mut().enumerate() {
+                    let col = jcol + slot + lane;
+                    let scale = scales[lane];
+                    let zero_point = zeros[lane];
+                    let byte_at = col * row_len + block * blob + offset_in_block / 2;
+                    // Eight nibbles of one column are four whole packed bytes,
+                    // because the block size is a multiple of the group. Taken as
+                    // one slice rather than four indexes: four separate
+                    // bounds-checked byte loads and the shifts to reassemble them
+                    // cost 18% of this pack (fixed 2.16 ms -> 1.78 ms at
+                    // 4096x11008), where the slice compiles to a single unaligned
+                    // 32-bit load with one bounds check.
+                    let raw =
+                        u32::from_le_bytes(self.packed[byte_at..byte_at + 4].try_into().unwrap());
+                    let packed4 = _mm_cvtsi32_si128(raw as i32);
+                    let low = _mm_and_si128(packed4, _mm_set1_epi8(0x0f));
+                    // A 16-bit shift drags the neighbouring byte's low nibble into
+                    // the top half of each lane; the mask drops it again.
+                    let high = _mm_and_si128(_mm_srli_epi16(packed4, 4), _mm_set1_epi8(0x0f));
+                    // Back into depth order: low nibble of each byte comes first.
+                    let ordered = _mm_unpacklo_epi8(low, high);
+                    let widened = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(ordered));
+                    *vec = _mm256_mul_ps(
+                        _mm256_sub_ps(widened, _mm256_set1_ps(zero_point)),
+                        _mm256_set1_ps(scale),
+                    );
+                }
+                // SAFETY: AVX2 is this function's own contract.
+                unsafe { transpose8x8_ps(&mut vecs) };
+                for (step, vec) in vecs.iter().enumerate() {
+                    // SAFETY: `(p + q + step) * NR + slot + DEQUANT_GROUP <= kc * NR`,
+                    // since `p + q + step < kc` and `slot + DEQUANT_GROUP <= NR`.
+                    unsafe {
+                        _mm256_storeu_ps(dst.as_mut_ptr().add((p + q + step) * NR + slot), *vec)
+                    };
+                }
+                q += DEQUANT_GROUP;
             }
-            p += DEQUANT_GROUP;
+            p += run;
         }
 
         // Depths past the last whole group, when `kc` is not a multiple of
