@@ -204,7 +204,7 @@ fn convert_tensor_fp32_to_fp16(tensor: &mut TensorData) {
 /// `f16` buffer (round-to-nearest-even via the `half` crate).
 fn f32_bytes_to_f16(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for chunk in bytes.chunks_exact(4) {
+    for chunk in bytes.as_chunks::<4>().0 {
         let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         let half = half::f16::from_f32(value);
         out.extend_from_slice(&half.to_le_bytes());

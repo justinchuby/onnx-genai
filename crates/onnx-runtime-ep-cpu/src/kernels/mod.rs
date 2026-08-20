@@ -2121,28 +2121,36 @@ pub(crate) mod testutil {
 
         pub fn to_f32(&self) -> Vec<f32> {
             self.bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect()
         }
 
         pub fn to_f64(&self) -> Vec<f64> {
             self.bytes
-                .chunks_exact(8)
-                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| f64::from_le_bytes(*c))
                 .collect()
         }
 
         pub fn to_i64(&self) -> Vec<i64> {
             self.bytes
-                .chunks_exact(8)
-                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| i64::from_le_bytes(*c))
                 .collect()
         }
 
         pub fn to_i32(&self) -> Vec<i32> {
             self.bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect()
         }
@@ -2154,7 +2162,9 @@ pub(crate) mod testutil {
         /// Widen an f16 buffer to f32 for comparison.
         pub fn to_f16_as_f32(&self) -> Vec<f32> {
             self.bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
                 .collect()
         }
@@ -2163,7 +2173,9 @@ pub(crate) mod testutil {
         /// f32-reinterpret corruption of NaN/inf/denormal inputs).
         pub fn to_u16_bits(&self) -> Vec<u16> {
             self.bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect()
         }
@@ -2171,7 +2183,9 @@ pub(crate) mod testutil {
         /// Widen a bf16 buffer to f32 for comparison.
         pub fn to_bf16_as_f32(&self) -> Vec<f32> {
             self.bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
                 .collect()
         }

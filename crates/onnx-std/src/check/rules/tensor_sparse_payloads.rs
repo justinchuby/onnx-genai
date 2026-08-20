@@ -551,8 +551,10 @@ fn tensor_i64_values(tensor: &TensorProto) -> Option<Vec<i64>> {
     Some(
         tensor
             .raw_data
-            .chunks_exact(8)
-            .map(|bytes| i64::from_le_bytes(bytes.try_into().expect("chunk size is eight")))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|bytes| i64::from_le_bytes(*bytes))
             .collect(),
     )
 }

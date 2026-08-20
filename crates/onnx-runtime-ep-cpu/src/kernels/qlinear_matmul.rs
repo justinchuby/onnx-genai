@@ -1030,8 +1030,10 @@ fn output_quant_params(scale: &TensorView, zero_point: &TensorView) -> Result<(f
 fn read_scales(view: &TensorView) -> Result<Vec<f32>> {
     let bytes = to_dense_bytes(view)?;
     let scales: Vec<f32> = bytes
-        .chunks_exact(4)
-        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_le_bytes(*bytes))
         .collect();
     if scales
         .iter()

@@ -524,7 +524,7 @@ mod tests {
         let mut want = Vec::new();
         let mut means = Vec::new();
         let mut invs = Vec::new();
-        for row in sum.chunks_exact(4) {
+        for row in sum.as_chunks::<4>().0 {
             let m = row.iter().sum::<f32>() / 4.;
             let inv = 1. / (row.iter().map(|v| (v - m).powi(2)).sum::<f32>() / 4. + 1e-5).sqrt();
             means.push(m);
@@ -612,7 +612,7 @@ mod tests {
         .unwrap();
         let scale_data = [1., 2., 0.5, 1.5];
         let mut want = Vec::new();
-        for row in [1., 2., 3., 4., -2., 0., 2., 4.].chunks_exact(4) {
+        for row in [1., 2., 3., 4., -2., 0., 2., 4.].as_chunks::<4>().0 {
             let inv = 1. / (row.iter().map(|v| v * v).sum::<f32>() / 4. + 1e-5).sqrt();
             want.extend((0..4).map(|i| row[i] * inv * scale_data[i]));
         }
@@ -812,7 +812,7 @@ mod tests {
         let gamma_data = [1., 2., 0.5, 1.5];
         let beta_data = [0., 1., -1., 0.5];
         let mut want = Vec::new();
-        for row in sum.chunks_exact(4) {
+        for row in sum.as_chunks::<4>().0 {
             let m = row.iter().sum::<f32>() / 4.;
             let inv = 1. / (row.iter().map(|v| (v - m).powi(2)).sum::<f32>() / 4. + 1e-5).sqrt();
             want.extend((0..4).map(|i| (row[i] - m) * inv * gamma_data[i] + beta_data[i]));
@@ -927,7 +927,7 @@ mod tests {
         let mut want = Vec::new();
         let mut means = Vec::new();
         let mut invs = Vec::new();
-        for row in sum.chunks_exact(4) {
+        for row in sum.as_chunks::<4>().0 {
             let m = row.iter().sum::<f32>() / 4.;
             let inv = 1. / (row.iter().map(|v| (v - m).powi(2)).sum::<f32>() / 4. + 1e-5).sqrt();
             means.push(m);
@@ -964,7 +964,7 @@ mod tests {
         let sum = [1.75f32, 1., 3.5, 5., 3.25, 3., 2.5, 8.];
         let gamma_data = [1., 2., 0.5, 1.5];
         let mut want = Vec::new();
-        for row in sum.chunks_exact(4) {
+        for row in sum.as_chunks::<4>().0 {
             let m = row.iter().sum::<f32>() / 4.;
             let inv = 1. / (row.iter().map(|v| (v - m).powi(2)).sum::<f32>() / 4. + 1e-5).sqrt();
             want.extend((0..4).map(|i| (row[i] - m) * inv * gamma_data[i]));
@@ -998,7 +998,7 @@ mod tests {
         let gamma_data = [1., 2., 0.5, 1.5];
         let beta_data = [0., 1., -1., 0.5];
         let mut want = Vec::new();
-        for row in sum.chunks_exact(4) {
+        for row in sum.as_chunks::<4>().0 {
             let m = row.iter().sum::<f32>() / 4.;
             let inv = 1. / (row.iter().map(|v| (v - m).powi(2)).sum::<f32>() / 4. + 1e-5).sqrt();
             want.extend((0..4).map(|i| (row[i] - m) * inv * gamma_data[i] + beta_data[i]));
@@ -1030,7 +1030,7 @@ mod tests {
         let scale_data = [1., 2., 0.5, 1.5];
         let mut want = Vec::new();
         let mut want_inv = Vec::new();
-        for group in x_data.chunks_exact(4) {
+        for group in x_data.as_chunks::<4>().0 {
             let inv = 1. / (group.iter().map(|v| v * v).sum::<f32>() / 4. + eps).sqrt();
             want_inv.push(inv);
             want.extend((0..4).map(|i| group[i] * inv * scale_data[i]));

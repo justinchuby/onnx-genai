@@ -272,7 +272,9 @@ impl Tensor {
             "to_vec_f32 on non-f32 tensor"
         );
         self.as_bytes()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
     }
@@ -281,8 +283,10 @@ impl Tensor {
     pub fn to_vec_i64(&self) -> Vec<i64> {
         assert_eq!(self.dtype, DataType::Int64, "to_vec_i64 on non-i64 tensor");
         self.as_bytes()
-            .chunks_exact(8)
-            .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| i64::from_le_bytes(*c))
             .collect()
     }
 }

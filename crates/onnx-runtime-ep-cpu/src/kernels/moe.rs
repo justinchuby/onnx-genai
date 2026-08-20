@@ -951,7 +951,7 @@ pub(super) fn run_expert(
             } else if attributes.swiglu_fusion == 1 {
                 let mut gate = Vec::with_capacity(inter);
                 let mut linear = Vec::with_capacity(inter);
-                for pair in fc1_out.chunks_exact(2) {
+                for pair in fc1_out.as_chunks::<2>().0 {
                     gate.push(pair[0]);
                     linear.push(pair[1]);
                 }
@@ -1029,7 +1029,7 @@ pub(super) fn run_expert_grouped(
                 let mut linear = Vec::with_capacity(rows * inter);
                 for row in fc1_out.chunks_exact(fc1_size) {
                     if attributes.swiglu_fusion == 1 {
-                        for pair in row.chunks_exact(2) {
+                        for pair in row.as_chunks::<2>().0 {
                             gate.push(pair[0]);
                             linear.push(pair[1]);
                         }
