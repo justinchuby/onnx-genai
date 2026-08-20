@@ -1067,6 +1067,18 @@ static BORROWED_INT4_ASYMMETRIC_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// [`x86_sgemm::Int8Weight`].
 #[cfg(all(test, target_arch = "x86_64"))]
 static INT8_PREFILL_GEBP_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
+/// Positive-proof counter for the fused-dequant 4-bit prefill GEBP.
+///
+/// The same argument as [`INT8_PREFILL_GEBP_TEST_CALLS`]: the routes either
+/// side of `int4_prefill_gebp_min_rows` agree to within a few f32 ulps, so a
+/// test that only compares values passes whether or not GEBP ran. Without this
+/// counter a threshold retune silently changes what the parity test covers --
+/// which is how `matmulnbits_int4_prefill_gebp_matches_reference_and_stays_borrowed`
+/// came to claim a dispatch threshold of 4 for an L2-resident weight gated at
+/// 6. Incremented once per `execute` that routes into
+/// [`x86_sgemm::quant_prefill_gebp`] with an [`x86_sgemm::Int4Weight`].
+#[cfg(all(test, target_arch = "x86_64"))]
+static INT4_PREFILL_GEBP_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// Counts entries into [`with_decode_pool_lazy`], so a test can assert *which*
 /// shapes defer building the decode pool and which still install it eagerly.
 #[cfg(test)]
@@ -1490,6 +1502,8 @@ impl Kernel for MatMulNBitsKernel {
                     block_size: self.block_size,
                     block_count: self.k.div_ceil(self.block_size),
                 };
+                #[cfg(test)]
+                INT4_PREFILL_GEBP_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
                 // SAFETY (feature contract): `has_simd_x86()` above is the
                 // AVX2 + FMA check the packed microkernel requires.
                 crate::kernels::matmul::x86_sgemm::quant_prefill_gebp(
@@ -7246,11 +7260,40 @@ const INT4_PREFILL_GEBP_L2_RESIDENT_BYTES: usize = 4 << 20;
 /// [`borrowed_affine_int4_matmul_nblock`] both require 32-element blocks. For
 /// the ONNX-minimum block size of 16 the GEBP prefill is the only vectorised
 /// route there is, and everything below it is a scalar per-block dot running on
-/// the narrow decode pool. Raising the crossover for those weights would not
-/// hand them a better kernel, it would hand them no kernel, so they keep the
-/// threshold measured before #1356 arrived.
+/// the narrow decode pool. That asymmetry cuts the other way from the
+/// 32-element case: below this threshold the fallback is not a rival kernel to
+/// be beaten, it is `borrowed_affine_int4_matmul` doing per-block scalar work,
+/// so the threshold should sit as low as the surrounding invariants allow.
+///
+/// It had never been re-measured, because the `int4_prefill_route_ab` bench
+/// pinned `block_size` to 32 and so could not reach this branch at all (the
+/// same defect that hid the 8-bit control until `PROBE_BITS` arrived in
+/// #1558). Measured with `PROBE_BLOCK=16`, native-alone, steady phase, median
+/// of five interleaved reps, as GEBP's speedup over the per-block dot:
+///
+/// | m | 2048x2048 | 4096x11008 |
+/// |---|---|---|
+/// | 1 | 2.51x | 4.62x |
+/// | 2 | **4.06x** | **8.96x** |
+/// | 3 | 6.81x | 14.6x |
+/// | 4 | 10.4x | 18.1x |
+/// | 6 | 13.2x | 30.1x |
+/// | 8 | 13.8x | 30.6x |
+///
+/// GEBP is ahead at every `m` on both shapes, and by a margin that grows
+/// linearly because the dot arm's cost is linear in `m` (9.4 -> 76.9 ms on the
+/// large shape) while GEBP's is flat (~2 ms, the pack). The old value of 4 was
+/// therefore giving up 8.96x at `m = 2` and 14.6x at `m = 3`. Unlike the
+/// 32-element gates this one needs no residency split: both shapes agree.
+///
+/// Set to 2 rather than 1 deliberately. `m = 1` is decode, and its 2.51x/4.62x
+/// is measured by a single-op prefill bench that cannot see the per-token pool
+/// contention the narrow decode pool exists to avoid -- GEBP returns before
+/// `with_decode_pool` and drives the global pool. That is the same reason
+/// [`borrowed_affine_int4_matmul_prefill`] is itself gated at `m >= 2`. Moving
+/// decode wants a decode-loop measurement, not this one.
 #[cfg(target_arch = "x86_64")]
-const INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED: usize = 4;
+const INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED: usize = 2;
 
 /// The `m` at which the fused-dequant GEBP overtakes the column-blocked
 /// borrowed kernel for this node's weight.
@@ -15491,8 +15534,11 @@ mod tests {
         for &asymmetric in &[false, true] {
             let (packed, scales, zero_points, dequantized) =
                 quantize(&weights, n, k, block_size, asymmetric);
-            // 4 is the dispatch threshold and 5 sits inside one 6-row A panel,
-            // so both exercise the zero-padded partial panel.
+            // The dispatch threshold for this weight is
+            // `INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT` -- 960 packed bytes is
+            // far inside L2 -- so the GEBP route starts at 6, and the smaller
+            // `m` here cover the routes below it. The counter assertion is what
+            // keeps that statement honest across retunes.
             for &m in &[4usize, 5, 8, 16, 37] {
                 let activations: Vec<f32> = (0..m * k)
                     .map(|i| ((i * 7 % 23) as f32 - 5.0) / 8.0)
@@ -15527,6 +15573,73 @@ mod tests {
                     kernel.weight_nk.get().is_none(),
                     "asymmetric={asymmetric} m={m}: the GEBP prefill must keep the \
                      weight borrowed, not materialize the f32 cache"
+                );
+            }
+        }
+    }
+
+    /// A 16-element block reaches the GEBP prefill through
+    /// [`INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED`], a branch neither this test's
+    /// 32-element sibling nor any other numeric test used to cover: with the
+    /// threshold at 4 the rows it now owns (`m = 2, 3`) went to the per-block
+    /// dot instead. The block size also exercises a panel whose block boundary
+    /// falls twice inside one `DEQUANT_GROUP`-stepped run.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn matmulnbits_int4_prefill_gebp_covers_the_unblocked_block_size() {
+        let _probe = lock_dispatch_probe();
+        let (k, n, block_size) = (96usize, 20usize, 16usize);
+        let blocks = k.div_ceil(block_size);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 19 % 37) as f32 - 9.0) / 10.0)
+            .collect();
+        for &asymmetric in &[false, true] {
+            let (packed, scales, zero_points, dequantized) =
+                quantize(&weights, n, k, block_size, asymmetric);
+            for &m in &[1usize, 2, 3, 4, 8] {
+                let activations: Vec<f32> = (0..m * k)
+                    .map(|i| ((i * 7 % 23) as f32 - 5.0) / 8.0)
+                    .collect();
+                let kernel = test_kernel(k, n, block_size);
+                let a = Owned::f32(&[m, k], &activations);
+                let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
+                let scales_tensor = Owned::f32(&[n * blocks], &scales);
+                let zp_owned = zero_points
+                    .as_ref()
+                    .map(|zp| Owned::u8(&[n, blocks.div_ceil(2)], zp));
+                let mut inputs = vec![a.view(), b.view(), scales_tensor.view()];
+                if let Some(zp) = zp_owned.as_ref() {
+                    inputs.push(zp.view());
+                }
+                let mut y = Owned::zeros_f32(&[m, n]);
+                let before = INT4_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
+                kernel.execute(&inputs, &mut [y.view_mut()]).unwrap();
+                let took_gebp = INT4_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed) > before;
+
+                // Same scaled tolerance as the 32-element case, and for the
+                // same reason: the packed microkernel reduces in a different
+                // order from the per-block dot.
+                let got = y.to_f32();
+                let expect = reference(&activations, &dequantized, m, k, n);
+                for (index, (&got, &expect)) in got.iter().zip(&expect).enumerate() {
+                    let tol = 1e-5 * (1.0 + expect.abs());
+                    assert!(
+                        (got - expect).abs() <= tol,
+                        "asymmetric={asymmetric} m={m} index {index}: got={got}, expect={expect}"
+                    );
+                }
+                // Positive proof the retune actually re-pointed these rows, and
+                // that it left decode where it was.
+                assert_eq!(
+                    took_gebp,
+                    m >= INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED,
+                    "asymmetric={asymmetric} m={m}: block_size=16 must take the \
+                     GEBP prefill exactly when m >= \
+                     INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED"
+                );
+                assert!(
+                    kernel.weight_nk.get().is_none(),
+                    "asymmetric={asymmetric} m={m}: must keep the weight borrowed"
                 );
             }
         }
@@ -19394,5 +19507,14 @@ mod tests {
             assert!(block_size.is_multiple_of(32));
             assert!(int4_prefill_gebp_min_rows(large, block_size) >= INT4_PREFILL_GEBP_MIN_ROWS);
         }
+        // The measured crossover is below 1, so what holds this threshold up is
+        // not the benchmark but the decision to leave decode alone: GEBP runs
+        // before `with_decode_pool` on the global pool. Dropping this to 1 is a
+        // decode routing change and needs a decode-loop measurement, not the
+        // prefill sweep that set the value.
+        assert!(
+            INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED >= 2,
+            "m == 1 is decode; re-pointing it needs its own measurement"
+        );
     }
 }
