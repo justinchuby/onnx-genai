@@ -163,18 +163,22 @@ fn read_floats(dtype: DataType, numel: usize, data: &[u8]) -> Option<Vec<f64>> {
             if data.len() < numel.checked_mul(4)? {
                 return None;
             }
-            data.chunks_exact(4)
+            data.as_chunks::<4>()
+                .0
+                .iter()
                 .take(numel)
-                .map(|bytes| Some(f32::from_le_bytes(bytes.try_into().ok()?) as f64))
+                .map(|bytes| Some(f32::from_le_bytes(*bytes) as f64))
                 .collect()
         }
         DataType::Float64 => {
             if data.len() < numel.checked_mul(8)? {
                 return None;
             }
-            data.chunks_exact(8)
+            data.as_chunks::<8>()
+                .0
+                .iter()
                 .take(numel)
-                .map(|bytes| Some(f64::from_le_bytes(bytes.try_into().ok()?)))
+                .map(|bytes| Some(f64::from_le_bytes(*bytes)))
                 .collect()
         }
         _ => None,

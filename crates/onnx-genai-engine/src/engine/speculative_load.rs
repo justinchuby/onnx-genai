@@ -13,8 +13,10 @@ pub(crate) fn read_f32_weights(path: &Path) -> anyhow::Result<Vec<f32>> {
         );
     }
     Ok(bytes
-        .chunks_exact(4)
-        .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_le_bytes(*bytes))
         .collect())
 }
 

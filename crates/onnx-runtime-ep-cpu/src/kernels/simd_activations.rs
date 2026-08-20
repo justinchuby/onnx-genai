@@ -3282,7 +3282,7 @@ mod tests {
     fn log_sweep_generates_full_arm_vector_batches() {
         const ARM_F32_LANES: usize = 4;
         let x = log_sweep_inputs();
-        let full_batches = x.chunks_exact(ARM_F32_LANES);
+        let full_batches = x.as_chunks::<ARM_F32_LANES>().0;
         let covered = full_batches.len() * ARM_F32_LANES;
 
         assert!(covered > 0, "ARM sweep did not generate a full SIMD batch");
@@ -3294,7 +3294,7 @@ mod tests {
             x[..covered].iter().any(|v| *v < 1.0) && x[..covered].iter().any(|v| *v > 1.0),
             "ARM sweep did not cover both signs of the log result"
         );
-        for batch in x[..covered].chunks_exact(ARM_F32_LANES) {
+        for batch in x[..covered].as_chunks::<ARM_F32_LANES>().0 {
             for &value in batch {
                 assert!(
                     value.ln().is_finite(),

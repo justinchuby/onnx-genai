@@ -5699,7 +5699,9 @@ fn quantize_activation_qai8dxp(
         block_counts[block] += 1;
     }
     let group_words = values
-        .chunks_exact(KAI_SDOT_K_GROUP)
+        .as_chunks::<KAI_SDOT_K_GROUP>()
+        .0
+        .iter()
         .map(|group| {
             u32::from_le_bytes([
                 group[0] as u8,
@@ -8036,7 +8038,12 @@ unsafe fn affine_int4_block32_dot_neon(activation: &[f32], packed: &[u8]) -> f32
 fn deinterleave_activation_int4(activation: &[i8]) -> Vec<i8> {
     debug_assert_eq!(activation.len() % 32, 0);
     let mut out = vec![0i8; activation.len()];
-    for (block_in, block_out) in activation.chunks_exact(32).zip(out.chunks_exact_mut(32)) {
+    for (block_in, block_out) in activation
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<32>().0.iter_mut())
+    {
         for i in 0..16 {
             block_out[i] = block_in[2 * i];
             block_out[16 + i] = block_in[2 * i + 1];
@@ -9178,19 +9185,15 @@ fn dot_u8_f32(weight: &[u8], activation: &[f32]) -> f32 {
     debug_assert_eq!(weight.len(), activation.len());
     const LANES: usize = 16;
     let mut acc = [0.0f32; LANES];
-    let mut weight_chunks = weight.chunks_exact(LANES);
-    let mut activation_chunks = activation.chunks_exact(LANES);
-    for (w, a) in weight_chunks.by_ref().zip(activation_chunks.by_ref()) {
+    let (weight_chunks, weight_tail) = weight.as_chunks::<LANES>();
+    let (activation_chunks, activation_tail) = activation.as_chunks::<LANES>();
+    for (w, a) in weight_chunks.iter().zip(activation_chunks) {
         for lane in 0..LANES {
             acc[lane] += w[lane] as f32 * a[lane];
         }
     }
     let mut tail = 0.0f32;
-    for (w, a) in weight_chunks
-        .remainder()
-        .iter()
-        .zip(activation_chunks.remainder())
-    {
+    for (w, a) in weight_tail.iter().zip(activation_tail) {
         tail += *w as f32 * *a;
     }
     tail + acc.iter().sum::<f32>()
@@ -12515,7 +12518,9 @@ mod tests {
             .collect();
         let values: Vec<i8> = (0..384).map(|i| ((i * 11 % 16) as i8) - 8).collect();
         let block_sums = values
-            .chunks_exact(128)
+            .as_chunks::<128>()
+            .0
+            .iter()
             .map(|block| block.iter().map(|&value| value as i32).sum())
             .collect();
         let prepacked = Int8Weight {
@@ -17615,7 +17620,9 @@ mod tests {
         assert_eq!(encoded.len() % 2, 0);
         encoded
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 let pair = std::str::from_utf8(pair).unwrap();
                 u8::from_str_radix(pair, 16).unwrap()
