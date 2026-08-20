@@ -584,10 +584,17 @@ def cell_specs(include_f16: bool) -> list[dict]:
         for op in ["Add", "Mul", "Relu"]:
             for name, n in [("small", 1024), ("medium", 262144), ("large", 1048576)]:
                 specs.append({"name": f"{op.lower()}/{name}/{dtype}", "op": op, "dtype": dtype, "dims": (n, 0, 0)})
+        # 前三个 cell 是已发布报告用的形状,不要改动,否则那份数字失去可复现性。
+        # 后两个是刻意放大的工作量阶梯:medium_gemm 只有 16.8 MFLOP,完全被
+        # ~900us 的 per-Run 固定开销淹没(warmed profile 显示 wall 962us 而
+        # node dur 只有 8-9us)。huge/xl 分别是 medium 的 64x 和 512x,用来判断
+        # 时间是否随工作量线性增长——不增长就说明还没走出固定开销主导区。
         for name, dims in [
             ("gemv", (1, 512, 512)),
             ("small_gemm", (16, 256, 256)),
             ("medium_gemm", (32, 512, 512)),
+            ("huge_gemm", (512, 1024, 1024)),
+            ("xl_gemm", (1024, 2048, 2048)),
         ]:
             specs.append({"name": f"matmul/{name}/{dtype}", "op": "MatMul", "dtype": dtype, "dims": dims})
     return specs

@@ -588,3 +588,79 @@ fn f16_matmul_accumulates_in_f32() {
         );
     }
 }
+
+/// Covers `matmul_regtiled`, which nothing else in this file reaches: every
+/// other MatMul test is below `REGTILE_MIN_M` and so exercises `matmul_tiled`.
+///
+/// The dimensions deliberately do not divide the block sizes — `M = 200`
+/// against a 128-row block, `N = 150` against a 128-column block, `K = 43`
+/// against an 8-deep block — so the partial blocks on all three axes are
+/// exercised. A shape that divided evenly would pass even if every bounds
+/// check were wrong.
+#[test]
+fn regtiled_matmul_matches_a_host_reference() {
+    let Some(provider) = provider() else { return };
+    let (m, k, n) = (200usize, 43usize, 150usize);
+    let lhs: Vec<f32> = (0..m * k).map(|i| ((i % 11) as f32) - 5.0).collect();
+    let rhs: Vec<f32> = (0..k * n).map(|i| ((i % 9) as f32) - 4.0).collect();
+    let mut expected = vec![0.0f32; m * n];
+    for row in 0..m {
+        for col in 0..n {
+            let mut acc = 0.0f32;
+            for i in 0..k {
+                acc += lhs[row * k + i] * rhs[i * n + col];
+            }
+            expected[row * n + col] = acc;
+        }
+    }
+    let result = run(
+        &provider,
+        "MatMul",
+        70,
+        &[(&[m, k], &lhs), (&[k, n], &rhs)],
+        &[m, n],
+    );
+    for (index, (actual, want)) in result.iter().zip(&expected).enumerate() {
+        assert!(
+            (actual - want).abs() < 1e-3,
+            "element {index} (row {}, col {}): {actual} != {want}",
+            index / n,
+            index % n
+        );
+    }
+}
+
+/// The register-tiled path must also hold the f32-accumulation guarantee, and
+/// batching must still address the right slice of a batched operand.
+#[test]
+fn regtiled_matmul_handles_batches() {
+    let Some(provider) = provider() else { return };
+    let (batch, m, k, n) = (3usize, 128usize, 32usize, 128usize);
+    let lhs: Vec<f32> = (0..batch * m * k).map(|i| ((i % 7) as f32) - 3.0).collect();
+    let rhs: Vec<f32> = (0..k * n).map(|i| ((i % 5) as f32) - 2.0).collect();
+    let mut expected = vec![0.0f32; batch * m * n];
+    for b in 0..batch {
+        for row in 0..m {
+            for col in 0..n {
+                let mut acc = 0.0f32;
+                for i in 0..k {
+                    acc += lhs[b * m * k + row * k + i] * rhs[i * n + col];
+                }
+                expected[b * m * n + row * n + col] = acc;
+            }
+        }
+    }
+    let result = run(
+        &provider,
+        "MatMul",
+        71,
+        &[(&[batch, m, k], &lhs), (&[k, n], &rhs)],
+        &[batch, m, n],
+    );
+    for (index, (actual, want)) in result.iter().zip(&expected).enumerate() {
+        assert!(
+            (actual - want).abs() < 1e-3,
+            "element {index}: {actual} != {want}"
+        );
+    }
+}

@@ -95,6 +95,164 @@ fn matmul_tiled<F: Float>(
     }
 }
 
+/// Output block a cube computes, and the per-thread sub-block inside it.
+///
+/// `matmul_tiled` gives every thread exactly one output element, so its inner
+/// loop is two shared-memory reads per FMA — arithmetic intensity 0.5, and the
+/// kernel is shared-memory bound rather than ALU bound. Measured against the
+/// official WebGPU EP on a workload large enough to leave the per-Run fixed
+/// cost behind (see `docs/benchmarks/`), that cost us ~3.6x.
+///
+/// Register tiling fixes the ratio: each thread keeps a `TM x TN` accumulator
+/// block in registers, so one pass of the inner loop reads `TM + TN` values and
+/// issues `TM * TN` FMAs. At 4x4 that is 16 FMAs per 8 reads — intensity 2.0,
+/// 4x better.
+///
+/// The sizes are constrained by WebGPU's portable baseline:
+/// - workgroup is `(BN / TN) x (BM / TM)` = 16x16 = 256 invocations, the
+///   portable ceiling.
+/// - staging is `BM * BK + BK * BN` = 2048 elements = 8 KiB at f32, inside the
+///   16 KiB baseline limit (f16 halves it).
+/// - `BM * BK` and `BK * BN` are both 1024 = 4 * 256, so staging divides evenly
+///   across the workgroup and needs no bounds check on the staging loop itself.
+const BM: usize = 128;
+const BN: usize = 128;
+const BK: usize = 8;
+const TM: usize = 8;
+const TN: usize = 8;
+const WG_X: usize = BN / TN;
+const WG_Y: usize = BM / TM;
+const WG_SIZE: usize = WG_X * WG_Y;
+
+/// Smallest problem worth handing to `matmul_regtiled`.
+///
+/// The register-tiled kernel claims a 64x64 output block per cube. When `M` is
+/// tiny — a decode-step GEMV has `M = 1` — 63 of every 64 rows in the block are
+/// padding, and the cube count collapses far below what it takes to fill the
+/// GPU. `matmul_tiled`'s 16x16 block wastes 4x less and launches 4x more cubes.
+///
+/// The threshold is deliberately on `M` alone: `N` and `K` are large in every
+/// shape we care about, and `M` is the dimension that actually collapses.
+const REGTILE_MIN_M: usize = 128;
+
+#[cube(launch_unchecked)]
+fn matmul_regtiled<F: Float>(
+    lhs: &[F],
+    rhs: &[F],
+    out: &mut [F],
+    #[comptime] m: usize,
+    #[comptime] n: usize,
+    #[comptime] k: usize,
+    #[comptime] rhs_batched: bool,
+) {
+    let batch = CUBE_POS_Z as usize;
+    let lhs_base = batch * m * k;
+    let rhs_batch_stride = comptime!(if rhs_batched { k * n } else { 0 });
+    let rhs_base = batch * rhs_batch_stride;
+
+    let block_row = CUBE_POS_Y as usize * BM;
+    let block_col = CUBE_POS_X as usize * BN;
+
+    let tx = UNIT_POS_X as usize;
+    let ty = UNIT_POS_Y as usize;
+    let tid = ty * WG_X + tx;
+
+    let mut lhs_tile = Shared::new_slice(BM * BK);
+    let mut rhs_tile = Shared::new_slice(BK * BN);
+
+    // f32 accumulation even when `F` is f16, for the same reason as
+    // `matmul_tiled`: a K-long f16 running sum stalls once the total outgrows
+    // the ulp of the addend.
+    let mut acc = Array::<f32>::new(TM * TN);
+    #[unroll]
+    for i in 0..TM * TN {
+        acc[i] = f32::new(0.0_f32);
+    }
+    let mut a_reg = Array::<f32>::new(TM);
+    let mut b_reg = Array::<f32>::new(TN);
+
+    let tiles = k.div_ceil(BK);
+    for t in 0..tiles {
+        let k_base = t * BK;
+
+        // Out-of-range lanes stage zeros rather than returning, so every unit
+        // reaches the barriers. A partially-attended barrier is UB in both
+        // WGSL and SPIR-V.
+        // `lhs_tile` is staged transposed, as [BK][BM] rather than [BM][BK].
+        //
+        // The inner loop reads TM values down a column of A for a fixed k. In
+        // [BM][BK] layout those are BK apart, so the reads are strided and land
+        // on a fraction of the shared-memory banks; transposed they are
+        // adjacent, matching what the `rhs_tile` reads already do.
+        //
+        // The cost is moved to the staging write, which becomes strided — but
+        // each element is written once and read TM times per k-step, so the
+        // trade favours the read. The global read stays contiguous either way,
+        // which matters more than either: `idx / BK` keeps consecutive lanes on
+        // consecutive addresses of A.
+        #[unroll]
+        for s in 0..(BM * BK / WG_SIZE) {
+            let idx = s * WG_SIZE + tid;
+            let r = idx / BK;
+            let c = idx % BK;
+            let gr = block_row + r;
+            let gc = k_base + c;
+            lhs_tile[c * BM + r] = if gr < m && gc < k {
+                lhs[lhs_base + gr * k + gc]
+            } else {
+                F::new(0.0_f32)
+            };
+        }
+        #[unroll]
+        for s in 0..(BK * BN / WG_SIZE) {
+            let idx = s * WG_SIZE + tid;
+            let gr = k_base + idx / BN;
+            let gc = block_col + idx % BN;
+            rhs_tile[idx] = if gr < k && gc < n {
+                rhs[rhs_base + gr * n + gc]
+            } else {
+                F::new(0.0_f32)
+            };
+        }
+
+        sync_cube();
+
+        #[unroll]
+        for kk in 0..BK {
+            #[unroll]
+            for i in 0..TM {
+                a_reg[i] = f32::cast_from(lhs_tile[kk * BM + ty * TM + i]);
+            }
+            #[unroll]
+            for j in 0..TN {
+                b_reg[j] = f32::cast_from(rhs_tile[kk * BN + tx * TN + j]);
+            }
+            #[unroll]
+            for i in 0..TM {
+                #[unroll]
+                for j in 0..TN {
+                    acc[i * TN + j] += a_reg[i] * b_reg[j];
+                }
+            }
+        }
+
+        sync_cube();
+    }
+
+    let out_base = batch * m * n;
+    #[unroll]
+    for i in 0..TM {
+        let gr = block_row + ty * TM + i;
+        #[unroll]
+        for j in 0..TN {
+            let gc = block_col + tx * TN + j;
+            if gr < m && gc < n {
+                out[out_base + gr * n + gc] = F::cast_from(acc[i * TN + j]);
+            }
+        }
+    }
+}
+
 pub struct MatMulFactory<R: Runtime> {
     context: Arc<CubeclContext<R>>,
 }
@@ -194,6 +352,20 @@ impl MatMulDims {
             self.batch as u32,
         )
     }
+
+    /// Whether this shape is big enough for the register-tiled kernel to pay
+    /// off. See `REGTILE_MIN_M`.
+    fn use_regtile(&self) -> bool {
+        self.m >= REGTILE_MIN_M && self.n >= BN && self.k >= BK
+    }
+
+    fn regtile_cube_count(&self) -> CubeCount {
+        CubeCount::Static(
+            self.n.div_ceil(BN).max(1) as u32,
+            self.m.div_ceil(BM).max(1) as u32,
+            self.batch as u32,
+        )
+    }
 }
 
 impl<R: Runtime> KernelFactory for MatMulFactory<R> {
@@ -236,18 +408,33 @@ impl<R: Runtime> KernelFactory for MatMulFactory<R> {
                         // kernel was created for, and `resolve` verified each buffer
                         // covers the bytes those shapes describe.
                         unsafe {
-                            matmul_tiled::launch_unchecked::<$float, R>(
-                                &context.client,
-                                dims.cube_count(),
-                                CubeDim::new_2d(TILE as u32, TILE as u32),
-                                BufferArg::from_raw_parts(lhs_res.handle, dims.lhs_elements()),
-                                BufferArg::from_raw_parts(rhs_res.handle, dims.rhs_elements()),
-                                BufferArg::from_raw_parts(out_res.handle, dims.out_elements()),
-                                dims.m,
-                                dims.n,
-                                dims.k,
-                                dims.rhs_batched,
-                            );
+                            if dims.use_regtile() {
+                                matmul_regtiled::launch_unchecked::<$float, R>(
+                                    &context.client,
+                                    dims.regtile_cube_count(),
+                                    CubeDim::new_2d(WG_X as u32, WG_Y as u32),
+                                    BufferArg::from_raw_parts(lhs_res.handle, dims.lhs_elements()),
+                                    BufferArg::from_raw_parts(rhs_res.handle, dims.rhs_elements()),
+                                    BufferArg::from_raw_parts(out_res.handle, dims.out_elements()),
+                                    dims.m,
+                                    dims.n,
+                                    dims.k,
+                                    dims.rhs_batched,
+                                );
+                            } else {
+                                matmul_tiled::launch_unchecked::<$float, R>(
+                                    &context.client,
+                                    dims.cube_count(),
+                                    CubeDim::new_2d(TILE as u32, TILE as u32),
+                                    BufferArg::from_raw_parts(lhs_res.handle, dims.lhs_elements()),
+                                    BufferArg::from_raw_parts(rhs_res.handle, dims.rhs_elements()),
+                                    BufferArg::from_raw_parts(out_res.handle, dims.out_elements()),
+                                    dims.m,
+                                    dims.n,
+                                    dims.k,
+                                    dims.rhs_batched,
+                                );
+                            }
                         }
                     };
                 }
@@ -316,5 +503,53 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("vector promotion"), "{err}");
+    }
+
+    /// Pins the shapes the GPU tests use to the register-tiled path.
+    ///
+    /// `regtiled_matmul_*` in `tests/provider_gpu.rs` check numbers, not which
+    /// kernel produced them — both kernels compute the same function, so those
+    /// tests would pass unchanged if the dispatch silently fell back. This test
+    /// is the other half: it fixes *which* path those shapes take, so the pair
+    /// together is evidence about `matmul_regtiled` specifically.
+    #[test]
+    fn gpu_test_shapes_select_the_register_tiled_path() {
+        let regtiled = MatMulDims::resolve(&node("mm"), &[200, 43], &[43, 150]).unwrap();
+        assert!(
+            regtiled.use_regtile(),
+            "regtiled_matmul_matches_a_host_reference must exercise the new kernel"
+        );
+        let batched = MatMulDims::resolve(&node("mm"), &[3, 128, 32], &[32, 128]).unwrap();
+        assert!(
+            batched.use_regtile(),
+            "regtiled_matmul_handles_batches must exercise the new kernel"
+        );
+
+        // And the small-shape tests must keep exercising the old one.
+        let small = MatMulDims::resolve(&node("mm"), &[37, 23], &[23, 19]).unwrap();
+        assert!(
+            !small.use_regtile(),
+            "matmul_matches_a_host_reference must stay on the simple kernel"
+        );
+    }
+
+    /// Each of the three conditions must be able to veto on its own, otherwise
+    /// the threshold is not doing what its doc comment claims.
+    #[test]
+    fn each_dimension_can_veto_the_register_tiled_path() {
+        let ok = MatMulDims::resolve(&node("mm"), &[128, 8], &[8, 128]).unwrap();
+        assert!(ok.use_regtile());
+
+        let m_too_small = MatMulDims::resolve(&node("mm"), &[127, 8], &[8, 128]).unwrap();
+        assert!(
+            !m_too_small.use_regtile(),
+            "M below REGTILE_MIN_M must veto"
+        );
+
+        let n_too_small = MatMulDims::resolve(&node("mm"), &[128, 8], &[8, 127]).unwrap();
+        assert!(!n_too_small.use_regtile(), "N below BN must veto");
+
+        let k_too_small = MatMulDims::resolve(&node("mm"), &[128, 7], &[7, 128]).unwrap();
+        assert!(!k_too_small.use_regtile(), "K below BK must veto");
     }
 }
