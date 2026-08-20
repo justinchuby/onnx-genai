@@ -1015,17 +1015,15 @@ pub(super) fn run_expert_grouped(
     let activated = match attributes.activation {
         Activation::Swiglu => {
             let (gate_part, linear_part) = if attributes.swiglu_fusion == 0 {
-                (
-                    fc1_out,
-                    linear_grouped(
-                        input,
-                        rows,
-                        fc3_weights.expect("validated unfused swiglu FC3"),
-                        fc3_bias,
-                        inter,
-                        hidden,
-                    )?,
-                )
+                let linear = linear_grouped(
+                    input,
+                    rows,
+                    fc3_weights.expect("validated unfused swiglu FC3"),
+                    fc3_bias,
+                    inter,
+                    hidden,
+                )?;
+                (fc1_out, linear)
             } else {
                 let mut gate = Vec::with_capacity(rows * inter);
                 let mut linear = Vec::with_capacity(rows * inter);
