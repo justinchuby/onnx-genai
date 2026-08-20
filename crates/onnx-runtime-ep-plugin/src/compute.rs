@@ -6368,11 +6368,35 @@ mod tests {
             prod.contains("static RUN_SCRATCH:"),
             "RUN_SCRATCH is gone -- this test would pass vacuously"
         );
+
+        // Counting resolutions of one *name* is not enough: splitting the pool
+        // back apart introduces a differently-named thread-local and leaves the
+        // RUN_SCRATCH count untouched. So the property asserted is the total
+        // thread-local surface of this file -- every declaration and every
+        // resolution of any of them.
+        let mut declared: Vec<&str> = prod
+            .match_indices("\n    static ")
+            .map(|(i, m)| {
+                let rest = &prod[i + m.len()..];
+                &rest[..rest.find(':').unwrap_or(0)]
+            })
+            .collect();
+        declared.sort_unstable();
         assert_eq!(
-            prod.matches("RUN_SCRATCH.").count(),
-            2,
-            "the scratch thread-local is resolved somewhere other than \
-             take_run_scratch/recycle_run_scratch"
+            declared,
+            [
+                "ENABLED",
+                "ENABLED",
+                "HOST_INTERMEDIATE_POOL",
+                "RUN_SCRATCH"
+            ],
+            "the set of thread-locals in compute.rs changed; a new per-`Run` \
+             pool costs another __tls_get_addr on the hot path"
+        );
+        assert_eq!(
+            prod.matches(".with(").count() + prod.matches(".try_with(").count(),
+            5,
+            "the number of thread-local resolutions in compute.rs changed"
         );
 
         let start = prod
