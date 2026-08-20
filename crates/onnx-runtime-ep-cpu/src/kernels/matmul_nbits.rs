@@ -11868,6 +11868,7 @@ mod tests {
                 block_size,
             );
             let mut n16_out = vec![0.0f32; n];
+            let before_n16 = N16_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed);
             n16_sdot_matmul_m1(
                 &activations,
                 &n16,
@@ -11897,6 +11898,13 @@ mod tests {
                 DotKernel::Scalar,
             );
             assert_close(&n16_out, &int8_out);
+            // Positive proof the counter is wired, which the dispatch-side
+            // equality in the route test cannot give on a lane where the
+            // route is excluded.
+            assert!(
+                N16_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed) > before_n16,
+                "n16_sdot_matmul_m1 must increment its own counter when it runs"
+            );
 
             let dequantized =
                 dequantize_reference(&packed, &scales, Some(&zero_points), n, k, block_size);
@@ -11991,6 +11999,101 @@ mod tests {
             let expected = reference(&activations, &dequantized, 1, k, n);
             assert_qai8dxp_close(&selected, &expected);
         }
+    }
+
+    /// `INT4_DIRECT_M1_TEST_CALLS` and `N16_SDOT_M1_TEST_CALLS` instrument the
+    /// two non-KAI arms of the int4-direct `m = 1` chain. Until
+    /// `check_dispatch_reachability.py` learned the `TEST_CALLS` suffix neither
+    /// had any test reading it: three `fetch_add` sites incrementing into the
+    /// void, on a route that is the default int4 decode path wherever VNNI is
+    /// present. The counters read as coverage and enforced nothing.
+    ///
+    /// The assertion is an equality against the route predicate rather than a
+    /// bare `assert!(reached)`, so it is a real test on every lane: on a
+    /// non-VNNI x86_64 host it proves the route is *excluded* (and that the
+    /// answer is still correct without it), and on a VNNI or aarch64 host it
+    /// proves the route is taken.
+    #[test]
+    fn int4_direct_m1_counters_track_their_dispatch_predicates() {
+        let _probe = lock_dispatch_probe();
+        let (k, n, block_size) = (128usize, 16usize, 32usize);
+        let blocks = k.div_ceil(block_size);
+        let activations: Vec<f32> = (0..k)
+            .map(|i| ((i * 17 % 127) as f32 - 63.0) / 50.0)
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 31 % 251) as f32 - 125.0) / 50.0)
+            .collect();
+        // Symmetric: the x86_64 int4-direct route refuses zero points.
+        let (packed, scales_values, zero_points, dequantized) =
+            quantize(&weights, n, k, block_size, false);
+        assert!(
+            zero_points.is_none(),
+            "symmetric quantization must not emit zero points"
+        );
+        let expected = reference(&activations, &dequantized, 1, k, n);
+
+        let dot = selected_dot_kernel();
+        let direct = dot.supports_int4_direct(block_size, false);
+        let expect_kai = direct && dot.uses_kai_sdot_direct(4, block_size);
+        let expect_n16 = direct && !expect_kai && dot.uses_n16_sdot_direct();
+        let expect_plain = direct && !expect_kai && !expect_n16;
+
+        let kernel = accuracy4_kernel(k, n, block_size);
+        let a = Owned::f32(&[1, k], &activations);
+        let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
+        let scales = Owned::f32(&[n, blocks], &scales_values);
+        let mut y = Owned::zeros_f32(&[1, n]);
+
+        let before_plain = INT4_DIRECT_M1_TEST_CALLS.load(Ordering::Relaxed);
+        let before_n16 = N16_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed);
+        kernel
+            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .unwrap();
+        let reached_plain = INT4_DIRECT_M1_TEST_CALLS.load(Ordering::Relaxed) > before_plain;
+        let reached_n16 = N16_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed) > before_n16;
+
+        assert_eq!(
+            reached_plain, expect_plain,
+            "int4_matmul_m1 must run exactly when the int4-direct chain falls \
+             through to it (direct={direct} kai={expect_kai} n16={expect_n16})"
+        );
+        assert_eq!(
+            reached_n16, expect_n16,
+            "n16_sdot_matmul_m1 must run exactly when uses_n16_sdot_direct() \
+             selects it (direct={direct})"
+        );
+
+        // Whichever arm ran, the answer is the same one. `accuracy_level = 4`
+        // quantizes the activation to int8, so this is the tolerance the rest
+        // of that path's tests use, not an fp32 one.
+        assert_qai8dxp_close(&y.to_f32(), &expected);
+
+        // On a lane where the route is excluded, both equalities above are
+        // `false == false`, which cannot tell "route correctly excluded" apart
+        // from "counter never wired". Call the kernel directly to prove the
+        // instrumentation actually fires -- that is the difference between a
+        // reachability test and a comment.
+        let mut direct_result = vec![0.0f32; n];
+        let weight = PackedInt4Weight {
+            values: packed.clone(),
+            scales: scales_values.clone(),
+        };
+        let before_direct = INT4_DIRECT_M1_TEST_CALLS.load(Ordering::Relaxed);
+        int4_matmul_m1(
+            &activations,
+            &weight,
+            &mut direct_result,
+            k,
+            n,
+            block_size,
+            dot,
+        );
+        assert!(
+            INT4_DIRECT_M1_TEST_CALLS.load(Ordering::Relaxed) > before_direct,
+            "int4_matmul_m1 must increment its own counter when it runs"
+        );
+        assert_qai8dxp_close(&direct_result, &expected);
     }
 
     #[cfg(target_arch = "aarch64")]
