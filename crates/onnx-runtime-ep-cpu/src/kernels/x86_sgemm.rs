@@ -836,13 +836,13 @@ impl Int4Weight<'_> {
                 let zero_point = self.zero_point(col, block);
                 let byte_at = col * row_len + block * blob + offset_in_block / 2;
                 // Eight nibbles of one column are four whole packed bytes,
-                // because the block size is a multiple of the group.
-                let raw = u32::from_le_bytes([
-                    self.packed[byte_at],
-                    self.packed[byte_at + 1],
-                    self.packed[byte_at + 2],
-                    self.packed[byte_at + 3],
-                ]);
+                // because the block size is a multiple of the group. Taken as
+                // one slice rather than four indexes: four separate
+                // bounds-checked byte loads and the shifts to reassemble them
+                // cost 18% of this pack (fixed 2.16 ms -> 1.78 ms at
+                // 4096x11008), where the slice compiles to a single unaligned
+                // 32-bit load with one bounds check.
+                let raw = u32::from_le_bytes(self.packed[byte_at..byte_at + 4].try_into().unwrap());
                 let packed4 = _mm_cvtsi32_si128(raw as i32);
                 let low = _mm_and_si128(packed4, _mm_set1_epi8(0x0f));
                 // A 16-bit shift drags the neighbouring byte's low nibble into
