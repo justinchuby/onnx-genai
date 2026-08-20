@@ -241,6 +241,11 @@ orders of magnitude larger than the noise: 32-48 ms before, 0.3-1.5 ms after.
 > the rows claim. See [section 3](#3-per-call-packing-and-a-missing-native-kernel--qlinearmatmul-fixed)
 > for the corrected native numbers; the rows themselves are left as measured, because they are
 > accurate for the build they describe.
+>
+> **The 11.9x figure is itself stale**: it predates #1194's native integer GEMM and stood only
+> because there was no `QLinearMatMul` generator to re-measure with. Re-measured on the default
+> build in [section 16](#16-qlinearmatmul-decode-had-never-been-measured-on-the-shipped-build-and-the-integer-gemm-branched-on-signedness-per-16-bytes),
+> it is **1.13x at u8 M=128**, **0.11x at i8 M=1 (a win)**, and a loss confined to u8 M=1.
 
 Ranges **outside** the measured region — `K * N < 2^20`, symbolic/dynamic weight shapes, and dense
 dtypes other than f32/f16 — are simply unmeasured. They are claimed like everything else; the note
@@ -253,9 +258,12 @@ is only that no row above characterises them.
 > which fixes it and re-measures the range end to end.
 >
 > The `QLinearMatMul` rows are likewise measured on a **`--features mlas` research build**. In the
-> default native build the integer path is the widened-`i32` scalar loop, which measures **11.8x
-> (M=1) / 12.0x (M=128)** against ORT at `1x2048x2048`, one thread. Section 3's "fixed" applies to
-> the MLAS route only; a native QGEMM is open work.
+> default native build the integer path was the widened-`i32` scalar loop, which measured **11.8x
+> (M=1) / 12.0x (M=128)** against ORT at `1x2048x2048`, one thread. Section 3's "fixed" applied to
+> the MLAS route only. #1194 then landed a native QGEMM and
+> [section 16](#16-qlinearmatmul-decode-had-never-been-measured-on-the-shipped-build-and-the-integer-gemm-branched-on-signedness-per-16-bytes)
+> is the first measurement of it through an ORT session: **1.13x at u8 M=128** and **0.11x at i8
+> M=1**, with the remaining loss confined to **u8 M=1**.
 
 ## Root causes
 
@@ -1412,3 +1420,55 @@ declines, because `gemv_f16_nk` reads `f16` bit patterns and has no `bf16` twin 
 not policy, pinned by a test that checks both the route and the numerics. Mutation-verified in both
 directions. Full record:
 [`docs/benchmarks/2026-08-21-gemm-bf16-decode-gemv.md`](../benchmarks/2026-08-21-gemm-bf16-decode-gemv.md).
+
+### 16. `QLinearMatMul` decode had never been measured on the shipped build, and the integer GEMM branched on signedness per 16 bytes
+
+The `QLinearMatMul` rows in the matrix are `--features mlas` numbers, and the caveat under them said
+the default build was 11.8x–12.0x behind ORT. That caveat predates #1194's native integer GEMM and
+**nothing re-measured it**, because `scripts/ort_ab/` had no `QLinearMatMul` generator at all — the
+op could not be driven through the standard harness. `gen_qlinear.py` (new) fixes the coverage hole,
+with rows straddling both of the kernel's own gates (`PARALLEL_MIN_WORK`, and the `m <= MR`
+fused/packed split).
+
+**The corrected picture on the default build**, one thread, arms interleaved, parity `PASS`
+everywhere: **1.13x at u8 M=128**, **0.11x at i8 M=1 (a 9.4x win**, because ORT's own i8 x i8 path is
+35x slower than its u8 x u8 path at the same shape**)**, and a real loss of **2.39x–3.21x confined to
+u8 x u8 at M=1** — decode. The 11.8x caveat is stale in both directions.
+
+**Localising it.** Timed alone the kernel is ~88% of the call, so the wrapper is not the story
+(the 44% an interleaved run implies is the paired-arm L3 eviction both arms pay; the ratio survives,
+the absolute does not). Sweeping aspect ratio at a fixed 12.85 MB footprint gives 17–20 GB/s
+everywhere, and a **1 MB weight that fits L2 runs at the same 19.5 GB/s** — so at m=1 the kernel is
+**instruction-bound, not memory-bound**, up to L3.
+
+**The defect.** `widen16(signed: bool, ..)` — the widen every byte of `B` passes through — took
+signedness as a runtime argument and branched on it in the innermost loop, once per 16 bytes, even
+though `Operand::signed` is fixed for the whole call and the `#[target_feature]` boundary stops the
+compiler hoisting it.
+
+**Disposition.** Signedness is now a `const SIGNED: bool` on `widen16`/`fused_strip`/
+`accumulate_fused`/`pack_panel`, with the single runtime `match` moved out to the dispatcher that
+already matched on `m`. No arithmetic changed — accumulation is still wrapping `i32` and the output
+is bit-identical, asserted by the existing both-sign-domain oracle. Kernel A/B, two prebuilt test
+binaries alternated over three repetitions with the harness's `portable` drift control steady to
+1.6%: **1.13x–1.14x at m=1** and **1.03x** on the packed `m > MR` path, with non-overlapping ranges
+between the arms at m=1.
+
+**A retraction rides with it.** A first end-to-end A/B across two separately built `bench_generic`
+binaries read 1.41x–1.46x at M=1 and "2.97x -> 1.61x against ORT". Both are **withdrawn**: a 1.13x
+kernel cannot yield a 1.43x call, since `1 / (f/R_k + 1 - f) <= R_k` for any kernel fraction `f`.
+A null control (the same binary against itself) puts this host's paired end-to-end floor at ±10%,
+and re-running each binary against its own ORT reference back to back gives medians of 2.43x (base)
+and 2.58x (new) — **no measurable end-to-end effect**. The kernel win is real and controlled; its
+effect on the whole call is below what this box can resolve, and the u8 M=1 gap against ORT stands
+at ~2.4x.
+
+**Still open, measured but not merged:** (a) the u8 M=1 gap itself, ~2.4x and unmoved; (b) *parallel scaling at m=1* — 8
+threads buy 1.3x where ORT gets 5.8x, because the fused path splits columns and hands every worker a
+page-crossing strided walk of `B`; at m=1 there is no `B` reuse to protect, so a `k` split with
+private accumulators is the shape that streams. (c) The single-thread residual is an
+instruction budget: exact full-range 8-bit needs `vpmaddwd` at ~0.25 vector uops/byte, and
+`vpmaddubsw` — which would halve it — saturates unless one operand stays within +/-64
+(`255 * 64 * 2 = 32640` fits `i16`, `255 * 65 * 2` does not), which is precisely why ORT's
+quantizer ships `reduce_range` for non-VNNI AVX2. Full record:
+[`docs/benchmarks/2026-08-21-qlinearmatmul-m1-signedness.md`](../benchmarks/2026-08-21-qlinearmatmul-m1-signedness.md).

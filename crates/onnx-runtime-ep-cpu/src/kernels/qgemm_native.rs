@@ -327,11 +327,31 @@ unsafe fn accumulate_products_avx2(
             unsafe {
                 let a_pairs = a_pairs.as_ptr();
                 let out = base.at(n0);
-                match m {
-                    1 => accumulate_fused::<1, 4>(b, a_pairs, pairs, n, n0, nc, k, out),
-                    2 => accumulate_fused::<2, 2>(b, a_pairs, pairs, n, n0, nc, k, out),
-                    3 => accumulate_fused::<3, 1>(b, a_pairs, pairs, n, n0, nc, k, out),
-                    _ => accumulate_fused::<4, 1>(b, a_pairs, pairs, n, n0, nc, k, out),
+                match (m, b.signed) {
+                    (1, false) => {
+                        accumulate_fused::<1, 4, false>(b, a_pairs, pairs, n, n0, nc, k, out)
+                    }
+                    (1, true) => {
+                        accumulate_fused::<1, 4, true>(b, a_pairs, pairs, n, n0, nc, k, out)
+                    }
+                    (2, false) => {
+                        accumulate_fused::<2, 2, false>(b, a_pairs, pairs, n, n0, nc, k, out)
+                    }
+                    (2, true) => {
+                        accumulate_fused::<2, 2, true>(b, a_pairs, pairs, n, n0, nc, k, out)
+                    }
+                    (3, false) => {
+                        accumulate_fused::<3, 1, false>(b, a_pairs, pairs, n, n0, nc, k, out)
+                    }
+                    (3, true) => {
+                        accumulate_fused::<3, 1, true>(b, a_pairs, pairs, n, n0, nc, k, out)
+                    }
+                    (_, false) => {
+                        accumulate_fused::<4, 1, false>(b, a_pairs, pairs, n, n0, nc, k, out)
+                    }
+                    (_, true) => {
+                        accumulate_fused::<4, 1, true>(b, a_pairs, pairs, n, n0, nc, k, out)
+                    }
                 }
             }
             return;
@@ -348,7 +368,13 @@ unsafe fn accumulate_products_avx2(
             // `KC/2 >= panel_pairs` pairs of `tiles * NR` columns, and the pack
             // reads `b[(k0 + row) * n + n0 + column]` only for `row < kc` and
             // `column < nc`, both in bounds.
-            unsafe { pack_panel(b, &mut panel, n, n0, nc, k0, kc, tiles) };
+            unsafe {
+                if b.signed {
+                    pack_panel::<true>(b, &mut panel, n, n0, nc, k0, kc, tiles);
+                } else {
+                    pack_panel::<false>(b, &mut panel, n, n0, nc, k0, kc, tiles);
+                }
+            };
             let mut r0 = m0;
             while r0 < m0 + mc {
                 let rows = MR.min(m0 + mc - r0);
@@ -406,7 +432,7 @@ unsafe fn accumulate_products_avx2(
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn pack_panel(
+unsafe fn pack_panel<const SIGNED: bool>(
     b: Operand<'_>,
     panel: &mut [i16],
     n: usize,
@@ -431,9 +457,9 @@ unsafe fn pack_panel(
                 let dst = out.add(pair * NR * 2);
                 if width == NR {
                     let lo_row = b.bytes.as_ptr().add((k0 + 2 * pair) * n + n0 + c0);
-                    let w0 = widen16(b.signed, lo_row);
+                    let w0 = widen16::<SIGNED>(lo_row);
                     let w1 = if 2 * pair + 1 < kc {
-                        widen16(b.signed, lo_row.add(n))
+                        widen16::<SIGNED>(lo_row.add(n))
                     } else {
                         _mm256_setzero_si256()
                     };
@@ -499,7 +525,7 @@ unsafe fn pack_panel(
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fused_strip<const R: usize, const T: usize>(
+unsafe fn fused_strip<const R: usize, const T: usize, const SIGNED: bool>(
     b: Operand<'_>,
     a_pairs: *const i32,
     pairs: usize,
@@ -526,9 +552,9 @@ unsafe fn fused_strip<const R: usize, const T: usize>(
                 *av = _mm256_set1_epi32(*a_pairs.add(row * pairs + k0 / 2 + pair));
             }
             for tile in 0..T {
-                let w0 = widen16(b.signed, lo_row.add(tile * NR));
+                let w0 = widen16::<SIGNED>(lo_row.add(tile * NR));
                 let w1 = if has_hi {
-                    widen16(b.signed, lo_row.add(n + tile * NR))
+                    widen16::<SIGNED>(lo_row.add(n + tile * NR))
                 } else {
                     _mm256_setzero_si256()
                 };
@@ -579,7 +605,7 @@ const FUSED_KC: usize = 256;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn accumulate_fused<const R: usize, const T: usize>(
+unsafe fn accumulate_fused<const R: usize, const T: usize, const SIGNED: bool>(
     b: Operand<'_>,
     a_pairs: *const i32,
     pairs: usize,
@@ -595,7 +621,7 @@ unsafe fn accumulate_fused<const R: usize, const T: usize>(
             let kc = FUSED_KC.min(k - k0);
             let mut column = 0;
             while column + NR * T <= nc {
-                fused_strip::<R, T>(
+                fused_strip::<R, T, SIGNED>(
                     b,
                     a_pairs,
                     pairs,
@@ -609,7 +635,7 @@ unsafe fn accumulate_fused<const R: usize, const T: usize>(
                 column += NR * T;
             }
             while column + NR <= nc {
-                fused_strip::<R, 1>(
+                fused_strip::<R, 1, SIGNED>(
                     b,
                     a_pairs,
                     pairs,
@@ -654,7 +680,7 @@ unsafe fn accumulate_fused<const R: usize, const T: usize>(
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 #[inline]
-unsafe fn widen16(signed: bool, src: *const u8) -> std::arch::x86_64::__m256i {
+unsafe fn widen16<const SIGNED: bool>(src: *const u8) -> std::arch::x86_64::__m256i {
     #[cfg(target_arch = "x86")]
     use std::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
@@ -662,7 +688,7 @@ unsafe fn widen16(signed: bool, src: *const u8) -> std::arch::x86_64::__m256i {
 
     unsafe {
         let raw = _mm_loadu_si128(src.cast());
-        if signed {
+        if SIGNED {
             _mm256_cvtepi8_epi16(raw)
         } else {
             _mm256_cvtepu8_epi16(raw)
