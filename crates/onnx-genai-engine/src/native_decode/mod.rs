@@ -1597,8 +1597,10 @@ mod prefill_chunk_tests {
         assert_eq!(tensor.shape, vec![1, 2, hidden]);
         let taken: Vec<f32> = tensor
             .as_bytes()
-            .chunks_exact(4)
-            .map(|word| f32::from_le_bytes(word.try_into().expect("f32")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| f32::from_le_bytes(*word))
             .collect();
         // Rows 1 and 2 of a [1, 4, 3] tensor numbered 0..12.
         assert_eq!(taken, vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);

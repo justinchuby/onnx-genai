@@ -3938,7 +3938,9 @@ fn growing_the_cpu_kv_cache_relocates_every_head() {
 
     let raw = grown.read_bytes().expect("read grown cache");
     let values: Vec<f32> = raw
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     assert_eq!(values.len(), heads * grown_capacity * head_dim);
@@ -4032,7 +4034,9 @@ fn assert_kv_prefix_intact(
     let capacity = binding.physical_shape()[2];
     let raw = binding.read_bytes().expect("read cache");
     let values: Vec<f32> = raw
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     for block in 0..heads {
