@@ -179,7 +179,7 @@ trials, 21 runs / 7 warmups each.
 | qwen3_0p6b m512 | 8 | 10.07 | 6.80 | **1.48x** | 10.04 | 2.79 | 3.61 | 2.44 |
 | qwen3_0p6b m512 | 16 | 8.30 | 4.99 | **1.66x** | 8.20 | 2.15 | 3.86 | 2.32 |
 
-**27 cells, 27 wins, 1.29x - 2.66x.** 25 of the 27 nulls are within 1.6% of base. Two are not —
+**27 cells, 27 wins, 1.29x - 2.66x** (as opened; see the latest-main re-measurement below). 25 of the 27 nulls are within 1.6% of base. Two are not —
 `qwen3_8b m32 t=1` (7.5%) and `qwen3_0p6b m32 t=16` (19.5%) — and both still win by far more than
 their own noise floor, but they are the two cells to distrust.
 
@@ -190,6 +190,72 @@ comparison this harness licenses. The 15.99x quoted at the top of this document 
 separate reproduction run above; ORT's own measured time differs between the two sessions (5.99 vs
 5.70 ms), which is exactly why cells from different invocations must not be pasted into one row.
 The change is the same size either way; only the denominator moved.
+
+### Re-measured on latest main, immediately before merge
+
+The table above was taken when the branch was opened. `main` has moved a long way since (the half
+GEMV register tile, the decode GEBP handover, the plugin thread-local change), so the whole sweep
+was re-run on the merged head. Same-tree A/B: only `half_gemm.rs` is reverted for the `base` arm,
+so the harness is byte-identical in both arms. Native-only `p50`, 5 interleaved trials.
+
+| cell | t | base ms | new ms | delta | speedup | null |
+|---|---:|---:|---:|---:|---:|---:|
+| llama3_8b_m128 | 1 | 235.55 | 164.03 | -30.4% | 1.44x | 2.8% |
+| llama3_8b_m128 | 8 | 132.66 | 47.61 | -64.1% | 2.79x | 9.2% |
+| llama3_8b_m128 | 16 | 170.78 | 64.09 | -62.5% | 2.66x | 0.2% |
+| llama3_8b_m32 | 1 | 83.16 | 49.35 | -40.7% | 1.68x | 0.2% |
+| llama3_8b_m32 | 8 | 57.18 | 20.01 | -65.0% | 2.86x | 0.0% |
+| llama3_8b_m32 | 16 | 127.50 | 56.10 | -56.0% | 2.27x | 0.6% |
+| llama3_8b_m512 | 1 | 904.50 | 640.38 | -29.2% | 1.41x | 0.3% |
+| llama3_8b_m512 | 8 | 169.65 | 98.41 | -42.0% | 1.72x | 0.4% |
+| llama3_8b_m512 | 16 | 203.15 | 98.97 | -51.3% | 2.05x | 0.0% |
+| qwen3_0p6b_m128 | 1 | 13.27 | 9.75 | -26.5% | 1.36x | 0.1% |
+| qwen3_0p6b_m128 | 8 | 6.64 | 3.11 | -53.2% | 2.14x | 0.0% |
+| qwen3_0p6b_m128 | 16 | 8.34 | 4.07 | -51.3% | 2.05x | 0.8% |
+| qwen3_0p6b_m32 | 1 | 4.75 | 2.96 | -37.6% | 1.60x | 0.1% |
+| qwen3_0p6b_m32 | 8 | 4.08 | 2.41 | -40.9% | 1.69x | 46.3% **null unusable** |
+| qwen3_0p6b_m32 | 16 | 7.72 | 3.57 | -53.8% | 2.16x | 1.0% |
+| qwen3_0p6b_m512 | 1 | 53.17 | 39.39 | -25.9% | 1.35x | 0.1% |
+| qwen3_0p6b_m512 | 8 | 10.09 | 6.53 | -35.3% | 1.55x | 0.3% |
+| qwen3_0p6b_m512 | 16 | 11.85 | 6.52 | -45.0% | 1.82x | 3.8% |
+| qwen3_8b_m128 | 1 | 160.56 | 121.32 | -24.4% | 1.32x | 0.2% |
+| qwen3_8b_m128 | 8 | 79.82 | 35.78 | -55.2% | 2.23x | 0.1% |
+| qwen3_8b_m128 | 16 | 94.52 | 43.90 | -53.6% | 2.15x | 0.0% |
+| qwen3_8b_m32 | 1 | 57.10 | 36.65 | -35.8% | 1.56x | 0.5% |
+| qwen3_8b_m32 | 8 | 36.53 | 14.69 | -59.8% | 2.49x | 0.5% |
+| qwen3_8b_m32 | 16 | 106.15 | 41.58 | -60.8% | 2.55x | 0.6% |
+| qwen3_8b_m512 | 1 | 654.63 | 496.33 | -24.2% | 1.32x | 0.5% |
+| qwen3_8b_m512 | 8 | 117.02 | 75.70 | -35.3% | 1.55x | 0.0% |
+| qwen3_8b_m512 | 16 | 137.19 | 73.66 | -46.3% | 1.86x | 0.1% |
+
+**26 of 27 prefill cells improve beyond their own noise floor, -24.2% to -65.0% (1.32x - 2.86x).**
+That is *stronger* than the 1.29x - 2.66x this PR originally claimed. The 27th cell,
+`qwen3_0p6b_m32 t=8`, reads -40.9% but its null moved 46.3%, so it is not claimed at all.
+
+#### The `M = 1` cells, and a measurement artifact worth recording
+
+The sweep also covers `M = 1`, which this PR does not claim: at `M = 1` with `transB = 1` the
+`Gemm` path takes `gemv_f16_nk` and never reaches `pack_b`, so no code this PR touches runs.
+
+At 5 trials x 15 runs three `M = 1` cells nevertheless read as regressions *above* their null —
+`qwen3_0p6b_m1 t=8` +10.20% against a 2.04% null, `t=16` +6.10% against 1.22%, and `qwen3_8b_m1
+t=1` +1.85% against 0.12%. Those are the shapes that run in tens of microseconds, where a null that
+tight is not credible. Re-measured at **11 trials x 40 runs**:
+
+| cell | t | base ms | new ms | delta | null | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| qwen3_0p6b_m1 | 1 | 0.095 | 0.095 | +0.00% | 0.00% | within noise |
+| qwen3_0p6b_m1 | 8 | 0.044 | 0.047 | +6.82% | 11.36% | within noise |
+| qwen3_0p6b_m1 | 16 | 0.095 | 0.092 | -3.16% | 11.58% | within noise |
+| qwen3_8b_m1 | 1 | 0.808 | 0.813 | +0.62% | 0.74% | within noise |
+| qwen3_8b_m1 | 8 | 0.212 | 0.212 | +0.00% | 0.00% | within noise |
+| qwen3_8b_m1 | 16 | 0.272 | 0.266 | -2.21% | 5.15% | within noise |
+
+All six are within noise once the null is allowed to show its real width — the longer run widened
+the nulls from 0.1-2% to 5-11.6%, and the deltas did not follow. **No `M = 1` regression is
+claimed, and none is supported.** The short-run signal is recorded here because it is a good
+example of a null control that is too tight to trust: on a cell this fast, a 5-trial null can
+under-report the noise floor by an order of magnitude and manufacture a regression out of nothing.
 
 ### The negative control: row-major `B` is untouched
 

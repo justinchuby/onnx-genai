@@ -847,11 +847,18 @@ through the same `T::pack_contiguous` the row-major path uses (F16C on x86, FP16
 new intrinsics, no new architecture gates). Columns are handled `TRANSPOSED_PACK_GROUP = 4` at a
 time so the transposing stores are contiguous too; the group width is swept in the constant's docs.
 
-**27 cells across three geometries, 27 wins, 1.29x-2.66x.** The headline cell, `M = 128 / t = 8`,
+**27 cells across three geometries, 27 wins, 1.29x-2.66x** when opened; re-measured on the merged
+head immediately before landing, **26 of 27 prefill cells improve beyond their own null, -24.2% to
+-65.0% (1.32x-2.86x)**, with the 27th (`qwen3_0p6b_m32 t=8`) not claimed because its null moved
+46.3%. The headline cell, `M = 128 / t = 8`,
 goes **14.0x -> 7.0x** against ORT within one invocation (the 15.99x above is the same cell from a
-separate reproduction run; before/after must come from one run). Results are **bit-identical** —
-widening is exact and
-elementwise, so fill order cannot change the packed panel, and
+separate reproduction run; before/after must come from one run). `M = 1` is unaffected and
+unclaimed — it takes `gemv_f16_nk` and never reaches `pack_b`; three `M = 1` cells that read as
+regressions at 5 trials were all within noise at 11 trials x 40 runs. Results are **bit-identical**
+for `f16` — the F16C and scalar converters agree on all 65536 patterns — and differ for `bf16` only
+on the 126 signalling NaNs, which the scalar converter quiets and the `<< 16` widening preserves;
+both are NaN, and the change makes transposed `B` agree with row-major `B`. Fill order cannot
+change the packed panel, and
 `transposed_b_is_bit_identical_to_pre_transposed_row_major` asserts `to_bits()` equality on every
 execution path rather than a tolerance.
 
