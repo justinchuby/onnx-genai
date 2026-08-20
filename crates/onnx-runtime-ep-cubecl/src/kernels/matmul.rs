@@ -253,6 +253,121 @@ fn matmul_regtiled<F: Float>(
     }
 }
 
+#[cube(launch_unchecked)]
+fn matmul_regtiled_vec4<F: Float>(
+    lhs: &[Vector<F, Const<4>>],
+    rhs: &[Vector<F, Const<4>>],
+    out: &mut [Vector<F, Const<4>>],
+    #[comptime] m: usize,
+    #[comptime] n: usize,
+    #[comptime] k: usize,
+    #[comptime] rhs_batched: bool,
+) {
+    let batch = CUBE_POS_Z as usize;
+    let lhs_base = batch * m * k;
+    let rhs_batch_stride = comptime!(if rhs_batched { k * n } else { 0 });
+    let rhs_base = batch * rhs_batch_stride;
+
+    let block_row = CUBE_POS_Y as usize * BM;
+    let block_col = CUBE_POS_X as usize * BN;
+
+    let tx = UNIT_POS_X as usize;
+    let ty = UNIT_POS_Y as usize;
+    let tid = ty * WG_X + tx;
+
+    let mut lhs_tile = Shared::new_slice(BM * BK);
+    let mut rhs_tile = Shared::new_slice(BK * BN);
+
+    let mut acc = Array::<f32>::new(TM * TN);
+    #[unroll]
+    for i in 0..TM * TN {
+        acc[i] = f32::new(0.0_f32);
+    }
+    let mut a_reg = Array::<f32>::new(TM);
+    let mut b_reg = Array::<f32>::new(TN);
+
+    let tiles = k.div_ceil(BK);
+    for t in 0..tiles {
+        let k_base = t * BK;
+
+        #[unroll]
+        for s in 0..(BM * BK / 4 / WG_SIZE) {
+            let idx = s * WG_SIZE + tid;
+            let r = idx / (BK / 4);
+            let c4 = idx % (BK / 4);
+            let gr = block_row + r;
+            let gc = k_base + c4 * 4;
+            let pack = if gr < m && gc + 3 < k {
+                lhs[(lhs_base + gr * k + gc) / 4]
+            } else {
+                Vector::<F, Const<4>>::new(F::new(0.0_f32))
+            };
+            #[unroll]
+            for q in 0..4 {
+                lhs_tile[(c4 * 4 + q) * BM + r] = pack.extract(q);
+            }
+        }
+        #[unroll]
+        for s in 0..(BK * BN / 4 / WG_SIZE) {
+            let idx = s * WG_SIZE + tid;
+            let r = idx / (BN / 4);
+            let c4 = idx % (BN / 4);
+            let gr = k_base + r;
+            let gc = block_col + c4 * 4;
+            let pack = if gr < k && gc + 3 < n {
+                rhs[(rhs_base + gr * n + gc) / 4]
+            } else {
+                Vector::<F, Const<4>>::new(F::new(0.0_f32))
+            };
+            #[unroll]
+            for q in 0..4 {
+                rhs_tile[r * BN + c4 * 4 + q] = pack.extract(q);
+            }
+        }
+
+        sync_cube();
+
+        #[unroll]
+        for kk in 0..BK {
+            #[unroll]
+            for i in 0..TM {
+                a_reg[i] = f32::cast_from(lhs_tile[kk * BM + ty * TM + i]);
+            }
+            #[unroll]
+            for j in 0..TN {
+                b_reg[j] = f32::cast_from(rhs_tile[kk * BN + tx * TN + j]);
+            }
+            #[unroll]
+            for i in 0..TM {
+                #[unroll]
+                for j in 0..TN {
+                    acc[i * TN + j] += a_reg[i] * b_reg[j];
+                }
+            }
+        }
+
+        sync_cube();
+    }
+
+    let out_base = batch * m * n;
+    #[unroll]
+    for i in 0..TM {
+        let gr = block_row + ty * TM + i;
+        #[unroll]
+        for j4 in 0..(TN / 4) {
+            let gc = block_col + tx * TN + j4 * 4;
+            if gr < m && gc + 3 < n {
+                let mut pack = Vector::<F, Const<4>>::empty();
+                #[unroll]
+                for q in 0..4 {
+                    pack.insert(q, F::cast_from(acc[i * TN + j4 * 4 + q]));
+                }
+                out[(out_base + gr * n + gc) / 4] = pack;
+            }
+        }
+    }
+}
+
 pub struct MatMulFactory<R: Runtime> {
     context: Arc<CubeclContext<R>>,
 }
@@ -359,6 +474,10 @@ impl MatMulDims {
         self.m >= REGTILE_MIN_M && self.n >= BN && self.k >= BK
     }
 
+    fn use_regtile_vec4(&self) -> bool {
+        self.use_regtile() && self.k.is_multiple_of(4) && self.n.is_multiple_of(4)
+    }
+
     fn regtile_cube_count(&self) -> CubeCount {
         CubeCount::Static(
             self.n.div_ceil(BN).max(1) as u32,
@@ -408,7 +527,29 @@ impl<R: Runtime> KernelFactory for MatMulFactory<R> {
                         // kernel was created for, and `resolve` verified each buffer
                         // covers the bytes those shapes describe.
                         unsafe {
-                            if dims.use_regtile() {
+                            if dims.use_regtile_vec4() {
+                                matmul_regtiled_vec4::launch_unchecked::<$float, R>(
+                                    &context.client,
+                                    dims.regtile_cube_count(),
+                                    CubeDim::new_2d(WG_X as u32, WG_Y as u32),
+                                    BufferArg::from_raw_parts(
+                                        lhs_res.handle.clone(),
+                                        dims.lhs_elements() / 4,
+                                    ),
+                                    BufferArg::from_raw_parts(
+                                        rhs_res.handle.clone(),
+                                        dims.rhs_elements() / 4,
+                                    ),
+                                    BufferArg::from_raw_parts(
+                                        out_res.handle.clone(),
+                                        dims.out_elements() / 4,
+                                    ),
+                                    dims.m,
+                                    dims.n,
+                                    dims.k,
+                                    dims.rhs_batched,
+                                );
+                            } else if dims.use_regtile() {
                                 matmul_regtiled::launch_unchecked::<$float, R>(
                                     &context.client,
                                     dims.regtile_cube_count(),
@@ -519,10 +660,24 @@ mod tests {
             regtiled.use_regtile(),
             "regtiled_matmul_matches_a_host_reference must exercise the new kernel"
         );
+        assert!(
+            !regtiled.use_regtile_vec4(),
+            "regtiled_matmul_matches_a_host_reference must stay on the scalar register path"
+        );
         let batched = MatMulDims::resolve(&node("mm"), &[3, 128, 32], &[32, 128]).unwrap();
         assert!(
             batched.use_regtile(),
             "regtiled_matmul_handles_batches must exercise the new kernel"
+        );
+        assert!(
+            batched.use_regtile_vec4(),
+            "regtiled_matmul_handles_batches must exercise the vec4 register path"
+        );
+
+        let vec4 = MatMulDims::resolve(&node("mm"), &[200, 44], &[44, 148]).unwrap();
+        assert!(
+            vec4.use_regtile_vec4(),
+            "vec4_regtiled_matmul_matches_a_host_reference must exercise the vec4 kernel"
         );
 
         // And the small-shape tests must keep exercising the old one.
@@ -551,5 +706,19 @@ mod tests {
 
         let k_too_small = MatMulDims::resolve(&node("mm"), &[128, 7], &[7, 128]).unwrap();
         assert!(!k_too_small.use_regtile(), "K below BK must veto");
+    }
+
+    #[test]
+    fn vec4_alignment_can_veto_the_vec4_register_tiled_path() {
+        let ok = MatMulDims::resolve(&node("mm"), &[128, 12], &[12, 132]).unwrap();
+        assert!(ok.use_regtile_vec4());
+
+        let k_not_vec4 = MatMulDims::resolve(&node("mm"), &[128, 10], &[10, 132]).unwrap();
+        assert!(k_not_vec4.use_regtile());
+        assert!(!k_not_vec4.use_regtile_vec4(), "K % 4 must veto vec4");
+
+        let n_not_vec4 = MatMulDims::resolve(&node("mm"), &[128, 12], &[12, 130]).unwrap();
+        assert!(n_not_vec4.use_regtile());
+        assert!(!n_not_vec4.use_regtile_vec4(), "N % 4 must veto vec4");
     }
 }

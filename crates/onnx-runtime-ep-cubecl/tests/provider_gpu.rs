@@ -630,6 +630,42 @@ fn regtiled_matmul_matches_a_host_reference() {
     }
 }
 
+/// Covers the vec4 register-tiled kernel with partial blocks on every axis.
+/// `K` and `N` satisfy the vec4 alignment precondition but deliberately do not
+/// divide `BK`/`BN`, so vectorized loads still hit the zero-padding edges.
+#[test]
+fn vec4_regtiled_matmul_matches_a_host_reference() {
+    let Some(provider) = provider() else { return };
+    let (m, k, n) = (200usize, 44usize, 148usize);
+    let lhs: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32) - 6.0).collect();
+    let rhs: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32) - 3.0).collect();
+    let mut expected = vec![0.0f32; m * n];
+    for row in 0..m {
+        for col in 0..n {
+            let mut acc = 0.0f32;
+            for i in 0..k {
+                acc += lhs[row * k + i] * rhs[i * n + col];
+            }
+            expected[row * n + col] = acc;
+        }
+    }
+    let result = run(
+        &provider,
+        "MatMul",
+        72,
+        &[(&[m, k], &lhs), (&[k, n], &rhs)],
+        &[m, n],
+    );
+    for (index, (actual, want)) in result.iter().zip(&expected).enumerate() {
+        assert!(
+            (actual - want).abs() < 1e-3,
+            "element {index} (row {}, col {}): {actual} != {want}",
+            index / n,
+            index % n
+        );
+    }
+}
+
 /// The register-tiled path must also hold the f32-accumulation guarantee, and
 /// batching must still address the right slice of a batched operand.
 #[test]
