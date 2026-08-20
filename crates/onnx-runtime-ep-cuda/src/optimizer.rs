@@ -3724,12 +3724,38 @@ fn dims_bytes(dims: &[usize], elem: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::EnvVarGuard;
     use onnx_runtime_ir::{Dim, Node, NodeId, ValueId};
 
-    /// Serializes the [`CudaDropIdentityCast`] tests: one mutates the process-wide
-    /// `IDENTITY_CAST_FOLD_DISABLE_ENV`, which the others read through the pass, so
-    /// they must not run concurrently (mirrors `TEST_SINGLE_SPLIT_LOCK`).
-    static IDENTITY_CAST_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Falsifiable guard against re-introducing the parallel-test env race this
+    /// module was fixed for: every environment mutation in `optimizer.rs` must go
+    /// through [`EnvVarGuard`] (which serialises on a process-global lock and
+    /// restores on drop), never a bare `std::env` setter. If a future edit adds a
+    /// direct `set_var`/`remove_var` here, this test fails at once instead of the
+    /// flake resurfacing under the parallel harness.
+    ///
+    /// The needles are assembled from fragments so this assertion never matches
+    /// itself. Production code in this file only *reads* the environment
+    /// (`env::var`/`env::var_os`), which is race-free, so a zero-mutation source
+    /// is the correct invariant.
+    #[test]
+    fn optimizer_source_routes_all_env_mutation_through_guard() {
+        let src = include_str!("optimizer.rs");
+        let set_needle = format!("env::{}", ["set", "_var"].concat());
+        let remove_needle = format!("env::{}", ["remove", "_var"].concat());
+        assert!(
+            !src.contains(&set_needle),
+            "found a direct `env::{}` in optimizer.rs; route it through \
+             EnvVarGuard (test_support) so it cannot race parallel tests",
+            ["set", "_var"].concat()
+        );
+        assert!(
+            !src.contains(&remove_needle),
+            "found a direct `env::{}` in optimizer.rs; route it through \
+             EnvVarGuard (test_support) so it cannot race parallel tests",
+            ["remove", "_var"].concat()
+        );
+    }
 
     fn value(graph: &mut Graph, name: &str, dtype: DataType, width: usize) -> ValueId {
         graph.create_named_value(name, dtype, vec![Dim::Static(1), Dim::Static(width)])
@@ -3803,6 +3829,12 @@ mod tests {
 
     #[test]
     fn folds_bf16_residual_add_norm_into_skip_node() {
+        // The fold is opt-in, and this test asserts BOTH the default (flag unset)
+        // and the enabled path. It holds the env lock for its whole body and
+        // toggles the flag through the guard, which restores the prior value on
+        // drop, so it never races a concurrent reader of the default.
+        let mut env = EnvVarGuard::acquire();
+        env.unset(SKIP_RMSNORM_FUSION_ENABLE_ENV);
         for gamma_dtype in [DataType::BFloat16, DataType::Float32] {
             let mut graph = bf16_skip_seam_graph(6656, gamma_dtype);
             let a = value_id_by_name(&graph, "a");
@@ -3824,10 +3856,9 @@ mod tests {
                 "default (flag unset) leaves the standalone norm (gamma={gamma_dtype:?})"
             );
 
-            // SAFETY: single-threaded test; env is restored before returning.
-            unsafe { std::env::set_var(SKIP_RMSNORM_FUSION_ENABLE_ENV, "1") };
+            env.set(SKIP_RMSNORM_FUSION_ENABLE_ENV, "1");
             let result = CudaSkipRmsNormFusion.run(&mut graph, &PassContext::new());
-            unsafe { std::env::remove_var(SKIP_RMSNORM_FUSION_ENABLE_ENV) };
+            env.unset(SKIP_RMSNORM_FUSION_ENABLE_ENV);
             result.unwrap();
             assert!(
                 graph
@@ -3885,10 +3916,10 @@ mod tests {
             let id = value_id_by_name(&graph, name);
             graph.value_mut(id).dtype = DataType::Float16;
         }
-        // SAFETY: single-threaded test; env is restored before returning.
-        unsafe { std::env::set_var(SKIP_RMSNORM_FUSION_ENABLE_ENV, "1") };
+        // Enabled via the guard, which holds the env lock for the set→run→restore
+        // window and returns the flag to its prior value on drop.
+        let _env = EnvVarGuard::with_var(SKIP_RMSNORM_FUSION_ENABLE_ENV, "1");
         let result = CudaSkipRmsNormFusion.run(&mut graph, &PassContext::new());
-        unsafe { std::env::remove_var(SKIP_RMSNORM_FUSION_ENABLE_ENV) };
         result.unwrap();
         assert!(
             graph
@@ -4520,6 +4551,8 @@ mod tests {
 
     #[test]
     fn folds_constant_cast_bf16_to_f32_byte_identical() {
+        // Asserts the fold fires by default; serialise against the disable-env test.
+        let _env = EnvVarGuard::without_var(CONST_CAST_FOLD_DISABLE_ENV);
         // bf16 → f32 widening is exact. Element i holds bf16(i * 1.5).
         let n = 6usize;
         let mut bytes = Vec::with_capacity(n * 2);
@@ -4559,6 +4592,8 @@ mod tests {
 
     #[test]
     fn folds_constant_cast_f32_to_bf16_round_to_nearest_even() {
+        // Asserts the fold fires by default; serialise against the disable-env test.
+        let _env = EnvVarGuard::without_var(CONST_CAST_FOLD_DISABLE_ENV);
         // f32 → bf16 narrowing must match the kernel's round-to-nearest-even
         // (`half::bf16::from_f32`).
         let values = [0.0f32, 1.0, 1.5, -2.75, 3.141_592_7, 65_504.0];
@@ -4654,7 +4689,6 @@ mod tests {
 
     #[test]
     fn const_cast_fold_respects_disable_env() {
-        // SAFETY: single-threaded test; env is restored before returning.
         let n = 4usize;
         let mut bytes = Vec::new();
         for i in 0..n {
@@ -4662,9 +4696,8 @@ mod tests {
         }
         let (mut graph, _cast_out) =
             const_cast_graph(n, DataType::BFloat16, bytes, DataType::Float32);
-        unsafe { std::env::set_var(CONST_CAST_FOLD_DISABLE_ENV, "1") };
+        let _env = EnvVarGuard::with_var(CONST_CAST_FOLD_DISABLE_ENV, "1");
         let result = CudaFoldConstantCast.run(&mut graph, &PassContext::new());
-        unsafe { std::env::remove_var(CONST_CAST_FOLD_DISABLE_ENV) };
         result.unwrap();
         assert_eq!(
             graph
@@ -7155,9 +7188,11 @@ mod tests {
     fn qkv_fusion_is_opt_in_and_disabled_by_default() {
         // The pass must not fire unless the opt-in env flag is set, so the
         // default release binary keeps the three separate GEMVs (no regression).
-        // SAFETY: single-threaded test; env is restored before returning.
+        // Holds the env lock for the whole body and toggles the flag through the
+        // guard, which restores the prior value on drop.
+        let mut env = EnvVarGuard::acquire();
         let mut g = qkv_graph(64, 8, 4, 4, true);
-        unsafe { std::env::remove_var(QKV_FUSION_ENABLE_ENV) };
+        env.unset(QKV_FUSION_ENABLE_ENV);
         CudaQkvProjectionFusion
             .run(&mut g.graph, &PassContext::new())
             .unwrap();
@@ -7173,9 +7208,8 @@ mod tests {
         );
 
         // With the flag set, `run` performs the fusion.
-        unsafe { std::env::set_var(QKV_FUSION_ENABLE_ENV, "1") };
+        env.set(QKV_FUSION_ENABLE_ENV, "1");
         let result = CudaQkvProjectionFusion.run(&mut g.graph, &PassContext::new());
-        unsafe { std::env::remove_var(QKV_FUSION_ENABLE_ENV) };
         result.unwrap();
         let fused = g
             .graph
@@ -7190,9 +7224,9 @@ mod tests {
     /// and `Relu` is rewired directly onto `x`, leaving a byte-identical graph.
     #[test]
     fn drops_identity_cast_and_rewires_consumer() {
-        let _serial = IDENTITY_CAST_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Default-reader of the identity-cast disable flag; serialise against the
+        // opt-out test that sets it.
+        let _env = EnvVarGuard::without_var(IDENTITY_CAST_FOLD_DISABLE_ENV);
         let mut g = Graph::new();
         g.opset_imports.insert(String::new(), 17);
         let x = value(&mut g, "x", DataType::Float32, 4);
@@ -7224,9 +7258,9 @@ mod tests {
     /// identity, so the pass must leave it untouched.
     #[test]
     fn keeps_narrowing_cast() {
-        let _serial = IDENTITY_CAST_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Default-reader of the identity-cast disable flag; serialise against the
+        // opt-out test that sets it.
+        let _env = EnvVarGuard::without_var(IDENTITY_CAST_FOLD_DISABLE_ENV);
         let mut g = Graph::new();
         g.opset_imports.insert(String::new(), 17);
         let x = value(&mut g, "x", DataType::Float32, 4);
@@ -7248,9 +7282,9 @@ mod tests {
     /// runtime's output binding (by value id) is never disturbed.
     #[test]
     fn keeps_identity_cast_feeding_graph_output() {
-        let _serial = IDENTITY_CAST_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Default-reader of the identity-cast disable flag; serialise against the
+        // opt-out test that sets it.
+        let _env = EnvVarGuard::without_var(IDENTITY_CAST_FOLD_DISABLE_ENV);
         let mut g = Graph::new();
         g.opset_imports.insert(String::new(), 17);
         let x = value(&mut g, "x", DataType::Float32, 4);
@@ -7271,9 +7305,7 @@ mod tests {
     /// The opt-out env restores the exported identity casts for A/B / rollback.
     #[test]
     fn opt_out_env_preserves_identity_cast() {
-        let _serial = IDENTITY_CAST_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = EnvVarGuard::with_var(IDENTITY_CAST_FOLD_DISABLE_ENV, "1");
         let mut g = Graph::new();
         g.opset_imports.insert(String::new(), 17);
         let x = value(&mut g, "x", DataType::Float32, 4);
@@ -7283,9 +7315,7 @@ mod tests {
         g.insert_node(Node::new(NodeId(0), "Relu", vec![Some(y)], vec![out]));
         g.add_output(out);
 
-        unsafe { std::env::set_var(IDENTITY_CAST_FOLD_DISABLE_ENV, "1") };
         let result = CudaDropIdentityCast.run(&mut g, &PassContext::new());
-        unsafe { std::env::remove_var(IDENTITY_CAST_FOLD_DISABLE_ENV) };
         result.unwrap();
         assert_eq!(
             g.nodes.values().filter(|n| n.op_type == "Cast").count(),
@@ -7430,6 +7460,9 @@ mod tests {
 
     #[test]
     fn folds_beta_sigmoid_and_decay_softplus_into_linear_attention() {
+        // Depends on the gating fusion being enabled by default, so serialise
+        // against `opt_out_env_preserves_exported_gate_chains`, which disables it.
+        let _env = EnvVarGuard::without_var(LINEAR_ATTENTION_GATING_DISABLE_ENV);
         for trailing_cast in [false, true] {
             let mut graph = gated_delta_la_graph(4, trailing_cast);
             let a = value_id_by_name(&graph, "a");
@@ -7475,6 +7508,8 @@ mod tests {
 
     #[test]
     fn folds_neg_exp_a_log_chain_into_linear_attention() {
+        // Depends on the gating fusion default; serialise against the opt-out test.
+        let _env = EnvVarGuard::without_var(LINEAR_ATTENTION_GATING_DISABLE_ENV);
         for trailing_cast in [false, true] {
             let mut graph = gated_delta_la_graph_ext(4, trailing_cast, true);
             let a = value_id_by_name(&graph, "a");
@@ -7521,6 +7556,10 @@ mod tests {
     fn precomputed_neg_exp_a_initializer_does_not_set_neg_exp_marker() {
         // When the exporter already provides `neg_exp_A` as an initializer, the
         // decay fold fires but the inline `Neg(Exp)` marker must stay absent.
+        // This asserts the gating fusion's *default* (enabled) behaviour, so it
+        // must hold the env lock to serialise against the opt-out test that
+        // disables the fusion process-wide.
+        let _env = EnvVarGuard::without_var(LINEAR_ATTENTION_GATING_DISABLE_ENV);
         let mut graph = gated_delta_la_graph(4, false);
         CudaLinearAttentionGatingFusion
             .run(&mut graph, &PassContext::new())
@@ -7540,6 +7579,8 @@ mod tests {
 
     #[test]
     fn leaves_beta_gate_when_it_escapes_to_a_second_consumer() {
+        // Depends on the gating fusion default; serialise against the opt-out test.
+        let _env = EnvVarGuard::without_var(LINEAR_ATTENTION_GATING_DISABLE_ENV);
         let mut graph = gated_delta_la_graph(4, false);
         // A second consumer of `beta` means the Sigmoid output escapes, so the
         // beta gate must be left exactly as exported; decay still folds.
@@ -7574,10 +7615,11 @@ mod tests {
     #[test]
     fn opt_out_env_preserves_exported_gate_chains() {
         let mut graph = gated_delta_la_graph(4, true);
-        // SAFETY: single-threaded test; env is restored before returning.
-        unsafe { std::env::set_var(LINEAR_ATTENTION_GATING_DISABLE_ENV, "1") };
+        // Holds the process-global env lock for the whole set→run→restore window,
+        // so no concurrent test observes the disable flag; the guard restores the
+        // prior value on drop.
+        let _env = EnvVarGuard::with_var(LINEAR_ATTENTION_GATING_DISABLE_ENV, "1");
         let result = CudaLinearAttentionGatingFusion.run(&mut graph, &PassContext::new());
-        unsafe { std::env::remove_var(LINEAR_ATTENTION_GATING_DISABLE_ENV) };
         result.unwrap();
         for op in ["Sigmoid", "Softplus", "Add", "Mul", "Cast"] {
             assert!(
