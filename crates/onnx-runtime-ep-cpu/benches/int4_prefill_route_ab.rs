@@ -29,7 +29,9 @@
 //! cargo bench -p onnx-runtime-ep-cpu --bench int4_prefill_route_ab
 //! ```
 //! `PROBE_BITS=4|8` picks the weight width; `PROBE_SHAPE=small|big` picks one
-//! shape; `PROBE_MS=prefill|cross` picks a row
+//! shape; `PROBE_BLOCK=<n>` picks the quantization block size (32 by default;
+//! use 16 to reach the `INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED` branch, where
+//! the route below the crossover is the generic per-block dot); `PROBE_MS=prefill|cross` picks a row
 //! sweep.
 
 mod common;
@@ -94,7 +96,17 @@ fn build_kernel(
 }
 
 fn main() {
-    let block_size = 32usize;
+    // `PROBE_BLOCK` exists because `int4_prefill_gebp_min_rows` returns a
+    // *different* threshold for weights whose block size the column-blocked
+    // kernels cannot take (`INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED`), and with
+    // the block size pinned to 32 this bench could not reach that branch at
+    // all. Below 32 the competitor is not the vectorized column-blocked
+    // kernel, it is the generic per-block dot, so the crossover is a genuinely
+    // different measurement rather than the same one at another size.
+    let block_size: usize = std::env::var("PROBE_BLOCK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32);
     let shapes: Vec<(usize, usize)> = match std::env::var("PROBE_SHAPE").as_deref() {
         Ok("big") => vec![(4096, 11008)],
         Ok("small") => vec![(2048, 2048)],
@@ -112,7 +124,7 @@ fn main() {
         Ok("8") => 8,
         _ => 4,
     };
-    println!("acc_level={acc} bits={bits}");
+    println!("acc_level={acc} bits={bits} block_size={block_size}");
     println!(
         "{:>6} {:>6} {:>5} {:>12} {:>12} {:>12}",
         "k", "n", "m", "cold_ms", "steady_ms", "gflops"

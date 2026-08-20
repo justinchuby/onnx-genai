@@ -1120,5 +1120,73 @@ microkernel already runs near peak.
 **What this does not fix.** `m = 1` is untouched. 8-bit prefill keeps the per-column scalar pack —
 and per the section 9 correction, vectorizing it is measured to be worth nothing.
 `INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED = 4` is untouched; it gates a different competitor and was not
-re-measured. The residual gap to ORT at small `m` remains structural: MLAS `SQNBitGemm` CompInt8
-wants VNNI, which this host does not have.
+re-measured — section 11 does that, and finds it could not have been re-measured here because the
+bench had no way to express its block size. The residual gap to ORT at small `m` remains
+structural: MLAS `SQNBitGemm` CompInt8 wants VNNI, which this host does not have.
+
+### 11. The gate for block sizes the row kernels reject was never measured at all (**fixed**)
+
+Sections 9 and 10 each re-derived `INT4_PREFILL_GEBP_MIN_ROWS` and its L2-resident twin. Section 10
+closed by naming `INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED = 4` as "untouched"; section 9 did not name it
+at all, and its closing claim that "the lowest gate of any route is 4" has been stale since section
+10 set the pair to (3, 6). It was untouched because it was **unmeasurable**: `benches/int4_prefill_route_ab.rs` pinned `block_size` to 32, so no
+run of that bench could reach the branch. This is the third instance of one defect —
+`PROBE_BITS` (#1558) existed for the same reason, and `scripts/ort_ab/gen_gemm.py` pinned
+`BLOCK_SIZE = 32` *and* stepped tokens `1 -> 8`, straddling every row gate the last three PRs moved.
+A threshold that no harness can express is not conservative, it is unowned.
+
+`PROBE_BLOCK` and `gen_gemm.py --block-size/--tokens` close that. The measurement then reads very
+differently from the 32-element case, because **the competitor is different**. For a block size the
+column-blocked kernels reject, the route below the threshold is not a rival vectorized kernel — both
+`borrowed_affine_int4_matmul_prefill` and `..._nblock` require 32-element blocks — it is
+`borrowed_affine_int4_matmul`, a per-block scalar dot. GEBP's speedup over it, native-alone, steady,
+median of five interleaved reps:
+
+| m | 2048x2048 | 4096x11008 |
+|---|---|---|
+| 1 | 2.51x | 4.62x |
+| 2 | **4.06x** | **8.96x** |
+| 3 | 6.81x | 14.6x |
+| 4 | 10.4x | 18.1x |
+| 6 | 13.2x | 30.1x |
+| 8 | 13.8x | 30.6x |
+
+GEBP wins at every `m` on both shapes, and the margin grows linearly because the dot arm's cost is
+linear in `m` (9.4 -> 76.9 ms on the large shape) while GEBP's is flat (~2 ms, the pack). Unlike the
+32-element gates this one needs no residency split: both shapes agree. Gate **4 -> 2**.
+
+The measured floor is 2048x2048 (2.1 MB). A weight far below that -- a few KB -- is unmeasured, and
+there GEBP forks the global pool where the scalar fallback stays on the narrow decode pool, so the
+fork/join could in principle dominate trivial compute. It is a correctness non-issue (GEBP
+zero-pads partial panels) and no real projection at `block_size = 16` is that small, but the claim
+above is bounded by the shapes measured.
+
+Production A/B on 16-element-block models through the real dispatch path, `t = 8` and `t = 16`,
+confirms it, and the ORT ratio on the rows that moved:
+
+| cell | before | after |
+|---|---|---|
+| `llama3_8b_qkv_t3` | 20.30x | **2.60x** |
+| `llama3_8b_mlp_t3` | 17.98x | **2.48x** |
+| `qwen3_0p6b_qkv_t3` | 16.48x | **2.99x** |
+| `llama3_8b_qkv_t2` | 13.63x | **2.53x** |
+| `qwen3_8b_square_t2` | 13.20x | **2.34x** |
+
+Parity PASS on every cell. That band — 2.3x-3.0x — is the same one the 32-element weights reach
+after section 10, so this closes an outlier class rather than opening a new front: 16-element blocks
+were paying 13-20x, not the 2-2.6x everything else pays.
+
+`t1`, `t4` and `t8` are the controls and are structurally identical between the arms (gates 4 and 2
+both exclude `m = 1`, and both admit `m >= 4`). Every apparent delta on them failed to survive
+re-measurement — `llama3_8b_qkv_t1 t=16` read +0.95%, +5.49% and -11.80% across three runs against a
+0.06% null, which is the signature of host noise, not a result.
+
+**Set to 2, not 1, deliberately.** `m = 1` is decode, and its 2.51x/4.62x here is measured by a
+single-op prefill bench that cannot see the per-token pool contention the narrow decode pool exists
+to avoid: GEBP returns before `with_decode_pool` and drives the global pool. That is the same reason
+`borrowed_affine_int4_matmul_prefill` is itself gated at `m >= 2`. Moving decode wants a decode-loop
+measurement, and is left open.
+
+**What this does not fix.** `m = 1` at any block size. The residual ~2.3x-3.0x to ORT is the same
+structural CompInt8/VNNI gap as section 10. 8-bit weights at 16-element blocks were not separately
+retuned — `INT8_PREFILL_GEBP_MIN_ROWS` is 2 already, so there is no equivalent gap to close.
