@@ -59,7 +59,7 @@ is why this kernel does not hit the partition ceiling described below.
 
 ### Numerics
 
-This is the one deliberate departure from `gemv_f16_kn`, which is bit-identical
+This is the one deliberate departure from `gemv_half_kn`, which is bit-identical
 to a naive sequential loop. `gemv_f16_nk` contracts **along** the lanes rather
 than across them, so its sum is split into 32 partial sums. That is a different
 result — very slightly *more* accurate, but different — and pretending otherwise
@@ -161,12 +161,12 @@ Unchanged within noise, as expected — the diff only reaches `Gemm` with
   goes 1.76 -> 0.17. The ratios in the work list degrade monotonically with
   thread count for exactly this reason, and it is **not** fork/join overhead —
   we do not get slower, we stop getting faster. It is **also not task
-  granularity**: `gemv_f16_kn`'s fixed `STRIPE = 512` does yield only 7 tasks at
+  granularity**: `gemv_half_kn`'s fixed `STRIPE = 512` does yield only 7 tasks at
   `n = 3584`, but making the width adaptive (8/16/28 tasks at 4/8/16 threads)
   left native `p50` at 1.15-1.64 ms in both arms at every thread count, and two
   interleaved A/B runs with null controls disagreed in sign. That change was
   measured and **not shipped**; see the work list for the table. The suspect it
-  leaves standing is the loop nest — `gemv_f16_kn` keeps a `w`-wide `f32`
+  leaves standing is the loop nest — `gemv_half_kn` keeps a `w`-wide `f32`
   accumulator in memory and loops `p` outermost, so every FMA is a
   load-modify-store against L1 at any stripe width.
 * **The 8-bit `MatMulNBits` "win" is mostly ORT being slow**, not us being fast.

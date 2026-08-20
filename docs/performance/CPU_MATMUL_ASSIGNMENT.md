@@ -695,7 +695,7 @@ four independent 8-lane FMA chains along `k`, 8 output rows per task. `M = 1`
 ratio too noisy on this host to quote; in absolute terms 38x to 90x faster, up
 to 148x on per-run minima.
 
-Two things this did **not** fix, both open:
+What this did **not** fix, and what was measured and rejected:
 
 * **`transB` prefill is still broken** and got no better: `M = 128` measures
   **4.0x at 1 thread and 17.0x at 8** (156 ms vs 39 ms). Unlike the decode
@@ -711,7 +711,7 @@ Two things this did **not** fix, both open:
   rules out: we do **not** get slower as threads are added, so it is not
   fork/join overhead — we stop getting *faster*.
 * **Task granularity is *not* the cause — measured and rejected.** The obvious
-  suspect was `gemv_f16_kn`'s fixed `STRIPE = 512`: at `n = 3584` it yields 7
+  suspect was `gemv_half_kn`'s fixed `STRIPE = 512`: at `n = 3584` it yields 7
   tasks however many workers are offered. Making the width adaptive
   (`n / (2 * threads)`, rounded up to a multiple of 32) raises that to 8/16/28
   tasks at 4/8/16 threads — and moves nothing. Two interleaved A/B runs of the
@@ -726,7 +726,7 @@ Two things this did **not** fix, both open:
   was **not shipped**. The absolute numbers are what actually settle it: native
   `p50` stayed at 1.15-1.64 ms in *both* arms at *every* thread count. 4x the
   tasks, same time.
-* **The mechanism the rejection points at.** `gemv_f16_kn` holds a `w`-wide
+* **The mechanism the rejection points at.** `gemv_half_kn` holds a `w`-wide
   `f32` accumulator *in memory* and loops `p` outermost, so every FMA is a
   load-modify-**store** against L1 — `w` is far too large for the 16 available
   `ymm` registers, at 512 lanes or at 128. Narrowing the stripe keeps the

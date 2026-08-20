@@ -55,6 +55,14 @@ impl GemmKernel {
     ///
     /// Returns `None` whenever neither applies, leaving the portable blocked
     /// half GEMM to serve the call exactly as before.
+    ///
+    /// `#[inline(never)]` is load-bearing and was **measured**, not assumed.
+    /// Carrying a second kernel made this body large enough that inlining it
+    /// into [`GemmKernel::execute`] cost the `M = 128` `transB` prefill 12%
+    /// (69.7 -> 78.9 ms, median of 10 per-run minima) -- a path this function
+    /// declines outright and never touches. It is a once-per-execute dispatch
+    /// probe returning an `Option`, so there is nothing to inline it for.
+    #[inline(never)]
     fn try_half_fast_path(
         &self,
         a: &TensorView,
