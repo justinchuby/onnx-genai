@@ -4936,13 +4936,14 @@ mod tests {
         // `CudaExecutionProvider::new_*` builds the queue before the residency
         // and passes it in -- so a residency built without one is a fixture
         // that does not model the production object.
+        let release_queue = CudaDeferredReleaseQueue::new(
+            Box::new(crate::deferred_release::CudaStreamFences::new(Arc::clone(
+                &runtime,
+            ))),
+            crate::deferred_release::DEFAULT_DEFERRED_RELEASE_CAPACITY,
+        );
         let residency = CudaWeightResidency::new(Arc::clone(&runtime), granule as u64)
-            .with_deferred_release_queue(CudaDeferredReleaseQueue::new(
-                Box::new(crate::deferred_release::CudaStreamFences::new(Arc::clone(
-                    &runtime,
-                ))),
-                crate::deferred_release::DEFAULT_DEFERRED_RELEASE_CAPACITY,
-            ))
+            .with_deferred_release_queue(Arc::clone(&release_queue))
             .with_vmm_admission(Arc::clone(&allocator), authority)
             .expect("install VMM admission");
         residency
@@ -5087,6 +5088,10 @@ mod tests {
         drop(_kv);
         drop(other);
         drop(residency);
+        assert!(
+            release_queue.wait_until_idle(DEFERRED_RELEASE_WAIT_TIMEOUT),
+            "the final resident page must be released before checking the unloaded gauges"
+        );
         let unloaded = global_offload_stats();
         assert_eq!(
             unloaded.content_resident_bytes,
