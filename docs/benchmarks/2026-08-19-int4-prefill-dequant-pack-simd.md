@@ -9,7 +9,7 @@ with a null control. Bundled ONNX Runtime 1.28.0.
 #1471 says the int4 prefill "expands the full weight into an f32 panel before running the GEMM" and
 proposes fusing the dequant into an L2 tile. That fusion **already landed**, in #1356: `pack_b_quant`
 dequantizes straight into the `KC x NR` panel the microkernel consumes, and `quant_prefill_gebp`
-reuses each panel across all `m` rows. There is no 100 MB f32 panel on `main` to remove.
+reuses each panel across all `m` rows. There is no 180 MB f32 panel on `main` to remove.
 
 The measurement behind the issue is still real. Fitting `t = fixed + marginal * m` over the GEBP arm
 at `4096x11008`:
@@ -101,7 +101,8 @@ name in the same invocation.
 ### The one cell above its null did not survive re-measurement
 
 `qwen3_0p6b_qkv_t1` at 16 threads read +7.69% against a 6.15% null. That cell is `m = 1`, which
-**cannot reach any changed code**: the lowest row gate is 5, so `quant_prefill_gebp` is never
+**cannot reach any changed code**: the lowest row gate is 4 (`INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED`,
+unchanged here; the gates this PR moves are 5 and 12), so `quant_prefill_gebp` is never
 called, and the threshold change does not move `m = 1` either (1 < 12 before, 1 < 5 after). It had
 to be noise, and at 11 trials x 40 runs it is:
 

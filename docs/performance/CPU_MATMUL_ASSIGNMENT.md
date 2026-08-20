@@ -1009,7 +1009,7 @@ before/after pair, not the absolute): `llama3_8b_qkv_t8` **4.61x -> 3.56x**, `ll
 `t512` 1.25x -> 1.17x and 1.20x -> 1.11x.
 
 Bounded honestly: 8-bit is untouched — `Int8Weight` keeps the per-column default, so its behaviour
-is byte-for-byte what it was. `m = 1` cannot reach any of this (the lowest gate is 5) and is
+is byte-for-byte what it was. `m = 1` cannot reach any of this (the lowest gate of any route is 4) and is
 unchanged. And the route is still behind ORT at small `m`, for the reason section 5 already gives:
 MLAS SQNBit's CompInt8 path uses integer dot products where this one widens every nibble to f32,
 and VNNI is what would make that pay.
