@@ -3,7 +3,7 @@ name: "cuda-perf-measurement"
 description: "Which tool to reach for when measuring CUDA decode/prefill performance in this repo, and the three CUDA-specific traps that have each produced a confidently wrong answer here. Load before profiling a kernel, comparing a GEMV variant, or quoting a tok/s number from the native CUDA backend."
 domain: "performance"
 confidence: "high"
-source: "earned (#1573 wall-clock-vs-nsys inversion, #1574 roofline diagnosis, GEMV bandwidth probe)"
+source: "earned (#1573 wall-clock-vs-nsys inversion, #1574 roofline diagnosis, #1581 probe that measured its own dispatch)"
 ---
 
 # CUDA performance measurement
@@ -105,6 +105,56 @@ clock is corroboration only, and must be reported with its spread and n.
 
 Also verify the GPU is idle **before each run**, not once per sweep, and pin to a
 specific device: `CUDA_VISIBLE_DEVICES=<n> ONNX_GENAI_CUDA_DEVICE=0`.
+
+## Trap 4: a microbenchmark that times one launch is timing the host
+
+`cuEventRecord` timestamps the *stream*, so `record(start); kernel.run(); record(end)`
+encloses the host-side dispatch as well as the kernel. In this repo `run()` costs
+about **24 us** — it re-reads tuning env vars, re-derives the launch geometry and
+re-looks-up the NVRTC entry every call. That is larger than several of the decode
+kernels themselves.
+
+What that produced: the GEMV probe reported the GQA k/v projection at **28 GB/s**,
+1.4% of peak, and an issue was filed against a "starved grid". The kernel's real
+time was **4.6 us, 214 GB/s**. Five sixths of the reading was the host.
+
+**Rule:** enqueue a *batch* between the events, and prefer a **captured CUDA
+graph** for the timed region. Graph replay is also what production decode does, so
+the number is representative as well as correct. Time the host separately and
+print it — an uncaptured path really is limited by it.
+
+## Trap 5: an idle GPU is clocked down, and it ramps slower than your probe runs
+
+An idle A100 in this box sits at **210 MHz against a 1410 MHz maximum**, with
+persistence mode off. A probe that starts timing immediately reports whichever
+partial ramp it caught.
+
+Measured cost: **17%** on the widest projection. Worse, the *direction* of the
+bias depended on whether a neighbour happened to be running work on an adjacent
+GPU — the same code measured 816 GB/s on a warm device and 586 GB/s on a cold
+one. Any A/B split across those two states is noise wearing a result's clothes.
+
+**Rule:** ramp before measuring, and prove the device held still.
+
+- Ramp until the timing stops improving **and** a wall-clock floor has elapsed
+  (~8 s of continuous work). Convergence alone is not enough: two short readings
+  agreed at "107 -> 107 us" on a device that then measured 90 us.
+- Re-measure the *first* shape at the *end* of the sweep and report the drift. If
+  it moved more than a few percent, the rows were measured under different
+  conditions and cannot be ranked against each other.
+- `nvidia-smi --query-gpu=index,clocks.sm,power.draw --format=csv` while the probe
+  runs is the cheap sanity check. Low power draw (an A100 near 70 W of a 400 W
+  TDP) means the device is mostly idle between your launches.
+
+## Sanity-check every absolute number against something independent
+
+The two traps above were caught by the same observation, not by suspicion: in a
+sweep over shapes, **per-shape time must be ordered by bytes moved**. When the
+1 MB k/v projection measured *slower* than the 16 MB q projection, no bandwidth
+story could explain it — which meant the instrument was wrong, not the kernel.
+
+Build that kind of internal cross-check into any probe you add. A microbenchmark
+with no self-contradicting case is a microbenchmark you cannot debug.
 
 ## Know your roofline, and what a good fraction actually is
 
