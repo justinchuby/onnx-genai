@@ -106,14 +106,11 @@ impl DigestBuilder {
     /// collide with a single field holding their concatenation.
     pub fn absorb(&mut self, bytes: &[u8]) {
         self.absorb_u64(bytes.len() as u64);
-        let mut chunks = bytes.chunks_exact(8);
-        for chunk in &mut chunks {
-            let word =
-                u64::from_le_bytes(chunk.try_into().expect("chunks_exact(8) yields 8 bytes"));
-            self.mix(u128::from(word));
+        let (chunks, remainder) = bytes.as_chunks::<8>();
+        for chunk in chunks {
+            self.mix(u128::from(u64::from_le_bytes(*chunk)));
         }
         let mut tail = [0u8; 8];
-        let remainder = chunks.remainder();
         tail[..remainder.len()].copy_from_slice(remainder);
         self.mix(u128::from(u64::from_le_bytes(tail)));
     }

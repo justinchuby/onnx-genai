@@ -1696,8 +1696,10 @@ mod device_binding_tests {
         let values = binding
             .read_bytes()
             .unwrap()
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
             .collect::<Vec<_>>();
         assert_eq!(values, vec![0.0, 3.0, -4.0, 5.0]);
         assert_eq!(

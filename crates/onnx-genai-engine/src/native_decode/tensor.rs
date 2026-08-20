@@ -89,10 +89,14 @@ pub(crate) fn argmax_logits_tensor(tensor: &Tensor) -> anyhow::Result<TokenId> {
                 }
                 return Ok(sample_greedy(&values[row_start..]) as TokenId);
             }
-            for bytes in tensor.as_bytes().chunks_exact(4).take(value_count) {
-                visit(f32::from_le_bytes(
-                    bytes.try_into().expect("four-byte chunk"),
-                ))?;
+            for bytes in tensor
+                .as_bytes()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .take(value_count)
+            {
+                visit(f32::from_le_bytes(*bytes))?;
             }
         }
         DataType::Float16 => {
@@ -102,10 +106,14 @@ pub(crate) fn argmax_logits_tensor(tensor: &Tensor) -> anyhow::Result<TokenId> {
                 return argmax_finite_half_values(halves, value_count, row_start)
                     .map(|index| index as TokenId);
             }
-            for bytes in tensor.as_bytes().chunks_exact(2).take(value_count) {
-                visit(f16_to_f32(u16::from_le_bytes(
-                    bytes.try_into().expect("two-byte chunk"),
-                )))?;
+            for bytes in tensor
+                .as_bytes()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .take(value_count)
+            {
+                visit(f16_to_f32(u16::from_le_bytes(*bytes)))?;
             }
         }
         DataType::BFloat16 => {
@@ -115,12 +123,14 @@ pub(crate) fn argmax_logits_tensor(tensor: &Tensor) -> anyhow::Result<TokenId> {
                 return argmax_finite_half_values(halves, value_count, row_start)
                     .map(|index| index as TokenId);
             }
-            for bytes in tensor.as_bytes().chunks_exact(2).take(value_count) {
-                visit(f32::from_bits(
-                    u32::from(u16::from_le_bytes(
-                        bytes.try_into().expect("two-byte chunk"),
-                    )) << 16,
-                ))?;
+            for bytes in tensor
+                .as_bytes()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .take(value_count)
+            {
+                visit(f32::from_bits(u32::from(u16::from_le_bytes(*bytes)) << 16))?;
             }
         }
         dtype => bail!("native logits must be Float32, Float16, or BFloat16, got {dtype:?}"),
@@ -203,12 +213,16 @@ fn tensor_to_f32(tensor: &Tensor) -> anyhow::Result<Vec<f32>> {
         DataType::Float32 => Ok(tensor.to_vec_f32()),
         DataType::Float16 => Ok(tensor
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|bytes| f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]])))
             .collect()),
         DataType::BFloat16 => Ok(tensor
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|bytes| f32::from_bits(u32::from(u16::from_le_bytes([bytes[0], bytes[1]])) << 16))
             .collect()),
         dtype => bail!("native logits must be Float32, Float16, or BFloat16, got {dtype:?}"),
@@ -281,7 +295,9 @@ pub(crate) fn kv_dtype_to_f32(tensor: &Tensor) -> anyhow::Result<Vec<f32>> {
             } else {
                 Ok(tensor
                     .as_bytes()
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|bytes| {
                         half::f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32()
                     })

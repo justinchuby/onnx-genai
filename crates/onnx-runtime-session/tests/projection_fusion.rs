@@ -230,8 +230,10 @@ fn projection_fusion_materializes_int64_split_initializer() {
     assert_eq!(split_data.dims, vec![2]);
     let sizes = split_data
         .data
-        .chunks_exact(8)
-        .map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|bytes| i64::from_le_bytes(*bytes))
         .collect::<Vec<_>>();
     assert_eq!(sizes, vec![2, 2]);
 }

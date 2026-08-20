@@ -880,8 +880,10 @@ mod tests {
         .unwrap();
         let values: Vec<f64> = y
             .bytes
-            .chunks_exact(8)
-            .map(|bytes| f64::from_le_bytes(bytes.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|bytes| f64::from_le_bytes(*bytes))
             .collect();
         assert_eq!(values, vec![-2.0, -1.0, 0.5, 2.0, 4.0]);
     }
