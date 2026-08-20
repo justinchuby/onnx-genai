@@ -2082,11 +2082,15 @@ mod tests {
         // tail width, and a panel too narrow for any group at all.
         // `kc`: multiples of eight and every remainder, including one longer
         // than a block so the run has to re-hoist scale and zero point.
-        // `block_size`: 8/32/128 take the vector path; 2 and 4 are not
-        // multiples of the group and must fall back to the scalar one.
+        // `block_size`: 8/24/32/40/128 take the vector path; 2 and 4 are not
+        // multiples of the group and must fall back to the scalar one. 24 and
+        // 40 are multiples of the group that do *not* divide `KC`, which is
+        // what pins the block-scoped hoist: it walks whole groups inside one
+        // block, so `block_size - pc % block_size` has to stay a multiple of
+        // the group even when the block does not tile `pc` evenly.
         let k = 256usize;
         let n = 32usize;
-        for &block_size in &[2usize, 4, 8, 32, 128] {
+        for &block_size in &[2usize, 4, 8, 24, 32, 40, 128] {
             for &asymmetric in &[false, true] {
                 let (packed, scales, zero_points, _) = int4_weight(k, n, block_size, asymmetric);
                 let weight = Int4Weight {
