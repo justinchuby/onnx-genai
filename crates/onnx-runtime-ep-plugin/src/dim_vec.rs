@@ -141,8 +141,14 @@ impl<T: Copy + Default> DimVec<T> {
         }
     }
 
+    /// The elements, as a mutable slice.
+    ///
+    /// Builders take this **once** and fill through it, rather than indexing or
+    /// pushing per element: either of those re-matches the representation for
+    /// every element of a length that is known up front, and leaves a bounds
+    /// check (with its panic-path setup) in the loop.
     #[inline]
-    fn as_mut_slice(&mut self) -> &mut [T] {
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
         match self {
             Self::Inline { buf, len } => &mut buf[..*len],
             Self::Heap(v) => v.as_mut_slice(),
