@@ -798,8 +798,10 @@ impl Int4Weight<'_> {
     /// override takes the pack's fixed cost from 4.92 ms to 2.09 ms; the same
     /// transpose applied to the 8-bit weight, which has no unpack to remove,
     /// is worth 0.07 ms and does not survive an interleaved A/B. So of the
-    /// 2.83 ms, roughly 0.07 ms is the store and the rest is the shift, mask
-    /// and scalar widen this replaces.
+    /// 2.83 ms, roughly 0.07 ms is the store and the rest is the nibble
+    /// unpack: the index arithmetic, the bounds-checked byte load, the
+    /// variable shift and the mask. The widen, subtract and multiply are in
+    /// both scalar loops, so they cancel into the 0.07 ms.
     ///
     /// # Safety
     /// AVX2 must be available. `dst` must be at least `kc * NR` long,

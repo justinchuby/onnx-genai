@@ -36,10 +36,11 @@ Every cell is inside the noise, and the sign is not even consistent. Fitting
 
 The vector path really did run. The panel is bit-identical by construction, so no timing can
 distinguish "ran and did not help" from "silently fell back" — that had to be settled separately.
-`int8_dequant_panel_is_bit_identical_to_the_per_column_path` passed, and perturbing the widened
-value inside `dequant_panel_avx2` by `+1.0` made it fail
+an `int8_dequant_panel_is_bit_identical_to_the_per_column_path` test passed, and perturbing the
+widened value inside the 8-bit `dequant_panel_avx2` by `+1.0` made it fail
 (`panel mismatch at depth 0 slot 0 (block=8, asym=false, nr=8, kc=8, pc=0): -4.329 vs -4.292`).
-The path is live; it just does not pay.
+The path was live; it just did not pay. Both names are from the discarded branch and are
+deliberately not in the tree — grepping `HEAD` for them finds nothing.
 
 ## The 4-bit A/B — same harness, same session
 
@@ -53,10 +54,20 @@ The path is live; it just does not pay.
 
 ## The decomposition
 
-| term | cost at `4096x11008` | share of #1556's win |
+| term | cost at `4096x11008` | share of the 2.83 ms |
 |---|---:|---:|
 | strided panel store | ~0.07 ms | 2.4% |
 | scalar nibble unpack | ~2.76 ms | **97.6%** |
+
+The 2.83 ms is this session's re-measurement (4.924 -> 2.093), not #1556's reported 2.56 ms
+(4.80 -> 2.24). Only the same-session pair can be split against the 8-bit control, and the split is
+a ratio, so it carries over either way.
+
+"Nibble unpack" here means precisely the per-element work the two scalar loops do *differently*:
+the `offset_in_block + step` add, the `index / 2`, the bounds-checked byte load, the `index % 2`
+shift amount, the variable shift and the mask. The widen, the subtract, the multiply and the store
+are in both loops, so they cancel into the 0.07 ms bucket — which makes 0.07 ms an *upper* bound on
+the store term, and the 97.6% a lower bound.
 
 #1556 said the store was the cause. It was not. The reasoning that misled me was "one f32 every 64
 bytes, so a separate cache line per element" — true about the *addresses*, irrelevant here, because
@@ -91,6 +102,11 @@ PROBE_BITS=8 PROBE_SHAPE=big PROBE_M_LIST=8,16,32,64,256 \
 
 `PROBE_BITS` is added by this change; before it the harness could only drive 4-bit weights, which
 is why the control was never run.
+
+That regenerates the **scalar** 8-bit baseline (~2.58 ms). The 2.52 ms SIMD row cannot be
+reproduced from `HEAD`, because the code that produced it is the code this record discards. To
+re-derive it, re-apply an `Int8Weight::dequant_panel` override modelled on `Int4Weight`'s — the
+point of writing the number down is that nobody should need to.
 
 ## What is not claimed
 
