@@ -1191,6 +1191,86 @@ to avoid: GEBP returns before `with_decode_pool` and drives the global pool. Tha
 `borrowed_affine_int4_matmul_prefill` is itself gated at `m >= 2`. Moving decode wants a decode-loop
 measurement, and is left open.
 
-**What this does not fix.** `m = 1` at any block size. The residual ~2.3x-3.0x to ORT is the same
-structural CompInt8/VNNI gap as section 10. 8-bit weights at 16-element blocks were not separately
-retuned — `INT8_PREFILL_GEBP_MIN_ROWS` is 2 already, so there is no equivalent gap to close.
+> **Superseded by section 12.** The decode-loop measurement was run and the objection above did not
+> survive it: at block 16 the contention argument points the other way, and the gate is now 1. The
+> reasoning is preserved because it was right to *withhold* the change until decode was measured —
+> what it got wrong was the sign, not the standard of evidence.
+
+**What this does not fix.** The residual ~2.3x-3.0x to ORT is the same structural CompInt8/VNNI gap
+as section 10. 8-bit weights at 16-element blocks were not separately retuned —
+`INT8_PREFILL_GEBP_MIN_ROWS` is 2 already, so there is no equivalent gap to close.
+
+
+### 12. The decode gate was held up by an objection that measured backwards (**fixed**)
+
+Section 11 set `INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED = 2` rather than 1, refusing a measured
+2.51x/4.62x at `m = 1` on the grounds that the number came from a single-op prefill bench: GEBP
+returns before `with_decode_pool`, so under a real decode loop it would fork the machine per op per
+token and lose whatever it had won. That was the right thing to withhold on. It was also,
+measured, backwards.
+
+**The harness the objection required.** `int4_decode_loop_ab.rs` runs a llama3-8B projection chain
+(qkv 4096x6144, o 4096x4096, gate/up 4096x14336, down 14336x4096) at `m = 1`, one token at a time,
+across `PROBE_SESSIONS` concurrent threads sharing one weight set. Both arms come from **one
+binary** with the gates forced to 1, selected by `ONNX_GENAI_CPU_MM_INT4_GEBP`, and a third
+unmodified build is run interleaved as a control for the `current` arm. It agreed to within 1% in
+every cell.
+
+The detail that decided the result is that each token runs inside **one**
+`with_decode_pool_scope`, which is exactly how `native_decode/cpu.rs` drives a single-token forward.
+A first version of this bench called the kernels directly. It reported GEBP 1.28x/1.53x/1.64x ahead
+at 1/2/4 sessions and the margin *growing* with concurrency — a clean, plausible, entirely
+artefactual result. Installing the scope the way production installs it moved the `current` arm
+alone by 1.44x at block 32 and inverted the finding. **Measuring the challenger faithfully is not
+enough; the incumbent has to be measured in the pool it actually runs in.**
+
+**Aggregate tokens/s, steady, mean of three interleaved reps.** The per-session median is
+unusable here — under contention the sessions serialise on the shared pool, so the median reports
+whichever token owned it (7.1 ms) while p90 reports the ones that waited (56.3 ms). Throughput and
+p90 are the honest pair:
+
+| block | competitor at `m = 1` | GEBP | current | verdict |
+|---|---|---|---|---|
+| **16** | generic **scalar** per-block dot | **97.3** | 30.6 | GEBP **3.2x** |
+| 32 | `borrowed_affine_int4_matmul_nblock` | 108.7 | 118.2 | GEBP 0.92x |
+| 64 | `borrowed_affine_int4_matmul_nblock` | 111.8 | 202.5 | GEBP 0.55x |
+| 128 | `borrowed_affine_int4_matmul_nblock` | 119.3 | 256.1 | GEBP 0.47x |
+
+So the answer is not "GEBP is good at decode" or "GEBP is bad at decode". It splits exactly along
+**which kernel is on the other side**, which is the fourth time this file has had to record that a
+threshold is a property of both kernels either side of it. Against a vectorized column-blocked
+kernel GEBP loses at `m = 1`, and loses harder as the block grows. Against the scalar fallback it
+wins, and the contention objection inverts:
+
+| sessions | GEBP | scalar dot | speedup | GEBP p90 | dot p90 |
+|---|---|---|---|---|---|
+| 1 | 97.3 | 30.6 | 3.2x | 10.3 ms | 29.7 ms |
+| 2 | 111.5 | 32.3 | 3.5x | 18.4 ms | 30.9 ms |
+| 4 | 122.8 | 29.7 | **4.1x** | **35.7 ms** | 233.3 ms |
+
+Tail latency improves 6.5x at 4 sessions. The global-pool fork that was supposed to sink this is
+real, and it is still cheaper than leaving the work on a scalar dot inside the narrow pool.
+
+**The gate names exactly one block size.** `MatMulNBits` rejects any block size that is not a power
+of two `>= 16`, and 16 is the only such value that is not a multiple of 32 — so "unblocked" is the
+block-16 gate and nothing else. That is now asserted rather than assumed: the crossover test sweeps
+`[16, 32, 64, 128, 256, 512]` and requires the unblocked branch to claim 16 and only 16. Blocks 24
+and 48 were tried against the bench and rejected by the kernel's own validation, which is how the
+constraint was found.
+
+`INT4_PREFILL_GEBP_MIN_ROWS` (3) and its L2-resident twin (6) are **unchanged and re-confirmed** by
+the same run: the 32/64/128 rows above are the direct evidence that lowering them to 1 would be a
+regression of 1.08x-2.1x.
+
+**Confirmed end to end.** The paired-ORT production A/B, run at `--block-size 16 --tokens 1` — the
+first time that harness has contained a row any int4 row gate controls — improves **all 20 cells**,
+1.86x-3.43x, parity PASS on every one. Against ORT the shape goes from 6.66x-13.44x to
+**3.44x-5.30x**.
+
+**What this does not fix.** Block-16 decode is now 97-123 tokens/s where block 128 reaches 256, so
+this closes a 3-8x outlier and leaves the ordinary case alone. The residual 3.4x-5.3x is still worse
+than the 2.3x-3.0x band the 32-element weights sit in, worst at `t = 8`, where GEBP fans out on the
+global pool while the persistent-SPMD workers spin. `m = 1` at blocks 32/64/128 keeps
+today's route. The residual 2.3x-3.0x to ORT is untouched and remains the CompInt8/VNNI gap of
+sections 10 and 11. Full record:
+[`docs/benchmarks/2026-08-20-int4-decode-loop.md`](../benchmarks/2026-08-20-int4-decode-loop.md).
