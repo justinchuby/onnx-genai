@@ -2283,6 +2283,37 @@ impl CudaSkipRmsNormMatMulFusion {
     }
 }
 
+impl CudaSwiGluFusion {
+    /// The SwiGLU gate activation, in either spelling this fusion accepts.
+    ///
+    /// `com.microsoft.Silu` is the contrib spelling. Standard-domain `Swish` is
+    /// the same function whenever its `alpha` is 1 (`Swish(x) = x *
+    /// sigmoid(alpha * x)`, and `alpha` defaults to 1), which is how current
+    /// exporters emit SwiGLU — Muse-Glimmer's decoder carries 52 of them, one
+    /// per layer. Matching only the contrib spelling is what left those models
+    /// on the unfused `swish` + `mul` path and, transitively, blocked
+    /// `CudaGateUpSwiGluFusion` too, since that pass keys off the marker this
+    /// one writes (#1528).
+    fn is_silu(node: &Node) -> bool {
+        if node.inputs.len() != 1 || node.outputs.len() != 1 {
+            return false;
+        }
+        match node.op_type.as_str() {
+            "Silu" => node.domain == MICROSOFT_DOMAIN,
+            "Swish" => {
+                matches!(node.domain.as_str(), "" | "ai.onnx")
+                    && node.attributes.keys().all(|name| name.as_str() == "alpha")
+                    && node
+                        .attr("alpha")
+                        .and_then(Attribute::as_float)
+                        .unwrap_or(1.0)
+                        == 1.0
+            }
+            _ => false,
+        }
+    }
+}
+
 impl OptimizationPass for CudaSwiGluFusion {
     fn name(&self) -> &str {
         "CudaSwiGluFusion"
@@ -2292,13 +2323,7 @@ impl OptimizationPass for CudaSwiGluFusion {
         let silu_nodes: Vec<NodeId> = graph
             .nodes
             .iter()
-            .filter_map(|(id, node)| {
-                (node.op_type == "Silu"
-                    && node.domain == MICROSOFT_DOMAIN
-                    && node.inputs.len() == 1
-                    && node.outputs.len() == 1)
-                    .then_some(id)
-            })
+            .filter_map(|(id, node)| Self::is_silu(node).then_some(id))
             .collect();
 
         let mut changed = false;
@@ -2585,12 +2610,21 @@ impl CudaGateUpSwiGluFusion {
         let weight = matmul.inputs[1]?;
         let scales = matmul.inputs[2]?;
 
-        // fp16 activation + output, fp16 scales, persistent (initializer)
-        // weights/scales: the exact form the paired kernel reproduces bit-for-bit
-        // and the only form that is capture-safe with a fixed device signature.
-        if graph.value(activation).dtype != DataType::Float16
-            || graph.value(matmul.outputs[0]).dtype != DataType::Float16
-            || graph.value(scales).dtype != DataType::Float16
+        // A single half-precision dtype shared by activation, output and scales,
+        // plus persistent (initializer) weights/scales: the exact form the paired
+        // kernel reproduces bit-for-bit and the only form that is capture-safe
+        // with a fixed device signature.
+        //
+        // BFloat16 qualifies because `MatMulNBits::run_bf16` stages every dynamic
+        // BFloat16 operand into an fp16 arena and caches the two constant scale
+        // slots (2 and 4 — the gate/up pair's slots, reserved for exactly this
+        // fusion) before dispatching the same fp16 paired kernel. Restricting the
+        // gate to Float16 was what kept every BFloat16 decode model on the
+        // unfused two-GEMV + `swish` + `mul` path (#1528).
+        let activation_dtype = graph.value(activation).dtype;
+        if !matches!(activation_dtype, DataType::Float16 | DataType::BFloat16)
+            || graph.value(matmul.outputs[0]).dtype != activation_dtype
+            || graph.value(scales).dtype != activation_dtype
         {
             return None;
         }
@@ -3611,6 +3645,79 @@ mod tests {
         graph
     }
 
+    /// `swiglu_graph`, but with the gate spelled as the standard-domain `Swish`
+    /// that current exporters emit (Muse-Glimmer's decoder carries one per
+    /// layer) instead of the `com.microsoft.Silu` contrib op.
+    fn swish_swiglu_graph(alpha: Option<f32>) -> Graph {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 24);
+        let gate = value(&mut graph, "gate", DataType::BFloat16, 7);
+        let up = value(&mut graph, "up", DataType::BFloat16, 7);
+        let swish_output = value(&mut graph, "swish", DataType::BFloat16, 7);
+        let output = value(&mut graph, "output", DataType::BFloat16, 7);
+        graph.add_input(gate);
+        graph.add_input(up);
+        let mut swish = Node::new(NodeId(0), "Swish", vec![Some(gate)], vec![swish_output]);
+        if let Some(alpha) = alpha {
+            swish
+                .attributes
+                .insert("alpha".into(), Attribute::Float(alpha));
+        }
+        graph.insert_node(swish);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(swish_output), Some(up)],
+            vec![output],
+        ));
+        graph.add_output(output);
+        graph
+    }
+
+    #[test]
+    fn fuses_standard_domain_swish_as_the_swiglu_gate() {
+        // #1528: `Swish` with a default (or explicit unit) alpha is exactly
+        // SiLU, so it must fuse like the contrib spelling. Matching only
+        // `com.microsoft.Silu` left these models running a standalone `swish`
+        // kernel per layer and, because `CudaGateUpSwiGluFusion` keys off the
+        // marker this pass writes, also blocked the paired gate/up GEMV.
+        for alpha in [None, Some(1.0)] {
+            let mut graph = swish_swiglu_graph(alpha);
+            CudaSwiGluFusion
+                .run(&mut graph, &PassContext::new())
+                .unwrap();
+
+            assert_eq!(graph.num_nodes(), 1, "alpha={alpha:?}");
+            let fused = graph.nodes.values().next().unwrap();
+            assert_eq!(fused.op_type, "Mul");
+            assert_eq!(
+                fused.attr(SILU_MUL_FUSION_ATTR).and_then(Attribute::as_int),
+                Some(1),
+                "alpha={alpha:?}"
+            );
+            assert!(graph.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn leaves_non_unit_alpha_swish_unfused() {
+        // `Swish(x) = x * sigmoid(alpha * x)`; only alpha == 1 is SiLU, and the
+        // fused kernel hard-codes that. Anything else must stay separate rather
+        // than silently computing a different activation.
+        let mut graph = swish_swiglu_graph(Some(1.702));
+        CudaSwiGluFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(graph.num_nodes(), 2);
+        assert!(
+            graph
+                .nodes
+                .values()
+                .all(|node| node.attr(SILU_MUL_FUSION_ATTR).is_none())
+        );
+    }
+
     #[test]
     fn fuses_equal_shape_silu_mul() {
         let mut graph = swiglu_graph(DataType::Float16, 7, 7);
@@ -4540,6 +4647,53 @@ mod tests {
         graph.insert_node(mul);
         graph.add_output(out);
         graph
+    }
+
+    #[test]
+    fn fuses_paired_gate_up_swiglu_for_bfloat16_projections() {
+        // #1528: every BFloat16 decode model was held on the unfused two-GEMV +
+        // `swish` + `mul` path because the gate demanded Float16. `run_bf16`
+        // stages the dynamic operands into an fp16 arena and caches slots 2/4 —
+        // which exist only for this fusion — so BFloat16 reaches the very same
+        // paired kernel and must fuse exactly like Float16 does.
+        let mut graph = gate_up_graph_dtype(QWEN_GATE_UP_K, QWEN_GATE_UP_N, DataType::BFloat16);
+        CudaGateUpSwiGluFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(
+            graph.num_nodes(),
+            1,
+            "a BFloat16 gate/up pair must collapse into one node just like fp16"
+        );
+        let fused = graph.nodes.values().next().unwrap();
+        assert_eq!(fused.op_type, "MatMulNBits");
+        assert_eq!(
+            fused
+                .attr(GATE_UP_SWIGLU_FUSION_ATTR)
+                .and_then(Attribute::as_int),
+            Some(1),
+            "the BFloat16 pair must carry the paired-kernel marker"
+        );
+    }
+
+    #[test]
+    fn does_not_fuse_gate_up_with_mismatched_activation_and_scale_dtypes() {
+        // Widening the gate to accept BFloat16 must not widen it to accept a
+        // *mixed* pair: the paired kernel has one fixed device signature, and
+        // `run_bf16` stages on the strength of a single uniform dtype.
+        let mut graph = gate_up_graph_dtype(QWEN_GATE_UP_K, QWEN_GATE_UP_N, DataType::BFloat16);
+        let scales = graph
+            .nodes
+            .values()
+            .find(|node| node.op_type == "MatMulNBits")
+            .and_then(|node| node.inputs[2])
+            .expect("the projection carries a scales input");
+        graph.value_mut(scales).dtype = DataType::Float16;
+        CudaGateUpSwiGluFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        asserts_not_fused(&graph);
     }
 
     #[test]
