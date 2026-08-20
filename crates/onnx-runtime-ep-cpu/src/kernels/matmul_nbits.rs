@@ -9827,21 +9827,79 @@ mod tests {
     #[test]
     fn every_probe_perturbing_test_takes_the_dispatch_lock() {
         const SOURCE: &str = include_str!("matmul_nbits.rs");
-        // `int4_matmul_m1` and `n16_sdot_matmul_m1` were missing here while no
-        // test observed their counters, so the omission was invisible: a
-        // perturber only matters once something reads what it perturbs. The
-        // first before/after *equality* observer of those two counters made
-        // the race real and reproducible (60/60 when co-scheduled), so the
-        // rule is to list a function here when its counter is added, not when
-        // an observer is.
-        const PERTURBS: [&str; 6] = [
+        // Entry points that reach a probe counter indirectly, through dispatch
+        // rather than by incrementing one themselves. These cannot be derived
+        // from a `fetch_add` and so are still named by hand.
+        const PERTURBS_INDIRECT: [&str; 3] = [
             ".execute(",
-            "kai_sdot_matmul_m1(",
-            "n16_sdot_matmul_m1(",
-            "int4_matmul_m1(",
             "try_mlas_sqnbit(",
             "borrowed_int4_prefill_block_enabled(",
         ];
+
+        // Every production function that increments a probe counter, derived
+        // from the source rather than listed by hand.
+        //
+        // This was a hand-written list, and it was wrong twice in a row: it
+        // named `kai_sdot_matmul_m1` but not `int4_matmul_m1` or
+        // `n16_sdot_matmul_m1`, and when those two were added by hand it still
+        // missed `n16_sdot_u8_i16_matmul_m1` -- a *second* incrementer of the
+        // same counter, which no substring of the first one matches. Each
+        // omission was invisible because a perturber only matters once
+        // something observes what it perturbs, so the guard stayed green while
+        // the hole stayed open.
+        //
+        // Deriving the set makes that failure mode structural rather than
+        // clerical: a new `fetch_add` on a probe counter joins this list by
+        // existing.
+        let production = SOURCE
+            .split_once("\nmod tests {")
+            .expect("this module defines `mod tests`")
+            .0;
+        let mut derived: Vec<String> = Vec::new();
+        let mut current_fn: Option<String> = None;
+        for line in production.lines() {
+            if let Some(rest) = line
+                .strip_prefix("fn ")
+                .or_else(|| line.strip_prefix("    fn "))
+            {
+                current_fn = Some(
+                    rest.chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect(),
+                );
+            }
+            let code = line.split_once("//").map_or(line, |(code, _)| code);
+            let increments = code.contains("_TEST_CALLS.fetch_add")
+                || code.contains("_TEST_HITS.fetch_add")
+                || code.contains("_TEST_DISPATCHES.fetch_add");
+            if increments && let Some(name) = current_fn.as_ref() {
+                let pattern = format!("{name}(");
+                if !derived.contains(&pattern) {
+                    derived.push(pattern);
+                }
+            }
+        }
+        assert!(
+            derived.len() >= 8,
+            "derived only {} counter-incrementing functions, so the parser is broken and this \
+             test proves nothing: {derived:?}",
+            derived.len()
+        );
+        for required in [
+            "int4_matmul_m1(",
+            "n16_sdot_matmul_m1(",
+            "n16_sdot_u8_i16_matmul_m1(",
+        ] {
+            assert!(
+                derived.iter().any(|name| name == required),
+                "`{required}` increments a probe counter but the derivation missed it: {derived:?}"
+            );
+        }
+        let perturb_patterns: Vec<&str> = PERTURBS_INDIRECT
+            .iter()
+            .copied()
+            .chain(derived.iter().map(String::as_str))
+            .collect();
 
         // (name, is_test, body) for every fn declared in the tests module.
         let tests_module = SOURCE
@@ -9898,7 +9956,11 @@ mod tests {
             .map(|(name, is_test, body)| (name.clone(), *is_test, code_of(body)))
             .collect();
 
-        let perturbs = |body: &str| PERTURBS.iter().any(|pattern| body.contains(pattern));
+        let perturbs = |body: &str| {
+            perturb_patterns
+                .iter()
+                .any(|pattern| body.contains(pattern))
+        };
         // Helpers reach counters through helpers too, so close the set rather
         // than looking one level deep -- a two-level chain would otherwise slip
         // through exactly the check that is supposed to prevent it.
@@ -12856,6 +12918,7 @@ mod tests {
 
     #[test]
     fn n16_sdot_bits8_block128_asymmetric_matches_i16_and_f32_reference() {
+        let _probe = lock_dispatch_probe();
         for &(k, n) in &[
             (1024usize, 1024usize),
             (1024, 3072),
@@ -19591,6 +19654,7 @@ mod tests {
     /// guarantee as the task-runtime path.
     #[test]
     fn parallel_output_rows_repeated_covers_every_output_on_the_wide_path() {
+        let _probe = lock_dispatch_probe();
         use std::sync::atomic::{AtomicU32, Ordering};
 
         let (n, k) = (4096usize, 1024usize);

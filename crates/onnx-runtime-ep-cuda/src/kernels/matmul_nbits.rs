@@ -14165,11 +14165,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         );
         assert!(
             use_scales_f16_zp_splitk_gate(ZP_SPLITK_BANDWIDTH_MIN_K, saturated_n, a100)
-                && !use_scales_f16_zp_splitk_gate(
-                    ZP_SPLITK_BANDWIDTH_MIN_K - 1,
-                    saturated_n,
-                    a100
-                ),
+                && !use_scales_f16_zp_splitk_gate(ZP_SPLITK_BANDWIDTH_MIN_K - 1, saturated_n, a100),
             "the K threshold is inclusive at the measured depth and does not \
              extrapolate below it"
         );
