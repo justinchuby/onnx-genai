@@ -1274,3 +1274,55 @@ global pool while the persistent-SPMD workers spin. `m = 1` at blocks 32/64/128 
 today's route. The residual 2.3x-3.0x to ORT is untouched and remains the CompInt8/VNNI gap of
 sections 10 and 11. Full record:
 [`docs/benchmarks/2026-08-20-int4-decode-loop.md`](../benchmarks/2026-08-20-int4-decode-loop.md).
+
+### 13. Halving the weight bytes at `accuracy_level = 4` made it slower, not faster (**rejected**)
+
+Section 10's diagnosis was that the int4 `accuracy_level = 4` route wastes its advantage by
+repacking 4-bit weights up to int8 before the dot: `prepack_int8_weight` doubles the bytes the
+kernel streams, so a kernel reading the ONNX nibbles directly should stream half as much and win.
+That premise was tested by building the kernel it implies, and it is **false on AVX2**.
+
+**What was built.** A complete packed-nibble int4 x int16 kernel: consumes the 0.5 B/weight ONNX
+blob unchanged (no value repack — the layout is already `[n][k_blocks][blob_size]` and
+block-padded), unsigned nibbles with per-block zero points folded out of the integer dot via
+`sum((q - zp) * a) = sum(q * a) - zp * sum(a)` so absent zero points are bit-identical to an
+explicit midpoint, per-group f32 scales, block sizes 16/32/64/128 with exact scalar tails, and
+`_mm256_madd_epi16` accumulation with four orders of magnitude of i32 overflow headroom. It was
+bit-exact against a scalar reference over every nibble value in every lane position, exhaustive
+over all 256 byte values x 32 element positions, and matched an independent f64 dequant contract.
+Three mutation guards were verified to fail loud.
+
+**The measurement.** It lost in **every cell**, 1.5x-2.2x, against the int8 route it was meant to
+replace. Three independent falsifications of the byte thesis, not one noisy result:
+
+- The `nibble/int8` ratio is **flat** (~1.6 at block 32, ~2.1 at block 128) across an 18x weight
+  footprint range, 1.6 MB to 29.4 MB. A byte-bound kernel's ratio would improve with size.
+- In the one cell where the int8 arm spills the 64 MiB L3 (73.4 MB) and the nibble arm does not
+  (44.1 MB) — the best case the thesis can construct — the nibble kernel is still **1.63x slower**.
+- The incumbent already runs at **74-77 GB/s, 98-102% of this host's 75.8 GB/s DRAM ceiling**, at
+  block 128; the nibble kernel reaches 16% of it. Fewer bytes cannot help a kernel that cannot
+  saturate the bus it already owns.
+
+**The mechanism.** `_mm256_madd_epi16` retires 16 products per instruction where
+`_mm256_maddubs_epi16` retires 32, so an int16-activation kernel needs twice the multiply
+instructions at the same width; and int16 activations are 2 B, so a fixed 32-weight step reads twice
+the activation bytes and needs two loads where int8 needs one. Per 32 weights: int8 ~5 vector ops,
+nibble ~14. The nibble unpack itself (~4 ops) is the *smaller* half of the loss. Folding each
+group's i32 partial into one `f32x8` block accumulator — the 8-bit kernel's structure — recovered
+only 1-3 pp and cost bit-exactness, so it was reverted too.
+
+**What is kept.** The kernel is deleted, following the precedent already recorded at
+`borrowed_affine_int4_matmul`'s precision contract, where an aarch64 int8-activation diversion was
+removed rather than gated. What survives is the finding the experiment turned up by accident and
+`accuracy4_int4_decode_error_envelope_is_pinned_against_f64` now pins: int4 `accuracy_level = 4`
+quantizes activations to **int8** (4.75e-3 relative error) while 8-bit `accuracy_level = 4`
+quantizes to **int16** — the same attribute selecting routes **9,703x** apart in accuracy. Because
+`accuracy_level = 4` is a contract to be *less* accurate, no output-comparison test can fail when
+that error drifts, so it was untracked; the pin's lower bound is the important half, failing if the
+asymmetry ever closes so the record gets revisited instead of rotting.
+
+**Bearing on the remaining gap.** ORT does `llama3_8b_qkv` at `accuracy_level = 4`, `m = 1` in
+0.18 ms against our 0.361 ms, and our int8 arm is already at 98-102% of DRAM — so ORT is not
+streaming faster. It must touch fewer bytes per output row or reuse more from cache. Weight byte
+*width* is now excluded as the lever, which is what this experiment bought. Full record:
+[`docs/benchmarks/2026-08-20-int4-nibble-i16-negative.md`](../benchmarks/2026-08-20-int4-nibble-i16-negative.md).
