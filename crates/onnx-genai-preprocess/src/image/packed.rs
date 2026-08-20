@@ -587,12 +587,20 @@ fn pack_image(image: &PreparedImage, patchify: &PatchifySpec) -> anyhow::Result<
                 height
             );
         }
-        for group_y in 0..patches_h / patchify.merge_size {
-            for group_x in 0..patches_w / patchify.merge_size {
-                for local_y in 0..patchify.merge_size {
-                    for local_x in 0..patchify.merge_size {
-                        let patch_y = group_y * patchify.merge_size + local_y;
-                        let patch_x = group_x * patchify.merge_size + local_x;
+        // `merge_size` decides how many patches become one image token; it does
+        // not have to decide the order they are written in. `PatchOrder::Raster`
+        // walks plain row-major order for exports that group patches inside the
+        // graph instead.
+        let group = match patchify.patch_order {
+            super::program::PatchOrder::MergeGroups => patchify.merge_size,
+            super::program::PatchOrder::Raster => 1,
+        };
+        for group_y in 0..patches_h / group {
+            for group_x in 0..patches_w / group {
+                for local_y in 0..group {
+                    for local_x in 0..group {
+                        let patch_y = group_y * group + local_y;
+                        let patch_x = group_x * group + local_x;
                         match patchify.channel_order {
                             PatchChannelOrder::ChannelsFirst => {
                                 let mut emit_channel = |channel: usize| {
@@ -1300,6 +1308,7 @@ mod tests {
             merge_size: 1,
             channel_order,
             temporal_order: PatchTemporalOrder::ChannelMajor,
+            patch_order: crate::image::program::PatchOrder::MergeGroups,
             coordinate_order: CoordinateOrder::Yx,
         };
 

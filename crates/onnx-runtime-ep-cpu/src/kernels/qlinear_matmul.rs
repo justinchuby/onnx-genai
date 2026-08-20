@@ -6,7 +6,7 @@ use onnx_runtime_ir::{
 };
 use rayon::prelude::*;
 
-use super::{check_arity, to_dense_bytes, write_dense_bytes};
+use super::{check_arity, qgemm_native, to_dense_bytes, write_dense_bytes};
 use crate::strided::numel;
 use std::borrow::Cow;
 
@@ -647,9 +647,9 @@ impl Kernel for QLinearMatMulKernel {
         let a_signed = inputs[0].dtype == DataType::Int8;
         let b_signed = inputs[3].dtype == DataType::Int8;
         let qgemm = QgemmPlan::select(&a_quant, a_signed, b_signed, &geometry);
-        // The fallback's widened copies are four bytes per element; the MLAS
-        // route hands the raw bytes to the kernel. Materialize only what the
-        // chosen path reads, so neither pays for the other's buffers.
+        // Both routes read the operands as raw bytes, so neither materializes a
+        // widened copy: the native kernel widens `A` to `i16` pairs as it packs
+        // and reads `B` straight out of the caller's buffer.
         // A constant B is packed once. After that its dense bytes are dead --
         // they exist only to feed the packer -- so skip the copy, which is
         // `k * n` bytes on every call and dominates decode at large K and N.
@@ -662,31 +662,19 @@ impl Kernel for QLinearMatMulKernel {
         #[cfg(not(feature = "mlas"))]
         let pack_ready = false;
         #[cfg_attr(not(feature = "mlas"), allow(unused_mut))]
-        let (mut a_bytes, mut b_bytes, a, b) = if qgemm.is_some() {
-            (
-                // Every MLAS route reads `A` exactly as the caller laid it
-                // out, so a contiguous operand is borrowed rather than copied
-                // per call. The one route that rewrites it -- the sign flip
-                // below -- goes through `Cow::to_mut`, which copies a borrowed
-                // operand first, so the caller's input is never written
-                // through.
-                dense_bytes(&inputs[0])?,
-                if pack_ready {
-                    Vec::new()
-                } else {
-                    to_dense_bytes(&inputs[3])?
-                },
-                Vec::new(),
-                Vec::new(),
-            )
+        // Every route reads `A` exactly as the caller laid it out, so a
+        // contiguous operand is borrowed rather than copied per call. The one
+        // route that rewrites it -- the MLAS sign flip below -- goes through
+        // `Cow::to_mut`, which copies a borrowed operand first, so the caller's
+        // input is never written through.
+        let mut a_bytes = dense_bytes(&inputs[0])?;
+        #[cfg_attr(not(feature = "mlas"), allow(unused_mut))]
+        let mut b_bytes = if pack_ready {
+            Cow::Borrowed(&[][..])
         } else {
-            (
-                Cow::Borrowed(&[][..]),
-                Vec::new(),
-                read_quantized(&inputs[0])?,
-                read_quantized(&inputs[3])?,
-            )
+            dense_bytes(&inputs[3])?
         };
+
         // Move any operand MLAS has no kernel for into the sign domain it does,
         // before it is either packed or handed to the unpacked entry point.
         #[cfg(feature = "mlas")]
@@ -695,7 +683,7 @@ impl Kernel for QLinearMatMulKernel {
                 flip_sign_domain(a_bytes.to_mut());
             }
             if plan.flip_b {
-                flip_sign_domain(&mut b_bytes);
+                flip_sign_domain(b_bytes.to_mut());
             }
         }
         // Loop-invariant: the pack depends only on the weight, not the batch.
@@ -742,6 +730,7 @@ impl Kernel for QLinearMatMulKernel {
         let mut products: Vec<i32> = ACCUMULATOR.with(|cell| cell.take());
         ACCUMULATOR_BUDGET.release((products.capacity() * std::mem::size_of::<i32>()) as u64);
         let mut b_zero_points: Vec<i32> = Vec::new();
+        let mut a_zero_points: Vec<i32> = Vec::new();
         let mut b_scales: Vec<f32> = Vec::new();
         #[cfg(feature = "mlas")]
         let mut combined_scales: Vec<f32> = Vec::new();
@@ -762,6 +751,8 @@ impl Kernel for QLinearMatMulKernel {
             b_zero_points.extend((0..n).map(|column| b_quant.at(b_batch, column).1));
             b_scales.clear();
             b_scales.extend((0..n).map(|column| b_quant.at(b_batch, column).0));
+            a_zero_points.clear();
+            a_zero_points.extend((0..m).map(|row| a_quant.at(a_batch, row).1));
 
             // Decided before the accumulator is sized because the two paths
             // want different buffers: the scalar gemm below accumulates into
@@ -859,56 +850,32 @@ impl Kernel for QLinearMatMulKernel {
                 continue;
             }
 
-            // Accumulate the integer product with `k` outermost so `B` is read
-            // along its rows. The previous order walked `B` down a column with
-            // stride `n`, which touches a fresh cache line per element.
-            //
-            // The zero points are lifted out of the inner loop by expanding
+            // The integer half of the product, on the operand bytes. See
+            // [`qgemm_native`]: the zero points are lifted out of the `k` loop
+            // by expanding
             //   sum_k (a_k - az) * (b_kn - bz_n)
             //     = sum_k (a_k - az) * b_kn  -  bz_n * sum_k (a_k - az)
             // which is an identity over the integers, so under wrapping
             // arithmetic (exactly arithmetic mod 2^32) both sides reduce to the
-            // same `i32`. The result is bit-identical to the previous loop,
-            // including on overflow, and the inner loop becomes a plain
-            // multiply-accumulate over two contiguous slices.
-            //
-            // Rows are independent, so integer accumulation stays deterministic
-            // whether the rows are walked serially or under `par_chunks_mut`:
-            // neither changes a summation order.
-            let b_zero_points = &b_zero_points[..];
-            let accumulate_row = |row: usize, accumulators: &mut [i32]| {
-                let a_zero_point = a_quant.at(a_batch, row).1;
-                let a_row = &a[a_offset + row * k..a_offset + row * k + k];
-                let mut a_sum = 0i32;
-                for (inner, &a_value) in a_row.iter().enumerate() {
-                    let centered = a_value.wrapping_sub(a_zero_point);
-                    a_sum = a_sum.wrapping_add(centered);
-                    if centered == 0 {
-                        continue;
-                    }
-                    let start = b_offset + inner * n;
-                    let b_row = &b[start..start + n];
-                    for (accumulator, &b_value) in accumulators.iter_mut().zip(b_row) {
-                        *accumulator = accumulator.wrapping_add(centered.wrapping_mul(b_value));
-                    }
-                }
-                for (accumulator, &b_zero_point) in accumulators.iter_mut().zip(b_zero_points) {
-                    *accumulator = accumulator.wrapping_sub(a_sum.wrapping_mul(b_zero_point));
-                }
-            };
-            // One chunk cannot be split, and a fork is pure overhead below the
-            // point where the accumulation dominates it. `m == 1` is the decode
-            // shape, so this is the common case rather than a corner.
-            if m <= 1 || rayon::current_num_threads() <= 1 || m * n * k < PARALLEL_MIN_WORK {
-                for (row, accumulators) in products.chunks_mut(n).enumerate() {
-                    accumulate_row(row, accumulators);
-                }
-            } else {
-                products
-                    .par_chunks_mut(n)
-                    .enumerate()
-                    .for_each(|(row, accumulators)| accumulate_row(row, accumulators));
-            }
+            // same `i32`. Wrapping addition is associative and commutative, so
+            // the kernel's blocking and its thread count are likewise unable to
+            // change a single output bit, on overflow included.
+            qgemm_native::qgemm(
+                qgemm_native::Operand {
+                    bytes: &a_bytes[a_offset..a_offset + m * k],
+                    signed: a_signed,
+                },
+                qgemm_native::Operand {
+                    bytes: &b_bytes[b_offset..b_offset + k * n],
+                    signed: b_signed,
+                },
+                &a_zero_points,
+                &b_zero_points,
+                m,
+                k,
+                n,
+                &mut products,
+            );
 
             requantize_rows(
                 &products,
@@ -1863,10 +1830,12 @@ mod tests {
     /// before touching it. Replace that with a write to the borrowed slice and
     /// this test fails.
     ///
-    /// The borrow counter is asserted too, because the property is only under
-    /// test when the call really did borrow: if `dense_bytes` ever stopped
+    /// Non-vacuity is asserted too, because the property is only under test
+    /// when the call really did borrow `A`: if `dense_bytes` ever stopped
     /// borrowing, the input would trivially survive and the test would pass
-    /// while proving nothing.
+    /// while proving nothing. That is asserted on `A` itself rather than on a
+    /// count of borrows across all operands, because how many *other* operands
+    /// a route borrows is a routing detail this test does not fix.
     #[cfg(feature = "mlas")]
     #[test]
     fn the_sign_flip_route_never_writes_through_to_the_callers_input() {
@@ -1883,6 +1852,10 @@ mod tests {
         let b_zero = Owned::u8(&[], &[130]);
         let y_scale = Owned::f32(&[], &[0.125]);
         let y_zero = i8(&[], &[-2]);
+        assert!(
+            matches!(dense_bytes(&a.view()).unwrap(), Cow::Borrowed(_)),
+            "A is no longer borrowed, so this test proves nothing"
+        );
         let borrows_before = BORROWED_INPUT_CALLS.with(|calls| calls.get());
         let _ = execute(
             [
@@ -1891,10 +1864,9 @@ mod tests {
             DataType::Int8,
             &[8, 8],
         );
-        assert_eq!(
-            BORROWED_INPUT_CALLS.with(|calls| calls.get()),
-            borrows_before + 1,
-            "the flip route no longer borrows A, so this test proves nothing"
+        assert!(
+            BORROWED_INPUT_CALLS.with(|calls| calls.get()) > borrows_before,
+            "the flip route borrowed nothing, so this test proves nothing"
         );
         assert_eq!(
             a.bytes, untouched,
@@ -3343,6 +3315,12 @@ mod tests {
             // Above `PARALLEL_MIN_WORK`, so `requantize_rows` forks. The
             // parallel and serial row walks must agree bit for bit.
             (96, 40, 900),
+            // `m <= 4` *and* above `PARALLEL_MIN_WORK`, so the pack-free
+            // kernel's column split runs and its products then flow through
+            // the forked `requantize_rows`. Without this the fused-parallel
+            // path was only ever checked at the kernel level, never end to
+            // end through requantization.
+            (4, 1029, 1100),
         ] {
             for per_axis in [false, true] {
                 // --- Uint8 ---

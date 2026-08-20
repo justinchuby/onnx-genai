@@ -64,15 +64,24 @@ impl KernelFactory for SoftmaxLegacyFactory {
     }
 }
 
-/// Rows below which the row-major softmax stays on one thread. A row is at
-/// least a few hundred bytes of streaming work, so the crossover is set by the
-/// pool's wake-up cost rather than by cache residency; 64 rows of any realistic
-/// width clears it comfortably.
-const MIN_PARALLEL_SOFTMAX_ROWS: usize = 64;
-
 /// Elements below which the row-major softmax stays on one thread, so that a
 /// tall-and-very-thin tensor (many rows of 2) does not pay for a fan-out that
 /// buys nothing.
+///
+/// This is the *only* work threshold, deliberately. It used to sit next to a
+/// `MIN_PARALLEL_SOFTMAX_ROWS = 64` row floor, which was a proxy for the same
+/// quantity -- "is there enough work to amortise the pool wake-up?" -- but
+/// measured in the wrong unit. Work is `n * d`, and a row floor prices only
+/// `n`, so it refused shapes that are wide instead of tall: decode attention is
+/// `n = heads` by `d = kv_len`, and `32 x 8192` is 256 Ki elements, sixteen
+/// times this floor, yet 32 rows could never clear a floor of 64. Those shapes
+/// then ran single-threaded at every pool width. See section 43 of the CPU-EP
+/// benchmark ledger for the measurement that found it.
+///
+/// Removing the row floor admits nothing that this floor did not already admit
+/// at the same *work per chunk*: chunks are sized by [`ROW_TILE_BYTES`], so the
+/// newly-admitted `32 x 8192` yields 32 chunks of 8192 elements, exactly the
+/// chunk size the previously-admitted `64 x 256` yields.
 const MIN_PARALLEL_SOFTMAX_ELEMENTS: usize = 16 * 1024;
 
 /// Numerically stable row-major softmax of `n` contiguous rows of `d` elements,
@@ -278,8 +287,20 @@ pub(crate) fn softmax_rows(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
 /// to keep a run of rows in a core's private cache between the scale/mask write
 /// and the softmax's two reads; a chunk smaller than a tile could not fill that
 /// pipeline, and would call MLAS more often for less work each time.
+/// Whether an `n x d` softmax holds enough work to be worth waking the pool.
+///
+/// Split out from [`parallel_rows_per_task`] so the policy is testable without
+/// a multi-threaded runtime: the caller's other condition is the pool width,
+/// which a unit test cannot vary.
+///
+/// `n < 2` is not a threshold but an impossibility -- a chunk is a whole number
+/// of rows, so a single row cannot be split however large it is.
+fn fan_out_is_worthwhile(n: usize, d: usize) -> bool {
+    n >= 2 && n.saturating_mul(d) >= MIN_PARALLEL_SOFTMAX_ELEMENTS
+}
+
 fn parallel_rows_per_task(n: usize, d: usize) -> Option<usize> {
-    if n < MIN_PARALLEL_SOFTMAX_ROWS || n.saturating_mul(d) < MIN_PARALLEL_SOFTMAX_ELEMENTS {
+    if !fan_out_is_worthwhile(n, d) {
         return None;
     }
     if crate::task_runtime::width() < 2 {
@@ -290,22 +311,68 @@ fn parallel_rows_per_task(n: usize, d: usize) -> Option<usize> {
     Some((ROW_TILE_BYTES / (d.max(1) * size_of::<f32>())).clamp(1, n))
 }
 
-#[cfg(feature = "mlas")]
+/// Softmax one chunk of whole rows through whatever route this build selects.
+///
+/// Production is [`softmax_rows_serial_native`]. The non-default `mlas`
+/// research feature swaps in MLAS's SIMD row softmax while the native routine
+/// stays compiled beside it, which is what lets
+/// `tests/native_vs_mlas_differential.rs` hold the two against each other in
+/// one process.
+#[inline]
 fn softmax_rows_serial(data: &mut [f32], n: usize, d: usize) {
-    mlas_sys::compute_softmax_in_place(data, n, d);
+    record_softmax_route(data.len());
+    #[cfg(feature = "mlas")]
+    {
+        mlas_sys::compute_softmax_in_place(data, n, d);
+    }
+    #[cfg(not(feature = "mlas"))]
+    {
+        softmax_rows_serial_native(data, n, d);
+    }
 }
 
 /// Out-of-place counterpart of [`softmax_rows_serial`]: read `src`, write `dst`,
 /// no copy. MLAS's non-log softmax streams `Input -> Output` and then rescales
 /// `Output` alone, so this is bit-identical to `dst.copy_from_slice(src)`
 /// followed by the in-place form.
-#[cfg(feature = "mlas")]
+#[inline]
 fn softmax_rows_serial_out(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
-    mlas_sys::compute_softmax(src, dst, n, d);
+    record_softmax_route(src.len());
+    #[cfg(feature = "mlas")]
+    {
+        mlas_sys::compute_softmax(src, dst, n, d);
+    }
+    #[cfg(not(feature = "mlas"))]
+    {
+        softmax_rows_serial_out_native(src, dst, n, d);
+    }
 }
 
-/// Portable fallback with the same semantics: subtract the row max, `exp`,
-/// normalize. Kept exact against the MLAS path by the parity tests below.
+/// Note the route this build takes, when the dispatch ledger is switched on.
+///
+/// Off — every shipped build, unless `NXRT_CPU_DISPATCH_LEDGER=1` — this is one
+/// relaxed atomic load, because the [`crate::dispatch_ledger::Observation`] is
+/// built inside the closure and never evaluated.
+#[inline]
+fn record_softmax_route(elements: usize) {
+    crate::dispatch_ledger::record_with(|| {
+        crate::dispatch_ledger::Observation::elementwise(
+            crate::dispatch_ledger::KernelFamily::Softmax,
+            if cfg!(feature = "mlas") {
+                crate::dispatch_ledger::Backend::Mlas
+            } else {
+                crate::dispatch_ledger::Backend::Native
+            },
+            "f32",
+            elements,
+        )
+    });
+}
+
+/// Portable implementation with the same semantics: subtract the row max,
+/// `exp`, normalize. **This is the production route** — and the baseline the
+/// MLAS reference is differentially tested against, so it is compiled in every
+/// configuration rather than only when MLAS is absent.
 ///
 /// The scalar `f32::exp` this used to call was one libm invocation per element
 /// and was the entire gap against ORT's vectorised CPU softmax (9-11x on the
@@ -314,8 +381,7 @@ fn softmax_rows_serial_out(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
 /// `exp` eight lanes at a time on AVX2+FMA (with a scalar fallback). Sharing a
 /// single core is also what keeps the two forms bit-identical - see
 /// `out_of_place_softmax_is_bit_identical_on_pathological_rows`.
-#[cfg(not(feature = "mlas"))]
-fn softmax_rows_serial(data: &mut [f32], n: usize, d: usize) {
+pub fn softmax_rows_serial_native(data: &mut [f32], n: usize, d: usize) {
     for row in data.chunks_mut(d) {
         let ptr = row.as_mut_ptr();
         // SAFETY: `row` is exactly `d` elements, so `ptr` is valid for `d` f32
@@ -333,8 +399,7 @@ fn softmax_rows_serial(data: &mut [f32], n: usize, d: usize) {
 /// the in-place form because it calls the *same* [`softmax_row_core`] per row,
 /// reading each `src` element in place of the copied `dst` element it would
 /// otherwise have read.
-#[cfg(not(feature = "mlas"))]
-fn softmax_rows_serial_out(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
+pub fn softmax_rows_serial_out_native(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
     for (srow, drow) in src.chunks(d).zip(dst.chunks_mut(d)) {
         debug_assert_eq!(srow.len(), d);
         debug_assert_eq!(drow.len(), d);
@@ -346,7 +411,7 @@ fn softmax_rows_serial_out(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
     let _ = n;
 }
 
-/// The single row reducer shared by the in-place and out-of-place non-MLAS
+/// The single row reducer shared by the in-place and out-of-place native
 /// softmax paths: find the row max, write `exp(src - max)` into `dst`, and
 /// normalize by the row sum. Reading from `src` and writing to `dst` through
 /// one routine is what makes those two paths bit-identical (including on the
@@ -361,7 +426,6 @@ fn softmax_rows_serial_out(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
 /// regions must be either identical (`src == dst`, the in-place case) or fully
 /// disjoint - never partially overlapping - because the AVX2 kernel loads a
 /// whole 8-lane block from `src` before storing the matching block to `dst`.
-#[cfg(not(feature = "mlas"))]
 #[inline]
 unsafe fn softmax_row_core(src: *const f32, dst: *mut f32, d: usize) {
     if d == 0 {
@@ -387,7 +451,6 @@ unsafe fn softmax_row_core(src: *const f32, dst: *mut f32, d: usize) {
 ///
 /// # Safety
 /// Same contract as [`softmax_row_core`].
-#[cfg(not(feature = "mlas"))]
 unsafe fn softmax_row_scalar(src: *const f32, dst: *mut f32, d: usize) {
     let mut max = f32::NEG_INFINITY;
     for i in 0..d {
@@ -425,14 +488,12 @@ unsafe fn softmax_row_scalar(src: *const f32, dst: *mut f32, d: usize) {
 /// the tests assert against libm. Because softmax only ever evaluates
 /// `exp(v - max)`
 /// with `v - max <= 0`, the reduced argument never overflows; the non-finite
-/// lanes (`-inf` -> `0`, `NaN` -> `NaN`) are patched explicitly so a fully
-/// masked row still normalizes to `NaN` and a partially masked row's masked
-/// positions are exactly `0`, matching the scalar reference bit for bit through
-/// the shared normalization.
-#[cfg(all(
-    not(feature = "mlas"),
-    any(target_arch = "x86", target_arch = "x86_64")
-))]
+/// lanes (`-inf` -> `0`, `NaN` -> `NaN`) come out of the arithmetic itself,
+/// with a single mask for the underflow/`-inf` flush, so a fully masked row
+/// still normalizes to `NaN` and a partially masked row's masked positions are
+/// exactly `0`, matching the scalar reference bit for bit through the shared
+/// normalization.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod softmax_avx2 {
     #[cfg(target_arch = "x86")]
     use std::arch::x86::*;
@@ -481,22 +542,36 @@ mod softmax_avx2 {
         let c6 = _mm256_set1_ps(1.383_684_6e-3_f32);
 
         // Below this, f32 `exp` has underflowed to (sub)normals we flush to
-        // 0; `-inf` lands here too and must become exactly 0.
+        // 0; `-inf` lands here too and must become exactly 0. Ordered `<=`, so
+        // `NaN` reports false and keeps the value the polynomial produces.
         let underflow = _mm256_set1_ps(UNDERFLOW);
-
-        let is_nan = _mm256_cmp_ps::<_CMP_UNORD_Q>(x, x);
-        // Ordered `<=` so `NaN` reports false here (it is handled above).
         let is_zero = _mm256_cmp_ps::<_CMP_LE_OQ>(x, underflow);
 
-        // Clamp so `-inf`/`NaN` cannot poison the exponent build; those
-        // lanes are overwritten below.
-        let xc = _mm256_max_ps(x, underflow);
+        // `x` goes into the exponent build unclamped. `-inf` and `NaN` do
+        // poison it, and that is exactly what both need:
+        //
+        // * `-inf` makes `r` = `+inf - inf` = `NaN` and hence `y` = `NaN`, but
+        //   `is_zero` is true for it, so the mask below replaces the lane with
+        //   the required `0` bit pattern whatever `y` holds.
+        // * `NaN` stays `NaN` through `round`, both `fnmadd`s and the Horner
+        //   chain; `cvtps_epi32` turns it into the integer indefinite
+        //   `0x8000_0000`, whose low nine bits build `pow2` = `1.0`, so
+        //   `y` = `NaN * 1.0` = `NaN` and `is_zero` is false for it.
+        //
+        // So both cases fall out of the arithmetic, and the clamp, the
+        // unordered compare and the `NaN` blend they fed are all gone -- three
+        // of the sixteen port-0/1 ops this loop is bound by (measured: pass 2
+        // 446 -> 370 ps/element at d=1024, 1.20x). Every finite input is
+        // bit-identical to the clamped form, since the clamp was the identity
+        // there. Only a `NaN` *payload* changes: it is now the quieted input
+        // rather than a canonical `f32::NAN`, which the row contract -- a
+        // poisoned row normalizes to `NaN` -- does not distinguish.
 
         // k = round(x * log2e); r = x - k*ln2 (two-part).
         let k = _mm256_round_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(
-            _mm256_mul_ps(xc, log2e),
+            _mm256_mul_ps(x, log2e),
         );
-        let r = _mm256_fnmadd_ps(k, ln2_hi, xc);
+        let r = _mm256_fnmadd_ps(k, ln2_hi, x);
         let r = _mm256_fnmadd_ps(k, ln2_lo, r);
 
         // Pure Horner of `1 + r + c2·r^2 + c3·r^3 + c4·r^4 + c5·r^5 + c6·r^6`.
@@ -511,13 +586,11 @@ mod softmax_avx2 {
         let ki = _mm256_cvtps_epi32(k);
         let biased = _mm256_add_epi32(ki, _mm256_set1_epi32(127));
         let pow2 = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(biased));
-        let mut y = _mm256_mul_ps(p, pow2);
+        let y = _mm256_mul_ps(p, pow2);
 
-        // Underflow / -inf -> exactly 0 (andnot zeroes the masked lanes).
-        y = _mm256_andnot_ps(is_zero, y);
-        // NaN input -> NaN output, so a poisoned row sum stays NaN.
-        y = _mm256_blendv_ps(y, _mm256_set1_ps(f32::NAN), is_nan);
-        y
+        // Underflow / -inf -> exactly 0 (andnot zeroes the masked lanes
+        // bitwise, so it does not matter what the poisoned build produced).
+        _mm256_andnot_ps(is_zero, y)
     }
 
     /// Horizontal maximum of the eight lanes.
@@ -560,11 +633,38 @@ mod softmax_avx2 {
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn softmax_row(src: *const f32, dst: *mut f32, d: usize) {
         unsafe {
-            // Pass 1: row maximum. Feeding `v` as the first `max_ps` operand
-            // makes a `NaN` lane return the running accumulator, so `NaN`
-            // inputs are ignored exactly as `if v > max` ignores them.
-            let mut vmax = _mm256_set1_ps(f32::NEG_INFINITY);
+            // Pass 1: row maximum, over four independent chains. Feeding `v` as
+            // the first `max_ps` operand makes a `NaN` lane return the running
+            // accumulator, so `NaN` inputs are ignored exactly as `if v > max`
+            // ignores them -- and since no accumulator can therefore ever hold
+            // a `NaN`, folding the four together at the end obeys the same
+            // convention. `max` is associative and commutative over the values
+            // that survive, with one caveat that does not reach the output: a
+            // row holding both `+0.0` and `-0.0` as its maximum can pick either
+            // sign depending on the grouping, and `v - (+0.0)`, `v - (-0.0)`
+            // and `exp8(±0.0) = 1.0` all erase it. Every row is therefore
+            // bit-identical to one chain (verified differentially over ~588k
+            // rows, `d` in 1..=140 plus seven larger widths, a quarter of them
+            // seeded with infinities, NaNs and signed zeros).
+            //
+            // One chain is latency-bound, not throughput-bound: `vmaxps`'s
+            // ~4-cycle latency lets it retire 8 floats per 4 cycles when the
+            // load ports could feed 16. Four chains hide that (measured: 67 ->
+            // 37 ps/element at d=1024, 1.8x).
+            let ninf = _mm256_set1_ps(f32::NEG_INFINITY);
+            let mut m0 = ninf;
+            let mut m1 = ninf;
+            let mut m2 = ninf;
+            let mut m3 = ninf;
             let mut i = 0usize;
+            while i + 32 <= d {
+                m0 = _mm256_max_ps(_mm256_loadu_ps(src.add(i)), m0);
+                m1 = _mm256_max_ps(_mm256_loadu_ps(src.add(i + 8)), m1);
+                m2 = _mm256_max_ps(_mm256_loadu_ps(src.add(i + 16)), m2);
+                m3 = _mm256_max_ps(_mm256_loadu_ps(src.add(i + 24)), m3);
+                i += 32;
+            }
+            let mut vmax = _mm256_max_ps(_mm256_max_ps(m0, m1), _mm256_max_ps(m2, m3));
             while i + 8 <= d {
                 let v = _mm256_loadu_ps(src.add(i));
                 vmax = _mm256_max_ps(v, vmax);
@@ -613,6 +713,86 @@ mod softmax_avx2 {
                 i += 1;
             }
         }
+    }
+
+    /// `exp8` no longer patches its non-finite lanes: `-inf` is caught by the
+    /// underflow mask and `NaN` survives the polynomial and the exponent build
+    /// on its own. Both are consequences of the arithmetic rather than of an
+    /// explicit branch, so they are exactly the kind of contract that a future
+    /// reformulation of the exponent build (a magic-number round, a different
+    /// clamp) could silently drop. Pin them at the vector level, with the
+    /// specials placed in every lane so a mask built for one lane cannot pass.
+    #[cfg(test)]
+    #[test]
+    fn exp8_maps_the_non_finite_lanes_without_an_explicit_patch() {
+        if !available() {
+            return;
+        }
+        // Signalling and quiet NaNs, both signs, plus a payload that would
+        // collide with the integer-indefinite pattern if the two were confused.
+        let nans = [
+            f32::NAN,
+            -f32::NAN,
+            f32::from_bits(0x7f80_0001),
+            f32::from_bits(0xff80_0001),
+            f32::from_bits(0x7fff_ffff),
+        ];
+        let zeros = [
+            f32::NEG_INFINITY,
+            UNDERFLOW,
+            UNDERFLOW - 1.0,
+            -1e30,
+            -f32::MAX,
+        ];
+        for lane in 0..8 {
+            for &n in &nans {
+                let mut xs = [-1.0f32; 8];
+                xs[lane] = n;
+                let mut out = [0f32; 8];
+                unsafe {
+                    _mm256_storeu_ps(out.as_mut_ptr(), exp8(_mm256_loadu_ps(xs.as_ptr())));
+                }
+                assert!(
+                    out[lane].is_nan(),
+                    "NaN {:#010x} in lane {lane} produced {} instead of NaN",
+                    n.to_bits(),
+                    out[lane]
+                );
+                for (j, &o) in out.iter().enumerate() {
+                    if j != lane {
+                        assert!(
+                            (o - (-1.0f32).exp()).abs() < 1e-6,
+                            "a NaN in lane {lane} disturbed lane {j}: {o}"
+                        );
+                    }
+                }
+            }
+            for &z in &zeros {
+                let mut xs = [-1.0f32; 8];
+                xs[lane] = z;
+                let mut out = [0f32; 8];
+                unsafe {
+                    _mm256_storeu_ps(out.as_mut_ptr(), exp8(_mm256_loadu_ps(xs.as_ptr())));
+                }
+                assert_eq!(
+                    out[lane].to_bits() & 0x7fff_ffff,
+                    0,
+                    "{z} in lane {lane} produced {} instead of exactly 0",
+                    out[lane]
+                );
+            }
+        }
+        // And the boundary itself: one ULP above the flush threshold must
+        // still be a normal, nonzero exponential.
+        let just_above = f32::from_bits(UNDERFLOW.to_bits() - 1);
+        let mut out = [0f32; 8];
+        unsafe {
+            _mm256_storeu_ps(out.as_mut_ptr(), exp8(_mm256_set1_ps(just_above)));
+        }
+        assert!(
+            out.iter().all(|v| *v > 0.0 && v.is_finite()),
+            "one ULP above the flush threshold must not flush: {out:?}"
+        );
     }
 
     /// The row-level softmax tests cannot police `exp8`'s absolute accuracy:
@@ -1025,18 +1205,21 @@ mod vectorized_tests {
 
     /// The fan-out must not change a single bit relative to the serial path:
     /// rows are independent, so chunking cannot legitimately alter any result.
-    /// Sizes straddle `MIN_PARALLEL_SOFTMAX_ROWS` and
-    /// `MIN_PARALLEL_SOFTMAX_ELEMENTS` in both directions.
+    /// Sizes straddle `MIN_PARALLEL_SOFTMAX_ELEMENTS` in both directions, and
+    /// include the wide-and-short shapes the old row floor used to refuse.
     #[test]
     fn the_parallel_fan_out_is_bit_identical_to_the_serial_path() {
         for (n, d) in [
             (1usize, 1usize),
             (1, 4096),
-            (63, 512),   // below the row floor
-            (64, 8),     // clears rows, below the element floor
-            (64, 256),   // clears both
-            (4096, 128), // comfortably parallel
-            (129, 1000), // rows not divisible by any worker count
+            (63, 512),    // once refused by the row floor, now parallel
+            (64, 8),      // below the element floor, still serial
+            (64, 256),    // the smallest shape the old gate admitted
+            (4096, 128),  // comfortably parallel
+            (129, 1000),  // rows not divisible by any worker count
+            (32, 8192),   // decode attention: wide, short, formerly serial
+            (2, 8192),    // the fewest rows that can be split at all
+            (1, 1 << 20), // one enormous row: unsplittable, must stay serial
         ] {
             let src = synthetic(n, d, (n * 31 + d) as u32);
             let mut serial = src.clone();
@@ -1050,6 +1233,76 @@ mod vectorized_tests {
             softmax_rows(&src, &mut out_of_place, n, d);
             assert_eq!(serial, out_of_place, "out-of-place n={n} d={d}");
         }
+    }
+
+    /// The fan-out gate prices *work*, not row count. This is the property the
+    /// old `MIN_PARALLEL_SOFTMAX_ROWS = 64` floor got wrong: it refused
+    /// `32 x 8192` -- 256 Ki elements, sixteen times the element floor -- purely
+    /// for having 32 rows, which pinned decode attention to one thread at every
+    /// pool width no matter how much work it held.
+    #[test]
+    fn the_fan_out_gate_prices_work_not_row_count() {
+        // Wide and short: refused by a row floor, admitted by a work floor.
+        assert!(fan_out_is_worthwhile(32, 8192));
+        assert!(fan_out_is_worthwhile(2, 8192));
+        assert!(fan_out_is_worthwhile(63, 512));
+
+        // A single row is unsplittable at any size, because a chunk is a whole
+        // number of rows.
+        assert!(!fan_out_is_worthwhile(1, 1 << 20));
+        assert!(!fan_out_is_worthwhile(0, 1 << 20));
+
+        // The work floor itself still bites, and still bites exactly.
+        assert!(!fan_out_is_worthwhile(64, 8));
+        assert!(!fan_out_is_worthwhile(
+            2,
+            MIN_PARALLEL_SOFTMAX_ELEMENTS / 2 - 1
+        ));
+        assert!(fan_out_is_worthwhile(2, MIN_PARALLEL_SOFTMAX_ELEMENTS / 2));
+        // Pin the floor to the element exactly, not to within one: 3*5461 is
+        // one element short of the floor, so a threshold relaxed by a single
+        // element flips this shape and fails here.
+        assert!(!fan_out_is_worthwhile(3, 5461));
+        assert!(fan_out_is_worthwhile(4, 4096));
+
+        // Newly-admitted shapes chunk to the same work per chunk as shapes the
+        // old gate already admitted, which is why this widening is safe: both
+        // yield 8192 elements per chunk.
+        let per_chunk =
+            |n: usize, d: usize| (ROW_TILE_BYTES / (d.max(1) * size_of::<f32>())).clamp(1, n) * d;
+        assert_eq!(per_chunk(32, 8192), per_chunk(64, 256));
+
+        // `n * d` must not wrap on absurd shapes. `saturating_mul` clamps
+        // *upward*, so an unrepresentable element count reads as "plenty of
+        // work" and fans out; a wrapping `*` would read as "none" and would
+        // silently pin the largest tensors to one thread.
+        assert!(fan_out_is_worthwhile(usize::MAX, usize::MAX));
+    }
+
+    /// The gate above decides nothing on its own — `parallel_rows_per_task` has
+    /// to consult it the right way round. That wiring is invisible to every
+    /// other test in this file, because rows are independent and so the output
+    /// is bit-identical whether or not the fan-out happens. Inverting the
+    /// condition would pin every large softmax back to a single thread and
+    /// silently undo this optimisation while the suite stayed green.
+    #[test]
+    fn the_fan_out_gate_is_wired_the_right_way_round() {
+        // Refusals hold at any pool width, so they need no guard.
+        assert_eq!(parallel_rows_per_task(1, 1 << 20), None);
+        assert_eq!(parallel_rows_per_task(64, 8), None);
+
+        if crate::task_runtime::width() < 2 {
+            return;
+        }
+        // A decode-shaped softmax is exactly what the old row floor refused.
+        let rows = parallel_rows_per_task(32, 8192)
+            .expect("a 32x8192 softmax is 256 Ki elements and must fan out");
+        assert!(
+            rows < 32,
+            "fanning out means more than one chunk, got {rows} rows per task \
+             for all 32 rows"
+        );
+        assert!(parallel_rows_per_task(4096, 128).is_some());
     }
 
     /// The out-of-place softmax derives every output element from `src` alone.
@@ -1127,10 +1380,11 @@ mod vectorized_tests {
     fn out_of_place_softmax_is_bit_identical_on_pathological_rows() {
         // 8 is a whole vector body with no tail; 11 is a vector body plus a
         // 3-lane scalar tail; 6 is a pure tail with no vector body at all.
-        // The tail widths matter: a NaN in a vectorized lane is forced to a
-        // canonical NaN by the mask, while a NaN in a tail lane is whatever
-        // libm returns, so a future change that stopped both forms sharing one
-        // core would diverge on exactly these rows and nowhere else.
+        // The tail widths matter: a NaN in a vectorized lane carries whatever
+        // payload the polynomial produced from the input, while a NaN in a
+        // tail lane is whatever libm returns, so a future change that stopped
+        // both forms sharing one core would diverge on exactly these rows and
+        // nowhere else.
         for d in [8usize, 11, 6] {
             check_pathological_rows_bit_identical(d);
         }
@@ -1276,6 +1530,45 @@ mod vectorized_tests {
                 if c % 3 == 0 {
                     assert_eq!(v, 0.0, "masked position must be exactly zero");
                 }
+            }
+        }
+    }
+
+    /// Softmax is invariant to the value subtracted, so a row maximum that
+    /// misses part of the row is *numerically silent* on ordinary data -- the
+    /// exponentials and the sum shift by the same factor and cancel. It only
+    /// surfaces as an overflow. Dropping one of the four accumulator chains in
+    /// pass 1 therefore passed every other test in this file.
+    ///
+    /// Force the issue: put one enormous logit at a chosen position and leave
+    /// the rest at zero. A max that saw the whole row yields a near one-hot
+    /// distribution; a max that missed the peak evaluates `exp(3e38)` and
+    /// blows the row to `inf`/`NaN`. Sweeping the position over more than one
+    /// full 32-lane block covers every chain, the 8-wide drain and the scalar
+    /// tail, and the `d` values put the peak in the block body, the drain and
+    /// the tail in turn.
+    #[test]
+    fn the_row_maximum_covers_every_position() {
+        for &d in &[32usize, 37, 40, 45, 96, 100, 256] {
+            for peak in 0..d {
+                let mut src = vec![0.0f32; d];
+                src[peak] = 3.0e38; // one exp() away from overflowing f32
+                let mut got = src.clone();
+                softmax_rows_in_place(&mut got, 1, d);
+                for (c, &v) in got.iter().enumerate() {
+                    assert!(
+                        v.is_finite(),
+                        "d={d} peak={peak}: column {c} is {v}, so the row \
+                         maximum missed position {peak}"
+                    );
+                }
+                assert!(
+                    (got[peak] - 1.0).abs() < 1e-6,
+                    "d={d} peak={peak}: the peak normalized to {} not 1.0",
+                    got[peak]
+                );
+                let sum: f32 = got.iter().sum();
+                assert!((sum - 1.0).abs() < 1e-5, "d={d} peak={peak} sums to {sum}");
             }
         }
     }

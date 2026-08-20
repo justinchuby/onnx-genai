@@ -144,6 +144,14 @@ pub struct ExportedEp {
     /// that `GetCapability` can dtype-filter claims against the same source of
     /// truth. Empty when no registry entries were provided.
     pub registry_entries: Vec<KernelRegistryEntry>,
+    /// Whether ORT places this EP's tensors in host-accessible memory, copied
+    /// from the factory's `DeviceSupport::host_accessible` in `CreateEp`.
+    ///
+    /// `Compile` hands it to each [`ExportedComputeInfo`] so `Compute` can tell
+    /// host placement from device placement without querying ORT per `Run`.
+    /// Defaults to `false` ("assume device"), the conservative direction: an EP
+    /// built by a path that does not set it keeps the full memory-info scan.
+    pub host_accessible: bool,
 }
 
 /// Owns an `OrtKernelRegistry*` allocated via ORT's EP API.
@@ -264,6 +272,7 @@ impl ExportedEp {
             name_cstr,
             kernel_registry: registry,
             registry_entries: entries,
+            host_accessible: false,
         }
     }
 }
@@ -891,6 +900,11 @@ fn ep_compile_inner(
 
         // Wrap kernels in OrtNodeComputeInfo.
         let mut info = ExportedComputeInfo::new(entries);
+
+        // Placement is a property of the EP, decided by the factory when it
+        // registered the allocator; pass it down so `Compute` never has to ask
+        // ORT where a routed subgraph's intermediates belong.
+        info.set_host_accessible(exported.host_accessible);
 
         // Attach device staging so an interspersed CPU→device partition can
         // upload host-resident boundary inputs before launching (#982).

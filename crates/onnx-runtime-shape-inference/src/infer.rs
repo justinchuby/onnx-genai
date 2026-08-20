@@ -29,7 +29,7 @@ struct ScopedInference {
 /// low range, so a fresh symbol here can never be confused with a named one nor
 /// with a future [`Graph::create_symbol`](onnx_runtime_ir::Graph) allocation
 /// (which advances the graph's private low-range counter).
-const ANON_SYMBOL_FLOOR: u32 = 0x8000_0000;
+pub(crate) const ANON_SYMBOL_FLOOR: u32 = 0x8000_0000;
 
 impl InferenceRegistry {
     /// Infer shapes for every value in `graph`, in topological order.

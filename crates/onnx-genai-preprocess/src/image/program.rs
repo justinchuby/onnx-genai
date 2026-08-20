@@ -104,6 +104,7 @@ struct ImageTransformMetadata {
     merge_size: Option<usize>,
     channel_order: Option<String>,
     temporal_order: Option<String>,
+    patch_order: Option<String>,
     coordinate_order: Option<String>,
     flatten: Option<bool>,
     pad_value: Option<f64>,
@@ -145,7 +146,22 @@ pub(super) struct PatchifySpec {
     pub(super) merge_size: usize,
     pub(super) channel_order: PatchChannelOrder,
     pub(super) temporal_order: PatchTemporalOrder,
+    pub(super) patch_order: PatchOrder,
     pub(super) coordinate_order: CoordinateOrder,
+}
+
+/// The order patches are emitted in, which is independent of `merge_size`.
+///
+/// Qwen2-VL packs each `merge_size x merge_size` spatial group contiguously, so
+/// the model's merge reshape sees a whole group per row. Some exports instead
+/// expect plain row-major patch order and do the grouping inside the graph.
+/// `merge_size` still governs how many patches collapse into one image token,
+/// so the two knobs cannot be folded together: emitting raster order by setting
+/// `merge_size: 1` would also quadruple the placeholder count.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum PatchOrder {
+    MergeGroups,
+    Raster,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -287,6 +303,7 @@ impl ImagePreprocessor {
             merge_size: transform.merge_size,
             channel_order: transform.channel_order.clone(),
             temporal_order: transform.temporal_order.clone(),
+            patch_order: transform.patch_order.clone(),
             coordinate_order: transform.coordinate_order.clone(),
             flatten: transform.flatten,
             pad_value: transform.pad_value,
@@ -904,6 +921,13 @@ fn typed_program_from_metadata(
                         "unsupported image patchify temporal_order '{other}'; expected channel_major or temporal_major"
                     ),
                 };
+                let patch_order = match transform.patch_order.as_deref().unwrap_or("merge_groups") {
+                    "merge_groups" | "merge_blocks" => PatchOrder::MergeGroups,
+                    "raster" | "row_major" => PatchOrder::Raster,
+                    other => anyhow::bail!(
+                        "unsupported image patchify patch_order '{other}'; expected merge_groups or raster"
+                    ),
+                };
                 let coordinate_order = match transform.coordinate_order.as_deref().unwrap_or("yx") {
                     "yx" => CoordinateOrder::Yx,
                     "xy" => CoordinateOrder::Xy,
@@ -917,6 +941,7 @@ fn typed_program_from_metadata(
                     merge_size,
                     channel_order,
                     temporal_order,
+                    patch_order,
                     coordinate_order,
                 });
                 patchified = true;

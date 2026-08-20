@@ -557,14 +557,25 @@ extern "C" __global__ void add_one(const float* x, float* y, unsigned long long 
         runtime.reset_graph().unwrap();
 
         // --- NEGATIVE: the SAME excursion INSIDE an active capture -----------
-        // A host-consuming D2H needs a stream sync; that sync is illegal while
+        // A host-consuming D2H needs a stream drain; that drain is illegal while
         // capturing and invalidates the graph. This is why a monolithic capture
         // ACROSS the excursion cannot work and segmentation is mandatory.
+        //
+        // The drain has to be the *unconditional* one. `synchronize()` has been
+        // a no-op by default since eager-sync deferral landed (#1383), so it can
+        // neither invalidate a capture nor be relied on to detect one. What
+        // actually makes the excursion illegal is `dtoh`'s internal
+        // `force_synchronize`, which `drain_for_unmap` is the public spelling
+        // of -- so that is what the negative case must exercise.
         runtime.begin_graph_capture(&[&capturable]).unwrap();
         launch_add_one(&runtime, &function, buf0, buf1, n);
         assert!(
-            runtime.synchronize().is_err(),
-            "a host-consuming sync inside active capture must invalidate it"
+            runtime.synchronize().is_ok(),
+            "the deferred synchronize is a no-op and must not be mistaken for a capture barrier"
+        );
+        assert!(
+            runtime.drain_for_unmap().is_err(),
+            "a host-consuming drain inside active capture must invalidate it"
         );
         runtime.abort_graph_capture().unwrap();
         runtime.reset_graph().ok();
@@ -833,15 +844,21 @@ extern "C" __global__ void add_one(const float* x, float* y, unsigned long long 
         // --- Reproduce a mid-segment kernel failure during capture ----------
         // Begin recording and launch one node into the segment, then trip the
         // exact illegal operation a Supported-but-unconditionally-syncing kernel
-        // would perform inside a captured segment: a stream synchronize during
-        // capture. This invalidates the capture (CUDA_ERROR_STREAM_CAPTURE_*),
+        // would perform inside a captured segment: an unconditional stream drain
+        // during capture. This invalidates the capture (CUDA_ERROR_STREAM_CAPTURE_*),
         // which is the error that reaches the executor's cleanup path.
+        //
+        // It has to be the unconditional drain. `synchronize()` has been a no-op
+        // by default since eager-sync deferral landed (#1383), so a kernel that
+        // calls it does not invalidate anything; the kernels that still force a
+        // drain are the ones that go through `force_synchronize`, of which
+        // `drain_for_unmap` is the public spelling.
         runtime.begin_graph_capture(&[&capturable]).unwrap();
         launch_add_one(&runtime, &function, input_ptr, output_ptr, n);
         assert!(runtime.is_capturing().unwrap());
         assert!(
-            runtime.synchronize().is_err(),
-            "a stream synchronize mid-capture is illegal and must error"
+            runtime.drain_for_unmap().is_err(),
+            "an unconditional stream drain mid-capture is illegal and must error"
         );
 
         // The wedge: while the stream is still (invalidly) capturing, reset is

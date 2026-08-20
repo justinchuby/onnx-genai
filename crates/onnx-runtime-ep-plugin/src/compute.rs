@@ -920,6 +920,21 @@ impl OperandKey {
             && self.present == metadata.present
             && self.shape.as_slice() == metadata.shape
     }
+
+    /// Same comparison as [`OperandKey::matches`], against the `TensorView` the
+    /// metadata would have been built from.
+    ///
+    /// This exists so the lock-free fast path in
+    /// [`WorkspacePlanCache::get_or_plan`] can verify a hit without first
+    /// materialising the `Vec<TensorMetadata>` — that allocation is only worth
+    /// paying on a miss. It must stay field-for-field identical to `matches`
+    /// composed with `TensorMetadata::new(v.dtype, v.shape, !v.is_absent())`,
+    /// which `the_view_and_metadata_comparisons_agree` pins.
+    fn matches_view(&self, view: &TensorView<'_>) -> bool {
+        self.dtype == view.dtype
+            && self.present == !view.is_absent()
+            && self.shape.as_slice() == view.shape
+    }
 }
 
 /// Owned copy of the metadata a [`WorkspaceRequirement`] was computed from.
@@ -1020,15 +1035,131 @@ const WORKSPACE_PLAN_CACHE_CAPACITY: usize = 8;
 /// re-derive their requirement in `execute_with_workspace` and reject a
 /// workspace that is too small (`governed_workspace_ptr`, `std_attention_carve`,
 /// `gqa` sub-range carving) rather than reading past the end.
+/// A signature that has been observed more than once, published for lock-free
+/// reads (#1077 lever 3).
+///
+/// Written at most once per node, through [`OnceLock`], and only for a
+/// signature that has already been served from the locked cache — that is, one
+/// that recurs. Reading it costs an acquire load and an operand-wise compare;
+/// it takes no lock and allocates nothing.
+#[derive(Debug)]
+struct HotPlan {
+    operands: Box<[OperandKey]>,
+    requirement: WorkspaceRequirement,
+}
+
 struct WorkspacePlanCache {
+    /// Lock-free fast path. See [`HotPlan`].
+    ///
+    /// Publishing on the *second* sighting rather than the first is deliberate:
+    /// a decoder's first `Run` is a prefill whose shape may never recur, and
+    /// pinning that one would leave every later decode `Run` on the locked
+    /// path. Waiting for a repeat costs one extra locked `Run` at startup and
+    /// picks the recurring shape in both the static and the prefill/decode
+    /// case.
+    ///
+    /// Exactly one signature is ever pinned, and it is never rotated. That
+    /// covers the shapes we care about (static graphs, and prefill-then-decode
+    /// where only the decode extent recurs), but a node that genuinely
+    /// alternates between two equally-recurring signatures keeps roughly half
+    /// its dispatches on the locked path. That is a missed optimisation, not a
+    /// correctness problem: a miss simply falls through to [`Self::lookup`].
+    hot: std::sync::OnceLock<HotPlan>,
+    /// Test-only: keep every dispatch on the locked path.
+    ///
+    /// The lock-free slot would otherwise answer the repeat access in
+    /// `a_repeatedly_used_signature_survives_eviction`, which would let that
+    /// test pass with move-to-front deleted — it would stop measuring what it
+    /// names. Tests of the locked cache opt out through
+    /// [`WorkspacePlanCache::locked_only`].
+    #[cfg(test)]
+    suppress_hot: bool,
     plans: Mutex<Vec<(WorkspaceSignature, WorkspaceRequirement)>>,
 }
 
 impl WorkspacePlanCache {
     fn new() -> Self {
         Self {
+            hot: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            suppress_hot: false,
             plans: Mutex::new(Vec::new()),
         }
+    }
+
+    /// A cache that never publishes to the lock-free slot, so every dispatch
+    /// exercises the locked path. See `suppress_hot`.
+    #[cfg(test)]
+    fn locked_only() -> Self {
+        Self {
+            suppress_hot: true,
+            ..Self::new()
+        }
+    }
+
+    /// The lock-free hit test, against already-built metadata.
+    fn hot_hit(&self, metadata: &[TensorMetadata<'_>]) -> Option<WorkspaceRequirement> {
+        let hot = self.hot.get()?;
+        (hot.operands.len() == metadata.len()
+            && hot
+                .operands
+                .iter()
+                .zip(metadata)
+                .all(|(key, meta)| key.matches(meta)))
+        .then_some(hot.requirement)
+    }
+
+    /// The lock-free hit test, against the views the metadata would describe.
+    ///
+    /// Identical in effect to [`WorkspacePlanCache::hot_hit`] on the metadata
+    /// built from `inputs`, but it does not build that `Vec`.
+    fn hot_hit_views(&self, inputs: &[TensorView<'_>]) -> Option<WorkspaceRequirement> {
+        let hot = self.hot.get()?;
+        (hot.operands.len() == inputs.len()
+            && hot
+                .operands
+                .iter()
+                .zip(inputs)
+                .all(|(key, view)| key.matches_view(view)))
+        .then_some(hot.requirement)
+    }
+
+    /// Publish a recurring signature to the lock-free slot, if it is still
+    /// empty. Losing the race is harmless: the winner is equally valid, and
+    /// this dispatch already has its answer.
+    fn publish_hot(&self, metadata: &[TensorMetadata<'_>], requirement: WorkspaceRequirement) {
+        #[cfg(test)]
+        if self.suppress_hot {
+            return;
+        }
+        if self.hot.get().is_some() {
+            return;
+        }
+        let _ = self.hot.set(HotPlan {
+            operands: signature_of(metadata).into_boxed_slice(),
+            requirement,
+        });
+    }
+
+    /// Look up the plan for `inputs`, computing and remembering it on a miss.
+    ///
+    /// The fast path takes no lock and makes no allocation. The metadata `Vec`
+    /// is built only when the lock-free slot does not already answer the
+    /// question, because it is needed only by the locked cache and by
+    /// `Kernel::workspace_requirement`.
+    fn get_or_plan_views(
+        &self,
+        inputs: &[TensorView<'_>],
+        plan: impl FnOnce(&[TensorMetadata<'_>]) -> Result<WorkspaceRequirement, String>,
+    ) -> Result<WorkspaceRequirement, String> {
+        if let Some(hit) = self.hot_hit_views(inputs) {
+            return Ok(hit);
+        }
+        let metadata: Vec<TensorMetadata<'_>> = inputs
+            .iter()
+            .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
+            .collect();
+        self.get_or_plan(&metadata, || plan(&metadata))
     }
 
     /// Look up the plan for `metadata`, computing and remembering it on a miss.
@@ -1037,7 +1168,13 @@ impl WorkspacePlanCache {
         metadata: &[TensorMetadata<'_>],
         plan: impl FnOnce() -> Result<WorkspaceRequirement, String>,
     ) -> Result<WorkspaceRequirement, String> {
+        if let Some(hit) = self.hot_hit(metadata) {
+            return Ok(hit);
+        }
         if let Some(hit) = self.lookup(metadata) {
+            // Second sighting: this signature recurs, so it is the one worth
+            // publishing.
+            self.publish_hot(metadata, hit);
             return Ok(hit);
         }
         let requirement = plan()?;
@@ -1050,11 +1187,20 @@ impl WorkspacePlanCache {
         let idx = plans
             .iter()
             .position(|(signature, _)| signature_matches(signature, metadata))?;
+        let requirement = plans[idx].1;
         // Move-to-front so the hot signature stays ahead of a one-off prefill
         // shape once the cache is full.
-        let entry = plans.remove(idx);
-        let requirement = entry.1;
-        plans.insert(0, entry);
+        //
+        // Skipped when the hit is already at the front, which is the steady
+        // state: one shape, every node, every `Run`. Promoting the front entry
+        // to the front is identity, but `remove` + `insert` still run the
+        // shift, bounds checks and length bookkeeping to achieve nothing.
+        // Callgrind, 100-node chain: `lookup` costs 141 instructions per node
+        // without this guard and 101 with it.
+        if idx != 0 {
+            let entry = plans.remove(idx);
+            plans.insert(0, entry);
+        }
         Some(requirement)
     }
 
@@ -1107,6 +1253,23 @@ pub struct ExportedComputeInfo {
     /// CPU EP (and any host EP), which uses its inputs verbatim exactly as
     /// before.
     device_staging: Option<DeviceStaging>,
+    /// Whether ORT places this EP's tensors in **host-accessible** memory.
+    ///
+    /// This is the same `DeviceSupport::host_accessible` the plugin factory
+    /// keys allocator registration on (`factory.rs`, `CreateAllocator`): when
+    /// it is true ORT hands out its own default host allocator, so every
+    /// `OrtValue` this EP sees is host-resident and a routed subgraph's
+    /// intermediates belong in host buffers. That lets `Compute` skip the
+    /// per-input `OrtMemoryInfo` scan entirely.
+    ///
+    /// Deliberately **defaults to `false`** — the conservative answer. A
+    /// caller that never sets it gets the full scan, i.e. the historical
+    /// behaviour, so a device EP cannot be mis-served by a forgotten setter.
+    /// Note this must *not* be inferred from `device_staging`: that is set
+    /// from `host_to_device_copier()`, which defaults to `None` and which a
+    /// device EP may legitimately decline (see `provider.rs`), so a device EP
+    /// can have `device_staging == None` and device-resident inputs.
+    host_accessible: bool,
     /// Whether ORT's intra-op pool has ever been seen running our elementwise
     /// chunks, and when to ask again if not.
     ///
@@ -1132,6 +1295,18 @@ struct DeviceStaging {
 /// Owns an `OrtMemoryInfo` rebuilt via `CreateMemoryInfo_V2`, released on drop.
 struct ReconstructedMemInfo {
     ptr: *const ort::OrtMemoryInfo,
+    /// Whether `ptr` denotes device memory, recorded from the `device_type` it
+    /// was built with rather than asked of ORT afterwards.
+    ///
+    /// `mem_info_is_device` is exactly `device_type != CPU`, and this memory
+    /// info was created by passing `device_type` straight to
+    /// `CreateMemoryInfo_V2`, so the two agree by construction. Every EP that
+    /// supplies a host-to-device copier today is non-CPU, which would make a
+    /// hardcoded `true` correct — but nothing in `HostToDeviceCopier` requires
+    /// that, and a CPU-typed EP that grew a copier would then be handed host
+    /// memory as a device scratch target. Deriving it costs nothing and cannot
+    /// drift.
+    is_device: bool,
 }
 
 // SAFETY: the pointer is read-only after construction and released only on drop.
@@ -1148,6 +1323,7 @@ impl Drop for ReconstructedMemInfo {
             return;
         }
         if let Some(release) = unsafe { (*api).ReleaseMemoryInfo } {
+            crate::dispatch_probe::ort_call();
             unsafe { release(self.ptr.cast_mut()) };
         }
     }
@@ -1172,8 +1348,19 @@ impl ExportedComputeInfo {
             routing: None,
             workspace_plans,
             device_staging: None,
+            host_accessible: false,
             host_pool_probe: std::sync::atomic::AtomicU32::new(0),
         }
+    }
+
+    /// Record whether ORT places this EP's tensors in host-accessible memory.
+    ///
+    /// Pass the factory's `DeviceSupport::host_accessible` — the *same* flag
+    /// `CreateAllocator` branches on — so this can never disagree with where
+    /// ORT actually allocates. Leaving it unset means "assume device", which
+    /// is the safe direction: `Compute` then scans as it always did.
+    pub fn set_host_accessible(&mut self, host_accessible: bool) {
+        self.host_accessible = host_accessible;
     }
 
     /// Attach the device staging context (#982) captured at compile time from a
@@ -1242,25 +1429,55 @@ unsafe extern "C" fn compute_create_state(
 /// # Safety
 ///
 /// `api` must be valid and `ctx` a valid `OrtKernelContext*`.
+/// Whether `Compute` must ask ORT where this EP's tensors live before it can
+/// place a routed subgraph's intermediates.
+///
+/// Keyed on `host_accessible` -- the flag the plugin factory registers its
+/// allocator on, so it is the same decision ORT itself made -- and
+/// deliberately **not** on the presence of a device-staging context. `staging`
+/// is taken and ignored on purpose: it comes from `host_to_device_copier()`,
+/// which defaults to `None` and which a device EP may legitimately decline, so
+/// keying on it would classify such an EP as host and place its intermediates
+/// in host memory for a device kernel to dereference. That was a real defect
+/// caught in review; the parameter is kept so the invariant is stated where it
+/// can be tested rather than only in a comment.
+fn must_scan_for_device_placement(host_accessible: bool, _staging: Option<&DeviceStaging>) -> bool {
+    !host_accessible
+}
+
 unsafe fn device_mem_info(
     api: &ort::OrtApi,
     ctx: *mut ort::OrtKernelContext,
     staging: Option<&DeviceStaging>,
-) -> Option<*const ort::OrtMemoryInfo> {
+) -> Option<(*const ort::OrtMemoryInfo, bool)> {
     // A routed subgraph's intermediates must be allocated in *device* memory so
     // the device kernels that produce and consume them dereference valid device
     // pointers. On an interspersed CPU→device partition, kernel-context input 0
     // may be a *host* boundary input (#982), so we must not assume input 0 lives
     // on the device — scan every input for a genuinely device-resident one.
+    //
+    // The scan remembers input 0's memory info as it goes. It used to throw it
+    // away and re-fetch it at the bottom, which cost two more FFI calls on the
+    // path every host EP takes: the scan finds nothing device-resident, and the
+    // fallback then asks ORT again for the value it had already seen first.
+    // Whether the result is a device is returned too, for the same reason — the
+    // one caller immediately asked, which meant a third query for a fact this
+    // function had just established.
+    let mut input0: Option<*const ort::OrtMemoryInfo> = None;
     if let Some(get_count) = api.KernelContext_GetInputCount {
         let mut count: usize = 0;
+        crate::dispatch_probe::ort_call();
         let status = unsafe { get_count(ctx, &mut count) };
         if status.is_null() {
             for i in 0..count {
-                if let Some(mi) = unsafe { ort_input_mem_info(api, ctx, i) }
-                    && unsafe { mem_info_is_device(api, mi) }
-                {
-                    return Some(mi);
+                let Some(mi) = (unsafe { ort_input_mem_info(api, ctx, i) }) else {
+                    continue;
+                };
+                if i == 0 {
+                    input0 = Some(mi);
+                }
+                if unsafe { mem_info_is_device(api, mi) } {
+                    return Some((mi, true));
                 }
             }
         }
@@ -1273,13 +1490,23 @@ unsafe fn device_mem_info(
         && let Some(recon) = staging.recon_mem_info.as_ref()
         && !recon.ptr.is_null()
     {
-        return Some(recon.ptr);
+        // Device-ness recorded when this was built from the EP's own device
+        // recipe, so it matches what the old `mem_info_is_device` call returned
+        // without spending an FFI call to re-derive it.
+        return Some((recon.ptr, recon.is_device));
     }
     // Host EP (no device staging context): preserve the historical behavior of
     // using input 0's memory info. For a host EP this is host memory, which is
     // exactly where its intermediates belong, so host-only partitions are
     // unchanged by the #982 device-staging work.
-    unsafe { ort_input_mem_info(api, ctx, 0) }
+    //
+    // The scan above already looked at input 0 unless it failed or there are no
+    // inputs, so this normally costs nothing.
+    match input0 {
+        Some(mi) => Some((mi, false)),
+        None => unsafe { ort_input_mem_info(api, ctx, 0) }
+            .map(|mi| (mi, unsafe { mem_info_is_device(api, mi) })),
+    }
 }
 
 /// Memory info of the `OrtValue` bound to kernel-context input `index`.
@@ -1295,11 +1522,13 @@ unsafe fn ort_input_mem_info(
     let get_input = api.KernelContext_GetInput?;
     let get_mem_info = api.GetTensorMemoryInfo?;
     let mut value: *const ort::OrtValue = std::ptr::null();
+    crate::dispatch_probe::ort_call();
     let status = unsafe { get_input(ctx, index, &mut value) };
     if !status.is_null() || value.is_null() {
         return None;
     }
     let mut mem_info: *const ort::OrtMemoryInfo = std::ptr::null();
+    crate::dispatch_probe::ort_call();
     let status = unsafe { get_mem_info(value, &mut mem_info) };
     if !status.is_null() || mem_info.is_null() {
         return None;
@@ -1335,10 +1564,102 @@ pub(crate) enum OperandMemInfo {
 struct PlacementSources<'a> {
     /// Kernel-context input indices bound to ORT for *this* node. Outputs are
     /// deliberately absent; see [`operand_mem_info`].
-    ort_inputs: &'a [usize],
+    ort_inputs: OrtOperands<'a>,
     /// Memory info to fall back to when the node binds no ORT inputs at all
     /// (every operand is a fused-subgraph intermediate).
-    subgraph_fallback: Option<*const ort::OrtMemoryInfo>,
+    subgraph_fallback: SubgraphFallback<'a>,
+}
+
+/// Where [`operand_mem_info`] gets its fallback memory info when a node binds
+/// no ORT inputs at all, plus the per-`Run` memo of that resolution.
+///
+/// Resolving it means walking every kernel-context input and asking ORT for its
+/// `OrtMemoryInfo` (see [`device_mem_info`]) — four FFI calls for a one-input
+/// node. Its only consumer reads it for a node with no ORT-bound operands at
+/// all, and then only past [`prepare_workspace`]'s zero-byte and servability
+/// gates, so an elementwise dispatch never makes the calls at all.
+///
+/// The routed path used to resolve it *eagerly*, once per `Run`, to share it
+/// across nodes — charging every routed `Run` for a value almost no dispatch
+/// reads. Deferring it must not trade that for a resolution *per node*: a fused
+/// subgraph whose nodes each take only intermediates and each request a
+/// non-zero step-scoped workspace would then rescan every input once per node.
+/// `memo` keeps both properties — at most one resolution per `Run`, and none
+/// when nothing reaches the fallback.
+#[derive(Clone, Copy)]
+struct SubgraphFallback<'a> {
+    /// Staging context to resolve against, `None` for an EP without one.
+    staging: Option<&'a DeviceStaging>,
+    /// `None` = not yet resolved this `Run`; `Some(v)` = resolved to `v`.
+    ///
+    /// A `Cell` is sufficient: a `Compute` call resolves on one thread, and
+    /// each `Run` builds a fresh cell, so nothing is shared across `Run`s or
+    /// across sessions.
+    memo: &'a std::cell::Cell<Option<Option<*const ort::OrtMemoryInfo>>>,
+}
+
+impl SubgraphFallback<'_> {
+    /// The fallback memory info, resolving (and memoising) on first use.
+    ///
+    /// # Safety
+    ///
+    /// `api` must be valid and `ctx` a valid `OrtKernelContext*`.
+    unsafe fn resolve(
+        self,
+        api: &ort::OrtApi,
+        ctx: *mut ort::OrtKernelContext,
+    ) -> Option<*const ort::OrtMemoryInfo> {
+        if let Some(cached) = self.memo.get() {
+            return cached;
+        }
+        let resolved = unsafe { device_mem_info(api, ctx, self.staging) }.map(|(mi, _)| mi);
+        self.memo.set(Some(resolved));
+        resolved
+    }
+}
+
+/// The ORT-bound operands of a node, in either of the two shapes a caller
+/// already has them in.
+///
+/// Placement is resolved for a vanishing fraction of dispatches -- only past
+/// [`prepare_workspace`]'s zero-byte and lifetime gates -- so a caller holding
+/// a slot map should not have to flatten it into a fresh `Vec` on every `Run`
+/// just to describe operands that will not be looked at. Both spellings
+/// iterate the same present ORT indices in the same order.
+#[derive(Clone, Copy)]
+enum OrtOperands<'a> {
+    /// Already-resolved kernel-context input indices.
+    Resolved(&'a [usize]),
+    /// A node's input slots, `None` for an absent optional input. Absent slots
+    /// bind no ORT input and are skipped.
+    Slots(&'a [Option<usize>]),
+}
+
+impl<'a> OrtOperands<'a> {
+    /// The present ORT input indices, in slot order.
+    fn indices(self) -> OrtOperandIter<'a> {
+        match self {
+            Self::Resolved(v) => OrtOperandIter::Resolved(v.iter()),
+            Self::Slots(v) => OrtOperandIter::Slots(v.iter()),
+        }
+    }
+}
+
+/// Iterator over [`OrtOperands`]; see [`OrtOperands::indices`].
+enum OrtOperandIter<'a> {
+    Resolved(std::slice::Iter<'a, usize>),
+    Slots(std::slice::Iter<'a, Option<usize>>),
+}
+
+impl Iterator for OrtOperandIter<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        match self {
+            Self::Resolved(it) => it.next().copied(),
+            Self::Slots(it) => it.by_ref().find_map(|slot| *slot),
+        }
+    }
 }
 
 /// Number of times a node's workspace placement has been **resolved**.
@@ -1458,8 +1779,10 @@ unsafe fn operand_mem_info(
     sources: PlacementSources<'_>,
 ) -> OperandMemInfo {
     WORKSPACE_PLACEMENT_QUERIES.fetch_add(1, Ordering::Relaxed);
-    let Some((&first_idx, rest)) = sources.ort_inputs.split_first() else {
-        return match sources.subgraph_fallback {
+    let mut rest = sources.ort_inputs.indices();
+    let Some(first_idx) = rest.next() else {
+        let fallback = unsafe { sources.subgraph_fallback.resolve(api, ctx) };
+        return match fallback {
             Some(ptr) => OperandMemInfo::FromIntermediates(ptr),
             None => OperandMemInfo::Unavailable,
         };
@@ -1467,17 +1790,19 @@ unsafe fn operand_mem_info(
     let Some(first) = (unsafe { ort_input_mem_info(api, ctx, first_idx) }) else {
         return OperandMemInfo::Unavailable;
     };
-    if rest.is_empty() {
+    let mut rest = rest.peekable();
+    if rest.peek().is_none() {
         return OperandMemInfo::Uniform(first);
     }
     let Some(compare) = api.CompareMemoryInfo else {
         return OperandMemInfo::Unavailable;
     };
-    for &idx in rest {
+    for idx in rest {
         let Some(other) = (unsafe { ort_input_mem_info(api, ctx, idx) }) else {
             return OperandMemInfo::Unavailable;
         };
         let mut equal: std::os::raw::c_int = 0;
+        crate::dispatch_probe::ort_call();
         let status = unsafe { compare(first, other, &mut equal) };
         if !status.is_null() {
             // ORT allocated this status and handed us ownership; dropping the
@@ -1515,6 +1840,7 @@ unsafe fn alloc_scratch(
         .KernelContext_GetScratchBuffer
         .ok_or("OrtApi.KernelContext_GetScratchBuffer is null")?;
     let mut out: *mut c_void = std::ptr::null_mut();
+    crate::dispatch_probe::ort_call();
     let status = unsafe { get_scratch(ctx, mem_info, bytes.max(1), &mut out) };
     if !status.is_null() {
         return Err("KernelContext_GetScratchBuffer failed".into());
@@ -1538,10 +1864,26 @@ fn staging_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("ONNX_GENAI_PLUGIN_TRANSFER_TRACE").as_deref() == Ok("1"))
 }
 
+/// Emit one staging-trace line, formatting the arguments only when the trace is
+/// on.
+///
+/// The gate has to come first: the bare `staging_log(&format!(..))` spelling
+/// builds and drops a `String` on every call whether or not anyone is
+/// listening, and one of these sites is on the per-`Run` dispatch path.
+macro_rules! staging_log {
+    ($($arg:tt)*) => {
+        if staging_trace_enabled() {
+            staging_log(&format!($($arg)*));
+        }
+    };
+}
+
 /// Emit one staging-trace line. Goes to stderr (buffered by pipes, so it can be
 /// lost when the process hangs) *and*, when `ONNX_GENAI_PLUGIN_TRANSFER_TRACE_FILE`
 /// is set, is appended to that file with an immediate flush — the file path is
 /// the only trace that survives a boundary hang. No-op unless the trace is on.
+///
+/// Prefer the [`staging_log!`] macro: it checks the gate before formatting.
 fn staging_log(msg: &str) {
     if !staging_trace_enabled() {
         return;
@@ -1581,6 +1923,7 @@ fn reconstruct_device_mem_info(
     let create = unsafe { (*api).CreateMemoryInfo_V2 }?;
     let name = std::ffi::CString::new(allocator_name).ok()?;
     let mut ptr: *mut ort::OrtMemoryInfo = std::ptr::null_mut();
+    crate::dispatch_probe::ort_call();
     let status = unsafe {
         create(
             name.as_ptr(),
@@ -1595,6 +1938,7 @@ fn reconstruct_device_mem_info(
     };
     if !status.is_null() {
         if let Some(release) = unsafe { (*api).ReleaseStatus } {
+            crate::dispatch_probe::ort_call();
             unsafe { release(status) };
         }
         return None;
@@ -1602,7 +1946,10 @@ fn reconstruct_device_mem_info(
     if ptr.is_null() {
         return None;
     }
-    Some(ReconstructedMemInfo { ptr })
+    Some(ReconstructedMemInfo {
+        ptr,
+        is_device: device_type != ort::OrtMemoryInfoDeviceType_CPU,
+    })
 }
 
 /// Device type ORT placed a memory info on, or `None` if unreadable.
@@ -1616,6 +1963,7 @@ unsafe fn mem_info_device_type(
 ) -> Option<ort::OrtMemoryInfoDeviceType> {
     let f = api.MemoryInfoGetDeviceType?;
     let mut out: ort::OrtMemoryInfoDeviceType = ort::OrtMemoryInfoDeviceType_CPU;
+    crate::dispatch_probe::ort_call();
     unsafe { f(mem_info, &mut out) };
     Some(out)
 }
@@ -1685,54 +2033,50 @@ unsafe fn stage_host_boundary_inputs(
 ) -> Result<(), String> {
     // First pass: which operands are host-resident data operands needing upload?
     let mut to_stage: Vec<usize> = Vec::new();
-    staging_log(&format!(
+    staging_log!(
         "[plugin/staging #982] {label}: enter operands={} host_operands={:?}",
         ort_indices.len(),
         host_operands
-    ));
+    );
     for (p, slot) in ort_indices.iter().enumerate() {
         let Some(ort_idx) = *slot else {
-            staging_log(&format!(
-                "[plugin/staging #982] {label}: op[{p}] skip (not ORT-bound)"
-            ));
+            staging_log!("[plugin/staging #982] {label}: op[{p}] skip (not ORT-bound)");
             continue;
         };
         if host_operands.contains(&p) {
-            staging_log(&format!(
+            staging_log!(
                 "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (host control operand)"
-            ));
+            );
             continue;
         }
         let view = &kernel_inputs[p];
         if view.is_absent() || view.data.0.is_null() {
-            staging_log(&format!(
+            staging_log!(
                 "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (absent/null)"
-            ));
+            );
             continue;
         }
         let numel: usize = view.shape.iter().product();
         if numel == 0 || view.dtype.byte_size() == 0 {
-            staging_log(&format!(
-                "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (empty)"
-            ));
+            staging_log!("[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (empty)");
             continue;
         }
         let Some(mem_info) = (unsafe { ort_input_mem_info(api, ctx, ort_idx) }) else {
-            staging_log(&format!(
+            staging_log!(
                 "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (no mem info)"
-            ));
+            );
             continue;
         };
         let dev_type = unsafe { mem_info_device_type(api, mem_info) };
         if unsafe { mem_info_is_device(api, mem_info) } {
-            staging_log(&format!(
+            staging_log!(
                 "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (already device, dev_type={dev_type:?})"
-            ));
+            );
             continue; // already on device — nothing to do
         }
-        staging_log(&format!(
+        staging_log!(
             "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} HOST (dev_type={dev_type:?}) → will stage"
-        ));
+        );
         to_stage.push(p);
     }
 
@@ -1763,10 +2107,10 @@ unsafe fn stage_host_boundary_inputs(
         && let Some(recon) = staging.recon_mem_info.as_ref()
     {
         device_mi = recon.ptr;
-        staging_log(&format!(
+        staging_log!(
             "[plugin/staging #982] {label}: no device OrtValue found; \
              falling back to reconstructed EP memory info recon={device_mi:?}"
-        ));
+        );
     }
     if device_mi.is_null() {
         return Err(format!(
@@ -1785,19 +2129,17 @@ unsafe fn stage_host_boundary_inputs(
         let byte_len = numel * view.dtype.byte_size();
         let dst = unsafe { alloc_scratch(api, ctx, device_mi, byte_len) }
             .map_err(|e| format!("{label}: staging scratch alloc failed: {e}"))?;
-        staging_log(&format!(
+        staging_log!(
             "[plugin/staging #982] {label}: staging op[{p}] byte_len={byte_len} \
              mem_dev={mem_dev:?} dst={dst:?} — issuing host→device upload"
-        ));
+        );
         // SAFETY: the source is a host tensor of `byte_len` contiguous bytes
         // (ORT-provided, contiguous strides); `dst` is device scratch of the
         // same size.
         let src = unsafe { std::slice::from_raw_parts(view.data.0.cast::<u8>(), byte_len) };
         unsafe { staging.copier.copy_host_to_device(src, dst) }
             .map_err(|e| format!("{label}: host→device upload failed: {e}"))?;
-        staging_log(&format!(
-            "[plugin/staging #982] {label}: op[{p}] host→device upload complete"
-        ));
+        staging_log!("[plugin/staging #982] {label}: op[{p}] host→device upload complete");
         kernel_inputs[p].data = DevicePtr(dst.cast_const());
     }
 
@@ -1948,15 +2290,11 @@ unsafe fn prepare_workspace(
     kernel: &dyn Kernel,
     plans: &WorkspacePlanCache,
     inputs: &[TensorView<'_>],
-    node_label: &str,
+    node_label: impl std::fmt::Display + Copy,
 ) -> Result<Option<WorkspaceView>, String> {
-    let metadata: Vec<TensorMetadata<'_>> = inputs
-        .iter()
-        .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
-        .collect();
-    let requirement: WorkspaceRequirement = plans.get_or_plan(&metadata, || {
+    let requirement: WorkspaceRequirement = plans.get_or_plan_views(inputs, |metadata| {
         kernel
-            .workspace_requirement(&metadata)
+            .workspace_requirement(metadata)
             .map_err(|e| format!("{node_label}: workspace_requirement failed: {e}"))
     })?;
     if requirement.bytes == 0 {
@@ -2062,7 +2400,7 @@ fn workspace_trace_enabled() -> bool {
 /// returned, capped at 4096 — the useful question is "did ORT already meet the
 /// kernel's alignment", not the exact 2-adic valuation of the address.
 fn workspace_trace_line(
-    node_label: &str,
+    node_label: impl std::fmt::Display,
     base: usize,
     aligned: usize,
     bytes: usize,
@@ -2163,6 +2501,8 @@ unsafe extern "C" fn compute_execute(
     kernel_context: *mut ort::OrtKernelContext,
 ) -> *mut ort::OrtStatus {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::dispatch_probe::count(crate::dispatch_probe::Event::ComputeExecute);
+        let entry_probe = crate::dispatch_probe::Phase::CallbackEntry.enter();
         if info.is_null() || kernel_context.is_null() {
             return fail_status("Compute: null argument");
         }
@@ -2173,12 +2513,12 @@ unsafe extern "C" fn compute_execute(
             return fail_status("Compute: no kernels compiled for this subgraph");
         }
 
-        staging_log(&format!(
+        staging_log!(
             "[plugin/staging #982] compute_execute enter: entries={} routing={} device_staging={}",
             exported.entries.len(),
             exported.routing.is_some(),
             exported.device_staging.is_some()
-        ));
+        );
 
         let api = crate::status::host_api();
         if api.is_null() {
@@ -2198,33 +2538,7 @@ unsafe extern "C" fn compute_execute(
             crate::host_pool::install(api_ref, kernel_context, &exported.host_pool_probe)
         };
 
-        // Memory info for intermediate scratch. On a device EP this is device
-        // memory, so multi-node intermediates stay on the GPU (a host buffer
-        // would make the next kernel dereference a host pointer as device →
-        // CUDA_ERROR_ILLEGAL_ADDRESS). `None` falls back to host buffers.
-        let scratch_mem_info =
-            unsafe { device_mem_info(api_ref, kernel_context, exported.device_staging.as_ref()) };
-
-        // Where a routed subgraph's *intermediates* are allocated.
-        //
-        // Device memory is not optional: a device kernel handed a host pointer
-        // dereferences it as device memory. Host memory is different — the
-        // intermediate only has to be readable by the next kernel on this
-        // thread, and `KernelContext_GetScratchBuffer` is a much worse way to
-        // get it than the Rust allocator. ORT's host scratch goes through an
-        // aligned allocation that glibc always services with a fresh `mmap`
-        // for buffers of this size, so every intermediate is a new mapping,
-        // first-touch page-faulted while the kernel writes it and unmapped at
-        // the end of the `Run`. Measured on an 8-node f32 `Relu` chain of
-        // 262144 elements (1 MiB per intermediate), one thread: 3246 us
-        // through ORT scratch vs 383 us through host buffers, an 8.5x
-        // difference on identical kernels, against ORT's own 220 us for the
-        // same graph. So: device memory when the resolved memory info is a
-        // device, host buffers otherwise.
-        let intermediate_scratch = match scratch_mem_info {
-            Some(mem_info) if unsafe { mem_info_is_device(api_ref, mem_info) } => Some(mem_info),
-            _ => None,
-        };
+        entry_probe.end();
 
         let inputs = match unsafe { read_inputs(api_ref, kernel_context) } {
             Ok(v) => v,
@@ -2233,6 +2547,75 @@ unsafe extern "C" fn compute_execute(
 
         if let Some(routing) = &exported.routing {
             // ── Routed multi-node path ────────────────────────────────────
+            // Where a routed subgraph's *intermediates* are allocated.
+            //
+            // Device memory is not optional: a device kernel handed a host pointer
+            // dereferences it as device memory. Host memory is different — the
+            // intermediate only has to be readable by the next kernel on this
+            // thread, and `KernelContext_GetScratchBuffer` is a much worse way to
+            // get it than the Rust allocator. ORT's host scratch goes through an
+            // aligned allocation that glibc always services with a fresh `mmap`
+            // for buffers of this size, so every intermediate is a new mapping,
+            // first-touch page-faulted while the kernel writes it and unmapped at
+            // the end of the `Run`. Measured on an 8-node f32 `Relu` chain of
+            // 262144 elements (1 MiB per intermediate), one thread: 3246 us
+            // through ORT scratch vs 383 us through host buffers, an 8.5x
+            // difference on identical kernels, against ORT's own 220 us for the
+            // same graph. So: device memory when the resolved memory info is a
+            // device, host buffers otherwise.
+            //
+            // Resolving this costs an ORT memory-info query *per kernel-context
+            // input* on every `Run` — four fixed FFI calls on the one-input
+            // graphs this path is measured on. When ORT placed this EP's
+            // tensors in **host-accessible** memory the answer is always
+            // `None`, and it is knowable without asking ORT anything: that is
+            // the same flag the factory registers the allocator on, so every
+            // `OrtValue` here is host-resident and the intermediates belong in
+            // host buffers.
+            //
+            // The discriminator is deliberately `host_accessible` and *not*
+            // `device_staging.is_some()`. The latter tracks
+            // `host_to_device_copier()`, which defaults to `None` and which a
+            // device EP may legitimately decline, so it would wrongly classify
+            // such an EP as host and place its intermediates on the wrong side
+            // of the bus. `host_accessible` defaults to the conservative
+            // `false`, so anything that has not explicitly declared itself
+            // host-placed keeps the full scan.
+            //
+            // The `debug_assert` re-derives the full answer in unoptimised
+            // builds, so a host-accessible EP that ever did see a
+            // device-resident input fails loudly in tests instead of silently
+            // mis-placing intermediates.
+            // Memoises the placement fallback for this `Run` (see
+            // `SubgraphFallback`): resolved at most once across all nodes, and
+            // not at all unless some node actually reaches it.
+            let subgraph_fallback_memo = std::cell::Cell::new(None);
+
+            let intermediate_scratch = if must_scan_for_device_placement(
+                exported.host_accessible,
+                exported.device_staging.as_ref(),
+            ) {
+                let scanned = unsafe {
+                    device_mem_info(api_ref, kernel_context, exported.device_staging.as_ref())
+                };
+                // The subgraph fallback wants this very resolution. Seed the
+                // memo so a node that reaches it later reuses this scan
+                // instead of repeating it -- which is what the eager
+                // once-per-`Run` version this replaced effectively did.
+                subgraph_fallback_memo.set(Some(scanned.map(|(mem_info, _)| mem_info)));
+                scanned.and_then(|(mem_info, is_device)| is_device.then_some(mem_info))
+            } else {
+                debug_assert!(
+                    unsafe {
+                        device_mem_info(api_ref, kernel_context, exported.device_staging.as_ref())
+                    }
+                    .is_none_or(|(_, is_device)| !is_device),
+                    "EP declared host-accessible saw a device-resident kernel-context input; \
+                     its routed intermediates would be placed in host memory"
+                );
+                None
+            };
+
             if routing.input_sources.len() != exported.entries.len()
                 || routing.output_sinks.len() != exported.entries.len()
             {
@@ -2249,10 +2632,37 @@ unsafe extern "C" fn compute_execute(
             // last reader has run is dead and its storage can be handed
             // straight back to the next allocation, so a chain of N nodes
             // cycles a couple of buffers instead of touching N fresh ones.
-            let last_reader =
-                last_reader_per_buffer(&routing.input_sources, routing.num_intermediate_buffers);
+            let (retire_starts, retire_items) =
+                retirements_per_node(&routing.input_sources, routing.num_intermediate_buffers);
+
+            // Per-node scratch, hoisted so each node reuses the previous
+            // node's capacity instead of allocating its own. These were the
+            // largest single item in the dispatch allocation table: six of the
+            // ~12 allocations per node were these vectors being created and
+            // dropped once each.
+            //
+            // Each is cleared at the top of the iteration that uses it, so a
+            // node always starts from empty regardless of how the previous one
+            // exited. (Every early exit in this loop is a `return`, so a failed
+            // node cannot leak into a later one either way -- the clears are
+            // load-bearing for ordinary node-to-node reuse, not for errors.)
+            enum RoutedSlotKind {
+                Ort,
+                Buffer,
+                Absent(usize), // index into absent_scratch
+            }
+            let mut ort_outputs: Vec<crate::kernel_ctx::OwnedOutput> = Vec::new();
+            // Stores the *output slot*, not a copy of its shape: cloning the
+            // shape cost one more allocation per buffer-bound output, and the
+            // shape is already live in `output_shapes` for the whole iteration.
+            let mut buf_writes: Vec<(usize, usize, DataType)> = Vec::new();
+            let mut absent_scratch: Vec<(usize, Vec<u8>, DataType)> = Vec::new();
+            let mut slot_kinds: Vec<RoutedSlotKind> = Vec::new();
+            let mut new_bufs: Vec<(usize, IntermediateBuf)> = Vec::new();
+            let mut node_ort_operands: Vec<usize> = Vec::new();
 
             for (node_idx, entry) in exported.entries.iter().enumerate() {
+                let node_probe = crate::dispatch_probe::Phase::TensorBind.enter();
                 let sources = &routing.input_sources[node_idx];
                 let sinks = &routing.output_sinks[node_idx];
 
@@ -2297,28 +2707,25 @@ unsafe extern "C" fn compute_execute(
                 }
 
                 // Infer output shapes.
+                node_probe.end();
+                let shape_probe = crate::dispatch_probe::Phase::DispatchLookup.enter();
                 let output_shapes = match infer_shapes(&entry.shape_inference, &kernel_inputs) {
                     Ok(s) => s,
                     Err(e) => {
                         return fail_status(&format!("Compute: shape inference failed: {e}"));
                     }
                 };
+                shape_probe.end();
 
                 // Execute — dispatch based on sinks.
                 // For outputs going to ORT we allocate via ORT API;
                 // for outputs going to intermediate buffers we allocate on heap;
                 // for absent slots we allocate a scratch buffer.
-                let mut ort_outputs: Vec<crate::kernel_ctx::OwnedOutput> = Vec::new();
-                let mut buf_writes: Vec<(usize, Vec<usize>, DataType)> = Vec::new();
-                let mut absent_scratch: Vec<(usize, Vec<u8>, DataType)> = Vec::new(); // (slot, buf, dtype)
-
-                // Per-slot view map to keep positions aligned end-to-end.
-                enum RoutedSlotKind {
-                    Ort,
-                    Buffer,
-                    Absent(usize), // index into absent_scratch
-                }
-                let mut slot_kinds: Vec<RoutedSlotKind> = Vec::with_capacity(sinks.len());
+                ort_outputs.clear();
+                buf_writes.clear();
+                absent_scratch.clear();
+                slot_kinds.clear();
+                slot_kinds.reserve(sinks.len());
 
                 // We need to know which output slot → which sink.
                 for (out_slot, shape) in output_shapes.iter().enumerate() {
@@ -2361,7 +2768,14 @@ unsafe extern "C" fn compute_execute(
                     match sink {
                         NodeOutputSink::Ort(ort_idx) => {
                             match unsafe {
-                                allocate_output(api_ref, kernel_context, *ort_idx, shape, out_dtype)
+                                allocate_output(
+                                    api_ref,
+                                    kernel_context,
+                                    *ort_idx,
+                                    shape,
+                                    out_dtype,
+                                    exported.device_staging.is_some(),
+                                )
                             } {
                                 Ok(out) => ort_outputs.push(out),
                                 Err(e) => {
@@ -2371,7 +2785,7 @@ unsafe extern "C" fn compute_execute(
                             slot_kinds.push(RoutedSlotKind::Ort);
                         }
                         NodeOutputSink::Buffer(buf_idx) => {
-                            buf_writes.push((*buf_idx, shape.clone(), out_dtype));
+                            buf_writes.push((*buf_idx, out_slot, out_dtype));
                             slot_kinds.push(RoutedSlotKind::Buffer);
                         }
                         NodeOutputSink::Absent => {
@@ -2416,17 +2830,17 @@ unsafe extern "C" fn compute_execute(
                     }
                 }
 
-                // Build mutable output views: ORT outputs first, then buffer outputs.
-                let mut ort_out_views: Vec<_> =
-                    ort_outputs.iter_mut().map(|o| o.view_mut()).collect();
-
                 // For buffer-sink outputs, allocate the IntermediateBuf and get a
                 // mutable pointer into it. Device EPs take ORT scratch memory so
                 // intermediates live where the kernels execute; host EPs take a
                 // plain host buffer, which is both correct and measurably faster
                 // than ORT's host scratch allocator (see `intermediate_scratch`).
-                let mut new_bufs: Vec<(usize, IntermediateBuf)> = Vec::new();
-                for (buf_idx, shape, dtype) in &buf_writes {
+                // Redundant while `drain(..)` below is the only consumer, and
+                // kept so the invariant survives an early `continue` being
+                // added to this loop.
+                new_bufs.clear();
+                for &(buf_idx, out_slot, dtype) in &buf_writes {
+                    let shape = &output_shapes[out_slot];
                     let numel: usize = shape.iter().product();
                     let byte_len = dtype.byte_size() * numel;
                     let strides = contiguous_strides(shape);
@@ -2446,26 +2860,38 @@ unsafe extern "C" fn compute_execute(
                         None => (take_host_intermediate(byte_len), std::ptr::null_mut()),
                     };
                     new_bufs.push((
-                        *buf_idx,
+                        buf_idx,
                         IntermediateBuf {
                             data,
                             scratch_ptr,
                             shape: shape.clone(),
                             strides,
-                            dtype: *dtype,
+                            dtype,
                         },
                     ));
                 }
 
                 // Collect all output views using the per-slot view map so
                 // positions stay aligned even when absent slots are present.
-                let absent_shapes: Vec<Vec<usize>> = output_shapes.clone();
-                let absent_strides_storage: Vec<Vec<i64>> = absent_shapes
-                    .iter()
-                    .map(|s| contiguous_strides(s))
-                    .collect();
+                let absent_shapes: &[Vec<usize>] = &output_shapes;
+                // One entry per *absent* slot, not per output slot. Only
+                // absent slots read these, and a node with an absent output is
+                // the exception, so building them for every output cost an
+                // allocation per output on every node that has none. Each entry
+                // is keyed by the same index that keys `absent_scratch`, where
+                // the slot it belongs to is recorded -- so this stays aligned by
+                // construction rather than by an invariant about emptiness.
+                let absent_strides_storage = absent_slot_strides(
+                    absent_scratch.iter().map(|(slot, _, _)| *slot),
+                    absent_shapes,
+                );
                 let mut all_output_views: Vec<_> = {
-                    let mut ort_iter = ort_out_views.drain(..);
+                    // Taken lazily. Collecting these into their own `Vec` and
+                    // immediately draining it built a second vector of views per
+                    // node, for every node of every `Run`, to hand each view
+                    // straight to the map below. The single-node path stopped
+                    // doing this; the routed path is where it is paid per node.
+                    let mut ort_iter = ort_outputs.iter_mut().map(|o| o.view_mut());
                     let mut buf_iter = new_bufs.iter_mut();
                     slot_kinds
                         .iter()
@@ -2479,7 +2905,7 @@ unsafe extern "C" fn compute_execute(
                             RoutedSlotKind::Absent(idx) => {
                                 let (_, scratch_buf, dtype) = &mut absent_scratch[*idx];
                                 let shape = &absent_shapes[slot_idx];
-                                let strides = &absent_strides_storage[slot_idx];
+                                let strides = &absent_strides_storage[*idx];
                                 TensorMut::new(
                                     DevicePtrMut(scratch_buf.as_mut_ptr().cast()),
                                     *dtype,
@@ -2493,44 +2919,45 @@ unsafe extern "C" fn compute_execute(
                         .collect()
                 };
 
-                let node_label = format!("Compute: node {node_idx}");
                 let plans = match exported.workspace_plan_cache(node_idx) {
                     Some(plans) => plans,
                     None => {
                         return fail_status(&format!(
-                            "{node_label}: no workspace plan cache for this node (entries and \
-                             workspace_plans have drifted)"
+                            "Compute: node {node_idx}: no workspace plan cache for this node \
+                             (entries and workspace_plans have drifted)"
                         ));
                     }
                 };
                 // This node's own ORT-bound operands — not subgraph input 0.
                 // Resolved lazily inside `prepare_workspace`, so a node that
                 // needs no workspace never queries ORT for placement.
-                let node_ort_operands: Vec<usize> = sources
-                    .iter()
-                    .filter_map(|src| match src {
-                        NodeInputSource::Ort(i) => Some(*i),
-                        NodeInputSource::Buffer(_) | NodeInputSource::Absent => None,
-                    })
-                    .collect();
+                node_ort_operands.clear();
+                node_ort_operands.extend(sources.iter().filter_map(|src| match src {
+                    NodeInputSource::Ort(i) => Some(*i),
+                    NodeInputSource::Buffer(_) | NodeInputSource::Absent => None,
+                }));
                 let workspace = match unsafe {
                     prepare_workspace(
                         api_ref,
                         kernel_context,
                         PlacementSources {
-                            ort_inputs: &node_ort_operands,
-                            subgraph_fallback: scratch_mem_info,
+                            ort_inputs: OrtOperands::Resolved(&node_ort_operands),
+                            subgraph_fallback: SubgraphFallback {
+                                staging: exported.device_staging.as_ref(),
+                                memo: &subgraph_fallback_memo,
+                            },
                         },
                         &*entry.kernel,
                         plans,
                         &kernel_inputs,
-                        &node_label,
+                        format_args!("Compute: node {node_idx}"),
                     )
                 } {
                     Ok(w) => w,
                     Err(e) => return fail_status(&e),
                 };
 
+                let kernel_probe = crate::dispatch_probe::Phase::KernelInvoke.enter();
                 if let Err(e) = entry.kernel.execute_with_workspace(
                     &kernel_inputs,
                     &mut all_output_views,
@@ -2538,10 +2965,12 @@ unsafe extern "C" fn compute_execute(
                 ) {
                     return fail_status(&format!("Compute: kernel execution failed: {e}"));
                 }
+                kernel_probe.end();
+                crate::dispatch_probe::count(crate::dispatch_probe::Event::NodeExecuted);
                 EXECUTED_NODE_COUNT.fetch_add(1, Ordering::Relaxed);
 
                 // Store new intermediate buffers.
-                for (buf_idx, buf) in new_bufs {
+                for (buf_idx, buf) in new_bufs.drain(..) {
                     if buf_idx >= intermediates.len() {
                         return fail_status(&format!(
                             "Compute: buffer index {buf_idx} out of range"
@@ -2557,10 +2986,9 @@ unsafe extern "C" fn compute_execute(
                 // it here — rather than at the end of the subgraph — is what
                 // lets the next node's allocation land on storage that is
                 // still hot in cache.
-                for (buf_idx, last) in last_reader.iter().enumerate() {
-                    if *last == Some(node_idx)
-                        && let Some(dead) = intermediates[buf_idx].take()
-                    {
+                for &buf_idx in &retire_items[retire_starts[node_idx]..retire_starts[node_idx + 1]]
+                {
+                    if let Some(dead) = intermediates[buf_idx].take() {
                         recycle_host_intermediate(dead.data);
                     }
                 }
@@ -2579,6 +3007,9 @@ unsafe extern "C" fn compute_execute(
             // disagree, and panicking across the C ABI inside `Compute` turns
             // that into an opaque "internal panic" instead of a diagnosable
             // session error.
+            crate::dispatch_probe::count(crate::dispatch_probe::Event::NodeExecuted);
+            let bind_probe = crate::dispatch_probe::Phase::TensorBind.enter();
+            crate::dispatch_probe::count(crate::dispatch_probe::Event::DispatchAlloc);
             let mut kernel_inputs: Vec<TensorView<'_>> =
                 Vec::with_capacity(entry.input_slots.len());
             for (position, slot) in entry.input_slots.iter().enumerate() {
@@ -2597,27 +3028,24 @@ unsafe extern "C" fn compute_execute(
                     None => kernel_inputs.push(TensorView::absent(DataType::Undefined)),
                 }
             }
+            bind_probe.end();
+            let lookup_probe = crate::dispatch_probe::Phase::DispatchLookup.enter();
             let output_shapes = match infer_shapes(&entry.shape_inference, &kernel_inputs) {
                 Ok(s) => s,
                 Err(e) => {
                     return fail_status(&format!("Compute: shape inference failed: {e}"));
                 }
             };
+            lookup_probe.end();
             // Allocate outputs. Absent slots get a local scratch buffer so the
             // kernel sees the full output arity and can index by position,
             // while only present slots are allocated through ORT's kernel
             // context (sequential ORT indices).
-            let mut owned_outputs: Vec<crate::kernel_ctx::OwnedOutput> = Vec::new();
+            let (mut owned_outputs, mut slot_map) = take_output_scratch(entry.num_outputs);
             let mut absent_bufs: Vec<Vec<u8>> = Vec::new();
-            // Track whether each node output slot is ORT-allocated or absent.
-            enum SlotKind {
-                Ort,           // present, comes from ORT
-                Absent(usize), // index into absent_bufs
-            }
             // Also record the dtype for each absent slot so the TensorMut
             // matches the kernel's element size.
             let mut absent_dtypes: Vec<DataType> = Vec::new();
-            let mut slot_map: Vec<SlotKind> = Vec::with_capacity(entry.num_outputs);
             let mut ort_out_idx: usize = 0;
 
             for (out_slot, shape) in output_shapes.iter().enumerate() {
@@ -2651,7 +3079,14 @@ unsafe extern "C" fn compute_execute(
                     }
                 };
                 match unsafe {
-                    allocate_output(api_ref, kernel_context, ort_out_idx, shape, out_dtype)
+                    allocate_output(
+                        api_ref,
+                        kernel_context,
+                        ort_out_idx,
+                        shape,
+                        out_dtype,
+                        exported.device_staging.is_some(),
+                    )
                 } {
                     Ok(out) => {
                         owned_outputs.push(out);
@@ -2684,15 +3119,25 @@ unsafe extern "C" fn compute_execute(
             }
             // Build output views in node-output order so the kernel sees the
             // full arity including absent scratch slots.
-            let absent_shapes: Vec<Vec<usize>> = output_shapes.clone();
-            let absent_strides_storage: Vec<Vec<i64>> = absent_shapes
-                .iter()
-                .map(|s| contiguous_strides(s))
-                .collect();
-            // First, get mutable views of all ORT outputs in order.
-            let mut ort_views: Vec<TensorMut<'_>> =
-                owned_outputs.iter_mut().map(|o| o.view_mut()).collect();
-            let mut ort_view_iter = ort_views.drain(..);
+            //
+            // The stride storage below exists only to back the absent slots'
+            // `TensorMut`s. `absent_slot_strides` builds one entry per *absent*
+            // slot, so a node with no absent outputs -- every elementwise op,
+            // which is most of what reaches this path -- allocates nothing here.
+            let absent_shapes: &[Vec<usize>] = &output_shapes;
+            // See the routed path. `slot_map` pushes `Absent(idx)` with
+            // increasing `idx`, so filtering it in slot order yields the strides
+            // in absent-index order.
+            let absent_strides_storage = absent_slot_strides(
+                slot_map.iter().enumerate().filter_map(|(slot_idx, kind)| {
+                    matches!(kind, SlotKind::Absent(_)).then_some(slot_idx)
+                }),
+                absent_shapes,
+            );
+            // Views of the ORT outputs, in order, taken lazily: collecting them
+            // into a `Vec` first and immediately draining it allocated a second
+            // vector of views per call for nothing.
+            let mut ort_view_iter = owned_outputs.iter_mut().map(|o| o.view_mut());
             let mut output_views: Vec<TensorMut<'_>> = Vec::with_capacity(slot_map.len());
             for (slot_idx, kind) in slot_map.iter().enumerate() {
                 match kind {
@@ -2702,7 +3147,7 @@ unsafe extern "C" fn compute_execute(
                     SlotKind::Absent(idx) => {
                         let buf = &mut absent_bufs[*idx];
                         let shape = &absent_shapes[slot_idx];
-                        let strides = &absent_strides_storage[slot_idx];
+                        let strides = &absent_strides_storage[*idx];
                         let scratch_dtype = absent_dtypes[*idx];
                         let view = TensorMut::new(
                             DevicePtrMut(buf.as_mut_ptr().cast()),
@@ -2728,15 +3173,18 @@ unsafe extern "C" fn compute_execute(
             // The single-node subgraph's operands are this node's operands, but
             // only the present ones are ORT-bound. Placement is resolved lazily
             // inside `prepare_workspace`, past the zero-byte and lifetime gates.
-            let node_ort_operands: Vec<usize> =
-                entry.input_slots.iter().flatten().copied().collect();
+            let subgraph_fallback_memo = std::cell::Cell::new(None);
+            let lookup2_probe = crate::dispatch_probe::Phase::DispatchLookup.enter();
             let workspace = match unsafe {
                 prepare_workspace(
                     api_ref,
                     kernel_context,
                     PlacementSources {
-                        ort_inputs: &node_ort_operands,
-                        subgraph_fallback: scratch_mem_info,
+                        ort_inputs: OrtOperands::Slots(&entry.input_slots),
+                        subgraph_fallback: SubgraphFallback {
+                            staging: exported.device_staging.as_ref(),
+                            memo: &subgraph_fallback_memo,
+                        },
                     },
                     &*entry.kernel,
                     plans,
@@ -2747,6 +3195,8 @@ unsafe extern "C" fn compute_execute(
                 Ok(w) => w,
                 Err(e) => return fail_status(&e),
             };
+            lookup2_probe.end();
+            let kernel_probe = crate::dispatch_probe::Phase::KernelInvoke.enter();
             if let Err(e) =
                 entry
                     .kernel
@@ -2754,7 +3204,13 @@ unsafe extern "C" fn compute_execute(
             {
                 return fail_status(&format!("Compute: kernel execution failed: {e}"));
             }
+            kernel_probe.end();
             EXECUTED_NODE_COUNT.fetch_add(1, Ordering::Relaxed);
+            // `output_views` borrows `owned_outputs`, so the recycle has to
+            // follow its last use. An early `return` above simply skips this and
+            // the next `Run` allocates again -- correct, just not reused.
+            drop(output_views);
+            recycle_output_scratch(owned_outputs, slot_map);
         } else {
             return fail_status(
                 "Compute: multi-node subgraph requires SubgraphRouting — \
@@ -2762,12 +3218,140 @@ unsafe extern "C" fn compute_execute(
             );
         }
 
+        // Every `TensorView` borrowing `inputs` is out of scope by here, so the
+        // vector can go back for the next `Run` on this thread. An early
+        // `return` skips this and the next `Run` allocates again.
+        recycle_input_scratch(inputs);
         ok_status()
     }));
     result.unwrap_or_else(|_| fail_status("Compute: internal panic"))
 }
 
 /// Build a contiguous stride array from a shape (C-order, innermost stride = 1).
+/// Whether a node output slot is ORT-allocated or absent (scratch-backed).
+///
+/// Module scope rather than local to the single-node path so the reusable
+/// scratch below can name it.
+enum SlotKind {
+    Ort,           // present, comes from ORT
+    Absent(usize), // index into absent_bufs
+}
+
+/// Capacity, in elements, above which per-`Run` scratch is dropped instead of
+/// kept. Shared by the input and output scratch.
+///
+/// A node with a handful of outputs is the case worth optimising; one with
+/// hundreds is not worth pinning that memory on every worker thread for the
+/// rest of the process.
+const SCRATCH_MAX_CAPACITY: usize = 16;
+
+thread_local! {
+    /// Reusable per-`Run` output bookkeeping, per thread.
+    ///
+    /// `Vec::new()` plus one `push` allocates capacity 4 -- 736 bytes for
+    /// `OwnedOutput` -- on every `Run`, and `slot_map` allocated again for a
+    /// handful of bytes. Neither vector outlives the call, so a thread can hand
+    /// the same capacity to the next `Run` instead. Thread-local for the same
+    /// reason as `HOST_INTERMEDIATE_POOL`: `Compute` runs on whichever thread
+    /// ORT calls it from, and sharing would need a lock on the hot path to buy
+    /// nothing.
+    ///
+    /// Both vectors are cleared on **recycle**, not on take, so no `OwnedOutput`
+    /// -- and so no raw pointer into a finished `Run`'s ORT values -- is ever
+    /// retained here between calls.
+    static OUTPUT_SCRATCH: std::cell::RefCell<(Vec<crate::kernel_ctx::OwnedOutput>, Vec<SlotKind>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+
+    /// Reusable per-`Run` input metadata, per thread.
+    ///
+    /// `read_inputs` builds one of these per `Run` and it never outlives the
+    /// call. Same ownership story as `OUTPUT_SCRATCH`: `OwnedInput` is inert
+    /// data -- a borrowed pointer plus shape and strides -- with no `Drop`, and
+    /// it is cleared on recycle so no pointer into a finished `Run`'s ORT values
+    /// is parked between calls.
+    static INPUT_SCRATCH: std::cell::RefCell<Vec<crate::kernel_ctx::OwnedInput>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// An empty input vector, reusing this thread's retired capacity.
+pub(crate) fn take_input_scratch(input_count: usize) -> Vec<crate::kernel_ctx::OwnedInput> {
+    let taken = INPUT_SCRATCH.try_with(|cell| {
+        cell.try_borrow_mut()
+            .map(|mut slot| std::mem::take(&mut *slot))
+            .ok()
+    });
+    let mut inputs = match taken {
+        Ok(Some(v)) => v,
+        _ => Vec::new(),
+    };
+    debug_assert!(inputs.is_empty(), "input scratch recycled dirty");
+    inputs.reserve(input_count);
+    inputs
+}
+
+/// Return the input vector for the next `Run` on this thread.
+fn recycle_input_scratch(mut inputs: Vec<crate::kernel_ctx::OwnedInput>) {
+    inputs.clear();
+    if inputs.capacity() > SCRATCH_MAX_CAPACITY {
+        return;
+    }
+    let _ = INPUT_SCRATCH.try_with(|cell| {
+        if let Ok(mut slot) = cell.try_borrow_mut()
+            && slot.capacity() < inputs.capacity()
+        {
+            *slot = inputs;
+        }
+    });
+}
+
+/// Empty output-bookkeeping vectors, reusing this thread's retired capacity.
+///
+/// Returns freshly allocated vectors if the scratch is already borrowed, which
+/// can only happen if a kernel re-entered `Compute` on this thread; correctness
+/// does not depend on reuse.
+fn take_output_scratch(num_outputs: usize) -> (Vec<crate::kernel_ctx::OwnedOutput>, Vec<SlotKind>) {
+    let taken = OUTPUT_SCRATCH.try_with(|cell| {
+        cell.try_borrow_mut()
+            .map(|mut slot| std::mem::take(&mut *slot))
+            .ok()
+    });
+    let (mut owned, mut slots) = match taken {
+        Ok(Some(pair)) => pair,
+        _ => (Vec::new(), Vec::new()),
+    };
+    debug_assert!(
+        owned.is_empty() && slots.is_empty(),
+        "scratch recycled dirty"
+    );
+    owned.reserve(num_outputs);
+    slots.reserve(num_outputs);
+    (owned, slots)
+}
+
+/// Return output-bookkeeping vectors for the next `Run` on this thread.
+fn recycle_output_scratch(
+    mut owned: Vec<crate::kernel_ctx::OwnedOutput>,
+    mut slots: Vec<SlotKind>,
+) {
+    owned.clear();
+    slots.clear();
+    if owned.capacity() > SCRATCH_MAX_CAPACITY || slots.capacity() > SCRATCH_MAX_CAPACITY {
+        return;
+    }
+    let _ = OUTPUT_SCRATCH.try_with(|cell| {
+        if let Ok(mut slot) = cell.try_borrow_mut() {
+            // Keep whichever pair has the larger capacity; a re-entrant call
+            // could have left one here already.
+            if slot.0.capacity() < owned.capacity() {
+                slot.0 = owned;
+            }
+            if slot.1.capacity() < slots.capacity() {
+                slot.1 = slots;
+            }
+        }
+    });
+}
+
 /// How many retired host intermediates one thread keeps for reuse.
 ///
 /// A routed subgraph's live set is bounded by its widest cut, which is small
@@ -2884,6 +3468,68 @@ fn last_reader_per_buffer(
         }
     }
     last
+}
+
+/// Buffers retiring after each node, as a CSR index: node `i` retires the
+/// buffers in `items[starts[i]..starts[i + 1]]`.
+///
+/// The routed loop used to find these by scanning every buffer's last-reader
+/// entry at every node, which is O(nodes x buffers) -- and a chain has a buffer
+/// per node, so it is quadratic in subgraph depth. That cost is invisible at
+/// depth 1 and dominant at depth 100.
+///
+/// Inverting the map once per `Run` makes each node touch only its own
+/// retirements. Within a node they stay in ascending buffer order, as the scan
+/// produced them.
+fn retirements_per_node(
+    input_sources: &[Vec<NodeInputSource>],
+    num_buffers: usize,
+) -> (Vec<usize>, Vec<usize>) {
+    let last = last_reader_per_buffer(input_sources, num_buffers);
+    let nodes = input_sources.len();
+    let mut starts = vec![0usize; nodes + 1];
+    for &reader in last.iter().flatten() {
+        if reader < nodes {
+            starts[reader + 1] += 1;
+        }
+    }
+    for i in 0..nodes {
+        starts[i + 1] += starts[i];
+    }
+    let mut items = vec![0usize; starts[nodes]];
+    let mut cursor = starts.clone();
+    for (buffer, reader) in last.iter().enumerate() {
+        if let Some(reader) = reader
+            && *reader < nodes
+        {
+            items[cursor[*reader]] = buffer;
+            cursor[*reader] += 1;
+        }
+    }
+    (starts, items)
+}
+
+/// Contiguous strides for the *absent* output slots only, in absent-index
+/// order.
+///
+/// Absent slots are the exception, so the routed loop used to build a stride
+/// vector for every output of every node and read it only when a slot turned
+/// out to be absent -- an allocation per output, per node, discarded unused.
+///
+/// The result is keyed by absent index, the same key `Absent(idx)` carries, so
+/// callers index it with `idx` rather than the slot number. Both callers pass
+/// absent slots in ascending slot order, which is the order `idx` was assigned
+/// in, so the two agree by construction.
+fn absent_slot_strides(
+    absent_slots: impl Iterator<Item = usize>,
+    shapes: &[Vec<usize>],
+) -> Vec<Vec<i64>> {
+    absent_slots
+        .map(|slot| match shapes.get(slot) {
+            Some(shape) => contiguous_strides(shape),
+            None => Vec::new(),
+        })
+        .collect()
 }
 
 fn contiguous_strides(shape: &[usize]) -> Vec<i64> {
@@ -4805,6 +5451,146 @@ mod tests {
         );
     }
 
+    /// The CSR index must retire exactly what the per-node scan retired.
+    ///
+    /// This is the property the rewrite trades on, so it is checked against the
+    /// scan itself rather than against hand-written expectations: for every
+    /// node, the buffers the index yields are the buffers whose last reader is
+    /// that node, in the same ascending order the scan visited them.
+    fn scan_retirements(sources: &[Vec<NodeInputSource>], buffers: usize) -> Vec<Vec<usize>> {
+        let last = super::last_reader_per_buffer(sources, buffers);
+        (0..sources.len())
+            .map(|node| {
+                last.iter()
+                    .enumerate()
+                    .filter(|(_, l)| **l == Some(node))
+                    .map(|(buffer, _)| buffer)
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn index_retirements(sources: &[Vec<NodeInputSource>], buffers: usize) -> Vec<Vec<usize>> {
+        let (starts, items) = super::retirements_per_node(sources, buffers);
+        (0..sources.len())
+            .map(|node| items[starts[node]..starts[node + 1]].to_vec())
+            .collect()
+    }
+
+    #[test]
+    fn the_retirement_index_agrees_with_the_scan_it_replaces() {
+        let chain: Vec<Vec<NodeInputSource>> = std::iter::once(vec![NodeInputSource::Ort(0)])
+            .chain((0..9).map(|i| vec![NodeInputSource::Buffer(i)]))
+            .collect();
+        let cases: Vec<(Vec<Vec<NodeInputSource>>, usize)> = vec![
+            // A plain chain: every buffer dies after the node that reads it.
+            (chain, 9),
+            // A buffer read twice must retire only after the later reader, and
+            // must appear exactly once in the index.
+            (
+                vec![
+                    vec![NodeInputSource::Ort(0)],
+                    vec![NodeInputSource::Buffer(0)],
+                    vec![NodeInputSource::Ort(1)],
+                    vec![NodeInputSource::Buffer(0), NodeInputSource::Buffer(1)],
+                ],
+                2,
+            ),
+            // Unread and out-of-range buffers retire nowhere.
+            (
+                vec![
+                    vec![NodeInputSource::Ort(0)],
+                    vec![NodeInputSource::Buffer(0), NodeInputSource::Buffer(7)],
+                    vec![NodeInputSource::Absent],
+                ],
+                2,
+            ),
+            // One node retiring several buffers at once: order must be
+            // ascending, as the scan produced it.
+            (
+                vec![
+                    vec![NodeInputSource::Ort(0)],
+                    vec![NodeInputSource::Ort(1)],
+                    vec![
+                        NodeInputSource::Buffer(2),
+                        NodeInputSource::Buffer(0),
+                        NodeInputSource::Buffer(1),
+                    ],
+                ],
+                3,
+            ),
+            // No buffers at all.
+            (vec![vec![NodeInputSource::Ort(0)]], 0),
+        ];
+        for (sources, buffers) in cases {
+            assert_eq!(
+                index_retirements(&sources, buffers),
+                scan_retirements(&sources, buffers),
+                "retirement index diverged from the scan for {sources:?}"
+            );
+        }
+    }
+
+    /// Every buffer retires exactly once, or storage leaks for the length of
+    /// the subgraph (or worse, is recycled twice).
+    #[test]
+    fn every_read_buffer_retires_exactly_once() {
+        let sources: Vec<Vec<NodeInputSource>> = std::iter::once(vec![NodeInputSource::Ort(0)])
+            .chain((0..20).map(|i| vec![NodeInputSource::Buffer(i)]))
+            .collect();
+        let (starts, items) = super::retirements_per_node(&sources, 20);
+        let mut seen = items.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), items.len(), "a buffer retired twice");
+        assert_eq!(items.len(), 20, "every buffer of a chain is read once");
+        assert_eq!(starts[sources.len()], items.len());
+    }
+
+    /// Absent strides are keyed by absent index, not slot index.
+    ///
+    /// Getting this wrong is invisible for a node with a single absent output
+    /// at slot 0 -- the two indices coincide -- and silently hands the wrong
+    /// strides to every other shape. It is pinned with absent slots that are
+    /// neither first nor contiguous, and with differing shapes per slot so a
+    /// mis-key produces a different answer rather than the same one twice.
+    #[test]
+    fn absent_strides_are_keyed_by_absent_index_not_slot_index() {
+        let shapes = vec![
+            vec![2usize, 3, 4],
+            vec![5usize, 6],
+            vec![7usize, 8, 9],
+            vec![10usize],
+        ];
+        // Slots 1 and 3 are absent, so absent index 0 is slot 1 and absent
+        // index 1 is slot 3.
+        let got = super::absent_slot_strides([1usize, 3].into_iter(), &shapes);
+        assert_eq!(got.len(), 2, "one entry per absent slot, not per output");
+        assert_eq!(got[0], super::contiguous_strides(&shapes[1]));
+        assert_eq!(got[1], super::contiguous_strides(&shapes[3]));
+        assert_ne!(
+            got[0],
+            super::contiguous_strides(&shapes[0]),
+            "keying by slot index would have produced this"
+        );
+    }
+
+    #[test]
+    fn a_node_with_no_absent_outputs_builds_no_absent_strides() {
+        let shapes = vec![vec![2usize, 3], vec![4usize, 5]];
+        assert!(super::absent_slot_strides(std::iter::empty(), &shapes).is_empty());
+    }
+
+    /// An out-of-range slot must not panic in the middle of a `Run`. It cannot
+    /// arise from a well-formed slot map, but this runs inside ORT's callback
+    /// where a panic crosses an FFI boundary.
+    #[test]
+    fn an_out_of_range_absent_slot_yields_empty_strides() {
+        let shapes = vec![vec![2usize, 3]];
+        let got = super::absent_slot_strides([9usize].into_iter(), &shapes);
+        assert_eq!(got, vec![Vec::<i64>::new()]);
+    }
+
     #[test]
     fn recycled_intermediate_storage_is_reused_without_reallocating() {
         super::drain_host_intermediate_pool();
@@ -5233,6 +6019,220 @@ mod tests {
         assert!(view.validate_write_dtype(DataType::Float32).is_ok());
         assert!(view.validate_write_dtype(DataType::Float16).is_err());
     }
+
+    /// An `OwnedOutput` is inert data -- raw pointers plus shape/strides -- so
+    /// these tests never dereference one.
+    fn dummy_owned_output() -> crate::kernel_ctx::OwnedOutput {
+        crate::kernel_ctx::OwnedOutput {
+            data_ptr: std::ptr::null_mut(),
+            dtype: DataType::Float32,
+            shape: crate::dim_vec::DimVec::zeroed(1),
+            strides: crate::dim_vec::DimVec::zeroed(1),
+            mem_info: std::ptr::null(),
+        }
+    }
+
+    fn dummy_owned_input() -> crate::kernel_ctx::OwnedInput {
+        crate::kernel_ctx::OwnedInput {
+            data_ptr: std::ptr::null(),
+            dtype: DataType::Float32,
+            shape: crate::dim_vec::DimVec::zeroed(1),
+            strides: crate::dim_vec::DimVec::zeroed(1),
+        }
+    }
+
+    #[test]
+    fn input_scratch_hands_back_capacity_it_retired() {
+        // Fill past the capacity an empty `Vec::reserve(1)` reaches on its own,
+        // or the assertion below would hold whether or not reuse happened.
+        let mut inputs = take_input_scratch(1);
+        for _ in 0..SCRATCH_MAX_CAPACITY {
+            inputs.push(dummy_owned_input());
+        }
+        let cap = inputs.capacity();
+        assert!(
+            cap > 4,
+            "retired capacity {cap} is one a fresh vector reaches anyway"
+        );
+        recycle_input_scratch(inputs);
+
+        let inputs = take_input_scratch(1);
+        assert!(inputs.is_empty(), "reused scratch must start empty");
+        assert!(
+            inputs.capacity() >= cap,
+            "capacity was not reused: {} vs {cap}",
+            inputs.capacity()
+        );
+        recycle_input_scratch(inputs);
+    }
+
+    /// The scratch must not hold an `OwnedInput` between `Run`s: those borrow
+    /// pointers into ORT values belonging to a call that has finished.
+    #[test]
+    fn input_scratch_retains_no_inputs_between_runs() {
+        let mut inputs = take_input_scratch(2);
+        inputs.push(dummy_owned_input());
+        recycle_input_scratch(inputs);
+
+        INPUT_SCRATCH.with(|cell| {
+            let slot = cell.borrow();
+            assert!(
+                slot.is_empty(),
+                "parked scratch still holds {} inputs",
+                slot.len()
+            );
+        });
+    }
+
+    #[test]
+    fn input_scratch_does_not_pin_a_pathological_capacity() {
+        let over = SCRATCH_MAX_CAPACITY + 1;
+        let mut inputs = take_input_scratch(over);
+        inputs.push(dummy_owned_input());
+        recycle_input_scratch(inputs);
+
+        INPUT_SCRATCH.with(|cell| {
+            assert!(
+                cell.borrow().capacity() <= SCRATCH_MAX_CAPACITY,
+                "oversized scratch was parked: {}",
+                cell.borrow().capacity()
+            );
+        });
+    }
+
+    /// A kernel that re-enters `Compute` on this thread finds the cell borrowed.
+    /// That must degrade to a fresh allocation, not panic.
+    #[test]
+    fn input_scratch_is_reentrancy_safe() {
+        INPUT_SCRATCH.with(|cell| {
+            let _held = cell.borrow_mut();
+            let mut inputs = take_input_scratch(2);
+            inputs.push(dummy_owned_input());
+            assert_eq!(inputs.len(), 1);
+            recycle_input_scratch(inputs);
+        });
+    }
+
+    #[test]
+    fn output_scratch_hands_back_capacity_it_retired() {
+        // Grow past the capacity a fresh vector reaches on its own. An empty
+        // `Vec::reserve(1)` already yields capacity 4 for these element sizes,
+        // so retiring only 4 would assert nothing: the check would pass whether
+        // or not the capacity came back. Fill to the cap instead.
+        let (mut owned, mut slots) = take_output_scratch(1);
+        for _ in 0..SCRATCH_MAX_CAPACITY {
+            owned.push(dummy_owned_output());
+            slots.push(SlotKind::Ort);
+        }
+        let (owned_cap, slots_cap) = (owned.capacity(), slots.capacity());
+        assert!(
+            owned_cap > 4 && slots_cap > 4,
+            "retired capacity {owned_cap}/{slots_cap} is one a fresh vector reaches anyway"
+        );
+        recycle_output_scratch(owned, slots);
+
+        let (owned, slots) = take_output_scratch(1);
+        assert!(
+            owned.is_empty() && slots.is_empty(),
+            "reused scratch must start empty"
+        );
+        assert!(
+            owned.capacity() >= owned_cap && slots.capacity() >= slots_cap,
+            "capacity was not reused: {} vs {owned_cap}, {} vs {slots_cap}",
+            owned.capacity(),
+            slots.capacity()
+        );
+        recycle_output_scratch(owned, slots);
+    }
+
+    /// The scratch must not hold an `OwnedOutput` between `Run`s: those carry
+    /// raw pointers into ORT values belonging to a call that has finished.
+    #[test]
+    fn output_scratch_retains_no_outputs_between_runs() {
+        let (mut owned, mut slots) = take_output_scratch(2);
+        owned.push(dummy_owned_output());
+        slots.push(SlotKind::Absent(0));
+        recycle_output_scratch(owned, slots);
+
+        OUTPUT_SCRATCH.with(|cell| {
+            let slot = cell.borrow();
+            assert!(
+                slot.0.is_empty() && slot.1.is_empty(),
+                "parked scratch still holds {} outputs / {} slots",
+                slot.0.len(),
+                slot.1.len()
+            );
+        });
+        let (owned, slots) = take_output_scratch(1);
+        assert!(owned.is_empty() && slots.is_empty());
+        recycle_output_scratch(owned, slots);
+    }
+
+    #[test]
+    fn output_scratch_does_not_pin_a_pathological_capacity() {
+        let over = SCRATCH_MAX_CAPACITY + 1;
+        let (mut owned, mut slots) = take_output_scratch(over);
+        assert!(owned.capacity() >= over);
+        owned.push(dummy_owned_output());
+        slots.push(SlotKind::Ort);
+        recycle_output_scratch(owned, slots);
+
+        OUTPUT_SCRATCH.with(|cell| {
+            let slot = cell.borrow();
+            assert!(
+                slot.0.capacity() <= SCRATCH_MAX_CAPACITY
+                    && slot.1.capacity() <= SCRATCH_MAX_CAPACITY,
+                "oversized scratch was parked: {} / {}",
+                slot.0.capacity(),
+                slot.1.capacity()
+            );
+        });
+    }
+
+    /// A kernel that re-enters `Compute` on this thread finds the scratch
+    /// already borrowed. That must degrade to a fresh allocation, not panic.
+    #[test]
+    fn output_scratch_is_reentrancy_safe() {
+        OUTPUT_SCRATCH.with(|cell| {
+            let _held = cell.borrow_mut();
+            let (mut owned, mut slots) = take_output_scratch(2);
+            owned.push(dummy_owned_output());
+            slots.push(SlotKind::Ort);
+            assert_eq!(owned.len(), 1);
+            // Recycling while the cell is borrowed must also not panic.
+            recycle_output_scratch(owned, slots);
+        });
+    }
+
+    /// Thread-local, so two threads never share a buffer -- concurrent `Run`s
+    /// on different threads cannot alias each other's output bookkeeping.
+    #[test]
+    fn output_scratch_is_per_thread() {
+        // Park a capacity a fresh `Vec` would not land on by itself: an empty
+        // `Vec::reserve(1)` already gives 4 for this element size, so a smaller
+        // parked capacity could not tell reuse from a coincidence.
+        let (mut owned, mut slots) = take_output_scratch(SCRATCH_MAX_CAPACITY);
+        for _ in 0..SCRATCH_MAX_CAPACITY {
+            owned.push(dummy_owned_output());
+            slots.push(SlotKind::Ort);
+        }
+        let parked = owned.capacity();
+        assert!(parked >= SCRATCH_MAX_CAPACITY);
+        recycle_output_scratch(owned, slots);
+
+        let other = std::thread::spawn(|| {
+            let (owned, slots) = take_output_scratch(1);
+            let cap = owned.capacity();
+            recycle_output_scratch(owned, slots);
+            cap
+        })
+        .join()
+        .unwrap();
+        assert!(
+            other < parked,
+            "a fresh thread reused another thread's capacity: {other} vs {parked}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5380,9 +6380,10 @@ mod workspace_plan_cache_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use onnx_runtime_ep_api::kernel::{TensorMetadata, WorkspaceRequirement};
+    use onnx_runtime_ep_api::tensor::{DevicePtr, TensorView};
     use onnx_runtime_ir::DataType;
 
-    use super::{WORKSPACE_PLAN_CACHE_CAPACITY, WorkspacePlanCache};
+    use super::{OperandKey, WORKSPACE_PLAN_CACHE_CAPACITY, WorkspacePlanCache};
 
     fn requirement(bytes: u64) -> WorkspaceRequirement {
         WorkspaceRequirement {
@@ -5429,9 +6430,63 @@ mod workspace_plan_cache_tests {
         TensorMetadata::new(dtype, shape, present)
     }
 
+    /// The signature every dispatch is actually using must survive eviction.
+    ///
+    /// The cache evicts from the back, so without move-to-front the first
+    /// signature inserted drifts to the back and is evicted even though it is
+    /// the hot one -- silently restoring the expensive planning call the cache
+    /// exists to avoid. Asserted on observed planning calls, not on cache
+    /// state.
+    #[test]
+    fn a_repeatedly_used_signature_survives_eviction() {
+        // Locked path on purpose: the lock-free slot would serve the repeat
+        // access below and the assertion would hold with move-to-front gone.
+        let cache = WorkspacePlanCache::locked_only();
+        let planner = CountingPlanner::new();
+
+        let hot_shape = vec![1usize];
+        let hot = [meta(DataType::Float32, &hot_shape, true)];
+        cache.get_or_plan(&hot, || planner.plan(&hot)).unwrap();
+
+        // Fill the rest of the cache. `hot` is now at the back, next to evict.
+        let cold: Vec<Vec<usize>> = (2..=WORKSPACE_PLAN_CACHE_CAPACITY)
+            .map(|n| vec![n])
+            .collect();
+        for sh in &cold {
+            let m = [meta(DataType::Float32, sh, true)];
+            cache.get_or_plan(&m, || planner.plan(&m)).unwrap();
+        }
+
+        // Using `hot` again is the access that must promote it.
+        let before = planner.calls();
+        cache.get_or_plan(&hot, || planner.plan(&hot)).unwrap();
+        assert_eq!(
+            planner.calls(),
+            before,
+            "hot signature was already lost before any eviction"
+        );
+
+        // One more distinct signature evicts whatever is at the back.
+        let evictor_shape = vec![WORKSPACE_PLAN_CACHE_CAPACITY + 1];
+        let evictor = [meta(DataType::Float32, &evictor_shape, true)];
+        cache
+            .get_or_plan(&evictor, || planner.plan(&evictor))
+            .unwrap();
+
+        let before = planner.calls();
+        let got = cache.get_or_plan(&hot, || planner.plan(&hot)).unwrap();
+        assert_eq!(
+            planner.calls(),
+            before,
+            "the signature every dispatch uses was evicted -- move-to-front is not promoting it"
+        );
+        assert_eq!(got.bytes, 4, "wrong plan served for the hot signature");
+    }
+
     /// The point of the cache: the second dispatch of an unchanged shape must
     /// not re-run the planner. Falsifier — delete the lookup and the call count
     /// becomes 2.
+
     #[test]
     fn a_repeated_signature_plans_exactly_once() {
         let cache = WorkspacePlanCache::new();
@@ -5621,9 +6676,11 @@ mod workspace_plan_cache_tests {
     }
 
     /// The hot signature must survive a one-off shape (a single prefill step
-    /// among many decode steps). Falsifier — remove the move-to-front on hit
-    /// and the interleaved decode signature is evicted, so the planner runs
-    /// once per iteration instead of once in total.
+    /// among many decode steps). The flood must run *past* capacity: filling
+    /// the cache to exactly capacity never evicts anything, so a shorter loop
+    /// passes with or without the promotion and proves nothing. Falsifier —
+    /// remove the move-to-front on hit and the hot signature drifts to the
+    /// back, gets evicted, and the planner runs again mid-flood.
     #[test]
     fn the_hot_signature_survives_a_flood_of_one_off_shapes() {
         let cache = WorkspacePlanCache::new();
@@ -5636,7 +6693,8 @@ mod workspace_plan_cache_tests {
             .expect("plan");
         let after_hot = planner.calls();
 
-        for n in 1..=(WORKSPACE_PLAN_CACHE_CAPACITY - 1) {
+        let flood = WORKSPACE_PLAN_CACHE_CAPACITY * 2;
+        for n in 1..=flood {
             let cold = [n];
             let cold_meta = [meta(DataType::Float32, &cold, true)];
             cache
@@ -5649,7 +6707,7 @@ mod workspace_plan_cache_tests {
         }
         assert_eq!(
             planner.calls(),
-            after_hot + (WORKSPACE_PLAN_CACHE_CAPACITY - 1),
+            after_hot + flood,
             "only the cold signatures may have been planned; the hot one must have stayed cached"
         );
     }
@@ -5757,6 +6815,678 @@ mod workspace_plan_cache_tests {
             planner.calls(),
             1,
             "the cached plan must survive the poisoning"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Lock-free fast path (#1077 lever 3)
+    // ──────────────────────────────────────────────────────────────────────
+
+    fn view<'a>(
+        data: &'a [u8],
+        dtype: DataType,
+        shape: &'a [usize],
+        strides: &'a [i64],
+    ) -> TensorView<'a> {
+        TensorView::new(
+            DevicePtr(data.as_ptr().cast()),
+            dtype,
+            shape,
+            strides,
+            onnx_runtime_ir::DeviceId::cpu(),
+        )
+    }
+
+    /// The fast path compares against `TensorView`s to avoid building the
+    /// metadata `Vec`, so its comparison must be indistinguishable from the
+    /// metadata one. Falsifier: drop any field from `matches_view` and a
+    /// disagreement appears here.
+    #[test]
+    fn the_view_and_metadata_comparisons_agree() {
+        let data = [0u8; 64];
+        let strides = [1i64; 3];
+        let shapes: [&[usize]; 3] = [&[8], &[2, 3], &[]];
+        for dtype in [DataType::Float32, DataType::Float16] {
+            for shape in shapes {
+                for absent in [false, true] {
+                    let v = if absent {
+                        TensorView::absent(dtype)
+                    } else {
+                        view(&data, dtype, shape, &strides[..shape.len()])
+                    };
+                    let m = TensorMetadata::new(v.dtype, v.shape, !v.is_absent());
+                    let exact = OperandKey {
+                        dtype: m.dtype,
+                        present: m.present,
+                        shape: m.shape.to_vec(),
+                    };
+                    assert_eq!(
+                        exact.matches(&m),
+                        exact.matches_view(&v),
+                        "view and metadata comparison disagree on a matching key"
+                    );
+                    for wrong in [
+                        OperandKey {
+                            dtype: m.dtype,
+                            present: !m.present,
+                            shape: m.shape.to_vec(),
+                        },
+                        OperandKey {
+                            dtype: m.dtype,
+                            present: m.present,
+                            shape: vec![99],
+                        },
+                    ] {
+                        assert_eq!(
+                            wrong.matches(&m),
+                            wrong.matches_view(&v),
+                            "view and metadata comparison disagree on a mismatching key"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A signature is published only once it recurs, and the published plan is
+    /// then served without re-planning.
+    #[test]
+    fn a_recurring_signature_is_published_to_the_lock_free_slot() {
+        let cache = WorkspacePlanCache::new();
+        let planner = CountingPlanner::new();
+        let data = [0u8; 64];
+        let shape = [8usize];
+        let strides = [1i64];
+        let inputs = [view(&data, DataType::Float32, &shape, &strides)];
+
+        cache
+            .get_or_plan_views(&inputs, |m| planner.plan(m))
+            .expect("plan");
+        assert!(
+            cache.hot.get().is_none(),
+            "a signature seen once must not be published: a prefill shape may never recur"
+        );
+
+        cache
+            .get_or_plan_views(&inputs, |m| planner.plan(m))
+            .expect("plan");
+        assert!(
+            cache.hot.get().is_some(),
+            "a signature seen twice must be published"
+        );
+
+        let before = planner.calls();
+        let got = cache
+            .get_or_plan_views(&inputs, |_| {
+                panic!("the published plan must not be re-planned")
+            })
+            .expect("served from the lock-free slot");
+        assert_eq!(got.bytes, 8 * 4);
+        assert_eq!(planner.calls(), before);
+    }
+
+    /// The published plan must be readable while the cache lock is held by
+    /// someone else — that is what "lock-free" means here. Falsifier: make the
+    /// fast path take `plans.lock()` and this times out.
+    #[test]
+    fn a_published_plan_is_served_while_the_lock_is_held() {
+        let cache = Arc::new(WorkspacePlanCache::new());
+        let planner = CountingPlanner::new();
+        let data = [0u8; 64];
+        let shape = [8usize];
+        let strides = [1i64];
+        let inputs = [view(&data, DataType::Float32, &shape, &strides)];
+        for _ in 0..2 {
+            cache
+                .get_or_plan_views(&inputs, |m| planner.plan(m))
+                .expect("plan");
+        }
+        assert!(cache.hot.get().is_some(), "signature must be published");
+
+        let held = cache.plans.lock().expect("lock");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = {
+            let cache = Arc::clone(&cache);
+            std::thread::spawn(move || {
+                let data = [0u8; 64];
+                let shape = [8usize];
+                let strides = [1i64];
+                let inputs = [view(&data, DataType::Float32, &shape, &strides)];
+                let got = cache
+                    .get_or_plan_views(&inputs, |_| panic!("must not re-plan"))
+                    .expect("served");
+                let _ = tx.send(got.bytes);
+            })
+        };
+        let bytes = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the fast path blocked on the cache lock");
+        assert_eq!(bytes, 8 * 4);
+        drop(held);
+        reader.join().expect("reader thread");
+    }
+
+    /// Publication must pick the *recurring* signature, not merely the first
+    /// one: a decoder's first `Run` is a prefill whose shape may never return.
+    #[test]
+    fn the_published_plan_is_the_recurring_shape_not_the_first_one() {
+        let cache = WorkspacePlanCache::new();
+        let planner = CountingPlanner::new();
+        let data = [0u8; 512];
+        let strides = [1i64];
+        let prefill = [32usize];
+        let decode = [1usize];
+
+        let p = [view(&data, DataType::Float32, &prefill, &strides)];
+        cache
+            .get_or_plan_views(&p, |m| planner.plan(m))
+            .expect("plan");
+        let d = [view(&data, DataType::Float32, &decode, &strides)];
+        for _ in 0..2 {
+            cache
+                .get_or_plan_views(&d, |m| planner.plan(m))
+                .expect("plan");
+        }
+
+        let published = cache.hot.get().expect("a recurring signature must publish");
+        assert_eq!(
+            published.operands[0].shape.as_slice(),
+            &decode[..],
+            "the one-off prefill shape was pinned instead of the recurring decode shape"
+        );
+        assert_eq!(published.requirement.bytes, 4);
+    }
+
+    /// Falsification of fast-path bypass: once a signature is published, every
+    /// *other* signature must still be planned on its own terms. Deleting any
+    /// field from the fast-path comparison makes one of these serve a stale
+    /// plan.
+    #[test]
+    fn the_lock_free_slot_is_never_served_for_a_different_signature() {
+        let data = [0u8; 512];
+        let strides = [1i64; 2];
+        let hot_shape = [8usize];
+
+        // Each case: (label, the differing operand list, the bytes its own
+        // plan must produce).
+        let publish = |cache: &WorkspacePlanCache, planner: &CountingPlanner| {
+            let inputs = [view(&data, DataType::Float32, &hot_shape, &strides[..1])];
+            for _ in 0..2 {
+                cache
+                    .get_or_plan_views(&inputs, |m| planner.plan(m))
+                    .expect("plan");
+            }
+            assert!(cache.hot.get().is_some(), "publication precondition failed");
+        };
+
+        // Changed shape.
+        {
+            let cache = WorkspacePlanCache::new();
+            let planner = CountingPlanner::new();
+            publish(&cache, &planner);
+            let other_shape = [4usize];
+            let other = [view(&data, DataType::Float32, &other_shape, &strides[..1])];
+            let got = cache
+                .get_or_plan_views(&other, |m| planner.plan(m))
+                .expect("plan");
+            assert_eq!(
+                got.bytes,
+                4 * 4,
+                "a changed shape was served the published plan"
+            );
+        }
+        // Changed dtype.
+        {
+            let cache = WorkspacePlanCache::new();
+            let planner = CountingPlanner::new();
+            publish(&cache, &planner);
+            let other = [view(&data, DataType::Float16, &hot_shape, &strides[..1])];
+            let got = cache
+                .get_or_plan_views(&other, |m| planner.plan(m))
+                .expect("plan");
+            assert_eq!(
+                got.bytes,
+                8 * 2,
+                "a changed dtype was served the published plan"
+            );
+        }
+        // Changed presence: an omitted optional slot.
+        {
+            let cache = WorkspacePlanCache::new();
+            let planner = CountingPlanner::new();
+            publish(&cache, &planner);
+            let other = [TensorView::absent(DataType::Float32)];
+            let got = cache
+                .get_or_plan_views(&other, |m| planner.plan(m))
+                .expect("plan");
+            assert_eq!(
+                got.bytes, 1,
+                "an absent optional slot was served the present operand's plan"
+            );
+        }
+        // Changed arity.
+        {
+            let cache = WorkspacePlanCache::new();
+            let planner = CountingPlanner::new();
+            publish(&cache, &planner);
+            let other = [
+                view(&data, DataType::Float32, &hot_shape, &strides[..1]),
+                view(&data, DataType::Float32, &hot_shape, &strides[..1]),
+            ];
+            let got = cache
+                .get_or_plan_views(&other, |m| planner.plan(m))
+                .expect("plan");
+            assert_eq!(
+                got.bytes,
+                8 * 4 * 2,
+                "a longer operand list was served the shorter signature's plan"
+            );
+        }
+    }
+
+    /// Concurrent dispatches of interleaved signatures must each receive their
+    /// own plan, whichever one wins publication.
+    #[test]
+    fn concurrent_dispatches_never_receive_another_signatures_plan() {
+        let cache = Arc::new(WorkspacePlanCache::new());
+        let planner = Arc::new(CountingPlanner::new());
+        let mut handles = Vec::new();
+        for t in 0..8usize {
+            let cache = Arc::clone(&cache);
+            let planner = Arc::clone(&planner);
+            handles.push(std::thread::spawn(move || {
+                let data = [0u8; 512];
+                let strides = [1i64];
+                for i in 0..250usize {
+                    let n = 1 + ((t + i) % 5);
+                    let shape = [n * 2];
+                    let inputs = [view(&data, DataType::Float32, &shape, &strides)];
+                    let got = cache
+                        .get_or_plan_views(&inputs, |m| planner.plan(m))
+                        .expect("plan");
+                    assert_eq!(
+                        got.bytes as usize,
+                        n * 2 * 4,
+                        "a concurrent dispatch received another signature's plan"
+                    );
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread");
+        }
+    }
+}
+
+/// Pins the FFI cost of resolving where a routed subgraph's intermediates
+/// should live — a question every `Compute` call asks, before any kernel runs.
+///
+/// A host EP takes the longest path through `device_mem_info`: the scan finds
+/// nothing device-resident, so it runs to completion and then falls back. The
+/// count below is what that costs, and it is the per-`Run` fixed overhead
+/// #1077 measures as ~0.9 us worse than ORT's.
+#[cfg(all(test, feature = "dispatch_probe"))]
+mod mem_info_cost {
+    use super::*;
+    use crate::dispatch_probe::{self, Event};
+
+    const MI: *const ort::OrtMemoryInfo = std::ptr::without_provenance(3);
+    const VALUE: *const ort::OrtValue = std::ptr::without_provenance(4);
+    const RECON: *const ort::OrtMemoryInfo = std::ptr::without_provenance(5);
+
+    /// A device EP's staging context with a reconstructed memory info of the
+    /// given device-ness.
+    ///
+    /// Built directly rather than through `set_device_staging`, which would
+    /// need a live ORT to call `CreateMemoryInfo_V2`. Dropping the result is
+    /// safe with no host API installed: `ReconstructedMemInfo::drop` returns
+    /// early when `host_api()` is null, so the sentinel pointer is never
+    /// passed to `ReleaseMemoryInfo`.
+    fn staging_with_recon(ptr: *const ort::OrtMemoryInfo, is_device: bool) -> DeviceStaging {
+        struct NoCopier;
+        impl HostToDeviceCopier for NoCopier {
+            unsafe fn copy_host_to_device(
+                &self,
+                _src: &[u8],
+                _dst: *mut std::ffi::c_void,
+            ) -> onnx_runtime_ep_api::Result<()> {
+                unreachable!("scratch placement must not copy")
+            }
+        }
+        assert!(
+            crate::status::host_api().is_null(),
+            "test builds a ReconstructedMemInfo over a sentinel pointer; a live \
+             host API would hand it to ReleaseMemoryInfo on drop"
+        );
+        DeviceStaging {
+            copier: Arc::new(NoCopier),
+            recon_mem_info: Some(ReconstructedMemInfo { ptr, is_device }),
+        }
+    }
+
+    unsafe extern "C" fn count_1(
+        _c: *const ort::OrtKernelContext,
+        out: *mut usize,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = 1 };
+        std::ptr::null_mut()
+    }
+    unsafe extern "C" fn get_input(
+        _c: *const ort::OrtKernelContext,
+        _i: usize,
+        out: *mut *const ort::OrtValue,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = VALUE };
+        std::ptr::null_mut()
+    }
+    unsafe extern "C" fn tensor_mem_info(
+        _v: *const ort::OrtValue,
+        out: *mut *const ort::OrtMemoryInfo,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = MI };
+        std::ptr::null_mut()
+    }
+    /// Always reports host memory — the answer a CPU EP always gets, and the
+    /// branch that makes the scan run to completion.
+    unsafe extern "C" fn device_type_cpu(
+        _m: *const ort::OrtMemoryInfo,
+        out: *mut ort::OrtMemoryInfoDeviceType,
+    ) {
+        unsafe { *out = ort::OrtMemoryInfoDeviceType_CPU };
+    }
+    unsafe extern "C" fn device_type_gpu(
+        _m: *const ort::OrtMemoryInfo,
+        out: *mut ort::OrtMemoryInfoDeviceType,
+    ) {
+        unsafe { *out = ort::OrtMemoryInfoDeviceType_GPU };
+    }
+
+    fn api(host: bool) -> ort::OrtApi {
+        let mut api: ort::OrtApi = unsafe { std::mem::zeroed() };
+        api.KernelContext_GetInputCount = Some(count_1);
+        api.KernelContext_GetInput = Some(get_input);
+        api.GetTensorMemoryInfo = Some(tensor_mem_info);
+        api.MemoryInfoGetDeviceType = Some(if host {
+            device_type_cpu
+        } else {
+            device_type_gpu
+        });
+        api
+    }
+
+    /// Four calls for a one-input host node: the input count, then `GetInput`,
+    /// `GetTensorMemoryInfo` and `MemoryInfoGetDeviceType` for that input.
+    ///
+    /// It was seven. The scan used to discard input 0's memory info and ask ORT
+    /// for it again at the fallback (two calls for a value it had already
+    /// seen), and the caller then asked a third time whether the result was a
+    /// device — a fact this function had just established and thrown away.
+    #[test]
+    fn resolving_host_scratch_costs_four_ort_calls() {
+        let api = api(true);
+        let before = dispatch_probe::snapshot();
+        let got = unsafe { device_mem_info(&api, std::ptr::null_mut(), None) };
+        let d = dispatch_probe::snapshot().since(&before);
+
+        assert_eq!(
+            got,
+            Some((MI, false)),
+            "host memory, reported as not device"
+        );
+        assert_eq!(
+            d.event(Event::OrtFfiCall),
+            4,
+            "FFI cost of resolving scratch placement changed"
+        );
+    }
+
+    /// A device-resident input short-circuits the scan, and the device-ness
+    /// comes back with it rather than costing another query.
+    #[test]
+    fn a_device_input_short_circuits_and_reports_itself() {
+        let api = api(false);
+        let before = dispatch_probe::snapshot();
+        let got = unsafe { device_mem_info(&api, std::ptr::null_mut(), None) };
+        let d = dispatch_probe::snapshot().since(&before);
+
+        assert_eq!(got, Some((MI, true)));
+        assert_eq!(d.event(Event::OrtFfiCall), 4);
+    }
+
+    /// A routed `Run` must resolve subgraph placement **at most once**, no
+    /// matter how many of its nodes reach the fallback.
+    ///
+    /// Deferring the resolution out of the per-`Run` prologue traded an
+    /// unconditional cost for a lazy one; without the memo it would also have
+    /// traded "once per `Run`" for "once per node", which for a fused subgraph
+    /// whose nodes each request a step-scoped workspace is strictly worse than
+    /// what it replaced.
+    #[test]
+    fn the_subgraph_fallback_resolves_once_per_run_however_many_nodes_ask() {
+        let api = api(true);
+        let memo = std::cell::Cell::new(None);
+        let fallback = SubgraphFallback {
+            staging: None,
+            memo: &memo,
+        };
+
+        let before = dispatch_probe::snapshot();
+        let first = unsafe { fallback.resolve(&api, std::ptr::null_mut()) };
+        let after_first = dispatch_probe::snapshot();
+        for _ in 0..8 {
+            assert_eq!(
+                unsafe { fallback.resolve(&api, std::ptr::null_mut()) },
+                first,
+                "memoised resolution changed its answer"
+            );
+        }
+        let after_rest = dispatch_probe::snapshot();
+
+        assert_eq!(first, Some(MI));
+        assert!(
+            after_first.since(&before).event(Event::OrtFfiCall) > 0,
+            "first resolution should actually query ORT"
+        );
+        assert_eq!(
+            after_rest.since(&after_first).event(Event::OrtFfiCall),
+            0,
+            "nodes after the first must not re-query placement"
+        );
+    }
+
+    /// A node that *does* bind ORT inputs never reaches the fallback, so the
+    /// memo must stay unresolved -- the lazy path has to be lazy, not merely
+    /// cached. This is the case every elementwise dispatch takes.
+    #[test]
+    fn a_node_with_ort_inputs_never_resolves_the_subgraph_fallback() {
+        let api = api(true);
+        let memo = std::cell::Cell::new(None);
+
+        let got = unsafe {
+            operand_mem_info(
+                &api,
+                std::ptr::null_mut(),
+                PlacementSources {
+                    ort_inputs: OrtOperands::Resolved(&[0]),
+                    subgraph_fallback: SubgraphFallback {
+                        staging: None,
+                        memo: &memo,
+                    },
+                },
+            )
+        };
+
+        assert!(
+            !matches!(got, OperandMemInfo::Unavailable),
+            "an operand-backed node should resolve from its own operands"
+        );
+        assert_eq!(
+            memo.get(),
+            None,
+            "the subgraph fallback must not be resolved for a node that binds \
+             ORT inputs"
+        );
+    }
+
+    /// The placement shortcut keys on `host_accessible`, and that flag must
+    /// default to the *conservative* answer.
+    ///
+    /// `host_accessible` is what the factory registers the allocator on, so it
+    /// is the only honest statement about where ORT puts this EP's tensors. It
+    /// must not be inferred from `device_staging`: that tracks
+    /// `host_to_device_copier()`, which defaults to `None` and which a device
+    /// EP may legitimately decline, so a device EP can have no staging *and*
+    /// device-resident inputs -- exactly what
+    /// `a_device_input_short_circuits_and_reports_itself` above demonstrates.
+    /// Defaulting to `false` means a forgotten setter costs FFI calls, not
+    /// correctness.
+    #[test]
+    fn compute_info_assumes_device_placement_until_told_otherwise() {
+        let mut info = ExportedComputeInfo::new(Vec::new());
+        assert!(
+            !info.host_accessible,
+            "default must be the conservative 'assume device', so an unset \
+             flag keeps the full memory-info scan"
+        );
+        assert!(
+            info.device_staging.is_none(),
+            "and staging must stay independent of it"
+        );
+
+        info.set_host_accessible(true);
+        assert!(info.host_accessible);
+    }
+
+    /// The regression test for the defect review caught: a **device** EP that
+    /// declined `host_to_device_copier()` has no staging context, and must
+    /// still scan for device placement.
+    ///
+    /// Keying the shortcut on staging presence -- as the first cut of this
+    /// change did -- classifies exactly this EP as host, so its routed
+    /// subgraph's intermediates get host buffers and its next device kernel
+    /// dereferences a host pointer as device memory.
+    /// `a_device_input_short_circuits_and_reports_itself` shows the scan such
+    /// an EP performs really does report a device input.
+    #[test]
+    fn a_device_ep_that_declined_staging_still_scans_for_placement() {
+        assert!(
+            must_scan_for_device_placement(false, None),
+            "a device EP without a copier must not be mistaken for a host EP"
+        );
+        // ...and staging presence must not sway the decision either way.
+        let staging = staging_with_recon(RECON, true);
+        assert!(must_scan_for_device_placement(false, Some(&staging)));
+        assert!(!must_scan_for_device_placement(true, Some(&staging)));
+        assert!(!must_scan_for_device_placement(true, None));
+    }
+
+    /// The two stock `DeviceSupport` recipes must keep disagreeing about
+    /// placement, since the shortcut above is only sound while they do.
+    #[test]
+    fn stock_device_support_recipes_declare_opposite_placement() {
+        use crate::device::DeviceSupport;
+        assert!(DeviceSupport::cpu_only().host_accessible);
+        assert!(!DeviceSupport::gpu("Gpu", 0).host_accessible);
+    }
+
+    /// The fallback still works when the scan cannot run at all, which is the
+    /// one case that legitimately needs the extra fetch. Behaviour here is what
+    /// it always was; only the cheap path got cheaper.
+    #[test]
+    fn a_missing_input_count_still_falls_back_to_input_zero() {
+        let mut api = api(true);
+        api.KernelContext_GetInputCount = None;
+        let got = unsafe { device_mem_info(&api, std::ptr::null_mut(), None) };
+        assert_eq!(got, Some((MI, false)));
+    }
+
+    /// A node with no inputs has nothing to scan and nothing to fall back on
+    /// beyond input 0, which does not exist either. It must not invent one.
+    #[test]
+    fn a_node_with_no_inputs_reports_no_memory_info() {
+        unsafe extern "C" fn none(
+            _c: *const ort::OrtKernelContext,
+            out: *mut usize,
+        ) -> ort::OrtStatusPtr {
+            unsafe { *out = 0 };
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn no_value(
+            _c: *const ort::OrtKernelContext,
+            _i: usize,
+            out: *mut *const ort::OrtValue,
+        ) -> ort::OrtStatusPtr {
+            unsafe { *out = std::ptr::null() };
+            std::ptr::null_mut()
+        }
+        let mut api = api(true);
+        api.KernelContext_GetInputCount = Some(none);
+        api.KernelContext_GetInput = Some(no_value);
+        assert_eq!(
+            unsafe { device_mem_info(&api, std::ptr::null_mut(), None) },
+            None
+        );
+    }
+
+    /// A device EP whose node has only host-resident inputs falls back to the
+    /// memory info reconstructed from its own device recipe, so intermediates
+    /// still land on the device.
+    ///
+    /// The old code returned that pointer and left the caller to ask ORT
+    /// whether it was a device; the device-ness is now carried alongside it.
+    /// This is the one branch whose reporting changed, so it is pinned
+    /// explicitly rather than left to the host-EP tests.
+    #[test]
+    fn all_host_inputs_on_a_device_ep_fall_back_to_the_reconstructed_device_info() {
+        let staging = staging_with_recon(RECON, true);
+        let api = api(true);
+        let before = dispatch_probe::snapshot();
+        let got = unsafe { device_mem_info(&api, std::ptr::null_mut(), Some(&staging)) };
+        let d = dispatch_probe::snapshot().since(&before);
+
+        assert_eq!(
+            got,
+            Some((RECON, true)),
+            "device scratch target, reported as a device"
+        );
+        assert_eq!(
+            d.event(Event::OrtFfiCall),
+            4,
+            "the fallback must not re-ask ORT about the info it just built"
+        );
+    }
+
+    /// The device-ness of the reconstructed info is recorded from the
+    /// `device_type` it was built with, not hardcoded.
+    ///
+    /// Nothing in `HostToDeviceCopier` obliges an EP that provides a copier to
+    /// be non-CPU. Every one that exists today is, which is what makes a
+    /// hardcoded `true` look safe -- but a CPU-typed EP that grew a copier
+    /// would be handed host memory as a device scratch target, and the staging
+    /// path would treat host pointers as device pointers. `mem_info_is_device`
+    /// is exactly `device_type != CPU`, so recording it at construction
+    /// reproduces the old query in this case too.
+    #[test]
+    fn a_cpu_typed_reconstruction_is_not_reported_as_a_device() {
+        let staging = staging_with_recon(RECON, false);
+        let api = api(true);
+        assert_eq!(
+            unsafe { device_mem_info(&api, std::ptr::null_mut(), Some(&staging)) },
+            Some((RECON, false)),
+            "host-typed reconstruction must not be reported as device memory"
+        );
+    }
+
+    /// A device-resident input still wins over the reconstruction: the scan
+    /// short-circuits before the fallback is consulted.
+    #[test]
+    fn a_device_input_wins_over_the_reconstruction() {
+        let staging = staging_with_recon(RECON, true);
+        let api = api(false);
+        assert_eq!(
+            unsafe { device_mem_info(&api, std::ptr::null_mut(), Some(&staging)) },
+            Some((MI, true)),
+            "the actual device input, not the fallback recipe"
         );
     }
 }

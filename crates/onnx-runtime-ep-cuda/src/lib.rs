@@ -89,6 +89,8 @@ mod optimizer;
 pub mod pinned_pool;
 pub mod provider;
 pub mod runtime;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod trace;
 // Device memory moved to `onnx-runtime-cuda-memory`: an execution provider is
 // about operators, and where the memory came from is a separate question that

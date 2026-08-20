@@ -55,6 +55,14 @@ impl GemmKernel {
     ///
     /// Returns `None` whenever neither applies, leaving the portable blocked
     /// half GEMM to serve the call exactly as before.
+    ///
+    /// `#[inline(never)]` is load-bearing and was **measured**, not assumed.
+    /// Carrying a second kernel made this body large enough that inlining it
+    /// into [`GemmKernel::execute`] cost the `M = 128` `transB` prefill 12%
+    /// (69.7 -> 78.9 ms, median of 10 per-run minima) -- a path this function
+    /// declines outright and never touches. It is a once-per-execute dispatch
+    /// probe returning an `Option`, so there is nothing to inline it for.
+    #[inline(never)]
     fn try_half_fast_path(
         &self,
         a: &TensorView,
@@ -62,6 +70,7 @@ impl GemmKernel {
         m: usize,
         k: usize,
         n: usize,
+        trans_b: bool,
     ) -> Result<Option<Vec<f32>>> {
         if a.dtype != DataType::Float16 || b.dtype != DataType::Float16 {
             return Ok(None);
@@ -69,11 +78,13 @@ impl GemmKernel {
 
         // Decode: read B in place as f16 rather than widening K*N floats for a
         // single row. Memory-bound, and measured at parity with ORT in MatMul.
+        // Both stored orders have a kernel, so `trans_b` picks one rather than
+        // disqualifying the call — see the dispatch comment in `execute`.
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         if m == 1
             && b.is_contiguous()
             && b.numel() == k.saturating_mul(n)
-            && half_gemv::simd_available()
+            && half_gemv::simd_available(HalfFormat::F16)
         {
             b.validate()?;
             let a_dense = self.prepack.dense(0, a)?;
@@ -84,9 +95,21 @@ impl GemmKernel {
                 // and the view outlives this call.
                 let b_bits = unsafe { std::slice::from_raw_parts(b.data_ptr::<u16>(), k * n) };
                 let mut result = vec![0.0f32; n];
-                half_gemv::gemv_f16_kn(&a_dense, b_bits, &mut result, k, n);
+                if trans_b {
+                    half_gemv::gemv_f16_nk(&a_dense, b_bits, &mut result, k, n);
+                } else {
+                    half_gemv::gemv_half_kn(HalfFormat::F16, &a_dense, b_bits, &mut result, k, n);
+                }
                 return Ok(Some(result));
             }
+        }
+
+        // Everything past here reads B as [K, N], so a transposed weight would
+        // have to be materialised first -- which is the trade the module header
+        // of `half_gemv` explains is not worth making.
+        if trans_b {
+            let _ = (m, k, n);
+            return Ok(None);
         }
 
         #[cfg(feature = "mlas")]
@@ -156,19 +179,21 @@ impl Kernel for GemmKernel {
             flops
         });
 
-        // f16 fast paths, shared with `MatMul`. Only the untransposed case
-        // qualifies: both read B in its stored [K, N] order, and materialising
-        // a transpose first would give back what they save.
+        // f16 fast paths, shared with `MatMul`. `trans_a` still disqualifies —
+        // A is a single row at decode, so transposing it is meaningless, and
+        // the packed prefill path wants it untransposed. `trans_b` no longer
+        // does: at M = 1 a `[N, K]` weight is the *better* GEMV layout, because
+        // every output element is one contiguous dot product.
         //
         // Without these, an f16 `Gemm` falls into the portable blocked half
         // GEMM, which is the worst dense region measured anywhere in this EP:
         // at K=N=3584 it was 6.57x slower than ORT at M=1/1 thread and 46.67x
         // at M=1/8 threads, because that path never scales with thread count on
         // a single-row problem (10.07 ms at 1 thread, 10.26 ms at 8).
-        let half_fast_path: Option<Vec<f32>> = if self.trans_a || self.trans_b {
+        let half_fast_path: Option<Vec<f32>> = if self.trans_a {
             None
         } else {
-            self.try_half_fast_path(&inputs[0], &inputs[1], m, k, n)?
+            self.try_half_fast_path(&inputs[0], &inputs[1], m, k, n, self.trans_b)?
         };
 
         let mut out = if let Some(mut half_output) = half_fast_path {
@@ -437,6 +462,80 @@ mod tests {
         (out.to_f32(), packed)
     }
 
+    /// An f16 `Gemm` decode with `transB = 1` -- the layout every `nn.Linear`
+    /// export produces -- takes the `[N, K]` GEMV and agrees with the same
+    /// logical matrix stored untransposed.
+    ///
+    /// Before this route existed, `trans_b` disqualified the f16 fast path
+    /// outright and the call fell into the portable blocked half GEMM. That is
+    /// not a small difference: at K=N=3584 it measured 32-36 ms against ORT's
+    /// 0.24-1.5 ms, and it did not improve with thread count at all.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn half_decode_gemm_takes_the_nk_gemv_when_b_is_transposed() {
+        let (m, k, n) = (1usize, 67usize, 41usize);
+        let a: Vec<f32> = (0..m * k).map(|i| (i % 13) as f32 * 0.125 - 0.5).collect();
+        let kn: Vec<f32> = (0..k * n).map(|i| (i % 17) as f32 * 0.0625 - 0.5).collect();
+        let mut nk = vec![0.0f32; n * k];
+        for p in 0..k {
+            for j in 0..n {
+                nk[j * k + p] = kn[p * n + j];
+            }
+        }
+
+        let before = super::half_gemv::NK_GEMV_CALLS.with(|calls| calls.get());
+        let (transposed, _) = run_half_gemm(m, k, n, &a, &nk, true);
+        let took_the_gemv = super::half_gemv::NK_GEMV_CALLS.with(|calls| calls.get()) == before + 1;
+        assert!(
+            took_the_gemv || !super::half_gemv::simd_available(HalfFormat::F16),
+            "an f16 transB decode must reach the [N, K] GEMV on an f16c host"
+        );
+
+        let (straight, _) = run_half_gemm(m, k, n, &a, &kn, false);
+        for (lhs, rhs) in transposed.iter().zip(&straight) {
+            assert!(
+                (lhs - rhs).abs() <= 1e-3 * (1.0 + lhs.abs()),
+                "transB={lhs} vs transB=0 {rhs}"
+            );
+        }
+    }
+
+    /// Prefill is untouched: `transB = 1` at `M > 1` still declines the f16
+    /// fast path, because everything past the GEMV reads B as `[K, N]`.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn half_prefill_gemm_does_not_take_the_nk_gemv() {
+        let (m, k, n) = (4usize, 67usize, 41usize);
+        let a: Vec<f32> = (0..m * k).map(|i| (i % 13) as f32 * 0.125 - 0.5).collect();
+        let nk: Vec<f32> = (0..n * k).map(|i| (i % 17) as f32 * 0.0625 - 0.5).collect();
+
+        let before = super::half_gemv::NK_GEMV_CALLS.with(|calls| calls.get());
+        let (out, _) = run_half_gemm(m, k, n, &a, &nk, true);
+        assert_eq!(
+            super::half_gemv::NK_GEMV_CALLS.with(|calls| calls.get()),
+            before,
+            "the GEMV is a decode kernel and must not claim an M > 1 call"
+        );
+
+        let mut want = vec![0.0f32; m * n];
+        for row in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0f32;
+                for p in 0..k {
+                    acc += half::f16::from_f32(a[row * k + p]).to_f32()
+                        * half::f16::from_f32(nk[j * k + p]).to_f32();
+                }
+                want[row * n + j] = acc;
+            }
+        }
+        for (got, expected) in out.iter().zip(&want) {
+            assert!(
+                (got - expected).abs() <= 1e-2 * (1.0 + expected.abs()),
+                "{got} vs {expected}"
+            );
+        }
+    }
+
     fn reference_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
         let mut c = vec![0.0f32; m * n];
         for i in 0..m {
@@ -508,9 +607,13 @@ mod tests {
         }
     }
 
-    /// A transposed B keeps the blocked half GEMM. Both fast paths read B in
-    /// its stored [K, N] order, so materialising a transpose first would give
-    /// back exactly what they save.
+    /// A transposed B at **`M > 1`** keeps the blocked half GEMM: the decode
+    /// GEMV declines anything but a single row, and everything past it reads B
+    /// as `[K, N]`, so a transpose would have to be materialised first.
+    ///
+    /// At `M == 1` this is no longer true -- see
+    /// `half_decode_gemm_takes_the_nk_gemv_when_b_is_transposed`, which is why
+    /// this test pins `m = 4`.
     #[test]
     fn gemm_f16_transposed_b_keeps_the_blocked_path() {
         let (m, k, n) = (4usize, 6usize, 3usize);

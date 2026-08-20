@@ -1240,6 +1240,7 @@ extern "C" __global__ void skip_layernorm(
     const int    gamma_dtype,
     const int    beta_dtype,
     const int    bias_dtype,
+    const int    stat_dtype,
     const int    has_beta,
     const int    has_bias,
     const float  epsilon)
@@ -1290,8 +1291,8 @@ extern "C" __global__ void skip_layernorm(
     const float var = red[0] / (float)norm_size;
     const float inv_std = 1.0f / sqrtf(var + epsilon);
     if (tid == 0) {
-        if (mean_out)   skip_ln_store(mean_out, g, mean, dtype);
-        if (invstd_out) skip_ln_store(invstd_out, g, inv_std, dtype);
+        if (mean_out)   skip_ln_store(mean_out, g, mean, stat_dtype);
+        if (invstd_out) skip_ln_store(invstd_out, g, inv_std, stat_dtype);
     }
     __syncthreads();
 
@@ -1364,6 +1365,42 @@ fn preferred_norm_block_threads(norm_size: usize, max_threads_per_block: u32) ->
         .max(32)
         .next_power_of_two()
         .min(NORM_BLOCK as usize) as u32;
+    useful_threads.min(device_limit)
+}
+
+/// Threads per block for a norm reduction, widened when the launch is
+/// grid-starved.
+///
+/// The grid is one block per group, so decode (`num_groups == 1`) puts a whole
+/// row's reduction on a *single SM*. On Muse-Glimmer-30B (hidden 6656) that is
+/// 209 launches per decode step, each measured at 13.4 us on one of an A100's
+/// 108 SMs — ~9% of the step spent moving 13 KB. Nothing about that is
+/// bandwidth; it is one block's worth of memory parallelism strided over 26
+/// elements per thread at `NORM_BLOCK` threads.
+///
+/// Widening only helps while the grid cannot already fill the device: once
+/// there is at least a block per SM, more threads per block would trade
+/// block-level parallelism for thread-level and change the summation order for
+/// no gain, so the starved case is the only one that moves.
+///
+/// The result is a pure function of shape and device, which is what lets the
+/// two launch sites that must agree bit-for-bit (`rmsnorm` and the dense
+/// skip-rmsnorm) keep agreeing: both size their block from here, so for a given
+/// shape they still share one summation order.
+fn norm_block_threads(
+    norm_size: usize,
+    num_groups: usize,
+    multiprocessor_count: u32,
+    max_threads_per_block: u32,
+) -> u32 {
+    let cap = if num_groups < multiprocessor_count.max(1) as usize {
+        max_threads_per_block.max(NORM_BLOCK)
+    } else {
+        NORM_BLOCK
+    };
+    let reported_limit = max_threads_per_block.clamp(32, cap);
+    let device_limit = 1 << (31 - reported_limit.leading_zeros());
+    let useful_threads = norm_size.max(32).next_power_of_two().min(cap as usize) as u32;
     useful_threads.min(device_limit)
 }
 
@@ -1941,10 +1978,16 @@ impl RmsNormKernel {
         let func = self
             .runtime
             .nvrtc_function(RMSNORM_MODULE, RMSNORM_SRC, entry)?;
+        let caps = self.runtime.capabilities();
         let cfg = self.runtime.reduction_launch_config(
             &func,
             groups_u,
-            NORM_BLOCK,
+            norm_block_threads(
+                norm_size,
+                groups_u as usize,
+                caps.multiprocessor_count(),
+                caps.max_threads_per_block(),
+            ),
             std::mem::size_of::<f32>() as u32,
         )?;
         let stream = self.runtime.stream();
@@ -2441,12 +2484,20 @@ impl SkipSimplifiedLayerNormKernel {
             .arg(&bias_is_bf16)
             .arg(&stat_is_bf16)
             .arg(&self.epsilon);
-        // Match `rmsnorm_bf16` exactly (same NORM_BLOCK block-tree reduction and
-        // f32 shared-memory bytes/thread) so the summation order is bit-identical.
+        // Match `rmsnorm_bf16` exactly (same block-tree reduction and f32
+        // shared-memory bytes/thread) so the summation order is bit-identical:
+        // both sides size their block from `norm_block_threads`, which is a pure
+        // function of shape and device.
+        let caps = self.runtime.capabilities();
         let cfg = self.runtime.reduction_launch_config(
             &func,
             groups_u,
-            NORM_BLOCK,
+            norm_block_threads(
+                norm_size,
+                groups_u as usize,
+                caps.multiprocessor_count(),
+                caps.max_threads_per_block(),
+            ),
             std::mem::size_of::<f32>() as u32,
         )?;
         // SAFETY: all pointers reference validated device buffers; metadata holds
@@ -2880,7 +2931,7 @@ impl SkipLayerNormKernel {
 
         // Optional outputs: mean (slot 1), inv_std_var (slot 2) — length
         // num_groups; input_skip_bias_sum (slot 3) — length input.numel().
-        let (mean_ptr, invstd_ptr) =
+        let (mean_ptr, invstd_ptr, stat_dtype) =
             optional_stat_ptrs_typed(op, outputs, num_groups, input.dtype)?;
         let sum_ptr = match outputs.get_mut(3) {
             None => 0u64,
@@ -2913,6 +2964,7 @@ impl SkipLayerNormKernel {
         let gamma_dtype = storage_kind(gamma.dtype);
         let beta_dtype = beta.map_or(dtype, |tensor| storage_kind(tensor.dtype));
         let bias_dtype = bias.map_or(dtype, |tensor| storage_kind(tensor.dtype));
+        let stat_dtype_kind = storage_kind(stat_dtype);
 
         let func = self.runtime.nvrtc_function(
             SKIP_LAYERNORM_MODULE,
@@ -2944,6 +2996,7 @@ impl SkipLayerNormKernel {
             .arg(&gamma_dtype)
             .arg(&beta_dtype)
             .arg(&bias_dtype)
+            .arg(&stat_dtype_kind)
             .arg(&has_beta)
             .arg(&has_bias)
             .arg(&eps);
@@ -3037,10 +3090,33 @@ fn optional_stat_ptrs_typed(
     outputs: &mut [TensorMut],
     num_groups: usize,
     dtype: DataType,
-) -> Result<(CUdeviceptr, CUdeviceptr)> {
-    let mean = optional_out_ptr_typed(op, "Mean", outputs, 1, num_groups, dtype)?;
-    let invstd = optional_out_ptr_typed(op, "InvStdDev", outputs, 2, num_groups, dtype)?;
-    Ok((mean, invstd))
+) -> Result<(CUdeviceptr, CUdeviceptr, DataType)> {
+    // ORT's schema types `mean`/`inv_std_var` as float, but exporters commonly
+    // emit these dangling training-only stats in the activation dtype. Accept
+    // either and tell the kernel which storage to write.
+    let mut stat_dtype = DataType::Float32;
+    for idx in [1, 2] {
+        if let Some(t) = outputs.get(idx) {
+            if t.dtype != DataType::Float32 && t.dtype != dtype {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep {op}: stat output {idx} dtype {:?} must be Float32 or the input dtype {dtype:?}",
+                    t.dtype
+                )));
+            }
+            stat_dtype = t.dtype;
+        }
+    }
+    if let (Some(mean), Some(invstd)) = (outputs.get(1), outputs.get(2))
+        && mean.dtype != invstd.dtype
+    {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep {op}: Mean dtype {:?} and InvStdDev dtype {:?} must match",
+            mean.dtype, invstd.dtype
+        )));
+    }
+    let mean = optional_out_ptr_typed(op, "Mean", outputs, 1, num_groups, stat_dtype)?;
+    let invstd = optional_out_ptr_typed(op, "InvStdDev", outputs, 2, num_groups, stat_dtype)?;
+    Ok((mean, invstd, stat_dtype))
 }
 
 fn optional_out_ptr_typed(
@@ -3249,6 +3325,35 @@ mod tests {
         assert_eq!(preferred_norm_block_threads(96, 1024), 128);
         assert_eq!(preferred_norm_block_threads(3584, 128), 128);
         assert_eq!(preferred_norm_block_threads(17, 1024), 32);
+    }
+
+    #[test]
+    fn norm_block_widens_only_when_the_grid_cannot_fill_the_device() {
+        // Decode: one group, so 107 of an A100's 108 SMs sit idle no matter how
+        // the block is sized. Spend the row on threads instead of leaving a
+        // 6656-wide reduction at 26 elements per thread.
+        assert_eq!(norm_block_threads(6656, 1, 108, 1024), 1024);
+        // Prefill: the grid already covers the device, so widening would only
+        // trade block parallelism for thread parallelism. Stay where we were.
+        assert_eq!(norm_block_threads(6656, 108, 108, 1024), NORM_BLOCK);
+        assert_eq!(norm_block_threads(6656, 4096, 108, 1024), NORM_BLOCK);
+        // Exactly one block per SM is already "full": the boundary is inclusive
+        // on the non-widening side.
+        assert_eq!(norm_block_threads(6656, 107, 108, 1024), 1024);
+    }
+
+    #[test]
+    fn norm_block_never_exceeds_what_the_shape_or_the_device_can_use() {
+        // A narrow row cannot use more threads than it has elements, starved or
+        // not: qk-norm at head_dim 128 stays at 128 even with 107 idle SMs.
+        assert_eq!(norm_block_threads(128, 32, 108, 1024), 128);
+        assert_eq!(norm_block_threads(17, 1, 108, 1024), 32);
+        // A device that refuses 1024-thread blocks caps the widening.
+        assert_eq!(norm_block_threads(6656, 1, 108, 512), 512);
+        // Non-power-of-two device limits round down, since the block tree halves.
+        assert_eq!(norm_block_threads(6656, 1, 108, 768), 512);
+        // A device reporting no SM count must not divide by zero or widen wildly.
+        assert_eq!(norm_block_threads(6656, 1, 0, 1024), NORM_BLOCK);
     }
 
     fn skip_rmsnorm_residuals(hidden: usize) -> (Vec<f16>, Vec<f16>) {
@@ -4778,13 +4883,7 @@ mod claim_probes {
     use crate::runtime::CudaRuntime;
 
     fn maybe_runtime() -> Option<Arc<CudaRuntime>> {
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let rt = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
-            .ok()
-            .flatten();
-        std::panic::set_hook(previous);
-        rt
+        crate::test_support::maybe_runtime()
     }
 
     fn reference(input: &[f32], skip: &[f32], gamma: &[f32], eps: f32) -> Vec<f32> {

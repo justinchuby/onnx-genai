@@ -139,6 +139,27 @@ impl Kernel for RangeKernel {
                 let bytes: Vec<u8> = out.iter().flat_map(|v| v.to_le_bytes()).collect();
                 write_dense_bytes(&mut outputs[0], &bytes)
             }
+            DataType::Int32 => {
+                let (start, limit, delta) = (
+                    to_dense_i64(&inputs[0])?[0],
+                    to_dense_i64(&inputs[1])?[0],
+                    to_dense_i64(&inputs[2])?[0],
+                );
+                if delta == 0 {
+                    return Err(EpError::KernelFailed(
+                        "Range: delta must not be zero".into(),
+                    ));
+                }
+                let count = int_range_count(start, limit, delta)?;
+                let mut out = alloc_range_output::<i32>(count)?;
+                for i in 0..count {
+                    let value = i32::try_from(start as i128 + i as i128 * delta as i128)
+                        .map_err(|_| EpError::KernelFailed("Range: value overflow".into()))?;
+                    out.push(value);
+                }
+                let bytes: Vec<u8> = out.iter().flat_map(|v| v.to_le_bytes()).collect();
+                write_dense_bytes(&mut outputs[0], &bytes)
+            }
             dtype => Err(EpError::KernelFailed(format!(
                 "Range: unsupported dtype {dtype:?}"
             ))),
@@ -452,6 +473,29 @@ mod tests {
         assert_eq!(y.to_f32().len(), 2);
         assert_eq!(y.to_f32().first(), Some(&16_777_216.));
         assert_eq!(y.to_f32().last(), Some(&16_777_216.));
+    }
+    #[test]
+    fn range_int32_produces_int32_output() {
+        // The Muse Glimmer vision tower builds int32 window offsets this way.
+        let a = Owned::i32(&[], &[2]);
+        let b = Owned::i32(&[], &[8]);
+        let d = Owned::i32(&[], &[2]);
+        let mut y = Owned::zeros(DataType::Int32, &[3]);
+        RangeKernel
+            .execute(&[a.view(), b.view(), d.view()], &mut [y.view_mut()])
+            .unwrap();
+        assert_eq!(y.to_i32(), vec![2, 4, 6]);
+    }
+    #[test]
+    fn range_int32_negative_delta_counts_down() {
+        let a = Owned::i32(&[], &[5]);
+        let b = Owned::i32(&[], &[1]);
+        let d = Owned::i32(&[], &[-2]);
+        let mut y = Owned::zeros(DataType::Int32, &[2]);
+        RangeKernel
+            .execute(&[a.view(), b.view(), d.view()], &mut [y.view_mut()])
+            .unwrap();
+        assert_eq!(y.to_i32(), vec![5, 3]);
     }
     #[test]
     fn range_int64_overflow_returns_error() {
