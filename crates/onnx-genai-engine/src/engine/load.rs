@@ -2779,7 +2779,7 @@ mod pool_sizing_tests {
             .expect("a VRAM limit should not reject a host-only execution provider");
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(all(feature = "cuda", feature = "native-backend"))]
     #[test]
     fn explicit_vram_limit_auto_enables_cuda_weight_offload() {
         let plan = cuda_plan(
@@ -2824,7 +2824,7 @@ mod pool_sizing_tests {
         );
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(all(feature = "cuda", feature = "native-backend"))]
     #[test]
     fn explicit_weight_offload_device_bytes_overrides_vram_limit_derivation() {
         let plan = cuda_plan(
@@ -2852,7 +2852,7 @@ mod pool_sizing_tests {
         assert!(policy.device_budget_is_override);
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(all(feature = "cuda", feature = "native-backend"))]
     #[test]
     fn explicit_vram_limit_selects_managed_mode_even_when_weights_fit() {
         let plan = cuda_plan(
@@ -2891,7 +2891,7 @@ mod pool_sizing_tests {
         );
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(all(feature = "cuda", feature = "native-backend"))]
     #[test]
     fn resident_non_vmm_weights_keep_package_reservation() {
         let resolution = CudaOffloadResolution {
