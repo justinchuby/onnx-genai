@@ -180,4 +180,8 @@ if __name__ == "__main__":
         "retunes are invisible to it; pass the rows explicitly to measure one",
     )
     args = ap.parse_args()
+    # MatMulNBits requires a power-of-two block size of at least 16; emitting
+    # anything else produces a graph that is invalid rather than interesting.
+    if args.block_size < 16 or args.block_size & (args.block_size - 1):
+        ap.error("--block-size must be a power of two >= 16")
     main(args.out, args.block_size, tuple(args.tokens))

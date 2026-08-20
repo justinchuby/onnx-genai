@@ -1126,9 +1126,10 @@ structural: MLAS `SQNBitGemm` CompInt8 wants VNNI, which this host does not have
 
 ### 11. The gate for block sizes the row kernels reject was never measured at all (**fixed**)
 
-Sections 9 and 10 each re-derived `INT4_PREFILL_GEBP_MIN_ROWS` and its L2-resident twin, and each
-closed by noting `INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED = 4` was "untouched". It was untouched
-because it was **unmeasurable**: `benches/int4_prefill_route_ab.rs` pinned `block_size` to 32, so no
+Sections 9 and 10 each re-derived `INT4_PREFILL_GEBP_MIN_ROWS` and its L2-resident twin. Section 10
+closed by naming `INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED = 4` as "untouched"; section 9 did not name it
+at all, and its closing claim that "the lowest gate of any route is 4" has been stale since section
+10 set the pair to (3, 6). It was untouched because it was **unmeasurable**: `benches/int4_prefill_route_ab.rs` pinned `block_size` to 32, so no
 run of that bench could reach the branch. This is the third instance of one defect —
 `PROBE_BITS` (#1558) existed for the same reason, and `scripts/ort_ab/gen_gemm.py` pinned
 `BLOCK_SIZE = 32` *and* stepped tokens `1 -> 8`, straddling every row gate the last three PRs moved.
@@ -1153,6 +1154,12 @@ median of five interleaved reps:
 GEBP wins at every `m` on both shapes, and the margin grows linearly because the dot arm's cost is
 linear in `m` (9.4 -> 76.9 ms on the large shape) while GEBP's is flat (~2 ms, the pack). Unlike the
 32-element gates this one needs no residency split: both shapes agree. Gate **4 -> 2**.
+
+The measured floor is 2048x2048 (2.1 MB). A weight far below that -- a few KB -- is unmeasured, and
+there GEBP forks the global pool where the scalar fallback stays on the narrow decode pool, so the
+fork/join could in principle dominate trivial compute. It is a correctness non-issue (GEBP
+zero-pads partial panels) and no real projection at `block_size = 16` is that small, but the claim
+above is bounded by the shapes measured.
 
 Production A/B on 16-element-block models through the real dispatch path, `t = 8` and `t = 16`,
 confirms it, and the ORT ratio on the rows that moved:

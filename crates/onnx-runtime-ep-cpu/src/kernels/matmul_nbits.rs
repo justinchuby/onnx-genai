@@ -15555,7 +15555,9 @@ mod tests {
                     inputs.push(zp.view());
                 }
                 let mut y = Owned::zeros_f32(&[m, n]);
+                let before = INT4_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
                 kernel.execute(&inputs, &mut [y.view_mut()]).unwrap();
+                let took_gebp = INT4_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed) > before;
                 // Scaled tolerance, not `assert_close`'s fixed 1e-5: the GEBP
                 // route reduces in the packed microkernel's order, so it
                 // differs from the row-serial order in the last f32 ulps, and
@@ -15573,6 +15575,18 @@ mod tests {
                     kernel.weight_nk.get().is_none(),
                     "asymmetric={asymmetric} m={m}: the GEBP prefill must keep the \
                      weight borrowed, not materialize the f32 cache"
+                );
+                // What keeps the comment above honest across retunes: this
+                // weight is L2-resident, so the threshold it routes on is
+                // `INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT`, and the sweep
+                // straddles it. Without this the test passes whichever route
+                // ran, which is how it came to name a threshold of 4.
+                assert_eq!(
+                    took_gebp,
+                    m >= INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT,
+                    "asymmetric={asymmetric} m={m}: an L2-resident weight must take \
+                     the GEBP prefill exactly when m >= \
+                     INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT"
                 );
             }
         }

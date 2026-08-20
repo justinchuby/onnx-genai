@@ -10,8 +10,10 @@ L3 2 x 32 MiB. AVX2 + FMA, **no** AVX-512, **no** VNNI. 75.8 GB/s DRAM. Shared h
 ## Why this was open
 
 `INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED` is the row threshold for weights whose block size the
-column-blocked int4 kernels reject. It has been 4 since before #1356. Both #1556 and #1560 re-derived
-the *other* two int4 prefill gates and both closed by recording that this one was "untouched".
+column-blocked int4 kernels reject. It has been 4 since before #1356. #1556 and #1560 both re-derived
+the *other* two int4 prefill gates; #1560 closed by naming this one as "untouched", and #1556 did
+not name it at all -- its closing "the lowest gate of any route is 4" has been stale since #1560 set
+the pair to (3, 6).
 
 It was untouched because no harness could express it:
 
@@ -149,6 +151,10 @@ python3 scripts/ort_ab/ab.py --arms base=<base> new=<new> --native-only --null-c
 
 ## Remaining losses
 
+- Weights far below the 2048x2048 floor measured here. GEBP forks the global pool where the scalar
+  fallback stays on the narrow decode pool, so for a few-KB weight the fork/join could dominate.
+  Correctness is unaffected (partial panels are zero-padded) and no real projection at
+  `block_size = 16` is that small, but the sweep does not cover it.
 - `m = 1` at every block size, and whether decode should route through GEBP at all.
 - The residual 2.3x-3.0x to ORT: structural, MLAS `SQNBitGemm` CompInt8 wants VNNI this host lacks.
 - 8-bit at 16-element blocks needed no retune — `INT8_PREFILL_GEBP_MIN_ROWS` is already 2.
