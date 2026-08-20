@@ -244,6 +244,14 @@ const GEMV_F16_SCALES_F16_ZP_SPLITK_ENTRY: &str = "matmul_nbits_gemv_f16_scales_
 /// its `blockDim.x / 32` warps but now covers `warps / K_SPLIT` columns, so the
 /// launch grid grows by this factor.
 const GEMV_F16_SCALES_F16_ZP_SPLITK: usize = 2;
+/// Deep-split entry for output widths that are still grid-starved at
+/// [`GEMV_F16_SCALES_F16_ZP_SPLITK`]. See
+/// [`scales_f16_zp_split_factor`] for when it is chosen.
+const GEMV_F16_SCALES_F16_ZP_SPLITK8_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_zp_splitk8";
+/// Warps per output column in [`GEMV_F16_SCALES_F16_ZP_SPLITK8_ENTRY`]. Must
+/// match the `K_SPLIT` template argument of that entry, and must not exceed the
+/// 8 warps of the 256-thread launch (at equality each CTA covers one column).
+const GEMV_F16_SCALES_F16_ZP_SPLITK8: usize = 8;
 /// General fp16/fp16-scales GEMV with a fused RMS-normalization prologue (see
 /// [`crate::optimizer::CudaSkipRmsNormMatMulFusion`]). It normalizes the input
 /// activation in-kernel — byte-identically to `skip_rmsnorm_f16_warp_half4` —
@@ -3233,7 +3241,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_zp_pipe(
 // latency-bound decode GEMV. The fp32 partial sum is a new block-sum
 // association, so results are near-equal (not byte-identical) to the
 // single-warp kernel.
-template <bool HasZp>
+template <bool HasZp, int K_SPLIT>
 __device__ __forceinline__ void matmul_nbits_gemv_f16_scales_f16_splitk_tpl(
     const __half* __restrict__ activation,
     const unsigned char* __restrict__ packed,
@@ -3253,7 +3261,6 @@ __device__ __forceinline__ void matmul_nbits_gemv_f16_scales_f16_splitk_tpl(
 {
     (void)block_size;
     (void)scales_fp16;
-    constexpr int K_SPLIT = 2;
     const __half* __restrict__ scales =
         reinterpret_cast<const __half*>(scales_raw);
     const int tid = (int)threadIdx.x;
@@ -3362,7 +3369,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_splitk(
     const int bias_post_round,
     const int out_bf16)
 {
-    matmul_nbits_gemv_f16_scales_f16_splitk_tpl<false>(
+    matmul_nbits_gemv_f16_scales_f16_splitk_tpl<false, 2>(
         activation, packed, scales_raw, zero_points, bias, output, k, n,
         block_size, k_blocks, blob_size, zp_row_bytes, scales_fp16,
         bias_post_round, out_bf16);
@@ -3385,7 +3392,39 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_zp_splitk(
     const int bias_post_round,
     const int out_bf16)
 {
-    matmul_nbits_gemv_f16_scales_f16_splitk_tpl<true>(
+    matmul_nbits_gemv_f16_scales_f16_splitk_tpl<true, 2>(
+        activation, packed, scales_raw, zero_points, bias, output, k, n,
+        block_size, k_blocks, blob_size, zp_row_bytes, scales_fp16,
+        bias_post_round, out_bf16);
+}
+
+// Deep-split sibling of `matmul_nbits_gemv_f16_scales_f16_zp_splitk` for output
+// widths so narrow that K_SPLIT=2 still leaves the device under one wave. The
+// GQA k/v projection is the case: N=256 at 8 warps/CTA and K_SPLIT=2 covers 4
+// columns per block, so the whole launch is 64 blocks on a 108-SM A100 and the
+// kernel runs at latency rather than at bandwidth. Measured 28 GB/s there — the
+// same K at N=4096 moved 16x the bytes in 21% LESS time, which no bandwidth
+// explanation survives. K_SPLIT=8 makes each CTA cover one column, taking that
+// launch to 256 blocks. Same accumulation as the K_SPLIT=2 entry, one more level
+// of fp32 partial summing.
+extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_zp_splitk8(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    void* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round,
+    const int out_bf16)
+{
+    matmul_nbits_gemv_f16_scales_f16_splitk_tpl<true, 8>(
         activation, packed, scales_raw, zero_points, bias, output, k, n,
         block_size, k_blocks, blob_size, zp_row_bytes, scales_fp16,
         bias_post_round, out_bf16);
@@ -6192,6 +6231,31 @@ fn use_scales_f16_zp_splitk_gate(k: usize, n: usize, multiprocessor_count: u32) 
         < (multiprocessor_count.max(1) as usize)
             .saturating_mul(F16_SYMMETRIC_SPLITK_TARGET_WARPS_PER_SM);
     grid_starved || k >= ZP_SPLITK_BANDWIDTH_MIN_K
+}
+
+/// Warps cooperating per output column for the asymmetric block-32 split-K
+/// decode GEMV. [`use_scales_f16_zp_splitk_gate`] decides WHETHER to split K;
+/// this decides HOW FAR.
+///
+/// The default factor of 2 doubles a starved grid, which was enough for the
+/// medium projections it was tuned against but not for the GQA k/v projection.
+/// At N=256 a 256-thread CTA still covers 4 output columns, so the whole launch
+/// is 64 blocks on a 108-SM A100 -- under a single wave, with 8 of 64 possible
+/// warps resident per SM and nothing to hide the weight-load latency behind. It
+/// measured 28 GB/s, 1.4% of peak, while the SAME K at N=4096 moved 16x the
+/// bytes in 21% LESS time. No bandwidth explanation survives that comparison, so
+/// the cost is grid starvation, and the remedy is more grid.
+///
+/// So: if the grid is still under one wave AFTER the default split, split all the
+/// way down to one output column per CTA.
+fn scales_f16_zp_split_factor(n: usize, multiprocessor_count: u32) -> usize {
+    let warps_per_cta = (GEMV_F16_LARGE_THREADS / 32) as usize;
+    let blocks_at_default = n.div_ceil(warps_per_cta / GEMV_F16_SCALES_F16_ZP_SPLITK);
+    if blocks_at_default < multiprocessor_count.max(1) as usize {
+        GEMV_F16_SCALES_F16_ZP_SPLITK8
+    } else {
+        GEMV_F16_SCALES_F16_ZP_SPLITK
+    }
 }
 
 /// Smallest K at which split-K has been measured to win on a saturated grid.
@@ -9517,6 +9581,8 @@ impl MatMulNBitsKernel {
                 self.n,
                 capabilities.multiprocessor_count(),
             );
+        let scales_f16_zp_factor =
+            scales_f16_zp_split_factor(self.n, capabilities.multiprocessor_count());
         let use_scales_f16_symmetric_splitk = self.block_size == 32
             && scales_fp16
             && zero_points.is_none()
@@ -9640,7 +9706,11 @@ impl MatMulNBitsKernel {
                         // SMs; otherwise the plain single-warp `_zp` entry (which
                         // handles the divergent K tail).
                         if use_scales_f16_zp_splitk {
-                            GEMV_F16_SCALES_F16_ZP_SPLITK_ENTRY
+                            if scales_f16_zp_factor == GEMV_F16_SCALES_F16_ZP_SPLITK8 {
+                                GEMV_F16_SCALES_F16_ZP_SPLITK8_ENTRY
+                            } else {
+                                GEMV_F16_SCALES_F16_ZP_SPLITK_ENTRY
+                            }
                         } else if use_scales_f16_pipe {
                             GEMV_F16_SCALES_F16_ZP_PIPE_ENTRY
                         } else {
@@ -9723,7 +9793,8 @@ impl MatMulNBitsKernel {
         // `matmul_nbits_store_narrowed`, so they can write a bf16 consumer
         // buffer directly and let `run_bf16` drop its per-node staging cast.
         let bf16_direct_capable = entry == GEMV_F16_SCALES_F16_SPLITK_ENTRY
-            || entry == GEMV_F16_SCALES_F16_ZP_SPLITK_ENTRY;
+            || entry == GEMV_F16_SCALES_F16_ZP_SPLITK_ENTRY
+            || entry == GEMV_F16_SCALES_F16_ZP_SPLITK8_ENTRY;
         let staging_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
         let direct_bf16_ptr = bf16_direct_capable
             .then(|| take_bf16_direct_out(staging_ptr, self.n))
@@ -9769,7 +9840,14 @@ impl MatMulNBitsKernel {
                         (threads / 32) as usize / GENERAL_BS_SPLITK
                     }
                 } else if use_scales_f16_splitk {
-                    (threads / 32) as usize / GEMV_F16_SCALES_F16_ZP_SPLITK
+                    // The symmetric split-K entry is always factor 2; only the
+                    // asymmetric one deepens on a still-starved grid.
+                    let factor = if use_scales_f16_zp_splitk {
+                        scales_f16_zp_factor
+                    } else {
+                        GEMV_F16_SCALES_F16_ZP_SPLITK
+                    };
+                    (threads / 32) as usize / factor
                 } else if entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY
                     || entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_FP16_ENTRY
                     || entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_INTERLEAVED_ENTRY
@@ -15096,6 +15174,86 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         }
     }
 
+    /// The GQA k/v projection routes to the deep-split asymmetric GEMV entry, so
+    /// it needs its own oracle check: `K_SPLIT=8` adds a second level of fp32
+    /// partial accumulation that `K_SPLIT=2` does not have, and a wrong
+    /// `columns_per_block` there does not crash -- it silently drops output
+    /// columns, which the oracle catches at `max_rel = 1.0` (verified by
+    /// building the mismatch on purpose). Note what it does NOT catch: making
+    /// the kernel's `K_SPLIT` SMALLER than the launch believes is numerically
+    /// benign, because every column still gets computed, just redundantly. Only
+    /// the column-dropping direction is a correctness bug, and only that
+    /// direction is guarded here.
+    ///
+    /// K=6656, N=256 is this repo's 30B model, whose grouped-query attention
+    /// makes the k and v projections 16x narrower than q.
+    #[test]
+    fn fp16_gemv_matches_dequant_reference_gqa_kv_deep_split_dims() {
+        let (k, n) = (6656usize, 256usize);
+        let (mut worst_abs, mut worst_rel, mut max_out, mut all_finite) =
+            (0.0f32, 0.0f32, 0.0f32, true);
+        for (with_bias, explicit_zp) in [(false, true), (true, true)] {
+            let (abs, rel, out, finite) = run_parity_dims(k, n, true, with_bias, explicit_zp);
+            worst_abs = worst_abs.max(abs);
+            worst_rel = worst_rel.max(rel);
+            max_out = max_out.max(out);
+            all_finite &= finite;
+        }
+        let abs_bound = (max_out * 1e-3).max(1e-3);
+        eprintln!(
+            "MatMulNBits GQA k/v deep-split GEMV parity K={k} N={n}: max_abs={worst_abs:.3e} \
+             max_rel={worst_rel:.3e} max_out={max_out:.3e} abs_bound={abs_bound:.3e}"
+        );
+        assert!(
+            all_finite,
+            "GQA k/v deep-split GEMV produced a non-finite output"
+        );
+        assert!(
+            worst_abs < abs_bound,
+            "GQA k/v deep-split GEMV diverged from dequant reference: \
+             max_abs={worst_abs:.3e} bound={abs_bound:.3e}"
+        );
+        assert!(
+            worst_rel < 5e-2,
+            "GQA k/v deep-split GEMV diverged from dequant reference: max_rel={worst_rel:.3e}"
+        );
+    }
+
+    /// `scales_f16_zp_split_factor` must never ask for more K-slices than the
+    /// launch has warps, because the launch derives `columns_per_block` by
+    /// dividing one by the other and a zero there produces a zero-sized grid --
+    /// a kernel that never runs, leaving the output tensor holding stale bytes.
+    /// It must also actually deepen on the shape it exists for, and leave the
+    /// shapes that already fill the device alone.
+    #[test]
+    fn zp_split_factor_deepens_only_for_starved_grids_and_keeps_a_column_per_block() {
+        let warps = (GEMV_F16_LARGE_THREADS / 32) as usize;
+        // The GQA k/v projection: 64 blocks at the default factor on an A100.
+        assert_eq!(
+            scales_f16_zp_split_factor(256, 108),
+            GEMV_F16_SCALES_F16_ZP_SPLITK8
+        );
+        // q and the wider projections already saturate; leave them at the tuned
+        // default rather than paying for partial reductions they do not need.
+        for n in [4096usize, 6656, 19968, 202048] {
+            assert_eq!(
+                scales_f16_zp_split_factor(n, 108),
+                GEMV_F16_SCALES_F16_ZP_SPLITK,
+                "N={n} fills the grid at the default split and must not deepen"
+            );
+        }
+        // Invariant across every width and every plausible device size.
+        for mp in [1u32, 16, 80, 108, 132, 148, 256] {
+            for n in [1usize, 2, 8, 64, 256, 257, 431, 432, 433, 4096, 202048] {
+                let factor = scales_f16_zp_split_factor(n, mp);
+                assert!(
+                    factor <= warps && warps % factor == 0,
+                    "N={n} mp={mp} produced factor {factor}, which does not divide {warps} warps"
+                );
+            }
+        }
+    }
+
     /// Int8 (bits=8) fp16 decode GEMV must track an f64 dequant oracle at Phi's
     /// GEMV dims — the shapes ORT beat us on. QKV (K=3072, N=5120), down
     /// projection (K=8192, N=3072), and the lm_head slice (K=3072, wide N) all
@@ -19496,5 +19654,493 @@ extern "C" __global__ void ref_silu_mul_f16(
                 "cached bf16 scale path diverged from inline staging at column {index}"
             );
         }
+    }
+
+    /// Achieved-bandwidth probe for the int4 decode GEMV, swept over the REAL
+    /// projection shapes of the 30B model this repo is tuned against.
+    ///
+    /// # Why this exists
+    ///
+    /// Issue #1574 established that decode reaches only ~20% of the A100 weight
+    /// -bandwidth roofline and that the INT4 GEMVs run at 18-26% of HBM peak.
+    /// Confirming that took a four-step nsys ritual per data point — profile at
+    /// 32 tokens, profile at 96, export both to sqlite, subtract to strip the
+    /// load/prefill fixed costs — and every step had a way to silently produce a
+    /// wrong answer (see the nsys notes in `measurement-discipline`). That is far
+    /// too slow and too failure-prone a loop to iterate a kernel against.
+    ///
+    /// This probe collapses it: it drives the SAME dispatch the model decodes
+    /// with (`MatMulNBitsKernel::run`), at the same shapes, and reports the
+    /// number the kernel work is actually bounded by — achieved read bandwidth.
+    /// There is no graph capture, no prefill, and no load phase to subtract, so
+    /// the reading needs no differencing to be meaningful.
+    ///
+    /// # The shapes are not invented
+    ///
+    /// They are every distinct `MatMulNBits` shape in the model's decoder graph,
+    /// with the exact per-token call counts, so the weighted total is the whole
+    /// token's GEMV cost rather than a microbenchmark of one favourable case.
+    /// The counts sum to 416 nodes/token, which is exactly the per-token
+    /// `matmul_nbits` launch count observed under nsys — that agreement is what
+    /// makes the extrapolated tok/s below a fair prediction rather than a guess.
+    ///
+    /// # Reading the output
+    ///
+    /// The headline is the last line: decode tok/s implied by GEMV time ALONE.
+    /// It is an UPPER BOUND on end-to-end decode — attention, norms, sampling and
+    /// launch gaps are all excluded — so the gap between it and a real
+    /// `profile_native` run is the non-GEMV budget, and the gap between it and
+    /// the bandwidth roofline is what a better GEMV can still recover.
+    ///
+    /// Percent-of-peak is quoted against `A100_SXM4_80GB_PEAK_GBPS`. On any other
+    /// device the GB/s column is still correct and the percentage is not; adjust
+    /// the constant rather than trusting the ratio.
+    ///
+    /// # Two things this probe got wrong, and now controls for
+    ///
+    /// The first version of it reported the k/v projection at 28 GB/s and led to
+    /// a filed issue about a starved GQA grid. Both the number and the issue were
+    /// artifacts:
+    ///
+    /// 1. **Host dispatch inside the timing window.** Bracketing a single
+    ///    `run()` between two events measures the host as well as the kernel,
+    ///    and `run()` costs ~24 us. That is larger than several of these kernels.
+    ///    The timed region is now a captured CUDA graph, which is also what
+    ///    production decode replays. k/v went from 23.9 us to 4.6 us -- the
+    ///    "pathology" was five sixths measurement overhead. The host cost is
+    ///    still reported, in its own column, because it is the real ceiling for
+    ///    any path that is not captured.
+    /// 2. **An unramped clock.** An idle A100 in this box sits at 210 MHz
+    ///    against a 1410 MHz maximum with persistence mode off, and a short probe
+    ///    reports whatever partial ramp it caught. This cost 17% on the widest
+    ///    shape, and which way it biased an A/B depended on whether a neighbour
+    ///    happened to be using an adjacent GPU. The sweep is now preceded by a
+    ///    ramp that runs until the timing stops improving AND at least 8 s of
+    ///    continuous work has elapsed, and it re-measures the first shape at the
+    ///    end to prove the device did not drift underneath the comparison.
+    ///
+    /// The general lesson, which applies to the next probe as much as this one:
+    /// an absolute number from a microbenchmark is worth nothing until something
+    /// independent agrees with it. Here the check is that per-shape times must be
+    /// ordered by bytes moved. When k/v (1 MB) appeared SLOWER than q (16 MB),
+    /// that was the signal -- and it pointed at the probe, not the kernel.
+    #[test]
+    #[ignore = "perf microbench; requires a dedicated idle SM80+ CUDA device"]
+    fn decode_gemv_achieved_bandwidth_by_projection_shape() {
+        use cudarc::driver::result::event;
+        use cudarc::driver::sys;
+        use cudarc::driver::sys::CUdeviceptr;
+
+        /// Datasheet HBM2e peak of the box this was written against. Only the
+        /// percent-of-peak column depends on it.
+        const A100_SXM4_80GB_PEAK_GBPS: f64 = 2039.0;
+        /// `(K, N, calls_per_token, label)` — every distinct decoder GEMV shape.
+        const SHAPES: [(usize, usize, usize, &str); 6] = [
+            (6656, 19968, 104, "gate/up"),
+            (19968, 6656, 52, "down"),
+            (6656, 4096, 104, "q"),
+            (4096, 6656, 52, "o"),
+            (6656, 202048, 1, "lm_head"),
+            (6656, 256, 104, "k/v (GQA)"),
+        ];
+        const BLOCK: usize = 32;
+
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping GEMV bandwidth probe: CUDA runtime unavailable");
+            return;
+        };
+        if runtime
+            .require_nvrtc_half_headers("gemv bandwidth probe")
+            .is_err()
+        {
+            eprintln!("skipping GEMV bandwidth probe: fp16 NVRTC headers unavailable");
+            return;
+        }
+        runtime.bind().unwrap();
+        let reps = zc_env_usize("GEMV_PROBE_REPS", 15).max(5);
+
+        /// Everything one shape needs to be launched repeatedly. Device buffers
+        /// are allocated once and reused so the ramp below is not paying for
+        /// allocation, and so all shapes are resident while any is measured.
+        struct ShapeBench {
+            kernel: MatMulNBitsKernel,
+            label: &'static str,
+            k: usize,
+            n: usize,
+            calls: usize,
+            k_blocks: usize,
+            blob_size: usize,
+            zp_row_bytes: usize,
+            activation_dev: CUdeviceptr,
+            packed_dev: CUdeviceptr,
+            scales_dev: CUdeviceptr,
+            zp_dev: CUdeviceptr,
+            output_dev: CUdeviceptr,
+            /// Weights + scales + zero points. The fp16 activation (2*K bytes)
+            /// and the fp16 output (2*N) are three orders of magnitude smaller at
+            /// these shapes and are left out so the number is unambiguously
+            /// weight traffic.
+            bytes: f64,
+        }
+
+        impl ShapeBench {
+            fn launch(&self) {
+                let a_shape = [1usize, self.k];
+                let a_strides = [self.k as i64, 1];
+                let b_shape = [self.n, self.k_blocks, self.blob_size];
+                let b_strides = [
+                    (self.k_blocks * self.blob_size) as i64,
+                    self.blob_size as i64,
+                    1,
+                ];
+                let scales_shape = [self.n, self.k_blocks];
+                let scales_strides = [self.k_blocks as i64, 1];
+                let zp_shape = [self.n, self.zp_row_bytes];
+                let zp_strides = [self.zp_row_bytes as i64, 1];
+                let y_shape = [1usize, self.n];
+                let y_strides = [self.n as i64, 1];
+                let device = DeviceId::cuda(0);
+                let inputs = vec![
+                    TensorView::new(
+                        device_ptr(self.activation_dev),
+                        DataType::Float16,
+                        &a_shape,
+                        &a_strides,
+                        device,
+                    ),
+                    TensorView::new(
+                        device_ptr(self.packed_dev),
+                        DataType::Uint8,
+                        &b_shape,
+                        &b_strides,
+                        device,
+                    ),
+                    TensorView::new(
+                        device_ptr(self.scales_dev),
+                        DataType::Float16,
+                        &scales_shape,
+                        &scales_strides,
+                        device,
+                    ),
+                    TensorView::new(
+                        device_ptr(self.zp_dev),
+                        DataType::Uint8,
+                        &zp_shape,
+                        &zp_strides,
+                        device,
+                    ),
+                ];
+                let mut outputs = [TensorMut::new(
+                    device_ptr_mut(self.output_dev),
+                    DataType::Float16,
+                    &y_shape,
+                    &y_strides,
+                    device,
+                )];
+                self.kernel.run(&inputs, &mut outputs, None).unwrap();
+            }
+
+            /// Median GPU milliseconds per launch, plus the host milliseconds
+            /// spent enqueueing one.
+            ///
+            /// The two are separated on purpose, and the separation is the whole
+            /// reason this helper is not three lines long. Bracketing ONE launch
+            /// between two events measures neither: `cuEventRecord` timestamps
+            /// the stream, so a start event, a host-side `run()` and an end event
+            /// enclose the host dispatch as well as the kernel, and `run()` is
+            /// not cheap -- it re-reads tuning env vars, re-derives the launch
+            /// geometry and re-looks-up the NVRTC entry on every call. Measured
+            /// that way the k/v projection appeared to spend 35 us moving 1 MB,
+            /// which is 30 GB/s and absurd; almost all of it was the host.
+            ///
+            /// So enqueue `BATCH` launches between the events. The host runs
+            /// ahead of the stream, consecutive kernels execute back to back, and
+            /// the elapsed time divided by `BATCH` is the kernel. This is also
+            /// what production decode sees, because CUDA graph replay removes the
+            /// per-launch host work entirely.
+            ///
+            /// The host cost is still worth knowing -- it is the ceiling a
+            /// non-captured path would hit -- so it is timed separately, by
+            /// wall-clocking the enqueue loop before any synchronisation.
+            fn median_ms(&self, reps: usize) -> (f64, f64) {
+                const BATCH: usize = 32;
+                let runtime = &self.kernel.runtime;
+
+                // Host cost first, on the uncaptured path, because that is the
+                // path whose host cost is interesting.
+                let mut host = Vec::with_capacity(reps);
+                for _ in 0..reps {
+                    let enqueue_begin = std::time::Instant::now();
+                    for _ in 0..BATCH {
+                        self.launch();
+                    }
+                    host.push(enqueue_begin.elapsed().as_secs_f64() * 1e3 / BATCH as f64);
+                    runtime.synchronize().unwrap();
+                }
+                host.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let host_ms = host[host.len() / 2];
+
+                // Capture the batch into a graph so the timed loop contains no
+                // host work at all. Without this the cheapest shapes cannot be
+                // measured: the k/v projection's kernel and its `run()` dispatch
+                // are both about 24 us, so the stream starves and the events
+                // report the host, not the GPU.
+                let captured = runtime.reset_graph().is_ok()
+                    && runtime.begin_graph_capture(&[&self.kernel]).is_ok()
+                    && {
+                        for _ in 0..BATCH {
+                            self.launch();
+                        }
+                        runtime.end_graph_capture().is_ok()
+                    };
+                if !captured {
+                    runtime.abort_graph_capture().ok();
+                }
+
+                let mut gpu = Vec::with_capacity(reps);
+                for _ in 0..reps {
+                    let start = event::create(sys::CUevent_flags::CU_EVENT_DEFAULT).unwrap();
+                    let end = event::create(sys::CUevent_flags::CU_EVENT_DEFAULT).unwrap();
+                    // SAFETY: both events belong to this context and bracket the
+                    // batch on the same stream the kernel enqueues to.
+                    unsafe {
+                        event::record(start, runtime.stream_ptr()).unwrap();
+                        if captured {
+                            runtime.replay_graph().unwrap();
+                        } else {
+                            for _ in 0..BATCH {
+                                self.launch();
+                            }
+                        }
+                        event::record(end, runtime.stream_ptr()).unwrap();
+                        event::synchronize(end).unwrap();
+                        gpu.push(event::elapsed(start, end).unwrap() as f64 / BATCH as f64);
+                        event::destroy(start).ok();
+                        event::destroy(end).ok();
+                    }
+                }
+                runtime.reset_graph().ok();
+                gpu.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                (gpu[gpu.len() / 2], host_ms)
+            }
+        }
+
+        let mut benches = Vec::new();
+        for (k, n, calls, label) in SHAPES {
+            let k_blocks = k / BLOCK;
+            let blob_size = BLOCK / 2;
+            let zp_row_bytes = k_blocks.div_ceil(2);
+
+            // Bandwidth does not depend on the VALUES, only on the traffic, so
+            // fill with a cheap deterministic pattern instead of paying for a
+            // realistic quantization (this keeps lm_head, at 672 MB of packed
+            // weights, from dominating the probe's own runtime).
+            let mut state = 0x9e37_79b9_7f4a_7c15u64;
+            let mut next_byte = || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 56) as u8
+            };
+            let packed: Vec<u8> = (0..n * k_blocks * blob_size).map(|_| next_byte()).collect();
+            let zp: Vec<u8> = (0..n * zp_row_bytes).map(|_| next_byte()).collect();
+            let scales: Vec<f16> = (0..n * k_blocks).map(|_| f16::from_f32(0.02)).collect();
+            let activation: Vec<f16> = (0..k).map(|_| f16::from_f32(0.01)).collect();
+
+            let activation_dev = runtime.alloc_raw(activation.len() * 2).unwrap();
+            let packed_dev = runtime.alloc_raw(packed.len()).unwrap();
+            let scales_dev = runtime.alloc_raw(scales.len() * 2).unwrap();
+            let zp_dev = runtime.alloc_raw(zp.len()).unwrap();
+            let output_dev = runtime.alloc_raw(n * 2).unwrap();
+            // SAFETY: every device buffer was sized from the slice it receives.
+            unsafe {
+                runtime.htod(as_bytes(&activation), activation_dev).unwrap();
+                runtime.htod(&packed, packed_dev).unwrap();
+                runtime.htod(as_bytes(&scales), scales_dev).unwrap();
+                runtime.htod(&zp, zp_dev).unwrap();
+            }
+
+            let bench = ShapeBench {
+                kernel: MatMulNBitsKernel {
+                    runtime: runtime.clone(),
+                    k,
+                    n,
+                    bits: 4,
+                    block_size: BLOCK,
+                    accuracy_level: 4,
+                    accuracy4_workspace: None,
+                    fold_bias_post_round: false,
+                    gate_up_swiglu: false,
+                    decomposed_silu: false,
+                    rmsnorm_prologue: false,
+                    rmsnorm_epsilon: 1e-5,
+                    last_call_capture_safe: AtomicBool::new(false),
+                    bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+                    bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+                },
+                label,
+                k,
+                n,
+                calls,
+                k_blocks,
+                blob_size,
+                zp_row_bytes,
+                activation_dev,
+                packed_dev,
+                scales_dev,
+                zp_dev,
+                output_dev,
+                bytes: (n * k_blocks * blob_size + n * k_blocks * 2 + n * zp_row_bytes) as f64,
+            };
+            // First call also compiles the NVRTC module; never time it.
+            bench.launch();
+            runtime.synchronize().unwrap();
+            benches.push(bench);
+        }
+
+        // Bring the SM clock up BEFORE measuring anything. An idle A100 in this
+        // box sits at 210 MHz against a 1410 MHz maximum and persistence mode is
+        // off, so a probe that starts timing immediately reports whatever partial
+        // ramp it happened to catch. That is not a small effect: the same code on
+        // the same device measured 816 GB/s on a GPU another tenant had left warm
+        // and 586 GB/s on an idle one -- a 1.4x swing with nothing changed. Any
+        // A/B run across two such states is pure noise, and the direction of the
+        // noise is set by which of the box's eight GPUs a neighbour is using.
+        //
+        // Rather than trust a fixed sleep, ramp until the timing itself stops
+        // improving: that is the observable the clock actually controls, so it
+        // needs no NVML and no privileges. `ramp` is deliberately the widest
+        // shape so the device is loaded the way decode loads it.
+        let ramp = &benches[0];
+        let ramp_start = std::time::Instant::now();
+        let ramp_deadline = ramp_start + std::time::Duration::from_secs(30);
+        let mut previous = f64::INFINITY;
+        let mut ramp_trace = Vec::new();
+        loop {
+            let (now, _) = ramp.median_ms(5);
+            ramp_trace.push(now * 1000.0);
+            let settled = now > previous * 0.985;
+            previous = now;
+            // Convergence alone is not enough: two short readings agree long
+            // before the clock is done climbing. A first attempt at this loop
+            // stopped at "107 -> 107 us" and the very same shape then measured
+            // 90 us at the end of the sweep -- a 16% drift the ramp had declared
+            // settled. So also demand a floor on how long the device has been
+            // kept busy, which is what the clock actually responds to.
+            if settled && ramp_start.elapsed() >= std::time::Duration::from_secs(8) {
+                break;
+            }
+            if std::time::Instant::now() >= ramp_deadline {
+                eprintln!(
+                    "WARNING: clock had not settled after 30 s of ramping; \
+                     absolute numbers below are not comparable across runs"
+                );
+                break;
+            }
+        }
+        let ramp_best = ramp_trace.iter().cloned().fold(f64::INFINITY, f64::min);
+        println!(
+            "clock ramp on {}: {:.0} -> {:.0} us over {} readings in {:.1} s \
+             (best {:.0} us, {:.0}% off the first)",
+            ramp.label,
+            ramp_trace[0],
+            ramp_trace[ramp_trace.len() - 1],
+            ramp_trace.len(),
+            ramp_start.elapsed().as_secs_f64(),
+            ramp_best,
+            100.0 * (ramp_trace[0] - ramp_best) / ramp_trace[0]
+        );
+
+        let mut total_ms_per_token = 0.0f64;
+        let mut total_bytes_per_token = 0.0f64;
+        println!(
+            "{:<10} {:>7} {:>7} {:>6} {:>10} {:>9} {:>7} {:>9} {:>7} {:>9}",
+            "shape",
+            "K",
+            "N",
+            "calls",
+            "median_us",
+            "MB/call",
+            "GB/s",
+            "%peak",
+            "ms/tok",
+            "host_us"
+        );
+
+        let (first_before, _) = benches[0].median_ms(reps);
+        let mut total_host_ms_per_token = 0.0f64;
+        for bench in &benches {
+            let (median_ms, host_ms) = bench.median_ms(reps);
+            total_host_ms_per_token += host_ms * bench.calls as f64;
+            let gbps = bench.bytes / (median_ms * 1e-3) / 1e9;
+            let ms_tok = median_ms * bench.calls as f64;
+            total_ms_per_token += ms_tok;
+            total_bytes_per_token += bench.bytes * bench.calls as f64;
+            println!(
+                "{:<10} {:>7} {:>7} {:>6} {:>10.1} {:>9.2} {:>7.0} {:>8.1}% {:>7.2} {:>9.1}",
+                bench.label,
+                bench.k,
+                bench.n,
+                bench.calls,
+                median_ms * 1000.0,
+                bench.bytes / 1e6,
+                gbps,
+                100.0 * gbps / A100_SXM4_80GB_PEAK_GBPS,
+                ms_tok,
+                host_ms * 1000.0
+            );
+        }
+
+        // Re-read the first shape last. If the device drifted (clock throttle, a
+        // neighbour starting work) the sweep above compared shapes measured under
+        // different conditions, and the per-shape ranking is not trustworthy.
+        let (first_after, _) = benches[0].median_ms(reps);
+        let drift = (first_after - first_before).abs() / first_before;
+        if drift > 0.03 {
+            eprintln!(
+                "WARNING: {} drifted {:.1}% across the sweep ({:.1} -> {:.1} us); \
+                 the device was not stable and these rows are not comparable",
+                benches[0].label,
+                100.0 * drift,
+                first_before * 1000.0,
+                first_after * 1000.0
+            );
+        } else {
+            println!("\ndevice stable across sweep: {:.1}% drift", 100.0 * drift);
+        }
+
+        for bench in &benches {
+            // SAFETY: every pointer came from `alloc_raw` above and is freed once.
+            unsafe {
+                runtime.free_raw(bench.activation_dev).ok();
+                runtime.free_raw(bench.packed_dev).ok();
+                runtime.free_raw(bench.scales_dev).ok();
+                runtime.free_raw(bench.zp_dev).ok();
+                runtime.free_raw(bench.output_dev).ok();
+            }
+        }
+
+        let aggregate_gbps = total_bytes_per_token / (total_ms_per_token * 1e-3) / 1e9;
+        let implied_tps = 1000.0 / total_ms_per_token;
+        let roofline_tps = A100_SXM4_80GB_PEAK_GBPS * 1e9 / total_bytes_per_token;
+        println!(
+            "\nweight traffic {:.2} GB/token, GEMV time {:.2} ms/token\n\
+             aggregate achieved bandwidth {:.0} GB/s ({:.1}% of peak)\n\
+             decode ceiling from GEMV alone: {:.1} tok/s (bandwidth roofline {:.1} tok/s)\n\
+             host dispatch for the same launches: {:.2} ms/token \
+             (uncaptured ceiling {:.1} tok/s)",
+            total_bytes_per_token / 1e9,
+            total_ms_per_token,
+            aggregate_gbps,
+            100.0 * aggregate_gbps / A100_SXM4_80GB_PEAK_GBPS,
+            implied_tps,
+            roofline_tps,
+            total_host_ms_per_token,
+            1000.0 / total_host_ms_per_token
+        );
+        assert!(
+            implied_tps.is_finite() && implied_tps > 0.0,
+            "GEMV bandwidth probe produced no usable timing"
+        );
     }
 }
