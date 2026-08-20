@@ -702,7 +702,10 @@ What this did **not** fix, and what was measured and rejected:
   cells these are long enough to be reproducible. The GEMV
   correctly declines `M > 1`, so prefill still takes the blocked path. Closing
   it needs a packed **NT** half GEMM — the f16 analogue of #1176's transposed-B
-  SGEMM.
+  SGEMM. **This has since been closed — see [section
+  8](#8-transposed-b-transb--1-was-packed-by-a-scalar-strided-gather-fixed) —
+  though not by the NT micro-kernel predicted here: the arithmetic was never
+  the problem, the *packer* was.**
 * **The residual loss at high thread counts is the section 1 ceiling**, not
   anything specific to this kernel. Every one of our `M = 1` GEMVs flattens at
   ~0.7-1.1 ms past 4-8 threads while ORT keeps scaling. Measured on the same
@@ -820,6 +823,56 @@ What is left is the same fan-out problem as [section 1](#1-parallel-efficiency-n
 `STRIPE = 512` gives `n = 3584` only 7 stripes, so past 7 threads the workers contend. It is now the
 dominant remaining loss on these cells — every unclaimed cell above is t=32 — and an adaptive stripe
 width was already measured and refuted.
+
+### 8. Transposed `B` (`transB = 1`) was packed by a scalar strided gather (**fixed**)
+
+`Gemm` f16 with `transB = 1` is the shape a fused QKV projection takes when the weight is stored
+output-major. At `M = 128`, `K = N = 3584` it measured **4.48x** against ORT at one thread and
+**15.99x** at eight — one of the few cells that gets dramatically *worse* as threads are added.
+
+The cause was in `half_gemm::pack_b`, not in any kernel. `MatrixLayout::transposed(k)` has
+`column_stride = k`, and the packer's inner loop walked `column`, so it read `B` with stride `k`,
+one scalar `to_f32` per element, never reaching F16C. Transposed `B` stores each logical column
+*contiguously*; the packer was walking the one axis that strides.
+
+This was localised by emitting each shape twice — `transB = 1`, and `transB = 0` over the same
+array physically pre-transposed. Identical product, identical numbers, same micro-kernel; the only
+difference is the layout handed to `pack_b`. The transposed spelling cost a flat **~62 ms more at
+both `t = 1` and `t = 8`**, and a constant that does not shrink under 8x the cores is not
+arithmetic. It is `pack_b` being called once per row-block while `gemm_impl` scales the row-block
+*count* with the thread count.
+
+`pack_b_transposed` reads along the stored direction instead, so each column is a contiguous run
+through the same `T::pack_contiguous` the row-major path uses (F16C on x86, FP16/bf16 on NEON — no
+new intrinsics, no new architecture gates). Columns are handled `TRANSPOSED_PACK_GROUP = 4` at a
+time so the transposing stores are contiguous too; the group width is swept in the constant's docs.
+
+**27 cells across three geometries, 27 wins, 1.29x-2.66x** when opened; re-measured on the merged
+head immediately before landing, **26 of 27 prefill cells improve beyond their own null, -24.2% to
+-65.0% (1.32x-2.86x)**, with the 27th (`qwen3_0p6b_m32 t=8`) not claimed because its null moved
+46.3%. The headline cell, `M = 128 / t = 8`,
+goes **14.0x -> 7.0x** against ORT within one invocation (the 15.99x above is the same cell from a
+separate reproduction run; before/after must come from one run). `M = 1` is unaffected and
+unclaimed — it takes `gemv_f16_nk` and never reaches `pack_b`; three `M = 1` cells that read as
+regressions at 5 trials were all within noise at 11 trials x 40 runs. Results are **bit-identical**
+for `f16` — the F16C and scalar converters agree on all 65536 patterns — and differ for `bf16` only
+on the 126 signalling NaNs, which the scalar converter quiets and the `<< 16` widening preserves;
+both are NaN, and the change makes transposed `B` agree with row-major `B`. Fill order cannot
+change the packed panel, and
+`transposed_b_is_bit_identical_to_pre_transposed_row_major` asserts `to_bits()` equality on every
+execution path rather than a tolerance.
+
+Bounded honestly: this removes **two-thirds to three-quarters** of the layout penalty and nothing
+else. The pre-transposed control is *itself* still 2.6-3.3x behind ORT, so the half GEMM remains as
+far behind as section 1 describes for f32; and `B` is still re-packed per row-block, which is most
+of the 9-20 ms residual. Full record, including the negative control showing row-major `B` does not
+move: [`docs/benchmarks/2026-08-19-f16-nt-gemm-packing.md`](../benchmarks/2026-08-19-f16-nt-gemm-packing.md).
+
+> The `Gemm` f16 `M = 128` rows in the matrix above (1.03-2.24) **do not describe the shipped
+> default build**: on it, `transB = 1` measures 4.24x and even the row-major control 2.88x at
+> `M = 128 / t = 1`. They belong to the same research-build category already flagged for `MatMul`
+> f32 `M = 1` and `QLinearMatMul`. They have not been re-measured row by row, so they are annotated
+> rather than rewritten.
 
 
 ## Precision
