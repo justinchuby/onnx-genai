@@ -81,20 +81,7 @@ fn fixed_state_zero_initialization_resolves_symbolic_batch_axis() {
 }
 
 fn empty_metadata() -> InferenceMetadata {
-    InferenceMetadata {
-        required_capabilities: vec![],
-        schema_version: None,
-        model: None,
-        quantization: None,
-        preprocessing: None,
-        pipeline: None,
-        adapters: None,
-        hardware_requirements: None,
-        package: None,
-        generation: None,
-        profiles: Default::default(),
-        speculative: None,
-    }
+    InferenceMetadata::default()
 }
 
 fn gqa_attention() -> AttentionConfig {
@@ -117,12 +104,12 @@ fn model_capabilities(
 ) -> ModelCapabilities {
     ModelCapabilities {
         vocab_size: None,
-        io: None,
         attention: Some(attention),
         max_sequence_length,
         runtime_configurable,
         sharding: None,
         mixture_of_experts: None,
+        ..Default::default()
     }
 }
 
@@ -150,10 +137,8 @@ fn key_sequence_lengths_policy_is_generic_and_strict_by_default() {
 fn sliding_window_metadata_is_consumed_and_validated() {
     let mut attention = gqa_attention();
     attention.sliding_window = Some(4096);
-    let metadata = InferenceMetadata {
-        model: Some(model_capabilities(attention, Some(131_072), None)),
-        ..empty_metadata()
-    };
+    let mut metadata = empty_metadata();
+    metadata.model = Some(model_capabilities(attention, Some(131_072), None));
     assert_eq!(sliding_window_from_metadata(&metadata).unwrap(), Some(4096));
 
     let mut invalid = metadata.clone();

@@ -125,9 +125,9 @@ them; there is no global metadata digest requirement.
 ```yaml
 schema_version: v1          # required
 required_capabilities: []   # capabilities the reader must implement
-model: {...}                # bare single-model facts and graph I/O
+model: {...}                # package-wide baked facts (attention geometry, vocab, MoE, sharding)
 quantization: {...}         # model-weight quantization intent
-pipeline: {workflow: {...}} # the executable workflow (composite packages)
+pipeline: {workflow: {...}} # the executable workflow: the only graph ABI
 adapters: {...}             # LoRA target manifest and artifact bindings
 preprocessing: {...}        # typed preprocessing contracts
 package: {...}              # tokenizer and constraint-language facts
@@ -137,9 +137,58 @@ speculative: {...}          # proposer/target compatibility facts
 hardware_requirements: {...}
 ```
 
-A bare single-model decoder **MAY** use `model.io` alone. A composite package
-**MUST** use exactly one `pipeline.workflow` and **MUST NOT** declare top-level
-`model.io`.
+`pipeline.workflow` is the **sole serialized expression of a package's
+executable graph ABI**, for every package, including one that ships a single
+ONNX file. `model:` carries facts that are true of the package rather than of
+any one graph — attention geometry, vocabulary and length limits, MoE structure,
+sharding. It does **not** carry port names. See §4.1a.
+
+### 4.1a One canonical graph ABI
+
+A package must not be able to say what its decode step looks like twice.
+
+Component ports, `Invoke` input/output bindings, workflow state cells and
+`state_service` groups already describe every port a runtime touches, because
+they are what the workflow engine executes. A serialized `model.io` beside them
+is a second writable answer to the same question, and nothing forces the two to
+agree: a runtime reading one never learns that the other said something else.
+Two accepted representations is a defect independent of their contents.
+
+So the ABI is written once, in the workflow, and **derived** where a runtime
+needs it flattened:
+
+| Resolved fact | Canonical source |
+| --- | --- |
+| token / embeds / mask / position inputs | `components.<c>.ports.roles` |
+| logits / hidden outputs | `components.<c>.ports.roles` |
+| encoder-hidden / audio inputs | `components.<c>.ports.roles` |
+| KV input/output pairs, per layer | self-attention `state_service` groups |
+| cross-attention KV pairs | `cross_attention` groups |
+| fixed loop-carried state pairs | `recurrent` groups |
+| `aliasing`, KV layout | the owning group |
+| fixed-capacity scatter ABI | `StateUpdate::IndexedScatter` |
+| KV ownership | presence of an owning group |
+
+`InferenceMetadata::decoder_io()` performs that derivation. It is a *lowering*,
+not a second source: the result is computed, never serialized, and there is no
+key a producer can write to make it disagree with the workflow. The optimized
+single-graph decode path is therefore a **recognizer** over the canonical
+workflow rather than a path with its own serialized truth, and a bare single
+ONNX decoder and a composite package are driven from one representation.
+
+Only one fact could not be recovered from an existing field: what a component
+*does* with a value an invoke binds to it. A binding records which value reaches
+a port, not whether that port is tokens, a mask, or logits, and guessing from a
+port's spelling is exactly the name-matching this schema refuses everywhere
+else. `ports.roles` states it, with an architecture-neutral vocabulary that
+describes the port and never the model family exposing it.
+
+**`model.io` is import-only and non-authoritative.** It is deserialized under
+its historical key, marked deprecated in the Rust API as `legacy_io`, and read
+only when a document carries no workflow — which is exactly the legacy
+`genai_config.json` import path (§17). Declaring it *beside* a workflow is
+rejected, so no document can hold two conflicting answers. Its removal path is
+in §18.
 
 ### 4.2 Strictness
 
@@ -627,11 +676,13 @@ state_service:
         capacity: package.capacity       # a graph-visible integer scalar
         write_indices_ports:             # which input port carries destinations
           model: write_indices
+        kv_length_ports:                 # which input port carries the valid KV length
+          model: cache_lengths
       checkpoint: { adapter: onnx-genai.kv-checkpoint, version: "1" }
       ports:
         model:
-          key_cache:   { input: key_cache,   output: updated_key_cache }
-          value_cache: { input: value_cache, output: updated_value_cache }
+          key_cache:   { input: key_cache,   output: updated_key_cache,   role: key,   layer: 0 }
+          value_cache: { input: value_cache, output: updated_value_cache, role: value, layer: 0 }
 ```
 
 Each part earns its place:
@@ -644,11 +695,22 @@ Each part earns its place:
 - **`capacity` separates the buffer's size from its contents.** `logical_lengths`
   is the valid prefix; capacity is the wall. Both are needed, because the whole
   point of a static cache is that they differ.
-- **`write_indices_ports` names the port.** The runtime checks destinations
-  *before* the invoke, which requires knowing which bound input carries them.
-  This is the one fact that cannot be recovered from the graph: destinations are
-  shape- and dtype-indistinguishable from any other integer control input, and
-  the runtime cannot invert a cell name back to a body SSA value at invoke time.
+- **`write_indices_ports` and `kv_length_ports` name the ports.** The runtime
+  checks destinations *before* the invoke, which requires knowing which bound
+  input carries them. These are the facts that cannot be recovered from the
+  graph: a write cursor and a valid length are both rank-1 integer vectors, so
+  they are shape- and dtype-indistinguishable from each other and from any
+  other integer control input, and the runtime cannot invert a cell name back to
+  a body SSA value at invoke time. `logical_lengths` names a *state cell*;
+  `kv_length_ports` names the *port* that cell reaches, and both are needed
+  because a cell is not a port.
+- **`role` and `layer` on a port pair.** A split cache exposes two
+  shape-identical buffers per layer; only the producer knows which half is
+  which, and the alias key is a producer-chosen label whose lexicographic order
+  is not the graph's (`layer.10` sorts before `layer.2`). A runtime pairing
+  buffers positionally would silently transpose two layers' caches, and no shape
+  check could catch it. `role` distinguishes the halves and `layer` fixes the
+  order.
 - **Group-bound buffers must be shape-`invariant`.** A fixed capacity that
   changes shape is a contradiction; the validator refuses it rather than letting
   the two claims drift.
@@ -670,31 +732,24 @@ destinations behind the island boundary, such components are excluded from
 fusion: an unchecked scatter is undefined behaviour, which is not a trade a
 performance optimization may make.
 
-#### `model.io` beside a workflow
+#### The static-cache ABI lives in the workflow
 
-A package may declare `model.io` **and** `pipeline.workflow`. They answer
-different questions about the same graph:
+The port ABI of a static cache is not a separate declaration beside the
+workflow. It **is** the workflow: `write_indices_ports` and `kv_length_ports`
+name the control inputs, the group's `ports` name the per-layer buffers, and
+`role`/`layer` say which buffer is which. A runtime that drives the decode graph
+directly reads the same declaration the workflow engine executes, resolved
+through `decoder_io()` (§4.1a).
 
-- `model.io.static_cache` is the **port ABI** — which input carries write
-  destinations, which carries the non-pad KV length, which ports are the
-  per-layer buffers. A runtime that drives the decoder graph directly reads this
-  and never sees a workflow.
-- the state group is the **binding** — what flows into those ports, and when.
-
-Earlier this pair was rejected outright, with the message directing authors to
-`pipeline.models.<component>.io`. The workflow IR removed that key, which left
-the rule unsatisfiable in both directions: a workflow package had nowhere to
-declare a port ABI, while `static_cache`'s own contract requires the ABI to be
-declared because its integer control ports are shape-indistinguishable. Two
-rules that cannot both be obeyed do not describe a valid document; they describe
-a hole.
-
-The overlap is now permitted and **checked**. The destination port settles which
-component the ABI describes — the workflow already had to name that port per
-component — and every per-layer cache pair the ABI claims must be a pair the
-group binds. Where the two surfaces state the same fact they must agree, and a
-disagreement is reported naming both sources, which is the only outcome that
-tells an author which one to fix.
+An earlier revision permitted a `model.io.static_cache` block beside the
+workflow, on the reasoning that a direct-drive runtime needs the port ABI while
+the group supplies the bindings. That was the wrong repair. The problem it
+solved was real — a workflow package genuinely had nowhere to name control ports
+that are shape-indistinguishable from one another — but the fix admitted a
+second writable answer to a question the workflow already answers, which is the
+defect §4.1a forbids. Adding the two port maps to `update` puts the missing fact
+where the binding that consumes it lives, and declaring the pair beside a
+workflow is now rejected.
 
 ### 12.2c FP8 and other narrow cache element types
 
@@ -1044,9 +1099,39 @@ Packages written against the previous contract migrate as follows:
 | native stateful components | add `row_scope` and `cache_affects_state` |
 | contracts | add `equivalence` (defaults to `semantic`) |
 | state cells bound to a group | add `management: runtime` + `release_boundary` |
+| top-level `model.io` beside a `pipeline.workflow` | delete `model.io`; declare port roles in `components.<c>.ports.roles` and cache ports in the owning `state_service` group |
+| `model.io.static_cache` | `state_service.groups.<g>.update` (`indexed_scatter`, `write_indices_ports`, `kv_length_ports`) plus `role`/`layer` on the group's port pairs |
+| `pipeline.models.<c>.io` | deleted with the composite IR; use `components.<c>.ports` |
 
 Every removed field is rejected by name, so migration failures are precise rather
 than mysterious.
+
+### 18.1 Removal path for `model.io`
+
+`model.io` still deserializes, so packages produced by the legacy importer keep
+working. It is not a supported way to *author* a package, and it is not a second
+source of truth: it is read only when a document carries no workflow, and
+declaring it beside one is an error today.
+
+The remaining steps, in order, each independently shippable:
+
+1. **Now** — `model.io` is deserialize-only. The Rust field is `legacy_io`,
+   marked `#[deprecated]`, and reachable through one accessor. No consumer reads
+   it directly; every runtime path goes through `decoder_io()`. Coexistence with
+   a workflow is rejected. *(done)*
+2. **Next** — the `genai_config.json` importer synthesizes a canonical workflow
+   instead of a `model.io` block. Import is already one-way and fail-closed
+   (§17), so this changes only what the converter writes, and the deprecated
+   deserialization stays to read packages already on disk.
+3. **Then** — deserializing `model.io` emits a validation warning naming the
+   canonical replacement for each key it carries.
+4. **Finally** — the field is deleted and the key is rejected by name, joining
+   the table above. The `ModelIoSpec` type survives as the *resolved* result of
+   `decoder_io()`, which is a derived value with no serialized form.
+
+`generation.speculative_decoding.io` is the same class of debt for a proposer
+graph and is unchanged here: it describes a model with no workflow component of
+its own, so it needs a canonical component before it can follow this path.
 
 ---
 
@@ -1080,6 +1165,10 @@ A conforming document satisfies all of these. Each is validator-enforced.
     does not understand them; ignorable profiles are skipped.
 12. **Session scope is normative.**
 13. **Checkpoint and private P/D transfer are explicitly different paths.**
+14. **One serialized graph ABI.** `pipeline.workflow` is the only place a
+    package states its executable port ABI. `model.io` is import-only, is read
+    only when no workflow is present, and is rejected beside one, so no document
+    holds two conflicting answers.
 
 ---
 
@@ -1108,6 +1197,10 @@ cargo run -p onnx-genai-metadata --bin validate_metadata -- <path>
 | Row ABI (`compact`/`release`) | `crates/onnx-genai-engine/src/pipeline/row_state.rs` |
 | Generation override fail-loud | `crates/onnx-genai-engine/src/config.rs::generation_contract_tests` |
 | Legacy import fail-closed | `crates/onnx-genai-genai-config/src/import.rs` unit tests |
+| One canonical graph ABI, bare and composite | `crates/onnx-genai-metadata/tests/canonical_graph_abi.rs` |
+| `model.io` beside a workflow rejected | `static_cache_and_fp8_state.rs::model_io_beside_a_workflow_is_refused` |
+| Static-cache ABI recognized from the workflow | `static_cache_and_fp8_state.rs::the_decode_abi_is_recognized_from_the_workflow_alone` |
+| Per-layer cache order follows declared `layer` | `static_cache_and_fp8_state.rs::per_layer_cache_order_follows_the_declared_layer_index` |
 | End-to-end workflows | `crates/onnx-genai-engine/tests/onnx_genai_workflow_conformance.rs` |
 | Canonical packages | `tests/fixtures/onnx_genai_workflows/` |
 | Row axis derivable without identity | `redesign_invariants.rs::the_row_axis_is_derivable_without_any_serialized_row_identity` |
@@ -1564,11 +1657,14 @@ limitations without weakening the representability claim. In particular:
 
 The canonical executable packages cover decoder, VLM, image diffusion, guided
 diffusion, masked diffusion, speculative decoding, codec, TTS, video, and
-adapters. CTC and audio preprocessing have profile/validator coverage, while
-real-weight Whisper, CTC, image-edit, diffusion, video, VLM, and heterogeneous
-KV runs establish the higher proof levels. These examples therefore cover the
-known workflow *shapes* without claiming that an untested model automatically
-has a correct exporter.
+adapters. Each declares its graph ABI only in its workflow, so the bare
+single-ONNX decoder package and the three-graph VLM package are evidence for the
+same representation rather than for two (§4.1a,
+`crates/onnx-genai-metadata/tests/canonical_graph_abi.rs`). CTC and audio
+preprocessing have profile/validator coverage, while real-weight Whisper, CTC,
+image-edit, diffusion, video, VLM, and heterogeneous KV runs establish the
+higher proof levels. These examples therefore cover the known workflow *shapes*
+without claiming that an untested model automatically has a correct exporter.
 
 ---
 

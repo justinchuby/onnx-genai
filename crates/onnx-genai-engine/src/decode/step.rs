@@ -216,7 +216,7 @@ pub(crate) fn run_decode_step_with_extra(
             );
         } else {
             anyhow::bail!(
-                "unsupported model input '{}' with shape {:?}; declare its semantic role in model.io or route it through pipeline metadata (declared state inputs: {:?})",
+                "unsupported model input '{}' with shape {:?}; declare its semantic role in pipeline.workflow.components.<component>.ports.roles or route it through pipeline metadata (declared state inputs: {:?})",
                 info.name,
                 info.shape,
                 decode_state

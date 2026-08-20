@@ -57,14 +57,15 @@ pub(crate) fn declared_or_detected_input(
     resolve_port(
         inputs,
         declared,
-        &format!("{metadata_scope}.{field}"),
+        &format!("{metadata_scope} {field}"),
         |info| structurally_matches(structural_role, info),
     )
     .map_err(anyhow::Error::msg)?
     .map(|resolved| resolved.name)
     .with_context(|| {
         format!(
-            "native graph cannot resolve {metadata_scope}.{field} from tensor shape; declare the exact graph port in {metadata_scope}.{field}"
+            "native graph cannot resolve {metadata_scope} {field} from tensor shape; \
+             declare the port's role in pipeline.workflow.components.<component>.ports.roles"
         )
     })
 }
@@ -79,7 +80,7 @@ pub(crate) fn optional_declared_or_detected_input(
     resolve_port(
         inputs,
         declared,
-        &format!("{metadata_scope}.{field}"),
+        &format!("{metadata_scope} {field}"),
         |info| structurally_matches(structural_role, info),
     )
     .map_err(anyhow::Error::msg)
@@ -96,14 +97,15 @@ pub(crate) fn declared_or_detected_output(
     resolve_port(
         outputs,
         declared,
-        &format!("{metadata_scope}.{field}"),
+        &format!("{metadata_scope} {field}"),
         |info| structurally_matches(structural_role, info),
     )
     .map_err(anyhow::Error::msg)?
     .map(|resolved| resolved.name)
     .with_context(|| {
         format!(
-            "native graph cannot resolve {metadata_scope}.{field} from tensor shape; declare the exact graph port in {metadata_scope}.{field}"
+            "native graph cannot resolve {metadata_scope} {field} from tensor shape; \
+             declare the port's role in pipeline.workflow.components.<component>.ports.roles"
         )
     })
 }
@@ -118,7 +120,7 @@ pub(crate) fn optional_declared_or_detected_output(
     resolve_port(
         outputs,
         declared,
-        &format!("{metadata_scope}.{field}"),
+        &format!("{metadata_scope} {field}"),
         |info| structurally_matches(structural_role, info),
     )
     .map_err(anyhow::Error::msg)

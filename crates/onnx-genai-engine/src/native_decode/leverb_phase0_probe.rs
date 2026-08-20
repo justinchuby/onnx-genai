@@ -75,7 +75,7 @@ fn load(model_dir: &std::path::Path, graph_capture: bool, kv_max: usize) -> Nati
     let mut io = meta
         .model
         .and_then(|m| m.io)
-        .expect("inference_metadata.yaml declares model.io");
+        .expect("inference_metadata.yaml declares a decode ABI");
     io.sequence_source = Some(SequenceInputKind::TokenIds);
     if io.token_input.is_none() {
         io.token_input = Some("input_ids".into());

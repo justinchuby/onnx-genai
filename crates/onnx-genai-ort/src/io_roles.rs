@@ -57,7 +57,8 @@ pub fn resolve_port(
     }
     if structural_matches.len() > 1 {
         return Err(format!(
-            "cannot resolve {metadata_key} from tensor shape because {} ports match: {:?}; declare the exact graph port in {metadata_key}",
+            "cannot resolve {metadata_key} from tensor shape because {} ports match: {:?}; \
+             declare the port's role in pipeline.workflow.components.<component>.ports.roles",
             structural_matches.len(),
             structural_matches
                 .iter()
@@ -143,7 +144,7 @@ mod tests {
             is_rank_one_or_two_sequence,
         )
         .unwrap_err();
-        assert!(error.contains("declare the exact graph port in io.token_input"));
+        assert!(error.contains("declare the port's role in"));
     }
 
     #[test]

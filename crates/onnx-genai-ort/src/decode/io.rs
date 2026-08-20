@@ -78,10 +78,12 @@ fn kv_pair(session: &Session, past_name: &str, present_name: &str) -> Result<KvP
 ///
 /// The `write_indices`/`kv_sequence_length` scatter control inputs are integer
 /// vectors and therefore SHAPE-indistinguishable, so their names come only from
-/// explicit `model.io.static_cache` metadata. The token/position ports come from
-/// the ordinary `model.io` roles. Nothing is ever interpreted from a graph port
-/// name: a static-cache graph without `model.io.static_cache` is rejected rather
-/// than name-guessed.
+/// the package's declared scatter ABI. The token/position ports come from the
+/// declared port roles. Both reach this driver through the resolved decode ABI
+/// (`InferenceMetadata::decoder_io()`), which a workflow package derives from
+/// its `state_service` group and its component port roles. Nothing is ever
+/// interpreted from a graph port name: a static-cache graph whose package
+/// declares no scatter ABI is rejected rather than name-guessed.
 #[derive(Debug, Clone)]
 pub(super) struct StaticCacheAbi {
     pub(super) token_input: String,
@@ -130,7 +132,7 @@ pub(super) fn detect_static_cache(
     reject_undeclared_static_cache(session)
 }
 
-/// Resolve the static-cache ABI from explicit `model.io.static_cache` metadata.
+/// Resolve the static-cache ABI from the package's declared scatter discipline.
 fn detect_static_cache_from_spec(
     session: &Session,
     io: Option<&onnx_genai_metadata::ModelIoSpec>,
@@ -185,10 +187,10 @@ fn detect_static_cache_from_spec(
 ///
 /// The TensorScatter static-cache scatter ABI is driven by SHAPE-indistinguish-
 /// able integer control ports (`write_indices` / `kv_sequence_length`), so it can
-/// only be bound from explicit `model.io.static_cache` metadata — never guessed
-/// from graph port names. When a graph exposes the historical scatter control
-/// ports but declares no `static_cache` spec, we refuse to interpret those names
-/// and instead return an actionable error naming the exact key to declare. Graphs
+/// only be bound from a declared scatter ABI — never guessed from graph port
+/// names. When a graph exposes the historical scatter control ports but the
+/// package declares no scatter discipline, we refuse to interpret those names and
+/// instead return an actionable error naming the exact keys to declare. Graphs
 /// that expose no static-cache scatter ABI return `Ok(None)` so the ordinary KV
 /// path handles them.
 fn reject_undeclared_static_cache(
@@ -202,25 +204,27 @@ fn reject_undeclared_static_cache(
         return Ok(None);
     }
     Err(OrtError::InvalidArgument(
-        "graph exposes a TensorScatter static-cache scatter ABI but declares no \
-         `model.io.static_cache`; its integer scatter control ports \
-         (write_indices / kv_sequence_length) are shape-indistinguishable and \
-         cannot be bound by port name. Declare `model.io.static_cache` with \
-         write_indices_input, kv_sequence_length_input, and the positionally \
-         paired key_cache_inputs / value_cache_inputs / key_cache_outputs / \
-         value_cache_outputs."
+        "graph exposes a TensorScatter static-cache scatter ABI but the package \
+         declares no fixed-capacity write discipline; its integer scatter control \
+         ports (write_indices / kv_sequence_length) are shape-indistinguishable \
+         and cannot be bound by port name. Declare the cache group at \
+         pipeline.workflow.serving.state_service.groups.<group> with `update.kind: \
+         indexed_scatter`, `update.write_indices_ports.<component>`, \
+         `update.kv_length_ports.<component>`, and a `role: key` / `role: value` \
+         (or `role: combined`) and `layer:` on each of the group's per-layer port \
+         pairs."
             .into(),
     ))
 }
 
-/// Resolve the token-sequence input: explicit `model.io.token_input`, else the
+/// Resolve the token-sequence input: the declared `token_input` role, else the
 /// historical `input_ids` port.
 fn token_input_name(_session: &Session, io: Option<&onnx_genai_metadata::ModelIoSpec>) -> String {
     io.and_then(|io| io.token_input.clone())
         .unwrap_or_else(|| "input_ids".to_string())
 }
 
-/// Resolve the position-ids input: explicit `model.io.position_ids_input`, else
+/// Resolve the position-ids input: the declared `position_ids_input` role, else
 /// the historical `position_ids` port when the graph exposes one.
 fn position_ids_input_name(
     session: &Session,
@@ -254,7 +258,8 @@ fn require_declared_input(session: &Session, name: &str, field: &str) -> Result<
         Ok(())
     } else {
         Err(OrtError::InvalidArgument(format!(
-            "model.io.{field} '{name}' is not exposed by the graph"
+            "the package's declared decode ABI names {field} '{name}', which the graph \
+             does not expose"
         )))
     }
 }
@@ -348,7 +353,9 @@ fn validate_static_cache_spec_lengths(
     let layer_count = spec.key_cache_inputs.len();
     if layer_count == 0 {
         return Err(OrtError::InvalidArgument(
-            "model.io.static_cache.key_cache_inputs must declare at least one layer".into(),
+            "the declared static-cache ABI has no key_cache_inputs; the cache group must bind \
+             at least one per-layer port pair"
+                .into(),
         ));
     }
     for (field, len) in [
@@ -358,8 +365,8 @@ fn validate_static_cache_spec_lengths(
     ] {
         if len != layer_count {
             return Err(OrtError::InvalidArgument(format!(
-                "model.io.static_cache.{field} ({len}) must have the same length as \
-                 key_cache_inputs ({layer_count})"
+                "the declared static-cache ABI has {len} {field} but {layer_count} key cache \
+                 inputs; every layer needs one port of each kind"
             )));
         }
     }

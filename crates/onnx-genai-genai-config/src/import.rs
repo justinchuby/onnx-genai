@@ -551,11 +551,7 @@ mod tests {
         let (metadata, _) =
             import(&config, &raw, None, None, ImportOptions::default()).expect("import");
         assert_eq!(
-            metadata
-                .model
-                .as_ref()
-                .and_then(|model| model.io.as_ref())
-                .and_then(|io| io.aliasing),
+            metadata.decoder_io().and_then(|io| io.aliasing),
             Some(onnx_genai_metadata::StateAliasing::Permitted)
         );
     }
@@ -577,14 +573,7 @@ mod tests {
             let config: GenAiConfig = serde_json::from_value(raw.clone()).expect("config");
             let (metadata, _) =
                 import(&config, &raw, None, None, ImportOptions::default()).expect("import");
-            assert_eq!(
-                metadata
-                    .model
-                    .as_ref()
-                    .and_then(|model| model.io.as_ref())
-                    .and_then(|io| io.aliasing),
-                None
-            );
+            assert_eq!(metadata.decoder_io().and_then(|io| io.aliasing), None);
         }
     }
 

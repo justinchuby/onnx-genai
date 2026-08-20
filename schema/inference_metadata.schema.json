@@ -1070,6 +1070,13 @@
           },
           "default": {},
           "type": "object"
+        },
+        "roles": {
+          "additionalProperties": {
+            "$ref": "#/$defs/PortRole"
+          },
+          "description": "Semantic role of the ports whose meaning the workflow's own structure\ncannot recover, keyed by port name.\n\nState ports never need an entry: a state group already names its\nper-component `(input, output)` pair, and the fixed-capacity control\nports are named by [`StateUpdate::IndexedScatter`]. What is left is the\nper-step dataflow a workflow binds by SSA value, where the binding\nrecords WHICH value reaches a port but not WHAT the component does with\nit. A runtime that specializes a decode step — packing tokens, reusing a\nlogits buffer, skipping a mask it can prove is causal — needs that\nsecond fact, and inferring it from a port's spelling is exactly the\nname-guessing this schema refuses everywhere else.\n\nRoles are architecture-neutral and describe the port, never the model\nfamily that happens to expose it.",
+          "type": "object"
         }
       },
       "type": "object"
@@ -2688,7 +2695,8 @@
             }
           ],
           "default": null,
-          "description": "Explicit graph I/O port bindings for the single-decoder LLM path.\n\nThe runtime binds decode-step inputs and outputs from the declared names.\nA port that is not declared is resolved ONLY from an unambiguous io-shape\nsignal; when the shape is ambiguous the runtime fails with an actionable\nerror naming the exact key to declare, and never guesses from a tensor\nname."
+          "deprecated": true,
+          "description": "DEPRECATED, import-only: legacy explicit graph I/O for a bare\nsingle-decoder package.\n\nThe canonical, and only authoritative, expression of a package's\nexecutable graph ABI is the workflow:\n`pipeline.workflow.components.<component>.ports` (with `ports.roles`),\nthe invoke bindings that connect them, and the `state_service` groups\nthat declare model state. A composite package and a bare one-file\ndecoder use that same representation.\n\nThis block remains only so packages written before the workflow existed\nstill load. It is never read directly: [`ModelCapabilities::io`] resolves\nthe workflow first and falls back here, and a document carrying both is\nrejected so the two can never disagree. New producers must not emit it."
         },
         "max_sequence_length": {
           "description": "Maximum total sequence length, in tokens.",
@@ -3064,6 +3072,51 @@
         "axis"
       ],
       "type": "object"
+    },
+    "PortRole": {
+      "description": "Architecture-neutral semantic role of one component port.\n\nThis vocabulary names what a value MEANS to the component that consumes or\nproduces it. It deliberately excludes anything a state group already\ndeclares, so a role and a state binding can never disagree about the same\nport.",
+      "oneOf": [
+        {
+          "const": "token_ids",
+          "description": "Discrete token identifiers driving autoregressive execution.",
+          "type": "string"
+        },
+        {
+          "const": "inputs_embeds",
+          "description": "Pre-embedded sequence, used when another component owns the embedding.",
+          "type": "string"
+        },
+        {
+          "const": "attention_mask",
+          "description": "Attention mask over the sequence.",
+          "type": "string"
+        },
+        {
+          "const": "position_ids",
+          "description": "Per-position indices used by position embedding.",
+          "type": "string"
+        },
+        {
+          "const": "logits",
+          "description": "Unnormalized next-token scores.",
+          "type": "string"
+        },
+        {
+          "const": "hidden_states",
+          "description": "Per-token hidden states exposed as a distinct output.",
+          "type": "string"
+        },
+        {
+          "const": "encoder_hidden_states",
+          "description": "Encoder result consumed by a cross-attending decoder.",
+          "type": "string"
+        },
+        {
+          "const": "audio_features",
+          "description": "Encoded audio features consumed by a speech decoder.",
+          "type": "string"
+        }
+      ]
     },
     "Precision": {
       "description": "Weight precision and quantization-recipe vocabulary.",
@@ -4040,8 +4093,28 @@
         "input": {
           "type": "string"
         },
+        "layer": {
+          "description": "Zero-based layer index of this port pair within its group.\n\nRequired when a group binds more than one alias of the same\n[`StatePortRole`], because the map key is a producer-chosen label and\nits lexicographic order is not the layer order (`layer.10` sorts before\n`layer.2`). A runtime that pairs per-layer buffers positionally would\notherwise silently transpose two layers' caches.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "output": {
           "type": "string"
+        },
+        "role": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StatePortRole"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Which half of an attention cache this port pair carries.\n\nA graph that splits keys and values into separate buffers exposes two\naliases per layer that are shape-identical and therefore\nindistinguishable; a graph that packs them exposes one. Only the\nproducer knows which it built, and recovering it from a port's spelling\nwould be the name-guessing this schema refuses. Absent means the group\ndoes not distinguish halves, which is correct for recurrent and latent\nstate."
         }
       },
       "required": [
@@ -4049,6 +4122,26 @@
         "output"
       ],
       "type": "object"
+    },
+    "StatePortRole": {
+      "description": "Which half of a split attention cache a state port pair carries.",
+      "oneOf": [
+        {
+          "const": "key",
+          "description": "Keys of a split key/value cache.",
+          "type": "string"
+        },
+        {
+          "const": "value",
+          "description": "Values of a split key/value cache.",
+          "type": "string"
+        },
+        {
+          "const": "combined",
+          "description": "A single buffer holding keys and values together.",
+          "type": "string"
+        }
+      ]
     },
     "StateReleaseBoundary": {
       "description": "Logical boundary after which a managed or external state cell is releasable.",
@@ -4130,6 +4223,13 @@
             "kind": {
               "const": "indexed_scatter",
               "type": "string"
+            },
+            "kv_length_ports": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "Per-component input port that receives the graph-visible valid\nlength, keyed by component name.\n\nExactly the same problem as `write_indices_ports`, and unsolvable the\nsame way: the length is a rank-1 integer vector, so it is\nshape-indistinguishable from the destinations sitting next to it. A\ngraph that reads no length port declares none.",
+              "type": "object"
             },
             "write_indices": {
               "description": "Semantic state cell carrying this step's per-row destination\npositions along `sequence_axis`.\n\nA cell rather than a step output because the write cursor is part of\nthe group's state: it must be checkpointed, forked, and rewound with\nthe buffer it indexes, or a restored row would overwrite live\npositions.",

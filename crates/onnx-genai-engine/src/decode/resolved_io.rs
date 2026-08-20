@@ -303,16 +303,17 @@ impl ResolvedIo {
                     .map_err(anyhow::Error::msg)
                     .map(|resolved| resolved.map(|resolved| resolved.name))
             };
-        let token_input = input("model.io.token_input", is_rank_one_or_two_sequence)?;
-        let inputs_embeds_input = input("model.io.inputs_embeds_input", is_rank_three_sequence)?;
+        let token_input = input("token_input", is_rank_one_or_two_sequence)?;
+        let inputs_embeds_input = input("inputs_embeds_input", is_rank_three_sequence)?;
         if token_input.is_none() && inputs_embeds_input.is_none() {
             anyhow::bail!(
-                "cannot resolve the decoder sequence input from tensor shape; declare model.io.sequence_source and its exact model.io.token_input or model.io.inputs_embeds_input"
+                "cannot resolve token_input or inputs_embeds_input from tensor shape; declare the \
+                 port's role in pipeline.workflow.components.<component>.ports.roles"
             );
         }
         let logits_output =
-            output("model.io.logits_output", is_rank_one_to_three_output)?.with_context(|| {
-                "cannot resolve decoder logits from tensor shape; declare model.io.logits_output"
+            output("logits_output", is_rank_one_to_three_output)?.with_context(|| {
+                "cannot resolve logits_output from tensor shape; declare the port's role in pipeline.workflow.components.<component>.ports.roles"
             })?;
         if session.inputs().iter().any(|info| {
             matches!(
@@ -322,7 +323,7 @@ impl ResolvedIo {
                 && Some(info.name.as_str()) != inputs_embeds_input.as_deref()
         }) {
             anyhow::bail!(
-                "decoder exposes stateful floating-point inputs that cannot be paired unambiguously by shape; declare model.io.kv_inputs and model.io.kv_outputs (or model.io.state_pairs)"
+                "decoder exposes stateful floating-point inputs that cannot be paired unambiguously by shape; declare kv_inputs and kv_outputs (or state_pairs)"
             );
         }
         Ok(Self {
@@ -378,11 +379,11 @@ impl ResolvedIo {
                 Some(
                     resolve_input(
                         io.token_input.as_deref(),
-                        "model.io.token_input",
+                        "token_input",
                         is_rank_one_or_two_sequence,
                     )?
                     .context(
-                        "cannot resolve decoder token input from tensor shape; declare model.io.token_input",
+                        "cannot resolve decoder token input from tensor shape; declare token_input",
                     )?,
                 ),
                 io.inputs_embeds_input.clone(),
@@ -392,11 +393,11 @@ impl ResolvedIo {
                 Some(
                     resolve_input(
                         io.inputs_embeds_input.as_deref(),
-                        "model.io.inputs_embeds_input",
+                        "inputs_embeds_input",
                         is_rank_three_sequence,
                     )?
                     .context(
-                        "cannot resolve decoder embedding input from tensor shape; declare model.io.inputs_embeds_input",
+                        "cannot resolve decoder embedding input from tensor shape; declare inputs_embeds_input",
                     )?,
                 ),
             ),
@@ -416,7 +417,7 @@ impl ResolvedIo {
         let logits_output = resolve_port(
             session.outputs(),
             io.logits_output.as_deref(),
-            "model.io.logits_output",
+            "logits_output",
             |tensor| {
                 !occupied_outputs.contains(tensor.name.as_str())
                     && is_rank_one_to_three_output(tensor)
@@ -425,7 +426,7 @@ impl ResolvedIo {
         .map_err(anyhow::Error::msg)?
         .map(|port| port.name)
         .context(
-            "cannot resolve decoder logits from tensor shape; declare model.io.logits_output",
+            "cannot resolve logits_output from tensor shape; declare the port's role in pipeline.workflow.components.<component>.ports.roles",
         )?;
 
         for (label, port) in [

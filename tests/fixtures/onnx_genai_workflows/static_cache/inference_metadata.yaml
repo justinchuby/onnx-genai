@@ -273,6 +273,9 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+          roles:
+            input_ids: token_ids
+            logits: logits
       state_init:
         implementation:
           kind: onnx
@@ -611,6 +614,8 @@ pipeline:
               capacity: package.capacity
               write_indices_ports:
                 model: write_indices
+              kv_length_ports:
+                model: cache_lengths
             reuse:
               prefix_reusable: true
               evictable_prefix: true
@@ -626,9 +631,13 @@ pipeline:
                 key_cache:
                   input: key_cache
                   output: updated_key_cache
+                  role: key
+                  layer: 0
                 value_cache:
                   input: value_cache
                   output: updated_value_cache
+                  role: value
+                  layer: 0
     steps:
     - kind: loop
       setup:

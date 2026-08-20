@@ -83,16 +83,18 @@ fn main() {
 /// A one-line structural summary of what the conversion produced.
 fn summarize(metadata: &onnx_genai_metadata::InferenceMetadata) -> String {
     let mut parts = Vec::new();
-    if let Some(model) = &metadata.model {
-        if let Some(attention) = &model.attention {
-            parts.push(format!("attention={}", attention.attention_type));
-        }
-        if let Some(io) = &model.io {
-            parts.push(format!(
-                "state_ports={}",
-                io.kv_inputs.as_ref().map_or(0, Vec::len)
-            ));
-        }
+    if let Some(attention) = metadata
+        .model
+        .as_ref()
+        .and_then(|model| model.attention.as_ref())
+    {
+        parts.push(format!("attention={}", attention.attention_type));
+    }
+    if let Some(io) = metadata.decoder_io() {
+        parts.push(format!(
+            "state_ports={}",
+            io.kv_inputs.as_ref().map_or(0, Vec::len)
+        ));
     }
     match &metadata.pipeline {
         Some(pipeline) => parts.push(format!("components={}", pipeline.workflow.components.len())),

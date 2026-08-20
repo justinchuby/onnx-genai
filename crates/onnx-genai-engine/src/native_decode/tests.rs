@@ -1220,10 +1220,7 @@ fn native_decoder_auto_derive_skips_dense_ambiguous_decoder() {
         Ok(_) => panic!("dense ambiguous decoder must still require explicit token_input"),
         Err(error) => error,
     };
-    assert!(
-        error.to_string().contains("model.io.token_input"),
-        "{error:#}"
-    );
+    assert!(error.to_string().contains("token_input"), "{error:#}");
 }
 
 fn target_io(sequence_source: SequenceInputKind) -> ModelIoSpec {
@@ -1284,10 +1281,7 @@ fn native_decoder_requires_explicit_ambiguous_io() {
         Ok(_) => panic!("ambiguous decoder roles must require metadata"),
         Err(error) => error,
     };
-    assert!(
-        error.to_string().contains("model.io.token_input"),
-        "{error:#}"
-    );
+    assert!(error.to_string().contains("token_input"), "{error:#}");
 }
 
 fn tiny_embedding_target(with_routed_input: bool) -> InferenceSession {
@@ -1770,7 +1764,7 @@ fn build_cuda_decoder_with_fixed_state(
 /// until growth fails" sentinel. This is the shape a model with no declared
 /// `max_sequence_length` produces on the non-VMM native-CUDA decode path. We go
 /// through the `fixed_state` builder purely because it declares the graph
-/// `model.io` ports explicitly via `tiny_decoder_io()`; the default (non-VMM)
+/// decode ABI ports explicitly via `tiny_decoder_io()`; the default (non-VMM)
 /// KV path is unaffected by the extra recurrent state pair, so
 /// `kv_commits_on_demand` stays false and this reproduces the metadata-less
 /// non-VMM construction exactly.

@@ -32,6 +32,7 @@ pub mod capabilities {
 
 pub mod cache;
 pub mod component;
+mod decoder_abi;
 pub mod identity;
 mod lowering;
 pub mod parser;
@@ -42,6 +43,7 @@ pub use cache::{CacheDependencies, cache_dependencies};
 pub use component::{
     ComponentDataType, ComponentError, ComponentIo, ComponentSession, ComponentTensor,
 };
+pub use decoder_abi::{decoder_abi, sole_decoder_component};
 pub use identity::{IDENTITY_SCHEME, semantic_identity, semantic_identity_of_str};
 pub use lowering::{CompiledWorkflow, compile_workflow};
 pub use parser::{

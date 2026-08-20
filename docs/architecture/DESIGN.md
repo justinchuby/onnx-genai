@@ -9,10 +9,13 @@
 
 ## Execution architecture
 
-A bare decoder may use `model.io`. Composite packages contain one
-`pipeline.workflow`, whose manifest, typed package boundary, component registry,
-state declarations, serving contract, and recursive control-flow graph are the only
-orchestration source of truth.
+Every package contains one `pipeline.workflow`, whose manifest, typed package
+boundary, component registry, state declarations, serving contract, and recursive
+control-flow graph are the only orchestration source of truth — and, through
+component ports and state groups, the only serialized graph ABI. A bare
+single-graph decoder is not an exception: the optimized single-model decode path
+recognizes that same workflow rather than reading a separate `model.io` block,
+which survives as an import-only legacy input.
 
 The workflow interpreter executes SSA nodes (`invoke`, `sequence`, `loop`, `branch`,
 `transfer`, `emit`). ONNX components implement sampling, predicates, solvers,

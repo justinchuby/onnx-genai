@@ -18,15 +18,26 @@ pub struct ModelCapabilities {
     /// Features that a serving runtime may configure at load time.
     pub runtime_configurable: Option<RuntimeConfigurable>,
 
-    /// Explicit graph I/O port bindings for the single-decoder LLM path.
+    /// DEPRECATED, import-only: legacy explicit graph I/O for a bare
+    /// single-decoder package.
     ///
-    /// The runtime binds decode-step inputs and outputs from the declared names.
-    /// A port that is not declared is resolved ONLY from an unambiguous io-shape
-    /// signal; when the shape is ambiguous the runtime fails with an actionable
-    /// error naming the exact key to declare, and never guesses from a tensor
-    /// name.
-    #[serde(default)]
-    pub io: Option<ModelIoSpec>,
+    /// The canonical, and only authoritative, expression of a package's
+    /// executable graph ABI is the workflow:
+    /// `pipeline.workflow.components.<component>.ports` (with `ports.roles`),
+    /// the invoke bindings that connect them, and the `state_service` groups
+    /// that declare model state. A composite package and a bare one-file
+    /// decoder use that same representation.
+    ///
+    /// This block remains only so packages written before the workflow existed
+    /// still load. It is never read directly: [`ModelCapabilities::io`] resolves
+    /// the workflow first and falls back here, and a document carrying both is
+    /// rejected so the two can never disagree. New producers must not emit it.
+    #[serde(default, rename = "io")]
+    #[deprecated(
+        note = "declare the graph ABI in pipeline.workflow.components.<component>.ports; \
+                read the resolved ABI through ModelCapabilities::io()"
+    )]
+    pub legacy_io: Option<ModelIoSpec>,
 
     /// Explicit sparse mixture-of-experts graph and routing contract.
     ///
@@ -43,6 +54,20 @@ pub struct ModelCapabilities {
     /// cache wire format.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sharding: Option<ShardingContract>,
+}
+
+impl ModelCapabilities {
+    /// The deprecated serialized ABI block, for callers that hold only
+    /// capabilities.
+    ///
+    /// Prefer [`crate::InferenceMetadata::decoder_io`], which resolves the
+    /// canonical workflow first. This accessor exists for the packages that
+    /// have no workflow at all, and returns `None` for every package that does.
+    pub fn legacy_io(&self) -> Option<&ModelIoSpec> {
+        #[allow(deprecated)]
+        let legacy = self.legacy_io.as_ref();
+        legacy
+    }
 }
 
 /// Explicit binding of the graph ports the decode step reads and writes.

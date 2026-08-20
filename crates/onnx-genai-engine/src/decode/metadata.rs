@@ -181,7 +181,7 @@ pub(crate) fn detect_model_decode_path(
         }
         if aliasing == onnx_genai_metadata::StateAliasing::Required {
             anyhow::bail!(
-                "model.io.aliasing is 'required', but this deployment cannot alias present onto \
+                "aliasing is 'required', but this deployment cannot alias present onto \
                  past: execution-provider fixed-capacity present binding is {}, and the resolved \
                  KV capacity is {}. Lower the requirement to 'permitted', or run on a provider \
                  that supports the shared KV buffer with a bounded max context",
@@ -342,7 +342,7 @@ mod aliasing_tests {
         )
         .expect_err("required aliasing must not be silently downgraded");
         let message = error.to_string();
-        assert!(message.contains("model.io.aliasing"), "{message}");
+        assert!(message.contains("aliasing"), "{message}");
         assert!(message.contains("unavailable"), "{message}");
     }
 

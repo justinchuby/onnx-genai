@@ -78,6 +78,52 @@ pub struct ComponentPorts {
     pub inputs: BTreeMap<String, TensorContract>,
     #[serde(default)]
     pub outputs: BTreeMap<String, TensorContract>,
+    /// Semantic role of the ports whose meaning the workflow's own structure
+    /// cannot recover, keyed by port name.
+    ///
+    /// State ports never need an entry: a state group already names its
+    /// per-component `(input, output)` pair, and the fixed-capacity control
+    /// ports are named by [`StateUpdate::IndexedScatter`]. What is left is the
+    /// per-step dataflow a workflow binds by SSA value, where the binding
+    /// records WHICH value reaches a port but not WHAT the component does with
+    /// it. A runtime that specializes a decode step — packing tokens, reusing a
+    /// logits buffer, skipping a mask it can prove is causal — needs that
+    /// second fact, and inferring it from a port's spelling is exactly the
+    /// name-guessing this schema refuses everywhere else.
+    ///
+    /// Roles are architecture-neutral and describe the port, never the model
+    /// family that happens to expose it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub roles: BTreeMap<String, PortRole>,
+}
+
+/// Architecture-neutral semantic role of one component port.
+///
+/// This vocabulary names what a value MEANS to the component that consumes or
+/// produces it. It deliberately excludes anything a state group already
+/// declares, so a role and a state binding can never disagree about the same
+/// port.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PortRole {
+    /// Discrete token identifiers driving autoregressive execution.
+    TokenIds,
+    /// Pre-embedded sequence, used when another component owns the embedding.
+    InputsEmbeds,
+    /// Attention mask over the sequence.
+    AttentionMask,
+    /// Per-position indices used by position embedding.
+    PositionIds,
+    /// Unnormalized next-token scores.
+    Logits,
+    /// Per-token hidden states exposed as a distinct output.
+    HiddenStates,
+    /// Encoder result consumed by a cross-attending decoder.
+    EncoderHiddenStates,
+    /// Encoded audio features consumed by a speech decoder.
+    AudioFeatures,
 }
 
 /// How multiple dataflow values are combined at one destination.
@@ -1120,6 +1166,15 @@ pub enum StateUpdate {
         /// integer control input.
         #[serde(default)]
         write_indices_ports: BTreeMap<String, String>,
+        /// Per-component input port that receives the graph-visible valid
+        /// length, keyed by component name.
+        ///
+        /// Exactly the same problem as `write_indices_ports`, and unsolvable the
+        /// same way: the length is a rank-1 integer vector, so it is
+        /// shape-indistinguishable from the destinations sitting next to it. A
+        /// graph that reads no length port declares none.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        kv_length_ports: BTreeMap<String, String>,
     },
 }
 
@@ -1173,4 +1228,38 @@ pub struct StateGroupCapabilities {
 pub struct StatePortAlias {
     pub input: String,
     pub output: String,
+    /// Which half of an attention cache this port pair carries.
+    ///
+    /// A graph that splits keys and values into separate buffers exposes two
+    /// aliases per layer that are shape-identical and therefore
+    /// indistinguishable; a graph that packs them exposes one. Only the
+    /// producer knows which it built, and recovering it from a port's spelling
+    /// would be the name-guessing this schema refuses. Absent means the group
+    /// does not distinguish halves, which is correct for recurrent and latent
+    /// state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<StatePortRole>,
+    /// Zero-based layer index of this port pair within its group.
+    ///
+    /// Required when a group binds more than one alias of the same
+    /// [`StatePortRole`], because the map key is a producer-chosen label and
+    /// its lexicographic order is not the layer order (`layer.10` sorts before
+    /// `layer.2`). A runtime that pairs per-layer buffers positionally would
+    /// otherwise silently transpose two layers' caches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<usize>,
+}
+
+/// Which half of a split attention cache a state port pair carries.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum StatePortRole {
+    /// Keys of a split key/value cache.
+    Key,
+    /// Values of a split key/value cache.
+    Value,
+    /// A single buffer holding keys and values together.
+    Combined,
 }

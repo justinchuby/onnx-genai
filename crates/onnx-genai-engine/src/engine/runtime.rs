@@ -1344,11 +1344,7 @@ impl Engine {
             .as_deref()
             .context("ORT decoder session is unavailable")?;
         // Bind ports from explicit metadata or unambiguous tensor shapes.
-        let io = self
-            .metadata
-            .model
-            .as_ref()
-            .and_then(|model| model.io.as_ref());
+        let io = self.metadata.decoder_io();
         let fixed_state_budget_bytes = self.governor.snapshot().resolved_limits.host_ram_bytes;
         if matches!(
             &self.speculative_mode,
@@ -1880,11 +1876,7 @@ impl Engine {
         let Some(session) = self.session.as_deref() else {
             return false;
         };
-        let io = self
-            .metadata
-            .model
-            .as_ref()
-            .and_then(|model| model.io.as_ref());
+        let io = self.metadata.decoder_io();
         ort_session_has_recurrent_state(session, io)
     }
 

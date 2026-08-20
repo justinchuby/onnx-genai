@@ -118,7 +118,7 @@ impl Engine {
             config.limits.vram_limit,
         )?;
         let metadata = load_inference_metadata(&model_directory)?;
-        let model_io = metadata.model.as_ref().and_then(|model| model.io.as_ref());
+        let model_io = metadata.decoder_io();
         let kv_inputs = model_io
             .and_then(|io| io.kv_inputs.clone())
             .unwrap_or_default();
@@ -401,7 +401,7 @@ impl Engine {
         let fim_config = load_fim_config_from_model_dir(&model_directory.root)?;
         let kv_model = {
             let _span = onnx_genai_ort::prof_span!("engine.native_kv_model_info");
-            let model_io = metadata.model.as_ref().and_then(|model| model.io.as_ref());
+            let model_io = metadata.decoder_io();
             let kv_inputs = model_io
                 .and_then(|io| io.kv_inputs.clone())
                 .unwrap_or_default();
@@ -419,7 +419,7 @@ impl Engine {
             infer_kv_model_info(&graph_io, model_io, config.page_size, config.kv_cache_dtype)
                 .context("failed to infer native decoder KV geometry from model graph I/O")?
         };
-        let model_io = metadata.model.as_ref().and_then(|model| model.io.as_ref());
+        let model_io = metadata.decoder_io();
         let governor_kv_config = match kv_model.as_ref() {
             Some(kv_model) => governor_native_kv_config(Some(kv_model), &config)?,
             None if model_io_declares_only_fixed_state(model_io) => {
@@ -693,7 +693,7 @@ impl Engine {
                     cuda_offload_policy,
                     #[cfg(feature = "native-cuda")]
                     cuda_memory_governor: std::sync::Arc::new(governor.device_authority()),
-                    io: metadata.model.as_ref().and_then(|model| model.io.as_ref()),
+                    io: metadata.decoder_io(),
                     metadata_max_len: metadata
                         .model
                         .as_ref()
@@ -1025,7 +1025,7 @@ impl Engine {
     }
 }
 
-/// Fill `metadata.model.io` from the ONNX graph's declared ports when the
+/// Fill the resolved decode ABI from the ONNX graph's declared ports when the
 /// package's sidecar declares no `io` block AND the graph is a hybrid
 /// linear-attention decoder (exposes recurrent `conv_state`/`recurrent_state`
 /// state pairs).
@@ -1043,16 +1043,14 @@ impl Engine {
 /// This is deliberately attribute/shape-driven, never model-name-gated, and
 /// engages only for the recurrent-hybrid case (the safety gate is a non-empty
 /// derived `state_pairs`, mirroring the native decode driver's
-/// `derive_fallback_io`). A declared `io` block always wins; pure-dense decoders
-/// (no state pairs) are left untouched and keep their existing load path.
+/// `derive_fallback_io`). An already-resolved ABI always wins; pure-dense
+/// decoders (no state pairs) are left untouched and keep their existing load
+/// path. The result is installed as a *derived* ABI rather than written into
+/// the deprecated serialized block, so it stays one representation.
 #[cfg(feature = "native-backend")]
 fn maybe_fill_hybrid_io_from_graph(metadata: &mut InferenceMetadata, model_path: &Path) {
-    // A declared `io` block is always authoritative.
-    if metadata
-        .model
-        .as_ref()
-        .is_some_and(|model| model.io.is_some())
-    {
+    // A workflow-recognized or legacy-declared ABI is always authoritative.
+    if metadata.decoder_io().is_some() {
         return;
     }
     let Some(graph_info) = crate::engine::decoder_graph_info_from_model_path(model_path) else {
@@ -1063,10 +1061,7 @@ fn maybe_fill_hybrid_io_from_graph(metadata: &mut InferenceMetadata, model_path:
     else {
         return;
     };
-    let model = metadata
-        .model
-        .get_or_insert_with(onnx_genai_metadata::ModelCapabilities::default);
-    model.io = Some(io);
+    metadata.set_derived_decoder_io(io);
 }
 
 fn package_selection_from_session_options(
@@ -1130,7 +1125,7 @@ fn resolve_metadata_and_decode_path(
     let decode_path = {
         let _span = onnx_genai_ort::prof_span!("engine.detect_decode_path");
         detect_model_decode_path(
-            metadata.model.as_ref().and_then(|model| model.io.as_ref()),
+            metadata.decoder_io(),
             sliding_window,
             sink_tokens,
             shared_kv,
@@ -1265,8 +1260,8 @@ fn required_bytes_per_token_from_kv_config(
     kv_config.bytes_per_token().map(Some).with_context(|| {
         format!(
             "cannot derive scheduler bytes_per_token because KV page byte geometry is unknown \
-             for {} token(s) per page; fix by declaring model.io.kv_inputs and \
-             model.io.kv_outputs so admission uses real KV memory costs",
+             for {} token(s) per page; fix by declaring kv_inputs and \
+             kv_outputs so admission uses real KV memory costs",
             kv_config.tokens_per_page
         )
     })
@@ -1303,7 +1298,7 @@ fn load_draft_model(
             .as_deref()
             .map(onnx_genai_metadata::load_metadata)
             .transpose()?
-            .and_then(|metadata| metadata.model.and_then(|model| model.io));
+            .and_then(|metadata| metadata.decoder_io().cloned());
         let draft_session = Session::new(
             environment,
             &draft_directory.model_path,
@@ -2477,9 +2472,9 @@ mod pool_sizing_tests {
             .canonicalize()?;
         let metadata = onnx_genai_metadata::load_metadata(&metadata_path)?;
         metadata
-            .model
-            .and_then(|model| model.io)
-            .context("tiny-llm fixture must declare model.io")
+            .decoder_io()
+            .cloned()
+            .context("tiny-llm fixture must declare a decode ABI")
     }
 
     fn profile_json(name: &str) -> anyhow::Result<serde_json::Value> {

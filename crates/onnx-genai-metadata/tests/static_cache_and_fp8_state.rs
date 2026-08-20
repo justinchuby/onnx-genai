@@ -547,6 +547,8 @@ pipeline:
               dtype: bool
               rank: 1
               shape: [1]
+          roles:
+            input_ids: token_ids
     state:
       token:
         contract:
@@ -654,12 +656,14 @@ pipeline:
               capacity: package.capacity
               write_indices_ports:
                 model: write_indices
+              kv_length_ports:
+                model: nonpad_kv_seqlen
             reuse: {prefix_reusable: true, evictable_prefix: true}
             capabilities: {rollback_positions: 8, snapshot: true, fork: true}
             ports:
               model:
-                key_cache: {input: key_cache.0, output: updated_key_cache.0}
-                value_cache: {input: value_cache.0, output: updated_value_cache.0}
+                key_cache: {input: key_cache.0, output: updated_key_cache.0, role: key, layer: 0}
+                value_cache: {input: value_cache.0, output: updated_value_cache.0, role: value, layer: 0}
     steps:
     - kind: loop
       setup: []
@@ -702,16 +706,6 @@ pipeline:
       iteration:
         value: loop.iteration
         contract: {dtype: int64, rank: 1, shape: [1]}
-model:
-  io:
-    kv_ownership: owned
-    static_cache:
-      write_indices_input: write_indices
-      kv_sequence_length_input: nonpad_kv_seqlen
-      key_cache_inputs: [key_cache.0]
-      value_cache_inputs: [value_cache.0]
-      key_cache_outputs: [updated_key_cache.0]
-      value_cache_outputs: [updated_value_cache.0]
 package:
   tokenizer:
     algorithm: bpe
@@ -780,6 +774,7 @@ fn indexed_scatter_group_round_trips() {
         write_indices,
         capacity,
         write_indices_ports,
+        ..
     }) = &cache_group(&metadata).update
     else {
         panic!("the update discipline did not survive the round trip");
@@ -908,16 +903,123 @@ fn fp8_state_group_round_trips_without_widening() {
     }
 }
 
-/// A port ABI may sit beside the workflow that binds it.
+/// A workflow package declares its graph ABI once, in the workflow.
 ///
-/// These are different questions about the same graph: `model.io` says which
-/// port carries write destinations, the workflow says what flows into it. A
-/// runtime that drives the decoder directly reads only the first and never sees
-/// the second, so a package that supports both entry points has to state both.
+/// The canonical document carries no `model.io` at all: the ports are on the
+/// component, the roles that name what they mean are beside them, and the cache
+/// pairs and write discipline are on the state group. This test is the baseline
+/// the rest of this section measures against.
 #[test]
-fn model_io_may_accompany_a_workflow() {
+fn the_canonical_static_cache_package_needs_no_model_io() {
+    let document = MOBIUS_STATIC_CACHE.replace("DTYPE", "float16");
+    let metadata = parse(&document);
+    validate_metadata(&metadata).expect("a workflow-only package is the canonical form");
+    assert!(
+        !document.contains("\nmodel:"),
+        "the canonical package must not carry a second ABI declaration"
+    );
+}
+
+/// A second serialized ABI beside the workflow is refused.
+///
+/// Two declarations of the same graph are not redundancy but a fork: the moment
+/// they disagree, which one a runtime obeys is decided by whichever code path
+/// reached it first. The refusal has to name where the facts belong, because
+/// "remove this" is not an actionable error on its own.
+#[test]
+fn model_io_beside_a_workflow_is_refused() {
+    let document = format!(
+        "{}model:\n  io:\n    token_input: input_ids\n",
+        MOBIUS_STATIC_CACHE.replace("DTYPE", "float16")
+    );
+    let reported = errors(&document);
+    assert!(
+        reported.iter().any(|error| {
+            error.contains("model.io and pipeline.workflow")
+                && error.contains("pipeline.workflow.components")
+                && error.contains("state_service")
+        }),
+        "the refusal must name the canonical location of every fact it rejects: {reported:?}"
+    );
+}
+
+/// The workflow alone yields the whole decode-step ABI.
+///
+/// This is the property that lets `model.io` go away: everything the optimized
+/// single-decoder path used to read from a separate block is recoverable from
+/// the component's ports, the roles beside them, and the state group.
+#[test]
+fn the_decode_abi_is_recognized_from_the_workflow_alone() {
     let metadata = parse(&MOBIUS_STATIC_CACHE.replace("DTYPE", "float16"));
-    validate_metadata(&metadata).expect("a port ABI beside a workflow is a legal package");
+    let io = metadata
+        .decoder_io()
+        .expect("the workflow declares one decoder");
+
+    assert_eq!(io.token_input.as_deref(), Some("input_ids"));
+    assert_eq!(
+        io.kv_ownership,
+        Some(onnx_genai_metadata::KvOwnership::Owned)
+    );
+    assert_eq!(
+        io.kv_inputs.as_deref(),
+        Some(["key_cache.0".to_string(), "value_cache.0".to_string()].as_slice()),
+        "the cache pairs come from the group that binds them"
+    );
+
+    let static_cache = io
+        .static_cache
+        .as_ref()
+        .expect("an indexed_scatter group is a static cache");
+    assert_eq!(static_cache.write_indices_input, "write_indices");
+    assert_eq!(static_cache.kv_sequence_length_input, "nonpad_kv_seqlen");
+    assert_eq!(static_cache.key_cache_inputs, ["key_cache.0"]);
+    assert_eq!(static_cache.value_cache_inputs, ["value_cache.0"]);
+    assert_eq!(static_cache.key_cache_outputs, ["updated_key_cache.0"]);
+    assert_eq!(static_cache.value_cache_outputs, ["updated_value_cache.0"]);
+}
+
+/// The recognized ABI is exactly what the deleted block used to say.
+///
+/// A migration that produced a *different* ABI would be a silent behavior
+/// change dressed up as a cleanup, so the equivalence is asserted against the
+/// literal block this package used to carry.
+#[test]
+fn the_recognized_abi_equals_the_block_it_replaced() {
+    let metadata = parse(&MOBIUS_STATIC_CACHE.replace("DTYPE", "float16"));
+    let recognized = metadata.decoder_io().expect("recognized");
+    let retired: onnx_genai_metadata::StaticCacheIoSpec = serde_yaml::from_str(
+        "write_indices_input: write_indices\n\
+         kv_sequence_length_input: nonpad_kv_seqlen\n\
+         key_cache_inputs: [key_cache.0]\n\
+         value_cache_inputs: [value_cache.0]\n\
+         key_cache_outputs: [updated_key_cache.0]\n\
+         value_cache_outputs: [updated_value_cache.0]\n",
+    )
+    .expect("the retired block parses");
+    assert_eq!(recognized.static_cache.as_ref(), Some(&retired));
+}
+
+/// Split cache halves are ordered by declared layer, never by label order.
+///
+/// A producer that labels layers `layer.2` and `layer.10` gets lexicographic
+/// order from the map, which would positionally pair layer 10's keys with layer
+/// 2's values and corrupt attention in a way no shape check can see.
+#[test]
+fn per_layer_cache_order_follows_the_declared_layer_index() {
+    let document = MOBIUS_STATIC_CACHE.replace("DTYPE", "float16").replace(
+        "key_cache: {input: key_cache.0, output: updated_key_cache.0, role: key, layer: 0}",
+        "zz_late_label: {input: key_cache.0, output: updated_key_cache.0, role: key, layer: 0}",
+    );
+    let metadata = parse(&document);
+    let io = metadata.decoder_io().expect("recognized");
+    assert_eq!(
+        io.static_cache
+            .as_ref()
+            .expect("static cache")
+            .key_cache_inputs,
+        ["key_cache.0"],
+        "the declared layer index, not the label, decides the order"
+    );
 }
 
 /// One cell may serve as both the write cursor and the valid length.
@@ -938,62 +1040,5 @@ fn the_write_cursor_and_the_valid_length_may_be_one_cell() {
         cache_group(&metadata).logical_lengths.as_deref(),
         Some("cache_lengths"),
         "the cursor and the length are the same quantity in this package"
-    );
-}
-
-/// A port ABI that names a port no group scatters into is refused.
-///
-/// Silence here would leave a package that looks like it declares a static
-/// cache while the workflow never advances one.
-#[test]
-fn a_port_abi_that_no_group_binds_is_refused() {
-    let document = MOBIUS_STATIC_CACHE.replace("DTYPE", "float16").replace(
-        "write_indices_input: write_indices",
-        "write_indices_input: slots",
-    );
-    let reported = errors(&document);
-    assert!(
-        reported
-            .iter()
-            .any(|error| error.contains("write_indices_input 'slots'")
-                && error.contains("indexed_scatter")),
-        "the refusal must name the port and the discipline it needs: {reported:?}"
-    );
-}
-
-/// The two declarations of a cache pair must agree.
-///
-/// The redundancy is deliberate, which is exactly why a disagreement has to be
-/// an error: a cache port the ABI claims but the group never binds reads at
-/// runtime as a cache that silently stops updating.
-#[test]
-fn a_cache_pair_the_workflow_does_not_bind_is_refused() {
-    let document = MOBIUS_STATIC_CACHE.replace("DTYPE", "float16").replace(
-        "value_cache_outputs: [updated_value_cache.0]",
-        "value_cache_outputs: [updated_key_cache.0]",
-    );
-    let reported = errors(&document);
-    assert!(
-        reported
-            .iter()
-            .any(|error| error.contains("value cache pair") && error.contains("does not bind")),
-        "the refusal must name the pair and the group that lacks it: {reported:?}"
-    );
-}
-
-/// A port ABI naming an input the component does not have is refused.
-#[test]
-fn a_port_abi_naming_a_missing_input_is_refused() {
-    let document = MOBIUS_STATIC_CACHE.replace("DTYPE", "float16").replace(
-        "kv_sequence_length_input: nonpad_kv_seqlen",
-        "kv_sequence_length_input: kv_len",
-    );
-    let reported = errors(&document);
-    assert!(
-        reported
-            .iter()
-            .any(|error| error.contains("kv_sequence_length_input 'kv_len'")
-                && error.contains("is not an input port")),
-        "the refusal must name the port and the component: {reported:?}"
     );
 }

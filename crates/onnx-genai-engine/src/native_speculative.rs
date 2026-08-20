@@ -251,7 +251,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
                     })?;
                     if target_hidden.len() != *hidden_size {
                         anyhow::bail!(
-                            "native target hidden output has width {}, but shared-KV metadata declares backbone_hidden_size {}; fix model.io.hidden_output or speculative.backbone_hidden_size",
+                            "native target hidden output has width {}, but shared-KV metadata declares backbone_hidden_size {}; fix hidden_output or speculative.backbone_hidden_size",
                             target_hidden.len(),
                             hidden_size
                         );

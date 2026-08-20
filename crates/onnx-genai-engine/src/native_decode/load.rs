@@ -69,10 +69,7 @@ impl NativeDecodeSession {
     ) -> anyhow::Result<Self> {
         let path = path.as_ref();
         let metadata = resolve_io_metadata_from_model_path(path);
-        let io = metadata
-            .as_ref()
-            .and_then(|metadata| metadata.model.as_ref())
-            .and_then(|model| model.io.as_ref());
+        let io = metadata.as_ref().and_then(|metadata| metadata.decoder_io());
         Self::load_with_cuda_options_and_io(
             path,
             device,
@@ -449,7 +446,7 @@ impl NativeDecodeSession {
     /// leaves a working shape-inference path. Letting it fire on dense graphs
     /// silently auto-bound roles that this path is supposed to refuse, so a
     /// decoder with genuinely ambiguous ports loaded against guessed bindings
-    /// instead of demanding `model.io`.
+    /// instead of demanding a declared port name.
     fn derive_fallback_io(session: &InferenceSession) -> Option<ModelIoSpec> {
         let to_graph_tensor =
             |meta: &onnx_runtime_session::IoMeta| onnx_genai_genai_config::GraphTensorInfo {
@@ -518,7 +515,7 @@ impl NativeDecodeSession {
                 &role_inputs,
                 io.and_then(|io| io.token_input.as_deref()),
                 StructuralRole::IntegerSequence,
-                "model.io",
+                "the decode ABI's",
                 "token_input",
             )?)
         } else {
@@ -528,7 +525,7 @@ impl NativeDecodeSession {
                         &role_inputs,
                         Some(name),
                         StructuralRole::IntegerSequence,
-                        "model.io",
+                        "the decode ABI's",
                         "token_input",
                     )
                 })
@@ -539,7 +536,7 @@ impl NativeDecodeSession {
                 &role_inputs,
                 io.and_then(|io| io.inputs_embeds_input.as_deref()),
                 StructuralRole::EmbeddingSequence,
-                "model.io",
+                "the decode ABI's",
                 "inputs_embeds_input",
             )?)
         } else {
@@ -549,7 +546,7 @@ impl NativeDecodeSession {
                         &role_inputs,
                         Some(name),
                         StructuralRole::EmbeddingSequence,
-                        "model.io",
+                        "the decode ABI's",
                         "inputs_embeds_input",
                     )
                 })
@@ -559,14 +556,14 @@ impl NativeDecodeSession {
             &role_inputs,
             io.and_then(|io| io.attention_mask_input.as_deref()),
             StructuralRole::None,
-            "model.io",
+            "the decode ABI's",
             "attention_mask_input",
         )?;
         let position_ids = optional_declared_or_detected_input(
             &role_inputs,
             io.and_then(|io| io.position_ids_input.as_deref()),
             StructuralRole::None,
-            "model.io",
+            "the decode ABI's",
             "position_ids_input",
         )?;
         let position_rank = declared_position_rank(&role_inputs, position_ids.as_deref())?;
@@ -574,14 +571,14 @@ impl NativeDecodeSession {
             &role_outputs,
             io.and_then(|io| io.logits_output.as_deref()),
             StructuralRole::ScoreOutput,
-            "model.io",
+            "the decode ABI's",
             "logits_output",
         )?;
         let hidden_output = optional_declared_or_detected_output(
             &role_outputs,
             io.and_then(|io| io.hidden_output.as_deref()),
             StructuralRole::None,
-            "model.io",
+            "the decode ABI's",
             "hidden_output",
         )?;
         let kv_ownership = io
@@ -597,7 +594,7 @@ impl NativeDecodeSession {
                 (Some(inputs), Some(outputs)) => (inputs.clone(), outputs.clone()),
                 (None, None) => (Vec::new(), Vec::new()),
                 _ => bail!(
-                    "native target decoder metadata must declare model.io.kv_inputs and model.io.kv_outputs together"
+                    "native target decoder metadata must declare kv_inputs and kv_outputs together"
                 ),
             },
             None => (Vec::new(), Vec::new()),
@@ -631,7 +628,7 @@ impl NativeDecodeSession {
 
         if kv_inputs.is_empty() || present_outputs.is_empty() {
             bail!(
-                "native decode requires explicit decoder state; declare model.io.kv_inputs and model.io.kv_outputs (or model.io.state_pairs)"
+                "native decode requires explicit decoder state; declare kv_inputs and kv_outputs (or state_pairs)"
             );
         }
 
