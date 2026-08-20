@@ -59,10 +59,11 @@ pub struct EngineArgs {
     /// `auto`.
     ///
     /// `auto` (the default) takes the device from the model's declared execution
-    /// providers. Most exported models declare none, which resolves to the CPU —
-    /// so on a machine with a GPU, `--backend native` alone will still run on the
-    /// CPU unless you say `--device cuda` (#1064). Ignored by the ORT backend,
-    /// which selects providers from the model's own session options.
+    /// providers, and — because most exported models declare none — falls back to
+    /// probing for a usable accelerator rather than assuming the CPU (#1551). Pass
+    /// `--device cpu` to decode on the CPU on a machine that has a GPU. The
+    /// resolved device is logged on every run. Ignored by the ORT backend, which
+    /// selects providers from the model's own session options.
     #[arg(
         long,
         value_name = "auto|cpu|cuda[:N]",
