@@ -212,7 +212,7 @@ impl NativeComponentSession {
                 manager,
             )
             .context("initialize governed native CUDA component provider")?;
-        let session = InferenceSession::builder()
+        let mut session = InferenceSession::builder()
             .model(path)
             .execution_provider(Arc::new(ep))
             .build()
@@ -223,6 +223,21 @@ impl NativeComponentSession {
                     path.display()
                 )
             })?;
+        // Same reasoning as `load`: a component graph runs once per request and
+        // records no device graph, so its intermediates can die as they go. This
+        // path must set it too -- it is the loader every CUDA component actually
+        // takes, so leaving it out puts the ~23 GB vision-encoder retention back.
+        session.set_release_dead_values(true);
+        if let Some(report) = session.execution_provider_fallback_report() {
+            tracing::warn!(
+                model = %path.display(),
+                fallback = %report,
+                "governed native CUDA pipeline component fell back to CPU"
+            );
+        }
+        // No `adopt_memory_governor` here on purpose: the provider above was
+        // built already governed, so charging the pool a second time through the
+        // component holder would double-count the same bytes.
         Self::new(session).map_err(anyhow::Error::from)
     }
 }
