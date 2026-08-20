@@ -1004,18 +1004,23 @@ impl CudaVmmAllocator {
             Err(error) => {
                 self.give_back_lease(arena, mapped_bytes);
                 self.release_granules(arena, &shared_claimed);
-                return Err(match &error {
-                    onnx_runtime_virtual_memory::VirtualMemoryError::Os {
+                return Err(match error {
+                    onnx_runtime_virtual_memory::VirtualMemoryError::Delegated {
                         operation: "growing physical handle pool lease",
-                        ..
+                        source,
                     } => MemoryError::CapacityUnavailable {
                         tier: "device",
                         requested: mapped_bytes as u64,
                         available: 0,
                         role: self.role,
-                        detail: format!("cuMemMap: {error}"),
+                        detail: String::from("cuMemMap could not grow the physical handle pool"),
+                        // Carried whole rather than folded into `detail`: an
+                        // admission caller needs to tell "we declined, retry
+                        // smaller" from "the driver failed, give up", and only
+                        // the typed refusal says which this was.
+                        source: Some(source),
                     },
-                    _ => invalid(mapped_bytes, format!("cuMemMap: {error}")),
+                    error => invalid(mapped_bytes, format!("cuMemMap: {error}")),
                 });
             }
         };
