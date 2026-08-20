@@ -665,28 +665,44 @@ mod tests {
         // tile loop's `j + TILE <= w` bound impossible to miss. The top width
         // is two whole tiles plus one 8-lane block plus one scalar, so the
         // sweep ends having exercised all three in a single call.
-        if !simd_available() {
-            return;
-        }
+        //
+        // Both formats: the tiling lives in `stripe_simd_fn!`, so it is
+        // instantiated once per widening kernel and each instance has to be
+        // checked against its own scalar reference.
         let k = 11;
         let n = 300;
         let a = sample(k, 41);
-        let b = f16v(&sample(k * n, 43));
+        let raw = sample(k * n, 43);
         let mut checked = 0usize;
-        for w in 1..=(2 * TILE + 9) {
-            for j0 in [0usize, 8, 64, 67] {
-                assert!(j0 + w <= n, "the sweep must not skip j0={j0} w={w}");
-                let mut scalar = vec![f32::NAN; w];
-                stripe_scalar(&a, &b, &mut scalar, j0, k, n);
-                let mut simd = vec![f32::NAN; w];
-                // SAFETY: `simd_available()` checked above; `j0 + w <= n` is
-                // asserted, and `b` holds `k * n` elements.
-                unsafe { stripe_simd(&a, &b, &mut simd, j0, k, n) };
-                assert_eq!(bits(&simd), bits(&scalar), "stripe j0={j0} w={w}");
-                checked += 1;
+        for format in [HalfFormat::F16, HalfFormat::Bf16] {
+            if !simd_available(format) {
+                continue;
+            }
+            let b = halfv(format, &raw);
+            for w in 1..=(2 * TILE + 9) {
+                for j0 in [0usize, 8, 64, 67] {
+                    assert!(j0 + w <= n, "the sweep must not skip j0={j0} w={w}");
+                    let mut scalar = vec![f32::NAN; w];
+                    stripe_scalar(format, &a, &b, &mut scalar, j0, k, n);
+                    let mut simd = vec![f32::NAN; w];
+                    // SAFETY: `simd_available(format)` checked above, and it
+                    // confirms exactly the features the selected kernel
+                    // declares; `j0 + w <= n` is asserted, and `b` holds
+                    // `k * n` elements.
+                    unsafe {
+                        match format {
+                            HalfFormat::F16 => stripe_simd_f16(&a, &b, &mut simd, j0, k, n),
+                            HalfFormat::Bf16 => stripe_simd_bf16(&a, &b, &mut simd, j0, k, n),
+                        }
+                    };
+                    assert_eq!(bits(&simd), bits(&scalar), "{format:?} stripe j0={j0} w={w}");
+                    checked += 1;
+                }
             }
         }
-        assert_eq!(checked, 4 * (2 * TILE + 9), "the sweep silently shrank");
+        if simd_available(HalfFormat::F16) {
+            assert_eq!(checked, 8 * (2 * TILE + 9), "the sweep silently shrank");
+        }
     }
 
     #[test]
