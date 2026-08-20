@@ -293,6 +293,18 @@ python scripts/bench_cubecl_vs_ort_webgpu.py
 plugin,逐 cell 做 CPU EP 参考对拍,并从 ORT profile 读回节点的实际 provider 归属
 (node count 为 0 的 cell 标为 INVALID,而不是当成「很快」)。
 
+## 与官方 WebGPU EP 的实测对比
+
+见 [`docs/benchmarks/2026-08-20-cubecl-webgpu-vs-ort-webgpu.md`](../../docs/benchmarks/2026-08-20-cubecl-webgpu-vs-ort-webgpu.md)。
+两条要点:
+
+- **端到端每次 `Run` 比官方慢约 1.3–2.1x**,但这个差距**与工作量无关**(从
+  add/small 到 add/large 工作量差几个数量级,比值不变),而 warmed profile 显示
+  node dur 只有 8–9 us 而 wall 是 ~962 us。**优化目标是每次 Run 的固定路径,不是
+  shader**。那张表几乎没测到 kernel。
+- **f16 MatMul 精度优于官方**:我们与 ORT CPU 参考逐元素相等(`max_abs = 0`),
+  官方最高 1.19。原因就是上面的 f32 累加 —— 这是一个用速度换精度的明确取舍。
+
 ## 正式来源
 
 - [`onnx-runtime-ep-cubecl`](../../crates/onnx-runtime-ep-cubecl/src/lib.rs)
