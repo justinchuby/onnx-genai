@@ -2410,6 +2410,47 @@ impl PipelineEngine {
     }
 }
 
+/// Sampling parameters as the workflow sampler must see them.
+///
+/// The workflow sampler is a graph: it has no access to `GenerateOptions::greedy`
+/// and can only be steered through its declared `sampling_*` runtime roles. Binding
+/// the raw request options would therefore run a *stochastic* sampler for a greedy
+/// request, because the runtime's own defaults (`top_k = 0`, `temperature = 1.0`)
+/// disable truncation entirely. The result is seeded — hence reproducible — but it
+/// silently departs from argmax whenever the top-2 logits are close, which is
+/// exactly where a greedy contract must not drift.
+///
+/// Greedy is projected onto the sampler contract as `temperature = 0` *and*
+/// `top_k = 1`, with the nucleus filters opened back up so a caller-supplied
+/// `top_p`/`min_p` cannot truncate the single surviving candidate. Either knob
+/// alone already forces argmax for a conforming sampler; sending both keeps the
+/// contract unambiguous for samplers that implement only one of them.
+struct EffectiveSampling {
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    min_p: f32,
+}
+
+fn effective_sampling(request: &GenerateRequest) -> EffectiveSampling {
+    let options = &request.options;
+    if options.greedy {
+        EffectiveSampling {
+            temperature: 0.0,
+            top_k: 1,
+            top_p: 1.0,
+            min_p: 0.0,
+        }
+    } else {
+        EffectiveSampling {
+            temperature: options.temperature,
+            top_k: options.top_k,
+            top_p: options.top_p,
+            min_p: options.min_p,
+        }
+    }
+}
+
 fn workflow_request_value(
     field: &RuntimeInputRole,
     request: &GenerateRequest,
@@ -2452,10 +2493,14 @@ fn workflow_request_value(
         RuntimeInputRole::Seed => {
             scalar_i64(request.options.seed.unwrap_or_default() as i64).map(Some)
         }
-        RuntimeInputRole::SamplingTemperature => scalar_f32(request.options.temperature).map(Some),
-        RuntimeInputRole::SamplingTopK => scalar_i64(request.options.top_k as i64).map(Some),
-        RuntimeInputRole::SamplingTopP => scalar_f32(request.options.top_p).map(Some),
-        RuntimeInputRole::SamplingMinP => scalar_f32(request.options.min_p).map(Some),
+        RuntimeInputRole::SamplingTemperature => {
+            scalar_f32(effective_sampling(request).temperature).map(Some)
+        }
+        RuntimeInputRole::SamplingTopK => {
+            scalar_i64(effective_sampling(request).top_k as i64).map(Some)
+        }
+        RuntimeInputRole::SamplingTopP => scalar_f32(effective_sampling(request).top_p).map(Some),
+        RuntimeInputRole::SamplingMinP => scalar_f32(effective_sampling(request).min_p).map(Some),
         RuntimeInputRole::Media
         | RuntimeInputRole::Constraint
         | RuntimeInputRole::SessionId
@@ -4082,5 +4127,83 @@ service_group: decoder_cache
             append_workflow_value(&previous, &next, 4).is_err(),
             "axis must be within rank"
         );
+    }
+}
+
+#[cfg(test)]
+mod workflow_sampling_binding_tests {
+    use super::*;
+    use crate::{GenerateOptions, GenerateRequest};
+    use onnx_genai_metadata::BatchLayout;
+
+    fn request(configure: impl FnOnce(&mut GenerateOptions)) -> GenerateRequest {
+        let mut request = GenerateRequest::new("hello");
+        configure(&mut request.options);
+        request
+    }
+
+    #[test]
+    fn greedy_requests_bind_argmax_forcing_sampler_parameters() {
+        // The runtime's own defaults leave truncation disabled, so a greedy
+        // request must not be forwarded verbatim to a graph sampler.
+        let options = GenerateOptions::default();
+        assert!(options.greedy, "runtime default is greedy");
+        assert_eq!(options.top_k, 0, "top_k default disables truncation");
+        assert_eq!(options.temperature, 1.0, "temperature default is neutral");
+
+        let sampling = effective_sampling(&request(|options| {
+            options.greedy = true;
+            options.temperature = 0.7;
+            options.top_k = 64;
+            options.top_p = 0.9;
+            options.min_p = 0.05;
+        }));
+
+        assert_eq!(sampling.temperature, 0.0);
+        assert_eq!(sampling.top_k, 1);
+        assert_eq!(sampling.top_p, 1.0);
+        assert_eq!(sampling.min_p, 0.0);
+    }
+
+    #[test]
+    fn sampling_requests_bind_caller_parameters_unchanged() {
+        let sampling = effective_sampling(&request(|options| {
+            options.greedy = false;
+            options.temperature = 0.7;
+            options.top_k = 64;
+            options.top_p = 0.9;
+            options.min_p = 0.05;
+        }));
+
+        assert_eq!(sampling.temperature, 0.7);
+        assert_eq!(sampling.top_k, 64);
+        assert_eq!(sampling.top_p, 0.9);
+        assert_eq!(sampling.min_p, 0.05);
+    }
+
+    #[test]
+    fn greedy_sampling_roles_resolve_to_argmax_forcing_values() {
+        let request = request(|options| {
+            options.greedy = true;
+            options.top_k = 0;
+        });
+        let contract = TensorContract {
+            dtype: "int64".to_string(),
+            rank: 1,
+            shape: Some(vec![TensorDimension::Fixed(1)]),
+            optional: false,
+            batch_layout: BatchLayout::default(),
+        };
+
+        let top_k = workflow_request_value(&RuntimeInputRole::SamplingTopK, &request, &contract)
+            .expect("top_k binding")
+            .expect("top_k value");
+        assert_eq!(top_k.to_vec_i64().expect("i64 rows"), vec![1]);
+
+        let temperature =
+            workflow_request_value(&RuntimeInputRole::SamplingTemperature, &request, &contract)
+                .expect("temperature binding")
+                .expect("temperature value");
+        assert_eq!(temperature.to_vec_f32().expect("f32 rows"), vec![0.0]);
     }
 }
