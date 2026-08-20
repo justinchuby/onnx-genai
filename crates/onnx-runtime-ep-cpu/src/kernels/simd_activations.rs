@@ -3225,14 +3225,34 @@ mod tests {
         let mut o = vec![0.0f32; x.len()];
         log_f32_slice(&x, &mut o);
         let mut worst = 0.0f64;
+        let mut checked = 0usize;
         for (&xi, &got) in x.iter().zip(&o) {
+            checked += 1;
             let e = log_err(got, xi.ln());
             if e > worst {
                 worst = e;
             }
             assert!(e <= LOG_BOUND, "log({xi:e}) = {got}, want {}", xi.ln());
         }
-        assert!(worst > 0.0, "sweep did not exercise anything");
+
+        // Anti-vacuity, stated so that it holds on every host.
+        //
+        // A non-zero worst error does not: where no vector path exists, the
+        // scalar implementation and the reference `xi.ln()` are the *same*
+        // function, so a bit-exact sweep is the correct outcome rather than
+        // evidence the sweep never ran. Requiring divergence there fails every
+        // aarch64 host — the comment on the next test says as much, that a host
+        // without AVX2 "reaches a different function" and the two "must not be
+        // distinguishable".
+        assert_eq!(checked, x.len(), "the sweep did not visit every input");
+        assert!(checked >= 350_000, "the sweep lost its inputs");
+        if vector_path_available() {
+            assert!(
+                worst > 0.0,
+                "the vector path returned bit-exact scalar results, so this \
+                 sweep did not reach it"
+            );
+        }
     }
 
     /// The four activations that moved off the generic scalar path together.
