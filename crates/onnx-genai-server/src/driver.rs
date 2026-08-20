@@ -5,7 +5,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Context;
 use onnx_genai::{
     Engine, GenerateOptions, GenerateRequest, GenerateResult, GenerateToken, SessionId, TokenId,
 };
@@ -1380,6 +1379,60 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
     }
 }
 
+/// How long a single-request path waits for its consumer to make room before it
+/// treats that consumer as gone.
+///
+/// Two bounds pin this value. It must be far longer than the microseconds an
+/// awake receiver needs to drain a `DRIVER_OUTPUT_BUFFER`-sized burst, so a
+/// consumer that is merely *behind* is never mistaken for a dead one. And it
+/// must stay well inside the time a caller is willing to wait for an unrelated
+/// request, because the driver runs one generation at a time on one thread: a
+/// consumer that has genuinely stopped reading must not hold that thread.
+const OUTPUT_STALL_BUDGET: Duration = Duration::from_secs(1);
+
+/// Poll interval used only while the output buffer is full.
+const OUTPUT_STALL_POLL: Duration = Duration::from_millis(1);
+
+/// Deliver one event to a single request's own output channel.
+///
+/// A full buffer and a closed buffer are different conditions and this reports
+/// them differently. `try_send` collapsed both into one error: a *full* buffer
+/// was reported as a closed stream, which aborted the generation, and then the
+/// terminal event was dropped into that same full buffer, so the client was
+/// told "generation stream ended before result" instead of what actually went
+/// wrong. Any non-streaming generation longer than `DRIVER_OUTPUT_BUFFER` on a
+/// fast-emitting path — the workflow pipeline emits its tokens in a burst —
+/// failed that way.
+///
+/// A full buffer now waits, briefly, for the consumer to drain it. Waiting
+/// forever is not an option: these paths run on the driver's single dedicated
+/// thread, so a consumer that stops reading would wedge every later request.
+/// Past the budget the consumer is abandoned and told so. (The shared
+/// continuous batch never waits at all — see `route_continuous_events`, where
+/// waiting would stall every co-decoded row behind the slowest one.)
+fn deliver_event(events: &mpsc::Sender<DriverEvent>, event: DriverEvent) -> anyhow::Result<()> {
+    let deadline = Instant::now() + OUTPUT_STALL_BUDGET;
+    let mut pending = event;
+    loop {
+        match events.try_send(pending) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                anyhow::bail!("stream receiver closed")
+            }
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                if Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "stream consumer stalled: output buffer stayed full for {:?}",
+                        OUTPUT_STALL_BUDGET
+                    );
+                }
+                pending = event;
+                std::thread::sleep(OUTPUT_STALL_POLL);
+            }
+        }
+    }
+}
+
 fn run_pipeline_generation(
     engine: &mut PipelineEngine,
     request: GenerateRequest,
@@ -1405,9 +1458,7 @@ fn run_pipeline_generation(
     let mut admission = Some(admission);
     let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
         metrics.token();
-        events
-            .try_send(DriverEvent::Token(token))
-            .context("stream receiver closed")
+        deliver_event(&events, DriverEvent::Token(token))
     };
     let result = {
         let mut admitted = || {
@@ -1420,14 +1471,14 @@ fn run_pipeline_generation(
     match result {
         Ok(result) => {
             metrics.result(result.token_ids.len(), result.prefix_cache_hit_len);
-            let _ = events.try_send(DriverEvent::Finished(result));
+            let _ = deliver_event(&events, DriverEvent::Finished(result));
         }
         Err(err) => {
             let failure = DriverFailure::from_engine_error(&err);
             if let Some(sender) = admission.take() {
                 let _ = sender.send(Err(failure.clone()));
             }
-            let _ = events.try_send(DriverEvent::Error(failure));
+            let _ = deliver_event(&events, DriverEvent::Error(failure));
         }
     }
 }
@@ -1444,9 +1495,7 @@ fn run_fallback_generation(
     let mut admission = Some(admission);
     let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
         metrics.token();
-        events
-            .try_send(DriverEvent::Token(token))
-            .context("stream receiver closed")
+        deliver_event(&events, DriverEvent::Token(token))
     };
     let result = {
         let mut admitted = || {
@@ -1469,14 +1518,14 @@ fn run_fallback_generation(
     match result {
         Ok(result) => {
             metrics.result(result.token_ids.len(), result.prefix_cache_hit_len);
-            let _ = events.try_send(DriverEvent::Finished(result));
+            let _ = deliver_event(&events, DriverEvent::Finished(result));
         }
         Err(err) => {
             let failure = DriverFailure::from_engine_error(&err);
             if let Some(sender) = admission.take() {
                 let _ = sender.send(Err(failure.clone()));
             }
-            let _ = events.try_send(DriverEvent::Error(failure));
+            let _ = deliver_event(&events, DriverEvent::Error(failure));
         }
     }
 }
@@ -1514,14 +1563,14 @@ fn run_fim_generation(
     match result {
         Ok(result) => {
             metrics.result(result.token_ids.len(), result.prefix_cache_hit_len);
-            let _ = events.try_send(DriverEvent::Finished(result));
+            let _ = deliver_event(&events, DriverEvent::Finished(result));
         }
         Err(err) => {
             let failure = DriverFailure::from_engine_error(&err);
             if let Some(sender) = admission.take() {
                 let _ = sender.send(Err(failure.clone()));
             }
-            let _ = events.try_send(DriverEvent::Error(failure));
+            let _ = deliver_event(&events, DriverEvent::Error(failure));
         }
     }
 }
@@ -1790,6 +1839,101 @@ mod admission_tests {
             admission_step(1, 1, 0, false, false),
             AdmissionStep::WaitToSettle,
             "a non-empty deferred queue is not a solo request"
+        );
+    }
+}
+
+#[cfg(test)]
+mod event_delivery_tests {
+    use super::*;
+    use onnx_genai::FinishReason;
+
+    fn result() -> GenerateResult {
+        GenerateResult {
+            text: "done".to_string(),
+            token_ids: Vec::new(),
+            finish_reason: FinishReason::EosToken,
+            prefix_cache_hit_len: 0,
+            logprobs: None,
+            budget_cap: None,
+        }
+    }
+
+    fn token() -> GenerateToken {
+        GenerateToken {
+            token_id: 1,
+            text: "a".to_string(),
+            finish_reason: None,
+        }
+    }
+
+    /// The defect: a generation longer than the output buffer aborted, and the
+    /// terminal event was then dropped into the same full buffer, so the client
+    /// was told the stream ended rather than what happened. A single request
+    /// owns its channel, so the driver must wait for capacity instead.
+    #[test]
+    fn a_generation_longer_than_the_output_buffer_still_delivers_every_event() {
+        let (events, mut rx) = mpsc::channel(DRIVER_OUTPUT_BUFFER);
+        let produced = DRIVER_OUTPUT_BUFFER * 3;
+        let sender = thread::spawn(move || {
+            for _ in 0..produced {
+                deliver_event(&events, DriverEvent::Token(token()))
+                    .expect("a live receiver must accept every token");
+            }
+            deliver_event(&events, DriverEvent::Finished(result()))
+                .expect("the terminal event must not be dropped for a full buffer");
+        });
+
+        let mut tokens = 0;
+        let mut finished = false;
+        while let Some(event) = rx.blocking_recv() {
+            match event {
+                DriverEvent::Token(_) => tokens += 1,
+                DriverEvent::Finished(_) => {
+                    finished = true;
+                    break;
+                }
+                DriverEvent::Error(error) => panic!("unexpected failure: {}", error.message),
+            }
+        }
+        sender.join().expect("sender thread panicked");
+        assert_eq!(tokens, produced);
+        assert!(finished, "the result must reach the caller");
+    }
+
+    /// A receiver that is genuinely gone must still be reported, so a
+    /// disconnected client stops the generation instead of blocking it forever.
+    #[test]
+    fn a_dropped_receiver_is_reported_as_a_closed_stream() {
+        let (events, rx) = mpsc::channel::<DriverEvent>(DRIVER_OUTPUT_BUFFER);
+        drop(rx);
+        let error = deliver_event(&events, DriverEvent::Token(token()))
+            .expect_err("a dropped receiver cannot accept events");
+        assert!(error.to_string().contains("stream receiver closed"));
+    }
+
+    /// Waiting for capacity must stay bounded. These paths run on the driver's
+    /// one dedicated thread, so a consumer that holds its receiver but never
+    /// reads it has to be abandoned, or every later request waits behind it.
+    /// It is reported as stalled, not as closed, because those differ.
+    #[test]
+    fn a_receiver_that_never_reads_is_abandoned_within_the_budget() {
+        let (events, _held) = mpsc::channel::<DriverEvent>(1);
+        deliver_event(&events, DriverEvent::Token(token())).expect("the first event fits");
+
+        let started = Instant::now();
+        let error = deliver_event(&events, DriverEvent::Token(token()))
+            .expect_err("a receiver that never reads cannot be waited on forever");
+        let waited = started.elapsed();
+
+        assert!(error.to_string().contains("stream consumer stalled"));
+        assert!(
+            waited >= OUTPUT_STALL_BUDGET,
+            "gave up too early: {waited:?}"
+        );
+        assert!(
+            waited < OUTPUT_STALL_BUDGET * 3,
+            "held the driver far past the budget: {waited:?}"
         );
     }
 }
