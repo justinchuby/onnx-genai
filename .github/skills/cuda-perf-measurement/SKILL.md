@@ -177,6 +177,18 @@ supposed to be on, prove it fires on the real model -- `--profile` and look for
 the span that should have *disappeared* (`loop.sampling`), not just at tok/s,
 which was inside the noise band here.
 
+The second gate had a second lesson. `chain.is_empty()` was not merely too
+strict, it was the wrong question: a greedy request should not have been
+carrying sampling warpers at all. When a fast path needs an exemption to fire on
+ordinary input, check whether the input should exist before you write the
+exemption.
+
+And this pair of fixes is where Trap 5 bit hardest: the new code measured 36.7
+tok/s against a 33.9 tok/s baseline taken twenty minutes earlier, which looked
+like the +8% the archive predicted. Re-measuring the baseline **back to back**
+gave 36.5. The entire "win" was the A100 ramping off its 210 MHz idle clock.
+**A baseline from earlier in the session is not a baseline.**
+
 ## Know your roofline, and what a good fraction actually is
 
 Decode is weight-bandwidth-bound: per token you must read every weight once.
