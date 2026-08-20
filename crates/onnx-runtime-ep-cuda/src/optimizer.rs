@@ -108,6 +108,13 @@ pub(crate) fn cuda_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
         // reciprocal kernel + its fp16 intermediate round-trip, ~1.2% of decode
         // GPU-kernel time on qwen3.5-0.8b-hybrid; see the profiling drop).
         Box::new(CudaRsqrtFusion),
+        // Collapse the Gated-DeltaNet Q/K L2-normalize glue
+        // `Div(x, Sqrt(ReduceSumSquare(x, axis)))` into a single fused
+        // `LpNormalization` (p=2) kernel — one pass over HBM instead of three
+        // launches (ReduceSumSquare + Sqrt + Div) per site, 96 sites/token on
+        // Qwen3.8-27B. The fused node runs a byte-faithful kernel that replays the
+        // chain's intermediate rounding, so greedy decode stays token-identical.
+        Box::new(CudaL2NormalizeFusion),
         // Fold the gated-delta `LinearAttention` beta-`Sigmoid` and decay
         // `Softplus` gate chains into the kernel while they are still in their
         // pristine exported form (before the cast-dropping passes run). Drops a
@@ -321,6 +328,210 @@ impl OptimizationPass for CudaRsqrtFusion {
                 .insert(CUDA_RSQRT_ATTR.into(), Attribute::Int(1));
             graph.replace_node(recip_id, rsqrt);
             graph.remove_node(sqrt_id);
+            changed = true;
+        }
+
+        if changed {
+            graph.validate().map_err(OptimizerError::from)?;
+        }
+        Ok(())
+    }
+}
+
+/// Environment opt-out for [`CudaL2NormalizeFusion`]. Setting
+/// `ONNX_GENAI_CUDA_L2NORM_FUSION=0` keeps the exported unfused
+/// `ReduceSumSquare → Sqrt → Div` chain — for A/B measurement or rollback.
+fn l2_normalize_fusion_disabled() -> bool {
+    std::env::var_os("ONNX_GENAI_CUDA_L2NORM_FUSION").is_some_and(|v| v == "0")
+}
+
+/// Collapse the Gated-DeltaNet query/key **L2 normalization** glue
+/// `Div(x, Sqrt(ReduceSumSquare(x, axis)))` into a single fused
+/// `LpNormalization` (`p = 2`) node.
+///
+/// ## The pattern (Qwen3.8 / Qwen3-Next Gated-DeltaNet, exported by mobius)
+///
+/// Each linear-attention sublayer L2-normalizes its query and key head vectors
+/// along the last (`head_dim`) axis:
+///
+/// ```text
+///   sq  = ReduceSumSquare(x, axes=[axis], keepdims=1)   // Σ x²
+///   nrm = Sqrt(sq)                                        // ‖x‖₂
+///   y   = Div(x, nrm)                                     // x / ‖x‖₂
+/// ```
+///
+/// That is exactly `LpNormalization(x, p=2, axis)`, for which the CUDA EP
+/// already has a single fused NVRTC kernel (`global_reduction::lp_normalization`)
+/// that does the sum-of-squares reduction, the `sqrt`, and the divide in **one**
+/// pass over a single HBM read — replacing three separate kernel launches (and
+/// two intermediate tensor round-trips) per site. On Qwen3.8-27B there are 96
+/// such sites per decode step (48 linear-attention layers × {query, key}), so the
+/// fold removes ~192 tiny launches from the captured decode graph.
+///
+/// ## Numerics
+///
+/// The fused node is tagged so the CUDA EP runs a **byte-faithful** L2-normalize
+/// kernel (`global_reduction::l2_normalize_faithful`) that reproduces the exported
+/// chain's arithmetic *exactly*: it accumulates `Σ x²` in fp32 with the same
+/// 256-way shared-memory tree reduce the EP already uses to lower
+/// `ReduceSumSquare`, then rounds the sum to the activation dtype, takes the fp32
+/// `sqrt` and rounds again, and finally divides in fp32 and rounds the result —
+/// matching the intermediate rounds of the separate `ReduceSumSquare`, `Sqrt`,
+/// and `Div` ops. The output is therefore **bit-identical** to the unfused graph
+/// (greedy decode stays token-identical on the validated 27B models), while
+/// collapsing three launches into one. The fold is refused unless the activation
+/// dtype is one the kernel serves (f32/f16/bf16) and the reduce is a single-axis
+/// `keepdims=1` reduction.
+pub(crate) struct CudaL2NormalizeFusion;
+
+impl CudaL2NormalizeFusion {
+    /// The single reduced axis of a `ReduceSumSquare`, if it reduces exactly one
+    /// axis with `keepdims=1` (so the following `Div` broadcasts cleanly). Reads
+    /// the `axes` attribute (opset < 18) or the `axes` initializer input (opset
+    /// ≥ 18); falls back to deriving it from the input/output static shapes. The
+    /// returned axis may be negative — [`LpNormalizationKernel`] normalizes it
+    /// against the input rank at launch.
+    fn reduce_axis(graph: &Graph, rss: &Node) -> Option<i64> {
+        if rss
+            .attr("keepdims")
+            .and_then(Attribute::as_int)
+            .unwrap_or(1)
+            != 1
+        {
+            return None;
+        }
+        // opset < 18: axes attribute.
+        if let Some(axes) = rss.attr("axes").and_then(Attribute::as_ints) {
+            return (axes.len() == 1).then(|| axes[0]);
+        }
+        // opset >= 18: axes is the second (optional) input, an int64 initializer.
+        if let Some(Some(axes_val)) = rss.inputs.get(1) {
+            if let Some(WeightRef::Inline(t)) = graph.initializers.get(axes_val) {
+                if t.dtype == DataType::Int64 && t.numel() == 1 && t.data.len() >= 8 {
+                    let mut bytes = [0u8; 8];
+                    bytes.copy_from_slice(&t.data[..8]);
+                    return Some(i64::from_le_bytes(bytes));
+                }
+            }
+            // An axes input we cannot statically read (dynamic or external) —
+            // refuse rather than guess the reduced axis.
+            return None;
+        }
+        // No axes given: derive from the static shapes (the one dim reduced to 1).
+        let x = rss.inputs.first().copied().flatten()?;
+        let in_shape = &graph.value(x).shape;
+        let out_shape = &graph.value(rss.outputs[0]).shape;
+        if in_shape.len() != out_shape.len() {
+            return None;
+        }
+        let mut axis = None;
+        for (index, (a, b)) in in_shape.iter().zip(out_shape.iter()).enumerate() {
+            let (Some(a), Some(b)) = (a.as_static(), b.as_static()) else {
+                return None;
+            };
+            if a != b {
+                if b != 1 || axis.is_some() {
+                    return None;
+                }
+                axis = Some(index as i64);
+            }
+        }
+        axis
+    }
+}
+
+impl OptimizationPass for CudaL2NormalizeFusion {
+    fn name(&self) -> &str {
+        "CudaL2NormalizeFusion"
+    }
+
+    fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> OptimizerResult<()> {
+        if l2_normalize_fusion_disabled() {
+            return Ok(());
+        }
+        let div_ids: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                (node.op_type == "Div"
+                    && node.is_default_domain()
+                    && node.inputs.len() == 2
+                    && node.outputs.len() == 1)
+                    .then_some(id)
+            })
+            .collect();
+        let mut changed = false;
+
+        for div_id in div_ids {
+            let Some(div) = graph.try_node(div_id) else {
+                continue;
+            };
+            let (Some(x), Some(nrm)) = (div.inputs[0], div.inputs[1]) else {
+                continue;
+            };
+            // The activation dtype must be one the LpNormalization kernel serves.
+            if !matches!(
+                graph.value(x).dtype,
+                DataType::Float32 | DataType::Float16 | DataType::BFloat16
+            ) {
+                continue;
+            }
+            // `nrm` must be a sole-consumer `Sqrt(sq)`.
+            let Some(sqrt_id) = graph.value(nrm).producer else {
+                continue;
+            };
+            let sqrt = graph.node(sqrt_id);
+            if sqrt.op_type != "Sqrt"
+                || !sqrt.is_default_domain()
+                || sqrt.inputs.len() != 1
+                || sqrt.outputs.len() != 1
+                || graph.value(nrm).is_graph_output
+                || graph.consumers(nrm).len() != 1
+            {
+                continue;
+            }
+            let Some(sq) = sqrt.inputs[0] else {
+                continue;
+            };
+            // `sq` must be a sole-consumer `ReduceSumSquare(x, axis)` over the
+            // *same* `x` the Div divides — the true L2-normalize shape.
+            let Some(rss_id) = graph.value(sq).producer else {
+                continue;
+            };
+            let rss = graph.node(rss_id);
+            if rss.op_type != "ReduceSumSquare"
+                || !rss.is_default_domain()
+                || rss.inputs.first().copied().flatten() != Some(x)
+                || rss.outputs.len() != 1
+                || graph.value(sq).is_graph_output
+                || graph.consumers(sq).len() != 1
+            {
+                continue;
+            }
+            let Some(axis) = Self::reduce_axis(graph, rss) else {
+                continue;
+            };
+
+            // Rewrite the Div into a single fused LpNormalization(p=2) that reads
+            // `x` directly and keeps the Div's output value (downstream untouched);
+            // then drop the now-dead Sqrt and ReduceSumSquare.
+            let mut lpnorm = div.clone();
+            lpnorm.op_type = "LpNormalization".to_string();
+            lpnorm.domain = String::new();
+            lpnorm.version = None;
+            lpnorm.inputs = vec![Some(x)];
+            lpnorm.attributes.clear();
+            lpnorm.attributes.insert("p".into(), Attribute::Int(2));
+            lpnorm.attributes.insert("axis".into(), Attribute::Int(axis));
+            // Private marker: route to the byte-faithful L2-normalize kernel that
+            // reproduces the exported chain's intermediate rounding, so greedy
+            // decode stays token-identical to the unfused graph.
+            lpnorm
+                .attributes
+                .insert("fused_reduce_chain".into(), Attribute::Int(1));
+            graph.replace_node(div_id, lpnorm);
+            graph.remove_node(sqrt_id);
+            graph.remove_node(rss_id);
             changed = true;
         }
 
@@ -3925,6 +4136,168 @@ mod tests {
                 .filter(|n| n.op_type == "Reciprocal")
                 .all(|n| n.attr(CUDA_RSQRT_ATTR).is_none()),
             "Reciprocal must not be retagged when Sqrt escapes"
+        );
+    }
+
+    // === L2 normalize fold (Gated-DeltaNet Q/K norm) ===
+
+    /// Build the Gated-DeltaNet Q/K L2-normalize glue the
+    /// [`CudaL2NormalizeFusion`] targets: `ReduceSumSquare(x, axes=[-1],
+    /// keepdims=1) → Sqrt → Div(x, ·) → output`. Returns the graph plus the
+    /// intermediate `sq`/`nrm` values so escape tests can add a second consumer.
+    fn l2_norm_glue_graph(dtype: DataType, width: usize) -> (Graph, ValueId, ValueId) {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 13);
+        let x = value(&mut graph, "x", dtype, width);
+        let sq = graph.create_named_value("sq", dtype, vec![Dim::Static(1), Dim::Static(1)]);
+        let nrm = graph.create_named_value("nrm", dtype, vec![Dim::Static(1), Dim::Static(1)]);
+        let output = value(&mut graph, "output", dtype, width);
+        graph.add_input(x);
+        let mut rss = Node::new(
+            NodeId(0),
+            "ReduceSumSquare",
+            vec![Some(x)],
+            vec![sq],
+        );
+        rss.attributes.insert("axes".into(), Attribute::Ints(vec![-1]));
+        rss.attributes.insert("keepdims".into(), Attribute::Int(1));
+        graph.insert_node(rss);
+        graph.insert_node(Node::new(NodeId(0), "Sqrt", vec![Some(sq)], vec![nrm]));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Div",
+            vec![Some(x), Some(nrm)],
+            vec![output],
+        ));
+        graph.add_output(output);
+        (graph, sq, nrm)
+    }
+
+    #[test]
+    fn fuses_l2_normalize_into_lpnormalization() {
+        let (mut graph, _sq, _nrm) = l2_norm_glue_graph(DataType::BFloat16, 8);
+        let x = value_id_by_name(&graph, "x");
+        let output = value_id_by_name(&graph, "output");
+        CudaL2NormalizeFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        // ReduceSumSquare and Sqrt are gone; a single LpNormalization remains.
+        assert_eq!(graph.num_nodes(), 1, "only the fused LpNormalization remains");
+        assert!(
+            graph
+                .nodes
+                .values()
+                .all(|n| n.op_type != "ReduceSumSquare" && n.op_type != "Sqrt"),
+            "ReduceSumSquare and Sqrt must be removed"
+        );
+        let lp = graph
+            .nodes
+            .values()
+            .find(|n| n.op_type == "LpNormalization")
+            .expect("Div must be rewritten to LpNormalization");
+        assert!(lp.is_default_domain(), "LpNormalization stays default domain");
+        assert_eq!(lp.inputs, vec![Some(x)], "reads the pre-norm activation x");
+        assert_eq!(lp.outputs, vec![output], "keeps the Div output value");
+        assert_eq!(
+            lp.attr("p").and_then(Attribute::as_int),
+            Some(2),
+            "L2 norm ⇒ p = 2"
+        );
+        assert_eq!(
+            lp.attr("axis").and_then(Attribute::as_int),
+            Some(-1),
+            "axis carried over from the ReduceSumSquare axes"
+        );
+        assert_eq!(
+            lp.attr("fused_reduce_chain").and_then(Attribute::as_int),
+            Some(1),
+            "fused node is marked to run the byte-faithful L2-normalize kernel"
+        );
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn l2_normalize_derives_axis_from_shapes_without_axes_attr() {
+        // No `axes` attribute or input: the pass must derive the single reduced
+        // axis from the input/output static shapes (the dim reduced to 1).
+        let (mut graph, _sq, _nrm) = l2_norm_glue_graph(DataType::BFloat16, 8);
+        let rss_id = graph
+            .nodes
+            .iter()
+            .find(|(_, n)| n.op_type == "ReduceSumSquare")
+            .map(|(id, _)| id)
+            .unwrap();
+        // Strip the axes attribute, forcing the shape-difference fallback.
+        let mut rss = graph.node(rss_id).clone();
+        rss.attributes.remove("axes");
+        graph.replace_node(rss_id, rss);
+
+        CudaL2NormalizeFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        let lp = graph
+            .nodes
+            .values()
+            .find(|n| n.op_type == "LpNormalization")
+            .expect("shape-derived axis must still fuse");
+        assert_eq!(
+            lp.attr("axis").and_then(Attribute::as_int),
+            Some(1),
+            "reduced axis (dim 1 → 1) derived from shapes"
+        );
+    }
+
+    #[test]
+    fn does_not_fuse_l2_when_norm_escapes() {
+        // The Sqrt output (‖x‖₂) also feeds a second consumer, so it escapes the
+        // L2-normalize shape and the chain must be left intact.
+        let (mut graph, _sq, nrm) = l2_norm_glue_graph(DataType::BFloat16, 8);
+        let sink = value(&mut graph, "sink", DataType::BFloat16, 1);
+        graph.insert_node(Node::new(NodeId(0), "Neg", vec![Some(nrm)], vec![sink]));
+        graph.add_output(sink);
+
+        CudaL2NormalizeFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert!(
+            graph
+                .nodes
+                .values()
+                .any(|n| n.op_type == "ReduceSumSquare")
+                && graph.nodes.values().any(|n| n.op_type == "Sqrt")
+                && graph.nodes.values().any(|n| n.op_type == "Div"),
+            "an escaping norm must leave the ReduceSumSquare/Sqrt/Div chain intact"
+        );
+        assert!(
+            graph.nodes.values().all(|n| n.op_type != "LpNormalization"),
+            "no fusion when the norm escapes"
+        );
+    }
+
+    #[test]
+    fn does_not_fuse_l2_with_mismatched_div_numerator() {
+        // Div's numerator differs from the ReduceSumSquare input: this is a plain
+        // division, not an L2 normalize, and must not be rewritten.
+        let (mut graph, _sq, _nrm) = l2_norm_glue_graph(DataType::BFloat16, 8);
+        let other = value(&mut graph, "other", DataType::BFloat16, 8);
+        graph.add_input(other);
+        let div_id = graph
+            .nodes
+            .iter()
+            .find(|(_, n)| n.op_type == "Div")
+            .map(|(id, _)| id)
+            .unwrap();
+        let mut div = graph.node(div_id).clone();
+        div.inputs[0] = Some(other); // divide a *different* tensor by ‖x‖₂
+        graph.replace_node(div_id, div);
+
+        CudaL2NormalizeFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert!(
+            graph.nodes.values().all(|n| n.op_type != "LpNormalization"),
+            "Div numerator ≠ ReduceSumSquare input ⇒ not an L2 normalize"
         );
     }
 
