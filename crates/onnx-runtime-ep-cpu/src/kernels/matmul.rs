@@ -5439,9 +5439,6 @@ mod tests {
                 kernel
                     .execute(&[a.view(), b.view()], &mut [out.view_mut()])
                     .unwrap();
-                if !crate::backend::has_simd_x86() {
-                    continue; // No AVX2/FMA: the blocked half GEMM still runs.
-                }
                 // Built with the non-default `mlas` feature, an x86 host
                 // auto-detects `CpuBackend::Mlas`, and `try_packed_half_prefill`
                 // claims contiguous f16 prefill before `try_matmul_half` is
@@ -5455,36 +5452,47 @@ mod tests {
                 #[cfg(not(feature = "mlas"))]
                 let mlas_claims_this = false;
                 if !mlas_claims_this {
-                    // `half_gemm_tile` tries the native AVX-512 BF16 kernel
-                    // before the GEBP, so on a host with `avx512bf16` a bf16
-                    // tile legitimately never reaches the GEBP. That is the
-                    // same precedence `half_decode_prefers_gebp_when` already
-                    // encodes for decode. Asserting a bare
-                    // `half_prefill_gebp_calls() == 1` therefore asserts a
-                    // route the hardware cannot take, and fails on exactly the
-                    // runners that have AVX-512 BF16 -- which is why this test
-                    // was intermittently red rather than consistently so.
+                    // Which of the two fast routes runs is a property of the
+                    // host, not of the kernel, so derive the expectation from
+                    // the very predicates `half_gemm_tile` dispatches on rather
+                    // than restating a hardware assumption here. Two of them
+                    // bite on real runners:
                     //
-                    // Assert the disjunction instead: exactly one of the two
-                    // fast routes ran. That still catches a silent fall-through
-                    // to the portable blocked half GEMM, on every CPU, which is
-                    // what the guardrail is actually for.
-                    let gebp = half_prefill_gebp_calls();
-                    let native_bf16 = half_native_bf16_calls();
-                    if dtype == DataType::BFloat16 && x86_bf16::native_available() {
-                        assert_eq!(
-                            (gebp, native_bf16),
-                            (0, 1),
-                            "{dtype:?} m={m}: host has avx512bf16, so prefill must take \
-                             the native BF16 kernel and not the widen-pack GEBP"
-                        );
-                    } else {
-                        assert_eq!(
-                            (gebp, native_bf16),
-                            (1, 0),
-                            "{dtype:?} m={m}: prefill did not take the fused widen-pack GEBP"
-                        );
-                    }
+                    //   * `x86_bf16::native_available()` -- `half_gemm_tile`
+                    //     tries the native AVX-512 BF16 kernel *before* the
+                    //     GEBP, so on a host with `avx512bf16` a bf16 tile
+                    //     legitimately never reaches the GEBP. That is the same
+                    //     precedence `half_decode_prefers_gebp_when` already
+                    //     encodes for decode. A bare
+                    //     `half_prefill_gebp_calls() == 1` asserts a route such
+                    //     a host cannot take, which is why this test was
+                    //     intermittently red across GitHub's mixed Linux x64
+                    //     pool rather than consistently so.
+                    //
+                    //   * `has_simd_x86()` -- without AVX2+FMA neither fast
+                    //     route is selected and the portable blocked half GEMM
+                    //     runs. That case is a legitimate `(0, 0)`, not a
+                    //     reason to skip: the numeric comparison below is the
+                    //     half of this test that is valuable on *every* host,
+                    //     so it must stay on the unconditional path.
+                    let format = match dtype {
+                        DataType::Float16 => HalfFormat::F16,
+                        _ => HalfFormat::Bf16,
+                    };
+                    let expect_native_bf16 =
+                        format == HalfFormat::Bf16 && x86_bf16::native_available();
+                    let expect_gebp = !expect_native_bf16
+                        && half_prefill_gebp_selected(format, m, k, n)
+                        && half_prefill_gebp_enabled();
+                    let want = (u64::from(expect_gebp), u64::from(expect_native_bf16));
+                    assert_eq!(
+                        (half_prefill_gebp_calls(), half_native_bf16_calls()),
+                        want,
+                        "{dtype:?} m={m}: prefill took the wrong route \
+                         (avx512bf16={}, simd_x86={})",
+                        x86_bf16::native_available(),
+                        crate::backend::has_simd_x86()
+                    );
                 }
 
                 let expected = naive_matmul(&a_data, &b_data, m, k, n);
