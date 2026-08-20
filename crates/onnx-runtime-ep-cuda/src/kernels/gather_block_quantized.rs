@@ -132,10 +132,7 @@ pub struct GatherBlockQuantizedFactory {
 
 impl KernelFactory for GatherBlockQuantizedFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let bits = node
-            .attr("bits")
-            .and_then(|a| a.as_int())
-            .unwrap_or(4);
+        let bits = node.attr("bits").and_then(|a| a.as_int()).unwrap_or(4);
         if !matches!(bits, 2 | 4 | 8) {
             return Err(not_implemented(
                 "GatherBlockQuantized CUDA supports uint8 data with bits in {2, 4, 8}",
@@ -612,13 +609,7 @@ mod tests {
     use super::*;
 
     fn runtime() -> Option<Arc<CudaRuntime>> {
-        let previous_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let runtime = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
-            .ok()
-            .flatten();
-        std::panic::set_hook(previous_hook);
-        runtime
+        crate::test_support::maybe_runtime()
     }
 
     fn as_bytes<T: Copy>(values: &[T]) -> &[u8] {

@@ -1508,3 +1508,108 @@ preprocessing:
         "unexpected error: {error:#}"
     );
 }
+
+#[test]
+fn patchify_patch_order_is_independent_of_merge_size() {
+    // A 4x4 image of 2x2 patches, each patch a distinct grey level, so a patch
+    // is identifiable from any single value it contributes.
+    const PROGRAM: &str = r#"
+preprocessing:
+  image:
+    transforms:
+      - op: decode_rgb
+      - op: resize
+        mode: pixel_area
+        min_pixels: 4
+        max_pixels: 65536
+        size_multiple: 4
+        interpolation: bicubic
+      - op: patchify
+        patch_size: 2
+        temporal_patch_size: 1
+        merge_size: 2
+        channel_order: channels_first
+        temporal_order: temporal_major
+{order}        flatten: true
+    outputs:
+      - name: pixel_values
+        content: pixels
+        dtype: fp32
+"#;
+    let mut image = RgbImage::new(4, 4);
+    for (patch_y, patch_x) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+        let level = (patch_y * 2 + patch_x) as u8 * 10 + 10;
+        for y in 0..2 {
+            for x in 0..2 {
+                image.put_pixel(
+                    (patch_x * 2 + x) as u32,
+                    (patch_y * 2 + y) as u32,
+                    Rgb([level, level, level]),
+                );
+            }
+        }
+    }
+    let image = DynamicImage::ImageRgb8(image);
+    // First red value of each emitted patch identifies which patch came out where.
+    let patch_levels = |order: &str| {
+        let preprocessor = typed_preprocessor(&[-1, 12], &PROGRAM.replace("{order}", order));
+        let bundle = preprocessor
+            .preprocess(std::slice::from_ref(&image))
+            .unwrap();
+        let values = match &bundle.tensor("pixel_values").unwrap().data {
+            ImageTensorData::Fp32(values) => values.clone(),
+            other => panic!("expected fp32 pixels, got {other:?}"),
+        };
+        (
+            values
+                .chunks_exact(12)
+                .map(|patch| patch[0])
+                .collect::<Vec<_>>(),
+            bundle.images[0].expansion_count,
+            bundle.images[0].spatial_merge_size,
+        )
+    };
+
+    // A 2x2 image of patches is a single merge group either way, so the emitted
+    // order matches; what must not change is the token accounting.
+    let (grouped, grouped_count, grouped_merge) = patch_levels("");
+    let (raster, raster_count, raster_merge) = patch_levels("        patch_order: raster\n");
+    assert_eq!(grouped, vec![10.0, 20.0, 30.0, 40.0]);
+    assert_eq!(raster, grouped);
+    assert_eq!(grouped_count, 4);
+    assert_eq!(
+        grouped_merge, 2,
+        "merge_size still collapses the four patches into one image token"
+    );
+    assert_eq!(
+        raster_count, grouped_count,
+        "patch_order must not disturb the placeholder count that merge_size sets"
+    );
+    assert_eq!(raster_merge, grouped_merge);
+}
+
+#[test]
+fn patchify_rejects_an_unknown_patch_order() {
+    const PROGRAM: &str = r#"
+preprocessing:
+  image:
+    transforms:
+      - op: decode_rgb
+      - op: patchify
+        patch_size: 2
+        temporal_patch_size: 1
+        merge_size: 1
+        patch_order: diagonal
+        flatten: true
+    outputs:
+      - name: pixel_values
+        content: pixels
+        dtype: fp32
+"#;
+    let document = serde_yaml::from_str::<MetadataDocument>(PROGRAM).unwrap();
+    let error = ImagePreprocessor::from_metadata_document(&[-1, 12], Some(document)).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("patch_order 'diagonal'"),
+        "unexpected error: {error:#}"
+    );
+}

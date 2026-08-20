@@ -2874,7 +2874,7 @@ impl GroupQueryAttentionKernel {
         } else if q.dtype == DataType::Float16 && gqa_decode_fp16::supported(q_seq, dim) {
             onnx_runtime_ep_api::record_kernel_variant!(
                 "attention_gqa_decode_fp16_splitk",
-                "capture-safe fp16 split-K flash-decode: q_seq={}, even head_dim={} (<=256); \
+                "capture-safe fp16 split-K flash-decode: q_seq={}, even head_dim={} (<=512); \
                  active split count (up to {}) chosen on-device from the valid length \
                  and a host occupancy target that fills the multiprocessors",
                 q_seq,
@@ -2910,7 +2910,7 @@ impl GroupQueryAttentionKernel {
         } else if q.dtype == DataType::BFloat16 && gqa_decode_bf16::supported(q_seq, dim) {
             onnx_runtime_ep_api::record_kernel_variant!(
                 "attention_gqa_decode_bf16_splitk",
-                "capture-safe bf16 split-K flash-decode: q_seq={}, even head_dim={} (<=256); \
+                "capture-safe bf16 split-K flash-decode: q_seq={}, even head_dim={} (<=512); \
                  active split count (up to {}) chosen on-device from the valid length \
                  and a host occupancy target that fills the multiprocessors",
                 q_seq,
@@ -3350,13 +3350,7 @@ mod tests {
     }
 
     fn runtime() -> Option<Arc<CudaRuntime>> {
-        let previous_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let runtime = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
-            .ok()
-            .flatten();
-        std::panic::set_hook(previous_hook);
-        runtime
+        crate::test_support::maybe_runtime()
     }
 
     #[test]
@@ -3377,16 +3371,30 @@ mod tests {
         assert_eq!(workspace.reserve(WS_Q_BNSH, 2048).unwrap(), first);
         assert_eq!(runtime.allocation_counts(), allocated);
 
+        // Growing releases the old block and takes a larger one. `frees` counts
+        // *driver* calls, and the runtime's allocation pool retains released
+        // blocks rather than returning them to the driver, so the released
+        // 4096-byte block shows up as retained bytes instead of as a `cuMemFree`.
+        // Asserting on the retained total keeps the property this test exists
+        // for -- the old block is released, not leaked -- without pinning which
+        // side of the pool it ends up on.
         let grown = workspace.reserve(WS_Q_BNSH, 8192).unwrap();
         assert_ne!(grown, first);
         let grown_counts = runtime.allocation_counts();
         assert_eq!(grown_counts.allocations, before.allocations + 2);
-        assert_eq!(grown_counts.frees, before.frees + 1);
+        assert!(
+            runtime.raw_pool_retained_bytes() == 4096 || grown_counts.frees == before.frees + 1,
+            "the 4096-byte block must be released -- retained by the pool or \
+             returned to the driver, but not held by the workspace"
+        );
 
         drop(workspace);
         let after = runtime.allocation_counts();
         assert_eq!(after.allocations, before.allocations + 2);
-        assert_eq!(after.frees, before.frees + 2);
+        assert!(
+            runtime.raw_pool_retained_bytes() == 4096 + 8192 || after.frees == before.frees + 2,
+            "dropping the workspace must release the 8192-byte block too"
+        );
     }
 
     #[test]
@@ -3412,11 +3420,18 @@ mod tests {
         // f32 prefill (Sq>1) has no split-K decode kernel: reference path runs
         // and materializes scores.
         assert!(gqa_reference_scores_path(DataType::Float32, 8, 64));
-        // f32 single-token decode with head_dim<=128 is covered by gqa_decode,
-        // which streams softmax and needs no score scratch.
+        // f32 single-token decode with head_dim within the gqa_decode ceiling
+        // (MAX_HEAD_DIM = 512) is covered by gqa_decode, which streams softmax
+        // and needs no score scratch. The ceiling was widened 128->256->512 as a
+        // feature (#1438, gemma4-e2b / Gemma-3n head_dim=512); this assertion is
+        // pinned to that ceiling so it flags deliberately if it moves again.
         assert!(!gqa_reference_scores_path(DataType::Float32, 1, 64));
-        // f32 single-token with head_dim>128 exceeds gqa_decode: reference path.
-        assert!(gqa_reference_scores_path(DataType::Float32, 1, 192));
+        assert!(!gqa_reference_scores_path(DataType::Float32, 1, 192));
+        assert!(!gqa_reference_scores_path(DataType::Float32, 1, 512));
+        // f32 single-token with head_dim > MAX_HEAD_DIM exceeds gqa_decode: the
+        // reference path runs and materializes scores.
+        assert!(gqa_reference_scores_path(DataType::Float32, 1, 513));
+        assert!(gqa_reference_scores_path(DataType::Float32, 1, 576));
         // fp16/bf16 never take the f32 reference path, so no score buffer is
         // charged on the common decode/prefill dtypes.
         assert!(!gqa_reference_scores_path(DataType::Float16, 8, 64));

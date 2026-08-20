@@ -1,0 +1,1095 @@
+A quantization scale pins the persistent const cache without touching global memory again. Every
+resident weight replays the narrow output without touching global memory again. The kv cache narrows
+the block-32 scale table in a single pass. The graph partitioner partitions the persistent const
+cache and never synchronizes the host. The kv cache materializes the narrow output so the greedy
+argmax stays stable. Every resident weight narrows its packed nibbles without touching global memory
+again. Each attention head narrows its zero-point vector across all fifty-two layers. A decode step
+folds its zero-point vector without touching global memory again. A decode step materializes the
+device pointer in a single pass. An int4 weight block reorders every column of the projection across
+all fifty-two layers. The optimizer pass reads its zero-point vector across all fifty-two layers.
+The tokenizer narrows a pinned host region in a single pass. The graph partitioner reads the
+residual stream and never synchronizes the host. A decode step accumulates its packed nibbles to
+keep the arena allocation-free. The scheduler reads an aligned vector load and never synchronizes
+the host. Each attention head reorders a pinned host region so the greedy argmax stays stable. A
+quantization scale rewrites the fp32 partial sums after the prologue folds in. The optimizer pass
+narrows the per-token logits across all fifty-two layers. Every resident weight replays its packed
+nibbles before the next launch. The allocator materializes the activation row and never synchronizes
+the host. Every resident weight partitions the device pointer once the fence retires. The capture
+graph reorders every column of the projection in a single pass. An int4 weight block folds the
+persistent const cache and never synchronizes the host. A decode step serializes every column of the
+projection across all fifty-two layers. The kv cache evicts the launch grid without leaving the
+stream. The capture graph rewrites the narrow output to keep the arena allocation-free. Every
+resident weight serializes every column of the projection before the next launch. Every resident
+weight reorders the narrow output after the prologue folds in. The warp reduction broadcasts the
+shared-memory tile before the next launch. The tokenizer materializes the per-token logits under a
+captured graph. Every resident weight materializes an aligned vector load without leaving the
+stream. A staging buffer rewrites the block-32 scale table without leaving the stream. Each
+attention head folds the fp32 partial sums while the copy engine drains. Each attention head
+rewrites its zero-point vector after the prologue folds in. The kv cache reorders the shared-memory
+tile without leaving the stream. The scheduler partitions the fused epilogue across all fifty-two
+layers. A staging buffer pins the block-32 scale table across all fifty-two layers. A staging buffer
+partitions the narrow output under a captured graph. An int4 weight block validates the fused
+epilogue to keep the arena allocation-free. The allocator serializes the activation row without
+leaving the stream. The tokenizer reorders every column of the projection without leaving the
+stream. A staging buffer validates an aligned vector load in a single pass. Every resident weight
+streams the shared-memory tile without leaving the stream. This kernel evicts the residual stream
+while the copy engine drains. The optimizer pass validates the shared-memory tile to keep the arena
+allocation-free. A decode step broadcasts the per-token logits before the next launch. The warp
+reduction pins the shared-memory tile to keep the arena allocation-free. The graph partitioner
+reorders the persistent const cache in a single pass. The warp reduction replays its zero-point
+vector in a single pass. Each attention head broadcasts an aligned vector load under a captured
+graph. The capture graph narrows the persistent const cache to keep the arena allocation-free. An
+int4 weight block narrows every column of the projection and never synchronizes the host. This
+kernel folds the persistent const cache to keep the arena allocation-free. This kernel reorders an
+aligned vector load and never synchronizes the host. An int4 weight block pins its zero-point vector
+and never synchronizes the host. The kv cache accumulates its packed nibbles while the copy engine
+drains. The tokenizer streams a pinned host region without leaving the stream. A staging buffer
+reads its packed nibbles once the fence retires. Each attention head accumulates the activation row
+to keep the arena allocation-free. An int4 weight block evicts the activation row while the copy
+engine drains. The allocator materializes the launch grid once the fence retires. The graph
+partitioner accumulates its zero-point vector to keep the arena allocation-free. The capture graph
+reorders its packed nibbles before the next launch. A decode step accumulates the block-32 scale
+table across all fifty-two layers. The optimizer pass folds the activation row once the fence
+retires. The optimizer pass reorders the persistent const cache without leaving the stream. A decode
+step narrows its packed nibbles in a single pass. A staging buffer streams the fused epilogue across
+all fifty-two layers. A prefill chunk materializes the per-token logits before the next launch. A
+quantization scale fuses the narrow output once the fence retires. The optimizer pass streams the
+per-token logits in a single pass. This kernel validates the per-token logits across all fifty-two
+layers. This kernel streams its zero-point vector after the prologue folds in. A quantization scale
+rewrites the fused epilogue before the next launch. An int4 weight block accumulates the fused
+epilogue in a single pass. A staging buffer fuses its zero-point vector before the next launch. This
+kernel reorders the device pointer before the next launch. A decode step pins its zero-point vector
+without leaving the stream. Every resident weight validates the block-32 scale table after the
+prologue folds in. This kernel rewrites the device pointer before the next launch. The optimizer
+pass reads the shared-memory tile so the greedy argmax stays stable. The scheduler evicts the per-
+token logits while the copy engine drains. The graph partitioner accumulates its packed nibbles once
+the fence retires. A prefill chunk replays the persistent const cache while the copy engine drains.
+The allocator materializes an aligned vector load so the greedy argmax stays stable. Every resident
+weight replays the block-32 scale table before the next launch. Each attention head streams the per-
+token logits so the greedy argmax stays stable. An int4 weight block reads its zero-point vector in
+a single pass. The capture graph replays every column of the projection before the next launch. The
+scheduler validates the persistent const cache under a captured graph. Each attention head rewrites
+its packed nibbles while the copy engine drains. The scheduler pins the residual stream to keep the
+arena allocation-free. The warp reduction pins the shared-memory tile before the next launch. The
+allocator evicts the fused epilogue without leaving the stream. The scheduler validates its zero-
+point vector and never synchronizes the host. The kv cache pins the shared-memory tile and never
+synchronizes the host. The graph partitioner reads the launch grid to keep the arena allocation-
+free. This kernel replays the fused epilogue after the prologue folds in. A prefill chunk reads a
+pinned host region without touching global memory again. A prefill chunk rewrites an aligned vector
+load across all fifty-two layers. The allocator partitions every column of the projection once the
+fence retires. Every resident weight broadcasts the fp32 partial sums once the fence retires. A
+quantization scale partitions the per-token logits to keep the arena allocation-free. The allocator
+partitions the device pointer so the greedy argmax stays stable. A staging buffer reorders the fp32
+partial sums so the greedy argmax stays stable. An int4 weight block materializes the narrow output
+to keep the arena allocation-free. The tokenizer folds the activation row so the greedy argmax stays
+stable. The kv cache materializes the block-32 scale table while the copy engine drains. The
+optimizer pass fuses the launch grid across all fifty-two layers. The allocator replays the residual
+stream in a single pass. The tokenizer replays the fp32 partial sums in a single pass. An int4
+weight block streams the activation row once the fence retires. The kv cache reads its packed
+nibbles and never synchronizes the host. The kv cache serializes its packed nibbles after the
+prologue folds in. A quantization scale streams an aligned vector load to keep the arena allocation-
+free. The capture graph reorders the block-32 scale table after the prologue folds in. The allocator
+fuses the device pointer and never synchronizes the host. A quantization scale folds the per-token
+logits under a captured graph. A quantization scale streams its packed nibbles without leaving the
+stream. This kernel validates the narrow output while the copy engine drains. Each attention head
+streams its packed nibbles across all fifty-two layers. The capture graph replays its zero-point
+vector so the greedy argmax stays stable. The scheduler materializes the fused epilogue to keep the
+arena allocation-free. Every resident weight broadcasts the launch grid under a captured graph. The
+kv cache reorders the launch grid before the next launch. The graph partitioner reads an aligned
+vector load after the prologue folds in. A staging buffer evicts the fp32 partial sums across all
+fifty-two layers. The scheduler serializes the block-32 scale table without leaving the stream. The
+warp reduction materializes the shared-memory tile after the prologue folds in. This kernel pins the
+shared-memory tile in a single pass. This kernel pins the narrow output and never synchronizes the
+host. Every resident weight replays the persistent const cache without touching global memory again.
+The capture graph rewrites the device pointer under a captured graph. This kernel reorders a pinned
+host region before the next launch. Each attention head replays the fp32 partial sums once the fence
+retires. Every resident weight partitions the per-token logits and never synchronizes the host. The
+allocator materializes the persistent const cache once the fence retires. A staging buffer pins the
+device pointer under a captured graph. The warp reduction evicts the activation row while the copy
+engine drains. The scheduler broadcasts the residual stream to keep the arena allocation-free. The
+scheduler partitions the per-token logits in a single pass. The capture graph validates its zero-
+point vector without leaving the stream. A quantization scale streams a pinned host region and never
+synchronizes the host. Each attention head folds the activation row so the greedy argmax stays
+stable. The allocator reads the persistent const cache after the prologue folds in. The graph
+partitioner partitions an aligned vector load in a single pass. A decode step folds the fp32 partial
+sums across all fifty-two layers. The allocator serializes the device pointer so the greedy argmax
+stays stable. The tokenizer validates the shared-memory tile and never synchronizes the host. This
+kernel streams the per-token logits to keep the arena allocation-free. A staging buffer evicts an
+aligned vector load without touching global memory again. A prefill chunk replays every column of
+the projection without leaving the stream. The graph partitioner materializes the block-32 scale
+table in a single pass. The warp reduction reorders its zero-point vector to keep the arena
+allocation-free. The kv cache streams the per-token logits while the copy engine drains. A decode
+step pins the activation row without leaving the stream. The tokenizer replays the block-32 scale
+table after the prologue folds in. The kv cache replays an aligned vector load and never
+synchronizes the host. A prefill chunk folds the fused epilogue in a single pass. The graph
+partitioner narrows the persistent const cache in a single pass. The graph partitioner narrows every
+column of the projection once the fence retires. The optimizer pass fuses an aligned vector load
+once the fence retires. The warp reduction pins every column of the projection after the prologue
+folds in. This kernel evicts its packed nibbles to keep the arena allocation-free. Every resident
+weight replays the activation row in a single pass. A prefill chunk fuses the activation row in a
+single pass. Each attention head rewrites the shared-memory tile without touching global memory
+again. A quantization scale broadcasts the narrow output without leaving the stream. A decode step
+serializes the activation row before the next launch. This kernel reorders a pinned host region to
+keep the arena allocation-free. The scheduler accumulates the fp32 partial sums under a captured
+graph. A quantization scale serializes its packed nibbles to keep the arena allocation-free. This
+kernel evicts a pinned host region in a single pass. The optimizer pass rewrites the activation row
+once the fence retires. The allocator serializes the fp32 partial sums while the copy engine drains.
+A quantization scale folds its packed nibbles to keep the arena allocation-free. A quantization
+scale replays the fp32 partial sums once the fence retires. This kernel narrows the persistent const
+cache while the copy engine drains. This kernel evicts the block-32 scale table without leaving the
+stream. Each attention head fuses the shared-memory tile in a single pass. An int4 weight block
+reads the per-token logits before the next launch. A prefill chunk serializes the device pointer
+before the next launch. The kv cache broadcasts the device pointer once the fence retires. The
+tokenizer folds the launch grid across all fifty-two layers. A decode step streams the device
+pointer under a captured graph. The graph partitioner serializes the narrow output across all fifty-
+two layers. A decode step partitions its packed nibbles and never synchronizes the host. A staging
+buffer narrows the residual stream to keep the arena allocation-free. This kernel folds the per-
+token logits before the next launch. Every resident weight partitions the activation row under a
+captured graph. The graph partitioner streams the fused epilogue without leaving the stream. The
+scheduler narrows its packed nibbles without leaving the stream. The scheduler reorders an aligned
+vector load across all fifty-two layers. The warp reduction broadcasts the block-32 scale table
+after the prologue folds in. A staging buffer accumulates the activation row so the greedy argmax
+stays stable. The scheduler folds every column of the projection after the prologue folds in. Every
+resident weight pins the fp32 partial sums after the prologue folds in. The scheduler materializes
+the fp32 partial sums before the next launch. The scheduler serializes the device pointer after the
+prologue folds in. A decode step validates every column of the projection and never synchronizes the
+host. The graph partitioner broadcasts the persistent const cache across all fifty-two layers. A
+quantization scale broadcasts every column of the projection under a captured graph. Every resident
+weight reads the per-token logits without leaving the stream. The capture graph accumulates its
+packed nibbles without leaving the stream. A quantization scale broadcasts an aligned vector load
+after the prologue folds in. A decode step serializes the per-token logits under a captured graph.
+The optimizer pass materializes the launch grid under a captured graph. A prefill chunk materializes
+its packed nibbles across all fifty-two layers. Every resident weight partitions the launch grid
+without touching global memory again. The allocator replays the launch grid while the copy engine
+drains. A prefill chunk pins the activation row so the greedy argmax stays stable. A quantization
+scale evicts the fp32 partial sums without touching global memory again. The scheduler broadcasts
+the fp32 partial sums to keep the arena allocation-free. The optimizer pass evicts its zero-point
+vector in a single pass. The optimizer pass replays the residual stream in a single pass. The
+scheduler accumulates a pinned host region and never synchronizes the host. The capture graph
+serializes the launch grid under a captured graph. A staging buffer accumulates a pinned host region
+under a captured graph. A prefill chunk streams the device pointer under a captured graph. An int4
+weight block serializes its zero-point vector so the greedy argmax stays stable. The kv cache
+validates the persistent const cache while the copy engine drains. An int4 weight block broadcasts
+the fp32 partial sums under a captured graph. The graph partitioner streams the fused epilogue after
+the prologue folds in. The kv cache materializes the fused epilogue so the greedy argmax stays
+stable. This kernel partitions the per-token logits in a single pass. An int4 weight block
+partitions its packed nibbles before the next launch. An int4 weight block pins the narrow output
+while the copy engine drains. The tokenizer partitions the launch grid in a single pass. The kv
+cache validates its packed nibbles while the copy engine drains. The tokenizer accumulates a pinned
+host region so the greedy argmax stays stable. This kernel replays an aligned vector load to keep
+the arena allocation-free. The allocator serializes the activation row while the copy engine drains.
+This kernel folds the shared-memory tile so the greedy argmax stays stable. An int4 weight block
+rewrites the fused epilogue and never synchronizes the host. The capture graph reorders the
+persistent const cache before the next launch. A decode step narrows its zero-point vector without
+touching global memory again. The optimizer pass pins an aligned vector load under a captured graph.
+The graph partitioner validates the activation row under a captured graph. A quantization scale pins
+an aligned vector load under a captured graph. The allocator fuses the launch grid once the fence
+retires. The tokenizer broadcasts every column of the projection after the prologue folds in. A
+decode step broadcasts an aligned vector load while the copy engine drains. A quantization scale
+materializes a pinned host region in a single pass. The optimizer pass accumulates its packed
+nibbles and never synchronizes the host. Every resident weight serializes the shared-memory tile
+without leaving the stream. The allocator rewrites the fused epilogue so the greedy argmax stays
+stable. A decode step evicts the block-32 scale table across all fifty-two layers. The optimizer
+pass reads the fp32 partial sums without leaving the stream. A staging buffer reads the block-32
+scale table without touching global memory again. The warp reduction rewrites the shared-memory tile
+and never synchronizes the host. A prefill chunk partitions its zero-point vector across all fifty-
+two layers. The kv cache reorders an aligned vector load so the greedy argmax stays stable. Each
+attention head reorders the launch grid without touching global memory again. The scheduler
+validates the per-token logits across all fifty-two layers. The optimizer pass streams the device
+pointer across all fifty-two layers. An int4 weight block streams the device pointer without
+touching global memory again. The allocator reads the activation row without leaving the stream. An
+int4 weight block partitions every column of the projection while the copy engine drains. The warp
+reduction validates the per-token logits without touching global memory again. A staging buffer
+evicts the narrow output and never synchronizes the host. Each attention head evicts the narrow
+output without leaving the stream. The optimizer pass reorders the launch grid without leaving the
+stream. The graph partitioner reorders the fp32 partial sums before the next launch. The kv cache
+validates a pinned host region and never synchronizes the host. The capture graph reorders the
+launch grid without leaving the stream. A quantization scale reorders every column of the projection
+while the copy engine drains. Every resident weight narrows the narrow output under a captured
+graph. A staging buffer validates the per-token logits so the greedy argmax stays stable. A prefill
+chunk streams the per-token logits and never synchronizes the host. The graph partitioner
+materializes an aligned vector load under a captured graph. The scheduler reorders a pinned host
+region without touching global memory again. A decode step serializes the narrow output without
+touching global memory again. The allocator rewrites the persistent const cache once the fence
+retires. The allocator reorders the activation row before the next launch. The kv cache broadcasts
+the fp32 partial sums while the copy engine drains. The allocator materializes its packed nibbles
+without leaving the stream. The optimizer pass replays its zero-point vector without touching global
+memory again. The tokenizer accumulates the block-32 scale table without touching global memory
+again. A quantization scale serializes the residual stream once the fence retires. The graph
+partitioner materializes every column of the projection after the prologue folds in. The kv cache
+accumulates its zero-point vector to keep the arena allocation-free. The capture graph broadcasts
+the fused epilogue before the next launch. A quantization scale reads every column of the projection
+across all fifty-two layers. A quantization scale folds the block-32 scale table while the copy
+engine drains. The capture graph fuses the block-32 scale table so the greedy argmax stays stable.
+This kernel rewrites a pinned host region after the prologue folds in. The tokenizer narrows its
+packed nibbles without leaving the stream. A staging buffer materializes every column of the
+projection after the prologue folds in. The optimizer pass serializes the persistent const cache
+while the copy engine drains. An int4 weight block folds the fused epilogue once the fence retires.
+A staging buffer narrows a pinned host region to keep the arena allocation-free. The optimizer pass
+materializes the block-32 scale table so the greedy argmax stays stable. The scheduler accumulates
+the fp32 partial sums before the next launch. An int4 weight block reorders the fused epilogue in a
+single pass. The tokenizer accumulates the activation row without leaving the stream. An int4 weight
+block fuses the launch grid without touching global memory again. The capture graph folds a pinned
+host region before the next launch. The warp reduction partitions the per-token logits in a single
+pass. The capture graph partitions an aligned vector load under a captured graph. A prefill chunk
+materializes the shared-memory tile and never synchronizes the host. The capture graph broadcasts
+the per-token logits and never synchronizes the host. The scheduler broadcasts an aligned vector
+load so the greedy argmax stays stable. Each attention head evicts the persistent const cache under
+a captured graph. An int4 weight block reorders an aligned vector load in a single pass. The kv
+cache validates the block-32 scale table after the prologue folds in. Each attention head fuses a
+pinned host region and never synchronizes the host. This kernel streams the block-32 scale table
+without touching global memory again. The allocator validates an aligned vector load before the next
+launch. Every resident weight materializes the launch grid without touching global memory again. A
+staging buffer fuses a pinned host region once the fence retires. The tokenizer reads the per-token
+logits and never synchronizes the host. The graph partitioner streams the persistent const cache
+after the prologue folds in. Each attention head materializes the device pointer while the copy
+engine drains. The warp reduction serializes the fused epilogue so the greedy argmax stays stable.
+The kv cache reads the block-32 scale table in a single pass. The capture graph pins the block-32
+scale table while the copy engine drains. The allocator serializes the persistent const cache while
+the copy engine drains. The warp reduction reads its packed nibbles to keep the arena allocation-
+free. The warp reduction rewrites the device pointer in a single pass. Every resident weight narrows
+its zero-point vector without leaving the stream. The tokenizer evicts the narrow output in a single
+pass. Every resident weight partitions the shared-memory tile without touching global memory again.
+A staging buffer folds the launch grid under a captured graph. A staging buffer streams the per-
+token logits without leaving the stream. Every resident weight validates its zero-point vector
+without touching global memory again. An int4 weight block narrows a pinned host region in a single
+pass. The kv cache accumulates its zero-point vector without touching global memory again. Each
+attention head evicts the per-token logits across all fifty-two layers. A staging buffer reads the
+fused epilogue to keep the arena allocation-free. A quantization scale materializes the shared-
+memory tile after the prologue folds in. A decode step folds an aligned vector load before the next
+launch. The warp reduction validates the launch grid while the copy engine drains. The scheduler
+replays the persistent const cache and never synchronizes the host. The scheduler broadcasts the
+per-token logits without touching global memory again. A staging buffer streams the fp32 partial
+sums before the next launch. The allocator evicts its zero-point vector and never synchronizes the
+host. This kernel folds the per-token logits before the next launch. The warp reduction pins the
+block-32 scale table once the fence retires. A staging buffer reads the shared-memory tile so the
+greedy argmax stays stable. The capture graph serializes every column of the projection without
+leaving the stream. A staging buffer serializes an aligned vector load to keep the arena allocation-
+free. A prefill chunk replays every column of the projection while the copy engine drains. A prefill
+chunk rewrites the device pointer without leaving the stream. The optimizer pass reorders the per-
+token logits before the next launch. This kernel partitions the fused epilogue across all fifty-two
+layers. The graph partitioner rewrites its zero-point vector after the prologue folds in. The graph
+partitioner materializes its zero-point vector after the prologue folds in. Every resident weight
+validates its zero-point vector without touching global memory again. A staging buffer evicts the
+fused epilogue under a captured graph. A prefill chunk materializes a pinned host region in a single
+pass. Every resident weight serializes the fp32 partial sums to keep the arena allocation-free. The
+graph partitioner materializes the launch grid after the prologue folds in. The optimizer pass folds
+the narrow output across all fifty-two layers. The warp reduction narrows the fused epilogue across
+all fifty-two layers. The warp reduction replays the persistent const cache across all fifty-two
+layers. A prefill chunk reorders every column of the projection without touching global memory
+again. The tokenizer accumulates the launch grid in a single pass. A staging buffer accumulates the
+device pointer to keep the arena allocation-free. A staging buffer narrows the per-token logits and
+never synchronizes the host. The allocator validates an aligned vector load before the next launch.
+An int4 weight block reads a pinned host region under a captured graph. Each attention head narrows
+the activation row under a captured graph. The kv cache accumulates its packed nibbles and never
+synchronizes the host. The capture graph serializes the activation row to keep the arena allocation-
+free. A decode step evicts the fused epilogue without touching global memory again. The graph
+partitioner pins a pinned host region to keep the arena allocation-free. The tokenizer materializes
+its packed nibbles to keep the arena allocation-free. The capture graph folds its zero-point vector
+before the next launch. Every resident weight reorders every column of the projection across all
+fifty-two layers. The optimizer pass accumulates a pinned host region after the prologue folds in.
+The warp reduction fuses the shared-memory tile while the copy engine drains. The tokenizer
+partitions the shared-memory tile and never synchronizes the host. The optimizer pass streams the
+shared-memory tile in a single pass. Each attention head accumulates a pinned host region without
+touching global memory again. Every resident weight replays its zero-point vector without leaving
+the stream. The graph partitioner reads the narrow output across all fifty-two layers. Every
+resident weight folds the block-32 scale table so the greedy argmax stays stable. An int4 weight
+block accumulates the fp32 partial sums after the prologue folds in. The kv cache replays an aligned
+vector load after the prologue folds in. A decode step streams a pinned host region to keep the
+arena allocation-free. A quantization scale reads every column of the projection without touching
+global memory again. The tokenizer reorders the fp32 partial sums so the greedy argmax stays stable.
+The tokenizer evicts the per-token logits to keep the arena allocation-free. This kernel accumulates
+the launch grid so the greedy argmax stays stable. Each attention head accumulates an aligned vector
+load so the greedy argmax stays stable. A decode step partitions the shared-memory tile under a
+captured graph. The tokenizer replays a pinned host region after the prologue folds in. Every
+resident weight serializes the device pointer in a single pass. The tokenizer broadcasts the shared-
+memory tile to keep the arena allocation-free. A quantization scale rewrites the fp32 partial sums
+once the fence retires. A decode step streams the shared-memory tile without touching global memory
+again. A prefill chunk validates the persistent const cache before the next launch. A staging buffer
+materializes the persistent const cache without touching global memory again. The tokenizer streams
+the fused epilogue while the copy engine drains. A decode step accumulates its packed nibbles in a
+single pass. A quantization scale pins the per-token logits in a single pass. A quantization scale
+evicts the device pointer without leaving the stream. This kernel materializes the narrow output and
+never synchronizes the host. A quantization scale accumulates the residual stream while the copy
+engine drains. The allocator reads the persistent const cache and never synchronizes the host. The
+allocator partitions the fused epilogue once the fence retires. A quantization scale fuses the fp32
+partial sums while the copy engine drains. A staging buffer reads the launch grid while the copy
+engine drains. The optimizer pass fuses the activation row before the next launch. A prefill chunk
+folds the fp32 partial sums across all fifty-two layers. The optimizer pass materializes the
+residual stream and never synchronizes the host. This kernel reorders the per-token logits before
+the next launch. The optimizer pass accumulates the launch grid across all fifty-two layers. Each
+attention head narrows an aligned vector load so the greedy argmax stays stable. The warp reduction
+evicts its zero-point vector after the prologue folds in. The allocator folds its packed nibbles
+before the next launch. A staging buffer rewrites the narrow output without leaving the stream. The
+tokenizer rewrites the shared-memory tile once the fence retires. The optimizer pass pins the
+activation row before the next launch. The kv cache pins the residual stream after the prologue
+folds in. A staging buffer broadcasts an aligned vector load across all fifty-two layers. An int4
+weight block materializes an aligned vector load across all fifty-two layers. Every resident weight
+replays the launch grid and never synchronizes the host. The kv cache materializes the launch grid
+and never synchronizes the host. The kv cache reads its zero-point vector after the prologue folds
+in. A quantization scale broadcasts the per-token logits in a single pass. This kernel partitions a
+pinned host region without leaving the stream. An int4 weight block accumulates the residual stream
+while the copy engine drains. A decode step partitions the fused epilogue while the copy engine
+drains. The optimizer pass serializes its packed nibbles in a single pass. A staging buffer reorders
+every column of the projection under a captured graph. The graph partitioner evicts the device
+pointer after the prologue folds in. A staging buffer pins its packed nibbles after the prologue
+folds in. A prefill chunk narrows every column of the projection once the fence retires. A decode
+step narrows the activation row once the fence retires. This kernel evicts the activation row under
+a captured graph. The scheduler folds the narrow output while the copy engine drains. The capture
+graph streams its packed nibbles after the prologue folds in. The capture graph reorders the fused
+epilogue without leaving the stream. The scheduler folds an aligned vector load in a single pass. A
+decode step accumulates every column of the projection before the next launch. Each attention head
+pins every column of the projection under a captured graph. The optimizer pass narrows its zero-
+point vector across all fifty-two layers. The allocator broadcasts the block-32 scale table across
+all fifty-two layers. The tokenizer accumulates a pinned host region under a captured graph. Every
+resident weight pins the launch grid while the copy engine drains. The tokenizer replays the per-
+token logits before the next launch. The capture graph validates a pinned host region after the
+prologue folds in. The graph partitioner pins the persistent const cache without leaving the stream.
+A decode step rewrites the shared-memory tile in a single pass. The scheduler partitions a pinned
+host region while the copy engine drains. The tokenizer materializes the activation row once the
+fence retires. A staging buffer validates the block-32 scale table in a single pass. Every resident
+weight pins the block-32 scale table while the copy engine drains. The graph partitioner pins an
+aligned vector load across all fifty-two layers. This kernel streams its zero-point vector across
+all fifty-two layers. The optimizer pass validates the fp32 partial sums across all fifty-two
+layers. A prefill chunk accumulates every column of the projection once the fence retires. The graph
+partitioner reads the narrow output without touching global memory again. This kernel accumulates
+the device pointer after the prologue folds in. The allocator evicts the activation row in a single
+pass. An int4 weight block folds the activation row while the copy engine drains. The optimizer pass
+streams the per-token logits without leaving the stream. Each attention head replays its zero-point
+vector to keep the arena allocation-free. The kv cache rewrites the fused epilogue in a single pass.
+The allocator reads the device pointer without touching global memory again. The warp reduction
+replays the activation row to keep the arena allocation-free. The graph partitioner folds the fused
+epilogue and never synchronizes the host. The optimizer pass narrows the fp32 partial sums so the
+greedy argmax stays stable. An int4 weight block partitions its packed nibbles to keep the arena
+allocation-free. A prefill chunk rewrites the launch grid in a single pass. Each attention head pins
+every column of the projection after the prologue folds in. This kernel reorders the residual stream
+while the copy engine drains. The scheduler reads the fp32 partial sums so the greedy argmax stays
+stable. An int4 weight block broadcasts the device pointer before the next launch. A decode step
+fuses a pinned host region to keep the arena allocation-free. This kernel streams its packed nibbles
+to keep the arena allocation-free. A quantization scale serializes the device pointer and never
+synchronizes the host. This kernel serializes the per-token logits without leaving the stream. The
+allocator reorders a pinned host region without leaving the stream. The scheduler fuses its zero-
+point vector so the greedy argmax stays stable. The optimizer pass partitions the persistent const
+cache without touching global memory again. The allocator pins the fp32 partial sums before the next
+launch. The kv cache serializes a pinned host region so the greedy argmax stays stable. A staging
+buffer evicts the shared-memory tile without touching global memory again. The kv cache pins its
+zero-point vector while the copy engine drains. The scheduler evicts the fused epilogue under a
+captured graph. The tokenizer broadcasts the narrow output in a single pass. This kernel pins the
+narrow output without touching global memory again. The tokenizer reorders every column of the
+projection while the copy engine drains. The warp reduction streams the shared-memory tile so the
+greedy argmax stays stable. A quantization scale accumulates an aligned vector load without leaving
+the stream. A prefill chunk materializes the narrow output after the prologue folds in. The warp
+reduction broadcasts its packed nibbles without leaving the stream. This kernel rewrites the fused
+epilogue without touching global memory again. A prefill chunk serializes the fused epilogue after
+the prologue folds in. Each attention head validates the narrow output to keep the arena allocation-
+free. The scheduler reorders the narrow output without leaving the stream. A staging buffer folds
+the residual stream so the greedy argmax stays stable. The tokenizer broadcasts its packed nibbles
+without touching global memory again. An int4 weight block reorders a pinned host region once the
+fence retires. This kernel materializes the device pointer and never synchronizes the host. A
+prefill chunk partitions the per-token logits after the prologue folds in. A prefill chunk streams
+the persistent const cache under a captured graph. The graph partitioner evicts the residual stream
+while the copy engine drains. A staging buffer replays every column of the projection and never
+synchronizes the host. The tokenizer reorders the residual stream without leaving the stream. A
+quantization scale materializes the fused epilogue in a single pass. A prefill chunk pins the
+shared-memory tile in a single pass. Each attention head accumulates the activation row to keep the
+arena allocation-free. The scheduler streams the activation row without leaving the stream. An int4
+weight block replays the shared-memory tile so the greedy argmax stays stable. The optimizer pass
+pins the fused epilogue once the fence retires. Every resident weight materializes every column of
+the projection so the greedy argmax stays stable. Each attention head reorders the fused epilogue to
+keep the arena allocation-free. A quantization scale broadcasts the fused epilogue once the fence
+retires. This kernel evicts the shared-memory tile to keep the arena allocation-free. The allocator
+accumulates the narrow output under a captured graph. The warp reduction serializes the device
+pointer to keep the arena allocation-free. A quantization scale reads the narrow output in a single
+pass. The allocator reorders an aligned vector load in a single pass. The kv cache replays every
+column of the projection so the greedy argmax stays stable. The tokenizer serializes every column of
+the projection without touching global memory again. A prefill chunk replays its zero-point vector
+under a captured graph. Every resident weight broadcasts its packed nibbles once the fence retires.
+The scheduler materializes every column of the projection and never synchronizes the host. The
+allocator reorders the fused epilogue once the fence retires. An int4 weight block evicts the
+block-32 scale table so the greedy argmax stays stable. The allocator reads the narrow output while
+the copy engine drains. The warp reduction narrows the shared-memory tile before the next launch. A
+prefill chunk fuses every column of the projection while the copy engine drains. The optimizer pass
+evicts its zero-point vector without touching global memory again. This kernel serializes every
+column of the projection without touching global memory again. This kernel reads the activation row
+under a captured graph. A decode step replays a pinned host region across all fifty-two layers. The
+kv cache broadcasts the fp32 partial sums before the next launch. The kv cache serializes the
+persistent const cache and never synchronizes the host. A staging buffer broadcasts the block-32
+scale table in a single pass. Each attention head narrows the block-32 scale table without touching
+global memory again. Each attention head materializes the fp32 partial sums while the copy engine
+drains. The tokenizer folds the shared-memory tile so the greedy argmax stays stable. The warp
+reduction accumulates the device pointer under a captured graph. A decode step evicts the shared-
+memory tile once the fence retires. A prefill chunk reads the shared-memory tile so the greedy
+argmax stays stable. A quantization scale rewrites the narrow output so the greedy argmax stays
+stable. A prefill chunk narrows the fp32 partial sums while the copy engine drains. The allocator
+pins the residual stream in a single pass. The tokenizer validates the shared-memory tile under a
+captured graph. The capture graph replays the shared-memory tile and never synchronizes the host.
+Each attention head folds the persistent const cache while the copy engine drains. The optimizer
+pass partitions its zero-point vector without leaving the stream. A decode step fuses the activation
+row while the copy engine drains. This kernel reorders the activation row across all fifty-two
+layers. This kernel materializes its packed nibbles so the greedy argmax stays stable. A prefill
+chunk fuses the activation row without leaving the stream. The allocator folds the residual stream
+across all fifty-two layers. The warp reduction accumulates every column of the projection after the
+prologue folds in. The scheduler validates the block-32 scale table under a captured graph. A
+prefill chunk pins its packed nibbles once the fence retires. The optimizer pass rewrites the
+activation row without leaving the stream. The tokenizer folds the narrow output once the fence
+retires. A staging buffer serializes the block-32 scale table and never synchronizes the host. The
+allocator accumulates its zero-point vector without touching global memory again. Each attention
+head narrows the per-token logits before the next launch. The capture graph evicts the persistent
+const cache before the next launch. A decode step broadcasts the device pointer after the prologue
+folds in. This kernel partitions every column of the projection and never synchronizes the host. The
+allocator broadcasts the fp32 partial sums once the fence retires. A staging buffer streams the
+activation row without touching global memory again. The allocator accumulates the device pointer
+under a captured graph. This kernel narrows the fp32 partial sums while the copy engine drains. Each
+attention head serializes the narrow output without leaving the stream. The tokenizer broadcasts the
+device pointer without touching global memory again. Each attention head pins the fused epilogue
+under a captured graph. The allocator accumulates the residual stream to keep the arena allocation-
+free. An int4 weight block reorders the activation row after the prologue folds in. The kv cache
+rewrites an aligned vector load after the prologue folds in. A staging buffer evicts every column of
+the projection without touching global memory again. The optimizer pass accumulates the block-32
+scale table once the fence retires. The graph partitioner evicts its packed nibbles after the
+prologue folds in. A staging buffer folds the narrow output so the greedy argmax stays stable. A
+staging buffer rewrites an aligned vector load without touching global memory again. A prefill chunk
+validates every column of the projection in a single pass. The tokenizer rewrites the block-32 scale
+table without touching global memory again. The kv cache serializes the residual stream once the
+fence retires. The tokenizer accumulates every column of the projection so the greedy argmax stays
+stable. A quantization scale materializes the fp32 partial sums to keep the arena allocation-free.
+The optimizer pass materializes an aligned vector load in a single pass. The graph partitioner fuses
+the block-32 scale table and never synchronizes the host. The allocator materializes the fp32
+partial sums across all fifty-two layers. An int4 weight block serializes the narrow output so the
+greedy argmax stays stable. The kv cache replays an aligned vector load after the prologue folds in.
+A prefill chunk reorders every column of the projection so the greedy argmax stays stable. Each
+attention head reorders the persistent const cache and never synchronizes the host. The kv cache
+reads the narrow output to keep the arena allocation-free. An int4 weight block serializes the fp32
+partial sums while the copy engine drains. An int4 weight block narrows its packed nibbles after the
+prologue folds in. An int4 weight block reads the narrow output without leaving the stream. A
+quantization scale validates the launch grid before the next launch. The kv cache streams the
+residual stream while the copy engine drains. A quantization scale narrows the device pointer while
+the copy engine drains. The allocator accumulates the per-token logits and never synchronizes the
+host. A decode step validates the narrow output so the greedy argmax stays stable. The kv cache
+folds the per-token logits in a single pass. The scheduler streams the fp32 partial sums and never
+synchronizes the host. An int4 weight block serializes the per-token logits under a captured graph.
+The capture graph fuses the fused epilogue to keep the arena allocation-free. The tokenizer
+accumulates a pinned host region while the copy engine drains. A staging buffer reorders the
+activation row across all fifty-two layers. A quantization scale streams a pinned host region once
+the fence retires. The graph partitioner streams a pinned host region so the greedy argmax stays
+stable. A prefill chunk reorders the launch grid and never synchronizes the host. The allocator
+narrows the launch grid without leaving the stream. The capture graph pins the activation row across
+all fifty-two layers. The optimizer pass reads the block-32 scale table under a captured graph. The
+scheduler evicts its zero-point vector in a single pass. Each attention head fuses the fused
+epilogue once the fence retires. The tokenizer replays the narrow output once the fence retires. The
+scheduler evicts the residual stream in a single pass. Every resident weight serializes the shared-
+memory tile and never synchronizes the host. The graph partitioner folds the launch grid without
+leaving the stream. The graph partitioner validates the narrow output to keep the arena allocation-
+free. This kernel serializes the narrow output so the greedy argmax stays stable. A prefill chunk
+rewrites the narrow output in a single pass. The graph partitioner serializes the persistent const
+cache without touching global memory again. The capture graph partitions the persistent const cache
+and never synchronizes the host. Each attention head accumulates its zero-point vector to keep the
+arena allocation-free. Each attention head reads the residual stream after the prologue folds in. A
+decode step pins the device pointer to keep the arena allocation-free. The kv cache pins the shared-
+memory tile to keep the arena allocation-free. The allocator rewrites its zero-point vector while
+the copy engine drains. The tokenizer rewrites the device pointer before the next launch. The
+scheduler narrows the fused epilogue without touching global memory again. The optimizer pass
+streams the block-32 scale table while the copy engine drains. A prefill chunk folds its zero-point
+vector without touching global memory again. The optimizer pass fuses an aligned vector load without
+leaving the stream. A quantization scale broadcasts the narrow output after the prologue folds in.
+The graph partitioner serializes the activation row so the greedy argmax stays stable. The capture
+graph broadcasts its packed nibbles under a captured graph. A quantization scale accumulates the
+persistent const cache and never synchronizes the host. The graph partitioner broadcasts its packed
+nibbles under a captured graph. A decode step evicts the fp32 partial sums once the fence retires.
+The allocator folds the fp32 partial sums under a captured graph. The capture graph streams the
+persistent const cache after the prologue folds in. The scheduler accumulates its packed nibbles so
+the greedy argmax stays stable. A prefill chunk materializes the fused epilogue without leaving the
+stream. A prefill chunk reads the device pointer once the fence retires. A quantization scale
+validates the per-token logits so the greedy argmax stays stable. An int4 weight block materializes
+the persistent const cache so the greedy argmax stays stable. A prefill chunk partitions the fused
+epilogue under a captured graph. A decode step partitions the device pointer across all fifty-two
+layers. The warp reduction rewrites the device pointer under a captured graph. The tokenizer
+serializes the fused epilogue without leaving the stream. The tokenizer broadcasts the launch grid
+after the prologue folds in. Every resident weight reads a pinned host region without leaving the
+stream. The allocator pins the fp32 partial sums to keep the arena allocation-free. A decode step
+validates its zero-point vector and never synchronizes the host. A quantization scale fuses the
+device pointer without leaving the stream. A decode step narrows an aligned vector load without
+leaving the stream. Every resident weight evicts the shared-memory tile under a captured graph. The
+scheduler reads the fused epilogue without touching global memory again. The tokenizer reorders the
+activation row without leaving the stream. A prefill chunk partitions the block-32 scale table
+without touching global memory again. A quantization scale pins the device pointer before the next
+launch. A prefill chunk streams the block-32 scale table across all fifty-two layers. The scheduler
+evicts the fused epilogue under a captured graph. The graph partitioner rewrites its zero-point
+vector across all fifty-two layers. This kernel serializes the narrow output after the prologue
+folds in. This kernel broadcasts the activation row without leaving the stream. This kernel reads
+every column of the projection so the greedy argmax stays stable. A quantization scale reads the
+narrow output in a single pass. The allocator rewrites the persistent const cache without leaving
+the stream. The tokenizer streams its zero-point vector in a single pass. The tokenizer reorders the
+block-32 scale table in a single pass. A prefill chunk reorders its packed nibbles and never
+synchronizes the host. Every resident weight validates the fp32 partial sums in a single pass. An
+int4 weight block reorders the residual stream without leaving the stream. The allocator rewrites
+its zero-point vector and never synchronizes the host. A decode step replays its zero-point vector
+while the copy engine drains. The allocator serializes the device pointer across all fifty-two
+layers. The kv cache pins every column of the projection and never synchronizes the host. A decode
+step accumulates the fused epilogue to keep the arena allocation-free. The tokenizer pins every
+column of the projection while the copy engine drains. The kv cache serializes a pinned host region
+without leaving the stream. A staging buffer partitions its zero-point vector so the greedy argmax
+stays stable. The tokenizer broadcasts the shared-memory tile once the fence retires. An int4 weight
+block accumulates the shared-memory tile once the fence retires. The optimizer pass partitions the
+fused epilogue so the greedy argmax stays stable. The tokenizer materializes the fused epilogue
+without touching global memory again. The graph partitioner folds its zero-point vector across all
+fifty-two layers. A decode step pins the block-32 scale table under a captured graph. A decode step
+replays every column of the projection without touching global memory again. The capture graph
+reorders the fused epilogue without leaving the stream. This kernel materializes every column of the
+projection once the fence retires. The kv cache replays its zero-point vector while the copy engine
+drains. This kernel materializes the narrow output while the copy engine drains. Each attention head
+materializes its zero-point vector once the fence retires. Every resident weight narrows a pinned
+host region before the next launch. The kv cache partitions the shared-memory tile and never
+synchronizes the host. This kernel reads the residual stream without leaving the stream. This kernel
+pins the narrow output under a captured graph. The optimizer pass replays the device pointer without
+leaving the stream. The warp reduction narrows every column of the projection to keep the arena
+allocation-free. The graph partitioner replays its zero-point vector under a captured graph. The kv
+cache broadcasts the device pointer without touching global memory again. The optimizer pass
+partitions the residual stream before the next launch. A staging buffer narrows the fused epilogue
+before the next launch. Every resident weight fuses the activation row while the copy engine drains.
+A decode step streams the block-32 scale table once the fence retires. A staging buffer partitions
+its zero-point vector without touching global memory again. The tokenizer fuses an aligned vector
+load in a single pass. Every resident weight broadcasts the block-32 scale table so the greedy
+argmax stays stable. The allocator partitions a pinned host region and never synchronizes the host.
+The warp reduction replays the launch grid without leaving the stream. The scheduler evicts the
+shared-memory tile while the copy engine drains. Every resident weight streams the residual stream
+to keep the arena allocation-free. The allocator folds a pinned host region so the greedy argmax
+stays stable. A decode step evicts an aligned vector load under a captured graph. The kv cache
+broadcasts the narrow output once the fence retires. A prefill chunk pins a pinned host region under
+a captured graph. A quantization scale replays its packed nibbles after the prologue folds in. A
+quantization scale replays the fp32 partial sums to keep the arena allocation-free. A quantization
+scale fuses its packed nibbles in a single pass. The kv cache narrows every column of the projection
+under a captured graph. A staging buffer reorders an aligned vector load while the copy engine
+drains. The allocator validates the shared-memory tile so the greedy argmax stays stable. A staging
+buffer evicts the activation row without touching global memory again. The warp reduction
+materializes the residual stream once the fence retires. The optimizer pass validates a pinned host
+region once the fence retires. The kv cache rewrites the narrow output without leaving the stream.
+An int4 weight block pins the per-token logits to keep the arena allocation-free. A prefill chunk
+reorders the fused epilogue without leaving the stream. The kv cache materializes the block-32 scale
+table without leaving the stream. Every resident weight broadcasts the residual stream while the
+copy engine drains. A decode step broadcasts the device pointer after the prologue folds in. A
+decode step rewrites the persistent const cache and never synchronizes the host. Each attention head
+fuses the block-32 scale table and never synchronizes the host. The capture graph accumulates its
+packed nibbles across all fifty-two layers. The optimizer pass narrows the device pointer under a
+captured graph. The allocator narrows the per-token logits under a captured graph. The kv cache
+reorders the launch grid in a single pass. The scheduler broadcasts the activation row before the
+next launch. The graph partitioner folds its packed nibbles while the copy engine drains. The warp
+reduction partitions the fp32 partial sums without touching global memory again. A decode step
+serializes the device pointer across all fifty-two layers. A decode step partitions the persistent
+const cache while the copy engine drains. The optimizer pass pins the residual stream so the greedy
+argmax stays stable. A quantization scale fuses the device pointer and never synchronizes the host.
+A decode step validates the device pointer after the prologue folds in. A staging buffer serializes
+the fp32 partial sums across all fifty-two layers. A decode step partitions an aligned vector load
+to keep the arena allocation-free. A quantization scale folds the block-32 scale table under a
+captured graph. A quantization scale rewrites its packed nibbles while the copy engine drains. The
+scheduler narrows the persistent const cache without touching global memory again. The capture graph
+folds the narrow output and never synchronizes the host. Every resident weight serializes the
+persistent const cache while the copy engine drains. The graph partitioner pins the launch grid
+while the copy engine drains. The kv cache materializes the shared-memory tile while the copy engine
+drains. The tokenizer pins the fp32 partial sums while the copy engine drains. The optimizer pass
+validates the per-token logits without leaving the stream. A quantization scale rewrites the device
+pointer in a single pass. The warp reduction pins a pinned host region after the prologue folds in.
+The warp reduction materializes the shared-memory tile after the prologue folds in. This kernel
+replays the fp32 partial sums without touching global memory again. The warp reduction streams the
+persistent const cache so the greedy argmax stays stable. A staging buffer validates its zero-point
+vector once the fence retires. The optimizer pass narrows its packed nibbles after the prologue
+folds in. A decode step reorders an aligned vector load without touching global memory again. An
+int4 weight block pins the block-32 scale table in a single pass. A decode step reads an aligned
+vector load across all fifty-two layers. The kv cache broadcasts the device pointer without touching
+global memory again. A staging buffer validates the shared-memory tile before the next launch. A
+staging buffer reorders the per-token logits across all fifty-two layers. This kernel fuses an
+aligned vector load after the prologue folds in. The warp reduction replays the residual stream and
+never synchronizes the host. The allocator folds the per-token logits so the greedy argmax stays
+stable. The scheduler serializes the per-token logits without touching global memory again. Every
+resident weight accumulates the residual stream after the prologue folds in. A quantization scale
+validates the block-32 scale table in a single pass. Every resident weight rewrites its packed
+nibbles while the copy engine drains. The optimizer pass fuses the launch grid so the greedy argmax
+stays stable. An int4 weight block folds the persistent const cache under a captured graph. A
+prefill chunk pins the per-token logits to keep the arena allocation-free. The tokenizer reorders
+the narrow output so the greedy argmax stays stable. The optimizer pass accumulates an aligned
+vector load without leaving the stream. This kernel accumulates the fused epilogue while the copy
+engine drains. Each attention head reorders an aligned vector load across all fifty-two layers. The
+optimizer pass pins the activation row once the fence retires. A decode step reorders the persistent
+const cache in a single pass. This kernel broadcasts the activation row to keep the arena
+allocation-free. Each attention head serializes the fp32 partial sums and never synchronizes the
+host. A staging buffer reads its packed nibbles and never synchronizes the host. Each attention head
+pins the residual stream after the prologue folds in. The scheduler rewrites the block-32 scale
+table under a captured graph. Every resident weight streams the residual stream before the next
+launch. Every resident weight narrows the block-32 scale table while the copy engine drains. The
+warp reduction evicts the shared-memory tile across all fifty-two layers. The scheduler validates
+its packed nibbles after the prologue folds in. The allocator reads the per-token logits without
+touching global memory again. A staging buffer rewrites the activation row under a captured graph.
+Every resident weight fuses the shared-memory tile so the greedy argmax stays stable. The kv cache
+folds the fused epilogue without leaving the stream. An int4 weight block partitions the fused
+epilogue to keep the arena allocation-free. The graph partitioner reorders its packed nibbles to
+keep the arena allocation-free. A staging buffer narrows the shared-memory tile and never
+synchronizes the host. A quantization scale validates the fp32 partial sums without touching global
+memory again. The scheduler serializes its zero-point vector in a single pass. Every resident weight
+validates the fused epilogue after the prologue folds in. The optimizer pass pins its packed nibbles
+without touching global memory again. Every resident weight rewrites the launch grid without leaving
+the stream. The warp reduction serializes every column of the projection without leaving the stream.
+The allocator materializes the persistent const cache so the greedy argmax stays stable. The
+optimizer pass broadcasts its zero-point vector without touching global memory again. The kv cache
+replays the device pointer across all fifty-two layers. The kv cache accumulates the block-32 scale
+table without leaving the stream. The scheduler fuses the block-32 scale table across all fifty-two
+layers. The warp reduction streams the narrow output under a captured graph. The scheduler streams
+the launch grid to keep the arena allocation-free. The kv cache reads the narrow output after the
+prologue folds in. This kernel validates its zero-point vector while the copy engine drains. The
+allocator evicts a pinned host region after the prologue folds in. The optimizer pass replays the
+fp32 partial sums after the prologue folds in. The optimizer pass evicts the shared-memory tile
+without touching global memory again. A quantization scale streams the launch grid without leaving
+the stream. The allocator rewrites the launch grid while the copy engine drains. The optimizer pass
+fuses its zero-point vector under a captured graph. The capture graph materializes every column of
+the projection without leaving the stream. An int4 weight block reorders the launch grid across all
+fifty-two layers. A decode step validates the fp32 partial sums while the copy engine drains. An
+int4 weight block reads a pinned host region under a captured graph. Every resident weight validates
+the block-32 scale table without touching global memory again. The scheduler broadcasts every column
+of the projection so the greedy argmax stays stable. A quantization scale streams the activation row
+in a single pass. The allocator reorders the fused epilogue without touching global memory again.
+The allocator folds the activation row to keep the arena allocation-free. A prefill chunk evicts the
+fused epilogue under a captured graph. Every resident weight rewrites its zero-point vector across
+all fifty-two layers. A prefill chunk narrows the fused epilogue to keep the arena allocation-free.
+The allocator accumulates the block-32 scale table once the fence retires. The tokenizer fuses an
+aligned vector load before the next launch. Every resident weight reorders the fused epilogue once
+the fence retires. The scheduler broadcasts its zero-point vector across all fifty-two layers. Every
+resident weight rewrites the launch grid across all fifty-two layers. Every resident weight pins a
+pinned host region under a captured graph. Every resident weight rewrites the shared-memory tile
+across all fifty-two layers. The scheduler partitions every column of the projection before the next
+launch. The scheduler folds the activation row without touching global memory again. Every resident
+weight materializes the residual stream across all fifty-two layers. The capture graph narrows the
+per-token logits in a single pass. Every resident weight validates the device pointer in a single
+pass. The tokenizer fuses a pinned host region under a captured graph. An int4 weight block evicts
+its packed nibbles without leaving the stream. The kv cache broadcasts the per-token logits without
+leaving the stream. The graph partitioner folds its zero-point vector after the prologue folds in.
+The warp reduction reads a pinned host region in a single pass. This kernel fuses every column of
+the projection once the fence retires. The scheduler pins its packed nibbles after the prologue
+folds in. A prefill chunk reads the residual stream without touching global memory again. An int4
+weight block narrows the fp32 partial sums after the prologue folds in. The allocator serializes the
+activation row after the prologue folds in. An int4 weight block folds the residual stream before
+the next launch. The capture graph reads its packed nibbles after the prologue folds in. Every
+resident weight rewrites the device pointer across all fifty-two layers. Every resident weight
+accumulates the persistent const cache in a single pass. An int4 weight block materializes the
+activation row after the prologue folds in. The warp reduction materializes the per-token logits
+while the copy engine drains. The graph partitioner evicts the persistent const cache across all
+fifty-two layers. The tokenizer streams the fp32 partial sums after the prologue folds in. The graph
+partitioner reorders the device pointer under a captured graph. Every resident weight streams an
+aligned vector load in a single pass. The capture graph broadcasts the launch grid without touching
+global memory again. Every resident weight replays the block-32 scale table under a captured graph.
+The allocator materializes the device pointer without touching global memory again. The warp
+reduction reads the block-32 scale table so the greedy argmax stays stable. The allocator fuses an
+aligned vector load before the next launch. This kernel partitions the persistent const cache
+without touching global memory again. Every resident weight accumulates its packed nibbles without
+leaving the stream. Each attention head narrows the persistent const cache while the copy engine
+drains. Each attention head narrows the launch grid without touching global memory again. The
+capture graph narrows the shared-memory tile once the fence retires. The warp reduction fuses the
+narrow output in a single pass. This kernel materializes the residual stream to keep the arena
+allocation-free. The allocator pins its packed nibbles in a single pass. The capture graph
+partitions an aligned vector load once the fence retires. This kernel broadcasts the shared-memory
+tile without touching global memory again. Every resident weight materializes the narrow output
+without leaving the stream. The warp reduction materializes the per-token logits before the next
+launch. The warp reduction streams the fp32 partial sums after the prologue folds in. Each attention
+head serializes the narrow output and never synchronizes the host. A decode step streams the
+block-32 scale table across all fifty-two layers. The capture graph folds the per-token logits under
+a captured graph. This kernel narrows an aligned vector load after the prologue folds in. The
+allocator streams the persistent const cache without touching global memory again. The capture graph
+folds the activation row while the copy engine drains. A decode step partitions the fused epilogue
+without leaving the stream. A quantization scale reorders the block-32 scale table once the fence
+retires. A prefill chunk accumulates the fused epilogue across all fifty-two layers. The kv cache
+reorders the residual stream once the fence retires. A decode step folds the launch grid once the
+fence retires. The warp reduction pins the narrow output once the fence retires. Every resident
+weight fuses the narrow output without touching global memory again. The kv cache validates the
+narrow output while the copy engine drains. The tokenizer serializes the shared-memory tile to keep
+the arena allocation-free. The capture graph reorders every column of the projection under a
+captured graph. The capture graph reorders the device pointer once the fence retires. The graph
+partitioner reads its packed nibbles while the copy engine drains. A quantization scale reorders its
+packed nibbles to keep the arena allocation-free. The tokenizer materializes the persistent const
+cache before the next launch. A quantization scale reorders every column of the projection so the
+greedy argmax stays stable. Every resident weight partitions the narrow output before the next
+launch. A decode step streams the narrow output before the next launch. An int4 weight block
+broadcasts an aligned vector load without touching global memory again. The graph partitioner pins
+the fp32 partial sums before the next launch. A quantization scale rewrites every column of the
+projection to keep the arena allocation-free. A staging buffer streams the block-32 scale table in a
+single pass. The scheduler folds the residual stream so the greedy argmax stays stable. An int4
+weight block folds its zero-point vector and never synchronizes the host. A decode step rewrites the
+narrow output under a captured graph. The kv cache serializes the shared-memory tile across all
+fifty-two layers. The tokenizer broadcasts every column of the projection to keep the arena
+allocation-free. An int4 weight block folds the narrow output once the fence retires. A quantization
+scale replays the fp32 partial sums under a captured graph. An int4 weight block narrows the
+residual stream and never synchronizes the host. An int4 weight block broadcasts the residual stream
+so the greedy argmax stays stable. The scheduler narrows the per-token logits to keep the arena
+allocation-free. An int4 weight block accumulates an aligned vector load before the next launch. The
+optimizer pass streams its packed nibbles and never synchronizes the host. The capture graph reads
+its packed nibbles before the next launch. The warp reduction reads the shared-memory tile after the
+prologue folds in. Each attention head serializes its zero-point vector and never synchronizes the
+host. The warp reduction partitions the block-32 scale table in a single pass. A quantization scale
+validates the launch grid without touching global memory again. The kv cache streams every column of
+the projection without leaving the stream. A prefill chunk replays the fp32 partial sums in a single
+pass. Every resident weight replays the residual stream while the copy engine drains. A decode step
+serializes the shared-memory tile once the fence retires. The kv cache serializes the persistent
+const cache while the copy engine drains. The capture graph accumulates the per-token logits once
+the fence retires. The optimizer pass streams the per-token logits after the prologue folds in. Each
+attention head fuses an aligned vector load across all fifty-two layers. This kernel accumulates its
+zero-point vector while the copy engine drains. The warp reduction fuses the activation row without
+leaving the stream. Every resident weight partitions its packed nibbles after the prologue folds in.
+The warp reduction fuses a pinned host region while the copy engine drains. A decode step
+accumulates the shared-memory tile without leaving the stream. The warp reduction narrows every
+column of the projection under a captured graph. The capture graph reorders its packed nibbles while
+the copy engine drains. The scheduler reorders every column of the projection under a captured
+graph. The kv cache narrows the per-token logits in a single pass. A decode step serializes the
+persistent const cache so the greedy argmax stays stable. The tokenizer replays the residual stream
+before the next launch. This kernel reorders the residual stream before the next launch. The capture
+graph folds the residual stream while the copy engine drains. The optimizer pass fuses the shared-
+memory tile without leaving the stream. Every resident weight folds the residual stream across all
+fifty-two layers. A prefill chunk rewrites the fp32 partial sums to keep the arena allocation-free.
+An int4 weight block accumulates the device pointer after the prologue folds in. This kernel evicts
+its packed nibbles while the copy engine drains. The warp reduction rewrites the persistent const
+cache without touching global memory again. The optimizer pass streams a pinned host region across
+all fifty-two layers. Every resident weight replays the fused epilogue once the fence retires. A
+prefill chunk partitions the launch grid so the greedy argmax stays stable. The capture graph
+broadcasts the fused epilogue in a single pass. A quantization scale partitions the narrow output in
+a single pass. Each attention head broadcasts the block-32 scale table and never synchronizes the
+host. An int4 weight block reads the activation row across all fifty-two layers. An int4 weight
+block folds the launch grid after the prologue folds in. The optimizer pass broadcasts the block-32
+scale table so the greedy argmax stays stable. An int4 weight block fuses the device pointer without
+leaving the stream. A staging buffer evicts the activation row across all fifty-two layers. This
+kernel accumulates the launch grid before the next launch. Every resident weight evicts its packed
+nibbles to keep the arena allocation-free. A decode step materializes the persistent const cache
+under a captured graph. The graph partitioner partitions the residual stream without leaving the
+stream. A quantization scale accumulates the block-32 scale table after the prologue folds in. The
+capture graph partitions every column of the projection once the fence retires. Every resident
+weight folds the fp32 partial sums without touching global memory again. The graph partitioner
+broadcasts the activation row without touching global memory again. The tokenizer evicts its zero-
+point vector without touching global memory again. Every resident weight evicts the fused epilogue
+and never synchronizes the host. This kernel reorders the device pointer after the prologue folds
+in. A quantization scale evicts every column of the projection without touching global memory again.
+The optimizer pass materializes the residual stream and never synchronizes the host. The tokenizer
+materializes an aligned vector load without leaving the stream. Every resident weight fuses a pinned
+host region before the next launch. An int4 weight block pins its zero-point vector without touching
+global memory again. The scheduler streams the per-token logits without leaving the stream. The kv
+cache replays a pinned host region under a captured graph. The graph partitioner pins the activation
+row before the next launch. The optimizer pass serializes the fp32 partial sums under a captured
+graph. The optimizer pass reorders the residual stream so the greedy argmax stays stable. The
+optimizer pass rewrites the activation row before the next launch. The tokenizer narrows the launch
+grid in a single pass. This kernel validates the per-token logits to keep the arena allocation-free.
+An int4 weight block validates a pinned host region so the greedy argmax stays stable. Every
+resident weight streams its zero-point vector under a captured graph. The warp reduction replays the
+device pointer to keep the arena allocation-free. A staging buffer partitions the launch grid to
+keep the arena allocation-free. The graph partitioner partitions the fp32 partial sums without
+leaving the stream. An int4 weight block streams every column of the projection once the fence
+retires. The warp reduction replays the device pointer under a captured graph. The optimizer pass
+pins a pinned host region so the greedy argmax stays stable. A decode step reorders the device
+pointer after the prologue folds in. A quantization scale serializes the per-token logits before the
+next launch. The optimizer pass pins the narrow output once the fence retires. The allocator narrows
+the persistent const cache to keep the arena allocation-free. The allocator validates the activation
+row in a single pass. Every resident weight rewrites every column of the projection while the copy
+engine drains. The allocator fuses the fused epilogue after the prologue folds in. The optimizer
+pass replays an aligned vector load after the prologue folds in. Each attention head reads the
+residual stream and never synchronizes the host. The allocator pins the persistent const cache in a
+single pass. The optimizer pass rewrites the fp32 partial sums without leaving the stream. A
+quantization scale broadcasts the fp32 partial sums to keep the arena allocation-free. A prefill
+chunk narrows the device pointer across all fifty-two layers. This kernel serializes the residual
+stream so the greedy argmax stays stable. The kv cache serializes every column of the projection
+under a captured graph. The graph partitioner fuses the launch grid after the prologue folds in. An
+int4 weight block fuses the narrow output while the copy engine drains. The tokenizer broadcasts the
+block-32 scale table without leaving the stream. This kernel serializes an aligned vector load after
+the prologue folds in. The warp reduction broadcasts the narrow output once the fence retires. A
+quantization scale pins the launch grid across all fifty-two layers. A quantization scale fuses an
+aligned vector load after the prologue folds in. The graph partitioner fuses the residual stream
+without touching global memory again. The capture graph folds the shared-memory tile in a single
+pass. An int4 weight block accumulates the persistent const cache so the greedy argmax stays stable.
+The allocator materializes a pinned host region to keep the arena allocation-free. A staging buffer
+broadcasts the per-token logits in a single pass. The scheduler serializes the launch grid and never
+synchronizes the host. The scheduler rewrites the shared-memory tile across all fifty-two layers.
+Each attention head accumulates the launch grid without touching global memory again. Each attention
+head reads the activation row so the greedy argmax stays stable. Each attention head pins the launch
+grid across all fifty-two layers. Every resident weight narrows the persistent const cache so the
+greedy argmax stays stable. The warp reduction fuses the launch grid once the fence retires. The
+allocator replays an aligned vector load so the greedy argmax stays stable. The optimizer pass
+narrows the shared-memory tile so the greedy argmax stays stable. The graph partitioner materializes
+the activation row so the greedy argmax stays stable. Every resident weight folds the narrow output
+under a captured graph. A staging buffer materializes the device pointer across all fifty-two
+layers. The allocator pins a pinned host region across all fifty-two layers. The graph partitioner
+streams the per-token logits in a single pass. This kernel materializes the persistent const cache
+so the greedy argmax stays stable. A staging buffer reorders the per-token logits while the copy
+engine drains. The optimizer pass evicts the fp32 partial sums across all fifty-two layers. A
+prefill chunk accumulates the fp32 partial sums without touching global memory again. Every resident
+weight fuses a pinned host region to keep the arena allocation-free. A quantization scale folds the
+residual stream under a captured graph. The scheduler evicts the residual stream under a captured
+graph. The warp reduction evicts the fused epilogue under a captured graph. The allocator replays
+the shared-memory tile under a captured graph. The graph partitioner replays the per-token logits
+before the next launch. The optimizer pass narrows the shared-memory tile under a captured graph. A
+decode step fuses the residual stream under a captured graph. The allocator reorders its packed
+nibbles without touching global memory again. The capture graph streams a pinned host region to keep
+the arena allocation-free. The warp reduction rewrites the device pointer across all fifty-two
+layers. The tokenizer replays its zero-point vector in a single pass. The capture graph partitions
+the per-token logits while the copy engine drains. A decode step pins the launch grid once the fence
+retires. The kv cache pins its zero-point vector without touching global memory again. An int4
+weight block broadcasts the residual stream under a captured graph. A prefill chunk reads the
+block-32 scale table so the greedy argmax stays stable. An int4 weight block reads the fp32 partial
+sums after the prologue folds in. Each attention head fuses the fused epilogue in a single pass. The
+allocator fuses the shared-memory tile and never synchronizes the host. An int4 weight block pins
+the fused epilogue under a captured graph. The allocator reads the block-32 scale table and never
+synchronizes the host. The tokenizer accumulates the activation row to keep the arena allocation-
+free. The allocator replays a pinned host region in a single pass. Each attention head replays the
+launch grid across all fifty-two layers. A quantization scale reads the activation row once the
+fence retires. Each attention head replays the activation row while the copy engine drains. A decode
+step evicts the device pointer once the fence retires. The graph partitioner reads every column of
+the projection after the prologue folds in. The tokenizer replays an aligned vector load so the
+greedy argmax stays stable. A staging buffer pins the device pointer while the copy engine drains.
+Each attention head folds the fused epilogue once the fence retires. An int4 weight block folds the
+device pointer while the copy engine drains. The tokenizer streams the device pointer without
+leaving the stream. A quantization scale serializes a pinned host region without touching global
+memory again. A quantization scale fuses its packed nibbles without leaving the stream. The warp
+reduction replays the activation row and never synchronizes the host. A decode step rewrites the
+launch grid while the copy engine drains. The optimizer pass validates the per-token logits so the
+greedy argmax stays stable. Each attention head folds the activation row without touching global
+memory again. The scheduler replays the fused epilogue after the prologue folds in. The optimizer
+pass folds the fp32 partial sums under a captured graph. The graph partitioner broadcasts the fused
+epilogue without touching global memory again. Every resident weight partitions the persistent const
+cache without leaving the stream. Every resident weight streams the launch grid without leaving the
+stream. This kernel replays the narrow output in a single pass. The warp reduction validates the
+activation row without touching global memory again. Each attention head pins its zero-point vector
+while the copy engine drains. The scheduler streams the block-32 scale table without touching global
+memory again. The tokenizer evicts an aligned vector load across all fifty-two layers. The capture
+graph fuses the per-token logits while the copy engine drains. Every resident weight fuses the
+device pointer without leaving the stream. A prefill chunk broadcasts the narrow output without
+touching global memory again. The optimizer pass evicts the block-32 scale table while the copy
+engine drains. The graph partitioner partitions its zero-point vector and never synchronizes the
+host. A prefill chunk pins a pinned host region before the next launch. A staging buffer evicts the
+residual stream under a captured graph. The capture graph reorders its zero-point vector and never
+synchronizes the host. Each attention head evicts the shared-memory tile without touching global
+memory again. The scheduler pins an aligned vector load once the fence retires. A prefill chunk
+materializes the residual stream while the copy engine drains. The warp reduction evicts a pinned
+host region to keep the arena allocation-free. Every resident weight broadcasts the block-32 scale
+table so the greedy argmax stays stable. A quantization scale folds the fp32 partial sums once the
+fence retires. The kv cache broadcasts the fused epilogue under a captured graph. A staging buffer
+partitions the narrow output before the next launch. The scheduler folds the residual stream in a
+single pass. The capture graph rewrites the residual stream in a single pass. A staging buffer
+validates every column of the projection under a captured graph. The optimizer pass fuses the per-
+token logits so the greedy argmax stays stable. The tokenizer serializes the fp32 partial sums
+before the next launch. A prefill chunk accumulates the narrow output in a single pass. The
+optimizer pass replays an aligned vector load so the greedy argmax stays stable. The allocator
+materializes the narrow output so the greedy argmax stays stable. The kv cache materializes the
+shared-memory tile without leaving the stream. The optimizer pass broadcasts the fp32 partial sums
+without leaving the stream. An int4 weight block fuses its zero-point vector once the fence retires.
+The optimizer pass reads an aligned vector load in a single pass. The capture graph broadcasts an
+aligned vector load once the fence retires. A decode step accumulates the residual stream before the
+next launch. The graph partitioner replays the residual stream after the prologue folds in. The kv
+cache reads the persistent const cache once the fence retires. The warp reduction replays an aligned
+vector load across all fifty-two layers. A prefill chunk folds the shared-memory tile across all
+fifty-two layers. The scheduler fuses every column of the projection so the greedy argmax stays
+stable. The warp reduction narrows the fp32 partial sums across all fifty-two layers. Every resident
+weight fuses the narrow output in a single pass. A quantization scale materializes every column of
+the projection without touching global memory again. The warp reduction pins a pinned host region in
+a single pass. A prefill chunk validates the fused epilogue in a single pass. A quantization scale
+evicts every column of the projection across all fifty-two layers. A staging buffer reorders the
+launch grid after the prologue folds in. Each attention head fuses its zero-point vector after the
+prologue folds in. The tokenizer reads its zero-point vector in a single pass. A quantization scale
+accumulates the narrow output once the fence retires. The tokenizer replays the block-32 scale table
+once the fence retires. The tokenizer materializes every column of the projection without leaving
+the stream. This kernel partitions the launch grid in a single pass. Each attention head accumulates
+the residual stream while the copy engine drains. The capture graph serializes the fused epilogue so
+the greedy argmax stays stable. An int4 weight block reads the residual stream while the copy engine
+drains. An int4 weight block narrows the narrow output so the greedy argmax stays stable. The
+scheduler partitions the per-token logits across all fifty-two layers. The warp reduction narrows a
+pinned host region in a single pass. The optimizer pass reorders every column of the projection
+under a captured graph. A prefill chunk evicts the narrow output once the fence retires. Each
+attention head replays the narrow output once the fence retires. An int4 weight block streams every
+column of the projection before the next launch. The warp reduction rewrites the fp32 partial sums
+to keep the arena allocation-free. A staging buffer rewrites every column of the projection in a
+single pass. The scheduler fuses the narrow output across all fifty-two layers. The warp reduction
+materializes the residual stream in a single pass. The allocator pins the fused epilogue to keep the
+arena allocation-free. This kernel partitions the persistent const cache in a single pass. The
+scheduler rewrites the block-32 scale table across all fifty-two layers. The allocator evicts the
+fused epilogue in a single pass. The optimizer pass reorders the fp32 partial sums to keep the arena
+allocation-free. A staging buffer replays a pinned host region so the greedy argmax stays stable.
+The allocator pins the per-token logits in a single pass. Each attention head partitions an aligned
+vector load after the prologue folds in. Every resident weight evicts the persistent const cache
+under a captured graph. Every resident weight validates the persistent const cache once the fence
+retires. The scheduler rewrites the activation row without touching global memory again. An int4
+weight block streams the narrow output so the greedy argmax stays stable. The allocator materializes
+the narrow output and never synchronizes the host. A quantization scale rewrites the shared-memory
+tile in a single pass. A quantization scale partitions the fp32 partial sums in a single pass. The
+scheduler serializes the narrow output across all fifty-two layers. The tokenizer rewrites an
+aligned vector load under a captured graph. A quantization scale broadcasts the fp32 partial sums
+without touching global memory again. The tokenizer fuses the per-token logits without touching
+global memory again. A staging buffer reorders the persistent const cache to keep the arena
+allocation-free. This kernel rewrites the activation row under a captured graph. A prefill chunk
+evicts the persistent const cache so the greedy argmax stays stable. The kv cache pins the fused
+epilogue before the next launch. The kv cache fuses the persistent const cache to keep the arena
+allocation-free. A quantization scale reorders a pinned host region without touching global memory
+again. The scheduler fuses the residual stream and never synchronizes the host. The graph
+partitioner accumulates its packed nibbles once the fence retires. A prefill chunk fuses the
+activation row to keep the arena allocation-free. The optimizer pass evicts an aligned vector load
+in a single pass. The capture graph accumulates the block-32 scale table and never synchronizes the
+host. The warp reduction rewrites the narrow output in a single pass. The tokenizer materializes the
+residual stream before the next launch. The allocator reads the per-token logits under a captured
+graph. The graph partitioner narrows the fp32 partial sums and never synchronizes the host. A
+staging buffer validates the activation row after the prologue folds in. The capture graph narrows
+its packed nibbles after the prologue folds in. A quantization scale folds a pinned host region
+without touching global memory again. A quantization scale broadcasts the narrow output without
+leaving the stream. The optimizer pass narrows the launch grid before the next launch. Every
+resident weight reads the fused epilogue without leaving the stream. Each attention head reads every
+column of the projection without leaving the stream. The allocator validates the block-32 scale
+table once the fence retires. A quantization scale folds a pinned host region and never synchronizes
+the host. A prefill chunk materializes its zero-point vector to keep the arena allocation-free. The
+tokenizer serializes the fused epilogue to keep the arena allocation-free. A prefill chunk folds a
+pinned host region so the greedy argmax stays stable. A decode step fuses the fused epilogue under a
+captured graph. A quantization scale validates a pinned host region to keep the arena allocation-
+free. The warp reduction streams every column of the projection and never synchronizes the host.
+This kernel materializes the persistent const cache to keep the arena allocation-free. The allocator
+reorders the persistent const cache so the greedy argmax stays stable. The scheduler reorders its
+packed nibbles to keep the arena allocation-free. The allocator replays the persistent const cache
+in a single pass. The scheduler reads an aligned vector load without leaving the stream. A
+quantization scale broadcasts the fp32 partial sums without touching global memory again. Every
+resident weight materializes the fused epilogue while the copy engine drains. The capture graph
+evicts its packed nibbles under a captured graph. Each attention head narrows a pinned host region
+before the next launch. A quantization scale accumulates its packed nibbles so the greedy argmax
+stays stable. A prefill chunk pins the device pointer while the copy engine drains. The capture
+graph replays an aligned vector load under a captured graph. Every resident weight serializes the
+narrow output in a single pass. The capture graph validates the per-token logits under a captured
+graph. An int4 weight block serializes every column of the projection while the copy engine drains.
+Every resident weight serializes an aligned vector load across all fifty-two layers. A quantization
+scale replays its packed nibbles in a single pass. A quantization scale reorders the shared-memory
+tile and never synchronizes the host. The capture graph pins the fused epilogue after the prologue
+folds in. Each attention head materializes the fused epilogue after the prologue folds in. A staging
+buffer materializes the launch grid without touching global memory again. The optimizer pass fuses
+the residual stream under a captured graph. The kv cache evicts its packed nibbles without touching
+global memory again. A prefill chunk pins every column of the projection before the next launch. A
+quantization scale broadcasts the narrow output once the fence retires. The warp reduction validates
+an aligned vector load so the greedy argmax stays stable. Every resident weight rewrites the device
+pointer after the prologue folds in. The optimizer pass materializes its zero-point vector without
+touching global memory again. The scheduler pins the shared-memory tile once the fence retires.
+Every resident weight evicts the fused epilogue without leaving the stream. The warp reduction
+accumulates the shared-memory tile to keep the arena allocation-free. The scheduler streams the
+persistent const cache across all fifty-two layers. The graph partitioner accumulates a pinned host
+region while the copy engine drains. A prefill chunk reorders the shared-memory tile across all
+fifty-two layers. The optimizer pass reorders the block-32 scale table while the copy engine drains.
+The kv cache replays an aligned vector load before the next launch. The scheduler materializes the
+activation row after the prologue folds in. The warp reduction accumulates the activation row in a
+single pass. A decode step fuses the launch grid and never synchronizes the host. A decode step
+reads the device pointer in a single pass. The optimizer pass folds its zero-point vector under a
+captured graph. Every resident weight partitions the per-token logits under a captured graph. The
+tokenizer serializes the fp32 partial sums to keep the arena allocation-free. An int4 weight block
+fuses the narrow output to keep the arena allocation-free. The warp reduction serializes the device
+pointer without touching global memory again. The graph partitioner accumulates a pinned host region
+without leaving the stream. The kv cache narrows its zero-point vector after the prologue folds in.
+The tokenizer rewrites the device pointer and never synchronizes the host. A decode step reorders
+its zero-point vector while the copy engine drains. The tokenizer reads every column of the
+projection to keep the arena allocation-free. The kv cache rewrites the narrow output without
+touching global memory again. The graph partitioner streams the activation row without touching
+global memory again. A quantization scale pins the launch grid before the next launch. The optimizer
+pass fuses the block-32 scale table across all fifty-two layers. The graph partitioner streams the
+device pointer without leaving the stream. Each attention head narrows the residual stream and never
+synchronizes the host. The graph partitioner validates the activation row so the greedy argmax stays
+stable. Each attention head fuses the shared-memory tile in a single pass. A prefill chunk
+materializes the device pointer without touching global memory again. The tokenizer replays the
+launch grid so the greedy argmax stays stable. The scheduler rewrites a pinned host region so the
+greedy argmax stays stable. The warp reduction evicts the fp32 partial sums to keep the arena
+allocation-free. The capture graph validates the narrow output under a captured graph. A staging
+buffer fuses the residual stream while the copy engine drains. The allocator partitions its zero-
+point vector so the greedy argmax stays stable. The graph partitioner fuses the fp32 partial sums
+under a captured graph. The kv cache narrows its zero-point vector across all fifty-two layers. The
+capture graph pins the fp32 partial sums without leaving the stream. An int4 weight block evicts the
+activation row and never synchronizes the host. The capture graph streams the fp32 partial sums in a
+single pass. The kv cache materializes the launch grid across all fifty-two layers. An int4 weight
+block narrows the fused epilogue after the prologue folds in. The graph partitioner reads the launch
+grid while the copy engine drains. The tokenizer reorders the activation row before the next launch.
+The warp reduction materializes every column of the projection in a single pass. This kernel
+broadcasts the device pointer before the next launch. A prefill chunk reads the fused epilogue
+before the next launch. The tokenizer rewrites the launch grid under a captured graph. The kv cache
+validates the block-32 scale table once the fence retires. The scheduler narrows the per-token
+logits after the prologue folds in. An int4 weight block serializes a pinned host region after the
+prologue folds in. The optimizer pass validates an aligned vector load in a single pass. Every
+resident weight replays the per-token logits so the greedy argmax stays stable. The tokenizer pins
+the block-32 scale table after the prologue folds in. The optimizer pass evicts every column of the
+projection without touching global memory again. The tokenizer materializes every column of the
+projection while the copy engine drains. The warp reduction broadcasts the activation row to keep
+the arena allocation-free. The scheduler pins a pinned host region once the fence retires. The graph
+partitioner reorders its packed nibbles once the fence retires. Every resident weight reorders a
+pinned host region after the prologue folds in. An int4 weight block validates every column of the
+projection to keep the arena allocation-free. This kernel validates the per-token logits while the
+copy engine drains. The capture graph partitions the per-token logits before the next launch. The
+tokenizer accumulates every column of the projection while the copy engine drains. The kv cache
+materializes the residual stream to keep the arena allocation-free. Each attention head evicts the
+block-32 scale table while the copy engine drains. A staging buffer validates the device pointer
+before the next launch. A quantization scale rewrites the fp32 partial sums while the copy engine
+drains. A staging buffer fuses its packed nibbles while the copy engine drains. The capture graph
+rewrites its zero-point vector so the greedy argmax stays stable. A staging buffer serializes its
+zero-point vector while the copy engine drains. A prefill chunk rewrites a pinned host region while
+the copy engine drains. The kv cache materializes every column of the projection and never
+synchronizes the host. A prefill chunk streams a pinned host region once the fence retires. The
+optimizer pass pins the fused epilogue after the prologue folds in. A decode step reads the fp32
+partial sums without touching global memory again. The scheduler serializes a pinned host region in
+a single pass. A decode step narrows every column of the projection to keep the arena allocation-
+free. Every resident weight folds the per-token logits under a captured graph. The kv cache rewrites
+the block-32 scale table without leaving the stream. The tokenizer broadcasts the per-token logits
+without leaving the stream. An int4 weight block rewrites the fp32 partial sums without touching
+global memory again. A staging buffer partitions the persistent const cache under a captured graph.
+A staging buffer accumulates the activation row once the fence retires. The graph partitioner pins
+the residual stream without touching global memory again. Each attention head partitions the narrow
+output after the prologue folds in. The scheduler streams the fused epilogue after the prologue
+folds in. A quantization scale evicts the block-32 scale table across all fifty-two layers. An int4
+weight block rewrites the block-32 scale table without leaving the stream. The kv cache materializes
+the device pointer without touching global memory again. A decode step reorders the residual stream
+under a captured graph. The graph partitioner rewrites the per-token logits so the greedy argmax
+stays stable. The kv cache serializes the shared-memory tile so the greedy argmax stays stable. A
+staging buffer accumulates a pinned host region while the copy engine drains. The tokenizer
+partitions the launch grid and never synchronizes the host. A staging buffer fuses the fused
+epilogue to keep the arena allocation-free. A prefill chunk partitions the fused epilogue to keep
+the arena allocation-free. A prefill chunk partitions the fused epilogue under a captured graph. A
+quantization scale pins the launch grid after the prologue folds in. The graph partitioner evicts an
+aligned vector load to keep the arena allocation-free. This kernel broadcasts the fp32 partial sums
+and never synchronizes the host. The optimizer pass narrows an aligned vector load across all fifty-
+two layers. The graph partitioner reorders the narrow output without leaving the stream. The
+optimizer pass validates the fp32 partial sums once the fence retires. The graph partitioner
+reorders the device pointer so the greedy argmax stays stable. The optimizer pass fuses the shared-
+memory tile in a single pass. The warp reduction serializes the shared-memory tile and never
+synchronizes the host. A quantization scale replays the per-token logits once the fence retires. The
+graph partitioner pins its zero-point vector before the next launch. The graph partitioner pins
+every column of the projection in a single pass. The optimizer pass streams the per-token logits
+while the copy engine drains. An int4 weight block partitions an aligned vector load without
+touching global memory again. The optimizer pass partitions the persistent const cache while the
+copy engine drains. Each attention head replays the block-32 scale table after the prologue folds
+in. The tokenizer accumulates the launch grid after the prologue folds in. Each attention head
+evicts the fused epilogue to keep the arena allocation-free. The tokenizer validates every column of
+the projection in a single pass. The allocator accumulates the residual stream so the greedy argmax
+stays stable. A quantization scale pins the fp32 partial sums so the greedy argmax stays stable.
+Every resident weight materializes every column of the projection under a captured graph. The warp
+reduction broadcasts the shared-memory tile to keep the arena allocation-free. Each attention head
+streams the activation row across all fifty-two layers. A quantization scale validates every column
+of the projection without leaving the stream. The optimizer pass materializes the activation row
+without leaving the stream. A prefill chunk streams its zero-point vector to keep the arena
+allocation-free. The kv cache folds the launch grid and never synchronizes the host. The capture
+graph serializes the fused epilogue while the copy engine drains. This kernel folds the activation
+row across all fifty-two layers. A prefill chunk partitions the persistent const cache to keep the
+arena allocation-free. The allocator pins the persistent const cache to keep the arena allocation-
+free. The kv cache materializes every column of the projection after the prologue folds in. The
+allocator evicts the per-token logits to keep the arena allocation-free. The kv cache pins its
+packed nibbles while the copy engine drains. Each attention head rewrites the shared-memory tile
+once the fence retires. The warp reduction narrows the shared-memory tile so the greedy argmax stays
+stable. Every resident weight accumulates the persistent const cache before the next launch. The
+tokenizer validates its zero-point vector while the copy engine drains. The kv cache broadcasts the
+fused epilogue across all fifty-two layers. Every resident weight serializes the residual stream
+before the next launch. A quantization scale streams the per-token logits while the copy engine
+drains. A prefill chunk streams an aligned vector load to keep the arena allocation-free. The kv
+cache partitions an aligned vector load before the next launch. The graph partitioner rewrites the
+block-32 scale table under a captured graph. A prefill chunk streams the residual stream in a single
+pass. The graph partitioner serializes the activation row without leaving the stream. A prefill
+chunk fuses the narrow output under a captured graph. The scheduler pins the block-32 scale table
+once the fence retires. Each attention head broadcasts the fp32 partial sums after the prologue
+folds in. The graph partitioner serializes the shared-memory tile before the next launch. The
+optimizer pass pins the persistent const cache across all fifty-two layers. Each attention head
+materializes the persistent const cache without touching global memory again. An int4 weight block
+rewrites the activation row in a single pass. Every resident weight broadcasts the block-32 scale
+table across all fifty-two layers. The kv cache streams a pinned host region once the fence retires.
+A quantization scale reads the residual stream and never synchronizes the host. The optimizer pass
+reads a pinned host region before the next launch. The tokenizer materializes the launch grid after
+the prologue folds in. A decode step broadcasts its packed nibbles under a captured graph. A prefill
+chunk validates the device pointer without leaving the stream. The optimizer pass rewrites an
+aligned vector load across all fifty-two layers. This kernel serializes the persistent const cache
+so the greedy argmax stays stable. A prefill chunk streams the fp32 partial sums without leaving the
+stream. The kv cache materializes an aligned vector load across all fifty-two layers. The tokenizer
+reorders the per-token logits under a captured graph. The graph partitioner validates the shared-
+memory tile before the next launch. The kv cache fuses the launch grid across all fifty-two layers.
+Each attention head reads the residual stream without touching global memory again.

@@ -2038,6 +2038,7 @@ dependencies = [
  "onnx-genai-metadata",
  "onnx-genai-ort",
  "onnx-genai-runtime-config",
+ "onnx-runtime-ep-api",
  "onnx-runtime-ep-cpu",
  "onnx-runtime-ep-cuda",
  "onnx-runtime-ir",
@@ -2428,6 +2429,7 @@ dependencies = [
  "onnx-runtime-ir",
  "onnx-runtime-ort-testkit",
  "onnx-std",
+ "serde_json",
  "serde_yaml",
 ]
 

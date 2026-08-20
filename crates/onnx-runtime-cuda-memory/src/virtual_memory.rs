@@ -787,10 +787,9 @@ impl PhysicalHandlePool {
             Some(capacity) => lease.grow_from_mapped_capacity(capacity, self.granularity as u64),
             None => lease.grow(self.granularity as u64),
         }
-        .map_err(|error| VirtualMemoryError::Os {
+        .map_err(|error| VirtualMemoryError::Delegated {
             operation: "growing physical handle pool lease",
-            reason: error.to_string(),
-            code: 0,
+            source: Box::new(error),
         });
         {
             let mut state = self.lock();
