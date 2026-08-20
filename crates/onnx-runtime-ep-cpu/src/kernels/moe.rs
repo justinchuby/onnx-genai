@@ -1014,11 +1014,8 @@ pub(super) fn run_expert_grouped(
     let mut fc1_out = linear_grouped(input, rows, fc1_weights, fc1_bias, fc1_size, hidden)?;
     let activated = match attributes.activation {
         Activation::Swiglu => {
-            let linear_part;
-            let gate_part;
-            if attributes.swiglu_fusion == 0 {
-                gate_part = fc1_out;
-                linear_part = linear_grouped(
+            let (gate_part, linear_part) = if attributes.swiglu_fusion == 0 {
+                let linear = linear_grouped(
                     input,
                     rows,
                     fc3_weights.expect("validated unfused swiglu FC3"),
@@ -1026,6 +1023,7 @@ pub(super) fn run_expert_grouped(
                     inter,
                     hidden,
                 )?;
+                (fc1_out, linear)
             } else {
                 let mut gate = Vec::with_capacity(rows * inter);
                 let mut linear = Vec::with_capacity(rows * inter);
@@ -1040,9 +1038,8 @@ pub(super) fn run_expert_grouped(
                         linear.extend_from_slice(&row[inter..]);
                     }
                 }
-                gate_part = gate;
-                linear_part = linear;
-            }
+                (gate, linear)
+            };
             gate_part
                 .into_iter()
                 .zip(linear_part)
