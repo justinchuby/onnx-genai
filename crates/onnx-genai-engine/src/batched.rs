@@ -260,7 +260,7 @@ impl<'a> ContinuousBatchManager<'a> {
             anyhow::bail!("prompt must contain at least one token");
         }
         let max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(self.tokenizer))?;
+        let chain = build_processor_chain(&options, Some(self.tokenizer), false)?;
         if reached_context_limit(prompt_tokens.len(), max_context) {
             self.admissions
                 .push_back(ContinuousBatchAdmission::Assigned { handle });
@@ -708,7 +708,7 @@ impl Engine {
                 anyhow::bail!("prompt must contain at least one token");
             }
             let max_context = self.batched_max_context_for_request(&options);
-            let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
+            let chain = build_processor_chain(&options, Some(&self.tokenizer), false)?;
             if reached_context_limit(prompt_tokens.len(), max_context) {
                 ensure_constrained_finish(&options, "", FinishReason::Length)?;
                 results[result_index] = Some(finish_result(

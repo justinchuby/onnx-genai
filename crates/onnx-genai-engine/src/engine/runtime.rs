@@ -393,7 +393,7 @@ impl Engine {
             anyhow::bail!("prompt must contain at least one token");
         }
         options.max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
+        let chain = build_processor_chain(&options, Some(&self.tokenizer), false)?;
         let speculation_plan = native_speculation_plan(&options, &chain);
         let scheduler_session_id = self.next_native_session_id();
         let scheduled = self.admit_generate_request_with_scheduler(
@@ -984,7 +984,8 @@ impl Engine {
         }
 
         let max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
+        let chain =
+            build_processor_chain(&options, Some(&self.tokenizer), custom_sampler.is_some())?;
 
         let scheduled = self.admit_generate_request_with_scheduler(
             session_id,
@@ -1743,7 +1744,7 @@ impl Engine {
         }
 
         let max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
+        let chain = build_processor_chain(&options, Some(&self.tokenizer), false)?;
         let mut state = self
             .sessions
             .remove(&request.session_id)
@@ -2146,7 +2147,7 @@ impl Engine {
             anyhow::bail!("prompt must contain at least one token");
         }
         options.max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
+        let chain = build_processor_chain(&options, Some(&self.tokenizer), false)?;
         if native_speculation_plan(&options, &chain).is_some() {
             anyhow::bail!(
                 "native session generation does not support speculative decoding; use stateless generate() for native prompt-lookup/shared-KV speculation"

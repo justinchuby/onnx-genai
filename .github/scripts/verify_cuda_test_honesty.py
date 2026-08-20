@@ -21,8 +21,15 @@ MEMORY_CRATE = ROOT / "crates" / "onnx-runtime-cuda-memory"
 CUDA_CRATES = (CUDA_CRATE, MEMORY_CRATE)
 TESTS = CUDA_CRATE / "tests"
 TEST_DIRS = tuple(crate / "tests" for crate in CUDA_CRATES)
-# Targets that must run in every configuration, and so cannot be held to the
-# "ignored, not passed" rule the rest of the suite is checked against.
+# CUDA integration-test targets conventionally end in `_gpu`. Keep historical
+# CUDA targets that predate that convention explicit so a genuinely CPU-only
+# target is not policed as a device test merely because it lives in a CUDA
+# crate.
+CUDA_TARGETS_WITHOUT_SUFFIX = frozenset({"matmul_nbits_marlin_numerics"})
+
+# CUDA-named targets that must run in every configuration, and so cannot be
+# held to the "ignored, not passed" rule the rest of the suite is checked
+# against.
 #
 # `suite_canary_gpu` is the test that exists because the rest of the suite can
 # skip silently. It is a no-op unless `NXRT_REQUIRE_CUDA` says a GPU is meant to
@@ -30,76 +37,7 @@ TEST_DIRS = tuple(crate / "tests" for crate in CUDA_CRATES)
 # ignore would remove it from exactly the runs it was written to police -- a
 # CPU-only machine that believes it tested a GPU.
 #
-# `capture_sync_contract` is a static source audit: it reads the CUDA kernel
-# sources and fails if any capture-eligible path reaches an unreviewed
-# unconditional `synchronize()`. It touches no device, so it MUST run on the
-# CPU-only lane and legitimately *passes* there -- holding it to the
-# "ignored, not passed" GPU rule would silence exactly the check that keeps a
-# capture-unsafe sync from landing. It is another "checking the checker" case,
-# not a GPU test that happens to be awkward. It still runs on the CPU lane via
-# the dedicated `cargo test ... --test capture_sync_contract` CI step.
-#
-# `dummy_fill_and_crossover` is a pure-CPU design probe for the #759 dummy-page
-# VMM KV scheme: it proves the correctness-safe dummy fill value (zeros, never
-# NaN) from additive-masking algebra and derives the fixed-stride+dummy vs
-# bucket-growth memory crossover from real model KV geometry. It issues no CUDA
-# calls and touches no device (unlike every `*_gpu` sibling in the same crate),
-# so it legitimately *passes* on the CPU-only lane and cannot honor the
-# "ignored, not passed" GPU rule -- it is a CPU probe, not a GPU test. Its name
-# deliberately omits the `_gpu` suffix its device-bound siblings carry.
-#
-# `matmul_nbits_marlin_oracle` is the pure-CPU half of the int4 `MatMulNBits`
-# parity gate: it self-checks the `f64` dequant->GEMM oracle against an
-# independent `f32` reference and validates the justified tolerance envelope
-# (`Envelope`/`ParityReport`) the GPU gate depends on. It shares the device-free
-# machinery in `tests/marlin_numerics/mod.rs` with the GPU target
-# (`matmul_nbits_marlin_numerics`) but issues no CUDA calls and touches no
-# device, so it legitimately *passes* on the CPU-only lane and cannot honor the
-# "ignored, not passed" GPU rule -- it is a CPU probe validating the checker's
-# own numeric ground truth, not a GPU test. It was split out of the GPU numerics
-# target precisely so that target stays purely-CUDA (all tests ignored without
-# `gpu-tests`); its name deliberately omits the `_gpu`/`_numerics` GPU suffixes.
-# It still runs on the CPU lane via a dedicated
-# `cargo test ... --test matmul_nbits_marlin_oracle` CI step (#1177).
-#
-# `deferred_release_queue`, `vmm_release_quarantine` and
-# `no_built_in_eager_allocator` are the #1186 memory refactor's CPU-side
-# probes, and they are the same case as `dummy_fill_and_crossover` above rather
-# than three more awkward GPU tests.
-#
-# The first two exist because the rules they check are state machines, not
-# driver calls: the deferred release queue's ordering, bounding, exactly-once
-# execution and device-loss behaviour are expressed over the `ReleaseFence` and
-# `DeferredReleaseAction` contracts, and the rule deciding whether a partially
-# released VMM address may be reused lives in `onnx_runtime_cuda_memory::release`
-# with no CUDA symbol in it. Both are driven by fakes -- a scripted fence, a
-# scripted driver that fails the Nth `cuMemUnmap` on demand -- so they issue no
-# CUDA calls and legitimately pass on a CPU host. #636 is the reason they were
-# written this way: it measured 44 tests silently skipped for months because the
-# rules had been left inside `*_gpu.rs`. Ignoring them here would put them back
-# in exactly that position.
-#
-# `no_built_in_eager_allocator` is a static source audit like
-# `capture_sync_contract`: it reads the two crates' sources and pins the exact
-# set of eager `malloc_sync`/`free_sync` sites outside the allocator seam. Its
-# whole value is proving a negative that the GPU tests structurally cannot --
-# a new eager site on a path they do not exercise would not turn them red -- so
-# it must run on the CPU-only lane or it checks nothing at all.
-#
-# Anything added here needs the same argument: not "this one is awkward" but
-# "this one is checking the checker" (or otherwise a genuine CPU-only probe that
-# issues no CUDA calls).
-ALWAYS_RUN = frozenset(
-    {
-        "suite_canary_gpu",
-        "capture_sync_contract",
-        "dummy_fill_and_crossover",
-        "matmul_nbits_marlin_oracle",
-        "deferred_release_queue",
-        "vmm_release_quarantine",
-        "no_built_in_eager_allocator",
-    }
-)
+ALWAYS_RUN = frozenset({"suite_canary_gpu"})
 SUMMARY = re.compile(
     r"test result: (?:ok|FAILED)\. (?P<passed>\d+) passed; (?P<failed>\d+) failed; "
     r"(?P<ignored>\d+) ignored; (?P<measured>\d+) measured; (?P<filtered>\d+) filtered out"
@@ -150,6 +88,13 @@ def run(command: list[str | Path]) -> subprocess.CompletedProcess[str]:
     )
 
 
+def is_cuda_test_target(target: str) -> bool:
+    return (
+        target not in ALWAYS_RUN
+        and (target.endswith("_gpu") or target in CUDA_TARGETS_WITHOUT_SUFFIX)
+    )
+
+
 def parse_test_binaries_from_json(stdout: str) -> list[TestBinary]:
     binaries: dict[str, Path] = {}
     for line in stdout.splitlines():
@@ -168,7 +113,7 @@ def parse_test_binaries_from_json(stdout: str) -> list[TestBinary]:
         if not any(src_path.is_relative_to(tests) for tests in TEST_DIRS):
             continue
         executable = message.get("executable")
-        if executable:
+        if executable and is_cuda_test_target(target["name"]):
             binaries[target["name"]] = Path(executable)
 
     return [
@@ -285,6 +230,16 @@ def validate_active_no_cuda_result(result: ActiveResult) -> list[str]:
 
 
 def self_test() -> None:
+    for cpu_target in (
+        "deferred_release_queue",
+        "no_built_in_eager_allocator",
+        "vmm_release_quarantine",
+    ):
+        if is_cuda_test_target(cpu_target):
+            raise AssertionError(f"CPU-only target {cpu_target} was classified as CUDA")
+    if not is_cuda_test_target("matmul_nbits_marlin_numerics"):
+        raise AssertionError("historical CUDA target without _gpu suffix was not classified as CUDA")
+
     fixture_stdout = "\n".join(
         [
             "not json",
@@ -303,6 +258,32 @@ def self_test() -> None:
                 {
                     "reason": "compiler-artifact",
                     "target": {
+                        "name": "deferred_release_queue",
+                        "kind": ["test"],
+                        "src_path": str(TESTS / "deferred_release_queue.rs"),
+                    },
+                    "executable": str(
+                        ROOT / "target" / "debug" / "deps" / "deferred_release_queue.exe"
+                    ),
+                }
+            ),
+            json.dumps(
+                {
+                    "reason": "compiler-artifact",
+                    "target": {
+                        "name": "matmul_nbits_marlin_numerics",
+                        "kind": ["test"],
+                        "src_path": str(TESTS / "matmul_nbits_marlin_numerics.rs"),
+                    },
+                    "executable": str(
+                        ROOT / "target" / "debug" / "deps" / "matmul_nbits_marlin_numerics.exe"
+                    ),
+                }
+            ),
+            json.dumps(
+                {
+                    "reason": "compiler-artifact",
+                    "target": {
                         "name": "onnx_runtime_ep_cuda",
                         "kind": ["lib"],
                         "src_path": str(CUDA_CRATE / "src" / "lib.rs"),
@@ -313,7 +294,14 @@ def self_test() -> None:
         ]
     )
     parsed = parse_test_binaries_from_json(fixture_stdout)
-    if parsed != [TestBinary("fixture_gpu", ROOT / "target" / "debug" / "deps" / "fixture_gpu.exe")]:
+    expected = [
+        TestBinary("fixture_gpu", ROOT / "target" / "debug" / "deps" / "fixture_gpu.exe"),
+        TestBinary(
+            "matmul_nbits_marlin_numerics",
+            ROOT / "target" / "debug" / "deps" / "matmul_nbits_marlin_numerics.exe",
+        ),
+    ]
+    if parsed != expected:
         raise AssertionError(f"JSON parser fixture returned {parsed!r}")
 
     if compare_inventories({"target": frozenset({"a"})}, {"target": frozenset({"a"})}):

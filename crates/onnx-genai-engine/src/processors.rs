@@ -15,11 +15,37 @@ use anyhow::Context;
 use onnx_genai_ort::Tokenizer;
 use std::path::Path;
 
+/// Build the request's logit processor chain.
+///
+/// The chain has two halves, and the split is the same one HuggingFace
+/// `transformers` draws between a *processor* and a *warper*:
+///
+/// - **Processors** express what the caller wants generated: the penalties, DRY,
+///   stop sequences, grammar/JSON constraints. They apply to every decoding
+///   strategy, and they may legitimately change which token is the maximum.
+/// - **Warpers** reshape a probability distribution so it can be *sampled*:
+///   temperature, top-k, top-p, min-p, top-a, typical-p, mirostat, XTC. They are
+///   meaningless under greedy selection, which reads only the maximum.
+///
+/// So when selection is greedy the warpers are not built at all. This is not an
+/// optimization, it is the definition of greedy: `do_sample=False` in
+/// `transformers` likewise never calls `_get_logits_warper`. Models ship
+/// `top_k` / `top_p` in their `generation` defaults and those defaults ride
+/// along on every request, so building them anyway meant a caller asking for
+/// greedy got a truncated distribution, an argmax over it, and no way to tell
+/// from the outside. It also blocked the device argmax, which is only sound
+/// when nothing rewrites the logits first.
+///
+/// `has_custom_sampler` suppresses the greedy shortcut: a custom sampler
+/// replaces the default selection entirely, so it is not necessarily greedy and
+/// must receive the distribution the caller configured.
 pub(crate) fn build_processor_chain(
     options: &GenerateOptions,
     tokenizer: Option<&Tokenizer>,
+    has_custom_sampler: bool,
 ) -> anyhow::Result<ProcessorChain> {
     let mut chain = ProcessorChain::new();
+    let samples = !options.selects_greedily() || has_custom_sampler;
 
     if options.repetition_penalty != 1.0 {
         chain.add(Box::new(RepetitionPenaltyProcessor {
@@ -108,6 +134,10 @@ pub(crate) fn build_processor_chain(
                 )));
             }
         }
+    }
+
+    if !samples {
+        return Ok(chain);
     }
 
     if options.temperature > 0.0 && options.temperature != 1.0 {
@@ -241,7 +271,7 @@ pub(crate) fn device_sampling_plan(
     // reports the processed distribution, which the fast path never forms.
     let greedy = chain.preserves_argmax()
         && options.top_logprobs.is_none()
-        && (options.greedy || options.temperature == 0.0)
+        && options.selects_greedily()
         && !has_custom_sampler
         && greedy_fastpath_supported;
     if greedy {
@@ -249,8 +279,7 @@ pub(crate) fn device_sampling_plan(
     }
     // Keep greedy behavior on its existing argmax path. The sampled path is only
     // for categorical decoding whose processor chain the device sampler supports.
-    let sampled = !options.greedy
-        && options.temperature != 0.0
+    let sampled = !options.selects_greedily()
         && options.top_logprobs.is_none()
         && !has_custom_sampler
         && is_device_portable_chain(chain)
@@ -404,10 +433,17 @@ mod device_portability_tests {
     use super::*;
     use crate::config::GenerateOptions;
 
+    /// A *sampling* request with the given truncation controls.
+    ///
+    /// `GenerateOptions::default()` is greedy (`greedy: true`), so `..Default`
+    /// alone would build no warpers at all now and these device-sampler tests
+    /// would vacuously pass on an empty chain. Every test here that is about
+    /// the sampled path has to say so.
     fn options_with(top_k: usize, top_p: f32) -> GenerateOptions {
         GenerateOptions {
             top_k,
             top_p,
+            greedy: false,
             ..Default::default()
         }
     }
@@ -422,7 +458,7 @@ mod device_portability_tests {
     /// decode-loop tests noticed. This pins it directly.
     #[test]
     fn a_top_k_top_p_chain_is_device_portable() {
-        let chain = build_processor_chain(&options_with(40, 0.95), None)
+        let chain = build_processor_chain(&options_with(40, 0.95), None, false)
             .expect("standard sampling options build a chain");
         assert!(
             chain.names().contains(&"top_k_top_p"),
@@ -444,105 +480,209 @@ mod device_portability_tests {
         }
     }
 
-    fn plan_for(options: &GenerateOptions) -> DeviceSamplingPlan {
-        let chain = build_processor_chain(options, None).expect("options build a chain");
-        device_sampling_plan(&chain, options, false, true, true)
+    /// Every sampling warper a request can carry, all at once, on a *sampling*
+    /// request.
+    fn every_warper() -> GenerateOptions {
+        GenerateOptions {
+            greedy: false,
+            temperature: 0.7,
+            top_k: 64,
+            top_p: 0.95,
+            min_p: 0.05,
+            top_a: 0.2,
+            typical_p: 0.5,
+            mirostat: Some(crate::config::MirostatConfig {
+                tau: 5.0,
+                eta: 0.1,
+                version: crate::config::MirostatVersion::V2,
+            }),
+            xtc: Some(crate::config::XtcConfig {
+                probability: 0.5,
+                threshold: 0.1,
+            }),
+            ..Default::default()
+        }
     }
 
-    /// A greedy request that also carries the model's own `generation` defaults
-    /// must still reach the device argmax.
+    const WARPER_NAMES: &[&str] = &[
+        "temperature",
+        "top_k",
+        "top_p",
+        "top_k_top_p",
+        "min_p",
+        "top_a",
+        "typical_p",
+        "mirostat_v2",
+        "xtc",
+    ];
+
+    /// A greedy request builds no sampling warpers, whatever the model's
+    /// `generation` defaults say.
     ///
-    /// This is the shape almost every chat model presents: `top_k` / `top_p`
-    /// come from the model card and ride along on the request even when the
-    /// caller asked for greedy decoding, plus a stop sequence from the chat
-    /// template. The old `chain.is_empty()` test read that as "sampling is
-    /// configured" and sent the request to the host, so the device argmax --
-    /// implemented, tested, and measured -- was dead for real models while
-    /// passing every test that used bare `GenerateOptions::default()`.
+    /// This is the whole point: greedy means the maximum logit wins, so a
+    /// request that asks for greedy and *also* carries `top_k` / `top_p` /
+    /// `typical_p` (because the model card ships them and they ride along on
+    /// every request) must not have its distribution reshaped on the way to an
+    /// argmax. `transformers` draws the same line -- `do_sample=False` never
+    /// calls `_get_logits_warper`.
     #[test]
-    fn a_greedy_request_carrying_model_sampler_defaults_still_plans_the_device_argmax() {
+    fn a_greedy_request_builds_no_sampling_warpers() {
+        let chain = build_processor_chain(&greedy_options(every_warper()), None, false)
+            .expect("greedy options build a chain");
+        assert!(
+            chain.names().is_empty(),
+            "greedy selection must not reshape the distribution, got {:?}",
+            chain.names()
+        );
+    }
+
+    /// Negative control for the test above.
+    ///
+    /// Without it, a `build_processor_chain` that returned an empty chain for
+    /// *every* request would pass, and sampling would silently become greedy.
+    #[test]
+    fn a_sampling_request_builds_every_warper_it_asked_for() {
+        let chain = build_processor_chain(&every_warper(), None, false)
+            .expect("sampling options build a chain");
+        let names = chain.names();
+        for warper in WARPER_NAMES {
+            if *warper == "top_k" || *warper == "top_p" {
+                // Fused into `top_k_top_p` when both are set, which they are here.
+                continue;
+            }
+            assert!(
+                names.contains(warper),
+                "sampling must keep {warper}, got {names:?}"
+            );
+        }
+    }
+
+    /// The controls that are *not* warpers survive a greedy request, because
+    /// they express what the caller wants generated rather than how to sample.
+    #[test]
+    fn a_greedy_request_keeps_penalties_and_stop_sequences() {
+        let options = greedy_options(GenerateOptions {
+            top_k: 64,
+            top_p: 0.95,
+            repetition_penalty: 1.1,
+            presence_penalty: 0.5,
+            stop_sequences: vec![crate::logits::StopSequence::Text("<|end|>".into())],
+            ..Default::default()
+        });
+        let chain = build_processor_chain(&options, None, false).expect("options build a chain");
+        assert_eq!(
+            chain.names(),
+            vec!["repetition_penalty", "presence_penalty", "stop_sequence"],
+            "only the sampling warpers are dropped under greedy selection"
+        );
+    }
+
+    /// A custom sampler replaces the default selection, so it is not
+    /// necessarily greedy and must still receive the configured distribution
+    /// even when `greedy` is set on the request.
+    #[test]
+    fn a_custom_sampler_keeps_the_warpers_a_greedy_request_would_drop() {
+        let options = greedy_options(every_warper());
+        let chain =
+            build_processor_chain(&options, None, true).expect("custom-sampler chain builds");
+        assert!(
+            chain.names().contains(&"top_k_top_p"),
+            "a custom sampler samples; it needs the distribution, got {:?}",
+            chain.names()
+        );
+    }
+
+    /// `temperature == 0.0` is the other spelling of greedy and must behave
+    /// identically to `greedy: true`.
+    #[test]
+    fn zero_temperature_drops_the_warpers_exactly_like_the_greedy_flag() {
+        let by_flag = build_processor_chain(&greedy_options(every_warper()), None, false)
+            .expect("chain builds")
+            .names()
+            .len();
+        let by_temperature = build_processor_chain(
+            &GenerateOptions {
+                temperature: 0.0,
+                ..every_warper()
+            },
+            None,
+            false,
+        )
+        .expect("chain builds")
+        .names()
+        .len();
+        assert_eq!(by_flag, by_temperature, "both spellings mean greedy");
+    }
+
+    /// The chat-model shape -- greedy plus the model's sampler defaults plus a
+    /// template stop sequence -- reaches the device argmax.
+    ///
+    /// Two independent gates used to close this path. `chain.is_empty()` was
+    /// one: it read a stop sequence as "sampling is configured". The other was
+    /// `PipelineDecodeLoopBackend` never overriding `greedy_fastpath_supported`.
+    #[test]
+    fn a_greedy_chat_request_plans_the_device_argmax() {
         let options = greedy_options(GenerateOptions {
             top_k: 64,
             top_p: 0.95,
             stop_sequences: vec![crate::logits::StopSequence::Text("<|end|>".into())],
             ..Default::default()
         });
-        let chain = build_processor_chain(&options, None).expect("options build a chain");
-        assert!(
-            !chain.is_empty(),
-            "this test is only meaningful with a non-empty chain"
+        let chain = build_processor_chain(&options, None, false).expect("options build a chain");
+        assert_eq!(
+            chain.names(),
+            vec!["stop_sequence"],
+            "the warpers should already be gone"
         );
         assert_eq!(
             device_sampling_plan(&chain, &options, false, true, true),
             DeviceSamplingPlan::Greedy,
-            "truncation and stop-sequence processors cannot move the argmax, got {:?}",
-            chain.names()
+            "the stop-sequence processor never touches logits"
         );
     }
 
-    /// Negative control for the test above: a processor that *can* move the
-    /// argmax must force the host path.
-    ///
-    /// Without this, `preserves_argmax` returning `true` unconditionally would
-    /// pass every other test here while silently changing generated text.
+    /// Negative control: a processor that survives greedy *and* rewrites logits
+    /// must force the host path, because the device argmax reads raw logits.
     #[test]
-    fn a_repetition_penalty_denies_the_device_argmax() {
-        let options = greedy_options(GenerateOptions {
-            top_k: 64,
-            top_p: 0.95,
-            repetition_penalty: 1.1,
-            ..Default::default()
-        });
-        assert_eq!(
-            plan_for(&options),
-            DeviceSamplingPlan::Host,
-            "a per-token logit rewrite changes which token is the maximum"
-        );
-    }
-
-    /// Same control for the truncation processors that keep a *relative*
-    /// threshold but can still discard the maximum.
-    #[test]
-    fn typical_p_and_xtc_deny_the_device_argmax() {
+    fn a_penalty_that_survives_greedy_denies_the_device_argmax() {
         for options in [
             greedy_options(GenerateOptions {
-                typical_p: 0.5,
+                repetition_penalty: 1.1,
                 ..Default::default()
             }),
             greedy_options(GenerateOptions {
-                xtc: Some(crate::config::XtcConfig {
-                    probability: 0.5,
-                    threshold: 0.1,
-                }),
+                presence_penalty: 0.5,
                 ..Default::default()
             }),
         ] {
+            let chain =
+                build_processor_chain(&options, None, false).expect("options build a chain");
+            assert!(!chain.is_empty(), "the penalty must survive greedy");
             assert_eq!(
-                plan_for(&options),
+                device_sampling_plan(&chain, &options, false, true, true),
                 DeviceSamplingPlan::Host,
-                "this processor may mask the top token itself"
+                "a per-token logit rewrite decides the argmax, so it must be applied"
             );
         }
     }
 
-    /// The claim `preserves_argmax` makes about top-k/top-p, checked against the
-    /// processor rather than assumed from its name.
+    /// Dropping the warpers must not change which token greedy selects. Checked
+    /// against the processors themselves rather than argued from their names.
     #[test]
-    fn top_k_top_p_leaves_the_argmax_where_it_was() {
-        let chain = build_processor_chain(&options_with(4, 0.5), None)
-            .expect("standard sampling options build a chain");
+    fn dropping_the_truncation_warpers_does_not_move_the_greedy_token() {
         let raw: Vec<f32> = vec![0.5, -3.0, 9.25, 1.0, 8.5, -1.0, 2.0, 0.0];
-        let expected = crate::sampling::sample_greedy(&raw);
+        let sampling_chain = build_processor_chain(&options_with(4, 0.5), None, false)
+            .expect("sampling options build a chain");
         let mut processed = raw.clone();
-        chain.process(&mut processed, &ProcessorContext::default());
+        sampling_chain.process(&mut processed, &ProcessorContext::default());
         assert_ne!(
             processed, raw,
-            "this test is only meaningful if the chain actually rewrote logits"
+            "this test is only meaningful if the warpers actually rewrote logits"
         );
         assert_eq!(
             crate::sampling::sample_greedy(&processed),
-            expected,
-            "truncation must not move the maximum"
+            crate::sampling::sample_greedy(&raw),
+            "top-k/top-p mask relative to the maximum, so the maximum survives"
         );
     }
 
@@ -550,8 +690,8 @@ mod device_portability_tests {
     #[test]
     fn top_k_alone_and_top_p_alone_stay_device_portable() {
         for (top_k, top_p, expected) in [(40usize, 1.0f32, "top_k"), (0, 0.95, "top_p")] {
-            let chain =
-                build_processor_chain(&options_with(top_k, top_p), None).expect("chain builds");
+            let chain = build_processor_chain(&options_with(top_k, top_p), None, false)
+                .expect("chain builds");
             assert!(
                 chain.names().contains(&expected),
                 "expected {expected}, got {:?}",
@@ -572,7 +712,7 @@ mod device_sampling_plan_tests {
     use crate::config::GenerateOptions;
 
     fn empty_chain() -> ProcessorChain {
-        build_processor_chain(&GenerateOptions::default(), None).expect("empty chain builds")
+        build_processor_chain(&GenerateOptions::default(), None, false).expect("empty chain builds")
     }
 
     fn history_chain() -> ProcessorChain {
@@ -580,7 +720,7 @@ mod device_sampling_plan_tests {
             repetition_penalty: 1.2,
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None).expect("penalty chain builds");
+        let chain = build_processor_chain(&options, None, false).expect("penalty chain builds");
         assert!(!chain.is_empty(), "repetition penalty must add a processor");
         assert!(
             !is_device_portable_chain(&chain),
