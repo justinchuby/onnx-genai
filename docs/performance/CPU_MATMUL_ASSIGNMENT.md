@@ -790,7 +790,7 @@ Native-alone (`ab.py --native-only --null-control`, 7 x 30, medians, latest `mai
 | `Gemm`, **default** | `dram_8192` | 134.2 MB | 16 | 3.278 ms | 1.913 ms | 1.71x |
 
 **15 of 15** `MatMul` cells win by 1.13x-2.61x above their null control; **13 of 15** `Gemm` cells by
-1.25x-2.21x. The four unclaimed cells are all t=32 with nulls of 16-49%, i.e. unusable controls
+1.25x-2.21x. The two unclaimed cells are both t=32, with nulls of 22.7% and 48.7% — unusable controls
 rather than small effects.
 
 `dram_8192` is the only cell whose weight really comes from DRAM, so it is the only one the DRAM
