@@ -418,19 +418,19 @@ pub(super) fn kernel_input_uses_physical_capacity(node: &Node, input_index: usiz
     // attention mask (input 3) instead of the growing cache extent. This mirrors
     // the GQA treatment and is what lets the decode step bind the KV cache at a
     // fixed capacity so whole-step CUDA-graph capture stays shape-static. Gated
-    // to the mask-driven, non-causal form (a present mask input and no
-    // `is_causal` attribute): that path derives length from the mask frontier,
-    // so the cache extent is pure capacity. Causal-attribute or mask-less
-    // Attention still reads the cache extent as the valid length.
+    // only on a present mask input (input 3): the standard additive causal-mask
+    // builder (`Where(And(attention_mask, causal), 0, -inf)`) is frozen to
+    // physical capacity alongside the KV, and its last-row frontier is the true
+    // valid length in BOTH the causal and non-causal form — at the last query
+    // row the causal frontier and the padding frontier coincide. The CUDA
+    // `Attention` kernel derives both the score-loop extent AND the causal offset
+    // from that on-device length (`standard_attention.rs`, `dev_len`), so the
+    // cache extent is pure capacity regardless of the op's `is_causal` attribute.
+    // A mask-less `Attention` still reads the cache extent as the valid length.
     node.is_default_domain()
         && node.op_type == "Attention"
         && matches!(input_index, 4 | 5)
         && node.inputs.get(3).is_some_and(Option::is_some)
-        && node
-            .attr("is_causal")
-            .and_then(|attr| attr.as_int())
-            .unwrap_or(0)
-            == 0
         || (
             // `pkg.nxrt::IndexShare` mirrors the mask-driven Attention treatment.
             // Its capacity form emits the 3-output present that ALIASES the
@@ -486,21 +486,21 @@ pub(super) fn is_additive_mask_builder_op(node: &Node) -> bool {
 
 /// Whether `node`/`input_index` is the additive-mask input (input 3) of a
 /// capacity-form `Attention`: a default-domain `Attention` whose KV cache
-/// (inputs 4/5) is already bound at physical capacity — i.e. a present mask and
-/// no `is_causal` attribute, so it derives the valid length from the mask
-/// frontier (see [`kernel_input_uses_physical_capacity`]). Such a node is
-/// *designed* to consume a physical-width additive mask, so it is a valid leaf
-/// for the frozen-mask (padded-capacity) classification.
+/// (inputs 4/5) is already bound at physical capacity — i.e. a present mask so
+/// it derives the valid length from the mask frontier (see
+/// [`kernel_input_uses_physical_capacity`]), in either the causal or non-causal
+/// form. Such a node is *designed* to consume a physical-width additive mask, so
+/// it is a valid leaf for the frozen-mask (padded-capacity) classification.
 ///
 /// The KV cache inputs (`past_key` = input 4, `past_value` = input 5) must both
 /// actually exist: `kernel_input_uses_physical_capacity` gates only on the mask
-/// (input 3) presence and `is_causal == 0`, but the CUDA `Attention` kernel's
-/// fixed-capacity append contract requires both past caches bound at physical
-/// capacity (`standard_attention.rs`: `has_past_key`/`has_past_value` on inputs
-/// 4/5, and `fixed_capacity_append` compares their capacity to the mask key
-/// width). A masked, non-causal `Attention` with only q/k/v/mask and no KV
-/// binding is NOT a capacity-form leaf, so require both KV inputs here rather
-/// than blessing any masked non-causal `Attention` as a valid cone terminus.
+/// (input 3) presence, but the CUDA `Attention` kernel's fixed-capacity append
+/// contract requires both past caches bound at physical capacity
+/// (`standard_attention.rs`: `has_past_key`/`has_past_value` on inputs 4/5, and
+/// `fixed_capacity_append` compares their capacity to the mask key width). A
+/// masked `Attention` with only q/k/v/mask and no KV binding is NOT a
+/// capacity-form leaf, so require both KV inputs here rather than blessing any
+/// masked `Attention` as a valid cone terminus.
 pub(super) fn is_capacity_form_attention_mask_input(node: &Node, input_index: usize) -> bool {
     input_index == 3
         && node.is_default_domain()

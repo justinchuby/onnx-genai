@@ -2008,8 +2008,8 @@ fn only_capacity_aware_inputs_keep_physical_capacity() {
 }
 
 // A capacity-form default-domain `Attention`: mask at input 3, KV cache at
-// inputs 4/5, no `is_causal` attribute — so it derives the valid length from the
-// mask frontier and binds the KV cache at physical capacity.
+// inputs 4/5 — so it derives the valid length from the mask frontier and binds
+// the KV cache at physical capacity, in either the causal or non-causal form.
 fn capacity_form_attention(id: u32, q: ValueId, mask: ValueId, out: ValueId) -> Node {
     Node::new(
         NodeId(id),
@@ -2022,8 +2022,9 @@ fn capacity_form_attention(id: u32, q: ValueId, mask: ValueId, out: ValueId) -> 
 #[test]
 fn capacity_form_attention_mask_input_classifier() {
     // The mask slot (input 3) of a capacity-form `Attention` is a valid frozen-mask
-    // leaf; input 3 of a causal-attribute `Attention` (which reads the cache extent
-    // as the valid length) is not, and neither is a non-mask slot.
+    // leaf in both the non-causal and causal form (the frozen additive mask carries
+    // the valid length on-device either way); a non-mask slot is not, and neither is
+    // a masked `Attention` that lacks the KV cache bindings.
     let q = ValueId(0);
     let capacity = capacity_form_attention(0, q, q, q);
     assert!(is_capacity_form_attention_mask_input(&capacity, 3));
@@ -2035,9 +2036,20 @@ fn capacity_form_attention_mask_input_classifier() {
         .attributes
         .insert("is_causal".into(), Attribute::Int(1));
     assert!(
-        !is_capacity_form_attention_mask_input(&causal, 3),
-        "an is_causal Attention reads the cache extent as valid length, not the mask frontier"
+        is_capacity_form_attention_mask_input(&causal, 3),
+        "a frozen causal additive mask carries the valid length at its last-row frontier, \
+         so the causal capacity-form Attention is a valid frozen-mask leaf"
     );
+
+    // A masked `Attention` with no past KV bindings (inputs 4/5 absent) is not a
+    // capacity-form leaf regardless of causality.
+    let mask_only = Node::new(
+        NodeId(2),
+        "Attention",
+        vec![Some(q), Some(q), Some(q), Some(q)],
+        vec![q],
+    );
+    assert!(!is_capacity_form_attention_mask_input(&mask_only, 3));
 }
 
 // Build the standard additive causal-mask builder cone feeding a capacity-form
@@ -2203,26 +2215,20 @@ fn glm_indexer_add_mask_keeps_logical_width() {
 #[test]
 fn mask_builder_without_capacity_attention_is_rejected() {
     use onnx_runtime_ir::static_shape;
-    // A mask cone that ends at an is_causal Attention (reads cache extent as valid
-    // length), or reaches no Attention at all, must not be classified padded-safe.
+    // A mask cone that reaches no `Attention` at all (only a Cast to a graph
+    // output) must not be classified padded-safe: there is no capacity-form
+    // consumer, so the mask keeps exposing its logical valid length.
     let mut graph = Graph::new();
     graph.opset_imports.insert(String::new(), 17);
     let sh = || static_shape([1]);
     let mask = graph.create_named_value("attention_mask", DataType::Int64, sh());
     graph.add_input(mask);
-    let q = graph.create_named_value("q", DataType::Float32, sh());
     let cast = graph.create_named_value("cast", DataType::Float32, sh());
     graph.insert_node(Node::new(NodeId(0), "Cast", vec![Some(mask)], vec![cast]));
-    let attn = graph.create_named_value("attn", DataType::Float32, sh());
-    let mut causal = capacity_form_attention(1, q, cast, attn);
-    causal
-        .attributes
-        .insert("is_causal".into(), Attribute::Int(1));
-    graph.insert_node(causal);
-    graph.add_output(attn);
+    graph.add_output(cast);
     assert!(
         !mask_binding_feeds_capacity_form_attention(&graph, mask),
-        "an is_causal terminal Attention is not a capacity-form mask consumer"
+        "a mask cone reaching no capacity-form Attention is not padded-safe"
     );
 }
 
@@ -6501,9 +6507,11 @@ fn gqa_fixed_capacity_kv_seq_symbol_is_pinned_and_admits_the_node() {
 // attention op does NOT read its cache as physical capacity — must NOT be pinned,
 // so its symbol stays disqualifying and the node stays eager.
 //
-// (1) A default-domain, CAUSAL `Attention` derives past length from the growing
-//     cache extent (not from a mask frontier), so its cache is not physical
-//     capacity: not pinned.
+// (1) A default-domain CAUSAL `Attention` with NO mask input (input 3 absent)
+//     derives past length from the growing cache extent (there is no mask
+//     frontier to read), so its cache is not physical capacity: not pinned.
+//     (A causal Attention WITH a frozen additive mask input IS a capacity form —
+//     covered by the classifier tests above.)
 // (2) `CompressedSparseAttention` has NO past-KV inputs (its records grow from
 //     total_sequence_length), so it cannot be a capacity form: not pinned.
 #[test]
