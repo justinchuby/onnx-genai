@@ -2714,54 +2714,54 @@ fn widened_sgemm_beats_half_gemm(
     }
 }
 
-/// Attempt the dedicated portable half GEMM path. Both operands must be
-/// contiguous and have the same `Float16` or `BFloat16` dtype. The operands stay
-/// in 16-bit storage until cache-panel packing, accumulation is always `f32`,
-/// and the caller narrows once into the requested output dtype.
-///
-/// Declines for a large-`M` `f16` GEMM, where widening to `f32` and using the
-/// tuned SGEMM is measurably faster -- see [`widened_sgemm_beats_half_gemm`].
-/// Every caller already falls through to that widened path.
-/// Minimum `B` size, in **elements** (`K * N`), before an `M == 1` decode
-/// gives up the GEMV and lets the fused widen-pack GEBP serve it.
-///
-/// Far above [`HALF_PREFILL_GEBP_MIN_WEIGHT`], and deliberately so. The GEMV
-/// reads the weight once and packs nothing, which is the least traffic any
-/// route can issue; the packing only wins once the weight is so much larger
-/// than any cache that the GEMV's stripe parallelism, not its traffic, is the
-/// limit -- `n / STRIPE` workers, each walking the whole `k` in strided
-/// visits. Measured on 32 vCPU / 16 AVX2 cores, `M == 1`, steady p50 of 7-9
-/// interleaved repetitions (a shared host, so the minimum of the same samples
-/// is given where the two disagree):
-///
-/// | `K x N` | elements | GEMV | fused GEBP |
-/// |---|---|---|---|
-/// | f16 4096x1024 | 4.2M | **0.39 ms** | 0.59 ms |
-/// | bf16 4096x2048 | 8.4M | **0.86 ms** | 0.71 ms (min 0.59 vs 0.51) |
-/// | f16 4096x4096 | 16.8M | 1.13 ms | **1.06 ms** |
-/// | f16 4096x8192 | 33.6M | 1.92 ms | 1.91 ms |
-/// | bf16 4096x8192 | 33.6M | 1.87 ms | 2.01 ms |
-/// | f16 4096x11008 | 45.1M | 2.47 ms | **2.46 ms** (min 2.30 vs 2.16) |
-/// | bf16 4096x11008 | 45.1M | 3.32 ms | **2.45 ms** |
-/// | f16 896x151936 | 136M | 6.94 ms | **5.84 ms** |
-/// | bf16 896x151936 | 136M | 6.61 ms | **5.56 ms** |
-///
-/// `1 << 25` is the *wash*, not the win. Below it the GEMV is at worst a wash:
-/// it wins outright only at 4.2M, and at 8.4M-16.8M the median actually
-/// favours the GEBP by ~6% while the minimum of the same samples favours the
-/// GEMV -- a disagreement between the two statistics is exactly what an
-/// unresolvable difference looks like on a shared host, so those shapes are
-/// tie-broken onto the GEMV because it is the route that allocates nothing.
-/// At 33.6M the two are within run-to-run noise in both formats by both
-/// statistics, and above it the GEBP pulls 6%-26% ahead by both. Placing the
-/// threshold at the wash rather than at the first clear win means no shape is
-/// left on the slower route, and no shape is moved onto the allocating one for
-/// a gain that could not be measured.
-#[cfg(target_arch = "x86_64")]
-const HALF_DECODE_GEBP_MIN_WEIGHT: usize = 1 << 25;
-
 /// Whether an `M == 1` decode should skip the GEMV and let the fused
-/// widen-pack GEBP serve it -- see [`HALF_DECODE_GEBP_MIN_WEIGHT`].
+/// widen-pack GEBP serve it.
+///
+/// The GEMV reads the weight once in `[K, N]` order and packs nothing, which
+/// is the least traffic any route can issue. That is decisive only while the
+/// GEBP is unavailable: the moment the GEBP will accept the weight at all it
+/// is also the faster decode, because its packed panel is read linearly by
+/// every worker while the GEMV walks `k` in strided visits with only
+/// `n / STRIPE` workers. The two thresholds are therefore **one** threshold --
+/// [`HALF_PREFILL_GEBP_MIN_WEIGHT`] -- and decode takes the GEMV exactly when
+/// the GEBP declines.
+///
+/// Measured on 32 vCPU / 16 AVX2 core AMD EPYC 9V74, `M == 1`, through the
+/// production kernel (`bench half_decode_gemv_ab`, arms selected by
+/// `ONNX_GENAI_CPU_MM_HALF_GEMV/GEBP`), median of the per-run steady p50 over
+/// 5 interleaved repetitions. `ratio` is `GEMV / GEBP`, so > 1 means the GEBP
+/// is faster; `ratio/ctl` divides out the `f32` control row of the same runs,
+/// which no arm here can move:
+///
+/// | `K x N` | elements | f16 ratio | f16 /ctl | bf16 ratio | bf16 /ctl |
+/// |---|---:|---:|---:|---:|---:|
+/// | 1024x768 | 0.79M | 0.39 | 0.40 | 0.36 | 0.37 |
+/// | **1024x1024** | **1.05M** | **1.77** | **1.97** | **1.93** | **2.14** |
+/// | 2048x1024 | 2.10M | 1.24 | 1.18 | 1.52 | 1.45 |
+/// | 1024x2048 | 2.10M | 1.69 | 1.75 | 1.93 | 1.99 |
+/// | 512x4096 | 2.10M | 2.17 | 2.27 | 2.13 | 2.23 |
+/// | 2048x2048 | 4.19M | 1.67 | 1.78 | 1.27 | 1.35 |
+/// | 4096x1024 | 4.19M | 0.89 | 0.98 | 1.34 | 1.47 |
+/// | 2048x4096 | 8.39M | 0.91 | 1.01 | 1.82 | 2.02 |
+/// | 4096x2048 | 8.39M | 1.19 | 1.25 | 1.38 | 1.45 |
+/// | 4096x4096 | 16.8M | 1.15 | 1.19 | 1.20 | 1.24 |
+/// | 4096x8192 | 33.6M | 0.94 | 1.00 | 1.00 | 1.06 |
+/// | 4096x11008 | 45.1M | 1.18 | 1.18 | 1.26 | 1.26 |
+/// | 896x151936 | 136M | 1.26 | 1.26 | 1.37 | 1.37 |
+///
+/// The 0.79M row is the GEMV's whole remaining job: there the GEBP declines on
+/// [`HALF_PREFILL_GEBP_MIN_WEIGHT`] and the column is really the row-blocked
+/// GEMM, which the GEMV beats 2.5x. One row above it -- 1024x1024, the
+/// smallest weight the GEBP accepts -- the ranking has already inverted, by
+/// 2.0x and 2.1x. Nothing at or above that weight favours the GEMV once the
+/// control is divided out: the three sub-1.00 raw ratios (0.89, 0.91, 0.94)
+/// all sit inside their own control's drift and correct to 0.98-1.01.
+///
+/// An earlier revision of this work put the handover at `1 << 25` on the
+/// strength of a `k = 4096`-only sweep. Re-measured on current `main` across
+/// both axes that threshold left every shape from 1.05M to 33.6M on the slower
+/// route -- up to 2.1x slower for `bf16` at 2048x2048 -- so it was retired
+/// rather than kept.
 ///
 /// Mirrors [`half_gemm_tile`]'s precedence: if the AVX-512 BF16 kernel would
 /// claim the call, or the GEBP is switched off, this must not divert a decode
@@ -2805,7 +2805,7 @@ fn half_decode_prefers_gebp_when(
     if format == HalfFormat::Bf16 && x86_bf16::native_available() {
         return false;
     }
-    gebp_enabled && k.saturating_mul(n) >= HALF_DECODE_GEBP_MIN_WEIGHT
+    gebp_enabled && k.saturating_mul(n) >= HALF_PREFILL_GEBP_MIN_WEIGHT
 }
 
 /// Whether the `M == 1` decode GEMV is used. On by default;
@@ -2844,6 +2844,14 @@ fn half_storage_format(
     }
 }
 
+/// Attempt the dedicated portable half GEMM path. Both operands must be
+/// contiguous and have the same `Float16` or `BFloat16` dtype. The operands stay
+/// in 16-bit storage until cache-panel packing, accumulation is always `f32`,
+/// and the caller narrows once into the requested output dtype.
+///
+/// Declines for a large-`M` `f16` GEMM, where widening to `f32` and using the
+/// tuned SGEMM is measurably faster -- see [`widened_sgemm_beats_half_gemm`].
+/// Every caller already falls through to that widened path.
 fn try_matmul_half(
     a: &TensorView,
     b: &TensorView,
@@ -3021,6 +3029,15 @@ fn half_gemm_tile(
 /// of `B` is repaid — which is why the gate is on the *weight* size and not on
 /// `m * k * n`.
 ///
+/// The rule is therefore **weight-only**: every `m`, both formats, once
+/// `k * n` clears [`HALF_PREFILL_GEBP_MIN_WEIGHT`]. `m >= 2` is settled by
+/// that constant's own sweep; `m == 1` by the decode sweep in
+/// [`half_decode_prefers_gebp`], which found the GEMV/GEBP crossover at the
+/// *same* weight -- 1024x1024, the smallest weight this gate accepts, is
+/// already 2.0x (`f16`) and 2.1x (`bf16`) in the GEBP's favour at `m == 1`.
+/// `format` and `m` are taken only so the signature still documents what the
+/// decision is about and so a future format- or row-dependent term has a home.
+///
 /// Requires AVX2 + FMA because it reuses the f32 microkernel.
 #[cfg(target_arch = "x86_64")]
 fn half_prefill_gebp_selected(format: HalfFormat, m: usize, k: usize, n: usize) -> bool {
@@ -3030,34 +3047,9 @@ fn half_prefill_gebp_selected(format: HalfFormat, m: usize, k: usize, n: usize) 
     if k.saturating_mul(n) < HALF_PREFILL_GEBP_MIN_WEIGHT {
         return false;
     }
-    // `m == 1` reaches here two ways. A `bf16` tile that never sees the decode
-    // GEMV -- batched, or a host without the GEMV's features -- would
-    // otherwise pay a full widen-pack of `B` on the blocked kernel for one
-    // row. And either format, once the weight clears
-    // `HALF_DECODE_GEBP_MIN_WEIGHT`, is deliberately routed here *by*
-    // `half_decode_prefers_gebp` declining the GEMV, so this gate must accept
-    // it or that decode would land on the blocked kernel instead.
-    m >= HALF_PREFILL_GEBP_MIN_ROWS
-        || format == HalfFormat::Bf16
-        || k.saturating_mul(n) >= HALF_DECODE_GEBP_MIN_WEIGHT
+    let _ = (format, m);
+    true
 }
-
-/// Minimum `M` at which the fused widen-pack GEBP replaces the blocked half
-/// GEMM (`bf16` also takes it at `m == 1`; see
-/// [`half_prefill_gebp_selected`]).
-///
-/// Every `m >= 2` wins once the weight clears
-/// [`HALF_PREFILL_GEBP_MIN_WEIGHT`], so this is categorical rather than a
-/// tuned crossover, and carries no machine-specific assumption.
-///
-/// `M = 1` is not a row-count decision at all: contiguous 2-D decode is
-/// intercepted upstream by the 16-bit GEMV, and only comes here when
-/// [`HALF_DECODE_GEBP_MIN_WEIGHT`] says the weight is large enough that the
-/// packing wins, or when the tile could never reach that GEMV in the first
-/// place (batched, or a `bf16` host without it). Both of those are spelled out
-/// in [`half_prefill_gebp_selected`] rather than folded into this constant.
-#[cfg(target_arch = "x86_64")]
-const HALF_PREFILL_GEBP_MIN_ROWS: usize = 2;
 
 /// Minimum `B` size, in **elements** (`K * N`), before the fused widen-pack
 /// GEBP is used.
@@ -5546,7 +5538,7 @@ mod tests {
         for format in [HalfFormat::F16, HalfFormat::Bf16] {
             for (k, n) in [(4096usize, 8192usize), (4096, 11008), (896, 151936)] {
                 assert!(
-                    k * n >= HALF_DECODE_GEBP_MIN_WEIGHT,
+                    k * n >= HALF_PREFILL_GEBP_MIN_WEIGHT,
                     "the shape must clear the decode threshold to be a test"
                 );
                 assert!(
@@ -5573,29 +5565,76 @@ mod tests {
         ));
     }
 
-    /// The decode threshold is where the measurement put it.
+    /// The decode threshold is where the measurement put it: at the weight
+    /// gate, not above it.
     ///
     /// A regression here is a silent performance change, so the boundary is
-    /// pinned rather than left to the constant's definition.
+    /// pinned by shape rather than left to the constant's definition. The pair
+    /// straddles [`HALF_PREFILL_GEBP_MIN_WEIGHT`] exactly -- 1024x768 is the
+    /// largest shape below it and 1024x1024 is the smallest at it -- which is
+    /// also where the measured GEMV/GEBP ranking inverts (0.40x below, 1.97x
+    /// at, `f16`; 0.37x and 2.14x for `bf16`).
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn the_decode_threshold_sits_at_the_measured_wash() {
+    fn the_decode_threshold_sits_at_the_weight_gate() {
         if !crate::backend::has_simd_x86() || x86_bf16::native_available() {
             return;
         }
-        let k = 4096;
         for format in [HalfFormat::F16, HalfFormat::Bf16] {
-            // 4096x4096 = 16.8M elements: the GEMV is within noise and keeps it.
+            // 1024x768 = 0.79M: under the gate, so the GEBP would decline and
+            // the alternative is the blocked GEMM. The GEMV keeps it.
             assert!(
-                !half_decode_prefers_gebp(format, k, 4096),
-                "{format:?}: a 16.8M weight must stay on the GEMV"
+                !half_decode_prefers_gebp(format, 1024, 768),
+                "{format:?}: a 0.79M weight must stay on the GEMV"
             );
-            // 4096x8192 = 33.6M elements: the measured wash, and the first
-            // size handed over.
+            // 1024x1024 = 1.05M: the first weight the GEBP accepts, and
+            // already 2.0x-2.1x ahead of the GEMV at M = 1.
             assert!(
-                half_decode_prefers_gebp(format, k, 8192),
-                "{format:?}: a 33.6M weight must go to the fused GEBP"
+                half_decode_prefers_gebp(format, 1024, 1024),
+                "{format:?}: a 1.05M weight must go to the fused GEBP"
             );
+            // ...and every larger shape stays handed over.
+            for (k, n) in [(2048usize, 2048usize), (4096, 4096), (896, 151936)] {
+                assert!(
+                    half_decode_prefers_gebp(format, k, n),
+                    "{format:?} {k}x{n}: above the gate the GEBP must keep it"
+                );
+            }
+        }
+    }
+
+    /// The decode handover and the GEBP's own acceptance are the same
+    /// predicate, not two that happen to agree today.
+    ///
+    /// They are read from different call sites, so a future edit that moves
+    /// one without the other would silently drop decode onto the row-blocked
+    /// GEMM (the failure `no_decode_is_handed_to_the_blocked_gemm` catches) or
+    /// strand it on the GEMV past the crossover. Asserted across the gate in
+    /// both directions rather than at a single point.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn the_decode_handover_tracks_the_gebp_weight_gate() {
+        if !crate::backend::has_simd_x86() || x86_bf16::native_available() {
+            return;
+        }
+        for format in [HalfFormat::F16, HalfFormat::Bf16] {
+            for (k, n) in [
+                (256usize, 256usize),
+                (512, 512),
+                (1024, 768),
+                (1024, 1024),
+                (1024, 2048),
+                (2048, 2048),
+                (4096, 8192),
+                (896, 151936),
+            ] {
+                assert_eq!(
+                    half_decode_prefers_gebp(format, k, n),
+                    half_prefill_gebp_selected(format, 1, k, n),
+                    "{format:?} {k}x{n}: the decode handover and the GEBP's \
+                     acceptance disagree"
+                );
+            }
         }
     }
 
@@ -5662,12 +5701,28 @@ mod tests {
         }
     }
 
-    /// `f16` decode keeps its bandwidth-optimal GEMV: the fused route is a wash
-    /// there and decode numerics must not move.
+    /// `f16` decode at the weight gate takes the fused GEBP, and its numbers
+    /// still agree with the GEMV's.
+    ///
+    /// This shape (1024x1024, the smallest weight the GEBP accepts) used to be
+    /// asserted the other way, on the belief that the fused route was a wash
+    /// at `M = 1` for `f16`. Re-measured through the production kernel it is
+    /// not a wash: the GEBP is 1.77x ahead raw and 1.97x after dividing out
+    /// the `f32` control (`bench half_decode_gemv_ab`, median of 5 interleaved
+    /// steady p50s) -- see [`half_decode_prefers_gebp`]. So the assertion is
+    /// inverted rather than deleted, and the numerics it was protecting are
+    /// checked directly instead of by proxy.
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn f16_decode_does_not_take_the_prefill_gebp() {
+    fn f16_decode_at_the_weight_gate_takes_the_prefill_gebp() {
+        if !crate::backend::has_simd_x86() {
+            return;
+        }
         let (k, n) = (1024usize, 1024usize);
+        assert!(
+            k * n >= HALF_PREFILL_GEBP_MIN_WEIGHT,
+            "the shape must be at or above the gate to be this test"
+        );
         let a_data: Vec<f32> = (0..k).map(|i| ((i % 17) as f32 - 8.0) / 16.0).collect();
         let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 19) as f32 - 9.0) / 16.0).collect();
 
@@ -5682,9 +5737,20 @@ mod tests {
             .unwrap();
         assert_eq!(
             half_prefill_gebp_calls(),
-            0,
-            "f16 M=1 decode must stay on the GEMV"
+            1,
+            "f16 M=1 decode at the weight gate must take the fused GEBP"
         );
+
+        // The route moved, so the numbers are checked rather than assumed.
+        // Multiples of 1/16 are exact in f16, so the only rounding either
+        // route can introduce is its own accumulation order.
+        let want = naive_matmul(&a_data, &b_data, 1, k, n);
+        for (index, (g, w)) in out.to_f32().iter().zip(&want).enumerate() {
+            assert!(
+                (g - w).abs() <= 2e-2 * (1.0 + w.abs()),
+                "column {index}: {g} != {w}"
+            );
+        }
     }
 
     #[test]

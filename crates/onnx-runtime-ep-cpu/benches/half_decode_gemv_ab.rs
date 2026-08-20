@@ -16,7 +16,7 @@
 //!
 //! Note that **neither** single-knob arm is the default: with no environment
 //! set, the shipped routing picks per shape -- GEMV below
-//! `HALF_DECODE_GEBP_MIN_WEIGHT`, fused GEBP at or above it -- so an unset run
+//! `HALF_PREFILL_GEBP_MIN_WEIGHT`, fused GEBP at or above it -- so an unset run
 //! is a fourth, *shipped* arm that agrees with the GEMV column on small
 //! weights and with the GEBP column on large ones. The output digest is what
 //! says which one it took.
@@ -116,6 +116,24 @@ fn main() {
         // A `k = 4096` column sweep across the GEMV/GEBP crossover: 4.2M,
         // 8.4M, 16.8M, 33.6M and 45.1M weight elements.
         Ok("cross") => vec![("w17M", 4096, 4096), ("w34M", 4096, 8192)],
+        Ok("low") => vec![
+            ("k1024n768", 1024, 768),
+            ("k1024n1024", 1024, 1024),
+            ("k1024n2048", 1024, 2048),
+            ("k2048n1024", 2048, 1024),
+            ("k512n4096", 512, 4096),
+        ],
+        Ok("full") => vec![
+            ("k1024n768", 1024, 768),
+            ("k2048n2048", 2048, 2048),
+            ("k4096n1024", 4096, 1024),
+            ("k2048n4096", 2048, 4096),
+            ("k4096n2048", 4096, 2048),
+            ("k4096n4096", 4096, 4096),
+            ("k4096n8192", 4096, 8192),
+            ("k4096n11008", 4096, 11008),
+            ("k896n151936", 896, 151936),
+        ],
         Ok("sweep") => vec![
             ("w4M", 4096, 1024),
             ("w8M", 4096, 2048),
