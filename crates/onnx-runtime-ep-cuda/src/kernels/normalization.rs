@@ -4706,8 +4706,6 @@ mod tests {
             "tree mean-square error {tree_err:e} exceeds serial error {serial_err:e}"
         );
     }
-
-
 }
 
 #[cfg(test)]
