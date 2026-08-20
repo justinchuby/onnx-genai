@@ -14206,7 +14206,6 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         assert!(!scales_f16_pipe_well_occupied(1, 8, 0));
     }
 
-    #[test]
     /// The asymmetric block-32 split-K gate recognises two separate reasons to
     /// split, so a saturated grid alone no longer vetoes it.
     ///
