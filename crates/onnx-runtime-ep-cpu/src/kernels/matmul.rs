@@ -2740,7 +2740,7 @@ fn widened_sgemm_beats_half_gemm(
 /// field without a rebuild, and so the A/B bench can measure both arms of the
 /// shipped binary. Read once and cached, like `half_prefill_gebp_enabled`.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn half_decode_gemv_enabled() -> bool {
+pub(crate) fn half_decode_gemv_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("ONNX_GENAI_CPU_MM_HALF_GEMV")
@@ -2758,7 +2758,7 @@ fn half_decode_gemv_enabled() -> bool {
 /// Mixed and non-16-bit pairs return `None`: every kernel behind this reads
 /// both operands as raw `u16` and widens them the same way, so a mismatch
 /// would silently reinterpret one of them.
-fn half_storage_format(
+pub(crate) fn half_storage_format(
     a: onnx_runtime_ir::DataType,
     b: onnx_runtime_ir::DataType,
 ) -> Option<HalfFormat> {
