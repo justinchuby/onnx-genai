@@ -5979,6 +5979,134 @@ fn dispatch_grid_cases() -> Vec<MatmulFamilyCase> {
     ]
 }
 
+/// Whether `NXRT_MM_BENCH_CASE` selects this case.
+///
+/// Exact when the filter names a case, substring otherwise, so `grid_relu` picks
+/// a family while `grid_relu_1_tiny` picks one case. `filter_names_a_case` is
+/// computed once over the whole case list by the caller.
+///
+/// This is a free function rather than an inline condition so that
+/// `case_selectors_do_not_match_a_neighbour` tests the rule the benchmark
+/// actually uses instead of a copy of it.
+fn case_selected(name: &str, filter: &str, filter_names_a_case: bool) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    if filter_names_a_case {
+        name == filter
+    } else {
+        name.contains(filter)
+    }
+}
+
+/// A case selector must name one case, not two.
+///
+/// `grid_relu_1_tiny` is a substring of `grid_relu_1_tiny_dyn`, and
+/// `grid_relu_10_tiny` of `grid_relu_10_tiny_dyn`, so under the old plain
+/// `contains` filter those selectors each ran **two** `Run`s per iteration while
+/// `grid_relu_100_tiny` — which has no `_dyn` sibling — ran one. Deterministic
+/// per-`Run` counts taken that way were 2x inflated at some depths and correct at
+/// others, which is exactly the shape that makes an error survive review: the
+/// figures stayed perfectly linear in iterations, so they looked high-confidence.
+/// Three published measurements in #1077 had to be withdrawn.
+///
+/// This pins the property that matters — *selecting a case by its own name
+/// selects that case alone* — rather than the absence of substring pairs, which
+/// would forbid perfectly reasonable names like `..._dyn`.
+///
+#[test]
+fn case_selectors_do_not_match_a_neighbour() {
+    let cases: Vec<MatmulFamilyCase> = matmul_bench_cases()
+        .into_iter()
+        .chain(unary_bench_cases())
+        .chain(dispatch_grid_cases())
+        .collect();
+    let names: Vec<&str> = cases.iter().map(|c| c.name).collect();
+    let names_slice = names.as_slice();
+
+    assert!(
+        !names.is_empty(),
+        "no cases: this test would pass vacuously"
+    );
+    {
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(before, sorted.len(), "duplicate case names: {names:?}");
+    }
+
+    let select = |filter: &str| -> Vec<&str> {
+        let exact = names_slice.contains(&filter);
+        names
+            .iter()
+            .copied()
+            .filter(|n| case_selected(n, filter, exact))
+            .collect()
+    };
+
+    for name in &names {
+        assert_eq!(
+            select(name),
+            vec![*name],
+            "selector `{name}` must run exactly that case"
+        );
+    }
+
+    // The hazard is real and still present in the names, so the exact rule above
+    // is load-bearing rather than decorative. If these pairs ever disappear this
+    // assertion should be updated, not deleted -- it is what proves the rule is
+    // doing work.
+    let overlapping: Vec<(&str, &str)> = names
+        .iter()
+        .flat_map(|a| {
+            names
+                .iter()
+                .filter(move |b| *b != a && b.contains(*a))
+                .map(move |b| (*a, *b))
+        })
+        .collect();
+    assert!(
+        overlapping
+            .iter()
+            .any(|(a, b)| *a == "grid_relu_1_tiny" && *b == "grid_relu_1_tiny_dyn"),
+        "expected the known overlapping pair to still exist; found {overlapping:?}"
+    );
+
+    // This test builds the `NXRT_MM_BENCH_GRID=1` superset. That covers the
+    // `only` and default lists too, but only because no name is a substring of
+    // two or more others and no `bench_*` name overlaps a `grid_*` one -- so a
+    // filter can never select a case that a narrower list would have hidden.
+    // That is an invariant, not a coincidence, so pin it: a future name
+    // bridging the two prefixes would double-select in a mode this list cannot
+    // reproduce.
+    for a in &names {
+        let contained_in: Vec<&&str> = names.iter().filter(|b| *b != a && b.contains(*a)).collect();
+        assert!(
+            contained_in.len() <= 1,
+            "`{a}` is a substring of {contained_in:?}; the per-mode lists are no longer covered by this superset"
+        );
+        for b in contained_in {
+            assert_eq!(
+                a.starts_with("grid_"),
+                b.starts_with("grid_"),
+                "`{a}` and `{b}` straddle the bench_/grid_ prefixes, which appear in different GRID modes"
+            );
+        }
+    }
+
+    // A name that is a prefix of another still selects only itself...
+    let exact_still_one = select("grid_relu_1_tiny");
+    assert_eq!(exact_still_one, vec!["grid_relu_1_tiny"]);
+
+    // ...while a filter naming no case still selects the whole family.
+    let group = select("grid_identity");
+    assert!(
+        group.len() > 1 && group.iter().all(|n| n.starts_with("grid_identity")),
+        "a non-exact filter must still select a family: {group:?}"
+    );
+}
+
 /// The elementwise grid `CPU_ACTIVATION_GAPS.md` is written against, as
 /// session-level cases.
 ///
@@ -6383,8 +6511,19 @@ fn plugin_path_ab_vs_plain_ort() {
             .chain(unary_bench_cases())
             .collect(),
     };
+    // `NXRT_MM_BENCH_CASE` selects **exactly** the case it names, and only falls
+    // back to substring matching when it names none — so `grid_relu` still picks
+    // the whole family while `grid_relu_1_tiny` picks one case.
+    //
+    // Without the exact rule this was a plain `contains`, and because
+    // `grid_relu_1_tiny` is a substring of `grid_relu_1_tiny_dyn` a selector
+    // naming one case silently ran two. Every per-`Run` figure derived from it
+    // was the sum of two `Run`s, which invalidated three published measurements
+    // in #1077 before it was caught. `case_selectors_do_not_match_a_neighbour`
+    // is the regression test.
+    let exact_case = cases.iter().any(|c| c.name == filter);
     for case in cases {
-        if !filter.is_empty() && !case.name.contains(&filter) {
+        if !case_selected(case.name, &filter, exact_case) {
             continue;
         }
         let path = write_generated_model(case.name, &case.model);
