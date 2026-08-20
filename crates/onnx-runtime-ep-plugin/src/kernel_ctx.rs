@@ -77,12 +77,12 @@ pub const CPU_EP_SUPPORTED_DTYPES: &[DataType] = &[
 /// duplication honest.
 fn contiguous_strides(shape: &[usize]) -> DimVec<i64> {
     let n = shape.len();
-    let mut strides = DimVec::with_capacity(n);
-    for _ in 0..n {
-        strides.push(1i64);
-    }
-    for i in (0..n.saturating_sub(1)).rev() {
-        strides[i] = strides[i + 1] * shape[i + 1] as i64;
+    let mut strides = DimVec::zeroed(n);
+    if n > 0 {
+        strides[n - 1] = 1;
+        for i in (0..n - 1).rev() {
+            strides[i] = strides[i + 1] * shape[i + 1] as i64;
+        }
     }
     strides
 }
@@ -293,10 +293,7 @@ pub(crate) unsafe fn read_inputs(
                     unsafe { release_type_shape(type_shape) };
                     return Err(format!("GetDimensionsCount failed for input {i}"));
                 }
-                owned_dims = DimVec::with_capacity(ndim);
-                for _ in 0..ndim {
-                    owned_dims.push(0i64);
-                }
+                owned_dims = DimVec::zeroed(ndim);
                 crate::dispatch_probe::count_n(
                     crate::dispatch_probe::Event::DispatchAlloc,
                     u64::from(ndim > crate::dim_vec::INLINE_RANK),
@@ -389,7 +386,11 @@ pub(crate) unsafe fn allocate_output(
     // of shapes this path sees, so the conversion goes to the stack and a
     // per-`Run`, per-output heap allocation disappears; a taller tensor still
     // works, through the `Vec`.
-    const INLINE_RANK: usize = 8;
+    //
+    // Shares `DimVec`'s threshold rather than declaring a second one: this
+    // path and the input path answer the same question about the same tensors,
+    // and two constants that must agree are one constant waiting to disagree.
+    use crate::dim_vec::INLINE_RANK;
     let mut inline_dims = [0i64; INLINE_RANK];
     let heap_dims: Vec<i64>;
     let dims: &[i64] = if shape.len() <= INLINE_RANK {

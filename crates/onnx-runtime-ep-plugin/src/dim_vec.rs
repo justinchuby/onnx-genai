@@ -51,6 +51,7 @@ pub(crate) enum DimVec<T: Copy + Default> {
 
 impl<T: Copy + Default> DimVec<T> {
     /// An empty vector, allocation-free.
+    #[inline]
     pub(crate) fn new() -> Self {
         Self::Inline {
             buf: [T::default(); INLINE_RANK],
@@ -63,6 +64,7 @@ impl<T: Copy + Default> DimVec<T> {
     /// Allocation-free when `cap` fits inline, which is the point: callers
     /// that know the rank up front get the fast representation directly
     /// instead of discovering it one `push` at a time.
+    #[inline]
     pub(crate) fn with_capacity(cap: usize) -> Self {
         if cap <= INLINE_RANK {
             Self::new()
@@ -72,6 +74,7 @@ impl<T: Copy + Default> DimVec<T> {
     }
 
     /// Copies a slice, inline when it fits.
+    #[inline]
     pub(crate) fn from_slice(src: &[T]) -> Self {
         if src.len() <= INLINE_RANK {
             let mut buf = [T::default(); INLINE_RANK];
@@ -85,7 +88,30 @@ impl<T: Copy + Default> DimVec<T> {
         }
     }
 
+    /// `len` copies of `T::default()` — zero for the integer dims and strides
+    /// this holds.
+    ///
+    /// This is the bulk path for builders that immediately overwrite every
+    /// element. It exists instead of a `filled(len, value)` because the inline
+    /// array is already `T::default()`-initialised by construction, so seeding
+    /// it with a caller-chosen value costs a second pass over the buffer that
+    /// those builders then throw away. Building one `push` at a time is worse
+    /// still: it re-matches the representation on every element for a length
+    /// that is known up front.
+    #[inline]
+    pub(crate) fn zeroed(len: usize) -> Self {
+        if len <= INLINE_RANK {
+            Self::Inline {
+                buf: [T::default(); INLINE_RANK],
+                len,
+            }
+        } else {
+            Self::Heap(vec![T::default(); len])
+        }
+    }
+
     /// Appends one element, spilling to the heap if the inline space is full.
+    #[inline]
     pub(crate) fn push(&mut self, value: T) {
         match self {
             Self::Inline { buf, len } if *len < INLINE_RANK => {
@@ -107,6 +133,7 @@ impl<T: Copy + Default> DimVec<T> {
 
     /// The elements, as a slice. The single point where the two
     /// representations become one.
+    #[inline]
     pub(crate) fn as_slice(&self) -> &[T] {
         match self {
             Self::Inline { buf, len } => &buf[..*len],
@@ -114,6 +141,7 @@ impl<T: Copy + Default> DimVec<T> {
         }
     }
 
+    #[inline]
     fn as_mut_slice(&mut self) -> &mut [T] {
         match self {
             Self::Inline { buf, len } => &mut buf[..*len],
@@ -139,12 +167,14 @@ impl<T: Copy + Default> Default for DimVec<T> {
 
 impl<T: Copy + Default> Deref for DimVec<T> {
     type Target = [T];
+    #[inline]
     fn deref(&self) -> &[T] {
         self.as_slice()
     }
 }
 
 impl<T: Copy + Default> DerefMut for DimVec<T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut [T] {
         self.as_mut_slice()
     }
@@ -285,6 +315,27 @@ mod tests {
             );
         }
         assert!(v.is_spilled());
+    }
+
+    /// `zeroed` is the bulk path the stride and dims builders use; it must
+    /// agree with the `push` loop it replaced at every length, including across
+    /// the spill boundary and at zero.
+    #[test]
+    fn zeroed_agrees_with_pushing_one_at_a_time() {
+        for len in 0..(INLINE_RANK + 4) {
+            let bulk = DimVec::<i64>::zeroed(len);
+            let mut one_at_a_time = DimVec::<i64>::with_capacity(len);
+            for _ in 0..len {
+                one_at_a_time.push(0i64);
+            }
+            assert_eq!(bulk, one_at_a_time, "len {len}");
+            assert_eq!(bulk.len(), len, "len {len}");
+            assert_eq!(
+                bulk.is_spilled(),
+                len > INLINE_RANK,
+                "len {len} took the wrong representation"
+            );
+        }
     }
 
     /// Zero-sized dimensions are ordinary values here, not a special case, and
