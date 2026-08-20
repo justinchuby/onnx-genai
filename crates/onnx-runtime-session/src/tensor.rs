@@ -727,7 +727,15 @@ impl DeviceIoBinding {
     }
 
     pub fn device_argmax_supported(&self) -> bool {
+        // Gate on both EP capability and logits dtype: the device-argmax kernel
+        // handles f32/f16/bf16 only. Returning false for any other dtype routes
+        // the greedy step to the host path instead of dispatching a kernel that
+        // would reject the dtype (the greedy fast path reads this predicate).
         self.allocator.device_argmax_supported()
+            && matches!(
+                self.dtype,
+                DataType::Float32 | DataType::Float16 | DataType::BFloat16
+            )
     }
 
     pub fn device_argmax(
@@ -751,11 +759,13 @@ impl DeviceIoBinding {
         result: &mut DeviceIoBinding,
         tie_break: onnx_runtime_ep_api::ArgmaxTieBreak,
     ) -> Result<()> {
-        if !matches!(self.dtype, DataType::Float32 | DataType::Float16)
-            || result.dtype != DataType::Uint32
+        if !matches!(
+            self.dtype,
+            DataType::Float32 | DataType::Float16 | DataType::BFloat16
+        ) || result.dtype != DataType::Uint32
         {
             return Err(SessionError::Internal(format!(
-                "device argmax requires f32/f16 logits and u32 result, got {:?} and {:?}",
+                "device argmax requires f32/f16/bf16 logits and u32 result, got {:?} and {:?}",
                 self.dtype, result.dtype
             )));
         }
