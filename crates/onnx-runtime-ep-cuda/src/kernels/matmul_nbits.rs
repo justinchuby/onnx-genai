@@ -1117,26 +1117,6 @@ extern "C" __global__ void matmul_nbits_accuracy4(
 // fp32 block accumulation. Both paths round once more to fp16 on write.
 const GEMV_F16_SRC: &str = r#"
 #include <cuda_fp16.h>
-#include <cuda_bf16.h>
-
-// Narrowing store shared by the GEMV epilogues that can write their result
-// straight into a bf16 consumer buffer instead of an fp16 staging buffer.
-//
-// `out_bf16` is a launch-uniform flag, so the branch costs one predicated
-// select on the single lane that stores. The bf16 arm deliberately rounds
-// fp32 -> fp16 -> bf16 rather than fp32 -> bf16 directly: the staging path it
-// replaces rounds to fp16 in the GEMV and then casts that fp16 to bf16, and
-// reproducing the double rounding is what keeps greedy decoding bit-identical.
-__device__ __forceinline__ void matmul_nbits_store_narrowed(
-    void* __restrict__ output, const int index, const __half value,
-    const int out_bf16)
-{
-    if (out_bf16) {
-        ((__nv_bfloat16*)output)[index] = __float2bfloat16(__half2float(value));
-    } else {
-        ((__half*)output)[index] = value;
-    }
-}
 
 __device__ __forceinline__ float warp_sum(float value)
 {
@@ -3240,7 +3220,7 @@ __device__ __forceinline__ void matmul_nbits_gemv_f16_scales_f16_splitk_tpl(
     const void* __restrict__ scales_raw,
     const unsigned char* __restrict__ zero_points,
     const __half* __restrict__ bias,
-    void* __restrict__ output,
+    __half* __restrict__ output,
     const int k,
     const int n,
     const int block_size,
@@ -3248,8 +3228,7 @@ __device__ __forceinline__ void matmul_nbits_gemv_f16_scales_f16_splitk_tpl(
     const int blob_size,
     const int zp_row_bytes,
     const int scales_fp16,
-    const int bias_post_round,
-    const int out_bf16)
+    const int bias_post_round)
 {
     (void)block_size;
     (void)scales_fp16;
@@ -3339,9 +3318,7 @@ __device__ __forceinline__ void matmul_nbits_gemv_f16_scales_f16_splitk_tpl(
         for (int s = 0; s < K_SPLIT; ++s) {
             acc += partials[col_local][s];
         }
-        matmul_nbits_store_narrowed(
-            output, column, fold_bias_f16(acc, bias, column, bias_post_round),
-            out_bf16);
+        output[column] = fold_bias_f16(acc, bias, column, bias_post_round);
     }
 }
 
@@ -3351,7 +3328,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_splitk(
     const void* __restrict__ scales_raw,
     const unsigned char* __restrict__ zero_points,
     const __half* __restrict__ bias,
-    void* __restrict__ output,
+    __half* __restrict__ output,
     const int k,
     const int n,
     const int block_size,
@@ -3359,13 +3336,12 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_splitk(
     const int blob_size,
     const int zp_row_bytes,
     const int scales_fp16,
-    const int bias_post_round,
-    const int out_bf16)
+    const int bias_post_round)
 {
     matmul_nbits_gemv_f16_scales_f16_splitk_tpl<false>(
         activation, packed, scales_raw, zero_points, bias, output, k, n,
         block_size, k_blocks, blob_size, zp_row_bytes, scales_fp16,
-        bias_post_round, out_bf16);
+        bias_post_round);
 }
 
 extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_zp_splitk(
@@ -3374,7 +3350,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_zp_splitk(
     const void* __restrict__ scales_raw,
     const unsigned char* __restrict__ zero_points,
     const __half* __restrict__ bias,
-    void* __restrict__ output,
+    __half* __restrict__ output,
     const int k,
     const int n,
     const int block_size,
@@ -3382,13 +3358,12 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_zp_splitk(
     const int blob_size,
     const int zp_row_bytes,
     const int scales_fp16,
-    const int bias_post_round,
-    const int out_bf16)
+    const int bias_post_round)
 {
     matmul_nbits_gemv_f16_scales_f16_splitk_tpl<true>(
         activation, packed, scales_raw, zero_points, bias, output, k, n,
         block_size, k_blocks, blob_size, zp_row_bytes, scales_fp16,
-        bias_post_round, out_bf16);
+        bias_post_round);
 }
 
 // Half4 view matching `skip_rmsnorm_f16_warp_half4` so the fused prologue below
@@ -5931,62 +5906,6 @@ fn dequant_f16_gemm_max_scratch_bytes() -> usize {
 /// so it stays opt-in and reversible until proven. Only routes symmetric
 /// (no zero-point) block!=32 int4 nodes that already qualify for the wide-load
 /// multicol kernel; every other node is untouched.
-/// Default-on gate (`ONNX_GENAI_GEMV_BF16_DIRECT_OUT`) for letting the block-32
-/// split-K decode GEMVs narrow their fp16 epilogue straight into the caller's
-/// bf16 tensor, skipping the separate staging `cast_half` launch that
-/// [`Bf16Kernel::run_bf16`] would otherwise issue per node. Kept as a lever so
-/// the path can be A/B'd against the staged one without a rebuild.
-fn gemv_bf16_direct_out_enabled() -> bool {
-    !matches!(
-        std::env::var("ONNX_GENAI_GEMV_BF16_DIRECT_OUT")
-            .ok()
-            .as_deref(),
-        Some("0") | Some("false") | Some("off")
-    )
-}
-
-/// Offer published by `run_bf16` for the duration of the staged fp16 call it
-/// makes on this same thread.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Bf16DirectOut {
-    /// fp16 staging buffer the fp16 path would otherwise write.
-    staging: CUdeviceptr,
-    /// Real bf16 destination the GEMV may write instead.
-    dst: CUdeviceptr,
-    /// Set once a GEMV has accepted the offer, so `run_bf16` knows to skip the
-    /// narrowing cast and so a second GEMV in the same call cannot take it.
-    taken: bool,
-}
-
-thread_local! {
-    /// Thread-local rather than a field on the op: `run_bf16` calls the fp16
-    /// path synchronously on the calling thread, so the offer cannot outlive
-    /// that call or be observed by a concurrent session executing the same
-    /// node. Acceptance additionally requires an exact match on the staging
-    /// pointer, so an unrelated fp16 node can never claim it.
-    static BF16_DIRECT_OUT: std::cell::Cell<Option<Bf16DirectOut>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// Count of GEMV launches that narrowed straight into a bf16 output. Tests
-/// assert this moves, so a routing change that silently reverts to the staged
-/// cast fails loudly instead of passing on an unexercised equality.
-static BF16_DIRECT_OUT_STORES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Accept the pending bf16 direct-store offer if it targets `staging`.
-fn take_bf16_direct_out(staging: CUdeviceptr) -> Option<CUdeviceptr> {
-    BF16_DIRECT_OUT.with(|cell| match cell.get() {
-        Some(mut offer) if !offer.taken && offer.staging == staging => {
-            offer.taken = true;
-            cell.set(Some(offer));
-            BF16_DIRECT_OUT_STORES.fetch_add(1, Ordering::Relaxed);
-            Some(offer.dst)
-        }
-        _ => None,
-    })
-}
-
 fn interleave_dequant_enabled() -> bool {
     matches!(
         std::env::var("ONNX_GENAI_INTERLEAVE_DEQUANT")
@@ -7236,31 +7155,15 @@ impl MatMulNBitsKernel {
             out_strides,
             out_device,
         );
-        // Offer the real bf16 output to the fp16 path: the split-K decode GEMVs
-        // can narrow into it directly and save this node's staging cast. The
-        // offer is restored (not just cleared) so a nested bf16 call cannot
-        // strand an outer one, and it is restored before `?` so an error cannot
-        // leave it published.
-        let dst_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-        let offer = gemv_bf16_direct_out_enabled().then_some(Bf16DirectOut {
-            staging: out_ptr,
-            dst: dst_ptr,
-            taken: false,
-        });
-        let previous = BF16_DIRECT_OUT.with(|cell| cell.replace(offer));
-        let run_result = self.run(&f16_inputs, std::slice::from_mut(&mut y_f16), workspace);
-        let settled = BF16_DIRECT_OUT.with(|cell| cell.replace(previous));
-        run_result?;
-        if !settled.is_some_and(|offer| offer.taken) {
-            super::cast::launch_cast_raw(
-                &self.runtime,
-                out_ptr,
-                DataType::Float16,
-                dst_ptr,
-                DataType::BFloat16,
-                out_n,
-            )?;
-        }
+        self.run(&f16_inputs, std::slice::from_mut(&mut y_f16), workspace)?;
+        super::cast::launch_cast_raw(
+            &self.runtime,
+            out_ptr,
+            DataType::Float16,
+            cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void),
+            DataType::BFloat16,
+            out_n,
+        )?;
         // Capture-safety is inherited from the staged fp16 run: the M==1 decode
         // GEMV is capture-safe, and the staging casts add only allocation-free,
         // sync-free stream launches against the persistent arena (which is grown
@@ -9643,19 +9546,7 @@ impl MatMulNBitsKernel {
         let bias_ptr = bias
             .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
             .unwrap_or(0);
-        // These two entries narrow their fp16 epilogue through
-        // `matmul_nbits_store_narrowed`, so they can write a bf16 consumer
-        // buffer directly and let `run_bf16` drop its per-node staging cast.
-        let bf16_direct_capable = entry == GEMV_F16_SCALES_F16_SPLITK_ENTRY
-            || entry == GEMV_F16_SCALES_F16_ZP_SPLITK_ENTRY;
-        let staging_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
-        let direct_bf16_ptr = if bf16_direct_capable && gemv_bf16_direct_out_enabled() {
-            take_bf16_direct_out(staging_ptr)
-        } else {
-            None
-        };
-        let output_ptr = direct_bf16_ptr.unwrap_or(staging_ptr);
-        let out_bf16_flag: i32 = direct_bf16_ptr.is_some() as i32;
+        let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
         let k = as_i32("K", self.k)?;
         let n = as_i32("N", self.n)?;
         let block_size = as_i32("block_size", self.block_size)?;
@@ -9742,11 +9633,6 @@ impl MatMulNBitsKernel {
             || entry == GEMV_F16_GENERAL_BS_SPLITK_WIDE_MULTICOL_INTERLEAVED_ENTRY
         {
             builder.arg(&bits);
-        }
-        // The block-32 split-K entries take one extra trailing scalar selecting
-        // the fp16 or bf16 narrowing store in their epilogue.
-        if bf16_direct_capable {
-            builder.arg(&out_bf16_flag);
         }
         // SAFETY: M=1 fp16 inputs; all tensors were dtype/shape/contiguity
         // validated above, including the optional packed per-block zero-point
@@ -18646,249 +18532,6 @@ extern "C" __global__ void ref_silu_mul_f16(
                     );
                 }
             }
-        }
-    }
-
-    /// The block-32 split-K decode GEMV narrows its fp16 epilogue straight into
-    /// the caller's bf16 tensor instead of writing an fp16 staging buffer that
-    /// `run_bf16` would then cast. That must be bit-identical to the staged
-    /// route, because greedy decoding is only stable if every token is.
-    ///
-    /// The reference here is deliberately the staged route itself: run the fp16
-    /// GEMV into an fp16 buffer, then `cast_half` it to bf16. That is exactly
-    /// what the direct store replaces, and it is why the kernel rounds
-    /// fp32 -> fp16 -> bf16 rather than fp32 -> bf16.
-    ///
-    /// The counter assertion is load-bearing. Without it a routing change that
-    /// silently fell back to staging would still compare equal, and this test
-    /// would pass while covering nothing.
-    #[test]
-    fn bf16_direct_store_matches_staged_cast_bit_for_bit() {
-        use half::bf16;
-
-        let Some(runtime) = runtime() else {
-            eprintln!("skipping MatMulNBits bf16 direct-store test: CUDA runtime unavailable");
-            return;
-        };
-
-        // Shaped to select `matmul_nbits_gemv_f16_scales_f16_zp_splitk`: block 32,
-        // fp16-family scales, per-block zero points, K a multiple of 256, and
-        // both dimensions past the small-shape (64-thread) path.
-        let k = 2048usize;
-        let n = 2048usize;
-        let block_size = 32usize;
-        let k_blocks = k / block_size;
-        let blob_size = block_size / 2;
-
-        let mut state = 0x51ed_2701_c0ff_ee11u64;
-        let mut next = || {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
-        };
-
-        let activation_bf16: Vec<bf16> = (0..k).map(|_| bf16::from_f32(next())).collect();
-        let packed: Vec<u8> = (0..n * k_blocks * blob_size)
-            .map(|_| next().to_bits() as u8)
-            .collect();
-        let scales_bf16: Vec<bf16> = (0..n * k_blocks)
-            .map(|_| bf16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5)))
-            .collect();
-        let zero_points: Vec<u8> = (0..n * k_blocks.div_ceil(2))
-            .map(|_| ((next() * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8)
-            .collect();
-
-        let device = DeviceId::cuda(0);
-        let a_shape = [1usize, k];
-        let a_strides = [k as i64, 1];
-        let b_shape = [n, k_blocks, blob_size];
-        let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
-        let scales_shape = [n, k_blocks];
-        let scales_strides = [k_blocks as i64, 1];
-        let zp_shape = [n, k_blocks.div_ceil(2)];
-        let zp_strides = [k_blocks.div_ceil(2) as i64, 1];
-        let y_shape = [1usize, n];
-        let y_strides = [n as i64, 1];
-
-        let act_dev = runtime.alloc_raw(activation_bf16.len() * 2).unwrap();
-        let packed_dev = runtime.alloc_raw(packed.len()).unwrap();
-        let scales_dev = runtime.alloc_raw(scales_bf16.len() * 2).unwrap();
-        let zp_dev = runtime.alloc_raw(zero_points.len()).unwrap();
-        let out_dev = runtime.alloc_raw(n * 2).unwrap();
-        let act_f16_dev = runtime.alloc_raw(k * 2).unwrap();
-        let scales_f16_dev = runtime.alloc_raw(scales_bf16.len() * 2).unwrap();
-        let ref_f16_dev = runtime.alloc_raw(n * 2).unwrap();
-        let ref_bf16_dev = runtime.alloc_raw(n * 2).unwrap();
-        // SAFETY: device buffers exactly cover their source slices.
-        unsafe {
-            runtime.htod(as_bytes(&activation_bf16), act_dev).unwrap();
-            runtime.htod(&packed, packed_dev).unwrap();
-            runtime.htod(as_bytes(&scales_bf16), scales_dev).unwrap();
-            runtime.htod(&zero_points, zp_dev).unwrap();
-        }
-
-        let kernel = MatMulNBitsKernel {
-            runtime: runtime.clone(),
-            k,
-            n,
-            bits: 4,
-            block_size,
-            accuracy_level: 0,
-            accuracy4_workspace: None,
-            fold_bias_post_round: false,
-            gate_up_swiglu: false,
-            decomposed_silu: false,
-            rmsnorm_prologue: false,
-            rmsnorm_epsilon: 1e-5,
-            last_call_capture_safe: AtomicBool::new(false),
-            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
-            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
-        };
-
-        let bf16_inputs = vec![
-            TensorView::new(
-                device_ptr(act_dev),
-                DataType::BFloat16,
-                &a_shape,
-                &a_strides,
-                device,
-            ),
-            TensorView::new(
-                device_ptr(packed_dev),
-                DataType::Uint8,
-                &b_shape,
-                &b_strides,
-                device,
-            ),
-            TensorView::new(
-                device_ptr(scales_dev),
-                DataType::BFloat16,
-                &scales_shape,
-                &scales_strides,
-                device,
-            ),
-            TensorView::new(
-                device_ptr(zp_dev),
-                DataType::Uint8,
-                &zp_shape,
-                &zp_strides,
-                device,
-            ),
-        ];
-
-        let before = BF16_DIRECT_OUT_STORES.load(Ordering::Relaxed);
-        let mut got_out = [TensorMut::new(
-            device_ptr_mut(out_dev),
-            DataType::BFloat16,
-            &y_shape,
-            &y_strides,
-            device,
-        )];
-        kernel.run(&bf16_inputs, &mut got_out, None).unwrap();
-        runtime.synchronize().unwrap();
-        let direct_stores = BF16_DIRECT_OUT_STORES.load(Ordering::Relaxed) - before;
-
-        // Reference: the staged route this replaces.
-        super::super::cast::launch_cast_raw(
-            &runtime,
-            cuptr(act_dev as *const c_void),
-            DataType::BFloat16,
-            act_f16_dev,
-            DataType::Float16,
-            k,
-        )
-        .unwrap();
-        super::super::cast::launch_cast_raw(
-            &runtime,
-            cuptr(scales_dev as *const c_void),
-            DataType::BFloat16,
-            scales_f16_dev,
-            DataType::Float16,
-            scales_bf16.len(),
-        )
-        .unwrap();
-        let ref_inputs = vec![
-            TensorView::new(
-                device_ptr(act_f16_dev),
-                DataType::Float16,
-                &a_shape,
-                &a_strides,
-                device,
-            ),
-            TensorView::new(
-                device_ptr(packed_dev),
-                DataType::Uint8,
-                &b_shape,
-                &b_strides,
-                device,
-            ),
-            TensorView::new(
-                device_ptr(scales_f16_dev),
-                DataType::Float16,
-                &scales_shape,
-                &scales_strides,
-                device,
-            ),
-            TensorView::new(
-                device_ptr(zp_dev),
-                DataType::Uint8,
-                &zp_shape,
-                &zp_strides,
-                device,
-            ),
-        ];
-        let mut ref_f16 = [TensorMut::new(
-            device_ptr_mut(ref_f16_dev),
-            DataType::Float16,
-            &y_shape,
-            &y_strides,
-            device,
-        )];
-        kernel.run(&ref_inputs, &mut ref_f16, None).unwrap();
-        super::super::cast::launch_cast_raw(
-            &runtime,
-            ref_f16_dev,
-            DataType::Float16,
-            ref_bf16_dev,
-            DataType::BFloat16,
-            n,
-        )
-        .unwrap();
-        runtime.synchronize().unwrap();
-
-        let mut got = vec![bf16::ZERO; n];
-        let mut want = vec![bf16::ZERO; n];
-        // SAFETY: each host buffer matches its device source.
-        unsafe {
-            runtime.dtoh(as_bytes_mut(&mut got), out_dev).unwrap();
-            runtime.dtoh(as_bytes_mut(&mut want), ref_bf16_dev).unwrap();
-            for buffer in [
-                act_dev,
-                packed_dev,
-                scales_dev,
-                zp_dev,
-                out_dev,
-                act_f16_dev,
-                scales_f16_dev,
-                ref_f16_dev,
-                ref_bf16_dev,
-            ] {
-                runtime.free_raw(buffer).unwrap();
-            }
-        }
-
-        assert_eq!(
-            direct_stores, 1,
-            "the bf16 run did not take the direct-store path, so this test would \
-             compare the staged route against itself"
-        );
-        for index in 0..n {
-            assert_eq!(
-                got[index].to_bits(),
-                want[index].to_bits(),
-                "direct bf16 store diverged from the staged cast at column {index}"
-            );
         }
     }
 
