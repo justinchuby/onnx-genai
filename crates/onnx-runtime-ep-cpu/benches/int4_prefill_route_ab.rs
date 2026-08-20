@@ -28,7 +28,8 @@
 //! ```text
 //! cargo bench -p onnx-runtime-ep-cpu --bench int4_prefill_route_ab
 //! ```
-//! `PROBE_SHAPE=small|big` picks one shape; `PROBE_MS=prefill|cross` picks a row
+//! `PROBE_BITS=4|8` picks the weight width; `PROBE_SHAPE=small|big` picks one
+//! shape; `PROBE_MS=prefill|cross` picks a row
 //! sweep.
 
 mod common;
@@ -63,16 +64,23 @@ fn median(mut samples: Vec<f64>) -> f64 {
     samples[samples.len() / 2]
 }
 
-fn build_kernel(k: usize, n: usize, block_size: usize, m: usize, acc: i64) -> Box<dyn Kernel> {
+fn build_kernel(
+    k: usize,
+    n: usize,
+    block_size: usize,
+    m: usize,
+    acc: i64,
+    bits: i64,
+) -> Box<dyn Kernel> {
     let blocks = k.div_ceil(block_size);
-    let blob = block_size / 2;
+    let blob = block_size / (8 / bits as usize);
     let shapes = vec![vec![m, k], vec![n, blocks, blob], vec![n, blocks]];
     let mut node = Node::new(NodeId(0), "MatMulNBits", vec![], vec![]);
     node.domain = "com.microsoft".into();
     for (name, value) in [
         ("K", Attribute::Int(k as i64)),
         ("N", Attribute::Int(n as i64)),
-        ("bits", Attribute::Int(4)),
+        ("bits", Attribute::Int(bits)),
         ("block_size", Attribute::Int(block_size as i64)),
         ("accuracy_level", Attribute::Int(acc)),
     ] {
@@ -96,19 +104,28 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    println!("acc_level={acc}");
+    // `PROBE_BITS=8` drives the same three routes over an 8-bit weight. The
+    // 8-bit and 4-bit packs differ only in their unpack cost -- same panel,
+    // same store pattern, same microkernel -- so running both is what
+    // separates "the pack was unpack bound" from "the pack was store bound".
+    let bits: i64 = match std::env::var("PROBE_BITS").as_deref() {
+        Ok("8") => 8,
+        _ => 4,
+    };
+    println!("acc_level={acc} bits={bits}");
     println!(
         "{:>6} {:>6} {:>5} {:>12} {:>12} {:>12}",
         "k", "n", "m", "cold_ms", "steady_ms", "gflops"
     );
     for &(k, n) in shapes.iter() {
         let blocks = k.div_ceil(block_size);
-        let packed = packed_bytes(n * blocks * (block_size / 2), 7);
+        let blob = block_size / (8 / bits as usize);
+        let packed = packed_bytes(n * blocks * blob, 7);
         let scales = floats(n * blocks, 0.3)
             .into_iter()
             .map(|v| v.abs().max(0.01) * 0.02)
             .collect::<Vec<_>>();
-        let b = Tensor::u8(&[n, blocks, block_size / 2], &packed);
+        let b = Tensor::u8(&[n, blocks, blob], &packed);
         let scales_t = Tensor::floats(common::FloatDType::F32, &[n, blocks], &scales);
         let ms: Vec<usize> = match std::env::var("PROBE_MS").as_deref() {
             Ok("prefill") => vec![8, 64, 256],
@@ -133,7 +150,7 @@ fn main() {
             let cold = median(
                 (0..3)
                     .map(|_| {
-                        let kernel = build_kernel(k, n, block_size, m, acc);
+                        let kernel = build_kernel(k, n, block_size, m, acc, bits);
                         let start = Instant::now();
                         kernel
                             .execute(&ins, &mut [out.view_mut()])
@@ -143,7 +160,7 @@ fn main() {
                     .collect(),
             );
 
-            let kernel = build_kernel(k, n, block_size, m, acc);
+            let kernel = build_kernel(k, n, block_size, m, acc, bits);
             for _ in 0..2 {
                 kernel.execute(&ins, &mut [out.view_mut()]).expect("warmup");
             }

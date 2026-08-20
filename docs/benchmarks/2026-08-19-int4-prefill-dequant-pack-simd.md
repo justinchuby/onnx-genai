@@ -25,12 +25,16 @@ is not memory. `marginal` barely moves, which is the control: the microkernel is
 ## What it actually was
 
 `Int4Weight::dequant_column` fills one column of the panel at a time. Per element that is a shift, a
-mask, a scalar widen, a subtract, a multiply — and a store to `dst[p * NR + slot]`, i.e. **one f32
-every 64 bytes**. A separate cache line, and a separate scalar store, for every element.
+mask, a scalar widen, a subtract, a multiply — and a store to `dst[p * NR + slot]`.
 
 The fix dequantizes `DEQUANT_GROUP = 8` columns at once into eight `__m256`, transposes them in
-registers, and writes eight contiguous 32-byte stores: **one store per eight elements instead of
-eight**. Eight is not a tuning knob, it is the f32 lane count.
+registers, and writes eight contiguous 32-byte stores. Eight is not a tuning knob, it is the f32
+lane count.
+
+> **Superseded attribution.** This section originally said the strided store was the cause. It is
+> not: measured against the 8-bit pack, which has the same store pattern and no nibble unpack, the
+> store is worth 0.07 ms of the 2.83 ms. See
+> [the follow-up](2026-08-20-quant-pack-cost-attribution.md).
 
 ## Numerics
 
