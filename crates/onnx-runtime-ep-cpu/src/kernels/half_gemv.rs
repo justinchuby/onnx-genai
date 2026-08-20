@@ -118,7 +118,7 @@ pub(crate) fn simd_available(format: HalfFormat) -> bool {
 ///
 /// # Panics
 /// When `b` is shorter than `k * n`. This is a real check, not a
-/// `debug_assert`: [`stripe_simd`] does unchecked pointer arithmetic derived
+/// `debug_assert`: `stripe_simd_fn!` does unchecked pointer arithmetic derived
 /// from `k`, `n` and `j0`, so a short `b` would be a memory-safety bug rather
 /// than a wrong answer. `k * n` is computed with `checked_mul` so an
 /// overflowing geometry fails closed instead of wrapping to a small bound.
@@ -184,7 +184,7 @@ pub(crate) fn gemv_half_kn(
 /// Reference stripe: `acc[j] = sum_p a[p] * b[p * n + j0 + j]`.
 ///
 /// Accumulates over `p` in increasing order, one element at a time — the same
-/// order [`stripe_simd`] uses within each lane.
+/// order `stripe_simd_fn!` uses within each lane.
 fn stripe_scalar(
     format: HalfFormat,
     a: &[f32],
@@ -695,7 +695,11 @@ mod tests {
                             HalfFormat::Bf16 => stripe_simd_bf16(&a, &b, &mut simd, j0, k, n),
                         }
                     };
-                    assert_eq!(bits(&simd), bits(&scalar), "{format:?} stripe j0={j0} w={w}");
+                    assert_eq!(
+                        bits(&simd),
+                        bits(&scalar),
+                        "{format:?} stripe j0={j0} w={w}"
+                    );
                     checked += 1;
                 }
             }
@@ -775,7 +779,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "operands are too small")]
     fn a_short_weight_panics_rather_than_reading_out_of_bounds() {
-        // `stripe_simd` derives raw pointers from `k`, `n` and `j0`, so a
+        // `stripe_simd_fn!` derives raw pointers from `k`, `n` and `j0`, so a
         // short `b` must fail closed in release too -- not just under
         // `debug_assert`.
         let mut out = vec![0.0f32; 4];

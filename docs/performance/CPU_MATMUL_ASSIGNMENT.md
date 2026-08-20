@@ -735,12 +735,15 @@ What this did **not** fix, and what was measured and rejected:
   accumulator tile across the whole `k` contraction — what `gemv_f16_nk`
   already does for `[N, K]` — not tuning a constant. That is a kernel rewrite
   and is the next thing to try, but it is unproven and is claimed as nothing more.
+  **It has since been done and measured: see [section
+  7](#7-the-f16-decode-gemv-accumulated-through-memory-fixed).** The mechanism
+  named here was the right one.
 
 Full record: [`docs/benchmarks/2026-08-19-f16-gemm-transb-decode.md`](../benchmarks/2026-08-19-f16-gemm-transb-decode.md).
 
 ### 7. The f16 decode GEMV accumulated through memory (**fixed**)
 
-`kernels::half_gemv::gemv_f16_kn` is the x86 `M = 1` f16 GEMV. Its own module documentation states
+`kernels::half_gemv::gemv_half_kn` is the x86 `M = 1` half GEMV. Its own module documentation states
 the premise — at `M = 1` "each weight element is touched exactly once, so the kernel is purely
 memory-bound" — and it was not true. Measured against this host's sustained read bandwidth
 (`roofline_bandwidth`: **75.8 GB/s**, saturating by 4-8 threads), the kernel ran at **12-47 GB/s**,
@@ -762,20 +765,41 @@ registers for the entire contraction, stored once — one memory operation per F
 minimum the problem admits. Tiling adds no traffic: the same `k * STRIPE` elements, the same stride,
 and `TILE` is exactly two cache lines with `STRIPE` a whole number of tiles.
 
-Native-alone (`ab.py --native-only --null-control`, 7 x 30, medians):
+This change lives in the `stripe_simd_fn!` macro, so it is instantiated for the bf16 kernel as well
+as the f16 one.
 
-| cell | weight | t | before | after | speedup | after % of roofline |
-|---|---:|---:|---:|---:|---:|---:|
-| `l2_512` | 0.5 MB | 16 | 0.028 ms | 0.018 ms | 1.56x | 39% |
-| `l2_1024` | 2.1 MB | 4 | 0.088 ms | 0.051 ms | 1.73x | 58% |
-| `l3_2048` | 8.4 MB | 16 | 0.401 ms | 0.154 ms | **2.60x** | 72% |
-| `l3_3584` | 25.7 MB | 4 | 0.549 ms | 0.419 ms | 1.31x | **86%** |
-| `l3_3584` | 25.7 MB | 32 | 1.075 ms | 0.560 ms | 1.92x | 61% |
-| `dram_8192` | 134.2 MB | 16 | 3.838 ms | 2.163 ms | 1.77x | **82%** |
+**Which routes reach this kernel matters, and changed underneath the work.** [Section
+5](#5-the-int4-prefill-re-decoded-the-weight-once-per-row-and-was-switched-off-fixed)'s sibling
+change, the decode handover added in #1381, sends an `M = 1` half `MatMul` of **1,048,576 elements or
+more** to the fused widen-pack GEBP instead. So the `MatMul` route reaches this kernel only below
+that weight; `Gemm` with `transB = 0` reaches it at **any** weight, having no gate at all. Both are
+measured, the first with the GEBP switched off to isolate the kernel, the second with **no
+environment set**, which is what a default build runs.
 
-14 of 15 cells win by 1.22x-2.60x above their null control. `l3_2048` at t=32 would not settle in
-three runs and is not claimed. Full matrix, the `TILE` sweep, and the two rejected explanations are
-in [`2026-08-19-f16-decode-gemv-register-tile.md`](../benchmarks/2026-08-19-f16-decode-gemv-register-tile.md).
+Native-alone (`ab.py --native-only --null-control`, 7 x 30, medians, latest `main`):
+
+| route | cell | weight | t | before | after | speedup |
+|---|---|---:|---:|---:|---:|---:|
+| `MatMul`, GEBP off | `l2_1024` | 2.1 MB | 4 | 0.090 ms | 0.053 ms | 1.70x |
+| `MatMul`, GEBP off | `l3_2048` | 8.4 MB | 4 | 0.213 ms | 0.095 ms | **2.24x** |
+| `MatMul`, GEBP off | `l3_3584` | 25.7 MB | 16 | 0.813 ms | 0.312 ms | **2.61x** |
+| `MatMul`, GEBP off | `dram_8192` | 134.2 MB | 16 | 4.067 ms | 2.126 ms | 1.91x |
+| `Gemm`, **default** | `l2_512` | 0.5 MB | 16 | 0.026 ms | 0.014 ms | 1.86x |
+| `Gemm`, **default** | `l3_2048` | 8.4 MB | 16 | 0.442 ms | 0.200 ms | **2.21x** |
+| `Gemm`, **default** | `l3_3584` | 25.7 MB | 16 | 0.561 ms | 0.324 ms | 1.73x |
+| `Gemm`, **default** | `dram_8192` | 134.2 MB | 16 | 3.278 ms | 1.913 ms | 1.71x |
+
+**15 of 15** `MatMul` cells win by 1.13x-2.61x above their null control; **13 of 15** `Gemm` cells by
+1.25x-2.21x. The four unclaimed cells are all t=32 with nulls of 16-49%, i.e. unusable controls
+rather than small effects.
+
+`dram_8192` is the only cell whose weight really comes from DRAM, so it is the only one the DRAM
+roofline applies to: **33.0 to 63.1 GB/s, 44% to 83% of 75.8**. The L3-resident cells now read *above*
+75.8 GB/s (up to 88.6), which is not a violation — their weight never reaches DRAM — but it does mean
+the "% of roofline" figures previously quoted for them were comparing against the wrong ceiling.
+
+Full matrix, the `TILE` sweep, and the two rejected explanations are in
+[`2026-08-19-f16-decode-gemv-register-tile.md`](../benchmarks/2026-08-19-f16-decode-gemv-register-tile.md).
 
 Unlike the int4 row-blocking change, this is **bit-identical**: tiling changes which register holds a
 partial sum, never the order it is built in, so every pre-existing oracle test passes unmodified.
@@ -783,10 +807,19 @@ partial sum, never the order it is built in, so every pre-existing oracle test p
 `TILE = 64` was chosen by sweeping 32/64/96/128 across all 15 cells. 128 needs 18 of 16 architectural
 `ymm` and spills — on the smallest cell it is slower than making no change at all.
 
+**A consequence this change does not act on.** #1381 placed the decode handover using a sweep of the
+*untiled* GEMV. Re-running that same harness against the tiled kernel inverts it at the two largest
+shapes — `4096x11008` goes 1.18 to 0.82 and `896x151936` 1.26 to 0.86, both now favouring the GEMV —
+while `2048x2048` narrows from 1.78 to 1.26 without inverting, and the `ab.py` cells disagree with the
+bench harness at that weight depending on thread count. The threshold is therefore wrong at both ends
+and right in the middle, and a single weight cutoff cannot express a thread-dependent crossover.
+Retuning it needs its own `k x n x` thread sweep; it is filed as a follow-up rather than folded in, and
+**this change alters no routing** — every shape takes the route it took before, only faster.
+
 What is left is the same fan-out problem as [section 1](#1-parallel-efficiency-not-kernel-quality--f32-dense-and-int4-matmulnbits):
-`STRIPE = 512` gives `n = 3584` only 7 stripes, so past 7 threads the workers contend. There is less
-to win there now — 46-61 GB/s against a 75.8 GB/s ceiling — and an adaptive stripe width was already
-measured and refuted.
+`STRIPE = 512` gives `n = 3584` only 7 stripes, so past 7 threads the workers contend. It is now the
+dominant remaining loss on these cells — every unclaimed cell above is t=32 — and an adaptive stripe
+width was already measured and refuted.
 
 
 ## Precision

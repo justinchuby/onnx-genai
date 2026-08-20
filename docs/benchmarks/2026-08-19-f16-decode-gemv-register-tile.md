@@ -1,4 +1,4 @@
-# The f16 decode GEMV accumulated through memory, not registers
+# The half decode GEMV accumulated through memory, not registers
 
 2026-08-19. AMD EPYC 9V74, 32 vCPU (16 cores x 2 SMT), AVX2 + FMA + F16C, no
 AVX-512, no VNNI. L1d 32 KiB/core, L2 1 MiB/core, L3 2 x 32 MiB. Shared host;
@@ -6,18 +6,26 @@ load average is disclosed per run.
 
 ## Summary
 
-`kernels::half_gemv::gemv_f16_kn` is the x86 `M == 1` f16 GEMV. Its module
-documentation states the design premise plainly: at `M == 1` "each weight
-element is touched exactly once, so the kernel is purely memory-bound". It was
-not. It ran at **12-47 GB/s against a measured 75.8 GB/s ceiling**, because the
-inner loop kept its accumulators in `acc` and therefore paid three memory
-operations per 8-lane FMA instead of one.
+`kernels::half_gemv::gemv_half_kn` is the x86 `M == 1` GEMV for an f16 or bf16
+weight in its stored `[K, N]` order. Its module documentation states the design
+premise plainly: at `M == 1` "each weight element is touched exactly once, so
+the kernel is purely memory-bound". It was not. It ran at **12-47 GB/s against a
+measured 75.8 GB/s ceiling**, because the inner loop kept its accumulators in
+`acc` and therefore paid three memory operations per 8-lane FMA instead of one.
 
 Holding the accumulators in `ymm` registers across the contraction is worth
-**1.22x-2.60x** on 14 of 15 measured cells and takes the large cells from ~46%
-of the memory roofline to **79-86%**. Numerics are unchanged: every output
-element still accumulates over `p` in strictly increasing order, so the result
-is bit-identical, and the pre-existing bit-identity tests pass untouched.
+**1.13x-2.61x** on 15 of 15 cells with the kernel isolated, and **1.25x-2.21x**
+on 13 of 15 cells of a **default** build with no environment set. The one cell
+whose weight genuinely comes from DRAM goes from 44% to **83%** of the measured
+memory roofline.
+
+The tiling lives in the `stripe_simd_fn!` macro, so it is instantiated for the
+bf16 kernel as well as the f16 one — the original revision of this work predated
+#1381 and was f16-only.
+
+Numerics are unchanged: every output element still accumulates over `p` in
+strictly increasing order, so the result is bit-identical, and the pre-existing
+bit-identity tests pass untouched.
 
 ## The measurement that started it
 
@@ -168,40 +176,101 @@ plus the broadcast and the widened weight, which is 18 of 16 architectural
 `ymm`, so it spills — and on the smallest cell it is *slower than doing
 nothing*. 64 leaves 10 registers in use and never regresses.
 
+## Which paths actually reach this kernel
+
+`gemv_half_kn` is not the only decode route any more, and the surface changed
+underneath this work while it was open. #1381 landed a decode handover: an
+`M == 1` `MatMul` on a half weight of **1,048,576 elements or more** now goes to
+the fused widen-pack GEBP instead, and only smaller weights keep the GEMV. So
+four of the five `MatMul` cells below no longer reach the kernel in a default
+build, and measuring them as if they did would be measuring nothing.
+
+What still reaches it:
+
+| route | weight range |
+|---|---|
+| `MatMul` f16/bf16 decode | below 1,048,576 elements |
+| `Gemm` f16 decode, `transB=0` | **any** — this path has no weight gate |
+| any decode under `ONNX_GENAI_CPU_MM_HALF_GEBP=0` | any |
+| any decode on 32-bit `x86` | any — there is no GEBP to hand off to |
+| bf16 decode on an AVX-512 BF16 host | any — the handover declines there |
+
+Both are therefore measured below, and separately: the `MatMul` cells with the
+GEBP switched off, which isolates the kernel over the whole weight range, and
+the `Gemm` cells with **no environment set at all**, which is what a default
+build runs. `gen_f16_gemv.py --op gemm` emits the second set.
+
 ## Result
 
 `scripts/ort_ab/ab.py --native-only --null-control`, 7 trials x 30 runs,
-medians, load average 5.3 at start. `null` is the baseline binary under a second
-name; its delta is the host's noise floor for that cell.
+medians, re-measured on latest `main` after the merge. `null` is the baseline
+binary under a second name; its delta is the host's noise floor for that cell,
+and a speedup no larger than it is not claimed.
 
-| cell | t | before | after | speedup | null | before GB/s | after GB/s | % of roofline |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| `l2_512` | 4 | 0.018 ms | 0.014 ms | 1.29x | 5.6% | 29.1 | 37.4 | 52% |
-| `l2_512` | 16 | 0.028 ms | 0.018 ms | 1.56x | 3.6% | 18.7 | 29.1 | 39% |
-| `l2_512` | 32 | 0.027 ms | 0.018 ms | 1.50x | 0.0% | 19.4 | 29.1 | 38% |
-| `l2_1024` | 4 | 0.088 ms | 0.051 ms | 1.73x | 2.3% | 23.8 | 41.1 | 58% |
-| `l2_1024` | 16 | 0.140 ms | 0.084 ms | 1.67x | 15.7% | 15.0 | 25.0 | 33% |
-| `l2_1024` | 32 | 0.171 ms | 0.109 ms | 1.57x | 1.2% | 12.3 | 19.2 | 25% |
-| `l3_2048` | 4 | 0.214 ms | 0.175 ms | 1.22x | 7.9% | 39.2 | 47.9 | 67% |
-| `l3_2048` | 16 | 0.401 ms | 0.154 ms | **2.60x** | 1.2% | 20.9 | 54.5 | 72% |
-| `l3_2048` | 32 | *not separable from noise — see below* ||||||
-| `l3_3584` | 4 | 0.549 ms | 0.419 ms | 1.31x | 4.9% | 46.8 | 61.3 | **86%** |
-| `l3_3584` | 16 | 1.260 ms | 0.522 ms | 2.41x | 16.3% | 20.4 | 49.2 | 65% |
-| `l3_3584` | 32 | 1.075 ms | 0.560 ms | 1.92x | 2.0% | 23.9 | 45.9 | 61% |
-| `dram_8192` | 4 | 7.689 ms | 4.100 ms | 1.88x | 1.8% | 17.5 | 32.7 | 46% |
-| `dram_8192` | 16 | 3.838 ms | 2.163 ms | 1.77x | 12.4% | 35.0 | 62.1 | **82%** |
-| `dram_8192` | 32 | 3.844 ms | 2.228 ms | 1.73x | 0.3% | 34.9 | 60.2 | 79% |
+### `MatMul` cells, GEBP switched off — the kernel over its whole range
 
-A second run of the two L3 cells, 11 trials x 40 runs, agrees: `l3_2048` t=4
-1.35x, t=16 2.42x; `l3_3584` t=4 1.36x, t=16 1.78x, t=32 2.04x (nulls 1.6-6.3%).
+| cell | t | before | after | speedup | null | before GB/s | after GB/s |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `l2_512` | 4 | 0.021 ms | 0.014 ms | 1.50x | 14.3% | 25.0 | 37.4 |
+| `l2_512` | 16 | 0.027 ms | 0.019 ms | 1.42x | 0.0% | 19.4 | 27.6 |
+| `l2_512` | 32 | 0.021 ms | 0.014 ms | 1.50x | 4.8% | 25.0 | 37.4 |
+| `l2_1024` | 4 | 0.090 ms | 0.053 ms | 1.70x | 2.2% | 23.3 | 39.6 |
+| `l2_1024` | 16 | 0.163 ms | 0.098 ms | 1.66x | 12.3% | 12.9 | 21.4 |
+| `l2_1024` | 32 | 0.144 ms | 0.112 ms | 1.29x | 13.2% | 14.6 | 18.7 |
+| `l3_2048` | 4 | 0.213 ms | 0.095 ms | **2.24x** | 9.4% | 39.4 | 88.3 |
+| `l3_2048` | 16 | 0.406 ms | 0.187 ms | **2.17x** | 4.4% | 20.7 | 44.9 |
+| `l3_2048` | 32 | 0.503 ms | 0.358 ms | 1.41x | 1.6% | 16.7 | 23.4 |
+| `l3_3584` | 4 | 0.592 ms | 0.290 ms | **2.04x** | 9.3% | 43.4 | 88.6 |
+| `l3_3584` | 16 | 0.813 ms | 0.312 ms | **2.61x** | 0.6% | 31.6 | 82.3 |
+| `l3_3584` | 32 | 0.790 ms | 0.701 ms | 1.13x | 1.8% | 32.5 | 36.6 |
+| `dram_8192` | 4 | 7.413 ms | 4.221 ms | 1.76x | 1.8% | 18.1 | 31.8 |
+| `dram_8192` | 16 | 4.067 ms | 2.126 ms | 1.91x | 9.7% | 33.0 | 63.1 |
+| `dram_8192` | 32 | 3.702 ms | 2.222 ms | 1.67x | 3.2% | 36.3 | 60.4 |
 
-**`l3_2048` at t=32 is not claimed.** Three runs measured -45.1% (null 0.6%),
-+18.8% (null 70.1%) and -25.8% (null 35.8%). Only the first has a usable
-control, and one clean run against two unusable ones is not a result. The cell
-is ~0.2 ms of work split into 16 stripes across 32 threads, short enough that
-scheduler jitter dominates; every other cell settled.
+**15 of 15 above their null control, 1.13x-2.61x.**
 
-The small `l2_*` cells read low GB/s in *both* arms because at 0.018 ms the
+### `Gemm` cells, shipped default — no environment set
+
+| cell | t | before | after | speedup | null | before GB/s | after GB/s |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `l2_512` | 4 | 0.021 ms | 0.014 ms | 1.50x | 4.8% | 25.0 | 37.4 |
+| `l2_512` | 16 | 0.026 ms | 0.014 ms | 1.86x | 3.8% | 20.2 | 37.4 |
+| `l2_512` | 32 | 0.022 ms | 0.017 ms | *not claimed* | 22.7% | 23.8 | 30.8 |
+| `l2_1024` | 4 | 0.087 ms | 0.055 ms | 1.58x | 2.3% | 24.1 | 38.1 |
+| `l2_1024` | 16 | 0.110 ms | 0.083 ms | 1.33x | 1.8% | 19.1 | 25.3 |
+| `l2_1024` | 32 | 0.154 ms | 0.112 ms | 1.38x | 4.5% | 13.6 | 18.7 |
+| `l3_2048` | 4 | 0.222 ms | 0.178 ms | 1.25x | 1.8% | 37.8 | 47.1 |
+| `l3_2048` | 16 | 0.442 ms | 0.200 ms | **2.21x** | 16.5% | 19.0 | 41.9 |
+| `l3_2048` | 32 | 0.343 ms | 0.352 ms | *not claimed* | 48.7% | 24.5 | 23.8 |
+| `l3_3584` | 4 | 0.566 ms | 0.409 ms | 1.38x | 12.0% | 45.4 | 62.8 |
+| `l3_3584` | 16 | 0.561 ms | 0.324 ms | 1.73x | 1.1% | 45.8 | 79.3 |
+| `l3_3584` | 32 | 0.823 ms | 0.594 ms | 1.39x | 16.6% | 31.2 | 43.2 |
+| `dram_8192` | 4 | 7.702 ms | 4.171 ms | 1.85x | 0.4% | 17.4 | 32.2 |
+| `dram_8192` | 16 | 3.278 ms | 1.913 ms | 1.71x | 2.8% | 40.9 | 70.2 |
+| `dram_8192` | 32 | 3.764 ms | 2.140 ms | 1.76x | 1.1% | 35.7 | 62.7 |
+
+**13 of 15 above their null control, 1.25x-2.21x.** The two unclaimed cells both
+had unusable controls (nulls of 22.7% and 48.7%) rather than small effects; at
+t=32 these are ~0.02 ms and ~0.35 ms of work split across 32 threads, short
+enough that scheduler jitter dominates. Every other cell settled.
+
+### On the bandwidth figures
+
+The GB/s column counts the `2 * k * n` weight, which is all this kernel reads.
+Three cells now exceed the host's **75.8 GB/s DRAM** ceiling — `l3_2048` at 88.3
+and `l3_3584` at 88.6 and 82.3. That is not a measurement error and not a
+roofline violation: at 8.4 MB and 25.7 MB those weights are L3-resident, so they
+never go to DRAM at all, and the DRAM roofline is simply the wrong ceiling for
+them. Before this change they ran at 20-43 GB/s, far enough below the DRAM
+figure that the distinction never showed up. It does now, which is itself the
+result: the kernel stopped being the limit, so the cells separated by where
+their weight actually lives.
+
+`dram_8192` is the only cell whose weight genuinely comes from DRAM, and it is
+the one to read against the roofline: **63.1 GB/s of 75.8, or 83%**, up from
+33.0 GB/s (44%).
+
+The small `l2_*` cells read low GB/s in *both* arms because at 0.014-0.02 ms the
 per-run fixed cost is a large fraction of the measurement. Their speedups are
 real and above noise; their absolute bandwidth figures are not meaningful.
 
@@ -241,17 +310,52 @@ pay that, and the first paired attempt at this measurement produced a table with
 three sign errors in it. The flag lives in the shared driver rather than a
 private script so the next person does not repeat the mistake.
 
+## The decode handover is now measured on a stale premise
+
+#1381 set the `MatMul` decode handover at `HALF_PREFILL_GEBP_MIN_WEIGHT` on a
+13-shape sweep showing the GEBP faster at every weight at or above 1.05M — by up
+to 2.27x. That sweep measured the **untiled** GEMV. Since this change is worth
+1.13x-2.61x to the GEMV, the comparison has to be re-run, and it partly inverts.
+
+Re-running #1381's own harness (`bench half_decode_gemv_ab`, 5 interleaved
+repetitions, median of the per-run steady p50, `ratio = GEMV / GEBP` so below
+1.00 favours the GEMV) against the tiled kernel:
+
+| `K x N` | elements | f16 ratio | f16 /ctl | bf16 ratio | bf16 /ctl | #1381 f16 /ctl |
+|---|---:|---:|---:|---:|---:|---:|
+| 1024x768 | 0.79M | 0.25 | 0.25 | 0.32 | 0.33 | 0.40 |
+| 2048x2048 | 4.19M | 1.12 | 1.26 | 1.16 | 1.31 | 1.78 |
+| 4096x11008 | 45.1M | 0.88 | 0.82 | 0.88 | 0.82 | 1.18 |
+| 896x151936 | 136M | 0.86 | 0.86 | 0.88 | 0.88 | 1.26 |
+
+**The two largest shapes invert** — `mlp` and `lm_head`, the shapes that
+actually dominate decode — and 2048x2048 narrows from 1.78 to 1.26 without
+inverting. The `ab.py` cells disagree with the bench harness at 4.19M, and the
+disagreement is thread count: `cargo bench` runs at the rayon default of 32,
+where `l3_2048` reads -2.13% *within* noise, while at t=4 and t=16 the same cell
+reads -83.5% and -61.8% in the GEMV's favour.
+
+So the honest statement is that the threshold is **wrong at both ends and right
+in the middle**, and that its correct value is thread-count dependent, which a
+single weight cutoff cannot express. Retuning it needs its own k x n x thread
+sweep and its own control, and stacking a routing change on evidence that
+conflicts between two harnesses is exactly the kind of unproven change this
+ledger exists to refuse. **Filed as a follow-up rather than folded in here.**
+This PR changes no routing at all: every shape takes the same route it took
+before, only faster.
+
 ## What this does not fix
 
 - **The parallel decomposition still anti-scales**, just from a higher floor:
-  `l3_3584` is 0.419 ms at t=4 and 0.560 ms at t=32. With `STRIPE = 512` and
+  `l3_3584` is 0.290 ms at t=4 and 0.701 ms at t=32. With `STRIPE = 512` and
   `n = 3584` there are 7 stripes, so beyond 7 threads the extra workers only
-  contend. That mattered when the kernel was at 24 GB/s; at 46-61 GB/s against a
-  75.8 GB/s ceiling there is much less left to win, and an earlier attempt to
-  make the stripe width adaptive was refuted outright (see the adaptive-stripe
-  rejection in `2026-08-19-f16-gemm-transb-decode.md`). Worth revisiting only
-  after something else moves the ceiling.
-- **`l2_1024` at t=32 is still only 19.2 GB/s.** Two stripes, so two working
+  contend. That mattered when the kernel was at 24 GB/s; against a 75.8 GB/s
+  ceiling there is less left to win, and an earlier attempt to make the stripe
+  width adaptive was refuted outright (see the adaptive-stripe rejection in
+  `2026-08-19-f16-gemm-transb-decode.md`). Worth revisiting only after something
+  else moves the ceiling — but note it is now the *dominant* remaining loss on
+  the L3 cells, since t=32 is where every unclaimed cell sits.
+- **`l2_1024` at t=32 is still only 18.7 GB/s.** Two stripes, so two working
   threads and a fork/join for 0.1 ms of work.
 - **The f16 *prefill* path is untouched.** This kernel is `M == 1` only.
 - Nothing here applies to aarch64: the module is `#[cfg(target_arch = "x86")]` /

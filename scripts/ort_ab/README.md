@@ -84,7 +84,7 @@ performance cliff that only trained weights would trigger.
 | `gen_mha.py` | `com.microsoft::MultiHeadAttention` (the operator the vectorised `sdpa_f32` path serves) |
 | `gen_moe.py` | `com.microsoft::MoE` / `QMoE`, top-k routing, grouped experts |
 | `gen_transforms.py` | the transforms that *surround* attention: `Softmax`, `RotaryEmbedding`, KV-cache `Concat`, BSNH↔BNSH `Transpose` |
-| `gen_f16_gemv.py` | decode-shaped (`M = 1`) f16 `MatMul`, sweeping the weight working set from L2-resident to past LLC |
+| `gen_f16_gemv.py` | decode-shaped (`M = 1`) f16 `MatMul` or `Gemm` (`--op`), sweeping the weight working set from L2-resident to past LLC |
 
 Each takes an output directory:
 
@@ -93,6 +93,14 @@ python3 scripts/ort_ab/gen_transforms.py --out /path/to/models/transforms
 python3 scripts/ort_ab/gen_grid.py --out /path/to/models/grid
 python3 scripts/ort_ab/gen_moe.py --out-dir /path/to/models/moe --tokens 1 32 512
 ```
+
+`gen_f16_gemv.py` additionally takes `--op {matmul,gemm}`, and the two are not
+interchangeable. A decode `MatMul` reaches the half GEMV only below
+`HALF_PREFILL_GEBP_MIN_WEIGHT` (1,048,576 elements); at or above it the fused
+widen-pack GEBP takes decode instead, so the larger `--op matmul` cells need
+`ONNX_GENAI_CPU_MM_HALF_GEBP=0` to reach the GEMV at all. `--op gemm` emits
+`Gemm` with `transB=0`, which has no weight gate and therefore measures the
+GEMV as a default build actually runs it.
 
 `gen_gqa.py` bakes semantically-constrained integer inputs (`seqlens_k`,
 `total_sequence_length`) as **initializers**, because the harness would
