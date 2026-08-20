@@ -46,6 +46,11 @@ const MAX_D_K: usize = 256;
 /// pass never touched keeps the exact exported (unfused) arithmetic.
 pub(crate) const FUSE_BETA_SIGMOID_ATTR: &str = "com.microsoft.cuda_fuse_beta_sigmoid";
 pub(crate) const FUSE_DECAY_SOFTPLUS_ATTR: &str = "com.microsoft.cuda_fuse_decay_softplus";
+/// Set alongside [`FUSE_DECAY_SOFTPLUS_ATTR`] when the folded decay operand is
+/// the raw per-head `A_log` constant rather than a precomputed `neg_exp_A`, so
+/// the kernel also folds the exported `neg_exp_A = Neg(Exp(A_log))` constant
+/// chain inline (`-round_store<T>(exp(A_log))`, byte-identical to the two ops).
+pub(crate) const FUSE_NEG_EXP_ATTR: &str = "com.microsoft.cuda_fuse_neg_exp";
 
 /// Whether the warp-cooperative `linear_attention_*_coop` kernel is disabled in
 /// favour of the original one-thread-per-column serial kernel. The warp-coop
@@ -110,6 +115,22 @@ __device__ __forceinline__ float la_softplus(float x) {
   return fmaxf(x, 0.0f) + log1pf(expf(-fabsf(x)));
 }
 
+// Byte-exact port of the standalone `Exp` op device function
+// (`kernels/pointwise.rs::op_exp`).
+__device__ __forceinline__ float la_exp(float x) { return expf(x); }
+
+// The per-head decay coefficient `neg_exp_A = -exp(A_log)`. When `fuse_neg_exp`
+// is set the trailing decay operand holds the raw `A_log` constant instead of a
+// precomputed `neg_exp_A`, so the kernel folds the exported `Neg(Exp(A_log))`
+// chain inline. It is byte-identical to the two standalone ops: `Exp` rounds
+// `expf(A_log)` to the storage dtype, then `Neg` negates that (an exact bf16/f16
+// sign flip, so re-rounding is a no-op) — i.e. `-round_store<T>(exp(A_log))`.
+// When `fuse_neg_exp` is clear, `raw` already is `neg_exp_A` and is used as-is.
+template <typename T>
+__device__ __forceinline__ float la_neg_exp(float raw, int fuse_neg_exp) {
+  return fuse_neg_exp ? -round_store<T>(la_exp(raw)) : raw;
+}
+
 // Full-warp butterfly sum: every lane returns Σ over all 32 lanes. Used by the
 // warp-cooperative kernel to reduce the d_k dot products (retrieval r = Sᵀk and
 // readout o = qᵀS) that the serial kernel walks with a 128-iteration loop. The
@@ -136,7 +157,8 @@ __device__ void linear_attention_core(
     unsigned long long kv_per_k_head, unsigned long long output_hidden,
     float scale, int needs_decay, int decay_per_key_dim,
     int needs_delta, int beta_per_head,
-    int fuse_beta_sigmoid, int fuse_decay_softplus) {
+    int fuse_beta_sigmoid, int fuse_decay_softplus,
+    int fuse_neg_exp) {
   const unsigned long long total = batch * kv_num_heads * d_v;
   const unsigned long long stride =
       (unsigned long long)gridDim.x * blockDim.x;
@@ -168,7 +190,7 @@ __device__ void linear_attention_core(
           for (unsigned long long i = 0; i < d_k; ++i) {
             float a = round_store<T>(to_f(g[i]) + to_f(dtb[i]));
             a = round_store<T>(la_softplus(a));
-            a = round_store<T>(to_f(na[i]) * a);
+            a = round_store<T>(la_neg_exp<T>(to_f(na[i]), fuse_neg_exp) * a);
             sc[i] *= expf(a);
           }
         } else {
@@ -180,7 +202,7 @@ __device__ void linear_attention_core(
           float a = round_store<T>(
               to_f(decay[row * kv_num_heads + h_kv]) + to_f(dt_bias[h_kv]));
           a = round_store<T>(la_softplus(a));
-          g_val = round_store<T>(to_f(neg_exp_A[h_kv]) * a);
+          g_val = round_store<T>(la_neg_exp<T>(to_f(neg_exp_A[h_kv]), fuse_neg_exp) * a);
         } else {
           g_val = to_f(decay[row * kv_num_heads + h_kv]);
         }
@@ -243,13 +265,14 @@ extern "C" __global__ void linear_attention_f32(
     unsigned long long kv_per_k_head, unsigned long long output_hidden,
     float scale, int needs_decay, int decay_per_key_dim,
     int needs_delta, int beta_per_head,
-    int fuse_beta_sigmoid, int fuse_decay_softplus) {
+    int fuse_beta_sigmoid, int fuse_decay_softplus,
+    int fuse_neg_exp) {
   linear_attention_core<float>(
       q, k, v, past_state, decay, beta, dt_bias, neg_exp_A, output,
       present_state, batch, seq, d_k, d_v, q_num_heads, kv_num_heads, n_k_heads,
       heads_per_group, kv_per_k_head, output_hidden, scale, needs_decay,
       decay_per_key_dim, needs_delta, beta_per_head, fuse_beta_sigmoid,
-      fuse_decay_softplus);
+      fuse_decay_softplus, fuse_neg_exp);
 }
 
 extern "C" __global__ void linear_attention_f16(
@@ -264,13 +287,14 @@ extern "C" __global__ void linear_attention_f16(
     unsigned long long kv_per_k_head, unsigned long long output_hidden,
     float scale, int needs_decay, int decay_per_key_dim,
     int needs_delta, int beta_per_head,
-    int fuse_beta_sigmoid, int fuse_decay_softplus) {
+    int fuse_beta_sigmoid, int fuse_decay_softplus,
+    int fuse_neg_exp) {
   linear_attention_core<__half>(
       q, k, v, past_state, decay, beta, dt_bias, neg_exp_A, output,
       present_state, batch, seq, d_k, d_v, q_num_heads, kv_num_heads, n_k_heads,
       heads_per_group, kv_per_k_head, output_hidden, scale, needs_decay,
       decay_per_key_dim, needs_delta, beta_per_head, fuse_beta_sigmoid,
-      fuse_decay_softplus);
+      fuse_decay_softplus, fuse_neg_exp);
 }
 
 extern "C" __global__ void linear_attention_bf16(
@@ -287,13 +311,14 @@ extern "C" __global__ void linear_attention_bf16(
     unsigned long long kv_per_k_head, unsigned long long output_hidden,
     float scale, int needs_decay, int decay_per_key_dim,
     int needs_delta, int beta_per_head,
-    int fuse_beta_sigmoid, int fuse_decay_softplus) {
+    int fuse_beta_sigmoid, int fuse_decay_softplus,
+    int fuse_neg_exp) {
   linear_attention_core<__nv_bfloat16>(
       q, k, v, past_state, decay, beta, dt_bias, neg_exp_A, output,
       present_state, batch, seq, d_k, d_v, q_num_heads, kv_num_heads, n_k_heads,
       heads_per_group, kv_per_k_head, output_hidden, scale, needs_decay,
       decay_per_key_dim, needs_delta, beta_per_head, fuse_beta_sigmoid,
-      fuse_decay_softplus);
+      fuse_decay_softplus, fuse_neg_exp);
 }
 
 // ── Warp-cooperative variant ────────────────────────────────────────────────
@@ -321,7 +346,8 @@ __device__ void linear_attention_core_coop(
     unsigned long long kv_per_k_head, unsigned long long output_hidden,
     float scale, int needs_decay, int decay_per_key_dim,
     int needs_delta, int beta_per_head,
-    int fuse_beta_sigmoid, int fuse_decay_softplus) {
+    int fuse_beta_sigmoid, int fuse_decay_softplus,
+    int fuse_neg_exp) {
   const unsigned lane = threadIdx.x & (LA_WARP - 1);
   const unsigned warps_per_block = blockDim.x / LA_WARP;
   const unsigned long long total_warps = batch * kv_num_heads * d_v;
@@ -363,7 +389,7 @@ __device__ void linear_attention_core_coop(
               if (i < d_k) {
                 float a = round_store<T>(to_f(g[i]) + to_f(dtb[i]));
                 a = round_store<T>(la_softplus(a));
-                a = round_store<T>(to_f(na[i]) * a);
+                a = round_store<T>(la_neg_exp<T>(to_f(na[i]), fuse_neg_exp) * a);
                 sc[s] *= expf(a);
               }
             }
@@ -380,7 +406,7 @@ __device__ void linear_attention_core_coop(
             float a = round_store<T>(
                 to_f(decay[row * kv_num_heads + h_kv]) + to_f(dt_bias[h_kv]));
             a = round_store<T>(la_softplus(a));
-            g_val = round_store<T>(to_f(neg_exp_A[h_kv]) * a);
+            g_val = round_store<T>(la_neg_exp<T>(to_f(neg_exp_A[h_kv]), fuse_neg_exp) * a);
           } else {
             g_val = to_f(decay[row * kv_num_heads + h_kv]);
           }
@@ -476,13 +502,14 @@ extern "C" __global__ void linear_attention_f32_coop(
     unsigned long long kv_per_k_head, unsigned long long output_hidden,
     float scale, int needs_decay, int decay_per_key_dim,
     int needs_delta, int beta_per_head,
-    int fuse_beta_sigmoid, int fuse_decay_softplus) {
+    int fuse_beta_sigmoid, int fuse_decay_softplus,
+    int fuse_neg_exp) {
   linear_attention_core_coop<float>(
       q, k, v, past_state, decay, beta, dt_bias, neg_exp_A, output,
       present_state, batch, seq, d_k, d_v, q_num_heads, kv_num_heads, n_k_heads,
       heads_per_group, kv_per_k_head, output_hidden, scale, needs_decay,
       decay_per_key_dim, needs_delta, beta_per_head, fuse_beta_sigmoid,
-      fuse_decay_softplus);
+      fuse_decay_softplus, fuse_neg_exp);
 }
 
 extern "C" __global__ void linear_attention_f16_coop(
@@ -497,13 +524,14 @@ extern "C" __global__ void linear_attention_f16_coop(
     unsigned long long kv_per_k_head, unsigned long long output_hidden,
     float scale, int needs_decay, int decay_per_key_dim,
     int needs_delta, int beta_per_head,
-    int fuse_beta_sigmoid, int fuse_decay_softplus) {
+    int fuse_beta_sigmoid, int fuse_decay_softplus,
+    int fuse_neg_exp) {
   linear_attention_core_coop<__half>(
       q, k, v, past_state, decay, beta, dt_bias, neg_exp_A, output,
       present_state, batch, seq, d_k, d_v, q_num_heads, kv_num_heads, n_k_heads,
       heads_per_group, kv_per_k_head, output_hidden, scale, needs_decay,
       decay_per_key_dim, needs_delta, beta_per_head, fuse_beta_sigmoid,
-      fuse_decay_softplus);
+      fuse_decay_softplus, fuse_neg_exp);
 }
 
 extern "C" __global__ void linear_attention_bf16_coop(
@@ -520,13 +548,14 @@ extern "C" __global__ void linear_attention_bf16_coop(
     unsigned long long kv_per_k_head, unsigned long long output_hidden,
     float scale, int needs_decay, int decay_per_key_dim,
     int needs_delta, int beta_per_head,
-    int fuse_beta_sigmoid, int fuse_decay_softplus) {
+    int fuse_beta_sigmoid, int fuse_decay_softplus,
+    int fuse_neg_exp) {
   linear_attention_core_coop<__nv_bfloat16>(
       q, k, v, past_state, decay, beta, dt_bias, neg_exp_A, output,
       present_state, batch, seq, d_k, d_v, q_num_heads, kv_num_heads, n_k_heads,
       heads_per_group, kv_per_k_head, output_hidden, scale, needs_decay,
       decay_per_key_dim, needs_delta, beta_per_head, fuse_beta_sigmoid,
-      fuse_decay_softplus);
+      fuse_decay_softplus, fuse_neg_exp);
 }
 "#;
 
@@ -642,6 +671,10 @@ impl KernelFactory for LinearAttentionFactory {
             .attr(FUSE_DECAY_SOFTPLUS_ATTR)
             .and_then(|a| a.as_int())
             .is_some_and(|v| v != 0);
+        let fuse_neg_exp = node
+            .attr(FUSE_NEG_EXP_ATTR)
+            .and_then(|a| a.as_int())
+            .is_some_and(|v| v != 0);
         Ok(Box::new(LinearAttentionKernel {
             runtime: self.runtime.clone(),
             q_num_heads,
@@ -650,6 +683,7 @@ impl KernelFactory for LinearAttentionFactory {
             scale,
             fuse_beta_sigmoid,
             fuse_decay_softplus,
+            fuse_neg_exp,
             warp_coop: !linattn_warp_coop_disabled(),
         }))
     }
@@ -664,6 +698,7 @@ struct LinearAttentionKernel {
     scale: Option<f32>,
     fuse_beta_sigmoid: bool,
     fuse_decay_softplus: bool,
+    fuse_neg_exp: bool,
     warp_coop: bool,
 }
 
@@ -799,6 +834,9 @@ impl Kernel for LinearAttentionKernel {
         }
         let fuse_beta_sigmoid = self.fuse_beta_sigmoid && needs_delta;
         let fuse_decay_softplus = self.fuse_decay_softplus && needs_decay;
+        // Only fold `Neg(Exp(A_log))` inline when the decay softplus chain is
+        // itself folded (the neg_exp_A slot is what carries the raw `A_log`).
+        let fuse_neg_exp = self.fuse_neg_exp && fuse_decay_softplus;
         if fuse_decay_softplus && (dt_bias.is_none() || neg_exp_a.is_none()) {
             return Err(EpError::KernelFailed(
                 "cuda_ep LinearAttention: folded decay softplus requires dt_bias and neg_exp_A \
@@ -985,6 +1023,7 @@ impl Kernel for LinearAttentionKernel {
         let beta_per_head_i = i32::from(beta_per_head);
         let fuse_beta_sigmoid_i = i32::from(fuse_beta_sigmoid);
         let fuse_decay_softplus_i = i32::from(fuse_decay_softplus);
+        let fuse_neg_exp_i = i32::from(fuse_neg_exp);
 
         // The serial kernel launches one thread per state column; the
         // warp-cooperative kernel launches one WARP (32 threads) per column.
@@ -1025,7 +1064,8 @@ impl Kernel for LinearAttentionKernel {
             .arg(&needs_delta_i)
             .arg(&beta_per_head_i)
             .arg(&fuse_beta_sigmoid_i)
-            .arg(&fuse_decay_softplus_i);
+            .arg(&fuse_decay_softplus_i)
+            .arg(&fuse_neg_exp_i);
         // SAFETY: argument types/order match `linear_attention_*`; every pointer
         // is a live contiguous device allocation validated above (nulls for
         // absent optionals), and each thread owns one disjoint state column so

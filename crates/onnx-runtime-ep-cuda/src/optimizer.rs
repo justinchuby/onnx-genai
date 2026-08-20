@@ -5,7 +5,9 @@ use onnx_runtime_optimizer::{
     OptimizationPass, OptimizerError, PassContext, Result as OptimizerResult,
 };
 
-use crate::kernels::linear_attention::{FUSE_BETA_SIGMOID_ATTR, FUSE_DECAY_SOFTPLUS_ATTR};
+use crate::kernels::linear_attention::{
+    FUSE_BETA_SIGMOID_ATTR, FUSE_DECAY_SOFTPLUS_ATTR, FUSE_NEG_EXP_ATTR,
+};
 
 pub(crate) const SILU_MUL_FUSION_ATTR: &str = "_cuda_silu_mul";
 pub(crate) const DECOMPOSED_SILU_ATTR: &str = "_cuda_decomposed_silu";
@@ -600,7 +602,14 @@ struct DecaySoftplusFold {
     /// Pre-chain activation `a` (the `Add`'s non-initializer operand).
     a: ValueId,
     dt_bias: ValueId,
+    /// The decay coefficient operand passed in the kernel's `neg_exp_A` slot.
+    /// When `fuse_neg_exp` is false this is the precomputed `neg_exp_A`
+    /// initializer; when true it is the raw `A_log` initializer and the kernel
+    /// folds the `Neg(Exp(A_log))` constant chain inline.
     neg_exp_a: ValueId,
+    /// Whether the exported `neg_exp_A = Neg(Exp(A_log))` constant chain was also
+    /// absorbed (so `neg_exp_a` above is `A_log`).
+    fuse_neg_exp: bool,
     /// Chain nodes to delete, consumer-first so each is orphaned before removal.
     dead: Vec<NodeId>,
 }
@@ -651,9 +660,49 @@ impl CudaLinearAttentionGatingFusion {
         Some(BetaSigmoidFold { sigmoid_id, raw })
     }
 
+    /// Match the exported `neg_exp_A = Neg(Exp(A_log))` constant chain feeding
+    /// `mul_id`, where `A_log` is an `io_dtype` graph initializer and both ops
+    /// are single-consumer and not graph outputs. Returns the `A_log` value and
+    /// the `[Neg, Exp]` node ids to delete (consumer-first). Some exporters emit
+    /// `neg_exp_A` as a ready initializer (nothing to fold here); others — the
+    /// Qwen3.8 / Qwen3-Next hybrids — emit these two elementwise ops on the
+    /// per-head `A_log` weight, which then run every decode step on a constant.
+    fn match_neg_exp_chain(
+        graph: &Graph,
+        neg_exp_a: ValueId,
+        consumer_id: NodeId,
+        io_dtype: DataType,
+    ) -> Option<(ValueId, [NodeId; 2])> {
+        let neg_id = Self::sole_producer(graph, neg_exp_a, consumer_id)?;
+        let neg = graph.node(neg_id);
+        if neg.op_type != "Neg"
+            || !neg.is_default_domain()
+            || neg.inputs.len() != 1
+            || neg.outputs.len() != 1
+        {
+            return None;
+        }
+        let exp_out = neg.inputs[0]?;
+        let exp_id = Self::sole_producer(graph, exp_out, neg_id)?;
+        let exp = graph.node(exp_id);
+        if exp.op_type != "Exp"
+            || !exp.is_default_domain()
+            || exp.inputs.len() != 1
+            || exp.outputs.len() != 1
+        {
+            return None;
+        }
+        let a_log = exp.inputs[0]?;
+        if !graph.initializers.contains_key(&a_log) || graph.value(a_log).dtype != io_dtype {
+            return None;
+        }
+        Some((a_log, [neg_id, exp_id]))
+    }
+
     /// Match `decay = [Cast](Mul(neg_exp_A, Softplus(Add(a, dt_bias))))` with an
     /// optional identity `Cast` tail, every intermediate single-consumer and of
-    /// `io_dtype`, and `dt_bias`/`neg_exp_A` graph initializers.
+    /// `io_dtype`, `dt_bias` a graph initializer, and `neg_exp_A` either a graph
+    /// initializer or the foldable `Neg(Exp(A_log))` constant chain.
     fn match_decay_softplus(
         graph: &Graph,
         decay: ValueId,
@@ -688,17 +737,30 @@ impl CudaLinearAttentionGatingFusion {
             return None;
         }
         let (a0, a1) = (mul.inputs[0]?, mul.inputs[1]?);
-        let (neg_exp_a, softplus_out) = if graph.initializers.contains_key(&a0) {
-            (a0, a1)
+        // The decay coefficient operand is either a precomputed `neg_exp_A`
+        // graph initializer, or the exported `Neg(Exp(A_log))` constant chain
+        // (A_log an initializer) which is folded into the kernel; the other
+        // operand is the `Softplus(...)` result. `dead` stays consumer-first, so
+        // `mul_id` is pushed before the coefficient chain it consumes.
+        dead.push(mul_id);
+        let (neg_exp_a, softplus_out, fuse_neg_exp) = if graph.initializers.contains_key(&a0) {
+            (a0, a1, false)
         } else if graph.initializers.contains_key(&a1) {
-            (a1, a0)
+            (a1, a0, false)
+        } else if let Some((a_log, chain)) = Self::match_neg_exp_chain(graph, a0, mul_id, io_dtype) {
+            dead.extend(chain);
+            (a_log, a1, true)
+        } else if let Some((a_log, chain)) = Self::match_neg_exp_chain(graph, a1, mul_id, io_dtype) {
+            dead.extend(chain);
+            (a_log, a0, true)
         } else {
             return None;
         };
-        if graph.value(neg_exp_a).dtype != io_dtype {
+        // The initializer path still checks the coefficient dtype here; the
+        // chain path already checked `A_log`'s dtype inside `match_neg_exp_chain`.
+        if !fuse_neg_exp && graph.value(neg_exp_a).dtype != io_dtype {
             return None;
         }
-        dead.push(mul_id);
         // `Softplus(Add(...))`.
         let softplus_id = Self::sole_producer(graph, softplus_out, mul_id)?;
         let softplus = graph.node(softplus_id);
@@ -737,6 +799,7 @@ impl CudaLinearAttentionGatingFusion {
             a,
             dt_bias,
             neg_exp_a,
+            fuse_neg_exp,
             dead,
         })
     }
@@ -801,6 +864,11 @@ impl OptimizationPass for CudaLinearAttentionGatingFusion {
                 new_la
                     .attributes
                     .insert(FUSE_DECAY_SOFTPLUS_ATTR.into(), Attribute::Int(1));
+                if fold.fuse_neg_exp {
+                    new_la
+                        .attributes
+                        .insert(FUSE_NEG_EXP_ATTR.into(), Attribute::Int(1));
+                }
                 dead.extend(fold.dead);
             }
             graph.replace_node(la_id, new_la);
@@ -7230,6 +7298,13 @@ mod tests {
     /// `trailing_cast` toggles the optional identity `Cast` between the decay
     /// `Mul` and the kernel (present on the fp32 text export).
     fn gated_delta_la_graph(heads: usize, trailing_cast: bool) -> Graph {
+        gated_delta_la_graph_ext(heads, trailing_cast, false)
+    }
+
+    /// `neg_exp_from_a_log`: when true the decay coefficient is the exported
+    /// `Neg(Exp(A_log))` constant chain (A_log the initializer) instead of a
+    /// ready `neg_exp_A` initializer, exercising the inline constant-chain fold.
+    fn gated_delta_la_graph_ext(heads: usize, trailing_cast: bool, neg_exp_from_a_log: bool) -> Graph {
         let mut graph = Graph::new();
         graph.opset_imports.insert(String::new(), 17);
         graph.opset_imports.insert(MICROSOFT_DOMAIN.into(), 1);
@@ -7244,11 +7319,13 @@ mod tests {
             graph.add_input(input);
         }
 
-        // dt_bias / neg_exp_A are graph initializers (that is how the pass tells
-        // the constant operand from the activation).
+        // dt_bias is always a graph initializer. The decay coefficient is either
+        // a ready `neg_exp_A` initializer, or `A_log` (initializer) feeding an
+        // `Exp → Neg` chain that produces the `neg_exp_A` value.
         let dt_bias = vec1d(&mut graph, "dt_bias", DataType::Float32, heads);
-        let neg_exp_a = vec1d(&mut graph, "neg_exp_A", DataType::Float32, heads);
-        for init in [dt_bias, neg_exp_a] {
+        let coeff_init_name = if neg_exp_from_a_log { "A_log" } else { "neg_exp_A" };
+        let coeff_init = vec1d(&mut graph, coeff_init_name, DataType::Float32, heads);
+        for init in [dt_bias, coeff_init] {
             graph.set_initializer(
                 init,
                 WeightRef::Inline(TensorData::from_raw(
@@ -7258,6 +7335,15 @@ mod tests {
                 )),
             );
         }
+        let neg_exp_a = if neg_exp_from_a_log {
+            let exp_out = value(&mut graph, "exp_out", DataType::Float32, heads);
+            graph.insert_node(Node::new(NodeId(0), "Exp", vec![Some(coeff_init)], vec![exp_out]));
+            let neg_out = value(&mut graph, "neg_exp_A", DataType::Float32, heads);
+            graph.insert_node(Node::new(NodeId(0), "Neg", vec![Some(exp_out)], vec![neg_out]));
+            neg_out
+        } else {
+            coeff_init
+        };
 
         // decay chain.
         let add_out = value(&mut graph, "add_out", DataType::Float32, heads);
@@ -7363,6 +7449,71 @@ mod tests {
             assert_eq!(la.inputs[6], Some(dt_bias));
             assert_eq!(la.inputs[7], Some(neg_exp_a));
         }
+    }
+
+    #[test]
+    fn folds_neg_exp_a_log_chain_into_linear_attention() {
+        for trailing_cast in [false, true] {
+            let mut graph = gated_delta_la_graph_ext(4, trailing_cast, true);
+            let a = value_id_by_name(&graph, "a");
+            let dt_bias = value_id_by_name(&graph, "dt_bias");
+            let a_log = value_id_by_name(&graph, "A_log");
+
+            CudaLinearAttentionGatingFusion
+                .run(&mut graph, &PassContext::new())
+                .unwrap();
+
+            // The whole decay chain, including the `Exp`/`Neg` constant ops, is
+            // folded into the kernel.
+            for op in ["Sigmoid", "Softplus", "Add", "Mul", "Cast", "Exp", "Neg"] {
+                assert!(
+                    graph.nodes.values().all(|n| n.op_type != op),
+                    "{op} must be folded away (trailing_cast={trailing_cast})"
+                );
+            }
+
+            let la = graph
+                .nodes
+                .values()
+                .find(|n| n.op_type == "LinearAttention")
+                .unwrap();
+            assert_eq!(
+                la.attr(FUSE_DECAY_SOFTPLUS_ATTR)
+                    .and_then(Attribute::as_int),
+                Some(1)
+            );
+            // The new marker signals the kernel to compute `-exp(A_log)` inline.
+            assert_eq!(
+                la.attr(FUSE_NEG_EXP_ATTR).and_then(Attribute::as_int),
+                Some(1)
+            );
+            // The neg_exp_A slot now carries the raw `A_log` initializer.
+            assert_eq!(la.inputs[4], Some(a));
+            assert_eq!(la.inputs.len(), 8);
+            assert_eq!(la.inputs[6], Some(dt_bias));
+            assert_eq!(la.inputs[7], Some(a_log));
+        }
+    }
+
+    #[test]
+    fn precomputed_neg_exp_a_initializer_does_not_set_neg_exp_marker() {
+        // When the exporter already provides `neg_exp_A` as an initializer, the
+        // decay fold fires but the inline `Neg(Exp)` marker must stay absent.
+        let mut graph = gated_delta_la_graph(4, false);
+        CudaLinearAttentionGatingFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        let la = graph
+            .nodes
+            .values()
+            .find(|n| n.op_type == "LinearAttention")
+            .unwrap();
+        assert_eq!(
+            la.attr(FUSE_DECAY_SOFTPLUS_ATTR)
+                .and_then(Attribute::as_int),
+            Some(1)
+        );
+        assert!(la.attr(FUSE_NEG_EXP_ATTR).is_none());
     }
 
     #[test]
