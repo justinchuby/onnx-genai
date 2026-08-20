@@ -80,6 +80,16 @@ impl GemmKernel {
         // single row. Memory-bound, and measured at parity with ORT in MatMul.
         // Both stored orders have a kernel, so `trans_b` picks one rather than
         // disqualifying the call — see the dispatch comment in `execute`.
+        //
+        // No weight diverts this to the fused GEBP. `MatMul` used to divert at
+        // `k * n >= 1M` and `Gemm` never did -- the divergence #1381 recorded.
+        // Re-measured through both production kernels the divert is a loss
+        // (1.3x-6.7x at 8 threads), so it was retired from `MatMul` rather
+        // than copied here, and the two ops now take the same **f16** route at
+        // every weight -- `half_decode_route_tests` pins that. `bf16` is a
+        // separate, still-open gap: the dtype check above admits `Float16`
+        // only, so a `bf16` `Gemm` decode falls into the portable blocked half
+        // GEMM where `MatMul` serves it from the same GEMV.
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         if m == 1
             && b.is_contiguous()
@@ -95,6 +105,7 @@ impl GemmKernel {
                 // and the view outlives this call.
                 let b_bits = unsafe { std::slice::from_raw_parts(b.data_ptr::<u16>(), k * n) };
                 let mut result = vec![0.0f32; n];
+                count_half_decode_gemv();
                 if trans_b {
                     half_gemv::gemv_f16_nk(&a_dense, b_bits, &mut result, k, n);
                 } else {
@@ -312,6 +323,32 @@ fn try_half_gemm(
         n,
     );
     Ok(Some(output))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only count of `m == 1` f16 decodes served by the GEMV, so a test
+    /// can assert *which route* ran rather than only that the numbers are
+    /// plausible -- every route here agrees to half-precision rounding, so the
+    /// numbers alone cannot tell them apart.
+    static HALF_DECODE_GEMV_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+fn count_half_decode_gemv() {
+    #[cfg(test)]
+    HALF_DECODE_GEMV_CALLS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+fn half_decode_gemv_calls() -> u64 {
+    HALF_DECODE_GEMV_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+fn reset_half_decode_gemv_calls() {
+    HALF_DECODE_GEMV_CALLS.with(|c| c.set(0));
 }
 
 #[cfg(test)]
@@ -1193,5 +1230,278 @@ mod tests {
             declined, admitted,
             "declining the transpose cache must not change results"
         );
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod half_decode_route_tests {
+    use super::*;
+    use crate::kernels::testutil::Owned;
+
+    /// `Gemm` at `m == 1` run through the real kernel. Returns the output and
+    /// the number of decode-GEMV calls it made, so a test asserts *which*
+    /// kernel ran and not only that the numbers are plausible.
+    fn decode_gemm(k: usize, n: usize, a: &[f32], b: &[f32], trans_b: bool) -> (Vec<f32>, u64) {
+        let a_t = Owned::f16(&[1, k], a);
+        let b_t = if trans_b {
+            Owned::f16(&[n, k], b)
+        } else {
+            Owned::f16(&[k, n], b)
+        };
+        let mut out = Owned::zeros_f32(&[1, n]);
+        let mut kernel = GemmKernel {
+            alpha: 1.0,
+            beta: 1.0,
+            trans_a: false,
+            trans_b,
+            prepack: MatMulPrepack::default(),
+        };
+        kernel.set_constant_inputs(&[false, true]);
+        super::reset_half_decode_gemv_calls();
+        kernel
+            .execute(&[a_t.view(), b_t.view()], &mut [out.view_mut()])
+            .unwrap();
+        (out.to_f32(), super::half_decode_gemv_calls())
+    }
+
+    /// The same logical decode through `MatMul`, for the route-agreement test.
+    fn decode_matmul(k: usize, n: usize, a: &[f32], b: &[f32]) -> (Vec<f32>, u64) {
+        let a_t = Owned::f16(&[1, k], a);
+        let b_t = Owned::f16(&[k, n], b);
+        let mut out = Owned::zeros_f32(&[1, n]);
+        let mut kernel = matmul::MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+        matmul::reset_half_decode_gemv_calls();
+        kernel
+            .execute(&[a_t.view(), b_t.view()], &mut [out.view_mut()])
+            .unwrap();
+        (out.to_f32(), matmul::half_decode_gemv_calls())
+    }
+
+    /// `f64` reference over the *narrowed* operand values, so the only error
+    /// the tolerance has to absorb is the kernel's own accumulation order.
+    fn reference(k: usize, n: usize, a: &[f32], b: &[f32]) -> Vec<f64> {
+        let narrow = |v: &[f32]| -> Vec<f64> {
+            v.iter()
+                .map(|&x| f64::from(half::f16::from_f32(x).to_f32()))
+                .collect()
+        };
+        let (a, b) = (narrow(a), narrow(b));
+        let mut out = vec![0.0f64; n];
+        for (p, &av) in a.iter().enumerate().take(k) {
+            for j in 0..n {
+                out[j] += av * b[p * n + j];
+            }
+        }
+        out
+    }
+
+    fn operand(len: usize, seed: f32) -> Vec<f32> {
+        (0..len)
+            .map(|i| ((i as f32) * 0.0137 + seed).sin() * 0.5)
+            .collect()
+    }
+
+    fn worst_rel(got: &[f32], want: &[f64]) -> f64 {
+        got.iter()
+            .zip(want)
+            .map(|(&got, &want)| (f64::from(got) - want).abs() / (1.0 + want.abs()))
+            .fold(0.0f64, f64::max)
+    }
+
+    /// #1381: `MatMul` and `Gemm` must take the *same* `m == 1` f16 route.
+    ///
+    /// They did not. `MatMul` diverted to the fused widen-pack GEBP once
+    /// `k * n` reached 1M and `Gemm` stayed on the decode GEMV at every
+    /// weight, so the identical operation had two kernels and two costs
+    /// depending on which op the exporter emitted. Re-measuring picked the
+    /// GEMV, so this asserts *both* ops reach it -- above and below the weight
+    /// where the divert used to happen, and out to a 45M `mlp` shape.
+    ///
+    /// Fails loudly if either side re-acquires a weight-dependent divert: the
+    /// counter is incremented by the GEMV arm alone.
+    #[test]
+    fn gemm_and_matmul_take_the_same_decode_route() {
+        if !half_gemv::simd_available(HalfFormat::F16) {
+            return;
+        }
+        // 1024x1024 is exactly the weight the retired divert triggered at;
+        // 1024x768 the largest below it; the rest are decode shapes from a
+        // 7B-class graph, every one of which the divert used to claim.
+        for (k, n) in [
+            (64usize, 64usize),
+            (1024, 768),
+            (1024, 1024),
+            (1024, 2048),
+            (4096, 4096),
+        ] {
+            let a = operand(k, 0.25);
+            let b = operand(k * n, -0.5);
+
+            let (gemm_out, gemm_gemv) = decode_gemm(k, n, &a, &b, false);
+            assert_eq!(
+                gemm_gemv, 1,
+                "k={k} n={n}: Gemm must serve an m == 1 f16 decode with the GEMV"
+            );
+
+            let (matmul_out, matmul_gemv) = decode_matmul(k, n, &a, &b);
+            assert_eq!(
+                matmul_gemv, 1,
+                "k={k} n={n}: MatMul must serve an m == 1 f16 decode with the GEMV"
+            );
+
+            assert_eq!(
+                gemm_out, matmul_out,
+                "k={k} n={n}: Gemm and MatMul decode must be bit-identical"
+            );
+
+            let worst = worst_rel(&gemm_out, &reference(k, n, &a, &b));
+            assert!(
+                worst <= 2e-3,
+                "k={k} n={n}: decode disagrees with the f64 reference by {worst:e}"
+            );
+        }
+    }
+
+    /// A transposed weight is `[N, K]` and keeps its own GEMV at every size.
+    ///
+    /// Worth pinning separately because the `[N, K]` arm is the layout every
+    /// `nn.Linear` export produces, and because declining it drops `Gemm` into
+    /// the portable blocked half GEMM -- there is no other fast path past this
+    /// point without the `mlas` feature.
+    #[test]
+    fn transposed_decode_keeps_its_gemv_at_every_weight() {
+        if !half_gemv::simd_available(HalfFormat::F16) {
+            return;
+        }
+        for (k, n) in [(1024usize, 2048usize), (4096, 4096)] {
+            let a = operand(k, 0.25);
+            let kn = operand(k * n, -0.5);
+            let mut nk = vec![0.0f32; n * k];
+            for p in 0..k {
+                for j in 0..n {
+                    nk[j * k + p] = kn[p * n + j];
+                }
+            }
+            let (out, gemv) = decode_gemm(k, n, &a, &nk, true);
+            assert_eq!(gemv, 1, "k={k} n={n}: a transB decode must reach the GEMV");
+
+            let worst = worst_rel(&out, &reference(k, n, &a, &kn));
+            assert!(
+                worst <= 2e-3,
+                "k={k} n={n}: transB decode disagrees by {worst:e}"
+            );
+        }
+    }
+}
+
+/// Production-path A/B for the `m == 1` f16 `Gemm` decode route.
+///
+/// Both arms come out of one build, selected by environment, because
+/// `half_prefill_gebp_enabled` is a process-wide `OnceLock` -- so one arm per
+/// process, exactly as `benches/half_decode_gemv_ab.rs` does it for `MatMul`:
+///
+/// ```text
+/// ONNX_GENAI_CPU_MM_HALF_GEBP=0 cargo test -p onnx-runtime-ep-cpu --release --lib \
+///     bench_gemm_half_decode_route -- --ignored --nocapture   # GEMV (pre-change)
+/// cargo test -p onnx-runtime-ep-cpu --release --lib \
+///     bench_gemm_half_decode_route -- --ignored --nocapture   # shipped routing
+/// ```
+///
+/// The `f32` row runs the same shape through the same kernel on a path neither
+/// arm can move, so it says whether a difference between two processes is the
+/// route or the machine.
+#[cfg(all(test, target_arch = "x86_64"))]
+mod half_decode_route_bench {
+    use super::*;
+    use crate::kernels::testutil::Owned;
+    use std::time::Instant;
+
+    fn median(mut samples: Vec<f64>) -> f64 {
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        samples[samples.len() / 2]
+    }
+
+    fn operand(len: usize, seed: f32) -> Vec<f32> {
+        (0..len)
+            .map(|i| ((i as f32) * 0.0137 + seed).sin() * 0.5)
+            .collect()
+    }
+
+    fn time_decode(dtype: DataType, k: usize, n: usize, reps: usize) -> (f64, f64, u64) {
+        let a_data = operand(k, 0.25);
+        let b_data = operand(k * n, -0.5);
+        let (a, b) = match dtype {
+            DataType::Float16 => (Owned::f16(&[1, k], &a_data), Owned::f16(&[k, n], &b_data)),
+            _ => (Owned::f32(&[1, k], &a_data), Owned::f32(&[k, n], &b_data)),
+        };
+        let mut out = Owned::zeros_f32(&[1, n]);
+        let mut kernel = GemmKernel {
+            alpha: 1.0,
+            beta: 1.0,
+            trans_a: false,
+            trans_b: false,
+            prepack: MatMulPrepack::default(),
+        };
+        kernel.set_constant_inputs(&[false, true]);
+
+        // Cold: the first Run of a session, weight not yet resident.
+        super::reset_half_decode_gemv_calls();
+        let start = Instant::now();
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        let cold = start.elapsed().as_secs_f64() * 1e3;
+        let gemv = super::half_decode_gemv_calls();
+
+        let mut samples = Vec::with_capacity(reps);
+        for _ in 0..reps {
+            let start = Instant::now();
+            kernel
+                .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+                .unwrap();
+            samples.push(start.elapsed().as_secs_f64() * 1e3);
+        }
+        (cold, median(samples), gemv)
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_gemm_half_decode_route() {
+        let shapes: [(&str, usize, usize); 8] = [
+            ("k1024n768", 1024, 768),
+            ("k1024n1024", 1024, 1024),
+            ("k1024n2048", 1024, 2048),
+            ("k2048n1024", 2048, 1024),
+            ("k512n4096", 512, 4096),
+            ("qwen_qkv", 3584, 4608),
+            ("llama_mlp", 4096, 11008),
+            ("llama_qkv", 4096, 4096),
+        ];
+        let reps: usize = std::env::var("REPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(25);
+        println!(
+            "gebp={} threads={}",
+            std::env::var("ONNX_GENAI_CPU_MM_HALF_GEBP").unwrap_or_else(|_| "default(on)".into()),
+            rayon::current_num_threads()
+        );
+        println!(
+            "{:>12} {:>7} {:>7} {:>9} {:>10} {:>8} {:>7}",
+            "shape", "k", "n", "cold_ms", "steady_ms", "GB/s", "route"
+        );
+        for (name, k, n) in shapes {
+            let (cold, steady, gemv) = time_decode(DataType::Float16, k, n, reps);
+            let route = if gemv == 1 { "gemv" } else { "other" };
+            let gb = (2 * k * n) as f64 / (steady * 1e-3) / 1e9;
+            println!("{name:>12} {k:>7} {n:>7} {cold:>9.3} {steady:>10.3} {gb:>8.1} {route:>7}");
+            let (cold, steady, _) = time_decode(DataType::Float32, k, n, reps.min(10));
+            let gb = (4 * k * n) as f64 / (steady * 1e-3) / 1e9;
+            println!(
+                "{:>12} {k:>7} {n:>7} {cold:>9.3} {steady:>10.3} {gb:>8.1} {:>7}",
+                "  ^f32 ctl", "ctl"
+            );
+        }
     }
 }
