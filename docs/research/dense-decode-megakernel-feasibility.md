@@ -741,7 +741,7 @@ LOP3 (4×`lop3.b32` + debias) — that is *why* the ALU pipe is at 65%. The one 
 separate `__hmul2(q, scale)` with a single `fma(code, scale, -zp*scale)`, dropping **4 `__hmul2` per 8
 weights** (~20% fewer fp16 ALU ops in the MAC). Env `ONNX_GENAI_GEMV_FOLDSCALE` — **retracted**:
 the kernel this selected was deleted by #1527 after the win failed to reproduce, so the variable
-no longer exists and setting it does nothing. See the re-measurement in §9.2.
+no longer exists and setting it does nothing. See the re-measurement in §9.3.
 
 | variant | tok/s | Δ | dominant-kernel µs | DRAM% |
 | --- | --- | --- | --- | --- |
