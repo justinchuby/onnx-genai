@@ -910,12 +910,21 @@ fn context_termination_requires_in_flight_allocator_callbacks_to_quiesce() {
     ));
     resume.wait();
     let allocation = worker.join().unwrap();
+    // Confirmed termination discharges retained ownership without calling the
+    // allocator, because on a real device the state it referred to is already
+    // gone. On the host heap nothing else reclaims these bytes, so the test
+    // gives back what it told the runtime to abandon rather than being exempted
+    // from Miri's leak check.
+    let abandoned = allocation.as_ptr();
     registry.confirm_context_terminated(context).unwrap();
     registry.remove(mechanism).unwrap();
     registry.remove_provider_context(context).unwrap();
     registry.remove_authority(authority).unwrap();
     drop(allocation);
     drop(binding);
+    // SAFETY: the exact address, size and alignment `HostAllocator` handed out
+    // above; the runtime has discharged its ownership and no handle survives.
+    unsafe { HostAllocator.deallocate(abandoned, 64, 16) };
 }
 
 #[derive(Debug)]
@@ -1053,6 +1062,13 @@ fn no_registry_or_mechanism_lock_is_held_across_allocator_or_capability_callback
         .unwrap();
     binding.release(allocation).unwrap();
     assert_eq!(allocator.virtual_calls.load(Ordering::SeqCst), 1);
+    // The hook is what makes this allocator re-entrant, and it is also an
+    // `Arc` cycle: the registry owns the mechanism, the mechanism owns this
+    // allocator, and the hook owns the registry back. Leaving it set leaks the
+    // whole graph, which Miri reports and which is a real trap for any provider
+    // that keeps a registry handle inside its allocator for re-entrancy. Break
+    // it once the callbacks under test have been observed.
+    *allocator.hook.lock().unwrap() = None;
 }
 
 #[test]

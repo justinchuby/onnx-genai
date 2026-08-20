@@ -65,6 +65,17 @@ impl RecordingAllocator {
         *self.probe.lock().expect("probe lock") = Some((registry, mechanism));
     }
 
+    /// Break the `Arc` cycle the armed probe creates.
+    ///
+    /// The registry owns the mechanism, the mechanism owns this object, and the
+    /// probe owns the registry back, so leaving it armed leaks the whole graph.
+    /// That is a real trap for any provider holding a registry handle inside a
+    /// callback, not just a test artifact, so it is broken explicitly rather
+    /// than exempted from Miri's leak check.
+    fn disarm_probe(&self) {
+        *self.probe.lock().expect("probe lock") = None;
+    }
+
     fn release_calls(&self) -> usize {
         self.release_calls.load(Ordering::SeqCst)
     }
@@ -205,6 +216,17 @@ impl BoundedQueue {
         *self.probe.lock().expect("probe lock") = Some((registry, mechanism));
     }
 
+    /// Break the `Arc` cycle the armed probe creates.
+    ///
+    /// The registry owns the mechanism, the mechanism owns this object, and the
+    /// probe owns the registry back, so leaving it armed leaks the whole graph.
+    /// That is a real trap for any provider holding a registry handle inside a
+    /// callback, not just a test artifact, so it is broken explicitly rather
+    /// than exempted from Miri's leak check.
+    fn disarm_probe(&self) {
+        *self.probe.lock().expect("probe lock") = None;
+    }
+
     /// Execute every queued request with the queue lock released first.
     fn drain(&self) -> Vec<AllocationReleaseOutcome> {
         let taken = {
@@ -308,6 +330,34 @@ impl Fixture {
 
     fn snapshot(&self) -> onnx_runtime_memory_api::MechanismSnapshot {
         self.registry.snapshot(self.mechanism).expect("snapshot")
+    }
+
+    /// Give back the host bytes this fixture's runtime deliberately retained.
+    ///
+    /// Quarantine is retention, not release: the address stays owned and is
+    /// discharged only at confirmed context termination, which makes no
+    /// allocator call because on a real device that state is already gone. On
+    /// the host heap nothing else reclaims those bytes, so a test that asserts
+    /// quarantine happened is, under Miri's leak check, a test that leaks.
+    /// Reclaiming here keeps the check on for everything else instead of
+    /// exempting these tests from it.
+    fn reclaim_retained(&self) -> usize {
+        // A test that has already torn the mechanism down has no quarantine to
+        // read; that is not a reclaim failure, so it reports zero rather than
+        // panicking. Such a test must reclaim before teardown instead.
+        let Ok(retained) = self.registry.quarantined(self.mechanism) else {
+            return 0;
+        };
+        for record in &retained {
+            let Some(ptr) = NonNull::new(record.address as *mut u8) else {
+                continue;
+            };
+            // SAFETY: the exact address, size and alignment the recording
+            // allocator handed out; the runtime has stopped tracking it as live
+            // and quarantined ownership is by construction unaliased.
+            unsafe { self.allocator.deallocate(ptr, record.bytes, record.align) };
+        }
+        retained.len()
     }
 
     fn assert_quiescent(&self) {
@@ -550,6 +600,7 @@ fn enqueue_failure_quarantines_the_exact_request() {
         quarantined[0].reason,
         QuarantineReason::EnqueueRejected(DeferredEnqueueRejection::Closed)
     );
+    fixture.reclaim_retained();
 }
 
 #[test]
@@ -601,6 +652,7 @@ fn a_dropped_enqueue_error_quarantines_rather_than_losing_the_request() {
         fixture.binding.quarantined().expect("quarantine list")[0].reason,
         QuarantineReason::AbandonedRequest
     );
+    fixture.reclaim_retained();
 }
 
 #[test]
@@ -623,6 +675,7 @@ fn an_abandoned_prepared_request_is_quarantined_not_freed() {
     assert_eq!(quarantined[0].state, AllocationReleaseState::Quarantined);
     assert_eq!(quarantined[0].retained_bytes, 4096);
     assert_eq!(fixture.snapshot().queued_releases, 0);
+    fixture.reclaim_retained();
 }
 
 #[test]
@@ -639,6 +692,7 @@ fn a_dropped_owning_allocation_is_quarantined_not_freed() {
     assert_eq!(quarantined[0].identity, identity);
     assert_eq!(quarantined[0].reason, QuarantineReason::OwnerDropped);
     assert_eq!(fixture.snapshot().live_allocations, 0);
+    fixture.reclaim_retained();
 }
 
 #[test]
@@ -700,6 +754,7 @@ fn a_view_that_outlives_its_owner_can_never_be_validated_or_release_anything() {
         "{error:?}"
     );
     assert_eq!(fixture.allocator.release_calls(), 0);
+    fixture.reclaim_retained();
 }
 
 #[test]
@@ -782,6 +837,7 @@ fn a_retired_record_cannot_be_released_twice() {
         ),
         "{removal:?}"
     );
+    fixture.reclaim_retained();
 }
 
 #[test]
@@ -805,6 +861,7 @@ fn an_allocator_failure_after_preparation_is_conservatively_quarantined() {
         fixture.binding.quarantined().expect("quarantine list")[0].identity,
         identity
     );
+    fixture.reclaim_retained();
 }
 
 #[test]
@@ -861,7 +918,14 @@ fn device_loss_refuses_preparation_and_keeps_the_owner() {
     );
     let (_, owning) = error.into_parts();
     assert_eq!(owning.len(), 4096, "the owner is handed back intact");
+    // Device loss is terminal without an allocator call, so the record never
+    // reaches the quarantine list the fixture can walk. The address is the
+    // test's only remaining handle on these host bytes.
+    let abandoned = owning.as_ptr();
     drop(owning);
+    // SAFETY: the exact address, size and alignment the recording allocator
+    // handed out; the runtime has given up ownership and no handle survives.
+    unsafe { fixture.allocator.deallocate(abandoned, 4096, 64) };
 }
 
 #[test]
@@ -903,6 +967,7 @@ fn a_queued_request_becomes_device_lost_quarantine_and_keeps_its_pins() {
     assert_eq!(quarantined.len(), 1);
     assert_eq!(quarantined[0].identity, identity);
     assert_eq!(quarantined[0].state, AllocationReleaseState::DeviceLost);
+    fixture.reclaim_retained();
 }
 
 #[test]
@@ -944,6 +1009,10 @@ fn queued_ownership_blocks_teardown_until_it_settles() {
     let outcomes = queue.drain();
     assert!(outcomes[0].is_quarantined());
     assert_eq!(fixture.snapshot().quarantined_allocations, 1);
+    // Reclaimed here rather than at the end: the confirmed termination below
+    // discharges the quarantine record, after which the address is no longer
+    // recoverable through the registry.
+    assert_eq!(fixture.reclaim_retained(), 1);
 
     fixture
         .registry
@@ -960,6 +1029,7 @@ fn queued_ownership_blocks_teardown_until_it_settles() {
         0,
         "teardown never calls the allocator"
     );
+    fixture.reclaim_retained();
 }
 
 #[test]
@@ -983,6 +1053,8 @@ fn queue_and_allocator_callbacks_never_run_under_a_registry_or_mechanism_lock() 
     assert!(outcomes[0].is_complete(), "{outcomes:?}");
     assert_eq!(fixture.allocator.release_calls(), 1);
     fixture.assert_quiescent();
+    fixture.allocator.disarm_probe();
+    queue.disarm_probe();
 }
 
 #[test]

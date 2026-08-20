@@ -1541,6 +1541,33 @@ mod tests {
         registry.bind(DeviceKey::HOST).expect("binding")
     }
 
+    /// Give back the host bytes a test deliberately left quarantined.
+    ///
+    /// Quarantine is retention, not release: the runtime keeps the address and
+    /// discharges it only at confirmed context termination, which makes no
+    /// allocator call because the device state is gone by then. That is right
+    /// for device memory and wrong for the host heap, where nothing else ever
+    /// reclaims those bytes -- so a test that asserts quarantine happened is,
+    /// under Miri's leak check, a test that leaks. Rather than exempt these
+    /// tests from that check or weaken it globally, the test reclaims what it
+    /// asked the runtime to retain.
+    fn reclaim_quarantined(binding: &onnx_runtime_memory_governor::MemoryBinding) -> usize {
+        use onnx_runtime_memory_governor::{DeviceAllocator, HostAllocator};
+
+        let quarantined = binding.quarantined().expect("quarantine list");
+        for record in &quarantined {
+            let Some(ptr) = std::ptr::NonNull::new(record.address as *mut u8) else {
+                continue;
+            };
+            // SAFETY: the record carries the exact address, size and alignment
+            // `HostAllocator` handed out, the runtime has stopped tracking it as
+            // live, and quarantined ownership is by construction not aliased by
+            // any surviving handle.
+            unsafe { HostAllocator.deallocate(ptr, record.bytes, record.align) };
+        }
+        quarantined.len()
+    }
+
     #[test]
     fn a_bound_buffer_carries_the_owner_that_minted_it() {
         let binding = host_binding();
@@ -1802,14 +1829,34 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "would bypass binding-identity")]
     fn into_raw_refuses_to_strip_bound_ownership() {
         let binding = host_binding();
         let owner = binding.allocate_owning(128, 16).expect("owning allocation");
         let buffer = DeviceBuffer::from_owning_allocation(owner, DeviceId::cpu());
         // Handing out the address alone would let a caller free it without
         // matching the binding identity or the allocation generation.
-        let _ = buffer.into_raw();
+        //
+        // Caught rather than `#[should_panic]` so the test can still run after
+        // the unwind: the buffer's `Drop` quarantines on the way out, and those
+        // host bytes are the test's to give back.
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = buffer.into_raw();
+        }))
+        .expect_err("into_raw must refuse a bound buffer");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("panic payload is a string");
+        assert!(
+            message.contains("would bypass binding-identity"),
+            "unexpected panic message: {message}"
+        );
+        assert_eq!(
+            reclaim_quarantined(&binding),
+            1,
+            "the refused buffer is retained, not silently freed"
+        );
     }
 
     #[test]
@@ -1854,6 +1901,7 @@ mod tests {
             "a dropped bound buffer stays accounted for instead of being freed"
         );
         assert_eq!(quarantined[0].retained_bytes, 64);
+        assert_eq!(reclaim_quarantined(&binding), 1);
     }
 
     #[test]
