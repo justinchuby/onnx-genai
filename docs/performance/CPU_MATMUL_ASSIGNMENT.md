@@ -973,14 +973,35 @@ Fitting `t = fixed + marginal * m` over the GEBP arm at `4096x11008` gives **fix
 Against 22.5 MB of packed weight that is **4.7 GB/s** — 6% of this host's 75.8 GB/s. Nothing about
 it is bandwidth. It is the pack loop: `Int4Weight::dequant_column` walks one column at a time, so
 per element it does a shift, a mask, a scalar widen, a subtract, a multiply and a store to
-`dst[p * NR + slot]` — one f32 every 64 bytes, a separate cache line and a separate scalar store
-for every single element.
+`dst[p * NR + slot]`.
 
-The fix dequantizes eight columns at once and transposes them in registers, so the panel is written
-with contiguous 32-byte stores: one store per eight elements instead of eight. The arithmetic is
+The fix dequantizes eight columns at once and transposes them in registers. The arithmetic is
 unchanged — the same widen, subtract and multiply, kept as separate `_mm256_sub_ps` and
 `_mm256_mul_ps` so it is never contracted into an FMA — so the packed panel is **bit-identical**,
 asserted directly against the scalar path rather than through the GEMM.
+
+**Correction (measured after #1556 landed).** #1556's write-up attributed the win to the strided
+store. That attribution is wrong, and the correct one is now measured. The 8-bit weight uses the
+same panel, the same store pattern and the same microkernel, and differs only in having no nibble
+unpack — so vectorizing *its* pack isolates the store term exactly. Over 5 interleaved reps at
+`4096x11008`:
+
+| pack | fixed cost | saved |
+|---|---:|---:|
+| int4 scalar | 4.92 ms | — |
+| int4 SIMD (#1556) | 2.09 ms | **2.83 ms** |
+| int8 scalar | 2.58 ms | — |
+| int8 SIMD | 2.52 ms | **0.07 ms — inside the noise** |
+
+The store is worth ~0.07 ms; the scalar nibble unpack was worth the other ~2.76 ms, **97.6% of the
+win**. The panel is only `KC * NR * 4` = 16 KB and stays in L1, so a strided store into it is
+cheap — the "separate cache line per element" reasoning was wrong about a buffer this small. The
+8-bit vectorization was implemented, proved bit-identical and mutation-tested to confirm the vector
+path was live, measured at 1.002x/1.010x/1.010x/0.992x/0.997x, and **discarded**: ~90 lines of
+unsafe SIMD for no measured gain. Reproduce with `PROBE_BITS=8` on `benches/int4_prefill_route_ab`.
+
+The rule this leaves behind: **vectorize a packer when its per-element arithmetic vectorizes, not
+because its stores are strided.** An L1-resident panel absorbs the strided store.
 
 `fixed` falls **4.80 ms -> 2.24 ms**, and with it both of section 5's row thresholds, which were
 measured against the scalar pack: the large-weight crossover moves **12 -> 5** and the L2-resident

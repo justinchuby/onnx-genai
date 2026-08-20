@@ -714,10 +714,16 @@ pub(crate) trait BlockQuantWeight: Sync {
     /// does not override it keeps its previous behaviour byte for byte. It
     /// exists so an implementation *can* see the whole panel at once: filling
     /// one column at a time writes `dst[p * NR + slot]` for consecutive `p`,
-    /// i.e. one f32 every 64 bytes -- a separate cache line and a separate
-    /// scalar store per element, which is what makes the scalar version store
-    /// bound. An implementation that transposes a group of columns in registers
-    /// can write the panel contiguously instead.
+    /// one f32 every 64 bytes, where a group of columns transposed in registers
+    /// can be written contiguously.
+    ///
+    /// Do not reach for this on the strength of the store pattern alone. The
+    /// panel is only `KC * NR * 4` bytes and stays in L1, so the strided store
+    /// is cheap: measured directly on the 8-bit weight -- where the store is
+    /// the *only* thing an override can remove -- it is worth **0.07 ms of a
+    /// 2.58 ms pack, inside the noise**. What paid for [`Int4Weight`]'s
+    /// override was its scalar nibble unpack, not its stores. An override is
+    /// worth it when the per-element *arithmetic* vectorizes.
     fn dequant_panel<S: Fn(usize) -> f32>(
         &self,
         scale_at: &S,
@@ -782,12 +788,20 @@ impl Int4Weight<'_> {
     /// contracted into an FMA, so every value is bit-identical to the scalar
     /// path rather than merely close.
     ///
-    /// The reason to group columns is the *store*. Filling one column at a time
-    /// writes `dst[p * NR + slot]` for consecutive `p`: one f32 every 64 bytes,
-    /// a separate cache line and a separate scalar store per element.
-    /// Dequantizing eight columns into eight registers and transposing them
-    /// in-register turns that into eight contiguous 32-byte stores per eight
-    /// depths -- one store per eight elements.
+    /// Columns are grouped because the nibble unpack has to be vectorized and
+    /// a vector of eight dequantized values is eight *depths of one column*,
+    /// which is the wrong orientation for a `[depth][NR]` panel. Transposing
+    /// eight such vectors in registers fixes the orientation, and makes the
+    /// stores contiguous as a side effect.
+    ///
+    /// The unpack is the part that pays. Measured at `4096x11008`, this
+    /// override takes the pack's fixed cost from 4.92 ms to 2.09 ms; the same
+    /// transpose applied to the 8-bit weight, which has no unpack to remove,
+    /// is worth 0.07 ms and does not survive an interleaved A/B. So of the
+    /// 2.83 ms, roughly 0.07 ms is the store and the rest is the nibble
+    /// unpack: the index arithmetic, the bounds-checked byte load, the
+    /// variable shift and the mask. The widen, subtract and multiply are in
+    /// both scalar loops, so they cancel into the 0.07 ms.
     ///
     /// # Safety
     /// AVX2 must be available. `dst` must be at least `kc * NR` long,
