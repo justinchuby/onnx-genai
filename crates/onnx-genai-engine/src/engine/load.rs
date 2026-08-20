@@ -1113,10 +1113,12 @@ fn resolve_metadata_and_decode_path(
     let sink_tokens = crate::decode::sink_tokens_from_metadata(&metadata);
     // Graph-truth check for the declared sliding window: only a window the
     // exported decoder graph actually enforces (GQA `local_window_size`) is
-    // treated as active. A metadata-only/vestigial window (e.g. Muse-Glimmer)
-    // is reclassified as global attention so decode reaches the capture-stable
-    // shared-buffer KV path. Best-effort: if the graph cannot be read, the
-    // declared window is kept (no regression for real SWA models).
+    // treated as active, because the runtime cannot re-apply a mask the export
+    // dropped. Such a model is reclassified as global attention so decode reaches
+    // the capture-stable shared-buffer KV path, and the mismatch is warned about
+    // (it is an export defect, not a harmless quirk). Best-effort: if the graph
+    // cannot be read, the declared window is kept (no regression for real SWA
+    // models).
     let decoder_graph =
         sliding_window.and_then(|_| onnx_runtime_loader::load_model(model_path).ok());
     let decode_path = {

@@ -146,6 +146,7 @@ unsafe fn ort_parallel_for(host: *mut c_void, total: usize, body: &(dyn Fn(usize
     // wide its pool is, so we hand it enough pieces to fill any pool and let
     // it decide how many to run at once.
     let status = unsafe {
+        crate::dispatch_probe::ort_call();
         (pool.parallel_for)(
             pool.ctx,
             Some(run_index),
@@ -168,6 +169,7 @@ unsafe fn ort_parallel_for(host: *mut c_void, total: usize, body: &(dyn Fn(usize
         // output tensor keeps whatever was in the buffer, so fall back to
         // running them here rather than silently returning short.
         if let Some(release) = pool.release_status {
+            crate::dispatch_probe::ort_call();
             unsafe { release(status) };
         }
         for index in 0..total {
@@ -233,8 +235,67 @@ impl Drop for Guard {
         // Explicit, and in this order, so a later field reshuffle cannot turn
         // the handle into a dangling pointer without failing to compile.
         drop(self.installed.take());
-        drop(self.pool.take());
+        if let Some(pool) = self.pool.take() {
+            recycle_pool(pool);
+        }
     }
+}
+
+thread_local! {
+    /// One retired `HostPool` box per thread, kept for the next `Run`.
+    ///
+    /// The box exists only to give the `void*` handle a stable address; its
+    /// contents are overwritten on every install. Allocating it fresh each
+    /// time was one `malloc` and one `free` per `Run` for 32 bytes, on a path
+    /// where the whole fixed cost is a couple of microseconds.
+    ///
+    /// Thread-local because `Compute` runs on whichever thread ORT calls it
+    /// from and the box never escapes that thread. `Cell` rather than
+    /// `RefCell`: the only operations are take and replace, so there is
+    /// nothing to borrow and no way to panic while holding it.
+    ///
+    /// # The invariant reuse rests on
+    ///
+    /// No one may hold the `void*` handle past the compute call that installed
+    /// it. That was already required, but freeing the box made a violation
+    /// loud: the stale handle pointed at freed memory, which a sanitiser
+    /// catches. Reuse makes it quiet instead — a stale handle would now find a
+    /// live box belonging to a *later* `Run` and silently compute against the
+    /// wrong context. Every consumer today takes the handle from
+    /// `host_parallel::current()` and uses it synchronously, within the
+    /// compute extent; keep it that way.
+    static POOL_CACHE: std::cell::Cell<Option<Box<HostPool>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// A box to build a `HostPool` in, reusing this thread's retired one.
+///
+/// Falls back to a fresh allocation when the cache is empty, which covers both
+/// the first call on a thread and a re-entrant one whose outer guard is still
+/// holding the cached box.
+fn take_pool(pool: HostPool) -> Box<HostPool> {
+    match POOL_CACHE.with(std::cell::Cell::take) {
+        Some(mut boxed) => {
+            *boxed = pool;
+            boxed
+        }
+        None => {
+            crate::dispatch_probe::count(crate::dispatch_probe::Event::DispatchAlloc);
+            Box::new(pool)
+        }
+    }
+}
+
+/// Hand a retired box back for the next `Run` on this thread.
+///
+/// Drops it if the cache is already occupied, so a re-entrant call cannot make
+/// the cache grow: at most one box per thread is ever retained.
+fn recycle_pool(pool: Box<HostPool>) {
+    POOL_CACHE.with(|cache| {
+        if let Some(existing) = cache.replace(Some(pool)) {
+            drop(existing);
+        }
+    });
 }
 
 /// Installs ORT's pool on the calling thread until the returned guard drops.
@@ -258,7 +319,7 @@ pub unsafe fn install(
     let (Some(parallel_for), false) = (api.KernelContext_ParallelFor, ctx.is_null()) else {
         return Guard::inert();
     };
-    let pool = Box::new(HostPool {
+    let pool = take_pool(HostPool {
         parallel_for,
         release_status: api.ReleaseStatus,
         ctx,
@@ -645,5 +706,88 @@ mod tests {
         );
         drop(outer);
         assert!(host_parallel::current().is_none());
+    }
+    /// The box handed to ORT as a `void*` exists only for its address, and its
+    /// contents are overwritten on every install — so it can be kept and
+    /// reused instead of being freed and reallocated once per `Run`.
+    ///
+    /// Counted rather than asserted structurally: the point of the change is
+    /// the allocation, so the allocation is what the test looks at.
+    #[cfg(feature = "dispatch_probe")]
+    #[test]
+    fn repeated_installs_on_one_thread_allocate_the_box_once() {
+        use crate::dispatch_probe::{self, Event};
+        let mut api: ort::OrtApi = unsafe { core::mem::zeroed() };
+        api.KernelContext_ParallelFor = Some(inline_parallel_for);
+        let width = AtomicU32::new(0);
+
+        // Prime the cache so the count below is not the first-call allocation.
+        drop(unsafe { install(&api, core::ptr::dangling_mut(), &width) });
+
+        let before = dispatch_probe::snapshot();
+        for _ in 0..8 {
+            let guard = unsafe { install(&api, core::ptr::dangling_mut(), &width) };
+            assert!(guard.is_installed());
+        }
+        let allocs = dispatch_probe::snapshot()
+            .since(&before)
+            .event(Event::DispatchAlloc);
+        assert_eq!(
+            allocs, 0,
+            "eight installs after the first must reuse this thread's box"
+        );
+    }
+
+    /// A reused box must be fully overwritten, not partly: an install that
+    /// inherited a previous call's context would hand ORT a stale pointer.
+    #[test]
+    fn a_reused_box_carries_the_new_context_not_the_old_one() {
+        let mut api: ort::OrtApi = unsafe { core::mem::zeroed() };
+        api.KernelContext_ParallelFor = Some(inline_parallel_for);
+        let width = AtomicU32::new(0);
+
+        let first_ctx = core::ptr::without_provenance_mut::<ort::OrtKernelContext>(0x1000);
+        let second_ctx = core::ptr::without_provenance_mut::<ort::OrtKernelContext>(0x2000);
+
+        drop(unsafe { install(&api, first_ctx, &width) });
+        let guard = unsafe { install(&api, second_ctx, &width) };
+        let pool = guard.pool.as_ref().expect("a working install has a pool");
+        assert_eq!(
+            pool.ctx, second_ctx,
+            "the recycled box kept the previous call's context"
+        );
+    }
+
+    /// Re-entrancy must not defeat the cache or make it grow: the inner call
+    /// finds the cache empty and allocates, and after both guards are gone the
+    /// thread still retains exactly one box.
+    #[test]
+    fn nesting_keeps_at_most_one_box_cached() {
+        let mut api: ort::OrtApi = unsafe { core::mem::zeroed() };
+        api.KernelContext_ParallelFor = Some(inline_parallel_for);
+        let width = AtomicU32::new(0);
+
+        {
+            let _outer = unsafe { install(&api, core::ptr::dangling_mut(), &width) };
+            let _inner = unsafe { install(&api, core::ptr::dangling_mut(), &width) };
+            assert!(
+                POOL_CACHE.with(|c| {
+                    let taken = c.take();
+                    let empty = taken.is_none();
+                    c.set(taken);
+                    empty
+                }),
+                "both boxes are checked out, so the cache must be empty"
+            );
+        }
+        assert!(
+            POOL_CACHE.with(|c| {
+                let taken = c.take();
+                let held = taken.is_some();
+                c.set(taken);
+                held
+            }),
+            "one box must be retained for the next call"
+        );
     }
 }

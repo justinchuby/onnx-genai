@@ -8,6 +8,7 @@ use onnx_runtime_ir::{DataType, Dim, Node, SymbolId, ValueId, normalize_domain};
 
 use crate::dim_expr::DimExpr;
 use crate::error::ShapeInferError;
+use crate::infer::ANON_SYMBOL_FLOOR;
 use crate::shape_data::ShapeData;
 
 /// An inferred shape: an ordered list of symbolic dimension expressions. The
@@ -530,8 +531,9 @@ impl<'a> InferenceContext<'a> {
     }
 
     /// Broadcast two shapes under NumPy rules. Where two distinct symbolic dims
-    /// must be unified, keeps a deterministic representative symbol (see
-    /// [`broadcast_dim`](Self::broadcast_dim)) rather than minting a fresh one.
+    /// meet, keeps a deterministic representative symbol only when one side is
+    /// anonymous; two distinct *named* graph dims degrade to a fresh symbol (see
+    /// [`broadcast_dim`](Self::broadcast_dim)).
     /// Errors only under [`MergePolicy::Strict`] on a concrete incompatibility.
     pub fn broadcast(
         &mut self,
@@ -584,20 +586,33 @@ impl<'a> InferenceContext<'a> {
             // must broadcast up to it, or the model is invalid).
             (Some(_), None) => Ok(a.clone()),
             (None, Some(_)) => Ok(b.clone()),
-            // Two distinct symbolic dims. In a valid model they must be equal at
-            // this position (or one is 1), so keeping a single *representative*
-            // symbol — rather than minting a fresh one no downstream consumer
-            // could ever bind — is both conformance-safe and what reference
-            // symbolic inference (onnxruntime) does. When both are bare symbols
-            // we keep the one with the smaller id, which deterministically
-            // prefers a named graph symbol (low-range, e.g. `batch`/`seq`) over
-            // an anonymous fresh one (allocated at/above `0x8000_0000`); this is
-            // what lets a data-dependent extent re-unify with the graph's real
-            // dims (e.g. a `Shape`-driven `Expand` target). A derived expression
-            // (not a bare symbol) has no id to compare, so it stays a fresh
-            // opaque symbol — the honest "unknown".
+            // Two distinct symbolic dims. Broadcasting them is only well-defined
+            // if they are equal *or* one of them is 1 at runtime — and a bare
+            // symbol gives us no way to rule the latter out. Which of the two
+            // cases holds decides whether unifying them is sound:
+            //
+            // * One side is an *anonymous* symbol (allocated at/above
+            //   `ANON_SYMBOL_FLOOR`): it is an extent this pass invented for a
+            //   value it could not track, so it carries no independent meaning
+            //   and adopting the other side's identity is exactly the intended
+            //   re-binding (e.g. a `Shape`-driven `Expand` target rediscovering
+            //   the graph's real `seq_len`). Unify, keeping the smaller id so a
+            //   named graph symbol always wins over an anonymous one.
+            // * Both sides are *named graph dim-params* (`batch`, `seq_len`, …):
+            //   the model author declared them as separate, independently valued
+            //   dimensions. Unifying them would assert an equality the graph
+            //   explicitly declines to state, and it is silently wrong for the
+            //   common export that leans on `batch == 1` to broadcast a batch
+            //   dim against a sequence dim (rank-3 `MatMul` rhs right-aligning
+            //   under a rank-4 lhs). Picking either name propagates a dimension
+            //   that is wrong whenever the *other* one is the non-1 side, so we
+            //   degrade to a fresh symbol — the honest "unknown" — and let the
+            //   concrete pass bind the real extent.
+            //
+            // A derived expression (not a bare symbol) has no id to compare, so
+            // it likewise stays a fresh opaque symbol.
             (None, None) => match (a.as_symbol(), b.as_symbol()) {
-                (Some(sa), Some(sb)) => {
+                (Some(sa), Some(sb)) if sa.0 >= ANON_SYMBOL_FLOOR || sb.0 >= ANON_SYMBOL_FLOOR => {
                     // Record the equivalence before returning. This is the SINGLE
                     // chokepoint every broadcasting handler funnels through
                     // (elementwise `broadcast`, `MatMul` batch dims, `Einsum`
@@ -608,9 +623,32 @@ impl<'a> InferenceContext<'a> {
                     self.interner.record_unification(sa, sb);
                     Ok(if sa.0 <= sb.0 { a.clone() } else { b.clone() })
                 }
-                _ => Ok(self.fresh_dim()),
+                _ => Ok(self.fresh_broadcast_dim(a, b)),
             },
         }
+    }
+
+    /// Mint the fresh "unknown" extent for a broadcast whose two operand dims
+    /// cannot be soundly unified, recording it as *derived* from both sides.
+    ///
+    /// The lineage record matters: [`Graph::symbol_derivations`] is what the
+    /// executor's capture-eligibility closure walks to decide whether an extent
+    /// depends on a growing dimension. A bare fresh symbol with no edges would
+    /// look seq-independent even when one of the operands is the growing KV
+    /// length, so the directed `source → derived` edges are what keep such an op
+    /// eager. Unlike a unification these edges assert no equality, only that the
+    /// result's value is a function of both inputs — which is exactly true.
+    ///
+    /// [`Graph::symbol_derivations`]: onnx_runtime_ir::Graph::symbol_derivations
+    fn fresh_broadcast_dim(&mut self, a: &DimExpr, b: &DimExpr) -> DimExpr {
+        let fresh = self.interner.fresh_symbol();
+        let mut seen = std::collections::HashSet::new();
+        for source in a.symbol_ids().chain(b.symbol_ids()) {
+            if source != fresh && seen.insert(source) {
+                self.interner.record_derivation(fresh, source);
+            }
+        }
+        DimExpr::symbol(fresh)
     }
 }
 

@@ -244,17 +244,6 @@ const GEMV_F16_SCALES_F16_ZP_SPLITK_ENTRY: &str = "matmul_nbits_gemv_f16_scales_
 /// its `blockDim.x / 32` warps but now covers `warps / K_SPLIT` columns, so the
 /// launch grid grows by this factor.
 const GEMV_F16_SCALES_F16_ZP_SPLITK: usize = 2;
-/// Fold-scale split-K entry names. The per-block scale is folded into the int4
-/// dequant so the MAC drops 4 fp16x2 multiplies per 8 weights, relieving the
-/// dequant-ALU pipe that co-bounds the decode GEMV (measured +2.7% end-to-end,
-/// byte-identical greedy stream on Muse-Glimmer-30B). Opt-in via
-/// `ONNX_GENAI_GEMV_FOLDSCALE=1` (default OFF; the fused `(code-zp)*scale` is
-/// slightly less accurate per element than the plain split-K path, so it stays
-/// gated pending a numerics review). Results are near-equal (tolerance).
-const GEMV_F16_SCALES_F16_FOLDSCALE_SPLITK_ENTRY: &str =
-    "matmul_nbits_gemv_f16_scales_f16_foldscale_splitk";
-const GEMV_F16_SCALES_F16_ZP_FOLDSCALE_SPLITK_ENTRY: &str =
-    "matmul_nbits_gemv_f16_scales_f16_foldscale_zp_splitk";
 /// General fp16/fp16-scales GEMV with a fused RMS-normalization prologue (see
 /// [`crate::optimizer::CudaSkipRmsNormMatMulFusion`]). It normalizes the input
 /// activation in-kernel — byte-identically to `skip_rmsnorm_f16_warp_half4` —
@@ -2754,27 +2743,6 @@ __device__ __forceinline__ void int4x8_to_half2x4_scaledsub(
     }
 }
 
-// Fold-scale MAC: dequant `(code - zp) * scale` via `int4x8_to_half2x4_scaledsub`
-// then a plain `__hfma2` per pair against the pre-permuted activation — no
-// separate scale multiply. `scale2` is the packed fp16x2 block scale and
-// `neg_zp_scale2` the packed fp16x2 `-(zp * scale)`.
-__device__ __forceinline__ void accumulate_int4x8_f16_foldscale(
-    const unsigned int packed,
-    const uint4& activation,
-    const unsigned int scale2,
-    const unsigned int neg_zp_scale2,
-    __half2& sum0,
-    __half2& sum1,
-    __half2& sum2,
-    __half2& sum3)
-{
-    __half2 q[4];
-    int4x8_to_half2x4_scaledsub(packed, q, scale2, neg_zp_scale2);
-    sum0 = __hfma2(q[0], *reinterpret_cast<const __half2*>(&activation.x), sum0);
-    sum1 = __hfma2(q[1], *reinterpret_cast<const __half2*>(&activation.y), sum1);
-    sum2 = __hfma2(q[2], *reinterpret_cast<const __half2*>(&activation.z), sum2);
-    sum3 = __hfma2(q[3], *reinterpret_cast<const __half2*>(&activation.w), sum3);
-}
 // per CTA. Four adjacent lanes split each block-32 weight blob into aligned
 // uint32 loads, so every warp issues contiguous 128-byte packed-weight
 // transactions. Each lane also reads eight activations with one uint4 load.
@@ -3004,7 +2972,6 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_zp(
 
 
 // Prefetch-pipelined sibling of `matmul_nbits_gemv_f16_scales_f16_tpl`.
-//
 // The single-warp scales-fp16 GEMV is Long-Scoreboard bound: ncu on qwen2.5-14b
 // q/o (N=5120) shows ~8.9 active warps/scheduler but only ~0.97 eligible, with
 // ~75% of warp cycles stalled waiting for the one in-flight 32-bit weight load.
@@ -3036,7 +3003,6 @@ __device__ __forceinline__ void matmul_nbits_gemv_f16_scales_f16_pipe_tpl(
 {
     (void)block_size;
     (void)scales_fp16;
-    constexpr int PF = 2;  // prefetch depth (weight words in flight per lane)
     const __half* __restrict__ scales =
         reinterpret_cast<const __half*>(scales_raw);
     const int tid = (int)threadIdx.x;
@@ -3068,17 +3034,26 @@ __device__ __forceinline__ void matmul_nbits_gemv_f16_scales_f16_pipe_tpl(
         };
         // Prime the shift register with the first PF steps' words (independent
         // loads -> they pipeline). Out-of-range slots are zero (never consumed).
-        unsigned int w0 = (0 < nfull) ? load_step(0) : 0u;
-        unsigned int w1 = (1 < nfull) ? load_step(1) : 0u;
+        // The array is `#pragma unroll`-rotated with a compile-time `PF`, so it
+        // stays fully in registers (no dynamic indexing -> no local spill).
+        constexpr int PF = 2;  // prefetch depth (weight words in flight per lane)
+        unsigned int wbuf[PF];
+#pragma unroll
+        for (int s = 0; s < PF; ++s) {
+            wbuf[s] = (s < nfull) ? load_step(s) : 0u;
+        }
 
         int depth_base = 0;
         for (int i = 0; i < nfull; ++i, depth_base += 256) {
-            const unsigned int packed_word = w0;
+            const unsigned int packed_word = wbuf[0];
             // Rotate the shift register and issue the load PF steps ahead BEFORE
             // consuming the current word, so PF loads stay in flight.
             const int pf = i + PF;
-            w0 = w1;
-            w1 = (pf < nfull) ? load_step(pf) : 0u;
+#pragma unroll
+            for (int s = 0; s < PF - 1; ++s) {
+                wbuf[s] = wbuf[s + 1];
+            }
+            wbuf[PF - 1] = (pf < nfull) ? load_step(pf) : 0u;
 
             const int block = (depth_base >> 5) + (lane >> 2);
             const unsigned int sub2 =
@@ -3315,175 +3290,6 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_zp_splitk(
     const int bias_post_round)
 {
     matmul_nbits_gemv_f16_scales_f16_splitk_tpl<true>(
-        activation, packed, scales_raw, zero_points, bias, output, k, n,
-        block_size, k_blocks, blob_size, zp_row_bytes, scales_fp16,
-        bias_post_round);
-}
-
-// Fold-scale split-K int4 GEMV. Identical structure/reduction to
-// `matmul_nbits_gemv_f16_scales_f16_splitk_tpl`, but the per-block scale is
-// folded into the dequant (`accumulate_int4x8_f16_foldscale`) so the MAC drops
-// 4 fp16x2 multiplies per 8 weights — relieving the ~65% dequant-ALU pipe that
-// co-bounds the M=1 decode GEMV (measured: dominant gate/up GEMV ~56us -> ~53us,
-// +2.7% end-to-end decode). Numerics differ from the plain split-K only by fp16
-// rounding of `(code-zp)*scale` (a fused fma vs a separate multiply); the greedy
-// token stream on Muse-Glimmer-30B is byte-identical to the plain split-K path,
-// so it is tolerance-clean (this path is already a new fp32 block-sum
-// association vs the single-warp kernel).
-template <bool HasZp>
-__device__ __forceinline__ void matmul_nbits_gemv_f16_scales_f16_splitk_foldscale_tpl(
-    const __half* __restrict__ activation,
-    const unsigned char* __restrict__ packed,
-    const void* __restrict__ scales_raw,
-    const unsigned char* __restrict__ zero_points,
-    const __half* __restrict__ bias,
-    __half* __restrict__ output,
-    const int k,
-    const int n,
-    const int block_size,
-    const int k_blocks,
-    const int blob_size,
-    const int zp_row_bytes,
-    const int scales_fp16,
-    const int bias_post_round)
-{
-    (void)block_size;
-    (void)scales_fp16;
-    constexpr int K_SPLIT = 2;
-    const __half* __restrict__ scales =
-        reinterpret_cast<const __half*>(scales_raw);
-    const int tid = (int)threadIdx.x;
-    const int lane = tid & 31;
-    const int warp = tid >> 5;
-    const int warps_per_block = (int)blockDim.x >> 5;
-    const int cols_per_block = warps_per_block / K_SPLIT;
-    const int col_local = warp / K_SPLIT;
-    const int ks = warp % K_SPLIT;
-    const int column = (int)blockIdx.x * cols_per_block + col_local;
-
-    __shared__ float partials[8][K_SPLIT];
-
-    __half2 sum0 = __float2half2_rn(0.0f);
-    __half2 sum1 = __float2half2_rn(0.0f);
-    __half2 sum2 = __float2half2_rn(0.0f);
-    __half2 sum3 = __float2half2_rn(0.0f);
-    float tail = 0.0f;
-    if (column < n) {
-        const int lane_depth = lane * 8;
-        int depth_base = ks * 256;
-        const __half* activation_ptr = activation + depth_base + lane_depth;
-        const unsigned char* packed_ptr =
-            packed + (long)column * k_blocks * blob_size +
-            (long)(depth_base >> 5) * blob_size + lane * 4;
-        const __half* scale_ptr =
-            scales + (long)column * k_blocks + (depth_base >> 5) + (lane >> 2);
-        for (; depth_base < k; depth_base += K_SPLIT * 256) {
-            const int depth = depth_base + lane_depth;
-            if (depth >= k) {
-                activation_ptr += K_SPLIT * 256;
-                packed_ptr += K_SPLIT * 128;
-                scale_ptr += K_SPLIT * 8;
-                continue;
-            }
-            const unsigned int packed_word =
-                *reinterpret_cast<const unsigned int*>(packed_ptr);
-            const int block = (depth_base >> 5) + (lane >> 2);
-            const __half sc = *scale_ptr;
-            const float scf = __half2float(sc);
-            const int zero_point =
-                block_zp<HasZp>(zero_points, column, block, zp_row_bytes);
-            if (depth + 8 <= k) {
-                const __half2 scale2h = __halves2half2(sc, sc);
-                const __half nzs = __float2half(-(float)zero_point * scf);
-                const __half2 nzs2 = __halves2half2(nzs, nzs);
-                const uint4 permuted = permute_activation_f16x8(activation_ptr);
-                accumulate_int4x8_f16_foldscale(
-                    packed_word, permuted,
-                    *reinterpret_cast<const unsigned int*>(&scale2h),
-                    *reinterpret_cast<const unsigned int*>(&nzs2),
-                    sum0, sum1, sum2, sum3);
-            } else {
-                const int valid = k - depth;
-#pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    if (i < valid) {
-                        const int q =
-                            (int)((packed_word >> (i * 4)) & 15u) - zero_point;
-                        tail += (float)q * __half2float(activation_ptr[i]) * scf;
-                    }
-                }
-            }
-            activation_ptr += K_SPLIT * 256;
-            packed_ptr += K_SPLIT * 128;
-            scale_ptr += K_SPLIT * 8;
-        }
-    }
-    const float2 value04 = __half22float2(sum0);
-    const float2 value15 = __half22float2(sum1);
-    const float2 value26 = __half22float2(sum2);
-    const float2 value37 = __half22float2(sum3);
-    float value = tail + value04.x;
-    value += value15.x;
-    value += value26.x;
-    value += value37.x;
-    value += value04.y;
-    value += value15.y;
-    value += value26.y;
-    value += value37.y;
-    value = warp_sum(value);
-    if (lane == 0) {
-        partials[col_local][ks] = (column < n) ? value : 0.0f;
-    }
-    __syncthreads();
-    if (ks == 0 && lane == 0 && column < n) {
-        float acc = 0.0f;
-#pragma unroll
-        for (int s = 0; s < K_SPLIT; ++s) {
-            acc += partials[col_local][s];
-        }
-        output[column] = fold_bias_f16(acc, bias, column, bias_post_round);
-    }
-}
-
-extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_foldscale_splitk(
-    const __half* __restrict__ activation,
-    const unsigned char* __restrict__ packed,
-    const void* __restrict__ scales_raw,
-    const unsigned char* __restrict__ zero_points,
-    const __half* __restrict__ bias,
-    __half* __restrict__ output,
-    const int k,
-    const int n,
-    const int block_size,
-    const int k_blocks,
-    const int blob_size,
-    const int zp_row_bytes,
-    const int scales_fp16,
-    const int bias_post_round)
-{
-    matmul_nbits_gemv_f16_scales_f16_splitk_foldscale_tpl<false>(
-        activation, packed, scales_raw, zero_points, bias, output, k, n,
-        block_size, k_blocks, blob_size, zp_row_bytes, scales_fp16,
-        bias_post_round);
-}
-
-extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_foldscale_zp_splitk(
-    const __half* __restrict__ activation,
-    const unsigned char* __restrict__ packed,
-    const void* __restrict__ scales_raw,
-    const unsigned char* __restrict__ zero_points,
-    const __half* __restrict__ bias,
-    __half* __restrict__ output,
-    const int k,
-    const int n,
-    const int block_size,
-    const int k_blocks,
-    const int blob_size,
-    const int zp_row_bytes,
-    const int scales_fp16,
-    const int bias_post_round)
-{
-    matmul_nbits_gemv_f16_scales_f16_splitk_foldscale_tpl<true>(
         activation, packed, scales_raw, zero_points, bias, output, k, n,
         block_size, k_blocks, blob_size, zp_row_bytes, scales_fp16,
         bias_post_round);
@@ -5797,6 +5603,19 @@ fn select_down_columns(n: usize, multiprocessor_count: u32) -> (usize, &'static 
 const ACCURACY4_GEMV_FILL_CTAS_PER_SM: usize = 12;
 const F16_SYMMETRIC_SPLITK_TARGET_WARPS_PER_SM: usize = 16;
 
+/// Per-SM CTA count at or above which a single-warp block-32 scales-fp16 int4
+/// GEMV is considered WELL-OCCUPIED and routed to the lower-register plain entry
+/// instead of the prefetch-pipelined one (see [`scales_f16_pipe_well_occupied`]).
+/// The pipe kernel's deeper register footprint hides the Long-Scoreboard
+/// weight-load latency on grid-starved (warp-capped) projections but only shaves
+/// occupancy once the launch already has many resident waves — measured on the
+/// qwen3.5-0.8b LM head (N=248320, grid=31040 ≈ 235 CTAs/SM on an H200): the
+/// plain entry runs ~85.0 µs vs the pipe entry's ~98.8 µs (-14%), while the
+/// grid-starved projections (N=4096, grid=512 ≈ 3.9 CTAs/SM) keep the pipe entry
+/// (4.66 vs 4.79 µs). One resident wave of 8-warp CTAs is 8/SM on sm_90; the
+/// crossover is far above that, so the threshold is set well clear of it.
+const GEMV_F16_PIPE_WELL_OCCUPIED_CTAS_PER_SM: usize = 32;
+
 /// Per-SM CTA target for the block!=32 general_bs split-K decode GEMV. The
 /// single-warp `general_bs` launch emits one 256-thread (8-warp) CTA per 8
 /// output columns, so a projection is grid-starved (leaves SMs idle, starving
@@ -5899,6 +5718,51 @@ fn use_gemv_splitk_multicol() -> bool {
             .as_deref(),
         Some("0") | Some("false") | Some("off")
     )
+}
+
+/// Grid-fill override for the split-K wide path on GRID-STARVED narrow-N
+/// projections (e.g. a GQA k/v projection: N = kv_heads * head_dim, ~256).
+///
+/// The multicol hybrid ([`GEMV_F16_GENERAL_BS_SPLITK_WIDE_MULTICOL_ENTRY`])
+/// register-blocks [`GEMV_F16_WIDE_MULTICOL_NC`] columns per warp group, so a
+/// 256-thread (8-warp) CTA covers `(8 / GENERAL_BS_SPLITK_MULTICOL) *
+/// GEMV_F16_WIDE_MULTICOL_NC` output columns and its launch grid is only
+/// `ceil(N / cols_per_cta)`. That register blocking is a WIN on the medium/large
+/// projections (down_proj / q / o at N~4096) where it lifts the memory-level
+/// parallelism at ~1 wave, but on a narrow projection it collapses the grid so
+/// far below the device SM count that most SMs sit idle (measured N=256 on GLM's
+/// 2-kv-head GQA: grid=32 / ~0.06 waves / 2% DRAM / 6.1 us), starving the
+/// latency-bound global loads of any in-flight parallelism to hide behind.
+///
+/// The single-column split-K wide entry
+/// ([`GEMV_F16_GENERAL_BS_SPLITK_WIDE_ENTRY`]) covers only `8 /
+/// GENERAL_BS_SPLITK` columns per CTA (4x fewer), so its grid is `4 *
+/// GEMV_F16_WIDE_MULTICOL_NC` = 4x larger and fills those idle SMs. It is
+/// BYTE-IDENTICAL to the multicol hybrid (same per-column depth0/stride, same
+/// K_SPLIT reduction order — the only difference is how many columns a warp
+/// register-blocks), so this is a pure occupancy swap, not a numeric change
+/// (measured N=256: grid=32->128, 6.1->4.1 us / -33%). The medium/large
+/// projections keep the multicol hybrid unchanged.
+///
+/// Returns true (prefer the single-column entry) when the multicol grid would
+/// leave the device under-filled — `ceil(N / multicol_cols_per_cta) <
+/// multiprocessor_count` — i.e. below ~1 CTA/SM from the column dimension. This
+/// is shape/device-derived (narrow-N + SM count), not model-specific, so it
+/// helps every GQA/MLA int4 model's narrow k/v projection. `unset` uses the
+/// heuristic; `ONNX_GENAI_GEMV_SPLITK_SMALLN_SINGLECOL=0|1` forces off/on.
+fn splitk_smalln_prefers_single_column(n: usize, multiprocessor_count: u32) -> bool {
+    match std::env::var("ONNX_GENAI_GEMV_SPLITK_SMALLN_SINGLECOL")
+        .ok()
+        .as_deref()
+    {
+        Some("1") | Some("true") | Some("on") => return true,
+        Some("0") | Some("false") | Some("off") => return false,
+        _ => {}
+    }
+    // Columns covered by one 256-thread (8-warp) CTA of the multicol hybrid.
+    let multicol_cols_per_cta = (8 / GENERAL_BS_SPLITK_MULTICOL) * GEMV_F16_WIDE_MULTICOL_NC;
+    let multicol_grid = n.div_ceil(multicol_cols_per_cta.max(1));
+    multicol_grid < multiprocessor_count.max(1) as usize
 }
 
 /// Whether the column register-blocked wide GEMV should take the fp16
@@ -6136,21 +6000,6 @@ fn down_columns_override() -> Option<(usize, &'static str)> {
     }
 }
 
-/// Fold-scale toggle for the dominant int4 decode GEMV. Default OFF: folding the
-/// per-block scale into the dequant drops 4 fp16x2 multiplies per 8 weights
-/// (measured +2.7% decode, greedy stream byte-identical on Muse-Glimmer-30B),
-/// but the fused `(code-zp)*scale` sums two fp16-rounded terms and so is
-/// slightly less accurate per element than the plain split-K path (exceeds the
-/// synthetic asymmetric-zp parity guard's 5e-2 rel bound at ~1e-1). Opt in with
-/// `ONNX_GENAI_GEMV_FOLDSCALE=1` (or `true`/`on`); production stays on the plain
-/// split-K entries until the accuracy trade is gated.
-fn gemv_foldscale_enabled() -> bool {
-    matches!(
-        std::env::var("ONNX_GENAI_GEMV_FOLDSCALE").ok().as_deref(),
-        Some("1") | Some("true") | Some("on")
-    )
-}
-
 /// Whether the single-warp block-32 scales-fp16 int4 decode GEMV takes the
 /// prefetch-pipelined entry (4 weight loads in flight per lane to hide the
 /// Long-Scoreboard global-load latency). Byte-identical to the original entry,
@@ -6161,6 +6010,57 @@ fn scales_f16_pipeline_enabled() -> bool {
         std::env::var("ONNX_GENAI_GEMV_PIPELINE").ok().as_deref(),
         Some("0") | Some("false") | Some("off")
     )
+}
+
+/// Opt-out for the SYMMETRIC (no zero-point) int8 decode GEMV split-K grid-fill.
+/// The asymmetric int8 GEMV already routes grid-starved shapes to the split-K
+/// entry; the symmetric path was historically pinned to its single-warp kernel
+/// purely to stay BYTE-IDENTICAL (split-K reassociates the per-column fp32
+/// partial sums). Now that decode correctness is validated on the GREEDY
+/// TOKEN-ID lock (not a byte-exact lock) — and fp32 accumulation is preserved,
+/// so the reassociation is a ULP-level shift that leaves the argmax stable, the
+/// same trade already shipped for the symmetric int4 split-K
+/// ([`use_f16_symmetric_splitk`]) — the symmetric int8 path may take the same
+/// grid-fill split-K on the grid-starved projections. Default-on; set
+/// `ONNX_GENAI_CUDA_DISABLE_INT8_SYMMETRIC_SPLITK=1` (or `true`/`on`) to force
+/// the byte-identical single-warp entry for A/B measurement or de-risking.
+fn int8_symmetric_splitk_enabled() -> bool {
+    !std::env::var_os("ONNX_GENAI_CUDA_DISABLE_INT8_SYMMETRIC_SPLITK")
+        .is_some_and(|value| value != "0" && !value.is_empty())
+}
+
+/// Whether a single-warp block-32 scales-fp16 int4 GEMV launch is WELL-OCCUPIED
+/// enough that it should take the lower-register plain entry
+/// ([`GEMV_F16_SCALES_F16_ENTRY`]) instead of the prefetch-pipelined entry
+/// ([`GEMV_F16_SCALES_F16_PIPE_ENTRY`]). Both entries are BYTE-IDENTICAL (same
+/// lane→nibble mapping, same fp16 accumulation order), so this is a pure
+/// occupancy/register trade, not a numeric change. The pipe entry's extra
+/// registers pay off only on grid-starved (warp-capped) projections where the
+/// scheduler has too few resident warps to hide the Long-Scoreboard weight-load
+/// latency; once the launch already fills the SMs many times over (e.g. the
+/// wide LM-head projection), the pipe entry's lower occupancy makes it a net
+/// loss and the plain entry wins. Keys only on `N`, the launch width and the
+/// live SM count (no per-model magic); returns a launch-time constant stable
+/// across CUDA-graph replays. `ONNX_GENAI_GEMV_PIPELINE=0` still forces the
+/// plain entry everywhere for A/B; `ONNX_GENAI_GEMV_PIPE_WELLOCC=0` forces the
+/// pipe entry even on well-occupied launches (restores the pre-gate behavior).
+fn scales_f16_pipe_well_occupied(
+    n: usize,
+    columns_per_block: usize,
+    multiprocessor_count: u32,
+) -> bool {
+    match std::env::var("ONNX_GENAI_GEMV_PIPE_WELLOCC")
+        .ok()
+        .as_deref()
+    {
+        Some("0") | Some("false") | Some("off") => return false,
+        Some("1") | Some("true") | Some("on") => return true,
+        _ => {}
+    }
+    let ctas = n.div_ceil(columns_per_block.max(1));
+    let threshold = (multiprocessor_count.max(1) as usize)
+        .saturating_mul(GEMV_F16_PIPE_WELL_OCCUPIED_CTAS_PER_SM);
+    ctas >= threshold
 }
 
 /// Whether the SYMMETRIC paired gate/up SwiGLU decode GEMV takes the
@@ -8086,12 +7986,30 @@ impl MatMulNBitsKernel {
         // step and the shape uses the 256-thread large path, take the split-K
         // entry (K_SPLIT warps/column, K_SPLIT x larger grid) to fill the SMs.
         // This kernel has no serial prologue, so the extra grid parallelism pays
-        // off directly. Symmetric int8 (no zero points) keeps its byte-identical
-        // single-warp kernel; the small-shape (64-thread) path lacks the warps to
-        // cooperate.
-        let use_splitk = zero_points.is_some()
-            && self.k.is_multiple_of(256)
+        // off directly. Asymmetric int8 (with zero points) fires unconditionally
+        // on the large path; SYMMETRIC int8 (no zero points) opts in only when
+        // the live SM count says the single-warp grid is too narrow (mirrors the
+        // symmetric int4 grid-fill gate [`use_f16_symmetric_splitk`]), so the
+        // already-occupied wide projections keep the byte-identical single-warp
+        // entry and small consumer GPUs are unaffected. The symmetric split-K
+        // reassociates the per-column fp32 partials (near-equal, not
+        // byte-identical) — greedy-token-stable under fp32 accumulation — and is
+        // opt-out via `int8_symmetric_splitk_enabled`.
+        let large_path_eligible = self.k.is_multiple_of(256)
             && !(self.n <= GEMV_F16_SMALL_N_MAX && self.k <= GEMV_F16_SMALL_N_MAX);
+        let capabilities = self.runtime.capabilities();
+        let use_splitk = large_path_eligible
+            && if zero_points.is_some() {
+                true
+            } else {
+                int8_symmetric_splitk_enabled()
+                    && use_f16_symmetric_splitk(
+                        self.k,
+                        self.n,
+                        capabilities.multiprocessor_count(),
+                        capabilities.max_threads_per_block(),
+                    )
+            };
         let entry = if use_splitk {
             GEMV_INT8_F16_SPLITK_ENTRY
         } else {
@@ -9062,19 +8980,37 @@ impl MatMulNBitsKernel {
         let use_scales_f16_splitk = use_scales_f16_zp_splitk || use_scales_f16_symmetric_splitk;
         // Prefetch-pipeline routing for the SINGLE-WARP block-32 scales-fp16 int4
         // GEMV (the entry taken when split-K is not selected). Byte-identical to
-        // the original entry (same mapping/math/order) but keeps 4 weight loads
+        // the original entry (same mapping/math/order) but keeps 2 weight loads
         // in flight per lane to hide the Long-Scoreboard latency that dominates
-        // it. Default-on; `ONNX_GENAI_GEMV_PIPELINE=0` forces the original entry.
+        // the grid-starved projections. Default-on; `ONNX_GENAI_GEMV_PIPELINE=0`
+        // forces the original entry.
+        //
+        // Occupancy gate: the pipe entry's extra registers are a net LOSS once
+        // the launch already fills the SMs many waves over (the pipe kernel's
+        // lower occupancy then outweighs its latency hiding). The wide LM-head
+        // projection is the only such well-occupied block-32 GEMV here (measured
+        // plain 85.0 µs vs pipe 98.8 µs, -14%), so it falls back to the plain
+        // entry while the grid-starved q/gate/kv projections keep the pipe entry.
+        // `pipe_columns_per_block` mirrors the launch's `columns_per_block`: the
+        // pipe path always takes the 256-thread (8-warp) large launch unless BOTH
+        // n and k are small.
         let use_scales_f16_pipeline = self.block_size == 32
             && scales_fp16
             && matches!(selection.variant, F16GemvVariant::General)
             && !use_scales_f16_splitk
             && scales_f16_pipeline_enabled();
-        // Fold-scale routing for the split-K decode GEMV: opt-in (default off)
-        // via `ONNX_GENAI_GEMV_FOLDSCALE`. Folds the per-block scale into the
-        // dequant, dropping the MAC's __hmul2. Only matters when the split-K
-        // path is actually taken.
-        let use_gemv_foldscale = use_scales_f16_splitk && gemv_foldscale_enabled();
+        let pipe_columns_per_block =
+            if self.n <= GEMV_F16_SMALL_N_MAX && self.k <= GEMV_F16_SMALL_N_MAX {
+                (GEMV_F16_SMALL_THREADS / 32) as usize
+            } else {
+                (GEMV_F16_LARGE_THREADS / 32) as usize
+            };
+        let use_scales_f16_pipe = use_scales_f16_pipeline
+            && !scales_f16_pipe_well_occupied(
+                self.n,
+                pipe_columns_per_block,
+                self.runtime.capabilities().multiprocessor_count(),
+            );
         // Down projection grid-fill: choose columns-per-CTA (8/4/2) from the
         // device SM count so a small-N (grid-starved) down launch splits enough
         // to fill the multiprocessors, bit-identically. A developer env override
@@ -9104,7 +9040,18 @@ impl MatMulNBitsKernel {
             // correct for both symmetric (zp==8) and asymmetric layouts.
             if use_general_splitk {
                 if use_gemv_wideload(self.bits, self.block_size, self.k) {
-                    if use_gemv_splitk_multicol() {
+                    // The multicol hybrid register-blocks WIDE_NC columns/warp,
+                    // which lifts memory-level parallelism on the medium/large
+                    // projections but collapses the launch grid on a narrow
+                    // (grid-starved) projection. For those, fall back to the
+                    // byte-identical single-column split-K wide entry, whose 4x
+                    // larger grid fills the otherwise-idle SMs.
+                    if use_gemv_splitk_multicol()
+                        && !splitk_smalln_prefers_single_column(
+                            self.n,
+                            self.runtime.capabilities().multiprocessor_count(),
+                        )
+                    {
                         GEMV_F16_GENERAL_BS_SPLITK_WIDE_MULTICOL_ENTRY
                     } else {
                         GEMV_F16_GENERAL_BS_SPLITK_WIDE_ENTRY
@@ -9143,24 +9090,16 @@ impl MatMulNBitsKernel {
                         // SMs; otherwise the plain single-warp `_zp` entry (which
                         // handles the divergent K tail).
                         if use_scales_f16_zp_splitk {
-                            if use_gemv_foldscale {
-                                GEMV_F16_SCALES_F16_ZP_FOLDSCALE_SPLITK_ENTRY
-                            } else {
-                                GEMV_F16_SCALES_F16_ZP_SPLITK_ENTRY
-                            }
-                        } else if use_scales_f16_pipeline {
+                            GEMV_F16_SCALES_F16_ZP_SPLITK_ENTRY
+                        } else if use_scales_f16_pipe {
                             GEMV_F16_SCALES_F16_ZP_PIPE_ENTRY
                         } else {
                             GEMV_F16_SCALES_F16_ZP_ENTRY
                         }
                     } else {
                         if use_scales_f16_symmetric_splitk {
-                            if use_gemv_foldscale {
-                                GEMV_F16_SCALES_F16_FOLDSCALE_SPLITK_ENTRY
-                            } else {
-                                GEMV_F16_SCALES_F16_SPLITK_ENTRY
-                            }
-                        } else if use_scales_f16_pipeline {
+                            GEMV_F16_SCALES_F16_SPLITK_ENTRY
+                        } else if use_scales_f16_pipe {
                             GEMV_F16_SCALES_F16_PIPE_ENTRY
                         } else {
                             GEMV_F16_SCALES_F16_ENTRY
@@ -10172,9 +10111,66 @@ mod tests {
 
     use super::*;
 
-    /// Serializes the env-mutating dispatch selection in the interleaved-dequant
-    /// byte-identity test so parallel test threads never observe a half-set flag.
-    static INTERLEAVE_TEST_ENV_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    /// Guards the `ONNX_GENAI_INTERLEAVE_DEQUANT` / `ONNX_GENAI_GEMV_PIPELINE`
+    /// levers, which the interleaved-dequant byte-identity test flips by writing
+    /// the PROCESS environment.
+    ///
+    /// A plain mutex is not enough here, and used to be the bug: it only excludes
+    /// other lock *holders*, while an env var is visible to every thread in the
+    /// binary. Any parity test running concurrently would silently pick up the
+    /// lever, route through `ensure_interleaved`, allocate the interleaved
+    /// weights on first sight and therefore report that call capture-UNSAFE —
+    /// failing an assertion about a kernel it never meant to exercise, at a
+    /// timing that depended on the harness's thread interleaving.
+    ///
+    /// So the writer takes the exclusive side and every helper that depends on
+    /// the levers being at their default (OFF) takes the shared side.
+    static INTERLEAVE_TEST_ENV_LOCK: std::sync::OnceLock<std::sync::RwLock<()>> =
+        std::sync::OnceLock::new();
+
+    /// Exclusive guard that clears the dispatch levers when it drops.
+    ///
+    /// Restoring the environment on the normal path only is not enough: these
+    /// helpers `unwrap()` their kernel runs, so a failing assertion unwinds past
+    /// the cleanup and leaves the lever set. The `RwLock` is then poisoned, and
+    /// readers — which recover with `into_inner` rather than cascade the
+    /// failure — would run with a lever nobody asked for, turning one real
+    /// failure into a run of unrelated ones. Clearing from `Drop` makes the
+    /// restore unwind-safe.
+    struct LeverEnvGuard(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+
+    impl LeverEnvGuard {
+        fn acquire() -> Self {
+            Self(
+                INTERLEAVE_TEST_ENV_LOCK
+                    .get_or_init(Default::default)
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
+        }
+    }
+
+    impl Drop for LeverEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: still inside the exclusive section, so no other thread is
+            // reading the environment concurrently.
+            unsafe {
+                std::env::remove_var("ONNX_GENAI_INTERLEAVE_DEQUANT");
+                std::env::remove_var("ONNX_GENAI_GENERAL_SPLITK");
+                std::env::remove_var("ONNX_GENAI_GEMV_PIPELINE");
+                std::env::remove_var("ONNX_GENAI_GATEUP_VEC");
+                std::env::remove_var("ONNX_GENAI_GATEUP_OCC");
+            }
+        }
+    }
+
+    /// Shared guard for a test that requires the dispatch levers to be OFF.
+    fn default_levers_guard() -> std::sync::RwLockReadGuard<'static, ()> {
+        INTERLEAVE_TEST_ENV_LOCK
+            .get_or_init(Default::default)
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 
     // Qwen2.5-0.5B down-projection shape (K=intermediate, N=hidden). Used as a
     // test fixture for the tall-skinny down variant and, transposed, as the
@@ -10270,13 +10266,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
 "#;
 
     fn runtime() -> Option<Arc<CudaRuntime>> {
-        let previous_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let runtime = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
-            .ok()
-            .flatten();
-        std::panic::set_hook(previous_hook);
-        runtime
+        crate::test_support::maybe_runtime()
     }
 
     fn as_bytes<T: Copy>(values: &[T]) -> &[u8] {
@@ -11292,6 +11282,14 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
+        // The default decode GEMV launch is a static grid that allocates
+        // nothing, so it is capture-safe on the very first call. That only holds
+        // with the dispatch levers OFF: `ONNX_GENAI_INTERLEAVE_DEQUANT` routes
+        // through `ensure_interleaved`, which allocates and interleaves the
+        // packed weights on first sight and correctly reports that call
+        // capture-unsafe. Hold the shared guard so the env-mutating interleave
+        // test cannot flip the lever underneath this kernel run.
+        let _levers = default_levers_guard();
         kernel.run(&inputs, &mut outputs, None).unwrap();
         runtime.synchronize().unwrap();
 
@@ -11299,6 +11297,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             kernel.last_call_capture_safe.load(Ordering::Relaxed),
             "fp16 decode GEMV must report capture-safe"
         );
+        drop(_levers);
 
         let mut got_f16 = vec![f16::ZERO; n];
         // SAFETY: `output_dev` holds `n` fp16 values.
@@ -11481,14 +11480,11 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
 
-        // Serialize the env-mutating dispatch selection across the two phases so
-        // parallel test threads never observe a half-set flag. SAFETY: the env
-        // writes are confined to this critical section and restored before the
-        // lock is released.
-        let _guard = INTERLEAVE_TEST_ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap();
+        // Take the EXCLUSIVE side: the env writes below are visible to every
+        // thread in the binary, so they must not overlap any test that expects
+        // the levers at their default. SAFETY: the writes are confined to this
+        // critical section and restored before the lock is released.
+        let _guard = LeverEnvGuard::acquire();
         unsafe {
             match general_splitk {
                 Some(true) => std::env::set_var("ONNX_GENAI_GENERAL_SPLITK", "on"),
@@ -11508,11 +11504,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         }
         kernel.run(&inputs, &mut outputs, None).unwrap();
         runtime.synchronize().unwrap();
-        unsafe {
-            std::env::remove_var("ONNX_GENAI_INTERLEAVE_DEQUANT");
-            std::env::remove_var("ONNX_GENAI_GENERAL_SPLITK");
-            std::env::remove_var("ONNX_GENAI_GEMV_PIPELINE");
-        }
+        // `_guard` clears the levers as it drops, on the unwind path too.
         drop(_guard);
 
         let mut got_f16 = vec![f16::ZERO; n];
@@ -13074,6 +13066,131 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             asymmetric.reason,
             "variant=general;zero_points=explicit;down_projection requires symmetric zp=8"
         );
+    }
+
+    #[test]
+    fn scales_f16_pipe_well_occupied_routes_lm_head_to_plain() {
+        // The pipe-vs-plain occupancy gate keys only on N, the launch's
+        // columns-per-CTA and the live SM count — no model-specific magic.
+        // qwen3.5-0.8b measured shapes on an H200 (132 SMs, 8-warp large launch
+        // => 8 columns per CTA):
+        //   LM head  N=248320 -> grid 31040 (~235 CTAs/SM): WELL-OCCUPIED -> plain
+        //   proj     N=4096   -> grid 512   (~3.9 CTAs/SM): grid-starved  -> pipe
+        assert!(
+            scales_f16_pipe_well_occupied(248_320, 8, 132),
+            "the wide LM-head projection must be treated as well-occupied (plain)"
+        );
+        assert!(
+            !scales_f16_pipe_well_occupied(4096, 8, 132),
+            "a grid-starved N=4096 projection must keep the pipe entry"
+        );
+
+        // Device-derived, not a fixed N: the same width flips with the SM count.
+        // grid = ceil(N/cols); well-occupied when grid >= mp_count*32.
+        // N=8192, cols=8 -> grid 1024; threshold(mp)=mp*32.
+        assert!(
+            scales_f16_pipe_well_occupied(8192, 8, 32),
+            "grid 1024 >= 32*32=1024 on a 32-SM device is well-occupied"
+        );
+        assert!(
+            !scales_f16_pipe_well_occupied(8192, 8, 33),
+            "grid 1024 < 33*32=1056 on a 33-SM device stays grid-starved"
+        );
+
+        // Degenerate inputs must not divide by zero.
+        assert!(scales_f16_pipe_well_occupied(1_000_000, 0, 1));
+        assert!(!scales_f16_pipe_well_occupied(1, 8, 0));
+    }
+
+    #[test]
+    fn symmetric_int8_splitk_gate_targets_grid_starved_only() {
+        // The symmetric (no zero-point) int8 decode GEMV reuses the symmetric
+        // int4 grid-fill predicate: split-K fires only when the single-warp grid
+        // is too narrow to fill the device (N < mp_count * 16), so the
+        // already-occupied wide projections keep the byte-identical single-warp
+        // entry. qwen3.5-0.8b int8 shapes on an H200 (132 SMs => threshold 2112):
+        //   N=1024 (down/o)  -> grid-starved  -> split-K
+        //   N=2048           -> grid-starved  -> split-K
+        //   N=3584 / N=6144  -> occupied      -> single-warp
+        let (mp, max_threads) = (132u32, GEMV_F16_LARGE_THREADS);
+        assert!(
+            use_f16_symmetric_splitk(2048, 1024, mp, max_threads),
+            "grid-starved N=1024 symmetric int8 must take split-K"
+        );
+        assert!(
+            use_f16_symmetric_splitk(1024, 2048, mp, max_threads),
+            "grid-starved N=2048 symmetric int8 must take split-K"
+        );
+        assert!(
+            !use_f16_symmetric_splitk(1024, 3584, mp, max_threads),
+            "occupied N=3584 symmetric int8 must keep the single-warp entry"
+        );
+        assert!(
+            !use_f16_symmetric_splitk(1024, 6144, mp, max_threads),
+            "occupied N=6144 symmetric int8 must keep the single-warp entry"
+        );
+        // K < 512 is ineligible (no whole 256-wide split step to spread).
+        assert!(!use_f16_symmetric_splitk(256, 512, mp, max_threads));
+        // Device-derived, not a fixed N: the same width flips with the SM count.
+        assert!(use_f16_symmetric_splitk(1024, 3584, 256, max_threads));
+
+        // The opt-out flag is default-on (enabled) when unset.
+        // (Env-driven; asserted here only for the unset default to avoid racing
+        // other tests that may set process-wide env.)
+        if std::env::var_os("ONNX_GENAI_CUDA_DISABLE_INT8_SYMMETRIC_SPLITK").is_none() {
+            assert!(int8_symmetric_splitk_enabled());
+        }
+    }
+
+    #[test]
+    fn splitk_smalln_single_column_is_shape_driven_and_general() {
+        // A narrow (grid-starved) projection — e.g. a GQA k/v projection with
+        // N = kv_heads * head_dim (2*128 = 256) — under-fills the device with the
+        // multicol hybrid (grid = ceil(256/8) = 32 CTAs << 132 SMs), so it must
+        // prefer the byte-identical single-column split-K wide entry whose 4x
+        // larger grid fills the idle SMs.
+        assert!(
+            splitk_smalln_prefers_single_column(256, 132),
+            "a narrow N=256 kv projection must fall back to the single-column entry"
+        );
+        // Larger GQA kv widths that still under-fill also flip (shape-driven, not
+        // a single magic constant): N=512 -> grid 64 < 132.
+        assert!(splitk_smalln_prefers_single_column(512, 132));
+
+        // The medium/large projections (down_proj / q / o at N~4096) keep the
+        // multicol hybrid: grid = ceil(4096/8) = 512 >= 132 SMs, so the register
+        // blocking wins and the grid already fills the device.
+        assert!(
+            !splitk_smalln_prefers_single_column(4096, 132),
+            "a wide N=4096 projection must keep the multicol hybrid"
+        );
+        assert!(!splitk_smalln_prefers_single_column(27_392, 132));
+
+        // Device-derived, not model-specific: the same N flips on a bigger device
+        // (more SMs to fill) and holds on a tiny one.
+        assert!(
+            splitk_smalln_prefers_single_column(1024, 132),
+            "N=1024 -> grid 128 < 132 SMs still under-fills a large device"
+        );
+        assert!(
+            !splitk_smalln_prefers_single_column(1024, 100),
+            "N=1024 -> grid 128 >= 100 SMs fills a smaller device"
+        );
+
+        // Env override forces the decision for A/B measurement.
+        // SAFETY: serial logic test (--test-threads=1); the flag is cleared below
+        // so it cannot leak into other tests.
+        unsafe {
+            std::env::set_var("ONNX_GENAI_GEMV_SPLITK_SMALLN_SINGLECOL", "1");
+        }
+        assert!(splitk_smalln_prefers_single_column(4096, 132));
+        unsafe {
+            std::env::set_var("ONNX_GENAI_GEMV_SPLITK_SMALLN_SINGLECOL", "0");
+        }
+        assert!(!splitk_smalln_prefers_single_column(256, 132));
+        unsafe {
+            std::env::remove_var("ONNX_GENAI_GEMV_SPLITK_SMALLN_SINGLECOL");
+        }
     }
 
     #[test]
@@ -15184,16 +15301,51 @@ extern "C" __global__ void ref_silu_mul_f16(
                 runtime.free_raw(fused_out_dev).unwrap();
             }
 
+            let marlin_prefill = m > 1
+                && marlin_gemm::marlin_m_gt_1_enabled()
+                && marlin_gemm::device_supports_marlin(runtime.capabilities().compute_capability())
+                && k.is_multiple_of(16)
+                && k.is_multiple_of(block_size);
+            let mut max_ulp = 0i64;
+            let mut worst = 0usize;
             for index in 0..output_elements {
-                assert_eq!(
-                    fused[index].to_bits(),
-                    reference[index].to_bits(),
-                    "paired gate/up SwiGLU diverged at M={m}, K={k}, N={n}, row={}, column={}: \
-                     fused={:?} reference={:?}",
-                    index / n,
-                    index % n,
-                    fused[index],
-                    reference[index]
+                let ulp = f16_ulp_diff(fused[index].to_bits(), reference[index].to_bits());
+                if ulp > max_ulp {
+                    max_ulp = ulp;
+                    worst = index;
+                }
+                if !marlin_prefill {
+                    assert_eq!(
+                        fused[index].to_bits(),
+                        reference[index].to_bits(),
+                        "paired gate/up SwiGLU diverged at M={m}, K={k}, N={n}, row={}, \
+                         column={}: fused={:?} reference={:?}",
+                        index / n,
+                        index % n,
+                        fused[index],
+                        reference[index]
+                    );
+                }
+            }
+            if marlin_prefill {
+                // On SM80+ the default M>1 gate/up dispatch is the Marlin
+                // `mma.sync.aligned.m16n8k16` tensor-core GEMM, while the
+                // two-op reference above is the portable 16x16 CUDA-core tiled
+                // GEMM. Those are different reduction trees (tensor-core K=16
+                // fragments, with per-group scaling around the mma accumulator,
+                // vs scalar CUDA-core accumulation), so byte identity is not a
+                // valid contract for this branch. Keep this sentinel tight: the
+                // deterministic Marlin-vs-tiled gate/up cases covered here are
+                // expected to stay within two fp16 representable values.
+                assert!(
+                    max_ulp <= 2,
+                    "paired gate/up SwiGLU Marlin prefill exceeded the measured 2-ULP \
+                     sentinel bound at M={m}, K={k}, N={n}, row={}, column={}: fused={:?} \
+                     reference={:?}, max_ulp={max_ulp}",
+                    worst / n,
+                    worst % n,
+                    fused[worst],
+                    reference[worst]
                 );
             }
         }
@@ -16052,10 +16204,11 @@ extern "C" __global__ void ref_silu_mul_f16(
     /// NOT that the rmsnorm loop matches a genuine two-op path. This sweep
     /// compares the fused rmsnorm loop against a real two-op reference (prefill
     /// normalize + standalone projections + silu_mul), across gamma dtypes,
-    /// shapes, seeds, and M. ANSWER: byte-identical (0 ULP) at M==1, so the
-    /// rmsnorm half is a byte-safe substitute for the two-op decode path and is
-    /// the half that landed; a few ULP at M>1 is pure GEMV-vs-GEMM reduction
-    /// order, not a batching-contract violation.
+    /// shapes, seeds, and M. ANSWER: byte-identical (0 ULP) at M==1 only when
+    /// the standalone projections use the same single-warp block-32 reduction as
+    /// the paired fused kernel. On many-SM devices the standalone general GEMV
+    /// may select its grid-fill split-K variant for narrow N; that intentionally
+    /// reassociates the K reduction and is bounded separately below.
     #[test]
     fn fp16_gate_up_swiglu_rmsnorm_two_op_ulp_bound_sweep() {
         let Some(runtime) = runtime() else {
@@ -16091,11 +16244,21 @@ extern "C" __global__ void ref_silu_mul_f16(
 
         let mut global_max = 0i64;
         let mut m1_max = 0i64;
+        let mut m1_single_warp_max = 0i64;
+        let mut m1_splitk_max = 0i64;
         let mut m1_nonzero_cases = 0usize;
         let mut m1_cases = 0usize;
+        let mut m1_worst = (0usize, 0usize, 0u64, DataType::Float16);
         let mut worst = (0usize, 0usize, 0usize, 0u64, DataType::Float16);
+        let caps = runtime.capabilities();
         for gamma in gammas {
             for (k, n) in shapes {
+                let reference_uses_splitk = use_f16_symmetric_splitk(
+                    k,
+                    n,
+                    caps.multiprocessor_count(),
+                    caps.max_threads_per_block(),
+                );
                 for m in ms {
                     for seed in seeds {
                         let (max_ulp, nonzero, total) =
@@ -16108,6 +16271,12 @@ extern "C" __global__ void ref_silu_mul_f16(
                             }
                             if max_ulp > m1_max {
                                 m1_max = max_ulp;
+                                m1_worst = (k, n, seed, gamma);
+                            }
+                            if reference_uses_splitk {
+                                m1_splitk_max = m1_splitk_max.max(max_ulp);
+                            } else {
+                                m1_single_warp_max = m1_single_warp_max.max(max_ulp);
                             }
                         }
                         if max_ulp > global_max {
@@ -16122,22 +16291,43 @@ extern "C" __global__ void ref_silu_mul_f16(
         eprintln!(
             "gate/up SwiGLU rmsnorm two-op ULP sweep: max_ulp={global_max} \
              (worst: M={} K={} N={} seed={:#018x} gamma={:?}); \
-             M==1: max_ulp={m1_max}, {m1_nonzero_cases}/{m1_cases} cases had >=1 ULP divergence",
-            worst.0, worst.1, worst.2, worst.3, worst.4
+             M==1: max_ulp={m1_max} (worst: K={} N={} seed={:#018x} gamma={:?}), \
+             {m1_nonzero_cases}/{m1_cases} cases had >=1 ULP divergence",
+            worst.0,
+            worst.1,
+            worst.2,
+            worst.3,
+            worst.4,
+            m1_worst.0,
+            m1_worst.1,
+            m1_worst.2,
+            m1_worst.3
         );
 
         // DECISION-RULE OUTPUT: at M==1 — the apples-to-apples decode
         // comparison — the fused rmsnorm decode GEMV is BYTE-IDENTICAL to the
-        // two-op reference (0 ULP). This is the property that made the rmsnorm
-        // half landable where the plain half was hard-stopped: routing M>1
-        // rmsnorm decode through the per-row loop is byte-exact to running each
-        // row alone as an M==1 decode (the batching contract), and each such
-        // row is byte-exact to the two-op path. Asserted strictly at 0 so any
-        // future divergence at M==1 fails loudly.
+        // two-op reference only when the two standalone projections use the same
+        // single-warp block-32 reduction shape. On this A100/sm_80, the
+        // device-property selector routes narrow standalone projections
+        // (`N < SM_count * F16_SYMMETRIC_SPLITK_TARGET_WARPS_PER_SM`, e.g.
+        // 896/1536 < 108*16) to `matmul_nbits_gemv_f16_scales_f16_splitk`:
+        // two warps own disjoint K-block ranges for one column and reduce their
+        // fp32 partials through shared memory. The paired gate/up RMS kernel has
+        // no split-K sibling; it keeps one warp per column and therefore cannot
+        // be byte-identical to that reference reduction tree on such shapes.
+        // Preserve the strict invariant where the reduction shape matches, and
+        // separately bound the named split-K reassociation observed on sm_80.
         assert_eq!(
-            m1_max, 0,
+            m1_single_warp_max, 0,
             "rmsnorm fused gate/up SwiGLU decode GEMV must be byte-identical to \
-             the two-op reference at M==1, but observed {m1_max} ULP"
+             the two-op reference at M==1 when both use the single-warp reduction, \
+             but observed {m1_single_warp_max} ULP"
+        );
+        assert!(
+            m1_splitk_max <= 3,
+            "rmsnorm fused gate/up SwiGLU decode GEMV exceeded the measured 3-ULP \
+             bound vs the standalone split-K two-op reference at M==1: \
+             max_ulp={m1_splitk_max}"
         );
         // M>1 compares the per-row decode GEMV loop against a tiled two-op GEMM
         // reference; they differ by a few ULP purely from GEMV-vs-GEMM reduction
@@ -16789,10 +16979,11 @@ extern "C" __global__ void ref_silu_mul_f16(
 
                         let run_once = |vec_on: bool, occ_on: bool| -> Vec<u16> {
                             let out_dev = runtime.alloc_raw(output_elements * 2).unwrap();
-                            let lock = INTERLEAVE_TEST_ENV_LOCK.get_or_init(|| Mutex::new(()));
-                            let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-                            // SAFETY: the env write is confined to this critical
-                            // section and removed before the lock is released.
+                            // Exclusive: this env write is process-wide, and the
+                            // guard clears it on drop so an unwinding `unwrap`
+                            // below cannot leak the lever to other tests.
+                            let _guard = LeverEnvGuard::acquire();
+                            // SAFETY: confined to the exclusive section.
                             unsafe {
                                 std::env::set_var(
                                     "ONNX_GENAI_GATEUP_VEC",

@@ -659,10 +659,19 @@ pub(crate) struct KernelCache {
 ///
 /// A per-node bound rather than a global one keeps the eviction proportional to
 /// what actually varies: a graph keeps its hot decode and prefill variants, and
-/// only a node that has genuinely seen many shapes gives one up. The default is
-/// deliberately generous enough to hold the shapes one request cycles through
-/// (a chunked prefill shape, its remainder, and the single-token decode shape)
-/// so steady state never recompiles.
+/// only a node that has genuinely seen many shapes gives one up.
+///
+/// The bound is small on purpose. A retained variant owns device scratch, so
+/// raising it raises the floor under every long-context request: measured on a
+/// 30B decoder, a bound of 10 pushed a 5.5k-token prompt past the mapped-memory
+/// ceiling that a bound of 4 cleared with 20 GB to spare. The bound is the cap
+/// on that scratch, and widening it defeats its own purpose.
+///
+/// Four is only enough because the shapes a request cycles through are kept
+/// deliberately few: the native CUDA decoder rounds its prefill widths onto a
+/// three-step ladder (`PREFILL_QUERY_WIDTH_STEPS`) so that a prompt's leftover
+/// final chunk cannot invent a fresh width per request, which leaves exactly one
+/// slot for the single-token decode shape.
 const DEFAULT_VARIANTS_PER_NODE: usize = 4;
 
 fn variants_per_node() -> usize {

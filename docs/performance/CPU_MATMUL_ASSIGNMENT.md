@@ -59,30 +59,58 @@ under test.
 | `MatMulNBits` | 8-bit, block 32 | 1 | 3584 | 8 | **0.25** | 0.30 | **win** |
 | `MatMulNBits` | 8-bit, block 32 | 1 | 3584 | 16 | **0.23** | 0.23 | **win** |
 | `MatMulNBits` | 8-bit, block 32 | 1 | 4096 | 8 | **0.23** | 0.24 | **win** |
-| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 2 | **0.90** | 0.91 | **win** |
-| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 4 | **0.87** | 0.87 | **win** |
-| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 8 | **0.94** | 1.06 | **win** |
-| `MatMulNBits` | 8-bit, block 32 | 256 | 3584 | 2 | 1.17 | 1.18 | gap (static M) |
-| `MatMulNBits` | 8-bit, block 32 | 256 | 3584 | 4 | 1.15 | 1.16 | gap (static M) |
-| `MatMulNBits` | 8-bit, block 32 | 256 | 3584 | 8 | 0.99 | 1.05 | gap (static M) |
-| `MatMulNBits` | 8-bit, block 32 | 512 | 3584 | 2 | 1.41 | 1.42 | gap (static M) |
-| `MatMulNBits` | 8-bit, block 32 | 512 | 3584 | 4 | 1.39 | 1.39 | gap (static M) |
-| `MatMulNBits` | 8-bit, block 32 | 512 | 3584 | 8 | 1.25 | 1.32 | gap (static M) |
+| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 2 | **0.66** | 0.66 † | **win** (was 2.06) |
+| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 4 | **0.75** | 0.84 † | **win** (was 2.01) |
+| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 8 | **0.68** | 0.88 † | **win** (was 2.32) |
+| `MatMulNBits` | 8-bit, block 32 | 256 | 3584 | 2 | **0.77** | 0.79 † | **win** (was 1.70) |
+| `MatMulNBits` | 8-bit, block 32 | 256 | 3584 | 4 | **0.83** | 0.99 † | **win** (was 1.69) |
+| `MatMulNBits` | 8-bit, block 32 | 256 | 3584 | 8 | **0.88** | 1.11 † | **win** (was 1.89) |
+| `MatMulNBits` | 8-bit, block 32 | 512 | 3584 | 2 | **0.86** | 0.87 † | **win** (was 1.41) |
+| `MatMulNBits` | 8-bit, block 32 | 512 | 3584 | 4 | **0.88** | 1.00 † | **win** (was 1.42) |
+| `MatMulNBits` | 8-bit, block 32 | 512 | 3584 | 8 | 1.01 | 1.13 † | parity (was 1.54) |
 
-### The 8-bit win is bounded by row count
+† **not a p90.** On the nine rows above, that column is the per-trial *maximum* — the worst of 7-11
+interleaved trials — because `ab.py` reports `p50 [min-max]` rather than a p90. It is a strictly more
+pessimistic statistic than the p90 the rest of this table carries, and it is marked rather than
+converted so no cell here is ever compared to a p90 as though the two were the same number.
 
-The 8-bit keep is **not** unconditional in `M`. The win erodes as rows are added and crosses over
-between 128 and 256 -- and the crossover rows are the *low*-dispersion measurements in this whole
-document (spread 0.01-0.04), so it is not a contended-host artefact.
+### The 8-bit prefill loss was a 51 MB f32 weight rebuilt on every call
 
-A node whose row count is **statically** >= 256 is pure prefill: there is no decode traffic on it to
-amortise the loss against, so this is the shape where the gap is felt undiluted, and the one to
-optimize first.
+**Fixed.** On a native (non-`mlas`) build there was no borrowed route for `bits == 8, m > 1` at all:
+`try_prefill_mlas_nt` declines and the kernel materialized the whole `k x n` weight as f32 in the
+transposed `Kn` layout -- 51.4 MB for 3584x3584, written at stride `n`, **per call**, because
+nothing caches that layout. Generalizing #1117's fused-dequant GEBP to 8 bits removed it: each
+packed byte is read once per call into the L1-resident panel every row reuses. Kernel level, the
+same `3584` geometry gets **17.1x** at `m = 2`, **13.9x** at `m = 8`, **5.8x** at `m = 64`, **2.6x**
+at `m = 256` and **1.8x** at `m = 512`, and the two arms' outputs are bit-identical.
 
-A **dynamic** row count is the LLM case, where a single node serves both phases. There the loss is
-already repaid in practice: at 8 threads decode saves **6.06 ms per token** (1.78 ms ours vs 7.84 ms
-ORT) while a 512-row prefill costs **7.69 ms once** (38.58 vs 30.89). The *second* generated token
-has repaid the entire prefill loss.
+Full record, including the ORT-comparison method and the controls:
+[`docs/benchmarks/2026-08-19-int8-prefill-gebp.md`](../benchmarks/2026-08-19-int8-prefill-gebp.md).
+
+Four things about the table above are worth stating plainly.
+
+* **The `p90` column on the nine re-measured rows is the per-trial *maximum*** (marked `†` above).
+  Where it crosses 1.00 (`M = 256, t = 4/8` and `M = 512, t = 4/8`) that is one trial out of 7-11,
+  not the median behaviour.
+* **The `was` column is a paired re-measurement, not the historical number.** Both arms are one
+  build of the current tree, differing only by `ONNX_GENAI_CPU_MM_INT8_GEBP`, interleaved trial by
+  trial (7-11 trials x 9 runs). The `M = 512` prior rows reproduce the numbers this file has always
+  carried almost exactly (1.41 -> 1.41 at 2 threads, 1.39 -> 1.42 at 4); the `M = 128` and `M = 256`
+  prior rows do **not** -- this file recorded 0.90/0.87/0.94 and 1.17/1.15/0.99 where the paired
+  arm now reads 2.06/2.01/2.32 and 1.70/1.69/1.89. Those older rows come from a tree and build
+  configuration that can no longer be reconstructed here, so they are replaced rather than defended.
+  A `--features mlas` build of the *current* tree does not reproduce them either (it reads 0.56 at
+  `M = 128, t = 2`), which rules out "the old rows were an MLAS build" as the explanation.
+* **`M = 512` at 8 threads reaches parity, not a win.** 1.01 `[0.886-1.131]` over 11 trials. By this
+  file's own bar -- a >= 5% repeatable win beyond noise at *every* measured thread count -- the
+  512-row row is not closed. It is no longer the shape that motivates optimizing 8-bit first.
+* **Decode is untouched and still wins.** `M = 1` reads 0.153 / 0.181 / 0.219 at 2 / 4 / 8 threads
+  with the switch on, against 0.154 / 0.207 / 0.244 with it off: overlapping ranges, as it must be,
+  since `m == 1` never reaches this branch.
+
+For reference, a `--features mlas` research build of the same tree reads 0.56 / 0.50 at
+`M = 128` (2 / 8 threads) and 0.82 / 0.76 at `M = 512`. The pure-native path is now within
+1.05-1.35x of it, where before it was 2.5-3.7x behind.
 
 ### Block sizes ORT cannot build at all
 
@@ -207,6 +235,13 @@ host.** What is *not* in doubt is the absolute change, which is three to four
 orders of magnitude larger than the noise: 32-48 ms before, 0.3-1.5 ms after.
 
 
+> **The `QLinearMatMul` rows above are `--features mlas` measurements.** They were taken on the
+> research build, and nothing on this page said so. The build we actually ship had no integer GEMM
+> at all until #1194, and measured **11.9x at M=1 and 11.9x at M=128** rather than the 1.13-1.20x
+> the rows claim. See [section 3](#3-per-call-packing-and-a-missing-native-kernel--qlinearmatmul-fixed)
+> for the corrected native numbers; the rows themselves are left as measured, because they are
+> accurate for the build they describe.
+
 Ranges **outside** the measured region — `K * N < 2^20`, symbolic/dynamic weight shapes, and dense
 dtypes other than f32/f16 — are simply unmeasured. They are claimed like everything else; the note
 is only that no row above characterises them.
@@ -321,7 +356,78 @@ The improvement stands on its own regardless: this EP runs its own f16 kernel in
 #1080 reports that kernel as 2.4x-14.3x faster than its predecessor. That range is ours-before over ours-after, from #1080's own report — it is a different
 quantity from this table's ours/ORT ratios and cannot be re-derived by dividing them.
 
-### 3. Per-call packing — `QLinearMatMul` (**fixed**)
+#### The default build never had #1080's route (**fixed natively**)
+
+#1080's f16 prefill gate is `#[cfg(feature = "mlas")]`, and `mlas` is **off by default**. Every row
+in the table above was measured with MLAS compiled in; the shipped default build had no such route
+and stayed on the row-blocked half GEMM, which re-widens and re-packs the whole of `B` once per row
+block (`m = 64` on 32 threads = 64 full passes over the weight).
+
+The native path now has its own answer: `f16`/`bf16` prefill widens `B` **directly into** the packed
+L1 panel of the existing AVX2/FMA f32 microkernel, so the weight is traversed once whatever `m` is,
+with no widened `B` copy retained. Self-A/B on the same host, default features, production kernel,
+p50 steady, `k = 4096, n = 11008` — **ours-before over ours-after**, a different quantity from this
+table's ours/ORT ratios:
+
+| dtype | m | before | after | gain |
+|---|---|---:|---:|---:|
+| f16 | 8 | 36.20 ms | 2.59 ms | **14.0x** |
+| f16 | 64 | 118.33 ms | 7.50 ms | **15.8x** |
+| f16 | 256 | 169.41 ms | 26.27 ms | **6.4x** |
+| bf16 | 1 | 31.36 ms | 1.96 ms | **16.0x** |
+| bf16 | 64 | 108.79 ms | 7.66 ms | **14.2x** |
+
+After the change `f16` prefill is at parity with this EP's own f32 SGEMM at `m = 64` (7.50 vs 7.42
+ms) and faster than it at `m = 8`. The **ours/ORT ratios above have not been re-measured** — this
+host has no model corpus to run the session-level A/B against, so the table stands as it was and
+this note is only about the native-vs-native change. Full record:
+`docs/benchmarks/2026-08-19-half-prefill-fused-widen-pack-gebp.md`.
+
+#### `bf16` decode had no GEMV at all, and `f16` decode kept a GEMV past its crossover (**both fixed natively**)
+
+The same audit found the mirror-image hole at `M = 1`. `f16` decode has had a dedicated GEMV since
+#1082 — at one row no packed panel is reused, so packing looked like pure overhead on a
+memory-bound problem — but `bf16` had none, and a single decode token widened and packed the whole
+weight to multiply it by one row.
+
+`half_gemv` now serves both formats (`bf16` widens by an AVX2 shift, so it does not require the
+`f16c` conversion unit the `f16` path needs). Measuring the GEMV against the fused prefill GEBP
+then **inverted the assumption behind the work**, and inverted it further than the first attempt
+recognised. A GEMV is the floor only while the weight is too small for the GEBP to accept at all.
+Above `HALF_PREFILL_GEBP_MIN_WEIGHT` the packed route is ahead in both formats at every shape
+measured, once the shared host's `f32` control row is divided out — at the very first weight above
+the gate (1024x1024) it is already 2.0x/2.1x ahead. So decode does not get a threshold of its own:
+it takes the GEMV exactly when the GEBP declines the weight.
+
+| dtype | `K x N` | elements | before | after | gain (control-corrected) |
+|---|---|---:|---:|---:|---:|
+| bf16 | 1024x768 | 0.79M | blocked 0.252 ms | GEMV 0.086 ms | **3.0x** |
+| bf16 | 512x512 | 0.26M | blocked 0.078 ms | GEMV 0.014 ms | **5.6x** |
+| f16 | 2048x2048 | 4.19M | GEMV 0.223 ms | GEBP 0.177 ms | **1.27x** |
+| f16 | 4096x11008 | 45.1M | GEMV 2.441 ms | GEBP 2.029 ms | **1.23x** |
+| f16 | 896x151936 | 136M | GEMV 6.172 ms | GEBP 4.611 ms | **1.34x** |
+
+Median of the per-run steady p50, two binaries interleaved rep by rep, 5 repetitions each, against
+`main` at `d4cb7341d`; the `f32` control rows of the same runs agree between the binaries to within
+3%, and every gain above is quoted after dividing that control out. The `bf16` rows at and above
+the weight gate are **unchanged** — `main` already routed them through the fused GEBP (#1365) —
+which is the honest scope of the `bf16` half of this work: it fixes decode *below* the gate, where
+there was no vectorised route, not above it.
+
+An earlier revision of this change split decode at 33.6M weight elements instead, on a sweep that
+varied only `n` at `k = 4096`. Across both axes that threshold is wrong in one direction
+everywhere it applies, worst of all for `bf16` at 2048x2048, where it moved decode off the GEBP
+`main` already used and onto the GEMV — a 2.1x regression against `main`. It was retired rather
+than retuned. Full record, including that retraction and the noisier earlier sweep kept as the
+disclosure of this shared host's worst case:
+`docs/benchmarks/2026-08-19-bf16-decode-gemv.md`.
+
+### 3. Per-call packing and a missing native kernel — `QLinearMatMul` (**fixed**)
+
+#### 3a. The research build
+
+Everything in this subsection is behind `--features mlas` and describes the **reference** build, not
+the one we ship. It is kept because it is the baseline the native kernel in 3b was measured against.
 
 #1058 bound MLAS's integer QGEMM and took u8 x u8 from **27-119x** down to 3-4x. What remained was
 structural: **ORT pre-packed the constant B once at session init; this kernel packed inside every
@@ -364,6 +470,78 @@ The `i8 x i8` "before" ratios above (5.20/4.97/5.22 at 8 threads) were re-measur
 Runtime 1.27.0 for this round on the same host. An earlier round recorded 2.23-3.07 for the same
 scalar path; the kernel side did not change between the two, so the difference is the
 baseline and the harness, not a regression.
+
+#### 3b. The build we ship had no integer GEMM at all (**fixed by #1194**)
+
+Section 3a was written as if it described the product. It did not. Every one of those wins is
+compiled out unless `--features mlas` is set, and the default build fell through to a path that
+had never been optimised at all:
+
+- `read_quantized` widened **both** operands into `Vec<i32>` on every call — 16 MiB for a
+  2048x2048 weight, allocated, filled and dropped per call;
+- the accumulation was a scalar rank-1 update, so each row of `A` re-streamed the entire widened
+  `B`. At M=128 that is 512 MiB of traffic for a 4 MiB weight.
+
+Measured through an ORT session, that was **11.9x ORT at M=1 and 11.9x at M=128** — not the
+1.13-1.20x the matrix above claims, and the largest single loss anywhere in the matmul family.
+
+`kernels::qgemm_native` replaces it with a real integer GEMM on the operand *bytes*. The
+instruction that fits is `vpmaddwd`: eight `i16` pairs multiplied and pairwise-summed into `i32`,
+sixteen multiply-accumulates each. It is exact here, not approximate — a centred `a` is in
+`[-255, 255]` and a raw `b` in `[-128, 255]`, so a pair sum cannot exceed 130050 — and unlike the
+`vpmaddubsw` that section 3a has to work around, it does not saturate, so **no operand has to be
+translated into another sign domain**.
+
+Two kernels, chosen by `M`:
+
+| `M` | strategy | why |
+|---|---|---|
+| `> 4` | `B` packed into 16-column, k-pair-interleaved tiles in a 256 KiB L2-resident panel | the panel is re-read once per row block, so the SIMD pack costs about 1% of the GEMM it feeds |
+| `<= 4` | no pack; the interleave happens in registers, accumulators stay in registers across a `k` block | at one row block a panel would be written once and read once, and `2 * k * n` bytes of stores to serve a GEMV that reads `k * n` **is** the call |
+
+Session A/B, `K = N = 2048`, u8 x u8, same host and harness on both sides, 61 iterations
+(`ratio = ours / ORT`, lower is better):
+
+| M | threads | before | after | our time before | our time after |
+|---|---|---|---|---|---|
+| 1 | 1 | 12.20 | **2.17** | 1.402 ms | 0.226 ms |
+| 128 | 1 | 11.90 | **1.20** | 99.84 ms | 9.99 ms |
+| 1 | 4 | 37.11 | **4.03** | 1.379 ms | 0.170 ms |
+| 128 | 4 | 14.44 | **1.47** | 31.03 ms | 3.14 ms |
+| 1 | 16 | 83.12 | **35.63** | 2.366 ms | 1.336 ms |
+| 128 | 16 | 42.28 | **15.05** | 51.05 ms | 16.55 ms |
+
+ORT's own side moved by under 1.5% between the two arms at one and four threads, which is what
+makes the comparison a comparison. The i8 x i8 win widened too: 0.206 to **0.049** at M=1, one
+thread.
+
+The sixteen-thread rows are directional only. This host's session A/B is not usable at that width —
+ORT's own p50/p90 spread there is 4.8x — and the kernel-level harness
+(`bench_qgemm_ab`, `#[ignore]`) is the reliable instrument for scaling:
+
+| shape | 1 thread | 2 | 4 | 8 | 16 | portable control, 1 thread |
+|---|---|---|---|---|---|---|
+| 1x2048x2048 | 0.229 ms | 0.136 | 0.090 | 0.098 | 0.166 | 4.92 ms (**21x**) |
+| 4x2048x2048 | 0.565 ms | 0.311 | 0.199 | 0.237 | 0.345 | 4.58 ms (**8.1x**) |
+| 128x2048x2048 | 8.911 ms | 4.773 | 2.755 | 2.780 | 1.991 | — |
+| 128x5120x5120 | 53.56 ms | 27.06 | 14.35 | 8.98 | 11.51 | — |
+
+The kernel scales to four threads and then flattens: this host has sixteen physical cores but the
+sweep is pinned to eight of them, so eight and sixteen are SMT siblings. What the table also shows
+is that the **session** does not reach even the four-thread kernel number (0.170 ms against 0.090
+ms), which is EP-level thread plumbing rather than this kernel, and is tracked with the rest of the
+oversubscription work.
+
+Two things are deliberately left open:
+
+1. **The constant-B pack is not cached.** `B` is a graph initializer and its packed panel could be
+   built once per session, which would remove the pack from prefill entirely. That cache is keyed on
+   a weight, so it has to go through `kernels::governed_weight_cache` and a budget; it is a separate
+   change with its own CI gate, not a rider on this one.
+2. **ORT is still ahead at M=1** (2.17x). The gap is now structural rather than sloppy: MLAS reaches
+   32 multiply-accumulates per pair of instructions with `vpmaddubsw`, which *saturates*, and this
+   kernel reaches 32 per four with `vpmaddwd`, which does not. Closing it means giving up exact
+   integer arithmetic, and this EP does not trade determinism for throughput.
 
 ### 4. The decode f32 GEMV was written but never shipped (**fixed**)
 
@@ -418,7 +596,82 @@ order — so this changes f32 results at `M = 1` within the tolerance
 column strips are disjoint and its K-unroll order is fixed, so the same input gives the same bits on
 every run and at every thread count.
 
-### 5. `Gemm` declined the f16 fast path whenever B was transposed (**fixed**)
+### 5. The int4 prefill re-decoded the weight once per row, and was switched off (**fixed**)
+
+The scheduler isolated `gemm_nbits_llama3_8b_qkv_t8` at ~10x behind ORT measured native-alone, flat
+across 8/16/32 threads. Reproduced on `f8f3878ba` at 6.837 ms against the note's 6.90 ms — three
+significant figures apart — so the cell is stable.
+
+Two defects, and the second is the expensive one.
+
+**It was switched off.** `borrowed_int4_prefill_block_enabled()` defaulted to `false`, so every build
+anyone ran took the row-serial `borrowed_affine_int4_matmul`. This is
+[section 4](#4-the-decode-f32-gemv-was-written-but-never-shipped-fixed) again, and #1080's f16 fix
+behind a `mlas` feature gate a third time: a toggle added "until the win is measured", and then
+nothing measured it. §36.2 of the phase-18 benchmark document had already written down "it is dead in
+the default build"; it had not been acted on.
+
+**It re-decoded the weight for every activation row.** Per 32-lane chunk of one column the int4 inner
+loop spends ~18 instructions unpacking nibbles (load, two masks, a shift, two `unpack`s, eight
+widen/converts) to feed **four** FMAs. Better than 80% of the instruction stream is decode, and the
+row loop sat outside all of it.
+
+Two independent measurements say so. Time was **exactly linear in `m`** — 0.890 / 0.859 / 0.851 ms
+*per row* at `m` = 1 / 8 / 128, which is what zero row reuse looks like. And the roofline: 402 MFLOP
+in 6.87 ms is 58.6 GFLOP/s, **0.61 FLOP/cycle/thread** against ORT's 6.07. A kernel 10x off compute
+peak whose entire 15.7 MiB working set fits in one 32 MiB L3 slice is not waiting for memory.
+
+Worth recording what it was *not*, since two plausible causes were built and rejected:
+
+* **Not bandwidth.** 100.7 MiB in 6.87 ms is 14.6 GB/s, an order of magnitude under this part. A
+  64-column tile with rows inner — so a tile's weight and activations both sit in L2 — moved nothing
+  at 16 or 32 threads. Removed.
+* **Not fork/join.** The path whose whole purpose is to replace `m` fork-joins with one reads
+  6.874 ms against the default's 6.897 ms.
+
+The fix is `borrowed_int4_rowblock_avx2`: decode each K block's nibbles **once**, then drive
+`PREFILL_ROW_BLOCK = 4` rows through the decoded vectors, taking the instruction budget per 32 MACs
+from ~22 to ~8.5. Within a row it is instruction-for-instruction the single-column case of the
+existing `NCols4` kernel. The default is flipped to on; the variable stays as a kill switch.
+
+All cells, 32 threads, **native-alone** (`--native-only` / `--ort-only` as separate arms, per
+`sebastian-paired-harness-coresidency` — paired runs depress the native arm by up to 4.8x here).
+"before" is `ONNX_GENAI_CPU_MM_INT4_PREFILL=0`, exactly the path that shipped.
+
+| cell | before | after | speedup | ours/ORT was | now |
+|---|---:|---:|---:|---:|---:|
+| `llama3_8b_qkv_t8` | 7.087 ms | **2.339 ms** | 3.03x | 9.35 | **3.09** |
+| `llama3_8b_qkv_t128` | 103.250 ms | 28.862 ms | 3.58x | 12.49 | 3.49 |
+| `llama3_8b_qkv_t512` | 509.199 ms | 97.591 ms | **5.22x** | 23.97 | 4.59 |
+| `llama3_8b_mlp_t8` | 15.350 ms | 5.327 ms | 2.88x | 10.47 | 3.63 |
+| `llama3_8b_mlp_t128` | 195.611 ms | 56.196 ms | 3.48x | 13.10 | 3.76 |
+| `llama3_8b_mlp_t512` | 810.630 ms | 227.322 ms | 3.57x | 15.49 | 4.34 |
+| `qwen3_0p6b_qkv_t8` | 0.895 ms | 0.261 ms | 3.43x | 9.32 | 2.72 |
+| `qwen3_0p6b_qkv_t128` | 13.645 ms | 4.981 ms | 2.74x | 19.98 | 7.29 |
+| `qwen3_0p6b_qkv_t512` | 51.084 ms | 15.337 ms | 3.33x | 8.50 | 2.55 |
+| `qwen3_0p6b_mlp_t8` | 1.718 ms | 0.678 ms | 2.53x | 10.10 | 3.99 |
+| `qwen3_0p6b_mlp_t128` | 26.891 ms | 6.981 ms | 3.85x | 18.83 | 4.89 |
+| `qwen3_0p6b_mlp_t512` | 104.909 ms | 30.250 ms | 3.47x | 17.16 | 4.95 |
+
+Twelve cells, twelve wins, 2.53x-5.22x, no regressions. Row reuse now shows up where its absence
+used to: per-row cost falls with `m` (0.292 / 0.226 / 0.191 ms at `m` = 8 / 128 / 512) instead of
+sitting flat at ~0.9.
+
+Like section 4, the two routes differ only in summation reassociation (~2 ULP): the per-element path
+reduces every 32-lane block to a scalar, the blocked kernel keeps a lanewise accumulator and reduces
+once. Nibble decode is untouched. The test that asserted byte-identity is rewritten to check both
+paths against an **f64 oracle** and require the blocked one to be no worse, and byte-identity is
+still asserted across fan-out partitions, across row-tile boundaries, and against `NCols4` for a
+single row.
+
+What is left is the decode itself: MLAS SQNBit's CompInt8 path quantizes activations to int8 and uses
+integer dot products, avoiding f32 dequantization entirely, where this kernel still widens every
+nibble to f32. That is a structural step, not a tuning one, and VNNI — which this host lacks — is
+what would make it pay.
+
+Full record: [`docs/benchmarks/2026-08-19-int4-prefill-row-blocking.md`](../benchmarks/2026-08-19-int4-prefill-row-blocking.md).
+
+### 6. `Gemm` declined the f16 fast path whenever B was transposed (**fixed**)
 
 `GemmKernel::execute` disqualified both f16 fast paths if either transpose flag
 was set, on the reasoning — written in a comment directly above the check — that
@@ -526,3 +779,27 @@ LD_LIBRARY_PATH=$ORT_ROOT/lib ./target/release/bench_prec \
 ```
 
 `native/ort` in the result line is the ratio quoted here; `parity` must read `PASS`.
+
+The `QLinearMatMul` numbers in [3b](#3b-the-build-we-ship-had-no-integer-gemm-at-all-fixed-by-1194)
+come from two harnesses instead. The session A/B — the one that counts — is
+
+```sh
+export NXRT_ORT_LIB_DIR=<ort-prebuilt>/lib
+NXRT_REQUIRE_ORT_TESTS=1 NXRT_MM_BENCH=1 NXRT_MM_BENCH_CASE=qlinear \
+  NXRT_MM_BENCH_ITERS=61 NXRT_MM_BENCH_THREADS=1 \
+  ONNX_GENAI_MLAS_THREADPOOL_THREADS=1 RAYON_NUM_THREADS=1 \
+  taskset -c 8-15 cargo test --release -p onnx-runtime-ep-cpu-plugin \
+  --test plugin_ort_e2e plugin_path_ab_vs_plain_ort -- --ignored --nocapture
+```
+
+All three thread knobs must agree or the harness refuses to run: a pinned A/B needs both pools
+pinned. Use `-c 8-15` at one thread and `-c 0-15` above it. The kernel-level scaling table comes
+from
+
+```sh
+QGEMM_AB_ITERS=21 taskset -c 0-15 cargo test --release -p onnx-runtime-ep-cpu --lib \
+  bench_qgemm_ab -- --ignored --nocapture
+```
+
+whose `portable` arm is the control: it is the same arithmetic with none of the blocking, so it must
+not move when a SIMD constant is retuned. If it does, the host was busy and the run says nothing.

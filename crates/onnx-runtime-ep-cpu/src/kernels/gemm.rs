@@ -76,7 +76,7 @@ impl GemmKernel {
         if m == 1
             && b.is_contiguous()
             && b.numel() == k.saturating_mul(n)
-            && half_gemv::simd_available()
+            && half_gemv::simd_available(HalfFormat::F16)
         {
             b.validate()?;
             let a_dense = self.prepack.dense(0, a)?;
@@ -90,7 +90,7 @@ impl GemmKernel {
                 if trans_b {
                     half_gemv::gemv_f16_nk(&a_dense, b_bits, &mut result, k, n);
                 } else {
-                    half_gemv::gemv_f16_kn(&a_dense, b_bits, &mut result, k, n);
+                    half_gemv::gemv_half_kn(HalfFormat::F16, &a_dense, b_bits, &mut result, k, n);
                 }
                 return Ok(Some(result));
             }
@@ -479,7 +479,7 @@ mod tests {
         let (transposed, _) = run_half_gemm(m, k, n, &a, &nk, true);
         let took_the_gemv = super::half_gemv::NK_GEMV_CALLS.with(|calls| calls.get()) == before + 1;
         assert!(
-            took_the_gemv || !super::half_gemv::simd_available(),
+            took_the_gemv || !super::half_gemv::simd_available(HalfFormat::F16),
             "an f16 transB decode must reach the [N, K] GEMV on an f16c host"
         );
 

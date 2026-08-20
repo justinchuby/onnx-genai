@@ -98,7 +98,7 @@ unsafe fn init_host_api(
             .then(|| unsafe { (*fallback_api).CreateStatus })
             .flatten()
         {
-            let msg = c"EP plugin requires ORT API version 27 but host does not support it. \
+            let msg = c"EP plugin requires ORT API version 28 but host does not support it. \
                        Plugin will not load (fail-closed).";
             unsafe {
                 if !out_num.is_null() {
@@ -149,6 +149,13 @@ fn build_factory(
             GetCustomOpDomains: Some(factory_get_custom_op_domains),
             InitGraphicsInterop: Some(factory_init_graphics_interop),
             DeinitGraphicsInterop: Some(factory_deinit_graphics_interop),
+            // Optional, new in ORT 1.28. It only matters for EPs that publish
+            // several compiled variants of one model (e.g. speed- vs
+            // memory-optimised) and need to rank them. We publish a single
+            // variant, so leaving this null makes ORT fall back to
+            // `ValidateCompiledModelCompatibilityInfo`, which we do implement
+            // and which is the correct answer for one candidate.
+            SelectBestModelCandidate: None,
         },
         name_cstr,
         vendor_cstr,
@@ -811,6 +818,12 @@ unsafe extern "C" fn factory_create_ep(
                 exported.kernel_registry_entries.clone(),
             ))
         };
+        // Carry the factory's own placement decision into the EP: this is the
+        // flag `CreateAllocator` above branches on, so a subgraph compiled by
+        // this EP can trust it to say whether ORT's tensors are host-resident.
+        let mut exported_ep = exported_ep;
+        exported_ep.host_accessible = exported.device_support.host_accessible;
+
         let ep_ptr = Box::into_raw(exported_ep);
         unsafe { *out_ep = ep_ptr.cast::<ort::OrtEp>() };
         ok_status()

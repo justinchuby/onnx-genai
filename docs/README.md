@@ -124,6 +124,9 @@ Project state and upstream tracking: [`PROGRESS.md`](status/PROGRESS.md),
 [`DECISIONS_FOR_JUSTIN.md`](status/DECISIONS_FOR_JUSTIN.md),
 [`UPSTREAM_ORT_ARM_INVENTORY.md`](status/UPSTREAM_ORT_ARM_INVENTORY.md),
 [`UPSTREAM_ORT_MATMULNBITS_INVENTORY.md`](status/UPSTREAM_ORT_MATMULNBITS_INVENTORY.md).
+Dated test-health snapshots (which suites are green/red/ignored on `main`, and
+why): [`2026-08-19-test-health-baseline.md`](status/2026-08-19-test-health-baseline.md)
+— **check the date; a baseline decays.**
 
 ### `benchmarks/`, `portability/`, `research/`
 Pre-existing directories, unchanged: dated benchmark runs, portability notes,

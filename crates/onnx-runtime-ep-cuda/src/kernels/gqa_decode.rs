@@ -27,18 +27,18 @@ use onnx_runtime_ep_api::{EpError, Result};
 use crate::error::driver_err;
 use crate::runtime::CudaRuntime;
 
-const MODULE_KEY: &str = "gqa_decode_attention_f32_v5";
+const MODULE_KEY: &str = "gqa_decode_attention_f32_v6";
 const ENTRY_PREFIX: &str = "gqa_decode_attention_f32_dpl";
 const MERGE_ENTRY_PREFIX: &str = "gqa_decode_attention_f32_merge_dpl";
 
 /// Largest `head_dim` this kernel supports. Each of the 32 warp lanes owns
 /// `ceil(head_dim / 32)` output dimensions in registers, capped at
-/// [`MAX_DIMS_PER_LANE`] (8 lanes-worth == 256).
-pub(super) const MAX_HEAD_DIM: usize = 256;
+/// [`MAX_DIMS_PER_LANE`] (16 lanes-worth == 512).
+pub(super) const MAX_HEAD_DIM: usize = 512;
 
 /// Highest dims-per-lane tier the CUDA source instantiates (`GQA_DECODE_ENTRIES`
-/// 1..=8). `32 * MAX_DIMS_PER_LANE == MAX_HEAD_DIM`.
-const MAX_DIMS_PER_LANE: usize = 8;
+/// 1..=16). `32 * MAX_DIMS_PER_LANE == MAX_HEAD_DIM`.
+const MAX_DIMS_PER_LANE: usize = 16;
 
 /// Dims-per-lane tier for a given head_dim: `ceil(head_dim / 32)`. The launcher
 /// picks the matching specialized entry so a small head keeps its original
@@ -118,9 +118,10 @@ const DECODE_SRC: &str = r#"
 // lanes owns `DPL` output dims, so the kernel covers head_dim <= 32 * DPL. The
 // launcher instantiates the exact tier `DPL = ceil(head_dim / 32)` (1..=8) so a
 // small head (e.g. 64 -> DPL 2, 128 -> DPL 4) keeps its original register
-// footprint while head_dim=256 uses DPL 8 -- no register regression on small
-// heads, no head256 fallback to the serial reference kernel.
-#define GQA_MAX_HEAD_SIZE 256
+// footprint while head_dim=256 uses DPL 8 and head_dim=512 uses DPL 16 -- no
+// register regression on small heads, no head256/head512 fallback to the serial
+// reference kernel.
+#define GQA_MAX_HEAD_SIZE 512
 #define GQA_MAX_SPLITS 16
 #define GQA_MAX_SCRATCH_ROWS 256
 #define GQA_SCRATCH_STRIDE (GQA_MAX_HEAD_SIZE + 2)
@@ -153,7 +154,8 @@ __device__ __forceinline__ void gqa_decode_f32_impl(
     const float scale,
     const int local_window,
     const float softcap,
-    const int single_split_direct)
+    const int single_split_direct,
+    const float* __restrict__ head_sink)
 {
     extern __shared__ float smem[];
     const int warps_per_block = blockDim.x / GQA_WARP_SIZE;
@@ -259,10 +261,6 @@ __device__ __forceinline__ void gqa_decode_f32_impl(
     for (int w = 0; w < warps_per_block; ++w) {
         global_max = fmaxf(global_max, warp_max[w]);
     }
-    float denom = 0.0f;
-    for (int w = 0; w < warps_per_block; ++w) {
-        denom += warp_sum[w] * expf(warp_max[w] - global_max);
-    }
     // When `single_split_direct` is enabled and the on-device length selects a
     // single split, the sole active CTA already owns the complete flash state,
     // so it normalizes and writes the final output directly, skipping the
@@ -270,6 +268,24 @@ __device__ __forceinline__ void gqa_decode_f32_impl(
     // (the merge with one split multiplies by exp(0)==1 and the same 1/denom).
     const bool direct_output =
         (row >= GQA_MAX_SCRATCH_ROWS) || (single_split_direct != 0 && active_splits == 1);
+    // Learned attention sink (gpt-oss family): a per-head logit that joins the
+    // softmax denominator once per row but contributes no value vector. It is
+    // folded in only on the FINAL normalization (direct-output here, or the
+    // merge kernel for multi-split rows), never per-split, so split states stay
+    // sink-free. When absent, `sink_val == -inf` makes the fold a no-op
+    // (byte-identical to the pre-sink path).
+    const float sink_val =
+        (head_sink != nullptr) ? head_sink[query_head] : negative_infinity;
+    if (direct_output) {
+        global_max = fmaxf(global_max, sink_val);
+    }
+    float denom = 0.0f;
+    for (int w = 0; w < warps_per_block; ++w) {
+        denom += warp_sum[w] * expf(warp_max[w] - global_max);
+    }
+    if (direct_output) {
+        denom += expf(sink_val - global_max);
+    }
     float* split_state = direct_output
         ? nullptr
         : gqa_split_scratch
@@ -307,7 +323,8 @@ __device__ __forceinline__ void gqa_merge_f32_impl(
     const int query_seq,
     const int head_size,
     const int local_window,
-    const int single_split_direct)
+    const int single_split_direct,
+    const float* __restrict__ head_sink)
 {
     const int row = blockIdx.x;
     const int rows = batch * query_heads * query_seq;
@@ -327,18 +344,26 @@ __device__ __forceinline__ void gqa_merge_f32_impl(
     // Single-split rows were finalized in-place by the decode kernel.
     if (single_split_direct != 0 && active_splits <= 1) return;
 
+    const int query_head = (row / query_seq) % query_heads;
     float global_max = __int_as_float(0xff800000);
     for (int split = 0; split < active_splits; ++split) {
         const float* state = gqa_split_scratch
             + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
         global_max = fmaxf(global_max, state[0]);
     }
+    // Learned attention sink (see the decode kernel): folded into the softmax
+    // denominator once, on this final merge, for multi-split rows. `-inf` when
+    // absent => byte-identical no-op.
+    const float sink_val =
+        (head_sink != nullptr) ? head_sink[query_head] : __int_as_float(0xff800000);
+    global_max = fmaxf(global_max, sink_val);
     float denom = 0.0f;
     for (int split = 0; split < active_splits; ++split) {
         const float* state = gqa_split_scratch
             + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
         denom += state[1] * expf(state[0] - global_max);
     }
+    denom += expf(sink_val - global_max);
     const float inverse_sum = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
     const long q_base = (long)row * (long)head_size;
 #pragma unroll
@@ -367,18 +392,22 @@ extern "C" __global__ void gqa_decode_attention_f32_dpl##DPL(                  \
     const int query_heads, const int kv_heads, const int query_seq,           \
     const int head_size, const int cache_capacity, const int group_size,      \
     const float scale, const int local_window, const float softcap,           \
-    const int single_split_direct) {                                          \
+    const int single_split_direct,                                            \
+    const float* __restrict__ head_sink) {                                    \
     gqa_decode_f32_impl<DPL>(query, key, value, output, total_lengths, batch, \
         query_heads, kv_heads, query_seq, head_size, cache_capacity,          \
-        group_size, scale, local_window, softcap, single_split_direct);       \
+        group_size, scale, local_window, softcap, single_split_direct,        \
+        head_sink);                                                           \
 }                                                                             \
 extern "C" __global__ void gqa_decode_attention_f32_merge_dpl##DPL(           \
     float* __restrict__ output, const int* __restrict__ total_lengths,        \
     const int batch, const int query_heads, const int query_seq,              \
     const int head_size, const int local_window,                             \
-    const int single_split_direct) {                                          \
+    const int single_split_direct,                                            \
+    const float* __restrict__ head_sink) {                                    \
     gqa_merge_f32_impl<DPL>(output, total_lengths, batch, query_heads,        \
-        query_seq, head_size, local_window, single_split_direct);             \
+        query_seq, head_size, local_window, single_split_direct,             \
+        head_sink);                                                           \
 }
 
 GQA_DECODE_ENTRIES(1)
@@ -389,6 +418,14 @@ GQA_DECODE_ENTRIES(5)
 GQA_DECODE_ENTRIES(6)
 GQA_DECODE_ENTRIES(7)
 GQA_DECODE_ENTRIES(8)
+GQA_DECODE_ENTRIES(9)
+GQA_DECODE_ENTRIES(10)
+GQA_DECODE_ENTRIES(11)
+GQA_DECODE_ENTRIES(12)
+GQA_DECODE_ENTRIES(13)
+GQA_DECODE_ENTRIES(14)
+GQA_DECODE_ENTRIES(15)
+GQA_DECODE_ENTRIES(16)
 "#;
 
 /// Launch the capture-safe warp-parallel decode kernel.
@@ -415,6 +452,7 @@ pub(super) fn run(
     total_lengths: CUdeviceptr,
     local_window: i32,
     softcap: f32,
+    head_sink: CUdeviceptr,
 ) -> Result<()> {
     let as_i32 = |name: &str, value: usize| {
         i32::try_from(value).map_err(|_| {
@@ -481,7 +519,8 @@ pub(super) fn run(
         .arg(&scale)
         .arg(&local_window)
         .arg(&softcap)
-        .arg(&single_split_direct);
+        .arg(&single_split_direct)
+        .arg(&head_sink);
     // SAFETY: the selected `dpl` entry matches this argument ABI; all buffers were sized by the
     // caller. Fixed module-global and dynamic shared scratch make the launch
     // legal to record into and replay from a CUDA graph.
@@ -504,7 +543,8 @@ pub(super) fn run(
         .arg(&query_seq_i)
         .arg(&dim_i)
         .arg(&local_window)
-        .arg(&single_split_direct);
+        .arg(&single_split_direct)
+        .arg(&head_sink);
     // SAFETY: the same-stream partial launch writes every active split state
     // consumed here; both launches are graph-recordable.
     unsafe {
@@ -525,13 +565,7 @@ mod tests {
     use super::*;
 
     fn runtime() -> Option<Arc<CudaRuntime>> {
-        let previous_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let runtime = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
-            .ok()
-            .flatten();
-        std::panic::set_hook(previous_hook);
-        runtime
+        crate::test_support::maybe_runtime()
     }
 
     fn as_bytes<T: Copy>(values: &[T]) -> &[u8] {
@@ -670,6 +704,7 @@ mod tests {
                 totals_dev,
                 0,
                 0.0,
+                0, // head_sink: null (no attention sink)
             )
             .unwrap();
 
@@ -790,6 +825,7 @@ mod tests {
                 totals_dev,
                 0,
                 0.0,
+                0, // head_sink: null (no attention sink)
             )
             .unwrap();
 
@@ -861,8 +897,12 @@ mod tests {
     /// General head-size coverage: the fused fast path is parameterized over
     /// dims-per-lane (`ceil(head_dim / 32)`), so it must be byte-identical-eligible
     /// for every common head_dim, including the non-multiple-of-32 dims (80/96/112)
-    /// that mask partial lanes and the DPL 6 tier (192). Each is checked against
-    /// the f64 CPU reference at the same tolerance the head_dim<=128 test accepts.
+    /// that mask partial lanes and the DPL 6 tier (192). The widened capability
+    /// band (`MAX_HEAD_DIM = 512`) is swept generally -- 320/384/448/512, i.e. the
+    /// new DPL 10/12/14/16 tiers -- not just the 512 endpoint, so the raised
+    /// ceiling is proven across the whole range rather than as a value-keyed
+    /// special case. Each is checked against the f64 CPU reference at the same
+    /// tolerance the head_dim<=128 test accepts.
     #[test]
     fn decode_kernel_matches_reference_softmax_general_head_dims() {
         let Some(runtime) = runtime() else {
@@ -874,7 +914,7 @@ mod tests {
 
         // Cover single-split, two-split and four-split lengths for each head_dim.
         let totals = [1usize, 7, 64, 65, 128, 129, 255, 256, 300];
-        for head_dim in [64usize, 80, 96, 112, 128, 192, 256] {
+        for head_dim in [64usize, 80, 96, 112, 128, 192, 256, 320, 384, 448, 512] {
             let (worst_abs, worst_rel) = parity_for_shape(&runtime, 8, 2, head_dim, &totals);
             eprintln!(
                 "GQA decode head{head_dim} parity (dpl={}): max_abs={worst_abs:.3e} max_rel={worst_rel:.3e}",
@@ -897,15 +937,17 @@ mod tests {
         assert!(supported(1, 128));
         assert!(supported(1, 129));
         assert!(supported(1, 256));
-        assert!(!supported(1, 257));
+        assert!(supported(1, 257));
+        assert!(supported(1, 512));
+        assert!(!supported(1, 513));
         assert!(!supported(2, 64));
         assert!(!supported(1, 0));
     }
 
     /// The single-split direct-output fast path (flag=1) must be bit-identical
-    /// to the original two-step decode+merge path (flag=0) across Phi's
-    /// head_dim (128) and Qwen's (64), for both single-split and multi-split
-    /// decode lengths.
+    /// to the original two-step decode+merge path (flag=0) across Qwen's
+    /// head_dim (64), Phi's (128), the head256 tier, and the widened head512
+    /// tier (DPL 16), for both single-split and multi-split decode lengths.
     #[test]
     fn single_split_direct_output_is_bit_exact_to_two_step_path_f32() {
         use std::sync::atomic::Ordering;
@@ -932,7 +974,7 @@ mod tests {
             ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
         };
 
-        for head_dim in [64usize, 128usize, 256usize] {
+        for head_dim in [64usize, 128usize, 256usize, 512usize] {
             let scale = 1.0f32 / (head_dim as f32).sqrt();
             let mut q = vec![0.0f32; num_heads * head_dim];
             for slot in q.iter_mut() {
@@ -982,6 +1024,7 @@ mod tests {
                     totals_dev,
                     0,
                     0.0,
+                    0, // head_sink: null (no attention sink)
                 )
                 .unwrap();
                 let mut got = vec![0.0f32; num_heads * head_dim];

@@ -210,7 +210,11 @@ impl DriverFailure {
             )
         });
         Self {
-            message: error.to_string(),
+            // Anyhow's Display shows only the outermost context, which for a
+            // decode failure is the generic "forward pass failed" wrapper. The
+            // alternate form keeps the whole chain, and this message is the
+            // only thing the client ever sees.
+            message: format!("{error:#}"),
             kind: if memory_overload {
                 DriverFailureKind::MemoryOverload
             } else {
@@ -1123,7 +1127,7 @@ fn run_static_batch_until_idle(
         route_continuous_admissions(manager.poll_admissions(), &mut routes);
         if let Err(err) = manager.step() {
             let mut failure = DriverFailure::from_engine_error(&err);
-            failure.message = format!("continuous batch generation failed: {err}");
+            failure.message = format!("continuous batch generation failed: {err:#}");
             for (_, mut route) in routes.drain() {
                 if let Some(sender) = route.admission.take() {
                     let _ = sender.send(Err(failure.clone()));
@@ -1717,7 +1721,22 @@ mod admission_tests {
                 requested: 4096,
                 available: 0,
                 role: onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
-                detail: "physical handle pool lease refused".into(),
+                detail: "cuMemMap could not grow the physical handle pool".into(),
+                // Shaped the way the allocator actually reports this: the
+                // governor's refusal is carried whole, so classification must
+                // not depend on the wording of `detail`.
+                source: Some(Box::new(
+                    onnx_runtime_memory_governor::MemoryError::TierExhausted {
+                        tier: "device",
+                        requested: 4096,
+                        used: 0,
+                        limit: 0,
+                        available: 0,
+                        role: onnx_runtime_memory_governor::MemoryRole::Workspace {
+                            step_scoped: false,
+                        },
+                    },
+                )),
             }
             .into();
         assert_eq!(

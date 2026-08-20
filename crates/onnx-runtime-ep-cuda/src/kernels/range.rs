@@ -253,13 +253,7 @@ mod claim_probes {
     use crate::runtime::CudaRuntime;
 
     fn maybe_runtime() -> Option<Arc<CudaRuntime>> {
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let rt = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
-            .ok()
-            .flatten();
-        std::panic::set_hook(previous);
-        rt
+        crate::test_support::maybe_runtime()
     }
 
     #[test]

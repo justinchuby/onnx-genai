@@ -149,6 +149,12 @@ pub struct NativeDecodeSession {
     /// prefill on one backend and not the other. `None` preserves the old
     /// whole-prompt behaviour for models that declare nothing.
     prefill_chunk_size: Option<NonZeroUsize>,
+    /// Whether this decoder's multi-row forwards may be padded on the query
+    /// axis. Cleared the first time a padded forward comes back with fewer
+    /// logits rows than it was given query rows: such a graph reduces the query
+    /// axis internally, so its rows cannot be mapped back to input positions and
+    /// padding would silently answer with a padded row.
+    prefill_query_padding: bool,
 }
 
 /// Deep-copy of the native loop-carried tensors at a semantic prefix boundary.

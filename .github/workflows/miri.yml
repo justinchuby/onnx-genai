@@ -8,6 +8,7 @@ on:
       - .github/workflows/miri.yml
       - crates/onnx-runtime-ep-api/**
       - crates/onnx-runtime-ep-cpu/**
+      - crates/onnx-runtime-ep-plugin/**
       - crates/onnx-runtime-session/**
       - crates/onnx-runtime-capi/**
       - crates/onnx-runtime-memory/**
@@ -22,6 +23,7 @@ on:
       - .github/workflows/miri.yml
       - crates/onnx-runtime-ep-api/**
       - crates/onnx-runtime-ep-cpu/**
+      - crates/onnx-runtime-ep-plugin/**
       - crates/onnx-runtime-session/**
       - crates/onnx-runtime-capi/**
       - crates/onnx-runtime-memory/**
@@ -122,12 +124,91 @@ jobs:
           # real threads under Stacked Borrows.
           run_miri "onnx-runtime-ep-cpu task runtime" \
             env MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --lib task_runtime::
+
+          # `-Zmiri-num-cpus` is load-bearing for aliasing coverage, not a
+          # tuning knob. Miri reports `available_parallelism() == 1` by default,
+          # so `resolve_width` gives a one-lane pool and every fan-out above
+          # degrades to `Backend::Serial`: the step type-checks the unsafe
+          # blocks but never runs two tasks against each other. That is how
+          # #1377's whole-row retag passed a lane that claimed to cover this
+          # module.
+          #
+          # Scoped to the single test that needs real concurrency rather than
+          # applied to all of `task_runtime::`, because multi-CPU Miri
+          # multiplies the runtime of the whole module and this module is
+          # already the slowest step in the lane.
+          #
+          # Verified both ways: with the flag, widening the retag in that test
+          # to the whole row reports "Data race detected between (1) retag write
+          # ... and (2) retag write of type `[u64]`"; without it, the same bad
+          # shape passes.
+          #
+          # `-Zmiri-ignore-leaks` is required *because* `-Zmiri-num-cpus=4`
+          # works. The pool is a process-lifetime global whose workers park
+          # rather than join, so once this test actually spawns them Miri's
+          # exit check fails the step with "the main thread terminated without
+          # waiting for all remaining threads" even though the test itself
+          # passes. At the default one CPU this test returns early on its
+          # `pool_width() < 2` guard and spawns nothing, which is why it only
+          # started failing once the lane became load-bearing.
+          #
+          # The flag disables Miri's exit-time leak checks -- both the memory
+          # leak checker and the remaining-threads check. It does not touch
+          # data-race, aliasing, or validity detection, which run during
+          # execution: with the flag set, widening the retag still reports the
+          # data race above, so the falsifier is intact. Little is given up
+          # here because the global pool is rooted in a `OnceLock` static and
+          # so is never leak-reported anyway.
+          #
+          # This does not blind the lane to a broken `shutdown()`. The broad
+          # `task_runtime::` step above runs without the flag and does spawn
+          # real workers (`TaskPool::new(4)`/`new(8)` in `pool.rs`); it stays
+          # green only because those are *local* pools that join on drop.
+          run_miri "onnx-runtime-ep-cpu task runtime concurrent retag" \
+            env MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-num-cpus=4 -Zmiri-ignore-leaks" cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --lib task_runtime::tests::concurrent_tasks_retag_only_their_own_range
+          # The lib step above covers the pool's own unsafe. It does not cover
+          # `tests/`, and that is the gap #1377 actually escaped through: every
+          # other step in this lane is `--lib`, so an integration test could
+          # carry undefined behaviour indefinitely without any lane compiling
+          # it, let alone running it. This step closes that.
+          #
+          # Tree Borrows rather than Stacked Borrows because this test drives
+          # the pool through Rayon, and `crossbeam-epoch` (Rayon's dependency)
+          # violates Stacked Borrows in `internal.rs:562` -- a third-party
+          # issue we cannot fix and should not suppress by skipping the test.
+          # Tree Borrows still catches the defect this exists for, which is the
+          # only thing that makes the substitution acceptable.
+          #
+          # `-Zmiri-ignore-leaks` because the task pool's workers are resident
+          # by design and are still alive at exit; Miri otherwise fails the run
+          # for "main thread terminated without waiting for all threads".
+          #
+          # The test is `#[ignore]`d (it is a measurement), so it needs
+          # `--ignored`, and its constants shrink under `cfg(miri)` to keep the
+          # aliasing shape at ~7s instead of the native measurement scale.
+          #
+          # Verified both ways: as written it reports `test result: ok`;
+          # restoring #1377's whole-row retag reports "Undefined Behavior: Data
+          # race detected between (1) non-atomic write on thread `nxrt-task-2`
+          # and (2) retag read of type `[u64]` on thread `nxrt-task-0`".
+          run_miri "onnx-runtime-ep-cpu task runtime nested dispatch (integration)" \
+            env MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-num-cpus=4 -Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --test task_runtime_latency -- --ignored nested_dispatch_slot_pressure
           run_miri "onnx-runtime-ep-cpu strided" \
             cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --lib strided::tests
           run_miri "onnx-runtime-ep-cpu provider" \
             cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --lib provider::tests
           run_miri "onnx-runtime-ep-cpu dtype" \
             cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --lib dtype::tests
+
+          # onnx-runtime-ep-plugin marshals ORT `OrtValue`s across the C ABI.
+          # Since #1246 `read_inputs` borrows the value's *own* shape array
+          # instead of copying it, and ORT spells a scalar as a null pointer
+          # with count 0 — `slice::from_raw_parts` on that is UB that no native
+          # run can observe. Miri is the only thing here that checks the guard,
+          # so `kernel_ctx::` is covered directly. The rest of the crate dlopens
+          # ORT and is not Miri-tractable.
+          run_miri "onnx-runtime-ep-plugin kernel context" \
+            cargo +nightly miri test --locked -p onnx-runtime-ep-plugin --lib kernel_ctx::
 
           run_miri "onnx-runtime-session tensor" \
             env MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test --locked -p onnx-runtime-session --lib tensor::tests

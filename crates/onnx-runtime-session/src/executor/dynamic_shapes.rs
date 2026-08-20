@@ -292,12 +292,20 @@ pub(super) fn dynamic_output_shapes(
                     head_dim,
                 )
             };
-            let total_sequence_values = input_values.get(6)?.as_ref()?;
-            if total_sequence_values.len() != 1 {
-                return None;
-            }
-            let total_sequence = usize::try_from(total_sequence_values[0]).ok()?;
-            let present_sequence = past_key[2].max(total_sequence);
+            let present_sequence = match input_values.get(6).and_then(|v| v.as_ref()) {
+                Some(total_sequence_values) => {
+                    if total_sequence_values.len() != 1 {
+                        return None;
+                    }
+                    let total_sequence = usize::try_from(total_sequence_values[0]).ok()?;
+                    past_key[2].max(total_sequence)
+                }
+                // `total_sequence_length` not materialized to host (the fixed
+                // physical-capacity aliased-KV decode path deliberately skips the
+                // per-layer read-back): the present-KV extent is the past-KV
+                // physical capacity, which already dominates the valid length.
+                None => past_key[2],
+            };
             let present = vec![query[0], kv_heads, present_sequence, head_dim];
             let mut shapes = vec![output];
             if node.outputs.len() >= 2 {

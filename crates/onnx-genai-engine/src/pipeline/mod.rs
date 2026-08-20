@@ -48,6 +48,7 @@ mod nested_autoregressive;
 mod paged_decode;
 mod prefix_reuse;
 mod routing;
+pub use routing::is_missing_required_input;
 mod schedulers;
 #[cfg(feature = "native-backend")]
 pub(crate) use decoder_component::NativePipelineDecoder;
@@ -410,6 +411,8 @@ fn build_native_pipeline_components(
     use crate::native_component::NativeComponentSession;
     use onnx_genai_metadata::ComponentSession;
 
+    // Deliberately CPU-neutral: this path exists only to name the components in
+    // an unsupported-plan error, so it must not claim device memory to do it.
     let device = crate::engine::resolve_native_decode_device(
         config.native_device.clone(),
         &SessionOptions::default(),
@@ -417,9 +420,10 @@ fn build_native_pipeline_components(
     let mut components: std::collections::BTreeMap<String, Box<dyn ComponentSession>> =
         std::collections::BTreeMap::new();
     for (name, path) in &directory.model_paths {
-        let session = NativeComponentSession::load(path, device.clone()).with_context(|| {
-            format!("failed to construct pipeline component '{name}' on the native backend")
-        })?;
+        let session =
+            NativeComponentSession::load(path, device.clone(), None).with_context(|| {
+                format!("failed to construct pipeline component '{name}' on the native backend")
+            })?;
         components.insert(name.clone(), Box::new(session));
     }
     Ok(components)
@@ -518,11 +522,17 @@ fn build_step_component_session<'a>(
             // CPU pipeline keeps it on CPU. Inputs/outputs still cross the host
             // `ComponentTensor` seam, so only one small `inputs_embeds` row
             // round-trips host<->device per step; the decoder's KV never does.
-            let native =
-                crate::native_component::NativeComponentSession::load(path, native_device.clone())
-                    .with_context(|| {
-                        format!("failed to load native every_step component '{component}'")
-                    })?;
+            let native = crate::native_component::NativeComponentSession::load(
+                path,
+                native_device.clone(),
+                // The governor does not exist yet at this point in construction:
+                // every_step components are built before the resource governor,
+                // which is itself sized from the models on disk. The lazily
+                // loaded prompt components (routing.rs) are the ones that can and
+                // do adopt it.
+                None,
+            )
+            .with_context(|| format!("failed to load native every_step component '{component}'"))?;
             return Ok(Box::new(native));
         }
         #[cfg(not(feature = "native-backend"))]
@@ -561,9 +571,11 @@ fn build_step_component_session<'a>(
     )
 )]
 fn pipeline_metadata_max_len(directory: &onnx_genai_ort::PipelineModelDirectory) -> Option<usize> {
-    if let Some(path) = directory.metadata_path.as_ref()
-        && let Ok(metadata) = onnx_genai_metadata::load_metadata(path)
-        && let Some(len) = metadata.model.and_then(|model| model.max_sequence_length)
+    if let Some(len) = directory
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.model.as_ref())
+        .and_then(|model| model.max_sequence_length)
     {
         return Some(len);
     }
@@ -577,12 +589,11 @@ fn pipeline_metadata_prefill_chunk_size(
     directory: &onnx_genai_ort::PipelineModelDirectory,
 ) -> Option<usize> {
     directory
-        .metadata_path
+        .metadata
         .as_ref()
-        .and_then(|path| onnx_genai_metadata::load_metadata(path).ok())
-        .and_then(|metadata| metadata.model)
-        .and_then(|model| model.runtime_configurable)
-        .and_then(|runtime| runtime.chunked_prefill)
+        .and_then(|metadata| metadata.model.as_ref())
+        .and_then(|model| model.runtime_configurable.as_ref())
+        .and_then(|runtime| runtime.chunked_prefill.as_ref())
         .and_then(|chunked| chunked.chunk_size)
         .filter(|size| *size > 0)
 }
@@ -591,24 +602,22 @@ fn pipeline_metadata_generation_defaults(
     directory: &onnx_genai_ort::PipelineModelDirectory,
 ) -> Option<onnx_genai_metadata::GenerationDefaults> {
     directory
-        .metadata_path
+        .metadata
         .as_ref()
-        .and_then(|path| onnx_genai_metadata::load_metadata(path).ok())
-        .and_then(|metadata| metadata.generation)
+        .and_then(|metadata| metadata.generation.clone())
 }
 
 fn pipeline_metadata_eos_token_ids(
     directory: &onnx_genai_ort::PipelineModelDirectory,
 ) -> Vec<TokenId> {
     directory
-        .metadata_path
+        .metadata
         .as_ref()
-        .and_then(|path| onnx_genai_metadata::load_metadata(path).ok())
-        .and_then(|metadata| metadata.tokens)
-        .and_then(|tokens| tokens.eos_token_id)
+        .and_then(|metadata| metadata.tokens.as_ref())
+        .and_then(|tokens| tokens.eos_token_id.as_ref())
         .into_iter()
         .flatten()
-        .filter_map(|id| TokenId::try_from(id).ok())
+        .filter_map(|id| TokenId::try_from(*id).ok())
         .collect()
 }
 
@@ -924,6 +933,23 @@ impl PipelineEngine {
             EngineDecodeBackend::Auto => resolve_auto_pipeline_backend(&directory)?,
         };
         let plan = PipelinePlan::from_spec(&directory.spec, schedulers)?;
+        // Resolve the native device from the session's execution providers, the
+        // same way `engine::load` does for the standalone decoder.
+        //
+        // `config.native_device` is only ever `Some` when an operator named a
+        // device explicitly, so reading it alone made `--ep cuda` resolve to
+        // `Cpu` for every native pipeline session. The decoder survived that on
+        // its own load path, which does consult the providers; the lazily loaded
+        // prompt components (a vision tower) did not, and ran the whole encoder
+        // on CPU with no warning -- a >20 minute prefill where the GPU took 13s.
+        #[cfg(feature = "native-backend")]
+        let resolved_native_device = match backend {
+            PipelineBackend::Native => Some(crate::engine::resolve_native_decode_device(
+                config.native_device.clone(),
+                &session_options,
+            )?),
+            PipelineBackend::Ort => config.native_device.clone(),
+        };
         let graph_memory = combine_graph_memory(
             directory
                 .model_paths
@@ -983,7 +1009,7 @@ impl PipelineEngine {
         // resident weights on any GPU.
         #[cfg(all(feature = "cuda", feature = "native-backend"))]
         let pipeline_cuda_index = if backend == PipelineBackend::Native {
-            native_decoder_device(config.native_device.as_ref()).cuda_index()
+            native_decoder_device(resolved_native_device.as_ref()).cuda_index()
         } else {
             None
         };
@@ -1008,7 +1034,7 @@ impl PipelineEngine {
         #[cfg(all(feature = "cuda", feature = "native-backend"))]
         let native_cuda_plan = backend == PipelineBackend::Native
             && matches!(
-                native_decoder_device(config.native_device.as_ref()),
+                native_decoder_device(resolved_native_device.as_ref()),
                 crate::native_decode_device::NativeDecodeDevice::Cuda { .. }
             );
         #[cfg(not(all(feature = "cuda", feature = "native-backend")))]
@@ -1091,7 +1117,7 @@ impl PipelineEngine {
         );
         #[cfg(all(feature = "cuda", feature = "native-backend"))]
         let authority_domain = if backend == PipelineBackend::Native {
-            match native_decoder_device(config.native_device.as_ref()) {
+            match native_decoder_device(resolved_native_device.as_ref()) {
                 crate::native_decode_device::NativeDecodeDevice::Cuda { index } => {
                     crate::memory_authority::DeviceCompatibilityDomain::Cuda(index.unwrap_or(0))
                 }
@@ -1113,7 +1139,7 @@ impl PipelineEngine {
         )?;
         #[cfg(all(feature = "cuda", feature = "native-backend"))]
         let native_cuda_authority = if backend == PipelineBackend::Native {
-            match native_decoder_device(config.native_device.as_ref()) {
+            match native_decoder_device(resolved_native_device.as_ref()) {
                 crate::native_decode_device::NativeDecodeDevice::Cuda { .. } => {
                     Some(resource_governor.device_authority())
                 }
@@ -1323,6 +1349,9 @@ impl PipelineEngine {
             native_retained_decoder: None,
             prefill_chunk_size,
             paged,
+            #[cfg(feature = "native-backend")]
+            native_device: resolved_native_device,
+            #[cfg(not(feature = "native-backend"))]
             native_device: config.native_device.clone(),
             native_prompt_sessions: RefCell::new(BTreeMap::new()),
             #[cfg(feature = "cuda")]

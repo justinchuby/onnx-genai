@@ -267,6 +267,15 @@ pub(crate) struct Executor {
     pub(super) decode_view_plan_disabled: bool,
     /// Master switch for graph-level compute-in-place aliasing.
     pub(super) compute_in_place_enabled: bool,
+    /// Release an intermediate value's buffer once its last consumer has run.
+    ///
+    /// Opt-in per session, and default OFF, because freeing lets a later run
+    /// place the same value at a different address. A session that records a
+    /// device graph needs its buffer addresses to stay put between the recording
+    /// run and every replay, so capture-eligible sessions (the decoder) leave
+    /// this alone. Prompt-phase component graphs never capture and are where the
+    /// resident set actually hurts, so they turn it on.
+    pub(super) release_dead_values_enabled: bool,
     /// Successful dead-input buffer aliases, retained for parity/safety tests.
     pub(super) compute_in_place_alias_count: u64,
     /// Opt-in (default OFF) master switch for the single-trip `Scan` inline
@@ -781,6 +790,9 @@ pub(crate) struct ChildExecutor {
     pub(super) runs: u64,
     /// Shared trace context, propagated to every compiled child plan's executor.
     pub(super) trace: TraceContext,
+    /// Dead-value release setting, propagated to every compiled child plan's
+    /// executor so a Scan/Loop body inherits the parent session's choice.
+    pub(super) release_dead_values: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
