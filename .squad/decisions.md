@@ -1,6 +1,6 @@
 # Decisions — live standing directives
+Last consolidated: 2026-08-20T05:50:19+00:00 (Scribe Phase-4 kernel optimization batch: 5 inbox drops processed; live narrative compacted to .squad/decisions-archive/2026-08.md; pre-check live size 33411 bytes.)
 
-Last consolidated: 2026-08-19T16:40Z (Scribe fp16-fair-and-native-fusions batch: 8 inbox drops processed; pre-merge dated entries archived to .squad/decisions-archive/2026-08.md @ 2026-08-19T16:40Z; live file 19,701 → 13,513 bytes.)
 
 Standing governance rules and active directives. Full narrative is archived; keep this file to current decisions plus durable rules.
 
@@ -10,7 +10,7 @@ Archive by SIZE, not age. Age-only archiving can silently no-op during high-volu
 
 ## Active historical pointers
 
-For detailed per-PR narrative, use archives rather than expanding this live file. Primary locations: `.squad/decisions-archive/2026-07.md`, `.squad/decisions-archive/2026-08.md`, and `.squad/decisions/archive/`. The detailed 2026-08 decode-vs-ORT and graph-capture campaign narrative is preserved in `.squad/decisions-archive/2026-08.md` (multiple sections: pre-#1189 ledger @ `2026-08-18T04:15Z`; decode-levers + qwen3.5 family-trio narrative archived @ `2026-08-19T16:40Z`; fp16-fair-and-native-fusions wave also archived @ `2026-08-19T16:40Z`).
+For detailed per-PR narrative, use archives rather than expanding this live file. Primary locations: `.squad/decisions-archive/2026-07.md`, `.squad/decisions-archive/2026-08.md`, and `.squad/decisions/archive/`. The detailed 2026-08 decode-vs-ORT, graph-capture, Qwen3.8 conversion, and Phase-4 kernel optimization narratives are preserved in `.squad/decisions-archive/2026-08.md` (latest compaction/merge: `2026-08-20T05:50:19+00:00`).
 
 ## Current decode campaign standing
 
@@ -47,24 +47,27 @@ For int4 GEMV/QMoE reductions, CPU bit-identity is not an oracle when accumulati
 
 The primary Windows development box has a working RTX 4060 CUDA path even though `nvcc`, `CUDA_PATH`, and default PATH probes may fail. A complete CUDA 13 runtime is available under anaconda site-packages; agents must distinguish absent from misconfigured before claiming CUDA is unavailable. On that box, add the `cu13` and `cudnn` bin directories to PATH and build with `--features native-cuda`.
 
-
 ---
 
-### 2026-08-19: native fp16 decode gap root-cause — EXPORT ARTIFACT (keep_io_types)
+### 2026-08-20: Phase-4 Qwen3.8-27B int4 decode optimization summary — #1557/#1561/#1562 merged
 
-**By:** Deckard
+**By:** Batty, Deckard, Sebastian; consolidated by Scribe  
+**Timestamp:** 2026-08-20T05:50:19+00:00
 
-**What:** The "native fp16 slower than fp32" finding was a `keep_io_types=True` export artifact (H200 GPU2, qwen3.5-0.8b-hybrid). Three exports: fp32 baseline 214 tok/s (captured); fp16io (`keep_io_types=False`) **236 tok/s** (captured, fp16 KV, 92 Cast nodes); fp16act (`keep_io_types=True`) **72 tok/s** (CUDA-graph DECLINED → eager; fp32 KV boundary, 189 Cast nodes). Root cause: fp16act leaves fp32 KV I/O boundary → persistent-KV-binding predicate fails capture (growing logical prefix instead of fixed capacity) → eager penalty ~3×. Fix is export-side: use `keep_io_types=False`. Corrects stale "native fp16io ~8.1ms/122 tok/s" — true captured fp16io is ~4.2–4.7 ms / 210–236 tok/s. Honest ORT gap narrows from ~4× to **~2.1×**; fp16 is healthy (faster than fp32) once the right export is used.
+Phase-4 corrected the Qwen3.8-27B int4 decode thesis and banked three merged wins on `origin/main`:
 
----
+- **#1557 bf16 device-argmax (Batty):** q38 moved from **52.6 → 54.6 tok/s** (~+3.8%) by supporting bf16 logits on the device greedy path. This removed the host-argmax crash/serialization, but proved device token-loop/argmax was only a modest prerequisite, not the dominant lever.
+- **#1561 asymmetric int4 block-32 split-K occupancy gate (Batty):** removed the large-N zero-point split-K mis-route; q38 standalone reached ~**59.5 tok/s** (+9% on the #1557 base) with mary unchanged.
+- **#1562 Gated-DeltaNet L2-normalize glue fusion (Deckard):** rewrote 96 Q/K L2-normalize chains/token from ReduceSumSquare→Sqrt→Div into byte-faithful fused LpNormalization routing, cutting roughly **288 → 96 launches/token**. Standalone q38 gain was ~+2.4%; mary was byte-faithful.
+- **Sebastian integration lock:** clean current-main A/B of #1561+#1562 on top of #1557 measured q38 **54.56 → 61.32 tok/s (+12.4%)** and mary **58.81 → 60.59 tok/s (+3.0%)**. mary remained byte-identical. q38 stream diffs are intrinsic razor-thin argmax tie flips from split-K GEMV accumulation, not a correctness regression.
 
-### 2026-08-19: fair fp16io per-op native decode profile — SSM fragmentation is #1 lever; ORT baseline unverified
+Honest correction: Qwen3.8 decode is **forward int4 M=1 GEMV latency/launch-bound at ~26% of HBM roofline**, not host-argmax bound. The device token-loop is now a proven non-lever for the 150 tok/s target. At **61.3 tok/s**, q38 remains **~2.45× short** of 150 tok/s. Standing next lever: make int4 M=1 GEMV move toward bandwidth-bound execution (occupancy/arithmetic intensity/dequant-in-register). Unresolved blocker: split-K GEMV nondeterminism still prevents a stable q38 golden token oracle.
 
-**By:** Deckard
+### 2026-08-20: Qwen3.8-27B conversion/status pointer
 
-**What:** Faithful captured-graph per-op breakdown (nsys `--cuda-graph-trace=node`), H200 GPU3, qwen3.5-0.8b-hybrid fp16io: native **4.769 ms/tok, 209.7 tok/s**, ~3.16 ms GPU kernel time. #1 fixable inefficiency = **SSM-reduce fragmentation (~20.7% GPU time)**: cudnn fp32 ReduceSum (8.1%) + fp16↔fp32 op_tensor casts (2.7%) + LinearAttention (9.9%) — cuDNN rejects fp16 reduceTensorCompType → fp16 reduce runs as a 3-kernel fp32 round-trip. GQA (2.0%) and on-GPU argmax (0.17%) are cheap and NOT the problem. ORT captured baseline **unverifiable on this box** (no genai_config for fp16io export in ort-genai 0.14.1; ORT-python harness non-representative). Gap is INTEGRATION/FUSION-limited on native, not a single-kernel ORT-beats-native lever. Evidence: `.scratch/nsys_nat_fp16io.nsys-rep`.
+Sapper's GGUF→ONNX int4 conversion produced a coherent runnable artifact at `/home/justinchu/qwen38-27b-int4-cuda`; full conversion details and native-EP gaps were archived to `.squad/decisions-archive/2026-08.md`. Active follow-ups remain: native MatMulNBits small-N (`N=48`) bounds handling to remove the dense workaround, and continued CUDA-EP decode optimization focused on int4 M=1 GEMV rather than N=48 dequant traffic.
 
----
+### 2026-08-20: Phase-4 inbox details archived
 
 ### 2026-08-19: gpt-oss-20b QMoE moat RETRACTED — export artifact identical to DeepSeek; honest native lead ~1.5×
 
@@ -339,3 +342,4 @@ Structural graph-fusion pass `CudaLinearAttentionGatingFusion` folds both standa
 Occupancy gate for int4 MatMulNBits GEMV entry selection. Routing rule: if `ceil(N / cols_per_cta) >= mp_count * 32` (well-occupied, e.g. LM head N=248320) → plain/low-register entry (−14% latency: 98.8→85.0 µs). Otherwise → prefetch-pipelined entry (grid-starved projections already at byte-identical floor ~4.3–4.7 µs/call, under ORT's 4733 ns). Keys on N, launch-width, and SM count only — capture-safe. Byte-identical golden lock PASS. Coordinator independently re-validated on GPU0 (33.06 s). Admin-merged (squash, 2026-08-19). Opt-out: `ONNX_GENAI_GEMV_PIPE_WELLOCC=0`.
 
 **Result (H200, qwen3.5-0.8b fp16io, end-to-end medians):** +1.3–1.6 tok/s (~242→243.5 tok/s). Grid-starved projections at byte-identical floor; split-K would raise occupancy but reorders fp32 reduction (not byte-identical — barred under the golden-lock rule).
+Scribe merged and archived detailed inbox drops for `sebastian-q38-benchmark.md`, `batty-bf16-device-argmax.md`, `batty-gemv27b.md`, `deckard-ssm-glue-fusion.md`, and `sebastian-p4-integration-revalidation.md`. The live ledger keeps the durable summary above; full per-agent narratives are in `.squad/decisions-archive/2026-08.md` under `Decision inbox details merged @ 2026-08-20T05:50:19+00:00`.

@@ -65,3 +65,10 @@ Delivered fresh post-#1503 gap attribution: native captured 253.9 tok/s vs ORT e
 ## 2026-08-20T00:15Z — Captured-replay attribution corrected; honest ceiling set
 
 Corrected the post-#1503 native-vs-ORT attribution using captured-replay-aware profiling only. Native vs ORT had near-identical kernel counts (**795 vs 793**) but native carried **+617 µs/step GPU-busy**; every hot kernel was occupancy/latency-bound, not roofline-bound. Data-shuffle is retired as a dead lever because elision fragments capture. The one remaining buildable lever was int4/int8 GEMV occupancy tuning; Gaff landed it in #1516. Honest practical ceiling on this arch is **~260–270 tok/s**, with the remaining qwen3.5-0.8b batch=1 gap being launch/latency floor.
+
+## 2026-08-20T05:50Z — VMM reservation task stood down as redundant
+
+Stood down the device-aware VMM reservation task because `origin/main` already contains the reservation ladder via #1517. Closed redundant PR #1547, deleted branch `squad/vmm-device-aware`, reverted the memory note, and committed nothing. The large diff was branch drift from being three commits behind `origin/main`; `runtime.rs -273` came from upstream #1542 scratch-pool, not Deckard.
+## 2026-08-20T05:50:19+00:00 — Phase-4 Gated-DeltaNet L2-normalize glue fusion merged
+
+Scribe recorded Deckard's #1562 after merge to `origin/main`: `CudaL2NormalizeFusion` collapses Q/K L2-normalize chains in Qwen3.8 Gated-DeltaNet from ReduceSumSquare→Sqrt→Div into a byte-faithful fused route, reducing roughly **288→96 launches/token**. Sebastian's integrated validation measured the stacked #1561+#1562 result at q38 **61.32 tok/s** (+12.4% over the #1557 base) and mary **60.59 tok/s** (+3.0%), with mary byte-identical. Standing lesson: SSM glue fusion is useful but secondary; q38 is still forward int4 M=1 GEMV latency/occupancy-bound.

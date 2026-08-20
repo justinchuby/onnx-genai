@@ -110,3 +110,6 @@ collapsible here; bigger levers blocked — 6 norms/layer needed a bf16 skip ker
 kernel byte-exact but fold regresses −1.5%), 208 gamma+1 Adds already −2.8% (#872), 4 reshapes
 kernel-coupled. Realized ≤ ceiling as §8.3 predicted. Lesson: activate dormant byte-exact fusions
 before chasing new kernels; check the dtype gate first.
+## 2026-08-20T05:50:19+00:00 — Phase-4 q38 int4 GEMV/argmax wins merged
+
+Scribe recorded Batty's Phase-4 contributions after merge to `origin/main`: #1557 added bf16 device-argmax and dtype-aware greedy routing, moving q38 **52.6→54.6 tok/s** (~+3.8%) while proving device token-loop/host-argmax was not the dominant remaining lever. #1561 added the asymmetric int4 block-32 split-K occupancy gate, removing the large-N zero-point split-K mis-route and lifting q38 to ~**59.5 tok/s** standalone; integration later measured q38 **61.32 tok/s** with #1562 stacked. Standing lesson: for Qwen3.8-27B, keep chasing int4 M=1 GEMV occupancy/arithmetic intensity; split-K GEMV nondeterminism still blocks a stable q38 golden oracle.
