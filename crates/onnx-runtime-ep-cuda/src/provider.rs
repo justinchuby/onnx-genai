@@ -964,7 +964,7 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn custom_passes(&self) -> Vec<Box<dyn onnx_runtime_optimizer::OptimizationPass>> {
-        cuda_optimization_passes()
+        cuda_optimization_passes(Some(self.runtime.capabilities()))
     }
 
     fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer> {

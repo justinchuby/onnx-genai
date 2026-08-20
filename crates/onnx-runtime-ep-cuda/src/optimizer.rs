@@ -8,6 +8,7 @@ use onnx_runtime_optimizer::{
 use crate::kernels::linear_attention::{
     FUSE_BETA_SIGMOID_ATTR, FUSE_DECAY_SOFTPLUS_ATTR, FUSE_NEG_EXP_ATTR,
 };
+use crate::runtime::CudaDeviceCapabilities;
 
 pub(crate) const SILU_MUL_FUSION_ATTR: &str = "_cuda_silu_mul";
 pub(crate) const DECOMPOSED_SILU_ATTR: &str = "_cuda_decomposed_silu";
@@ -102,7 +103,9 @@ pub(crate) struct CudaSwiGluFusion;
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct CudaSiluFusion;
 
-pub(crate) fn cuda_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
+pub(crate) fn cuda_optimization_passes(
+    device: Option<CudaDeviceCapabilities>,
+) -> Vec<Box<dyn OptimizationPass>> {
     vec![
         Box::new(CudaSiluFusion),
         // Collapse the SSM/linear-attention `Reciprocal(Sqrt(x))` normalize-scale
@@ -141,7 +144,7 @@ pub(crate) fn cuda_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
         Box::new(CudaMatMulNBitsBiasFusion),
         Box::new(CudaSwiGluFusion),
         Box::new(CudaGateUpSwiGluFusion),
-        Box::new(CudaSkipRmsNormMatMulFusion),
+        Box::new(CudaSkipRmsNormMatMulFusion::for_device(device)),
         // Lower a capture-unsafe LongRoPE-style `If(Greater, const, const)` cos/sin
         // cache selector into an on-device `Where`, collapsing the per-token host
         // cond readback / graph split so decode captures as a single graph.
@@ -2083,35 +2086,89 @@ fn rmsnorm_fusion_disabled() -> bool {
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 
-/// Minimum hidden width (`norm_size`) at which folding the standalone
-/// `SkipSimplifiedLayerNormalization` into its following GEMV(s) is projected to
-/// be a net win. Below this floor the fusion keeps the standalone norm. See
-/// [`fusion_benefit_is_positive`] for the derivation and calibration.
+/// The **single calibrated anchor point** for the fold's M=1 hidden-size floor,
+/// and the fallback used when the device is unknown. See
+/// [`fusion_benefit_is_positive`] for how the live per-device floor is derived
+/// from this one measurement rather than applied globally (#1421).
 ///
 /// Expressed as ten [`RMSNORM_FUSION_WARP_HALF4_MULTIPLE`]-wide reduction chunks
-/// (`10 * 128 == 1280`): the measured throughput crossover sits between a hidden
-/// of seven chunks (896, which regresses) and twelve chunks (1536, which wins),
-/// so the floor is the granularity-aligned midpoint. It is a property of the
-/// kernel's 128-lane reduction, never of any model.
+/// (`10 * 128 == 1280`): on the calibration device the measured M=1 throughput
+/// crossover sits between a hidden of seven chunks (896, which regressed) and
+/// twelve chunks (1536, which won), so the anchor is the granularity-aligned
+/// midpoint. It is a property of the kernel's 128-lane reduction, never of any
+/// model.
 ///
-/// Caveat — this floor was calibrated on **M=1 single-stream** throughput on an
-/// **H200** (commit `05e1fd10`: 0.5B hidden-896 regressed -2.7% folded), and it
-/// predates the capture-safe batch-decode path (#1404). At **M>=2** the fold
-/// makes the gate/up node capture-safe and collapses the batch-decode CUDA-graph
-/// segmentation (25 -> 1 segments), saving ~20 ms/step — which dwarfs the M=1
-/// prologue cost. The fold is byte-identical, so keeping the standalone norm
-/// below 1280 leaves that batch win on the table for small resident models
-/// (0.5B at 896, granite-1B MoE at 1024). The M=1 cost is also hardware-
-/// dependent: on RTX 4060 the same hidden-896 fold measured neutral-to-faster,
-/// not a regression. Making this gate batch/device-aware is tracked in #1421;
-/// until then the override below enables it. See the operator-knob section of
+/// **Regime this anchor was measured in** (per §40.3 of
+/// `docs/benchmarks/2026-08-15-cpu-ep-vs-ort-attention-moe.md`, "a tuning
+/// constant should carry the regime it was calibrated in"):
+/// * **What was varied:** hidden width (896 vs 1536).
+/// * **What was held fixed:** **M=1 single-stream** decode, greedy, one following
+///   GEMV, on an **H200** (`sm_90`, 132 SMs), commit `05e1fd10`.
+/// * **Workload shape:** resident (not streaming) decode, M=1.
+///
+/// Two facts make a *global* 1280 the wrong default outside that regime, and both
+/// are handled by [`fusion_benefit_is_positive`] instead of here:
+/// * **Batch.** At **M>=2** the fold makes the gate/up node capture-safe and
+///   collapses the batch-decode CUDA-graph segmentation (25 -> 1 segments),
+///   saving ~20 ms/step — dwarfing the M=1 prologue cost. This is a *structural*,
+///   byte-identical win independent of hidden width. The optimizer cannot see M
+///   (the decode graph is shared across all batch sizes; batch dims are
+///   symbolic), so M cannot gate the fold per-step — see the note in
+///   [`fusion_benefit_is_positive`].
+/// * **Device.** The M=1 cost is hardware-dependent: on an RTX 4060 (`sm_89`,
+///   24 SMs) the same hidden-896 fold measured neutral-to-faster, not a
+///   regression, because a small GPU has far less parallel slack to make the
+///   standalone norm "almost free". The live floor is therefore *derived from SM
+///   count*, anchored on this H200 point.
+///
+/// See the operator-knob section of
 /// `docs/benchmarks/2026-08-19-batch-decode-mge2-capture-segmentation.md`.
 const RMSNORM_FUSION_MIN_HIDDEN: usize = 10 * RMSNORM_FUSION_WARP_HALF4_MULTIPLE;
-/// Optional environment override for [`RMSNORM_FUSION_MIN_HIDDEN`]. Beyond
-/// calibrating the floor against measured throughput, this is the documented
-/// interim knob (#1421) an operator lowers to force the byte-identical fold on a
-/// small resident model so **batched** decode gets #1404's capture-safe path;
-/// set it only when batching (see the constant's caveat on the M=1 cost).
+
+/// SM count of the device the [`RMSNORM_FUSION_MIN_HIDDEN`] anchor was calibrated
+/// on (H200, `sm_90`, 132 streaming multiprocessors). The derived per-device
+/// floor scales linearly from this `(sm_count, floor)` anchor.
+const RMSNORM_FUSION_ANCHOR_SM_COUNT: u32 = 132;
+
+/// Derive the M=1 fold hidden-size floor for a device from its SM count, anchored
+/// on the one calibrated point ([`RMSNORM_FUSION_MIN_HIDDEN`] on
+/// [`RMSNORM_FUSION_ANCHOR_SM_COUNT`] SMs).
+///
+/// **Physics (from [`fusion_benefit_is_positive`]'s cost model):** the fold's
+/// only M=1 downside is the added serialized single-warp prologue latency; its
+/// upside is eliminating the standalone norm launch, which is "almost free"
+/// exactly to the extent the device has parallel slack to absorb it. That slack
+/// scales with the number of SMs, so the hidden width at which the upside
+/// overtakes the fixed downside — the crossover floor — scales with SM count:
+/// more SMs make the standalone norm cheaper to keep, pushing the floor up.
+///
+/// This is a **one-point anchor plus a proportionality**, not a two-point fit:
+/// the slope is fixed by the single H200 calibration, and the RTX 4060 point only
+/// *corroborates* it (24 SMs → `round(10 * 24 / 132) = 2` chunks = 256, so
+/// hidden 896 folds — consistent with the measured neutral-to-faster there). The
+/// result is rounded to whole 128-wide chunks (the fold only fires on 128
+/// multiples anyway) and clamped to at least one chunk (a device with very few
+/// SMs folds essentially always). An unseen device gets a floor from its own SM
+/// count — a big datacenter part inherits the protective H200-class floor, a
+/// small edge part folds aggressively — with no per-device table.
+fn derived_min_hidden(sm_count: u32) -> usize {
+    let sm_count = sm_count.max(1);
+    let anchor_chunks = (RMSNORM_FUSION_MIN_HIDDEN / RMSNORM_FUSION_WARP_HALF4_MULTIPLE) as u64;
+    let anchor_sm = u64::from(RMSNORM_FUSION_ANCHOR_SM_COUNT);
+    // Round-nearest so the anchor reproduces itself exactly (132 SM -> 10 chunks).
+    let chunks = (anchor_chunks * u64::from(sm_count) + anchor_sm / 2) / anchor_sm;
+    (chunks.max(1) as usize) * RMSNORM_FUSION_WARP_HALF4_MULTIPLE
+}
+
+/// Optional environment override for the derived fold floor. It short-circuits
+/// the whole [`fusion_benefit_is_positive`] decision with an explicit hidden-size
+/// floor, so an operator can still force or suppress the byte-identical fold for
+/// A/B measurement or to cover the one case the derivation cannot reach on its
+/// own: **batched decode of a small model on a large GPU**, where the SM-derived
+/// floor stays high (protecting M=1) but M>=2 would benefit from folding, and the
+/// optimizer cannot see M to decide automatically. Lower it (e.g. to the model's
+/// hidden size) when serving such a workload; the fold is byte-identical, so
+/// tokens are unchanged.
 const RMSNORM_FUSION_MIN_HIDDEN_ENV: &str = "ONNX_GENAI_RMSNORM_MIN_HIDDEN";
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -2138,12 +2195,48 @@ fn env_usize(name: &str, default: usize) -> usize {
 /// with how memory bound the model is, while on a tiny decoder the standalone
 /// norm is already almost free under decode graph capture and the added serial
 /// prologue latency dominates. Measured throughput bears this out: the fusion
-/// regresses at a hidden of 896 but wins from 1536 upward, so the gate keeps the
-/// standalone norm whenever `norm_size` is below [`RMSNORM_FUSION_MIN_HIDDEN`].
+/// regresses at a hidden of 896 but wins from 1536 upward *on the H200 anchor*,
+/// so the gate keeps the standalone norm whenever `norm_size` is below the
+/// floor derived for `device` by [`derived_min_hidden`].
+///
+/// **The floor is now per-device, derived from SM count** ([`derived_min_hidden`]),
+/// rather than the historical global 1280. Rationale, and what each axis buys:
+/// * **Device-aware (derived).** The M=1 downside is a fixed serialized-prologue
+///   latency; the upside — eliminating the standalone norm — is only "almost
+///   free" in proportion to the device's parallel slack (∝ SM count). So the
+///   crossover floor scales with SM count, anchored on the one H200 calibration.
+///   A small GPU (few SMs) gets a low floor and folds aggressively; a large GPU
+///   keeps the protective H200-class floor at M=1. This also *captures the M>=2
+///   structural win by default on small/edge GPUs*, which is where batching small
+///   models is most common.
+/// * **Batch-aware — as far as the optimizer can be.** At M>=2 the fold is a
+///   large, byte-identical, *structural* win (segmentation 25 -> 1), independent
+///   of hidden width. Ideally M>=2 would fold unconditionally. **But the
+///   optimizer does not know M**: this pass runs once at model-load on a decode
+///   graph whose batch dimension is symbolic and shared across every batch size,
+///   so there is no per-step M to test here. Plumbing M would require a
+///   deployment-wide "batched decode expected" hint threaded from session config
+///   → EP → [`cuda_optimization_passes`] into this pass, and even then it would
+///   be a build-time hint, not a per-step value. Until such a hint exists, the
+///   SM-derived floor covers the common (small-GPU) batch case automatically, and
+///   the `ONNX_GENAI_RMSNORM_MIN_HIDDEN` override covers the residual case of a
+///   small model batched on a large GPU.
+///
 /// The `fanout`/`following_min_n` signals are accepted for completeness but the
-/// hidden floor is the decisive, measurement-calibrated term.
-fn fusion_benefit_is_positive(norm_size: usize, _fanout: usize, _following_min_n: usize) -> bool {
-    let floor = env_usize(RMSNORM_FUSION_MIN_HIDDEN_ENV, RMSNORM_FUSION_MIN_HIDDEN);
+/// hidden floor is the decisive term. `device == None` (device unknown, e.g. in
+/// unit tests) falls back to [`RMSNORM_FUSION_MIN_HIDDEN`], reproducing the
+/// historical global behavior. The `ONNX_GENAI_RMSNORM_MIN_HIDDEN` override, when
+/// set, wins over both.
+fn fusion_benefit_is_positive(
+    norm_size: usize,
+    _fanout: usize,
+    _following_min_n: usize,
+    device: Option<CudaDeviceCapabilities>,
+) -> bool {
+    let derived = device
+        .map(|caps| derived_min_hidden(caps.multiprocessor_count()))
+        .unwrap_or(RMSNORM_FUSION_MIN_HIDDEN);
+    let floor = env_usize(RMSNORM_FUSION_MIN_HIDDEN_ENV, derived);
     norm_size >= floor
 }
 
@@ -2167,7 +2260,23 @@ fn fusion_benefit_is_positive(norm_size: usize, _fanout: usize, _following_min_n
 /// bias, hidden % 128 == 0), so the fused arithmetic is bit-for-bit identical.
 /// Any other shape safely keeps the standalone norm.
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct CudaSkipRmsNormMatMulFusion;
+pub(crate) struct CudaSkipRmsNormMatMulFusion {
+    /// Device capabilities used to derive the batch-agnostic hidden-size floor
+    /// (see [`fusion_benefit_is_positive`]). `None` means "device unknown" — the
+    /// pass then falls back to the H200-calibrated [`RMSNORM_FUSION_MIN_HIDDEN`],
+    /// reproducing the historical global behavior (used by the unit tests and any
+    /// non-provider construction path).
+    device: Option<CudaDeviceCapabilities>,
+}
+
+impl CudaSkipRmsNormMatMulFusion {
+    /// Construct the pass for a specific device (or `None` when the device is
+    /// unknown). The provider passes `Some(runtime.capabilities())` so the fold
+    /// floor is derived from this GPU's SM count rather than a global constant.
+    pub(crate) fn for_device(device: Option<CudaDeviceCapabilities>) -> Self {
+        Self { device }
+    }
+}
 
 struct SkipRmsNormPlan {
     skip_id: NodeId,
@@ -2419,7 +2528,8 @@ impl CudaSkipRmsNormMatMulFusion {
             .min()
             .unwrap_or(0)
             .max(0) as usize;
-        if !fusion_benefit_is_positive(norm_size, following_ids.len(), following_min_n) {
+        if !fusion_benefit_is_positive(norm_size, following_ids.len(), following_min_n, self.device)
+        {
             return None;
         }
 
@@ -3756,6 +3866,11 @@ mod tests {
             ["remove", "_var"].concat()
         );
     }
+
+    /// Serializes the RMSNorm-fold floor tests that mutate the process-wide
+    /// `RMSNORM_FUSION_MIN_HIDDEN_ENV` against the ones that read it through the
+    /// pass, so a concurrent env override cannot flip an unrelated floor test.
+    static RMSNORM_FLOOR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn value(graph: &mut Graph, name: &str, dtype: DataType, width: usize) -> ValueId {
         graph.create_named_value(name, dtype, vec![Dim::Static(1), Dim::Static(width)])
@@ -5401,7 +5516,7 @@ mod tests {
         ));
         graph.add_output(out);
 
-        for pass in cuda_optimization_passes() {
+        for pass in cuda_optimization_passes(None) {
             pass.run(&mut graph, &PassContext::new()).unwrap();
         }
 
@@ -5516,7 +5631,7 @@ mod tests {
         let residual = value_id_by_name(&graph, "residual");
         let gamma = value_id_by_name(&graph, "gamma");
 
-        CudaSkipRmsNormMatMulFusion
+        CudaSkipRmsNormMatMulFusion::default()
             .run(&mut graph, &PassContext::new())
             .unwrap();
 
@@ -5587,7 +5702,7 @@ mod tests {
         let pre_out = value_id_by_name(&graph, "pre_out");
         let gamma = value_id_by_name(&graph, "gamma");
 
-        CudaSkipRmsNormMatMulFusion
+        CudaSkipRmsNormMatMulFusion::default()
             .run(&mut graph, &PassContext::new())
             .unwrap();
 
@@ -5622,7 +5737,7 @@ mod tests {
         // 1288 % 128 != 0 → warp_half4 byte-identity does not hold, so no fusion.
         // Kept above the size floor so the `% 128` check is the sole reason.
         let mut graph = skip_rms_graph(1288, RMSNORM_FUSION_MIN_HIDDEN + 256);
-        CudaSkipRmsNormMatMulFusion
+        CudaSkipRmsNormMatMulFusion::default()
             .run(&mut graph, &PassContext::new())
             .unwrap();
         assert!(
@@ -5639,7 +5754,7 @@ mod tests {
         // Following K(1280) > N(1152): the tall-skinny down variant has no
         // prologue. Hidden is at the floor so the down variant is the sole reason.
         let mut graph = skip_rms_graph(RMSNORM_FUSION_MIN_HIDDEN, RMSNORM_FUSION_MIN_HIDDEN - 128);
-        CudaSkipRmsNormMatMulFusion
+        CudaSkipRmsNormMatMulFusion::default()
             .run(&mut graph, &PassContext::new())
             .unwrap();
         assert!(
@@ -5675,7 +5790,7 @@ mod tests {
         skip.inputs.push(Some(bias));
         graph.replace_node(skip_id, skip);
 
-        CudaSkipRmsNormMatMulFusion
+        CudaSkipRmsNormMatMulFusion::default()
             .run(&mut graph, &PassContext::new())
             .unwrap();
         assert!(
@@ -5698,7 +5813,7 @@ mod tests {
         graph.insert_node(Node::new(NodeId(0), "Neg", vec![Some(pre_out)], vec![sink]));
         graph.add_output(sink);
 
-        CudaSkipRmsNormMatMulFusion
+        CudaSkipRmsNormMatMulFusion::default()
             .run(&mut graph, &PassContext::new())
             .unwrap();
         assert!(
@@ -5718,7 +5833,7 @@ mod tests {
         let residual = value_id_by_name(&graph, "residual");
         graph.value_mut(residual).shape = vec![Dim::Static(1), Dim::Static(1)];
 
-        CudaSkipRmsNormMatMulFusion
+        CudaSkipRmsNormMatMulFusion::default()
             .run(&mut graph, &PassContext::new())
             .unwrap();
         assert!(
@@ -5750,7 +5865,7 @@ mod tests {
             graph.value_mut(id).shape = symbolic.clone();
         }
 
-        CudaSkipRmsNormMatMulFusion
+        CudaSkipRmsNormMatMulFusion::default()
             .run(&mut graph, &PassContext::new())
             .unwrap();
 
@@ -5777,7 +5892,7 @@ mod tests {
         // End-to-end through the registered CUDA passes: the fusion is the last
         // pass and must fire on the eligible chain.
         let mut graph = skip_rms_graph(RMSNORM_FUSION_MIN_HIDDEN, RMSNORM_FUSION_MIN_HIDDEN + 256);
-        for pass in cuda_optimization_passes() {
+        for pass in cuda_optimization_passes(None) {
             pass.run(&mut graph, &PassContext::new()).unwrap();
         }
         assert!(
@@ -5798,7 +5913,7 @@ mod tests {
         // ~free graph-captured standalone launch it would remove).
         let hidden = RMSNORM_FUSION_MIN_HIDDEN - RMSNORM_FUSION_WARP_HALF4_MULTIPLE;
         let mut graph = skip_rms_graph(hidden, hidden + 256);
-        CudaSkipRmsNormMatMulFusion
+        CudaSkipRmsNormMatMulFusion::default()
             .run(&mut graph, &PassContext::new())
             .unwrap();
         assert!(
@@ -5816,7 +5931,7 @@ mod tests {
         // only thing the smaller case tripped (not any structural mismatch).
         let hidden = RMSNORM_FUSION_MIN_HIDDEN;
         let mut graph = skip_rms_graph(hidden, hidden + 256);
-        CudaSkipRmsNormMatMulFusion
+        CudaSkipRmsNormMatMulFusion::default()
             .run(&mut graph, &PassContext::new())
             .unwrap();
         assert!(
@@ -5829,7 +5944,110 @@ mod tests {
         assert!(graph.validate().is_ok());
     }
 
-    /// Build the post-attention decode chain the fan-out-2 fold targets:
+    #[test]
+    fn derived_min_hidden_reproduces_h200_anchor_and_scales_with_sm_count() {
+        // The one calibrated point reproduces itself exactly (round-nearest).
+        assert_eq!(
+            derived_min_hidden(RMSNORM_FUSION_ANCHOR_SM_COUNT),
+            RMSNORM_FUSION_MIN_HIDDEN,
+            "the H200 anchor (132 SM) must map back to its calibrated 1280 floor"
+        );
+        // RTX 4060 laptop: 24 SM -> round(10 * 24 / 132) = 2 chunks = 256. This is
+        // a *corroboration*, not a fit: the slope came only from the H200 anchor,
+        // and 256 <= 896 predicts the measured neutral-to-faster hidden-896 fold.
+        assert_eq!(derived_min_hidden(24), 256);
+        // Monotonic in SM count, and never below one 128-wide chunk.
+        assert!(derived_min_hidden(1) >= RMSNORM_FUSION_WARP_HALF4_MULTIPLE);
+        assert_eq!(derived_min_hidden(0), RMSNORM_FUSION_WARP_HALF4_MULTIPLE);
+        assert!(derived_min_hidden(264) > derived_min_hidden(132));
+        // Every derived floor is a whole 128 chunk (the fold only fires on those).
+        for sm in [1u32, 8, 24, 60, 132, 200, 264] {
+            assert_eq!(
+                derived_min_hidden(sm) % RMSNORM_FUSION_WARP_HALF4_MULTIPLE,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn fusion_benefit_gate_is_device_derived() {
+        let h200 = CudaDeviceCapabilities::for_test((9, 0), 132, 0);
+        let rtx4060 = CudaDeviceCapabilities::for_test((8, 9), 24, 0);
+        // Hidden 896 (== qwen 0.5B, granite-1B MoE is 1024): below the H200 floor
+        // (1280) but above the RTX 4060 floor (256), so the two devices disagree —
+        // exactly the batch/device split #1421 is about.
+        assert!(!fusion_benefit_is_positive(896, 1, 896, Some(h200)));
+        assert!(fusion_benefit_is_positive(896, 1, 896, Some(rtx4060)));
+        // Device unknown falls back to the H200-calibrated global constant, so the
+        // historical behavior (and every existing unit test) is preserved.
+        assert!(!fusion_benefit_is_positive(896, 1, 896, None));
+        assert!(fusion_benefit_is_positive(
+            RMSNORM_FUSION_MIN_HIDDEN,
+            1,
+            0,
+            None
+        ));
+    }
+
+    #[test]
+    fn device_aware_gate_folds_small_hidden_on_consumer_gpu() {
+        // A fully fusable hidden-896 chain that the H200 floor (and the None
+        // fallback) keep unfused, but a 24-SM consumer GPU folds — capturing the
+        // byte-identical M>=2 structural win on the exact small models (#1421).
+        let hidden = 896;
+        let rtx4060 = CudaDeviceCapabilities::for_test((8, 9), 24, 0);
+
+        let mut folded = skip_rms_graph(hidden, hidden + 256);
+        CudaSkipRmsNormMatMulFusion::for_device(Some(rtx4060))
+            .run(&mut folded, &PassContext::new())
+            .unwrap();
+        assert!(
+            folded
+                .nodes
+                .values()
+                .all(|node| node.op_type != "SkipSimplifiedLayerNormalization"),
+            "a 24-SM device must fold hidden 896 (floor 256)"
+        );
+        assert!(folded.validate().is_ok());
+
+        let mut kept = skip_rms_graph(hidden, hidden + 256);
+        CudaSkipRmsNormMatMulFusion::default()
+            .run(&mut kept, &PassContext::new())
+            .unwrap();
+        assert!(
+            kept.nodes
+                .values()
+                .any(|node| node.op_type == "SkipSimplifiedLayerNormalization"),
+            "device-unknown (H200 fallback) must keep the standalone norm at 896"
+        );
+    }
+
+    #[test]
+    fn rmsnorm_min_hidden_env_override_wins_over_device_derivation() {
+        let _serial = RMSNORM_FLOOR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // `fusion_benefit_is_positive` resolves its floor as
+        // `env_usize(RMSNORM_FUSION_MIN_HIDDEN_ENV, derived_min_hidden(sm))`, so the
+        // override precedence is exactly `env_usize`'s: a set value replaces the
+        // derived default. Exercise that mechanism through a dedicated throwaway
+        // var so this test cannot perturb the real floor other tests read.
+        const PROBE: &str = "ONNX_GENAI_TEST_RMSNORM_OVERRIDE_PROBE";
+        let derived = derived_min_hidden(24); // 256, the RTX 4060 default
+        assert_eq!(
+            env_usize(PROBE, derived),
+            derived,
+            "unset -> derived default"
+        );
+        unsafe { std::env::set_var(PROBE, "4096") };
+        assert_eq!(env_usize(PROBE, derived), 4096, "set -> override wins");
+        unsafe { std::env::remove_var(PROBE) };
+        assert_eq!(
+            env_usize(PROBE, derived),
+            derived,
+            "removed -> back to derived"
+        );
+    }
     /// `o_proj MatMulNBits (N == hidden)` → `SkipSimplifiedLayerNormalization`
     /// → gate + up `MatMulNBits` → `Silu(gate)` → `Mul(silu, up)`. Running the
     /// full CUDA pass list first collapses gate+up into one SwiGLU node, then the
@@ -5907,7 +6125,7 @@ mod tests {
         let intermediate = hidden * 2;
         let mut graph = post_attention_swiglu_graph(hidden, intermediate);
 
-        for pass in cuda_optimization_passes() {
+        for pass in cuda_optimization_passes(None) {
             pass.run(&mut graph, &PassContext::new()).unwrap();
         }
 
@@ -5962,7 +6180,7 @@ mod tests {
         let intermediate = hidden * 2;
         let mut graph = post_attention_swiglu_graph(hidden, intermediate);
 
-        for pass in cuda_optimization_passes() {
+        for pass in cuda_optimization_passes(None) {
             pass.run(&mut graph, &PassContext::new()).unwrap();
         }
 
@@ -6071,7 +6289,7 @@ mod tests {
         ));
         graph.add_output(sum1_sink);
 
-        CudaSkipRmsNormMatMulFusion
+        CudaSkipRmsNormMatMulFusion::default()
             .run(&mut graph, &PassContext::new())
             .unwrap();
 
@@ -6266,7 +6484,7 @@ mod tests {
         // End-to-end through the registered CUDA passes: the cast-drop pass runs
         // and removes every wrapper, leaving the norm in fp16-native form.
         let (mut graph, ..) = cast_wrapped_skip_norm_graph(128);
-        for pass in cuda_optimization_passes() {
+        for pass in cuda_optimization_passes(None) {
             pass.run(&mut graph, &PassContext::new()).unwrap();
         }
         assert_eq!(
