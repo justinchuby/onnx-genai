@@ -70,6 +70,10 @@ KNOWN_UNIMPLEMENTED: dict[str, str] = {
     "dense-decode-megakernel-feasibility.md §9.2; the cp.async double-buffered "
     "weight-load path regressed (−13%, 4 B/lane granularity) and was reverted, "
     "not shipped",
+    "ONNX_GENAI_GEMV_FOLDSCALE": "retracted experiment knob documented in "
+    "dense-decode-megakernel-feasibility.md; the fold-scale GEMV it selected was "
+    "deleted by #1527 after the +2.7% failed to reproduce (re-measured as a 2.9% "
+    "cost), and the document says so where it is named",
     "NXRT_AUTO_INSTALL_CUDA": "referenced in prose about a proposed installer step",
     "NXRT_SQNBIT_PREFILL_MIN": "referenced in prose about a proposed tuning knob",
     "ONNX_GENAI_BASE_URL": "client-side variable read by external tooling, not by this workspace",
