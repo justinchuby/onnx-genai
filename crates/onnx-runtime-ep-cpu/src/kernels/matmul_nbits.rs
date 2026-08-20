@@ -7181,19 +7181,27 @@ fn borrowed_int4_output_element(
 /// `m` its total work is genuinely lower — the panels only pay off once enough
 /// rows reuse them.
 ///
-/// This threshold was originally tuned at `4` against the *row-serial* borrowed
-/// kernel. #1356 replaced that with the column-blocked one, which amortizes its
-/// re-decode over a block of rows and therefore stays ahead considerably
-/// longer; the retune to `12` (and `24` when the weight is L2-resident, see
-/// [`int4_prefill_gebp_min_rows`]) measures against that current kernel.
+/// This threshold has been re-derived twice, because it is a property of the
+/// two kernels either side of it and both have moved. It was tuned at `4`
+/// against the *row-serial* borrowed kernel; #1356 replaced that with the
+/// column-blocked one, which amortizes its re-decode over a block of rows and
+/// stays ahead considerably longer, so #1431 raised it to `12`. Both of those
+/// measured a GEBP whose pack was a scalar per-element loop with a
+/// cache-line-per-element store. Vectorizing that pack roughly halved the
+/// GEBP's fixed cost, which moves the crossover back down: the measured value
+/// is now `5`, and `12` when the weight is L2-resident (see
+/// [`int4_prefill_gebp_min_rows`]).
 #[cfg(target_arch = "x86_64")]
-const INT4_PREFILL_GEBP_MIN_ROWS: usize = 12;
+const INT4_PREFILL_GEBP_MIN_ROWS: usize = 5;
 
 /// Row threshold for weights small enough to stay resident in L2, where the
 /// column-blocked kernel's re-decode is nearly free and the GEBP pack takes
 /// longer to pay off.
+///
+/// Re-derived alongside [`INT4_PREFILL_GEBP_MIN_ROWS`] against the vectorized
+/// pack: was `24`, measures `12`.
 #[cfg(target_arch = "x86_64")]
-const INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT: usize = 24;
+const INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT: usize = 12;
 
 /// Packed-weight size above which the column-blocked kernel can no longer keep
 /// the weight in cache between rows. Sits between the two measured regimes:
@@ -7219,19 +7227,28 @@ const INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED: usize = 4;
 /// borrowed kernel for this node's weight.
 ///
 /// The crossover is not a single row count: it depends on whether the packed
-/// weight stays cache-resident across rows. Measured on a 32-core AVX2 host,
-/// native-alone, min of 5, GEBP / column-blocked:
+/// weight stays cache-resident across rows. Re-measured on a 32-core AVX2 host
+/// against the **vectorized** pack, native-alone, steady phase, median of five
+/// interleaved reps, as GEBP's speedup over the column-blocked kernel:
 ///
-/// | m | qwen3-0.6B QKV (1.0 MB) | llama3-8B QKV (12.6 MB) | llama3-8B MLP (29.4 MB) |
-/// |---|---|---|---|
-/// | 8 | 0.50x | 0.73x | 0.81x |
-/// | 12 | 0.69x | **1.01x** | **1.01x** |
-/// | 16 | 0.80x | 1.35x | 1.26x |
-/// | 24 | **1.14x** | 1.80x | 1.98x |
-/// | 32 | 1.68x | 2.24x | 2.35x |
+/// | m | 2048x2048 (2.1 MB, L2-resident) | 4096x11008 (22.5 MB) |
+/// |---|---|---|
+/// | 4 | 0.54x | 0.98x |
+/// | 5 | 0.89x | **1.48x** |
+/// | 6 | 0.89x | 1.52x |
+/// | 8 | 0.86x | 1.49x |
+/// | 12 | **1.19x** | 2.21x |
+/// | 16 | 1.38x | 2.60x |
 ///
-/// A flat `12` would hand the small shape a 1.45x regression at `m = 12`; a
-/// flat `24` would give up 1.35x-1.80x on the large shapes at `m = 16..23`.
+/// The large-weight crossover therefore sits between 4 and 5, and the
+/// L2-resident one between 8 and 12. Against the previous scalar pack the same
+/// two crossovers measured 12 and 24; halving the pack cost is what moved them.
+/// A flat `5` would hand the small shape a 1.16x regression at `m = 8`; a flat
+/// `12` would give up 1.48x-2.21x on the large shape at `m = 5..11`.
+///
+/// Reproduce with `PROBE_M_LIST=4,5,6,8,12,16` on the
+/// `int4_prefill_route_ab` bench, once with the default env and once with
+/// `ONNX_GENAI_CPU_MM_INT4_GEBP=0`.
 ///
 /// Both regimes were measured on `block_size = 32` weights, which is also the
 /// smallest block the kernels that win below the crossover can take; see
@@ -19310,15 +19327,15 @@ mod tests {
         assert_eq!(
             int4_prefill_gebp_min_rows(small, 32),
             INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT,
-            "an L2-resident weight measured its crossover at m=24"
+            "an L2-resident weight measured its crossover at m=12"
         );
         assert_eq!(
             int4_prefill_gebp_min_rows(large, 32),
             INT4_PREFILL_GEBP_MIN_ROWS,
-            "a DRAM-streaming weight measured its crossover at m=12"
+            "a DRAM-streaming weight measured its crossover at m=5"
         );
         // The resident threshold is the later one; swapping them would regress
-        // the small shape by 1.45x at m=12.
+        // the small shape by 1.16x at m=8.
         const {
             assert!(INT4_PREFILL_GEBP_MIN_ROWS < INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT);
         }

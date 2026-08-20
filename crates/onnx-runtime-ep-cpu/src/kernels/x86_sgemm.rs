@@ -706,6 +706,31 @@ pub(crate) trait BlockQuantWeight: Sync {
         slot: usize,
         dst: &mut [f32],
     );
+
+    /// Fill a whole `kc x NR` panel: columns `[jcol, jcol + nr)` of depths
+    /// `[pc, pc + kc)` into `dst[p * NR + slot]`.
+    ///
+    /// The default is exactly the loop it replaces, so an implementation that
+    /// does not override it keeps its previous behaviour byte for byte. It
+    /// exists so an implementation *can* see the whole panel at once: filling
+    /// one column at a time writes `dst[p * NR + slot]` for consecutive `p`,
+    /// i.e. one f32 every 64 bytes -- a separate cache line and a separate
+    /// scalar store per element, which is what makes the scalar version store
+    /// bound. An implementation that transposes a group of columns in registers
+    /// can write the panel contiguously instead.
+    fn dequant_panel<S: Fn(usize) -> f32>(
+        &self,
+        scale_at: &S,
+        jcol: usize,
+        pc: usize,
+        kc: usize,
+        nr: usize,
+        dst: &mut [f32],
+    ) {
+        for slot in 0..nr {
+            self.dequant_column(scale_at, jcol + slot, pc, kc, slot, dst);
+        }
+    }
 }
 
 /// Block-quantized int4 weight described in its on-disk `MatMulNBits` layout,
@@ -746,6 +771,155 @@ impl Int4Weight<'_> {
             }
         }
     }
+
+    /// Dequantize depths `[pc, pc + kc)` of the [`DEQUANT_GROUP`] columns
+    /// starting at `jcol + slot` into `dst[p * NR + slot ..][..DEQUANT_GROUP]`.
+    ///
+    /// The arithmetic is the same as [`Int4Weight::dequant_column`] -- widen
+    /// the nibble, subtract the block's zero point, multiply by the block's
+    /// scale, in that order -- done eight lanes at a time. The subtract and the
+    /// multiply stay separate `_mm256_sub_ps` / `_mm256_mul_ps`, never
+    /// contracted into an FMA, so every value is bit-identical to the scalar
+    /// path rather than merely close.
+    ///
+    /// The reason to group columns is the *store*. Filling one column at a time
+    /// writes `dst[p * NR + slot]` for consecutive `p`: one f32 every 64 bytes,
+    /// a separate cache line and a separate scalar store per element.
+    /// Dequantizing eight columns into eight registers and transposing them
+    /// in-register turns that into eight contiguous 32-byte stores per eight
+    /// depths -- one store per eight elements.
+    ///
+    /// # Safety
+    /// AVX2 must be available. `dst` must be at least `kc * NR` long,
+    /// `slot + DEQUANT_GROUP` must not exceed `NR`, and `self.block_size` must
+    /// be a multiple of [`DEQUANT_GROUP`].
+    #[target_feature(enable = "avx2")]
+    unsafe fn dequant_panel_avx2<S: Fn(usize) -> f32>(
+        &self,
+        scale_at: &S,
+        jcol: usize,
+        pc: usize,
+        kc: usize,
+        slot: usize,
+        dst: &mut [f32],
+    ) {
+        use std::arch::x86_64::*;
+
+        let block_size = self.block_size;
+        let blob = block_size / 2;
+        let row_len = self.packed_row_len();
+        let whole = kc / DEQUANT_GROUP * DEQUANT_GROUP;
+
+        let mut p = 0usize;
+        while p < whole {
+            let depth = pc + p;
+            let block = depth / block_size;
+            let offset_in_block = depth % block_size;
+            let mut vecs = [_mm256_setzero_ps(); DEQUANT_GROUP];
+            for (lane, vec) in vecs.iter_mut().enumerate() {
+                let col = jcol + slot + lane;
+                let scale = scale_at(col * self.block_count + block);
+                let zero_point = self.zero_point(col, block);
+                let byte_at = col * row_len + block * blob + offset_in_block / 2;
+                // Eight nibbles of one column are four whole packed bytes,
+                // because the block size is a multiple of the group.
+                let raw = u32::from_le_bytes([
+                    self.packed[byte_at],
+                    self.packed[byte_at + 1],
+                    self.packed[byte_at + 2],
+                    self.packed[byte_at + 3],
+                ]);
+                let packed4 = _mm_cvtsi32_si128(raw as i32);
+                let low = _mm_and_si128(packed4, _mm_set1_epi8(0x0f));
+                // A 16-bit shift drags the neighbouring byte's low nibble into
+                // the top half of each lane; the mask drops it again.
+                let high = _mm_and_si128(_mm_srli_epi16(packed4, 4), _mm_set1_epi8(0x0f));
+                // Back into depth order: low nibble of each byte comes first.
+                let ordered = _mm_unpacklo_epi8(low, high);
+                let widened = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(ordered));
+                *vec = _mm256_mul_ps(
+                    _mm256_sub_ps(widened, _mm256_set1_ps(zero_point)),
+                    _mm256_set1_ps(scale),
+                );
+            }
+            // SAFETY: AVX2 is this function's own contract.
+            unsafe { transpose8x8_ps(&mut vecs) };
+            for (step, vec) in vecs.iter().enumerate() {
+                // SAFETY: `(p + step) * NR + slot + DEQUANT_GROUP <= kc * NR`,
+                // since `p + step < kc` and `slot + DEQUANT_GROUP <= NR`.
+                unsafe { _mm256_storeu_ps(dst.as_mut_ptr().add((p + step) * NR + slot), *vec) };
+            }
+            p += DEQUANT_GROUP;
+        }
+
+        // Depths past the last whole group, when `kc` is not a multiple of
+        // eight. Only the final `k` panel can reach this.
+        for lane in 0..DEQUANT_GROUP {
+            let col = jcol + slot + lane;
+            let mut q = whole;
+            while q < kc {
+                let depth = pc + q;
+                let block = depth / block_size;
+                let offset_in_block = depth % block_size;
+                let scale = scale_at(col * self.block_count + block);
+                let zero_point = self.zero_point(col, block);
+                let run = (block_size - offset_in_block).min(kc - q);
+                for step in 0..run {
+                    let index = offset_in_block + step;
+                    let byte = self.packed[col * row_len + block * blob + index / 2];
+                    let nibble = (byte >> (4 * (index % 2))) & 0x0f;
+                    dst[(q + step) * NR + slot + lane] = (f32::from(nibble) - zero_point) * scale;
+                }
+                q += run;
+            }
+        }
+    }
+}
+
+/// Columns dequantized together by [`Int4Weight::dequant_panel_avx2`].
+///
+/// Not a tuning parameter: it is the f32 lane count of an `__m256`, and the
+/// transpose that makes the stores contiguous is an 8x8 one.
+#[cfg(target_arch = "x86_64")]
+const DEQUANT_GROUP: usize = 8;
+
+/// Transpose eight `__m256` of f32 in registers: on entry `v[c]` holds eight
+/// consecutive depths of column `c`; on exit `v[p]` holds one depth of all
+/// eight columns.
+///
+/// The standard unpack / shuffle / permute sequence -- 24 shuffles, no memory
+/// round trip.
+///
+/// # Safety
+/// AVX2 must be available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn transpose8x8_ps(v: &mut [std::arch::x86_64::__m256; 8]) {
+    use std::arch::x86_64::*;
+    let a0 = _mm256_unpacklo_ps(v[0], v[1]);
+    let a1 = _mm256_unpackhi_ps(v[0], v[1]);
+    let a2 = _mm256_unpacklo_ps(v[2], v[3]);
+    let a3 = _mm256_unpackhi_ps(v[2], v[3]);
+    let a4 = _mm256_unpacklo_ps(v[4], v[5]);
+    let a5 = _mm256_unpackhi_ps(v[4], v[5]);
+    let a6 = _mm256_unpacklo_ps(v[6], v[7]);
+    let a7 = _mm256_unpackhi_ps(v[6], v[7]);
+    let b0 = _mm256_shuffle_ps(a0, a2, 0b01_00_01_00);
+    let b1 = _mm256_shuffle_ps(a0, a2, 0b11_10_11_10);
+    let b2 = _mm256_shuffle_ps(a1, a3, 0b01_00_01_00);
+    let b3 = _mm256_shuffle_ps(a1, a3, 0b11_10_11_10);
+    let b4 = _mm256_shuffle_ps(a4, a6, 0b01_00_01_00);
+    let b5 = _mm256_shuffle_ps(a4, a6, 0b11_10_11_10);
+    let b6 = _mm256_shuffle_ps(a5, a7, 0b01_00_01_00);
+    let b7 = _mm256_shuffle_ps(a5, a7, 0b11_10_11_10);
+    v[0] = _mm256_permute2f128_ps(b0, b4, 0x20);
+    v[1] = _mm256_permute2f128_ps(b1, b5, 0x20);
+    v[2] = _mm256_permute2f128_ps(b2, b6, 0x20);
+    v[3] = _mm256_permute2f128_ps(b3, b7, 0x20);
+    v[4] = _mm256_permute2f128_ps(b0, b4, 0x31);
+    v[5] = _mm256_permute2f128_ps(b1, b5, 0x31);
+    v[6] = _mm256_permute2f128_ps(b2, b6, 0x31);
+    v[7] = _mm256_permute2f128_ps(b3, b7, 0x31);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -780,6 +954,45 @@ impl BlockQuantWeight for Int4Weight<'_> {
                 dst[(p + step) * NR + slot] = (f32::from(nibble) - zero_point) * scale;
             }
             p += run;
+        }
+    }
+
+    /// Fill the panel a [`DEQUANT_GROUP`]-wide column group at a time.
+    ///
+    /// Falls back to the per-column default whenever the vector path's
+    /// preconditions do not hold, so behaviour is unchanged, only faster.
+    fn dequant_panel<S: Fn(usize) -> f32>(
+        &self,
+        scale_at: &S,
+        jcol: usize,
+        pc: usize,
+        kc: usize,
+        nr: usize,
+        dst: &mut [f32],
+    ) {
+        // The vector path needs each eight-depth run to sit inside one block
+        // (so scale and zero point are loop-invariant across it) and to start
+        // on a byte boundary (so eight nibbles are four whole bytes). `pc` is a
+        // multiple of `KC`, so both follow from the block being a multiple of
+        // the group.
+        if self.block_size.is_multiple_of(DEQUANT_GROUP) && crate::backend::has_simd_x86() {
+            let groups = nr / DEQUANT_GROUP;
+            for g in 0..groups {
+                // SAFETY: `has_simd_x86()` is the AVX2 check the callee
+                // requires. `dst` is the caller's `kc * NR` panel, and the
+                // callee writes only `[p * NR + slot, p * NR + slot + 8)` for
+                // `p < kc` with `slot + 8 <= nr <= NR`.
+                unsafe {
+                    self.dequant_panel_avx2(scale_at, jcol, pc, kc, g * DEQUANT_GROUP, dst);
+                }
+            }
+            for slot in groups * DEQUANT_GROUP..nr {
+                self.dequant_column(scale_at, jcol + slot, pc, kc, slot, dst);
+            }
+            return;
+        }
+        for slot in 0..nr {
+            self.dequant_column(scale_at, jcol + slot, pc, kc, slot, dst);
         }
     }
 }
@@ -1004,9 +1217,7 @@ fn pack_b_quant<W, S>(
         let jcol = j0 + jp * NR;
         let nr = NR.min(nc - jp * NR);
         let dst = &mut bpack[jp * KC * NR..jp * KC * NR + kc * NR];
-        for col_in_panel in 0..nr {
-            weight.dequant_column(scale_at, jcol + col_in_panel, pc, kc, col_in_panel, dst);
-        }
+        weight.dequant_panel(scale_at, jcol, pc, kc, nr, dst);
         // Zero-pad columns [nr, NR) so the microkernel needs no masking.
         if nr < NR {
             for p in 0..kc {
@@ -1821,6 +2032,85 @@ mod tests {
         check_int4_gebp(9, 300, 33, 32, true);
         check_int4_gebp(8, 128, 48, 16, false);
         check_int4_gebp(8, 128, 48, 128, true);
+    }
+
+    /// The vectorized panel fill must reproduce the per-column scalar fill
+    /// exactly. The end-to-end test above would catch a gross error, but this
+    /// pins the packer itself, so a bug that happens to cancel in the GEMM --
+    /// or one that only shows in a padding lane the microkernel ignores --
+    /// still fails.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn int4_dequant_panel_is_bit_identical_to_the_per_column_path() {
+        if !has_simd_x86() {
+            return;
+        }
+        // `nr`: two whole groups, one whole group, a group plus every scalar
+        // tail width, and a panel too narrow for any group at all.
+        // `kc`: multiples of eight and every remainder, including one longer
+        // than a block so the run has to re-hoist scale and zero point.
+        // `block_size`: 8/32/128 take the vector path; 2 and 4 are not
+        // multiples of the group and must fall back to the scalar one.
+        let k = 256usize;
+        let n = 32usize;
+        for &block_size in &[2usize, 4, 8, 32, 128] {
+            for &asymmetric in &[false, true] {
+                let (packed, scales, zero_points, _) = int4_weight(k, n, block_size, asymmetric);
+                let weight = Int4Weight {
+                    packed: &packed,
+                    zero_points: zero_points.as_deref(),
+                    block_size,
+                    block_count: k.div_ceil(block_size),
+                };
+                let scale_at = |index: usize| scales[index];
+                for &nr in &[1usize, 5, 7, 8, 9, 13, 15, 16] {
+                    for &kc in &[1usize, 7, 8, 9, 16, 33, 64, 130] {
+                        // `pc = 0` and a later panel, so the block arithmetic
+                        // is exercised at a non-zero depth offset too.
+                        for &pc in &[0usize, 128] {
+                            if pc + kc > k {
+                                continue;
+                            }
+                            let jcol = 8usize;
+                            let mut expect = vec![f32::NAN; kc * NR];
+                            for slot in 0..nr {
+                                weight.dequant_column(
+                                    &scale_at,
+                                    jcol + slot,
+                                    pc,
+                                    kc,
+                                    slot,
+                                    &mut expect,
+                                );
+                            }
+                            let mut got = vec![f32::NAN; kc * NR];
+                            weight.dequant_panel(&scale_at, jcol, pc, kc, nr, &mut got);
+                            for p in 0..kc {
+                                for slot in 0..nr {
+                                    let (e, g) = (expect[p * NR + slot], got[p * NR + slot]);
+                                    assert_eq!(
+                                        e.to_bits(),
+                                        g.to_bits(),
+                                        "panel mismatch at depth {p} slot {slot} \
+                                         (block={block_size}, asym={asymmetric}, nr={nr}, \
+                                         kc={kc}, pc={pc}): {e} vs {g}"
+                                    );
+                                }
+                                // Columns past `nr` are the caller's
+                                // zero-padding, so the packer must not have
+                                // touched them.
+                                for slot in nr..NR {
+                                    assert!(
+                                        got[p * NR + slot].is_nan(),
+                                        "packer wrote past nr={nr} at depth {p} slot {slot}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
