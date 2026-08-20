@@ -15555,8 +15555,13 @@ mod tests {
                     inputs.push(zp.view());
                 }
                 let mut y = Owned::zeros_f32(&[m, n]);
+                // The counter and the threshold are both x86_64-only; this test
+                // is not, so the routing assertion has to be gated even though
+                // the numeric one below runs everywhere.
+                #[cfg(target_arch = "x86_64")]
                 let before = INT4_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
                 kernel.execute(&inputs, &mut [y.view_mut()]).unwrap();
+                #[cfg(target_arch = "x86_64")]
                 let took_gebp = INT4_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed) > before;
                 // Scaled tolerance, not `assert_close`'s fixed 1e-5: the GEBP
                 // route reduces in the packed microkernel's order, so it
@@ -15581,6 +15586,7 @@ mod tests {
                 // `INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT`, and the sweep
                 // straddles it. Without this the test passes whichever route
                 // ran, which is how it came to name a threshold of 4.
+                #[cfg(target_arch = "x86_64")]
                 assert_eq!(
                     took_gebp,
                     m >= INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT,
