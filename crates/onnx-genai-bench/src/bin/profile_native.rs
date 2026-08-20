@@ -339,8 +339,9 @@ struct Args {
     /// with the host argmax (logits D2H + host reduction) vs the on-GPU argmax
     /// (`decode_greedy_batch`, no logits D2H), reporting tok/s for both and the
     /// token divergence between them. Pure base-decode measurement — no
-    /// speculative / draft machinery. Selects the primary reported path via the
-    /// `ONNX_GENAI_ONGPU_ARGMAX` env flag (default OFF = host argmax).
+    /// speculative / draft machinery. Both arms are always measured and their
+    /// token streams cross-checked for byte-identity; the on-GPU path is what
+    /// the engine ships, so it is the one the net ratio is reported against.
     #[arg(long, default_value_t = false)]
     ongpu_argmax_bench: bool,
 }
@@ -1826,18 +1827,6 @@ fn host_argmax(logits: &[f32]) -> u32 {
     best_index as u32
 }
 
-/// Opt-in on-GPU-argmax base-decode flag (`ONNX_GENAI_ONGPU_ARGMAX`). Default
-/// OFF. When ON, the base-decode greedy A/B benchmark reports the on-GPU-argmax
-/// (`decode_greedy_batch`) path as its primary throughput number; when OFF it
-/// reports the host-argmax path. Both paths are always measured and their token
-/// streams cross-checked for byte-identity regardless of the flag.
-fn ongpu_argmax_enabled() -> bool {
-    matches!(
-        std::env::var("ONNX_GENAI_ONGPU_ARGMAX").ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE") | Some("on") | Some("ON")
-    )
-}
-
 /// Lowest-index-on-ties argmax: strict `>` from `-inf` keeps the FIRST maximum,
 /// matching the ONNX/ORT canonical greedy tie-break (`ArgMax` with
 /// `select_last_index=false`), the host sampler `sample_greedy` ("ties keep the
@@ -1997,11 +1986,9 @@ fn run_ongpu_argmax_bench(args: &Args, model_dir: &Path, device: NativeDecodeDev
     let eos: Vec<u32> = vec![151645, 151643];
     let max_new = args.tokens;
     let skip = args.decode_skip.max(1);
-    let primary_ongpu = ongpu_argmax_enabled();
-
     println!(
         "profile_native: ongpu-argmax-bench model={} layers={} prompt_tokens={} tokens={} \
-         warmups={} runs={} decode_skip={} ONNX_GENAI_ONGPU_ARGMAX={} (primary_path={})",
+         warmups={} runs={} decode_skip={}",
         model_dir.display(),
         session.kv_layer_count(),
         prompt_tokens.len(),
@@ -2009,8 +1996,6 @@ fn run_ongpu_argmax_bench(args: &Args, model_dir: &Path, device: NativeDecodeDev
         args.warmups,
         args.runs,
         skip,
-        if primary_ongpu { "1" } else { "0" },
-        if primary_ongpu { "ongpu" } else { "host" },
     );
 
     // Warmup both paths to arm CUDA-graph capture before timing.

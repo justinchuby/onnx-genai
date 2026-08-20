@@ -43,6 +43,38 @@ impl DecodeBackend for NativeDecodeSession {
 }
 
 impl NativeDecodeSession {
+    /// Greedy sibling of [`Self::decode_with_step_inputs`] for the pipeline
+    /// decoder, which routes per-step ports (an embedding output, and any other
+    /// declared `Routed` port) that [`DecodeBackend::decode_argmax`] cannot carry.
+    ///
+    /// Returns `Ok(None)` whenever the step is not the captured single-token
+    /// shape the device-argmax epilogue applies to — a multi-token prefill, a
+    /// decoder whose step inputs are not capture-eligible, a non-CUDA session.
+    /// The caller then falls back to logits, so this is a fast path and never a
+    /// behaviour switch.
+    pub(crate) fn decode_argmax_with_step_inputs(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+        step_inputs: &[(String, Tensor)],
+    ) -> anyhow::Result<Option<TokenId>> {
+        if token_ids.len() != 1 || !self.captured_step_input_greedy_supported() {
+            return Ok(None);
+        }
+        if past_len != self.current_len {
+            bail!(
+                "native decode past length mismatch: caller supplied {past_len}, adapter holds {}",
+                self.current_len
+            );
+        }
+        let total_len = past_len
+            .checked_add(1)
+            .context("native decode context length overflow")?;
+        self.maybe_enable_decode_inline(token_ids);
+        self.decode_cuda_captured_step_inputs_greedy(token_ids, past_len, total_len, step_inputs)
+            .map(Some)
+    }
+
     /// One prefill or decode forward over `token_ids`, with no chunking.
     fn decode_argmax_forward(
         &mut self,

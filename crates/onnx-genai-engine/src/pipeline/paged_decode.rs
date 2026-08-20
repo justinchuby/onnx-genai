@@ -208,13 +208,45 @@ impl PipelineDecodeLoopBackend<'_, '_> {
         input_tokens: &[TokenId],
         past_len: usize,
     ) -> anyhow::Result<()> {
+        self.run_decoder_step_inner(input_tokens, past_len, false)
+            .map(|_| ())
+    }
+
+    /// Like [`Self::run_decoder_step`], but ask the decoder to select the greedy
+    /// token on the device and skip the logits readback.
+    ///
+    /// `Ok(None)` means the decoder declined for this step and ran the ordinary
+    /// forward instead, so its logits are available as usual.
+    fn run_decoder_step_argmax(
+        &mut self,
+        input_tokens: &[TokenId],
+        past_len: usize,
+    ) -> anyhow::Result<Option<TokenId>> {
+        self.run_decoder_step_inner(input_tokens, past_len, true)
+    }
+
+    /// The one decode step body. Both entry points share it so that the KV
+    /// bookkeeping after the forward -- `kv_len`, paged mirroring, the sliding
+    /// window -- cannot be forgotten on the newer path.
+    fn run_decoder_step_inner(
+        &mut self,
+        input_tokens: &[TokenId],
+        past_len: usize,
+        greedy: bool,
+    ) -> anyhow::Result<Option<TokenId>> {
         self.run_step_components(input_tokens)?;
         let extras = self.decoder_extras()?;
         self.decoder.prepare_step(input_tokens, past_len, &extras)?;
         if let Some(admitted) = self.admission.take() {
             admitted();
         }
-        self.decoder.step(input_tokens, past_len, &extras)?;
+        let mut token = None;
+        if greedy {
+            token = self.decoder.step_argmax(input_tokens, past_len, &extras)?;
+        }
+        if token.is_none() {
+            self.decoder.step(input_tokens, past_len, &extras)?;
+        }
         self.kv_len = past_len + input_tokens.len();
 
         if let Some(paged) = self.paged.as_mut().filter(|paged| !paged.exhausted) {
@@ -257,20 +289,18 @@ impl PipelineDecodeLoopBackend<'_, '_> {
                 paged.windowed = true;
             }
         }
-        Ok(())
+        Ok(token)
     }
 }
 
-impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_, '_> {
-    fn context_len(&self) -> usize {
-        self.context_tokens.len()
-    }
-
-    fn processor_prompt_tokens(&self) -> &[TokenId] {
-        &self.context_tokens
-    }
-
-    fn next_logits(&mut self) -> anyhow::Result<Vec<f32>> {
+impl PipelineDecodeLoopBackend<'_, '_> {
+    /// The tokens to feed this step, the absolute `past_len` they start at, and
+    /// the chunk size to feed them in.
+    ///
+    /// Shared by the logits and greedy entry points so the two cannot drift: a
+    /// disagreement here would not fail loudly, it would silently decode from
+    /// the wrong KV offset.
+    fn step_plan(&self) -> (Vec<TokenId>, usize, usize) {
         let use_kv = self.decoder.use_kv();
         let past_len = if use_kv {
             self.context_tokens
@@ -296,10 +326,55 @@ impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_, '_> {
         } else {
             input_tokens.len().max(1)
         };
+        (input_tokens, past_len, chunk_size)
+    }
+}
+
+impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_, '_> {
+    fn context_len(&self) -> usize {
+        self.context_tokens.len()
+    }
+
+    fn processor_prompt_tokens(&self) -> &[TokenId] {
+        &self.context_tokens
+    }
+
+    fn next_logits(&mut self) -> anyhow::Result<Vec<f32>> {
+        let (input_tokens, past_len, chunk_size) = self.step_plan();
         for (chunk_index, chunk) in input_tokens.chunks(chunk_size).enumerate() {
             self.run_decoder_step(chunk, past_len + chunk_index * chunk_size)?;
         }
         self.decoder.next_token_logits()
+    }
+
+    fn greedy_fastpath_supported(&self) -> bool {
+        self.decoder.supports_argmax()
+    }
+
+    fn next_token_greedy(&mut self) -> anyhow::Result<TokenId> {
+        // Same stepping as `next_logits` -- identical chunking, identical
+        // `past_len` arithmetic -- and only the FINAL chunk takes the argmax
+        // epilogue. Earlier chunks exist to populate KV and have no next token,
+        // so running them through `run_decoder_step` keeps this path from
+        // duplicating any of that bookkeeping.
+        let (input_tokens, past_len, chunk_size) = self.step_plan();
+        let chunks: Vec<&[TokenId]> = input_tokens.chunks(chunk_size).collect();
+        let last = chunks.len().saturating_sub(1);
+        for (chunk_index, chunk) in chunks.iter().enumerate() {
+            let chunk_past = past_len + chunk_index * chunk_size;
+            if chunk_index == last {
+                if let Some(token) = self.run_decoder_step_argmax(chunk, chunk_past)? {
+                    return Ok(token);
+                }
+                // The decoder declined the fast path for this step (a multi-token
+                // prefill chunk); it already ran the ordinary forward, so its
+                // logits are below. The fast path stays armed for later steps.
+            } else {
+                self.run_decoder_step(chunk, chunk_past)?;
+            }
+        }
+        let logits = self.decoder.next_token_logits()?;
+        Ok(crate::sampling::sample_greedy(&logits))
     }
 
     fn commit_token(&mut self, token_id: TokenId) -> anyhow::Result<()> {
