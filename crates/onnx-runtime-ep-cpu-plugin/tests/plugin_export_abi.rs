@@ -467,7 +467,12 @@ fn compute_add_broadcast() {
 /// on the numbers that came out the other end.
 #[derive(Default)]
 struct SeenOperands {
-    inputs: Vec<bool>,
+    /// One entry per operand: `None` when the slot arrived absent, otherwise
+    /// the operand's first element, which identifies *which* ORT input landed
+    /// there. Recording identity and not merely absent-ness is what makes a
+    /// mis-paired binding visible: a pattern of absent slots can be symmetric,
+    /// but the values are not.
+    inputs: Vec<Option<f32>>,
     outputs: usize,
 }
 
@@ -489,7 +494,18 @@ impl onnx_runtime_ep_api::kernel::Kernel for RecordingKernel {
     ) -> onnx_runtime_ep_api::Result<()> {
         SEEN.with(|c| {
             let mut c = c.borrow_mut();
-            c.inputs = inputs.iter().map(|v| v.is_absent()).collect();
+            c.inputs = inputs
+                .iter()
+                .map(|v| {
+                    if v.is_absent() {
+                        None
+                    } else {
+                        // SAFETY: present operands in these tests are f32 with
+                        // at least one element.
+                        Some(unsafe { *v.data_ptr::<f32>() })
+                    }
+                })
+                .collect();
             c.outputs = outputs.len();
         });
         let src = inputs.iter().find(|v| !v.is_absent()).ok_or_else(|| {
@@ -508,7 +524,7 @@ impl onnx_runtime_ep_api::kernel::Kernel for RecordingKernel {
 
 /// Drive one single-node `Compute` over `slots`, with `present` ORT inputs
 /// bound, and return what the kernel saw.
-fn run_slots(slots: Vec<Option<usize>>, present: usize) -> (bool, Vec<bool>, usize) {
+fn run_slots(slots: Vec<Option<usize>>, present: usize) -> (bool, Vec<Option<f32>>, usize) {
     use mock_kernel_ctx::*;
     use onnx_runtime_ep_plugin::compute::{
         CompiledKernelEntry, ExportedComputeInfo, ShapeInference,
@@ -572,7 +588,7 @@ fn a_node_sees_exactly_its_own_operand_count() {
             seen.len()
         );
         assert!(
-            seen.iter().all(|absent| !absent),
+            seen.iter().all(|v| v.is_some()),
             "arity {arity}: a bound operand arrived absent: {seen:?}"
         );
     }
@@ -585,12 +601,24 @@ fn a_node_sees_exactly_its_own_operand_count() {
 /// actually reached — not merely that nothing crashed.
 #[test]
 fn an_unbound_slot_arrives_absent_and_in_position() {
+    // Asymmetric on purpose. `[present, absent, present]` reads as a fine
+    // test and is not one: it is a palindrome, so a binding that paired
+    // operands with slots in reverse order produces exactly the same absent
+    // pattern and the test passes. The values are what break the symmetry.
     let (ok, seen, _) = run_slots(vec![Some(0), None, Some(1)], 2);
     assert!(ok, "Compute failed with an unbound middle slot");
     assert_eq!(
         seen,
-        vec![false, true, false],
-        "absent-ness did not land in the slot that was unbound"
+        vec![Some(1.0), None, Some(2.0)],
+        "operands did not land in their own slots"
+    );
+
+    let (ok, seen, _) = run_slots(vec![None, Some(0), Some(1)], 2);
+    assert!(ok, "Compute failed with an unbound leading slot");
+    assert_eq!(
+        seen,
+        vec![None, Some(1.0), Some(2.0)],
+        "a leading unbound slot shifted the operands"
     );
 }
 
@@ -605,9 +633,10 @@ fn a_node_wider_than_the_inline_array_spills_to_the_heap() {
     let (ok, seen, _) = run_slots((0..arity).map(Some).collect(), arity);
     assert!(ok, "Compute failed for a {arity}-operand node");
     assert_eq!(seen.len(), arity, "wide node lost or gained operands");
-    assert!(
-        seen.iter().all(|absent| !absent),
-        "wide node: a bound operand arrived absent: {seen:?}"
+    assert_eq!(
+        seen,
+        (0..arity).map(|k| Some(1.0 + k as f32)).collect::<Vec<_>>(),
+        "wide node: operands arrived absent or out of order"
     );
 }
 
@@ -618,7 +647,11 @@ fn the_inline_operand_boundary_is_off_by_none() {
     for arity in [4usize, 5] {
         let (ok, seen, outs) = run_slots((0..arity).map(Some).collect(), arity);
         assert!(ok, "arity {arity}: Compute failed at the inline boundary");
-        assert_eq!(seen.len(), arity, "arity {arity}: wrong operand count");
+        assert_eq!(
+            seen,
+            (0..arity).map(|k| Some(1.0 + k as f32)).collect::<Vec<_>>(),
+            "arity {arity}: operands arrived absent or out of order"
+        );
         assert_eq!(outs, 1, "arity {arity}: wrong output count");
     }
 }
