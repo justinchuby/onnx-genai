@@ -59,6 +59,35 @@ pub(crate) trait PipelineDecoderComponent {
     /// Next-token logits (final position) from the most recent step.
     fn next_token_logits(&self) -> anyhow::Result<Vec<f32>>;
 
+    /// Whether this decoder can select the greedy token without materializing
+    /// the vocabulary on the host.
+    ///
+    /// Defaulting this to `false` is what silently cost the pipeline its device
+    /// argmax: the CUDA backend had implemented and measured the fast path
+    /// (+8%), the engine's other two decode-loop backends opted in, and this
+    /// component -- the one the pipeline runner actually drives -- inherited the
+    /// default and read 404 KB of logits per token instead. If you add a decoder
+    /// here, answer this question deliberately.
+    fn supports_argmax(&self) -> bool {
+        false
+    }
+
+    /// Run one decoder step and return only the greedy token id, selecting it on
+    /// the device.
+    ///
+    /// `Ok(None)` means the fast path did not apply to *this* step (a multi-token
+    /// prefill chunk, for instance) and the caller should fall back to
+    /// [`step`](Self::step) plus [`next_token_logits`](Self::next_token_logits).
+    /// It is not an error and must not disarm the fast path for later steps.
+    fn step_argmax(
+        &mut self,
+        _input_tokens: &[TokenId],
+        _past_len: usize,
+        _extras: &[(String, Value)],
+    ) -> anyhow::Result<Option<TokenId>> {
+        Ok(None)
+    }
+
     /// Mirror the most recent step's present KV into the paged cache so a later
     /// request opening with the same prefix can attach the pages. Takes `&mut
     /// self` because a device-resident native decoder (GAP-3 Inc-D) reads its
@@ -350,6 +379,29 @@ impl PipelineDecoderComponent for NativePipelineDecoder {
         self.last_logits
             .clone()
             .context("decoder logits requested before any decode step ran")
+    }
+
+    fn supports_argmax(&self) -> bool {
+        self.session.captured_step_input_greedy_supported()
+    }
+
+    fn step_argmax(
+        &mut self,
+        input_tokens: &[TokenId],
+        past_len: usize,
+        extras: &[(String, Value)],
+    ) -> anyhow::Result<Option<TokenId>> {
+        let step_inputs = Self::native_step_inputs(extras)?;
+        let token =
+            self.session
+                .decode_argmax_with_step_inputs(input_tokens, past_len, &step_inputs)?;
+        if token.is_some() {
+            // The vocabulary never reached the host, so any logits still held are
+            // from an earlier step. Drop them rather than let a later reader see
+            // a stale distribution as if it were this step's.
+            self.last_logits = None;
+        }
+        Ok(token)
     }
 
     fn mirror_last_present_kv(

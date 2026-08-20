@@ -234,7 +234,12 @@ pub(crate) fn device_sampling_plan(
 ) -> DeviceSamplingPlan {
     // A custom sampler replaces the default greedy/categorical selection, so the
     // device fast paths must be bypassed to give the sampler processed logits.
-    let greedy = chain.is_empty()
+    //
+    // The greedy test is argmax-equivalence, not emptiness: a chain of pure
+    // truncation processors cannot move the maximum, and greedy selection reads
+    // nothing but the maximum. `top_logprobs` is still excluded because it
+    // reports the processed distribution, which the fast path never forms.
+    let greedy = chain.preserves_argmax()
         && options.top_logprobs.is_none()
         && (options.greedy || options.temperature == 0.0)
         && !has_custom_sampler
@@ -429,6 +434,115 @@ mod device_portability_tests {
             "the most common sampling configuration must reach the device \
              sampler, got {:?}",
             chain.names()
+        );
+    }
+
+    fn greedy_options(base: GenerateOptions) -> GenerateOptions {
+        GenerateOptions {
+            greedy: true,
+            ..base
+        }
+    }
+
+    fn plan_for(options: &GenerateOptions) -> DeviceSamplingPlan {
+        let chain = build_processor_chain(options, None).expect("options build a chain");
+        device_sampling_plan(&chain, options, false, true, true)
+    }
+
+    /// A greedy request that also carries the model's own `generation` defaults
+    /// must still reach the device argmax.
+    ///
+    /// This is the shape almost every chat model presents: `top_k` / `top_p`
+    /// come from the model card and ride along on the request even when the
+    /// caller asked for greedy decoding, plus a stop sequence from the chat
+    /// template. The old `chain.is_empty()` test read that as "sampling is
+    /// configured" and sent the request to the host, so the device argmax --
+    /// implemented, tested, and measured -- was dead for real models while
+    /// passing every test that used bare `GenerateOptions::default()`.
+    #[test]
+    fn a_greedy_request_carrying_model_sampler_defaults_still_plans_the_device_argmax() {
+        let options = greedy_options(GenerateOptions {
+            top_k: 64,
+            top_p: 0.95,
+            stop_sequences: vec![crate::logits::StopSequence::Text("<|end|>".into())],
+            ..Default::default()
+        });
+        let chain = build_processor_chain(&options, None).expect("options build a chain");
+        assert!(
+            !chain.is_empty(),
+            "this test is only meaningful with a non-empty chain"
+        );
+        assert_eq!(
+            device_sampling_plan(&chain, &options, false, true, true),
+            DeviceSamplingPlan::Greedy,
+            "truncation and stop-sequence processors cannot move the argmax, got {:?}",
+            chain.names()
+        );
+    }
+
+    /// Negative control for the test above: a processor that *can* move the
+    /// argmax must force the host path.
+    ///
+    /// Without this, `preserves_argmax` returning `true` unconditionally would
+    /// pass every other test here while silently changing generated text.
+    #[test]
+    fn a_repetition_penalty_denies_the_device_argmax() {
+        let options = greedy_options(GenerateOptions {
+            top_k: 64,
+            top_p: 0.95,
+            repetition_penalty: 1.1,
+            ..Default::default()
+        });
+        assert_eq!(
+            plan_for(&options),
+            DeviceSamplingPlan::Host,
+            "a per-token logit rewrite changes which token is the maximum"
+        );
+    }
+
+    /// Same control for the truncation processors that keep a *relative*
+    /// threshold but can still discard the maximum.
+    #[test]
+    fn typical_p_and_xtc_deny_the_device_argmax() {
+        for options in [
+            greedy_options(GenerateOptions {
+                typical_p: 0.5,
+                ..Default::default()
+            }),
+            greedy_options(GenerateOptions {
+                xtc: Some(crate::config::XtcConfig {
+                    probability: 0.5,
+                    threshold: 0.1,
+                }),
+                ..Default::default()
+            }),
+        ] {
+            assert_eq!(
+                plan_for(&options),
+                DeviceSamplingPlan::Host,
+                "this processor may mask the top token itself"
+            );
+        }
+    }
+
+    /// The claim `preserves_argmax` makes about top-k/top-p, checked against the
+    /// processor rather than assumed from its name.
+    #[test]
+    fn top_k_top_p_leaves_the_argmax_where_it_was() {
+        let chain = build_processor_chain(&options_with(4, 0.5), None)
+            .expect("standard sampling options build a chain");
+        let raw: Vec<f32> = vec![0.5, -3.0, 9.25, 1.0, 8.5, -1.0, 2.0, 0.0];
+        let expected = crate::sampling::sample_greedy(&raw);
+        let mut processed = raw.clone();
+        chain.process(&mut processed, &ProcessorContext::default());
+        assert_ne!(
+            processed, raw,
+            "this test is only meaningful if the chain actually rewrote logits"
+        );
+        assert_eq!(
+            crate::sampling::sample_greedy(&processed),
+            expected,
+            "truncation must not move the maximum"
         );
     }
 
