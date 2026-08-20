@@ -101,3 +101,7 @@ Windows stays 256 MiB, Linux/non-Windows raised to **2 GiB** (both consts refere
 byte-identical). 2 GiB bounded on purpose (>3× below measured-safe 6.795 GB, only Hopper tested); operator
 override via `ONNX_GENAI_ZERO_COPY_HYBRID_BUDGET_BYTES`. Feature stays opt-in default-OFF; Windows unchanged
 (do NOT inherit the Linux conclusion there — inverse of #783).
+
+## 2026-08-20T13:46Z — External decode-path survey delivered
+
+Scribe merged Holden's vLLM/FLA/llama.cpp/Marlin survey for int4 GDN batch=1 decode. Core lesson: launch-bound M=1 decode should prioritize inter-kernel fusion and fewer launches. The ranked shortlist sent Deckard to the GDN recurrence megakernel and Batty to adjacent projection + inline SwiGLU fusion; full detail is archived in `.squad/decisions-archive/2026-08.md`.

@@ -72,3 +72,7 @@ Stood down the device-aware VMM reservation task because `origin/main` already c
 ## 2026-08-20T05:50:19+00:00 — Phase-4 Gated-DeltaNet L2-normalize glue fusion merged
 
 Scribe recorded Deckard's #1562 after merge to `origin/main`: `CudaL2NormalizeFusion` collapses Q/K L2-normalize chains in Qwen3.8 Gated-DeltaNet from ReduceSumSquare→Sqrt→Div into a byte-faithful fused route, reducing roughly **288→96 launches/token**. Sebastian's integrated validation measured the stacked #1561+#1562 result at q38 **61.32 tok/s** (+12.4% over the #1557 base) and mary **60.59 tok/s** (+3.0%), with mary byte-identical. Standing lesson: SSM glue fusion is useful but secondary; q38 is still forward int4 M=1 GEMV latency/occupancy-bound.
+
+## 2026-08-20T13:46Z — #1569 merged; next GDN megakernel lever active
+
+Scribe recorded PR #1569 after Sebastian's independent re-validation and merge to `origin/main` (`b693f2bb2`): q38 improved **61.27 → 62.76 tok/s (+2.43%)** under the relaxed dtype-tolerance bar; mary control stayed byte-identical and q38 clear prompts were coherent/byte-identical. The unsupported q38 determinism claim should be dropped because split-K GEMV nondeterminism persists. Deckard's next assigned lever is the GDN recurrence megakernel: fold β-sigmoid + softplus/dt_bias + conv1d/state into the fused recurrence.
