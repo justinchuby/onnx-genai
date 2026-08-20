@@ -31,8 +31,20 @@ fn features() -> Vec<&'static str> {
     if cfg!(feature = "dispatch_probe") {
         f.push("dispatch_probe");
     }
+    debug_assert!(
+        f.iter().all(|name| MIRRORED_FEATURES.contains(name)),
+        "features() returned a name missing from MIRRORED_FEATURES: {f:?}"
+    );
     f
 }
+
+/// Every feature of this package that [`features`] knows how to mirror.
+///
+/// `cdylib_feature_mirror` checks this against the `[features]` table in
+/// `Cargo.toml` and fails when they diverge, which is the only thing standing
+/// between a new feature and the silent-wrong-library failure described above.
+/// Kept next to [`features`] so the two are edited together.
+pub const MIRRORED_FEATURES: &[&str] = &["mlas", "dispatch_probe"];
 
 /// Locate the cpu-plugin cdylib, building it if needed.
 ///
