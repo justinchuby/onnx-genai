@@ -10297,11 +10297,18 @@ mod tests {
     /// takes here: `supports_int4_direct` requires `!has_zero_points` on
     /// x86_64 and this fixture quantizes asymmetrically, so the result is
     /// identical across the whole Scalar/AVX2/VNNI ladder. Non-Apple aarch64
-    /// defaults `ONNX_GENAI_CPU_ARM64_INT4_DIRECT` on and can route
+    /// defaults `ONNX_GENAI_CPU_ARM64_INT4_DIRECT` on and routes
     /// `accuracy_level = 4` to `kai_sdot_matmul_m1`, a different quantisation
-    /// scheme whose error has not been measured against this band -- so the
-    /// test asserts it did *not* take that route rather than silently pinning
-    /// a number it never measured.
+    /// scheme. That route has now been measured against this fixture and lands
+    /// at `2.839095278992024e-3` -- inside the band, and bit-identical on
+    /// Windows ARM64 (from the `Rust (Windows ARM64)` job log) and on Apple
+    /// aarch64 with `ONNX_GENAI_CPU_ARM64_INT4_DIRECT=1`. So the band is
+    /// asserted on both routes and the message names which one it measured.
+    ///
+    /// This previously asserted that the kai_sdot route was *not* taken, which
+    /// was a guaranteed failure on `Rust (Windows ARM64)` -- that job runs
+    /// these tests on exactly the default that selects it. The intent was right
+    /// (do not pin a number nobody measured); the resolution is to measure it.
     #[test]
     fn accuracy4_int4_decode_error_envelope_is_pinned_against_f64() {
         let _probe = lock_dispatch_probe();
@@ -10363,14 +10370,6 @@ mod tests {
         }
         let (exact, reduced) = (errors[0], errors[1]);
         assert!(
-            !reduced_took_kai_sdot,
-            "the pinned band below was measured for the int8-activation route \
-             (prepack_int8_weight -> int8_matmul); this host dispatched \
-             accuracy_level 4 to the aarch64 kai_sdot direct route instead, \
-             which is a different quantisation scheme and needs its own \
-             measurement before it can share this pin (measured {reduced:e})",
-        );
-        assert!(
             exact < 1e-5,
             "accuracy_level 0 promises exact fp32 activations; relative error \
              {exact:e} is too large to be rounding",
@@ -10381,12 +10380,18 @@ mod tests {
              otherwise this test is not measuring the trade it claims to \
              (level0={exact:e}, level4={reduced:e})",
         );
+        let route = if reduced_took_kai_sdot {
+            "aarch64 kai_sdot direct"
+        } else {
+            "int8-activation (prepack_int8_weight -> int8_matmul)"
+        };
         assert!(
             (1e-4..1e-2).contains(&reduced),
             "int4 accuracy_level 4 relative error {reduced:e} left its pinned \
-             band; it quantizes activations to int8 (~3e-3). Below the band \
-             means the int8/int16 asymmetry with the 8-bit route closed and the \
-             docs need updating; above means a precision regression",
+             band on the {route} route; it quantizes activations to int8 \
+             (~3e-3). Below the band means the int8/int16 asymmetry with the \
+             8-bit route closed and the docs need updating; above means a \
+             precision regression",
         );
     }
 
