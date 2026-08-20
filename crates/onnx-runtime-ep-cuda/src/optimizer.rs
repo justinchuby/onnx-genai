@@ -522,7 +522,9 @@ impl OptimizationPass for CudaL2NormalizeFusion {
             lpnorm.inputs = vec![Some(x)];
             lpnorm.attributes.clear();
             lpnorm.attributes.insert("p".into(), Attribute::Int(2));
-            lpnorm.attributes.insert("axis".into(), Attribute::Int(axis));
+            lpnorm
+                .attributes
+                .insert("axis".into(), Attribute::Int(axis));
             // Private marker: route to the byte-faithful L2-normalize kernel that
             // reproduces the exported chain's intermediate rounding, so greedy
             // decode stays token-identical to the unfused graph.
@@ -4153,13 +4155,9 @@ mod tests {
         let nrm = graph.create_named_value("nrm", dtype, vec![Dim::Static(1), Dim::Static(1)]);
         let output = value(&mut graph, "output", dtype, width);
         graph.add_input(x);
-        let mut rss = Node::new(
-            NodeId(0),
-            "ReduceSumSquare",
-            vec![Some(x)],
-            vec![sq],
-        );
-        rss.attributes.insert("axes".into(), Attribute::Ints(vec![-1]));
+        let mut rss = Node::new(NodeId(0), "ReduceSumSquare", vec![Some(x)], vec![sq]);
+        rss.attributes
+            .insert("axes".into(), Attribute::Ints(vec![-1]));
         rss.attributes.insert("keepdims".into(), Attribute::Int(1));
         graph.insert_node(rss);
         graph.insert_node(Node::new(NodeId(0), "Sqrt", vec![Some(sq)], vec![nrm]));
@@ -4183,7 +4181,11 @@ mod tests {
             .unwrap();
 
         // ReduceSumSquare and Sqrt are gone; a single LpNormalization remains.
-        assert_eq!(graph.num_nodes(), 1, "only the fused LpNormalization remains");
+        assert_eq!(
+            graph.num_nodes(),
+            1,
+            "only the fused LpNormalization remains"
+        );
         assert!(
             graph
                 .nodes
@@ -4196,7 +4198,10 @@ mod tests {
             .values()
             .find(|n| n.op_type == "LpNormalization")
             .expect("Div must be rewritten to LpNormalization");
-        assert!(lp.is_default_domain(), "LpNormalization stays default domain");
+        assert!(
+            lp.is_default_domain(),
+            "LpNormalization stays default domain"
+        );
         assert_eq!(lp.inputs, vec![Some(x)], "reads the pre-norm activation x");
         assert_eq!(lp.outputs, vec![output], "keeps the Div output value");
         assert_eq!(
@@ -4261,10 +4266,7 @@ mod tests {
             .run(&mut graph, &PassContext::new())
             .unwrap();
         assert!(
-            graph
-                .nodes
-                .values()
-                .any(|n| n.op_type == "ReduceSumSquare")
+            graph.nodes.values().any(|n| n.op_type == "ReduceSumSquare")
                 && graph.nodes.values().any(|n| n.op_type == "Sqrt")
                 && graph.nodes.values().any(|n| n.op_type == "Div"),
             "an escaping norm must leave the ReduceSumSquare/Sqrt/Div chain intact"
