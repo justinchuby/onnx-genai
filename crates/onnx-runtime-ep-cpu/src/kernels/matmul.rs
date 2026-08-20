@@ -2994,6 +2994,7 @@ fn half_gemm_tile(
     #[cfg(target_arch = "x86_64")]
     if format == HalfFormat::Bf16 && x86_bf16::native_available() {
         x86_bf16::gemm(a, b, c, m, k, n);
+        count_bf16_native_gemm();
         return;
     }
 
@@ -3132,6 +3133,34 @@ pub(crate) fn half_prefill_gebp_calls() -> u64 {
 #[cfg(all(test, target_arch = "x86_64"))]
 pub(crate) fn reset_half_prefill_gebp_calls() {
     HALF_PREFILL_GEBP_CALLS.with(|c| c.set(0));
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+thread_local! {
+    /// Test-only count of bf16 tiles served by the native AVX-512 BF16
+    /// microkernel. It is the sibling of [`HALF_PREFILL_GEBP_CALLS`]: that
+    /// route and this one are the two a bf16 tile can take on x86-64, and a
+    /// route assertion is only meaningful if *both* can be observed. Without
+    /// this counter a test on an AVX-512 BF16 host can only say "the GEBP did
+    /// not run", which is equally true of a kernel that silently did nothing.
+    static BF16_NATIVE_GEMM_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn count_bf16_native_gemm() {
+    #[cfg(test)]
+    BF16_NATIVE_GEMM_CALLS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+pub(crate) fn bf16_native_gemm_calls() -> u64 {
+    BF16_NATIVE_GEMM_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+pub(crate) fn reset_bf16_native_gemm_calls() {
+    BF16_NATIVE_GEMM_CALLS.with(|c| c.set(0));
 }
 
 #[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
@@ -5410,6 +5439,7 @@ mod tests {
                 let mut out = Owned::zeros_f32(&[m, n]);
 
                 reset_half_prefill_gebp_calls();
+                reset_bf16_native_gemm_calls();
                 let mut kernel = MatMulKernel::default();
                 kernel.set_constant_inputs(&[false, true]);
                 kernel
@@ -5430,7 +5460,35 @@ mod tests {
                     && CpuBackend::auto_detect() == crate::backend::CpuBackend::Mlas;
                 #[cfg(not(feature = "mlas"))]
                 let mlas_claims_this = false;
-                if !mlas_claims_this {
+                // On a host with AVX-512 BF16, `half_gemm_tile` hands bf16 to
+                // the native microkernel and returns before the GEBP is
+                // reached, so the GEBP counter is legitimately 0. That is the
+                // intended ranking -- the native kernel is the better route
+                // where it exists -- and it is the mirror image of the MLAS
+                // case above: which route an opt-in *host* takes, not a
+                // regression. Asserting the GEBP unconditionally makes the
+                // test a statement about the developer's CPU rather than about
+                // the code, and fails on exactly the machines that have the
+                // faster kernel.
+                //
+                // The assertion is not dropped there, it is redirected: each
+                // host asserts the route it is supposed to take, so neither
+                // arm can silently stop running. The numbers below are checked
+                // on every route either way.
+                let bf16_native_claims_this =
+                    dtype == DataType::BFloat16 && x86_bf16::native_available();
+                if bf16_native_claims_this {
+                    assert_eq!(
+                        bf16_native_gemm_calls(),
+                        1,
+                        "{dtype:?} m={m}: an AVX-512 BF16 host did not take the native kernel"
+                    );
+                    assert_eq!(
+                        half_prefill_gebp_calls(),
+                        0,
+                        "{dtype:?} m={m}: both bf16 routes ran"
+                    );
+                } else if !mlas_claims_this {
                     assert_eq!(
                         half_prefill_gebp_calls(),
                         1,
