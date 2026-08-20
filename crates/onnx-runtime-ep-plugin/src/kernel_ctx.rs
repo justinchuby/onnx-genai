@@ -29,6 +29,8 @@ use onnx_genai_ort_sys as ort;
 use onnx_runtime_ep_api::tensor::{DevicePtr, DevicePtrMut, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, DeviceId};
 
+use crate::dim_vec::DimVec;
+
 /// All element types the CPU EP can marshal across the ORT ABI.
 ///
 /// Deckard's `ep.rs` must import this slice (do not copy-paste it) to populate
@@ -65,6 +67,26 @@ pub const CPU_EP_SUPPORTED_DTYPES: &[DataType] = &[
     DataType::BFloat16,
 ];
 
+/// Row-major strides for `shape`, without touching the allocator for an
+/// ordinary rank.
+///
+/// Deliberately not a call to `onnx_runtime_ir::compute_contiguous_strides`:
+/// that one returns a `Vec` and so allocates for every operand of every
+/// dispatch. The arithmetic is identical and pinned to it by
+/// `contiguous_strides_matches_the_ir_crate` below, which is what keeps the
+/// duplication honest.
+fn contiguous_strides(shape: &[usize]) -> DimVec<i64> {
+    let n = shape.len();
+    let mut strides = DimVec::with_capacity(n);
+    for _ in 0..n {
+        strides.push(1i64);
+    }
+    for i in (0..n.saturating_sub(1)).rev() {
+        strides[i] = strides[i + 1] * shape[i + 1] as i64;
+    }
+    strides
+}
+
 /// Validate raw ORT dimensions for a single tensor, converting to `usize` shape.
 ///
 /// Rejects negative dims (fail closed) and detects element-count overflow.
@@ -73,8 +95,8 @@ pub(crate) fn validate_dims(
     dims: &[i64],
     dtype: DataType,
     context: impl std::fmt::Display,
-) -> Result<(Vec<usize>, usize, usize), String> {
-    let mut shape: Vec<usize> = Vec::with_capacity(dims.len());
+) -> Result<(DimVec<usize>, usize, usize), String> {
+    let mut shape: DimVec<usize> = DimVec::with_capacity(dims.len());
     for (dim_idx, &d) in dims.iter().enumerate() {
         if d < 0 {
             return Err(format!(
@@ -108,8 +130,8 @@ pub(crate) fn validate_dims(
 pub(crate) struct OwnedInput {
     pub data_ptr: *const c_void,
     pub dtype: DataType,
-    pub shape: Vec<usize>,
-    pub strides: Vec<i64>,
+    pub shape: DimVec<usize>,
+    pub strides: DimVec<i64>,
 }
 
 impl OwnedInput {
@@ -220,8 +242,8 @@ pub(crate) unsafe fn read_inputs(
             inputs.push(OwnedInput {
                 data_ptr: std::ptr::null(),
                 dtype: DataType::Float32,
-                shape: vec![],
-                strides: vec![],
+                shape: DimVec::new(),
+                strides: DimVec::new(),
             });
             continue;
         }
@@ -230,7 +252,7 @@ pub(crate) unsafe fn read_inputs(
         let mut elem_type: ort::ONNXTensorElementDataType = 0;
         let mut borrowed_dims: *const i64 = std::ptr::null();
         let mut borrowed_ndim: usize = 0;
-        let mut owned_dims: Vec<i64> = Vec::new();
+        let mut owned_dims: DimVec<i64> = DimVec::new();
         let borrowed = match get_type_and_shape_ref {
             Some(get_ref) => {
                 crate::dispatch_probe::ort_call();
@@ -271,8 +293,14 @@ pub(crate) unsafe fn read_inputs(
                     unsafe { release_type_shape(type_shape) };
                     return Err(format!("GetDimensionsCount failed for input {i}"));
                 }
-                crate::dispatch_probe::count(crate::dispatch_probe::Event::DispatchAlloc);
-                owned_dims = vec![0i64; ndim];
+                owned_dims = DimVec::with_capacity(ndim);
+                for _ in 0..ndim {
+                    owned_dims.push(0i64);
+                }
+                crate::dispatch_probe::count_n(
+                    crate::dispatch_probe::Event::DispatchAlloc,
+                    u64::from(ndim > crate::dim_vec::INLINE_RANK),
+                );
                 crate::dispatch_probe::ort_call();
                 let status = unsafe { get_dims(type_shape, owned_dims.as_mut_ptr(), ndim) };
                 if !status.is_null() {
@@ -299,12 +327,18 @@ pub(crate) unsafe fn read_inputs(
             unsafe { std::slice::from_raw_parts(borrowed_dims, borrowed_ndim) }
         };
 
-        // Validate ORT-supplied dims: reject negatives and detect overflow.
-        // Two allocations: `shape` and `strides`. The label is `format_args!`,
-        // which borrows its arguments and formats only if an error is raised.
-        crate::dispatch_probe::count_n(crate::dispatch_probe::Event::DispatchAlloc, 2);
+        // Validate ORT-supplied dims. The label is `format_args!`, which
+        // borrows its arguments and formats only if an error is raised.
+        //
+        // `shape` and `strides` are `DimVec`s, so an ordinary rank costs no
+        // allocation at all; only a tensor of rank > `INLINE_RANK` reaches the
+        // allocator, and then it is charged below.
         let (shape, _, _) = validate_dims(dims, dtype, format_args!("input {i}"))?;
-        let strides = onnx_runtime_ir::compute_contiguous_strides(&shape);
+        let strides = contiguous_strides(&shape);
+        crate::dispatch_probe::count_n(
+            crate::dispatch_probe::Event::DispatchAlloc,
+            u64::from(shape.len() > crate::dim_vec::INLINE_RANK) * 2,
+        );
 
         // Data pointer.
         let mut data: *const c_void = std::ptr::null();
@@ -753,6 +787,62 @@ mod tests {
     /// costs. Gated with the probe, like the other cost pins in this file.
     #[cfg(feature = "dispatch_probe")]
     mod reference_hook_cost {
+
+        /// A rank past [`crate::dim_vec::INLINE_RANK`], where a `DimVec` must
+        /// spill. Every element is 1, so the tensor is still a single f32 and the
+        /// data fake below stays valid.
+        static FAKE_HIGH_RANK_DIMS: [i64; crate::dim_vec::INLINE_RANK + 2] =
+            [1; crate::dim_vec::INLINE_RANK + 2];
+
+        /// # Safety
+        ///
+        /// Matches the ABI ORT expects; all out pointers must be valid.
+        unsafe extern "C" fn high_rank_shape_reference(
+            _value: *const ort::OrtValue,
+            elem_type: *mut ort::ONNXTensorElementDataType,
+            shape_data: *mut *const i64,
+            shape_data_count: *mut usize,
+        ) -> ort::OrtStatusPtr {
+            unsafe {
+                *elem_type = super::ORT_ELEM_FLOAT;
+                *shape_data = FAKE_HIGH_RANK_DIMS.as_ptr();
+                *shape_data_count = FAKE_HIGH_RANK_DIMS.len();
+            }
+            std::ptr::null_mut()
+        }
+
+        /// # Safety
+        ///
+        /// Matches the ABI ORT expects; `out` must be a valid pointer.
+        unsafe extern "C" fn high_rank_dims_count(
+            _info: *const ort::OrtTensorTypeAndShapeInfo,
+            out: *mut usize,
+        ) -> ort::OrtStatusPtr {
+            unsafe { *out = FAKE_HIGH_RANK_DIMS.len() };
+            std::ptr::null_mut()
+        }
+
+        /// # Safety
+        ///
+        /// Matches the ABI ORT expects; `out` must point at `count` writable i64.
+        unsafe extern "C" fn high_rank_dims(
+            _info: *const ort::OrtTensorTypeAndShapeInfo,
+            out: *mut i64,
+            count: usize,
+        ) -> ort::OrtStatusPtr {
+            let n = count.min(FAKE_HIGH_RANK_DIMS.len());
+            unsafe { std::ptr::copy_nonoverlapping(FAKE_HIGH_RANK_DIMS.as_ptr(), out, n) };
+            std::ptr::null_mut()
+        }
+
+        /// An `OrtApi` with both shape routes wired, reporting a rank that spills.
+        fn api_with_both_shape_routes_high_rank() -> ort::OrtApi {
+            let mut api = super::api_with_both_shape_routes();
+            api.GetTensorElementTypeAndShapeDataReference = Some(high_rank_shape_reference);
+            api.GetDimensionsCount = Some(high_rank_dims_count);
+            api.GetDimensions = Some(high_rank_dims);
+            api
+        }
         use super::*;
         use crate::dispatch_probe::{self, Event};
 
@@ -788,12 +878,16 @@ mod tests {
         }
 
         /// The five-call sequence also allocated: `GetDimensionsCount` then a
-        /// `dims` scratch `Vec` sized to the rank, before the shape and strides
-        /// were built from it. Borrowing the dims leaves the scratch with
-        /// nothing to do, so the reference-hook path must allocate strictly
-        /// less than the legacy one for the same input. Pinned as a comparison
-        /// rather than an absolute so it keeps its meaning as both paths
-        /// evolve.
+        /// `dims` scratch sized to the rank, before the shape and strides were
+        /// built from it. Borrowing the dims leaves the scratch with nothing to
+        /// do, so the reference-hook path must allocate strictly less than the
+        /// legacy one **for an input whose rank does not fit inline**.
+        ///
+        /// At ordinary rank neither path allocates at all any more, so the
+        /// comparison is only meaningful once a `DimVec` is forced to spill —
+        /// which is exactly why this test drives a rank of
+        /// `INLINE_RANK + 2`. Pinned as a comparison rather than an absolute
+        /// so it keeps its meaning as both paths evolve.
         #[test]
         fn the_reference_hook_path_allocates_less_than_the_legacy_path() {
             let ctx = std::ptr::dangling_mut::<ort::OrtKernelContext>();
@@ -803,14 +897,14 @@ mod tests {
             // one scope deadlocks (shadowing does not drop the first).
             let _counters = shape_counters_reset();
 
-            let api = api_with_both_shape_routes();
+            let api = api_with_both_shape_routes_high_rank();
             let before = dispatch_probe::snapshot();
             let fast = unsafe { read_inputs(&api, ctx) }.expect("the fake ORT reads successfully");
             let fast_allocs = dispatch_probe::snapshot()
                 .since(&before)
                 .event(Event::DispatchAlloc);
 
-            let mut api = api_with_both_shape_routes();
+            let mut api = api_with_both_shape_routes_high_rank();
             api.GetTensorElementTypeAndShapeDataReference = None;
             let before = dispatch_probe::snapshot();
             let slow = unsafe { read_inputs(&api, ctx) }.expect("the fake ORT reads successfully");
@@ -819,11 +913,48 @@ mod tests {
                 .event(Event::DispatchAlloc);
 
             assert_eq!(fast[0].shape, slow[0].shape, "same input either way");
+            assert_eq!(
+                fast[0].shape.len(),
+                crate::dim_vec::INLINE_RANK + 2,
+                "this test is only meaningful at a rank that spills"
+            );
             assert!(
                 fast_allocs < slow_allocs,
                 "the reference-hook path allocated {fast_allocs}, the legacy path \
                  {slow_allocs}; borrowing the dims must skip the rank-sized scratch"
             );
+        }
+
+        /// The other half of the claim above: at an ordinary rank the input
+        /// path must not touch the allocator on *either* route. This is the
+        /// assertion that would fail if a `Vec` crept back into the per-operand
+        /// path, and the one the depth grid actually feels.
+        #[test]
+        fn neither_shape_route_allocates_at_an_ordinary_rank() {
+            let ctx = std::ptr::dangling_mut::<ort::OrtKernelContext>();
+            let _counters = shape_counters_reset();
+
+            for (label, mut api) in [
+                ("reference hook", api_with_both_shape_routes()),
+                ("five-call legacy", api_with_both_shape_routes()),
+            ] {
+                if label == "five-call legacy" {
+                    api.GetTensorElementTypeAndShapeDataReference = None;
+                }
+                let before = dispatch_probe::snapshot();
+                let inputs = unsafe { read_inputs(&api, ctx) }.expect("the fake ORT reads");
+                let allocs = dispatch_probe::snapshot()
+                    .since(&before)
+                    .event(Event::DispatchAlloc);
+                assert!(
+                    inputs[0].shape.len() <= crate::dim_vec::INLINE_RANK,
+                    "{label}: the fake must report an ordinary rank"
+                );
+                assert_eq!(
+                    allocs, 1,
+                    "{label}: only the shared `Vec<OwnedInput>` may allocate"
+                );
+            }
         }
     }
 
@@ -932,8 +1063,8 @@ mod tests {
         let input = OwnedInput {
             data_ptr: data.as_ptr().cast(),
             dtype: DataType::Float32,
-            shape: vec![2, 2],
-            strides: vec![2, 1],
+            shape: DimVec::from([2, 2]),
+            strides: DimVec::from([2, 1]),
         };
         let view = input.view();
         assert_eq!(view.shape, &[2, 2]);
@@ -960,8 +1091,8 @@ mod tests {
         let input = OwnedInput {
             data_ptr: std::ptr::null(),
             dtype: DataType::Float32,
-            shape: vec![],
-            strides: vec![],
+            shape: DimVec::new(),
+            strides: DimVec::new(),
         };
         let view = input.view();
         assert_eq!(view.shape, &[] as &[usize]);
@@ -1280,29 +1411,35 @@ mod dispatch_cost {
         );
     }
 
-    /// One input costs four heap allocations: the `Vec<OwnedInput>` once per
-    /// `Run`, then per input the `dims` scratch, `shape`, and `strides`.
+    /// One input of ordinary rank costs **one** heap allocation: the
+    /// `Vec<OwnedInput>`, once per `Run`. Nothing per input at all.
     ///
-    /// It was five until the error label stopped being built eagerly. That is
-    /// the counter earning its keep: the improvement is visible as a number
-    /// changing in a test, not as a claim in a commit message.
+    /// It was five, then four when the error label stopped being built
+    /// eagerly, and now one: `dims`, `shape` and `strides` are [`DimVec`]s
+    /// that keep an ordinary rank in the value itself. That is the counter
+    /// earning its keep — the improvement is a number changing in a test, not
+    /// a claim in a commit message.
     #[test]
-    fn reading_one_input_costs_exactly_four_allocations() {
+    fn reading_one_input_of_ordinary_rank_costs_exactly_one_allocation() {
         let api = fake_api();
         let before = dispatch_probe::snapshot();
         let _ = unsafe { read_inputs(&api, std::ptr::null_mut()) }.expect("fake api is total");
         let d = dispatch_probe::snapshot().since(&before);
         assert_eq!(
             d.event(Event::DispatchAlloc),
-            1 + 3,
+            1,
             "allocations on the per-Run input path changed"
         );
     }
 
-    /// The costs above must be *per input*, not amortised — three inputs cost
-    /// three times the per-input work plus the single shared `Vec`. This is
-    /// what makes the counters usable as a model rather than a single data
-    /// point.
+    /// The FFI cost must be *per input*, not amortised — three inputs cost
+    /// three times the per-input round trips plus the single shared `Vec`.
+    /// This is what makes the counters usable as a model rather than a single
+    /// data point.
+    ///
+    /// Allocations no longer scale with the input count at ordinary rank,
+    /// which is the whole change: the assertion below is the one that would
+    /// catch a regression back to a `Vec` per operand.
     #[test]
     fn per_input_cost_scales_linearly() {
         unsafe extern "C" fn three(
@@ -1321,7 +1458,12 @@ mod dispatch_cost {
 
         assert_eq!(inputs.len(), 3);
         assert_eq!(d.event(Event::OrtFfiCall), 1 + 3 * 7);
-        assert_eq!(d.event(Event::DispatchAlloc), 1 + 3 * 3);
+        assert_eq!(
+            d.event(Event::DispatchAlloc),
+            1,
+            "the per-input allocations are gone; only the shared `Vec` is left, \
+             and it must not start scaling with the input count"
+        );
     }
 
     /// An absent optional input short-circuits: ORT hands back a null value and
