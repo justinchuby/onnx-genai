@@ -64,7 +64,14 @@ BLOCK_SIZE = 32
 
 
 def build_matmul_nbits(
-    path: Path, *, tokens: int, k: int, n: int, bits: int = 4, block_size: int = BLOCK_SIZE
+    path: Path,
+    *,
+    tokens: int,
+    k: int,
+    n: int,
+    bits: int = 4,
+    block_size: int = BLOCK_SIZE,
+    accuracy_level: int = 0,
 ) -> None:
     blocks = (k + block_size - 1) // block_size
     # One byte holds two 4-bit weights, or one 8-bit weight.
@@ -86,7 +93,7 @@ def build_matmul_nbits(
         N=n,
         bits=bits,
         block_size=block_size,
-        accuracy_level=0,
+        accuracy_level=accuracy_level,
     )
     graph = helper.make_graph(
         [node],
@@ -129,6 +136,7 @@ def main(
     out: Path,
     block_size: int = BLOCK_SIZE,
     tokens_list: tuple[int, ...] = NBITS_TOKENS,
+    accuracy_level: int = 0,
 ) -> None:
     out.mkdir(parents=True, exist_ok=True)
     made = []
@@ -137,13 +145,26 @@ def main(
     # column-blocked kernels reject routes on
     # `INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED` instead of the size-aware pair.
     tag = "" if block_size == BLOCK_SIZE else f"_b{block_size}"
+    # `accuracy_level` selects the ONNX compute type, and the EP gates every
+    # reduced-precision activation route on it (`accuracy_level >= 2`). Pinned
+    # at 0 this generator could only ever emit CompFp32 models, so no A/B cell
+    # could reach those routes at all -- they were unmeasurable, not merely
+    # unmeasured.
+    if accuracy_level:
+        tag += f"_a{accuracy_level}"
     for bits in (4, 8):
         stem = "nbits" if bits == 4 else "nbits8"
         for name, (k, n) in NBITS_SHAPES.items():
             for tokens in tokens_list:
                 path = out / f"gemm_{stem}{tag}_{name}_t{tokens}.onnx"
                 build_matmul_nbits(
-                    path, tokens=tokens, k=k, n=n, bits=bits, block_size=block_size
+                    path,
+                    tokens=tokens,
+                    k=k,
+                    n=n,
+                    bits=bits,
+                    block_size=block_size,
+                    accuracy_level=accuracy_level,
                 )
                 made.append(path)
     if tag:
@@ -179,9 +200,20 @@ if __name__ == "__main__":
         "straddles every int4 prefill row gate (they sit at 2..6), so those "
         "retunes are invisible to it; pass the rows explicitly to measure one",
     )
+    ap.add_argument(
+        "--accuracy-level",
+        type=int,
+        default=0,
+        help=(
+            "MatMulNBits accuracy_level (ONNX compute type). The EP allows a "
+            "reduced-precision activation only at >= 2, so the default of 0 "
+            "makes every int16/int8-activation route unreachable -- pass 4 to "
+            "measure them"
+        ),
+    )
     args = ap.parse_args()
     # MatMulNBits requires a power-of-two block size of at least 16; emitting
     # anything else produces a graph that is invalid rather than interesting.
     if args.block_size < 16 or args.block_size & (args.block_size - 1):
         ap.error("--block-size must be a power of two >= 16")
-    main(args.out, args.block_size, tuple(args.tokens))
+    main(args.out, args.block_size, tuple(args.tokens), args.accuracy_level)
