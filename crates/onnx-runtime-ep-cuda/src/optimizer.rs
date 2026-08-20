@@ -3727,6 +3727,36 @@ mod tests {
     use crate::test_support::EnvVarGuard;
     use onnx_runtime_ir::{Dim, Node, NodeId, ValueId};
 
+    /// Falsifiable guard against re-introducing the parallel-test env race this
+    /// module was fixed for: every environment mutation in `optimizer.rs` must go
+    /// through [`EnvVarGuard`] (which serialises on a process-global lock and
+    /// restores on drop), never a bare `std::env` setter. If a future edit adds a
+    /// direct `set_var`/`remove_var` here, this test fails at once instead of the
+    /// flake resurfacing under the parallel harness.
+    ///
+    /// The needles are assembled from fragments so this assertion never matches
+    /// itself. Production code in this file only *reads* the environment
+    /// (`env::var`/`env::var_os`), which is race-free, so a zero-mutation source
+    /// is the correct invariant.
+    #[test]
+    fn optimizer_source_routes_all_env_mutation_through_guard() {
+        let src = include_str!("optimizer.rs");
+        let set_needle = format!("env::{}", ["set", "_var"].concat());
+        let remove_needle = format!("env::{}", ["remove", "_var"].concat());
+        assert!(
+            !src.contains(&set_needle),
+            "found a direct `env::{}` in optimizer.rs; route it through \
+             EnvVarGuard (test_support) so it cannot race parallel tests",
+            ["set", "_var"].concat()
+        );
+        assert!(
+            !src.contains(&remove_needle),
+            "found a direct `env::{}` in optimizer.rs; route it through \
+             EnvVarGuard (test_support) so it cannot race parallel tests",
+            ["remove", "_var"].concat()
+        );
+    }
+
     fn value(graph: &mut Graph, name: &str, dtype: DataType, width: usize) -> ValueId {
         graph.create_named_value(name, dtype, vec![Dim::Static(1), Dim::Static(width)])
     }
