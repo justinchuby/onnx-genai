@@ -6157,47 +6157,6 @@ mod tests {
         });
     }
 
-    /// The take-and-return shape this replaced returned the scratch with a call
-    /// at the end of the `Run`, which every early `return` above it skipped --
-    /// so a failing `Run` left the next one to allocate again. The guard makes
-    /// the return unconditional.
-    ///
-    /// Falsifier: move the recycle out of `ScratchGuard::drop` and back to a
-    /// call at the end of `with_run_scratch`'s success path, and the capacity
-    /// assertion here fails.
-    #[test]
-    fn an_early_return_still_gives_the_scratch_back() {
-        let cap = with_run_scratch(|scratch| {
-            for _ in 0..SCRATCH_MAX_CAPACITY {
-                scratch.inputs.push(dummy_owned_input());
-            }
-            scratch.inputs.capacity()
-        });
-        assert!(cap > 4);
-
-        // A body that leaves early, the way a `fail_status` return does.
-        with_run_scratch(|scratch| {
-            scratch.inputs.push(dummy_owned_input());
-            if scratch.inputs.len() == 1 {
-                return;
-            }
-            unreachable!("the early return must be the path taken");
-        });
-
-        with_run_scratch(|scratch| {
-            assert!(
-                scratch.inputs.is_empty(),
-                "an early return parked {} live inputs",
-                scratch.inputs.len()
-            );
-            assert!(
-                scratch.inputs.capacity() >= cap,
-                "an early return threw the capacity away: {} vs {cap}",
-                scratch.inputs.capacity()
-            );
-        });
-    }
-
     #[test]
     fn run_scratch_does_not_pin_a_pathological_input_capacity() {
         with_run_scratch(|scratch| {
@@ -6404,6 +6363,14 @@ mod tests {
     /// borrowed rather than moved out, so this is the guard's `Drop` running
     /// during the unwind -- not a side effect of dropping an owned value.
     ///
+    /// This is the **only** test that can tell `ScratchGuard::drop` from a call
+    /// at the end of `with_run_scratch`'s success path, because unwinding is
+    /// the only exit where the two differ. An earlier version of this suite
+    /// also claimed an "early return" test pinned that distinction; it did not,
+    /// and could not -- a `return` out of an `FnOnce` *is* the success path.
+    /// Review caught the false claim. Do not delete this test in favour of one
+    /// that looks like it covers the same ground.
+    ///
     /// Falsifier: clear the scratch at the end of `with_run_scratch` instead of
     /// in `ScratchGuard::drop` and the next borrow finds a live `OwnedInput`.
     #[test]
@@ -6513,6 +6480,27 @@ mod tests {
             body.matches("with_run_scratch(").count(),
             1,
             "compute_execute acquires the scratch more than once per Run"
+        );
+
+        // The recycle must live in the guard's `Drop`, not in the `Run` body.
+        // That is the whole reason an early `return` cannot skip it any more --
+        // and it is a placement no behavioural unit test can observe except
+        // through an unwind, so it is asserted here as well.
+        let drop_impl = prod
+            .split_once("impl Drop for ScratchGuard<'_> {")
+            .expect("ScratchGuard has a Drop impl")
+            .1;
+        assert!(
+            drop_impl[..drop_impl.find("\n}").unwrap_or(0)].contains("clear_and_bound()"),
+            "ScratchGuard::drop no longer recycles; an early return or an \
+             unwinding kernel would park a dirty buffer"
+        );
+        assert_eq!(
+            body.matches("clear_and_bound(").count(),
+            0,
+            "compute_execute recycles the scratch itself; a call in the body is \
+             a call every early `return` above it skips, which is exactly the \
+             defect the guard removed"
         );
     }
 }
