@@ -9827,12 +9827,117 @@ mod tests {
     #[test]
     fn every_probe_perturbing_test_takes_the_dispatch_lock() {
         const SOURCE: &str = include_str!("matmul_nbits.rs");
-        const PERTURBS: [&str; 4] = [
+        // Entry points that reach a probe counter indirectly, through dispatch
+        // rather than by incrementing one themselves. These cannot be derived
+        // from a `fetch_add` and so are still named by hand.
+        const PERTURBS_INDIRECT: [&str; 3] = [
             ".execute(",
-            "kai_sdot_matmul_m1(",
             "try_mlas_sqnbit(",
             "borrowed_int4_prefill_block_enabled(",
         ];
+
+        // Every production function that increments a probe counter, derived
+        // from the source rather than listed by hand.
+        //
+        // This was a hand-written list, and it was wrong twice in a row: it
+        // named `kai_sdot_matmul_m1` but not `int4_matmul_m1` or
+        // `n16_sdot_matmul_m1`, and when those two were added by hand it still
+        // missed `n16_sdot_u8_i16_matmul_m1` -- a *second* incrementer of the
+        // same counter, which no substring of the first one matches. Each
+        // omission was invisible because a perturber only matters once
+        // something observes what it perturbs, so the guard stayed green while
+        // the hole stayed open.
+        //
+        // Deriving the set makes that failure mode structural rather than
+        // clerical: a new `fetch_add` on a probe counter joins this list by
+        // existing.
+        let production = SOURCE
+            .split_once("\nmod tests {")
+            .expect("this module defines `mod tests`")
+            .0;
+        let mut derived: Vec<String> = Vec::new();
+        let mut current_fn: Option<String> = None;
+        for line in production.lines() {
+            // Strip modifiers before looking for `fn`. Matching only a bare
+            // `fn ` would be blind to `pub fn`, `unsafe fn`, `const fn` and
+            // friends -- and the SIMD inner kernels next door to the counted
+            // functions (`kai_sdot_matmul_m1_neon_dot`,
+            // `n16_sdot_matmul_m1_neon_dot`, `n16_sdot_u8_i16_matmul_m1_neon_dot`)
+            // are all `unsafe fn`, which makes a counter added inside one of
+            // them the natural next mistake. An unrecognised header does not
+            // merely drop that site: it charges it to whatever function was
+            // last seen, which is worse than missing it because the derived
+            // list still looks populated.
+            let mut header = line.trim_start();
+            while let Some(rest) = [
+                "pub(crate) ",
+                "pub(super) ",
+                "pub ",
+                "unsafe ",
+                "async ",
+                "const ",
+                "extern ",
+            ]
+            .iter()
+            .find_map(|kw| header.strip_prefix(kw))
+            {
+                header = rest;
+            }
+            if let Some(rest) = header.strip_prefix("fn ") {
+                current_fn = Some(
+                    rest.chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect(),
+                );
+            }
+            let code = line.split_once("//").map_or(line, |(code, _)| code);
+            let increments = code.contains("_TEST_CALLS.fetch_add")
+                || code.contains("_TEST_HITS.fetch_add")
+                || code.contains("_TEST_DISPATCHES.fetch_add");
+            if increments {
+                let name = current_fn.as_ref().expect(
+                    "a probe counter is incremented before any recognised `fn` header, so the \
+                     header parser is broken and every attribution below it is charged to the \
+                     wrong function",
+                );
+                let pattern = format!("{name}(");
+                if !derived.contains(&pattern) {
+                    derived.push(pattern);
+                }
+            }
+        }
+        // Pin the whole set, not a floor. "At least N" tolerates exactly the
+        // failure this derivation exists to prevent: one site misattributed to
+        // a neighbouring function keeps the count intact while silently
+        // guarding the wrong name. If this list needs editing, a probe counter
+        // moved -- check that whatever observes it still locks.
+        let mut expected: Vec<String> = [
+            "execute(",
+            "try_int8_prefill_gebp(",
+            "try_mlas_sqnbit(",
+            "with_decode_pool_lazy(",
+            "parallel_output_rows_repeated(",
+            "int4_matmul_m1(",
+            "kai_sdot_matmul_m1(",
+            "n16_sdot_matmul_m1(",
+            "n16_sdot_u8_i16_matmul_m1(",
+        ]
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+        expected.sort();
+        let mut found = derived.clone();
+        found.sort();
+        assert_eq!(
+            found, expected,
+            "the set of functions incrementing a dispatch-probe counter changed; each one must \
+             stay reachable-checked, so update this list deliberately rather than loosening it"
+        );
+        let perturb_patterns: Vec<&str> = PERTURBS_INDIRECT
+            .iter()
+            .copied()
+            .chain(derived.iter().map(String::as_str))
+            .collect();
 
         // (name, is_test, body) for every fn declared in the tests module.
         let tests_module = SOURCE
@@ -9889,7 +9994,28 @@ mod tests {
             .map(|(name, is_test, body)| (name.clone(), *is_test, code_of(body)))
             .collect();
 
-        let perturbs = |body: &str| PERTURBS.iter().any(|pattern| body.contains(pattern));
+        // A body perturbs a counter if it calls something that moves one, or
+        // if it moves one itself. The call-based half alone would miss a test
+        // that pokes a counter directly instead of going through a dispatch
+        // function -- two such tests exist, and they happen to lock today, so
+        // the gap is latent rather than live. Close it anyway: "happens to be
+        // correct" is what the hand-maintained list was.
+        let touches_counter_directly = |body: &str| {
+            ["_TEST_CALLS", "_TEST_HITS", "_TEST_DISPATCHES"]
+                .iter()
+                .any(|counter| {
+                    body.match_indices(counter).any(|(at, _)| {
+                        let rest = &body[at..];
+                        rest.contains(".fetch_add") || rest.contains(".store(")
+                    })
+                })
+        };
+        let perturbs = |body: &str| {
+            perturb_patterns
+                .iter()
+                .any(|pattern| body.contains(pattern))
+                || touches_counter_directly(body)
+        };
         // Helpers reach counters through helpers too, so close the set rather
         // than looking one level deep -- a two-level chain would otherwise slip
         // through exactly the check that is supposed to prevent it.
@@ -11817,6 +11943,7 @@ mod tests {
 
     #[test]
     fn n16_sdot_int4_block128_asymmetric_matches_int8_and_f32_reference() {
+        let _probe = lock_dispatch_probe();
         for &(k, n) in &[
             (1024usize, 1024usize),
             (1024, 3072),
@@ -11868,6 +11995,7 @@ mod tests {
                 block_size,
             );
             let mut n16_out = vec![0.0f32; n];
+            let before_n16 = N16_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed);
             n16_sdot_matmul_m1(
                 &activations,
                 &n16,
@@ -11897,6 +12025,13 @@ mod tests {
                 DotKernel::Scalar,
             );
             assert_close(&n16_out, &int8_out);
+            // Positive proof the counter is wired, which the dispatch-side
+            // equality in the route test cannot give on a lane where the
+            // route is excluded.
+            assert!(
+                N16_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed) > before_n16,
+                "n16_sdot_matmul_m1 must increment its own counter when it runs"
+            );
 
             let dequantized =
                 dequantize_reference(&packed, &scales, Some(&zero_points), n, k, block_size);
@@ -11991,6 +12126,101 @@ mod tests {
             let expected = reference(&activations, &dequantized, 1, k, n);
             assert_qai8dxp_close(&selected, &expected);
         }
+    }
+
+    /// `INT4_DIRECT_M1_TEST_CALLS` and `N16_SDOT_M1_TEST_CALLS` instrument the
+    /// two non-KAI arms of the int4-direct `m = 1` chain. Until
+    /// `check_dispatch_reachability.py` learned the `TEST_CALLS` suffix neither
+    /// had any test reading it: three `fetch_add` sites incrementing into the
+    /// void, on a route that is the default int4 decode path wherever VNNI is
+    /// present. The counters read as coverage and enforced nothing.
+    ///
+    /// The assertion is an equality against the route predicate rather than a
+    /// bare `assert!(reached)`, so it is a real test on every lane: on a
+    /// non-VNNI x86_64 host it proves the route is *excluded* (and that the
+    /// answer is still correct without it), and on a VNNI or aarch64 host it
+    /// proves the route is taken.
+    #[test]
+    fn int4_direct_m1_counters_track_their_dispatch_predicates() {
+        let _probe = lock_dispatch_probe();
+        let (k, n, block_size) = (128usize, 16usize, 32usize);
+        let blocks = k.div_ceil(block_size);
+        let activations: Vec<f32> = (0..k)
+            .map(|i| ((i * 17 % 127) as f32 - 63.0) / 50.0)
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 31 % 251) as f32 - 125.0) / 50.0)
+            .collect();
+        // Symmetric: the x86_64 int4-direct route refuses zero points.
+        let (packed, scales_values, zero_points, dequantized) =
+            quantize(&weights, n, k, block_size, false);
+        assert!(
+            zero_points.is_none(),
+            "symmetric quantization must not emit zero points"
+        );
+        let expected = reference(&activations, &dequantized, 1, k, n);
+
+        let dot = selected_dot_kernel();
+        let direct = dot.supports_int4_direct(block_size, false);
+        let expect_kai = direct && dot.uses_kai_sdot_direct(4, block_size);
+        let expect_n16 = direct && !expect_kai && dot.uses_n16_sdot_direct();
+        let expect_plain = direct && !expect_kai && !expect_n16;
+
+        let kernel = accuracy4_kernel(k, n, block_size);
+        let a = Owned::f32(&[1, k], &activations);
+        let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
+        let scales = Owned::f32(&[n, blocks], &scales_values);
+        let mut y = Owned::zeros_f32(&[1, n]);
+
+        let before_plain = INT4_DIRECT_M1_TEST_CALLS.load(Ordering::Relaxed);
+        let before_n16 = N16_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed);
+        kernel
+            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .unwrap();
+        let reached_plain = INT4_DIRECT_M1_TEST_CALLS.load(Ordering::Relaxed) > before_plain;
+        let reached_n16 = N16_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed) > before_n16;
+
+        assert_eq!(
+            reached_plain, expect_plain,
+            "int4_matmul_m1 must run exactly when the int4-direct chain falls \
+             through to it (direct={direct} kai={expect_kai} n16={expect_n16})"
+        );
+        assert_eq!(
+            reached_n16, expect_n16,
+            "n16_sdot_matmul_m1 must run exactly when uses_n16_sdot_direct() \
+             selects it (direct={direct})"
+        );
+
+        // Whichever arm ran, the answer is the same one. `accuracy_level = 4`
+        // quantizes the activation to int8, so this is the tolerance the rest
+        // of that path's tests use, not an fp32 one.
+        assert_qai8dxp_close(&y.to_f32(), &expected);
+
+        // On a lane where the route is excluded, both equalities above are
+        // `false == false`, which cannot tell "route correctly excluded" apart
+        // from "counter never wired". Call the kernel directly to prove the
+        // instrumentation actually fires -- that is the difference between a
+        // reachability test and a comment.
+        let mut direct_result = vec![0.0f32; n];
+        let weight = PackedInt4Weight {
+            values: packed.clone(),
+            scales: scales_values.clone(),
+        };
+        let before_direct = INT4_DIRECT_M1_TEST_CALLS.load(Ordering::Relaxed);
+        int4_matmul_m1(
+            &activations,
+            &weight,
+            &mut direct_result,
+            k,
+            n,
+            block_size,
+            dot,
+        );
+        assert!(
+            INT4_DIRECT_M1_TEST_CALLS.load(Ordering::Relaxed) > before_direct,
+            "int4_matmul_m1 must increment its own counter when it runs"
+        );
+        assert_qai8dxp_close(&direct_result, &expected);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -12235,6 +12465,7 @@ mod tests {
 
     #[test]
     fn matmulnbits_direct_int4_gemv_matches_int8_reference() {
+        let _probe = lock_dispatch_probe();
         let (k, n, block_size) = (77usize, 9usize, 32usize);
         let blocks = k.div_ceil(block_size);
         let padded_k = blocks * block_size;
@@ -12364,6 +12595,7 @@ mod tests {
     /// dequantized-f32 oracle, and must be materially better than per-row.
     #[test]
     fn matmulnbits_compint8_per_block_activation_tracks_dequant_f32_oracle() {
+        let _probe = lock_dispatch_probe();
         let (k, n, block_size) = (256usize, 8usize, 32usize);
         let blocks = k.div_ceil(block_size);
 
@@ -12454,6 +12686,7 @@ mod tests {
     /// the output magnitude) so a passing argmax is a real accuracy result.
     #[test]
     fn matmulnbits_compint8_argmax_matches_dequant_f32_oracle_at_near_tie() {
+        let _probe = lock_dispatch_probe();
         let (k, n, block_size) = (128usize, 2usize, 32usize);
         let mut checked = 0usize;
         for seed in 1..=400u32 {
@@ -12529,6 +12762,7 @@ mod tests {
     /// exactly this greedy-token divergence, and this test would catch it.
     #[test]
     fn int4_decode_preserves_f32_argmax_where_per_row_int8_activation_flips() {
+        let _probe = lock_dispatch_probe();
         let (k, n, block_size) = (128usize, 2usize, 32usize);
         let mut near_ties = 0usize;
         let mut per_row_flips = 0usize;
@@ -12739,6 +12973,7 @@ mod tests {
 
     #[test]
     fn n16_sdot_bits8_block128_asymmetric_matches_i16_and_f32_reference() {
+        let _probe = lock_dispatch_probe();
         for &(k, n) in &[
             (1024usize, 1024usize),
             (1024, 3072),
@@ -14608,6 +14843,7 @@ mod tests {
 
     #[test]
     fn matmulnbits_direct_int4_parallel_partial_k_matches_serial() {
+        let _probe = lock_dispatch_probe();
         let (k, n, block_size) = (77usize, 1025usize, 32usize);
         let blocks = k.div_ceil(block_size);
         let activations: Vec<f32> = (0..k)
@@ -17207,6 +17443,7 @@ mod tests {
 
     #[test]
     fn spmd_real_int4_parity_subprocess() {
+        let _probe = lock_dispatch_probe();
         let Ok(mode) = std::env::var(SPMD_PARITY_CHILD_ENV) else {
             return;
         };
@@ -18473,6 +18710,7 @@ mod tests {
     #[test]
     #[ignore = "perf probe; run explicitly with --ignored --nocapture"]
     fn matmulnbits_mlas_perf() {
+        let _probe = lock_dispatch_probe();
         use std::time::Instant;
 
         fn time<F: FnMut() + Send>(threads: usize, mut run: F) -> f64 {
@@ -18740,6 +18978,7 @@ mod tests {
     #[test]
     #[ignore = "perf probe; run explicitly with --ignored --nocapture"]
     fn int4_gemv_decode_microbench() {
+        let _probe = lock_dispatch_probe();
         use std::time::Instant;
 
         // Median-of-5 ns/call for one warm, L3-resident M=1 GEMV.
@@ -18859,6 +19098,7 @@ mod tests {
     #[test]
     #[ignore = "perf probe; run explicitly with --ignored --nocapture"]
     fn matmulnbits_mlas_decode_step() {
+        let _probe = lock_dispatch_probe();
         use std::time::Instant;
 
         // (K, N, count-per-token) for one Qwen2.5-Coder-7B decode step.
@@ -19469,6 +19709,7 @@ mod tests {
     /// guarantee as the task-runtime path.
     #[test]
     fn parallel_output_rows_repeated_covers_every_output_on_the_wide_path() {
+        let _probe = lock_dispatch_probe();
         use std::sync::atomic::{AtomicU32, Ordering};
 
         let (n, k) = (4096usize, 1024usize);
