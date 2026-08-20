@@ -261,6 +261,21 @@ unsafe fn widen_bf16_neon(source: &[u16], destination: &mut [f32]) {
     widen_scalar::<Bf16>(&source[index..], &mut destination[index..]);
 }
 
+/// Widen a contiguous run of 16-bit floats into `f32`, using whichever vector
+/// conversion the host supports.
+///
+/// Exposed so sibling kernels that pack their own panels (the x86 fused
+/// widen-pack prefill GEBP) convert exactly as this module does, keeping the
+/// two paths numerically identical.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub(crate) fn widen_contiguous(format: HalfFormat, source: &[u16], destination: &mut [f32]) {
+    let path = selected_execution_path();
+    match format {
+        HalfFormat::F16 => F16::pack_contiguous(source, destination, path),
+        HalfFormat::Bf16 => Bf16::pack_contiguous(source, destination, path),
+    }
+}
+
 /// Compute `c[m,n] = a[m,k] @ b[k,n]` with `f32` accumulation.
 ///
 /// `a` and `b` contain raw `f16` or `bf16` bit patterns selected by `format`.

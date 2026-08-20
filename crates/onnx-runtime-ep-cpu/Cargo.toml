@@ -85,6 +85,10 @@ criterion = "0.5"
 onnx-runtime-operator-selection = { workspace = true }
 
 [[bench]]
+name = "half_prefill_route_ab"
+harness = false
+
+[[bench]]
 name = "int4_prefill_route_ab"
 harness = false
 
