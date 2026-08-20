@@ -8,11 +8,19 @@
 //! prefill, where every packed panel of `B` is reused across `MR` rows of `A`.
 //!
 //! At `M == 1` there is no reuse: each weight element is touched exactly once,
-//! so the kernel is purely memory-bound and every cycle spent packing is
-//! wasted.  Apple hosts already dodge this — `matmul` checks a NEON f16 GEMV
-//! *before* `try_matmul_half`, and the comment there records that the blocked
-//! GEMM is "~4x slower than the bandwidth-optimal NEON GEMV at M=1 decode
-//! shapes".  x86 had no such path and fell into the blocked kernel.
+//! so there is no arithmetic to amortise the packing against and every cycle
+//! spent packing is wasted.  Apple hosts already dodge this — `matmul` checks a
+//! NEON f16 GEMV *before* `try_matmul_half`, and the comment there records that
+//! the blocked GEMM is "~4x slower than the bandwidth-optimal NEON GEMV at M=1
+//! decode shapes".  x86 had no such path and fell into the blocked kernel.
+//!
+//! Touching each weight once is what makes memory speed the *ceiling*; it does
+//! not on its own put the kernel anywhere near it.  This one originally ran at
+//! 12-47 GB/s against a measured 75.8 GB/s host bandwidth, because accumulating
+//! straight into `acc` cost two more memory operations per FMA than the weight
+//! load itself.  Reaching 79-86% of the roofline took the register tiling
+//! described on [`TILE`].  See
+//! `docs/benchmarks/2026-08-19-f16-decode-gemv-register-tile.md`.
 //!
 //! # Why it reads `B` in `[K, N]` order rather than transposing
 //!
@@ -58,6 +66,28 @@ use std::arch::x86::__m256;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::__m256;
 
+/// Output columns whose accumulators are held in `ymm` registers across the
+/// whole `k` loop.
+///
+/// The point of the tile is what the inner loop *stops* doing. Accumulating
+/// straight into `acc` costs three memory operations per 8-lane FMA — load the
+/// weight, load the accumulator, store it back — so the loop is limited by the
+/// load/store ports rather than by the FMA units, and every FMA also carries a
+/// store-to-load forwarding round trip from the previous `p`. Keeping the
+/// accumulators in registers leaves exactly one memory operation per FMA (the
+/// weight), which is the minimum this problem can have: the weight is read
+/// once and nothing else is touched.
+///
+/// 64 columns is 8 `ymm` accumulators, plus the broadcast activation and the
+/// widened weight, so 10 of 16 architectural registers. It is also 128 bytes,
+/// exactly two cache lines, and `STRIPE` is a multiple of it, so a tile never
+/// straddles a line it does not fully consume.
+///
+/// Tiling does not re-read anything: a stripe's weight is swept once per tile
+/// over `STRIPE / TILE` disjoint column ranges, which is the same `k * STRIPE`
+/// elements in total and the same `n`-element stride between consecutive `p`.
+const TILE: usize = 64;
+
 /// Output columns owned by one worker at a time.
 ///
 /// Must be at least 32 (one 64-byte line holds 32 `f16`) so no fetched line is
@@ -88,7 +118,7 @@ pub(crate) fn simd_available(format: HalfFormat) -> bool {
 ///
 /// # Panics
 /// When `b` is shorter than `k * n`. This is a real check, not a
-/// `debug_assert`: [`stripe_simd`] does unchecked pointer arithmetic derived
+/// `debug_assert`: `stripe_simd_fn!` does unchecked pointer arithmetic derived
 /// from `k`, `n` and `j0`, so a short `b` would be a memory-safety bug rather
 /// than a wrong answer. `k * n` is computed with `checked_mul` so an
 /// overflowing geometry fails closed instead of wrapping to a small bound.
@@ -154,7 +184,7 @@ pub(crate) fn gemv_half_kn(
 /// Reference stripe: `acc[j] = sum_p a[p] * b[p * n + j0 + j]`.
 ///
 /// Accumulates over `p` in increasing order, one element at a time — the same
-/// order [`stripe_simd`] uses within each lane.
+/// order `stripe_simd_fn!` uses within each lane.
 fn stripe_scalar(
     format: HalfFormat,
     a: &[f32],
@@ -381,9 +411,18 @@ fn widen_scalar(format: HalfFormat, bits: u16) -> f32 {
 /// must *not* ask for it, and a generic would either demand the union of both
 /// feature sets or lose the inlining that makes the intrinsics worth using.
 ///
-/// `$widen8` widens 8 contiguous 16-bit weights to `__m256`; `$widen1` does one
-/// element for the tail, using the same fused multiply-add so the last lanes
-/// round identically to the vectorised ones.
+/// `$widen8` widens 8 contiguous 16-bit weights to `__m256`; the scalar tail
+/// uses `widen_scalar($format, ..)` with the same fused multiply-add, so the
+/// last lanes round identically to the vectorised ones.
+///
+/// Column-tiled: each [`TILE`] of output columns keeps its accumulators in
+/// `ymm` for the whole `k` loop and is stored exactly once, so the inner loop
+/// issues one load per FMA instead of a load/FMA/store triple. Within any one
+/// output element the `p` order is still strictly increasing, so this stays
+/// bit-identical to the untiled form and to [`stripe_scalar`] — the tiling
+/// changes which registers hold a partial sum, never the order it is built in.
+/// Every element of `acc` is written exactly once, so unlike [`stripe_scalar`]
+/// there is no zeroing pass.
 macro_rules! stripe_simd_fn {
     ($name:ident, $features:literal, $format:expr, $widen8:expr) => {
         /// # Safety
@@ -401,27 +440,51 @@ macro_rules! stripe_simd_fn {
 
             let widen8: unsafe fn(*const u16) -> __m256 = $widen8;
             let w = acc.len();
-            acc.fill(0.0);
             let ap = a.as_ptr();
             let bp = b.as_ptr();
             let cp = acc.as_mut_ptr();
             unsafe {
-                for p in 0..k {
-                    let avs = *ap.add(p);
-                    let av = _mm256_set1_ps(avs);
-                    let row = bp.add(p * n + j0);
-                    let mut j = 0;
-                    while j + 8 <= w {
-                        let bw = widen8(row.add(j));
-                        let cur = _mm256_loadu_ps(cp.add(j));
-                        _mm256_storeu_ps(cp.add(j), _mm256_fmadd_ps(bw, av, cur));
-                        j += 8;
+                let mut j = 0;
+                // Register-resident tiles: `TILE / 8` accumulators live in
+                // `ymm` across the whole contraction and reach memory once, at
+                // the end.
+                while j + TILE <= w {
+                    let mut sums = [_mm256_setzero_ps(); TILE / 8];
+                    let base = bp.add(j0 + j);
+                    for p in 0..k {
+                        let av = _mm256_set1_ps(*ap.add(p));
+                        let row = base.add(p * n);
+                        for (lane, sum) in sums.iter_mut().enumerate() {
+                            *sum = _mm256_fmadd_ps(widen8(row.add(lane * 8)), av, *sum);
+                        }
                     }
-                    while j < w {
-                        let bv = widen_scalar($format, *row.add(j));
-                        *cp.add(j) = bv.mul_add(avs, *cp.add(j));
-                        j += 1;
+                    for (lane, sum) in sums.iter().enumerate() {
+                        _mm256_storeu_ps(cp.add(j + lane * 8), *sum);
                     }
+                    j += TILE;
+                }
+                // Sub-tile remainder: one register accumulator per 8 columns,
+                // same shape as above, so it is bit-identical to the tiled path.
+                while j + 8 <= w {
+                    let mut sum = _mm256_setzero_ps();
+                    let base = bp.add(j0 + j);
+                    for p in 0..k {
+                        let av = _mm256_set1_ps(*ap.add(p));
+                        sum = _mm256_fmadd_ps(widen8(base.add(p * n)), av, sum);
+                    }
+                    _mm256_storeu_ps(cp.add(j), sum);
+                    j += 8;
+                }
+                // Scalar tail, using the same fused multiply-add so the last
+                // lanes round identically to the vectorised ones.
+                while j < w {
+                    let mut sum = 0.0f32;
+                    let base = bp.add(j0 + j);
+                    for p in 0..k {
+                        sum = widen_scalar($format, *base.add(p * n)).mul_add(*ap.add(p), sum);
+                    }
+                    *cp.add(j) = sum;
+                    j += 1;
                 }
             }
         }
@@ -594,6 +657,77 @@ mod tests {
     }
 
     #[test]
+    fn stripe_widths_around_the_tile_boundary_are_exact() {
+        // The register-tiled path runs in `TILE`-column blocks, then 8-lane
+        // blocks, then scalars, so every width class and every boundary
+        // between them has to land on the same bits. Sweeping a contiguous
+        // range rather than picked widths is what makes an off-by-one in the
+        // tile loop's `j + TILE <= w` bound impossible to miss. The top width
+        // is two whole tiles plus one 8-lane block plus one scalar, so the
+        // sweep ends having exercised all three in a single call.
+        //
+        // Both formats: the tiling lives in `stripe_simd_fn!`, so it is
+        // instantiated once per widening kernel and each instance has to be
+        // checked against its own scalar reference.
+        let k = 11;
+        let n = 300;
+        let a = sample(k, 41);
+        let raw = sample(k * n, 43);
+        let mut checked = 0usize;
+        for format in [HalfFormat::F16, HalfFormat::Bf16] {
+            if !simd_available(format) {
+                continue;
+            }
+            let b = halfv(format, &raw);
+            for w in 1..=(2 * TILE + 9) {
+                for j0 in [0usize, 8, 64, 67] {
+                    assert!(j0 + w <= n, "the sweep must not skip j0={j0} w={w}");
+                    let mut scalar = vec![f32::NAN; w];
+                    stripe_scalar(format, &a, &b, &mut scalar, j0, k, n);
+                    let mut simd = vec![f32::NAN; w];
+                    // SAFETY: `simd_available(format)` checked above, and it
+                    // confirms exactly the features the selected kernel
+                    // declares; `j0 + w <= n` is asserted, and `b` holds
+                    // `k * n` elements.
+                    unsafe {
+                        match format {
+                            HalfFormat::F16 => stripe_simd_f16(&a, &b, &mut simd, j0, k, n),
+                            HalfFormat::Bf16 => stripe_simd_bf16(&a, &b, &mut simd, j0, k, n),
+                        }
+                    };
+                    assert_eq!(
+                        bits(&simd),
+                        bits(&scalar),
+                        "{format:?} stripe j0={j0} w={w}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        if simd_available(HalfFormat::F16) {
+            assert_eq!(checked, 8 * (2 * TILE + 9), "the sweep silently shrank");
+        }
+    }
+
+    #[test]
+    fn a_tile_never_straddles_a_stripe() {
+        // `TILE`'s doc comment rests on this: a tile is two whole cache lines
+        // and a stripe is a whole number of tiles, so no tile boundary can
+        // split a line the kernel has already paid to fetch.
+        assert_eq!(
+            STRIPE % TILE,
+            0,
+            "STRIPE={STRIPE} must be a whole number of TILE={TILE} blocks"
+        );
+        assert_eq!(TILE % 8, 0, "a tile must be a whole number of 8-lane steps");
+        assert_eq!(
+            (TILE * size_of::<u16>()) % 64,
+            0,
+            "a tile must be a whole number of 64-byte cache lines"
+        );
+    }
+
+    #[test]
     fn results_do_not_depend_on_the_thread_count() {
         // Above PARALLEL_MIN_WORK the stripes are split across rayon workers.
         // Each output element is still owned by exactly one worker and summed
@@ -645,7 +779,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "operands are too small")]
     fn a_short_weight_panics_rather_than_reading_out_of_bounds() {
-        // `stripe_simd` derives raw pointers from `k`, `n` and `j0`, so a
+        // `stripe_simd_fn!` derives raw pointers from `k`, `n` and `j0`, so a
         // short `b` must fail closed in release too -- not just under
         // `debug_assert`.
         let mut out = vec![0.0f32; 4];
