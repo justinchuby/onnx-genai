@@ -2110,8 +2110,10 @@ fn rmsnorm_fusion_disabled() -> bool {
 /// are handled by [`fusion_benefit_is_positive`] instead of here:
 /// * **Batch.** At **M>=2** the fold makes the gate/up node capture-safe and
 ///   collapses the batch-decode CUDA-graph segmentation (25 -> 1 segments),
-///   saving ~20 ms/step — dwarfing the M=1 prologue cost. This is a *structural*,
-///   byte-identical win independent of hidden width. The optimizer cannot see M
+///   saving ~20 ms/step — dwarfing the M=1 prologue cost. This is a *structural*
+///   win independent of hidden width. It changes the fp16 reduction order (not
+///   bit-identical — see [`CudaSkipRmsNormMatMulFusion`]) but preserves greedy
+///   tokens except at rare argmax near-ties. The optimizer cannot see M
 ///   (the decode graph is shared across all batch sizes; batch dims are
 ///   symbolic), so M cannot gate the fold per-step — see the note in
 ///   [`fusion_benefit_is_positive`].
@@ -2167,8 +2169,9 @@ fn derived_min_hidden(sm_count: u32) -> usize {
 /// own: **batched decode of a small model on a large GPU**, where the SM-derived
 /// floor stays high (protecting M=1) but M>=2 would benefit from folding, and the
 /// optimizer cannot see M to decide automatically. Lower it (e.g. to the model's
-/// hidden size) when serving such a workload; the fold is byte-identical, so
-/// tokens are unchanged.
+/// hidden size) when serving such a workload. The fold changes the fp16 reduction
+/// order (not bit-identical; see [`CudaSkipRmsNormMatMulFusion`]), so greedy
+/// tokens are unchanged except at rare argmax near-ties.
 const RMSNORM_FUSION_MIN_HIDDEN_ENV: &str = "ONNX_GENAI_RMSNORM_MIN_HIDDEN";
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -2210,8 +2213,9 @@ fn env_usize(name: &str, default: usize) -> usize {
 ///   structural win by default on small/edge GPUs*, which is where batching small
 ///   models is most common.
 /// * **Batch-aware — as far as the optimizer can be.** At M>=2 the fold is a
-///   large, byte-identical, *structural* win (segmentation 25 -> 1), independent
-///   of hidden width. Ideally M>=2 would fold unconditionally. **But the
+///   large, *structural* win (segmentation 25 -> 1; a reduction-order change,
+///   not bit-identical), independent of hidden width. Ideally M>=2 would fold
+///   unconditionally. **But the
 ///   optimizer does not know M**: this pass runs once at model-load on a decode
 ///   graph whose batch dimension is symbolic and shared across every batch size,
 ///   so there is no per-step M to test here. Plumbing M would require a
@@ -2257,8 +2261,19 @@ fn fusion_benefit_is_positive(
 ///
 /// The fusion is gated on exactly the conditions under which the standalone norm
 /// uses `skip_rmsnorm_f16_warp_half4` (dense skip, fp16 input/gamma, no norm
-/// bias, hidden % 128 == 0), so the fused arithmetic is bit-for-bit identical.
-/// Any other shape safely keeps the standalone norm.
+/// bias, hidden % 128 == 0). The residual epilogue is bit-identical
+/// (`fp16(fp16(acc) + residual)` == `skip_rmsnorm`'s `__hadd2`), but folding the
+/// RMS normalization into the following GEMV's prologue **changes the fp16
+/// reduction order, so the fused result is not bit-for-bit identical** to the
+/// standalone norm — at a greedy-argmax near-tie it can flip a token. This was
+/// long claimed to be byte-identical; it is not, and that claim had never been
+/// checked. Measured on qwen0.5B (hidden 896): 1 of 6 sampled prompts flipped one
+/// token (at index 49, a 0.0156-nats gap between the top-2 logits). A CPU-EP
+/// full-prefill oracle over the 60-token prefix put the *folded* token (`448`)
+/// closer to the high-precision reference than the unfused one (`304`) — i.e. the
+/// reorder rounded toward the more accurate result, not away from it, so this is
+/// a reduction-order effect, not a fusion bug. Any other shape safely keeps the
+/// standalone norm.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct CudaSkipRmsNormMatMulFusion {
     /// Device capabilities used to derive the batch-agnostic hidden-size floor
@@ -5993,7 +6008,8 @@ mod tests {
     fn device_aware_gate_folds_small_hidden_on_consumer_gpu() {
         // A fully fusable hidden-896 chain that the H200 floor (and the None
         // fallback) keep unfused, but a 24-SM consumer GPU folds — capturing the
-        // byte-identical M>=2 structural win on the exact small models (#1421).
+        // M>=2 structural win on the exact small models (#1421). The fold changes
+        // the fp16 reduction order (not bit-identical; see the struct docs).
         let hidden = 896;
         let rtx4060 = CudaDeviceCapabilities::for_test((8, 9), 24, 0);
 
