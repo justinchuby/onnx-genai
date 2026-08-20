@@ -126,6 +126,7 @@ edition 的(多数成员是 edition 2024,少数是 2021)。**不要**改用裸�
 later`)。只有 cargo 知道每个包声明的 edition,因此按包驱动检查是唯一正确的
 做法。
 
+<!-- code-parity: allow-divergence -->
 ```bash
 # 只检查你改动过的包(Windows 安全):
 cargo fmt -p onnx-runtime-memory -- --check
