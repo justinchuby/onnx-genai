@@ -1,5 +1,18 @@
 # A decode GEMV for `bf16`, and the weight size where packing beats not packing
 
+> **Partly superseded (2026-08-21).** The `bf16` decode GEMV this record
+> introduced is unchanged and still shipping. Its *second* finding — that
+> `m == 1` decode should hand over to the fused GEBP once
+> `k * n >= HALF_PREFILL_GEBP_MIN_WEIGHT` — was **retired**: re-measured at 8
+> threads and at `k > 2048` the handover is a loss at every shape. The
+> predicates it describes below in the present tense
+> (`half_decode_prefers_gebp`, `half_decode_prefers_gebp_when`) and the tests
+> that pinned them (`no_decode_is_handed_to_the_blocked_gemm`,
+> `switching_off_the_gebp_leaves_decode_on_the_gemv`,
+> `the_decode_handover_tracks_the_gebp_weight_gate`) **no longer exist**;
+> non-batched half decode now takes the GEMV at every weight. See
+> [`2026-08-21-half-decode-gebp-retired.md`](2026-08-21-half-decode-gebp-retired.md).
+
 **Date:** 2026-08-19
 **Host:** AMD EPYC 9V74, 32 vCPU / 16 physical cores, AVX2 + FMA + F16C. No AVX-512, no
 AVX512-BF16, no VNNI, no AMX. Linux, `--release`, default features (no `mlas`).

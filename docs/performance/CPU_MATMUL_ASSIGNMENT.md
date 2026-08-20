@@ -1336,3 +1336,54 @@ asymmetry ever closes so the record gets revisited instead of rotting.
 streaming faster. It must touch fewer bytes per output row or reuse more from cache. Weight byte
 *width* is now excluded as the lever, which is what this experiment bought. Full record:
 [`docs/benchmarks/2026-08-20-int4-nibble-i16-negative.md`](../benchmarks/2026-08-20-int4-nibble-i16-negative.md).
+
+### 14. The half decode's handover to the fused GEBP was measured on one thread count and one `k` (**retired**)
+
+`MatMul` sent every `m == 1` `f16`/`bf16` decode with `k * n >= HALF_PREFILL_GEBP_MIN_WEIGHT`
+(1 048 576) to the fused widen-pack GEBP. `Gemm` did not — its `m == 1` `f16` path stayed on the
+decode GEMV at every weight. That is the divergence #1381 recorded, and the obvious reading was
+that `Gemm` was missing a gate. Re-measured, it was `MatMul` that was carrying a bad one.
+
+**What the original evidence missed.** Its sweep was 32 threads and `k <= 2048`. Run through the
+same production harness (`benches/half_decode_gemv_ab.rs`, arms selected by
+`ONNX_GENAI_CPU_MM_HALF_GEMV/GEBP`, `f32` control divided out) at **8 threads**, the handover is a
+loss at every `full`-set shape at or above the gate (`/ctl` 0.26–0.76) and in 20 of the 22 `f16`
+cells of the `band` set over two independent repetitions (`/ctl` 0.20–1.14) — up to **5.0x**
+slower — with the GEBP's weight bandwidth pinned at 20–34 GB/s independent of shape while the GEMV
+reaches 24–155 GB/s. The two `band` cells that do exceed 1.00 sit *exactly* at the retired
+threshold at `k = 1024` and do not hold across repetitions (1.14 then 0.89). At 32
+threads it is still a loss at every shape a 7B-class decode issues: `k = 4096` qkv/mlp 0.51–0.89,
+a 136M `lm_head` 0.86. The corner it does win — `k = 1024`, 1.05M–4.2M, 32 threads, `/ctl`
+0.95–1.49 — is real but is not a shape any such model emits, and its `k = 2048` rows are not
+reproducible run to run (6.3M measured 1.31 then 0.70 from the same binary).
+
+**Why there was nothing to retune.** The GEBP earns its packing by reusing a `KC x NR` panel of
+`B` across the rows of `A`. At `m == 1`, `m_panels` is 1 — every panel is consumed by exactly one
+microkernel pass, so none of the packing is repaid. Stated where the cost actually lands: the
+widen-pack writes `k*n` `f32` and reads it back, but per strip that is a `bpack` of at most
+`KC * 16 * NR * 4 B` = 256 KiB, which is **L2-resident on this host** and so is not a DRAM story;
+what does reach DRAM is line amplification, because `pack_b_half` walks `B` column-strip-major and
+at the usual one panel per strip touches `NR * 2` = 32 bytes of each 64-byte line, roughly **2x**
+the GEMV's read traffic. The rest is L2 bandwidth, the widening work itself, and a fork/join over
+strips that a single row of `A` cannot amortise. The two axes follow: the pack work per unit of
+reuse rises with `k`, and it can only be overlapped if there are workers to overlap it with, which
+is why the arm collapses at 8 threads and merely loses at 32. A decode-specialised GEBP that skips
+packing `B` **is** the GEMV, so the finding is structural rather than a threshold.
+
+**Disposition.** `half_decode_prefers_gebp`/`_when` deleted, the `!half_decode_prefers_gebp(..)`
+term removed from `MatMul`'s decode arm, and #1381 closed with `MatMul` adopting `Gemm`'s route
+rather than the reverse — the third time this file records an in-tree gate whose evidence was
+narrower than the region it governed (cf. §11, §12). `HALF_PREFILL_GEBP_MIN_WEIGHT` and
+`half_prefill_gebp_selected` are untouched: they are the **prefill** gate, and they still serve a
+*batched* `m == 1` half MatMul, which the non-batched GEMV declines and whose only alternative is
+the row-blocked half GEMM at 16x–21x. Coverage was repaired in the same change:
+`PROBE_SHAPE=band` puts 11 rows immediately below, at and above the retired threshold at three
+different `k`, so a `k`-dependent effect cannot hide inside a `k * n` gate again, and the pins are
+by execution (`no_half_decode_is_diverted_off_the_gemv_on_weight`,
+`gemm_and_matmul_take_the_same_decode_route`) rather than by asking a predicate — the predicate is
+what was deleted. Full record:
+[`docs/benchmarks/2026-08-21-half-decode-gebp-retired.md`](../benchmarks/2026-08-21-half-decode-gebp-retired.md).
+
+**Still open here.** `Gemm`'s half fast path remains `f16`-only: `bf16` operands return `None` at
+the dtype check and fall into the portable blocked half GEMM, where `MatMul` serves them from the
+same GEMV. That is a separate, separately mergeable gap.
