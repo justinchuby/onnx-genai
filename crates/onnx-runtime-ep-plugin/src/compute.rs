@@ -26,7 +26,7 @@ use onnx_runtime_ep_api::kernel::{
 use onnx_runtime_ep_api::tensor::{DevicePtr, DevicePtrMut, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, DeviceId, Node};
 
-use crate::kernel_ctx::{allocate_output, read_inputs};
+use crate::kernel_ctx::{allocate_output, read_inputs_into};
 use crate::status::{fail_status, ok_status};
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2540,10 +2540,19 @@ unsafe extern "C" fn compute_execute(
 
         entry_probe.end();
 
-        let inputs = match unsafe { read_inputs(api_ref, kernel_context) } {
-            Ok(v) => v,
-            Err(e) => return fail_status(&format!("Compute: {e}")),
-        };
+        // One thread-local resolution for the whole `Run`. The output vectors
+        // are not needed until the fast path below, but acquiring them here
+        // costs nothing extra and spares a second `__tls_get_addr`.
+        let mut scratch = take_run_scratch();
+        let RunScratch {
+            inputs,
+            owned: owned_outputs,
+            slots: slot_map,
+        } = &mut scratch;
+        if let Err(e) = unsafe { read_inputs_into(api_ref, kernel_context, inputs) } {
+            return fail_status(&format!("Compute: {e}"));
+        }
+        let inputs = &*inputs;
 
         if let Some(routing) = &exported.routing {
             // ── Routed multi-node path ────────────────────────────────────
@@ -3041,7 +3050,8 @@ unsafe extern "C" fn compute_execute(
             // kernel sees the full output arity and can index by position,
             // while only present slots are allocated through ORT's kernel
             // context (sequential ORT indices).
-            let (mut owned_outputs, mut slot_map) = take_output_scratch(entry.num_outputs);
+            owned_outputs.reserve(entry.num_outputs);
+            slot_map.reserve(entry.num_outputs);
             let mut absent_bufs: Vec<Vec<u8>> = Vec::new();
             // Also record the dtype for each absent slot so the TensorMut
             // matches the kernel's element size.
@@ -3210,7 +3220,6 @@ unsafe extern "C" fn compute_execute(
             // follow its last use. An early `return` above simply skips this and
             // the next `Run` allocates again -- correct, just not reused.
             drop(output_views);
-            recycle_output_scratch(owned_outputs, slot_map);
         } else {
             return fail_status(
                 "Compute: multi-node subgraph requires SubgraphRouting — \
@@ -3218,10 +3227,11 @@ unsafe extern "C" fn compute_execute(
             );
         }
 
-        // Every `TensorView` borrowing `inputs` is out of scope by here, so the
-        // vector can go back for the next `Run` on this thread. An early
-        // `return` skips this and the next `Run` allocates again.
-        recycle_input_scratch(inputs);
+        // Every `TensorView` borrowing the scratch is out of scope by here, so
+        // the whole set can go back for the next `Run` on this thread. An early
+        // `return` skips this and the next `Run` allocates again -- correct,
+        // just not reused.
+        recycle_run_scratch(scratch);
         ok_status()
     }));
     result.unwrap_or_else(|_| fail_status("Compute: internal panic"))
@@ -3237,8 +3247,34 @@ enum SlotKind {
     Absent(usize), // index into absent_bufs
 }
 
+/// The per-`Run` scratch one thread keeps between calls: the input metadata
+/// vector and the two output-bookkeeping vectors, in a single cell.
+///
+/// These were three vectors behind two thread-locals, acquired and returned
+/// independently, which cost four thread-local resolutions per `Run`. Under a
+/// cdylib every one of those is a real `__tls_get_addr` call, not a fixed
+/// offset off `%fs`, because the dynamic TLS model cannot know the module's
+/// offset until load time. Callgrind attributed 72 Ir/`Run` to `__tls_get_addr`
+/// alone and a further 160 to the take/recycle pairs, against a total fixed
+/// excess over ORT of ~1,760 -- so the pooling machinery was spending a third
+/// of what the pooling saved.
+///
+/// One cell means one resolution to take and one to return. The vectors keep
+/// their own capacity bounds (see [`recycle_run_scratch`]); bundling their
+/// storage must not bundle the decision about whether to keep it.
+#[derive(Default)]
+pub(crate) struct RunScratch {
+    /// Input metadata for this `Run`. Cleared on recycle: an `OwnedInput`
+    /// borrows a pointer into an `OrtValue` owned by a call that has finished.
+    inputs: Vec<crate::kernel_ctx::OwnedInput>,
+    /// Output bookkeeping. Cleared on recycle for the same reason.
+    owned: Vec<crate::kernel_ctx::OwnedOutput>,
+    /// Which output slots are ORT-allocated and which are absent scratch.
+    slots: Vec<SlotKind>,
+}
+
 /// Capacity, in elements, above which per-`Run` scratch is dropped instead of
-/// kept. Shared by the input and output scratch.
+/// kept. Applied to each vector on its own.
 ///
 /// A node with a handful of outputs is the case worth optimising; one with
 /// hundreds is not worth pinning that memory on every worker thread for the
@@ -3246,107 +3282,81 @@ enum SlotKind {
 const SCRATCH_MAX_CAPACITY: usize = 16;
 
 thread_local! {
-    /// Reusable per-`Run` output bookkeeping, per thread.
+    /// This thread's parked [`RunScratch`].
     ///
-    /// `Vec::new()` plus one `push` allocates capacity 4 -- 736 bytes for
-    /// `OwnedOutput` -- on every `Run`, and `slot_map` allocated again for a
-    /// handful of bytes. Neither vector outlives the call, so a thread can hand
-    /// the same capacity to the next `Run` instead. Thread-local for the same
-    /// reason as `HOST_INTERMEDIATE_POOL`: `Compute` runs on whichever thread
-    /// ORT calls it from, and sharing would need a lock on the hot path to buy
-    /// nothing.
+    /// Thread-local for the same reason as `HOST_INTERMEDIATE_POOL`: `Compute`
+    /// runs on whichever thread ORT calls it from, and sharing would need a
+    /// lock on the hot path to buy nothing.
     ///
-    /// Both vectors are cleared on **recycle**, not on take, so no `OwnedOutput`
-    /// -- and so no raw pointer into a finished `Run`'s ORT values -- is ever
-    /// retained here between calls.
-    static OUTPUT_SCRATCH: std::cell::RefCell<(Vec<crate::kernel_ctx::OwnedOutput>, Vec<SlotKind>)> =
-        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
-
-    /// Reusable per-`Run` input metadata, per thread.
-    ///
-    /// `read_inputs` builds one of these per `Run` and it never outlives the
-    /// call. Same ownership story as `OUTPUT_SCRATCH`: `OwnedInput` is inert
-    /// data -- a borrowed pointer plus shape and strides -- with no `Drop`, and
-    /// it is cleared on recycle so no pointer into a finished `Run`'s ORT values
-    /// is parked between calls.
-    static INPUT_SCRATCH: std::cell::RefCell<Vec<crate::kernel_ctx::OwnedInput>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    /// Every vector is cleared on **recycle**, not on take, so no pointer into
+    /// a finished `Run`'s ORT values is ever retained here between calls.
+    static RUN_SCRATCH: std::cell::RefCell<RunScratch> =
+        const { std::cell::RefCell::new(RunScratch {
+            inputs: Vec::new(),
+            owned: Vec::new(),
+            slots: Vec::new(),
+        }) };
 }
 
-/// An empty input vector, reusing this thread's retired capacity.
-pub(crate) fn take_input_scratch(input_count: usize) -> Vec<crate::kernel_ctx::OwnedInput> {
-    let taken = INPUT_SCRATCH.try_with(|cell| {
-        cell.try_borrow_mut()
-            .map(|mut slot| std::mem::take(&mut *slot))
-            .ok()
-    });
-    let mut inputs = match taken {
-        Ok(Some(v)) => v,
-        _ => Vec::new(),
-    };
-    debug_assert!(inputs.is_empty(), "input scratch recycled dirty");
-    inputs.reserve(input_count);
-    inputs
-}
-
-/// Return the input vector for the next `Run` on this thread.
-fn recycle_input_scratch(mut inputs: Vec<crate::kernel_ctx::OwnedInput>) {
-    inputs.clear();
-    if inputs.capacity() > SCRATCH_MAX_CAPACITY {
-        return;
-    }
-    let _ = INPUT_SCRATCH.try_with(|cell| {
-        if let Ok(mut slot) = cell.try_borrow_mut()
-            && slot.capacity() < inputs.capacity()
-        {
-            *slot = inputs;
-        }
-    });
-}
-
-/// Empty output-bookkeeping vectors, reusing this thread's retired capacity.
+/// This thread's empty scratch, reusing the capacity the last `Run` retired.
 ///
-/// Returns freshly allocated vectors if the scratch is already borrowed, which
-/// can only happen if a kernel re-entered `Compute` on this thread; correctness
-/// does not depend on reuse.
-fn take_output_scratch(num_outputs: usize) -> (Vec<crate::kernel_ctx::OwnedOutput>, Vec<SlotKind>) {
-    let taken = OUTPUT_SCRATCH.try_with(|cell| {
+/// Returns freshly allocated vectors if the cell is already borrowed, which can
+/// only happen if a kernel re-entered `Compute` on this thread; correctness
+/// does not depend on reuse. `try_with` likewise fails during thread teardown,
+/// after the destructor has run, and takes the same path.
+fn take_run_scratch() -> RunScratch {
+    let taken = RUN_SCRATCH.try_with(|cell| {
         cell.try_borrow_mut()
             .map(|mut slot| std::mem::take(&mut *slot))
             .ok()
     });
-    let (mut owned, mut slots) = match taken {
-        Ok(Some(pair)) => pair,
-        _ => (Vec::new(), Vec::new()),
+    let scratch = match taken {
+        Ok(Some(s)) => s,
+        _ => RunScratch::default(),
     };
     debug_assert!(
-        owned.is_empty() && slots.is_empty(),
-        "scratch recycled dirty"
+        scratch.inputs.is_empty() && scratch.owned.is_empty() && scratch.slots.is_empty(),
+        "run scratch recycled dirty"
     );
-    owned.reserve(num_outputs);
-    slots.reserve(num_outputs);
-    (owned, slots)
+    scratch
 }
 
-/// Return output-bookkeeping vectors for the next `Run` on this thread.
-fn recycle_output_scratch(
-    mut owned: Vec<crate::kernel_ctx::OwnedOutput>,
-    mut slots: Vec<SlotKind>,
-) {
-    owned.clear();
-    slots.clear();
-    if owned.capacity() > SCRATCH_MAX_CAPACITY || slots.capacity() > SCRATCH_MAX_CAPACITY {
+/// Park this thread's scratch for the next `Run`.
+///
+/// The keep/drop decision is made **per vector**, which is what the two
+/// separate pools did before they were merged: a node with 200 inputs must not
+/// cost the output vectors the capacity they had earned, and a node with 200
+/// outputs must not cost the input vector its own. Bundling the storage is an
+/// optimisation; bundling the policy would be a behaviour change.
+fn recycle_run_scratch(mut scratch: RunScratch) {
+    scratch.inputs.clear();
+    scratch.owned.clear();
+    scratch.slots.clear();
+
+    let keep_inputs = scratch.inputs.capacity() <= SCRATCH_MAX_CAPACITY;
+    // The output pair is judged together, as it was when it shared a cell:
+    // `owned` and `slots` are always the same length, so one being pathological
+    // says the other is too, and keeping half a pair buys nothing.
+    let keep_outputs = scratch.owned.capacity() <= SCRATCH_MAX_CAPACITY
+        && scratch.slots.capacity() <= SCRATCH_MAX_CAPACITY;
+    if !keep_inputs && !keep_outputs {
         return;
     }
-    let _ = OUTPUT_SCRATCH.try_with(|cell| {
+
+    let _ = RUN_SCRATCH.try_with(|cell| {
         if let Ok(mut slot) = cell.try_borrow_mut() {
-            // Keep whichever pair has the larger capacity; a re-entrant call
-            // could have left one here already.
-            if slot.0.capacity() < owned.capacity() {
-                slot.0 = owned;
+            // Keep whichever vector has the larger capacity; a re-entrant call
+            // could have parked one here already.
+            if keep_inputs && slot.inputs.capacity() < scratch.inputs.capacity() {
+                slot.inputs = std::mem::take(&mut scratch.inputs);
             }
-            if slot.1.capacity() < slots.capacity() {
-                slot.1 = slots;
+            if keep_outputs {
+                if slot.owned.capacity() < scratch.owned.capacity() {
+                    slot.owned = std::mem::take(&mut scratch.owned);
+                }
+                if slot.slots.capacity() < scratch.slots.capacity() {
+                    slot.slots = std::mem::take(&mut scratch.slots);
+                }
             }
         }
     });
@@ -6042,60 +6052,170 @@ mod tests {
     }
 
     #[test]
-    fn input_scratch_hands_back_capacity_it_retired() {
+    fn run_scratch_hands_back_input_capacity_it_retired() {
         // Fill past the capacity an empty `Vec::reserve(1)` reaches on its own,
         // or the assertion below would hold whether or not reuse happened.
-        let mut inputs = take_input_scratch(1);
+        let mut scratch = take_run_scratch();
         for _ in 0..SCRATCH_MAX_CAPACITY {
-            inputs.push(dummy_owned_input());
+            scratch.inputs.push(dummy_owned_input());
         }
-        let cap = inputs.capacity();
+        let cap = scratch.inputs.capacity();
         assert!(
             cap > 4,
             "retired capacity {cap} is one a fresh vector reaches anyway"
         );
-        recycle_input_scratch(inputs);
+        recycle_run_scratch(scratch);
 
-        let inputs = take_input_scratch(1);
-        assert!(inputs.is_empty(), "reused scratch must start empty");
+        let scratch = take_run_scratch();
+        assert!(scratch.inputs.is_empty(), "reused scratch must start empty");
         assert!(
-            inputs.capacity() >= cap,
+            scratch.inputs.capacity() >= cap,
             "capacity was not reused: {} vs {cap}",
-            inputs.capacity()
+            scratch.inputs.capacity()
         );
-        recycle_input_scratch(inputs);
+        recycle_run_scratch(scratch);
     }
 
-    /// The scratch must not hold an `OwnedInput` between `Run`s: those borrow
-    /// pointers into ORT values belonging to a call that has finished.
     #[test]
-    fn input_scratch_retains_no_inputs_between_runs() {
-        let mut inputs = take_input_scratch(2);
-        inputs.push(dummy_owned_input());
-        recycle_input_scratch(inputs);
+    fn run_scratch_hands_back_output_capacity_it_retired() {
+        let mut scratch = take_run_scratch();
+        for _ in 0..SCRATCH_MAX_CAPACITY {
+            scratch.owned.push(dummy_owned_output());
+            scratch.slots.push(SlotKind::Ort);
+        }
+        let owned_cap = scratch.owned.capacity();
+        let slot_cap = scratch.slots.capacity();
+        assert!(
+            owned_cap > 4,
+            "retired capacity {owned_cap} is one a fresh vector reaches anyway"
+        );
+        recycle_run_scratch(scratch);
 
-        INPUT_SCRATCH.with(|cell| {
+        let scratch = take_run_scratch();
+        assert!(
+            scratch.owned.is_empty() && scratch.slots.is_empty(),
+            "reused scratch must start empty"
+        );
+        assert!(
+            scratch.owned.capacity() >= owned_cap && scratch.slots.capacity() >= slot_cap,
+            "capacity was not reused: {} / {} vs {owned_cap} / {slot_cap}",
+            scratch.owned.capacity(),
+            scratch.slots.capacity()
+        );
+        recycle_run_scratch(scratch);
+    }
+
+    /// The scratch must not hold an `OwnedInput` or `OwnedOutput` between
+    /// `Run`s: those borrow pointers into ORT values belonging to a call that
+    /// has finished.
+    #[test]
+    fn run_scratch_retains_nothing_between_runs() {
+        let mut scratch = take_run_scratch();
+        scratch.inputs.push(dummy_owned_input());
+        scratch.owned.push(dummy_owned_output());
+        scratch.slots.push(SlotKind::Ort);
+        recycle_run_scratch(scratch);
+
+        RUN_SCRATCH.with(|cell| {
             let slot = cell.borrow();
             assert!(
-                slot.is_empty(),
-                "parked scratch still holds {} inputs",
-                slot.len()
+                slot.inputs.is_empty() && slot.owned.is_empty() && slot.slots.is_empty(),
+                "parked scratch still holds {} inputs / {} outputs / {} slots",
+                slot.inputs.len(),
+                slot.owned.len(),
+                slot.slots.len()
             );
         });
     }
 
     #[test]
-    fn input_scratch_does_not_pin_a_pathological_capacity() {
-        let over = SCRATCH_MAX_CAPACITY + 1;
-        let mut inputs = take_input_scratch(over);
-        inputs.push(dummy_owned_input());
-        recycle_input_scratch(inputs);
+    fn run_scratch_does_not_pin_a_pathological_input_capacity() {
+        let mut scratch = take_run_scratch();
+        scratch.inputs.reserve(SCRATCH_MAX_CAPACITY + 1);
+        scratch.inputs.push(dummy_owned_input());
+        recycle_run_scratch(scratch);
 
-        INPUT_SCRATCH.with(|cell| {
+        RUN_SCRATCH.with(|cell| {
+            let cap = cell.borrow().inputs.capacity();
             assert!(
-                cell.borrow().capacity() <= SCRATCH_MAX_CAPACITY,
-                "oversized scratch was parked: {}",
-                cell.borrow().capacity()
+                cap <= SCRATCH_MAX_CAPACITY,
+                "oversized scratch was parked: {cap}"
+            );
+        });
+    }
+
+    #[test]
+    fn run_scratch_does_not_pin_a_pathological_output_capacity() {
+        let mut scratch = take_run_scratch();
+        let over = SCRATCH_MAX_CAPACITY + 1;
+        scratch.owned.reserve(over);
+        scratch.slots.reserve(over);
+        assert!(scratch.owned.capacity() >= over);
+        scratch.owned.push(dummy_owned_output());
+        scratch.slots.push(SlotKind::Ort);
+        recycle_run_scratch(scratch);
+
+        RUN_SCRATCH.with(|cell| {
+            let slot = cell.borrow();
+            assert!(
+                slot.owned.capacity() <= SCRATCH_MAX_CAPACITY
+                    && slot.slots.capacity() <= SCRATCH_MAX_CAPACITY,
+                "oversized scratch was parked: {} / {}",
+                slot.owned.capacity(),
+                slot.slots.capacity()
+            );
+        });
+    }
+
+    /// Bundling the storage must not bundle the keep/drop policy. Before these
+    /// three vectors shared a cell they were judged separately, and a node with
+    /// a pathological input arity did not cost the *output* vectors the
+    /// capacity they had earned.
+    ///
+    /// Falsifier: replace the two `keep_*` flags in `recycle_run_scratch` with a
+    /// single conjunction over all three vectors and this fails both ways.
+    #[test]
+    fn run_scratch_bounds_each_vector_independently() {
+        // Oversized inputs, ordinary outputs: the outputs must survive.
+        let mut scratch = take_run_scratch();
+        scratch.inputs.reserve(SCRATCH_MAX_CAPACITY + 1);
+        scratch.owned.reserve(SCRATCH_MAX_CAPACITY);
+        scratch.slots.reserve(SCRATCH_MAX_CAPACITY);
+        let kept = scratch.owned.capacity();
+        recycle_run_scratch(scratch);
+        RUN_SCRATCH.with(|cell| {
+            let slot = cell.borrow();
+            assert!(
+                slot.inputs.capacity() <= SCRATCH_MAX_CAPACITY,
+                "pathological input capacity was parked: {}",
+                slot.inputs.capacity()
+            );
+            assert!(
+                slot.owned.capacity() >= kept,
+                "an oversized input vector cost the outputs their capacity: {} vs {kept}",
+                slot.owned.capacity()
+            );
+        });
+
+        // And the converse: oversized outputs must not cost the inputs theirs.
+        RUN_SCRATCH.with(|cell| *cell.borrow_mut() = RunScratch::default());
+        let mut scratch = take_run_scratch();
+        scratch.inputs.reserve(SCRATCH_MAX_CAPACITY);
+        scratch.owned.reserve(SCRATCH_MAX_CAPACITY + 1);
+        scratch.slots.reserve(SCRATCH_MAX_CAPACITY + 1);
+        let kept_in = scratch.inputs.capacity();
+        recycle_run_scratch(scratch);
+        RUN_SCRATCH.with(|cell| {
+            let slot = cell.borrow();
+            assert!(
+                slot.owned.capacity() <= SCRATCH_MAX_CAPACITY,
+                "pathological output capacity was parked: {}",
+                slot.owned.capacity()
+            );
+            assert!(
+                slot.inputs.capacity() >= kept_in,
+                "an oversized output vector cost the inputs their capacity: {} vs {kept_in}",
+                slot.inputs.capacity()
             );
         });
     }
@@ -6103,127 +6223,75 @@ mod tests {
     /// A kernel that re-enters `Compute` on this thread finds the cell borrowed.
     /// That must degrade to a fresh allocation, not panic.
     #[test]
-    fn input_scratch_is_reentrancy_safe() {
-        INPUT_SCRATCH.with(|cell| {
+    fn run_scratch_is_reentrancy_safe() {
+        RUN_SCRATCH.with(|cell| {
             let _held = cell.borrow_mut();
-            let mut inputs = take_input_scratch(2);
-            inputs.push(dummy_owned_input());
-            assert_eq!(inputs.len(), 1);
-            recycle_input_scratch(inputs);
-        });
-    }
-
-    #[test]
-    fn output_scratch_hands_back_capacity_it_retired() {
-        // Grow past the capacity a fresh vector reaches on its own. An empty
-        // `Vec::reserve(1)` already yields capacity 4 for these element sizes,
-        // so retiring only 4 would assert nothing: the check would pass whether
-        // or not the capacity came back. Fill to the cap instead.
-        let (mut owned, mut slots) = take_output_scratch(1);
-        for _ in 0..SCRATCH_MAX_CAPACITY {
-            owned.push(dummy_owned_output());
-            slots.push(SlotKind::Ort);
-        }
-        let (owned_cap, slots_cap) = (owned.capacity(), slots.capacity());
-        assert!(
-            owned_cap > 4 && slots_cap > 4,
-            "retired capacity {owned_cap}/{slots_cap} is one a fresh vector reaches anyway"
-        );
-        recycle_output_scratch(owned, slots);
-
-        let (owned, slots) = take_output_scratch(1);
-        assert!(
-            owned.is_empty() && slots.is_empty(),
-            "reused scratch must start empty"
-        );
-        assert!(
-            owned.capacity() >= owned_cap && slots.capacity() >= slots_cap,
-            "capacity was not reused: {} vs {owned_cap}, {} vs {slots_cap}",
-            owned.capacity(),
-            slots.capacity()
-        );
-        recycle_output_scratch(owned, slots);
-    }
-
-    /// The scratch must not hold an `OwnedOutput` between `Run`s: those carry
-    /// raw pointers into ORT values belonging to a call that has finished.
-    #[test]
-    fn output_scratch_retains_no_outputs_between_runs() {
-        let (mut owned, mut slots) = take_output_scratch(2);
-        owned.push(dummy_owned_output());
-        slots.push(SlotKind::Absent(0));
-        recycle_output_scratch(owned, slots);
-
-        OUTPUT_SCRATCH.with(|cell| {
-            let slot = cell.borrow();
-            assert!(
-                slot.0.is_empty() && slot.1.is_empty(),
-                "parked scratch still holds {} outputs / {} slots",
-                slot.0.len(),
-                slot.1.len()
-            );
-        });
-        let (owned, slots) = take_output_scratch(1);
-        assert!(owned.is_empty() && slots.is_empty());
-        recycle_output_scratch(owned, slots);
-    }
-
-    #[test]
-    fn output_scratch_does_not_pin_a_pathological_capacity() {
-        let over = SCRATCH_MAX_CAPACITY + 1;
-        let (mut owned, mut slots) = take_output_scratch(over);
-        assert!(owned.capacity() >= over);
-        owned.push(dummy_owned_output());
-        slots.push(SlotKind::Ort);
-        recycle_output_scratch(owned, slots);
-
-        OUTPUT_SCRATCH.with(|cell| {
-            let slot = cell.borrow();
-            assert!(
-                slot.0.capacity() <= SCRATCH_MAX_CAPACITY
-                    && slot.1.capacity() <= SCRATCH_MAX_CAPACITY,
-                "oversized scratch was parked: {} / {}",
-                slot.0.capacity(),
-                slot.1.capacity()
-            );
-        });
-    }
-
-    /// A kernel that re-enters `Compute` on this thread finds the scratch
-    /// already borrowed. That must degrade to a fresh allocation, not panic.
-    #[test]
-    fn output_scratch_is_reentrancy_safe() {
-        OUTPUT_SCRATCH.with(|cell| {
-            let _held = cell.borrow_mut();
-            let (mut owned, mut slots) = take_output_scratch(2);
-            owned.push(dummy_owned_output());
-            slots.push(SlotKind::Ort);
-            assert_eq!(owned.len(), 1);
+            let mut scratch = take_run_scratch();
+            scratch.inputs.push(dummy_owned_input());
+            scratch.owned.push(dummy_owned_output());
+            scratch.slots.push(SlotKind::Ort);
+            assert_eq!(scratch.inputs.len(), 1);
+            assert_eq!(scratch.owned.len(), 1);
             // Recycling while the cell is borrowed must also not panic.
-            recycle_output_scratch(owned, slots);
+            recycle_run_scratch(scratch);
         });
+    }
+
+    /// A nested `Run` must find the scratch empty in **all three** vectors: one
+    /// acquisition moves the whole set, so an inner call cannot be handed
+    /// storage the outer call is still using.
+    ///
+    /// Falsifier: split the cell back into per-vector pools and the outer take
+    /// no longer empties the ones it did not ask for.
+    #[test]
+    fn one_acquisition_moves_the_whole_set() {
+        RUN_SCRATCH.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            slot.inputs.reserve(8);
+            slot.owned.reserve(8);
+            slot.slots.reserve(8);
+        });
+        let outer = take_run_scratch();
+        assert!(
+            outer.inputs.capacity() >= 8,
+            "take did not hand back inputs"
+        );
+        RUN_SCRATCH.with(|cell| {
+            let slot = cell.borrow();
+            assert_eq!(
+                (
+                    slot.inputs.capacity(),
+                    slot.owned.capacity(),
+                    slot.slots.capacity()
+                ),
+                (0, 0, 0),
+                "a single take left storage behind for a re-entrant Run to alias"
+            );
+        });
+        recycle_run_scratch(outer);
     }
 
     /// Thread-local, so two threads never share a buffer -- concurrent `Run`s
-    /// on different threads cannot alias each other's output bookkeeping.
+    /// on different threads cannot alias each other's bookkeeping.
     #[test]
-    fn output_scratch_is_per_thread() {
+    fn run_scratch_is_per_thread() {
         // Park a capacity a fresh `Vec` would not land on by itself: an empty
-        // `Vec::reserve(1)` already gives 4 for this element size, so a smaller
+        // `Vec::reserve(1)` already gives 4 for these element sizes, so a smaller
         // parked capacity could not tell reuse from a coincidence.
-        let (mut owned, mut slots) = take_output_scratch(SCRATCH_MAX_CAPACITY);
+        let mut scratch = take_run_scratch();
         for _ in 0..SCRATCH_MAX_CAPACITY {
-            owned.push(dummy_owned_output());
-            slots.push(SlotKind::Ort);
+            scratch.owned.push(dummy_owned_output());
+            scratch.slots.push(SlotKind::Ort);
         }
-        let parked = owned.capacity();
+        let parked = scratch.owned.capacity();
         assert!(parked >= SCRATCH_MAX_CAPACITY);
-        recycle_output_scratch(owned, slots);
+        recycle_run_scratch(scratch);
 
         let other = std::thread::spawn(|| {
-            let (owned, slots) = take_output_scratch(1);
-            let cap = owned.capacity();
-            recycle_output_scratch(owned, slots);
+            let mut scratch = take_run_scratch();
+            scratch.owned.reserve(1);
+            let cap = scratch.owned.capacity();
+            recycle_run_scratch(scratch);
             cap
         })
         .join()
@@ -6231,6 +6299,138 @@ mod tests {
         assert!(
             other < parked,
             "a fresh thread reused another thread's capacity: {other} vs {parked}"
+        );
+    }
+
+    /// Many threads taking and recycling concurrently must not observe each
+    /// other's storage, and must not panic on teardown.
+    #[test]
+    fn concurrent_runs_do_not_share_scratch() {
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        let mut scratch = take_run_scratch();
+                        for _ in 0..=(t % 4) {
+                            scratch.inputs.push(dummy_owned_input());
+                            scratch.owned.push(dummy_owned_output());
+                            scratch.slots.push(SlotKind::Ort);
+                        }
+                        assert_eq!(scratch.inputs.len(), (t % 4) + 1);
+                        recycle_run_scratch(scratch);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("no thread panicked");
+        }
+    }
+
+    /// A panic between take and recycle must not park a dirty buffer: the
+    /// scratch is moved out of the cell, so unwinding simply drops it.
+    #[test]
+    fn a_panic_between_take_and_recycle_parks_nothing_dirty() {
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let caught = std::panic::catch_unwind(|| {
+            let mut scratch = take_run_scratch();
+            scratch.inputs.push(dummy_owned_input());
+            panic!("kernel exploded");
+        });
+        std::panic::set_hook(hook);
+        assert!(caught.is_err(), "the test panic must actually have fired");
+
+        let scratch = take_run_scratch();
+        assert!(
+            scratch.inputs.is_empty(),
+            "a panicking Run parked {} live inputs",
+            scratch.inputs.len()
+        );
+        recycle_run_scratch(scratch);
+    }
+
+    /// The `Run` path must resolve the thread-local exactly twice: once to take
+    /// and once to return. That is the whole point of merging the pools, and it
+    /// is not observable from a unit test, so it is asserted structurally.
+    ///
+    /// Falsifier: reintroduce a second scratch thread-local, or add another
+    /// `RUN_SCRATCH.with` on the `Run` path, and this fails.
+    #[test]
+    fn a_run_resolves_the_scratch_thread_local_exactly_twice() {
+        let src = include_str!("compute.rs");
+        let (prod, _tests) = src
+            .split_once("\n#[cfg(test)]\nmod ")
+            .expect("compute.rs has a test module");
+
+        // Anchor: the thing being counted must exist, or the count is vacuous.
+        assert!(
+            prod.contains("static RUN_SCRATCH:"),
+            "RUN_SCRATCH is gone -- this test would pass vacuously"
+        );
+
+        // Counting resolutions of one *name* is not enough: splitting the pool
+        // back apart introduces a differently-named thread-local and leaves the
+        // RUN_SCRATCH count untouched. So the property asserted is the total
+        // thread-local surface of this file -- every declaration and every
+        // resolution of any of them.
+        let mut declared: Vec<&str> = prod
+            .match_indices("\n    static ")
+            .map(|(i, m)| {
+                let rest = &prod[i + m.len()..];
+                &rest[..rest.find(':').unwrap_or(0)]
+            })
+            .collect();
+        declared.sort_unstable();
+        assert_eq!(
+            declared,
+            [
+                "ENABLED",
+                "ENABLED",
+                "HOST_INTERMEDIATE_POOL",
+                "RUN_SCRATCH"
+            ],
+            "the set of thread-locals in compute.rs changed; a new per-`Run` \
+             pool costs another __tls_get_addr on the hot path"
+        );
+        assert_eq!(
+            prod.matches(".with(").count() + prod.matches(".try_with(").count(),
+            5,
+            "the number of thread-local resolutions in compute.rs changed"
+        );
+
+        // Scoping these counts to `compute_execute`'s body is not enough: a
+        // helper defined outside it that takes and recycles, called from inside
+        // the per-node loop, regresses the optimisation while the body contains
+        // neither name. Review found exactly that bypass. So the call sites are
+        // counted over the whole production source instead -- there must be one
+        // of each in the crate, and it must be the one in `compute_execute`.
+        let take_calls = prod.matches("take_run_scratch()").count()
+            - prod.matches("fn take_run_scratch()").count();
+        let recycle_calls = prod.matches("recycle_run_scratch(").count()
+            - prod.matches("fn recycle_run_scratch(").count();
+        assert_eq!(
+            (take_calls, recycle_calls),
+            (1, 1),
+            "the scratch is taken/recycled somewhere other than the one place \
+             on the `Run` path; a second site costs another __tls_get_addr"
+        );
+
+        let start = prod
+            .find("unsafe extern \"C\" fn compute_execute(")
+            .expect("compute_execute exists");
+        let body = &prod[start..];
+        let end = body.find("\n}\n").expect("compute_execute terminates") + 3;
+        let body = &body[..end];
+        assert_eq!(
+            body.matches("take_run_scratch()").count(),
+            1,
+            "compute_execute takes the scratch more than once per Run"
+        );
+        assert_eq!(
+            body.matches("recycle_run_scratch(").count(),
+            1,
+            "compute_execute returns the scratch more than once per Run"
         );
     }
 }
