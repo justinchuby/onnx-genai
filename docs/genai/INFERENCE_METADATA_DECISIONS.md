@@ -1079,6 +1079,359 @@ It is native, it holds per-request parser state, it declares its row axis so the
 runtime can compact it, and it declares the non-dataflow fact that its parser
 table participates in cache identity. Nothing about it is a special case.
 
+### A.3 Workflow pattern catalogue
+
+This section is self-contained. It shows how the five workflow operations
+(`sequence`, `invoke`, pre-test `loop`, `branch`, and `emit`) compose into the
+major inference workflow families. The names in the examples are descriptive,
+not dispatch keys: a runtime executes the typed graph and never switches on
+`whisper`, `diffusion`, `gemma`, or any other model-family string.
+
+The catalogue is a constructive representability argument, not a claim that
+every future model is already implemented. A workflow family is representable
+when its computation can be decomposed into:
+
+1. typed component invocations;
+2. SSA values and explicitly scoped state cells;
+3. structural control flow using the five operations;
+4. typed preprocessing and postprocessing components; and
+5. request-aligned, packed, invariant, or runtime-sequence-state layouts.
+
+If a model requires a semantic operation outside those primitives, the package
+must fail validation until the contract is extended. A model-family-specific
+runtime branch is never the fallback.
+
+#### A.3.1 Autoregressive text, MoE, hybrid attention, and shared KV
+
+```text
+sequence
+  invoke tokenizer_or_accept_tokens
+  invoke prefill
+  loop while any_row_active
+    invoke decoder
+    invoke sampler
+    invoke stop_test
+    emit token row-wise
+```
+
+The decoder may contain dense, MoE, recurrent, sliding-attention, or
+full-attention layers; those are component internals. Graph-visible recurrent
+state is split into semantic state groups:
+
+```yaml
+serving:
+  state_service:
+    groups:
+      sliding:
+        kind: sliding_attention
+        sequence_axis: 2
+        layout: bnsh
+      global:
+        kind: full_attention
+        sequence_axis: 2
+        layout: bnsh
+      recurrent:
+        kind: recurrent
+        sequence_axis: null
+```
+
+Each cache-owning graph port binds to one cell in the appropriate group.
+Different groups may have different head dimensions. A layer that borrows
+another layer's K/V has no independent cells; the graph wiring identifies the
+source. Continuous batching changes runtime row placement and physical storage,
+not this workflow. Request-aligned tokens, sampler inputs, LoRA routes, and stop
+flags compact together; runtime-sequence-state cells follow the same row
+permutation through the state-service ABI.
+
+#### A.3.2 Optional multimodal generation
+
+```text
+sequence
+  branch image_is_present
+    then
+      invoke image_preprocess
+      invoke vision_encoder
+      invoke image_token_mixer
+    else
+      invoke text_only_embedding
+  invoke decoder_prefill
+  loop while any_row_active
+    invoke decoder
+    invoke sampler
+    emit token row-wise
+```
+
+`image_is_present` comes from the generic input-presence capability. An audio
+or video encoder is the same pattern with a different typed preprocessing
+program and tensor contract. Packed media tokens carry offsets or owner
+mappings; they do not invent serialized request IDs. Cross-attention or
+projected media state is request-aligned and loop-invariant, so it can be reused
+through decode and moved during compaction. A single package can therefore mix
+media-present and media-absent rows without selecting a different model family.
+
+#### A.3.3 Encoder-decoder speech recognition
+
+```text
+sequence
+  invoke audio_preprocess(encoded_audio -> log_mel)
+  invoke encoder(log_mel -> encoder_hidden)
+  invoke decoder_prefill(encoder_hidden, prompt_tokens)
+  loop while any_row_active
+    invoke decoder(encoder_hidden, token, self_cache)
+    invoke sampler
+    emit token row-wise
+```
+
+The encoder output is a request-aligned, loop-invariant state cell. Decoder
+self-attention state grows or slides; cross-attention state is invariant or is
+materialized once when the graph exposes separate cross K/V ports. Unequal
+audio lengths and early EOS are represented by per-row lengths and active
+masks, so one row ending cannot truncate another.
+
+#### A.3.4 CTC transcription and other non-generative tasks
+
+```text
+sequence
+  invoke audio_preprocess(encoded_audio -> samples, attention_mask)
+  invoke acoustic_encoder(samples, attention_mask -> logits, frame_lengths)
+  invoke ctc_decode(logits, frame_lengths -> token_ids)
+  emit transcript
+```
+
+There is no generation loop and no carried state. The task profile declares the
+decoding facts needed to interpret logits:
+
+```yaml
+profiles:
+  transcription:
+    task: speech_to_text
+    decoding:
+      kind: ctc
+      blank_id: 0
+      collapse_repeats: true
+      time_axis: 1
+      class_axis: 2
+      lengths: frame_lengths
+```
+
+Embedding, reranking, classification, reward scoring, detection, and ordinary
+encoder inference are the same one-pass shape: preprocess if needed, invoke one
+or more components, then emit typed outputs. They use task-specific profiles
+instead of pretending to be token generation.
+
+#### A.3.5 Image diffusion with CFG and multistep solvers
+
+```text
+sequence
+  invoke text_encoder
+  invoke schedule
+  invoke latent_initializer(seed -> latent, rng_offset)
+  loop while step < step_count
+    invoke denoiser(latent, conditional_embedding -> conditional_noise)
+    invoke denoiser(latent, unconditional_embedding -> unconditional_noise)
+    invoke guidance_combine
+    invoke solver_step(latent, guided_noise, history -> next_latent, next_history)
+    emit latent_trajectory append
+  invoke vae_decoder
+  emit image
+```
+
+Two denoiser invocations express classifier-free guidance without falsely
+claiming that two physical rows are two requests. First- and higher-order
+solvers differ only in whether the loop carries history cells. The schedule,
+RNG, guidance equation, and solver are replaceable typed components, so Euler,
+DDIM, flow matching, and DPM-style methods do not require strategy enums in the
+workflow IR.
+
+#### A.3.6 Image editing and other multi-source diffusion
+
+```text
+sequence
+  invoke source_image_preprocess
+  invoke source_vae_encoder
+  invoke source_latent_pack
+  invoke text_encoder
+  invoke vision_encoder
+  invoke schedule
+  invoke latent_initializer
+  loop while step < step_count
+    invoke conditioning_concat(source_latent, target_latent, embeddings)
+    invoke denoiser
+    invoke guidance_combine
+    invoke solver_step
+  invoke target_latent_unpack
+  invoke vae_decoder
+  emit image
+```
+
+Source and target tokens have explicit slice/packing components and contracts.
+ControlNet, adapters, masks, depth maps, and reference images add typed
+conditioning invocations and values to the same graph. They do not change the
+control-flow vocabulary.
+
+#### A.3.7 Video generation and causal chunked decode
+
+```text
+sequence
+  invoke text_encoder
+  invoke latent_initializer(rank_5_shape)
+  loop while denoise_step < step_count
+    invoke video_denoiser
+    invoke solver_step
+  loop while decode_chunk < chunk_count
+    invoke causal_video_vae(latent_chunk, conv_cache -> frames, next_conv_cache)
+    emit frames append axis=2
+```
+
+Video latent state is rank 5 and the emitted output grows on its declared time
+axis, not an assumed final axis. Causal VAE convolution caches are ordinary
+state cells with invocation lifetime. Spatial scale facts belong to port
+contracts or component metadata. Text-to-video, image-to-video, and
+video-to-video differ in their conditioning prefix, not in denoising or
+temporal publication semantics.
+
+#### A.3.8 Masked or discrete diffusion
+
+```text
+sequence
+  invoke token_initializer
+  loop while masked_positions_remain
+    invoke masked_model
+    invoke confidence_or_schedule
+    invoke token_update
+    emit token_trajectory append
+  emit completed_tokens
+```
+
+This proves that a loop need not be autoregressive or operate on continuous
+latents. The carried value is the partially filled token grid; termination
+comes from the mask state rather than EOS.
+
+#### A.3.9 TTS, neural codecs, and full-duplex speech-to-speech
+
+Text-to-speech composes a text-token loop, an acoustic-token loop, and codec
+decode:
+
+```text
+sequence
+  loop while text_or_semantic_stream_active
+    invoke language_model
+    invoke sampler
+  loop while acoustic_stream_active
+    invoke acoustic_model
+    invoke sampler
+  invoke codec_decoder
+  emit audio
+```
+
+A full-duplex model repeats that structure per audio frame and nests a fixed
+acoustic-substep loop:
+
+```text
+loop while session_active
+  invoke user_codec_encoder
+  invoke temporal_model
+  loop while codebook_index < codebook_count
+    invoke acoustic_depformer
+    invoke sampler
+  invoke delay_ring_commit
+  invoke agent_codec_decoder
+  emit audio guarded by readiness
+```
+
+Interleaved text and audio streams are separate values with explicit delays.
+Temporal KV, delay rings, and codec convolution state are heterogeneous cells
+with session or invocation scope. A phase-boundary codec reset is represented
+as a release boundary, not inferred from a model name.
+
+#### A.3.10 Speculative decoding
+
+```text
+loop while any_row_active
+  sequence
+    invoke proposer
+    invoke target_verifier
+    branch proposal_accepted
+      then invoke commit
+      else invoke rollback_and_correct
+    emit accepted_tokens row-wise
+```
+
+The speculative region names every component whose state must rewind.
+`speculation_safety` states whether that rewind is legal; retry idempotency is a
+separate property. Proposal width and scheduling remain runtime choices.
+
+#### A.3.11 LoRA and request-selected adapters
+
+LoRA does not create a second workflow. Adapter selection, ordered composition,
+and scales are request-aligned inputs to the affected component invocation:
+
+```text
+invoke decoder(
+  hidden,
+  adapter_segments,
+  adapter_counts,
+  adapter_scales,
+  adapter_active
+)
+```
+
+The package's target manifest states which parameters are adaptable. The
+runtime owns loading, caching, eviction, and kernel selection. Because adapter
+selection participates in dataflow and cache dependencies, two requests with
+different adapters cannot accidentally share an incompatible prefix cache.
+
+### A.4 Coverage and proof levels
+
+Representability, executability, and model correctness are different claims:
+
+| Level | Meaning |
+| --- | --- |
+| **R** | A complete document validates and contains all required dataflow, state, and control flow. |
+| **X** | The generic runtime executes a deterministic package through the complete workflow. |
+| **W** | A real-weight run matches an upstream implementation numerically or token-for-token. |
+| **B** | Multiple unequal request rows, permutation, compaction, or early completion are verified. |
+
+The current evidence is:
+
+| Workflow family | R | X | W | B | Evidence represented by the example |
+| --- | --- | --- | --- | --- | --- |
+| Autoregressive decoder | yes | yes | yes | yes | Prefill/decode, heterogeneous KV, shared KV, row-wise EOS |
+| Optional VLM | yes | yes | yes | partial | Image-present/text-only branch; workflow execution is currently per request |
+| Encoder-decoder ASR | yes | yes | yes | yes | Raw audio, encoder state, cached decode, unequal early EOS |
+| CTC ASR | yes | yes | yes | yes | One-pass logits, frame lengths, collapse, transcript |
+| Image diffusion | yes | yes | yes | yes | CFG, RNG, Euler/DPM-style history, VAE decode |
+| Image editing | yes | yes | yes | partial | Source/target packing and full denoise; distinct source images depend on caller/upstream batching |
+| Video diffusion | yes | yes | yes | yes | Rank-5 latent, causal chunk decode, non-terminal emit axis |
+| Masked diffusion | yes | yes | synthetic | yes | Discrete iterative refinement |
+| TTS and codec | yes | yes | producer graphs | yes | Nested token generation and audio publication |
+| Full-duplex speech | yes | component path | yes | trace parity | Nested frame/acoustic loops; full engine-driven session loop remains pending |
+| Speculative decoding | yes | yes | synthetic | yes | Accept, reject, rollback, correction |
+| LoRA composition | yes | yes | artifact parity | yes | Ordered adapters survive row compaction |
+| Embedding/classification/reranking | yes | trivial sequence | model-dependent | ordinary batching | Task profile plus invoke and emit |
+
+“Partial” and “pending” are deliberate. They identify runtime or upstream
+limitations without weakening the representability claim. In particular:
+
+- Foundry Local serializes workflow requests, so it is not evidence for
+  continuous batching.
+- A full-duplex speech graph is representable and its real components have
+  trace parity, but the generic engine has not yet driven the complete
+  long-lived frame loop.
+- Model preprocessing must be fully declared. Supplying precomputed embeddings
+  proves the downstream workflow but not a raw-media request path.
+- Runtime-private storage formats such as paged KV do not require a new
+  workflow pattern; they are implementations of the declared state-service
+  semantics.
+
+The canonical executable packages cover decoder, VLM, image diffusion, guided
+diffusion, masked diffusion, speculative decoding, codec, TTS, video, and
+adapters. CTC and audio preprocessing have profile/validator coverage, while
+real-weight Whisper, CTC, image-edit, diffusion, video, VLM, and heterogeneous
+KV runs establish the higher proof levels. These examples therefore cover the
+known workflow *shapes* without claiming that an untested model automatically
+has a correct exporter.
+
 ---
 
 ## Appendix B: decision index
