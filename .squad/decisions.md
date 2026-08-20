@@ -196,3 +196,40 @@ Rewrote the gated-delta `LinearAttention` decode kernel (`linear_attention.rs`) 
 Occupancy gate for int4 MatMulNBits GEMV entry selection. Routing rule: if `ceil(N / cols_per_cta) >= mp_count * 32` (well-occupied, e.g. LM head N=248320) → plain/low-register entry (−14% latency: 98.8→85.0 µs). Otherwise → prefetch-pipelined entry (grid-starved projections already at byte-identical floor ~4.3–4.7 µs/call, under ORT's 4733 ns). Keys on N, launch-width, and SM count only — capture-safe. Byte-identical golden lock PASS. Coordinator independently re-validated on GPU0 (33.06 s). Admin-merged (squash, 2026-08-19). Opt-out: `ONNX_GENAI_GEMV_PIPE_WELLOCC=0`.
 
 **Result (H200, qwen3.5-0.8b fp16io, end-to-end medians):** +1.3–1.6 tok/s (~242→243.5 tok/s). Grid-starved projections at byte-identical floor; split-K would raise occupancy but reorders fp32 reduction (not byte-identical — barred under the golden-lock rule).
+
+---
+
+### 2026-08-19: data-shuffle lever investigation — attribution refuted by captured-graph honest floor
+
+**By:** Deckard (deckard-8) + Gaff (gaff-16)
+
+**Attribution:** After PR #1503 on current `origin/main` (`4bbd9152c`), Deckard re-measured qwen3.5-0.8b-hybrid fp16io on H200: native captured decode **253.9 tok/s** (3.939 ms/tok, 8 captures, 1008 replays, fallbacks=0) vs ORT eager **279.1 tok/s** (3.583 ms/tok), leaving **1.099x ORT-ahead / ~356 us per step**. The eager kernel-count attribution ranked `data_shuffle` as apparent #1: native 341.2 us/step vs ORT 52.3 us/step (**+288.9 us/step**) across transpose/split/gather/concat/where copy-like kernels; int4 GEMV was #2 (+176.1 us/step), and linear attention residual #3 (+58.7 us/step).
+
+**Attempt:** Gaff tested the data-shuffle fusion lever on branch `squad/shuffle-fusion` by using CUDA `TransposeKernel::view_outputs()` for seq_len=1 no-op transposes, gated during the experiment by `ONNX_GENAI_CUDA_DISABLE_SHUFFLE_FUSION=1`. The elision path fired correctly, but zero-copy view installation mutates device-buffer lifetimes and is illegal during CUDA graph capture.
+
+**Correction / decision:** Deckard's **+289 us/step data-shuffle lever is refuted for the captured decode path**. The standalone eager kernel count is real, but its cost attribution is an eager-mode/nsys artifact: inside captured replay, the 60 no-op transposes are ~2 KB copies and cost roughly **~40 ns/step** (~0.001% of a ~4 ms step). Installing views mid-capture aborts graph recording, quarantines Transpose, and fragments the decode graph from **16 captured segments / 15 eager seams** to **70 captured segments / 69 eager seams** — a regression, not a buildable win.
+
+**Outcome:** No code shipped. `movement.rs` was reverted, origin/main behavior is unchanged, and docs-only PR **#1511** was closed by the coordinator without merge. Do **not** treat data-shuffle fusion as the top buildable lever. Future attribution for captured decode must use captured-replay profiling (`ncu --graph-profiling node` or `nsys --cuda-graph-trace=node`) rather than eager standalone kernel counts.
+
+
+---
+
+### 2026-08-20: Corrected captured-replay attribution — honest native ceiling is the batch=1 launch/latency floor
+
+**By:** Deckard
+
+**What:** Re-ran qwen3.5-0.8b-hybrid fp16io native-vs-ORT decode attribution using captured-replay-aware tooling only (`nsys --cuda-graph-trace=node`, `cuda_gpu_kern_sum`, and `ncu --graph-profiling node`) after Gaff refuted the data-shuffle hypothesis. Native captured replay measured ~249.6 tok/s (run-to-run 249–254; later campaign baseline ~254) vs ORT eager 279.1 tok/s, with GPU-busy time **native 2516 µs/step vs ORT 1899 µs/step (+617 µs)** and near-identical kernel counts (**795 vs 793**). Every hot native kernel is occupancy/latency-bound rather than bandwidth/compute-roofline-bound: main int8/int4 GEMV ~22% occupancy, `transpose_bytes` ~12% occupancy and near-zero bytes moved, and post-#1503 `linear_attention_f16_coop` ~21.5% occupancy.
+
+**Why:** The previous data-shuffle attribution was real GPU timeline cost but not a buildable lever. The transposes are tiny seq_len=1 floor kernels; eliding them mid-capture fragments CUDA graph replay and regresses. Deckard retired data-shuffle and int64-index chasing, identified **int4/int8 GEMV occupancy tuning** as the single remaining credible lever, and set the honest practical ceiling for this arch at roughly **260–270 tok/s**: ORT parity minus the small-batch launch/latency floor tax.
+
+---
+
+### 2026-08-20: Symmetric int8 MatMulNBits split-K grid-fill landed — sixth clean token-stable win (PR #1516, merged)
+
+**By:** Gaff
+
+**What:** PR **#1516** landed the final buildable GEMV lever on `origin/main` (`ec695d897`): symmetric int8 `MatMulNBits` GEMV now uses the existing split-K/grid-fill path for grid-starved decode projections, keyed only on `K`, `N`, bits, zero-point presence, and live SM count. The bias-fusion sub-lever was a no-op: native already has `CudaMatMulNBitsBiasFusion`, and all Qwen3.5 exports checked here are bias-free. The shipped change is general, capture-safe, and opt-out guarded by `ONNX_GENAI_CUDA_DISABLE_INT8_SYMMETRIC_SPLITK=1`.
+
+**Result:** H200 qwen3.5-0.8b-hybrid fp16io paired A/B improved **254.0 → 263.8 tok/s (+3.9%, +9.8 tok/s)**. ncu confirmed the targeted grid-starved int8 projections improved: N=1024 **11424 → 8049 ns** with occupancy **11.6% → 23.4%**; N=2048 **6065 → 4877 ns** with occupancy **22.2% → 45.4%**. Golden token-ID locks passed on qwen3.5-0.8b and qwen3.5-2b, and the coordinator independently re-validated both as `ok`.
+
+**Campaign state:** The decode campaign now has **six clean token-identical/token-stable wins**: #1486, #1495, #1496, #1501, #1503, and #1516. Native is now ~**263.8 tok/s** vs ORT **279.1 tok/s** (**~1.057× ORT-ahead**), narrowed from ~1.24× at session start. Per Deckard's corrected attribution, the int4/int8 GEMV lever was the **last genuine buildable lever**; the remaining gap is the batch=1 0.8b launch/latency floor, not an unmined roofline or data-shuffle opportunity.
