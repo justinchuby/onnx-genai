@@ -7277,7 +7277,7 @@ const INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED: usize = 4;
 ///
 /// The split is still load bearing, and by more than before: a flat `3` would
 /// hand the small shape a 1.37x regression at `m = 4` and 1.83x at `m = 2`; a
-/// flat `6` would give up 1.48x-2.08x on the large shape at `m = 3..5`.
+/// flat `6` would give up 1.08x-2.08x on the large shape at `m = 3..5`.
 ///
 /// Reproduce with `PROBE_M_LIST=1,2,3,4,5,6,8,12` on the
 /// `int4_prefill_route_ab` bench, once with the default env and once with

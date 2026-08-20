@@ -84,7 +84,7 @@ noise, and `m = 1` is decode, which has its own dedicated route and should not b
 strength of a prefill bench.
 
 The split between the two regimes is still load bearing, and by more than before: a flat `3` costs
-the small shape 1.37x at `m = 4` and 1.83x at `m = 2`; a flat `6` gives up 1.48x-2.08x on the large
+the small shape 1.37x at `m = 4` and 1.83x at `m = 2`; a flat `6` gives up 1.08x-2.08x on the large
 shape at `m = 3..5`.
 
 ## Production A/B
