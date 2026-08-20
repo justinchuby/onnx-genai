@@ -18919,7 +18919,9 @@ extern "C" __global__ void ref_silu_mul_f16(
         use half::bf16;
 
         let Some(runtime) = runtime() else {
-            eprintln!("skipping MatMulNBits bf16 small-batch direct-store test: CUDA runtime unavailable");
+            eprintln!(
+                "skipping MatMulNBits bf16 small-batch direct-store test: CUDA runtime unavailable"
+            );
             return;
         };
         // The loop this guards only exists when more than one row routes to the
