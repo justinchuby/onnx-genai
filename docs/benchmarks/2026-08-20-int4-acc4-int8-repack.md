@@ -14,6 +14,13 @@ default no-MLAS artifact.
 | ratio vs ORT | **4.58** | 2.60 | 2.33 | 1.87 | 1.85 | 1.47 | 1.63 | 1.45 |
 | native ms | 2.38 | 2.63 | 2.33 | 2.85 | 3.67 | 4.60 | 8.91 | 14.66 |
 
+The m=1 cell here reads 2.38 ms / 4.58 where §3 reads 1.86 ms / 4.14 and a
+later confirmation run read 1.76 ms / 3.91. These are **separate sweeps on a
+shared host**, not repeats of one measurement, and the spread across them
+(1.76-2.38 ms) is the honest run-to-run envelope for this cell. Nothing below
+turns on a difference smaller than that envelope; the claims that matter --
+flatness in m, and the acc0/acc4 contrast in §3 -- are far larger than it.
+
 `native` is essentially **flat from m=1 to m=8** (2.33-2.85 ms) and only starts
 tracking `m` past 16. Time that does not respond to work is a fixed cost --
 here, walking the whole weight once per call -- not a slow multiply. Every
@@ -29,6 +36,10 @@ confirms this rather than assuming it:
 |---|---|---|---|
 | native | 1.569 ms | 28.3 MB (int8 repack) | 18.0 GB/s |
 | ORT | 0.179 ms | 15.7 MB (int4) | **87.9 GB/s** |
+
+(The native figure counts values + scales only; `int8_matmul` also walks
+per-block sums, so 28.3 MB understates its traffic. The understatement is
+conservative -- it works against the argument being made here.)
 
 87.9 GB/s **exceeds the 75.8 GB/s DRAM ceiling**, which is only possible from
 cache. So DRAM bandwidth is not the binding constraint for either arm and a
@@ -102,7 +113,7 @@ precision contract for the code it calls, including
 > [...] -- that is CompInt8, and delivering it where CompFp32 was requested
 > costs ~1e-3 relative error. An `aarch64` `m == 1, block_size == 32` NEON-SDOT
 > diversion used to sit here and did exactly that; it was removed rather than
-> gated.
+> gated [...]
 
 So a reduced-precision int4 kernel belongs behind
 `reduced_precision_activation_allowed` (`accuracy_level >= 2`, `:9297`), on the
