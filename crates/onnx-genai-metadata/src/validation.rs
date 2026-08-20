@@ -1416,6 +1416,16 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
         }
     }
 
+    /// Check that a workflow tensor names a dtype this format can talk about.
+    ///
+    /// This is a vocabulary check, not a capability check. Metadata is portable:
+    /// it cannot know which execution provider will load the package, so it must
+    /// not refuse a dtype merely because some runtime lacks a kernel for it. FP8
+    /// caches are the motivating case — a package may legitimately store its KV
+    /// state as `float8_e4m3fn`, and whether a given EP can compute on that is
+    /// answered at binding time by the runtime, with a capability error that
+    /// names the EP. Rejecting it here would report an execution-provider gap as
+    /// a malformed document.
     fn validate_runtime_dtype(
         path: &str,
         contract: &crate::schema::TensorContract,
@@ -1440,6 +1450,12 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                 | "fp32"
                 | "bfloat16"
                 | "bf16"
+                | "float8_e4m3fn"
+                | "fp8_e4m3fn"
+                | "float8_e4m3"
+                | "fp8_e4m3"
+                | "float8_e5m2"
+                | "fp8_e5m2"
                 | "int8"
                 | "int16"
                 | "int32"
@@ -1451,7 +1467,7 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                 | "bool"
         ) {
             errors.push(format!(
-                "{path} uses dtype '{}', which the workflow runtime does not support",
+                "{path} uses dtype '{}', which is not a tensor dtype this format can name",
                 contract.dtype
             ));
         }
@@ -1813,6 +1829,7 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                     errors,
                 );
             }
+            validate_state_update(group_name, group, workflow, errors);
             for cascade in &group.capabilities.cascade {
                 if !state_service.groups.contains_key(cascade) {
                     errors.push(format!(
@@ -3278,6 +3295,144 @@ fn validate_integer_scalar_contract(
             }
         }
         _ => errors.push(format!("{path} must be a scalar or rank-one tensor")),
+    }
+}
+
+/// Check that a state group's declared update discipline is self-consistent.
+///
+/// An `indexed_scatter` group is a rectangular buffer whose valid region is a
+/// declared prefix rather than its shape. Every fact that makes that region
+/// derivable has to be present, or the runtime is left guessing where a row
+/// ends — and a guess here is silent corruption, not a failed load.
+fn validate_state_update(
+    group_name: &str,
+    group: &crate::schema::StateGroupContract,
+    workflow: &crate::schema::WorkflowSpec,
+    errors: &mut Vec<String>,
+) {
+    let Some(crate::schema::StateUpdate::IndexedScatter {
+        write_indices,
+        capacity,
+        write_indices_ports,
+    }) = &group.update
+    else {
+        return;
+    };
+
+    if group.logical_lengths.is_none() {
+        errors.push(format!(
+            "state service group '{group_name}' declares an indexed_scatter update but no \
+             logical_lengths; the valid prefix of a fixed-capacity buffer is not derivable from \
+             its shape"
+        ));
+    }
+
+    match workflow.state.get(write_indices) {
+        Some(cell) => {
+            validate_integer_control_contract(
+                &cell.contract,
+                &format!(
+                    "state service group '{group_name}' write_indices state '{write_indices}'"
+                ),
+                errors,
+            );
+            if cell.contract.rank != 1 {
+                errors.push(format!(
+                    "state service group '{group_name}' write_indices state '{write_indices}' \
+                     must be rank one with one destination per row"
+                ));
+            }
+            if cell.class != crate::schema::WorkflowStateClass::Semantic {
+                errors.push(format!(
+                    "state service group '{group_name}' write_indices state '{write_indices}' \
+                     must be semantic: a write cursor that is not restored with its buffer would \
+                     overwrite live positions"
+                ));
+            }
+        }
+        None => errors.push(format!(
+            "state service group '{group_name}' references unknown write_indices state \
+             '{write_indices}'"
+        )),
+    }
+
+    let declared_values = workflow
+        .inputs
+        .keys()
+        .chain(workflow.state.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    require_workflow_value(
+        capacity,
+        &declared_values,
+        &format!("state service group '{group_name}' capacity"),
+        errors,
+    );
+    if let Some(contract) = workflow
+        .inputs
+        .get(capacity)
+        .map(|input| &input.contract)
+        .or_else(|| workflow.state.get(capacity).map(|cell| &cell.contract))
+    {
+        validate_integer_scalar_contract(
+            contract,
+            &format!("state service group '{group_name}' capacity '{capacity}'"),
+            errors,
+        );
+    }
+
+    for (component_name, port) in write_indices_ports {
+        match workflow.components.get(component_name) {
+            Some(component) => {
+                let inferred_ports = component.ports.inputs.is_empty()
+                    && component.ports.outputs.is_empty()
+                    && matches!(
+                        component.implementation,
+                        crate::schema::ComponentImplementation::Onnx { .. }
+                    );
+                if !inferred_ports && !component.ports.inputs.contains_key(port) {
+                    errors.push(format!(
+                        "state service group '{group_name}' component '{component_name}' \
+                         write_indices port '{port}' is not a declared port"
+                    ));
+                }
+            }
+            None => errors.push(format!(
+                "state service group '{group_name}' binds write_indices to unknown component \
+                 '{component_name}'"
+            )),
+        }
+    }
+
+    // A component that reads this group's buffers but never receives the
+    // destinations cannot be the one scattering into them, so the runtime would
+    // have no way to bounds-check the writes it is about to perform.
+    for component_name in group.ports.keys() {
+        if !write_indices_ports.contains_key(component_name) {
+            errors.push(format!(
+                "state service group '{group_name}' binds component '{component_name}' to a \
+                 fixed-capacity buffer but declares no write_indices port for it; destinations \
+                 cannot be recovered from the step graph"
+            ));
+        }
+    }
+
+    // A fixed-capacity buffer that also changes shape is a contradiction: the
+    // scatter destinations are only meaningful against one constant extent.
+    for (cell_name, cell) in &workflow.state {
+        if cell.service_group.as_deref() != Some(group_name) {
+            continue;
+        }
+        if cell_name == write_indices || Some(cell_name) == group.logical_lengths.as_ref() {
+            continue;
+        }
+        if !matches!(cell.recurrence, crate::schema::ShapeRecurrence::Invariant) {
+            errors.push(format!(
+                "workflow state '{cell_name}' binds indexed_scatter group '{group_name}' but \
+                 declares a varying shape; a scattered buffer's capacity is constant, and its \
+                 length is carried by logical_lengths"
+            ));
+        }
     }
 }
 

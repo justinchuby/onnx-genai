@@ -3938,6 +3938,17 @@
             "string",
             "null"
           ]
+        },
+        "update": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StateUpdate"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How the graph writes each step's positions into this group's buffers.\n\nAbsent means the buffer extends along `sequence_axis` as the sequence\ngrows, which is the historical behavior. `indexed_scatter` declares a\nbuffer of fixed capacity whose new positions are written at destinations\nthe graph reads from a declared value. That distinction is what makes\nrewind, row replacement, and inactive-row compaction expressible: in a\ngrowing buffer the valid region is the whole tensor, while in a\nfixed-capacity buffer it is a declared prefix that the shape cannot\nreveal.\n\nThis describes the GRAPH's update discipline, not an allocator. The\nphysical buffer and where it lives remain runtime-owned."
         }
       },
       "required": [
@@ -4089,6 +4100,59 @@
         }
       },
       "type": "object"
+    },
+    "StateUpdate": {
+      "description": "How a state group's buffers absorb each step's new positions.\n\nBoth variants describe what the GRAPH does. Neither selects a storage\nstrategy, a slot allocator, or a device: a runtime is free to back an\n`append` group with a fixed arena or an `indexed_scatter` group with paged\nstorage, so long as the graph sees what it declared.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Each step's positions extend the buffer along `sequence_axis`.\n\nThe valid region is the whole tensor, so no write cursor is graph-visible\nand the buffer's shape carries the length.",
+          "properties": {
+            "kind": {
+              "const": "append",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Each step's positions are scattered into a buffer of FIXED capacity at\ndestinations the graph reads from `write_indices`.\n\nThe tensor's extent along `sequence_axis` is the capacity, not the\nlength: the valid region is the prefix named by the group's\n`logical_lengths`. Because destinations are data rather than position,\nrewinding a row is a cursor move, replacing a row reuses its slots, and\nrows of unequal length share one rectangular buffer.",
+          "properties": {
+            "capacity": {
+              "description": "Integer-scalar workflow value giving the fixed extent of\n`sequence_axis` that the graph was built against.\n\nThis is a graph fact, not a deployment budget. It bounds legal write\ndestinations; it does not say where the buffer lives, when it is\nallocated, or how many rows a deployment admits.",
+              "minLength": 1,
+              "type": "string"
+            },
+            "kind": {
+              "const": "indexed_scatter",
+              "type": "string"
+            },
+            "write_indices": {
+              "description": "Semantic state cell carrying this step's per-row destination\npositions along `sequence_axis`.\n\nA cell rather than a step output because the write cursor is part of\nthe group's state: it must be checkpointed, forked, and rewound with\nthe buffer it indexes, or a restored row would overwrite live\npositions.",
+              "minLength": 1,
+              "type": "string"
+            },
+            "write_indices_ports": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "description": "Per-component input port that receives the destinations, keyed by\ncomponent name.\n\nThe same class of fact as [`StateGroupContract::ports`]: which port\nof which component carries this group's ABI. A runtime cannot\nrecover it from the step graph, because destinations are an ordinary\ninteger vector and are shape-indistinguishable from every other\ninteger control input.",
+              "type": "object"
+            }
+          },
+          "required": [
+            "kind",
+            "write_indices",
+            "capacity"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "StateUpdateKind": {
       "description": "Loop-carried state update-semantics vocabulary.",

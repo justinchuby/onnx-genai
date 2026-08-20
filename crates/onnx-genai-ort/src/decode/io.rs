@@ -316,16 +316,17 @@ fn accumulate_static_cache_layer(
     Ok(())
 }
 
+/// Check that a port looks like a static-cache buffer.
+///
+/// The element type is deliberately not constrained. A static cache is a
+/// fixed-capacity buffer the graph scatters into, and the runtime's job is to
+/// allocate it, bind it, and hand back the handle — none of which depends on
+/// what the elements mean. An FP8 cache is exactly as bindable as an fp16 one;
+/// if the model's attention kernel has no FP8 implementation, the session fails
+/// to load with the execution provider's own type error, which names the
+/// operator. Rejecting the dtype here would replace that precise diagnosis with
+/// a vaguer one from a layer that has no kernels to speak for.
 fn validate_static_cache_tensor(info: &TensorInfo) -> Result<()> {
-    if !matches!(
-        info.dtype,
-        DataType::Float32 | DataType::Float16 | DataType::BFloat16
-    ) {
-        return Err(OrtError::InvalidArgument(format!(
-            "static-cache tensor '{}' must be Float32, Float16, or BFloat16, got {:?}",
-            info.name, info.dtype
-        )));
-    }
     if info.shape.len() != 3 || info.shape[1] <= 0 || info.shape[2] <= 0 {
         return Err(OrtError::InvalidArgument(format!(
             "static-cache tensor '{}' must have shape [B, MAX_LEN, KV_DIM], got {:?}",

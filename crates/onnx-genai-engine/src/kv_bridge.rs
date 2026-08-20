@@ -124,7 +124,9 @@ pub(crate) fn infer_kv_model_info(
 fn native_kv_tensor_spec(info: &TensorInfo) -> anyhow::Result<KvTensorSpec> {
     if !is_supported_kv_dtype(info.dtype) {
         anyhow::bail!(
-            "past KV input '{}' must be Float32, Float16, or BFloat16, got {:?}",
+            "past KV input '{}' has dtype {:?}, which the paged KV cache cannot store \
+             (its pages hold Float32, Float16, or BFloat16). The declaration is well \
+             formed; this backend lacks the capability.",
             info.name,
             info.dtype
         );
@@ -279,7 +281,9 @@ fn require_present_kv_output(graph: &dyn GraphIo, name: &str) -> anyhow::Result<
         })?;
     if !is_supported_kv_dtype(info.dtype) {
         anyhow::bail!(
-            "KV present output '{name}' must be Float32, Float16, or BFloat16, got {:?}",
+            "KV present output '{name}' has dtype {:?}, which the paged KV cache cannot \
+             store (its pages hold Float32, Float16, or BFloat16). The declaration is \
+             well formed; this backend lacks the capability.",
             info.dtype
         );
     }
@@ -348,11 +352,16 @@ pub(crate) fn infer_kv_heads_and_head_dim(info: &TensorInfo) -> anyhow::Result<(
     Ok((num_kv_heads, head_dim))
 }
 
-/// KV present/past tensor element types the runtime can consume.
+/// KV element types the *paged* KV cache can store.
 ///
-/// The host paged-mirror path widens 16-bit float values to fp32 page storage.
-/// Shared buffers keep their native dtype and never round-trip through the host
-/// cache.
+/// This is a storage capability of this backend, not a property of the metadata
+/// format: `KvStorageType` has fp32 and 16-bit float pages and nothing narrower,
+/// and the host paged-mirror path widens 16-bit float values to fp32 page
+/// storage. A package may legitimately declare an FP8 cache — the format can
+/// name `float8_e4m3fn` — and it will be refused here, by name, because these
+/// pages cannot hold it. Callers surface that as an unsupported-capability
+/// error so the reader knows to change backend or EP, not to edit the
+/// document.
 fn is_supported_kv_dtype(dtype: DataType) -> bool {
     matches!(
         dtype,

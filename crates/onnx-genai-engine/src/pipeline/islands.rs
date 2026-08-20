@@ -111,6 +111,14 @@ struct StableIslandBinding {
     graph_id: i32,
     service_generation: u64,
     source_ptrs: Vec<usize>,
+    /// Stable inputs whose buffer a shared service output is actually bound to.
+    ///
+    /// Only these may skip the per-run copy from the caller's value: the graph
+    /// wrote this run's state into that exact buffer, so copying would put back
+    /// the value the caller held before the write. Declaring the aliasing legal
+    /// is not enough - the binding either happened or it did not, and the two
+    /// have to be the same decision or the state silently stops advancing.
+    aliased_service_inputs: HashSet<String>,
 }
 
 impl ExecutionIsland {
@@ -320,7 +328,7 @@ impl ExecutionIsland {
                 if source.numel() == 0 {
                     continue;
                 }
-                let shared_service = self.shared_buffer_inputs.contains_key(*name);
+                let shared_service = stable.aliased_service_inputs.contains(*name);
                 let aliases_destination = source_ptr
                     == destination.data_ptr_addr().with_context(|| {
                         format!(
@@ -494,6 +502,7 @@ impl ExecutionIsland {
                 binding.bind_input(name, input)?;
             }
             let mut stable_outputs = Vec::new();
+            let mut aliased_service_inputs = HashSet::new();
             for (name, output) in self.session.output_names().iter().zip(produced) {
                 if self.session.supports_fixed_capacity_present_binding()
                     && let Some(input_name) = self
@@ -518,6 +527,7 @@ impl ExecutionIsland {
                     // distinct even when metadata requests shared storage.
                     if input.shape() == output.shape() && input.dtype() == output.dtype() {
                         binding.bind_output(name, input)?;
+                        aliased_service_inputs.insert(input_name.clone());
                         continue;
                     }
                 }
@@ -566,6 +576,7 @@ impl ExecutionIsland {
                     graph_id,
                     service_generation: self.execution_generation.get(),
                     source_ptrs,
+                    aliased_service_inputs,
                 },
             );
             self.record_elapsed(started);
@@ -607,6 +618,7 @@ impl ExecutionIsland {
                 graph_id,
                 service_generation: self.execution_generation.get(),
                 source_ptrs,
+                aliased_service_inputs: HashSet::new(),
             },
         );
         self.store_outputs(values, produced)?;
@@ -916,12 +928,40 @@ fn pure_onnx_device(
     if !is_fusible_component(&resolved) {
         return None;
     }
+    // A component that scatters into a fixed-capacity buffer keeps its own
+    // invocation. Fusion would move the destinations to a value the island
+    // computes internally, and the runtime cannot bounds-check a write whose
+    // destinations it never sees. An unchecked scatter is undefined behaviour,
+    // which is not a trade fusion is allowed to make.
+    if receives_fixed_capacity_destinations(workflow, component) {
+        return None;
+    }
     Some(match session.cuda_device_id() {
         Some(device) => format!("cuda:{device}"),
         None => "cpu".to_string(),
     })
 }
 
+fn receives_fixed_capacity_destinations(workflow: &WorkflowSpec, component: &str) -> bool {
+    workflow.serving.as_ref().is_some_and(|serving| {
+        serving.state_service.groups.values().any(|group| {
+            matches!(
+                &group.update,
+                Some(onnx_genai_metadata::StateUpdate::IndexedScatter {
+                    write_indices_ports,
+                    ..
+                }) if write_indices_ports.contains_key(component)
+            )
+        })
+    })
+}
+
+/// Describe a session tensor as a metadata contract.
+///
+/// The dtype spellings are the metadata vocabulary's, not the component ABI's:
+/// the result is compared against declared [`TensorContract`]s, so a value that
+/// spelled FP8 the component way would never match a package that spelled it the
+/// schema way.
 fn session_tensor_contract(
     tensor: &onnx_genai_ort::TensorInfo,
 ) -> onnx_genai_metadata::TensorContract {
@@ -930,8 +970,8 @@ fn session_tensor_contract(
         DataType::Float32 => "float32",
         DataType::Float16 => "float16",
         DataType::BFloat16 => "bfloat16",
-        DataType::Float8E4M3 => "float8e4m3",
-        DataType::Float8E5M2 => "float8e5m2",
+        DataType::Float8E4M3 => "float8_e4m3fn",
+        DataType::Float8E5M2 => "float8_e5m2",
         DataType::Int8 => "int8",
         DataType::Int16 => "int16",
         DataType::Int32 => "int32",

@@ -1008,6 +1008,15 @@ impl PipelineEngine {
                             outputs,
                             component_overrides,
                         )?;
+                        // Fixed-capacity groups scatter to positions carried in
+                        // data. Bounds-check them here, while an illegal write
+                        // is still a diagnosable error rather than corruption.
+                        self.enforce_fixed_capacity_writes(
+                            workflow,
+                            selected_component,
+                            &selected_inputs,
+                            values,
+                        )?;
                         let session =
                             self.models.session(selected_component).with_context(|| {
                                 format!(
@@ -1565,9 +1574,164 @@ impl PipelineEngine {
                     )?;
                     return Ok(());
                 }
+                // Fusing components into one session does not make their writes
+                // safe. The island's fallback still carries the original
+                // bindings, so the same bounds check applies to the fused form.
+                let fused = island.fallback().clone();
+                for (component, inputs) in invoke_bindings(&fused) {
+                    self.enforce_fixed_capacity_writes(workflow, component, inputs, values)?;
+                }
+                let island = self.execution_islands.get(*id).with_context(|| {
+                    format!("workflow references unknown execution island {id}")
+                })?;
                 telemetry.component_invocations += island.component_count() as u64;
                 island.run(values, component_overrides)?;
                 telemetry.record_stage(format!("island:{id}"), stage_started.elapsed().as_nanos());
+            }
+        }
+        Ok(())
+    }
+
+    /// Enforce a fixed-capacity state group's write contract before the graph runs.
+    ///
+    /// An `indexed_scatter` group writes to positions carried in data, so the
+    /// graph itself cannot be trusted to stay inside its buffer: an out-of-range
+    /// destination is a silent out-of-bounds write on most execution providers,
+    /// not an error. The declaration exists precisely so the runtime can check
+    /// the writes it is about to perform, and it must do so before the invoke,
+    /// not after.
+    ///
+    /// This does not allocate, place, or size anything. Capacity is read from
+    /// the graph-visible value the package declared; the buffers are whatever
+    /// the caller already bound.
+    fn enforce_fixed_capacity_writes(
+        &self,
+        workflow: &WorkflowSpec,
+        component: &str,
+        inputs: &BTreeMap<String, String>,
+        values: &mut PipelineTensors,
+    ) -> anyhow::Result<()> {
+        let Some(serving) = workflow.serving.as_ref() else {
+            return Ok(());
+        };
+        for (group_name, group) in &serving.state_service.groups {
+            let Some(onnx_genai_metadata::StateUpdate::IndexedScatter {
+                capacity,
+                write_indices_ports,
+                ..
+            }) = &group.update
+            else {
+                continue;
+            };
+            let Some(port) = write_indices_ports.get(component) else {
+                continue;
+            };
+            let Some(destinations) = inputs.get(port) else {
+                continue;
+            };
+
+            self.materialize_workflow_value(values, capacity)?;
+            let capacity_rows = workflow_scalar_usize(values, capacity).with_context(|| {
+                format!("state service group '{group_name}' capacity '{capacity}'")
+            })?;
+            anyhow::ensure!(
+                capacity_rows > 0,
+                "state service group '{group_name}' declares capacity '{capacity}' = 0, so no \
+                 write destination is legal"
+            );
+            let axis = group.sequence_axis;
+
+            // The buffers must actually be the size the destinations were
+            // computed against. A capacity that disagrees with the bound tensor
+            // means either the declaration or the caller is wrong, and guessing
+            // which would turn a detectable mismatch into a memory error.
+            for (cell_name, alias) in group.ports.get(component).into_iter().flatten() {
+                let Some(value_name) = inputs.get(&alias.input) else {
+                    continue;
+                };
+                let Some(tensor) = values.get(value_name) else {
+                    continue;
+                };
+                let shape = tensor.shape();
+                let Some(extent) = shape
+                    .get(axis)
+                    .and_then(|extent| usize::try_from(*extent).ok())
+                else {
+                    anyhow::bail!(
+                        "state service group '{group_name}' declares sequence_axis {axis} but \
+                         state '{cell_name}' value '{value_name}' has shape {shape:?}"
+                    );
+                };
+                anyhow::ensure!(
+                    extent == capacity_rows,
+                    "state service group '{group_name}' state '{cell_name}' value '{value_name}' \
+                     has extent {extent} along sequence_axis {axis}, but the group declares a \
+                     fixed capacity of {capacity_rows}"
+                );
+            }
+
+            self.materialize_workflow_value(values, destinations)?;
+            let destination_rows = values
+                .get(destinations)
+                .with_context(|| {
+                    format!(
+                        "state service group '{group_name}' write destinations '{destinations}' \
+                         are unavailable"
+                    )
+                })?
+                .to_vec_i64()
+                .with_context(|| {
+                    format!(
+                        "state service group '{group_name}' write destinations '{destinations}' \
+                         must be an integer vector"
+                    )
+                })?;
+            for (row, destination) in destination_rows.iter().enumerate() {
+                anyhow::ensure!(
+                    *destination >= 0 && (*destination as u128) < capacity_rows as u128,
+                    "state service group '{group_name}' would write row {row} to position \
+                     {destination}, outside its capacity of {capacity_rows}"
+                );
+            }
+
+            // The valid prefix is what downstream reads mask against, so a
+            // length past the buffer exposes uninitialized slots as if they
+            // were history.
+            if let Some(lengths) = group
+                .logical_lengths
+                .as_deref()
+                .filter(|lengths| values.contains_key(*lengths))
+            {
+                self.materialize_workflow_value(values, lengths)?;
+                let logical = values
+                    .get(lengths)
+                    .with_context(|| {
+                        format!(
+                            "state service group '{group_name}' logical_lengths '{lengths}' \
+                             are unavailable"
+                        )
+                    })?
+                    .to_vec_i64()
+                    .with_context(|| {
+                        format!(
+                            "state service group '{group_name}' logical_lengths '{lengths}' \
+                             must be an integer vector"
+                        )
+                    })?;
+                for (row, length) in logical.iter().enumerate() {
+                    anyhow::ensure!(
+                        *length >= 0 && (*length as u128) <= capacity_rows as u128,
+                        "state service group '{group_name}' declares row {row} valid to \
+                         length {length}, beyond its capacity of {capacity_rows}"
+                    );
+                }
+                anyhow::ensure!(
+                    logical.len() == destination_rows.len(),
+                    "state service group '{group_name}' has {} logical lengths but {} write \
+                     destinations; every row writes on every step",
+                    logical.len(),
+                    destination_rows.len()
+                );
             }
         }
         Ok(())
@@ -2871,6 +3035,12 @@ fn validate_workflow_value(
         "float32" | "fp32" => DataType::Float32,
         "float16" | "fp16" => DataType::Float16,
         "bfloat16" | "bf16" => DataType::BFloat16,
+        // FP8 state and activations are ordinary 1-byte ORT tensors. Whether a
+        // kernel can COMPUTE on them is an execution-provider question answered
+        // at binding time; refusing to carry the value here would turn a
+        // capability gap into a false schema error.
+        "float8_e4m3fn" | "fp8_e4m3fn" | "float8_e4m3" | "fp8_e4m3" => DataType::Float8E4M3,
+        "float8_e5m2" | "fp8_e5m2" => DataType::Float8E5M2,
         "int64" => DataType::Int64,
         "int32" => DataType::Int32,
         "int16" => DataType::Int16,
@@ -3687,6 +3857,21 @@ fn workflow_row_selection(
         })
         .collect::<anyhow::Result<Vec<_>>>()
         .map(Some)
+}
+
+/// Component invocations reachable from a node, in order.
+///
+/// An execution island keeps its pre-fusion node as a fallback, which is the
+/// only place the original per-component port bindings survive; fusion rewrites
+/// them into one flat session signature.
+fn invoke_bindings(node: &WorkflowNode) -> Vec<(&str, &BTreeMap<String, String>)> {
+    match node {
+        WorkflowNode::Invoke {
+            component, inputs, ..
+        } => vec![(component.as_str(), inputs)],
+        WorkflowNode::Sequence { nodes } => nodes.iter().flat_map(invoke_bindings).collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn workflow_scalar_usize(values: &PipelineTensors, name: &str) -> anyhow::Result<usize> {

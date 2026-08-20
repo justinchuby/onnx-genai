@@ -997,6 +997,21 @@ pub struct StateGroupContract {
     /// Whether the component may write `present` into the `past` buffer.
     #[serde(default)]
     pub aliasing: StateAliasing,
+    /// How the graph writes each step's positions into this group's buffers.
+    ///
+    /// Absent means the buffer extends along `sequence_axis` as the sequence
+    /// grows, which is the historical behavior. `indexed_scatter` declares a
+    /// buffer of fixed capacity whose new positions are written at destinations
+    /// the graph reads from a declared value. That distinction is what makes
+    /// rewind, row replacement, and inactive-row compaction expressible: in a
+    /// growing buffer the valid region is the whole tensor, while in a
+    /// fixed-capacity buffer it is a declared prefix that the shape cannot
+    /// reveal.
+    ///
+    /// This describes the GRAPH's update discipline, not an allocator. The
+    /// physical buffer and where it lives remain runtime-owned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<StateUpdate>,
     /// Graph-visible total-length input, when the component reads one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_length: Option<String>,
@@ -1053,6 +1068,59 @@ pub enum StateKind {
     CrossAttention,
     /// Encoder output retained across decoder steps.
     Encoder,
+}
+
+/// How a state group's buffers absorb each step's new positions.
+///
+/// Both variants describe what the GRAPH does. Neither selects a storage
+/// strategy, a slot allocator, or a device: a runtime is free to back an
+/// `append` group with a fixed arena or an `indexed_scatter` group with paged
+/// storage, so long as the graph sees what it declared.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StateUpdate {
+    /// Each step's positions extend the buffer along `sequence_axis`.
+    ///
+    /// The valid region is the whole tensor, so no write cursor is graph-visible
+    /// and the buffer's shape carries the length.
+    Append,
+    /// Each step's positions are scattered into a buffer of FIXED capacity at
+    /// destinations the graph reads from `write_indices`.
+    ///
+    /// The tensor's extent along `sequence_axis` is the capacity, not the
+    /// length: the valid region is the prefix named by the group's
+    /// `logical_lengths`. Because destinations are data rather than position,
+    /// rewinding a row is a cursor move, replacing a row reuses its slots, and
+    /// rows of unequal length share one rectangular buffer.
+    IndexedScatter {
+        /// Semantic state cell carrying this step's per-row destination
+        /// positions along `sequence_axis`.
+        ///
+        /// A cell rather than a step output because the write cursor is part of
+        /// the group's state: it must be checkpointed, forked, and rewound with
+        /// the buffer it indexes, or a restored row would overwrite live
+        /// positions.
+        #[schemars(length(min = 1))]
+        write_indices: String,
+        /// Integer-scalar workflow value giving the fixed extent of
+        /// `sequence_axis` that the graph was built against.
+        ///
+        /// This is a graph fact, not a deployment budget. It bounds legal write
+        /// destinations; it does not say where the buffer lives, when it is
+        /// allocated, or how many rows a deployment admits.
+        #[schemars(length(min = 1))]
+        capacity: String,
+        /// Per-component input port that receives the destinations, keyed by
+        /// component name.
+        ///
+        /// The same class of fact as [`StateGroupContract::ports`]: which port
+        /// of which component carries this group's ABI. A runtime cannot
+        /// recover it from the step graph, because destinations are an ordinary
+        /// integer vector and are shape-indistinguishable from every other
+        /// integer control input.
+        #[serde(default)]
+        write_indices_ports: BTreeMap<String, String>,
+    },
 }
 
 /// Legality of aliasing a component's `present` output onto its `past` input.

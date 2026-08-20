@@ -1,0 +1,762 @@
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      ir_version: '1.0'
+      onnx_opsets:
+        ai.onnx: 24
+      capabilities:
+      - workflow_ssa
+      - linear_effects
+      - typed_emit
+      - nested_control_flow
+      - loop_induction_values
+      - serving_service_contract
+    inputs:
+      request.input_ids:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - prompt_sequence
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: prompt_tokens
+        source:
+          kind: request
+        required: true
+      request.max_iterations:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: runtime
+          version: '1.0'
+          role: max_iterations
+        source:
+          kind: request
+        required: false
+        default: 3
+      request.write_indices:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: write_indices
+        required: true
+      request.active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: active
+        required: true
+      package.capacity:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 8
+      package.done:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: false
+      package.accepted_len:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 0
+      package.loop_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: true
+    outputs:
+      logits:
+        contract:
+          dtype: float32
+          rank: 3
+          shape:
+          - batch
+          - 1
+          - 8
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
+      cache_lengths:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
+      write_indices:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
+      key_cache:
+        contract:
+          dtype: float32
+          rank: 3
+          shape:
+          - batch
+          - cache_capacity
+          - 4
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
+      value_cache:
+        contract:
+          dtype: float32
+          rank: 3
+          shape:
+          - batch
+          - cache_capacity
+          - 4
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
+    components:
+      model:
+        implementation:
+          kind: onnx
+          artifact: model.onnx
+        ports:
+          inputs:
+            input_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            key_cache:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - cache_capacity
+              - 4
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            value_cache:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - cache_capacity
+              - 4
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            write_indices:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            cache_lengths:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            logits:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - 1
+              - 8
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            updated_key_cache:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - cache_capacity
+              - 4
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            updated_value_cache:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - cache_capacity
+              - 4
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      state_init:
+        implementation:
+          kind: onnx
+          artifact: policies/state_init.onnx
+        ports:
+          inputs:
+            input_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - prompt_sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            write_indices:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            capacity:
+              dtype: int64
+              rank: 1
+              shape:
+              - 1
+          outputs:
+            key_cache:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - cache_capacity
+              - 4
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            value_cache:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - cache_capacity
+              - 4
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            cache_lengths:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            token:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      step_update:
+        implementation:
+          kind: onnx
+          artifact: policies/step_update.onnx
+        ports:
+          inputs:
+            write_indices:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            cache_lengths:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            capacity:
+              dtype: int64
+              rank: 1
+              shape:
+              - 1
+            active:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            next_write_indices:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            next_cache_lengths:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            next_active:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            next_done:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            accepted_len:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      next_token:
+        implementation:
+          kind: onnx
+          artifact: policies/next_token.onnx
+        ports:
+          inputs:
+            logits:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - 1
+              - 8
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            token:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      loop_continue:
+        implementation:
+          kind: onnx
+          artifact: policies/loop_continue.onnx
+        ports:
+          inputs:
+            active:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            continue:
+              dtype: bool
+              rank: 1
+              shape:
+              - 1
+    state:
+      logits:
+        contract:
+          dtype: float32
+          rank: 3
+          shape:
+          - batch
+          - 1
+          - 8
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: setup.logits
+        recurrence:
+          kind: invariant
+      active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: request.active
+        recurrence:
+          kind: invariant
+      done:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.done
+        recurrence:
+          kind: invariant
+      accepted_len:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.accepted_len
+        recurrence:
+          kind: invariant
+      loop_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        scope: invocation
+        initializer: package.loop_active
+        recurrence:
+          kind: invariant
+      write_indices:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: request.write_indices
+        recurrence:
+          kind: invariant
+      cache_lengths:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: setup.cache_lengths
+        recurrence:
+          kind: invariant
+      key_cache:
+        contract:
+          dtype: float32
+          rank: 3
+          shape:
+          - batch
+          - cache_capacity
+          - 4
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: setup.updated_key_cache
+        recurrence:
+          kind: invariant
+        service_group: decoder_cache
+        management: runtime
+        release_boundary: invocation
+      value_cache:
+        contract:
+          dtype: float32
+          rank: 3
+          shape:
+          - batch
+          - cache_capacity
+          - 4
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: setup.updated_value_cache
+        recurrence:
+          kind: invariant
+        service_group: decoder_cache
+        management: runtime
+        release_boundary: invocation
+    serving:
+      active: active
+      done: done
+      accepted_len: accepted_len
+      state_service:
+        groups:
+          decoder_cache:
+            kind: full_attention
+            sequence_axis: 1
+            layout: bsh
+            logical_lengths: cache_lengths
+            aliasing: permitted
+            update:
+              kind: indexed_scatter
+              write_indices: write_indices
+              capacity: package.capacity
+              write_indices_ports:
+                model: write_indices
+            reuse:
+              prefix_reusable: true
+              evictable_prefix: true
+            capabilities:
+              rollback_positions: 8
+              snapshot: true
+              fork: true
+            checkpoint:
+              adapter: onnx-genai.kv-checkpoint
+              version: '1'
+            ports:
+              model:
+                key_cache:
+                  input: key_cache
+                  output: updated_key_cache
+                value_cache:
+                  input: value_cache
+                  output: updated_value_cache
+    steps:
+    - kind: loop
+      setup:
+      - kind: invoke
+        component: state_init
+        inputs:
+          input_ids: request.input_ids
+          write_indices: request.write_indices
+          capacity: package.capacity
+        outputs:
+          key_cache: setup.key_cache
+          value_cache: setup.value_cache
+          cache_lengths: setup.cache_lengths
+          token: setup.token
+      - kind: invoke
+        component: model
+        inputs:
+          input_ids: setup.token
+          key_cache: setup.key_cache
+          value_cache: setup.value_cache
+          write_indices: request.write_indices
+          cache_lengths: setup.cache_lengths
+        outputs:
+          logits: setup.logits
+          updated_key_cache: setup.updated_key_cache
+          updated_value_cache: setup.updated_value_cache
+      steps:
+      - kind: invoke
+        component: next_token
+        inputs:
+          logits: logits
+        outputs:
+          token: body.token
+      - kind: invoke
+        component: step_update
+        inputs:
+          write_indices: write_indices
+          cache_lengths: cache_lengths
+          capacity: package.capacity
+          active: active
+        outputs:
+          next_write_indices: body.write_indices
+          next_cache_lengths: body.cache_lengths
+          next_active: body.active
+          next_done: body.done
+          accepted_len: body.accepted_len
+      - kind: invoke
+        component: model
+        inputs:
+          input_ids: body.token
+          key_cache: key_cache
+          value_cache: value_cache
+          write_indices: body.write_indices
+          cache_lengths: body.cache_lengths
+        outputs:
+          logits: body.logits
+          updated_key_cache: body.key_cache
+          updated_value_cache: body.value_cache
+      - kind: invoke
+        component: loop_continue
+        inputs:
+          active: body.active
+        outputs:
+          continue: loop.continue
+      continue_when: loop_active
+      max_iterations: request.max_iterations
+      carried:
+      - cell: logits
+        next: body.logits
+      - cell: active
+        next: body.active
+      - cell: done
+        next: body.done
+      - cell: accepted_len
+        next: body.accepted_len
+      - cell: loop_active
+        next: loop.continue
+      - cell: write_indices
+        next: body.write_indices
+      - cell: cache_lengths
+        next: body.cache_lengths
+      - cell: key_cache
+        next: body.key_cache
+      - cell: value_cache
+        next: body.value_cache
+      iteration:
+        value: loop.iteration
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+    - kind: emit
+      value: logits
+      output: logits
+      mode: replace
+    - kind: emit
+      value: cache_lengths
+      output: cache_lengths
+      mode: replace
+    - kind: emit
+      value: write_indices
+      output: write_indices
+      mode: replace
+    - kind: emit
+      value: key_cache
+      output: key_cache
+      mode: replace
+    - kind: emit
+      value: value_cache
+      output: value_cache
+      mode: replace
+package:
+  tokenizer:
+    algorithm: bpe
+    vocab_size: 32000
+    byte_level: true
+    artifacts:
+    - location: tokenizer.json
+      sha256: '0000000000000000000000000000000000000000000000000000000000000000'
+    special_tokens:
+      bos:
+        id: 1
+        content: <s>
+      eos:
+        id: 2
+        content: </s>
+generation:
+  overrides:
+    max_output_tokens:
+      input: request.max_iterations

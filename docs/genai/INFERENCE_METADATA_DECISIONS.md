@@ -600,6 +600,111 @@ old flag said *"use one buffer"* — a deployment decision. `aliasing` says
 a property of the graph. It defaults to `forbidden`, so a graph that never stated
 its aliasing legality is never aliased.
 
+### 12.2b Fixed-capacity state and the write contract
+
+A growing cache and a fixed-capacity ("static") cache differ in one respect that
+the runtime cannot infer: where the next write lands. A growing cache appends,
+so the destination *is* the current length. A static cache scatters into a
+preallocated buffer at a position the graph receives as data, and that position
+is chosen by whatever produced it — a prior step, a policy graph, or a scheduler
+decision reified into a tensor. Nothing about the tensor distinguishes it from
+any other integer control input.
+
+`update` closes that gap:
+
+```yaml
+state_service:
+  groups:
+    decoder_cache:
+      kind: full_attention
+      sequence_axis: 1
+      layout: bsh
+      logical_lengths: cache_lengths     # graph-visible valid prefix per row
+      aliasing: permitted
+      update:
+        kind: indexed_scatter            # append (default) | indexed_scatter
+        write_indices: write_indices     # a rank-1 semantic state cell, one slot per row
+        capacity: package.capacity       # a graph-visible integer scalar
+        write_indices_ports:             # which input port carries destinations
+          model: write_indices
+      checkpoint: { adapter: onnx-genai.kv-checkpoint, version: "1" }
+      ports:
+        model:
+          key_cache:   { input: key_cache,   output: updated_key_cache }
+          value_cache: { input: value_cache, output: updated_value_cache }
+```
+
+Each part earns its place:
+
+- **`write_indices` is a state cell, not a step output.** The cursor is part of
+  the cache's identity: forking a session forks it, rewinding restores it, and a
+  checkpoint that saved the buffer without it would restore a cache that
+  overwrites its own history. Declaring it as state is what makes those
+  operations coherent.
+- **`capacity` separates the buffer's size from its contents.** `logical_lengths`
+  is the valid prefix; capacity is the wall. Both are needed, because the whole
+  point of a static cache is that they differ.
+- **`write_indices_ports` names the port.** The runtime checks destinations
+  *before* the invoke, which requires knowing which bound input carries them.
+  This is the one fact that cannot be recovered from the graph: destinations are
+  shape- and dtype-indistinguishable from any other integer control input, and
+  the runtime cannot invert a cell name back to a body SSA value at invoke time.
+- **Group-bound buffers must be shape-`invariant`.** A fixed capacity that
+  changes shape is a contradiction; the validator refuses it rather than letting
+  the two claims drift.
+
+What this does **not** do is allocate anything. Capacity is read from a value the
+package already exposes; the buffers are whatever the caller bound. Physical
+allocation, placement, and device remain runtime-owned exactly as in §12.1 — the
+declaration only says what the graph will do to memory it is given, so the
+runtime can check it first.
+
+The check is not decorative. `ScatterND` accepts negative indices as
+from-the-end addressing, so a corrupted destination is *valid ONNX* that
+silently writes into another row's history; and an out-of-range one is an
+out-of-bounds write on providers that do not bounds-check. Validating
+destinations against declared capacity before execution is the only place that
+distinction can be caught while it is still an error rather than a wrong answer.
+Because fusing a scatter component into an execution island would hide its
+destinations behind the island boundary, such components are excluded from
+fusion: an unchecked scatter is undefined behaviour, which is not a trade a
+performance optimization may make.
+
+### 12.2c FP8 and other narrow cache element types
+
+The dtype vocabulary includes `float8_e4m3fn` and `float8_e5m2`, and a package
+may declare state in them. This is a representability decision with a sharp
+boundary, because three capabilities are involved and they are supported
+independently:
+
+| Capability | Who decides | Status |
+| --- | --- | --- |
+| Declare FP8 state and ports | metadata format | supported |
+| Validate the document | validator | supported |
+| Allocate and bind FP8 buffers | runtime | supported |
+| Compute on FP8 in a kernel | execution provider | provider-dependent |
+
+The rule that follows: **validation must not pre-empt the provider.** Metadata is
+portable and cannot know which provider will load a package, so refusing an FP8
+dtype at validation time reports a missing kernel as a malformed document — and
+those two problems have opposite remedies. A capability gap tells the reader to
+change provider or build; a schema error tells them to edit a file that was
+correct. The runtime therefore carries FP8 as far as it can and fails, when it
+must, with the provider's own error naming the operator and the element type.
+
+Measured on the CPU provider (ORT 1.28): an FP8 tensor allocates, binds, and
+round-trips through a session, so FP8 state is *loadable*. `ScatterND` has no FP8
+kernel there, so an FP8 *static* cache is not executable on that provider — the
+session fails to load with a type error naming `ScatterND` and
+`tensor(float8e4m3fn)`. That is an execution-provider blocker, not a metadata
+limitation, and it moves on its own when a provider registers the kernel.
+
+Two runtime storage paths remain narrower than the format, and say so by name
+rather than by refusing the document: the **paged KV cache** stores fp32 and
+16-bit float pages only, and **host-side KV growth** materializes buffers through
+per-dtype host representations. Both are backend capabilities; a package that
+declares FP8 state is well formed and simply cannot use those backends.
+
 ### 12.3 Capabilities and cascade
 
 `capabilities` declares the bounds within which a group can be rewound, snapshot,
@@ -1409,6 +1514,8 @@ The current evidence is:
 | Speculative decoding | yes | yes | synthetic | yes | Accept, reject, rollback, correction |
 | LoRA composition | yes | yes | artifact parity | yes | Ordered adapters survive row compaction |
 | Embedding/classification/reranking | yes | trivial sequence | model-dependent | ordinary batching | Task profile plus invoke and emit |
+| Fixed-capacity (static) cache | yes | yes | synthetic | yes | Indexed scatter, per-row cursors, unequal lengths, inactive-row freeze, rewind |
+| FP8 cache state | yes | provider-dependent | no | n/a | Declared, validated, allocated, and bound; compute awaits an FP8 kernel |
 
 “Partial” and “pending” are deliberate. They identify runtime or upstream
 limitations without weakening the representability claim. In particular:
@@ -1423,6 +1530,11 @@ limitations without weakening the representability claim. In particular:
 - Runtime-private storage formats such as paged KV do not require a new
   workflow pattern; they are implementations of the declared state-service
   semantics.
+- FP8 state is representable, validated, allocatable, and bindable, and its
+  “provider-dependent” execution level is a measurement, not a hedge: the CPU
+  provider has no FP8 `ScatterND` kernel, so a static FP8 cache fails to load
+  there with the provider's own type error. §12.2c records why that must not be
+  turned into a validation error.
 
 The canonical executable packages cover decoder, VLM, image diffusion, guided
 diffusion, masked diffusion, speculative decoding, codec, TTS, video, and
