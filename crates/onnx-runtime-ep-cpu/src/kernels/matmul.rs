@@ -2993,6 +2993,7 @@ fn half_gemm_tile(
 ) {
     #[cfg(target_arch = "x86_64")]
     if format == HalfFormat::Bf16 && x86_bf16::native_available() {
+        count_half_native_bf16();
         x86_bf16::gemm(a, b, c, m, k, n);
         return;
     }
@@ -3132,6 +3133,30 @@ pub(crate) fn half_prefill_gebp_calls() -> u64 {
 #[cfg(all(test, target_arch = "x86_64"))]
 pub(crate) fn reset_half_prefill_gebp_calls() {
     HALF_PREFILL_GEBP_CALLS.with(|c| c.set(0));
+    HALF_NATIVE_BF16_CALLS.with(|c| c.set(0));
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+thread_local! {
+    /// Test-only count of half GEMM tiles served by the native AVX-512 BF16
+    /// kernel. `half_gemm_tile` tries that kernel *before* the fused
+    /// widen-pack GEBP, so on a host with `avx512bf16` a bf16 tile never
+    /// reaches the GEBP. Counting both arms lets a test assert that exactly
+    /// one of them ran, which keeps the dispatch guarded on every CPU instead
+    /// of only on the ones that lack AVX-512 BF16.
+    static HALF_NATIVE_BF16_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn count_half_native_bf16() {
+    #[cfg(test)]
+    HALF_NATIVE_BF16_CALLS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+pub(crate) fn half_native_bf16_calls() -> u64 {
+    HALF_NATIVE_BF16_CALLS.with(std::cell::Cell::get)
 }
 
 #[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
@@ -5430,11 +5455,36 @@ mod tests {
                 #[cfg(not(feature = "mlas"))]
                 let mlas_claims_this = false;
                 if !mlas_claims_this {
-                    assert_eq!(
-                        half_prefill_gebp_calls(),
-                        1,
-                        "{dtype:?} m={m}: prefill did not take the fused widen-pack GEBP"
-                    );
+                    // `half_gemm_tile` tries the native AVX-512 BF16 kernel
+                    // before the GEBP, so on a host with `avx512bf16` a bf16
+                    // tile legitimately never reaches the GEBP. That is the
+                    // same precedence `half_decode_prefers_gebp_when` already
+                    // encodes for decode. Asserting a bare
+                    // `half_prefill_gebp_calls() == 1` therefore asserts a
+                    // route the hardware cannot take, and fails on exactly the
+                    // runners that have AVX-512 BF16 -- which is why this test
+                    // was intermittently red rather than consistently so.
+                    //
+                    // Assert the disjunction instead: exactly one of the two
+                    // fast routes ran. That still catches a silent fall-through
+                    // to the portable blocked half GEMM, on every CPU, which is
+                    // what the guardrail is actually for.
+                    let gebp = half_prefill_gebp_calls();
+                    let native_bf16 = half_native_bf16_calls();
+                    if dtype == DataType::BFloat16 && x86_bf16::native_available() {
+                        assert_eq!(
+                            (gebp, native_bf16),
+                            (0, 1),
+                            "{dtype:?} m={m}: host has avx512bf16, so prefill must take \
+                             the native BF16 kernel and not the widen-pack GEBP"
+                        );
+                    } else {
+                        assert_eq!(
+                            (gebp, native_bf16),
+                            (1, 0),
+                            "{dtype:?} m={m}: prefill did not take the fused widen-pack GEBP"
+                        );
+                    }
                 }
 
                 let expected = naive_matmul(&a_data, &b_data, m, k, n);
