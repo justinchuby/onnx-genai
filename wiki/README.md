@@ -18,6 +18,12 @@ updated: 2026-08-19
 
 发布后的读者请从 [[index|onnx-genai Knowledge Base]] 开始。
 
+笔记只在这里编辑。站点由
+[justinchuby/onnx-genai-wiki](https://github.com/justinchuby/onnx-genai-wiki)
+发布:它定时镜像本目录,并派生一份英文版,发布成中英双语站点
+<https://www.justinchuby.com/onnx-genai-wiki/>。那边的中文内容是镜像,直接改动会
+被下一次同步覆盖。
+
 > [!important] 来源优先级
 > 当 wiki 笔记与正式文档或代码不一致时,按以下顺序采信:
 > 1. 当前代码与可复现的实测数据
@@ -90,8 +96,8 @@ updated: 2026-08-19
 > "execution provider(执行提供者,EP)";此后可只用英文缩写。当英文术语本身就是
 > 业界通用称呼时(如 kernel、arena、allocator),直接沿用英文,不必强译。
 
-`lang` 字段会被 Quartz 直接用作发布页面的 `<html lang>` 属性
-(`renderPage.tsx`),因此它影响的是真实的可访问性与搜索引擎行为,不只是元数据。
+`lang` 字段会被 Quartz 直接用作发布页面的 `<html lang>` 属性,因此它影响的是真实
+的可访问性与搜索引擎行为,不只是元数据。
 中文笔记写 `lang: zh-CN`。
 
 > [!note] 创建与修改日期
