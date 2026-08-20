@@ -1030,8 +1030,12 @@ before/after pair, not the absolute): `llama3_8b_qkv_t8` **4.61x -> 3.56x**, `ll
 `t512` 1.25x -> 1.17x and 1.20x -> 1.11x.
 
 Bounded honestly: 8-bit is untouched — `Int8Weight` keeps the per-column default, so its behaviour
-is byte-for-byte what it was. `m = 1` cannot reach any of this (the lowest gate of any route is 4) and is
-unchanged. And the route is still behind ORT at small `m`, for the reason section 5 already gives:
+is byte-for-byte what it was. `m = 1` cannot reach any of this -- no int4 prefill route is gated
+below `m = 2`, a floor section 11 pins with a `const` assert -- and is unchanged. (This sentence
+originally read "the lowest gate of any route is 4", which was true when it was written and stale
+within two PRs; the conclusion survives because it rests on the floor, not on the value.)
+
+And the route is still behind ORT at small `m`, for the reason section 5 already gives:
 MLAS SQNBit's CompInt8 path uses integer dot products where this one widens every nibble to f32,
 and VNNI is what would make that pay.
 
@@ -1127,10 +1131,10 @@ structural: MLAS `SQNBitGemm` CompInt8 wants VNNI, which this host does not have
 ### 11. The gate for block sizes the row kernels reject was never measured at all (**fixed**)
 
 Sections 9 and 10 each re-derived `INT4_PREFILL_GEBP_MIN_ROWS` and its L2-resident twin. Section 10
-closed by naming `INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED = 4` as "untouched"; section 9 did not name it
-at all, and its closing claim that "the lowest gate of any route is 4" has been stale since section
-10 set the pair to (3, 6). It was untouched because it was **unmeasurable**: `benches/int4_prefill_route_ab.rs` pinned `block_size` to 32, so no
-run of that bench could reach the branch. This is the third instance of one defect —
+closed by naming `INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED = 4` as "untouched"; section 9 did not name
+it at all. It was untouched because it was **unmeasurable**: `int4_prefill_route_ab.rs` pinned
+`block_size` to 32, so no run of that bench could reach the branch. This is the third instance of
+one defect —
 `PROBE_BITS` (#1558) existed for the same reason, and `scripts/ort_ab/gen_gemm.py` pinned
 `BLOCK_SIZE = 32` *and* stepped tokens `1 -> 8`, straddling every row gate the last three PRs moved.
 A threshold that no harness can express is not conservative, it is unowned.
