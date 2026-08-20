@@ -4462,3 +4462,77 @@ their code path cannot change. Their scatter — up to +31.1% at prefill t=8,
 against a 31.41% A/A floor — is a calibration of the host, not a result, and is
 reported as such. When a host is too noisy to measure, knowing which cells
 *cannot* have moved is worth more than more trials.
+
+## 44. Two identical symptoms, opposite verdicts: why a self-consistent A/B cannot adjudicate correctness (#1491, #1421)
+
+On the same day, two changes produced the *same* symptom: a reordered
+floating-point reduction flipped the greedy `argmax` at a near-tie, changing the
+decoded token stream. The obvious reading — "output changed, therefore
+regression" — would have been wrong for one of them, and the equally obvious
+reading — "the A/B agrees with itself, therefore fine" — would have shipped a
+silent corruption in the other.
+
+| | #1491 (causal capture) | #1421 (RMSNorm fold) |
+|---|---|---|
+| Mechanism | split-KV chunked online softmax reorders the fp32 key reduction vs the monolithic `attention_row` serial reduction | folding the standalone norm into the following GEMV reorders the fp16 reduction |
+| Margin at the flip | 0.047 nats (`6086` vs `30879`) | 0.0156 nats (`448` vs `304`) |
+| Independent oracle picked | the **parent** — the change was wrong | the **changed** side — the change was *more* accurate |
+| Disposition | fix (gate causal back onto the monolithic path) | accept, and correct the docs |
+
+### 44.1 The trap: a comparison that passes because both sides moved together
+
+#1491 was first validated by comparing eager decode against captured decode:
+300/300 tokens identical. That comparison is *necessary* but proves only that the
+two paths agree **with each other**. Enabling `dev_length_eligible` for the causal
+form routed *both* eager and capture onto the split-KV kernel, so both moved, and
+the check passed while the output was wrong.
+
+The failure was maximally quiet: no crash, no NaN, no garbage — a *plausible*
+alternative token (the runner-up), appearing only past a capacity boundary and
+only at a near-tie. A downstream reader would have seen fluent text.
+
+**Rule.** Byte-identity between two paths you changed together is not evidence of
+correctness. At least one arm of a correctness comparison must be something the
+change provably cannot reach.
+
+### 44.2 The instrument: a teacher-forced dense-prefill oracle
+
+What settled both cases was cheap and reusable. Take the shared prefix both sides
+agree on (prompt + generated tokens up to the divergence), then run it as a
+**fresh full prefill** — one dense causal attention pass that touches no KV-ring,
+no fixed-capacity decode, no `dev_len` logic — and dump the top-k next-token
+logprobs:
+
+```
+profile_native --model <dir> --ep cpu \
+  --dump-logprobs <abs-out.json> --prompt-ids <abs-prefix.json>
+```
+
+Note `--prompt-ids` takes a **file path**, not inline JSON (inline yields a
+misleading `os error 123`). Run it on the **CPU EP**: a different implementation
+at different precision, which a CUDA kernel change cannot influence. Keep the
+prefix under the KV capacity so the oracle stays on the dense path.
+
+This gives the *ranking and the margin*, not just a winner — and the margin is
+what tells you whether you are looking at a bug or at rounding. Both cases here
+were sub-0.05-nat ties, i.e. positions where any legitimate reassociation may
+flip the choice.
+
+### 44.3 The corollary: a "byte-identical" claim in a comment is a hypothesis
+
+The RMSNorm fold was documented in-code as *byte-identical*. It is not: it changes
+reduction order, and one prompt in six flipped a token at qwen0.5B/896. The claim
+had apparently never been tested — and because it was written as settled fact, it
+was reused as a premise. The comment now states what is actually true (reduction
+order changes; greedy tokens can flip at near-ties) with the oracle verdict
+attached.
+
+**Rule.** Treat an unverified numerical-equivalence claim in a comment as an
+untested hypothesis, especially when it is load-bearing for a decision. Verifying
+one is usually a single measurement.
+
+### 44.4 Reporting note
+
+Neither investigation reported throughput: the box was shared, and a token-stream
+comparison is immune to contention while a timing number is not. Both conclusions
+rest on exact token ids and logprob margins, which are contention-independent.
