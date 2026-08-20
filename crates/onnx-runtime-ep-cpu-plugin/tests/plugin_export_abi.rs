@@ -462,6 +462,167 @@ fn compute_add_broadcast() {
     });
 }
 
+/// Records the operand arity and absent-ness the plugin actually handed a
+/// kernel, so a test can assert on what the binding produced rather than only
+/// on the numbers that came out the other end.
+#[derive(Default)]
+struct SeenOperands {
+    inputs: Vec<bool>,
+    outputs: usize,
+}
+
+thread_local! {
+    static SEEN: std::cell::RefCell<SeenOperands> =
+        std::cell::RefCell::new(SeenOperands::default());
+}
+
+/// A kernel that records what it was given and writes its first present input
+/// through to output 0.
+#[derive(Debug)]
+struct RecordingKernel;
+
+impl onnx_runtime_ep_api::kernel::Kernel for RecordingKernel {
+    fn execute(
+        &self,
+        inputs: &[onnx_runtime_ep_api::tensor::TensorView],
+        outputs: &mut [onnx_runtime_ep_api::tensor::TensorMut],
+    ) -> onnx_runtime_ep_api::Result<()> {
+        SEEN.with(|c| {
+            let mut c = c.borrow_mut();
+            c.inputs = inputs.iter().map(|v| v.is_absent()).collect();
+            c.outputs = outputs.len();
+        });
+        let src = inputs.iter().find(|v| !v.is_absent()).ok_or_else(|| {
+            onnx_runtime_ep_api::EpError::KernelFailed("RecordingKernel: no present input".into())
+        })?;
+        let n = src.shape.iter().product::<usize>();
+        let src_ptr = src.data_ptr::<f32>();
+        // SAFETY: both operands are f32, host-resident and `n` elements long;
+        // the plugin sized output 0 from this kernel's shape inference.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src_ptr, outputs[0].data_ptr_mut::<f32>(), n);
+        }
+        Ok(())
+    }
+}
+
+/// Drive one single-node `Compute` over `slots`, with `present` ORT inputs
+/// bound, and return what the kernel saw.
+fn run_slots(slots: Vec<Option<usize>>, present: usize) -> (bool, Vec<bool>, usize) {
+    use mock_kernel_ctx::*;
+    use onnx_runtime_ep_plugin::compute::{
+        CompiledKernelEntry, ExportedComputeInfo, ShapeInference,
+    };
+    use onnx_runtime_ir::DataType;
+
+    let api = mock_ort_api();
+    let api_ptr: *const ort::OrtApi = &api;
+    unsafe { onnx_runtime_ep_plugin::status::set_host_api(api_ptr) };
+
+    STATE.with(|s| {
+        *s.borrow_mut() = Some(MockKernelState {
+            inputs: (0..present)
+                .map(|k| MockTensor {
+                    data: vec![1.0 + k as f32, 2.0, 3.0, 4.0],
+                    shape: vec![4],
+                })
+                .collect(),
+            outputs: vec![],
+        });
+    });
+    SEEN.with(|c| *c.borrow_mut() = SeenOperands::default());
+
+    let entry = CompiledKernelEntry {
+        kernel: Box::new(RecordingKernel),
+        num_inputs: slots.len(),
+        num_outputs: 1,
+        output_dtypes: vec![DataType::Float32],
+        absent_output_slots: std::collections::HashSet::new(),
+        shape_inference: ShapeInference::ElementwiseBroadcast,
+        input_slots: slots,
+    };
+    let mut info = ExportedComputeInfo::new(vec![entry]);
+    let compute_fn = info.vtable.Compute.unwrap();
+    let info_ptr = &mut info.vtable as *mut ort::OrtNodeComputeInfo;
+    let dummy_ctx = 0xDEAD_BEEFusize as *mut ort::OrtKernelContext;
+    let status = unsafe { compute_fn(info_ptr, ptr::null_mut(), dummy_ctx) };
+    let ok = status.is_null();
+    let (seen_in, seen_out) = SEEN.with(|c| {
+        let c = c.borrow();
+        (c.inputs.clone(), c.outputs)
+    });
+    (ok, seen_in, seen_out)
+}
+
+/// The kernel sees exactly as many operands as the node has slots.
+///
+/// The operand views are built in a fixed-width stack array, so the arity the
+/// kernel observes is a property of the slicing, not of the storage. A binding
+/// that handed over the whole array would show up here as extra absent
+/// operands.
+#[test]
+fn a_node_sees_exactly_its_own_operand_count() {
+    for arity in 1..=3usize {
+        let (ok, seen, _) = run_slots((0..arity).map(Some).collect(), arity);
+        assert!(ok, "arity {arity}: Compute failed");
+        assert_eq!(
+            seen.len(),
+            arity,
+            "arity {arity}: kernel saw {} operands, not {arity}",
+            seen.len()
+        );
+        assert!(
+            seen.iter().all(|absent| !absent),
+            "arity {arity}: a bound operand arrived absent: {seen:?}"
+        );
+    }
+}
+
+/// An unbound optional slot arrives at the kernel marked absent.
+///
+/// The stack array is seeded with the absent sentinel and the fill loop skips
+/// unbound slots, so this is what proves the seed is the right value and is
+/// actually reached — not merely that nothing crashed.
+#[test]
+fn an_unbound_slot_arrives_absent_and_in_position() {
+    let (ok, seen, _) = run_slots(vec![Some(0), None, Some(1)], 2);
+    assert!(ok, "Compute failed with an unbound middle slot");
+    assert_eq!(
+        seen,
+        vec![false, true, false],
+        "absent-ness did not land in the slot that was unbound"
+    );
+}
+
+/// A node wider than the inline operand array still works, through the heap.
+///
+/// `INLINE_OPERANDS` is 4, so 6 forces the spill path. Without this the whole
+/// fallback branch would be untested and a node with many inputs would be the
+/// first thing to discover it.
+#[test]
+fn a_node_wider_than_the_inline_array_spills_to_the_heap() {
+    let arity = 6usize;
+    let (ok, seen, _) = run_slots((0..arity).map(Some).collect(), arity);
+    assert!(ok, "Compute failed for a {arity}-operand node");
+    assert_eq!(seen.len(), arity, "wide node lost or gained operands");
+    assert!(
+        seen.iter().all(|absent| !absent),
+        "wide node: a bound operand arrived absent: {seen:?}"
+    );
+}
+
+/// The boundary itself: exactly `INLINE_OPERANDS` operands stays inline and
+/// one more spills, and both give the kernel the same arity.
+#[test]
+fn the_inline_operand_boundary_is_off_by_none() {
+    for arity in [4usize, 5] {
+        let (ok, seen, outs) = run_slots((0..arity).map(Some).collect(), arity);
+        assert!(ok, "arity {arity}: Compute failed at the inline boundary");
+        assert_eq!(seen.len(), arity, "arity {arity}: wrong operand count");
+        assert_eq!(outs, 1, "arity {arity}: wrong output count");
+    }
+}
+
 // ─── L1 — ABI surface: exported symbol audit ─────────────────────────────────
 
 /// L1 (portable): Verify the two required symbols resolve via `dlsym`/`LoadLibrary`.

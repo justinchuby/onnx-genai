@@ -3025,13 +3025,32 @@ unsafe extern "C" fn compute_execute(
                 // session error.
                 crate::dispatch_probe::count(crate::dispatch_probe::Event::NodeExecuted);
                 let bind_probe = crate::dispatch_probe::Phase::TensorBind.enter();
-                crate::dispatch_probe::count(crate::dispatch_probe::Event::DispatchAlloc);
-                let mut kernel_inputs: Vec<TensorView<'_>> =
-                    Vec::with_capacity(entry.input_slots.len());
-                for (position, slot) in entry.input_slots.iter().enumerate() {
-                    match slot {
-                        Some(ort_idx) => match inputs.get(*ort_idx) {
-                            Some(input) => kernel_inputs.push(input.view()),
+                // Operand views for an ordinary node live on the stack. A
+                // `Vec::with_capacity` here was one `malloc`/`free` pair per
+                // `Run` -- pure fixed cost -- to hold a handful of `Copy`
+                // views that never outlive this block. The `absent` seed is
+                // what the unbound-slot arm used to push, so a slot with no
+                // ORT input is already correct and the loop leaves it alone.
+                let operand_count = entry.input_slots.len();
+                let mut inline_inputs;
+                let mut heap_inputs;
+                let kernel_inputs: &mut [TensorView<'_>] = if operand_count <= INLINE_OPERANDS {
+                    inline_inputs = [TensorView::absent(DataType::Undefined); INLINE_OPERANDS];
+                    &mut inline_inputs[..operand_count]
+                } else {
+                    crate::dispatch_probe::count(crate::dispatch_probe::Event::DispatchAlloc);
+                    heap_inputs = vec![TensorView::absent(DataType::Undefined); operand_count];
+                    &mut heap_inputs[..]
+                };
+                for (position, (dst, slot)) in
+                    kernel_inputs.iter_mut().zip(&entry.input_slots).enumerate()
+                {
+                    // A slot beyond ORT's input count means the compile-time
+                    // slot map and the runtime binding disagree; fail closed
+                    // rather than index.
+                    if let Some(ort_idx) = slot {
+                        match inputs.get(*ort_idx) {
+                            Some(input) => *dst = input.view(),
                             None => {
                                 return fail_status(&format!(
                                     "Compute: input slot {position} maps to ORT input \
@@ -3040,13 +3059,12 @@ unsafe extern "C" fn compute_execute(
                                     inputs.len()
                                 ));
                             }
-                        },
-                        None => kernel_inputs.push(TensorView::absent(DataType::Undefined)),
+                        }
                     }
                 }
                 bind_probe.end();
                 let lookup_probe = crate::dispatch_probe::Phase::DispatchLookup.enter();
-                let output_shapes = match infer_shapes(&entry.shape_inference, &kernel_inputs) {
+                let output_shapes = match infer_shapes(&entry.shape_inference, kernel_inputs) {
                     Ok(s) => s,
                     Err(e) => {
                         return fail_status(&format!("Compute: shape inference failed: {e}"));
@@ -3124,7 +3142,7 @@ unsafe extern "C" fn compute_execute(
                             api_ref,
                             kernel_context,
                             staging,
-                            &mut kernel_inputs,
+                            kernel_inputs,
                             &entry.input_slots,
                             host_operand_indices(&entry.shape_inference),
                             &output_mem_infos,
@@ -3155,18 +3173,37 @@ unsafe extern "C" fn compute_execute(
                 // into a `Vec` first and immediately draining it allocated a second
                 // vector of views per call for nothing.
                 let mut ort_view_iter = owned_outputs.iter_mut().map(|o| o.view_mut());
-                let mut output_views: Vec<TensorMut<'_>> = Vec::with_capacity(slot_map.len());
-                for (slot_idx, kind) in slot_map.iter().enumerate() {
+                // Same stack storage as the operand views above. `TensorMut` is
+                // not `Copy` — it is a unique borrow — so the seed is built per
+                // slot rather than copied, but it is the same null-backed absent
+                // sentinel the `Absent` arm produces and it borrows only empty
+                // `'static` slices, so it coerces to this block's lifetime.
+                let mut inline_outputs;
+                let mut heap_outputs;
+                let output_views: &mut [TensorMut<'_>] = if slot_map.len() <= INLINE_OPERANDS {
+                    inline_outputs =
+                        std::array::from_fn::<_, INLINE_OPERANDS, _>(|_| absent_output_view());
+                    &mut inline_outputs[..slot_map.len()]
+                } else {
+                    crate::dispatch_probe::count(crate::dispatch_probe::Event::DispatchAlloc);
+                    heap_outputs = Vec::from_iter(
+                        std::iter::repeat_with(absent_output_view).take(slot_map.len()),
+                    );
+                    &mut heap_outputs[..]
+                };
+                for ((slot_idx, kind), dst) in
+                    slot_map.iter().enumerate().zip(output_views.iter_mut())
+                {
                     match kind {
                         SlotKind::Ort => {
-                            output_views.push(ort_view_iter.next().unwrap());
+                            *dst = ort_view_iter.next().unwrap();
                         }
                         SlotKind::Absent(idx) => {
                             let buf = &mut absent_bufs[*idx];
                             let shape = &absent_shapes[slot_idx];
                             let strides = &absent_strides_storage[*idx];
                             let scratch_dtype = absent_dtypes[*idx];
-                            let view = TensorMut::new(
+                            *dst = TensorMut::new(
                                 DevicePtrMut(buf.as_mut_ptr().cast()),
                                 scratch_dtype,
                                 shape.as_slice(),
@@ -3174,7 +3211,6 @@ unsafe extern "C" fn compute_execute(
                                 DeviceId::cpu(),
                             )
                             .mark_absent();
-                            output_views.push(view);
                         }
                     }
                 }
@@ -3205,7 +3241,7 @@ unsafe extern "C" fn compute_execute(
                         },
                         &*entry.kernel,
                         plans,
-                        &kernel_inputs,
+                        kernel_inputs,
                         "Compute: node 0",
                     )
                 } {
@@ -3214,19 +3250,21 @@ unsafe extern "C" fn compute_execute(
                 };
                 lookup2_probe.end();
                 let kernel_probe = crate::dispatch_probe::Phase::KernelInvoke.enter();
-                if let Err(e) = entry.kernel.execute_with_workspace(
-                    &kernel_inputs,
-                    &mut output_views,
-                    workspace,
-                ) {
+                if let Err(e) =
+                    entry
+                        .kernel
+                        .execute_with_workspace(kernel_inputs, output_views, workspace)
+                {
                     return fail_status(&format!("Compute: kernel execution failed: {e}"));
                 }
                 kernel_probe.end();
                 EXECUTED_NODE_COUNT.fetch_add(1, Ordering::Relaxed);
-                // `output_views` borrows `owned_outputs`, so the recycle has to
-                // follow its last use. An early `return` above simply skips this and
-                // the next `Run` allocates again -- correct, just not reused.
-                drop(output_views);
+                // `output_views` borrows `owned_outputs`, so anything that
+                // touches the outputs again has to follow its last use. That
+                // used to need an explicit `drop` of the owning `Vec`; the
+                // views now live in this frame's own storage, which holds no
+                // allocation and has no `Drop`, so the borrow simply ends
+                // here.
             } else {
                 return fail_status(
                     "Compute: multi-node subgraph requires SubgraphRouting — \
@@ -3287,6 +3325,41 @@ pub(crate) struct RunScratch {
 /// hundreds is not worth pinning that memory on every worker thread for the
 /// rest of the process.
 const SCRATCH_MAX_CAPACITY: usize = 16;
+
+/// Operand count up to which a node's input views are built on the stack.
+///
+/// Unlike [`SCRATCH_MAX_CAPACITY`] this is not about how much memory to keep —
+/// nothing is kept, the storage dies with the block — it is about how wide a
+/// stack array is worth initialising to avoid a `malloc`/`free` pair. Every
+/// slot is seeded whether the node uses it or not, so the trade turns on how
+/// many operands ONNX nodes actually have: `Relu` and the rest of the
+/// elementwise family take 1, `MatMul` 2, `Gemm`/`Conv`/`Where`/`LayerNorm` 3,
+/// and past that the population thins out fast. Four covers those and costs a
+/// handful of stores; a wider node simply allocates, as it did before.
+///
+/// Deliberately *not* `dim_vec::INLINE_RANK`: that one answers "how many
+/// dimensions does a tensor have", this one answers "how many tensors does a
+/// node take". They are different questions about different things and tying
+/// them together would make one of the two answers wrong.
+const INLINE_OPERANDS: usize = 4;
+
+/// The seed for an unfilled output-view slot: null-backed, zero-rank, marked
+/// absent — the same sentinel the `SlotKind::Absent` arm builds.
+///
+/// Every slot is overwritten before the kernel sees it; this exists so the
+/// stack array can be initialised without `TensorMut` being `Copy`, and so
+/// that a slot which somehow escaped the fill would present as absent rather
+/// than as a tensor pointing at nothing.
+fn absent_output_view<'a>() -> TensorMut<'a> {
+    TensorMut::new(
+        DevicePtrMut(std::ptr::null_mut()),
+        DataType::Undefined,
+        &[],
+        &[],
+        DeviceId::cpu(),
+    )
+    .mark_absent()
+}
 
 thread_local! {
     /// This thread's parked [`RunScratch`].
