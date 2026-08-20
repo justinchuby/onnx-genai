@@ -144,9 +144,7 @@ impl DecodeRunner {
     /// and a pure-dense native runner — answers `None`, so the commit machinery
     /// stays inert outside hybrid recurrent targets.
     #[cfg(feature = "native-backend")]
-    fn native_recurrent_mut(
-        &mut self,
-    ) -> Option<&mut crate::native_decode::NativeDecodeSession> {
+    fn native_recurrent_mut(&mut self) -> Option<&mut crate::native_decode::NativeDecodeSession> {
         match self {
             DecodeRunner::Native(runner) if runner.has_recurrent_state() => Some(runner),
             _ => None,

@@ -514,9 +514,14 @@ impl NativeDecodeSession {
         let mut host = HashMap::with_capacity(recurrent.len());
         for name in &recurrent {
             let tensor = self.past.get(name).with_context(|| {
-                format!("recurrent state '{name}' is not materialized yet; snapshot it after a step")
+                format!(
+                    "recurrent state '{name}' is not materialized yet; snapshot it after a step"
+                )
             })?;
-            host.insert(name.clone(), tensor.try_clone().map_err(anyhow::Error::from)?);
+            host.insert(
+                name.clone(),
+                tensor.try_clone().map_err(anyhow::Error::from)?,
+            );
         }
         Ok(RecurrentStateSnapshot {
             len,

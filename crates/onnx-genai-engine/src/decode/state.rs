@@ -463,7 +463,9 @@ impl DecodeState {
     pub(crate) fn native_recurrent_runner_mut(
         &mut self,
     ) -> Option<&mut crate::native_decode::NativeDecodeSession> {
-        self.runner.as_mut().and_then(DecodeRunner::native_recurrent_mut)
+        self.runner
+            .as_mut()
+            .and_then(DecodeRunner::native_recurrent_mut)
     }
 
     pub(crate) fn rewind_runner(&mut self, target_len: usize) -> anyhow::Result<()> {
