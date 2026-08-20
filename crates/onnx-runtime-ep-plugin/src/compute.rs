@@ -3261,10 +3261,12 @@ unsafe extern "C" fn compute_execute(
                 EXECUTED_NODE_COUNT.fetch_add(1, Ordering::Relaxed);
                 // `output_views` borrows `owned_outputs`, so anything that
                 // touches the outputs again has to follow its last use. That
-                // used to need an explicit `drop` of the owning `Vec`; the
-                // views now live in this frame's own storage, which holds no
-                // allocation and has no `Drop`, so the borrow simply ends
-                // here.
+                // used to need an explicit `drop` of the owning `Vec`. It no
+                // longer does, and not because the storage moved to the stack
+                // -- the spill arm is still a `Vec` that owns an allocation and
+                // has a `Drop`. It is because `TensorMut` itself has no `Drop`,
+                // so dropck never extends the borrow past the last use and NLL
+                // ends it at the kernel call above.
             } else {
                 return fail_status(
                     "Compute: multi-node subgraph requires SubgraphRouting — \

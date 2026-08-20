@@ -523,8 +523,18 @@ impl onnx_runtime_ep_api::kernel::Kernel for RecordingKernel {
 }
 
 /// Drive one single-node `Compute` over `slots`, with `present` ORT inputs
-/// bound, and return what the kernel saw.
+/// bound and one output, and return what the kernel saw.
 fn run_slots(slots: Vec<Option<usize>>, present: usize) -> (bool, Vec<Option<f32>>, usize) {
+    run_node(slots, present, 1)
+}
+
+/// As [`run_slots`], but with a chosen output arity so the output storage can
+/// be pushed past its inline width independently of the operand storage.
+fn run_node(
+    slots: Vec<Option<usize>>,
+    present: usize,
+    num_outputs: usize,
+) -> (bool, Vec<Option<f32>>, usize) {
     use mock_kernel_ctx::*;
     use onnx_runtime_ep_plugin::compute::{
         CompiledKernelEntry, ExportedComputeInfo, ShapeInference,
@@ -551,10 +561,17 @@ fn run_slots(slots: Vec<Option<usize>>, present: usize) -> (bool, Vec<Option<f32
     let entry = CompiledKernelEntry {
         kernel: Box::new(RecordingKernel),
         num_inputs: slots.len(),
-        num_outputs: 1,
-        output_dtypes: vec![DataType::Float32],
+        num_outputs,
+        output_dtypes: vec![DataType::Float32; num_outputs],
         absent_output_slots: std::collections::HashSet::new(),
-        shape_inference: ShapeInference::ElementwiseBroadcast,
+        shape_inference: if num_outputs == 1 {
+            ShapeInference::ElementwiseBroadcast
+        } else {
+            ShapeInference::SameAsInputMultiOutput {
+                idx: 0,
+                count: num_outputs,
+            }
+        },
         input_slots: slots,
     };
     let mut info = ExportedComputeInfo::new(vec![entry]);
@@ -569,6 +586,28 @@ fn run_slots(slots: Vec<Option<usize>>, present: usize) -> (bool, Vec<Option<f32
     });
     (ok, seen_in, seen_out)
 }
+
+/// A node with more outputs than the inline array holds spills them to the
+/// heap, and still gets exactly its own output arity.
+///
+/// The input and output storages have separate widths decided by separate
+/// lengths, so the operand spill test says nothing about this one. Without a
+/// case here the output heap arm inherits its confidence from the input arm by
+/// analogy, which is not evidence.
+#[test]
+fn a_node_wider_than_the_inline_array_spills_its_outputs_to_the_heap() {
+    for outs in [INLINE_OPERAND_WIDTH, INLINE_OPERAND_WIDTH + 1, 6] {
+        let (ok, seen, seen_outs) = run_node(vec![Some(0)], 1, outs);
+        assert!(ok, "{outs} outputs: Compute failed");
+        assert_eq!(seen_outs, outs, "{outs} outputs: kernel saw {seen_outs}");
+        assert_eq!(seen, vec![Some(1.0)], "{outs} outputs: operands disturbed");
+    }
+}
+
+/// Mirror of `compute::INLINE_OPERANDS`, which is private. A drift between the
+/// two only weakens the boundary cases below into ordinary ones, and the
+/// mutation harness raises the real constant to catch that.
+const INLINE_OPERAND_WIDTH: usize = 4;
 
 /// The kernel sees exactly as many operands as the node has slots.
 ///
