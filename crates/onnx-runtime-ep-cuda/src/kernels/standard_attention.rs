@@ -170,6 +170,7 @@ const ATTN_SPLIT_MIN_CHUNK: u64 = 128;
 fn attention_split_config(
     is_decode: bool,
     dev_length_eligible: bool,
+    is_causal: bool,
     want_qk: bool,
     cap: u64,
     total_rows: u64,
@@ -194,7 +195,22 @@ fn attention_split_config(
     // Split only on the capture-safe fixed-capacity decode route, and never when
     // the raw QK scores are an observable output (the score scratch is reused as
     // per-key storage inside the split kernel).
-    if !enabled || !is_decode || !dev_length_eligible || want_qk || cap == 0 {
+    //
+    // Also never for the causal form. The multi-split path reorders the fp32
+    // key reduction (chunk-local online softmax merged by `attention_combine`)
+    // versus the monolithic `attention_row` serial ascending reduction. That is
+    // a legitimately different — but not bit-identical — fp32 result, and at a
+    // near-tie between the top-1 and top-2 logits it can flip the greedy argmax.
+    // The monolithic reduction is the reference: it matches both the parent CUDA
+    // build and an independent CPU dense-prefill oracle token-for-token, whereas
+    // the split reduction diverges at such a tie (measured on granite-1b: the
+    // decode stream flips at the first near-tie once causal decode is routed
+    // through the split kernel). The non-causal fixed-capacity decode has always
+    // taken the split path, so its byte-identity baseline already includes it;
+    // gating the causal form out keeps the newly capture-enabled causal decode
+    // bit-for-bit equal to the pre-capture monolithic path while still capturing
+    // (the split is a throughput optimization, not a capture requirement).
+    if !enabled || !is_decode || !dev_length_eligible || is_causal || want_qk || cap == 0 {
         return None;
     }
     attention_split_geometry(chunk_override, cap, total_rows)
@@ -2222,6 +2238,7 @@ impl StandardAttentionKernel {
             let split_cfg = attention_split_config(
                 q_seq == 1,
                 dev_length_eligible,
+                self.is_causal,
                 want_qk,
                 key_cap as u64,
                 total_rows_u,
