@@ -1233,6 +1233,12 @@ mod tests {
         let mut api: ort::OrtApi = unsafe { core::mem::zeroed() };
         api.KernelContext_ParallelFor = Some(inline_parallel_for);
 
+        // Distinct addresses only mean distinct slots while every slot is live
+        // at once. Without this rendezvous a thread may exit, its cache
+        // destructor may free its slot, and the allocator may hand the same
+        // address to a thread that starts later -- a legitimate reuse that
+        // would read as a shared slot.
+        let all_allocated = std::sync::Barrier::new(3);
         let addresses: Vec<usize> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..3)
                 .map(|_| {
@@ -1252,6 +1258,7 @@ mod tests {
                                 .expect("install publishes a handle")
                                 .run(2, &|_| {});
                         }
+                        all_allocated.wait();
                         address
                     })
                 })
