@@ -248,6 +248,40 @@ fn dynamic_shared_memory_optin(
 }
 
 /// Device context, stream, and vendor-library backends shared across the EP.
+/// Environment override for the `alloc_raw` pool bound, in bytes.
+///
+/// `0` disables pooling, restoring one `cuMemAlloc`/`cuMemFree` pair per
+/// request — which is what to set when bisecting a suspected reuse bug.
+pub const CUDA_RAW_POOL_BYTES_ENV: &str = "ONNX_GENAI_CUDA_RAW_POOL_BYTES";
+
+/// Default bound on device bytes held in the `alloc_raw` pool.
+///
+/// Sized for the transient scratch one prefill chunk holds rather than for the
+/// model, so pooling never competes with weights for a meaningful share of the
+/// device.
+const DEFAULT_RAW_POOL_BYTES: u64 = 2 << 30;
+
+fn raw_pool_limit_bytes() -> u64 {
+    std::env::var(CUDA_RAW_POOL_BYTES_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_RAW_POOL_BYTES)
+}
+
+/// Round a raw allocation to the size class the pool keys on.
+///
+/// Rounding up is what lets a recycled block satisfy a slightly different
+/// request without ever being too small, and keeps the number of distinct
+/// classes bounded when shapes vary a little between chunks.
+fn raw_pool_size_class(bytes: usize) -> usize {
+    const SMALL: usize = 1 << 20;
+    if bytes <= SMALL {
+        bytes.next_power_of_two().max(512)
+    } else {
+        bytes.div_ceil(SMALL) * SMALL
+    }
+}
+
 pub struct CudaRuntime {
     context: Arc<CudaContext>,
     stream: Arc<CudaStream>,
@@ -275,6 +309,16 @@ pub struct CudaRuntime {
     nvrtc_cubin_fallback: AtomicBool,
     allocations: AtomicU64,
     frees: AtomicU64,
+    /// Blocks freed through `free_raw` and held for reuse, keyed by size class.
+    ///
+    /// `free_raw` is told only a pointer, so the class each live block was
+    /// carved from is recorded in `raw_pool_classes` at allocation time. Device
+    /// addresses rather than pointers, so this stays `Send`/`Sync`; nothing
+    /// here is dereferenced on the host.
+    raw_pool: Mutex<HashMap<usize, Vec<CUdeviceptr>>>,
+    raw_pool_classes: Mutex<HashMap<CUdeviceptr, usize>>,
+    raw_pool_retained: AtomicU64,
+    raw_pool_hits: AtomicU64,
     host_to_device_copies: AtomicU64,
     device_to_host_copies: AtomicU64,
     async_host_to_device_copies: AtomicU64,
@@ -441,6 +485,10 @@ impl CudaRuntime {
             nvrtc_cubin_fallback: AtomicBool::new(false),
             allocations: AtomicU64::new(0),
             frees: AtomicU64::new(0),
+            raw_pool: Mutex::new(HashMap::new()),
+            raw_pool_classes: Mutex::new(HashMap::new()),
+            raw_pool_retained: AtomicU64::new(0),
+            raw_pool_hits: AtomicU64::new(0),
             host_to_device_copies: AtomicU64::new(0),
             device_to_host_copies: AtomicU64::new(0),
             async_host_to_device_copies: AtomicU64::new(0),
@@ -1036,12 +1084,107 @@ impl CudaRuntime {
     /// pointer. Binds the context first.
     pub fn alloc_raw(&self, bytes: usize) -> Result<CUdeviceptr> {
         self.bind()?;
+        let class = raw_pool_size_class(bytes.max(1));
+        if let Some(ptr) = self.take_pooled(class) {
+            self.raw_pool_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(ptr);
+        }
         // SAFETY: `malloc_sync` returns a fresh device allocation on the current
         // (bound) context; we own it and free it exactly once via `free_raw`.
-        let ptr = unsafe { cudarc::driver::result::malloc_sync(bytes.max(1)) }
-            .map_err(|e| driver_err("cuMemAlloc", e))?;
+        let mut allocated = unsafe { cudarc::driver::result::malloc_sync(class) };
+        if allocated.is_err() {
+            // Pooled blocks are device memory this runtime is holding back from
+            // everyone else. Releasing them before reporting out-of-memory is
+            // what keeps a pool from behaving like a leak under pressure.
+            self.drain_raw_pool();
+            // SAFETY: as above.
+            allocated = unsafe { cudarc::driver::result::malloc_sync(class) };
+        }
+        let ptr = allocated.map_err(|e| driver_err("cuMemAlloc", e))?;
+        self.raw_pool_classes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(ptr, class);
         self.allocations.fetch_add(1, Ordering::Relaxed);
         Ok(ptr)
+    }
+
+    /// Blocks `alloc_raw` served from the pool instead of the driver.
+    pub fn raw_pool_hits(&self) -> u64 {
+        self.raw_pool_hits.load(Ordering::Relaxed)
+    }
+
+    /// Device bytes currently held in the `alloc_raw` pool.
+    pub fn raw_pool_retained_bytes(&self) -> u64 {
+        self.raw_pool_retained.load(Ordering::Relaxed)
+    }
+
+    fn take_pooled(&self, class: usize) -> Option<CUdeviceptr> {
+        let mut pool = self.raw_pool.lock().unwrap_or_else(|e| e.into_inner());
+        let ptr = pool.get_mut(&class)?.pop()?;
+        self.raw_pool_retained
+            .fetch_sub(class as u64, Ordering::Relaxed);
+        Some(ptr)
+    }
+
+    /// Hold a freed block for reuse, or report that the cap leaves no room.
+    fn retain_pooled(&self, ptr: CUdeviceptr) -> bool {
+        let limit = raw_pool_limit_bytes();
+        if limit == 0 {
+            return false;
+        }
+        let Some(class) = self
+            .raw_pool_classes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ptr)
+            .copied()
+        else {
+            // Not ours to pool: an allocation made before this runtime tracked
+            // classes, or a double free the caller is responsible for.
+            return false;
+        };
+        let class_bytes = class as u64;
+        // Reserve before inserting, so two threads cannot both claim the last
+        // of the budget.
+        if self
+            .raw_pool_retained
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                (held + class_bytes <= limit).then_some(held + class_bytes)
+            })
+            .is_err()
+        {
+            return false;
+        }
+        self.raw_pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(class)
+            .or_default()
+            .push(ptr);
+        true
+    }
+
+    /// Return every pooled block to the driver.
+    fn drain_raw_pool(&self) {
+        let drained: Vec<CUdeviceptr> = {
+            let mut pool = self.raw_pool.lock().unwrap_or_else(|e| e.into_inner());
+            let mut drained = Vec::new();
+            for (class, blocks) in pool.drain() {
+                self.raw_pool_retained
+                    .fetch_sub((class as u64) * blocks.len() as u64, Ordering::Relaxed);
+                drained.extend(blocks);
+            }
+            drained
+        };
+        let mut classes = self.raw_pool_classes.lock().unwrap_or_else(|e| e.into_inner());
+        for ptr in drained {
+            classes.remove(&ptr);
+            // SAFETY: every pooled block came from `malloc_sync` on this
+            // runtime's context and is freed exactly once — it was removed from
+            // the pool here, so `free_raw` cannot also free it.
+            let _ = unsafe { cudarc::driver::result::free_sync(ptr) };
+        }
     }
 
     /// Free a device pointer previously returned by [`CudaRuntime::alloc_raw`].
@@ -1050,6 +1193,17 @@ impl CudaRuntime {
     /// `ptr` must have come from this runtime's `alloc_raw` and not been freed.
     pub unsafe fn free_raw(&self, ptr: CUdeviceptr) -> Result<()> {
         self.bind()?;
+        // A pooled free deliberately does not count here. `frees` exists to
+        // report driver calls — a `cuMemFree` during graph capture invalidates
+        // the capture — and retaining a block makes no driver call at all, so
+        // counting it would report a capture hazard that did not happen.
+        if self.retain_pooled(ptr) {
+            return Ok(());
+        }
+        self.raw_pool_classes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&ptr);
         // SAFETY: caller upholds the single-free contract.
         unsafe { cudarc::driver::result::free_sync(ptr) }
             .map_err(|e| driver_err("cuMemFree", e))?;
@@ -1462,6 +1616,115 @@ pub fn raw_ptr(dptr: CUdeviceptr) -> *mut c_void {
 mod tests {
     use super::*;
     use cudarc::driver::PushKernelArg;
+
+    /// The pool hands a recycled block to a *different* request than the one it
+    /// was carved for, so the only thing standing between reuse and a buffer
+    /// overrun is that the class is never smaller than the request. Check that
+    /// directly, including the boundary where the rounding rule changes.
+    #[test]
+    fn raw_pool_size_class_never_undersizes_a_request() {
+        let sizes = [
+            1usize,
+            2,
+            511,
+            512,
+            513,
+            4096,
+            (1 << 20) - 1,
+            1 << 20,
+            (1 << 20) + 1,
+            3_000_000,
+            1 << 24,
+        ];
+        for bytes in sizes {
+            let class = raw_pool_size_class(bytes);
+            assert!(
+                class >= bytes,
+                "class {class} is smaller than the {bytes}-byte request it must satisfy"
+            );
+            assert!(class >= 512, "class {class} is below the minimum block size");
+        }
+        // Monotonic, so a larger request can never land in a smaller class and
+        // pick up a block that does not fit it.
+        let mut previous = 0;
+        for bytes in sizes {
+            let class = raw_pool_size_class(bytes);
+            assert!(class >= previous, "class fell from {previous} to {class}");
+            previous = class;
+        }
+    }
+
+    /// Pooling only pays if the second request for a shape skips the driver
+    /// entirely, and it is only safe if the pointer it hands back is the one it
+    /// retained. Both are asserted here rather than inferred from a wall-clock
+    /// improvement.
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn raw_pool_recycles_freed_blocks_without_reentering_the_driver() {
+        let Ok(runtime) = CudaRuntime::new(0) else {
+            eprintln!("skipping raw pool reuse: CUDA runtime unavailable");
+            return;
+        };
+        let bytes = 4 << 20;
+        let first = runtime.alloc_raw(bytes).unwrap();
+        let allocations_after_first = runtime.allocation_counts().allocations;
+        // SAFETY: `first` came from this runtime's `alloc_raw` and is freed once.
+        unsafe { runtime.free_raw(first).unwrap() };
+
+        let second = runtime.alloc_raw(bytes).unwrap();
+        assert_eq!(
+            second, first,
+            "the pool must hand back the block it just retained"
+        );
+        assert_eq!(
+            runtime.raw_pool_hits(),
+            1,
+            "the second request must be served from the pool"
+        );
+        assert_eq!(
+            runtime.allocation_counts().allocations,
+            allocations_after_first,
+            "a pooled request must not reach cuMemAlloc"
+        );
+        // SAFETY: `second` is the same live block, freed once.
+        unsafe { runtime.free_raw(second).unwrap() };
+    }
+
+    /// With pooling disabled the runtime must behave exactly as it did before:
+    /// every request reaches the driver. This is the bisect switch, so it has
+    /// to actually switch something.
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn raw_pool_disabled_returns_every_block_to_the_driver() {
+        let Ok(runtime) = CudaRuntime::new(0) else {
+            eprintln!("skipping raw pool disable: CUDA runtime unavailable");
+            return;
+        };
+        // SAFETY: this ignored GPU test runs serially; no other thread reads the
+        // variable concurrently.
+        unsafe { std::env::set_var(CUDA_RAW_POOL_BYTES_ENV, "0") };
+        let bytes = 4 << 20;
+        let first = runtime.alloc_raw(bytes).unwrap();
+        // SAFETY: `first` came from `alloc_raw` and is freed once.
+        unsafe { runtime.free_raw(first).unwrap() };
+        let before = runtime.allocation_counts().allocations;
+        let second = runtime.alloc_raw(bytes).unwrap();
+        assert_eq!(
+            runtime.raw_pool_hits(),
+            0,
+            "pooling is disabled, so nothing may be served from the pool"
+        );
+        assert_eq!(
+            runtime.allocation_counts().allocations,
+            before + 1,
+            "with pooling disabled every request must reach cuMemAlloc"
+        );
+        assert_eq!(runtime.raw_pool_retained_bytes(), 0);
+        // SAFETY: `second` is live and freed once.
+        unsafe { runtime.free_raw(second).unwrap() };
+        // SAFETY: restore the process-global default for other tests.
+        unsafe { std::env::remove_var(CUDA_RAW_POOL_BYTES_ENV) };
+    }
 
     #[test]
     fn derives_ptx_arch_from_compute_capability() {
