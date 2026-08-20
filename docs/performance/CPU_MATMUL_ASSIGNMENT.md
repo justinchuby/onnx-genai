@@ -671,6 +671,9 @@ what would make it pay.
 
 Full record: [`docs/benchmarks/2026-08-19-int4-prefill-row-blocking.md`](../benchmarks/2026-08-19-int4-prefill-row-blocking.md).
 
+Sequel in section 9: the fused pack that made this route viable was itself a scalar loop, and
+vectorizing it moved both of this section's row thresholds.
+
 ### 6. `Gemm` declined the f16 fast path whenever B was transposed (**fixed**)
 
 `GemmKernel::execute` disqualified both f16 fast paths if either transpose flag
@@ -958,3 +961,57 @@ python3 scripts/ort_ab/ab.py --native-only --null-control \
 these cells a paired run depressed the native median by up to 6x and pushed the null control past the
 effect being measured.
 
+### 9. The int4 prefill's fused dequant pack was scalar, and its row gate was measured against it (**fixed**)
+
+Section 5 fused the dequantization into the GEBP pack, so the f32 weight is never materialized: at
+`4096x11008` the route reads 22.5 MB of packed int4 and never writes a 180 MB f32 panel. Issue
+#1471 proposed fusing the dequant into an L2 tile to remove that panel — but that had already
+landed in #1356, and the panel it describes does not exist on `main`. The fixed cost it measured is
+real; the cause is not the one it names.
+
+Fitting `t = fixed + marginal * m` over the GEBP arm at `4096x11008` gives **fixed = 4.80 ms**.
+Against 22.5 MB of packed weight that is **4.7 GB/s** — 6% of this host's 75.8 GB/s. Nothing about
+it is bandwidth. It is the pack loop: `Int4Weight::dequant_column` walks one column at a time, so
+per element it does a shift, a mask, a scalar widen, a subtract, a multiply and a store to
+`dst[p * NR + slot]` — one f32 every 64 bytes, a separate cache line and a separate scalar store
+for every single element.
+
+The fix dequantizes eight columns at once and transposes them in registers, so the panel is written
+with contiguous 32-byte stores: one store per eight elements instead of eight. The arithmetic is
+unchanged — the same widen, subtract and multiply, kept as separate `_mm256_sub_ps` and
+`_mm256_mul_ps` so it is never contracted into an FMA — so the packed panel is **bit-identical**,
+asserted directly against the scalar path rather than through the GEMM.
+
+`fixed` falls **4.80 ms -> 2.24 ms**, and with it both of section 5's row thresholds, which were
+measured against the scalar pack: the large-weight crossover moves **12 -> 5** and the L2-resident
+one **24 -> 12**. Half the win in production comes from the pack and half from rows the gate now
+lets through.
+
+Production A/B on real `MatMulNBits` models, native-alone, median of five interleaved reps,
+`null` control per cell: **14 cells improve 1.02x-1.31x, 9 within noise, no regression survives
+re-measurement.**
+
+| cell | threads | base ms | new ms | speedup |
+|---|---:|---:|---:|---:|
+| `llama3_8b_qkv_t8` | 8 | 3.808 | 2.897 | **1.31x** |
+| `llama3_8b_mlp_t8` | 8 | 8.811 | 6.793 | **1.30x** |
+| `llama3_8b_mlp_t128` | 8 | 35.901 | 27.579 | **1.30x** |
+| `llama3_8b_qkv_t128` | 8 | 15.092 | 12.171 | **1.24x** |
+| `llama3_8b_mlp_t8` | 16 | 4.465 | 3.670 | **1.22x** |
+| `llama3_8b_qkv_t512` | 8 | 45.496 | 41.752 | 1.09x |
+
+`llama3_8b_qkv_t8` is the cell the scheduler evidence flagged; it is `m = 8`, which the old gate of
+12 sent to the column-blocked kernel and the new gate of 5 sends to the GEBP.
+
+Against ORT in the same paired invocation (paired mode depresses the native arm, so read the
+before/after pair, not the absolute): `llama3_8b_qkv_t8` **4.61x -> 3.56x**, `llama3_8b_mlp_t8`
+3.42x -> 2.73x, `llama3_8b_qkv_t128` 1.98x -> 1.57x, `llama3_8b_mlp_t128` 1.84x -> 1.44x,
+`t512` 1.25x -> 1.17x and 1.20x -> 1.11x.
+
+Bounded honestly: 8-bit is untouched — `Int8Weight` keeps the per-column default, so its behaviour
+is byte-for-byte what it was. `m = 1` cannot reach any of this (the lowest gate of any route is 4) and is
+unchanged. And the route is still behind ORT at small `m`, for the reason section 5 already gives:
+MLAS SQNBit's CompInt8 path uses integer dot products where this one widens every nibble to f32,
+and VNNI is what would make that pay.
+
+Full record: [`docs/benchmarks/2026-08-19-int4-prefill-dequant-pack-simd.md`](../benchmarks/2026-08-19-int4-prefill-dequant-pack-simd.md).

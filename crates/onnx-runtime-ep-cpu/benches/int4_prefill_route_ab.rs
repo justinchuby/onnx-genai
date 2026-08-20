@@ -113,7 +113,17 @@ fn main() {
         let ms: Vec<usize> = match std::env::var("PROBE_MS").as_deref() {
             Ok("prefill") => vec![8, 64, 256],
             Ok("cross") => vec![1, 2, 4, 8, 16, 32],
-            _ => vec![1, 8, 64, 256, 512],
+            _ => match std::env::var("PROBE_M_LIST") {
+                // An explicit list, so the row thresholds in
+                // `int4_prefill_gebp_min_rows` can be re-derived at whatever
+                // `m` the crossover has moved to rather than only at the
+                // powers of two the fixed sweeps happen to cover.
+                Ok(list) => list
+                    .split(',')
+                    .filter_map(|v| v.trim().parse().ok())
+                    .collect(),
+                Err(_) => vec![1, 8, 64, 256, 512],
+            },
         };
         for &m in &ms {
             let a = Tensor::floats(common::FloatDType::F32, &[m, k], &floats(m * k, 1.1));
