@@ -9756,8 +9756,7 @@ impl MatMulNBitsKernel {
         };
         let orig_packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
         let interleave_on = interleave_dequant_enabled() && self.bits == 4 && zero_points.is_none();
-        let (entry, packed_ptr) = if interleave_on && interleaved_entry.is_some() {
-            let target = interleaved_entry.unwrap();
+        let (entry, packed_ptr) = if interleave_on && let Some(target) = interleaved_entry {
             let bytes = self.n.saturating_mul(k_blocks).saturating_mul(blob_size);
             match ensure_interleaved(&self.runtime, orig_packed_ptr, bytes) {
                 Ok((iptr, warm)) => {
