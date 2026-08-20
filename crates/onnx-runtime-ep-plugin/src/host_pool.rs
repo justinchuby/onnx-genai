@@ -1218,4 +1218,54 @@ mod tests {
             );
         }
     }
+
+    /// The cache is per thread, and a thread that exits must take its slot with
+    /// it. Owning the allocation as a raw pointer is the part of this change
+    /// that could have turned into a leak — `PoolSlot`'s `Drop` is now the only
+    /// thing that frees it, and a thread-local's destructor is the only thing
+    /// that runs it at thread exit.
+    ///
+    /// Under Miri this is the falsifier for that: removing `impl Drop for
+    /// PoolSlot` reports "the evaluated program leaked memory" here. Natively
+    /// it still pins that concurrent installs do not share a slot.
+    #[test]
+    fn each_thread_owns_its_slot_and_frees_it_on_exit() {
+        let mut api: ort::OrtApi = unsafe { core::mem::zeroed() };
+        api.KernelContext_ParallelFor = Some(inline_parallel_for);
+
+        let addresses: Vec<usize> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..3)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let width = AtomicU32::new(HOST_HELPED);
+                        // Twice, so the thread exercises its own cache before
+                        // the thread-local destructor has to free it.
+                        let mut address = 0;
+                        for _ in 0..2 {
+                            let guard = unsafe { install(&api, core::ptr::dangling_mut(), &width) };
+                            address = guard
+                                .pool
+                                .as_ref()
+                                .expect("a working install has a pool")
+                                .as_ptr() as usize;
+                            host_parallel::current()
+                                .expect("install publishes a handle")
+                                .run(2, &|_| {});
+                        }
+                        address
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let mut unique = addresses.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            addresses.len(),
+            "two threads shared a slot: {addresses:?}"
+        );
+    }
 }
