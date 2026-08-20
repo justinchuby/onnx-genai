@@ -1,0 +1,47 @@
+name: Wiki lint
+
+# The main CI workflow classifies a wiki-only change as docs_only and skips
+# every Rust job, which is right for compile time and leaves a wiki-only pull
+# request with nothing checking it at all. This is that check.
+
+on:
+  pull_request:
+    paths:
+      - "wiki/**"
+      - "scripts/lint_wiki_voice.py"
+      - "scripts/test_lint_wiki_voice.py"
+      - ".github/workflows/wiki-lint.yml"
+  push:
+    branches: [main]
+    paths:
+      - "wiki/**"
+      - "scripts/lint_wiki_voice.py"
+      - "scripts/test_lint_wiki_voice.py"
+      - ".github/workflows/wiki-lint.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  voice:
+    name: Notes stand on their own
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The linter's own tests run first. A linter whose tests are not run is a
+      # linter that can be quietly weakened by editing one regex.
+      - name: Test the linter
+        run: python3 -m unittest scripts.test_lint_wiki_voice -v
+
+      - name: Check the wiki
+        run: python3 scripts/lint_wiki_voice.py
