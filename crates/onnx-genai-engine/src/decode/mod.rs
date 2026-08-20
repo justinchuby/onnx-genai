@@ -139,6 +139,20 @@ impl DecodeRunner {
         }
     }
 
+    /// The native runner iff it carries recurrent (Gated-DeltaNet SSM / conv1d)
+    /// state, for the speculative recurrent-state commit. Every other runner —
+    /// and a pure-dense native runner — answers `None`, so the commit machinery
+    /// stays inert outside hybrid recurrent targets.
+    #[cfg(feature = "native-backend")]
+    fn native_recurrent_mut(
+        &mut self,
+    ) -> Option<&mut crate::native_decode::NativeDecodeSession> {
+        match self {
+            DecodeRunner::Native(runner) if runner.has_recurrent_state() => Some(runner),
+            _ => None,
+        }
+    }
+
     fn supports_sampled(&self) -> bool {
         match self {
             DecodeRunner::PastPresent(runner) => runner.supports_sampled(),

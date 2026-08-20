@@ -21,7 +21,7 @@ impl SamplingRng {
     }
 
     pub(crate) fn value_for(&mut self, options: &GenerateOptions) -> f32 {
-        if options.greedy || options.temperature == 0.0 {
+        if options.selects_greedily() {
             0.0
         } else {
             self.rng.random()
@@ -100,7 +100,7 @@ pub(crate) fn default_sampler_for_options(
     options: &GenerateOptions,
     rng_value: f32,
 ) -> DefaultSampler {
-    if options.greedy || options.temperature == 0.0 {
+    if options.selects_greedily() {
         DefaultSampler::Greedy(GreedySampler)
     } else {
         DefaultSampler::Categorical(CategoricalSampler::new(rng_value))

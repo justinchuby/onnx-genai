@@ -4868,9 +4868,12 @@ impl DecodeCudaState {
             // Fixed-size recurrent/conv states are unmasked rolling caches: a
             // reused session would otherwise inherit the previous generation's
             // terminal state, corrupting generation #2+. A full reset restores
-            // the declared `init: zeros`. Speculative recurrent rewind to a
-            // non-zero length is unsupported (mirrors the CPU path), so only the
-            // reset boundary re-zeros here.
+            // the declared `init: zeros`. A speculative rewind to a *non-zero*
+            // length cannot prefix-slice these destructive caches, so it is
+            // handled out-of-band by snapshot + accepted-token re-advance
+            // (`snapshot_fixed_states` / `restore_fixed_states`, driven by
+            // `NativeDecodeSession::commit_recurrent_state_to_accepted`); only
+            // the reset boundary re-zeros here.
             for index in self.fixed_state_binding_range.clone() {
                 let binding = &self.bindings[index];
                 let bytes = checked_shape_bytes(binding.physical_shape(), binding.dtype)
@@ -4884,6 +4887,61 @@ impl DecodeCudaState {
             }
         }
         self.set_logical_len(target_len)
+    }
+
+    /// Copy every fixed-size recurrent/conv binding off the device into host
+    /// buffers keyed by binding index, capturing the state as of the last
+    /// committed token. Paired with [`Self::restore_fixed_states`] for
+    /// speculative recurrent-state commit; the bindings are the existing
+    /// `fixed_state_binding_range`, so no layer/dim geometry is hardcoded.
+    pub(crate) fn snapshot_fixed_states(&mut self) -> anyhow::Result<Vec<(usize, Vec<u8>)>> {
+        let mut snapshot = Vec::with_capacity(self.fixed_state_binding_range.len());
+        for index in self.fixed_state_binding_range.clone() {
+            let binding = &mut self.bindings[index];
+            let bytes = checked_shape_bytes(binding.physical_shape(), binding.dtype)
+                .with_context(|| {
+                    format!(
+                        "fixed CUDA decoder state snapshot size overflow for binding {index} shape {:?}",
+                        binding.physical_shape()
+                    )
+                })?;
+            let host = binding.read_bytes_range(0, bytes).with_context(|| {
+                format!("read device recurrent/conv state for binding {index}")
+            })?;
+            snapshot.push((index, host));
+        }
+        Ok(snapshot)
+    }
+
+    /// Write a [`Self::snapshot_fixed_states`] capture back into the device
+    /// recurrent/conv bindings. Restoring bytes leaves every binding's shape
+    /// unchanged, so this never invalidates a captured decode graph.
+    pub(crate) fn restore_fixed_states(
+        &mut self,
+        snapshot: &[(usize, Vec<u8>)],
+    ) -> anyhow::Result<()> {
+        for (index, host) in snapshot {
+            let binding = self.bindings.get_mut(*index).with_context(|| {
+                format!("recurrent snapshot names out-of-range fixed-state binding {index}")
+            })?;
+            let bytes = checked_shape_bytes(binding.physical_shape(), binding.dtype)
+                .with_context(|| {
+                    format!(
+                        "fixed CUDA decoder state restore size overflow for binding {index} shape {:?}",
+                        binding.physical_shape()
+                    )
+                })?;
+            if host.len() != bytes {
+                bail!(
+                    "recurrent snapshot for binding {index} has {} bytes but the binding needs {bytes}",
+                    host.len()
+                );
+            }
+            binding
+                .write_bytes(0, host)
+                .with_context(|| format!("restore device recurrent/conv state for binding {index}"))?;
+        }
+        Ok(())
     }
 
     fn write_decode_inputs(&mut self, token_id: TokenId, position: usize) -> anyhow::Result<()> {

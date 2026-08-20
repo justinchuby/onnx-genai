@@ -9162,58 +9162,58 @@ impl MatMulNBitsKernel {
             // decode-GEMV would change plain-path logits vs the two-op path by
             // more than 1 ULP. It stays on the prefill/Marlin path (advertised
             // capture-unsafe at M>1) pending a decision on that bound in #1334.
-            if m <= decode_gemv_loop_max_m() {
-                if let Some(gamma) = gamma {
-                    onnx_runtime_ep_api::record_kernel_variant!(
-                        "gate_up_swiglu_rmsnorm_batched_loop",
-                        "M={} small-batch rmsnorm decode: {} single-row fused gate/up SwiGLU \
+            if m <= decode_gemv_loop_max_m()
+                && let Some(gamma) = gamma
+            {
+                onnx_runtime_ep_api::record_kernel_variant!(
+                    "gate_up_swiglu_rmsnorm_batched_loop",
+                    "M={} small-batch rmsnorm decode: {} single-row fused gate/up SwiGLU \
                          GEMV launches (one per row), each byte-identical to M==1 decode; keeps \
                          the batch decode graph a single captured subgraph instead of a \
                          per-MLP-layer eager seam",
-                        m,
-                        m
+                    m,
+                    m
+                );
+                self.last_call_capture_safe.store(true, Ordering::Relaxed);
+                let a_base = inputs[0].data_ptr::<u8>();
+                let y_base = outputs[0].data_ptr_mut::<u8>();
+                let a_row_shape = [1usize, self.k];
+                let a_row_strides = [self.k as i64, 1];
+                let y_row_shape = [1usize, self.n];
+                let y_row_strides = [self.n as i64, 1];
+                let a_row_bytes = self.k * 2; // fp16 activation
+                let y_row_bytes = self.n * 2; // fp16 output
+                for row in 0..m {
+                    let a_row = TensorView::new(
+                        DevicePtr(a_base.wrapping_add(row * a_row_bytes) as *const c_void),
+                        DataType::Float16,
+                        &a_row_shape,
+                        &a_row_strides,
+                        inputs[0].device,
                     );
-                    self.last_call_capture_safe.store(true, Ordering::Relaxed);
-                    let a_base = inputs[0].data_ptr::<u8>();
-                    let y_base = outputs[0].data_ptr_mut::<u8>();
-                    let a_row_shape = [1usize, self.k];
-                    let a_row_strides = [self.k as i64, 1];
-                    let y_row_shape = [1usize, self.n];
-                    let y_row_strides = [self.n as i64, 1];
-                    let a_row_bytes = self.k * 2; // fp16 activation
-                    let y_row_bytes = self.n * 2; // fp16 output
-                    for row in 0..m {
-                        let a_row = TensorView::new(
-                            DevicePtr(a_base.wrapping_add(row * a_row_bytes) as *const c_void),
-                            DataType::Float16,
-                            &a_row_shape,
-                            &a_row_strides,
-                            inputs[0].device,
-                        );
-                        let mut y_row = TensorMut::new(
-                            DevicePtrMut(y_base.wrapping_add(row * y_row_bytes) as *mut c_void),
-                            DataType::Float16,
-                            &y_row_shape,
-                            &y_row_strides,
-                            outputs[0].device,
-                        );
-                        self.launch_gate_up_swiglu_rmsnorm(
-                            &a_row,
-                            &inputs[1],
-                            &inputs[2],
-                            &inputs[3],
-                            &inputs[4],
-                            zp_gate,
-                            zp_up,
-                            gamma,
-                            &mut y_row,
-                            k_blocks,
-                            blob_size,
-                            zp_row_bytes,
-                        )?;
-                    }
-                    return Ok(());
+                    let mut y_row = TensorMut::new(
+                        DevicePtrMut(y_base.wrapping_add(row * y_row_bytes) as *mut c_void),
+                        DataType::Float16,
+                        &y_row_shape,
+                        &y_row_strides,
+                        outputs[0].device,
+                    );
+                    self.launch_gate_up_swiglu_rmsnorm(
+                        &a_row,
+                        &inputs[1],
+                        &inputs[2],
+                        &inputs[3],
+                        &inputs[4],
+                        zp_gate,
+                        zp_up,
+                        gamma,
+                        &mut y_row,
+                        k_blocks,
+                        blob_size,
+                        zp_row_bytes,
+                    )?;
                 }
+                return Ok(());
             }
             self.last_call_capture_safe.store(false, Ordering::Relaxed);
             // Dequantize both projections to fp16 and run them on cuBLASLt
@@ -10009,8 +10009,7 @@ impl MatMulNBitsKernel {
         };
         let orig_packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
         let interleave_on = interleave_dequant_enabled() && self.bits == 4 && zero_points.is_none();
-        let (entry, packed_ptr) = if interleave_on && interleaved_entry.is_some() {
-            let target = interleaved_entry.unwrap();
+        let (entry, packed_ptr) = if interleave_on && let Some(target) = interleaved_entry {
             let bytes = self.n.saturating_mul(k_blocks).saturating_mul(blob_size);
             match ensure_interleaved(&self.runtime, orig_packed_ptr, bytes) {
                 Ok((iptr, warm)) => {
@@ -10961,10 +10960,10 @@ impl MatMulNBitsKernel {
     /// Whether this node's quantization layout is expressible by the packed
     /// eight-nibble word the fp16 dequant kernel reads.
     fn dequant_f16_block_shift(&self) -> Option<i32> {
-        if self.bits != 4 || self.k % 8 != 0 {
+        if self.bits != 4 || !self.k.is_multiple_of(8) {
             return None;
         }
-        if self.block_size % 8 != 0 || !self.block_size.is_power_of_two() {
+        if !self.block_size.is_multiple_of(8) || !self.block_size.is_power_of_two() {
             return None;
         }
         Some(self.block_size.trailing_zeros() as i32)
@@ -11024,6 +11023,7 @@ impl MatMulNBitsKernel {
         .map_err(|err| driver_err("launch MatMulNBits f16 dequant", err))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn launch_dequant(
         &self,
         packed: &TensorView,
@@ -14576,7 +14576,6 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         assert!(!scales_f16_pipe_well_occupied(1, 8, 0));
     }
 
-    #[test]
     /// The asymmetric block-32 split-K gate recognises two separate reasons to
     /// split, so a saturated grid alone no longer vetoes it.
     ///

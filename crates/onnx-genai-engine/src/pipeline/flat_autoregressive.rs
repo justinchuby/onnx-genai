@@ -309,7 +309,7 @@ impl PipelineEngine {
             reused = ReusedPrefix::from_paged_admission(shared);
         }
 
-        let chain = build_processor_chain(&options, Some(self.tokenizer()?))?;
+        let chain = build_processor_chain(&options, Some(self.tokenizer()?), false)?;
         if reused.is_empty() && paged_session.is_none() {
             self.decoder_state = Some(Self::new_decoder_state(
                 &self.models,
