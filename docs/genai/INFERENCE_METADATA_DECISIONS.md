@@ -670,6 +670,32 @@ destinations behind the island boundary, such components are excluded from
 fusion: an unchecked scatter is undefined behaviour, which is not a trade a
 performance optimization may make.
 
+#### `model.io` beside a workflow
+
+A package may declare `model.io` **and** `pipeline.workflow`. They answer
+different questions about the same graph:
+
+- `model.io.static_cache` is the **port ABI** — which input carries write
+  destinations, which carries the non-pad KV length, which ports are the
+  per-layer buffers. A runtime that drives the decoder graph directly reads this
+  and never sees a workflow.
+- the state group is the **binding** — what flows into those ports, and when.
+
+Earlier this pair was rejected outright, with the message directing authors to
+`pipeline.models.<component>.io`. The workflow IR removed that key, which left
+the rule unsatisfiable in both directions: a workflow package had nowhere to
+declare a port ABI, while `static_cache`'s own contract requires the ABI to be
+declared because its integer control ports are shape-indistinguishable. Two
+rules that cannot both be obeyed do not describe a valid document; they describe
+a hole.
+
+The overlap is now permitted and **checked**. The destination port settles which
+component the ABI describes — the workflow already had to name that port per
+component — and every per-layer cache pair the ABI claims must be a pair the
+group binds. Where the two surfaces state the same fact they must agree, and a
+disagreement is reported naming both sources, which is the only outcome that
+tells an author which one to fix.
+
 ### 12.2c FP8 and other narrow cache element types
 
 The dtype vocabulary includes `float8_e4m3fn` and `float8_e5m2`, and a package

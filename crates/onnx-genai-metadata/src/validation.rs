@@ -217,9 +217,7 @@ fn collect_workflow_capabilities(node: &WorkflowNode, capabilities: &mut BTreeSe
 pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
 
-    if let Err(error) = validate_composite_io(metadata) {
-        errors.push(error);
-    }
+    validate_model_io_against_workflow(metadata, &mut errors);
 
     if let Some(pipeline) = &metadata.pipeline
         && let Err(error) = validate_pipeline_spec(pipeline)
@@ -812,21 +810,137 @@ fn require_compatible_tensor_contracts(
     }
 }
 
-pub(crate) fn validate_composite_io(metadata: &InferenceMetadata) -> Result<(), String> {
-    if metadata.pipeline.is_some()
-        && metadata
-            .model
+/// Check `model.io` against the workflow that accompanies it.
+///
+/// `model.io` and `pipeline.workflow` answer different questions about the same
+/// graph. `model.io` is the **port ABI**: which input carries write
+/// destinations, which carries the non-pad KV length, which ports are the
+/// per-layer cache buffers. `pipeline.workflow` is the **binding**: what flows
+/// into those ports and when. A runtime that drives a decoder graph directly
+/// reads the former and never sees the latter, so a package that supports both
+/// entry points has to state both.
+///
+/// This once rejected the pair outright, directing authors to
+/// `pipeline.models.<component>.io`. That key no longer exists — the workflow IR
+/// replaced the per-component model list — so the rule had become unsatisfiable
+/// in both directions: a workflow package could not declare a port ABI anywhere,
+/// while `static_cache`'s own contract says an undeclared scatter ABI must be
+/// rejected because its integer control ports are shape-indistinguishable. Two
+/// rules that cannot both be obeyed do not describe a valid document; they
+/// describe a hole.
+///
+/// The overlap is therefore permitted and **checked** instead of banned. Where
+/// the two surfaces describe the same fact, they must agree, and disagreement is
+/// reported naming both sources — which is the only outcome that tells an author
+/// which one to fix.
+fn validate_model_io_against_workflow(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
+    let (Some(io), Some(workflow)) = (
+        metadata.model.as_ref().and_then(|model| model.io.as_ref()),
+        metadata
+            .pipeline
             .as_ref()
-            .and_then(|model| model.io.as_ref())
-            .is_some()
-    {
-        Err(
-            "model.io is only valid for bare single-model metadata; when pipeline is present, \
-             declare decoder I/O at pipeline.models.<component>.io"
-                .to_string(),
-        )
-    } else {
-        Ok(())
+            .map(|pipeline| &pipeline.workflow),
+    ) else {
+        return;
+    };
+    let Some(static_cache) = io.static_cache.as_ref() else {
+        return;
+    };
+
+    // Which component the ABI describes is settled by the destination port, not
+    // by position or naming convention: the workflow already had to name that
+    // port per component for the runtime to check writes at all.
+    let mut matches = workflow
+        .serving
+        .iter()
+        .flat_map(|serving| serving.state_service.groups.iter())
+        .filter_map(|(group_name, group)| match group.update.as_ref() {
+            Some(crate::schema::StateUpdate::IndexedScatter {
+                write_indices_ports,
+                ..
+            }) => Some((group_name, group, write_indices_ports)),
+            _ => None,
+        })
+        .flat_map(|(group_name, group, ports)| {
+            ports
+                .iter()
+                .filter(|(_, port)| *port == &static_cache.write_indices_input)
+                .map(move |(component, _)| (group_name, group, component))
+        })
+        .collect::<Vec<_>>();
+
+    let Some((group_name, group, component)) = matches.pop() else {
+        errors.push(format!(
+            "model.io.static_cache.write_indices_input '{}' is not declared as a write-destination \
+             port by any state group; a workflow package that declares a scatter ABI must bind it \
+             through a state group whose update.kind is indexed_scatter",
+            static_cache.write_indices_input
+        ));
+        return;
+    };
+    if !matches.is_empty() {
+        errors.push(format!(
+            "model.io.static_cache.write_indices_input '{}' is claimed by more than one workflow \
+             component, so the ABI it describes is ambiguous",
+            static_cache.write_indices_input
+        ));
+        return;
+    }
+
+    // The non-pad length port has no workflow counterpart to contradict — the
+    // workflow binds it as an ordinary input — so the only check available is
+    // that the component actually has it. That is still worth making: a typo
+    // here is otherwise discovered by a direct-driver session at load time,
+    // long after the package left the exporter.
+    if let Some(declaration) = workflow.components.get(component.as_str()) {
+        for (role, port) in [
+            ("write_indices_input", &static_cache.write_indices_input),
+            (
+                "kv_sequence_length_input",
+                &static_cache.kv_sequence_length_input,
+            ),
+        ] {
+            if !declaration.ports.inputs.contains_key(port.as_str()) {
+                errors.push(format!(
+                    "model.io.static_cache.{role} '{port}' is not an input port of workflow \
+                     component '{component}'"
+                ));
+            }
+        }
+    }
+
+    // The per-layer buffers are declared twice on purpose, so they must match.
+    // A cache port the ABI claims but the group does not bind is a buffer the
+    // workflow will never advance, which reads as a cache that silently stops
+    // updating rather than as a malformed document.
+    let bound = group
+        .ports
+        .get(component.as_str())
+        .into_iter()
+        .flatten()
+        .map(|(_, alias)| (alias.input.as_str(), alias.output.as_str()))
+        .collect::<BTreeSet<_>>();
+    for (inputs, outputs, role) in [
+        (
+            &static_cache.key_cache_inputs,
+            &static_cache.key_cache_outputs,
+            "key",
+        ),
+        (
+            &static_cache.value_cache_inputs,
+            &static_cache.value_cache_outputs,
+            "value",
+        ),
+    ] {
+        for (input, output) in inputs.iter().zip(outputs) {
+            if !bound.contains(&(input.as_str(), output.as_str())) {
+                errors.push(format!(
+                    "model.io.static_cache declares the {role} cache pair \
+                     '{input}' -> '{output}', which state group '{group_name}' does not bind for \
+                     component '{component}'"
+                ));
+            }
+        }
     }
 }
 

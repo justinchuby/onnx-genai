@@ -367,7 +367,6 @@ pub fn load_metadata(path: &Path) -> Result<InferenceMetadata, crate::MetadataEr
         }
     };
 
-    crate::validation::validate_composite_io(&metadata).map_err(crate::MetadataError::Parse)?;
     Ok(metadata)
 }
 
