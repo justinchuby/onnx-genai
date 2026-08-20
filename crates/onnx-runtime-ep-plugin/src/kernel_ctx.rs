@@ -178,10 +178,11 @@ impl OwnedOutput {
 /// # Safety
 ///
 /// `api` must be valid. `ctx` must be a valid `OrtKernelContext*`.
-pub(crate) unsafe fn read_inputs(
+pub(crate) unsafe fn read_inputs_into(
     api: &ort::OrtApi,
     ctx: *mut ort::OrtKernelContext,
-) -> Result<Vec<OwnedInput>, String> {
+    inputs: &mut Vec<OwnedInput>,
+) -> Result<(), String> {
     let _probe = crate::dispatch_probe::Phase::MetadataQuery.enter();
     let get_input_count = api
         .KernelContext_GetInputCount
@@ -229,7 +230,11 @@ pub(crate) unsafe fn read_inputs(
     if input_count > 0 {
         crate::dispatch_probe::count(crate::dispatch_probe::Event::DispatchAlloc);
     }
-    let mut inputs = crate::compute::take_input_scratch(input_count);
+    debug_assert!(
+        inputs.is_empty(),
+        "read_inputs_into was handed a dirty buffer"
+    );
+    inputs.reserve(input_count);
     for i in 0..input_count {
         let mut value: *const ort::OrtValue = std::ptr::null();
         crate::dispatch_probe::ort_call();
@@ -358,6 +363,23 @@ pub(crate) unsafe fn read_inputs(
         });
     }
 
+    Ok(())
+}
+
+/// [`read_inputs_into`] with a freshly allocated vector.
+///
+/// The production path supplies its own buffer from the per-thread [`RunScratch`]
+/// so a `Run` does not allocate one; this wrapper exists for the tests, which
+/// care about what is read and not about where the storage came from.
+///
+/// [`RunScratch`]: crate::compute::RunScratch
+#[cfg(test)]
+pub(crate) unsafe fn read_inputs(
+    api: &ort::OrtApi,
+    ctx: *mut ort::OrtKernelContext,
+) -> Result<Vec<OwnedInput>, String> {
+    let mut inputs = Vec::new();
+    unsafe { read_inputs_into(api, ctx, &mut inputs) }?;
     Ok(inputs)
 }
 

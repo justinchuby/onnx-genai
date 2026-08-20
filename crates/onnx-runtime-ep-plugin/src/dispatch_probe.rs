@@ -1052,14 +1052,38 @@ mod ffi_coverage {
         ("host_pool.rs", include_str!("host_pool.rs"), 2, 2),
     ];
 
-    /// Source ahead of the file's `#[cfg(test)]` block — test scaffolding
-    /// names ORT members too (the fake `OrtApi` in `kernel_ctx`, the fake
-    /// thread pools here), and instrumenting a fake would prove nothing.
-    fn production_source(src: &str) -> &str {
-        match src.find("\n#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
+    /// Source with every `#[cfg(test)]` item removed — test scaffolding names
+    /// ORT members too (the fake `OrtApi` in `kernel_ctx`, the fake thread
+    /// pools here), and instrumenting a fake would prove nothing.
+    ///
+    /// This used to truncate at the *first* `#[cfg(test)]`, which silently
+    /// dropped every real FFI call below it. A single test-only helper placed
+    /// beside the function it exercises was enough to hide three instrumented
+    /// ORT members from this audit while the count still matched a lowered
+    /// expectation. Excluding items individually means where a test helper sits
+    /// in the file cannot change what gets audited.
+    ///
+    /// Items are recognised by a `#[cfg(...test...)]` attribute at column 0 and
+    /// skipped through to the next closing brace at column 0, which is how
+    /// rustfmt lays out every top-level item in this crate.
+    fn production_source(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut skipping = false;
+        for line in src.lines() {
+            if skipping {
+                if line == "}" {
+                    skipping = false;
+                }
+                continue;
+            }
+            if line.starts_with("#[cfg(") && line.ends_with(")]") && line.contains("test") {
+                skipping = true;
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
         }
+        out
     }
 
     fn ort_members(src: &str) -> Vec<String> {
@@ -1093,6 +1117,7 @@ mod ffi_coverage {
     fn every_ort_entry_point_is_accounted_for() {
         for (name, src, want_members, want_calls) in EXPECTED {
             let prod = production_source(src);
+            let prod = prod.as_str();
             let members = ort_members(prod);
             let calls = prod.matches("dispatch_probe::ort_call()").count();
             assert_eq!(
@@ -1115,7 +1140,7 @@ mod ffi_coverage {
     /// nothing would let the assertions above pass vacuously forever.
     #[test]
     fn the_source_scan_is_not_vacuous() {
-        let m = ort_members(production_source(include_str!("kernel_ctx.rs")));
+        let m = ort_members(&production_source(include_str!("kernel_ctx.rs")));
         assert!(m.contains(&"KernelContext_GetInput".to_string()), "{m:?}");
         assert!(m.contains(&"GetTensorData".to_string()), "{m:?}");
         assert!(
