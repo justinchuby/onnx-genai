@@ -9827,9 +9827,18 @@ mod tests {
     #[test]
     fn every_probe_perturbing_test_takes_the_dispatch_lock() {
         const SOURCE: &str = include_str!("matmul_nbits.rs");
-        const PERTURBS: [&str; 4] = [
+        // `int4_matmul_m1` and `n16_sdot_matmul_m1` were missing here while no
+        // test observed their counters, so the omission was invisible: a
+        // perturber only matters once something reads what it perturbs. The
+        // first before/after *equality* observer of those two counters made
+        // the race real and reproducible (60/60 when co-scheduled), so the
+        // rule is to list a function here when its counter is added, not when
+        // an observer is.
+        const PERTURBS: [&str; 6] = [
             ".execute(",
             "kai_sdot_matmul_m1(",
+            "n16_sdot_matmul_m1(",
+            "int4_matmul_m1(",
             "try_mlas_sqnbit(",
             "borrowed_int4_prefill_block_enabled(",
         ];
@@ -11817,6 +11826,7 @@ mod tests {
 
     #[test]
     fn n16_sdot_int4_block128_asymmetric_matches_int8_and_f32_reference() {
+        let _probe = lock_dispatch_probe();
         for &(k, n) in &[
             (1024usize, 1024usize),
             (1024, 3072),
@@ -12338,6 +12348,7 @@ mod tests {
 
     #[test]
     fn matmulnbits_direct_int4_gemv_matches_int8_reference() {
+        let _probe = lock_dispatch_probe();
         let (k, n, block_size) = (77usize, 9usize, 32usize);
         let blocks = k.div_ceil(block_size);
         let padded_k = blocks * block_size;
@@ -12467,6 +12478,7 @@ mod tests {
     /// dequantized-f32 oracle, and must be materially better than per-row.
     #[test]
     fn matmulnbits_compint8_per_block_activation_tracks_dequant_f32_oracle() {
+        let _probe = lock_dispatch_probe();
         let (k, n, block_size) = (256usize, 8usize, 32usize);
         let blocks = k.div_ceil(block_size);
 
@@ -12557,6 +12569,7 @@ mod tests {
     /// the output magnitude) so a passing argmax is a real accuracy result.
     #[test]
     fn matmulnbits_compint8_argmax_matches_dequant_f32_oracle_at_near_tie() {
+        let _probe = lock_dispatch_probe();
         let (k, n, block_size) = (128usize, 2usize, 32usize);
         let mut checked = 0usize;
         for seed in 1..=400u32 {
@@ -12632,6 +12645,7 @@ mod tests {
     /// exactly this greedy-token divergence, and this test would catch it.
     #[test]
     fn int4_decode_preserves_f32_argmax_where_per_row_int8_activation_flips() {
+        let _probe = lock_dispatch_probe();
         let (k, n, block_size) = (128usize, 2usize, 32usize);
         let mut near_ties = 0usize;
         let mut per_row_flips = 0usize;
@@ -14711,6 +14725,7 @@ mod tests {
 
     #[test]
     fn matmulnbits_direct_int4_parallel_partial_k_matches_serial() {
+        let _probe = lock_dispatch_probe();
         let (k, n, block_size) = (77usize, 1025usize, 32usize);
         let blocks = k.div_ceil(block_size);
         let activations: Vec<f32> = (0..k)
@@ -17310,6 +17325,7 @@ mod tests {
 
     #[test]
     fn spmd_real_int4_parity_subprocess() {
+        let _probe = lock_dispatch_probe();
         let Ok(mode) = std::env::var(SPMD_PARITY_CHILD_ENV) else {
             return;
         };
@@ -18576,6 +18592,7 @@ mod tests {
     #[test]
     #[ignore = "perf probe; run explicitly with --ignored --nocapture"]
     fn matmulnbits_mlas_perf() {
+        let _probe = lock_dispatch_probe();
         use std::time::Instant;
 
         fn time<F: FnMut() + Send>(threads: usize, mut run: F) -> f64 {
@@ -18843,6 +18860,7 @@ mod tests {
     #[test]
     #[ignore = "perf probe; run explicitly with --ignored --nocapture"]
     fn int4_gemv_decode_microbench() {
+        let _probe = lock_dispatch_probe();
         use std::time::Instant;
 
         // Median-of-5 ns/call for one warm, L3-resident M=1 GEMV.
@@ -18962,6 +18980,7 @@ mod tests {
     #[test]
     #[ignore = "perf probe; run explicitly with --ignored --nocapture"]
     fn matmulnbits_mlas_decode_step() {
+        let _probe = lock_dispatch_probe();
         use std::time::Instant;
 
         // (K, N, count-per-token) for one Qwen2.5-Coder-7B decode step.

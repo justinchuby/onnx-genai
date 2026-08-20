@@ -749,10 +749,12 @@ impl CudaLinearAttentionGatingFusion {
             (a0, a1, false)
         } else if graph.initializers.contains_key(&a1) {
             (a1, a0, false)
-        } else if let Some((a_log, chain)) = Self::match_neg_exp_chain(graph, a0, mul_id, io_dtype) {
+        } else if let Some((a_log, chain)) = Self::match_neg_exp_chain(graph, a0, mul_id, io_dtype)
+        {
             dead.extend(chain);
             (a_log, a1, true)
-        } else if let Some((a_log, chain)) = Self::match_neg_exp_chain(graph, a1, mul_id, io_dtype) {
+        } else if let Some((a_log, chain)) = Self::match_neg_exp_chain(graph, a1, mul_id, io_dtype)
+        {
             dead.extend(chain);
             (a_log, a0, true)
         } else {
@@ -7306,7 +7308,11 @@ mod tests {
     /// `neg_exp_from_a_log`: when true the decay coefficient is the exported
     /// `Neg(Exp(A_log))` constant chain (A_log the initializer) instead of a
     /// ready `neg_exp_A` initializer, exercising the inline constant-chain fold.
-    fn gated_delta_la_graph_ext(heads: usize, trailing_cast: bool, neg_exp_from_a_log: bool) -> Graph {
+    fn gated_delta_la_graph_ext(
+        heads: usize,
+        trailing_cast: bool,
+        neg_exp_from_a_log: bool,
+    ) -> Graph {
         let mut graph = Graph::new();
         graph.opset_imports.insert(String::new(), 17);
         graph.opset_imports.insert(MICROSOFT_DOMAIN.into(), 1);
@@ -7325,7 +7331,11 @@ mod tests {
         // a ready `neg_exp_A` initializer, or `A_log` (initializer) feeding an
         // `Exp → Neg` chain that produces the `neg_exp_A` value.
         let dt_bias = vec1d(&mut graph, "dt_bias", DataType::Float32, heads);
-        let coeff_init_name = if neg_exp_from_a_log { "A_log" } else { "neg_exp_A" };
+        let coeff_init_name = if neg_exp_from_a_log {
+            "A_log"
+        } else {
+            "neg_exp_A"
+        };
         let coeff_init = vec1d(&mut graph, coeff_init_name, DataType::Float32, heads);
         for init in [dt_bias, coeff_init] {
             graph.set_initializer(
@@ -7339,9 +7349,19 @@ mod tests {
         }
         let neg_exp_a = if neg_exp_from_a_log {
             let exp_out = value(&mut graph, "exp_out", DataType::Float32, heads);
-            graph.insert_node(Node::new(NodeId(0), "Exp", vec![Some(coeff_init)], vec![exp_out]));
+            graph.insert_node(Node::new(
+                NodeId(0),
+                "Exp",
+                vec![Some(coeff_init)],
+                vec![exp_out],
+            ));
             let neg_out = value(&mut graph, "neg_exp_A", DataType::Float32, heads);
-            graph.insert_node(Node::new(NodeId(0), "Neg", vec![Some(exp_out)], vec![neg_out]));
+            graph.insert_node(Node::new(
+                NodeId(0),
+                "Neg",
+                vec![Some(exp_out)],
+                vec![neg_out],
+            ));
             neg_out
         } else {
             coeff_init
