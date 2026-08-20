@@ -1036,3 +1036,89 @@ MLAS SQNBit's CompInt8 path uses integer dot products where this one widens ever
 and VNNI is what would make that pay.
 
 Full record: [`docs/benchmarks/2026-08-19-int4-prefill-dequant-pack-simd.md`](../benchmarks/2026-08-19-int4-prefill-dequant-pack-simd.md).
+
+_Sequel: the pack was still the dominant term at small `m` after this. See section 10._
+
+### 10. The int4 pack's remaining fixed cost was index arithmetic, not unpacking (**fixed**)
+
+Section 9 halved the int4 prefill pack. It was still the dominant term at small `m`: at
+`4096x11008` the fitted fixed cost was 2.16 ms against 22.5 MB of packed weight — **10.8 GB/s, 14%
+of this host's 75.8 GB/s roofline**, and the pack is already parallel over column strips. Not
+bandwidth. The microkernel next to it runs at 1161 GFLOPS, ~95% of this host's AVX2 FMA peak, so
+the pack was the whole remaining opportunity.
+
+Two costs, both bookkeeping rather than arithmetic:
+
+1. **The four packed bytes were four bounds-checked indexes.** `self.packed[byte_at]` ..
+   `[byte_at + 3]` assembled into a `u32` compiles to four loads, four bounds checks and the shifts
+   to reassemble. Taking `self.packed[byte_at..byte_at + 4].try_into()` compiles to one unaligned
+   32-bit load with one bounds check. **fixed 2.155 -> 1.775 ms.**
+2. **Scale and zero point were re-derived every eight depths.** They are constant across a whole
+   block, but the group is eight depths, so at `block_size = 32` each was recomputed four times per
+   block — and for int4 the zero point lookup is itself a nibble extract. Hoisting both to block
+   scope: **fixed 1.881 -> 1.407 ms.**
+
+Together **2.155 -> 1.407 ms, 1.53x**, on top of section 9's 2.2x. Neither touches the arithmetic;
+the panel stays bit-identical, still asserted directly against the per-column path.
+
+The block-scoped hoist introduces an invariant worth naming: the vector loop now walks whole groups
+*inside one block*, so `block_size - pc % block_size` must stay a multiple of the group. It does,
+because `pc` is a multiple of `KC` and both `KC` and `block_size` are multiples of 8 — the test now
+covers `block_size` 24 and 40, which are multiples of the group that do **not** divide `KC`, so the
+invariant is pinned rather than assumed.
+
+**Both row gates moved again**, for the third time, exactly as section 9 predicted they would
+whenever the pack's cost changes:
+
+| regime | scalar pack | after §9 | after §10 |
+|---|---:|---:|---:|
+| non-resident (`INT4_PREFILL_GEBP_MIN_ROWS`) | 12 | 5 | **3** |
+| L2-resident (`..._L2_RESIDENT`) | 24 | 12 | **6** |
+
+On the non-resident shape the GEBP is now ahead at *every* `m >= 1`, so that crossover has fallen
+off the bottom of the sweep. The constant is set to `3` rather than `1` deliberately: `m = 2` is a
+1.7% difference, inside the noise, and `m = 1` is decode, which has its own route and should not be
+re-pointed on the strength of a prefill bench.
+
+Production A/B on real `MatMulNBits` models, 25 shapes x 3 thread counts, `--native-only` with a
+null control: **60 of 75 cells improved, 15 within noise, 0 surviving regressions**, parity `PASS`
+on every row.
+
+| cell | threads | base ms | new ms | speedup |
+|---|---:|---:|---:|---:|
+| `qwen3_0p6b_mlp_t8` | 32 | 1.585 | 0.556 | **2.85x** |
+| `qwen3_0p6b_qkv_t8` | 32 | 1.086 | 0.422 | **2.57x** |
+| `qwen3_0p6b_qkv_t8` | 8 | 0.945 | 0.389 | **2.43x** |
+| `qwen3_0p6b_mlp_t8` | 8 | 1.444 | 0.733 | **1.97x** |
+| `llama3_8b_qkv_t8` | 8 | 3.125 | 2.193 | **1.43x** |
+| `llama3_8b_mlp_t8` | 8 | 7.629 | 5.373 | **1.42x** |
+| `qwen3_8b_square_t8` | 8 | 2.100 | 1.477 | **1.42x** |
+
+The `qwen3_0p6b` `t8` cells are the largest because they are the L2-resident gate moving 12 -> 6:
+at `m = 8` they were taking the column-blocked route and now take the GEBP.
+
+Three cells first read as regressions and none survived re-measurement at 11 trials x 40 runs:
+`llama3_8b_qkv_t512` t=16 +1.53% -> **-1.73%**, `qwen3_8b_square_t8` t=16 +5.33% -> **-21.21%**
+(agreeing with its own t=8 and t=32 siblings, which had improved 1.42x and 1.22x — opposite signs
+on the same shape at different thread counts is the noise signature). The third,
+`qwen3_0p6b_qkv_t1` t=16, is `m = 1` on a 1.57 MB weight, whose gate is 6 both before and after, so
+it **provably cannot reach any changed code**; at 15 trials x 60 runs it reads -3.16% against a
+-7.22% null.
+
+Versus ORT, paired before/after from the same invocation at 8 threads:
+
+| cell | before | after |
+|---|---:|---:|
+| `qwen3_0p6b_qkv_t8` | 4.69x | **2.59x** |
+| `llama3_8b_qkv_t8` | 2.93x | **2.05x** |
+| `llama3_8b_mlp_t8` | 2.57x | **2.03x** |
+| `llama3_8b_qkv_t128` | 1.53x | 1.53x |
+
+`t128` is unchanged, which is the control: there the pack is a small fraction of the call and the
+microkernel already runs near peak.
+
+**What this does not fix.** `m = 1` is untouched. 8-bit prefill keeps the per-column scalar pack —
+and per the section 9 correction, vectorizing it is measured to be worth nothing.
+`INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED = 4` is untouched; it gates a different competitor and was not
+re-measured. The residual gap to ORT at small `m` remains structural: MLAS `SQNBitGemm` CompInt8
+wants VNNI, which this host does not have.
