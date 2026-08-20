@@ -19501,4 +19501,261 @@ extern "C" __global__ void ref_silu_mul_f16(
             );
         }
     }
+
+    /// Achieved-bandwidth probe for the int4 decode GEMV, swept over the REAL
+    /// projection shapes of the 30B model this repo is tuned against.
+    ///
+    /// # Why this exists
+    ///
+    /// Issue #1574 established that decode reaches only ~20% of the A100 weight
+    /// -bandwidth roofline and that the INT4 GEMVs run at 18-26% of HBM peak.
+    /// Confirming that took a four-step nsys ritual per data point — profile at
+    /// 32 tokens, profile at 96, export both to sqlite, subtract to strip the
+    /// load/prefill fixed costs — and every step had a way to silently produce a
+    /// wrong answer (see the nsys notes in `measurement-discipline`). That is far
+    /// too slow and too failure-prone a loop to iterate a kernel against.
+    ///
+    /// This probe collapses it: it drives the SAME dispatch the model decodes
+    /// with (`MatMulNBitsKernel::run`), at the same shapes, and reports the
+    /// number the kernel work is actually bounded by — achieved read bandwidth.
+    /// There is no graph capture, no prefill, and no load phase to subtract, so
+    /// the reading needs no differencing to be meaningful.
+    ///
+    /// # The shapes are not invented
+    ///
+    /// They are every distinct `MatMulNBits` shape in the model's decoder graph,
+    /// with the exact per-token call counts, so the weighted total is the whole
+    /// token's GEMV cost rather than a microbenchmark of one favourable case.
+    /// The counts sum to 416 nodes/token, which is exactly the per-token
+    /// `matmul_nbits` launch count observed under nsys — that agreement is what
+    /// makes the extrapolated tok/s below a fair prediction rather than a guess.
+    ///
+    /// # Reading the output
+    ///
+    /// The headline is the last line: decode tok/s implied by GEMV time ALONE.
+    /// It is an UPPER BOUND on end-to-end decode — attention, norms, sampling and
+    /// launch gaps are all excluded — so the gap between it and a real
+    /// `profile_native` run is the non-GEMV budget, and the gap between it and
+    /// the bandwidth roofline is what a better GEMV can still recover.
+    ///
+    /// Percent-of-peak is quoted against `A100_SXM4_80GB_PEAK_GBPS`. On any other
+    /// device the GB/s column is still correct and the percentage is not; adjust
+    /// the constant rather than trusting the ratio.
+    #[test]
+    #[ignore = "perf microbench; requires a dedicated idle SM80+ CUDA device"]
+    fn decode_gemv_achieved_bandwidth_by_projection_shape() {
+        use cudarc::driver::result::event;
+        use cudarc::driver::sys;
+
+        /// Datasheet HBM2e peak of the box this was written against. Only the
+        /// percent-of-peak column depends on it.
+        const A100_SXM4_80GB_PEAK_GBPS: f64 = 2039.0;
+        /// `(K, N, calls_per_token, label)` — every distinct decoder GEMV shape.
+        const SHAPES: [(usize, usize, usize, &str); 6] = [
+            (6656, 19968, 104, "gate/up"),
+            (19968, 6656, 52, "down"),
+            (6656, 4096, 104, "q"),
+            (4096, 6656, 52, "o"),
+            (6656, 202048, 1, "lm_head"),
+            (6656, 256, 104, "k/v (GQA)"),
+        ];
+        const BLOCK: usize = 32;
+
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping GEMV bandwidth probe: CUDA runtime unavailable");
+            return;
+        };
+        if runtime
+            .require_nvrtc_half_headers("gemv bandwidth probe")
+            .is_err()
+        {
+            eprintln!("skipping GEMV bandwidth probe: fp16 NVRTC headers unavailable");
+            return;
+        }
+        runtime.bind().unwrap();
+        let reps = zc_env_usize("GEMV_PROBE_REPS", 15).max(5);
+
+        let mut total_ms_per_token = 0.0f64;
+        let mut total_bytes_per_token = 0.0f64;
+        println!(
+            "{:<10} {:>7} {:>7} {:>6} {:>10} {:>9} {:>7} {:>9} {:>7}",
+            "shape", "K", "N", "calls", "median_us", "MB/call", "GB/s", "%peak", "ms/tok"
+        );
+
+        for (k, n, calls, label) in SHAPES {
+            let k_blocks = k / BLOCK;
+            let blob_size = BLOCK / 2;
+            let zp_row_bytes = k_blocks.div_ceil(2);
+
+            // Bandwidth does not depend on the VALUES, only on the traffic, so
+            // fill with a cheap deterministic pattern instead of paying for a
+            // realistic quantization (this keeps lm_head, at 672 MB of packed
+            // weights, from dominating the probe's own runtime).
+            let mut state = 0x9e37_79b9_7f4a_7c15u64;
+            let mut next_byte = || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 56) as u8
+            };
+            let packed: Vec<u8> = (0..n * k_blocks * blob_size).map(|_| next_byte()).collect();
+            let zp: Vec<u8> = (0..n * zp_row_bytes).map(|_| next_byte()).collect();
+            let scales: Vec<f16> = (0..n * k_blocks)
+                .map(|_| f16::from_f32(0.02))
+                .collect();
+            let activation: Vec<f16> = (0..k).map(|_| f16::from_f32(0.01)).collect();
+
+            let activation_dev = runtime.alloc_raw(activation.len() * 2).unwrap();
+            let packed_dev = runtime.alloc_raw(packed.len()).unwrap();
+            let scales_dev = runtime.alloc_raw(scales.len() * 2).unwrap();
+            let zp_dev = runtime.alloc_raw(zp.len()).unwrap();
+            let output_dev = runtime.alloc_raw(n * 2).unwrap();
+            // SAFETY: every device buffer was sized from the slice it receives.
+            unsafe {
+                runtime.htod(as_bytes(&activation), activation_dev).unwrap();
+                runtime.htod(&packed, packed_dev).unwrap();
+                runtime.htod(as_bytes(&scales), scales_dev).unwrap();
+                runtime.htod(&zp, zp_dev).unwrap();
+            }
+
+            let a_shape = [1usize, k];
+            let a_strides = [k as i64, 1];
+            let b_shape = [n, k_blocks, blob_size];
+            let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
+            let scales_shape = [n, k_blocks];
+            let scales_strides = [k_blocks as i64, 1];
+            let zp_shape = [n, zp_row_bytes];
+            let zp_strides = [zp_row_bytes as i64, 1];
+            let y_shape = [1usize, n];
+            let y_strides = [n as i64, 1];
+            let device = DeviceId::cuda(0);
+            let inputs = vec![
+                TensorView::new(
+                    device_ptr(activation_dev),
+                    DataType::Float16,
+                    &a_shape,
+                    &a_strides,
+                    device,
+                ),
+                TensorView::new(
+                    device_ptr(packed_dev),
+                    DataType::Uint8,
+                    &b_shape,
+                    &b_strides,
+                    device,
+                ),
+                TensorView::new(
+                    device_ptr(scales_dev),
+                    DataType::Float16,
+                    &scales_shape,
+                    &scales_strides,
+                    device,
+                ),
+                TensorView::new(
+                    device_ptr(zp_dev),
+                    DataType::Uint8,
+                    &zp_shape,
+                    &zp_strides,
+                    device,
+                ),
+            ];
+            let mut outputs = [TensorMut::new(
+                device_ptr_mut(output_dev),
+                DataType::Float16,
+                &y_shape,
+                &y_strides,
+                device,
+            )];
+
+            let kernel = MatMulNBitsKernel {
+                runtime: runtime.clone(),
+                k,
+                n,
+                bits: 4,
+                block_size: BLOCK,
+                accuracy_level: 4,
+                accuracy4_workspace: None,
+                fold_bias_post_round: false,
+                gate_up_swiglu: false,
+                decomposed_silu: false,
+                rmsnorm_prologue: false,
+                rmsnorm_epsilon: 1e-5,
+                last_call_capture_safe: AtomicBool::new(false),
+                bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+                bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+            };
+
+            // First call also compiles the NVRTC module; never time it.
+            kernel.run(&inputs, &mut outputs, None).unwrap();
+            runtime.synchronize().unwrap();
+            let mut times = Vec::with_capacity(reps);
+            for _ in 0..reps {
+                let start = event::create(sys::CUevent_flags::CU_EVENT_DEFAULT).unwrap();
+                let end = event::create(sys::CUevent_flags::CU_EVENT_DEFAULT).unwrap();
+                // SAFETY: both events belong to this context and bracket a launch
+                // on the same stream the kernel enqueues to.
+                unsafe {
+                    event::record(start, runtime.stream_ptr()).unwrap();
+                    kernel.run(&inputs, &mut outputs, None).unwrap();
+                    event::record(end, runtime.stream_ptr()).unwrap();
+                    event::synchronize(end).unwrap();
+                    times.push(event::elapsed(start, end).unwrap());
+                    event::destroy(start).ok();
+                    event::destroy(end).ok();
+                }
+            }
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median_ms = times[times.len() / 2] as f64;
+
+            // Weights + scales + zero points. The fp16 activation (2*K bytes) and
+            // the fp16 output (2*N) are three orders of magnitude smaller at these
+            // shapes and are left out so the number is unambiguously weight traffic.
+            let bytes = (n * k_blocks * blob_size + n * k_blocks * 2 + n * zp_row_bytes) as f64;
+            let gbps = bytes / (median_ms * 1e-3) / 1e9;
+            let ms_tok = median_ms * calls as f64;
+            total_ms_per_token += ms_tok;
+            total_bytes_per_token += bytes * calls as f64;
+            println!(
+                "{:<10} {:>7} {:>7} {:>6} {:>10.1} {:>9.2} {:>7.0} {:>8.1}% {:>7.2}",
+                label,
+                k,
+                n,
+                calls,
+                median_ms * 1000.0,
+                bytes / 1e6,
+                gbps,
+                100.0 * gbps / A100_SXM4_80GB_PEAK_GBPS,
+                ms_tok
+            );
+
+            // SAFETY: every pointer came from `alloc_raw` above and is freed once.
+            unsafe {
+                runtime.free_raw(activation_dev).ok();
+                runtime.free_raw(packed_dev).ok();
+                runtime.free_raw(scales_dev).ok();
+                runtime.free_raw(zp_dev).ok();
+                runtime.free_raw(output_dev).ok();
+            }
+        }
+
+        let aggregate_gbps = total_bytes_per_token / (total_ms_per_token * 1e-3) / 1e9;
+        let implied_tps = 1000.0 / total_ms_per_token;
+        let roofline_tps = A100_SXM4_80GB_PEAK_GBPS * 1e9 / total_bytes_per_token;
+        println!(
+            "\nweight traffic {:.2} GB/token, GEMV time {:.2} ms/token\n\
+             aggregate achieved bandwidth {:.0} GB/s ({:.1}% of peak)\n\
+             decode ceiling from GEMV alone: {:.1} tok/s (bandwidth roofline {:.1} tok/s)",
+            total_bytes_per_token / 1e9,
+            total_ms_per_token,
+            aggregate_gbps,
+            100.0 * aggregate_gbps / A100_SXM4_80GB_PEAK_GBPS,
+            implied_tps,
+            roofline_tps
+        );
+        assert!(
+            implied_tps.is_finite() && implied_tps > 0.0,
+            "GEMV bandwidth probe produced no usable timing"
+        );
+    }
+
 }
