@@ -218,7 +218,10 @@ static int compare_outputs(OrtValue* ref, OrtValue* got, size_t n, const char* d
   return ok;
 }
 
-static OrtSession* create_session(OrtEnv* env, const char* model, const OrtEpDevice* device, const char* profile_prefix, char* err, size_t err_len) {
+/* `ep_opts` is a "k=v,k=v" string, or NULL/empty for none. Parsed per call so
+   each arm can carry its own options and the harness can prove which arm had
+   which setting. */
+static OrtSession* create_session(OrtEnv* env, const char* model, const OrtEpDevice* device, const char* profile_prefix, const char* ep_opts, char* err, size_t err_len) {
   OrtSessionOptions* so = NULL;
   OrtSession* session = NULL;
   OrtStatus* st = api->CreateSessionOptions(&so);
@@ -229,7 +232,23 @@ static OrtSession* create_session(OrtEnv* env, const char* model, const OrtEpDev
   }
   if (device) {
     const OrtEpDevice* arr[1] = {device};
-    st = api->SessionOptionsAppendExecutionProvider_V2(so, env, arr, 1, NULL, NULL, 0);
+    char opt_buf[2048];
+    const char* keys[16];
+    const char* vals[16];
+    size_t nopt = 0;
+    if (ep_opts && ep_opts[0]) {
+      snprintf(opt_buf, sizeof(opt_buf), "%s", ep_opts);
+      char* save = NULL;
+      for (char* tok = strtok_r(opt_buf, ",", &save); tok && nopt < 16; tok = strtok_r(NULL, ",", &save)) {
+        char* eq = strchr(tok, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        keys[nopt] = tok;
+        vals[nopt] = eq + 1;
+        nopt++;
+      }
+    }
+    st = api->SessionOptionsAppendExecutionProvider_V2(so, env, arr, 1, keys, vals, nopt);
     if (st) {
       snprintf(err, err_len, "SessionOptionsAppendExecutionProvider_V2: %s", api->GetErrorMessage(st));
       api->ReleaseStatus(st);
@@ -285,7 +304,7 @@ static void end_profile(OrtSession* session, const char* arm) {
 }
 
 int main(int argc, char** argv) {
-  if (argc != 18) {
+  if (argc != 20) {
     fprintf(stderr, "usage: helper <ort> <cubecl_plugin> <webgpu_plugin> <model> <op> <dtype> <a> <b> <c> <warmups> <iterations> <samples> <profile_dir> <rtol> <atol> <cubecl_ep> <webgpu_ep>\n");
     return 2;
   }
@@ -304,6 +323,7 @@ int main(int argc, char** argv) {
   double atol = atof(argv[15]);
   const char* cubecl_ep = argv[16];
   const char* webgpu_ep = argv[17];
+  const char* arm_opts[2] = {argv[18], argv[19]};
 
   void* h = dlopen(ort_path, RTLD_NOW | RTLD_LOCAL);
   if (!h) { printf("{\"event\":\"error\",\"stage\":\"dlopen_ort\",\"message\":"); json_escape_print(dlerror()); printf("}\n"); return 2; }
@@ -337,17 +357,19 @@ int main(int argc, char** argv) {
   const char* output_name = strcmp(op, "MatMul") == 0 ? "C" : "Z";
 
   char err[1024] = {0};
-  OrtSession* cpu = create_session(env, model, NULL, NULL, err, sizeof(err));
+  OrtSession* cpu = create_session(env, model, NULL, NULL, NULL, err, sizeof(err));
   if (!cpu) { printf("{\"event\":\"error\",\"stage\":\"CreateSession(cpu)\",\"message\":"); json_escape_print(err); printf("}\n"); return 4; }
   OrtValue* ref = NULL;
   if (run_once(cpu, input_names, inputs, input_count, output_name, &ref)) return 4;
 
   Arm arms[2] = {{"cubecl", NULL, 0, {0}}, {"official_webgpu", NULL, 0, {0}}};
   const OrtEpDevice* arm_devs[2] = {cubecl_dev, webgpu_dev};
+  printf("{\"event\":\"ep_options\",\"cubecl\":"); json_escape_print(arm_opts[0]);
+  printf(",\"official_webgpu\":"); json_escape_print(arm_opts[1]); printf("}\n");
   for (int i = 0; i < 2; ++i) {
     char prefix[2048];
     snprintf(prefix, sizeof(prefix), "%s/%s_%s_%s", profile_dir, arms[i].name, op, dtype);
-    OrtSession* prof = create_session(env, model, arm_devs[i], prefix, arms[i].error, sizeof(arms[i].error));
+    OrtSession* prof = create_session(env, model, arm_devs[i], prefix, arm_opts[i], arms[i].error, sizeof(arms[i].error));
     if (!prof) {
       printf("{\"event\":\"arm_error\",\"arm\":"); json_escape_print(arms[i].name); printf(",\"message\":"); json_escape_print(arms[i].error); printf("}\n");
       continue;
@@ -370,7 +392,7 @@ int main(int argc, char** argv) {
 
   for (int i = 0; i < 2; ++i) {
     if (!arms[i].valid) continue;
-    arms[i].session = create_session(env, model, arm_devs[i], NULL, arms[i].error, sizeof(arms[i].error));
+    arms[i].session = create_session(env, model, arm_devs[i], NULL, arm_opts[i], arms[i].error, sizeof(arms[i].error));
     if (!arms[i].session) {
       printf("{\"event\":\"arm_error\",\"arm\":"); json_escape_print(arms[i].name); printf(",\"message\":"); json_escape_print(arms[i].error); printf("}\n");
       arms[i].valid = 0;
@@ -506,6 +528,47 @@ def profile_counts(profile_path: str | None) -> dict[str, int]:
     return counts
 
 
+SENTINEL_VALUE = "__nxrt_sentinel_bogus__"
+
+
+def _sentinel_of(options: str) -> str:
+    """把每个 k=v 的值换成一个必然非法的哨兵值,保留 key 不变。"""
+    out = []
+    for pair in options.split(","):
+        if "=" not in pair:
+            continue
+        out.append(f"{pair.split('=', 1)[0]}={SENTINEL_VALUE}")
+    return ",".join(out)
+
+
+def assert_ep_options_are_consumed(cmd: list[str], cubecl_opts: str, official_opts: str) -> None:
+    """证明我们传的 provider option 真的被 EP 消费了。
+
+    动机:`ep.webgpuexecutionprovider.enableGraphCapture` 这种带前缀的 key 会被
+    plugin EP API 静默忽略——不报错、不警告、也不生效。拿这种 key 测出来的
+    "开关没有影响"是无效结论,因为开关压根没打开。
+
+    判别方法:把值换成必然非法的哨兵值再跑一次。一个会因错误输入而失败的开关,
+    才可能因正确输入而生效。若哨兵跑**成功**了,说明 key 没被消费,直接终止。
+    """
+    probe = list(cmd)
+    probe[10] = probe[11] = probe[12] = "1"  # warmups / iterations / samples
+    probe[18] = _sentinel_of(cubecl_opts)
+    probe[19] = _sentinel_of(official_opts)
+    proc = run(probe)
+    rejected = proc.returncode != 0 or "Invalid" in proc.stderr or "exception" in proc.stderr
+    if not rejected:
+        raise SystemExit(
+            "EP option 自检失败:哨兵值 "
+            f"{SENTINEL_VALUE!r} 被静默接受了,说明 key 没有被 EP 消费,"
+            "任何基于它的测量都是无效的。\n"
+            f"  cubecl:   {cubecl_opts or '(none)'}\n"
+            f"  official: {official_opts or '(none)'}\n"
+            "提示:走 plugin EP API 时 key 不带 `ep.<provider>.` 前缀。"
+        )
+    print(f"<!-- ep-option 自检通过:哨兵值被拒绝 -->")
+
+
 def percentile(values: list[float], q: float) -> float:
     if not values:
         return math.nan
@@ -541,6 +604,17 @@ def main() -> int:
     parser.add_argument("--include-f16", action="store_true", default=True)
     parser.add_argument("--no-f16", dest="include_f16", action="store_false")
     parser.add_argument("--filter", default="")
+    parser.add_argument(
+        "--cubecl-ep-options",
+        default="",
+        help="逗号分隔的 k=v provider option,传给 CubeCL EP",
+    )
+    parser.add_argument(
+        "--official-ep-options",
+        default="",
+        help="逗号分隔的 k=v provider option,传给官方 WebGPU EP。"
+        "例:ep.webgpuexecutionprovider.enableGraphCapture=1",
+    )
     args = parser.parse_args()
 
     if not args.cubecl_plugin.exists():
@@ -565,6 +639,8 @@ def main() -> int:
     print(f"- cubecl plugin: `{args.cubecl_plugin}`")
     print(f"- official webgpu plugin: `{official}`")
     print(f"- warmups: {args.warmups}; iterations/sample: {args.iterations}; samples/arm: {args.samples}")
+    print(f"- cubecl ep options: `{args.cubecl_ep_options or '(none)'}`")
+    print(f"- official webgpu ep options: `{args.official_ep_options or '(none)'}`")
     print("- f32 tolerance: rtol=1e-5, atol=1e-5")
     print("- f16 tolerance: rtol=5e-2, atol=5e-2（半精度累加/舍入差异门限；所有 cell 仍逐元素 allclose）")
     print()
@@ -574,6 +650,7 @@ def main() -> int:
     print("|---|---|---|---|---:|---:|---:|---|---:|---:|")
 
     rc = 0
+    options_verified = False
     for spec in cell_specs(args.include_f16):
         if args.filter and args.filter not in spec["name"]:
             continue
@@ -601,7 +678,12 @@ def main() -> int:
             str(atol),
             CUBECL_EP,
             WEBGPU_EP,
+            args.cubecl_ep_options,
+            args.official_ep_options,
         ]
+        if not options_verified and (args.cubecl_ep_options or args.official_ep_options):
+            assert_ep_options_are_consumed(cmd, args.cubecl_ep_options, args.official_ep_options)
+            options_verified = True
         proc = run(cmd)
         events = []
         for line in proc.stdout.splitlines():

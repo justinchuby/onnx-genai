@@ -200,3 +200,44 @@ harness 会把一份运行产物写进 `target/`,那份是一次性的;本文件
 **重跑前先让机器安静下来。** 第一轮就是因为没做到这一点而全表作废(见上文)。
 至少确认没有 `cargo`/`rustc` 在跑、loadavg 已回落,并且在**每次**运行前确认,
 而不是只在开始时确认一次。
+
+## 附录:graph capture 与本表的口径
+
+本表**两个 arm 都没有开 graph capture**,因此比较是同口径的。但这一节要记下
+两件在后续工作中会反复踩到的事。
+
+### 1. 带前缀的 provider option key 会被静默忽略
+
+官方 dylib 里能 `strings` 出 `ep.webgpuexecutionprovider.enableGraphCapture`,
+但那是**旧式 EP 的 session-config 命名**。走 plugin EP API
+(`SessionOptionsAppendExecutionProvider_V2`)时,key **不带**前缀,就是
+`enableGraphCapture`。
+
+带前缀的 key 传进去不会报错、不会警告,只是不生效。我第一次就是这样测的,
+拿到一个"开了 graph capture 也没变化"的数字——那个数字是无效的,因为
+**knob 从未生效**。
+
+判别方法(值得对任何 provider option 都做一遍):**传一个非法值,要求它报错。**
+
+```
+enableGraphCapture=bogus
+  -> Invalid enable graph capture: bogus      # key 被消费了,可信
+ep.webgpuexecutionprovider.enableGraphCapture=bogus
+  -> 静默通过                                  # key 没被消费,之前的测量作废
+```
+
+一个不会因错误输入而失败的开关,也不会因正确输入而生效。
+
+### 2. graph capture 打开后,本 harness 的结果是错的
+
+在 `matmul/medium_gemm/f32` 上打开 `enableGraphCapture=1`,官方 arm 对 CPU
+参考的 `max_abs` 是 **115.281**(FAIL)。
+
+这不是官方 EP 的 bug,是 harness 用法不满足 graph capture 的前提:本 harness
+每次 Run 传的是 **CPU 内存里的 `OrtValue`**,而 capture 会把 buffer 地址录进
+命令流后 replay,后续迭代写入的新输入根本没进到被 replay 的那份 GPU buffer。
+
+因此"给官方开 graph capture"不是加一个参数就完事,需要 harness 改成
+`OrtIoBinding` + 常驻 GPU 的输入输出。在 ResNet 那类全静态形状的多节点图上
+这件事必须做对,否则官方 arm 要么结果错、要么白白背着它本可以省掉的固定开销,
+两种都不是可比的口径。
