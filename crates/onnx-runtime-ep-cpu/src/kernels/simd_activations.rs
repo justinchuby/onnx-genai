@@ -3235,16 +3235,25 @@ mod tests {
             assert!(e <= LOG_BOUND, "log({xi:e}) = {got}, want {}", xi.ln());
         }
 
-        // Anti-vacuity, stated so that it holds on every host.
+        // Anti-vacuity, in a form that holds on every host.
         //
-        // A non-zero worst error does not: where no vector path exists, the
-        // scalar implementation and the reference `xi.ln()` are the *same*
-        // function, so a bit-exact sweep is the correct outcome rather than
-        // evidence the sweep never ran. Requiring divergence there fails every
-        // aarch64 host — the comment on the next test says as much, that a host
-        // without AVX2 "reaches a different function" and the two "must not be
-        // distinguishable".
-        assert_eq!(checked, x.len(), "the sweep did not visit every input");
+        // The guard here used to require a non-zero worst error, which does not
+        // prove the sweep ran: where no vector path exists `log_f32_slice`
+        // takes `log_scalar`, which *is* `xi.ln()` — the very function this
+        // test compares against — so a bit-exact sweep is the correct outcome
+        // and `worst` stays 0. That is every aarch64 host.
+        //
+        // Divergence is still required where a vector path exists, and there it
+        // is a real property: `log_avx2` is an approximation, so it must differ
+        // from `ln` somewhere in a sweep this wide. If it did not, the sweep
+        // never reached it.
+        assert_eq!(
+            o.len(),
+            x.len(),
+            "the output buffer must cover every input, or `zip` hides the tail"
+        );
+        // The three grids above contribute 350_009 points; the floor only has
+        // to be large enough that emptying or truncating the sweep is caught.
         assert!(checked >= 350_000, "the sweep lost its inputs");
         if vector_path_available() {
             assert!(
