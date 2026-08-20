@@ -9858,10 +9858,32 @@ mod tests {
         let mut derived: Vec<String> = Vec::new();
         let mut current_fn: Option<String> = None;
         for line in production.lines() {
-            if let Some(rest) = line
-                .strip_prefix("fn ")
-                .or_else(|| line.strip_prefix("    fn "))
+            // Strip modifiers before looking for `fn`. Matching only a bare
+            // `fn ` would be blind to `pub fn`, `unsafe fn`, `const fn` and
+            // friends -- and the SIMD inner kernels next door to the counted
+            // functions (`kai_sdot_matmul_m1_neon_dot`,
+            // `n16_sdot_matmul_m1_neon_dot`, `n16_sdot_u8_i16_matmul_m1_neon_dot`)
+            // are all `unsafe fn`, which makes a counter added inside one of
+            // them the natural next mistake. An unrecognised header does not
+            // merely drop that site: it charges it to whatever function was
+            // last seen, which is worse than missing it because the derived
+            // list still looks populated.
+            let mut header = line.trim_start();
+            while let Some(rest) = [
+                "pub(crate) ",
+                "pub(super) ",
+                "pub ",
+                "unsafe ",
+                "async ",
+                "const ",
+                "extern ",
+            ]
+            .iter()
+            .find_map(|kw| header.strip_prefix(kw))
             {
+                header = rest;
+            }
+            if let Some(rest) = header.strip_prefix("fn ") {
                 current_fn = Some(
                     rest.chars()
                         .take_while(|c| c.is_alphanumeric() || *c == '_')
@@ -9872,29 +9894,45 @@ mod tests {
             let increments = code.contains("_TEST_CALLS.fetch_add")
                 || code.contains("_TEST_HITS.fetch_add")
                 || code.contains("_TEST_DISPATCHES.fetch_add");
-            if increments && let Some(name) = current_fn.as_ref() {
+            if increments {
+                let name = current_fn.as_ref().expect(
+                    "a probe counter is incremented before any recognised `fn` header, so the \
+                     header parser is broken and every attribution below it is charged to the \
+                     wrong function",
+                );
                 let pattern = format!("{name}(");
                 if !derived.contains(&pattern) {
                     derived.push(pattern);
                 }
             }
         }
-        assert!(
-            derived.len() >= 8,
-            "derived only {} counter-incrementing functions, so the parser is broken and this \
-             test proves nothing: {derived:?}",
-            derived.len()
-        );
-        for required in [
+        // Pin the whole set, not a floor. "At least N" tolerates exactly the
+        // failure this derivation exists to prevent: one site misattributed to
+        // a neighbouring function keeps the count intact while silently
+        // guarding the wrong name. If this list needs editing, a probe counter
+        // moved -- check that whatever observes it still locks.
+        let mut expected: Vec<String> = [
+            "execute(",
+            "try_int8_prefill_gebp(",
+            "try_mlas_sqnbit(",
+            "with_decode_pool_lazy(",
+            "parallel_output_rows_repeated(",
             "int4_matmul_m1(",
+            "kai_sdot_matmul_m1(",
             "n16_sdot_matmul_m1(",
             "n16_sdot_u8_i16_matmul_m1(",
-        ] {
-            assert!(
-                derived.iter().any(|name| name == required),
-                "`{required}` increments a probe counter but the derivation missed it: {derived:?}"
-            );
-        }
+        ]
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+        expected.sort();
+        let mut found = derived.clone();
+        found.sort();
+        assert_eq!(
+            found, expected,
+            "the set of functions incrementing a dispatch-probe counter changed; each one must \
+             stay reachable-checked, so update this list deliberately rather than loosening it"
+        );
         let perturb_patterns: Vec<&str> = PERTURBS_INDIRECT
             .iter()
             .copied()
@@ -9956,10 +9994,27 @@ mod tests {
             .map(|(name, is_test, body)| (name.clone(), *is_test, code_of(body)))
             .collect();
 
+        // A body perturbs a counter if it calls something that moves one, or
+        // if it moves one itself. The call-based half alone would miss a test
+        // that pokes a counter directly instead of going through a dispatch
+        // function -- two such tests exist, and they happen to lock today, so
+        // the gap is latent rather than live. Close it anyway: "happens to be
+        // correct" is what the hand-maintained list was.
+        let touches_counter_directly = |body: &str| {
+            ["_TEST_CALLS", "_TEST_HITS", "_TEST_DISPATCHES"]
+                .iter()
+                .any(|counter| {
+                    body.match_indices(counter).any(|(at, _)| {
+                        let rest = &body[at..];
+                        rest.contains(".fetch_add") || rest.contains(".store(")
+                    })
+                })
+        };
         let perturbs = |body: &str| {
             perturb_patterns
                 .iter()
                 .any(|pattern| body.contains(pattern))
+                || touches_counter_directly(body)
         };
         // Helpers reach counters through helpers too, so close the set rather
         // than looking one level deep -- a two-level chain would otherwise slip
