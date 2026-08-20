@@ -1,4 +1,4 @@
-//! First production consumer of the pinned shared-prefix primitive (#777).
+//! Isolated end-to-end validation of the pinned shared-prefix primitive (#777).
 //!
 //! PR #803 landed `create_shared_prefix` / `commit_shared_prefix` on the
 //! production `CudaVmmAllocator`, but nothing outside its own GPU tests called
@@ -7,9 +7,10 @@
 //! fp16 seq-major (BSNH) group-query-attention decode kernel (#782/#792), the
 //! same kernel the `gqa_seqmajor_parity_gpu` oracle proves bit-identical to
 //! head-major. It drives that kernel over KV caches that are **physically
-//! shared** through the allocator-agnostic seam (`DeviceAllocator::create_shared_prefix`
-//! / `commit_shared_prefix`, #777/#745/#750) and proves the whole point of the
-//! primitive end to end at the KV-consumer level:
+//! shared** through the low-level CUDA allocator. The allocator does not
+//! advertise `SharedMapping`: a kernel store into a read-only alias poisons the
+//! CUDA context, as the dedicated Q3 probe demonstrates. This test retains
+//! parity and accounting coverage for the quarantined primitive:
 //!
 //! 1. **Byte-identical output.** Two sequences whose read-only prefix KV is one
 //!    physically shared set of granules produce **byte-identical** decode output
@@ -57,8 +58,7 @@ use onnx_runtime_ep_cuda::{CudaExecutionProvider, GroupQueryAttentionKernel};
 use onnx_runtime_ir::{DataType, compute_contiguous_strides};
 use onnx_runtime_memory_governor::{
     DeviceAllocator, DeviceKey, HolderId, KvFragmentation, LeaseLedger, LedgerGovernor,
-    MemoryGovernor, MemoryRole, ModelKvGeometry, SharedDevicePrefix, Tier,
-    evaluate_prefix_shareability,
+    MemoryGovernor, MemoryRole, ModelKvGeometry, Tier, evaluate_prefix_shareability,
 };
 
 const BATCH: usize = 1;
@@ -593,16 +593,17 @@ fn two_sequences_sharing_a_pinned_prefix_match_two_independent_sequences() {
     let shared_backing = shared
         .as_virtual_backing()
         .expect("shared VMM exposes VirtualBacking");
-    let shared_mapping = shared
-        .as_shared_mapping()
-        .expect("pooled VMM exposes SharedMapping independently");
+    assert!(
+        shared.as_shared_mapping().is_none(),
+        "context-sticky read-only aliases must not be advertised to production consumers"
+    );
 
-    // Create the two pinned prefixes (K, V) through the trait seam and fill
-    // their content once through each owner window.
-    let key_prefix: Box<dyn SharedDevicePrefix> = shared_mapping
+    // Exercise the quarantined primitive directly and fill each prefix once
+    // through its writable owner window.
+    let key_prefix = shared_alloc
         .create_shared_prefix(granule)
         .expect("pin key prefix");
-    let value_prefix: Box<dyn SharedDevicePrefix> = shared_mapping
+    let value_prefix = shared_alloc
         .create_shared_prefix(granule)
         .expect("pin value prefix");
     assert_eq!(key_prefix.committed_physical_bytes(), granule as u64);
@@ -635,15 +636,15 @@ fn two_sequences_sharing_a_pinned_prefix_match_two_independent_sequences() {
 
         // The shared prefix costs zero incremental owned bytes to admit.
         assert_eq!(
-            shared_mapping
-                .incremental_owned_bytes_for_shared_prefix(key_prefix.as_ref())
+            shared_alloc
+                .incremental_owned_bytes_for_shared_prefix(&key_prefix)
                 .expect("key prefix belongs to this mapping capability"),
             0,
             "admitting sharer {seq} needs zero incremental owned bytes for the key prefix"
         );
         assert_eq!(
-            shared_mapping
-                .incremental_owned_bytes_for_shared_prefix(value_prefix.as_ref())
+            shared_alloc
+                .incremental_owned_bytes_for_shared_prefix(&value_prefix)
                 .expect("value prefix belongs to this mapping capability"),
             0
         );
@@ -651,11 +652,11 @@ fn two_sequences_sharing_a_pinned_prefix_match_two_independent_sequences() {
         let owned_after_private = shared_governor.used(Tier::Device);
 
         // Map each shared prefix read-only into this sequence at offset 0.
-        let kc = shared_mapping
-            .commit_shared_prefix(key_prefix.as_ref(), key_ptr, alloc_bytes, 0)
+        let kc = shared_alloc
+            .commit_shared_prefix(&key_prefix, key_ptr, alloc_bytes, 0)
             .expect("map key prefix into sequence");
-        let vc = shared_mapping
-            .commit_shared_prefix(value_prefix.as_ref(), value_ptr, alloc_bytes, 0)
+        let vc = shared_alloc
+            .commit_shared_prefix(&value_prefix, value_ptr, alloc_bytes, 0)
             .expect("map value prefix into sequence");
         assert_eq!(
             kc.additional_owned_bytes, 0,

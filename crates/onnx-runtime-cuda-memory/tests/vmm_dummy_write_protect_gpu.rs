@@ -1,6 +1,6 @@
-//! Q3 for #759 — is the dummy page's write-protection fault *non-sticky*? In
-//! its own test binary so that if a write to a read-only mapping poisons the
-//! CUDA context, only this probe is affected and the finding is unambiguous.
+//! Q3 for #759 — is the dummy page's write-protection fault *non-sticky*? This
+//! isolated binary records the hardware answer without contaminating any other
+//! test's CUDA context.
 //!
 //! The #759 dummy page is *shared*: one physical page backs the entire tail of
 //! every KV reservation. A stray *write* into the tail would therefore corrupt
@@ -12,18 +12,20 @@
 //! single bad step into a dead process. That would be a **kill finding** for
 //! this mechanism, and this probe reports it rather than working around it.
 //!
-//! We exercise two write paths into the read-only dummy — a synchronous
-//! copy-engine `cuMemcpyHtoD_v2` and an asynchronous `cuMemsetD8Async` whose
-//! fault surfaces at the stream sync (closest to a kernel-issued store) — and
-//! after each we probe context health with `cuCtxSynchronize` plus a fresh
-//! independent allocate/write/read. The test *passes* if the context survives
-//! (non-sticky) and *fails loudly* if it is poisoned.
+//! Copy-engine and memset writes are rejected non-stickily, but those operations
+//! do not model a production kernel store. A real `st.global` faults with
+//! `CUDA_ERROR_ILLEGAL_ADDRESS` and poisons the context on A100. The CUDA
+//! allocator therefore must not advertise this mechanism as a production
+//! capability.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use cudarc::driver::CudaContext;
 use cudarc::driver::sys as cu;
+
+mod support;
+use support::{read_through_device, write_through_device};
 
 /// Arbitrary non-zero byte written to confirm reads work; not the production
 /// fill (which the masking rule decides — zeros, never NaN).
@@ -173,7 +175,7 @@ fn context_is_healthy(device: i32, granule: usize) -> Result<(), cu::CUresult> {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
-fn read_only_dummy_write_fault_is_non_sticky() {
+fn read_only_dummy_kernel_write_fault_is_sticky() {
     let context = require_cuda();
     context.bind_to_thread().expect("bind CUDA context");
     let device = 0;
@@ -194,6 +196,9 @@ fn read_only_dummy_write_fault_is_non_sticky() {
 
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         write_host(base, READBACK_MARKER, granule);
+        check("cuCtxSynchronize(initial fill)", unsafe {
+            cu::cuCtxSynchronize()
+        });
         set_access_flags(
             device,
             base,
@@ -201,14 +206,8 @@ fn read_only_dummy_write_fault_is_non_sticky() {
             cu::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READ,
         );
 
-        // A read still works after the downgrade.
-        let mut back = vec![0u8; 4096];
-        let read = unsafe { cu::cuMemcpyDtoH_v2(back.as_mut_ptr().cast(), base, back.len()) };
-        assert_eq!(
-            read,
-            cu::CUresult::CUDA_SUCCESS,
-            "a read of the read-only dummy must still succeed; got {read:?}"
-        );
+        // A device read still works after the downgrade.
+        let back = read_through_device(base, 4096);
         assert!(
             back.iter().all(|&b| b == READBACK_MARKER),
             "read-only dummy keeps its contents"
@@ -262,10 +261,24 @@ fn read_only_dummy_write_fault_is_non_sticky() {
             ),
         }
 
+        let (kernel_write, kernel_sync) = write_through_device(base, 0x00);
         eprintln!(
-            "Q3 result: read-only dummy rejects both synchronous and asynchronous writes and the \
-             context survives both -- write-protection is a non-sticky, viable defence for the \
-             shared dummy page on this hardware."
+            "Q3 kernel store into PROT_READ dummy: launch {kernel_write:?}, sync {kernel_sync:?}"
+        );
+        assert!(
+            kernel_write != cu::CUresult::CUDA_SUCCESS || kernel_sync != cu::CUresult::CUDA_SUCCESS,
+            "a kernel store to the read-only dummy must surface a fault"
+        );
+        let context_error = context_is_healthy(device, granule)
+            .expect_err("a kernel protection fault is expected to poison the CUDA context");
+        eprintln!(
+            "Q3 KILL FINDING: kernel write fault is sticky; recovery returned {context_error:?}"
+        );
+
+        eprintln!(
+            "Q3 result: copy-engine writes are rejected non-stickily, but a production-shaped \
+             kernel store poisons the context -- read-only dummy-page sharing must remain \
+             unavailable as a production capability."
         );
     }));
 

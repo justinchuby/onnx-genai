@@ -580,8 +580,8 @@ fn unsupported_shared_prefix_requests_error_rather_than_mismap() {
         "a detached/pool-less allocator must not advertise SharedMapping"
     );
     assert!(
-        DeviceAllocator::as_shared_mapping(&allocator).is_some(),
-        "a pooled allocator must advertise SharedMapping"
+        DeviceAllocator::as_shared_mapping(&allocator).is_none(),
+        "CUDA must not advertise context-sticky read-only shared mappings"
     );
 
     // SAFETY: live pointers from this allocator, no CUDA work in flight.
@@ -606,9 +606,7 @@ fn foreign_device_and_authority_prefixes_are_not_free_and_are_rejected() {
 
     let governor_a = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
     let allocator_a = allocator(&governor_a, 64 << 20);
-    let mapping_a = DeviceAllocator::as_shared_mapping(&allocator_a)
-        .expect("production allocator has shared mapping");
-    let prefix = mapping_a
+    let prefix = allocator_a
         .create_shared_prefix(granule)
         .expect("prefix on allocator a");
 
@@ -623,17 +621,15 @@ fn foreign_device_and_authority_prefixes_are_not_free_and_are_rejected() {
         MemoryRole::KvCache,
     )
     .expect("logical device-one allocator");
-    let wrong_device_mapping = DeviceAllocator::as_shared_mapping(&wrong_device)
-        .expect("wrong-device allocator still has its own pool");
     assert!(
-        wrong_device_mapping
-            .incremental_owned_bytes_for_shared_prefix(prefix.as_ref())
+        wrong_device
+            .incremental_owned_bytes_for_shared_prefix(&prefix)
             .is_err(),
         "a wrong-device prefix must be rejected before a cost is reported"
     );
     assert!(
-        wrong_device_mapping
-            .commit_shared_prefix(prefix.as_ref(), NonNull::dangling(), granule, 0)
+        wrong_device
+            .commit_shared_prefix(&prefix, NonNull::dangling(), granule, 0)
             .is_err(),
         "wrong-device mapping must be rejected"
     );
@@ -644,17 +640,15 @@ fn foreign_device_and_authority_prefixes_are_not_free_and_are_rejected() {
         allocator_a.physical_pool_authority(),
         wrong_authority.physical_pool_authority()
     );
-    let wrong_authority_mapping = DeviceAllocator::as_shared_mapping(&wrong_authority)
-        .expect("wrong-authority allocator has its own pool");
     assert!(
-        wrong_authority_mapping
-            .incremental_owned_bytes_for_shared_prefix(prefix.as_ref())
+        wrong_authority
+            .incremental_owned_bytes_for_shared_prefix(&prefix)
             .is_err(),
         "a wrong-authority prefix must be rejected before a cost is reported"
     );
     assert!(
-        wrong_authority_mapping
-            .commit_shared_prefix(prefix.as_ref(), NonNull::dangling(), granule, 0)
+        wrong_authority
+            .commit_shared_prefix(&prefix, NonNull::dangling(), granule, 0)
             .is_err(),
         "wrong-authority mapping must be rejected"
     );

@@ -2566,7 +2566,11 @@ impl DeviceAllocator for CudaVmmAllocator {
     }
 
     fn as_shared_mapping(&self) -> Option<&dyn SharedMapping> {
-        self.backing.physical_pool().is_some().then_some(self)
+        // A production kernel store into a PROT_READ shared mapping raises a
+        // sticky CUDA illegal-address fault on A100. Keep the low-level
+        // primitive available for isolated validation, but do not advertise a
+        // capability that can turn one mis-targeted store into a dead process.
+        None
     }
 }
 

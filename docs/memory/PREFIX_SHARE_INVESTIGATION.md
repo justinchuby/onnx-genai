@@ -24,8 +24,9 @@ WDDM. Granule `CU_MEM_ALLOC_GRANULARITY_MINIMUM == RECOMMENDED == 2 MiB` (#776).
 
 ## TL;DR — the recommendation
 
-**The primitive is sound enough to build KV integration on.** All five
-questions cleared with no kill finding:
+**The primitive's mapping and accounting work, but it is not safe to expose as
+a production capability.** The production-shaped write probe found a kill
+condition:
 
 1. **N-way sharing works**, including under captured-graph replay. One physical
    granule mapped into 8 sequences' reservations is read identically by all 8,
@@ -39,16 +40,16 @@ questions cleared with no kill finding:
    incremental owned bytes; the granule stays mapped until the **last** sharer
    leaves; teardown returns the ledger to zero. Admission arithmetic: **admitting
    the Nth request costs only its private bytes.**
-3. **Write protection is sound and — critically — non-sticky.** A synchronous
-   and an asynchronous write into a `PROT_READ` shared prefix both fault
-   (`CUDA_ERROR_INVALID_VALUE`); the context **survives both** and later work
-   succeeds; the other sharer's copy is **uncorrupted**. This was the potential
-   kill finding — it did **not** fire.
+3. **Kernel write protection is sticky.** Copy-engine and memset writes into a
+   `PROT_READ` shared prefix return `CUDA_ERROR_INVALID_VALUE` without poisoning
+   the context, but a real kernel `st.global` returns
+   `CUDA_ERROR_ILLEGAL_ADDRESS` at synchronization and leaves the context
+   unusable. This is the kill finding the earlier copy-only probe missed.
 4. **It composes with the #759 dummy page.** A read-only shared prefix head, a
    read/write private live granule, and a read-only shared dummy tail coexist in
    **one** reservation with three distinct `cuMemSetAccess` postures. Reads
-   succeed everywhere; only the private region accepts writes; both shared pages
-   survive rejected writes.
+   succeed everywhere; copy-engine writes are rejected without corruption. A
+   kernel store still has the sticky behavior above.
 5. **Copy-on-write at the boundary is a one-time burst, not a per-token tax.**
    Diverging one sequence (copy 2 MiB + remap) measured **~5.5 ms pooled**
    (production #740 retained handle, no `cuMemCreate`) and **~9.8 ms cold** on
@@ -123,7 +124,7 @@ allocator entry point must reuse.
 
 ### Q3 — is write protection sound and non-sticky? (potential kill finding)
 
-`vmm_prefix_share_write_protect_gpu.rs::shared_prefix_write_fault_is_loud_non_sticky_and_non_corrupting`,
+`vmm_prefix_share_write_protect_gpu.rs::shared_prefix_kernel_write_fault_is_sticky`,
 in its own binary. One prefix handle is mapped into a `victim` VA (downgraded to
 `PROT_READ`) and an `other` VA (a second sharer). Both a synchronous
 `cuMemcpyHtoD_v2` and an asynchronous `cuMemsetD8Async` into the read-only prefix
@@ -131,9 +132,15 @@ in its own binary. One prefix handle is mapped into a `victim` VA (downgraded to
 **each** fault, a `cuCtxSynchronize` plus a fresh independent
 allocate/write/read succeeds — the fault is **non-sticky**, the context is not
 poisoned — and the `other` sharer still reads the original prefix, so the
-rejected write **did not corrupt** the shared page. A sticky fault here would
-have made write-protection worse than the corruption it prevents; it **did not
-fire**.
+rejected copy-engine write **did not corrupt** the shared page.
+
+That result does not generalize to production kernels. A driver-JITed probe
+first reads both aliases with `ld.global`, then issues `st.global` into the
+read-only victim. The launch succeeds, synchronization returns
+`CUDA_ERROR_ILLEGAL_ADDRESS`, and a fresh-context-health operation returns the
+same sticky error. Because one bad store can kill the process serving every
+request, `CudaVmmAllocator::as_shared_mapping()` returns `None`; the low-level
+primitive remains available only for isolated validation.
 
 ### Q4 — does it compose with the #759 dummy page?
 
@@ -330,8 +337,8 @@ detection, no COW):
    sharers.
 2. **`CudaVmmAllocator::commit_shared_prefix(&prefix, ptr, allocation_bytes,
    byte_offset)`** maps those already-owned physical handles into a *different*
-   sequence's reservation at `byte_offset`, **`PROT_READ`** (Q3's non-sticky
-   write-protection posture), and takes a pool-level shared-map ref. It goes
+   sequence's reservation at `byte_offset`, **`PROT_READ`**, and takes a
+   pool-level shared-map ref. It goes
    through the existing #740 pool and `carve()` suballocation on the existing
    global granule-ref **0->1 / 1->0** attribution — **no second allocator, no
    per-sequence physical reservation** (which is what made #733 net-negative).
@@ -353,6 +360,10 @@ detection, no COW):
    region uncommitted.
 5. Reported bytes are **physical** (`committed_physical_bytes`, `mapped_bytes`),
    never nominal content bytes; no `assert!` runs inside any `Drop`.
+6. The CUDA allocator deliberately reports no optional `SharedMapping`
+   capability. Q3 proved that a production kernel store into a read-only alias
+   poisons the context; callers cannot discover or select this primitive through
+   the production allocator seam.
 
 `vmm_commit_shared_prefix_gpu.rs` proves this against the **real**
 `CudaVmmAllocator` + `LedgerGovernor` (no mock), one concern per test:
@@ -365,9 +376,9 @@ detection, no COW):
 - **Admitting a sharer costs only private bytes** — asserted against the real
   ledger: mapping the shared prefix moves the governor by 0; only committing the
   sequence's own private granule charges it.
-- **A write into the shared prefix faults and the context survives** — reusing
-  the Q3 pattern; both a synchronous and an asynchronous write fault, the context
-  is healthy afterwards (non-sticky), and the owner's copy is uncorrupted.
+- **Copy-engine writes fault without corruption** — synchronous and asynchronous
+  copy paths are non-sticky. The isolated Q3 kernel-store probe separately
+  records the sticky kill finding that keeps the production capability disabled.
 - **Unsupported requests error rather than mis-map** — misaligned offset,
   over-long prefix, mapping over a committed granule, and mapping under an open
   capture all return `Err` and leave the region clean.
@@ -389,28 +400,23 @@ divergence past the shared region. Those are the increments below.
 
 ## Smallest next increment
 
-1. **KV-path integration (first production consumer — landed for seq-major,
-   #777).** The landed primitive previously had no live caller. It is now
-   reachable from production through the independent `SharedMapping`
-   capability discovered from the selected `DeviceAllocator`
-   (`create_shared_prefix` /
-   `incremental_owned_bytes_for_shared_prefix` / `commit_shared_prefix`, yielding
-   an opaque `dyn SharedDevicePrefix`); allocators without a physical-handle pool
-   report capability absence rather than a default failing implementation. The
-   first consumer is the **seq-major** fused fp16
-   GQA decode kernel: a caller pins a token prefix once and a second sequence maps
-   it, then the real kernel reads it. Validated on the output-level parity oracle
-   in `crates/onnx-runtime-ep-cuda/tests/gqa_shared_prefix_parity_gpu.rs`: two
+1. **KV-path integration is blocked by context-sticky protection faults.**
+   `CudaVmmAllocator` deliberately does not expose the independent
+   `SharedMapping` capability from the selected `DeviceAllocator`; production
+   discovery returns `None`. The low-level primitive is retained only for
+   isolated validation while a non-poisoning isolation design is absent. The
+   **seq-major** fused fp16 GQA decode kernel remains the end-to-end oracle: the
+   test pins a token prefix once, maps it into a second sequence through the
+   concrete allocator, and runs the real kernel. In
+   `crates/onnx-runtime-ep-cuda/tests/gqa_shared_prefix_parity_gpu.rs`, two
    sequences sharing one pinned seq-major prefix (`layers × 2` contiguous ranges)
    produce **byte-identical** output to two independent sequences. Measured
    (KV_HEADS=8, HEAD_DIM=128, f16, 1024-token prefix + 1024-token private tail):
    independent = 8 granules (16,777,216 B), shared = 6 granules (12,582,912 B);
    prefix charged **once** (`incremental_owned_bytes_for_shared_prefix` = 0),
    second sharer's admission = **private bytes only** (4,194,304 B), saving
-   `(C−1)×(K_prefix+V_prefix)` = 2 granules. This is deliberately restricted to
-   the **explicit** case (a caller declares the shared prefix) and to prefixes
-   **provably read-only for the sharers' lifetime** — divergence/COW is out of
-   scope here (layer 3 below).
+   `(C−1)×(K_prefix+V_prefix)` = 2 granules. These results validate parity and
+   accounting only; they do not make the capability production-safe.
 
    Seq-major accepts `layers × 2` multi-maps per sequence rather than the single
    multi-map that only token-major (#783/#787) achieves; token-major is measured

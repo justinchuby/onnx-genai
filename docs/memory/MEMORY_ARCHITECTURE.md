@@ -1025,24 +1025,18 @@ the seven duplicate copies saves about **2.56 GiB** (#777/#787). This uses the
 multi-map primitive proven in #727, but detection, lifetime, read-only/COW
 enforcement, and 1:N handle bookkeeping are **not yet implemented**.
 
-The #777 isolating GPU probe has now cleared all five primitive questions with
-no kill finding — N-way multi-map under captured-graph replay, charge-once in the
-real #740 ledger, non-sticky/non-corrupting write protection, coexistence with
-the #759 dummy page, and a one-time ~5.5 ms pooled copy-on-write at the boundary.
-Measured answers, the concurrency/saving and capacity tables, and the design for
-an explicit pinned-prefix API (the smallest next increment) are in
+The #777 isolating GPU probe validates N-way multi-map, charge-once accounting,
+dummy-page composition, and the measured copy-on-write boundary cost. Its
+production-shaped kernel-store probe also found the decisive blocker: writing a
+`PROT_READ` alias poisons the CUDA context. Measured answers and the resulting
+capability quarantine are in
 [`PREFIX_SHARE_INVESTIGATION.md`](PREFIX_SHARE_INVESTIGATION.md).
 
-**First production consumer landed (#777).** The prefix-sharing primitive
-(`create_shared_prefix`/`commit_shared_prefix`, #803) previously had no live
-caller — only its definition and GPU tests. It is now reachable from production
-code through the optional `SharedMapping` capability discovered from the
-already-selected `dyn DeviceAllocator`
-(`create_shared_prefix` / `incremental_owned_bytes_for_shared_prefix` /
-`commit_shared_prefix`, returning an opaque `dyn SharedDevicePrefix`). An
-allocator without that capability reports `None`; a pool-less VMM does so
-independently of its `VirtualBacking` support. The **seq-major** fused fp16 GQA
-decode kernel is the first consumer: a GPU parity test
+**The CUDA capability is quarantined.** The low-level
+`create_shared_prefix`/`commit_shared_prefix` primitive remains available to
+isolated GPU tests, but `CudaVmmAllocator::as_shared_mapping()` returns `None`,
+so production code cannot discover or select it. The **seq-major** fused fp16
+GQA GPU parity test
 (`crates/onnx-runtime-ep-cuda/tests/gqa_shared_prefix_parity_gpu.rs`) drives the
 real kernel over shared-prefix VMM KV and proves two sequences sharing one pinned
 seq-major prefix (`layers × 2` contiguous ranges) produce **byte-identical**
@@ -1051,7 +1045,8 @@ output to two independent sequences. Measured at KV_HEADS=8, HEAD_DIM=128, f16,
 granules (16,777,216 B), shared = 6 granules (12,582,912 B); the prefix is
 charged **once** (`incremental_owned_bytes_for_shared_prefix` = 0) and the second
 sharer's admission is **only its private bytes** (4,194,304 B = its two private
-tails), so sharing removes `(C−1)×(K_prefix+V_prefix)` = 2 granules.
+tails), so sharing removes `(C−1)×(K_prefix+V_prefix)` = 2 granules. This retains
+parity and accounting evidence without advertising the unsafe capability.
 
 **What remains structural.** The *engine generation loop* cannot yet call this
 seam automatically: `persistent_state_shapes` in

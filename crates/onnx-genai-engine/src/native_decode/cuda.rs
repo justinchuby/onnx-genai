@@ -4905,9 +4905,9 @@ impl DecodeCudaState {
                         binding.physical_shape()
                     )
                 })?;
-            let host = binding.read_bytes_range(0, bytes).with_context(|| {
-                format!("read device recurrent/conv state for binding {index}")
-            })?;
+            let host = binding
+                .read_bytes_range(0, bytes)
+                .with_context(|| format!("read device recurrent/conv state for binding {index}"))?;
             snapshot.push((index, host));
         }
         Ok(snapshot)
@@ -4937,9 +4937,9 @@ impl DecodeCudaState {
                     host.len()
                 );
             }
-            binding
-                .write_bytes(0, host)
-                .with_context(|| format!("restore device recurrent/conv state for binding {index}"))?;
+            binding.write_bytes(0, host).with_context(|| {
+                format!("restore device recurrent/conv state for binding {index}")
+            })?;
         }
         Ok(())
     }
