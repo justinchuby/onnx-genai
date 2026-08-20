@@ -5923,28 +5923,24 @@ fn dequant_f16_gemm_max_scratch_bytes() -> usize {
         .unwrap_or(1 << 30)
 }
 
-/// Opt-in gate for the TRT-LLM-style interleaved + biased int4 decode dequant/// (`ONNX_GENAI_INTERLEAVE_DEQUANT`). Default OFF: the lever bakes an offline
+/// Opt-in gate for the TRT-LLM-style interleaved + biased int4 decode dequant
+/// (`ONNX_GENAI_INTERLEAVE_DEQUANT`). Default OFF: the lever bakes an offline
 /// nibble-interleave into the packed weights and folds the symmetric `-8` bias
 /// into the LOP3 converter, dropping the per-block zero-point `sub.f16x2` and the
 /// `prmt.b32` activation reorder from the decode inner loop. Byte-identical to the
-/// fp32 multicol path on symmetric weights, but glm base decode is a knife-edge,
-/// so it stays opt-in and reversible until proven. Only routes symmetric
-/// (no zero-point) block!=32 int4 nodes that already qualify for the wide-load
-/// multicol kernel; every other node is untouched.
-/// Default-on gate (`ONNX_GENAI_GEMV_BF16_DIRECT_OUT`) for letting the block-32
-/// split-K decode GEMVs narrow their fp16 epilogue straight into the caller's
-/// bf16 tensor, skipping the separate staging `cast_half` launch that
-/// [`Bf16Kernel::run_bf16`] would otherwise issue per node. Kept as a lever so
-/// the path can be A/B'd against the staged one without a rebuild.
-fn gemv_bf16_direct_out_enabled() -> bool {
-    !matches!(
-        std::env::var("ONNX_GENAI_GEMV_BF16_DIRECT_OUT")
-            .ok()
-            .as_deref(),
-        Some("0") | Some("false") | Some("off")
-    )
-}
-
+/// fp32 multicol path on symmetric weights. Only routes symmetric (no zero-point)
+/// block!=32 int4 nodes that already qualify for the wide-load multicol kernel;
+/// every other node is untouched.
+///
+/// It stays opt-in because the speedup is bought with memory, not for free:
+/// [`ensure_interleaved`] allocates a SECOND copy of every routed weight and keys
+/// the cache off the ORIGINAL packed pointer, which ORT still owns and never
+/// frees. So the routed int4 weights are resident TWICE for the life of the
+/// process — the cache holds 4096 entries while a 52-layer model registers only a
+/// few hundred, so nothing is ever evicted. Measured +8.6% on H200 (211.9 → 230.0
+/// tok/s, glm base); on a 20 GB int4 model that costs ~20 GB extra VRAM, which is
+/// why it must NOT be defaulted on for the memory-tight consumer cards that would
+/// otherwise benefit most from the instruction-count win.
 /// Offer published by `run_bf16` for the duration of the staged fp16 call it
 /// makes on this same thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7313,7 +7309,7 @@ impl MatMulNBitsKernel {
         // strand an outer one, and it is restored before `?` so an error cannot
         // leave it published.
         let dst_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-        let offer = gemv_bf16_direct_out_enabled().then_some(Bf16DirectOut {
+        let offer = Some(Bf16DirectOut {
             staging: out_ptr,
             dst: dst_ptr,
             elements: out_n,
@@ -9729,11 +9725,9 @@ impl MatMulNBitsKernel {
         let bf16_direct_capable = entry == GEMV_F16_SCALES_F16_SPLITK_ENTRY
             || entry == GEMV_F16_SCALES_F16_ZP_SPLITK_ENTRY;
         let staging_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
-        let direct_bf16_ptr = if bf16_direct_capable && gemv_bf16_direct_out_enabled() {
-            take_bf16_direct_out(staging_ptr, self.n)
-        } else {
-            None
-        };
+        let direct_bf16_ptr = bf16_direct_capable
+            .then(|| take_bf16_direct_out(staging_ptr, self.n))
+            .flatten();
         let output_ptr = direct_bf16_ptr.unwrap_or(staging_ptr);
         let out_bf16_flag: i32 = direct_bf16_ptr.is_some() as i32;
         let k = as_i32("K", self.k)?;
