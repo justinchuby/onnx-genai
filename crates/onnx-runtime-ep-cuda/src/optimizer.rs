@@ -408,12 +408,14 @@ impl CudaL2NormalizeFusion {
         }
         // opset >= 18: axes is the second (optional) input, an int64 initializer.
         if let Some(Some(axes_val)) = rss.inputs.get(1) {
-            if let Some(WeightRef::Inline(t)) = graph.initializers.get(axes_val) {
-                if t.dtype == DataType::Int64 && t.numel() == 1 && t.data.len() >= 8 {
-                    let mut bytes = [0u8; 8];
-                    bytes.copy_from_slice(&t.data[..8]);
-                    return Some(i64::from_le_bytes(bytes));
-                }
+            if let Some(WeightRef::Inline(t)) = graph.initializers.get(axes_val)
+                && t.dtype == DataType::Int64
+                && t.numel() == 1
+                && t.data.len() >= 8
+            {
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&t.data[..8]);
+                return Some(i64::from_le_bytes(bytes));
             }
             // An axes input we cannot statically read (dynamic or external) —
             // refuse rather than guess the reduced axis.
