@@ -3041,17 +3041,11 @@ unsafe extern "C" fn compute_execute(
             // kernel sees the full output arity and can index by position,
             // while only present slots are allocated through ORT's kernel
             // context (sequential ORT indices).
-            let mut owned_outputs: Vec<crate::kernel_ctx::OwnedOutput> = Vec::new();
+            let (mut owned_outputs, mut slot_map) = take_output_scratch(entry.num_outputs);
             let mut absent_bufs: Vec<Vec<u8>> = Vec::new();
-            // Track whether each node output slot is ORT-allocated or absent.
-            enum SlotKind {
-                Ort,           // present, comes from ORT
-                Absent(usize), // index into absent_bufs
-            }
             // Also record the dtype for each absent slot so the TensorMut
             // matches the kernel's element size.
             let mut absent_dtypes: Vec<DataType> = Vec::new();
-            let mut slot_map: Vec<SlotKind> = Vec::with_capacity(entry.num_outputs);
             let mut ort_out_idx: usize = 0;
 
             for (out_slot, shape) in output_shapes.iter().enumerate() {
@@ -3212,6 +3206,11 @@ unsafe extern "C" fn compute_execute(
             }
             kernel_probe.end();
             EXECUTED_NODE_COUNT.fetch_add(1, Ordering::Relaxed);
+            // `output_views` borrows `owned_outputs`, so the recycle has to
+            // follow its last use. An early `return` above simply skips this and
+            // the next `Run` allocates again -- correct, just not reused.
+            drop(output_views);
+            recycle_output_scratch(owned_outputs, slot_map);
         } else {
             return fail_status(
                 "Compute: multi-node subgraph requires SubgraphRouting — \
@@ -3225,6 +3224,91 @@ unsafe extern "C" fn compute_execute(
 }
 
 /// Build a contiguous stride array from a shape (C-order, innermost stride = 1).
+/// Whether a node output slot is ORT-allocated or absent (scratch-backed).
+///
+/// Module scope rather than local to the single-node path so the reusable
+/// scratch below can name it.
+enum SlotKind {
+    Ort,           // present, comes from ORT
+    Absent(usize), // index into absent_bufs
+}
+
+/// Capacity, in elements, above which per-`Run` output scratch is dropped
+/// instead of kept.
+///
+/// A node with a handful of outputs is the case worth optimising; one with
+/// hundreds is not worth pinning that memory on every worker thread for the
+/// rest of the process.
+const OUTPUT_SCRATCH_MAX_CAPACITY: usize = 16;
+
+thread_local! {
+    /// Reusable per-`Run` output bookkeeping, per thread.
+    ///
+    /// `Vec::new()` plus one `push` allocates capacity 4 -- 736 bytes for
+    /// `OwnedOutput` -- on every `Run`, and `slot_map` allocated again for a
+    /// handful of bytes. Neither vector outlives the call, so a thread can hand
+    /// the same capacity to the next `Run` instead. Thread-local for the same
+    /// reason as `HOST_INTERMEDIATE_POOL`: `Compute` runs on whichever thread
+    /// ORT calls it from, and sharing would need a lock on the hot path to buy
+    /// nothing.
+    ///
+    /// Both vectors are cleared on **recycle**, not on take, so no `OwnedOutput`
+    /// -- and so no raw pointer into a finished `Run`'s ORT values -- is ever
+    /// retained here between calls.
+    static OUTPUT_SCRATCH: std::cell::RefCell<(Vec<crate::kernel_ctx::OwnedOutput>, Vec<SlotKind>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// Empty output-bookkeeping vectors, reusing this thread's retired capacity.
+///
+/// Returns freshly allocated vectors if the scratch is already borrowed, which
+/// can only happen if a kernel re-entered `Compute` on this thread; correctness
+/// does not depend on reuse.
+fn take_output_scratch(num_outputs: usize) -> (Vec<crate::kernel_ctx::OwnedOutput>, Vec<SlotKind>) {
+    let taken = OUTPUT_SCRATCH.try_with(|cell| {
+        cell.try_borrow_mut()
+            .map(|mut slot| std::mem::take(&mut *slot))
+            .ok()
+    });
+    let (mut owned, mut slots) = match taken {
+        Ok(Some(pair)) => pair,
+        _ => (Vec::new(), Vec::new()),
+    };
+    debug_assert!(
+        owned.is_empty() && slots.is_empty(),
+        "scratch recycled dirty"
+    );
+    owned.reserve(num_outputs);
+    slots.reserve(num_outputs);
+    (owned, slots)
+}
+
+/// Return output-bookkeeping vectors for the next `Run` on this thread.
+fn recycle_output_scratch(
+    mut owned: Vec<crate::kernel_ctx::OwnedOutput>,
+    mut slots: Vec<SlotKind>,
+) {
+    owned.clear();
+    slots.clear();
+    if owned.capacity() > OUTPUT_SCRATCH_MAX_CAPACITY
+        || slots.capacity() > OUTPUT_SCRATCH_MAX_CAPACITY
+    {
+        return;
+    }
+    let _ = OUTPUT_SCRATCH.try_with(|cell| {
+        if let Ok(mut slot) = cell.try_borrow_mut() {
+            // Keep whichever pair has the larger capacity; a re-entrant call
+            // could have left one here already.
+            if slot.0.capacity() < owned.capacity() {
+                slot.0 = owned;
+            }
+            if slot.1.capacity() < slots.capacity() {
+                slot.1 = slots;
+            }
+        }
+    });
+}
+
 /// How many retired host intermediates one thread keeps for reuse.
 ///
 /// A routed subgraph's live set is bounded by its widest cut, which is small
@@ -5891,6 +5975,131 @@ mod tests {
         // Not marked absent — exact dtype required.
         assert!(view.validate_write_dtype(DataType::Float32).is_ok());
         assert!(view.validate_write_dtype(DataType::Float16).is_err());
+    }
+
+    /// An `OwnedOutput` is inert data -- raw pointers plus shape/strides -- so
+    /// these tests never dereference one.
+    fn dummy_owned_output() -> crate::kernel_ctx::OwnedOutput {
+        crate::kernel_ctx::OwnedOutput {
+            data_ptr: std::ptr::null_mut(),
+            dtype: DataType::Float32,
+            shape: crate::dim_vec::DimVec::zeroed(1),
+            strides: crate::dim_vec::DimVec::zeroed(1),
+            mem_info: std::ptr::null(),
+        }
+    }
+
+    #[test]
+    fn output_scratch_hands_back_capacity_it_retired() {
+        let (mut owned, mut slots) = take_output_scratch(1);
+        for _ in 0..4 {
+            owned.push(dummy_owned_output());
+            slots.push(SlotKind::Ort);
+        }
+        let (owned_cap, slots_cap) = (owned.capacity(), slots.capacity());
+        recycle_output_scratch(owned, slots);
+
+        let (owned, slots) = take_output_scratch(1);
+        assert!(
+            owned.is_empty() && slots.is_empty(),
+            "reused scratch must start empty"
+        );
+        assert!(
+            owned.capacity() >= owned_cap && slots.capacity() >= slots_cap,
+            "capacity was not reused: {} vs {owned_cap}, {} vs {slots_cap}",
+            owned.capacity(),
+            slots.capacity()
+        );
+        recycle_output_scratch(owned, slots);
+    }
+
+    /// The scratch must not hold an `OwnedOutput` between `Run`s: those carry
+    /// raw pointers into ORT values belonging to a call that has finished.
+    #[test]
+    fn output_scratch_retains_no_outputs_between_runs() {
+        let (mut owned, mut slots) = take_output_scratch(2);
+        owned.push(dummy_owned_output());
+        slots.push(SlotKind::Absent(0));
+        recycle_output_scratch(owned, slots);
+
+        OUTPUT_SCRATCH.with(|cell| {
+            let slot = cell.borrow();
+            assert!(
+                slot.0.is_empty() && slot.1.is_empty(),
+                "parked scratch still holds {} outputs / {} slots",
+                slot.0.len(),
+                slot.1.len()
+            );
+        });
+        let (owned, slots) = take_output_scratch(1);
+        assert!(owned.is_empty() && slots.is_empty());
+        recycle_output_scratch(owned, slots);
+    }
+
+    #[test]
+    fn output_scratch_does_not_pin_a_pathological_capacity() {
+        let over = OUTPUT_SCRATCH_MAX_CAPACITY + 1;
+        let (mut owned, mut slots) = take_output_scratch(over);
+        assert!(owned.capacity() >= over);
+        owned.push(dummy_owned_output());
+        slots.push(SlotKind::Ort);
+        recycle_output_scratch(owned, slots);
+
+        OUTPUT_SCRATCH.with(|cell| {
+            let slot = cell.borrow();
+            assert!(
+                slot.0.capacity() <= OUTPUT_SCRATCH_MAX_CAPACITY
+                    && slot.1.capacity() <= OUTPUT_SCRATCH_MAX_CAPACITY,
+                "oversized scratch was parked: {} / {}",
+                slot.0.capacity(),
+                slot.1.capacity()
+            );
+        });
+    }
+
+    /// A kernel that re-enters `Compute` on this thread finds the scratch
+    /// already borrowed. That must degrade to a fresh allocation, not panic.
+    #[test]
+    fn output_scratch_is_reentrancy_safe() {
+        OUTPUT_SCRATCH.with(|cell| {
+            let _held = cell.borrow_mut();
+            let (mut owned, mut slots) = take_output_scratch(2);
+            owned.push(dummy_owned_output());
+            slots.push(SlotKind::Ort);
+            assert_eq!(owned.len(), 1);
+            // Recycling while the cell is borrowed must also not panic.
+            recycle_output_scratch(owned, slots);
+        });
+    }
+
+    /// Thread-local, so two threads never share a buffer -- concurrent `Run`s
+    /// on different threads cannot alias each other's output bookkeeping.
+    #[test]
+    fn output_scratch_is_per_thread() {
+        // Park a capacity a fresh `Vec` would not land on by itself: an empty
+        // `Vec::reserve(1)` already gives 4 for this element size, so a smaller
+        // parked capacity could not tell reuse from a coincidence.
+        let (mut owned, mut slots) = take_output_scratch(OUTPUT_SCRATCH_MAX_CAPACITY);
+        for _ in 0..OUTPUT_SCRATCH_MAX_CAPACITY {
+            owned.push(dummy_owned_output());
+            slots.push(SlotKind::Ort);
+        }
+        let parked = owned.capacity();
+        assert!(parked >= OUTPUT_SCRATCH_MAX_CAPACITY);
+        recycle_output_scratch(owned, slots);
+
+        let other = std::thread::spawn(|| {
+            let (owned, slots) = take_output_scratch(1);
+            let cap = owned.capacity();
+            recycle_output_scratch(owned, slots);
+            cap
+        })
+        .join()
+        .unwrap();
+        assert!(
+            other < parked,
+            "a fresh thread reused another thread's capacity: {other} vs {parked}"
+        );
     }
 }
 
