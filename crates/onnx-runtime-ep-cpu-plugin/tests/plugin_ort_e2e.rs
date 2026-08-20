@@ -6073,9 +6073,33 @@ fn case_selectors_do_not_match_a_neighbour() {
         "expected the known overlapping pair to still exist; found {overlapping:?}"
     );
 
-    // A family prefix that names no case still selects the whole family.
-    let family = select("grid_relu_1_tiny");
-    assert_eq!(family, vec!["grid_relu_1_tiny"]);
+    // This test builds the `NXRT_MM_BENCH_GRID=1` superset. That covers the
+    // `only` and default lists too, but only because no name is a substring of
+    // two or more others and no `bench_*` name overlaps a `grid_*` one -- so a
+    // filter can never select a case that a narrower list would have hidden.
+    // That is an invariant, not a coincidence, so pin it: a future name
+    // bridging the two prefixes would double-select in a mode this list cannot
+    // reproduce.
+    for a in &names {
+        let contained_in: Vec<&&str> = names.iter().filter(|b| *b != a && b.contains(*a)).collect();
+        assert!(
+            contained_in.len() <= 1,
+            "`{a}` is a substring of {contained_in:?}; the per-mode lists are no longer covered by this superset"
+        );
+        for b in contained_in {
+            assert_eq!(
+                a.starts_with("grid_"),
+                b.starts_with("grid_"),
+                "`{a}` and `{b}` straddle the bench_/grid_ prefixes, which appear in different GRID modes"
+            );
+        }
+    }
+
+    // A name that is a prefix of another still selects only itself...
+    let exact_still_one = select("grid_relu_1_tiny");
+    assert_eq!(exact_still_one, vec!["grid_relu_1_tiny"]);
+
+    // ...while a filter naming no case still selects the whole family.
     let group = select("grid_identity");
     assert!(
         group.len() > 1 && group.iter().all(|n| n.starts_with("grid_identity")),
