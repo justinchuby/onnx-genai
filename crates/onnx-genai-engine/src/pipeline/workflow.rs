@@ -1770,6 +1770,40 @@ impl PipelineEngine {
                 .map(|(name, value)| ((*name).to_string(), value.shape().to_vec()))
                 .collect(),
         );
+        // Shape-changing policy components (for example an append recurrence)
+        // intentionally expose an output symbol that is not bound by their
+        // inputs. Such outputs cannot use a fixed-address CUDA binding: ORT
+        // must allocate the newly discovered shape on each invocation.
+        if selected_outputs.keys().any(|output| {
+            declaration
+                .ports
+                .outputs
+                .get(output)
+                .is_some_and(|contract| {
+                    resolve_workflow_shape(contract, component_symbols).is_err()
+                })
+        }) {
+            let mut values = session
+                .output_names()
+                .iter()
+                .cloned()
+                .zip(session.run(resolved)?)
+                .collect::<HashMap<_, _>>();
+            return selected_outputs
+                .keys()
+                .map(|output| {
+                    values
+                        .remove(output)
+                        .map(|value| (output.clone(), value))
+                        .with_context(|| {
+                            format!(
+                                "dynamic component '{component}' did not return selected output \
+                                 '{output}'"
+                            )
+                        })
+                })
+                .collect();
+        }
         let shared = workflow
             .serving
             .as_ref()
