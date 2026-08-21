@@ -1645,3 +1645,50 @@ evidence of one; a bandwidth percentage means nothing until the denominator is
 shown to bind, which is the error §18 had to correct in the other direction.
 Full record:
 [`docs/benchmarks/2026-08-21-gemm-transposed-bf16-decode-gemv.md`](../benchmarks/2026-08-21-gemm-transposed-bf16-decode-gemv.md).
+
+### 20. Int4 acc4 N-tile — designed, bounded, not built; two hypotheses closed
+
+Investigated the block-major scale/zero-point N-tile over #1619's packed-nibble
+kernel. **Not built**, and the reason is recorded rather than hidden: the
+analytic case is ~15% (a ~62→~53 uop reduction per 4 (block, column) pairs,
+against §18's finding that the per-block term is 78% of runtime at block 32),
+but §18's uop model **mispredicts measured per-block cost by 2.8x**, so it
+cannot adjudicate a 15% delta. The tile also removes instructions, not the
+139.7 MB/token that must cross the memory system, and the measurement that
+would have bounded that failed on a contended host (block 128 at 32 threads
+spread 1.135–9.035 ms, 8x). MLAS uses `NCols = 4`, so this is a statement about
+available evidence, not about the design.
+
+Two cheaper hypotheses were tested and **both are closed negative**:
+
+- *"The kernel does not thread-scale."* An artifact: `RAYON_NUM_THREADS` does
+  not size the decode pool (`configured_decode_threads` reads
+  `available_parallelism` and `ONNX_GENAI_CPU_DECODE_THREADS`). The real knob
+  gives 22.949/22.893/11.584/5.866/3.302 ms/token at 1/2/4/8/16 threads —
+  8→16 is **1.77x, ±0.7% over three interleaved repetitions**. (t=1≡t=2 is
+  unexplained and recorded as an open question, not an explanation.)
+- *"Production is stuck on the narrow flat pool, so 1.77x is free."* False.
+  `default_persistent_threads(32)` is 16 and `PERSISTENT_POOL_DEFAULT` is
+  `true`, so `is_forced()` holds; every pool configuration reachable from this
+  harness measures 3.23–3.42 ms/token = t=16, never t=8 (5.87–5.91) nor the
+  6-wide flat default. **No pool-default change is proposed.** Note this is
+  *not* a persistent-vs-flat A/B: `PROBE_SPMD` does not move the pool under the
+  default policy, an earlier draft wrongly labelled an arm "flat", and
+  adversarial review caught it — a 6-wide pool cannot produce a 16-wide time.
+
+**Shipped:** `PROBE_ACCURACY` in `int4_decode_loop_ab`. The bench hard-coded
+`accuracy_level = 0`, and 4 is the only value reaching the packed-nibble route,
+so #1619 had **no decode-loop row at all** — only single-op benches, which is
+the wrong shape for a decode gate. The bench header now also documents the
+`RAYON_NUM_THREADS` trap, because a wrong "does not scale" verdict is one
+env-var name away.
+
+**Next lever, unmeasured and deliberately unranked:** at block 32 the f32
+scales are 27.26 MB against 109.05 MB of packed weights — with zero points,
+**22% of all bytes moved**. Storing them as bf16 in a block-major prepack
+removes ~10% of traffic, converting ~1:1 into time *wherever the kernel is
+bandwidth-bound*, without touching the integer dot's exactness. It is **not**
+claimed to be worth more than the N-tile: the two bet on opposite unmeasured
+regimes (the byte lever pays only if bandwidth-bound; the N-tile is discounted
+only if it is). Establish the regime on a quiet host first. Full record:
+[`docs/benchmarks/2026-08-21-int4-acc4-ntile-design.md`](../benchmarks/2026-08-21-int4-acc4-ntile-design.md).
