@@ -3001,7 +3001,12 @@ impl DecodeCudaState {
     /// a regression test can assert it is *actually* exercising the VMM path
     /// rather than silently falling back to the eager path (which would make a
     /// "VMM reservation" assertion prove nothing).
-    #[cfg(feature = "native-cuda")]
+    ///
+    /// `cfg(test)` as well as the feature: its only caller is the assertion in
+    /// `native_decode::tests`, so in the plain `lib` target it is genuinely
+    /// dead and `-D dead-code` rejects it. It is `pub(crate)`, so no integration
+    /// test outside this crate could reach it anyway.
+    #[cfg(all(feature = "native-cuda", test))]
     pub(crate) fn kv_commits_on_demand(&self) -> bool {
         self.kv_commits_on_demand
     }
