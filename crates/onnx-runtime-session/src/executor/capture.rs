@@ -477,7 +477,16 @@ impl Executor {
     /// binding-signature mismatch on replay is independently caught, so a pinned
     /// symbol is never replayed against a stale grid.
     pub(crate) fn pin_fixed_capacity_kv_capture_symbols(&mut self) -> usize {
-        let pinned = collect_capacity_pinned_kv_symbols(&self.graph);
+        let mut pinned = collect_capacity_pinned_kv_symbols(&self.graph);
+        // Also pin the decode-freeze-safe attention-mask length symbol(s): the
+        // mask/causal-bias axis is a fixed-capacity constant on the single-token
+        // decode path (the frozen-width mask saturates to the true valid length),
+        // exactly like a pinned KV seq axis. Without this the mask-builder cone
+        // AND every capacity-form `Attention` consuming the bias stay eager seams
+        // (an MLA / HF-causal model captures with dozens of interleaved seams that
+        // replay incoherently); pinning admits them into capture. See
+        // [`collect_freeze_safe_mask_symbols`].
+        pinned.extend(collect_freeze_safe_mask_symbols(&self.graph));
         if pinned.is_empty() {
             return 0;
         }
@@ -489,7 +498,7 @@ impl Executor {
         self.capacity_pinned_kv_symbols = pinned;
         if std::env::var("ONNX_GENAI_LOG_GROWING_SYMBOLS").is_ok() {
             eprintln!(
-                "[onnx-genai-capture] pinned {} fixed-capacity KV seq symbol(s): {:?}; \
+                "[onnx-genai-capture] pinned {} fixed-capacity KV seq / freeze-safe mask symbol(s): {:?}; \
                  disqualifying set now {} symbol(s)",
                 count,
                 self.capacity_pinned_kv_symbols,

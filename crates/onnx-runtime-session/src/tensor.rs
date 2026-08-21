@@ -236,6 +236,12 @@ pub(crate) struct DeviceBindingSpec {
     pub(crate) logical_shape: Vec<usize>,
     /// Whether graph inputs see the valid prefix rather than allocation capacity.
     pub(crate) expose_logical_input_shape: bool,
+    /// Whether an attention-mask binding that exposes its logical length for
+    /// multi-token prefill may nonetheless be **frozen to physical capacity for a
+    /// single-token decode step** (its causal-window arithmetic saturates at
+    /// `q_seq == 1`, so a frozen mask is byte-identical and stays CUDA-graph
+    /// capture-eligible). Only meaningful together with a mask input binding.
+    pub(crate) decode_freeze_safe_mask: bool,
     /// Bytes reserved in the allocation. Defaults to the physical shape's byte
     /// size; larger values let a binding grow its exposed shape without moving.
     pub(crate) allocation_bytes: Option<usize>,
@@ -322,6 +328,9 @@ pub struct DeviceIoBinding {
     logical_shape: Vec<usize>,
     /// Whether graph inputs see the valid prefix rather than allocation capacity.
     expose_logical_input_shape: bool,
+    /// Whether a logical-exposing mask binding may be frozen to physical capacity
+    /// for a single-token decode step (see [`DeviceBindingSpec::decode_freeze_safe_mask`]).
+    decode_freeze_safe_mask: bool,
     buffer: Option<DeviceBuffer>,
     allocator: Arc<dyn ExecutionProvider>,
     transfer_stats: DeviceBindingTransferStats,
@@ -340,6 +349,7 @@ impl DeviceIoBinding {
             physical_shape,
             logical_shape,
             expose_logical_input_shape,
+            decode_freeze_safe_mask,
             allocation_bytes,
             committed_ranges,
         } = spec;
@@ -381,6 +391,7 @@ impl DeviceIoBinding {
             physical_shape,
             logical_shape,
             expose_logical_input_shape,
+            decode_freeze_safe_mask,
             buffer: Some(buffer),
             allocator,
             transfer_stats: DeviceBindingTransferStats::default(),
@@ -425,6 +436,7 @@ impl DeviceIoBinding {
             physical_shape,
             logical_shape,
             expose_logical_input_shape,
+            decode_freeze_safe_mask,
             allocation_bytes: _,
             committed_ranges: _,
         } = spec;
@@ -476,6 +488,7 @@ impl DeviceIoBinding {
             physical_shape,
             logical_shape,
             expose_logical_input_shape,
+            decode_freeze_safe_mask,
             buffer: Some(buffer),
             allocator,
             transfer_stats: DeviceBindingTransferStats::default(),
@@ -528,6 +541,19 @@ impl DeviceIoBinding {
     /// capacity (e.g. GLM-5.2's indexer arithmetic branch).
     pub fn exposes_logical_input_shape(&self) -> bool {
         self.bind_input && self.expose_logical_input_shape
+    }
+
+    /// Whether this mask input binding — even if it [`exposes_logical_input_shape`]
+    /// for multi-token prefill — may be frozen to physical capacity on a
+    /// **single-token decode step** without changing the additive bias. Holds
+    /// when the mask feeds only the additive causal-mask builder cone, whose
+    /// query-window arithmetic saturates at `q_seq == 1`
+    /// (see `mask_binding_feeds_additive_causal_builder`). A frozen decode mask
+    /// keeps `logical == physical`, so the step stays CUDA-graph capture-eligible.
+    ///
+    /// [`exposes_logical_input_shape`]: Self::exposes_logical_input_shape
+    pub fn mask_decode_freeze_safe(&self) -> bool {
+        self.bind_input && self.decode_freeze_safe_mask
     }
 
     pub fn set_logical_shape(&mut self, shape: Vec<usize>) -> Result<()> {
@@ -928,6 +954,7 @@ impl std::fmt::Debug for DeviceIoBinding {
                 "expose_logical_input_shape",
                 &self.expose_logical_input_shape,
             )
+            .field("decode_freeze_safe_mask", &self.decode_freeze_safe_mask)
             .field("device", &self.buffer().device())
             .field("device_ptr", &self.device_ptr())
             .field("transfer_stats", &self.transfer_stats)
@@ -1468,6 +1495,7 @@ mod tests {
                 physical_shape: vec![element_count],
                 logical_shape: vec![element_count],
                 expose_logical_input_shape: false,
+                decode_freeze_safe_mask: false,
                 allocation_bytes: None,
                 committed_ranges: None,
             },
@@ -1549,6 +1577,7 @@ mod tests {
                 physical_shape: vec![1, 4096],
                 logical_shape: vec![1, 4096],
                 expose_logical_input_shape: true,
+                decode_freeze_safe_mask: false,
                 allocation_bytes: None,
                 committed_ranges: None,
             },
@@ -1577,6 +1606,7 @@ mod tests {
                 physical_shape: vec![1, 4096],
                 logical_shape: vec![1, 5],
                 expose_logical_input_shape: false,
+                decode_freeze_safe_mask: false,
                 allocation_bytes: None,
                 committed_ranges: None,
             },
