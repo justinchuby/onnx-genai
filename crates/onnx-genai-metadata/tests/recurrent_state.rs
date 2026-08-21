@@ -1,7 +1,8 @@
 //! Fixed-size recurrent state uses one generic replacement discipline.
 
 use onnx_genai_metadata::{
-    InferenceMetadata, StateGroupContract, StateKind, StateUpdate, validate_metadata,
+    InferenceMetadata, StateGroupContract, StateKind, StatePortAccess, StatePortAlias, StateUpdate,
+    validate_metadata,
 };
 
 #[test]
@@ -54,5 +55,22 @@ fn replace_state_rejects_a_sequence_axis() {
             .iter()
             .any(|error| error.contains("replace") && error.contains("sequence_axis")),
         "unexpected validation errors: {errors:?}"
+    );
+}
+
+#[test]
+fn state_alias_access_is_explicit_and_backward_compatible() {
+    let writer: StatePortAlias = serde_yaml::from_str("input: past_key\noutput: present_key\n")
+        .expect("default writer alias parses");
+    assert_eq!(writer.access, StatePortAccess::ReadWrite);
+
+    let reader: StatePortAlias =
+        serde_yaml::from_str("input: past_key\noutput: present_key\naccess: read_only\n")
+            .expect("read-only alias parses");
+    assert_eq!(reader.access, StatePortAccess::ReadOnly);
+    assert!(
+        serde_yaml::to_string(&reader)
+            .expect("read-only alias serializes")
+            .contains("access: read_only")
     );
 }

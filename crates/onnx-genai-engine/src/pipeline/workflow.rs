@@ -1781,6 +1781,7 @@ impl PipelineEngine {
                     .filter(|group| group.aliasing != StateAliasing::Forbidden)
                     .filter_map(|group| group.ports.get(component))
                     .flat_map(|aliases| aliases.values())
+                    .filter(|alias| alias.access == onnx_genai_metadata::StatePortAccess::ReadWrite)
                     .map(|alias| (alias.output.clone(), alias.input.clone()))
                     .collect::<HashMap<_, _>>()
             })
@@ -2926,7 +2927,7 @@ fn resolve_workflow_shape(
 
 fn resolve_workflow_adapter_shape(
     contract: &TensorContract,
-    symbols: &HashMap<String, i64>,
+    _symbols: &HashMap<String, i64>,
 ) -> anyhow::Result<Vec<i64>> {
     let shape = contract
         .shape
@@ -2936,7 +2937,12 @@ fn resolve_workflow_adapter_shape(
         .iter()
         .map(|dimension| match dimension {
             TensorDimension::Fixed(value) => Ok(*value),
-            TensorDimension::Symbol(symbol) => Ok(symbols.get(symbol).copied().unwrap_or(-1)),
+            // Adapter outputs are produced before their concrete dimensions
+            // exist. A symbol here is a typed dynamic axis, not permission to
+            // borrow an equal-spelled extent from another component artifact
+            // (for example a source image and generated latent that both call
+            // their private axes "height").
+            TensorDimension::Symbol(_) => Ok(-1),
         })
         .collect()
 }

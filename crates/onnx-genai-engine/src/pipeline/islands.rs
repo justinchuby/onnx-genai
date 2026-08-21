@@ -1309,6 +1309,9 @@ fn build_execution_island(
                     continue;
                 };
                 for alias in aliases.values() {
+                    if alias.access == onnx_genai_metadata::StatePortAccess::ReadOnly {
+                        continue;
+                    }
                     let Some(input_value) = invocation.inputs.get(&alias.input) else {
                         continue;
                     };
