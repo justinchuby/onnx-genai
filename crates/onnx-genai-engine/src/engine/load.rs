@@ -192,9 +192,12 @@ impl Engine {
                 .any(|provider| !provider.caps.is_host()),
         )?;
 
-        // ORT CUDA graph capture is opt-in: it fails with unconstructed OrtValue
-        // outputs on some Foundry exports. SessionOptions still honors an explicit
-        // ONNX_GENAI_CUDA_GRAPH=1 request; native whole-step capture is separate.
+        // ORT CUDA graph capture is opt-in via ONNX_GENAI_CUDA_GRAPH (default
+        // off, resolved per-EP as `ResolvedEp::graph_capture_env`): it fails with
+        // unconstructed OrtValue outputs on some Foundry exports. Note that
+        // requesting it is not sufficient — the decode session only captures on
+        // `DecodeKvMode::SharedBuffer`, so a model on the zero-copy-rebind path
+        // runs uncaptured regardless. Native whole-step capture is separate.
         configure_ort_cuda_graph(&mut session_options, &model_directory.model_path);
 
         let environment = {
@@ -1205,6 +1208,24 @@ fn resolve_metadata_and_decode_path(
             sink_tokens,
         )?
     };
+    // Report the resolved decode path together with whether the session even
+    // asked for CUDA-graph capture. Both matter and neither was visible before:
+    // ORT capture requires `DecodeKvMode::SharedBuffer` (see
+    // `will_sample_on_device`), so a model that lands on zero-copy-rebind runs
+    // uncaptured no matter what `enable_cuda_graph` says. A benchmark can
+    // therefore compare two backends on two different KV strategies and read
+    // like a backend comparison. Emitting this once at load makes it visible in
+    // every CLI, server and benchmark run.
+    let capture_requested = session.graph_capture();
+    tracing::info!(
+        decode_path = %decode_path.summary(),
+        graph_capture_requested = capture_requested,
+        "resolved decode path"
+    );
+    eprintln!(
+        "decode_path: {} graph_capture_requested={capture_requested}",
+        decode_path.summary()
+    );
     Ok(MetadataResolution {
         metadata,
         metadata_max_context,

@@ -11,8 +11,7 @@ use onnx_genai_ort::Tokenizer;
 use onnx_runtime_ir::{DataType, DeviceType, Dim, SymbolId};
 use onnx_runtime_session::{
     CaptureDeclineReport, DecodePrecision, DeviceAllocationCounts, DeviceBindingTransferStats,
-    DeviceGraphCaptureResult, DeviceGraphSlot, DeviceIoBinding, DevicePreference, InferenceSession,
-    Tensor,
+    DeviceGraphCaptureResult, DeviceIoBinding, DevicePreference, InferenceSession, Tensor,
 };
 use onnx_runtime_tracer::{Args, TraceContext, capture_rejected};
 use std::collections::{HashMap, HashSet};
@@ -600,8 +599,17 @@ impl NativeDecodeSession {
         // Restore the destructive recurrent/conv states to the pre-draft snapshot,
         // then deterministically re-advance them by exactly the accepted tokens.
         self.restore_recurrent_state(snapshot)?;
-        if !accepted_tokens.is_empty() {
-            self.decode_argmax(accepted_tokens, base_len)?;
+        // Re-advance ONE token at a time (M=1) rather than a single M=num_accepted
+        // batch. The recurrent/conv state advance is inherently sequential, so a
+        // per-token replay is state-equivalent to a batched forward, but it keeps
+        // the shared `Primary` decode executor pinned at the [1,1] shape: a
+        // batched M=num_accepted forward would resize the Primary interior arena
+        // to [1,num_accepted] and invalidate the captured M=1 decode graph every
+        // spec step (Blocker B). Feeding single tokens matches the M=1 base decode
+        // shape so the Primary graph stays valid and replays.
+        for &token in accepted_tokens {
+            let past_len = self.current_len;
+            self.decode_argmax(&[token], past_len)?;
         }
         Ok(())
     }
