@@ -391,6 +391,16 @@ pub fn cached_transpose_f16(src: &[u16], k: usize, n: usize) -> Option<Arc<Vec<u
     WEIGHT_TRANSPOSE_F16.get_or_insert_transpose(src, k, n)
 }
 
+/// Test-only: drop any f16 entry keyed on `(ptr, k, n)`.
+///
+/// The f16 counterpart of [`f32_cache_evict`], and safe for the same reason: a
+/// *live* concurrent allocation can never share `ptr`, so the only entry this
+/// can remove is a stale one left by a freed buffer that nobody is using.
+#[cfg(test)]
+pub(crate) fn f16_cache_evict(ptr: *const u16, k: usize, n: usize) {
+    WEIGHT_TRANSPOSE_F16.remove(&WeightTransposeKey::new(ptr, k, n));
+}
+
 /// Entry counts of the global caches as `(f16, f32)`.
 pub fn cache_sizes() -> (usize, usize) {
     (WEIGHT_TRANSPOSE_F16.len(), WEIGHT_TRANSPOSE_F32.len())
@@ -890,15 +900,36 @@ mod tests {
     }
 
     /// The process-global entry points reach their own dtype's cache and honour
-    /// the same total key. Assertions are monotone (`>=` against a baseline)
-    /// because other tests in this binary share the global caches.
+    /// the same total key.
+    ///
+    /// Both halves of this test have to survive sharing the global caches with
+    /// every other test in the binary, and they need *different* defences:
+    ///
+    /// * The size assertions are monotone (`>=` against a baseline) because
+    ///   other tests insert concurrently.
+    /// * The **value** assertions need more than that. The cache keys on
+    ///   `(address, K, N)`, and these buffers are short-lived locals, so the
+    ///   allocator can hand us an address a freed buffer of the same shape used
+    ///   earlier — at which point `cached_transpose_f32` answers from a stale
+    ///   entry describing someone else's data and never looks at ours. That is
+    ///   not hypothetical: it turned this test red on `Rust coverage (Windows
+    ///   x86_64)`, returning a uniform `[1.0; 12]` left-hand side. So evict our
+    ///   three keys first, exactly as the `gemm.rs` cache tests do.
+    ///
+    /// Eviction happens *before* the baseline is sampled: evicting after would
+    /// remove up to two entries the baseline had already counted and turn the
+    /// `>= f32_before + 2` assertion into a false failure.
     #[test]
     fn global_caches_are_per_dtype_and_keyed_by_shape() {
-        let (f16_before, f32_before) = cache_sizes();
-
         let mut f32_buf = vec![0.0f32; 12];
         fill(&mut f32_buf, 1.0);
         let f16_buf: Vec<u16> = (0..12u16).map(|i| 0x3C00 + i).collect();
+
+        f32_cache_evict(f32_buf.as_ptr(), 3, 4);
+        f32_cache_evict(f32_buf.as_ptr(), 4, 3);
+        f16_cache_evict(f16_buf.as_ptr(), 3, 4);
+
+        let (f16_before, f32_before) = cache_sizes();
 
         let a = cached_transpose_f32(&f32_buf, 3, 4).expect("f32 [3,4]");
         let b = cached_transpose_f32(&f32_buf, 4, 3).expect("f32 [4,3]");
