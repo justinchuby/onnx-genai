@@ -230,7 +230,11 @@ tried first](#safe-formulations-were-tried-first)). Estimator is **min over 6+
 interleaved repetitions** — this host takes intermittent one-sided interference
 spikes, and contention can only ever *add* time, so the minimum is the robust
 estimate of uncontended cost. Every row carries its own A/A; rows failing the
-2% gate are not reported as results.
+2% gate are not reported as results. **All rows in this table are against base
+`f8eb8a3e2`**; they are retained as the original correction record. The
+current-main re-measurement is the table in [the next
+section](#re-measured-on-current-main-and-two-rows-changed), and it supersedes
+these rows at t=8 and at block 64/128.
 
 | threads | sessions | block | baseline | patched | speedup | A/A | original draft claimed |
 |---|---|---|---|---|---|---|---|
@@ -261,11 +265,14 @@ evidence**, and re-running found one reversal and one under-claim:
 | 1 | 128 | 10.251 | 9.392 | **1.091x** | 0.10% | 1.003x @ t=8 — **was under-claimed** |
 
 **The t=8 win is gone.** Two independent runs (1.009x at 240 tokens, 1.016x at
-400 tokens, A/A 0.52% and 0.03%) agree. The cause is visible in the arms: the
+400 tokens, A/A 0.52% and 0.03%) agree. What moved is visible in the arms: the
 *baseline* got 7.8% faster on new main (3.542 → 3.264) while the patched arm
-barely moved. Something in the MTP series closed this cell's gap for both arms;
-this change no longer buys anything at t=8 and that row is now reported as a
-wash.
+barely moved, so the cell closed on its own. **Why** it closed is not
+established: the rebase window contains the native-MTP series, but those are
+CUDA-graph and speculative-decode commits with no stated path into a CPU int4
+decode kernel, so attributing it to them would be a guess. Recorded as
+correlated with the window, not explained. Either way this change no longer buys
+anything at t=8 and that row is reported as a wash.
 
 **"Block-32-specific" was wrong, and the error was methodological.** Block 64
 and 128 had only ever been measured *at t=8* — the one thread count where
@@ -273,7 +280,7 @@ nothing shows. Measured at t=1, where the mechanism is visible, block 64 gets
 **1.380x** and block 128 **1.091x**. The win covers the two most common
 configurations, not one.
 
-The ladder is exactly what the mechanism predicts. `wide` requires
+The ladder is consistent with what the mechanism predicts. `wide` requires
 `group >= WIDE_GROUP` (32), and `wide_groups = blob / 16`, so the removed fixed
 per-block cost is amortized over 1, 2 and 4 groups at block 32, 64 and 128:
 
@@ -285,10 +292,12 @@ per-block cost is amortized over 1, 2 and 4 groups at block 32, 64 and 128:
 | 128 | yes | 4 | 1.172x | 1.091x |
 
 Fitting `F` from the block-32 row predicts block 64 within 3% and block 128
-within 7% — the residual is because `G` is not constant across block sizes (the
+within 8% — the residual is because `G` is not constant across block sizes (the
 absolute baseline cost per group falls as blocks get larger and the activation
-is re-read less often). Block 16 is the control: it never enters the wide path,
-and it measures nothing.
+is re-read less often). That second, unfitted variable is why this is
+*consistent with* amortization rather than a clean prediction from it: it is a
+one-parameter fit checked at two points. Block 16 is the stronger evidence — it
+provably never enters the wide path, and it measures nothing.
 
 
 Output is bit-identical. The t=16 row uses a 240-token steady window (see
@@ -388,14 +397,19 @@ The attribute is honoured rather than assumed: ORT at `accuracy_level=0` costs
 30.632 ms against 7.822 ms at `accuracy_level=4`, a 3.9x separation, so ORT is
 genuinely running its int8-activation path in the acc4 rows.
 
+Both native columns below are the **current-main (`2f94cba4d`)** arms from the
+re-measurement above — not the superseded `f8eb8a3e2` numbers. Mixing the two
+bases would credit this change with the t=8 win that the re-measurement
+retracts.
+
 | threads | ORT acc4 | native, main | native, this PR | gap before | **gap after** |
 |---|---|---|---|---|---|
-| 1 | 7.822 ms/tok | 23.525 | 14.016 | 3.01x | **1.79x** |
-| 4 | 2.154 | 7.963 | 4.777 | 3.70x | **2.22x** |
-| 8 | 1.249 | 3.542 | 3.104 | 2.84x | **2.49x** |
-| 16 | 1.227 | 1.801 | 1.447 | 1.47x | **1.18x** |
+| 1 | 7.822 ms/tok | 23.535 | 13.962 | 3.01x | **1.78x** |
+| 4 | 2.154 | 6.100 | 3.720 | 2.83x | **1.73x** |
+| 8 | 1.249 | 3.264 | 3.214 | 2.61x | 2.57x |
+| 16 | 1.227 | 1.804 | 1.452 | 1.47x | **1.18x** |
 
-So this change takes the single-thread deficit from **3.01x to 1.79x**, which is
+So this change takes the single-thread deficit from **3.01x to 1.78x**, which is
 the largest single step any int4 decode change has produced so far, and at t=16
 brings us to **1.18x** — near parity, though see the caveat below about *why*
 that row flatters us.
@@ -405,14 +419,19 @@ Three things this table says that the headline speedup does not:
 - **ORT saturates by t=8** (1.249 → 1.227 from 8 to 16 threads, 2%). Our t=16
   row looks good partly because ORT has stopped scaling, not only because we
   got faster. Parity at t=16 is worth much less than the same ratio at t=1.
-- **The worst remaining row is t=8 at 2.49x**, and that is the same t=8 anomaly
-  the speedup table shows (1.141x where t=4 gets 1.667x). Whatever costs us at
-  t=8 is now the top of the list.
-- **Zero-points cost ORT 29%** — 10.041 ms with per-block zero-points against
-  7.822 without, at t=1. Every row above is measured *without* zero-points,
-  which is ORT's fastest configuration and therefore the harder comparison. Our
-  kernel handles the zero-point case in the same loop; comparing there would
-  make us look better and is not the number I am reporting.
+- **The worst remaining row is t=8 at 2.57x**, and it barely moves (2.61x →
+  2.57x) because this change is a wash at t=8 on current main. That cell is now
+  the top of the list, and nothing in this PR addresses it.
+- **Zero-points cost ORT ~26%** — 9.885 ms with per-block zero-points against
+  7.816 without, at t=1, each the min over three windows. (An earlier revision
+  said 28% from a single 10.041 ms window; more reps moved it down. The
+  zero-point arm is noticeably noisier than the plain one — a short 3-rep/32-token
+  window read 12.2 ms — so this cell needs the full rep count to converge, and
+  the figure is quoted as approximate.) Every row above is measured *without*
+  zero-points on **both** sides, which is ORT's fastest configuration and
+  therefore the harder comparison. Our kernel handles the zero-point case in the
+  same loop; comparing there would make us look better and is not the number I
+  am reporting.
 
 Caveat on comparability: ORT's figure includes per-`Run` binding and allocation
 for a five-node graph, and ours includes `with_decode_pool_scope` entry. Neither
@@ -455,7 +474,10 @@ are not re-tried:
 The shipped kernel uses raw pointers inside `unsafe`. That is only defensible if
 a safe formulation is actually slower, so three were built and measured before
 the raw form was accepted. All are bit-identical; all A/A gates <= 0.05%;
-single physical core, block 32, min of 6 interleaved repetitions.
+single physical core, block 32, min of 6 interleaved repetitions. **Base
+`f8eb8a3e2`** — these are relative comparisons among formulations measured in
+one session, so the base affects the absolute ms but not the ranking, which is
+the result being used here.
 
 | form | ms/token | vs main |
 |---|---|---|
@@ -543,17 +565,17 @@ shipped. No sanitizer beyond Miri was available on this host.
 The original draft placed the boundary at t=16 ("1.6x at 1-8 threads,
 1.065x at 16") and read that as the kernel handing off to the memory system and
 the parallel runtime. The re-measurement moves the boundary **one octave
-earlier and makes it non-monotonic**: 1.678x / 1.667x at t=1/t=4, then
-**1.141x at t=8**, then back up to **1.245x at t=16**.
+earlier and makes it non-monotonic**: on current main, 1.686x / 1.640x at
+t=1/t=4, then a **wash at t=8 (1.016x)**, then back up to **1.242x at t=16**.
 
-The dip at t=8 is not explained by this data and is recorded as open. Its
-proximate cause is that the *baseline* scales superlinearly from t=4 to t=8
-(7.963 -> 3.542 ms, **2.25x from 2x the cores**) while the patched arm scales
-only 1.54x, so the two converge; the patched arm at t=4 (4.777 ms) is already
-doing what the baseline needs 8 threads to reach. A superlinear baseline step
-across 4->8 physical cores is the signature of a working-set/aggregation effect
-— 8 cores span more of one CCX's 32 MiB L3 — but with **no PMU on this host**
-that is a hypothesis, not a finding, and it is left labelled as one.
+The dip at t=8 is not explained by this data and is recorded as open. On the
+older base it read 1.141x with a superlinear baseline step from t=4 to t=8
+(7.963 -> 3.542 ms, **2.25x from 2x the cores**) against 1.54x for the patched
+arm; on current main the baseline improved further at that cell (to 3.264 ms)
+and the gap closed entirely. A working-set/aggregation effect — 8 cores span
+more of one CCX's 32 MiB L3 — is the natural shape for a superlinear baseline
+step, but with **no PMU on this host** that is a hypothesis, not a finding, and
+it is left labelled as one.
 
 What does survive from the original reading is the direction: **the kernel is no
 longer the sole binding constraint at full width.** It is simply not true that
@@ -572,13 +594,16 @@ survive past 4.
    arithmetic is correct and the kernel is simply not traffic-limited where it
    would help. If bf16 scales are wanted for *footprint*, that is a separate
    and defensible case — but it should not be sold as speed. **Retired.**
-3. **Take the per-block bookkeeping instead.** **1.678x at t=1, 1.667x at t=4,
-   1.141x at t=8, 1.245x at t=16, ~1.42x multi-session — all at block 32 only;
-   block 64 and 128 are 1.00x.** Bit-identical, all gates green. Shipped in
-   #1628.
-4. **Do not tune this kernel further at block 64/128, or at t>=8, on the
-   strength of this result** — the win is a block-32, low-thread-count effect,
-   and at 8+ threads the decode loop is no longer purely kernel-bound.
+3. **Take the per-block bookkeeping instead.** On current main: **1.686x at
+   t=1, 1.640x at t=4, a wash (1.016x) at t=8, 1.242x at t=16, ~1.42x
+   multi-session**; across block sizes at t=1, **1.380x at block 64, 1.091x at
+   block 128, and nothing (1.028x) at block 16**. Bit-identical, all gates
+   green. Shipped in #1628.
+4. **Do not tune this kernel further at block 16, or at t=8, on the strength of
+   this result** — block 16 provably never enters the wide path, and at t=8 the
+   decode loop is no longer purely kernel-bound. Block 64 *does* benefit and an
+   earlier revision of this document wrongly said it did not, because it had
+   only been measured at t=8.
 5. **Do not quote a single headline multiplier for this change.** Four of the
    nine rows in the first draft of this document did not reproduce, in both
    directions, and the multi-session rows moved by 0.17x once the statistic was

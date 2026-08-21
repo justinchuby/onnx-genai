@@ -1763,30 +1763,43 @@ interleaved repetitions with a per-row A/A control:
 | t=16, block 32 | **1.242x** | | 2 sessions x t=4 | 1.419x |
 
 Four of the nine rows in the originating draft did not reproduce — three
-optimistic, one (t=16, claimed 1.065x) **pessimistic**. The mechanism explains
-the shape exactly: `wide` requires `group >= WIDE_GROUP` (32) and
+optimistic, one (t=16, claimed 1.065x) **pessimistic**. The mechanism is
+consistent with the shape: `wide` requires `group >= WIDE_GROUP` (32) and
 `wide_groups = blob/16`, so the removed fixed per-block cost is amortized over
 1, 2 and 4 groups at block 32/64/128 and the path is not taken at all at block
-16. Fitting the fixed cost from the block-32 row predicts block 64 within 3%.
-`accuracy_level = 0` is a 1.000x null control at t=1/4/8. **Quote the cell, not
-a multiplier** (§18 is the same lesson from the other side).
+16. A one-parameter fit from the block-32 row predicts block 64 within 3% and
+block 128 within 8%, which is corroboration from two points rather than proof;
+the block-16 null is the stronger evidence, since that path provably cannot be
+entered. `accuracy_level = 0` is a 1.000x null control at t=1/4/8. **Quote the
+cell, not a multiplier** (§18 is the same lesson from the other side).
 
 **Two of my own corrections did not survive re-measurement against current
 main, and both failures were mine, not the draft's.** (i) **t=8 reversed to a
 wash.** It read 1.141x against `f8eb8a3e2`; against `2f94cba4d` it is 1.016x
-(two windows, A/A 0.52% and 0.03%). The *baseline* arm got 7.8% faster in the
-native-MTP series while the patched arm did not move, so the cell closed on its
-own. (ii) **"Specific to block_size 32" was wrong**, and wrong the same way the
-three defects below are wrong: block 64 and 128 had only ever been measured **at
-t=8**, the one thread count where this change buys nothing, confounding two
-variables in one cell. At t=1 block 64 is **1.380x**. The rule this yields is
-that a negative result measured at a single point on another axis is not a
-negative result.
+(two windows, A/A 0.52% and 0.03%). The *baseline* arm got 7.8% faster across
+that rebase window while the patched arm did not move, so the cell closed on its
+own. The window contains the native-MTP series, but those are CUDA-graph and
+speculative-decode commits with no stated path into a CPU int4 decode kernel;
+**the cause is not established** and is recorded as correlated-with-window, not
+explained. (ii) **"Specific to block_size 32" was wrong**, and wrong the same
+way the three defects below are wrong: block 64 and 128 had only ever been
+measured **at t=8**, the one thread count where this change buys nothing,
+confounding two variables in one cell. At t=1 block 64 is **1.380x**. The rule
+this yields is that a negative result measured at a single point on another axis
+is not a negative result.
+
+**A fourth defect was found in review of this very section**, and it is the
+same family: the ORT gap table above originally carried the **old-base** native
+arms next to the new-base A/B table, undisclosed. At t=8 that manufactured a
+2.84x -> 2.49x "improvement" out of a cell this section retracts as a wash. Base
+labels now travel with the numbers. **Two tables in one document may not sit on
+different baselines without saying so.**
 
 **Three measurement defects were found in the originating evidence, and all
 three are protocol, not arithmetic.** (i) The t=8 baseline was its *slow* mode —
 that arm is bimodal at 3.54/5.2 ms while the patched arm is stable, so pairing
-against 5.880 ms produced 1.609x where the reproducible figure is 1.141x.
+against 5.880 ms produced 1.609x where the reproducible figure on that base was
+1.141x — and 1.016x on current main.
 (ii) The multi-session rows used the harness's **pooled median per-token
 latency**, which mixes contended and uncontended tokens as sessions
 desynchronise — one baseline repetition read 9.348 ms against a 15.9 ms
@@ -1853,19 +1866,26 @@ acc0 vs 7.822 ms at acc4, 3.9x apart).
 
 | threads | ORT acc4 | native before | native after | before | **after** |
 |---|---|---|---|---|---|
-| 1 | 7.822 ms/tok | 23.525 | 14.016 | 3.01x | **1.79x** |
-| 4 | 2.154 | 7.963 | 4.777 | 3.70x | **2.22x** |
-| 8 | 1.249 | 3.542 | 3.104 | 2.84x | **2.49x** |
-| 16 | 1.227 | 1.801 | 1.447 | 1.47x | **1.18x** |
+| 1 | 7.822 ms/tok | 23.535 | 13.962 | 3.01x | **1.78x** |
+| 4 | 2.154 | 6.100 | 3.720 | 2.83x | **1.73x** |
+| 8 | 1.249 | 3.264 | 3.214 | 2.61x | 2.57x |
+| 16 | 1.227 | 1.804 | 1.452 | 1.47x | **1.18x** |
+
+Both native columns are the current-main (`2f94cba4d`) arms. Quoting the older
+`f8eb8a3e2` arms here would credit the change with the t=8 win that the
+re-measurement retracts, and an earlier revision of this section did exactly
+that — see the review note below.
 
 Three qualifications travel with that table. **ORT saturates by t=8** (1.249 ->
 1.227 to t=16), so the t=16 row flatters us — parity there is worth much less
 than the same ratio at t=1, and per-`Run` framing overhead is not negligible at
 ~1.2 ms/token, so that row carries the most uncertainty. **The worst remaining
-row is t=8 at 2.49x**, the same anomaly that shows as 1.141x in the speedup
-table; that is now the top of the list. And every row is measured **without**
-zero-points, which is ORT's fastest configuration (they cost ORT 29%: 10.041 vs
-7.822 ms) and therefore the harder comparison.
+row is t=8 at 2.57x**, and it barely moves (2.61x -> 2.57x) because the change
+is a wash at t=8; that cell is now the top of the list and nothing here
+addresses it. And every row is measured **without** zero-points on both sides,
+which is ORT's fastest configuration (they cost ORT ~26%: 9.885 vs 7.816 ms,
+min over three windows each)
+and therefore the harder comparison.
 
 **The default path did not move and is now the bigger target.** This kernel is
 gated to `accuracy_level = 4`; production default is 0, where native is 56.307

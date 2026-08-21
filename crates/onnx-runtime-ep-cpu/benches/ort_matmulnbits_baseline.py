@@ -40,7 +40,11 @@ def build(block_size, accuracy, with_zp):
         inits.append(numpy_helper.from_array(sc, f"S{i}"))
         node_in = [f"A{i}", f"B{i}", f"S{i}"]
         if with_zp:
-            zp = np.full(((n * blocks + 1) // 2,), 0x88, dtype=np.uint8)
+            # Zero points are packed per *column*, so an odd block count pads
+            # each column rather than the flattened whole: N*ceil(blocks/2), not
+            # ceil(N*blocks/2). Those agree only for even `blocks`, which every
+            # shape here happens to have.
+            zp = np.full((n * ((blocks + 1) // 2),), 0x88, dtype=np.uint8)
             inits.append(numpy_helper.from_array(zp, f"Z{i}"))
             node_in.append(f"Z{i}")
         nodes.append(helper.make_node(
@@ -63,10 +67,24 @@ def main():
     args = ap.parse_args()
 
     model = build(args.block, args.accuracy, args.zp)
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        ".ort_matmulnbits_baseline.onnx")
+    # ~117 MB of initializers. Unique per process so two invocations cannot
+    # race on the same file, and removed on the way out rather than left in the
+    # source tree.
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        f".ort_matmulnbits_baseline.{os.getpid()}.onnx",
+    )
     onnx.save(model, path, save_as_external_data=False)
+    try:
+        run(args, path)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
+
+def run(args, path):
     so = ort.SessionOptions()
     so.intra_op_num_threads = args.threads
     so.inter_op_num_threads = 1
