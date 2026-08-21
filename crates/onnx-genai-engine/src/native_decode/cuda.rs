@@ -5512,12 +5512,16 @@ impl DecodeCudaState {
     /// (`retain_decode_graph_across_spec`). Kept off in production because it is
     /// not capture-safe until the M=K verify is captured with a pinned workspace;
     /// exposed for the option-c work and its tests. See the field docs.
+    // The seam is landed ahead of the option-c tests that will drive it, so it
+    // currently has no caller in the `lib test` target.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn set_retain_decode_graph_across_spec(&mut self, retain: bool) {
         self.retain_decode_graph_across_spec = retain;
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn retain_decode_graph_across_spec(&self) -> bool {
         self.retain_decode_graph_across_spec
     }
