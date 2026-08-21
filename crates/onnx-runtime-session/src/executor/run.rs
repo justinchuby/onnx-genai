@@ -619,8 +619,8 @@ impl Executor {
                 // ~600-entry resolved map every token would be pure waste and
                 // would defeat the memo's allocation amortization.
                 if !decode_memo_eligible {
-                    self.capture_warm_shapes = resolved.clone();
-                    self.capture_warm_signature = Some(external.capture_signature());
+                    self.cap_mut().capture_warm_shapes = resolved.clone();
+                    self.cap_mut().capture_warm_signature = Some(external.capture_signature());
                 }
             }
             RunMode::Capture => {
@@ -670,19 +670,20 @@ impl Executor {
                                 self.last_capture_failed_node.take().and_then(|node_id| {
                                     let node = self.graph.node(node_id);
                                     let key = (canonical_domain(node), node.op_type.clone());
-                                    self.capture_quarantine_ops.insert(key).then_some(())
+                                    self.cap_mut().capture_quarantine_ops.insert(key).then_some(())
                                 });
                             if quarantined.is_some()
-                                && self.capture_quarantine_ops.len() < max_capture_attempts
+                                && self.cap().capture_quarantine_ops.len() < max_capture_attempts
                             {
                                 // Re-plan with the offending op-type forced eager.
                                 self.if_last_predicate.clear();
                                 continue 'capture;
                             }
-                            self.capture_schedule = None;
-                            self.capture_segmentation.clear();
-                            self.capture_cf_shapes.clear();
-                            self.capture_warm_seeded.clear();
+                            let cap = self.cap_mut();
+                            cap.capture_schedule = None;
+                            cap.capture_segmentation.clear();
+                            cap.capture_cf_shapes.clear();
+                            cap.capture_warm_seeded.clear();
                             return Ok(Some(ScopedRunResult::NotCapturable(
                                 CaptureDeclineReport::one(CaptureDecline::graph(format!(
                                     "segmented CUDA graph capture failed: {error}"
@@ -699,6 +700,7 @@ impl Executor {
                 // the shape restabilizes) or keeps this op eager. This upholds
                 // "recapture when any shape changes; never replay a stale graph."
                 if let Some((vid, seeded)) = self
+                    .cap()
                     .capture_warm_seeded
                     .iter()
                     .find(|(vid, seeded)| resolved.get(vid) != Some(*seeded))
@@ -706,10 +708,11 @@ impl Executor {
                 {
                     let current = resolved.get(&vid).cloned();
                     let _ = self.ep.reset_device_graph_in(self.graph_slot);
-                    self.capture_schedule = None;
-                    self.capture_segmentation.clear();
-                    self.capture_cf_shapes.clear();
-                    self.capture_warm_seeded.clear();
+                    let cap = self.cap_mut();
+                    cap.capture_schedule = None;
+                    cap.capture_segmentation.clear();
+                    cap.capture_cf_shapes.clear();
+                    cap.capture_warm_seeded.clear();
                     return Ok(Some(ScopedRunResult::NotCapturable(
                         CaptureDeclineReport::one(CaptureDecline::graph(format!(
                             "warm decode shape seed for value#{} ({seeded:?}) diverged from the \
@@ -721,21 +724,25 @@ impl Executor {
                 // Snapshot the concrete control-flow output shapes this capture
                 // assumed so a later replay can detect a branch flip that changes
                 // them and retire the now-stale installed graph.
-                self.capture_cf_shapes = self
+                let cf_shapes = self
                     .control_flow_output_values
                     .iter()
                     .filter_map(|vid| resolved.get(vid).map(|shape| (*vid, shape.clone())))
                     .collect();
-                self.capture_segmentation = schedule.boundaries.clone();
-                if capture_segmentation_logging_enabled() {
+                let boundaries = schedule.boundaries.clone();
+                let logging = capture_segmentation_logging_enabled();
+                if logging {
                     log_capture_segmentation(&schedule);
                 }
-                self.capture_schedule = Some(schedule);
+                let cap = self.cap_mut();
+                cap.capture_cf_shapes = cf_shapes;
+                cap.capture_segmentation = boundaries;
+                cap.capture_schedule = Some(schedule);
             }
             RunMode::Replay => {
                 // Move the schedule out so the segmented runner can take `&mut
                 // self`; restore it afterwards for the next step's replay.
-                let Some(schedule) = self.capture_schedule.take() else {
+                let Some(schedule) = self.cap_mut().capture_schedule.take() else {
                     return Ok(Some(ScopedRunResult::NotCapturable(
                         CaptureDeclineReport::one(CaptureDecline::graph(
                             "segmented device graph replay requested without a capture schedule",
@@ -750,16 +757,17 @@ impl Executor {
                     external,
                 )?;
                 if still_valid {
-                    self.capture_schedule = Some(schedule);
+                    self.cap_mut().capture_schedule = Some(schedule);
                 } else {
                     // A control-flow branch flip changed a seeded output shape:
                     // the remaining plan already ran eagerly this step (correct
                     // token), but the installed segments are stale. Retire the
                     // device graph so the caller re-warms and re-captures for the
                     // new branch. `capture_schedule` stays `None`.
-                    self.capture_segmentation.clear();
-                    self.capture_cf_shapes.clear();
-                    self.device_graph_signature = None;
+                    let cap = self.cap_mut();
+                    cap.capture_segmentation.clear();
+                    cap.capture_cf_shapes.clear();
+                    cap.device_graph_signature = None;
                     self.ep.reset_device_graph_in(self.graph_slot)?;
                 }
             }
