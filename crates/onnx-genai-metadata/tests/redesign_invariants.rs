@@ -18,6 +18,36 @@ fn errors(document: &str) -> Vec<String> {
 }
 
 #[test]
+fn image_outputs_require_an_explicit_value_range() {
+    let document = include_str!(
+        "../../../examples/inference_metadata/catalogue/07-stable-diffusion-text-to-image.yaml"
+    );
+    let missing_range = document.replacen("        value_range: negative_one_to_one\n", "", 1);
+    let errors = errors(&missing_range);
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("image output 'image' must declare value_range")),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn image_value_range_is_rejected_on_non_image_outputs() {
+    let document = include_str!(
+        "../../../examples/inference_metadata/catalogue/07-stable-diffusion-text-to-image.yaml"
+    );
+    let invalid = document.replacen("        role: image\n", "        role: tensor\n", 1);
+    let errors = errors(&invalid);
+    assert!(
+        errors.iter().any(
+            |error| error.contains("non-image output 'image' cannot declare image value_range")
+        ),
+        "{errors:#?}"
+    );
+}
+
+#[test]
 fn workflow_manifest_rejects_facts_owned_by_schema_and_onnx_artifacts() {
     for duplicated in ["ir_version: '1.0'", "onnx_opsets: {ai.onnx: 24}"] {
         let document = format!(

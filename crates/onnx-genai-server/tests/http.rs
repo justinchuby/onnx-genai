@@ -39,6 +39,19 @@ async fn image_app() -> axum::Router {
     app(state)
 }
 
+async fn image_admin_app() -> axum::Router {
+    let state = AppState::load_with_config(
+        &diffusion_fixture_dir(),
+        Some("tiny-diffusion".to_string()),
+        ServerConfig {
+            enable_admin_endpoints: true,
+            ..ServerConfig::default()
+        },
+    )
+    .unwrap();
+    app(state)
+}
+
 async fn post_json(app: axum::Router, uri: &str, body: Value) -> axum::response::Response {
     app.oneshot(
         Request::builder()
@@ -67,6 +80,31 @@ fn assert_png_base64(encoded: &str) {
     assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
     let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png).unwrap();
     assert_eq!((decoded.width(), decoded.height()), (4, 4));
+}
+
+async fn pending_queue_depth(app: axum::Router) -> u64 {
+    let (_, body) = response_json(
+        app.oneshot(
+            Request::builder()
+                .uri("/v1/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    body["queue_depth"].as_u64().unwrap()
+}
+
+async fn wait_for_pending_queue_depth(app: axum::Router, expected: u64) {
+    for _ in 0..300 {
+        if pending_queue_depth(app.clone()).await == expected {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(pending_queue_depth(app).await, expected);
 }
 
 fn sse_data_lines(text: &str) -> Vec<&str> {
@@ -147,6 +185,26 @@ async fn openai_images_executes_metadata_diffusion_pipeline_and_returns_png() {
 }
 
 #[tokio::test]
+async fn admin_warmup_executes_image_only_pipeline_output() {
+    let app = image_admin_app().await;
+    let (status, body) = response_json(
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/admin/models/tiny-diffusion/warm")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["id"], "tiny-diffusion");
+    assert_eq!(body["warmed"], true);
+}
+
+#[tokio::test]
 async fn openai_and_a1111_lower_to_equivalent_pipeline_inputs() {
     let app = image_app().await;
     let (_, openai) = response_json(
@@ -216,6 +274,31 @@ async fn a1111_seed_is_deterministic_and_reported() {
     let info: Value = serde_json::from_str(first["info"].as_str().unwrap()).unwrap();
     assert_eq!(info["all_seeds"], json!([11]));
     assert_png_base64(first["images"][0].as_str().unwrap());
+}
+
+#[tokio::test]
+async fn repeated_image_generations_restore_pending_metrics_to_baseline() {
+    let app = image_app().await;
+    wait_for_pending_queue_depth(app.clone(), 0).await;
+    let baseline = 0;
+    for seed in 100..103 {
+        let (status, body) = response_json(
+            post_json(
+                app.clone(),
+                "/sdapi/v1/txt2img",
+                json!({
+                    "prompt": "metrics lifecycle",
+                    "seed": seed,
+                    "steps": 1,
+                    "cfg_scale": 7.5
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    wait_for_pending_queue_depth(app, baseline).await;
 }
 
 #[tokio::test]
@@ -295,6 +378,50 @@ async fn image_apis_fail_closed_for_unbindable_or_fake_behavior() {
             "{body}"
         );
     }
+}
+
+#[tokio::test]
+async fn img2img_accepts_media_sized_json_and_preserves_payload_too_large() {
+    let app = image_app().await;
+    let accepted_base64 = "A".repeat(3 * 1024 * 1024);
+    let (status, body) = response_json(
+        post_json(
+            app.clone(),
+            "/sdapi/v1/img2img",
+            json!({
+                "prompt": "large source image",
+                "init_images": [accepted_base64],
+                "denoising_strength": 0.5
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no semantic image/media input"),
+        "{body}"
+    );
+
+    let oversized_base64 = "A".repeat(26 * 1024 * 1024);
+    let (status, body) = response_json(
+        post_json(
+            app,
+            "/sdapi/v1/img2img",
+            json!({
+                "prompt": "oversized source image",
+                "init_images": [oversized_base64],
+                "denoising_strength": 0.5
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
 }
 
 #[tokio::test]

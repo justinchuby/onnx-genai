@@ -1,20 +1,23 @@
-use onnx_genai::GenerateRequest;
+use anyhow::Context;
+use onnx_genai::{GenerateOptions, GeneratePrompt, GenerateRequest};
 use onnx_genai_engine::PipelineGenerateRequest;
 use onnx_genai_metadata::{
-    LiteralValue, PipelineSpec, RuntimeInputRole, ScalarValue, SemanticInputRole, TensorContract,
-    WorkflowOutputRole,
+    ImageOutputValueRange, LiteralValue, PipelineSpec, RuntimeInputRole, ScalarValue,
+    SemanticInputRole, TensorContract, WorkflowOutputRole,
 };
-use onnx_genai_ort::{DataType, Value};
+use onnx_genai_ort::{DataType, Tokenizer, Value};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ImageInputBinding {
     pub(crate) name: String,
     pub(crate) contract: TensorContract,
     pub(crate) default: Option<LiteralValue>,
+    pub(crate) required: bool,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ImagePipelineSpec {
+    pub(crate) output_value_range: ImageOutputValueRange,
     pub(crate) prompt_tokens: Option<ImageInputBinding>,
     pub(crate) negative_prompt_tokens: Option<ImageInputBinding>,
     pub(crate) seed: Option<ImageInputBinding>,
@@ -29,24 +32,25 @@ pub(crate) struct ImagePipelineSpec {
 
 impl ImagePipelineSpec {
     pub(crate) fn from_pipeline(spec: &PipelineSpec) -> Option<Self> {
-        spec.workflow
+        let image_output = spec
+            .workflow
             .outputs
             .values()
-            .any(|output| output.role == WorkflowOutputRole::Image)
-            .then(|| Self {
-                prompt_tokens: binding(spec, RuntimeInputRole::PromptTokens),
-                negative_prompt_tokens: binding(spec, RuntimeInputRole::NegativePromptTokens),
-                seed: binding(spec, RuntimeInputRole::Seed),
-                steps: binding(spec, RuntimeInputRole::MaxIterations),
-                guidance_scale: binding(spec, RuntimeInputRole::GuidanceScale),
-                width: binding(spec, RuntimeInputRole::Width),
-                height: binding(spec, RuntimeInputRole::Height),
-                media: binding(spec, RuntimeInputRole::Media).filter(|binding| {
-                    binding.contract.dtype == "uint8" && binding.contract.rank == 1
-                }),
-                denoising_strength: binding(spec, RuntimeInputRole::DenoisingStrength),
-                samplers: declared_samplers(spec),
-            })
+            .find(|output| output.role == WorkflowOutputRole::Image)?;
+        Some(Self {
+            output_value_range: image_output.value_range?,
+            prompt_tokens: binding(spec, RuntimeInputRole::PromptTokens),
+            negative_prompt_tokens: binding(spec, RuntimeInputRole::NegativePromptTokens),
+            seed: binding(spec, RuntimeInputRole::Seed),
+            steps: binding(spec, RuntimeInputRole::MaxIterations),
+            guidance_scale: binding(spec, RuntimeInputRole::GuidanceScale),
+            width: binding(spec, RuntimeInputRole::Width),
+            height: binding(spec, RuntimeInputRole::Height),
+            media: binding(spec, RuntimeInputRole::Media)
+                .filter(|binding| binding.contract.dtype == "uint8" && binding.contract.rank == 1),
+            denoising_strength: binding(spec, RuntimeInputRole::DenoisingStrength),
+            samplers: declared_samplers(spec),
+        })
     }
 
     pub(crate) fn default_i64(binding: Option<&ImageInputBinding>) -> Option<i64> {
@@ -63,6 +67,86 @@ impl ImagePipelineSpec {
             _ => None,
         }
     }
+
+    pub(crate) fn warmup_request(
+        &self,
+        tokenizer: &Tokenizer,
+        max_context: Option<usize>,
+    ) -> anyhow::Result<ImageExecutionRequest> {
+        if self.media.as_ref().is_some_and(|binding| binding.required) {
+            anyhow::bail!(
+                "image warmup cannot synthesize a required media input; the package must provide a canonical default or a text-to-image path"
+            );
+        }
+        if self
+            .denoising_strength
+            .as_ref()
+            .is_some_and(|binding| binding.required)
+        {
+            anyhow::bail!(
+                "image warmup cannot bind required denoising_strength without a source image"
+            );
+        }
+
+        let prompt_binding = self
+            .prompt_tokens
+            .as_ref()
+            .context("image warmup requires a prompt_tokens runtime role")?;
+        let mut prompt = tokenizer
+            .encode("warmup")
+            .context("failed to tokenize image warmup prompt")?;
+        let mut negative = self
+            .negative_prompt_tokens
+            .as_ref()
+            .map(|binding| {
+                tokenizer
+                    .encode("")
+                    .context("failed to tokenize image warmup negative prompt")
+                    .map(|tokens| (binding, tokens))
+            })
+            .transpose()?;
+        if let Some((_, negative_tokens)) = negative.as_mut() {
+            let target = prompt.len().max(negative_tokens.len());
+            let pad = ["<pad>", "[PAD]", "<|pad|>"]
+                .into_iter()
+                .find_map(|token| tokenizer.token_id(token))
+                .unwrap_or(0);
+            prompt.resize(target, pad);
+            negative_tokens.resize(target, pad);
+        }
+
+        let seed = Self::default_i64(self.seed.as_ref()).unwrap_or(0).max(0);
+        let steps = Self::default_i64(self.steps.as_ref()).unwrap_or(1).max(1);
+        let mut inputs = vec![(
+            prompt_binding.name.clone(),
+            token_input(prompt_binding, &prompt)?,
+        )];
+        if let Some((binding, tokens)) = negative {
+            inputs.push((binding.name.clone(), token_input(binding, &tokens)?));
+        }
+        if let Some(binding) = &self.seed {
+            inputs.push((binding.name.clone(), scalar_i64(binding, seed)?));
+        }
+        if let Some(binding) = &self.steps {
+            inputs.push((binding.name.clone(), scalar_i64(binding, steps)?));
+        }
+        push_optional_default_f32(&mut inputs, self.guidance_scale.as_ref())?;
+        push_optional_default_i64(&mut inputs, self.width.as_ref())?;
+        push_optional_default_i64(&mut inputs, self.height.as_ref())?;
+
+        Ok(ImageExecutionRequest {
+            request: GenerateRequest {
+                prompt: GeneratePrompt::TokenIds(prompt),
+                options: GenerateOptions {
+                    max_new_tokens: usize::try_from(steps)?,
+                    max_context,
+                    seed: Some(seed as u64),
+                    ..GenerateOptions::default()
+                },
+            },
+            inputs,
+        })
+    }
 }
 
 fn binding(spec: &PipelineSpec, wanted: RuntimeInputRole) -> Option<ImageInputBinding> {
@@ -75,6 +159,7 @@ fn binding(spec: &PipelineSpec, wanted: RuntimeInputRole) -> Option<ImageInputBi
             name: name.clone(),
             contract: input.contract.clone(),
             default: input.default.clone(),
+            required: input.required,
         })
     })
 }
@@ -162,6 +247,58 @@ pub(crate) fn scalar_f32(
         values: vec![value; numel(&shape)],
         shape,
     })
+}
+
+pub(crate) fn token_input(
+    binding: &ImageInputBinding,
+    tokens: &[u32],
+) -> anyhow::Result<ImageInputValue> {
+    let values = tokens
+        .iter()
+        .map(|token| i64::from(*token))
+        .collect::<Vec<_>>();
+    let shape = match binding.contract.rank {
+        1 => vec![values.len() as i64],
+        2 => vec![1, values.len() as i64],
+        rank => anyhow::bail!("prompt token binding must have rank 1 or 2, got rank {rank}"),
+    };
+    Ok(ImageInputValue::I64 { values, shape })
+}
+
+fn push_optional_default_i64(
+    inputs: &mut Vec<(String, ImageInputValue)>,
+    binding: Option<&ImageInputBinding>,
+) -> anyhow::Result<()> {
+    let Some(binding) = binding else {
+        return Ok(());
+    };
+    match ImagePipelineSpec::default_i64(Some(binding)) {
+        Some(value) => inputs.push((binding.name.clone(), scalar_i64(binding, value)?)),
+        None if binding.required => anyhow::bail!(
+            "required image warmup input '{}' has no integer default",
+            binding.name
+        ),
+        None => {}
+    }
+    Ok(())
+}
+
+fn push_optional_default_f32(
+    inputs: &mut Vec<(String, ImageInputValue)>,
+    binding: Option<&ImageInputBinding>,
+) -> anyhow::Result<()> {
+    let Some(binding) = binding else {
+        return Ok(());
+    };
+    match ImagePipelineSpec::default_f32(Some(binding)) {
+        Some(value) => inputs.push((binding.name.clone(), scalar_f32(binding, value)?)),
+        None if binding.required => anyhow::bail!(
+            "required image warmup input '{}' has no numeric default",
+            binding.name
+        ),
+        None => {}
+    }
+    Ok(())
 }
 
 fn scalar_shape(contract: &TensorContract) -> anyhow::Result<Vec<i64>> {
