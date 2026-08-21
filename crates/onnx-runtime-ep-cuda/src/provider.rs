@@ -1628,6 +1628,14 @@ impl ExecutionProvider for CudaExecutionProvider {
         Ok(invalidated)
     }
 
+    fn has_device_graph_in(&self, slot: DeviceGraphSlot) -> Result<bool> {
+        // The CUDA EP owns one `CudaGraphLifecycle` per slot whose segments can be
+        // reset out-of-band (kernel-variant eviction retires kernels baked into a
+        // captured graph and resets both slots). Report the real per-slot liveness
+        // so the executor re-warms instead of replaying an emptied slot.
+        Ok(self.runtime.has_graph_executable_in(slot)?)
+    }
+
     fn check_device_capture_error(&self) -> Result<u32> {
         self.runtime.check_capture_error()
     }
@@ -2773,5 +2781,113 @@ extern "C" __global__ void copy_out(const float* in, float* out, unsigned long l
         ep.deallocate(pos_dst).unwrap();
         ep.deallocate(neg_dst).unwrap();
         ep.deallocate(out).unwrap();
+    }
+
+    /// Regression for the MTP dual-slot graph-replay crash: a kernel-variant
+    /// eviction resets BOTH the `Primary` (M=1 decode) and `Verify` (M=K
+    /// speculative) EP graph slots out-of-band while the executor's host-side
+    /// capture signature/schedule stay live. The next replay would then hit an
+    /// emptied slot and hard-error ("no executable is installed"). The executor's
+    /// pre-replay guard relies on [`ExecutionProvider::has_device_graph_in`]
+    /// reporting the real per-slot liveness so it can re-warm instead of crashing.
+    /// This locks that contract: after an out-of-band reset of both slots (exactly
+    /// what `evict_surplus_variants` does), the trait method reports no executable.
+    #[test]
+    fn has_device_graph_in_tracks_out_of_band_slot_eviction() {
+        use cudarc::driver::{LaunchConfig, PushKernelArg};
+        use onnx_runtime_ep_api::{CaptureSupport, Kernel, TensorMut, TensorView};
+
+        const MODULE: &str = "cuda_ep_slot_eviction_test";
+        const SOURCE: &str = r#"
+extern "C" __global__ void add_one(const float* x, float* y, unsigned long long n) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = x[i] + 1.0f;
+}
+"#;
+
+        struct CapturableKernel;
+        impl Kernel for CapturableKernel {
+            fn execute(&self, _inputs: &[TensorView], _outputs: &mut [TensorMut]) -> Result<()> {
+                Ok(())
+            }
+            fn capture_support(&self) -> CaptureSupport {
+                CaptureSupport::Supported
+            }
+        }
+
+        let Ok(ep) = CudaExecutionProvider::initialized(0) else {
+            eprintln!("skipping slot-eviction liveness test: CUDA EP unavailable");
+            return;
+        };
+        let runtime = ep.runtime().clone();
+        let add_one = runtime.nvrtc_function(MODULE, SOURCE, "add_one").unwrap();
+
+        let n = 32usize;
+        let size = n * std::mem::size_of::<f32>();
+        let p_in = runtime.alloc_raw(size).unwrap();
+        let p_out = runtime.alloc_raw(size).unwrap();
+        let v_in = runtime.alloc_raw(size).unwrap();
+        let v_out = runtime.alloc_raw(size).unwrap();
+
+        let launch = |src, dst| {
+            let n_u64 = n as u64;
+            let mut builder = runtime.stream().launch_builder(&add_one);
+            builder.arg(&src).arg(&dst).arg(&n_u64);
+            // SAFETY: signature `(const float*, float*, u64)`; both pointers
+            // cover `n` f32 elements and the launch bounds-checks `n`.
+            unsafe {
+                builder
+                    .launch(LaunchConfig::for_num_elems(n as u32))
+                    .unwrap();
+            }
+        };
+
+        // Install a captured graph into each slot (as the M=1 base decode and the
+        // M=K verify forward do).
+        let kernels: [&dyn Kernel; 1] = [&CapturableKernel];
+        ep.begin_device_graph_capture_in(DeviceGraphSlot::Primary, &kernels)
+            .unwrap();
+        launch(p_in, p_out);
+        ep.end_device_graph_capture_in(DeviceGraphSlot::Primary)
+            .unwrap();
+        ep.begin_device_graph_capture_in(DeviceGraphSlot::Verify, &kernels)
+            .unwrap();
+        launch(v_in, v_out);
+        ep.end_device_graph_capture_in(DeviceGraphSlot::Verify)
+            .unwrap();
+
+        // Both slots hold a replayable executable.
+        assert!(
+            ep.has_device_graph_in(DeviceGraphSlot::Primary).unwrap(),
+            "Primary must report an installed graph after capture"
+        );
+        assert!(
+            ep.has_device_graph_in(DeviceGraphSlot::Verify).unwrap(),
+            "Verify must report an installed graph after capture"
+        );
+
+        // Kernel-variant eviction resets BOTH slots out-of-band (mirrors
+        // `evict_surplus_variants`), without touching the executor's host state.
+        ep.reset_device_graph_in(DeviceGraphSlot::Primary).unwrap();
+        ep.reset_device_graph_in(DeviceGraphSlot::Verify).unwrap();
+
+        // The liveness signal the executor's pre-replay guard reads must now show
+        // both slots emptied, so it re-warms instead of replaying nothing.
+        assert!(
+            !ep.has_device_graph_in(DeviceGraphSlot::Primary).unwrap(),
+            "Primary must report no executable after out-of-band eviction"
+        );
+        assert!(
+            !ep.has_device_graph_in(DeviceGraphSlot::Verify).unwrap(),
+            "Verify must report no executable after out-of-band eviction"
+        );
+
+        // SAFETY: both slots reset, dropping all graph ownership before frees.
+        unsafe {
+            runtime.free_raw(v_out).unwrap();
+            runtime.free_raw(v_in).unwrap();
+            runtime.free_raw(p_out).unwrap();
+            runtime.free_raw(p_in).unwrap();
+        }
     }
 }

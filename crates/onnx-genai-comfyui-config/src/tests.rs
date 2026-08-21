@@ -100,6 +100,10 @@ fn converts_core_txt2img_into_canonical_workflow() {
         json!(20)
     );
     assert_eq!(workflow["outputs"]["image"]["role"], json!("image"));
+    assert_eq!(
+        workflow["outputs"]["image"]["value_range"],
+        json!("negative_one_to_one")
+    );
 }
 
 #[test]
@@ -139,6 +143,14 @@ fn guidance_becomes_two_encoder_passes_and_a_combine() {
     assert_eq!(
         workflow["inputs"]["request.guidance_scale"]["default"],
         json!(7.5)
+    );
+    assert_eq!(
+        workflow["inputs"]["request.guidance_scale"]["role"]["role"],
+        json!("guidance_scale")
+    );
+    assert_eq!(
+        workflow["inputs"]["request.negative_input_ids"]["role"]["role"],
+        json!("negative_prompt_tokens")
     );
 }
 

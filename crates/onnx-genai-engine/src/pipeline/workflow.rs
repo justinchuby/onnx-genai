@@ -1296,12 +1296,14 @@ impl PipelineEngine {
                                     carry.body_output
                                 )
                             })?;
-                            merge_inactive_rows(current, next, &active_rows).with_context(|| {
-                                format!(
-                                    "workflow loop carry '{}' cannot preserve inactive rows",
-                                    carry.cell
-                                )
-                            })?
+                            merge_inactive_rows(current, next, &active_rows, state).with_context(
+                                || {
+                                    format!(
+                                        "workflow loop carry '{}' cannot preserve inactive rows",
+                                        carry.cell
+                                    )
+                                },
+                            )?
                         };
                         values.insert(carry.next.clone(), next_value);
                         final_state_refs.insert(carry.cell.clone(), carry.next.clone());
@@ -3714,34 +3716,111 @@ fn slice_workflow_row(
     }
 }
 
-fn merge_inactive_rows(current: &Value, next: &Value, active: &[bool]) -> anyhow::Result<Value> {
+fn merge_inactive_rows(
+    current: &Value,
+    next: &Value,
+    active: &[bool],
+    state: &onnx_genai_metadata::WorkflowStateCell,
+) -> anyhow::Result<Value> {
     if active.len() == 1 || active.iter().all(|active| *active) {
         return clone_value(next);
     }
     anyhow::ensure!(current.dtype() == next.dtype());
-    anyhow::ensure!(
-        current.shape() == next.shape(),
-        "mixed active rows require equal current/next dense shapes; use per-row lengths and a \
-         KV service group for growing state"
-    );
+    anyhow::ensure!(current.shape().len() == next.shape().len());
+    let batch_axis = state
+        .contract
+        .batch_layout
+        .request_axis()
+        .context("mixed active row carry must be request-aligned")?;
     let rows = usize::try_from(
         *current
             .shape()
-            .first()
-            .context("mixed active row carry requires rank >= 1")?,
+            .get(batch_axis)
+            .context("mixed active row carry batch axis exceeds tensor rank")?,
     )?;
     anyhow::ensure!(
         active.len() == rows,
         "loop active mask has {} rows for state batch {rows}",
         active.len()
     );
-    let row_bytes = current.to_raw_bytes()?.len() / rows;
+    anyhow::ensure!(
+        next.shape().get(batch_axis) == current.shape().get(batch_axis),
+        "mixed active row carry changed its request-aligned axis"
+    );
+    for (axis, (before, after)) in current.shape().iter().zip(next.shape()).enumerate() {
+        if before != after {
+            anyhow::ensure!(
+                matches!(
+                    &state.recurrence,
+                    onnx_genai_metadata::ShapeRecurrence::Growing {
+                        axis: growing_axis,
+                        ..
+                    } if *growing_axis == axis && after > before
+                ),
+                "mixed active rows require equal dense shapes or declared monotonic growth"
+            );
+        }
+    }
+
+    let current_shape = current
+        .shape()
+        .iter()
+        .map(|dimension| usize::try_from(*dimension))
+        .collect::<Result<Vec<_>, _>>()?;
+    let next_shape = next
+        .shape()
+        .iter()
+        .map(|dimension| usize::try_from(*dimension))
+        .collect::<Result<Vec<_>, _>>()?;
+    let dense_strides = |shape: &[usize]| -> anyhow::Result<Vec<usize>> {
+        let mut strides = vec![1usize; shape.len()];
+        for axis in (0..shape.len().saturating_sub(1)).rev() {
+            strides[axis] = strides[axis + 1]
+                .checked_mul(shape[axis + 1])
+                .context("workflow carry stride overflowed")?;
+        }
+        Ok(strides)
+    };
+    let current_strides = dense_strides(&current_shape)?;
+    let next_strides = dense_strides(&next_shape)?;
+    let element_size = current.dtype().size_of();
     let current_bytes = current.to_raw_bytes()?;
-    let next_bytes = next.to_raw_bytes()?;
-    let mut merged = Vec::with_capacity(next_bytes.len());
-    for (row, active) in active.iter().enumerate() {
-        let source = if *active { &next_bytes } else { &current_bytes };
-        merged.extend_from_slice(&source[row * row_bytes..(row + 1) * row_bytes]);
+    // A dense tensor has one physical extent for the whole batch. Declared
+    // growth therefore allocates the new extent for inactive rows too: retain
+    // the producer's new suffix, but restore every coordinate that existed in
+    // the inactive row's prior semantic state.
+    let mut merged = next.to_raw_bytes()?;
+    for current_index in 0..current.numel() {
+        let row = (current_index / current_strides[batch_axis]) % current_shape[batch_axis];
+        if active[row] {
+            continue;
+        }
+        let mut remainder = current_index;
+        let mut next_index = 0usize;
+        for axis in 0..current_shape.len() {
+            let coordinate = remainder / current_strides[axis];
+            remainder %= current_strides[axis];
+            next_index = next_index
+                .checked_add(
+                    coordinate
+                        .checked_mul(next_strides[axis])
+                        .context("workflow carry index overflowed")?,
+                )
+                .context("workflow carry index overflowed")?;
+        }
+        let current_offset = current_index
+            .checked_mul(element_size)
+            .context("workflow carry byte offset overflowed")?;
+        let next_offset = next_index
+            .checked_mul(element_size)
+            .context("workflow carry byte offset overflowed")?;
+        let current_end = current_offset
+            .checked_add(element_size)
+            .context("workflow carry byte range overflowed")?;
+        let next_end = next_offset
+            .checked_add(element_size)
+            .context("workflow carry byte range overflowed")?;
+        merged[next_offset..next_end].copy_from_slice(&current_bytes[current_offset..current_end]);
     }
     Value::from_raw_bytes(merged, next.shape(), next.dtype()).map_err(Into::into)
 }
@@ -3990,9 +4069,48 @@ mod workflow_scalar_tests {
     fn inactive_rows_keep_their_previous_carry() {
         let current = Value::from_slice_i64(&[1, 2, 3, 4], &[2, 2]).expect("current");
         let next = Value::from_slice_i64(&[10, 20, 30, 40], &[2, 2]).expect("next");
-        let merged =
-            merge_inactive_rows(&current, &next, &[true, false]).expect("merge active rows");
+        let state: onnx_genai_metadata::WorkflowStateCell = serde_yaml::from_str(
+            "contract: { dtype: int64, rank: 2, shape: [batch, 2], batch_layout: { kind: \
+             request_aligned, axis: 0 } }\nscope: invocation\ninitializer: initial\nrecurrence: { \
+             kind: invariant }",
+        )
+        .expect("state");
+        let merged = merge_inactive_rows(&current, &next, &[true, false], &state)
+            .expect("merge active rows");
         assert_eq!(merged.to_vec_i64().expect("merged values"), [10, 20, 3, 4]);
+    }
+
+    #[test]
+    fn inactive_rows_keep_their_prefix_when_dense_state_grows() {
+        let current = Value::from_slice_i64(&[1, 2, 3, 4], &[2, 2]).expect("current");
+        let next = Value::from_slice_i64(&[10, 20, 30, 40, 50, 60], &[2, 3]).expect("next");
+        let state: onnx_genai_metadata::WorkflowStateCell = serde_yaml::from_str(
+            "contract: { dtype: int64, rank: 2, shape: [batch, context], batch_layout: { kind: \
+             request_aligned, axis: 0 } }\nscope: invocation\ninitializer: initial\nrecurrence: { \
+             kind: growing, axis: 1, increment: one, max: limit }",
+        )
+        .expect("state");
+        let merged = merge_inactive_rows(&current, &next, &[true, false], &state)
+            .expect("merge growing rows");
+        assert_eq!(
+            merged.to_vec_i64().expect("merged values"),
+            [10, 20, 30, 3, 4, 60]
+        );
+    }
+
+    #[test]
+    fn inactive_rows_follow_the_declared_nonleading_batch_axis() {
+        let current = Value::from_slice_i64(&[1, 2, 3, 4], &[2, 2]).expect("current");
+        let next = Value::from_slice_i64(&[10, 20, 30, 40], &[2, 2]).expect("next");
+        let state: onnx_genai_metadata::WorkflowStateCell = serde_yaml::from_str(
+            "contract: { dtype: int64, rank: 2, shape: [features, batch], batch_layout: { kind: \
+             request_aligned, axis: 1 } }\nscope: invocation\ninitializer: initial\nrecurrence: { \
+             kind: invariant }",
+        )
+        .expect("state");
+        let merged = merge_inactive_rows(&current, &next, &[true, false], &state)
+            .expect("merge active rows");
+        assert_eq!(merged.to_vec_i64().expect("merged values"), [10, 2, 30, 4]);
     }
 
     #[test]

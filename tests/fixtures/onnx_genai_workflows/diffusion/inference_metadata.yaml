@@ -9,24 +9,6 @@ pipeline:
       - loop_induction_values
       - typed_emit
     inputs:
-      request.latent:
-        contract:
-          dtype: float32
-          rank: 4
-          shape:
-          - batch
-          - 4
-          - height
-          - width
-          batch_layout:
-            kind: request_aligned
-            axis: 0
-        role:
-          kind: opaque
-        source:
-          kind: application
-          name: latent
-        required: true
       request.max_iterations:
         contract:
           dtype: int64
@@ -56,6 +38,25 @@ pipeline:
           kind: literal
         required: false
         default: false
+      request.noise:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 4
+          - height
+          - width
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: noise
+        required: true
+        externally_suppliable: true
       request.input_ids:
         contract:
           dtype: int64
@@ -73,6 +74,7 @@ pipeline:
         source:
           kind: request
         required: true
+        externally_suppliable: true
       package.loop_0_active:
         contract:
           dtype: bool
@@ -101,61 +103,68 @@ pipeline:
         role: image
         value_range: negative_one_to_one
         stage: pre_adapter
+      latent:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 4
+          - height
+          - width
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
+      noise_estimate:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 4
+          - height
+          - noise_estimate_width
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
+      latent_trajectory:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 4
+          - height
+          - trajectory_width
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
     components:
       text_encoder:
         implementation:
           kind: onnx
           artifact: text_encoder/model.onnx.textproto
+        ports:
+          roles:
+            input_ids: token_ids
+            encoder_hidden_states: encoder_hidden_states
       denoiser:
         implementation:
           kind: onnx
           artifact: denoiser/model.onnx.textproto
+        ports:
+          roles:
+            encoder_hidden_states: encoder_hidden_states
       vae_decoder:
         implementation:
           kind: onnx
           artifact: vae_decoder/model.onnx.textproto
-      euler_model_input:
-        implementation:
-          kind: onnx
-          artifact: policies/euler_model_input.onnx.textproto
-        ports:
-          inputs:
-            sample:
-              dtype: float32
-              rank: 4
-              shape:
-              - batch
-              - channels
-              - height
-              - width
-              batch_layout:
-                kind: request_aligned
-                axis: 0
-            step:
-              dtype: int64
-              rank: 1
-              shape:
-              - batch
-              batch_layout:
-                kind: request_aligned
-                axis: 0
-            schedule:
-              dtype: float32
-              rank: 1
-              shape:
-              - schedule_length
-          outputs:
-            model_input:
-              dtype: float32
-              rank: 4
-              shape:
-              - batch
-              - channels
-              - height
-              - width
-              batch_layout:
-                kind: request_aligned
-                axis: 0
       solver_step:
         implementation:
           kind: onnx
@@ -238,6 +247,48 @@ pipeline:
               rank: 1
               shape:
               - 1
+      model_input_scale:
+        implementation:
+          kind: onnx
+          artifact: policies/model_input_scale.onnx.textproto
+        ports:
+          inputs:
+            sample:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            step:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            schedule:
+              dtype: float32
+              rank: 1
+              shape:
+              - schedule_length
+          outputs:
+            model_input:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
       diffusion_schedule:
         implementation:
           kind: onnx
@@ -290,8 +341,54 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+      tensor_scale:
+        implementation:
+          kind: onnx
+          artifact: policies/tensor_scale.onnx.textproto
+        ports:
+          inputs:
+            tensor:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            scale:
+              dtype: float32
+              rank: 1
+              shape:
+              - 1
+          outputs:
+            scaled:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      initial_state_scale:
+        implementation:
+          kind: onnx
+          artifact: policies/initial_state_scale.onnx.textproto
+        ports:
+          inputs: {}
+          outputs:
+            value:
+              dtype: float32
+              rank: 1
+              shape:
+              - 1
     state:
-      latent:
+      latent_state:
         contract:
           dtype: float32
           rank: 4
@@ -304,7 +401,7 @@ pipeline:
             kind: request_aligned
             axis: 0
         scope: invocation
-        initializer: request.latent
+        initializer: diffusion.initial_state
         recurrence:
           kind: invariant
       loop_0_active:
@@ -331,6 +428,18 @@ pipeline:
         outputs:
           schedule: diffusion.timesteps
       - kind: invoke
+        component: initial_state_scale
+        inputs: {}
+        outputs:
+          value: diffusion.initial_scale
+      - kind: invoke
+        component: tensor_scale
+        inputs:
+          tensor: request.noise
+          scale: diffusion.initial_scale
+        outputs:
+          scaled: diffusion.initial_state
+      - kind: invoke
         component: text_encoder
         inputs:
           input_ids: request.input_ids
@@ -351,9 +460,9 @@ pipeline:
         outputs:
           timestep: diffusion.timestep
       - kind: invoke
-        component: euler_model_input
+        component: model_input_scale
         inputs:
-          sample: latent
+          sample: latent_state
           step: loop.iteration
           schedule: diffusion.schedule
         outputs:
@@ -369,12 +478,20 @@ pipeline:
       - kind: invoke
         component: solver_step
         inputs:
-          sample: latent
-          derivative: denoiser.estimate
+          sample: latent_state
           step: loop.iteration
           schedule: diffusion.schedule
+          derivative: denoiser.estimate
         outputs:
           next_state: latent.body
+      - kind: emit
+        value: denoiser.estimate
+        output: noise_estimate
+        mode: append
+      - kind: emit
+        value: latent.body
+        output: latent_trajectory
+        mode: append
       - kind: invoke
         component: continue_predicate
         inputs:
@@ -384,7 +501,7 @@ pipeline:
       continue_when: loop_0_active
       max_iterations: request.max_iterations
       carried:
-      - cell: latent
+      - cell: latent_state
         next: latent.body
       - cell: loop_0_active
         next: loop.continue
@@ -395,32 +512,20 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
     - kind: invoke
       component: vae_decoder
       inputs:
-        latent: latent
+        latent: latent_state
       outputs:
         image: vae.image
+    - kind: emit
+      value: latent_state
+      output: latent
+      mode: replace
     - kind: emit
       value: vae.image
       output: image
       mode: replace
-package:
-  tokenizer:
-    algorithm: bpe
-    vocab_size: 32000
-    byte_level: true
-    artifacts:
-    - location: tokenizer.json
-      sha256: '0000000000000000000000000000000000000000000000000000000000000000'
-    special_tokens:
-      bos:
-        id: 1
-        content: <s>
-      eos:
-        id: 2
-        content: </s>
-generation:
-  overrides:
-    max_output_tokens:
-      input: request.max_iterations

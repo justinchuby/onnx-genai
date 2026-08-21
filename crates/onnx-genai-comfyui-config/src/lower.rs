@@ -145,10 +145,15 @@ impl<'a> Lowering<'a> {
         );
 
         if plan.uses_guidance() {
-            self.application_input(
+            self.request_input(
                 "request.negative_input_ids",
                 token_contract(),
-                "negative_input_ids",
+                json!({
+                    "kind": "runtime",
+                    "version": "1.0",
+                    "role": "negative_prompt_tokens"
+                }),
+                json!({"kind": "application", "name": "negative_input_ids"}),
                 true,
                 None,
             );
@@ -156,10 +161,11 @@ impl<'a> Lowering<'a> {
                 .guidance
                 .as_ref()
                 .map_or(1.0, |guidance| guidance.scale);
-            self.application_input(
+            self.request_input(
                 "request.guidance_scale",
                 row_contract("float32"),
-                "guidance_scale",
+                json!({"kind": "runtime", "version": "1.0", "role": "guidance_scale"}),
+                json!({"kind": "application", "name": "guidance_scale"}),
                 false,
                 Some(json!(scale)),
             );
@@ -1007,7 +1013,12 @@ impl<'a> Lowering<'a> {
         }));
         self.outputs.insert(
             "image".to_owned(),
-            json!({"contract": image_contract(3), "role": "image", "stage": "pre_adapter"}),
+            json!({
+                "contract": image_contract(3),
+                "role": "image",
+                "value_range": "negative_one_to_one",
+                "stage": "pre_adapter"
+            }),
         );
         self.outputs.insert(
             "latent".to_owned(),

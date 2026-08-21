@@ -2007,6 +2007,33 @@ fn only_capacity_aware_inputs_keep_physical_capacity() {
     assert!(!kernel_input_uses_padded_capacity(&indexer_cast, 0));
 }
 
+/// A decline is only actionable if it names the consumer that caused it.
+/// `describe_non_padded_consumer` is the single place that formats that name,
+/// and it is derived from the same allowlist as the predicate so the two cannot
+/// drift apart.
+#[test]
+fn non_padded_consumers_are_named_for_attribution() {
+    let mut cast = Node::new(NodeId(0), "Cast", vec![], vec![]);
+    cast.name = "model/Cast_node_5".to_string();
+    assert_eq!(
+        describe_non_padded_consumer(&cast, 0).as_deref(),
+        Some("model/Cast_node_5(Cast)[input 0]")
+    );
+
+    // A capacity-safe consumer is not an offender and must not be reported,
+    // otherwise every model would look like it had a blocker.
+    let shape = Node::new(NodeId(1), "Shape", vec![], vec![]);
+    assert_eq!(describe_non_padded_consumer(&shape, 0), None);
+
+    // Non-zero slots are outside the allowlist regardless of op type, and an
+    // unnamed node still has to produce a usable message.
+    let unnamed = Node::new(NodeId(2), "Shape", vec![], vec![]);
+    assert_eq!(
+        describe_non_padded_consumer(&unnamed, 1).as_deref(),
+        Some("<unnamed>(Shape)[input 1]")
+    );
+}
+
 // A capacity-form default-domain `Attention`: mask at input 3, KV cache at
 // inputs 4/5 — so it derives the valid length from the mask frontier and binds
 // the KV cache at physical capacity, in either the causal or non-causal form.
@@ -2401,15 +2428,40 @@ fn v2lite_symbolic_mask_graph() -> (Graph, ValueId, SymbolId, Node) {
     let mask = graph.create_named_value("attention_mask", DataType::Int64, m2(batch, seq));
     graph.add_input(mask);
     let cumsum = graph.create_named_value("cumsum", DataType::Int64, m2(batch, seq));
-    graph.insert_node(Node::new(NodeId(0), "CumSum", vec![Some(mask)], vec![cumsum]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "CumSum",
+        vec![Some(mask)],
+        vec![cumsum],
+    ));
     let unsq0 = graph.create_named_value("unsq0", DataType::Int64, m3(batch, seq));
-    graph.insert_node(Node::new(NodeId(1), "Unsqueeze", vec![Some(cumsum)], vec![unsq0]));
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "Unsqueeze",
+        vec![Some(cumsum)],
+        vec![unsq0],
+    ));
     let ge = graph.create_named_value("ge", DataType::Bool, m3(batch, seq));
-    graph.insert_node(Node::new(NodeId(2), "GreaterOrEqual", vec![Some(unsq0)], vec![ge]));
+    graph.insert_node(Node::new(
+        NodeId(2),
+        "GreaterOrEqual",
+        vec![Some(unsq0)],
+        vec![ge],
+    ));
     let unsq1 = graph.create_named_value("unsq1", DataType::Int64, m3(batch, seq));
-    graph.insert_node(Node::new(NodeId(3), "Unsqueeze", vec![Some(mask)], vec![unsq1]));
+    graph.insert_node(Node::new(
+        NodeId(3),
+        "Unsqueeze",
+        vec![Some(mask)],
+        vec![unsq1],
+    ));
     let padbool = graph.create_named_value("padbool", DataType::Bool, m3(batch, seq));
-    graph.insert_node(Node::new(NodeId(4), "Cast", vec![Some(unsq1)], vec![padbool]));
+    graph.insert_node(Node::new(
+        NodeId(4),
+        "Cast",
+        vec![Some(unsq1)],
+        vec![padbool],
+    ));
     let and = graph.create_named_value("and", DataType::Bool, m3(batch, seq));
     graph.insert_node(Node::new(
         NodeId(5),
@@ -2418,20 +2470,36 @@ fn v2lite_symbolic_mask_graph() -> (Graph, ValueId, SymbolId, Node) {
         vec![and],
     ));
     let where_o = graph.create_named_value("where", DataType::Float32, m3(batch, seq));
-    graph.insert_node(Node::new(NodeId(6), "Where", vec![Some(and)], vec![where_o]));
+    graph.insert_node(Node::new(
+        NodeId(6),
+        "Where",
+        vec![Some(and)],
+        vec![where_o],
+    ));
     let cast_o = graph.create_named_value("cast", DataType::Float32, m3(batch, seq));
-    graph.insert_node(Node::new(NodeId(7), "Cast", vec![Some(where_o)], vec![cast_o]));
+    graph.insert_node(Node::new(
+        NodeId(7),
+        "Cast",
+        vec![Some(where_o)],
+        vec![cast_o],
+    ));
     let bias = graph.create_named_value(
         "mask_bias",
         DataType::Float32,
         vec![sym(batch), st(1), st(1), sym(seq)],
     );
-    graph.insert_node(Node::new(NodeId(8), "Unsqueeze", vec![Some(cast_o)], vec![bias]));
+    graph.insert_node(Node::new(
+        NodeId(8),
+        "Unsqueeze",
+        vec![Some(cast_o)],
+        vec![bias],
+    ));
 
     // Capacity-form `Attention` consuming the additive bias (input 3) with past
     // KV bindings at inputs 4/5.
     let q = graph.create_named_value("q", DataType::Float32, vec![sym(batch), st(1), st(256)]);
-    let attn = graph.create_named_value("attn", DataType::Float32, vec![sym(batch), st(1), st(256)]);
+    let attn =
+        graph.create_named_value("attn", DataType::Float32, vec![sym(batch), st(1), st(256)]);
     let node = capacity_form_attention(10, q, bias, attn);
     graph.insert_node(node.clone());
     graph.add_output(attn);
