@@ -101,6 +101,10 @@ name = "int4_decode_loop_ab"
 harness = false
 
 [[bench]]
+name = "int4_acc0_attribution"
+harness = false
+
+[[bench]]
 name = "int8_prefill_route_ab"
 harness = false
 
