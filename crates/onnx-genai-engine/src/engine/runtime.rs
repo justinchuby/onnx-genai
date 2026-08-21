@@ -381,7 +381,9 @@ impl Engine {
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         self.last_speculative_stats = SpeculativeStats::default();
-        if request.options.speculative_mode.is_none() && self.native_shared_kv_proposer.is_some() {
+        if request.options.speculative_mode.is_none()
+            && (self.native_shared_kv_proposer.is_some() || self.mtp.is_some())
+        {
             request.options.speculative_mode = Some(self.speculative_mode.clone());
         }
         reject_native_request_speculation(&request.options)?;
@@ -452,6 +454,42 @@ impl Engine {
                             &proposer.embedder,
                             &proposer.groups,
                             proposer.hidden_size,
+                            plan.width,
+                        )?
+                    }
+                    NativeSpeculationKind::Mtp => {
+                        let mtp = self.mtp.as_ref().context(
+                            "native MTP speculation requested without a loaded MTP head",
+                        )?;
+                        // Reuse the generic MtpProposer (guaranteed target token +
+                        // K speculative drafts from the ORT MTP head) through the
+                        // native driver; the head runs on the ORT CUDA EP while the
+                        // hybrid GDN target runs natively. The recurrent-state
+                        // commit-by-accepted primitive (#1633) advances the target's
+                        // GDN/conv state on accept.
+                        let proposer = MtpProposer::new_owned(
+                            std::sync::Arc::clone(&mtp.session),
+                            onnx_genai_ort::MtpDecodeOptions {
+                                kv_mode: mtp.kv_mode,
+                                batch_size: 1,
+                                hc_mult: mtp.runtime_config.hc_mult,
+                                hidden_state_rank4: mtp.runtime_config.target_hidden_layout
+                                    == MtpHiddenLayout::Bshc,
+                                hidden_output: mtp.runtime_config.mtp_hidden_output.clone(),
+                                state_output: mtp.runtime_config.mtp_state_output.clone(),
+                            },
+                            mtp.embedder.clone(),
+                            mtp.lm_head.clone(),
+                            mtp.runtime_config.cache_scope,
+                        )?;
+                        let hidden_size = mtp
+                            .runtime_config
+                            .hc_mult
+                            .saturating_mul(mtp.config.hidden_size);
+                        crate::native_speculative::NativeSpeculativeDriver::new_mtp(
+                            native_session,
+                            proposer,
+                            hidden_size,
                             plan.width,
                         )?
                     }
@@ -822,7 +860,9 @@ impl Engine {
             // cold and session-reusing paths still admit through the scheduler
             // before touching the native backend.
             let native_spec_requested = request.options.speculative_mode.is_some()
-                || request.options.num_speculative_tokens.is_some();
+                || request.options.num_speculative_tokens.is_some()
+                || self.mtp.is_some()
+                || self.native_shared_kv_proposer.is_some();
             if request.options.cold_start || native_spec_requested {
                 let result = self.generate_native_cold_with_callback(
                     request,

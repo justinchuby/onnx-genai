@@ -731,6 +731,26 @@ pub(crate) struct DecodeCudaState {
     /// captured graph already tolerates on the M=1 replay path. Kept dormant
     /// (default `false`) until WP4 graduates verify to the captured path.
     pub(crate) retain_graph_on_rewind: bool,
+    /// **Dormant seam (default `false`).** When `true`, the captured M=1 decode
+    /// graph would be retained across a speculative verify+commit cycle instead
+    /// of being torn down twice per step (once by the eager M>1 verify forward,
+    /// once by the commit rewind), the two invalidations that pin MTP at
+    /// `replays=0` (empirically 30 verify + 21 rewind invalidations over 10
+    /// verify steps).
+    ///
+    /// Kept OFF because enabling it is **not capture-safe** as-is: the eager M>1
+    /// verify reserves a larger StepScoped `step_workspace` that is freed after
+    /// the run, so a later M=1 replay reads the captured graph's now-stale
+    /// workspace pointer and yields non-finite logits (GPU-verified; the finite
+    /// guard catches it — no silent corruption). Retaining across the rewind
+    /// alone, or across the verify alone, is safe but useless (the other site
+    /// still tears the graph down, so `replays` stays 0); retaining across both —
+    /// the only config that actually replays — is what corrupts. A real speedup
+    /// requires the M=K verify itself captured into a fixed-shape replayable
+    /// graph with a pinned workspace (option-c padded verify capture), since the
+    /// eager verify otherwise pays the full per-op launch overhead that graphed
+    /// greedy avoids. See the decision note for the GPU evidence and plan.
+    pub(crate) retain_decode_graph_across_spec: bool,
     /// Dormant option (c) scaffolding: the fixed query-row capacity (M=maxK) a
     /// padded single-capture verify graph would be captured at. `None` today —
     /// the eager verify path (option (b)) captures nothing. Set only by the
@@ -1251,14 +1271,45 @@ impl NativeDecodeSession {
             .cuda
             .as_mut()
             .context("CUDA decode state is not initialized")?;
-        state.invalidate_graph(&mut self.session)?;
+        // An eager M>1 verify/prefill forward tears down the captured M=1 decode
+        // graph here so the plain M=1 hot path re-warms cleanly. The dormant
+        // `retain_decode_graph_across_spec` seam (default OFF) would skip this to
+        // let the base-decode graph survive a spec verify+commit cycle — but that
+        // is NOT capture-safe yet: this forward reserves a larger StepScoped
+        // `step_workspace` that is freed (`release_step_workspace`) after the run,
+        // so a subsequent M=1 replay reads the captured graph's now-stale
+        // workspace pointer and produces non-finite logits (GPU-verified; the
+        // finite-check guard catches it). Graduating this to a real speedup needs
+        // the M=K verify itself captured into a fixed-shape replayable graph with
+        // a pinned workspace (option-c padded verify capture), not just retaining
+        // the M=1 graph. Kept as a documented seam; see the decision note.
+        if !state.retain_decode_graph_across_spec {
+            state.invalidate_graph(&mut self.session)?;
+        }
+        // Auxiliary graph outputs (e.g. the MTP hidden-state seed
+        // `hidden_states.63`) get a persistent device binding whose symbolic
+        // query-seq axis is collapsed to `1` for the captured decode step
+        // (`persistent_output_shape`). A multi-row eager forward (`m > 1`
+        // prefill/verify) produces `[1, m, hidden]`, which cannot fit that
+        // `[1, 1, hidden]` binding, so we EXCLUDE the auxiliary tail from the
+        // device-binding slice here and let those outputs materialize to host
+        // this step — mirroring how `logits` (bound past `base_binding_count`)
+        // already materializes. The captured single-token path keeps the
+        // persistent binding (it produces `m == 1`), preserving capture-safety.
+        // For pure-attention models with no auxiliary outputs this range is
+        // empty and the slice is byte-identical to `..base_binding_count`.
+        let aux_start = state.auxiliary_binding_range.start;
+        let aux_names = state.bindings[state.auxiliary_binding_range.clone()]
+            .iter()
+            .filter_map(|binding| binding.output_name().map(str::to_owned))
+            .collect::<HashSet<_>>();
         let bindings = owned
             .iter()
             .map(|(name, tensor)| (name.as_str(), tensor))
             .collect::<Vec<_>>();
         let outputs = match self
             .session
-            .run_with_device_bindings(&bindings, &mut state.bindings[..state.base_binding_count])
+            .run_with_device_bindings(&bindings, &mut state.bindings[..aux_start])
         {
             Ok(outputs) => outputs,
             Err(error) => {
@@ -1282,12 +1333,31 @@ impl NativeDecodeSession {
         let logits = named
             .remove(&self.logits)
             .with_context(|| format!("native decoder omitted logits output '{}'", self.logits))?;
-        if !named.is_empty() {
+        // The declared hidden seed (if any) materialized to host because it is an
+        // auxiliary output; record its last row so the MTP proposer can read it
+        // via `last_hidden()`. Inert when no hidden output is declared.
+        let hidden = self
+            .hidden_output
+            .as_ref()
+            .and_then(|name| named.remove(name.as_str()));
+        // Every remaining materialized output must be an auxiliary output we
+        // deliberately excluded from the device slice; a non-auxiliary
+        // materialization signals a real binding bug and must still fail.
+        if let Some(unexpected) = named.keys().find(|name| !aux_names.contains(name.as_str())) {
             bail!(
-                "native CUDA {error_context} unexpectedly materialized bound outputs: {:?}",
-                named.keys().collect::<Vec<_>>()
+                "native CUDA {error_context} unexpectedly materialized bound output '{unexpected}'"
             );
         }
+        self.last_hidden = match (&self.hidden_output, hidden) {
+            (Some(name), Some(tensor)) => Some(
+                extract_last_row(&tensor)
+                    .with_context(|| format!("read native decoder hidden output '{name}'"))?,
+            ),
+            (Some(name), None) => {
+                bail!("native decoder omitted declared hidden output '{name}'")
+            }
+            (None, _) => None,
+        };
         let logits = extract_logits(&logits)?;
         if logits.iter().flatten().any(|value| !value.is_finite()) {
             bail!("native decoder produced non-finite logits");
@@ -1921,6 +1991,9 @@ impl NativeDecodeSession {
                 if let Some(profile) = step_profile {
                     profile.finish("decode_inline", step_wall);
                 }
+                if let Some(hidden_output) = self.hidden_output.as_deref() {
+                    self.last_hidden = Some(read_aux_hidden_last_row(state, hidden_output)?);
+                }
                 state.set_logical_len(total_len)?;
                 self.current_len = total_len;
                 return Ok(logits);
@@ -1959,6 +2032,9 @@ impl NativeDecodeSession {
             step_wall.finite_check_ms = finite_check_start.elapsed().as_secs_f64() * 1_000.0;
             if let Some(profile) = step_profile {
                 profile.finish("decode", step_wall);
+            }
+            if let Some(hidden_output) = self.hidden_output.as_deref() {
+                self.last_hidden = Some(read_aux_hidden_last_row(state, hidden_output)?);
             }
             state.set_logical_len(total_len)?;
             self.current_len = total_len;
@@ -3001,7 +3077,12 @@ impl DecodeCudaState {
     /// a regression test can assert it is *actually* exercising the VMM path
     /// rather than silently falling back to the eager path (which would make a
     /// "VMM reservation" assertion prove nothing).
-    #[cfg(feature = "native-cuda")]
+    ///
+    /// `cfg(test)` as well as the feature: its only caller is the assertion in
+    /// `native_decode::tests`, so in the plain `lib` target it is genuinely
+    /// dead and `-D dead-code` rejects it. It is `pub(crate)`, so no integration
+    /// test outside this crate could reach it anyway.
+    #[cfg(all(feature = "native-cuda", test))]
     pub(crate) fn kv_commits_on_demand(&self) -> bool {
         self.kv_commits_on_demand
     }
@@ -4412,6 +4493,11 @@ impl DecodeCudaState {
             graph_fallback_report: None,
             auxiliary_bind_declines: declined_auxiliary,
             retain_graph_on_rewind: false,
+            // Dormant seam (default off): retaining the M=1 graph across a spec
+            // verify+commit cycle is not capture-safe until the M=K verify is
+            // itself captured with a pinned workspace. See the field docs and the
+            // decision note for the GPU evidence.
+            retain_decode_graph_across_spec: false,
             #[cfg(test)]
             padded_query_capacity: None,
             device_token_loop_k,
@@ -5422,6 +5508,20 @@ impl DecodeCudaState {
         self.retain_graph_on_rewind = retain;
     }
 
+    /// Toggle the dormant spec-decode graph-retention seam
+    /// (`retain_decode_graph_across_spec`). Kept off in production because it is
+    /// not capture-safe until the M=K verify is captured with a pinned workspace;
+    /// exposed for the option-c work and its tests. See the field docs.
+    #[cfg(test)]
+    pub(crate) fn set_retain_decode_graph_across_spec(&mut self, retain: bool) {
+        self.retain_decode_graph_across_spec = retain;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retain_decode_graph_across_spec(&self) -> bool {
+        self.retain_decode_graph_across_spec
+    }
+
     /// Fixed query-row capacity (M=maxK) of the dormant padded verify capture, or
     /// `None` while the eager (option (b)) verify path is in force.
     #[cfg(test)]
@@ -5649,6 +5749,34 @@ fn checked_shape_bytes(shape: &[usize], dtype: DataType) -> Option<usize> {
         .iter()
         .try_fold(1usize, |product, &dim| product.checked_mul(dim))?;
     dtype.checked_storage_bytes(elements)
+}
+
+/// Read the last row of a declared hidden-state auxiliary output from its
+/// persistent CUDA device binding (the captured single-token decode step leaves
+/// this output device-resident). Used to seed the MTP proposer with the target's
+/// hidden state after a captured decode step; the eager multi-row path reads the
+/// same value from the host-materialized output instead. Locating the binding by
+/// its declared output name keeps this free of hardcoded layer/dim assumptions.
+fn read_aux_hidden_last_row(
+    state: &mut DecodeCudaState,
+    hidden_output: &str,
+) -> anyhow::Result<Vec<f32>> {
+    let index = state
+        .auxiliary_binding_range
+        .clone()
+        .find(|&index| state.bindings[index].output_name() == Some(hidden_output))
+        .with_context(|| {
+            format!(
+                "declared hidden output '{hidden_output}' has no persistent CUDA auxiliary binding; the MTP hidden seed must be a bound graph output"
+            )
+        })?;
+    let binding = &mut state.bindings[index];
+    let dtype = binding.dtype;
+    let shape = binding.physical_shape().to_vec();
+    let bytes = binding.read_bytes()?;
+    let tensor = Tensor::from_raw(dtype, shape, &bytes)?;
+    extract_last_row(&tensor)
+        .with_context(|| format!("read native decoder hidden output '{hidden_output}'"))
 }
 
 #[cfg(feature = "native-cuda")]

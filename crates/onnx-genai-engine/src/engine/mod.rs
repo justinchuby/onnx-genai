@@ -63,6 +63,14 @@ pub(crate) use crate::speculative::{
     LinearEmbedder, LinearLmHead, MtpEmbedder, MtpLmHead, SpeculativeStats,
     load_target_initializer_adapters,
 };
+// `MtpProposer` is reached from exactly one place in this module tree --
+// `runtime.rs`'s `generate_native_cold_with_callback`, which is itself
+// `#[cfg(feature = "native-backend")]`. Importing it unconditionally therefore
+// makes it an unused import in the default feature set, which `-D warnings`
+// rejects. Its siblings above stay ungated because each has uses that are not
+// feature-dependent (load.rs, model.rs, runtime.rs).
+#[cfg(feature = "native-backend")]
+pub(crate) use crate::speculative::MtpProposer;
 
 mod decode_backend;
 mod governor;

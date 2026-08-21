@@ -22,11 +22,11 @@ def save(model, name, check=True):
     # Fixtures are committed as git-friendly ONNX protobuf TextFormat
     # (`model.onnx.textproto`), which our runtime loader parses transparently
     # (see `onnx_runtime_loader::is_textproto_path`). No binary `model.onnx` is
-    # committed. NOTE: the canonical committed textproto is produced by the Rust
-    # helper (`cargo run -p onnx-std --example convert_fixture`, which uses
-    # `onnx_std::textproto::to_textproto`); this Python path emits an equivalent,
-    # loader-compatible textproto whose exact formatting may differ from the
-    # Rust canonical output.
+    # committed. NOTE: this comment used to name a Rust helper example as the
+    # canonical producer, but no such example exists and git history shows none
+    # ever did. `onnx_std::textproto::to_textproto` is the canonical formatter;
+    # this Python path emits an equivalent, loader-compatible textproto whose
+    # exact formatting may differ from that Rust output.
     path = os.path.join(FIXTURES_DIR, name, "model.onnx.textproto")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if check:

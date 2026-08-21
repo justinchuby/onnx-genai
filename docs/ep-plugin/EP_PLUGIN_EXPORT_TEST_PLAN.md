@@ -103,10 +103,13 @@ required symbols.
 **How:**
 
 ```bash
-cargo build -p onnx-runtime-ep-cpu --features plugin-export
-nm -D target/debug/libonnx_runtime_ep_cpu.so \
-  | grep -E "CreateEpApiFactories|ReleaseEpApiFactory"
-# Must print both (at minimum CreateEpApiFactories) as type "T" (defined text symbols).
+# What shipped is a separate cdylib crate rather than a `plugin-export` feature
+# on `onnx-runtime-ep-cpu`, and the exported names are `CreateEpFactories` /
+# `ReleaseEpFactory` (no `Api` infix).
+cargo build -p onnx-runtime-ep-cpu-plugin
+nm -D target/debug/libonnx_runtime_ep_cpu_plugin.so \
+  | grep -E "CreateEpFactories|ReleaseEpFactory"
+# Must print both (at minimum CreateEpFactories) as type "T" (defined text symbols).
 ```
 
 This can also be a CI shell step or a `#[test]` that `std::process::Command`s
