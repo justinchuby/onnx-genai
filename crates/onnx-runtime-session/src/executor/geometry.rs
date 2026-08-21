@@ -460,6 +460,22 @@ pub(super) fn kernel_input_uses_padded_capacity(node: &Node, input_index: usize)
         && matches!(node.op_type.as_str(), "Shape" | "ReduceSum")
 }
 
+/// Name a consumer that is *not* padded-capacity-safe, for attribution. Returns
+/// `None` for a capacity-safe consumer so callers can filter and format in one
+/// pass. Kept next to [`kernel_input_uses_padded_capacity`] so the allowlist and
+/// the message that explains a decline cannot drift apart.
+pub(super) fn describe_non_padded_consumer(node: &Node, input_index: usize) -> Option<String> {
+    if kernel_input_uses_padded_capacity(node, input_index) {
+        return None;
+    }
+    let name = if node.name.is_empty() {
+        "<unnamed>"
+    } else {
+        node.name.as_str()
+    };
+    Some(format!("{name}({})[input {input_index}]", node.op_type))
+}
+
 /// The default-domain ops that make up the standard additive causal-attention
 /// mask builder (`attention_mask → CumSum/Unsqueeze/… → Where(0/-inf) → Cast →
 /// Attention[input 3]`). When the mask binding's entire transitive consumer cone
