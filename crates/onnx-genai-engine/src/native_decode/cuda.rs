@@ -1628,6 +1628,27 @@ impl NativeDecodeSession {
         // stable across replays; the main executor's M=1 decode keeps its natural
         // (unpinned) workspace on the `Primary` slot.
         self.session.enable_verify_sibling()?;
+
+        // Blocker B: with the verify running on its own sibling, the ONLY thing
+        // still tearing down the M=1 `Primary` decode graph every spec step is the
+        // contents-only KV roll-back in `commit_recurrent_state_to_accepted`
+        // (`rewind_inner` at a non-zero `target_len`). That rewind leaves every
+        // binding's physical_shape/device_ptr fixed (it only zeros the mask tail +
+        // truncates the KV logical length), so the captured M=1 graph's replay
+        // signature stays valid across it — exactly the contents-only case the
+        // `retain_decode_graph_across_spec` seam was built for. Its historical
+        // caveat ("the eager M>1 verify tears the graph down every step
+        // regardless, and retaining is capture-unsafe until the verify workspace
+        // is pinned") is now resolved: the verify is a separate, workspace-pinned
+        // sibling and never touches the Primary slot. Enabling retention here lets
+        // the Primary graph replay across the spec rewind while the per-token
+        // (M=1) re-advance replays it too. Scoped to verify-capture (recurrent
+        // MTP): greedy has no `verify_width`, never hits a non-zero rewind, and is
+        // left byte-identical. A generation reset (`target_len == 0`) still
+        // invalidates, so no stale graph leaks across prompts.
+        if let Some(state) = self.cuda.as_mut() {
+            state.retain_decode_graph_across_spec = true;
+        }
         Ok(())
     }
 
