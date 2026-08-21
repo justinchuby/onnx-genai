@@ -1,0 +1,33 @@
+ir_version: 11
+producer_name: "onnx-genai-comfyui-fixture"
+graph {
+  node {
+    input: "sigmas"
+    output: "schedule"
+    op_type: "Identity"
+  }
+  name: "diffusion_schedule"
+  initializer {
+    dims: 5
+    data_type: 1
+    name: "sigmas"
+    raw_data: "\000\000\200@\013\273\215?\215\344j>\217\302\365<\000\000\000\000"
+  }
+  output {
+    name: "schedule"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 5
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}

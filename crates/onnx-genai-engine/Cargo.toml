@@ -33,43 +33,11 @@ name = "weight_offload_native_cuda_e2e"
 required-features = ["native-cuda"]
 
 [[test]]
-name = "native_step_component_parity"
-required-features = ["native-backend"]
-
-[[test]]
-name = "native_pipeline_decoder_parity"
-required-features = ["native-backend"]
-
-# Uses PipelineEngine::materialize_published_prefix_kv, which is itself
-# #[cfg(feature = "native-backend")]. Without this the test is built on a
-# default `cargo test --all-targets` and fails to compile; CI only checks this
-# crate with the feature on, so the break is invisible there.
-[[test]]
-name = "native_pipeline_backend_selection_parity"
-required-features = ["native-backend"]
-
-[[test]]
-name = "native_full_pipeline_parity"
-required-features = ["native-backend"]
-
-[[test]]
 name = "deepseek_v2_tiny_qmoe_native_e2e"
 required-features = ["native-backend"]
 
 [[test]]
-name = "native_cuda_pipeline_decoder_parity"
-required-features = ["native-cuda"]
-
-[[test]]
-name = "native_cuda_routed_pipeline_decoder_parity"
-required-features = ["native-cuda"]
-
-[[test]]
 name = "native_cuda_captured_step_inputs_parity"
-required-features = ["native-cuda"]
-
-[[test]]
-name = "gemma4_e2b_native_cuda_pipeline_bench"
 required-features = ["native-cuda"]
 
 [[test]]
@@ -143,6 +111,7 @@ cuda-13000 = [
 
 [dependencies]
 onnx-genai-metadata = { workspace = true }
+onnx-genai-preprocess = { workspace = true }
 onnx-genai-genai-config = { workspace = true }
 onnx-genai-kv = { workspace = true }
 onnx-runtime-memory-governor = { workspace = true }
@@ -166,6 +135,7 @@ anyhow = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
+sha2 = { workspace = true }
 tokenizers = { workspace = true }
 rand = "0.9.5"
 half = { workspace = true, features = ["use-intrinsics"] }
@@ -179,7 +149,6 @@ toktrie_hf_tokenizers = "1.7.6"
 libc = "0.2"
 
 [dev-dependencies]
-onnx-genai-preprocess = { workspace = true }
 async-trait = { workspace = true }
 proptest = "1.9"
 

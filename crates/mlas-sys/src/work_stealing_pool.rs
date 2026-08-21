@@ -85,6 +85,7 @@ impl Job {
 struct Shared {
     epoch: AtomicUsize,
     ready: AtomicUsize,
+    observed: AtomicUsize,
     remaining: AtomicUsize,
     active: AtomicUsize,
     shutdown: AtomicBool,
@@ -122,6 +123,7 @@ impl WorkStealingThreadPool {
         let shared = Arc::new(Shared {
             epoch: AtomicUsize::new(0),
             ready: AtomicUsize::new(0),
+            observed: AtomicUsize::new(0),
             remaining: AtomicUsize::new(0),
             active: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
@@ -228,6 +230,7 @@ impl WorkStealingThreadPool {
             };
         }
 
+        self.shared.observed.store(0, Ordering::Relaxed);
         self.shared.remaining.store(claims, Ordering::Release);
         self.shared.epoch.fetch_add(1, Ordering::Release);
         for worker in self
@@ -243,6 +246,7 @@ impl WorkStealingThreadPool {
             self.shared.panicked.store(true, Ordering::Release);
         }
         wait_for_completion(&self.shared);
+        wait_for_workers(&self.shared);
         if self.shared.panicked.load(Ordering::Acquire) {
             wait_for_active(&self.shared);
         }
@@ -284,6 +288,7 @@ fn worker_loop(shared: Arc<Shared>, worker_id: usize) {
         if result.is_err() {
             shared.panicked.store(true, Ordering::Release);
         }
+        shared.observed.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -321,6 +326,13 @@ fn wait_for_completion(shared: &Shared) {
 
 fn wait_for_active(shared: &Shared) {
     while shared.active.load(Ordering::Acquire) != 0 {
+        std::hint::spin_loop();
+    }
+}
+
+fn wait_for_workers(shared: &Shared) {
+    let worker_count = shared.thread_count.saturating_sub(1);
+    while shared.observed.load(Ordering::Acquire) != worker_count {
         std::hint::spin_loop();
     }
 }

@@ -1,0 +1,14 @@
+pipeline:
+  workflow:
+    manifest:
+      capabilities:
+        - workflow_ssa
+    components:
+      missing:
+        implementation:
+          kind: onnx
+          artifact: missing.onnx.textproto
+        ports: {}
+    steps:
+      - kind: invoke
+        component: missing

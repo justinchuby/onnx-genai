@@ -22,46 +22,6 @@ pub struct ModelGraphInfo {
     pub outputs: Vec<GraphTensorInfo>,
 }
 
-/// ONNX graph inventories required to synthesize a strict multimodal pipeline.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PipelineGraphInfo {
-    pub vision: ModelGraphInfo,
-    pub embedding: ModelGraphInfo,
-    pub decoder: ModelGraphInfo,
-}
-
-/// ONNX graph inventories required to synthesize a strict encoder-decoder
-/// (audio/text sequence-to-sequence) pipeline, e.g. Whisper.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct EncoderDecoderGraphInfo {
-    pub encoder: ModelGraphInfo,
-    pub decoder: ModelGraphInfo,
-}
-
-pub(crate) fn require_graph_input<'a>(
-    graph: &'a ModelGraphInfo,
-    name: &str,
-    component: &str,
-) -> Result<&'a GraphTensorInfo, GenAiConfigError> {
-    graph
-        .inputs
-        .iter()
-        .find(|tensor| tensor.name == name)
-        .ok_or_else(|| incomplete(format!("{component} ONNX input '{name}'")))
-}
-
-pub(crate) fn require_graph_output<'a>(
-    graph: &'a ModelGraphInfo,
-    name: &str,
-    component: &str,
-) -> Result<&'a GraphTensorInfo, GenAiConfigError> {
-    graph
-        .outputs
-        .iter()
-        .find(|tensor| tensor.name == name)
-        .ok_or_else(|| incomplete(format!("{component} ONNX output '{name}'")))
-}
-
 pub(crate) fn require_same_dtype(
     left: &GraphTensorInfo,
     right: &GraphTensorInfo,
@@ -75,55 +35,6 @@ pub(crate) fn require_same_dtype(
             left.name, left.dtype, right.name, right.dtype
         )))
     }
-}
-
-/// Match a paired key/value `%d` name pattern against `tensors` and return the
-/// ordered layer index set, the interleaved `[key_0, value_0, key_1, ...]`
-/// names verified to exist in the graph, and the single shared cache dtype.
-///
-/// Unlike [`GenAiConfig::strict_decoder_state`], this does not require the key
-/// and value patterns to share a common textual prefix (Whisper self/cross KV
-/// use distinct `..._key_self_%d` / `..._value_self_%d` prefixes), and it does
-/// not derive any fixed-state `state_pairs`, so encoder-decoder cross-attention
-/// and cross-QK ports are never misread as recurrent state.
-pub(crate) fn strict_indexed_kv(
-    tensors: &[GraphTensorInfo],
-    key_pattern: &str,
-    value_pattern: &str,
-    description: &str,
-) -> Result<(Vec<usize>, Vec<String>, String), GenAiConfigError> {
-    let keys = match_indexed_tensors(tensors, key_pattern)?;
-    let values = match_indexed_tensors(tensors, value_pattern)?;
-    let indices = exact_index_set(&[&keys, &values], description)?;
-    if indices.is_empty() {
-        return Err(incomplete(format!(
-            "at least one {description} graph-port pair"
-        )));
-    }
-    let mut names = Vec::with_capacity(indices.len() * 2);
-    let mut dtype: Option<String> = None;
-    for index in &indices {
-        let key = keys[index];
-        let value = values[index];
-        require_same_dtype(key, value, description)?;
-        match dtype.as_deref() {
-            Some(canonical) if canonical != key.dtype => {
-                return Err(incomplete(format!(
-                    "all {description} tensors must use one dtype: canonical dtype is {canonical}, but '{}' is {}",
-                    key.name, key.dtype
-                )));
-            }
-            None => dtype = Some(key.dtype.clone()),
-            _ => {}
-        }
-        names.push(key.name.clone());
-        names.push(value.name.clone());
-    }
-    Ok((
-        indices,
-        names,
-        dtype.expect("non-empty KV indices establish a dtype"),
-    ))
 }
 
 pub(crate) fn split_indexed_pattern(pattern: &str) -> Result<(&str, &str), GenAiConfigError> {

@@ -1,0 +1,359 @@
+# The canonical workflow package for the sibling `tiny-llm-scatter` graph.
+#
+# It declares no `model:` block: the scatter ABI a driver binds is derived
+# from the state_service group's indexed_scatter update and the decoder
+# component's port roles. The sibling directory keeps the retired legacy
+# `model.io` form so the import-only path stays covered.
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      capabilities:
+      - workflow_ssa
+      - linear_effects
+      - typed_emit
+      - nested_control_flow
+      - loop_induction_values
+      - serving_service_contract
+    inputs:
+      request.input_ids:
+        contract:
+          dtype: int64
+          rank: 2
+          shape: [batch, prompt_sequence]
+          batch_layout: {kind: request_aligned, axis: 0}
+        role: {kind: runtime, version: '1.0', role: prompt_tokens}
+        source: {kind: request}
+        required: true
+      request.max_iterations:
+        contract: {dtype: int64, rank: 1, shape: [1]}
+        role: {kind: runtime, version: '1.0', role: max_iterations}
+        source: {kind: request}
+        required: false
+        default: 4
+      package.capacity:
+        contract: {dtype: int64, rank: 1, shape: [1]}
+        role: {kind: opaque}
+        source: {kind: literal}
+        required: false
+        default: 8
+      package.active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape: [batch]
+          batch_layout: {kind: request_aligned, axis: 0}
+        role: {kind: opaque}
+        source: {kind: literal}
+        required: false
+        default: true
+      package.done:
+        contract:
+          dtype: bool
+          rank: 1
+          shape: [batch]
+          batch_layout: {kind: request_aligned, axis: 0}
+        role: {kind: opaque}
+        source: {kind: literal}
+        required: false
+        default: false
+      package.accepted_len:
+        contract:
+          dtype: int64
+          rank: 1
+          shape: [batch]
+          batch_layout: {kind: request_aligned, axis: 0}
+        role: {kind: opaque}
+        source: {kind: literal}
+        required: false
+        default: 0
+      package.loop_active:
+        contract: {dtype: bool, rank: 1, shape: [1]}
+        role: {kind: opaque}
+        source: {kind: literal}
+        required: false
+        default: true
+      package.write_indices:
+        contract:
+          dtype: int64
+          rank: 1
+          shape: [batch]
+          batch_layout: {kind: request_aligned, axis: 0}
+        role: {kind: opaque}
+        source: {kind: literal}
+        required: false
+        default: 0
+      package.cache_lengths:
+        contract:
+          dtype: int64
+          rank: 1
+          shape: [batch]
+          batch_layout: {kind: request_aligned, axis: 0}
+        role: {kind: opaque}
+        source: {kind: literal}
+        required: false
+        default: 0
+      package.cache:
+        contract:
+          dtype: float32
+          rank: 3
+          shape: [batch, cache_capacity, 4]
+          batch_layout: {kind: request_aligned, axis: 0}
+        role: {kind: opaque}
+        source: {kind: literal}
+        required: false
+        default: 0.0
+    outputs:
+      tokens:
+        contract:
+          dtype: int64
+          rank: 2
+          shape: [batch, generated]
+          batch_layout: {kind: request_aligned, axis: 0}
+        role: tokens
+        stage: pre_adapter
+    components:
+      model:
+        implementation: {kind: onnx, artifact: model.onnx.textproto}
+        ports:
+          inputs:
+            input_ids:
+              dtype: int64
+              rank: 2
+              shape: [batch, 1]
+              batch_layout: {kind: request_aligned, axis: 0}
+            key_cache.0:
+              dtype: float32
+              rank: 3
+              shape: [batch, cache_capacity, 4]
+              batch_layout: {kind: request_aligned, axis: 0}
+            value_cache.0:
+              dtype: float32
+              rank: 3
+              shape: [batch, cache_capacity, 4]
+              batch_layout: {kind: request_aligned, axis: 0}
+            write_indices:
+              dtype: int64
+              rank: 1
+              shape: [batch]
+              batch_layout: {kind: request_aligned, axis: 0}
+            nonpad_kv_seqlen:
+              dtype: int64
+              rank: 1
+              shape: [batch]
+              batch_layout: {kind: request_aligned, axis: 0}
+          outputs:
+            token:
+              dtype: int64
+              rank: 2
+              shape: [batch, 1]
+              batch_layout: {kind: request_aligned, axis: 0}
+            updated_key_cache.0:
+              dtype: float32
+              rank: 3
+              shape: [batch, cache_capacity, 4]
+              batch_layout: {kind: request_aligned, axis: 0}
+            updated_value_cache.0:
+              dtype: float32
+              rank: 3
+              shape: [batch, cache_capacity, 4]
+              batch_layout: {kind: request_aligned, axis: 0}
+            next_write_indices:
+              dtype: int64
+              rank: 1
+              shape: [batch]
+              batch_layout: {kind: request_aligned, axis: 0}
+            next_cache_lengths:
+              dtype: int64
+              rank: 1
+              shape: [batch]
+              batch_layout: {kind: request_aligned, axis: 0}
+            next_active:
+              dtype: bool
+              rank: 1
+              shape: [batch]
+              batch_layout: {kind: request_aligned, axis: 0}
+            next_done:
+              dtype: bool
+              rank: 1
+              shape: [batch]
+              batch_layout: {kind: request_aligned, axis: 0}
+            next_accepted_len:
+              dtype: int64
+              rank: 1
+              shape: [batch]
+              batch_layout: {kind: request_aligned, axis: 0}
+            next_loop_active:
+              dtype: bool
+              rank: 1
+              shape: [1]
+          roles:
+            input_ids: token_ids
+    state:
+      token:
+        contract:
+          dtype: int64
+          rank: 2
+          shape: [batch, 1]
+          batch_layout: {kind: request_aligned, axis: 0}
+        scope: invocation
+        initializer: request.input_ids
+        recurrence: {kind: invariant}
+      active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape: [batch]
+          batch_layout: {kind: request_aligned, axis: 0}
+        class: semantic
+        scope: invocation
+        initializer: package.active
+        recurrence: {kind: invariant}
+      done:
+        contract:
+          dtype: bool
+          rank: 1
+          shape: [batch]
+          batch_layout: {kind: request_aligned, axis: 0}
+        class: semantic
+        scope: invocation
+        initializer: package.done
+        recurrence: {kind: invariant}
+      accepted_len:
+        contract:
+          dtype: int64
+          rank: 1
+          shape: [batch]
+          batch_layout: {kind: request_aligned, axis: 0}
+        class: semantic
+        scope: invocation
+        initializer: package.accepted_len
+        recurrence: {kind: invariant}
+      loop_active:
+        contract: {dtype: bool, rank: 1, shape: [1]}
+        scope: invocation
+        initializer: package.loop_active
+        recurrence: {kind: invariant}
+      write_indices:
+        contract:
+          dtype: int64
+          rank: 1
+          shape: [batch]
+          batch_layout: {kind: request_aligned, axis: 0}
+        class: semantic
+        scope: invocation
+        initializer: package.write_indices
+        recurrence: {kind: invariant}
+      cache_lengths:
+        contract:
+          dtype: int64
+          rank: 1
+          shape: [batch]
+          batch_layout: {kind: request_aligned, axis: 0}
+        class: semantic
+        scope: invocation
+        initializer: package.cache_lengths
+        recurrence: {kind: invariant}
+      key_cache:
+        contract:
+          dtype: float32
+          rank: 3
+          shape: [batch, cache_capacity, 4]
+          batch_layout: {kind: request_aligned, axis: 0}
+        scope: invocation
+        initializer: package.cache
+        recurrence: {kind: invariant}
+        service_group: decoder_cache
+        management: runtime
+        release_boundary: invocation
+      value_cache:
+        contract:
+          dtype: float32
+          rank: 3
+          shape: [batch, cache_capacity, 4]
+          batch_layout: {kind: request_aligned, axis: 0}
+        scope: invocation
+        initializer: package.cache
+        recurrence: {kind: invariant}
+        service_group: decoder_cache
+        management: runtime
+        release_boundary: invocation
+    serving:
+      active: active
+      done: done
+      accepted_len: accepted_len
+      state_service:
+        groups:
+          decoder_cache:
+            kind: full_attention
+            sequence_axis: 1
+            layout: bsh
+            logical_lengths: cache_lengths
+            aliasing: permitted
+            update:
+              kind: indexed_scatter
+              write_indices: cache_lengths
+              capacity: package.capacity
+              write_indices_ports:
+                model: write_indices
+              kv_length_ports:
+                model: nonpad_kv_seqlen
+            reuse: {prefix_reusable: true, evictable_prefix: true}
+            capabilities: {rollback_positions: 8, snapshot: true, fork: true}
+            ports:
+              model:
+                key_cache: {input: key_cache.0, output: updated_key_cache.0, role: key, layer: 0}
+                value_cache: {input: value_cache.0, output: updated_value_cache.0, role: value, layer: 0}
+    steps:
+    - kind: loop
+      setup: []
+      steps:
+      - kind: invoke
+        component: model
+        inputs:
+          input_ids: token
+          key_cache.0: key_cache
+          value_cache.0: value_cache
+          write_indices: cache_lengths
+          nonpad_kv_seqlen: cache_lengths
+        outputs:
+          token: body.token
+          updated_key_cache.0: body.key_cache
+          updated_value_cache.0: body.value_cache
+          next_write_indices: body.write_indices
+          next_cache_lengths: body.cache_lengths
+          next_active: body.active
+          next_done: body.done
+          next_accepted_len: body.accepted_len
+          next_loop_active: body.loop_active
+      - kind: emit
+        value: body.token
+        output: tokens
+        mode: append
+        when: active
+      continue_when: loop_active
+      max_iterations: request.max_iterations
+      carried:
+      - {cell: token, next: body.token}
+      - {cell: key_cache, next: body.key_cache}
+      - {cell: value_cache, next: body.value_cache}
+      - {cell: write_indices, next: body.write_indices}
+      - {cell: cache_lengths, next: body.cache_lengths}
+      - {cell: active, next: body.active}
+      - {cell: done, next: body.done}
+      - {cell: accepted_len, next: body.accepted_len}
+      - {cell: loop_active, next: body.loop_active}
+      iteration:
+        value: loop.iteration
+        contract: {dtype: int64, rank: 1, shape: [1]}
+package:
+  tokenizer:
+    algorithm: bpe
+    vocab_size: 32
+    byte_level: true
+    artifacts:
+    - location: tokenizer.json
+      sha256: '0000000000000000000000000000000000000000000000000000000000000000'
+    special_tokens:
+      bos: {id: 1, content: <s>}
+      eos: {id: 2, content: </s>}

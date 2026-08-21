@@ -124,7 +124,9 @@ pub(crate) fn infer_kv_model_info(
 fn native_kv_tensor_spec(info: &TensorInfo) -> anyhow::Result<KvTensorSpec> {
     if !is_supported_kv_dtype(info.dtype) {
         anyhow::bail!(
-            "past KV input '{}' must be Float32, Float16, or BFloat16, got {:?}",
+            "past KV input '{}' has dtype {:?}, which the paged KV cache cannot store \
+             (its pages hold Float32, Float16, or BFloat16). The declaration is well \
+             formed; this backend lacks the capability.",
             info.name,
             info.dtype
         );
@@ -159,7 +161,7 @@ fn native_kv_tensor_spec(info: &TensorInfo) -> anyhow::Result<KvTensorSpec> {
 /// metadata — the runtime never reads a tensor name to decide which port is
 /// key/value, which layer it belongs to, or how past pairs with present.
 ///
-/// `model.io.kv_inputs`/`kv_outputs` are equal-length, positionally paired
+/// `kv_inputs`/`kv_outputs` are equal-length, positionally paired
 /// past<->present lists ordered as consecutive per-layer `[key_i, value_i]`
 /// pairs (the exporter contract, matching `genai-config` `expand_kv`). Layer `l`
 /// therefore binds index `2*l` (key) and `2*l + 1` (value).
@@ -171,7 +173,7 @@ fn native_kv_tensor_spec(info: &TensorInfo) -> anyhow::Result<KvTensorSpec> {
 /// from a tensor name or shape, since a growing paged present output is
 /// shape-indistinguishable from a static-cache buffer or a logits/hidden
 /// output. The decode-path resolver (`decode::resolved_io`) independently fails
-/// closed, naming `model.io.kv_inputs`/`kv_outputs`, when a decoder genuinely
+/// closed, naming `kv_inputs`/`kv_outputs`, when a decoder genuinely
 /// carries unpaired KV state without an explicit declaration.
 fn resolve_kv_layers(
     graph: &dyn GraphIo,
@@ -184,7 +186,7 @@ fn resolve_kv_layers(
         // static-cache or non-KV graph): there is no paged bridge to build.
         Some((None, None)) => return Ok(None),
         Some((Some(_), None)) | Some((None, Some(_))) => {
-            anyhow::bail!("model.io.kv_inputs and model.io.kv_outputs must be declared together")
+            anyhow::bail!("kv_inputs and kv_outputs must be declared together")
         }
         // No I/O metadata at all: never guess KV pairing from tensor names or
         // shapes. The engine simply builds no paged cache; KV correctness is
@@ -236,7 +238,7 @@ fn pair_kv_ports(
 ) -> anyhow::Result<Vec<KvLayerPortNames>> {
     if kv_inputs.len() != kv_outputs.len() {
         anyhow::bail!(
-            "model.io.kv_inputs ({}) and model.io.kv_outputs ({}) must have equal length",
+            "kv_inputs ({}) and kv_outputs ({}) must have equal length",
             kv_inputs.len(),
             kv_outputs.len()
         );
@@ -245,7 +247,7 @@ fn pair_kv_ports(
     // positional lists must contain an even number of ports.
     if !kv_inputs.len().is_multiple_of(2) {
         anyhow::bail!(
-            "model.io.kv_inputs/kv_outputs declare {} KV ports; a paged self-attention cache \
+            "kv_inputs/kv_outputs declare {} KV ports; a paged self-attention cache \
              pairs them as per-layer [key, value], which requires an even count",
             kv_inputs.len()
         );
@@ -267,7 +269,7 @@ fn pair_kv_ports(
 
 /// Look up a declared present-KV output and validate its element type, returning
 /// its shape record for structural geometry inference. Errors name the exact
-/// missing/invalid `model.io.kv_outputs` port.
+/// missing/invalid `kv_outputs` port.
 fn require_present_kv_output(graph: &dyn GraphIo, name: &str) -> anyhow::Result<TensorInfo> {
     let info = graph
         .outputs()
@@ -275,11 +277,13 @@ fn require_present_kv_output(graph: &dyn GraphIo, name: &str) -> anyhow::Result<
         .find(|output| output.name == name)
         .cloned()
         .with_context(|| {
-            format!("declared model.io.kv_outputs port '{name}' is not exposed by the graph")
+            format!("declared kv_outputs port '{name}' is not exposed by the graph")
         })?;
     if !is_supported_kv_dtype(info.dtype) {
         anyhow::bail!(
-            "KV present output '{name}' must be Float32, Float16, or BFloat16, got {:?}",
+            "KV present output '{name}' has dtype {:?}, which the paged KV cache cannot \
+             store (its pages hold Float32, Float16, or BFloat16). The declaration is \
+             well formed; this backend lacks the capability.",
             info.dtype
         );
     }
@@ -287,16 +291,14 @@ fn require_present_kv_output(graph: &dyn GraphIo, name: &str) -> anyhow::Result<
 }
 
 /// Validate that a declared past-KV input exists; errors name the exact missing
-/// `model.io.kv_inputs` port.
+/// `kv_inputs` port.
 fn require_kv_input(graph: &dyn GraphIo, name: &str) -> anyhow::Result<TensorInfo> {
     graph
         .inputs()
         .iter()
         .find(|input| input.name == name)
         .cloned()
-        .with_context(|| {
-            format!("declared model.io.kv_inputs port '{name}' is not exposed by the graph")
-        })
+        .with_context(|| format!("declared kv_inputs port '{name}' is not exposed by the graph"))
 }
 
 /// Build the per-layer KV geometry from each exported present-KV output shape.
@@ -348,11 +350,16 @@ pub(crate) fn infer_kv_heads_and_head_dim(info: &TensorInfo) -> anyhow::Result<(
     Ok((num_kv_heads, head_dim))
 }
 
-/// KV present/past tensor element types the runtime can consume.
+/// KV element types the *paged* KV cache can store.
 ///
-/// The host paged-mirror path widens 16-bit float values to fp32 page storage.
-/// Shared buffers keep their native dtype and never round-trip through the host
-/// cache.
+/// This is a storage capability of this backend, not a property of the metadata
+/// format: `KvStorageType` has fp32 and 16-bit float pages and nothing narrower,
+/// and the host paged-mirror path widens 16-bit float values to fp32 page
+/// storage. A package may legitimately declare an FP8 cache — the format can
+/// name `float8_e4m3fn` — and it will be refused here, by name, because these
+/// pages cannot hold it. Callers surface that as an unsupported-capability
+/// error so the reader knows to change backend or EP, not to edit the
+/// document.
 fn is_supported_kv_dtype(dtype: DataType) -> bool {
     matches!(
         dtype,
@@ -1096,7 +1103,7 @@ pub(crate) fn kv_model_past_is_f32(session: &Session, kv_model: &KvModelInfo) ->
 mod tests {
     use super::*;
     use crate::decode::{
-        DecodeState, ModelDecodePath, detect_model_decode_path,
+        DecodeState, ModelDecodePath, SharedKvOffer, detect_model_decode_path,
         extract_next_token_logits_from_outputs, run_decode_session_logits, run_decode_step,
     };
     use onnx_genai_kv::{KvCacheOps, MaterializedLayerKv};
@@ -1135,9 +1142,9 @@ mod tests {
             .join("inference_metadata.yaml");
         let metadata = onnx_genai_metadata::load_metadata(&path)?;
         metadata
-            .model
-            .and_then(|model| model.io)
-            .with_context(|| format!("fixture '{name}' must declare model.io"))
+            .decoder_io()
+            .cloned()
+            .with_context(|| format!("fixture '{name}' must declare a decode ABI"))
     }
 
     fn tensor_config() -> PageTensorConfig {
@@ -1327,8 +1334,8 @@ mod tests {
         let mismatch = infer_kv_model_info(&session, Some(&half_declared), 4, KvDType::F32)
             .expect_err("declaring kv_inputs without kv_outputs must fail");
         assert!(
-            mismatch.to_string().contains("model.io.kv_inputs")
-                && mismatch.to_string().contains("model.io.kv_outputs"),
+            mismatch.to_string().contains("kv_inputs")
+                && mismatch.to_string().contains("kv_outputs"),
             "the error must name both explicit keys: {mismatch}"
         );
         Ok(())
@@ -1505,8 +1512,8 @@ mod tests {
         let error = pair_kv_ports(&ports(&["a", "b"]), &ports(&["x"]))
             .expect_err("unequal kv_inputs/kv_outputs must fail");
         let message = error.to_string();
-        assert!(message.contains("model.io.kv_inputs"), "{message}");
-        assert!(message.contains("model.io.kv_outputs"), "{message}");
+        assert!(message.contains("kv_inputs"), "{message}");
+        assert!(message.contains("kv_outputs"), "{message}");
     }
 
     #[test]
@@ -1514,7 +1521,7 @@ mod tests {
         let error = pair_kv_ports(&ports(&["a", "b", "c"]), &ports(&["x", "y", "z"]))
             .expect_err("an odd KV port count cannot form [key, value] pairs");
         assert!(
-            error.to_string().contains("model.io.kv_inputs/kv_outputs"),
+            error.to_string().contains("kv_inputs/kv_outputs"),
             "the error must name the offending key: {error}"
         );
     }
@@ -1820,7 +1827,7 @@ mod tests {
         let _guard = model_test_lock();
         let (_environment, session) = load_session("tiny-llm")?;
         let io = fixture_io("tiny-llm")?;
-        let path = detect_model_decode_path(&session, Some(&io), None, None, Some(2), None, 0)?;
+        let path = detect_model_decode_path(Some(&io), Some(2), 0, SharedKvOffer::default())?;
         assert!(matches!(
             path,
             ModelDecodePath::PastPresent {
@@ -1839,12 +1846,10 @@ mod tests {
         run_decode_step(&session, &mut state, &[3], 2)?;
         assert_eq!(state.retained_kv_len(3), 2);
         assert!(state.past().values().all(|value| value.shape()[2] == 2));
-        // A declared share-buffer KV dtype (shared_kv_max_len = Some) does not
-        // override sliding-window attention: the model still takes the bounded
-        // paged sliding-window path (shared_buffer: false), since the append-only
-        // single shared buffer cannot express windowed eviction.
+        // Sliding-window attention always takes bounded functional
+        // past/present dataflow; storage hints cannot override it.
         assert!(matches!(
-            detect_model_decode_path(&session, Some(&io), Some(16), Some(16), Some(2), None, 0)?,
+            detect_model_decode_path(Some(&io), Some(2), 0, SharedKvOffer::default())?,
             ModelDecodePath::PastPresent {
                 shared_buffer: false,
                 max_len: None,
@@ -1852,83 +1857,6 @@ mod tests {
                 sink_tokens: None,
             }
         ));
-        Ok(())
-    }
-
-    /// Build a single-node GroupQueryAttention decoder graph. `Some(w)` carries a
-    /// real, graph-enforced `local_window_size`; `None` is global attention.
-    fn gqa_graph(local_window_size: Option<i64>) -> onnx_runtime_ir::Graph {
-        use onnx_runtime_ir::{Attribute, Graph, Node};
-        let mut graph = Graph::default();
-        graph.nodes.insert_with(|id| {
-            let mut node = Node::new(id, "GroupQueryAttention", vec![], vec![]);
-            node.domain = "com.microsoft".to_string();
-            if let Some(window) = local_window_size {
-                node.attributes
-                    .insert("local_window_size".to_string(), Attribute::Int(window));
-            }
-            node
-        });
-        graph
-    }
-
-    #[test]
-    fn vestigial_metadata_window_routes_to_shared_buffer() -> anyhow::Result<()> {
-        let _guard = model_test_lock();
-        let (_environment, session) = load_session("tiny-llm")?;
-        let io = fixture_io("tiny-llm")?;
-
-        // A window declared in metadata (Some(2)) but NOT enforced by the graph
-        // (GQA carries no local_window_size => global attention, like
-        // Muse-Glimmer) must be reclassified as global and reach the
-        // capture-stable shared-buffer / fixed-capacity KV path.
-        let global_graph = gqa_graph(None);
-        let path = detect_model_decode_path(
-            &session,
-            Some(&io),
-            Some(16),
-            Some(16),
-            Some(2),
-            Some(&global_graph),
-            0,
-        )?;
-        assert!(
-            matches!(
-                path,
-                ModelDecodePath::PastPresent {
-                    shared_buffer: true,
-                    max_len: Some(16),
-                    sliding_window: None,
-                    sink_tokens: None,
-                }
-            ),
-            "vestigial window must route to shared-buffer, got {path:?}"
-        );
-
-        // A window the graph actually enforces (GQA local_window_size > 0, real
-        // SWA) stays on the bounded paged windowed path — no regression.
-        let windowed_graph = gqa_graph(Some(2));
-        let windowed = detect_model_decode_path(
-            &session,
-            Some(&io),
-            Some(16),
-            Some(16),
-            Some(2),
-            Some(&windowed_graph),
-            0,
-        )?;
-        assert!(
-            matches!(
-                windowed,
-                ModelDecodePath::PastPresent {
-                    shared_buffer: false,
-                    max_len: None,
-                    sliding_window: Some(2),
-                    sink_tokens: None,
-                }
-            ),
-            "real graph-enforced window must stay on the paged windowed path, got {windowed:?}"
-        );
         Ok(())
     }
 
@@ -1970,7 +1898,7 @@ mod tests {
     /// port renamed to a non-conventional name (`tokens`, `attn_mask_port`,
     /// `pos_port`, `out_logits`, `cache_k_in.0`/`cache_v_in.0` ->
     /// `cache_k_out.0`/`cache_v_out.0`). The runtime can only decode it by
-    /// reading the explicit `model.io` block, proving it never infers a port by
+    /// reading the explicit resolved decode ABI, proving it never infers a port by
     /// tensor name.
     #[test]
     fn explicit_io_binds_decode_ports_purely_from_metadata_names() -> anyhow::Result<()> {
@@ -1997,7 +1925,7 @@ mod tests {
         assert!(
             convention_err
                 .to_string()
-                .contains("declare the exact graph port in model.io.token_input"),
+                .contains("declare the port's role in"),
             "expected actionable metadata error, got: {convention_err}"
         );
 
@@ -2007,10 +1935,8 @@ mod tests {
             .join("../../tests/fixtures/tiny-llm-explicit-io/inference_metadata.yaml");
         let metadata = onnx_genai_metadata::load_metadata(&metadata_path)?;
         let io = metadata
-            .model
-            .as_ref()
-            .and_then(|model| model.io.as_ref())
-            .expect("fixture declares a model.io block");
+            .decoder_io()
+            .expect("fixture declares a decode ABI");
 
         let mut state = DecodeState::new_with_io(&session, Some(io))?;
         assert!(

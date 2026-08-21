@@ -10,11 +10,12 @@ use onnx_genai_engine::logits::{
     MinPProcessor, RepetitionPenaltyProcessor, TemperatureProcessor, TopKProcessor, TopPProcessor,
 };
 use onnx_genai_engine::{
-    DecodePrecision, Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GenerateRequest,
-    NativeDecodeDevice, NativeDecodeSession, PipelineEngine, PipelineGenerateRequest,
-    ProcessorChain, SpeculativeMode, SpeculativeStats, parse_resource_limit,
+    DecodePrecision, Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GeneratePrompt,
+    GenerateRequest, NativeDecodeDevice, NativeDecodeSession, PipelineEngine,
+    PipelineGenerateRequest, ProcessorChain, SpeculativeMode, SpeculativeStats,
+    parse_resource_limit,
 };
-use onnx_genai_ort::{Tokenizer, available_execution_providers, profile};
+use onnx_genai_ort::{DataType, Tokenizer, Value, available_execution_providers, profile};
 use onnx_runtime_session::InferenceSession;
 
 /// Honor `ONNX_GENAI_VRAM_LIMIT` in the profiler, mirroring the server CLI.
@@ -185,11 +186,13 @@ struct Args {
     #[arg(long, default_value_t = 40)]
     logprobs_k: usize,
     /// Override the text prompt with an explicit JSON array of token ids (e.g.
-    /// "[9707, 12824, 13]"). Enables exact teacher-forced logit comparison
-    /// against ORT without tokenizer round-trip drift. Only honored with
-    /// --dump-logprobs.
+    /// "[9707, 12824, 13]"). Applies to native, pipeline, and log-probability
+    /// runs so paired benchmarks avoid tokenizer round-trip drift.
     #[arg(long)]
     prompt_ids: Option<PathBuf>,
+    /// Encoded image supplied as the optional `request.image` workflow input.
+    #[arg(long)]
+    image: Option<PathBuf>,
     /// HF-style repetition penalty applied host-side to the output logits before
     /// token selection (divides positive / multiplies negative logits of tokens
     /// already in the prompt+generated stream). Default 1.0 is OFF and keeps the
@@ -479,8 +482,24 @@ fn describe_speculative(args: &Args) -> String {
     }
 }
 
-fn pipeline_request(args: &Args, tokens: usize, prompt: &str) -> PipelineGenerateRequest {
-    PipelineGenerateRequest::new(request_with_prompt(args, tokens, prompt))
+fn pipeline_request(
+    args: &Args,
+    tokens: usize,
+    prompt_tokens: &[u32],
+) -> Result<PipelineGenerateRequest> {
+    let mut request = request(args, tokens);
+    request.prompt = GeneratePrompt::TokenIds(prompt_tokens.to_vec());
+    let mut pipeline_request = PipelineGenerateRequest::new(request);
+    if let Some(image_path) = args.image.as_ref() {
+        let image = std::fs::read(image_path)
+            .with_context(|| format!("read workflow image {}", image_path.display()))?;
+        let encoded_bytes = i64::try_from(image.len()).context("workflow image is too large")?;
+        pipeline_request = pipeline_request.with_input(
+            "request.image",
+            Value::from_raw_bytes(image, &[encoded_bytes], DataType::Uint8)?,
+        );
+    }
+    Ok(pipeline_request)
 }
 
 fn describe_sampling(args: &Args) -> String {
@@ -2911,7 +2930,7 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
 fn time_first_token(
     args: &Args,
     engine: &mut PipelineEngine,
-    prompt: &str,
+    prompt_tokens: &[u32],
 ) -> Result<(f64, usize)> {
     let start = Instant::now();
     let mut first: Option<std::time::Duration> = None;
@@ -2922,7 +2941,10 @@ fn time_first_token(
         Ok(())
     };
     let result = engine
-        .generate_with_callback(pipeline_request(args, 1, prompt), Some(&mut callback))
+        .generate_with_callback(
+            pipeline_request(args, 1, prompt_tokens)?,
+            Some(&mut callback),
+        )
         .context("prefill sweep generation")?;
     let elapsed = first.context("generation emitted no tokens")?;
     Ok((elapsed.as_secs_f64() * 1_000.0, result.prefix_cache_hit_len))
@@ -2933,12 +2955,16 @@ fn time_first_token(
 /// The prefix cache is cleared before every point. Without that, each point is
 /// a prefix of the next and the sweep answers almost every generation out of
 /// cache, reporting a prefill that does not vary with prompt length at all.
-fn run_prefill_sweep(args: &Args, engine: &mut PipelineEngine, lengths: &[usize]) -> Result<()> {
+fn run_prefill_sweep(
+    args: &Args,
+    engine: &mut PipelineEngine,
+    ids: &[u32],
+    lengths: &[usize],
+) -> Result<()> {
     if lengths.is_empty() {
         bail!("--prefill-sweep needs at least one length");
     }
     const WARMUP_TOKENS: usize = 64;
-    let ids = engine.tokenize(&args.prompt).context("tokenize prompt")?;
     let longest = lengths.iter().copied().max().unwrap_or(0);
     if ids.len() < longest {
         bail!(
@@ -2950,30 +2976,31 @@ fn run_prefill_sweep(args: &Args, engine: &mut PipelineEngine, lengths: &[usize]
 
     // One throwaway generation absorbs process startup so the first measured
     // point does not carry it.
-    let warmup = engine.detokenize(&ids[..WARMUP_TOKENS.min(ids.len())])?;
-    time_first_token(args, engine, &warmup).context("prefill sweep warmup")?;
+    time_first_token(args, engine, &ids[..WARMUP_TOKENS.min(ids.len())])
+        .context("prefill sweep warmup")?;
 
     let mut points: Vec<(f64, f64)> = Vec::with_capacity(lengths.len());
     for &len in lengths {
-        let text = engine.detokenize(&ids[..len])?;
-        // Re-encoding the detokenized window is not always length-preserving,
-        // so report the count the engine will really see rather than the request.
-        let actual = engine.tokenize(&text)?.len();
+        // Prompts are submitted as token ids, so the measured window is exactly
+        // `len` tokens; there is no detokenize/re-encode round trip to distort
+        // the count the engine really sees.
+        let window = &ids[..len];
         engine.clear_prefix_cache();
-        let (ms, hit) = time_first_token(args, engine, &text)?;
+        let (ms, hit) = time_first_token(args, engine, window)?;
         if hit > 0 {
             bail!(
                 "prefill sweep measured a {hit}-token prefix cache hit after clearing the \
                  cache; the measurement would not reflect prompt processing"
             );
         }
-        let processed = actual.saturating_sub(hit);
+        let processed = window.len().saturating_sub(hit);
         println!(
-            "prefill_sweep: prompt_tokens={actual} prefix_cache_hit={hit} prefill={ms:.3} ms \
+            "prefill_sweep: prompt_tokens={} prefix_cache_hit={hit} prefill={ms:.3} ms \
              throughput={:.1} tok/s",
+            window.len(),
             processed as f64 * 1_000.0 / ms
         );
-        points.push((actual as f64, ms));
+        points.push((window.len() as f64, ms));
     }
 
     if points.len() >= 2 {
@@ -3046,38 +3073,49 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
     apply_vram_limit_env(&mut config)?;
     let mut engine = PipelineEngine::from_dir_with_config(model_dir, config)
         .with_context(|| format!("load pipeline engine {}", model_dir.display()))?;
-
-    // Resolve the prompt against the engine's own tokenizer, then report the
+    let tokenizer =
+        Tokenizer::from_file(tokenizer_file(model_dir)).context("load pipeline tokenizer.json")?;
+    // Resolve the prompt against the package's own tokenizer, then report the
     // length. Prefill numbers are meaningless without the token count they were
     // measured over, and a harness-side tokenizer is not guaranteed to be the
     // one this pipeline routes prompts through.
-    let prompt = match args.prompt_tokens {
-        None => args.prompt.clone(),
-        Some(want) => {
-            let ids = engine.tokenize(&args.prompt).context("tokenize prompt")?;
-            if ids.len() < want {
-                bail!(
-                    "--prompt-tokens {want} exceeds the {} tokens available in the prompt; \
-                     supply a longer --prompt-file (testdata/long-prompt.txt has ~21.7k)",
-                    ids.len()
-                );
-            }
-            engine
-                .detokenize(&ids[..want])
-                .context("detokenize truncated prompt")?
-        }
+    let mut prompt_tokens = if let Some(ids_path) = args.prompt_ids.as_ref() {
+        let raw = std::fs::read_to_string(ids_path)
+            .with_context(|| format!("read prompt ids from {}", ids_path.display()))?;
+        serde_json::from_str::<Vec<u32>>(raw.trim())
+            .with_context(|| format!("parse prompt ids JSON from {}", ids_path.display()))?
+    } else {
+        tokenizer
+            .encode(&args.prompt)
+            .context("tokenize pipeline prompt")?
     };
-    let prompt_tokens = engine.tokenize(&prompt).context("tokenize prompt")?.len();
-    println!("profile_native: prompt_tokens={prompt_tokens}");
+    if prompt_tokens.is_empty() {
+        bail!("pipeline prompt tokenized to an empty sequence");
+    }
+    if let Some(want) = args.prompt_tokens {
+        if prompt_tokens.len() < want {
+            bail!(
+                "--prompt-tokens {want} exceeds the {} tokens available in the prompt; \
+                 supply a longer --prompt-file (testdata/long-prompt.txt has ~21.7k)",
+                prompt_tokens.len()
+            );
+        }
+        prompt_tokens.truncate(want);
+    }
+    println!("profile_native: prompt_tokens={}", prompt_tokens.len());
 
     if let Some(lengths) = args.prefill_sweep.clone() {
-        return run_prefill_sweep(args, &mut engine, &lengths);
+        return run_prefill_sweep(args, &mut engine, &prompt_tokens, &lengths);
     }
 
     for _ in 0..args.warmups {
         std::hint::black_box(
             engine
-                .generate_with_pipeline_request(pipeline_request(args, args.tokens, &prompt))
+                .generate_with_pipeline_request(pipeline_request(
+                    args,
+                    args.tokens,
+                    &prompt_tokens,
+                )?)
                 .context("pipeline warmup generation")?,
         );
     }
@@ -3100,7 +3138,7 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
             };
             let result = engine
                 .generate_with_callback(
-                    pipeline_request(args, args.tokens, &prompt),
+                    pipeline_request(args, args.tokens, &prompt_tokens)?,
                     Some(&mut callback),
                 )
                 .context("steady pipeline measured generation")?;
@@ -3112,6 +3150,7 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
                     args.decode_skip
                 );
             }
+            let generated_tokens = result.token_ids.len();
             if let Some(reference) = &reference_tokens {
                 if reference != &result.token_ids {
                     bail!("pipeline greedy decode was not deterministic across measured runs");
@@ -3121,17 +3160,33 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
                 reference_text = Some(result.text);
             }
 
-            let prefill_ms = token_times[0].as_secs_f64() * 1_000.0;
-            // A measured prefill that reused KV from the prefix cache did not
-            // process those tokens, so reporting it as prompt-processing
-            // throughput overstates prefill by however much it reused. This is
-            // easy to hit by accident: --warmups replays the *same* prompt, so
-            // the measured run reads back a fully cached prefix and reports a
-            // prefill that is independent of prompt length (#1529).
-            let prefill_new_tokens = prompt_tokens.saturating_sub(cache_hit);
+            let diagnostic = engine.workflow_performance_diagnostic();
+            if diagnostic.last_emit_timestamps_ns.len() != generated_tokens {
+                bail!(
+                    "workflow emitted {} timing events for {} generated tokens",
+                    diagnostic.last_emit_timestamps_ns.len(),
+                    generated_tokens
+                );
+            }
+            let prefill_ms = diagnostic.last_emit_timestamps_ns[0] as f64 / 1_000_000.0;
+            let decode_tokens = diagnostic.last_emit_timestamps_ns.len() - args.decode_skip;
+            let decode_ns = diagnostic.last_emit_timestamps_ns
+                [diagnostic.last_emit_timestamps_ns.len() - 1]
+                - diagnostic.last_emit_timestamps_ns[args.decode_skip - 1];
+            let decode_wall = Duration::from_nanos(u64::try_from(decode_ns)?);
+            let ms_per_token = decode_ns as f64 / 1_000_000.0 / decode_tokens as f64;
+            let tok_per_s = decode_tokens as f64 * 1_000_000_000.0 / decode_ns as f64;
+            // A measured prefill that reused workflow state did not process
+            // those tokens, so reporting it as prompt-processing throughput
+            // overstates prefill by however much it reused. This is easy to hit
+            // by accident: --warmups replays the *same* prompt, so the measured
+            // run reads back a fully cached prefix and reports a prefill that is
+            // independent of prompt length (#1529).
+            let prompt_token_count = prompt_tokens.len();
+            let prefill_new_tokens = prompt_token_count.saturating_sub(cache_hit);
             let prefill_note = if cache_hit > 0 {
                 format!(
-                    " prefix_cache_hit={cache_hit}/{prompt_tokens} \
+                    " prefix_cache_hit={cache_hit}/{prompt_token_count} \
                      WARNING: only {prefill_new_tokens} tokens were actually processed; \
                      this is NOT prompt-processing throughput (re-run with --warmups 0 \
                      or a distinct prompt per run)"
@@ -3144,11 +3199,6 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
             } else {
                 String::new()
             };
-            let decode_tokens = token_times.len() - args.decode_skip;
-            let decode_wall =
-                token_times[token_times.len() - 1] - token_times[args.decode_skip - 1];
-            let ms_per_token = decode_wall.as_secs_f64() * 1_000.0 / decode_tokens as f64;
-            let tok_per_s = decode_tokens as f64 / decode_wall.as_secs_f64();
             println!(
                 "steady_run {run}: prefill={prefill_ms:.3} ms{prefill_note} \
                  decode_tokens={decode_tokens} \
@@ -3170,6 +3220,43 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
             args.warmups,
             args.decode_skip
         );
+        let diagnostic = engine.workflow_performance_diagnostic();
+        for (stage, elapsed_ns) in &diagnostic.last_stage_elapsed_ns {
+            let runs = diagnostic.last_stage_runs.get(stage).copied().unwrap_or(0);
+            println!(
+                "workflow_stage {stage}: runs={runs} elapsed={:.3}ms avg={:.3}ms",
+                *elapsed_ns as f64 / 1_000_000.0,
+                if runs == 0 {
+                    0.0
+                } else {
+                    *elapsed_ns as f64 / runs as f64 / 1_000_000.0
+                }
+            );
+        }
+        for island in diagnostic.islands {
+            println!(
+                "workflow_island {}: components={:?} runs={} session_runs={} eager={} stable={} \
+                 captures={} replays={} syncs={} h2d={}/{}B d2h={}/{}B d2d={}/{}B \
+                 elapsed={:.3}ms fallback={:?}",
+                island.id,
+                island.components,
+                island.runs,
+                island.session_runs,
+                island.eager_runs,
+                island.stable_binding_runs,
+                island.captures,
+                island.replays,
+                island.device_synchronizations,
+                island.host_to_device_copies,
+                island.host_to_device_bytes,
+                island.device_to_host_copies,
+                island.device_to_host_bytes,
+                island.device_to_device_copies,
+                island.device_to_device_bytes,
+                island.total_run_ns as f64 / 1_000_000.0,
+                island.fallback_reason
+            );
+        }
         if let Some(tokens) = reference_tokens {
             println!("generated_token_ids: {tokens:?}");
         }
@@ -3186,7 +3273,7 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
     for _ in 0..args.runs {
         let start = Instant::now();
         let result = engine
-            .generate_with_pipeline_request(pipeline_request(args, args.tokens, &prompt))
+            .generate_with_pipeline_request(pipeline_request(args, args.tokens, &prompt_tokens)?)
             .context("pipeline measured generation")?;
         elapsed += start.elapsed();
         generated += result.token_ids.len();
@@ -3287,7 +3374,14 @@ fn main() -> Result<()> {
     };
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .context("load tokenizer.json beside native decoder")?;
-    let prompt_tokens = tokenizer.encode(&args.prompt).context("tokenize prompt")?;
+    let prompt_tokens = if let Some(ids_path) = args.prompt_ids.as_ref() {
+        let raw = std::fs::read_to_string(ids_path)
+            .with_context(|| format!("read prompt ids from {}", ids_path.display()))?;
+        serde_json::from_str::<Vec<u32>>(raw.trim())
+            .with_context(|| format!("parse prompt ids JSON from {}", ids_path.display()))?
+    } else {
+        tokenizer.encode(&args.prompt).context("tokenize prompt")?
+    };
     if prompt_tokens.is_empty() {
         bail!("prompt tokenized to an empty sequence");
     }
@@ -3398,19 +3492,10 @@ fn main() -> Result<()> {
         );
     }
     if let Some(dump_path) = args.dump_logprobs.as_ref() {
-        let dump_prompt_tokens = if let Some(ids_path) = args.prompt_ids.as_ref() {
-            let raw = std::fs::read_to_string(ids_path)
-                .with_context(|| format!("read prompt ids from {}", ids_path.display()))?;
-            let ids: Vec<u32> = serde_json::from_str(raw.trim())
-                .with_context(|| format!("parse prompt ids JSON from {}", ids_path.display()))?;
-            if ids.is_empty() {
-                bail!("--prompt-ids must contain at least one token id");
-            }
-            println!("dump_prompt_ids: {ids:?}");
-            ids
-        } else {
-            prompt_tokens.clone()
-        };
+        let dump_prompt_tokens = prompt_tokens.clone();
+        if args.prompt_ids.is_some() {
+            println!("dump_prompt_ids: {dump_prompt_tokens:?}");
+        }
         let options = GenerateOptions {
             max_new_tokens: 1,
             temperature: 0.0,

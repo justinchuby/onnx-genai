@@ -7,6 +7,10 @@
 //! frozen the config, and the freeze guard then trips on a knob that changed
 //! afterwards. The guard's own advice is to isolate a policy phase in its own
 //! process, so these drive the real binary and read the profile it wrote.
+//!
+//! Only the `generate` command is covered here: the `transcribe` counterpart
+//! needs the `tiny-whisper` package, which is not one of the canonical fixtures
+//! this branch keeps, so it would assert against a model that does not exist.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -72,28 +76,6 @@ fn generate_profile_provider_comes_from_live_command_profile() {
         "--max-new-tokens",
         "1",
         "--no-stats",
-        "--cpu-cores",
-        "1",
-    ]);
-
-    assert_eq!(profile_execution_provider(&profile), "cpu");
-    std::fs::remove_dir_all(directory).expect("the scratch directory must be removed");
-}
-
-#[test]
-fn transcribe_profile_provider_comes_from_live_command_profile() {
-    let directory = scratch("transcribe");
-    let profile = directory.join("profile.json");
-    let model = fixture("tiny-whisper");
-
-    run_cli(&[
-        "--profile-json",
-        &profile.display().to_string(),
-        "transcribe",
-        &model.display().to_string(),
-        &model.join("tiny.wav").display().to_string(),
-        "--format",
-        "json",
         "--cpu-cores",
         "1",
     ]);

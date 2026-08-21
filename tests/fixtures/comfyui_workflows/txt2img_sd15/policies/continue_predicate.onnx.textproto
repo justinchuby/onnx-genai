@@ -1,0 +1,77 @@
+ir_version: 11
+producer_name: "onnx-genai-comfyui-fixture"
+graph {
+  node {
+    input: "done"
+    output: "done_i32"
+    op_type: "Cast"
+    attribute {
+      name: "to"
+      i: 6
+      type: INT
+    }
+  }
+  node {
+    input: "done_i32"
+    input: "axis_0"
+    output: "all_done_i32"
+    op_type: "ReduceMin"
+    attribute {
+      name: "keepdims"
+      i: 1
+      type: INT
+    }
+  }
+  node {
+    input: "all_done_i32"
+    output: "all_done"
+    op_type: "Cast"
+    attribute {
+      name: "to"
+      i: 9
+      type: INT
+    }
+  }
+  node {
+    input: "all_done"
+    output: "continue"
+    op_type: "Not"
+  }
+  name: "continue_predicate"
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "axis_0"
+    raw_data: "\000\000\000\000\000\000\000\000"
+  }
+  input {
+    name: "done"
+    type {
+      tensor_type {
+        elem_type: 9
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "continue"
+    type {
+      tensor_type {
+        elem_type: 9
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}

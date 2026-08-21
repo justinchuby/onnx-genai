@@ -622,7 +622,9 @@ impl Executor {
         // Ask the kernel whether its outputs are strided views over its inputs
         // (a layout/movement op such as Slice). If so, record view metadata
         // aliasing the source buffer and skip compute + allocation entirely.
-        if !has_lazy_inputs && let Some(specs) = kernel.view_outputs(&views, &output_shapes, outputs.len()) {
+        if !has_lazy_inputs
+            && let Some(specs) = kernel.view_outputs(&views, &output_shapes, outputs.len())
+        {
             if outputs
                 .iter()
                 .any(|output| external.outputs.contains_key(output))

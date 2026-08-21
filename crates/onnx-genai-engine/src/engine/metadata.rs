@@ -372,23 +372,6 @@ pub(crate) fn default_inference_metadata() -> InferenceMetadata {
     InferenceMetadata::default()
 }
 
-/// Optional cap (in tokens) on the runtime-owned fixed-capacity KV buffer,
-/// read from `ONNX_GENAI_KV_MAX_LEN`. Returns `None` when the variable is
-/// unset, empty, or unparseable (in which case the model's full advertised
-/// context length is used, preserving prior behavior).
-pub(crate) fn shared_buffer_cap_from_env() -> Option<usize> {
-    std::env::var("ONNX_GENAI_KV_MAX_LEN")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|&cap| cap > 0)
-}
-
-/// Apply an optional KV-buffer capacity cap: the effective length is the
-/// smaller of the model's advertised max length and the cap, if any.
-pub(crate) fn cap_kv_len(model_max_len: usize, cap: Option<usize>) -> usize {
-    cap.map_or(model_max_len, |cap| model_max_len.min(cap))
-}
-
 /// Like [`genai_config_compat_metadata`], but derives the decoder graph
 /// inventory by inspecting the ONNX model file directly (used by the native
 /// decoder constructor, which builds metadata before a `Session` exists).
@@ -398,45 +381,63 @@ pub(crate) fn cap_kv_len(model_max_len: usize, cap: Option<usize>) -> usize {
 /// read from the graph, not expanded from a uniform layer count. If the graph
 /// cannot be inspected, this falls back to pattern-expanded metadata so no
 /// currently loading model regresses.
+/// Import a legacy `genai_config.json` through the fail-closed importer.
+///
+/// The runtime accepts a lossy import — refusing to load a package the stock
+/// runtime can run would help nobody — but it does not accept a *silent* one.
+/// Every key the new contract cannot carry is named in the log, with its reason
+/// when one is recorded, so an operator sees exactly which package semantics
+/// stopped at the boundary instead of discovering them as behaviour drift.
 pub(crate) fn genai_config_compat_metadata_from_model_path(
     genai_config_path: Option<&Path>,
     model_path: &Path,
 ) -> anyhow::Result<Option<InferenceMetadata>> {
     let decoder_graph = decoder_graph_info_from_model_path(model_path);
-    let result = match (genai_config_path, &decoder_graph) {
-        (Some(path), Some(graph)) => {
-            onnx_genai_genai_config::inference_metadata_from_path_with_graph(
-                path,
-                graph
-                    .inputs
-                    .iter()
-                    .find(|info| crate::decode::is_kv_input(&info.name))
-                    .map(|info| info.dtype.as_str()),
-                graph,
-            )
-            .map(Some)
-        }
-        (Some(path), None) => {
-            onnx_genai_genai_config::inference_metadata_from_path(path, None).map(Some)
-        }
-        (None, Some(graph)) => {
-            let kv_native_dtype = graph
-                .inputs
-                .iter()
-                .find(|info| crate::decode::is_kv_input(&info.name))
-                .map(|info| info.dtype.as_str());
-            onnx_genai_genai_config::inference_metadata_from_dir_with_graph(
-                model_path.parent().unwrap_or_else(|| Path::new(".")),
-                kv_native_dtype,
-                graph,
-            )
-        }
-        (None, None) => onnx_genai_genai_config::inference_metadata_from_dir(
+    let kv_native_dtype = decoder_graph.as_ref().and_then(|graph| {
+        graph
+            .inputs
+            .iter()
+            .find(|info| crate::decode::is_kv_input(&info.name))
+            .map(|info| info.dtype.as_str())
+    });
+    // Lossy is permitted, silence is not: the report is the whole point.
+    let options = onnx_genai_genai_config::ImportOptions { allow_lossy: true };
+    let result = match genai_config_path {
+        Some(path) => onnx_genai_genai_config::import_from_path(
+            path,
+            kv_native_dtype,
+            decoder_graph.as_ref(),
+            options,
+        )
+        .map(Some),
+        None => onnx_genai_genai_config::import_from_dir(
             model_path.parent().unwrap_or_else(|| Path::new(".")),
-            None,
+            kv_native_dtype,
+            decoder_graph.as_ref(),
+            options,
         ),
     };
-    result.map_err(|e| anyhow::anyhow!("Failed to convert genai_config.json: {e}"))
+    let imported =
+        result.map_err(|e| anyhow::anyhow!("Failed to convert genai_config.json: {e}"))?;
+    Ok(imported.map(|(metadata, report)| {
+        if report.is_lossy() {
+            tracing::warn!(
+                dropped_keys = report.dropped_keys.len(),
+                "genai_config.json import dropped keys the inference metadata contract does not \
+                 carry: {}",
+                report
+                    .dropped_keys
+                    .iter()
+                    .map(|key| match onnx_genai_genai_config::drop_reason(key) {
+                        Some(reason) => format!("{key} ({reason})"),
+                        None => key.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        metadata
+    }))
 }
 
 /// Best-effort decoder graph inventory read straight from an ONNX model file,

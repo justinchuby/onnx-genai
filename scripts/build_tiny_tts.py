@@ -332,17 +332,10 @@ pipeline:
           kind: autoregressive
           decoder: decoder
           max_tokens: 4
-        run_on: every_step
       - name: synthesize_waveform
         strategy:
           kind: single_pass
           model: vocoder
-        run_on: final_only
-  phases:
-    decoder:
-      run_on: every_step
-    vocoder:
-      run_on: final_only
   audio:
     sample_rate: 16000
     output: vocoder.audio

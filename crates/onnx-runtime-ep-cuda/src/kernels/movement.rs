@@ -4,7 +4,9 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView, ViewOutput};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, Result, TensorMut, TensorView, ViewOutput,
+};
 use onnx_runtime_ir::{Attribute, DataType, Node, compute_contiguous_strides};
 
 use super::elementwise::{broadcast_strides, u64_bytes};

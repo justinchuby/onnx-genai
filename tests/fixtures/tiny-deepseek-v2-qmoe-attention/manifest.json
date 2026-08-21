@@ -21,7 +21,7 @@
     11
   ],
   "files": {
-    "model.onnx": 10247,
+    "model.onnx.textproto": 10247,
     "inference_metadata.yaml": 463,
     "tokenizer.json": 524
   }

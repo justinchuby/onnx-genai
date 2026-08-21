@@ -5270,6 +5270,7 @@ impl DecodeCudaState {
     ///
     /// `bf16`, non-rank-4, and in-place / CPU-resident caches stay gated to the
     /// non-paged fallback (Inc-D.2 and later) — no silent-wrong paged run.
+    #[allow(dead_code)]
     pub(crate) fn kv_bindings_paged_rank4(&self) -> bool {
         let range = self.kv_binding_range.clone();
         if range.is_empty() {
@@ -5301,6 +5302,7 @@ impl DecodeCudaState {
     /// The binding may be `f32` (Inc-D) or `f16` (Inc-D.1); the raw device bytes
     /// are widened to `f32` with the same `half` convert ORT uses
     /// ([`kv_dtype_to_f32`]) so the mirrored pages are byte-identical to ORT's.
+    #[allow(dead_code)]
     pub(crate) fn read_present_kv(
         &mut self,
         past_name: &str,
@@ -5381,6 +5383,7 @@ impl DecodeCudaState {
     /// marked attendable (the per-step decode only extends `[seq_len, total)`),
     /// and the KV logical length is advanced so the next step appends at
     /// `seq_len`.
+    #[allow(dead_code)]
     pub(crate) fn seed_prefix(
         &mut self,
         session: &mut InferenceSession,

@@ -51,6 +51,7 @@ pub mod loader;
 pub mod mtp;
 mod pipeline_admission;
 pub mod profile;
+pub mod runtime_capability;
 pub mod session;
 pub mod shared_kv_proposer;
 pub mod tokenizer;

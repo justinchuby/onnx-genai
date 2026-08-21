@@ -42,9 +42,10 @@ pub use fp8::{Fp8Format, decode_f32 as decode_fp8, encode_f32 as encode_fp8};
 pub use local_tiered::{DiskTierConfig, LocalTieredConfig, LocalTieredConnector};
 pub use page_table::{
     DevicePageSpan, HostPageStore, HostPageStoreFactory, HostPageStoreView, HostPageStoreViewMut,
-    KvDType, KvKind, KvPageStore, KvPageStoreFactory, KvQuantConfig, LayerKvDType,
-    LayerTensorConfig, Page, PageId, PageMigration, PageStats, PageStoreLayout, PageTable,
-    PageTensorConfig, PageUsage, SequenceUsage,
+    KvComponentPolicy, KvDType, KvKind, KvPageStore, KvPageStoreFactory, KvQuantAxis,
+    KvQuantConfig, KvQuantPolicy, LayerKvDType, LayerPrecisionRule, LayerTensorConfig, Page,
+    PageId, PageMigration, PageStats, PageStoreLayout, PageTable, PageTensorConfig, PageUsage,
+    SequenceUsage,
 };
 pub use paged_cache::{LayerKv, MaterializedKv, MaterializedLayerKv, PagedKvCache};
 pub use prefix_cache::PrefixCache;

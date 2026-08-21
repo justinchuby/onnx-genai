@@ -6,8 +6,6 @@
 //! ([onnx/onnx#8184](https://github.com/onnx/onnx/issues/8184)).
 
 pub mod reasoning;
-pub mod text_to_audio;
-pub mod text_to_image;
 
 pub use onnx_genai_engine as engine;
 pub use onnx_genai_kv as kv;
