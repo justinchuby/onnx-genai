@@ -506,6 +506,9 @@ select a hard-coded diffusion implementation by model name. The workflow must
 declare an `image` output role plus semantic inputs such as `prompt_tokens`,
 `seed`, `max_iterations`, and (when supported) `negative_prompt_tokens`,
 `guidance_scale`, `width`, `height`, `media`, and `denoising_strength`.
+Every image output must also declare its architecture-neutral `value_range`
+(`zero_to_one`, `negative_one_to_one`, or `zero_to_255`); the server validates
+that contract and never guesses normalization from generated pixel content.
 
 ```bash
 curl http://127.0.0.1:8080/v1/images/generations \
@@ -521,7 +524,9 @@ AUTOMATIC1111 compatibility includes `POST /sdapi/v1/txt2img`,
 `POST /sdapi/v1/img2img`, and discovery at `/sdapi/v1/sd-models`,
 `/sdapi/v1/samplers`, and `/sdapi/v1/options`. Images are returned as base64
 PNG. `img2img` is available only when metadata declares image/media and
-denoising-strength inputs. URL responses, server-side image saving, scripts,
+denoising-strength inputs. Its JSON body limit is 25 MiB so base64-encoded
+1024px-class source images fit while oversized uploads receive HTTP 413. URL
+responses, server-side image saving, scripts,
 extensions, ControlNet fields, and parameters the package cannot bind are
 rejected explicitly rather than ignored. OpenAI `output_format: png` and opaque
 backgrounds are supported; JPEG/WebP, transparency, and moderation requests are

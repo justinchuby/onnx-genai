@@ -5,13 +5,14 @@ use axum::{Json, extract::State};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
 use onnx_genai::{GenerateOptions, GeneratePrompt, GenerateRequest};
+use onnx_genai_metadata::ImageOutputValueRange;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
 use super::{ApiError, ApiJson, AppState, map_generate_submit_error, now_unix, resolve_model};
 use crate::image_generation::{
-    ImageExecutionRequest, ImageInputBinding, ImageInputValue, ImagePipelineSpec, ProducedImage,
-    scalar_f32, scalar_i64,
+    ImageExecutionRequest, ImageInputValue, ImagePipelineSpec, ProducedImage, scalar_f32,
+    scalar_i64, token_input,
 };
 
 const MAX_IMAGES_PER_REQUEST: usize = 8;
@@ -445,7 +446,7 @@ async fn execute(
         .await
         .map_err(map_generate_submit_error)?
         .map_err(|error| ApiError::internal(format!("image generation failed: {error:#}")))?;
-    encode_png(image)
+    encode_png(image, spec.output_value_range)
 }
 
 fn lower(
@@ -507,14 +508,14 @@ fn lower(
         },
         inputs: vec![(
             prompt_binding.name.clone(),
-            token_tensor(prompt_binding, &prompt)
+            token_input(prompt_binding, &prompt)
                 .map_err(|error| ApiError::bad_request(format!("{error:#}")))?,
         )],
     };
     if let Some((binding, tokens)) = negative_tokens {
         lowered.inputs.push((
             binding.name.clone(),
-            token_tensor(binding, &tokens)
+            token_input(binding, &tokens)
                 .map_err(|error| ApiError::bad_request(format!("{error:#}")))?,
         ));
     }
@@ -569,32 +570,30 @@ fn lower(
     Ok(lowered)
 }
 
-fn token_tensor(binding: &ImageInputBinding, tokens: &[u32]) -> anyhow::Result<ImageInputValue> {
-    let values = tokens
-        .iter()
-        .map(|token| i64::from(*token))
-        .collect::<Vec<_>>();
-    let shape = match binding.contract.rank {
-        1 => vec![values.len() as i64],
-        2 => vec![1, values.len() as i64],
-        rank => anyhow::bail!("prompt token binding must have rank 1 or 2, got rank {rank}"),
-    };
-    Ok(ImageInputValue::I64 { values, shape })
-}
-
-fn encode_png(image: ProducedImage) -> Result<Vec<u8>, ApiError> {
+fn encode_png(
+    image: ProducedImage,
+    value_range: ImageOutputValueRange,
+) -> Result<Vec<u8>, ApiError> {
     let (minimum, maximum) = image
         .values
         .iter()
         .fold((f32::INFINITY, f32::NEG_INFINITY), |(min, max), value| {
             (min.min(*value), max.max(*value))
         });
-    if !minimum.is_finite() || !maximum.is_finite() || minimum < -1.0 || maximum > 1.0 {
+    let (range_minimum, range_maximum) = match value_range {
+        ImageOutputValueRange::ZeroToOne => (0.0, 1.0),
+        ImageOutputValueRange::NegativeOneToOne => (-1.0, 1.0),
+        ImageOutputValueRange::ZeroTo255 => (0.0, 255.0),
+    };
+    if !minimum.is_finite()
+        || !maximum.is_finite()
+        || minimum < range_minimum
+        || maximum > range_maximum
+    {
         return Err(ApiError::internal(format!(
-            "image output must use normalized [0,1] or [-1,1] pixels, got range [{minimum}, {maximum}]"
+            "image output violates declared {value_range:?} pixel range: [{minimum}, {maximum}]"
         )));
     }
-    let signed_pixels = minimum < 0.0;
     let (height, width, channel_first) = match image.shape.as_slice() {
         [1, 3, height, width] => (*height, *width, true),
         [1, height, width, 3] => (*height, *width, false),
@@ -637,10 +636,10 @@ fn encode_png(image: ProducedImage) -> Result<Vec<u8>, ApiError> {
                 x as u32,
                 y as u32,
                 Rgb(pixel.map(|value| {
-                    let normalized = if signed_pixels {
-                        (value + 1.0) * 0.5
-                    } else {
-                        value
+                    let normalized = match value_range {
+                        ImageOutputValueRange::ZeroToOne => value,
+                        ImageOutputValueRange::NegativeOneToOne => (value + 1.0) * 0.5,
+                        ImageOutputValueRange::ZeroTo255 => value / 255.0,
                     };
                     (normalized.clamp(0.0, 1.0) * 255.0).round() as u8
                 })),
@@ -877,13 +876,60 @@ pub(crate) async fn a1111_options(
 mod tests {
     use super::*;
 
+    fn decode_pixel(png: &[u8]) -> [u8; 3] {
+        image::load_from_memory_with_format(png, ImageFormat::Png)
+            .unwrap()
+            .into_rgb8()
+            .get_pixel(0, 0)
+            .0
+    }
+
     #[test]
     fn channel_first_tensor_encodes_as_png() {
-        let png = encode_png(ProducedImage {
-            values: vec![1.0, 0.0, 0.0],
-            shape: vec![1, 3, 1, 1],
-        })
+        let png = encode_png(
+            ProducedImage {
+                values: vec![1.0, 0.0, 0.0],
+                shape: vec![1, 3, 1, 1],
+            },
+            ImageOutputValueRange::ZeroToOne,
+        )
         .unwrap();
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn declared_value_range_controls_pixel_conversion() {
+        let image = || ProducedImage {
+            values: vec![0.0, 0.5, 1.0],
+            shape: vec![1, 3, 1, 1],
+        };
+        let zero_to_one = encode_png(image(), ImageOutputValueRange::ZeroToOne).unwrap();
+        let negative_one_to_one =
+            encode_png(image(), ImageOutputValueRange::NegativeOneToOne).unwrap();
+        let zero_to_255 = encode_png(
+            ProducedImage {
+                values: vec![0.0, 127.5, 255.0],
+                shape: vec![1, 3, 1, 1],
+            },
+            ImageOutputValueRange::ZeroTo255,
+        )
+        .unwrap();
+
+        assert_eq!(decode_pixel(&zero_to_one), [0, 128, 255]);
+        assert_eq!(decode_pixel(&negative_one_to_one), [128, 191, 255]);
+        assert_eq!(decode_pixel(&zero_to_255), [0, 128, 255]);
+    }
+
+    #[test]
+    fn pixels_outside_the_declared_range_are_rejected() {
+        let error = encode_png(
+            ProducedImage {
+                values: vec![-0.1, 0.0, 1.0],
+                shape: vec![1, 3, 1, 1],
+            },
+            ImageOutputValueRange::ZeroToOne,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("violates declared ZeroToOne"));
     }
 }

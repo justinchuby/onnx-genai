@@ -453,6 +453,15 @@ impl ApiError {
             retry_after_secs: Some(OVERLOAD_RETRY_AFTER_SECS),
         }
     }
+
+    fn payload_too_large(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: message.into(),
+            kind: "invalid_request_error",
+            retry_after_secs: None,
+        }
+    }
 }
 
 fn generation_failure(error: DriverFailure) -> ApiError {
@@ -489,6 +498,9 @@ where
     async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
         match Json::<T>::from_request(request, state).await {
             Ok(Json(value)) => Ok(Self(value)),
+            Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+                Err(ApiError::payload_too_large(rejection.body_text()))
+            }
             Err(rejection) => Err(ApiError::bad_request(describe_json_rejection(&rejection))),
         }
     }

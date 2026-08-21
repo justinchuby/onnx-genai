@@ -1572,6 +1572,16 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
             &output.contract,
             errors,
         );
+        match (&output.role, output.value_range) {
+            (crate::schema::WorkflowOutputRole::Image, None) => errors.push(format!(
+                "workflow image output '{name}' must declare value_range"
+            )),
+            (crate::schema::WorkflowOutputRole::Image, Some(_)) => {}
+            (_, Some(_)) => errors.push(format!(
+                "workflow non-image output '{name}' cannot declare image value_range"
+            )),
+            (_, None) => {}
+        }
     }
     for (name, component) in &workflow.components {
         if name.trim().is_empty() || name.contains('.') {

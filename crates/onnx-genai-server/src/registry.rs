@@ -124,8 +124,8 @@ impl ModelHandle {
         }
     }
 
-    /// Run exactly one deterministic token generation to initialize lazy runtime
-    /// allocations. Repeated calls after a successful warmup are no-ops.
+    /// Run one deterministic generation matching the loaded model's output
+    /// contract to initialize lazy runtime allocations.
     fn warmup(&self) -> anyhow::Result<Duration> {
         if self.warmed.load(Ordering::Acquire) {
             return Ok(Duration::ZERO);
@@ -137,22 +137,27 @@ impl ModelHandle {
         if self.warmed.load(Ordering::Acquire) {
             return Ok(Duration::ZERO);
         }
-        let prompt = self
-            .tokenizer
-            .encode("warmup")
-            .context("failed to tokenize warmup prompt")?;
         let started = Instant::now();
-        self.engine.warmup(
-            GenerateRequest {
-                prompt: GeneratePrompt::TokenIds(prompt),
-                options: GenerateOptions {
-                    max_new_tokens: 1,
-                    max_context: self.model_max_context,
-                    ..GenerateOptions::default()
+        if let Some(image_pipeline) = &self.image_pipeline {
+            let request = image_pipeline.warmup_request(&self.tokenizer, self.model_max_context)?;
+            self.engine.warmup_image(request)?;
+        } else {
+            let prompt = self
+                .tokenizer
+                .encode("warmup")
+                .context("failed to tokenize warmup prompt")?;
+            self.engine.warmup(
+                GenerateRequest {
+                    prompt: GeneratePrompt::TokenIds(prompt),
+                    options: GenerateOptions {
+                        max_new_tokens: 1,
+                        max_context: self.model_max_context,
+                        ..GenerateOptions::default()
+                    },
                 },
-            },
-            self.pipeline,
-        )?;
+                self.pipeline,
+            )?;
+        }
         self.warmed.store(true, Ordering::Release);
         Ok(started.elapsed())
     }

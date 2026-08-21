@@ -124,6 +124,7 @@ pub(crate) enum DriverCommand {
         request: Box<ImageExecutionRequest>,
         reply: oneshot::Sender<anyhow::Result<ProducedImage>>,
         permit: OwnedSemaphorePermit,
+        track_metrics: bool,
     },
     GenerateFim {
         prefix: String,
@@ -536,6 +537,7 @@ impl EngineDriver {
                 request: Box::new(request),
                 reply,
                 permit,
+                track_metrics: true,
             })
             .await
             .is_err()
@@ -546,6 +548,27 @@ impl EngineDriver {
         receiver
             .await
             .map_err(|_| GenerateSubmitError::DriverStopped)
+    }
+
+    pub(crate) fn warmup_image(&self, request: ImageExecutionRequest) -> anyhow::Result<()> {
+        let permit = self
+            .generation_capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| anyhow::anyhow!("generation capacity exceeded"))?;
+        let (reply, receiver) = oneshot::channel();
+        self.commands
+            .blocking_send(DriverCommand::GenerateImage {
+                request: Box::new(request),
+                reply,
+                permit,
+                track_metrics: false,
+            })
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
+        receiver
+            .blocking_recv()
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))??;
+        Ok(())
     }
 
     pub(crate) async fn generate_fim(
@@ -707,7 +730,9 @@ fn run_pipeline_driver(
                 request,
                 reply,
                 permit: _permit,
+                track_metrics,
             } => {
+                let _metrics = track_metrics.then(GenerationMetrics::start);
                 let result = (|| {
                     let outputs = engine.run_pipeline_outputs(request.into_pipeline()?)?;
                     let image = engine

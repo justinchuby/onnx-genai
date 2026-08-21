@@ -590,7 +590,22 @@ pub enum WorkflowInputSource {
 pub struct WorkflowOutput {
     pub contract: TensorContract,
     pub role: WorkflowOutputRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_range: Option<ImageOutputValueRange>,
     pub stage: OutputStage,
+}
+
+/// Numeric interpretation of pixels emitted by an image workflow output.
+///
+/// This is an output contract, not a model-family hint: consumers must never
+/// infer normalization from observed pixel values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageOutputValueRange {
+    ZeroToOne,
+    NegativeOneToOne,
+    #[serde(rename = "zero_to_255")]
+    ZeroTo255,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
