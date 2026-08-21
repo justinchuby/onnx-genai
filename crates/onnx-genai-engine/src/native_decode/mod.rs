@@ -1115,9 +1115,7 @@ impl NativeDecodeSession {
     /// Snapshot the destructive recurrent/conv state at the current committed
     /// length. See [`Self::snapshot_recurrent_state`]. Public, opaque handle for
     /// diagnostics that must restore recurrent state around an eager verify.
-    pub fn snapshot_recurrent_state_public(
-        &mut self,
-    ) -> anyhow::Result<NativeRecurrentSnapshot> {
+    pub fn snapshot_recurrent_state_public(&mut self) -> anyhow::Result<NativeRecurrentSnapshot> {
         Ok(NativeRecurrentSnapshot(self.snapshot_recurrent_state()?))
     }
 
