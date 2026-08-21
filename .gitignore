@@ -144,3 +144,7 @@ bench-bins/
 .rg_*
 .rv_*
 .roy_*
+
+# Deckard local bench env + scratch (not for PR)
+.deckard_env.sh
+.scratch/

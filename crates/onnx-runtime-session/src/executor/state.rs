@@ -103,6 +103,14 @@ pub(crate) struct Executor {
     /// `buffers` before `run_scoped_mode` returns, so it is empty between runs
     /// and no borrowed handle ever outlives the `&Tensor` it aliases.
     pub(super) parked_input_buffers: Vec<(ValueId, DeviceBuffer)>,
+    /// Stale output buffers whose owner became a zero-copy view while a device
+    /// graph was being recorded. Freeing a buffer mid-capture is illegal (the
+    /// pooled-memory unmap synchronizes the copy stream, which CUDA rejects
+    /// during stream capture), so `install_view_outputs` parks the orphaned
+    /// allocation here and [`Self::run_plan_segmented`] flushes it (a normal
+    /// `deallocate`) once `end_device_graph_capture` has closed the capture.
+    /// Empty outside an in-progress capture pass.
+    pub(super) capture_deferred_frees: Vec<DeviceBuffer>,
     /// Loader-produced (possibly symbolic) shape of every value.
     pub(super) value_shapes: HashMap<ValueId, Shape>,
     /// Element type of every value.
