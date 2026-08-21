@@ -156,6 +156,20 @@ impl NativeDecodeSession {
                 state.invalidate_graph(&mut self.session)?;
             }
             state.rewind(target_len)?;
+            if target_len == 0 {
+                // Generation-reset boundary: `rewind(0)` just re-zeroed the
+                // recurrent/conv rolling caches, so a verify graph captured in the
+                // previous generation would replay against reset state (and, on a
+                // reused session across prompts, potentially stale bindings). Reset
+                // the verify-dedicated sibling's captured graph and re-arm its
+                // phase so the next generation re-warms + recaptures cleanly. This
+                // is the ONLY place the verify sibling is reset — within a
+                // generation it survives the per-step Primary teardowns because it
+                // binds only fixed-capacity, non-moving external buffers plus its
+                // own private interior arena (see `invalidate_graph`).
+                self.session.reset_verify_sibling_device_graph()?;
+                state.reset_verify_graph_phase();
+            }
             self.current_len = target_len;
             return Ok(());
         }
