@@ -1271,13 +1271,21 @@ pub trait ExecutionProvider: Send + Sync {
         }
     }
 
-    /// Read (without clearing) any latching device-side capture-safety error a
-    /// captured kernel recorded during graph replay, as a raw violation bitmask
-    /// (zero when none). EPs without device graphs report no error.
+    /// Clear the provider's latching device-side validation error.
     ///
-    /// The decode loop calls this at the per-step logits device→host sync so an
-    /// out-of-range bounds violation becomes a hard error before the produced
-    /// token is consumed, without adding a separate synchronization.
+    /// Session executors call this at top-level request boundaries. Implementations
+    /// must make the reset safe for both eager and captured execution; providers
+    /// without a device validation latch keep the no-op default.
+    fn reset_device_validation_error(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Read (without clearing) any latching device-side validation error as a
+    /// raw violation bitmask (zero when none). The compatibility name predates
+    /// deferred eager validation; EPs without device validation report no error.
+    ///
+    /// The caller must first establish a host synchronization boundary so all
+    /// kernels from the request have completed before this value is observed.
     fn check_device_capture_error(&self) -> Result<u32> {
         Ok(0)
     }

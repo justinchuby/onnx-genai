@@ -3192,6 +3192,10 @@ impl ExecutionProvider for CudaExecutionProvider {
         Ok(invalidated)
     }
 
+    fn reset_device_validation_error(&self) -> Result<()> {
+        self.runtime.reset_capture_error()
+    }
+
     fn check_device_capture_error(&self) -> Result<u32> {
         self.runtime.check_capture_error()
     }
@@ -3388,7 +3392,10 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn sync(&self) -> Result<()> {
-        self.runtime.synchronize()
+        // `ExecutionProvider::sync` is an explicit host/cross-stream completion
+        // boundary, not a trailing per-op eager sync that may be deferred.
+        self.runtime.drain_for_unmap()?;
+        self.runtime.sync_copy_stream()
     }
 }
 
@@ -3464,6 +3471,58 @@ mod tests {
         assert!(
             ladder.iter().all(|&size| size >= RESERVATION_MIN_BYTES),
             "no rung may drop below the minimum: {ladder:?}"
+        );
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn explicit_ep_sync_drains_compute_and_copy_streams_when_eager_sync_is_deferred() {
+        use cudarc::driver::{LaunchConfig, PushKernelArg};
+
+        let Ok(ep) = CudaExecutionProvider::initialized(0) else {
+            eprintln!("skipping explicit sync test: CUDA EP unavailable");
+            return;
+        };
+        let runtime = ep.runtime();
+        runtime.set_defer_eager_sync(true);
+        let spin_delay = runtime
+            .nvrtc_function(
+                "cuda_ep_explicit_sync_test",
+                r#"
+extern "C" __global__ void spin_delay(long long spin) {
+    long long start = clock64();
+    while (clock64() - start < spin) { }
+}
+"#,
+                "spin_delay",
+            )
+            .unwrap();
+
+        let spin: i64 = 100_000_000;
+        let mut compute = runtime.stream().launch_builder(&spin_delay);
+        compute.arg(&spin);
+        unsafe { compute.launch(LaunchConfig::for_num_elems(1)).unwrap() };
+        let mut copy = runtime.copy_stream().launch_builder(&spin_delay);
+        copy.arg(&spin);
+        unsafe { copy.launch(LaunchConfig::for_num_elems(1)).unwrap() };
+
+        let context = runtime.cuda_context();
+        let compute_done = context.new_event(None).unwrap();
+        compute_done.record(runtime.stream()).unwrap();
+        let copy_done = context.new_event(None).unwrap();
+        copy_done.record(runtime.copy_stream()).unwrap();
+        assert!(
+            !compute_done.is_complete() || !copy_done.is_complete(),
+            "the delayed work must still be pending before the explicit boundary"
+        );
+
+        ExecutionProvider::sync(&ep).unwrap();
+        assert!(
+            compute_done.is_complete() && copy_done.is_complete(),
+            "ExecutionProvider::sync must block until both CUDA streams complete"
         );
     }
 
