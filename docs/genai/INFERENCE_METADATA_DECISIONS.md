@@ -190,6 +190,15 @@ port's spelling is exactly the name-matching this schema refuses everywhere
 else. `ports.roles` states it, with an architecture-neutral vocabulary that
 describes the port and never the model family exposing it.
 
+State ports use the same separation of graph facts from semantic facts. The
+artifact owns every individual tensor's geometry. The state group supplies
+`role: key|value|combined` and numeric `layer`, because neither semantic half
+nor layer ordering is recoverable from shape or a producer-chosen label.
+`layer` pairs and orders aliases; it never asserts equal geometry. Different
+layers may expose different KV head counts, and the key and value aliases of
+one layer may themselves have different head counts or head dimensions without
+requiring a different metadata vocabulary.
+
 **`model.io` is import-only and non-authoritative.** It is deserialized under
 its historical key, marked deprecated in the Rust API as `legacy_io`, and read
 only when a document carries no workflow — which is exactly the legacy
