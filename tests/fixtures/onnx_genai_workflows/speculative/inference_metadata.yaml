@@ -1325,9 +1325,6 @@ package:
     algorithm: bpe
     vocab_size: 32000
     byte_level: true
-    artifacts:
-    - location: tokenizer.json
-      sha256: '0000000000000000000000000000000000000000000000000000000000000000'
     special_tokens:
       bos:
         id: 1

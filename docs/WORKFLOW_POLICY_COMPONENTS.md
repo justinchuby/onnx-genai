@@ -290,7 +290,6 @@ workflow steps or `run_once` nodes. Composite packages reference request SSA inp
 
 ```yaml
 adapters:
-  base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:<64 lowercase hex>
   target_manifest:
     targets:
       - id: decoder.layers.0.q_proj
@@ -333,7 +332,6 @@ adapters:
       index: 0
       identity: example.summarizer
       version: "1"
-      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:<same hex>
       rank: 8
       alpha: 16.0
       dtype: float16
@@ -345,14 +343,11 @@ adapters:
         - format: hf_peft
           loader_capability: onnx-genai.adapters.hf-peft@1
           location: adapters/summarizer/adapter_model.safetensors
-          sha256: <exact-safetensors sha256>
           config_location: adapters/summarizer/adapter_config.json
-          config_sha256: <exact-config sha256>
           scale_encoding: alpha_over_rank
         - format: ort_genai
           loader_capability: onnxruntime.lora-adapter@1
           location: adapters/summarizer/adapter.onnx_adapter
-          sha256: <exact-file sha256>
           scale_encoding: baked
       bindings:
         - target: decoder.layers.0.q_proj
@@ -382,11 +377,11 @@ This matrix audits Phase 1 at `813a9b53` and Phase 2 at `326fddcf`.
 ### Artifact, manifest, and compatibility identity
 
 Artifact map keys are package-local aliases and `index` is the stable segment ID. Indices are
-unique and contiguous from zero. Every source file is beneath `adapters/<alias>/`; SHA-256 is over
-exact bytes and is checked before parsing or upload. `hf_peft` pairs `adapter_config.json` with
-safetensors with `scale_encoding: alpha_over_rank`. `ort_genai` is upstream `.onnx_adapter`
-(`TORT`, format version 1) with its static scale already baked into factors and therefore requires
-`scale_encoding: baked`; a loader must not apply alpha/rank again. `json` is the
+unique and contiguous from zero. Every source file is beneath `adapters/<alias>/`. Byte-level
+integrity belongs to the distribution layer rather than inference metadata. `hf_peft` pairs
+`adapter_config.json` with safetensors with `scale_encoding: alpha_over_rank`. `ort_genai` is
+upstream `.onnx_adapter` (`TORT`, format version 1) with its static scale already baked into factors
+and therefore requires `scale_encoding: baked`; a loader must not apply alpha/rank again. `json` is the
 float32 RFC 8785 reference bundle `{"targets":{"<weight_key>":{"a":[...],"b":[...]}}}`. A
 manifest-keyed safetensors source uses `<weight_key>.a` and `<weight_key>.b`. Source formats may
 coexist for one artifact only when they encode the same canonical factors.
@@ -400,13 +395,10 @@ binding must satisfy after applying its per-binding or artifact defaults.
 If absent, a capable runtime may apply an immutable parameter overlay or invoke a portable standard
 ONNX delta component. Base initializers are never modified.
 
-The targeted base fingerprint sorts targets by UTF-8 `(component,initializer)` and hashes RFC 8785
-canonical JSON containing component, exact initializer name, ONNX dtype number, dimensions, SHA-256
-of logical contiguous row-major little-endian initializer bytes, and direct consumers sorted by
-node/input ordinal with normalized domain, op type, input ordinal, and canonical attributes. It is
-also records the resolved output value, activation dtype, output slice, and graph-input binding.
-It is encoded as `onnx-genai-targeted-base-v1:sha256:<hex>`. Names used only for debugging,
-protobuf field order, paths, and external-data chunking are excluded.
+Compatibility is established by the authoritative target manifest and live graph
+admission: component identity, initializer and output bindings, tensor geometry,
+ports/state ABI, capabilities, and graph-input seams must resolve. Compatible
+artifact bytes may be replaced without changing inference metadata.
 
 ### Request routing, composition, and batching
 

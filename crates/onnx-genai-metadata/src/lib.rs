@@ -50,7 +50,7 @@ pub use parser::{
     MtpProposerSpec, SharedKvProposerSpec, SpeculatorConfigSource, SpeculatorDescriptor,
     SpeculatorProposerKind, SpeculatorProposerStatus, detect_speculator, find_metadata_path,
     load_metadata, load_metadata_from_dir, load_metadata_package, load_metadata_with_identity,
-    load_pipeline_spec,
+    load_pipeline_spec, resolve_package_artifact,
 };
 pub use schema::*;
 pub use validation::{

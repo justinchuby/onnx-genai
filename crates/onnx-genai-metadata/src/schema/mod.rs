@@ -98,7 +98,7 @@ pub struct InferenceMetadata {
 
     /// Exact package facts needed to interpret request data correctly.
     ///
-    /// Tokenizer bytes, vocabulary size, special tokens, and the constraint
+    /// Tokenizer artifacts, vocabulary size, special tokens, and the constraint
     /// dialects the package's parser accepts. Grammars and JSON Schemas
     /// themselves are request data, not package metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
