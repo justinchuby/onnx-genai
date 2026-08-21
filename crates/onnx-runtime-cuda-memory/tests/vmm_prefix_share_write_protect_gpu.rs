@@ -18,8 +18,9 @@
 //!
 //! Copy-engine and memset writes are rejected non-stickily and leave the other
 //! sharer uncorrupted. A real kernel `st.global`, however, faults with
-//! `CUDA_ERROR_ILLEGAL_ADDRESS` and poisons the context on A100. The allocator
-//! therefore must not advertise shared mapping as a production capability.
+//! `CUDA_ERROR_ILLEGAL_ADDRESS` and poisons the context on A100, like any CUDA
+//! illegal address. Shared-prefix protection is therefore fail-stop: it prevents
+//! silent cross-request KV corruption but cannot recover an invalid kernel.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -300,7 +301,8 @@ fn shared_prefix_kernel_write_fault_is_sticky() {
 
         eprintln!(
             "Q3 result: copy-engine writes are rejected non-stickily, but a production-shaped \
-             kernel store poisons the context -- CUDA shared mapping must remain unadvertised."
+             kernel store poisons the context -- shared-prefix protection is fail-stop, not a \
+             recoverable kernel-error boundary."
         );
     }));
 

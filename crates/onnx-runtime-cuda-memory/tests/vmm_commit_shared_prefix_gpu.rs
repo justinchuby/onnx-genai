@@ -580,8 +580,8 @@ fn unsupported_shared_prefix_requests_error_rather_than_mismap() {
         "a detached/pool-less allocator must not advertise SharedMapping"
     );
     assert!(
-        DeviceAllocator::as_shared_mapping(&allocator).is_none(),
-        "CUDA must not advertise context-sticky read-only shared mappings"
+        DeviceAllocator::as_shared_mapping(&allocator).is_some(),
+        "a pooled allocator must advertise SharedMapping"
     );
 
     // SAFETY: live pointers from this allocator, no CUDA work in flight.

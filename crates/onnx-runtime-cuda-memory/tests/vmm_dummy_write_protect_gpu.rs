@@ -14,9 +14,10 @@
 //!
 //! Copy-engine and memset writes are rejected non-stickily, but those operations
 //! do not model a production kernel store. A real `st.global` faults with
-//! `CUDA_ERROR_ILLEGAL_ADDRESS` and poisons the context on A100. The CUDA
-//! allocator therefore must not advertise this mechanism as a production
-//! capability.
+//! `CUDA_ERROR_ILLEGAL_ADDRESS` and poisons the context on A100, the normal CUDA
+//! fail-stop behavior for an illegal device access. The protection therefore
+//! prevents silent shared-page corruption; it does not make an invalid kernel
+//! recoverable.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -277,8 +278,8 @@ fn read_only_dummy_kernel_write_fault_is_sticky() {
 
         eprintln!(
             "Q3 result: copy-engine writes are rejected non-stickily, but a production-shaped \
-             kernel store poisons the context -- read-only dummy-page sharing must remain \
-             unavailable as a production capability."
+             kernel store poisons the context -- read-only protection is fail-stop, not a \
+             recoverable kernel-error boundary."
         );
     }));
 

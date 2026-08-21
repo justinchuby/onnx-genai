@@ -24,9 +24,9 @@ WDDM. Granule `CU_MEM_ALLOC_GRANULARITY_MINIMUM == RECOMMENDED == 2 MiB` (#776).
 
 ## TL;DR — the recommendation
 
-**The primitive's mapping and accounting work, but it is not safe to expose as
-a production capability.** The production-shaped write probe found a kill
-condition:
+**The primitive is sound enough to build KV integration on.** The
+production-shaped probe clarifies that its protection is fail-stop, not a
+recoverable kernel-error boundary:
 
 1. **N-way sharing works**, including under captured-graph replay. One physical
    granule mapped into 8 sequences' reservations is read identically by all 8,
@@ -40,11 +40,12 @@ condition:
    incremental owned bytes; the granule stays mapped until the **last** sharer
    leaves; teardown returns the ledger to zero. Admission arithmetic: **admitting
    the Nth request costs only its private bytes.**
-3. **Kernel write protection is sticky.** Copy-engine and memset writes into a
+3. **Kernel write protection is fail-stop.** Copy-engine and memset writes into a
    `PROT_READ` shared prefix return `CUDA_ERROR_INVALID_VALUE` without poisoning
    the context, but a real kernel `st.global` returns
    `CUDA_ERROR_ILLEGAL_ADDRESS` at synchronization and leaves the context
-   unusable. This is the kill finding the earlier copy-only probe missed.
+   unusable. This is normal CUDA illegal-address behavior: protection prevents
+   silent cross-request KV corruption, but it cannot recover a broken kernel.
 4. **It composes with the #759 dummy page.** A read-only shared prefix head, a
    read/write private live granule, and a read-only shared dummy tail coexist in
    **one** reservation with three distinct `cuMemSetAccess` postures. Reads
@@ -138,9 +139,9 @@ That result does not generalize to production kernels. A driver-JITed probe
 first reads both aliases with `ld.global`, then issues `st.global` into the
 read-only victim. The launch succeeds, synchronization returns
 `CUDA_ERROR_ILLEGAL_ADDRESS`, and a fresh-context-health operation returns the
-same sticky error. Because one bad store can kill the process serving every
-request, `CudaVmmAllocator::as_shared_mapping()` returns `None`; the low-level
-primitive remains available only for isolated validation.
+same sticky error. This establishes the production contract: correct kernels
+read the shared prefix; an invalid store fails loudly and requires context
+recreation, just like any other CUDA illegal address.
 
 ### Q4 — does it compose with the #759 dummy page?
 
@@ -360,10 +361,10 @@ detection, no COW):
    region uncommitted.
 5. Reported bytes are **physical** (`committed_physical_bytes`, `mapped_bytes`),
    never nominal content bytes; no `assert!` runs inside any `Drop`.
-6. The CUDA allocator deliberately reports no optional `SharedMapping`
-   capability. Q3 proved that a production kernel store into a read-only alias
-   poisons the context; callers cannot discover or select this primitive through
-   the production allocator seam.
+6. A pooled CUDA allocator exposes the optional `SharedMapping` capability;
+   detached allocators without the physical-handle pool report capability
+   absence. The capability's protection contract is fail-stop as established by
+   Q3.
 
 `vmm_commit_shared_prefix_gpu.rs` proves this against the **real**
 `CudaVmmAllocator` + `LedgerGovernor` (no mock), one concern per test:
@@ -400,14 +401,12 @@ divergence past the shared region. Those are the increments below.
 
 ## Smallest next increment
 
-1. **KV-path integration is blocked by context-sticky protection faults.**
-   `CudaVmmAllocator` deliberately does not expose the independent
-   `SharedMapping` capability from the selected `DeviceAllocator`; production
-   discovery returns `None`. The low-level primitive is retained only for
-   isolated validation while a non-poisoning isolation design is absent. The
-   **seq-major** fused fp16 GQA decode kernel remains the end-to-end oracle: the
-   test pins a token prefix once, maps it into a second sequence through the
-   concrete allocator, and runs the real kernel. In
+1. **KV-path integration (first production consumer — landed for seq-major,
+   #777).** A pooled `CudaVmmAllocator` exposes the independent `SharedMapping`
+   capability from the selected `DeviceAllocator`; detached allocators report
+   capability absence. The **seq-major** fused fp16 GQA decode kernel is the
+   end-to-end consumer: the test pins a token prefix through the capability,
+   maps it into a second sequence, and runs the real kernel. In
    `crates/onnx-runtime-ep-cuda/tests/gqa_shared_prefix_parity_gpu.rs`, two
    sequences sharing one pinned seq-major prefix (`layers × 2` contiguous ranges)
    produce **byte-identical** output to two independent sequences. Measured
@@ -415,8 +414,9 @@ divergence past the shared region. Those are the increments below.
    independent = 8 granules (16,777,216 B), shared = 6 granules (12,582,912 B);
    prefix charged **once** (`incremental_owned_bytes_for_shared_prefix` = 0),
    second sharer's admission = **private bytes only** (4,194,304 B), saving
-   `(C−1)×(K_prefix+V_prefix)` = 2 granules. These results validate parity and
-   accounting only; they do not make the capability production-safe.
+   `(C−1)×(K_prefix+V_prefix)` = 2 granules. Shared-prefix mappings are read-only;
+   an invalid kernel store is a fail-stop CUDA error rather than a recoverable
+   operation.
 
    Seq-major accepts `layers × 2` multi-maps per sequence rather than the single
    multi-map that only token-major (#783/#787) achieves; token-major is measured

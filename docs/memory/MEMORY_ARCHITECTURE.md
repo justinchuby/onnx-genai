@@ -1027,16 +1027,15 @@ enforcement, and 1:N handle bookkeeping are **not yet implemented**.
 
 The #777 isolating GPU probe validates N-way multi-map, charge-once accounting,
 dummy-page composition, and the measured copy-on-write boundary cost. Its
-production-shaped kernel-store probe also found the decisive blocker: writing a
-`PROT_READ` alias poisons the CUDA context. Measured answers and the resulting
-capability quarantine are in
+production-shaped kernel-store probe clarifies the protection contract: writing
+a `PROT_READ` alias is a fail-stop CUDA illegal-address error, not a recoverable
+kernel fault. Measured answers are in
 [`PREFIX_SHARE_INVESTIGATION.md`](PREFIX_SHARE_INVESTIGATION.md).
 
-**The CUDA capability is quarantined.** The low-level
-`create_shared_prefix`/`commit_shared_prefix` primitive remains available to
-isolated GPU tests, but `CudaVmmAllocator::as_shared_mapping()` returns `None`,
-so production code cannot discover or select it. The **seq-major** fused fp16
-GQA GPU parity test
+**First production consumer landed (#777).** A pooled CUDA allocator exposes
+`create_shared_prefix`/`commit_shared_prefix` through the optional
+`SharedMapping` capability; pool-less allocators report `None`. The
+**seq-major** fused fp16 GQA GPU parity test
 (`crates/onnx-runtime-ep-cuda/tests/gqa_shared_prefix_parity_gpu.rs`) drives the
 real kernel over shared-prefix VMM KV and proves two sequences sharing one pinned
 seq-major prefix (`layers × 2` contiguous ranges) produce **byte-identical**
@@ -1045,8 +1044,7 @@ output to two independent sequences. Measured at KV_HEADS=8, HEAD_DIM=128, f16,
 granules (16,777,216 B), shared = 6 granules (12,582,912 B); the prefix is
 charged **once** (`incremental_owned_bytes_for_shared_prefix` = 0) and the second
 sharer's admission is **only its private bytes** (4,194,304 B = its two private
-tails), so sharing removes `(C−1)×(K_prefix+V_prefix)` = 2 granules. This retains
-parity and accounting evidence without advertising the unsafe capability.
+tails), so sharing removes `(C−1)×(K_prefix+V_prefix)` = 2 granules.
 
 **What remains structural.** The *engine generation loop* cannot yet call this
 seam automatically: `persistent_state_shapes` in

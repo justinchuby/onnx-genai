@@ -162,11 +162,11 @@ Windows 上还有一个平台差异:WDDM 在超预算时**默认回退到操作�
 
 ### 本仓库怎么用它:只读前缀共享
 
-> **当前未向生产调用方开放。** A100 实测中,copy-engine 对只读映射的写入会
-> 非粘滞地失败,但真实 kernel 的 `st.global` 会触发
-> `CUDA_ERROR_ILLEGAL_ADDRESS` 并永久 poison 当前 CUDA context。因此底层
-> primitive 仅保留用于隔离验证,`CudaVmmAllocator::as_shared_mapping()` 返回
-> `None`,直到有不会杀死共享 context 的隔离方案。
+> **保护语义是 fail-stop。** A100 实测中,copy-engine 对只读映射的写入会
+> 非粘滞地失败;真实 kernel 的非法 `st.global` 则会触发
+> `CUDA_ERROR_ILLEGAL_ADDRESS` 并 poison 当前 CUDA context,与其他 CUDA
+> illegal-address bug 一样。正常 decode kernel 只读取共享 prefix;只读映射的
+> 作用是避免错误写入静默污染其他请求的 KV,而不是让错误 kernel 可恢复。
 
 场景:多个请求共享同一段 system prompt / 同一段对话前缀。它们的这段 KV 内容
 逐字节相同,没有理由各存一份。
