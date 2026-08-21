@@ -64,7 +64,8 @@ pub(crate) use crate::speculative::{
     load_target_initializer_adapters,
 };
 // The MTP proposer is driven only from the native decode path; an ORT-only
-// build has no consumer for it and would see an unused import.
+// build has no consumer for it and would see an unused import. Its only runtime
+// use is the native cold-generation path.
 #[cfg(feature = "native-backend")]
 pub(crate) use crate::speculative::MtpProposer;
 

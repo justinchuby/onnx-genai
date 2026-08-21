@@ -340,7 +340,8 @@ impl LmHead for MtpLmHead {
 /// target decode step.
 #[derive(Debug, Clone, Copy)]
 // An ORT-only build still threads `Option<DraftProjectionDevice>` through the
-// adapter loader, but only the native path ever constructs one.
+// adapter loader, but only the native path ever constructs one; outside that
+// feature, constructions are limited to tests.
 #[cfg_attr(not(feature = "native-backend"), allow(dead_code))]
 pub(crate) enum DraftProjectionDevice {
     /// Project on the CPU int4 `MatMulNBits` kernel (used by unit tests and the

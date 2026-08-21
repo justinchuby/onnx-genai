@@ -894,6 +894,27 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
       - name: Clippy onnx-genai-cli
         run: cargo clippy --locked -p onnx-genai-cli --all-targets -- -D warnings
+      # The step above builds these crates with their *default* features, under
+      # which every `#[cfg(feature = "native-cuda")]` block evaluates to false
+      # and is therefore never parsed as code -- it cannot be type-checked or
+      # linted, so a defect there is invisible rather than red. #1632 closed
+      # that hole for `onnx-genai-engine` on the CUDA job; these two crates
+      # could not go there because both link the downloaded ONNX Runtime, which
+      # that job deliberately excludes. This is their home instead.
+      #
+      # A separate step rather than adding the feature to the one above: the
+      # default configuration is what ships, so it must keep being checked on
+      # its own rather than being replaced by a union of both.
+      #
+      # `onnx-genai-cli/native-cuda` pulls in `onnx-genai-server/native-cuda`
+      # transitively, but `-D warnings` is only enforced for packages named
+      # with `-p`, so the server is listed explicitly.
+      - name: Clippy onnx-genai-cli and onnx-genai-server with native CUDA
+        run: >-
+          cargo clippy --locked
+          -p onnx-genai-cli -p onnx-genai-server
+          --features onnx-genai-cli/native-cuda,onnx-genai-server/native-cuda
+          --all-targets -- -D warnings
 
   cuda-compile-linux:
     name: CUDA compile (Linux x86_64)

@@ -49,10 +49,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use onnx_runtime_ep_api::{
-    CaptureRegionShapeStatus, DeviceBuffer, DevicePtr, DevicePtrMut, EpError, ExecutionProvider,
-    ExternalMmapRegion, Kernel, KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary,
-    ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMetadata, TensorMut, TensorView,
-    WeightHandle, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView, lazy_weight_candidates,
+    CaptureRegionShapeStatus, DeviceBuffer, DeviceGraphSlot, DevicePtr, DevicePtrMut, EpError,
+    ExecutionProvider, ExternalMmapRegion, Kernel, KernelInput, KernelMatch, LazyWeight,
+    LazyWeightBoundary, ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMetadata,
+    TensorMut, TensorView, WeightHandle, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+    lazy_weight_candidates,
 };
 
 type OptionalTensorSpecs = Vec<Option<(DataType, Vec<usize>)>>;
@@ -705,8 +706,8 @@ impl Drop for Executor {
         // mmap recycles an address for a same-shaped weight must not inherit this
         // model's packed buffers.
         onnx_runtime_ep_cpu::kernels::matmul_nbits::clear_mlas_packed_caches();
-        let _ = self.ep.reset_device_graph();
-        self.device_graph_signature = None;
+        let _ = self.ep.reset_device_graph_in(self.graph_slot);
+        self.cap_mut().device_graph_signature = None;
         // Free every buffer via the owning EP (DeviceBuffer has no Drop).
         for (_, buf) in self.buffers.drain() {
             let _ = self.ep.deallocate(buf);

@@ -1743,3 +1743,155 @@ issue to **0.156 uops/MAC** — the largest identified `m = 1` lever. Blocked on
 constant-`B` pack cache, which the native path lacks entirely
 (`pack_lookup`/`pack_build` are `#[cfg(feature = "mlas")]`). Full record:
 [`docs/benchmarks/2026-08-21-qlinear-u8-m1-instruction-mix.md`](../benchmarks/2026-08-21-qlinear-u8-m1-instruction-mix.md).
+
+### 22. Per-block bookkeeping was 1.68x of the int4 acc4 decode kernel — at block 32, at low thread counts, and nowhere else
+
+`nibble_outputs_avx2` built **two bounds-checked slices per block** and made the
+callee recover its group count from `packed.len()` on every call. Removing that —
+raw pointers hoisted above the `wide` branch, group count hoisted out of the
+block loop — is the whole result. It is bit-identical output.
+
+**The headline does not generalise, and the first draft of it did not
+reproduce.** Re-measured on latest main against the merged baseline, min of 6+
+interleaved repetitions with a per-row A/A control:
+
+| cell | speedup | | cell | speedup |
+|---|---|---|---|---|
+| t=1, block 32 | **1.686x** | | t=1, block 16 | 1.028x |
+| t=4, block 32 | **1.640x** | | t=1, block 64 | **1.380x** |
+| t=8, block 32 | 1.016x | | t=1, block 128 | 1.091x |
+| t=16, block 32 | **1.242x** | | 2 sessions x t=4 | 1.419x |
+
+Four of the nine rows in the originating draft did not reproduce — three
+optimistic, one (t=16, claimed 1.065x) **pessimistic**. The mechanism is
+consistent with the shape: `wide` requires `group >= WIDE_GROUP` (32) and
+`wide_groups = blob/16`, so the removed fixed per-block cost is amortized over
+1, 2 and 4 groups at block 32/64/128 and the path is not taken at all at block
+16. A one-parameter fit from the block-32 row predicts block 64 within 3% and
+block 128 within 8%, which is corroboration from two points rather than proof;
+the block-16 null is the stronger evidence, since that path provably cannot be
+entered. `accuracy_level = 0` is a 1.000x null control at t=1/4/8. **Quote the
+cell, not a multiplier** (§18 is the same lesson from the other side).
+
+**Two of my own corrections did not survive re-measurement against current
+main, and both failures were mine, not the draft's.** (i) **t=8 reversed to a
+wash.** It read 1.141x against `f8eb8a3e2`; against `2f94cba4d` it is 1.016x
+(two windows, A/A 0.52% and 0.03%). The *baseline* arm got 7.8% faster across
+that rebase window while the patched arm did not move, so the cell closed on its
+own. The window contains the native-MTP series, but those are CUDA-graph and
+speculative-decode commits with no stated path into a CPU int4 decode kernel;
+**the cause is not established** and is recorded as correlated-with-window, not
+explained. (ii) **"Specific to block_size 32" was wrong**, and wrong the same
+way the three defects below are wrong: block 64 and 128 had only ever been
+measured **at t=8**, the one thread count where this change buys nothing,
+confounding two variables in one cell. At t=1 block 64 is **1.380x**. The rule
+this yields is that a negative result measured at a single point on another axis
+is not a negative result.
+
+**A fourth defect was found in review of this very section**, and it is the
+same family: the ORT gap table above originally carried the **old-base** native
+arms next to the new-base A/B table, undisclosed. At t=8 that manufactured a
+2.84x -> 2.49x "improvement" out of a cell this section retracts as a wash. Base
+labels now travel with the numbers. **Two tables in one document may not sit on
+different baselines without saying so.**
+
+**Three measurement defects were found in the originating evidence, and all
+three are protocol, not arithmetic.** (i) The t=8 baseline was its *slow* mode —
+that arm is bimodal at 3.54/5.2 ms while the patched arm is stable, so pairing
+against 5.880 ms produced 1.609x where the reproducible figure on that base was
+1.141x — and 1.016x on current main.
+(ii) The multi-session rows used the harness's **pooled median per-token
+latency**, which mixes contended and uncontended tokens as sessions
+desynchronise — one baseline repetition read 9.348 ms against a 15.9 ms
+population and the A/A hit **52.7%**. Aggregate throughput is the only valid
+multi-session statistic here, and it moves those rows by ~0.17x. (iii) A cell
+whose min and median disagree in *direction* (t=16: 1.234x vs 0.730x) has not
+been measured; the fix is a longer window (240 tokens -> 1.245x/1.412x), not a
+choice of statistic. Also: `ONNX_GENAI_CPU_DECODE_THREADS=2` is **inert** on this
+harness (identical to `=1`), so any "t=2" row is a duplicate t=1 row.
+
+**Two corrections to this file's host model**, both of which change how earlier
+roofline arguments read: **L3 is 32 MiB per CCX, not 64 MiB shared**, and
+**75.8 GB/s is not achievable** (measured 31-36 GB/s within a CCX, ~56.6 GB/s
+across both). §18's refutation of "the incumbent is at the roofline" stands, but
+its stated reason — that a 58.7 MB working set was L3-resident — is void; the
+supported reason is that the denominator was ~2x the real ceiling. **SMT
+siblings are adjacent pairs**, so physical cores are the even CPUs.
+
+**Unsafe was kept only because safe was measured and is slower.** Three safe
+formulations were built: bounds-checked index sub-slicing **1.340x**, nested
+`chunks_exact` **1.542x**, and the same with a hoisted group count **1.542x** —
+identical to three decimals, which rules out the inner loop shape and localises
+the entire cost to caller-side slice construction. The best safe form runs
+**8.8% slower** than the shipped one and gives up **13% of the win** (worst:
+25.3% slower, 37% of the win), so codegen is *not* equivalent. Shipped form
+confines the unsafe
+to one `#[inline]` function with a stated loop invariant and adds a
+`validate_nibble_outputs` prevalidation pass on the safe entry, so the pointer
+derivations rest on checked arithmetic (`checked_mul` throughout) rather than on
+caller discipline. No integer-pointer round trips.
+
+**The tiled path had never been executed by a test in its own module.**
+`the_kernel_tracks_the_float64_contract` drives `k_blocks <= 3` against
+`BLOCK_TILE = 4`, so the tile loop's trip count was always zero; coverage came
+only from four `matmul_nbits` integration tests one module away. "1607 tests
+pass" was true and vacuous. Six mutations now all die. Two of them only died
+after the *tests* were fixed: `tiles - 1` is an **equivalent mutant** (work
+migrates to the tail loop) and was replaced with `tiled_blocks + 1`, and the
+fail-before-unsafe test had to assert the **panic message** rather than
+`is_err()`, because malformed inputs also trip an incidental bounds check
+*after* the pointers are formed.
+
+**Miri covers this code only if you make it.** `is_x86_feature_detected!("avx2")`
+is **false** under Miri, so a default run takes the generic path and the vector
+tests early-return — vacuous. Under
+`RUSTFLAGS=-C target-feature=+avx2` with `-Zmiri-strict-provenance` Miri
+interprets the intrinsics; that it genuinely covers both raw-pointer derivations
+was proved by injecting an off-by-one group read and a `+8` element offset and
+confirming Miri reports UB for each. Clean as shipped.
+
+**Retired, do not build:** the int4 acc4 **N-tile** (0.94x DRAM-resident, 0.76x
+at full width; its positive number is an L3-residency artifact of undersized
+benchmark shapes) and **bf16 scales / block-major prepack** for throughput
+(0.96x at tile 1; the traffic arithmetic is right and the kernel is not
+traffic-limited where it would help). Both remain defensible for *footprint*;
+neither may be sold as speed.
+
+**The gap against ORT, which is the number that actually matters.** There was no
+int4 ORT baseline in the tree — `benches/ort_baseline.py` is f32-only — so one
+was added as `benches/ort_matmulnbits_baseline.py`: the same five projections in
+one graph, matched `block_size`/`accuracy_level`/thread count, one `Run` per
+token. ORT's `accuracy_level` is honoured rather than assumed (30.632 ms at
+acc0 vs 7.822 ms at acc4, 3.9x apart).
+
+| threads | ORT acc4 | native before | native after | before | **after** |
+|---|---|---|---|---|---|
+| 1 | 7.822 ms/tok | 23.535 | 13.962 | 3.01x | **1.78x** |
+| 4 | 2.154 | 6.100 | 3.720 | 2.83x | **1.73x** |
+| 8 | 1.249 | 3.264 | 3.214 | 2.61x | 2.57x |
+| 16 | 1.227 | 1.804 | 1.452 | 1.47x | **1.18x** |
+
+Both native columns are the current-main (`2f94cba4d`) arms. Quoting the older
+`f8eb8a3e2` arms here would credit the change with the t=8 win that the
+re-measurement retracts, and an earlier revision of this section did exactly
+that — see the review note below.
+
+Three qualifications travel with that table. **ORT saturates by t=8** (1.249 ->
+1.227 to t=16), so the t=16 row flatters us — parity there is worth much less
+than the same ratio at t=1, and per-`Run` framing overhead is not negligible at
+~1.2 ms/token, so that row carries the most uncertainty. **The worst remaining
+row is t=8 at 2.57x**, and it barely moves (2.61x -> 2.57x) because the change
+is a wash at t=8; that cell is now the top of the list and nothing here
+addresses it. And every row is measured **without** zero-points on both sides,
+which is ORT's fastest configuration (they cost ORT ~26%: 9.885 vs 7.816 ms,
+min over three windows each)
+and therefore the harder comparison.
+
+**The default path did not move and is now the bigger target.** This kernel is
+gated to `accuracy_level = 4`; production default is 0, where native is 56.307
+ms/token against ORT's 30.632 — **1.84x**, unchanged. That it nearly equals the
+new acc4 gap is a coincidence of this shape, not a shared cause. Nothing here is
+progress on acc0.
+
+Full record:
+[`docs/benchmarks/2026-08-21-int4-acc4-execution-regime.md`](../benchmarks/2026-08-21-int4-acc4-execution-regime.md).

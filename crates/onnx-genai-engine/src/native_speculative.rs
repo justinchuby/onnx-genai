@@ -168,6 +168,29 @@ impl<'a> NativeSpeculativeDriver<'a> {
         }
         self.session.reset()?;
 
+        // Option-c native MTP verify capture: install the fixed-M (=k+1) padded
+        // verify bindings + Verify graph slot ONCE per generation so the M=K
+        // verify forward is captured and replayed instead of recaptured every
+        // step (the pre-#1650 replays=0 pin). Idempotent and a no-op unless this
+        // is an MTP proposer over a graph-enabled hybrid recurrent CUDA session
+        // (`configure_verify_capture` self-guards on all of those). Greedy /
+        // prompt-lookup / pure-attention / CPU paths are entirely unaffected.
+        if matches!(self.proposer, NativeProposer::Mtp { .. }) {
+            self.session.configure_verify_capture(self.draft_width)?;
+        }
+
+        // Env-gated per-phase timing to ground the base-decode-fusion analysis.
+        // ONNX_GENAI_PROFILE_SPEC_PHASES=1 prints cumulative ms for the base
+        // decode / propose / verify / commit phases at the end of generation.
+        // Inert (no Instant calls) unless the env var is set.
+        let phase_profile = std::env::var("ONNX_GENAI_PROFILE_SPEC_PHASES").is_ok();
+        let mut t_base = 0f64;
+        let mut t_propose = 0f64;
+        let mut t_verify = 0f64;
+        let mut t_commit = 0f64;
+        let mut n_base = 0usize;
+        let mut n_verify = 0usize;
+
         let prompt_len = prompt_tokens.len();
         let mut state = DecodeLoopState::new(0, options.seed, options.top_logprobs);
         // Committed tokens not yet folded into the device KV cache. Mirrors
@@ -177,6 +200,13 @@ impl<'a> NativeSpeculativeDriver<'a> {
 
         loop {
             if state.generated_tokens.len() >= options.max_new_tokens {
+                if phase_profile {
+                    eprintln!(
+                        "spec_phases: base={t_base:.1}ms/{n_base} propose={t_propose:.1}ms verify={t_verify:.1}ms/{n_verify} commit={t_commit:.1}ms | per_base={:.3}ms per_verify={:.3}ms",
+                        t_base / n_base.max(1) as f64,
+                        t_verify / n_verify.max(1) as f64,
+                    );
+                }
                 ensure_constrained_finish(options, &state.generated_text, FinishReason::MaxTokens)?;
                 return finish_result(
                     tokenizer,
@@ -201,11 +231,16 @@ impl<'a> NativeSpeculativeDriver<'a> {
             // Fold the trailing committed token(s) into the KV and read the
             // target's next-token distribution for the first uncommitted position.
             let past = self.session.current_len();
+            let t0 = phase_profile.then(std::time::Instant::now);
             let base_logits = self
                 .session
                 .decode(&pending, past)?
                 .pop()
                 .context("native speculative decode produced no base logits")?;
+            if let Some(t0) = t0 {
+                t_base += t0.elapsed().as_secs_f64() * 1e3;
+                n_base += 1;
+            }
             pending.clear();
             let base = self.session.current_len();
             debug_assert_eq!(base, context_len);
@@ -223,6 +258,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 .copied()
                 .chain(state.generated_tokens.iter().copied())
                 .collect();
+            let tp = phase_profile.then(std::time::Instant::now);
             let mut draft = match &mut self.proposer {
                 NativeProposer::PromptLookup(proposer) => {
                     let proposer_context = SpeculativeProposerContext {
@@ -334,6 +370,9 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 }
             };
             draft.truncate(width);
+            if let Some(tp) = tp {
+                t_propose += tp.elapsed().as_secs_f64() * 1e3;
+            }
 
             if draft.is_empty() {
                 // No proposal: fall back to a single plain greedy step. Worst case
@@ -379,7 +418,12 @@ impl<'a> NativeSpeculativeDriver<'a> {
 
             // Eager M=K verify pass: one target row per draft position (predicts
             // the token AFTER each draft token). current_len advances to base + K.
+            let tv = phase_profile.then(std::time::Instant::now);
             let rows = self.session.decode_verify(&draft, base)?;
+            if let Some(tv) = tv {
+                t_verify += tv.elapsed().as_secs_f64() * 1e3;
+                n_verify += 1;
+            }
 
             // ==== WP3 device-accept seam ====
             // Host argmax over the [K+1, vocab] rows. `target_tokens[idx]` is the
@@ -417,13 +461,38 @@ impl<'a> NativeSpeculativeDriver<'a> {
             // destructive GDN/conv state stranded at `base + K`; commit it to
             // exactly the accepted prefix instead (snapshot restore + accepted-
             // token re-advance), which also performs the KV rewind. See #1598.
-            match recurrent_snapshot.as_ref() {
-                Some(snapshot) => self.session.commit_recurrent_state_to_accepted(
-                    snapshot,
-                    base,
-                    &draft[..accepted],
-                )?,
-                None => self.session.rewind(base + accepted)?,
+            //
+            // Approach-B fast path (full accept): when EVERY draft token is
+            // accepted, the eager verify forward already advanced BOTH the KV
+            // (`base + K`) and the destructive GDN/conv recurrent state by exactly
+            // those `K == accepted` tokens, and the committed length equals the
+            // current length — so there is nothing to roll back. Skip the KV
+            // rewind, the snapshot restore, AND the accepted-token re-advance
+            // entirely: the verify's own post-state IS the committed state. This
+            // removes the redundant re-advance target forwards on the majority of
+            // steps (every multi-token accept). The snapshot is still taken before
+            // the verify because acceptance is only known after it; it is simply
+            // unused on this path. Only a PARTIAL accept (`accepted < draft.len()`)
+            // needs the snapshot→restore→re-advance rebuild to a shorter prefix.
+            let tc = phase_profile.then(std::time::Instant::now);
+            if accepted == draft.len() {
+                debug_assert_eq!(
+                    self.session.current_len(),
+                    base + accepted,
+                    "full-accept commit: verify must leave KV + state at base + accepted"
+                );
+            } else {
+                match recurrent_snapshot.as_ref() {
+                    Some(snapshot) => self.session.commit_recurrent_state_to_accepted(
+                        snapshot,
+                        base,
+                        &draft[..accepted],
+                    )?,
+                    None => self.session.rewind(base + accepted)?,
+                }
+            }
+            if let Some(tc) = tc {
+                t_commit += tc.elapsed().as_secs_f64() * 1e3;
             }
 
             // Commit accepted draft tokens followed by the bonus, honoring the

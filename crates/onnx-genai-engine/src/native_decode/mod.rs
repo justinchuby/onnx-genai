@@ -11,7 +11,8 @@ use onnx_genai_ort::Tokenizer;
 use onnx_runtime_ir::{DataType, DeviceType, Dim, SymbolId};
 use onnx_runtime_session::{
     CaptureDeclineReport, DecodePrecision, DeviceAllocationCounts, DeviceBindingTransferStats,
-    DeviceGraphCaptureResult, DeviceIoBinding, DevicePreference, InferenceSession, Tensor,
+    DeviceBuffer, DeviceGraphCaptureResult, DeviceIoBinding, DevicePreference, InferenceSession,
+    Tensor,
 };
 use onnx_runtime_tracer::{Args, TraceContext, capture_rejected};
 use std::collections::{HashMap, HashSet};
@@ -181,14 +182,20 @@ impl NativePastSnapshot {
 /// Unlike [`NativePastSnapshot`] (which clones the whole host past for prefix
 /// caching), this captures *only* the recurrent/conv bindings and works on both
 /// the host past path and the CUDA fixed-state bindings. Exactly one of `host`
-/// (rank-carrying host tensors keyed by past-input name) or `device` (raw
-/// device bytes keyed by fixed-state binding index) is populated, depending on
-/// which decode backend produced it. `len` is the committed length the snapshot
-/// was taken at, asserted against the commit's `base_len`.
+/// (rank-carrying host tensors keyed by past-input name) or `device_scratch`
+/// (the CUDA fixed-state bindings staged into device scratch) indicates where
+/// the captured state lives, depending on which decode backend produced it.
+/// `len` is the committed length the snapshot was taken at, asserted against the
+/// commit's `base_len`.
 pub(crate) struct RecurrentStateSnapshot {
     len: usize,
     host: Option<HashMap<String, Tensor>>,
-    device: Option<Vec<(usize, Vec<u8>)>>,
+    /// True when the CUDA fixed-state bindings were staged into the session's
+    /// device scratch buffers (a stream-ordered device→device snapshot). The
+    /// bytes live in the CUDA decode state rather than in this handle, so a
+    /// restore copies them back from there. Only one such snapshot is live at a
+    /// time (per speculative step), matching the single scratch arena.
+    device_scratch: bool,
 }
 
 impl RecurrentStateSnapshot {
@@ -197,6 +204,12 @@ impl RecurrentStateSnapshot {
         self.len
     }
 }
+
+/// Opaque public handle wrapping a [`RecurrentStateSnapshot`], returned by
+/// [`NativeDecodeSession::snapshot_recurrent_state_public`] so out-of-crate
+/// diagnostics can restore recurrent/conv state around an eager verify forward
+/// without exposing the snapshot internals.
+pub struct NativeRecurrentSnapshot(RecurrentStateSnapshot);
 
 /// State of the Inc-1b PR-2 decode-specialized inlined-body plan for a session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -497,11 +510,11 @@ impl NativeDecodeSession {
         }
         let len = self.current_len;
         if let Some(cuda) = self.cuda.as_mut() {
-            let device = cuda.snapshot_fixed_states()?;
+            cuda.snapshot_fixed_states_device()?;
             return Ok(RecurrentStateSnapshot {
                 len,
                 host: None,
-                device: Some(device),
+                device_scratch: true,
             });
         }
         if self.cpu_kv.is_some() {
@@ -526,7 +539,7 @@ impl NativeDecodeSession {
         Ok(RecurrentStateSnapshot {
             len,
             host: Some(host),
-            device: None,
+            device_scratch: false,
         })
     }
 
@@ -538,11 +551,11 @@ impl NativeDecodeSession {
         &mut self,
         snapshot: &RecurrentStateSnapshot,
     ) -> anyhow::Result<()> {
-        if let Some(device) = &snapshot.device {
+        if snapshot.device_scratch {
             let cuda = self.cuda.as_mut().context(
                 "recurrent snapshot targets the CUDA fixed-state bindings but this session has no CUDA state",
             )?;
-            cuda.restore_fixed_states(device)?;
+            cuda.restore_fixed_states_device()?;
             return Ok(());
         }
         if let Some(host) = &snapshot.host {
@@ -593,8 +606,17 @@ impl NativeDecodeSession {
         // Restore the destructive recurrent/conv states to the pre-draft snapshot,
         // then deterministically re-advance them by exactly the accepted tokens.
         self.restore_recurrent_state(snapshot)?;
-        if !accepted_tokens.is_empty() {
-            self.decode_argmax(accepted_tokens, base_len)?;
+        // Re-advance ONE token at a time (M=1) rather than a single M=num_accepted
+        // batch. The recurrent/conv state advance is inherently sequential, so a
+        // per-token replay is state-equivalent to a batched forward, but it keeps
+        // the shared `Primary` decode executor pinned at the [1,1] shape: a
+        // batched M=num_accepted forward would resize the Primary interior arena
+        // to [1,num_accepted] and invalidate the captured M=1 decode graph every
+        // spec step (Blocker B). Feeding single tokens matches the M=1 base decode
+        // shape so the Primary graph stays valid and replays.
+        for &token in accepted_tokens {
+            let past_len = self.current_len;
+            self.decode_argmax(&[token], past_len)?;
         }
         Ok(())
     }
@@ -1104,6 +1126,32 @@ impl NativeDecodeSession {
         <Self as DecodeBackend>::decode(self, token_ids, past_len)
     }
 
+    /// Whether this decoder carries destructive recurrent/conv state (a hybrid
+    /// GDN + attention model). Exposed for diagnostics (e.g. `verify_logits_probe`)
+    /// so a caller that rewinds the attention KV can also restore the recurrent
+    /// state to the correct committed boundary before an eager verify forward,
+    /// exactly as the speculative driver does around a draft window.
+    pub fn has_recurrent_state_public(&self) -> bool {
+        self.has_recurrent_state()
+    }
+
+    /// Snapshot the destructive recurrent/conv state at the current committed
+    /// length. See [`Self::snapshot_recurrent_state`]. Public, opaque handle for
+    /// diagnostics that must restore recurrent state around an eager verify.
+    pub fn snapshot_recurrent_state_public(&mut self) -> anyhow::Result<NativeRecurrentSnapshot> {
+        Ok(NativeRecurrentSnapshot(self.snapshot_recurrent_state()?))
+    }
+
+    /// Restore the recurrent/conv bindings from a [`NativeRecurrentSnapshot`],
+    /// leaving attention KV and the logical length untouched (the caller drives
+    /// the KV rewind separately). See [`Self::restore_recurrent_state`].
+    pub fn restore_recurrent_state_public(
+        &mut self,
+        snapshot: &NativeRecurrentSnapshot,
+    ) -> anyhow::Result<()> {
+        self.restore_recurrent_state(&snapshot.0)
+    }
+
     /// Batch-N greedy decode step (stage 2b-impl-4, #750). Steps the pinned
     /// `batch` sequences together — one token per sequence — and returns the
     /// `batch` selected token ids. Requires a CUDA decode session pinned at the
@@ -1306,8 +1354,20 @@ impl NativeDecodeSession {
     /// decoder never builds a sibling, never retries, and stays byte-identical
     /// on the main path.
     ///
+    /// "Byte-identical" here is the *inline-sibling-vs-main-executor* property,
+    /// verified by the Scan-equivalence tests
+    /// (`decode_inline_sibling_is_byte_exact_with_scan_and_preserves_state` and
+    /// its persistent-state sibling): when a single-trip `Scan` IS lowered, the
+    /// sibling reproduces the main executor's result exactly, including a
+    /// non-zero loop-carried recurrent state. It is NOT a claim that the main
+    /// executor mishandles recurrent state — it does not (confirmed on the real
+    /// Qwen3 GDN hybrid, whose recurrence is expressed as ordinary custom ops
+    /// with top-level `past/present` state I/O and therefore has NO `Scan` at
+    /// all: it latches `Disabled` and runs entirely on the main executor, eager
+    /// multi-token verify forwards included, bit-matching an m=1 greedy step).
+    ///
     /// A build failure is non-fatal: it latches `Disabled` and decode proceeds
-    /// on the byte-identical main (Scan child-session) executor.
+    /// on the main executor.
     fn maybe_enable_decode_inline(&mut self, token_ids: &[TokenId]) {
         if self.decode_inline != DecodeInlineState::Untried {
             return;

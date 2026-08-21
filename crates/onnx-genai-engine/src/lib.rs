@@ -68,7 +68,7 @@ pub use memory_authority::{
 pub use native_decode::{
     CudaGraphDebugStats, CudaKvDebugStats, NATIVE_DECODER_CAPTURED_STEP_INPUT_DECODES,
     NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS, NativeDecodeCudaOptions, NativeDecodeDevice,
-    NativeDecodeSession,
+    NativeDecodeSession, NativeRecurrentSnapshot,
 };
 pub use onnx_genai_kv::{
     Applicability, CachePriority, KvDType, KvNotApplicable, KvTelemetry, KvTelemetrySnapshot,

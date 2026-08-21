@@ -480,6 +480,7 @@ impl Executor {
             graph,
             weights,
             ep,
+            graph_slot: DeviceGraphSlot::Primary,
             weight_handles,
             prefetch_issue_nodes: std::sync::Mutex::new(HashMap::new()),
             prefetch_lookahead_nodes: dense_weight_prefetch_lookahead_nodes(),
@@ -496,15 +497,8 @@ impl Executor {
             subgraph_execs: HashMap::new(),
             control_flow_stats: ControlFlowStats::default(),
             if_last_predicate: HashMap::new(),
-            device_graph_signature: None,
-            capture_schedule: None,
-            capture_segmentation: Vec::new(),
+            slot_capture: std::array::from_fn(|_| SlotCaptureState::default()),
             control_flow_output_values,
-            capture_cf_shapes: HashMap::new(),
-            capture_warm_signature: None,
-            capture_warm_shapes: HashMap::new(),
-            capture_warm_seeded: HashMap::new(),
-            capture_quarantine_ops: HashSet::new(),
             capture_growing_symbols,
             capacity_pinned_kv_symbols: HashSet::new(),
             last_capture_failed_node: None,
@@ -542,6 +536,7 @@ impl Executor {
             kernel_bindings: vec![None; plan_len],
             persistent_workspace: None,
             step_workspace: None,
+            pin_step_workspace: false,
             inherited_workspace: None,
             workspace_preparation_required: false,
         };
@@ -718,6 +713,48 @@ impl Executor {
 
         let sibling = Self::build(graph, Arc::clone(&self.weights), Arc::clone(&self.ep))?;
         Ok(Some(sibling))
+    }
+
+    /// Build a verify-dedicated sibling executor for native MTP self-speculative
+    /// decode. Structurally identical to the main executor (same graph), but with
+    /// its **own** interior device-buffer arena (`buffers`/`buffer_shapes`) so the
+    /// fixed M=k+1 verify forward's JIT-sized interior scratch is never resized by
+    /// the interleaved M=1 base decode running on the main executor — the exact
+    /// clobber that made the shared-arena verify capture decline (interior
+    /// `Slice` sized `[1,1]` by the M=1 decode vs the `[1,2]` the M=2 verify
+    /// needs). Shares ONLY the immutable `Arc<WeightStore>` and
+    /// `Arc<dyn ExecutionProvider>` with the main executor, so a verify step
+    /// routed here binds the identical persistent **external** state buffers (KV
+    /// cache, recurrent/conv state, embeds) supplied through the caller's
+    /// `bindings`, while its **interior** scratch stays private and fixed at the
+    /// M=k+1 shape across every replay. Drives the [`DeviceGraphSlot::Verify`]
+    /// slot so its captured M=k+1 graph is independent of the main executor's
+    /// `Primary` M=1 decode graph (both coexist on the shared EP and each replays
+    /// by shape key). No graph transform is applied: unlike the decode-inline
+    /// sibling this is a plain structural clone, so it is available for **any**
+    /// model with recurrent state (including artifacts whose recurrent `Scan` is
+    /// not single-trip-inlineable).
+    pub(crate) fn build_verify_sibling(&self) -> Result<Self> {
+        let mut graph = self.graph.clone();
+        // Re-resolve interior shapes on the cloned (post-placement) graph before
+        // build, mirroring `build_decode_inline_sibling`'s permissive re-inference.
+        let registry = InferenceRegistry::default_registry();
+        let opset_imports = graph.opset_imports.clone();
+        registry.infer_graph(&mut graph, &opset_imports, MergePolicy::Permissive)?;
+        let mut sibling = Self::build(graph, Arc::clone(&self.weights), Arc::clone(&self.ep))?;
+        sibling.graph_slot = DeviceGraphSlot::Verify;
+        // Pin the sibling's StepScoped workspace. The sibling ONLY ever runs the
+        // fixed M=k+1 verify shape, so its workspace is reserved once at that peak
+        // and never needs to grow or shrink. Its captured verify graph bakes the
+        // workspace device pointer, so it must NOT be freed between replays:
+        // without the pin, `release_step_workspace` returns the workspace to the
+        // shared EP arena after each step, the interleaved M=1 decode on the main
+        // executor reserves that same freed slot, and the next verify replay reads
+        // reallocated memory (a nondeterministic illegal access, #1647's stale-ptr
+        // hazard). Pinning keeps the sibling's scratch pointer stable for every
+        // replay.
+        sibling.pin_step_workspace = true;
+        Ok(sibling)
     }
 
     /// Place the graph on execution providers: reject incompatible graphs, run

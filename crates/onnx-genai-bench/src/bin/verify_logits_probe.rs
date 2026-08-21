@@ -164,6 +164,23 @@ fn main() -> Result<()> {
     );
 
     // --- Phase 1: greedy M=1 decode, recording full logits per output index.
+    //
+    // A hybrid GDN + attention decoder carries destructive recurrent/conv state
+    // that the attention-KV `rewind` cannot restore (it has no per-step history to
+    // prefix-slice). Phase 2 rewinds the KV to `base` before each eager verify, so
+    // to make the comparison a VALID oracle we must ALSO restore the recurrent
+    // state to `S_base` — exactly what the speculative driver does via
+    // `snapshot_recurrent_state` before a draft window. We therefore snapshot the
+    // recurrent state at every `base` length here (keyed by `current_len`) and
+    // restore the matching snapshot before each verify below. Non-recurrent
+    // (pure-attention) decoders skip this entirely.
+    let track_recurrent = session.has_recurrent_state_public();
+    let mut recurrent_snapshots: std::collections::HashMap<
+        usize,
+        onnx_genai_engine::NativeRecurrentSnapshot,
+    > = std::collections::HashMap::new();
+    let last_p = args.tokens.saturating_sub(args.k);
+
     let prefill = session.decode(&prompt_tokens, 0)?;
     let mut logits = prefill
         .last()
@@ -176,6 +193,13 @@ fn main() -> Result<()> {
         greedy_tokens.push(tok);
         greedy_logits.push(logits.clone());
         let past = session.current_len();
+        // Snapshot S_base for every base a verify will start from (base in
+        // [prompt_len, prompt_len + last_p - 1]); this is the state BEFORE the
+        // m=1 forward that produces greedy_logits[base - prompt_len + 1], i.e. the
+        // exact state the corresponding verify row 0 must run from.
+        if track_recurrent && past >= prompt_len && past < prompt_len + last_p {
+            recurrent_snapshots.insert(past, session.snapshot_recurrent_state_public()?);
+        }
         logits = session
             .decode(std::slice::from_ref(&tok), past)?
             .last()
@@ -183,6 +207,13 @@ fn main() -> Result<()> {
             .clone();
     }
     println!("verify_probe: greedy_token_ids={greedy_tokens:?}");
+    if track_recurrent {
+        println!(
+            "verify_probe: recurrent decoder detected — restoring recurrent state to S_base \
+             before each verify ({} snapshots)",
+            recurrent_snapshots.len()
+        );
+    }
 
     // --- Phase 2: for each position P, re-run the SAME greedy continuation as an
     // M=K draft through eager decode_verify, compare each row's argmax + logits to
@@ -191,12 +222,20 @@ fn main() -> Result<()> {
     let mut flip_count = 0usize;
     let mut min_flip_gap = f32::INFINITY;
 
-    let last_p = args.tokens.saturating_sub(args.k);
     for p in 1..=last_p {
         // KV must hold prompt + greedy[0..P-2]; base = prompt_len + P - 1 so row 0
         // predicts output index P from context identical to greedy_logits[P].
         let base = prompt_len + p - 1;
         session.rewind(base)?;
+        // Restore the destructive recurrent/conv state to S_base so verify starts
+        // from the SAME state that produced greedy_logits[P] (the KV rewind above
+        // only handles the prefix-sliceable attention cache).
+        if track_recurrent {
+            let snapshot = recurrent_snapshots
+                .get(&base)
+                .with_context(|| format!("missing recurrent snapshot for base {base}"))?;
+            session.restore_recurrent_state_public(snapshot)?;
+        }
         let draft: Vec<u32> = greedy_tokens[(p - 1)..(p - 1 + args.k)].to_vec();
         let rows = session.decode_verify(&draft, base)?;
         for (i, row) in rows.iter().enumerate() {

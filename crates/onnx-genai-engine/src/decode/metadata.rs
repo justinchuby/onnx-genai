@@ -131,6 +131,42 @@ pub(crate) struct SharedKvOffer {
     pub(crate) max_len: Option<usize>,
 }
 
+/// Whether the decoder graph positively uses an attention operator that takes an
+/// **explicit valid length** and writes each step in place at that offset —
+/// `GroupQueryAttention` and its relatives.
+///
+/// This is the affirmative counterpart to [`graph_accepts_padded_past`]. The two
+/// are deliberately not inverses: the veto is permissive (anything that is not a
+/// standard `Attention` is allowed through, so an unrecognised op cannot silently
+/// break a model), whereas enabling the shared KV buffer needs *positive*
+/// evidence, so an unrecognised op must not switch it on.
+///
+/// This exists because a `genai_config.json` exported for CPU carries
+/// `search.past_present_share_buffer: false` — correct for CPU, but not a fact
+/// about the model. Taking that declaration as the last word left CUDA runs of
+/// GQA models on the growing-KV rebind path, where ORT CUDA-graph capture is
+/// unreachable no matter what `enable_cuda_graph` says.
+pub(crate) fn graph_uses_explicit_kv_length_attention(graph: &onnx_runtime_ir::Graph) -> bool {
+    fn node_takes_explicit_kv_length(node: &onnx_runtime_ir::Node) -> bool {
+        if matches!(
+            node.op_type.as_str(),
+            "GroupQueryAttention" | "SparseAttention" | "PagedAttention"
+        ) {
+            return true;
+        }
+        node.attributes.values().any(|attr| match attr {
+            onnx_runtime_ir::Attribute::Graph(subgraph) => {
+                graph_uses_explicit_kv_length_attention(subgraph)
+            }
+            onnx_runtime_ir::Attribute::Graphs(subgraphs) => subgraphs
+                .iter()
+                .any(graph_uses_explicit_kv_length_attention),
+            _ => false,
+        })
+    }
+    graph.nodes.values().any(node_takes_explicit_kv_length)
+}
+
 pub(crate) fn detect_model_decode_path(
     io: Option<&onnx_genai_metadata::ModelIoSpec>,
     sliding_window: Option<usize>,

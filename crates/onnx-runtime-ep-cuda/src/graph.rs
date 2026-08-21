@@ -979,4 +979,114 @@ extern "C" __global__ void add_one(const float* x, float* y, unsigned long long 
             runtime.free_raw(input_ptr).unwrap();
         }
     }
+
+    /// The runtime owns two independent captured-graph slots (`Primary` for the
+    /// M=1 decode step, `Verify` for the MTP fixed-width verify step). This is
+    /// the enabling invariant for replaying two differently-shaped decode graphs
+    /// by shape key without per-step recapture: capturing/replaying/resetting one
+    /// slot must never disturb the other's installed executable, even though both
+    /// launch on the same compute stream.
+    #[test]
+    fn primary_and_verify_graph_slots_are_independent() {
+        use onnx_runtime_ep_api::DeviceGraphSlot;
+
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping two-slot graph test: CUDA runtime unavailable");
+            return;
+        };
+        let function = runtime.nvrtc_function(MODULE, SOURCE, "add_one").unwrap();
+        let n = 32usize;
+        let size = n * std::mem::size_of::<f32>();
+        let p_in = runtime.alloc_raw(size).unwrap();
+        let p_out = runtime.alloc_raw(size).unwrap();
+        let v_in = runtime.alloc_raw(size).unwrap();
+        let v_mid = runtime.alloc_raw(size).unwrap();
+        let v_out = runtime.alloc_raw(size).unwrap();
+        let base = (0..n).map(|i| i as f32).collect::<Vec<_>>();
+        // SAFETY: each pointer covers the whole slice.
+        unsafe {
+            runtime.htod(bytes(&base), p_in).unwrap();
+            runtime.htod(bytes(&base), v_in).unwrap();
+        }
+        let capturable = TestKernel { capturable: true };
+
+        // Primary slot: a single add_one (out = in + 1).
+        runtime
+            .begin_graph_capture_in(DeviceGraphSlot::Primary, &[&capturable])
+            .unwrap();
+        launch_add_one(&runtime, &function, p_in, p_out, n);
+        runtime
+            .end_graph_capture_in(DeviceGraphSlot::Primary)
+            .unwrap();
+
+        // Verify slot: a different shape/topology (two chained add_one,
+        // out = in + 2) captured while Primary already holds an executable.
+        runtime
+            .begin_graph_capture_in(DeviceGraphSlot::Verify, &[&capturable])
+            .unwrap();
+        launch_add_one(&runtime, &function, v_in, v_mid, n);
+        launch_add_one(&runtime, &function, v_mid, v_out, n);
+        runtime
+            .end_graph_capture_in(DeviceGraphSlot::Verify)
+            .unwrap();
+
+        // Both slots hold an executable simultaneously.
+        assert!(
+            runtime
+                .has_graph_executable_in(DeviceGraphSlot::Primary)
+                .unwrap()
+        );
+        assert!(
+            runtime
+                .has_graph_executable_in(DeviceGraphSlot::Verify)
+                .unwrap()
+        );
+
+        // Each slot replays its own graph independently, interleaved.
+        for _ in 0..3 {
+            runtime.replay_graph_in(DeviceGraphSlot::Primary).unwrap();
+            runtime.replay_graph_in(DeviceGraphSlot::Verify).unwrap();
+        }
+        runtime.synchronize().unwrap();
+        assert_eq!(
+            read_f32(&runtime, p_out, n),
+            base.iter().map(|v| v + 1.0).collect::<Vec<_>>(),
+            "Primary slot must apply +1"
+        );
+        assert_eq!(
+            read_f32(&runtime, v_out, n),
+            base.iter().map(|v| v + 2.0).collect::<Vec<_>>(),
+            "Verify slot must apply +2, undisturbed by Primary replays"
+        );
+
+        // Resetting Primary leaves Verify's installed executable intact.
+        assert!(runtime.reset_graph_in(DeviceGraphSlot::Primary).unwrap());
+        assert!(
+            !runtime
+                .has_graph_executable_in(DeviceGraphSlot::Primary)
+                .unwrap()
+        );
+        assert!(
+            runtime
+                .has_graph_executable_in(DeviceGraphSlot::Verify)
+                .unwrap(),
+            "resetting Primary must not tear down the Verify slot"
+        );
+        runtime.replay_graph_in(DeviceGraphSlot::Verify).unwrap();
+        runtime.synchronize().unwrap();
+        assert_eq!(
+            read_f32(&runtime, v_out, n),
+            base.iter().map(|v| v + 2.0).collect::<Vec<_>>(),
+        );
+
+        assert!(runtime.reset_graph_in(DeviceGraphSlot::Verify).unwrap());
+        // SAFETY: both slots reset, dropping all graph ownership before free.
+        unsafe {
+            runtime.free_raw(v_out).unwrap();
+            runtime.free_raw(v_mid).unwrap();
+            runtime.free_raw(v_in).unwrap();
+            runtime.free_raw(p_out).unwrap();
+            runtime.free_raw(p_in).unwrap();
+        }
+    }
 }

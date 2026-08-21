@@ -726,7 +726,13 @@ impl KernelCache {
         }
         variants.sort_by_key(|(used, _)| *used);
         let surplus = variants.len() - bound;
-        let _ = ep.reset_device_graph();
+        // Evicting kernel variants can retire kernels baked into a captured
+        // device graph in EITHER slot, so defensively reset both the Primary
+        // (M=1 decode) and Verify (M=K speculative) slots here — resetting an
+        // empty slot is a cheap no-op. This keeps the eviction path slot-correct
+        // without threading the caller's active slot through the whole cache API.
+        let _ = ep.reset_device_graph_in(DeviceGraphSlot::Primary);
+        let _ = ep.reset_device_graph_in(DeviceGraphSlot::Verify);
         for (_, key) in variants.into_iter().take(surplus) {
             self.entries.remove(&key);
             self.last_used.remove(&key);

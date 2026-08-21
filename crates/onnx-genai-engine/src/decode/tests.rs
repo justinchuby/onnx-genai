@@ -3,8 +3,8 @@
 //! Pure code motion from `decode.rs`.
 
 use super::metadata::{
-    KeySequenceLengthsPolicy, graph_accepts_padded_past, key_sequence_lengths_policy,
-    sliding_window_from_metadata,
+    KeySequenceLengthsPolicy, graph_accepts_padded_past, graph_uses_explicit_kv_length_attention,
+    key_sequence_lengths_policy, sliding_window_from_metadata,
 };
 use super::step::{build_position_step, decode_step_layout};
 use super::values::{slice_value_axis, zero_state_value};
@@ -266,4 +266,51 @@ fn a_single_standard_attention_node_disqualifies_a_mixed_graph() {
         node
     });
     assert!(!graph_accepts_padded_past(&graph));
+}
+
+#[test]
+fn gqa_graph_is_positive_evidence_for_the_shared_kv_buffer() {
+    // A `genai_config.json` exported for CPU carries
+    // `search.past_present_share_buffer: false`, which is correct for CPU and is
+    // not a fact about the model. Positive graph evidence — an attention op that
+    // takes an explicit valid KV length — is what actually qualifies the shared
+    // buffer, so a GQA graph must count even when nothing advertised it.
+    assert!(graph_uses_explicit_kv_length_attention(&gqa_graph(None)));
+    assert!(graph_uses_explicit_kv_length_attention(&gqa_graph(Some(
+        4096
+    ))));
+}
+
+#[test]
+fn standard_attention_graph_is_not_evidence_for_the_shared_kv_buffer() {
+    // The standard opset `Attention` derives the KV extent from the past tensor
+    // itself, so a capacity-padded past is exactly what it cannot take.
+    assert!(!graph_uses_explicit_kv_length_attention(
+        &standard_attention_graph("")
+    ));
+    assert!(!graph_uses_explicit_kv_length_attention(
+        &standard_attention_graph("ai.onnx")
+    ));
+}
+
+#[test]
+fn the_share_buffer_predicates_are_not_inverses_of_each_other() {
+    // Deliberately asymmetric: the veto is permissive so an unrecognised op
+    // cannot silently break a model, while enabling needs positive evidence so
+    // an unrecognised op cannot silently switch the shared buffer on. A graph of
+    // ops we do not classify must therefore be allowed by one and rejected by
+    // the other.
+    use onnx_runtime_ir::{Graph, Node};
+    let mut graph = Graph::default();
+    graph
+        .nodes
+        .insert_with(|id| Node::new(id, "MatMul", vec![], vec![]));
+    assert!(
+        graph_accepts_padded_past(&graph),
+        "an unrecognised op must not trip the veto"
+    );
+    assert!(
+        !graph_uses_explicit_kv_length_attention(&graph),
+        "an unrecognised op must not count as positive evidence"
+    );
 }

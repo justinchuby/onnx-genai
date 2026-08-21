@@ -38,6 +38,8 @@ pub use executor::{
     exec_phase_stats, plan_double_buffer, print_exec_phase_profile, reset_dense_prefetch_gap_stats,
     reset_exec_phase_profile,
 };
+pub use onnx_runtime_ep_api::DeviceBuffer;
+pub use onnx_runtime_ep_api::DeviceGraphSlot;
 pub use onnx_runtime_ep_api::WorkspaceRequirement;
 pub use onnx_runtime_loader::{
     EpContextDumpConfig, EpContextPartition, Model as EncoderModel, ModelMetadata,
@@ -934,6 +936,18 @@ pub struct InferenceSession {
     /// shares `exec`'s `Arc<WeightStore>` and `Arc<dyn ExecutionProvider>`, so a
     /// decode step routed to it binds the identical persistent state buffers.
     decode_inline_exec: Option<executor::Executor>,
+    /// Verify-dedicated sibling executor for native MTP self-speculative decode
+    /// (built lazily by [`InferenceSession::enable_verify_sibling`]). Runs the
+    /// fixed M=k+1 verify forward with its OWN interior device-buffer arena so
+    /// the M=2 verify's JIT-sized interior scratch is never resized by the
+    /// interleaved M=1 base decode on `exec` (the shared-arena clobber that made
+    /// the verify capture decline). Shares `exec`'s `Arc<WeightStore>` and
+    /// `Arc<dyn ExecutionProvider>`, so a verify step routed here binds the
+    /// identical persistent external KV/recurrent-state buffers; it drives the
+    /// EP's [`DeviceGraphSlot::Verify`] slot, independent of `exec`'s `Primary`
+    /// M=1 decode graph. `None` (the default) for every non-MTP session, so an
+    /// ordinary session is byte-identical and pays nothing.
+    verify_exec: Option<executor::Executor>,
     /// EPContext dump config parsed from the `ep.context_*` session options
     /// (§21.4). Drives [`InferenceSession::export_ep_context`]; disabled by
     /// default so an ordinary session never touches the dump path.
@@ -1085,6 +1099,7 @@ impl InferenceSession {
             model_metadata,
             exec,
             decode_inline_exec: None,
+            verify_exec: None,
             ep_context_config,
         })
     }
@@ -1320,6 +1335,100 @@ impl InferenceSession {
             .unwrap_or(&[])
     }
 
+    /// Lazily build the verify-dedicated sibling executor for native MTP
+    /// self-speculative decode. Idempotent: a second call is a no-op. The
+    /// sibling is a structural clone of the main executor's graph with its own
+    /// interior device-buffer arena (so the fixed M=k+1 verify's interior scratch
+    /// is never resized by the interleaved M=1 decode on the main executor), and
+    /// it drives the [`DeviceGraphSlot::Verify`] slot. Also pins the sibling's
+    /// fixed-capacity KV sequence-axis symbols so its captured verify graph
+    /// admits the attention nodes, mirroring the main executor. The main/prefill
+    /// executor is left byte-identical.
+    pub fn enable_verify_sibling(&mut self) -> Result<bool> {
+        if self.verify_exec.is_none() {
+            let mut sibling = self.exec.build_verify_sibling()?;
+            sibling.pin_fixed_capacity_kv_capture_symbols();
+            self.verify_exec = Some(sibling);
+        }
+        Ok(self.verify_exec.is_some())
+    }
+
+    /// Whether the verify-dedicated sibling executor is built and ready to run.
+    pub fn verify_sibling_ready(&self) -> bool {
+        self.verify_exec.is_some()
+    }
+
+    /// Run one fixed M=k+1 verify forward through the verify-dedicated sibling
+    /// executor (eager), binding the identical persistent external device buffers
+    /// `bindings` supplies (KV cache, recurrent/conv state) while the sibling's
+    /// interior scratch stays private. Errors if
+    /// [`Self::enable_verify_sibling`] has not built a sibling.
+    pub fn run_verify_sibling_with_device_bindings(
+        &mut self,
+        inputs: &[(&str, &Tensor)],
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<Vec<Option<Tensor>>> {
+        let exec = self.verify_exec.as_mut().ok_or_else(|| {
+            SessionError::Internal(
+                "verify sibling requested but not built; call enable_verify_sibling first".into(),
+            )
+        })?;
+        exec.run_with_device_bindings(inputs, bindings)
+    }
+
+    /// Capture-record one fixed M=k+1 verify forward of the verify-dedicated
+    /// sibling into its `Verify`-slot device graph. Mirrors
+    /// [`Self::try_capture_with_device_bindings`] but drives the sibling executor,
+    /// whose interior arena is private so the captured graph's baked interior
+    /// pointers are not resized by the interleaved M=1 decode. Errors if
+    /// [`Self::enable_verify_sibling`] has not built a sibling.
+    pub fn try_capture_verify_sibling_with_device_bindings(
+        &mut self,
+        inputs: &[(&str, &Tensor)],
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<DeviceGraphCaptureResult> {
+        let exec = self.verify_exec.as_mut().ok_or_else(|| {
+            SessionError::Internal(
+                "verify sibling capture requested but no sibling built; call enable_verify_sibling first".into(),
+            )
+        })?;
+        exec.try_capture_with_device_bindings(inputs, bindings)
+    }
+
+    /// Replay the verify-dedicated sibling's installed `Verify`-slot device graph.
+    /// Returns `false` when a seam retired the graph this step (logits produced
+    /// eagerly; caller re-warms/re-captures). Errors if
+    /// [`Self::enable_verify_sibling`] has not built a sibling.
+    pub fn replay_verify_sibling_device_graph(
+        &mut self,
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<bool> {
+        let exec = self.verify_exec.as_mut().ok_or_else(|| {
+            SessionError::Internal(
+                "verify sibling replay requested but no sibling built; call enable_verify_sibling first".into(),
+            )
+        })?;
+        exec.replay_device_graph(bindings)
+    }
+
+    /// Invalidate the verify-dedicated sibling's installed device graph. A no-op
+    /// returning `false` when no sibling has been built.
+    pub fn reset_verify_sibling_device_graph(&mut self) -> Result<bool> {
+        match self.verify_exec.as_mut() {
+            Some(exec) => exec.reset_device_graph(),
+            None => Ok(false),
+        }
+    }
+
+    /// Number of captured device-graph segments installed by the most recent
+    /// verify-sibling capture (`0` when no sibling or nothing captured).
+    pub fn verify_sibling_captured_graph_segment_count(&self) -> usize {
+        self.verify_exec
+            .as_ref()
+            .map(executor::Executor::captured_segment_count)
+            .unwrap_or(0)
+    }
+
     /// Allocate a persistent buffer on this session's execution device.
     pub fn allocate_device_binding(
         &self,
@@ -1439,6 +1548,43 @@ impl InferenceSession {
         self.exec.reset_device_graph()
     }
 
+    /// Which captured-graph slot the main executor currently drives.
+    pub fn main_exec_graph_slot(&self) -> DeviceGraphSlot {
+        self.exec.graph_slot()
+    }
+
+    /// Route the **main** executor's CUDA-graph capture/replay/reset to the given
+    /// slot. The main executor defaults to [`DeviceGraphSlot::Primary`]; native
+    /// MTP self-speculative decode retargets it to [`DeviceGraphSlot::Verify`]
+    /// around each fixed M=k+1 verify forward so that forward captures/replays
+    /// into an independent slot, then switches back to `Primary` for the M=1
+    /// decode. Because the executor now holds **per-slot** host capture state,
+    /// the switch is a pure retarget — it does NOT reset the other slot's
+    /// installed graph — so `Primary` (M=1) and `Verify` (M=k+1) graphs coexist
+    /// and each replays across steps.
+    ///
+    /// Safe to leave at Primary (the default) for every non-MTP path, which keeps
+    /// greedy byte-identical: all main-exec graph calls then route to the same
+    /// single slot they always did.
+    pub fn set_main_exec_graph_slot(&mut self, slot: DeviceGraphSlot) -> Result<()> {
+        self.exec.set_graph_slot(slot)
+    }
+
+    /// Whether the main executor's StepScoped workspace is pinned across runs.
+    pub fn main_exec_step_workspace_pinned(&self) -> bool {
+        self.exec.step_workspace_pinned()
+    }
+
+    /// Pin (or unpin) the **main** executor's StepScoped workspace across runs.
+    /// Native MTP verify capture pins it so the captured fixed-M verify graph
+    /// replays against a stable scratch pointer even though the M=1 decode step
+    /// (on the sibling executor) reserves a smaller scratch in between (#1647).
+    /// Inert by default; leaving it unpinned keeps every non-verify path
+    /// byte-identical.
+    pub fn set_main_exec_pin_step_workspace(&mut self, pin: bool) {
+        self.exec.set_pin_step_workspace(pin);
+    }
+
     /// Pin the fixed-capacity KV sequence-axis symbols CONSTANT so CUDA-graph
     /// capture ADMITS the attention nodes (`GroupQueryAttention` in particular)
     /// instead of vetoing each as a growing-seq eager seam. Returns the total
@@ -1453,6 +1599,9 @@ impl InferenceSession {
         let mut pinned = self.exec.pin_fixed_capacity_kv_capture_symbols();
         if let Some(inline) = self.decode_inline_exec.as_mut() {
             pinned += inline.pin_fixed_capacity_kv_capture_symbols();
+        }
+        if let Some(verify) = self.verify_exec.as_mut() {
+            pinned += verify.pin_fixed_capacity_kv_capture_symbols();
         }
         pinned
     }
@@ -1795,6 +1944,100 @@ mod device_binding_tests {
         assert_eq!(session.device_allocation_counts().unwrap(), before);
         assert!(session.reset_device_graph().unwrap());
 
+        input_write(&mut bindings[0], 31);
+        assert!(matches!(
+            session
+                .try_capture_with_device_bindings(&[], &mut bindings)
+                .unwrap(),
+            DeviceGraphCaptureResult::Captured(_)
+        ));
+        assert_eq!(read_bound_f32(&mut bindings[1]), 31.0);
+        input_write(&mut bindings[0], 47);
+        session.replay_device_graph(&mut bindings).unwrap();
+        assert_eq!(read_bound_f32(&mut bindings[1]), 47.0);
+        assert!(session.reset_device_graph().unwrap());
+    }
+
+    /// The main executor can drive the **Verify** captured-graph slot (the second
+    /// independent slot added for option-c) end-to-end through the session +
+    /// executor layers, not just at the raw EP: retargeting the slot, capturing,
+    /// replaying with persistent I/O, and resetting all succeed on the Verify
+    /// slot exactly as they do on Primary. This is the executor-level lift of the
+    /// EP-level `primary_and_verify_graph_slots_are_independent` proof — the
+    /// plumbing native MTP verify capture will drive.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn main_exec_drives_verify_graph_slot_end_to_end() {
+        let Ok(mut ep) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) else {
+            eprintln!("skipping session Verify-slot test: CUDA runtime unavailable");
+            return;
+        };
+        onnx_runtime_ep_api::ExecutionProvider::initialize(&mut ep, &Default::default()).unwrap();
+
+        let mut graph = Graph::new();
+        graph.opset_imports.insert("".into(), 13);
+        let input = graph.create_named_value("input", DataType::Int64, static_shape([1]));
+        graph.add_input(input);
+        let output = graph.create_named_value("output", DataType::Float32, static_shape([1]));
+        let mut cast = Node::new(NodeId(0), "Cast", vec![Some(input)], vec![output]);
+        cast.attributes
+            .insert("to".into(), Attribute::Int(DataType::Float32 as i64));
+        graph.insert_node(cast);
+        graph.add_output(output);
+
+        let mut session = InferenceSession::from_parts(
+            graph,
+            std::sync::Arc::new(onnx_runtime_loader::WeightStore::new()),
+            Path::new("."),
+            EpContextDumpConfig::default(),
+            ModelMetadata::default(),
+            std::sync::Arc::new(ep),
+        )
+        .unwrap();
+
+        // Default routing is Primary; retarget the main executor to Verify.
+        assert_eq!(session.main_exec_graph_slot(), DeviceGraphSlot::Primary);
+        session
+            .set_main_exec_graph_slot(DeviceGraphSlot::Verify)
+            .unwrap();
+        assert_eq!(session.main_exec_graph_slot(), DeviceGraphSlot::Verify);
+
+        let mut input = session
+            .allocate_device_binding("input", None::<String>, DataType::Int64, vec![1], vec![1])
+            .unwrap();
+        let output = session
+            .allocate_device_output_binding("output", DataType::Float32, vec![1], vec![1])
+            .unwrap();
+        input.write_bytes(0, &7i64.to_le_bytes()).unwrap();
+        let mut bindings = vec![input, output];
+        session
+            .run_with_device_bindings(&[], &mut bindings)
+            .unwrap();
+
+        // Capture into the Verify slot and replay with persistent I/O (no new
+        // device allocations across the replay) — the same guarantees Primary has.
+        input_write(&mut bindings[0], 11);
+        assert!(matches!(
+            session
+                .try_capture_with_device_bindings(&[], &mut bindings)
+                .unwrap(),
+            DeviceGraphCaptureResult::Captured(_)
+        ));
+        assert_eq!(read_bound_f32(&mut bindings[1]), 11.0);
+
+        let before = session.device_allocation_counts().unwrap();
+        input_write(&mut bindings[0], 23);
+        session.replay_device_graph(&mut bindings).unwrap();
+        assert_eq!(read_bound_f32(&mut bindings[1]), 23.0);
+        assert_eq!(session.device_allocation_counts().unwrap(), before);
+        assert!(session.reset_device_graph().unwrap());
+
+        // Switching back to Primary keeps the API working (resets the Verify slot
+        // on the way out) — proving the retarget is reversible and inert.
+        session
+            .set_main_exec_graph_slot(DeviceGraphSlot::Primary)
+            .unwrap();
+        assert_eq!(session.main_exec_graph_slot(), DeviceGraphSlot::Primary);
         input_write(&mut bindings[0], 31);
         assert!(matches!(
             session

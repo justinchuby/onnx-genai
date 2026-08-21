@@ -791,10 +791,30 @@ impl Executor {
     }
 
     pub(super) fn release_step_workspace(&mut self) -> Result<()> {
+        // When pinned (an installed fixed-shape verify graph baked this buffer's
+        // address), keep the StepScoped scratch alive so a later replay reads a
+        // valid pointer. `reserve_prepared_workspace` reuses it whenever the next
+        // requirement fits, so the pointer stays stable across replays.
+        if self.pin_step_workspace {
+            return Ok(());
+        }
         if let Some(workspace) = self.step_workspace.take() {
             self.ep.deallocate(workspace.buffer)?;
         }
         Ok(())
+    }
+
+    /// Whether this executor's StepScoped workspace is pinned across runs.
+    pub(crate) fn step_workspace_pinned(&self) -> bool {
+        self.pin_step_workspace
+    }
+
+    /// Pin (or unpin) this executor's StepScoped workspace across runs. Pinning
+    /// keeps the reserved scratch buffer alive so a captured fixed-shape graph
+    /// (the M=K speculative verify) replays against a stable pointer; unpinning
+    /// frees it on the next release. See [`Self::pin_step_workspace`].
+    pub(crate) fn set_pin_step_workspace(&mut self, pin: bool) {
+        self.pin_step_workspace = pin;
     }
 
     /// Bind the graph's symbols to concrete sizes from the actual bound-input
@@ -961,7 +981,7 @@ impl Executor {
                         }
                     }
                 }
-                self.device_graph_signature = Some(Self::binding_signature(bindings));
+                self.cap_mut().device_graph_signature = Some(Self::binding_signature(bindings));
                 Ok(DeviceGraphCaptureResult::Captured(tensors))
             }
             ScopedRunResult::NotCapturable(reason) => {
@@ -977,7 +997,7 @@ impl Executor {
     pub(crate) fn replay_device_graph(&mut self, bindings: &mut [DeviceIoBinding]) -> Result<bool> {
         let external = self.prepare_external_bindings(bindings)?;
         let signature = Self::binding_signature(bindings);
-        if self.device_graph_signature.as_ref() != Some(&signature) {
+        if self.cap().device_graph_signature.as_ref() != Some(&signature) {
             self.reset_device_graph()?;
             return Err(SessionError::Internal(
                 "device graph replay bindings changed shape, address, or I/O identity; graph was invalidated"
@@ -990,11 +1010,12 @@ impl Executor {
         // segment replays with eager seam-node execution, so it routes through
         // the scoped runner in replay mode.
         let single_graph = self
+            .cap()
             .capture_schedule
             .as_ref()
             .is_none_or(CaptureSchedule::is_single_graph);
         if single_graph {
-            self.ep.replay_device_graph()?;
+            self.ep.replay_device_graph_in(self.graph_slot)?;
             return Ok(true);
         }
         let result = self.run_scoped_mode(&[], &HashMap::new(), &external, RunMode::Replay);
@@ -1002,7 +1023,7 @@ impl Executor {
         match result? {
             // `run_scoped_mode` clears `capture_schedule` when a branch flip
             // retired the graph this step; report that so the caller re-arms.
-            ScopedRunResult::Executed(_) => Ok(self.capture_schedule.is_some()),
+            ScopedRunResult::Executed(_) => Ok(self.cap().capture_schedule.is_some()),
             ScopedRunResult::NotCapturable(reason) => {
                 self.reset_device_graph()?;
                 Err(SessionError::Internal(format!(
@@ -1013,24 +1034,62 @@ impl Executor {
     }
 
     pub(crate) fn reset_device_graph(&mut self) -> Result<bool> {
-        self.device_graph_signature = None;
-        self.capture_schedule = None;
-        self.capture_cf_shapes.clear();
-        self.capture_warm_seeded.clear();
-        Ok(self.ep.reset_device_graph()?)
+        let cap = self.cap_mut();
+        cap.device_graph_signature = None;
+        cap.capture_schedule = None;
+        cap.capture_cf_shapes.clear();
+        cap.capture_warm_seeded.clear();
+        Ok(self.ep.reset_device_graph_in(self.graph_slot)?)
+    }
+
+    /// Which of the EP's captured-graph slots this executor drives.
+    pub(crate) fn graph_slot(&self) -> DeviceGraphSlot {
+        self.graph_slot
+    }
+
+    /// Host-side captured-graph bookkeeping for the slot this executor is
+    /// currently driving ([`Self::graph_slot`]). All capture/replay/seeding
+    /// state reads and writes go through here so the `Primary` (M=1) and
+    /// `Verify` (M=k+1) graphs never share a signature/schedule.
+    #[inline]
+    pub(super) fn cap(&self) -> &SlotCaptureState {
+        &self.slot_capture[self.graph_slot.index()]
+    }
+
+    /// Mutable accessor mirroring [`Self::cap`].
+    #[inline]
+    pub(super) fn cap_mut(&mut self) -> &mut SlotCaptureState {
+        let slot = self.graph_slot.index();
+        &mut self.slot_capture[slot]
+    }
+
+    /// Retarget this executor's captured-graph slot. With per-slot host capture
+    /// state ([`Self::slot_capture`]) each slot owns an independent
+    /// signature/schedule/warm-shape set, so switching slots must NOT reset the
+    /// other slot's installed graph — that is precisely what let the M=1 decode
+    /// clobber the M=k+1 verify graph and pinned verify replays at 0. The switch
+    /// is now a pure retarget: the EP keeps one [`CudaGraphLifecycle`] per slot,
+    /// and this executor simply points its capture/replay calls at `slot`.
+    /// Idempotent when `slot` already matches. Used to route the main executor's
+    /// verify forward to [`DeviceGraphSlot::Verify`] while M=1 decode keeps
+    /// [`DeviceGraphSlot::Primary`].
+    pub(crate) fn set_graph_slot(&mut self, slot: DeviceGraphSlot) -> Result<()> {
+        self.graph_slot = slot;
+        Ok(())
     }
 
     /// Structured segment-boundary reasons from the most recent capture: one
     /// entry per non-capturable seam node the CUDA EP ran eagerly between
     /// captured segments. Empty for a whole-subgraph (single-graph) capture.
     pub(crate) fn capture_segmentation(&self) -> &[CaptureDecline] {
-        &self.capture_segmentation
+        &self.cap().capture_segmentation
     }
 
     /// Number of captured device-graph segments installed by the most recent
     /// capture (1 for a whole-subgraph capture, >=2 when seams split it).
     pub(crate) fn captured_segment_count(&self) -> usize {
-        self.capture_schedule
+        self.cap()
+            .capture_schedule
             .as_ref()
             .map(CaptureSchedule::captured_segments)
             .unwrap_or(0)
