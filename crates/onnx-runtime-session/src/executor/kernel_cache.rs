@@ -296,6 +296,97 @@ fn collect_structural_growing_symbols_excluding(
 /// is `false` for the growing-concat / paged / mask-less forms (and for
 /// `CompressedSparseAttention`, which has no past-KV inputs). A growing/paged KV
 /// path thus keeps its symbol in the disqualifying set and stays vetoed.
+/// The sequence-axis symbol(s) of every *decode-freeze-safe* attention-mask
+/// graph input — the mask / causal-bias length symbol that a single-token decode
+/// step freezes to physical capacity (see
+/// [`super::geometry::mask_binding_feeds_additive_causal_builder`]).
+///
+/// Unlike the KV cache seq axis, this symbol lives on the `attention_mask` input
+/// and its additive-causal-builder cone (`CumSum`/`Slice`/`Where`/… → the
+/// capacity-form `Attention` mask input), NOT on a `past`/`present` KV slot, so
+/// [`collect_capacity_pinned_kv_symbols`] never captures it. Left unpinned it
+/// keeps the *entire* mask-builder cone AND every `Attention` node that consumes
+/// the bias as forced eager seams — for an MLA / HF-causal-mask model
+/// (DeepSeek-V2-Lite) that is all 27 attention layers plus the shared cone,
+/// producing a heavily-segmented capture whose eager-seam interleaving replays
+/// incoherently.
+///
+/// Pinning it is safe under exactly the condition the runtime freezes the mask:
+/// [`super::geometry::mask_binding_feeds_additive_causal_builder`] holds (the
+/// same predicate that drives `DeviceIoBinding::mask_decode_freeze_safe`), so a
+/// single-token decode step binds `logical == physical == max_len`. The frozen
+/// width saturates the `CumSum` prefix to the true valid length and forces the
+/// padded suffix to `-inf`, so a captured replay over the per-step-updated mask
+/// buffer is byte-identical to the eager mask — the mask/bias axis is genuinely
+/// a fixed-capacity constant across replays, exactly like a pinned KV seq axis.
+/// CUDA-graph capture only ever engages on the single-token decode path, so this
+/// never leaks the frozen width into multi-token prefill (which runs eager and
+/// keeps exposing the logical length).
+pub(super) fn collect_freeze_safe_mask_symbols(graph: &Graph) -> HashSet<SymbolId> {
+    use super::geometry::{
+        is_additive_mask_builder_op, is_capacity_form_attention_mask_input,
+        mask_binding_feeds_additive_causal_builder,
+    };
+    use std::collections::HashMap;
+
+    // value → consumers as (node id, input slot).
+    let mut consumers: HashMap<ValueId, Vec<(NodeId, usize)>> = HashMap::new();
+    for (node_id, node) in graph.nodes.iter() {
+        for (slot, value) in node.inputs.iter().enumerate() {
+            if let Some(vid) = value {
+                consumers.entry(*vid).or_default().push((node_id, slot));
+            }
+        }
+    }
+
+    let mut symbols = HashSet::new();
+    let collect_shape = |symbols: &mut HashSet<SymbolId>, vid: ValueId| {
+        if let Some(value) = graph.try_value(vid) {
+            for axis in 0..value.shape.len() {
+                if let Dim::Symbolic(sym) = value.shape[axis] {
+                    symbols.insert(sym);
+                }
+            }
+        }
+    };
+
+    for &mask in &graph.inputs {
+        if !mask_binding_feeds_additive_causal_builder(graph, mask) {
+            continue;
+        }
+        // Walk the additive-mask-builder cone forward from the mask binding,
+        // collecting every symbolic dim on every cone value (the mask input, the
+        // `CumSum`/`Slice`/`Where`/… intermediates, and the causal-bias leaf the
+        // capacity-form `Attention` consumes). Inference MINTS a fresh derived
+        // symbol on the bias axis (distinct from the mask input's raw seq symbol
+        // and not always recorded as a derivation of it), so pinning only the
+        // input symbol leaves the bias/attention nodes disqualified — the whole
+        // cone's symbol set must be pinned to admit them into capture.
+        let mut visited: HashSet<ValueId> = HashSet::new();
+        let mut frontier = vec![mask];
+        while let Some(value) = frontier.pop() {
+            if !visited.insert(value) {
+                continue;
+            }
+            collect_shape(&mut symbols, value);
+            for &(node_id, slot) in consumers.get(&value).map_or(&[][..], Vec::as_slice) {
+                let node = graph.node(node_id);
+                // The `Attention` op is a cone leaf: its bias input value is
+                // already collected above; do not traverse into the attention.
+                if is_capacity_form_attention_mask_input(node, slot) {
+                    continue;
+                }
+                if is_additive_mask_builder_op(node) {
+                    for out in &node.outputs {
+                        frontier.push(*out);
+                    }
+                }
+            }
+        }
+    }
+    symbols
+}
+
 pub(super) fn collect_capacity_pinned_kv_symbols(graph: &Graph) -> HashSet<SymbolId> {
     let mut pinned = HashSet::new();
     for node in graph.nodes.values() {

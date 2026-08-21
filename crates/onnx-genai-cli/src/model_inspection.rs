@@ -43,10 +43,6 @@ pub(super) fn show(model: &Path) -> anyhow::Result<()> {
     if genai_config.is_file() {
         println!("genai config:    {}", genai_config.display());
     }
-    if directory.speculator.is_some() {
-        println!("speculator:      detected");
-    }
-
     if let Some(metadata_path) = &directory.metadata_path {
         show_metadata(metadata_path)?;
     }

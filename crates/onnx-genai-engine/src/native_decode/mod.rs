@@ -649,6 +649,7 @@ impl NativeDecodeSession {
     /// against a reused attention prefix and silently emit wrong logits (#695).
     /// Gating the mirror off forces a full recompute for these models — correct,
     /// if slower — until per-prefix recurrent-state restore lands.
+    #[allow(dead_code)]
     pub(crate) fn supports_host_kv_mirror(&self) -> bool {
         if self.cuda.is_some()
             || self.cpu_kv.is_some()
@@ -688,6 +689,7 @@ impl NativeDecodeSession {
     /// while the recurrent/conv state is reconstructed only on a full
     /// `rewind(0)`, so a mirrored continuation runs a fresh-zero recurrent state
     /// against a reused attention prefix and silently emits wrong logits (#695).
+    #[allow(dead_code)]
     pub(crate) fn supports_device_kv_mirror(&self) -> bool {
         if self.kv_inputs.is_empty() || self.has_recurrent_state() {
             return false;
@@ -709,6 +711,7 @@ impl NativeDecodeSession {
     /// caller slices out the freshly-decoded tokens with the same
     /// `extract_present_token` geometry the ORT decoder uses, so all three paths
     /// mirror byte-identical pages.
+    #[allow(dead_code)]
     pub(crate) fn present_kv(
         &mut self,
         past_name: &str,
@@ -725,6 +728,7 @@ impl NativeDecodeSession {
     /// cache the CPU decode path leaves in `self.past` keyed by the past-input
     /// name; the caller slices out the freshly-decoded tokens with the same
     /// `extract_present_token` geometry the ORT decoder uses.
+    #[allow(dead_code)]
     pub(crate) fn host_present_kv(&self, past_name: &str) -> Option<(Vec<f32>, Vec<usize>)> {
         self.past
             .get(past_name)
@@ -739,6 +743,7 @@ impl NativeDecodeSession {
     /// layout the ORT decoder injects (`kv_bridge::past_shape`), so native and
     /// ORT prefix reuse are byte-identical. Only valid on the host-growable path
     /// (`supports_host_kv_mirror`).
+    #[allow(dead_code)]
     pub(crate) fn seed_growable_kv(
         &mut self,
         entries: Vec<(String, Vec<f32>, Vec<usize>)>,
@@ -764,6 +769,7 @@ impl NativeDecodeSession {
     /// (GAP-3 Inc-D) by how the session keeps its KV. `entries` carry the same
     /// compact `[1, num_kv_heads, seq, head_dim]` layout for both paths, so
     /// native (host or device) and ORT prefix reuse stay byte-identical.
+    #[allow(dead_code)]
     pub(crate) fn seed_kv(
         &mut self,
         entries: Vec<(String, Vec<f32>, Vec<usize>)>,
@@ -781,6 +787,7 @@ impl NativeDecodeSession {
     /// (GAP-3 Inc-D). The `&mut self.session` / `&mut self.cuda` split borrow lets
     /// the device seed grow the KV bucket if the prefix exceeds the current
     /// capacity, exactly as a decode step would.
+    #[allow(dead_code)]
     fn seed_device_kv(
         &mut self,
         entries: Vec<(String, Vec<f32>, Vec<usize>)>,
@@ -1474,6 +1481,7 @@ impl NativeDecodeSession {
         self.prepare_generation_workspace_inner(prompt_tokens, prompt_tokens.len(), false)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn prepare_generation_workspace_with_step_inputs(
         &mut self,
         tokens: &[TokenId],

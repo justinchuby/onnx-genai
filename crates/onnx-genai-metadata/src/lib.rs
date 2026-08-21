@@ -30,22 +30,32 @@ pub mod capabilities {
     pub const DUAL_SEQUENCE_INPUTS: &str = "dual_sequence_inputs";
 }
 
+pub mod cache;
 pub mod component;
+mod decoder_abi;
+pub mod identity;
+mod lowering;
 pub mod parser;
 pub mod schema;
 pub mod validation;
 
+pub use cache::{CacheDependencies, cache_dependencies};
 pub use component::{
     ComponentDataType, ComponentError, ComponentIo, ComponentSession, ComponentTensor,
 };
+pub use decoder_abi::{decoder_abi, sole_decoder_component};
+pub use identity::{IDENTITY_SCHEME, semantic_identity, semantic_identity_of_str};
+pub use lowering::{CompiledWorkflow, compile_workflow};
 pub use parser::{
     MtpProposerSpec, SharedKvProposerSpec, SpeculatorConfigSource, SpeculatorDescriptor,
     SpeculatorProposerKind, SpeculatorProposerStatus, detect_speculator, find_metadata_path,
-    load_metadata, load_metadata_from_dir, load_pipeline_spec, resolve_speculator_config,
+    load_metadata, load_metadata_from_dir, load_metadata_package, load_metadata_with_identity,
+    load_pipeline_spec,
 };
 pub use schema::*;
 pub use validation::{
-    PipelineValidationError, RuntimeCapabilities, validate, validate_pipeline_spec,
+    PipelineValidationError, RuntimeCapabilities, derived_capabilities, validate,
+    validate_metadata, validate_pipeline_spec,
 };
 
 /// Generates the inference-metadata JSON Schema with deterministic object-key ordering.

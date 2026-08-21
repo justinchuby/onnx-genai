@@ -1,0 +1,426 @@
+# Operator ABI comparison: graph-visible scatter/GQA/Attention/explicit paging versus runtime-private paging.
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      capabilities:
+      - workflow_ssa
+      - typed_emit
+    inputs:
+      request.query:
+        contract:
+          dtype: float16
+          rank: 4
+          shape:
+          - batch
+          - heads
+          - sequence
+          - head_dim
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: request.query
+        required: true
+      request.key:
+        contract:
+          dtype: float16
+          rank: 4
+          shape:
+          - batch
+          - heads
+          - sequence
+          - head_dim
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: request.key
+        required: true
+      request.value:
+        contract:
+          dtype: float16
+          rank: 4
+          shape:
+          - batch
+          - heads
+          - sequence
+          - head_dim
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: request.value
+        required: true
+      request.indices:
+        contract:
+          dtype: int32
+          rank: 2
+          shape:
+          - batch
+          - sequence
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: request.indices
+        required: true
+      request.block_table:
+        contract:
+          dtype: int32
+          rank: 2
+          shape:
+          - batch
+          - blocks
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: request.block_table
+        required: true
+    outputs:
+      output:
+        contract:
+          dtype: float16
+          rank: 4
+          shape:
+          - batch
+          - heads
+          - sequence
+          - head_dim
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
+    components:
+      tensor_scatter:
+        implementation:
+          kind: onnx
+          artifact: operators/tensor_scatter.onnx.textproto
+        ports:
+          inputs:
+            data:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            indices:
+              dtype: int32
+              rank: 2
+              shape:
+              - batch
+              - sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            output:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      microsoft_gqa:
+        implementation:
+          kind: onnx
+          artifact: operators/com.microsoft_gqa.onnx.textproto
+        ports:
+          inputs:
+            query:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            key:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            value:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            output:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      onnx_attention:
+        implementation:
+          kind: onnx
+          artifact: operators/onnx_attention.onnx.textproto
+        ports:
+          inputs:
+            query:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            key:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            value:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            output:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      explicit_paged_attention:
+        implementation:
+          kind: onnx
+          artifact: operators/explicit_paged_attention.onnx.textproto
+        ports:
+          inputs:
+            query:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            key_pages:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            value_pages:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            block_table:
+              dtype: int32
+              rank: 2
+              shape:
+              - batch
+              - blocks
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            slot_mapping:
+              dtype: int32
+              rank: 2
+              shape:
+              - batch
+              - sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            output:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+        contract:
+          id: example.paged-attention
+          version: '1'
+          bindings:
+            block_table: block_table
+            slot_mapping: slot_mapping
+            key_pages: key_pages
+            value_pages: value_pages
+      runtime_private_paged_substitution:
+        implementation:
+          kind: onnx
+          artifact: operators/ordinary_attention.onnx.textproto
+        ports:
+          inputs:
+            query:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            key:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            value:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            output:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+    state: {}
+    steps:
+    - kind: invoke
+      component: tensor_scatter
+      inputs:
+        data: request.key
+        indices: request.indices
+      outputs:
+        output: scatter.output
+    - kind: invoke
+      component: microsoft_gqa
+      inputs:
+        query: request.query
+        key: scatter.output
+        value: request.value
+      outputs:
+        output: gqa.output
+    - kind: invoke
+      component: onnx_attention
+      inputs:
+        query: gqa.output
+        key: request.key
+        value: request.value
+      outputs:
+        output: attention.output
+    - kind: invoke
+      component: explicit_paged_attention
+      inputs:
+        query: attention.output
+        key_pages: request.key
+        value_pages: request.value
+        block_table: request.block_table
+        slot_mapping: request.indices
+      outputs:
+        output: paged.output
+    - kind: invoke
+      component: runtime_private_paged_substitution
+      inputs:
+        query: paged.output
+        key: request.key
+        value: request.value
+      outputs:
+        output: final.output
+    - kind: emit
+      value: final.output
+      output: output
+      mode: replace

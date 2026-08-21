@@ -1,0 +1,267 @@
+# WeatherNext autoregressive weather rollout with persistent atmospheric state.
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      capabilities:
+      - workflow_ssa
+      - typed_emit
+      - serving_service_contract
+      - session_state_lease
+      - nested_control_flow
+    inputs:
+      request.active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: active
+        required: true
+      request.done:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: done
+        required: true
+      request.accepted_len:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: accepted_len
+        required: true
+      request.forcing:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - forcing_variables
+          - latitude
+          - longitude
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: request.forcing
+        required: true
+      request.atmosphere:
+        contract:
+          dtype: float32
+          rank: 5
+          shape:
+          - batch
+          - variables
+          - levels
+          - latitude
+          - longitude
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: atmosphere
+        required: true
+      request.max_iterations:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: runtime
+          version: '1.0'
+          role: max_iterations
+        source:
+          kind: request
+        required: false
+        default: 10
+      package.continue:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: true
+    outputs:
+      forecast:
+        contract:
+          dtype: float32
+          rank: 5
+          shape:
+          - batch
+          - variables
+          - levels
+          - latitude
+          - longitude
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
+    components:
+      model:
+        implementation:
+          kind: onnx
+          artifact: weathernext/forecast_step.onnx.textproto
+        ports:
+          inputs:
+            atmosphere:
+              dtype: float32
+              rank: 5
+              shape:
+              - batch
+              - variables
+              - levels
+              - latitude
+              - longitude
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            forcing:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - forcing_variables
+              - latitude
+              - longitude
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            next_atmosphere:
+              dtype: float32
+              rank: 5
+              shape:
+              - batch
+              - variables
+              - levels
+              - latitude
+              - longitude
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            forecast:
+              dtype: float32
+              rank: 5
+              shape:
+              - batch
+              - variables
+              - levels
+              - latitude
+              - longitude
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+    state:
+      atmosphere:
+        contract:
+          dtype: float32
+          rank: 5
+          shape:
+          - batch
+          - variables
+          - levels
+          - latitude
+          - longitude
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: session
+        initializer: request.atmosphere
+        recurrence:
+          kind: invariant
+        management: runtime
+        release_boundary: session
+        service_group: atmosphere
+      forecast:
+        contract:
+          dtype: float32
+          rank: 5
+          shape:
+          - batch
+          - variables
+          - levels
+          - latitude
+          - longitude
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: request.atmosphere
+        recurrence:
+          kind: invariant
+    steps:
+    - kind: loop
+      steps:
+      - kind: invoke
+        component: model
+        inputs:
+          atmosphere: atmosphere
+          forcing: request.forcing
+        outputs:
+          next_atmosphere: body.atmosphere
+          forecast: body.forecast
+      continue_when: package.continue
+      max_iterations: request.max_iterations
+      carried:
+      - cell: atmosphere
+        next: body.atmosphere
+      - cell: forecast
+        next: body.forecast
+    - kind: emit
+      value: forecast
+      output: forecast
+      mode: replace
+    serving:
+      active: request.active
+      done: request.done
+      accepted_len: request.accepted_len
+      state_service:
+        groups:
+          atmosphere:
+            kind: recurrent
+            layout: bvlhw
+            update:
+              kind: replace
+            ports:
+              model:
+                atmosphere:
+                  input: atmosphere
+                  output: next_atmosphere

@@ -1,0 +1,82 @@
+ir_version: 11
+graph {
+  node {
+    input: "activations"
+    input: "projection"
+    output: "projection.output"
+    name: "projection"
+    op_type: "MatMul"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  name: "decoder"
+  initializer {
+    dims: 2
+    dims: 2
+    data_type: 1
+    name: "projection"
+    raw_data: "\000\000\200?\000\000\000\000\000\000\000\000\000\000\200?"
+  }
+  input {
+    name: "activations"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "component.decoder.batch"
+          }
+          dim {
+            dim_value: 2
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "projection.output"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "component.decoder.batch"
+          }
+          dim {
+            dim_value: 2
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "projection"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 2
+          }
+          dim {
+            dim_value: 2
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}

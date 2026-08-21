@@ -17,7 +17,7 @@ fn tiny_scatter_llm() -> PathBuf {
         .join("../../tests/fixtures/tiny-llm-scatter/model.onnx.textproto")
 }
 
-/// Explicit `model.io.static_cache` ABI matching the `tiny-llm-scatter` fixture
+/// Explicit `static_cache` ABI matching the `tiny-llm-scatter` fixture
 /// graph's actual port names. The scatter control ports are shape-indistinguish-
 /// able integers, so they must be declared rather than name-guessed.
 fn scatter_io() -> onnx_genai_metadata::ModelIoSpec {
@@ -40,7 +40,7 @@ fn scatter_io() -> onnx_genai_metadata::ModelIoSpec {
 
 fn tiny_sharedbuffer_llm() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/tiny-llm-sharedbuffer/model.onnx")
+        .join("../../tests/fixtures/tiny-llm-sharedbuffer/model.onnx.textproto")
 }
 
 /// The graph-port roles the fixture beside the model already declares.
@@ -59,10 +59,9 @@ fn declared_io(fixture: &str) -> onnx_genai_metadata::ModelIoSpec {
     let metadata = onnx_genai_metadata::load_metadata(&path)
         .unwrap_or_else(|error| panic!("loading {}: {error}", path.display()));
     metadata
-        .model
-        .as_ref()
-        .and_then(|model| model.io.clone())
-        .unwrap_or_else(|| panic!("{fixture} declares no model.io block"))
+        .decoder_io()
+        .cloned()
+        .unwrap_or_else(|| panic!("{fixture} declares no decode ABI"))
 }
 
 fn tiny_llm_io() -> onnx_genai_metadata::ModelIoSpec {
@@ -202,6 +201,25 @@ fn shared_buffer_decode_matches_naive_repass() {
 }
 
 #[test]
+fn artifact_metadata_does_not_implicitly_select_shared_buffer() {
+    let _guard = ort_test_lock().lock().expect("ORT test lock");
+    let session = Session::new(
+        test_environment(),
+        &tiny_sharedbuffer_llm(),
+        deterministic_session_options(),
+    )
+    .expect("shared-buffer session");
+
+    let decode = DecodeSession::new_with_io(
+        &session,
+        DecodeSessionOptions::default(),
+        Some(&declared_io("tiny-llm-sharedbuffer")),
+    )
+    .expect("functional past/present decode session");
+    assert_eq!(decode.mode(), DecodeKvMode::ZeroCopyRebind);
+}
+
+#[test]
 fn exported_kv_handoff_continues_decode_identically() {
     // Emulates the hybrid prefill/decode handoff: session A runs the prompt
     // "prefill", its KV is exported and imported into a second DecodeSession B
@@ -306,9 +324,9 @@ fn bound_decode_rewind_matches_replay() {
 #[test]
 fn static_cache_without_metadata_errors_naming_the_key() {
     // A static-cache-shaped graph (TensorScatter scatter ABI) that declares no
-    // `model.io.static_cache` must fail closed rather than name-guess the
-    // shape-indistinguishable integer control ports, and the error must name the
-    // exact key to declare.
+    // fixed-capacity write discipline must fail closed rather than name-guess
+    // the shape-indistinguishable integer control ports, and the error must name
+    // the exact canonical keys to declare.
     let _guard = ort_test_lock().lock().expect("ORT test lock");
     let session = Session::new(
         test_environment(),
@@ -319,10 +337,16 @@ fn static_cache_without_metadata_errors_naming_the_key() {
 
     let detect_err = StaticCacheDecodeSession::detect(&session, None)
         .expect_err("undeclared static cache must fail closed");
-    assert!(
-        detect_err.to_string().contains("model.io.static_cache"),
-        "error must name the missing key: {detect_err}"
-    );
+    for expected in [
+        "state_service.groups",
+        "indexed_scatter",
+        "write_indices_ports",
+    ] {
+        assert!(
+            detect_err.to_string().contains(expected),
+            "error must name the canonical key '{expected}': {detect_err}"
+        );
+    }
 
     let new_err = match StaticCacheDecodeSession::new(
         &session,
@@ -332,17 +356,23 @@ fn static_cache_without_metadata_errors_naming_the_key() {
         Ok(_) => panic!("undeclared static cache must fail closed"),
         Err(err) => err,
     };
-    assert!(
-        new_err.to_string().contains("model.io.static_cache"),
-        "error must name the missing key: {new_err}"
-    );
+    for expected in [
+        "state_service.groups",
+        "indexed_scatter",
+        "write_indices_ports",
+    ] {
+        assert!(
+            new_err.to_string().contains(expected),
+            "error must name the canonical key '{expected}': {new_err}"
+        );
+    }
 }
 
 #[test]
 fn static_cache_with_explicit_metadata_classifies_from_fixture() {
-    // The fixture WITH an explicit `model.io.static_cache` block loads and
-    // classifies through the same name-agnostic `StaticCacheAbi::classify` path,
-    // with equal-length positionally-paired cache ports.
+    // A package WITH a declared scatter ABI loads and classifies through the
+    // same name-agnostic `StaticCacheAbi::classify` path, with equal-length
+    // positionally-paired cache ports.
     let _guard = ort_test_lock().lock().expect("ORT test lock");
     let session = Session::new(
         test_environment(),

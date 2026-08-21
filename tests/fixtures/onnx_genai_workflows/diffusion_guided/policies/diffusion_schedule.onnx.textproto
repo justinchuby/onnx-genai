@@ -1,0 +1,61 @@
+ir_version: 11
+producer_name: "mobius"
+graph {
+  node {
+    output: "schedule"
+    name: "Constant_node_0"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 4
+        data_type: 1
+        name: "schedule"
+        raw_data: "\000\000\000A\000\000\200@\000\000\200?\000\000\000\000"
+      }
+      type: TENSOR
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  name: "diffusion_schedule"
+  output {
+    name: "schedule"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+  metadata_props {
+    key: "mobius.generation.policy_contract"
+    value: "{}"
+  }
+  metadata_props {
+    key: "mobius.generation.policy_contract_id"
+    value: "mobius.policy.auxiliary@1"
+  }
+  metadata_props {
+    key: "mobius.generation.policy_effects"
+    value: "[]"
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}

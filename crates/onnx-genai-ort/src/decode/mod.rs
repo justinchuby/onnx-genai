@@ -67,7 +67,7 @@ pub enum DecodeKvMode {
     /// ORT allocates `present.*` outputs; those OrtValues are rebound as next
     /// step's `past_key_values.*` inputs. No Rust-side KV copy is performed.
     ZeroCopyRebind,
-    /// Caller/model-declared `past_present_share_buffer` mode. One max-length
+    /// Explicit caller-selected `past_present_share_buffer` mode. One max-length
     /// OrtValue per KV tensor is bound as both past input and present output.
     SharedBuffer,
 }
@@ -123,7 +123,10 @@ pub struct DecodeSessionOptions {
     pub batch_size: i64,
     /// Maximum logical context length. Required for shared-buffer mode.
     pub max_length: Option<usize>,
-    /// Override ORT custom metadata detection of `past_present_share_buffer`.
+    /// Explicitly enable or disable the low-level shared-buffer ABI.
+    ///
+    /// `None` defaults to functional past/present rebinding; artifact custom
+    /// metadata never changes execution mode.
     pub past_present_share_buffer: Option<bool>,
 }
 

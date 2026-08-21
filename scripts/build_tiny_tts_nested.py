@@ -525,19 +525,10 @@ pipeline:
           inner: code_predictor
           num_code_groups: {NUM_CODE_GROUPS}
           max_tokens: {MAX_FRAMES}
-        run_on: every_step
       - name: vocode
         strategy:
           kind: single_pass
           model: vocoder
-        run_on: final_only
-  phases:
-    talker:
-      run_on: every_step
-    code_predictor:
-      run_on: every_step
-    vocoder:
-      run_on: final_only
   audio:
     sample_rate: 16000
     output: vocoder.audio

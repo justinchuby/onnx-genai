@@ -112,6 +112,39 @@ pub struct ImageExpansionSummary {
     pub tensor_length: usize,
 }
 
+impl ImageExpansionSummary {
+    /// Prompt tokens this image occupies once its placeholder run is expanded.
+    ///
+    /// A patchified export merges `spatial_merge_size` patches per spatial axis
+    /// into one image token, so the run length follows the packed patch grid and
+    /// is a property of this image, not of the package. A tiled export has no
+    /// patch grid: its run length is `tokens_per_tile * tile_count`, and
+    /// `tokens_per_tile` is a package fact that preprocessing alone cannot
+    /// recover, so this returns `None` and the caller must consult the package's
+    /// declared token-expansion config instead.
+    pub fn image_token_count(&self) -> anyhow::Result<Option<usize>> {
+        let Some([temporal, height, width]) = self.patch_grid else {
+            return Ok(None);
+        };
+        let merge = self.spatial_merge_size.max(1);
+        if !height.is_multiple_of(merge) || !width.is_multiple_of(merge) {
+            anyhow::bail!(
+                "image {} has a {height}x{width} patch grid that is not divisible by \
+                 spatial_merge_size {merge}, so its patches cannot be merged into whole \
+                 image tokens",
+                self.image_index
+            );
+        }
+        // (t, h/merge, w/merge): each merge_size x merge_size patch group
+        // collapses to exactly one image token in the prompt.
+        temporal
+            .checked_mul(height / merge)
+            .and_then(|rows| rows.checked_mul(width / merge))
+            .map(Some)
+            .context("image token count overflowed")
+    }
+}
+
 /// Named typed tensors plus image-order-preserving expansion metadata.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImageTensorBundle {

@@ -61,7 +61,10 @@ pub(crate) async fn status(State(state): State<AppState>) -> Result<Json<NodeSta
         active_sessions: u32::try_from(snapshot.active_sessions).unwrap_or(u32::MAX),
         paused_sessions: 0, // not yet tracked (no preemption/pause state exposed)
         tokens_per_second: 0.0, // not yet tracked (only cumulative token totals recorded)
-        batch_utilization: 0.0, // not yet tracked (max batch size not surfaced to the server)
+        // Real when a batched forward has run: mean co-decoded rows over the
+        // physical batch. Stays 0.0 on a backend that never batches, which is
+        // the honest answer rather than a placeholder.
+        batch_utilization: snapshot.batch_utilization().unwrap_or(0.0) as f32,
         // Per-session detail: session ids are real (redacted, since full ids are
         // bearer tokens — see session.rs). priority/kv_pages/state are not yet
         // tracked, so they carry documented placeholders rather than invented values.

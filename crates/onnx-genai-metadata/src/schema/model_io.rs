@@ -15,21 +15,29 @@ pub struct ModelCapabilities {
     #[schemars(range(min = 1))]
     pub vocab_size: Option<usize>,
 
-    /// Built-in draft-head or self-speculative model properties.
-    pub speculative: Option<SpeculativeModelInfo>,
-
     /// Features that a serving runtime may configure at load time.
     pub runtime_configurable: Option<RuntimeConfigurable>,
 
-    /// Explicit graph I/O port bindings for the single-decoder LLM path.
+    /// DEPRECATED, import-only: legacy explicit graph I/O for a bare
+    /// single-decoder package.
     ///
-    /// The runtime binds decode-step inputs and outputs from the declared names.
-    /// A port that is not declared is resolved ONLY from an unambiguous io-shape
-    /// signal; when the shape is ambiguous the runtime fails with an actionable
-    /// error naming the exact key to declare, and never guesses from a tensor
-    /// name.
-    #[serde(default)]
-    pub io: Option<ModelIoSpec>,
+    /// The canonical, and only authoritative, expression of a package's
+    /// executable graph ABI is the workflow:
+    /// `pipeline.workflow.components.<component>.ports` (with `ports.roles`),
+    /// the invoke bindings that connect them, and the `state_service` groups
+    /// that declare model state. A composite package and a bare one-file
+    /// decoder use that same representation.
+    ///
+    /// This block remains only so packages written before the workflow existed
+    /// still load. It is never read directly: [`ModelCapabilities::io`] resolves
+    /// the workflow first and falls back here, and a document carrying both is
+    /// rejected so the two can never disagree. New producers must not emit it.
+    #[serde(default, rename = "io")]
+    #[deprecated(
+        note = "declare the graph ABI in pipeline.workflow.components.<component>.ports; \
+                read the resolved ABI through ModelCapabilities::io()"
+    )]
+    pub legacy_io: Option<ModelIoSpec>,
 
     /// Explicit sparse mixture-of-experts graph and routing contract.
     ///
@@ -38,6 +46,28 @@ pub struct ModelCapabilities {
     /// node names, initializer shapes, or architecture strings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mixture_of_experts: Option<MixtureOfExpertsSpec>,
+
+    /// Legal tensor, pipeline, and expert sharding facts.
+    ///
+    /// The caller and runtime choose degree, device mapping, and collective
+    /// backend. Portable metadata never standardizes a cross-runtime KV or
+    /// cache wire format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sharding: Option<ShardingContract>,
+}
+
+impl ModelCapabilities {
+    /// The deprecated serialized ABI block, for callers that hold only
+    /// capabilities.
+    ///
+    /// Prefer [`crate::InferenceMetadata::decoder_io`], which resolves the
+    /// canonical workflow first. This accessor exists for the packages that
+    /// have no workflow at all, and returns `None` for every package that does.
+    pub fn legacy_io(&self) -> Option<&ModelIoSpec> {
+        #[allow(deprecated)]
+        let legacy = self.legacy_io.as_ref();
+        legacy
+    }
 }
 
 /// Explicit binding of the graph ports the decode step reads and writes.
@@ -48,6 +78,7 @@ pub struct ModelCapabilities {
 /// fails with an actionable error naming the key to declare rather than
 /// interpreting a tensor name. A declared port is always authoritative.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ModelIoSpec {
     /// Which declared sequence port drives autoregressive execution.
     ///
@@ -124,6 +155,19 @@ pub struct ModelIoSpec {
     #[schemars(inner(length(min = 1)))]
     pub kv_outputs: Option<Vec<String>>,
 
+    /// Whether the graph permits, requires, or forbids the runtime aliasing a
+    /// `present` output onto its paired `past` input.
+    ///
+    /// This is the graph ABI fact that replaced the old `shared_buffer` policy
+    /// flag: the package states what aliasing its graph is CORRECT under, and
+    /// the runtime alone decides whether to exploit it (execution provider
+    /// capability, buffer capacity, and batching are runtime concerns). A graph
+    /// that reads a `past` region after the paired `present` write would touch
+    /// it must declare `forbidden`, which is the default when the package is
+    /// silent — silence never grants an optimization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aliasing: Option<StateAliasing>,
+
     /// Encoder-hidden-states input for an encoder-decoder (cross-attention)
     /// decoder graph (e.g. `encoder_hidden_states`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -150,18 +194,6 @@ pub struct ModelIoSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(inner(length(min = 1)))]
     pub cross_kv_outputs: Option<Vec<String>>,
-
-    /// How the paired `kv_inputs`/`kv_outputs` cache tensors evolve each step.
-    ///
-    /// This declares GROWING/append versus fixed shared-buffer cache semantics
-    /// explicitly, and is deliberately kept separate from `state_pairs` (which
-    /// describes fixed recurrent tensors that are wholly REPLACED). The KV pair
-    /// lists are the authoritative sparse layer ports: the runtime binds exactly
-    /// the ports named in `kv_inputs`/`kv_outputs` and never expands them from a
-    /// total layer count. Absent means the historical growing-cache default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "Option<schema_vocabulary::KvUpdateKind>")]
-    pub kv_update: Option<String>,
 
     /// Fixed-shape loop-carried recurrent state ports, distinct from KV cache.
     ///
@@ -554,9 +586,8 @@ impl KvCacheLayout {
 /// on the first step, runs the graph, and copies `output` back into `input` for
 /// the next step (`replace` update). This models any fixed recurrent tensor
 /// (convolution state, linear-attention recurrent state, and so on) without
-/// referencing a model family. It is intentionally distinct from growing or
-/// shared-buffer KV cache, which is declared through `kv_inputs`/`kv_outputs`
-/// and `kv_update`.
+/// referencing a model family. It is intentionally distinct from growing KV
+/// state, whose logical cells and storage service are declared by a workflow.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[schemars(transform = schema_helpers::loop_state_pair)]
 pub struct LoopStatePair {
@@ -644,23 +675,10 @@ pub enum SequenceLengthScalarBroadcast {
     UnitBatch,
 }
 
-/// Build-time support for self-contained speculative decoding.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct SpeculativeModelInfo {
-    /// Whether the exported graph contains Medusa/EAGLE/MTP-style draft heads.
-    pub has_draft_heads: Option<bool>,
-
-    /// Early-exit layer depth usable for self-speculation.
-    #[schemars(range(min = 1))]
-    pub self_speculative_depth: Option<usize>,
-}
-
 /// Features whose concrete settings may be selected by the runtime.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeConfigurable {
-    /// Supported runtime-selectable KV-cache dtypes.
-    pub kv_cache: Option<RuntimeKvConfig>,
-
     /// Whether prefix caching may be enabled.
     pub prefix_cache: Option<bool>,
 
@@ -671,88 +689,12 @@ pub struct RuntimeConfigurable {
     pub chunked_prefill: Option<ChunkedPrefillConfig>,
 }
 
-/// Runtime-selectable KV-cache representations.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct RuntimeKvConfig {
-    /// Non-empty list of supported KV-cache scalar dtypes, in preference order.
-    #[schemars(with = "Vec<schema_vocabulary::DType>", length(min = 1))]
-    pub dtype: Vec<String>,
-}
-
 /// Runtime chunked-prefill preference.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ChunkedPrefillConfig {
     /// Preferred number of prompt tokens processed in each prefill chunk.
     #[schemars(range(min = 1))]
     pub chunk_size: Option<usize>,
-}
-
-/// KV-cache storage, precision tolerance, and operational guarantees.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct KvCacheSpec {
-    /// Native KV scalar dtype produced by the model before optional compression.
-    #[schemars(with = "Option<schema_vocabulary::DType>")]
-    pub native_dtype: Option<String>,
-
-    /// Independent precision tolerance for key and value tensors.
-    pub quantization_tolerance: Option<KvQuantTolerance>,
-
-    /// Layer indices that should retain high precision; negative indices count from the end.
-    pub sensitive_layers: Option<Vec<i32>>,
-
-    /// Cache mutation and persistence operations known to be safe for this model.
-    pub operations: Option<KvCacheOperations>,
-}
-
-/// Precision tolerance for key and value cache components.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct KvQuantTolerance {
-    /// Key-cache precision tolerance.
-    pub key: Option<KvComponentTolerance>,
-
-    /// Value-cache precision tolerance.
-    pub value: Option<KvComponentTolerance>,
-}
-
-/// Quantization tolerance for one KV-cache component.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct KvComponentTolerance {
-    /// Default minimum acceptable scalar dtype for this component.
-    #[schemars(with = "Option<schema_vocabulary::DType>")]
-    pub default: Option<String>,
-
-    /// Layer-specific minimum-precision overrides.
-    pub per_layer: Option<Vec<LayerPrecisionOverride>>,
-
-    /// Quantization scaling axis, such as `per_tensor`, `per_channel`, or `per_token`.
-    #[schemars(with = "Option<schema_vocabulary::QuantizationAxis>")]
-    pub quantization_axis: Option<String>,
-}
-
-/// Minimum precision required by a set of model layers.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct LayerPrecisionOverride {
-    /// Non-empty layer-index list; negative indices count from the final layer.
-    #[schemars(length(min = 1))]
-    pub layers: Vec<i32>,
-
-    /// Minimum acceptable scalar dtype for the listed layers.
-    #[schemars(with = "schema_vocabulary::DType")]
-    pub min_precision: String,
-}
-
-/// Operational guarantees for mutable KV-cache state.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct KvCacheOperations {
-    /// Whether truncating cache state to an earlier token position is correctness-preserving.
-    pub rewind_safe: Option<bool>,
-
-    /// Precision policy for a copy-on-write fork, such as `inherit` or `highest`.
-    #[schemars(with = "Option<schema_vocabulary::ForkPrecisionPolicy>")]
-    pub fork_precision_policy: Option<String>,
-
-    /// Whether checkpoints can be serialized for suspend/resume or migration.
-    pub checkpoint_serializable: Option<bool>,
 }
 
 /// Runtime-independent model-weight quantization intent.

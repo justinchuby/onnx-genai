@@ -55,10 +55,8 @@ pub use types::{
     ChatMessageToolCallFunction, ChatTokenLogprob, ChatTool, ChatToolFunction, ChatTopLogprob,
     CompletionChoice, CompletionLogprobs, CompletionRequest, CompletionResponse, EmbeddingData,
     EmbeddingEncodingFormat, EmbeddingInput, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage,
-    EmbeddingVector, ImageData, ImageGenerationRequest, ImageGenerationResponse,
-    ImageResponseFormat, ImageUrl, InputAudio, JsonSchemaSpec, ResponseFormat, SpeechRequest,
-    SpeechResponseFormat, StopInput, ToolChoice, ToolChoiceFunction, ToolChoiceMode,
-    ToolChoiceSpecific, Usage,
+    EmbeddingVector, ImageUrl, InputAudio, JsonSchemaSpec, ResponseFormat, StopInput, ToolChoice,
+    ToolChoiceFunction, ToolChoiceMode, ToolChoiceSpecific, Usage,
 };
 
 pub fn app(state: AppState) -> Router {
@@ -75,9 +73,7 @@ pub fn app(state: AppState) -> Router {
             "/v1/audio/transcriptions",
             post(routes::audio_transcriptions).layer(DefaultBodyLimit::max(25 * 1024 * 1024)),
         )
-        .route("/v1/chat/completions", post(routes::chat_completions))
-        .route("/v1/images/generations", post(routes::image_generations))
-        .route("/v1/audio/speech", post(routes::audio_speech));
+        .route("/v1/chat/completions", post(routes::chat_completions));
     if state.config.enable_debug_endpoints {
         router = router
             .route("/v1/debug/config", get(routes::debug_config))

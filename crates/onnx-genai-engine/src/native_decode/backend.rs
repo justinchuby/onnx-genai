@@ -43,9 +43,9 @@ impl DecodeBackend for NativeDecodeSession {
 }
 
 impl NativeDecodeSession {
-    /// Greedy sibling of [`Self::decode_with_step_inputs`] for the pipeline
-    /// decoder, which routes per-step ports (an embedding output, and any other
-    /// declared `Routed` port) that [`DecodeBackend::decode_argmax`] cannot carry.
+    /// Greedy sibling of [`Self::decode_with_step_inputs`] for a decoder whose
+    /// graph declares per-step ports (an embedding input, and any other declared
+    /// `Routed` port) that [`DecodeBackend::decode_argmax`] cannot carry.
     ///
     /// Returns `Ok(None)` whenever the step is not the captured single-token
     /// shape the device-argmax epilogue applies to — a multi-token prefill, a
@@ -84,6 +84,26 @@ impl NativeDecodeSession {
         self.maybe_enable_decode_inline(token_ids);
         if self.cuda.is_some() {
             if token_ids.len() == 1 {
+                // A decoder that declares per-step `inputs_embeds`/routed ports
+                // cannot take the token-id-only greedy step below: that step
+                // writes only the token id, so those persistent bindings would
+                // replay whatever bytes they last held. Offer the captured
+                // step-input epilogue first; it returns `None` whenever the step
+                // is not that shape, and otherwise fails naming the port that
+                // was not supplied instead of decoding without it.
+                if let Some(token) =
+                    self.decode_argmax_with_step_inputs(token_ids, past_len, &[])?
+                {
+                    return Ok(Some(token));
+                }
+                if self.has_eager_step_inputs() {
+                    bail!(
+                        "native CUDA decoder declares per-step inputs_embeds/routed ports, which \
+                         the greedy argmax fast path cannot supply; drive this decoder through \
+                         the workflow bindings that route those ports, or read logits and sample \
+                         on the host"
+                    );
+                }
                 return self.decode_cuda_greedy(token_ids[0], past_len).map(Some);
             }
             let token = self

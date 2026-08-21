@@ -1,0 +1,260 @@
+ir_version: 11
+producer_name: "onnx-genai-comfyui-fixture"
+graph {
+  node {
+    input: "seed"
+    input: "seed_stride"
+    output: "seed_term"
+    op_type: "Mul"
+  }
+  node {
+    input: "offset"
+    input: "offset_stride"
+    output: "offset_term"
+    op_type: "Mul"
+  }
+  node {
+    input: "seed_term"
+    input: "offset_term"
+    output: "key_flat"
+    op_type: "Add"
+  }
+  node {
+    input: "key_flat"
+    input: "column_shape"
+    output: "key"
+    op_type: "Reshape"
+  }
+  node {
+    input: "key"
+    input: "indices"
+    output: "counter"
+    op_type: "Add"
+  }
+  node {
+    input: "counter"
+    input: "modulus"
+    output: "base"
+    op_type: "Mod"
+  }
+  node {
+    input: "base"
+    input: "multiplier"
+    output: "stepped"
+    op_type: "Mul"
+  }
+  node {
+    input: "stepped"
+    input: "increment"
+    output: "biased"
+    op_type: "Add"
+  }
+  node {
+    input: "biased"
+    input: "modulus"
+    output: "hashed"
+    op_type: "Mod"
+  }
+  node {
+    input: "hashed"
+    output: "hashed_f"
+    op_type: "Cast"
+    attribute {
+      name: "to"
+      i: 1
+      type: INT
+    }
+  }
+  node {
+    input: "hashed_f"
+    input: "modulus_f"
+    output: "unit"
+    op_type: "Div"
+  }
+  node {
+    input: "unit"
+    input: "two"
+    output: "doubled"
+    op_type: "Mul"
+  }
+  node {
+    input: "doubled"
+    input: "one"
+    output: "flat_noise"
+    op_type: "Sub"
+  }
+  node {
+    input: "seed"
+    output: "batch_shape"
+    op_type: "Shape"
+  }
+  node {
+    input: "batch_shape"
+    input: "row_shape"
+    output: "noise_shape"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "flat_noise"
+    input: "noise_shape"
+    output: "noise"
+    op_type: "Reshape"
+  }
+  node {
+    input: "offset"
+    input: "one_i64"
+    output: "next_offset"
+    op_type: "Add"
+  }
+  name: "latent_noise"
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "seed_stride"
+    raw_data: "CB\017\000\000\000\000\000"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "offset_stride"
+    raw_data: "\330#\000\000\000\000\000\000"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "modulus"
+    raw_data: "\377\377\377\177\000\000\000\000"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "multiplier"
+    raw_data: "mN\306A\000\000\000\000"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "increment"
+    raw_data: "90\000\000\000\000\000\000"
+  }
+  initializer {
+    dims: 1
+    data_type: 1
+    name: "modulus_f"
+    raw_data: "\000\000\000O"
+  }
+  initializer {
+    dims: 2
+    data_type: 7
+    name: "column_shape"
+    raw_data: "\377\377\377\377\377\377\377\377\001\000\000\000\000\000\000\000"
+  }
+  initializer {
+    dims: 1
+    dims: 64
+    data_type: 7
+    name: "indices"
+    raw_data: "\000\000\000\000\000\000\000\000\001\000\000\000\000\000\000\000\002\000\000\000\000\000\000\000\003\000\000\000\000\000\000\000\004\000\000\000\000\000\000\000\005\000\000\000\000\000\000\000\006\000\000\000\000\000\000\000\007\000\000\000\000\000\000\000\010\000\000\000\000\000\000\000\t\000\000\000\000\000\000\000\n\000\000\000\000\000\000\000\013\000\000\000\000\000\000\000\014\000\000\000\000\000\000\000\r\000\000\000\000\000\000\000\016\000\000\000\000\000\000\000\017\000\000\000\000\000\000\000\020\000\000\000\000\000\000\000\021\000\000\000\000\000\000\000\022\000\000\000\000\000\000\000\023\000\000\000\000\000\000\000\024\000\000\000\000\000\000\000\025\000\000\000\000\000\000\000\026\000\000\000\000\000\000\000\027\000\000\000\000\000\000\000\030\000\000\000\000\000\000\000\031\000\000\000\000\000\000\000\032\000\000\000\000\000\000\000\033\000\000\000\000\000\000\000\034\000\000\000\000\000\000\000\035\000\000\000\000\000\000\000\036\000\000\000\000\000\000\000\037\000\000\000\000\000\000\000 \000\000\000\000\000\000\000!\000\000\000\000\000\000\000\"\000\000\000\000\000\000\000#\000\000\000\000\000\000\000$\000\000\000\000\000\000\000%\000\000\000\000\000\000\000&\000\000\000\000\000\000\000\'\000\000\000\000\000\000\000(\000\000\000\000\000\000\000)\000\000\000\000\000\000\000*\000\000\000\000\000\000\000+\000\000\000\000\000\000\000,\000\000\000\000\000\000\000-\000\000\000\000\000\000\000.\000\000\000\000\000\000\000/\000\000\000\000\000\000\0000\000\000\000\000\000\000\0001\000\000\000\000\000\000\0002\000\000\000\000\000\000\0003\000\000\000\000\000\000\0004\000\000\000\000\000\000\0005\000\000\000\000\000\000\0006\000\000\000\000\000\000\0007\000\000\000\000\000\000\0008\000\000\000\000\000\000\0009\000\000\000\000\000\000\000:\000\000\000\000\000\000\000;\000\000\000\000\000\000\000<\000\000\000\000\000\000\000=\000\000\000\000\000\000\000>\000\000\000\000\000\000\000?\000\000\000\000\000\000\000"
+  }
+  initializer {
+    dims: 1
+    data_type: 1
+    name: "two"
+    raw_data: "\000\000\000@"
+  }
+  initializer {
+    dims: 1
+    data_type: 1
+    name: "one"
+    raw_data: "\000\000\200?"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "one_i64"
+    raw_data: "\001\000\000\000\000\000\000\000"
+  }
+  input {
+    name: "seed"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "offset"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "row_shape"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "row_rank"
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "noise"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "next_offset"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}

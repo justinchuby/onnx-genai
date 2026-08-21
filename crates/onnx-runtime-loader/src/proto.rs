@@ -37,9 +37,8 @@ pub fn decode_model(bytes: &[u8]) -> Result<ModelProto, LoaderError> {
 /// weight/graph build path, so a textproto fixture flows through the identical
 /// binary-decode pipeline as a real `.onnx` model.
 ///
-/// Because this yields a self-contained binary buffer with no model-directory
-/// context, textproto fixtures must inline all weights (no external
-/// `.onnx.data`).
+/// This conversion preserves external-data descriptors. Path-based loader
+/// entry points resolve them relative to the TextFormat file's directory.
 pub fn textproto_to_binary(text: &str) -> Result<Vec<u8>, LoaderError> {
     use prost_reflect::{DescriptorPool, DynamicMessage};
     use std::sync::OnceLock;

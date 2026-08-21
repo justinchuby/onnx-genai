@@ -80,6 +80,10 @@ struct Registry {
     active_sessions: AtomicU64,
     pending: AtomicU64,
     batch_size: AtomicU64,
+    codecoded_forward_steps: AtomicU64,
+    codecoded_rows: AtomicU64,
+    codecoded_rows_peak: AtomicU64,
+    codecoded_max_batch: AtomicU64,
     prefix_cache_hits: AtomicU64,
     prefix_cache_lookups: AtomicU64,
     rejections: AtomicU64,
@@ -97,6 +101,10 @@ impl Registry {
             active_sessions: AtomicU64::new(0),
             pending: AtomicU64::new(0),
             batch_size: AtomicU64::new(0),
+            codecoded_forward_steps: AtomicU64::new(0),
+            codecoded_rows: AtomicU64::new(0),
+            codecoded_rows_peak: AtomicU64::new(0),
+            codecoded_max_batch: AtomicU64::new(0),
             prefix_cache_hits: AtomicU64::new(0),
             prefix_cache_lookups: AtomicU64::new(0),
             rejections: AtomicU64::new(0),
@@ -215,6 +223,10 @@ pub(crate) fn snapshot() -> MetricsSnapshot {
         active_sessions: REGISTRY.active_sessions.load(Ordering::Relaxed),
         pending_requests: REGISTRY.pending.load(Ordering::Relaxed),
         current_batch_size: REGISTRY.batch_size.load(Ordering::Relaxed),
+        codecoded_forward_steps: REGISTRY.codecoded_forward_steps.load(Ordering::Relaxed),
+        codecoded_rows: REGISTRY.codecoded_rows.load(Ordering::Relaxed),
+        codecoded_rows_peak: REGISTRY.codecoded_rows_peak.load(Ordering::Relaxed),
+        codecoded_max_batch: REGISTRY.codecoded_max_batch.load(Ordering::Relaxed),
         prefix_cache_hits: REGISTRY.prefix_cache_hits.load(Ordering::Relaxed),
         prefix_cache_lookups: REGISTRY.prefix_cache_lookups.load(Ordering::Relaxed),
         rejections: REGISTRY.rejections.load(Ordering::Relaxed),
@@ -222,14 +234,56 @@ pub(crate) fn snapshot() -> MetricsSnapshot {
     }
 }
 
+/// Record the rows a batched forward actually carried.
+///
+/// This is the honest counterpart to `batch_size`: that gauge counts admitted
+/// generations, which climbs with concurrency even on a backend that decodes
+/// them one at a time, whereas this only moves when a single forward advanced
+/// several sequences (issue #750).
+///
+/// `steps`/`rows` are cumulative sums, so a caller that only has totals can
+/// report them without inventing a per-step series; `peak_rows` is tracked
+/// separately because a mean cannot recover it.
+pub(crate) fn batch_forwards_observed(steps: u64, rows: u64, peak_rows: usize, max_batch: usize) {
+    if steps == 0 {
+        return;
+    }
+    REGISTRY
+        .codecoded_forward_steps
+        .fetch_add(steps, Ordering::Relaxed);
+    REGISTRY.codecoded_rows.fetch_add(rows, Ordering::Relaxed);
+    REGISTRY
+        .codecoded_rows_peak
+        .fetch_max(peak_rows as u64, Ordering::Relaxed);
+    REGISTRY
+        .codecoded_max_batch
+        .fetch_max(max_batch as u64, Ordering::Relaxed);
+}
+
 pub(crate) struct MetricsSnapshot {
     pub(crate) active_sessions: u64,
     pub(crate) pending_requests: u64,
     pub(crate) total_tokens: u64,
     pub(crate) current_batch_size: u64,
+    pub(crate) codecoded_forward_steps: u64,
+    pub(crate) codecoded_rows: u64,
+    pub(crate) codecoded_rows_peak: u64,
+    pub(crate) codecoded_max_batch: u64,
     pub(crate) prefix_cache_hits: u64,
     pub(crate) prefix_cache_lookups: u64,
     pub(crate) rejections: u64,
+}
+
+impl MetricsSnapshot {
+    /// Mean fraction of the physical decode batch that carried a sequence, over
+    /// every batched forward this process issued, or `None` before any ran.
+    pub(crate) fn batch_utilization(&self) -> Option<f64> {
+        if self.codecoded_forward_steps == 0 || self.codecoded_max_batch == 0 {
+            return None;
+        }
+        let mean_rows = self.codecoded_rows as f64 / self.codecoded_forward_steps as f64;
+        Some(mean_rows / self.codecoded_max_batch as f64)
+    }
 }
 
 #[cfg(feature = "metrics")]
@@ -300,6 +354,24 @@ pub(crate) fn encode_prometheus() -> String {
         // pass; it moves even on non-batching backends (issue #750).
         "Current number of admitted generations (not necessarily co-batched).",
         REGISTRY.batch_size.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut output,
+        "onnx_genai_batch_forward_steps_total",
+        "Batched decode forward passes issued by the continuous batch driver.",
+        snapshot.codecoded_forward_steps,
+    );
+    counter(
+        &mut output,
+        "onnx_genai_batch_rows_codecoded_total",
+        "Sequences carried by those forward passes, summed over steps.",
+        snapshot.codecoded_rows,
+    );
+    gauge(
+        &mut output,
+        "onnx_genai_batch_rows_peak",
+        "Most sequences ever co-decoded in a single forward pass.",
+        snapshot.codecoded_rows_peak,
     );
     let hits = REGISTRY.prefix_cache_hits.load(Ordering::Relaxed);
     let lookups = REGISTRY.prefix_cache_lookups.load(Ordering::Relaxed);
@@ -753,6 +825,72 @@ fn decrement(value: &AtomicU64) {
     let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_sub(1))
     });
+}
+
+#[cfg(test)]
+mod batch_occupancy_tests {
+    use super::*;
+
+    fn snapshot_with(steps: u64, rows: u64, peak: u64, max_batch: u64) -> MetricsSnapshot {
+        MetricsSnapshot {
+            active_sessions: 0,
+            pending_requests: 0,
+            total_tokens: 0,
+            current_batch_size: 0,
+            codecoded_forward_steps: steps,
+            codecoded_rows: rows,
+            codecoded_rows_peak: peak,
+            codecoded_max_batch: max_batch,
+            prefix_cache_hits: 0,
+            prefix_cache_lookups: 0,
+            rejections: 0,
+        }
+    }
+
+    #[test]
+    fn utilization_is_unknown_before_any_batched_forward() {
+        // A backend that never batches must not report a fabricated 0.5.
+        assert_eq!(snapshot_with(0, 0, 0, 8).batch_utilization(), None);
+        assert_eq!(snapshot_with(4, 4, 1, 0).batch_utilization(), None);
+    }
+
+    #[test]
+    fn utilization_is_mean_rows_over_the_physical_batch() {
+        // 10 forwards carrying 40 rows on a batch of 8 -> mean 4 rows -> 0.5.
+        assert_eq!(snapshot_with(10, 40, 8, 8).batch_utilization(), Some(0.5));
+        // Serialized decode: every forward carried one row of eight.
+        assert_eq!(snapshot_with(10, 10, 1, 8).batch_utilization(), Some(0.125));
+        // Fully packed.
+        assert_eq!(snapshot_with(10, 80, 8, 8).batch_utilization(), Some(1.0));
+    }
+
+    #[test]
+    fn observing_forwards_accumulates_totals_and_keeps_the_peak() {
+        // Cumulative deltas are added, but the peak is a maximum: averaging it
+        // away would hide that a forward ever carried the whole batch.
+        let before = snapshot();
+        batch_forwards_observed(3, 9, 4, 8);
+        batch_forwards_observed(2, 2, 1, 8);
+        let after = snapshot();
+        assert_eq!(
+            after.codecoded_forward_steps - before.codecoded_forward_steps,
+            5
+        );
+        assert_eq!(after.codecoded_rows - before.codecoded_rows, 11);
+        assert!(after.codecoded_rows_peak >= 4);
+        assert!(after.codecoded_max_batch >= 8);
+    }
+
+    #[test]
+    fn a_zero_step_delta_records_nothing() {
+        let before = snapshot();
+        batch_forwards_observed(0, 0, 0, 8);
+        let after = snapshot();
+        assert_eq!(
+            after.codecoded_forward_steps,
+            before.codecoded_forward_steps
+        );
+    }
 }
 
 #[cfg(all(test, feature = "metrics"))]

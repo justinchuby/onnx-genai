@@ -332,28 +332,30 @@ impl<'a> DecodeSession<'a> {
         let never = |_: &TensorInfo| false;
         let token_input = resolve_input(
             io.and_then(|io| io.token_input.as_deref()),
-            "model.io.token_input",
+            "token_input",
             crate::io_roles::is_rank_one_or_two_sequence,
         )?
         .ok_or_else(|| {
             OrtError::InvalidArgument(
-                "cannot resolve token input from tensor shape; declare model.io.token_input".into(),
+                "cannot resolve token_input from tensor shape; give the port the token_ids role \
+                 in pipeline.workflow.components.<component>.ports.roles"
+                    .into(),
             )
         })?;
         let attention_mask_input = resolve_input(
             io.and_then(|io| io.attention_mask_input.as_deref()),
-            "model.io.attention_mask_input",
+            "attention_mask_input",
             never,
         )?;
         let position_ids_input = resolve_input(
             io.and_then(|io| io.position_ids_input.as_deref()),
-            "model.io.position_ids_input",
+            "position_ids_input",
             never,
         )?;
         let logits_output = crate::io_roles::resolve_port(
             session.outputs(),
             io.and_then(|io| io.logits_output.as_deref()),
-            "model.io.logits_output",
+            "logits_output",
             |tensor| {
                 !excluded.contains(tensor.name.as_str())
                     && crate::io_roles::is_rank_one_to_three_output(tensor)
@@ -363,7 +365,8 @@ impl<'a> DecodeSession<'a> {
         .map(|port| port.name)
         .ok_or_else(|| {
             OrtError::InvalidArgument(
-                "cannot resolve logits output from tensor shape; declare model.io.logits_output"
+                "cannot resolve logits_output from tensor shape; give the port the logits role \
+                 in pipeline.workflow.components.<component>.ports.roles"
                     .into(),
             )
         })?;
@@ -403,12 +406,10 @@ impl<'a> DecodeSession<'a> {
             .collect::<Vec<_>>();
         if !unassigned_state_inputs.is_empty() || !unassigned_state_outputs.is_empty() {
             return Err(OrtError::InvalidArgument(format!(
-                "cannot resolve decoder state from tensor shapes (inputs: {unassigned_state_inputs:?}, outputs: {unassigned_state_outputs:?}); declare model.io.kv_inputs and model.io.kv_outputs"
+                "cannot resolve decoder state from tensor shapes (inputs: {unassigned_state_inputs:?}, outputs: {unassigned_state_outputs:?}); bind the per-layer buffers in a pipeline.workflow.serving.state_service group"
             )));
         }
-        let share_buffer = options
-            .past_present_share_buffer
-            .unwrap_or(session.past_present_share_buffer_supported());
+        let share_buffer = options.past_present_share_buffer.unwrap_or(false);
         let mode = if share_buffer {
             DecodeKvMode::SharedBuffer
         } else {

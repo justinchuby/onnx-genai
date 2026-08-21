@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 /// Source used to discover a speculator declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpeculatorConfigSource {
-    InferenceMetadata,
     HuggingFaceConfig,
 }
 
@@ -188,14 +187,6 @@ impl SpeculatorDescriptor {
     }
 }
 
-/// Resolve a parsed speculative declaration without re-reading metadata.
-pub fn resolve_speculator_config(
-    model_dir: &Path,
-    config: SpeculatorConfig,
-) -> SpeculatorDescriptor {
-    SpeculatorDescriptor::from_config(model_dir, config, SpeculatorConfigSource::InferenceMetadata)
-}
-
 /// Resolve a `shared_kv` speculator into a supported proposer status.
 ///
 /// Missing or malformed required fields — `model`, `backbone_hidden_size`,
@@ -264,11 +255,11 @@ fn resolve_shared_kv(model_dir: &Path, config: &SpeculatorConfig) -> SpeculatorP
             ),
             kv_inputs: None,
             kv_outputs: None,
+            aliasing: None,
             encoder_hidden_states_input: None,
             audio_features_input: None,
             cross_kv_inputs: None,
             cross_kv_outputs: None,
-            kv_update: None,
             state_pairs: None,
             optional_inputs: std::collections::BTreeMap::new(),
             static_cache: None,
@@ -379,6 +370,166 @@ pub fn load_metadata(path: &Path) -> Result<InferenceMetadata, crate::MetadataEr
     Ok(metadata)
 }
 
+/// Load inference metadata together with its canonical semantic identity.
+///
+/// The identity binds disposable artifacts -- compiled plans, memory plans,
+/// state checkpoints -- to the metadata semantics they were produced against.
+/// It is not integrity, not provenance, and not a trust decision.
+pub fn load_metadata_with_identity(
+    path: &Path,
+) -> Result<(InferenceMetadata, String), crate::MetadataError> {
+    let content = std::fs::read_to_string(path).map_err(crate::MetadataError::Io)?;
+    let identity = crate::identity::semantic_identity_of_str(&content)?;
+    Ok((load_metadata(path)?, identity))
+}
+
+/// Load and semantically validate a metadata document or package directory.
+///
+/// Package-relative artifact references are checked for existence and may not
+/// escape the package root. ONNX signature admission remains the runtime's
+/// responsibility because it depends on the selected execution provider.
+pub fn load_metadata_package(path: &Path) -> Result<InferenceMetadata, crate::MetadataError> {
+    let metadata_path = if path.is_dir() {
+        [
+            "inference_metadata.yaml",
+            "inference_metadata.yml",
+            "inference_metadata.json",
+        ]
+        .into_iter()
+        .map(|name| path.join(name))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            crate::MetadataError::Parse(format!(
+                "package '{}' has no inference_metadata.yaml, .yml, or .json",
+                path.display()
+            ))
+        })?
+    } else {
+        path.to_path_buf()
+    };
+    let metadata = load_metadata(&metadata_path)?;
+    let Some(pipeline) = &metadata.pipeline else {
+        return Err(crate::MetadataError::Parse(
+            "metadata has no pipeline section".to_string(),
+        ));
+    };
+    crate::validation::validate_pipeline_spec(pipeline)
+        .map_err(|error| crate::MetadataError::Parse(error.to_string()))?;
+    // Document-level invariants are not pipeline-scoped, so `validate_pipeline_spec`
+    // cannot see them. Without this call the rule that forbids a package from
+    // carrying both `model.io` and a workflow holds only for callers who reach
+    // for `validate_metadata` directly — which is nobody loading a package from
+    // disk, including the `validate_metadata` binary. A guarantee that a
+    // producer's own validation run cannot observe is not a guarantee.
+    crate::validation::validate_metadata(&metadata)
+        .map_err(|errors| crate::MetadataError::Parse(errors.join("; ")))?;
+    validate_package_artifacts(
+        &pipeline.workflow,
+        metadata_path.parent().unwrap_or_else(|| Path::new(".")),
+    )?;
+    if let Some(adapters) = &metadata.adapters {
+        validate_adapter_artifacts(
+            adapters,
+            metadata_path.parent().unwrap_or_else(|| Path::new(".")),
+        )?;
+    }
+    Ok(metadata)
+}
+
+fn validate_adapter_artifacts(
+    service: &crate::schema::AdapterServiceContract,
+    root: &Path,
+) -> Result<(), crate::MetadataError> {
+    use sha2::{Digest, Sha256};
+
+    let root = root.canonicalize().map_err(crate::MetadataError::Io)?;
+    for (alias, artifact) in &service.artifacts {
+        for (index, source) in artifact.weights.iter().enumerate() {
+            let mut files = vec![("weights", source.location.as_str(), source.sha256.as_str())];
+            if let (Some(location), Some(checksum)) =
+                (&source.config_location, &source.config_sha256)
+            {
+                files.push(("config", location.as_str(), checksum.as_str()));
+            }
+            for (kind, location, expected) in files {
+                let candidate = root.join(location);
+                let resolved = candidate.canonicalize().map_err(|error| {
+                    crate::MetadataError::Parse(format!(
+                        "adapter '{alias}' source {index} {kind} artifact '{}' cannot be opened: {error}",
+                        candidate.display()
+                    ))
+                })?;
+                if !resolved.starts_with(&root) || !resolved.is_file() {
+                    return Err(crate::MetadataError::Parse(format!(
+                        "adapter '{alias}' source {index} {kind} artifact '{location}' is not a package file"
+                    )));
+                }
+                let bytes = std::fs::read(&resolved).map_err(crate::MetadataError::Io)?;
+                let actual = format!("{:x}", Sha256::digest(&bytes));
+                if actual != expected {
+                    return Err(crate::MetadataError::Parse(format!(
+                        "adapter '{alias}' source {index} {kind} checksum mismatch: expected {expected}, got {actual}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_package_artifacts(
+    workflow: &crate::schema::WorkflowSpec,
+    root: &Path,
+) -> Result<(), crate::MetadataError> {
+    let root = root.canonicalize().map_err(crate::MetadataError::Io)?;
+    let mut artifacts = Vec::new();
+    for (component, declaration) in &workflow.components {
+        match &declaration.implementation {
+            crate::schema::ComponentImplementation::Onnx { artifact } => {
+                artifacts.push((format!("component '{component}'"), artifact.as_str()));
+            }
+            crate::schema::ComponentImplementation::Adapter {
+                artifact: Some(artifact),
+                ..
+            } => {
+                artifacts.push((
+                    format!("adapter component '{component}'"),
+                    artifact.as_str(),
+                ));
+            }
+            crate::schema::ComponentImplementation::Adapter { artifact: None, .. }
+            | crate::schema::ComponentImplementation::Binding => {}
+        }
+    }
+    for (name, input) in &workflow.inputs {
+        if let crate::schema::WorkflowInputSource::Artifact { path } = &input.source {
+            artifacts.push((format!("workflow input '{name}'"), path.as_str()));
+        }
+    }
+    for (owner, artifact) in artifacts {
+        let candidate = root.join(artifact);
+        let resolved = candidate.canonicalize().map_err(|error| {
+            crate::MetadataError::Parse(format!(
+                "{owner} artifact '{}' cannot be opened: {error}",
+                candidate.display()
+            ))
+        })?;
+        if !resolved.starts_with(&root) {
+            return Err(crate::MetadataError::Parse(format!(
+                "{owner} artifact '{artifact}' escapes package root '{}'",
+                root.display()
+            )));
+        }
+        if !resolved.is_file() {
+            return Err(crate::MetadataError::Parse(format!(
+                "{owner} artifact '{}' is not a file",
+                resolved.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Load and validate a metadata file's `pipeline` section.
 pub fn load_pipeline_spec(path: &Path) -> Result<PipelineSpec, crate::MetadataError> {
     let metadata = load_metadata(path)?;
@@ -390,28 +541,11 @@ pub fn load_pipeline_spec(path: &Path) -> Result<PipelineSpec, crate::MetadataEr
     Ok(spec)
 }
 
-/// Detect a speculator package, preferring native inference metadata over the
-/// HuggingFace `config.json` compatibility format.
+/// Detect a legacy HuggingFace speculator package from `config.json`.
 ///
 /// Detection is best-effort so malformed or unrelated external configuration
 /// does not change normal model-directory loading behavior.
 pub fn detect_speculator(model_dir: &Path) -> Option<SpeculatorDescriptor> {
-    for name in METADATA_FILE_NAMES {
-        let path = model_dir.join(name);
-        if !path.is_file() {
-            continue;
-        }
-        if let Ok(metadata) = load_metadata(&path)
-            && let Some(config) = metadata.speculative
-        {
-            return Some(SpeculatorDescriptor::from_config(
-                model_dir,
-                config,
-                SpeculatorConfigSource::InferenceMetadata,
-            ));
-        }
-    }
-
     let config_path = model_dir.join("config.json");
     let content = std::fs::read_to_string(config_path).ok()?;
     let config = serde_json::from_str::<HuggingFaceModelConfig>(&content)
@@ -433,7 +567,17 @@ struct HuggingFaceModelConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::InferenceMetadata;
+
+    #[derive(serde::Deserialize)]
+    struct LegacySpeculatorDocument {
+        speculative: SpeculatorConfig,
+    }
+
+    fn parse_legacy_speculator(document: &str) -> SpeculatorConfig {
+        serde_yaml::from_str::<LegacySpeculatorDocument>(document)
+            .expect("legacy speculator config parses")
+            .speculative
+    }
 
     /// A directory of this test's own, so parallel tests cannot see each
     /// other's sidecars.
@@ -510,9 +654,7 @@ speculative:
 
     #[test]
     fn shared_kv_metadata_round_trips_into_supported_descriptor() {
-        let metadata: InferenceMetadata =
-            serde_yaml::from_str(SHARED_KV_YAML).expect("shared_kv metadata parses");
-        let config = metadata.speculative.expect("speculative section present");
+        let config = parse_legacy_speculator(SHARED_KV_YAML);
         assert_eq!(config.proposal_type, ProposalType::SharedKv);
         assert_eq!(config.num_speculative_tokens, 3);
         assert_eq!(config.backbone_hidden_size, Some(16));
@@ -526,7 +668,7 @@ speculative:
         let descriptor = SpeculatorDescriptor::from_config(
             Path::new("/models/shared-kv"),
             config,
-            SpeculatorConfigSource::InferenceMetadata,
+            SpeculatorConfigSource::HuggingFaceConfig,
         );
         let SpeculatorProposerStatus::SharedKv(spec) = descriptor.proposer else {
             panic!("expected a supported shared_kv proposer");
@@ -566,8 +708,7 @@ speculative:
       target_layers: [0]
 "
             );
-            let metadata: InferenceMetadata = serde_yaml::from_str(&yaml).expect("metadata parses");
-            let config = metadata.speculative.expect("speculative section present");
+            let config = parse_legacy_speculator(&yaml);
             assert!(
                 matches!(config.proposal_type, ProposalType::Unknown(_)),
                 "expected Unknown for legacy value '{legacy}', got {:?}",
@@ -576,7 +717,7 @@ speculative:
             let descriptor = SpeculatorDescriptor::from_config(
                 Path::new("/models/shared-kv"),
                 config,
-                SpeculatorConfigSource::InferenceMetadata,
+                SpeculatorConfigSource::HuggingFaceConfig,
             );
             assert!(
                 matches!(descriptor.proposer, SpeculatorProposerStatus::Unknown(_)),
@@ -587,7 +728,7 @@ speculative:
 
     #[test]
     fn shared_kv_defaults_output_names() {
-        let metadata: InferenceMetadata = serde_yaml::from_str(
+        let config = parse_legacy_speculator(
             "\
 speculative:
   proposal_type: shared-kv
@@ -599,13 +740,11 @@ speculative:
     - name: sliding_attention
       target_layers: [0]
 ",
-        )
-        .expect("shared_kv metadata parses");
-        let config = metadata.speculative.expect("speculative section present");
+        );
         let descriptor = SpeculatorDescriptor::from_config(
             Path::new("/models/shared-kv"),
             config,
-            SpeculatorConfigSource::InferenceMetadata,
+            SpeculatorConfigSource::HuggingFaceConfig,
         );
         let SpeculatorProposerStatus::SharedKv(spec) = descriptor.proposer else {
             panic!("expected a supported shared_kv proposer");
@@ -636,7 +775,7 @@ speculative:
 
     #[test]
     fn shared_kv_explicit_execution_contract_and_ports_are_preserved() {
-        let metadata: InferenceMetadata = serde_yaml::from_str(
+        let config = parse_legacy_speculator(
             "\
 speculative:
   proposal_type: shared_kv
@@ -658,12 +797,11 @@ speculative:
       target_key_input: target_cache_key
       target_value_input: target_cache_value
 ",
-        )
-        .expect("explicit proposer metadata parses");
+        );
         let descriptor = SpeculatorDescriptor::from_config(
             Path::new("/models/explicit"),
-            metadata.speculative.expect("speculative section"),
-            SpeculatorConfigSource::InferenceMetadata,
+            config,
+            SpeculatorConfigSource::HuggingFaceConfig,
         );
         let SpeculatorProposerStatus::SharedKv(spec) = descriptor.proposer else {
             panic!("expected shared-KV proposer");
@@ -693,19 +831,17 @@ speculative:
 
     #[test]
     fn shared_kv_missing_required_field_is_unknown() {
-        let metadata: InferenceMetadata = serde_yaml::from_str(
+        let config = parse_legacy_speculator(
             "\
 speculative:
   proposal_type: shared_kv
   model: assistant/model.onnx
 ",
-        )
-        .expect("shared_kv metadata parses");
-        let config = metadata.speculative.expect("speculative section present");
+        );
         let descriptor = SpeculatorDescriptor::from_config(
             Path::new("/models/shared-kv"),
             config,
-            SpeculatorConfigSource::InferenceMetadata,
+            SpeculatorConfigSource::HuggingFaceConfig,
         );
         assert!(matches!(
             descriptor.proposer,
@@ -718,7 +854,7 @@ speculative:
     /// never aborts model loading — the engine treats it as absent.
     #[test]
     fn shared_kv_empty_binding_groups_degrade_to_unknown() {
-        let metadata: InferenceMetadata = serde_yaml::from_str(
+        let config = parse_legacy_speculator(
             "\
 speculative:
   proposal_type: shared_kv
@@ -726,14 +862,12 @@ speculative:
   backbone_hidden_size: 8
   vocab_size: 16
 ",
-        )
-        .expect("shared_kv metadata parses");
-        let config = metadata.speculative.expect("speculative section present");
+        );
         assert!(config.shared_kv.is_empty());
         let descriptor = SpeculatorDescriptor::from_config(
             Path::new("/models/shared-kv"),
             config,
-            SpeculatorConfigSource::InferenceMetadata,
+            SpeculatorConfigSource::HuggingFaceConfig,
         );
         assert!(matches!(
             descriptor.proposer,
@@ -743,7 +877,7 @@ speculative:
 
     #[test]
     fn shared_kv_empty_target_layers_degrade_to_unknown() {
-        let metadata: InferenceMetadata = serde_yaml::from_str(
+        let config = parse_legacy_speculator(
             "\
 speculative:
   proposal_type: shared_kv
@@ -753,14 +887,12 @@ speculative:
   shared_kv:
     - name: sliding_attention
 ",
-        )
-        .expect("shared_kv metadata parses");
-        let config = metadata.speculative.expect("speculative section present");
+        );
         assert!(config.shared_kv[0].target_layers.is_empty());
         let descriptor = SpeculatorDescriptor::from_config(
             Path::new("/models/shared-kv"),
             config,
-            SpeculatorConfigSource::InferenceMetadata,
+            SpeculatorConfigSource::HuggingFaceConfig,
         );
         assert!(matches!(
             descriptor.proposer,

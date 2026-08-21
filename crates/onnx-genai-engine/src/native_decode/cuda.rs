@@ -720,6 +720,16 @@ pub(crate) struct DecodeCudaState {
     /// mask at the growing logical length rather than freezing it to `max_len`,
     /// which also forfeits CUDA-graph capture (mirroring the eager prefill path).
     mask_exposes_logical: bool,
+    /// `true` when the attention-mask binding, though it [`mask_exposes_logical`]
+    /// for multi-token prefill, is *decode-freeze-safe*: on a single-token decode
+    /// step its causal-window arithmetic saturates (`q_seq == 1`), so freezing the
+    /// mask to physical `max_len` yields a byte-identical additive bias and keeps
+    /// `logical == physical`, restoring CUDA-graph capture eligibility. Set for
+    /// masks that feed only the additive causal-mask builder cone (e.g.
+    /// DeepSeek-V2-Lite); clear for logical-width combiners like GLM-5.2's indexer.
+    ///
+    /// [`mask_exposes_logical`]: Self::mask_exposes_logical
+    mask_decode_freeze_safe: bool,
     graph_phase: DecodeCudaGraphPhase,
     /// Inc-1b PR-3: capture phase of the **decode-inline sibling** graph, tracked
     /// separately from `graph_phase` because the sibling executor owns its own
@@ -4854,7 +4864,19 @@ impl DecodeCudaState {
         let mask_exposes_logical = bindings
             .first()
             .is_some_and(DeviceIoBinding::exposes_logical_input_shape);
-        if graph_capture.is_enabled() && mask_exposes_logical {
+        // A logical-exposing mask that feeds *only* the additive causal-mask
+        // builder is still freeze-safe for a single-token decode step: the query
+        // window `Slice(CumSum(mask), Shape-q_seq, Shape)` saturates to the same
+        // position at `q_seq == 1` whether `Shape` is the logical length or the
+        // padded capacity (the `CumSum` plateaus across the zero-padding). So the
+        // decode step can freeze the mask to `max_len` (keeping `logical ==
+        // physical`, hence CUDA-graph capture-eligible) while prefill still exposes
+        // the logical length. Masks that reach a non-builder consumer (GLM-5.2's
+        // indexer `Add`) are not freeze-safe and keep forfeiting capture below.
+        let mask_decode_freeze_safe = bindings
+            .first()
+            .is_some_and(DeviceIoBinding::mask_decode_freeze_safe);
+        if graph_capture.is_enabled() && mask_exposes_logical && !mask_decode_freeze_safe {
             graph_capture.decline_if_enabled(
                 "attention_mask_consumers_are_capacity_aware",
                 format_args!(
@@ -4985,6 +5007,7 @@ impl DecodeCudaState {
             greedy_result,
             graph_enabled,
             mask_exposes_logical,
+            mask_decode_freeze_safe,
             graph_phase: DecodeCudaGraphPhase::NeedsWarmup,
             inline_graph_phase: DecodeCudaGraphPhase::NeedsWarmup,
             graph_captures: 0,
@@ -5051,11 +5074,17 @@ impl DecodeCudaState {
     /// decode step. Frozen to the current physical bucket (`max_len`) so the step
     /// stays CUDA-graph-capture eligible — *unless* the mask binding exposes its
     /// logical valid length to a non-capacity-aware consumer
-    /// (`mask_exposes_logical`), in which case the true valid length (`total_len`)
-    /// must be used or the padded width leaks into that consumer's arithmetic
-    /// (see [`Self::mask_exposes_logical`]).
+    /// (`mask_exposes_logical`) that is **not** decode-freeze-safe
+    /// (`mask_decode_freeze_safe`), in which case the true valid length
+    /// (`total_len`) must be used or the padded width leaks into that consumer's
+    /// arithmetic (see [`Self::mask_exposes_logical`]).
+    ///
+    /// A decode-freeze-safe mask (the additive causal-mask builder cone, e.g.
+    /// DeepSeek-V2-Lite) exposes its logical length for prefill but freezes here:
+    /// its query-window arithmetic saturates at `q_seq == 1`, so `max_len` yields
+    /// the identical additive bias while restoring capture eligibility.
     fn decode_mask_expose_len(&self, total_len: usize) -> usize {
-        if self.mask_exposes_logical {
+        if self.mask_exposes_logical && !self.mask_decode_freeze_safe {
             total_len
         } else {
             self.max_len
@@ -5270,6 +5299,7 @@ impl DecodeCudaState {
     ///
     /// `bf16`, non-rank-4, and in-place / CPU-resident caches stay gated to the
     /// non-paged fallback (Inc-D.2 and later) — no silent-wrong paged run.
+    #[allow(dead_code)]
     pub(crate) fn kv_bindings_paged_rank4(&self) -> bool {
         let range = self.kv_binding_range.clone();
         if range.is_empty() {
@@ -5301,6 +5331,7 @@ impl DecodeCudaState {
     /// The binding may be `f32` (Inc-D) or `f16` (Inc-D.1); the raw device bytes
     /// are widened to `f32` with the same `half` convert ORT uses
     /// ([`kv_dtype_to_f32`]) so the mirrored pages are byte-identical to ORT's.
+    #[allow(dead_code)]
     pub(crate) fn read_present_kv(
         &mut self,
         past_name: &str,
@@ -5381,6 +5412,7 @@ impl DecodeCudaState {
     /// marked attendable (the per-step decode only extends `[seq_len, total)`),
     /// and the KV logical length is advanced so the next step appends at
     /// `seq_len`.
+    #[allow(dead_code)]
     pub(crate) fn seed_prefix(
         &mut self,
         session: &mut InferenceSession,

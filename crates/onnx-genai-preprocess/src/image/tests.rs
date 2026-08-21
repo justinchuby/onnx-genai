@@ -1615,3 +1615,54 @@ preprocessing:
         "unexpected error: {error:#}"
     );
 }
+
+/// A summary for an image whose packed patch grid is `grid`.
+fn patched_summary(grid: [usize; 3], merge: usize) -> crate::image::ImageExpansionSummary {
+    crate::image::ImageExpansionSummary {
+        image_index: 0,
+        original_size: (64, 64),
+        tile_grid: TileGrid {
+            rows: 1,
+            columns: 1,
+        },
+        tile_count: 1,
+        expansion_count: grid[0] * grid[1] * grid[2],
+        patch_grid: Some(grid),
+        spatial_merge_size: merge,
+        tensor_offset: 0,
+        tensor_length: grid[0] * grid[1] * grid[2],
+    }
+}
+
+#[test]
+fn a_patch_grid_sizes_its_image_token_run() {
+    // Each merge_size x merge_size patch group becomes exactly one image token,
+    // which is what the prompt must reserve for the vision features.
+    let summary = patched_summary([1, 8, 12], 2);
+    assert_eq!(summary.image_token_count().expect("count"), Some(24));
+}
+
+#[test]
+fn an_unmerged_patch_grid_keeps_every_patch_as_a_token() {
+    let summary = patched_summary([1, 5, 7], 1);
+    assert_eq!(summary.image_token_count().expect("count"), Some(35));
+}
+
+#[test]
+fn a_patch_grid_that_does_not_divide_by_the_merge_edge_is_refused() {
+    let summary = patched_summary([1, 5, 6], 2);
+    let error = summary.image_token_count().expect_err("must refuse");
+    assert!(
+        format!("{error:#}").contains("not divisible by spatial_merge_size"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn a_tiled_image_reports_no_derivable_token_count() {
+    // tokens_per_tile is a package fact; preprocessing cannot invent it, so the
+    // caller is told to consult the package rather than given a wrong number.
+    let mut summary = patched_summary([1, 4, 4], 2);
+    summary.patch_grid = None;
+    assert_eq!(summary.image_token_count().expect("count"), None);
+}

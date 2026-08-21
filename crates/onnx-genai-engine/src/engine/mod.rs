@@ -29,7 +29,7 @@ pub(crate) use anyhow::Context;
 pub(crate) use onnx_genai_kv::{
     Device, KvCacheOps, KvDType, LocalTieredConnector, PagedKvCache, PrefixCache,
 };
-pub(crate) use onnx_genai_metadata::{InferenceMetadata, ProposalType, SpeculatorProposerStatus};
+pub(crate) use onnx_genai_metadata::InferenceMetadata;
 pub(crate) use onnx_genai_ort::{
     DataType, Eagle3DecodeSession, Environment, ModelDirectory, MtpDecodeSession, Session,
     SessionOptions, SharedKvProposerSession, Tokenizer,
@@ -63,12 +63,9 @@ pub(crate) use crate::speculative::{
     LinearEmbedder, LinearLmHead, MtpEmbedder, MtpLmHead, SpeculativeStats,
     load_target_initializer_adapters,
 };
-// `MtpProposer` is reached from exactly one place in this module tree --
-// `runtime.rs`'s `generate_native_cold_with_callback`, which is itself
-// `#[cfg(feature = "native-backend")]`. Importing it unconditionally therefore
-// makes it an unused import in the default feature set, which `-D warnings`
-// rejects. Its siblings above stay ungated because each has uses that are not
-// feature-dependent (load.rs, model.rs, runtime.rs).
+// The MTP proposer is driven only from the native decode path; an ORT-only
+// build has no consumer for it and would see an unused import. Its only runtime
+// use is the native cold-generation path.
 #[cfg(feature = "native-backend")]
 pub(crate) use crate::speculative::MtpProposer;
 
@@ -88,11 +85,8 @@ mod speculative_load;
 pub(crate) use decode_backend::*;
 pub(crate) use governor::*;
 pub use governor::{EngineGovernorError, EngineResourceGovernor, resolve_device_vram_limit_bytes};
-#[cfg(feature = "native-cuda")]
-pub(crate) use load::managed_vmm_default_enabled;
 pub(crate) use load::{
-    force_managed_weight_streaming_enabled, kv_pages_for_budget, session_device_domain,
-    validate_shared_authority_limit,
+    force_managed_weight_streaming_enabled, session_device_domain, validate_shared_authority_limit,
 };
 #[cfg(feature = "native-backend")]
 pub(crate) use memory_plan::Holder;
@@ -121,21 +115,6 @@ mod tests {
     #[cfg(feature = "native-backend")]
     use std::collections::BTreeMap;
     use std::collections::HashMap;
-
-    #[test]
-    fn cap_kv_len_uncapped_returns_model_max() {
-        assert_eq!(cap_kv_len(32_768, None), 32_768);
-    }
-
-    #[test]
-    fn cap_kv_len_caps_when_smaller() {
-        assert_eq!(cap_kv_len(40_960, Some(512)), 512);
-    }
-
-    #[test]
-    fn cap_kv_len_ignores_cap_larger_than_model_max() {
-        assert_eq!(cap_kv_len(512, Some(40_960)), 512);
-    }
 
     #[test]
     fn paged_kv_fork_shares_prefix_then_diverges_copy_on_write() -> anyhow::Result<()> {
@@ -221,7 +200,7 @@ mod tests {
             prefix_cache: PrefixCache::new(),
             token_prefix_cache: Vec::new(),
             kv_model: None,
-            decode_path: ModelDecodePath::Legacy,
+            decode_path: ModelDecodePath::Generic,
             scheduler: Scheduler::new(onnx_genai_scheduler::SchedulerConfig::default()),
             governor,
             sessions,
@@ -622,10 +601,10 @@ mod tests {
             audio_features_input: None,
             cross_kv_inputs: None,
             cross_kv_outputs: None,
-            kv_update: None,
             state_pairs: None,
             optional_inputs: BTreeMap::new(),
             static_cache: None,
+            aliasing: None,
         }
     }
 
@@ -1858,25 +1837,15 @@ mod tests {
     }
 
     #[test]
-    fn scatter_fixture_uses_static_cache_decode_session_with_stable_greedy_output()
-    -> anyhow::Result<()> {
+    fn scatter_fixture_does_not_select_static_cache_from_metadata() -> anyhow::Result<()> {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm-scatter")
             .canonicalize()?;
-        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
-        assert!(matches!(
+        let engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        assert!(!matches!(
             engine.decode_path,
-            ModelDecodePath::StaticCache { max_len } if max_len > 0
+            ModelDecodePath::StaticCache { .. }
         ));
-        let mut request = GenerateRequest::new("hello");
-        request.options.max_new_tokens = 3;
-        request.options.temperature = 0.0;
-        request.options.stop_on_eos = false;
-
-        let result = engine.generate(request)?;
-
-        assert_eq!(result.token_ids, vec![23, 15, 28]);
-        assert_eq!(result.finish_reason, FinishReason::MaxTokens);
         Ok(())
     }
 

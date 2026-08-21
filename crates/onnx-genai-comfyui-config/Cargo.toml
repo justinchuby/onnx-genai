@@ -1,6 +1,6 @@
 [package]
 name = "onnx-genai-comfyui-config"
-description = "Compatibility layer that converts a ComfyUI API-format workflow JSON into native onnx-genai inference metadata"
+description = "One-way importer that lowers a ComfyUI API-format workflow JSON into canonical onnx-genai workflow inference metadata"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,6 +12,7 @@ categories = ["science", "parser-implementations"]
 onnx-genai-metadata = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 
 [lints]
