@@ -2007,6 +2007,33 @@ fn only_capacity_aware_inputs_keep_physical_capacity() {
     assert!(!kernel_input_uses_padded_capacity(&indexer_cast, 0));
 }
 
+/// A decline is only actionable if it names the consumer that caused it.
+/// `describe_non_padded_consumer` is the single place that formats that name,
+/// and it is derived from the same allowlist as the predicate so the two cannot
+/// drift apart.
+#[test]
+fn non_padded_consumers_are_named_for_attribution() {
+    let mut cast = Node::new(NodeId(0), "Cast", vec![], vec![]);
+    cast.name = "model/Cast_node_5".to_string();
+    assert_eq!(
+        describe_non_padded_consumer(&cast, 0).as_deref(),
+        Some("model/Cast_node_5(Cast)[input 0]")
+    );
+
+    // A capacity-safe consumer is not an offender and must not be reported,
+    // otherwise every model would look like it had a blocker.
+    let shape = Node::new(NodeId(1), "Shape", vec![], vec![]);
+    assert_eq!(describe_non_padded_consumer(&shape, 0), None);
+
+    // Non-zero slots are outside the allowlist regardless of op type, and an
+    // unnamed node still has to produce a usable message.
+    let unnamed = Node::new(NodeId(2), "Shape", vec![], vec![]);
+    assert_eq!(
+        describe_non_padded_consumer(&unnamed, 1).as_deref(),
+        Some("<unnamed>(Shape)[input 1]")
+    );
+}
+
 // A capacity-form default-domain `Attention`: mask at input 3, KV cache at
 // inputs 4/5 — so it derives the valid length from the mask frontier and binds
 // the KV cache at physical capacity, in either the causal or non-causal form.

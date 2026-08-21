@@ -1965,7 +1965,52 @@ impl Executor {
         found
     }
 
+    /// Name the direct consumers of `input` that are **not** padded-capacity-safe
+    /// — the ones that force the binding to expose its logical valid length and
+    /// therefore forfeit CUDA-graph capture. The predicate itself only answers
+    /// yes/no, so bring-up on a new architecture otherwise has to re-derive the
+    /// offender from the graph by hand; report it instead of inferring it.
+    pub(super) fn padded_capacity_offenders(&self, input: ValueId) -> Vec<String> {
+        let mut offenders = Vec::new();
+        for plan in &self.plan {
+            for (slot, value) in plan.inputs.iter().enumerate() {
+                if *value != Some(input) {
+                    continue;
+                }
+                let node = self.graph.node(plan.node_id);
+                if let Some(described) = describe_non_padded_consumer(node, slot) {
+                    offenders.push(described);
+                }
+            }
+        }
+        offenders
+    }
+
     pub(super) fn binding_consumers_use_padded_capacity(&self, input: ValueId) -> bool {
+        let padded = self.binding_consumers_use_padded_capacity_inner(input);
+        if !padded {
+            self.report_padded_capacity_decline(input);
+        }
+        padded
+    }
+
+    /// Emit the attribution for a padded-capacity decline. Gated behind
+    /// `ONNX_GENAI_CUDA_DEBUG_MASK_CAPACITY` so the default path stays silent,
+    /// matching the RMSNorm-fold attribution added in #1671.
+    fn report_padded_capacity_decline(&self, input: ValueId) {
+        let offenders = self.padded_capacity_offenders(input);
+        if offenders.is_empty() {
+            return;
+        }
+        if std::env::var("ONNX_GENAI_CUDA_DEBUG_MASK_CAPACITY").is_ok_and(|v| v != "0") {
+            eprintln!(
+                "mask_capacity_decline: non-capacity-aware consumer(s) {}",
+                offenders.join(", ")
+            );
+        }
+    }
+
+    fn binding_consumers_use_padded_capacity_inner(&self, input: ValueId) -> bool {
         let mut found = false;
         let mut all_direct_padded = true;
         for plan in &self.plan {

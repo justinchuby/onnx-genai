@@ -185,10 +185,11 @@ struct Args {
     dump_logprobs: Option<PathBuf>,
     #[arg(long, default_value_t = 40)]
     logprobs_k: usize,
-    /// Override the text prompt with an explicit JSON array of token ids (e.g.
-    /// "[9707, 12824, 13]"). Applies to native, pipeline, and log-probability
-    /// runs so paired benchmarks avoid tokenizer round-trip drift.
-    #[arg(long)]
+    /// Path to a JSON file holding an explicit array of prompt token ids (file
+    /// contents e.g. `[9707, 12824, 13]`), overriding the text prompt. Applies
+    /// to the engine (`--steady`), native, pipeline, and log-probability runs so
+    /// paired benchmarks avoid tokenizer round-trip drift.
+    #[arg(long, value_name = "JSON_FILE")]
     prompt_ids: Option<PathBuf>,
     /// Encoded image supplied as the optional `request.image` workflow input.
     #[arg(long)]
@@ -444,7 +445,38 @@ fn generate(
     Ok(result.token_ids)
 }
 
+/// Prompt ids parsed from `--prompt-ids`, published once by [`init_prompt_ids`]
+/// before any request is built.
+static PROMPT_IDS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+
+/// Parse `--prompt-ids` up front so every request path — including the engine
+/// `--steady` path — sees the same explicit token ids. Without this the engine
+/// path silently fell back to `--prompt` text, so a paired benchmark could
+/// report numbers for a prompt the caller never asked for.
+fn init_prompt_ids(args: &Args) -> Result<()> {
+    let Some(ids_path) = args.prompt_ids.as_ref() else {
+        return Ok(());
+    };
+    let raw = std::fs::read_to_string(ids_path)
+        .with_context(|| format!("read prompt ids from {}", ids_path.display()))?;
+    let ids = serde_json::from_str::<Vec<u32>>(raw.trim())
+        .with_context(|| format!("parse prompt ids JSON from {}", ids_path.display()))?;
+    if ids.is_empty() {
+        bail!("prompt ids from {} are empty", ids_path.display());
+    }
+    let _ = PROMPT_IDS.set(ids);
+    Ok(())
+}
+
 fn request(args: &Args, tokens: usize) -> GenerateRequest {
+    if let Some(ids) = PROMPT_IDS.get() {
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(ids.clone()));
+        request.options.max_new_tokens = tokens;
+        request.options.stop_on_eos = false;
+        apply_sampling_options(&mut request.options, args);
+        apply_speculative_options(&mut request.options, args);
+        return request;
+    }
     request_with_prompt(args, tokens, &args.prompt)
 }
 
@@ -3317,6 +3349,7 @@ fn main() -> Result<()> {
             .with_context(|| format!("failed to read --prompt-file {}", path.display()))?;
     }
     validate_backend(&args)?;
+    init_prompt_ids(&args)?;
     eprintln!(
         "profile_native: WEIGHT_OFFLOAD_BYTE_AWARE={:?} WEIGHT_OFFLOAD_EVICT_ORDER={:?} \
          MANAGED_WEIGHT_STREAMING={:?} CUDA_GRAPH={:?}",
