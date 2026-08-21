@@ -637,10 +637,8 @@ fn mask_binding_feeds_capacity_form_attention_impl(
                 // `q_seq == 1`, where the window saturates to the same position
                 // regardless of width), so a consumed `Shape` does not disqualify.
                 if node.op_type == "Shape" && shape_policy == ShapeConsumptionPolicy::Disqualify {
-                    let shape_output_consumed = node
-                        .outputs
-                        .iter()
-                        .any(|out| consumers.contains_key(out));
+                    let shape_output_consumed =
+                        node.outputs.iter().any(|out| consumers.contains_key(out));
                     if shape_output_consumed {
                         return false;
                     }
