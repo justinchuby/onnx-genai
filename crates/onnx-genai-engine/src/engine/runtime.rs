@@ -860,7 +860,9 @@ impl Engine {
             // cold and session-reusing paths still admit through the scheduler
             // before touching the native backend.
             let native_spec_requested = request.options.speculative_mode.is_some()
-                || request.options.num_speculative_tokens.is_some();
+                || request.options.num_speculative_tokens.is_some()
+                || self.mtp.is_some()
+                || self.native_shared_kv_proposer.is_some();
             if request.options.cold_start || native_spec_requested {
                 let result = self.generate_native_cold_with_callback(
                     request,

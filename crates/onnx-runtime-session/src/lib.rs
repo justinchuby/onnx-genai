@@ -984,6 +984,31 @@ impl InferenceSession {
         )
     }
 
+    /// Build a session from an in-memory IR [`Graph`](onnx_runtime_ir::Graph)
+    /// with a caller-supplied execution provider and weight store.
+    ///
+    /// Like [`Self::from_graph`] but lets the caller choose the execution
+    /// provider (e.g. a native CUDA EP) and supply the [`WeightStore`] whose
+    /// mmap backs the graph's initializer [`WeightRef`]s. This is how the MTP
+    /// draft LM-head projection reuses the target model's already-loaded int4
+    /// `MatMulNBits` initializers zero-copy on the native CUDA EP, without
+    /// re-exporting a sidecar or dequantising the weight host-side.
+    pub fn from_graph_with_provider(
+        graph: onnx_runtime_ir::Graph,
+        weights: std::sync::Arc<onnx_runtime_loader::WeightStore>,
+        model_dir: &Path,
+        provider: std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>,
+    ) -> Result<Self> {
+        Self::from_parts(
+            graph,
+            weights,
+            model_dir,
+            EpContextDumpConfig::default(),
+            ModelMetadata::default(),
+            provider,
+        )
+    }
+
     fn from_parts(
         graph: onnx_runtime_ir::Graph,
         weights: std::sync::Arc<onnx_runtime_loader::WeightStore>,

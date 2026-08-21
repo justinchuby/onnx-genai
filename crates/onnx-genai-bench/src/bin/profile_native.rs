@@ -2863,6 +2863,13 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     }
     if args.speculative != SpeculativeArg::None {
         print_speculative_observability(&engine.last_speculative_stats());
+    } else {
+        let stats = engine.last_speculative_stats();
+        if stats.verification_steps > 0 || stats.proposed_tokens > 0 {
+            print_speculative_observability(&stats);
+        } else {
+            println!("speculative_stats: none (no speculative decode engaged)");
+        }
     }
     print_cuda_observability(&engine, cuda_before.as_ref());
     print_weight_offload_observability(generated as u64);

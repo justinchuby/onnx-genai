@@ -379,6 +379,31 @@ impl Engine {
         if let Err(unsupported) = onnx_genai_metadata::validate(&metadata, &runtime_caps) {
             anyhow::bail!("Unsupported capabilities: {unsupported:?}");
         }
+        // Metadata-advertised MTP self-speculation seeds its draft head from a
+        // target hidden output (`speculative.target_hidden_output`). The native
+        // decode session only records that hidden state when `model.io.hidden_output`
+        // names it, but MTP artifacts declare the seed solely in the speculative
+        // block. Derive the model-IO hidden output from the speculative target so
+        // the native session materializes the seed; never override an explicit
+        // `model.io.hidden_output`, and leave non-MTP models untouched.
+        if let Some(spec) = metadata.speculative.as_ref() {
+            if spec.proposal_type == ProposalType::Mtp {
+                if let Some(target_hidden) = spec
+                    .target_hidden_output
+                    .as_ref()
+                    .filter(|name| !name.is_empty())
+                    .cloned()
+                {
+                    if let Some(model) = metadata.model.as_mut() {
+                        if let Some(io) = model.io.as_mut() {
+                            if io.hidden_output.as_deref().unwrap_or_default().is_empty() {
+                                io.hidden_output = Some(target_hidden);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let tokenizer = {
             let _span = onnx_genai_ort::prof_span!("engine.tokenizer_load");
             Tokenizer::from_file(&model_directory.tokenizer_path)
@@ -2050,6 +2075,10 @@ fn load_mtp_model(
             environment,
             session_options,
             model_directory,
+            // The ORT target path has no native projection device; a quantised
+            // shared LM-head therefore still fails fast in the adapter loader,
+            // preserving the existing ORT-backend behaviour exactly.
+            None,
         )?)
     } else {
         None
@@ -2072,6 +2101,7 @@ fn build_mtp_model_from_resolved(
     environment: &Environment,
     session_options: &SessionOptions,
     model_directory: &ModelDirectory,
+    draft_projection: Option<crate::speculative::DraftProjectionDevice>,
 ) -> anyhow::Result<MtpModel> {
     if mtp_config.cache_scope == MtpCacheScope::AcceptedPrefix {
         anyhow::bail!(
@@ -2132,6 +2162,7 @@ fn build_mtp_model_from_resolved(
                     embedding,
                     lm_head,
                     mtp_config.public_config.hidden_size,
+                    draft_projection,
                 )?;
                 if vocab_size != mtp_config.public_config.vocab_size {
                     anyhow::bail!(
@@ -2217,11 +2248,19 @@ fn load_native_mtp_proposer(
         }
         None => session_options.clone(),
     };
+    // The int4 shared LM-head is projected on the same device as the native
+    // target: CUDA when the target is on CUDA, otherwise the CPU int4 kernel.
+    // This projection runs during proposal, outside the captured decode step.
+    let draft_projection = Some(match native_device.cuda_index() {
+        Some(index) => crate::speculative::DraftProjectionDevice::Cuda { index },
+        None => crate::speculative::DraftProjectionDevice::Cpu,
+    });
     let mtp = build_mtp_model_from_resolved(
         resolved,
         environment,
         &head_session_options,
         model_directory,
+        draft_projection,
     )?;
     let mode = SpeculativeMode::Mtp(mtp.config.clone());
     Ok((Some(mtp), mode))

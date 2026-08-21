@@ -305,6 +305,11 @@ impl TokenEmbedder for MtpEmbedder {
 pub(crate) enum MtpLmHead {
     Linear(LinearLmHead),
     TargetInitializer(TargetInitializerLmHead),
+    /// int4 `MatMulNBits` shared LM-head projected on the GPU (or CPU) via a
+    /// standalone single-node session that reuses the target's quantised
+    /// initializers zero-copy. Selected when the target LM-head is quantised.
+    #[cfg(feature = "native-backend")]
+    Quantized(QuantizedDraftLmHead),
 }
 
 impl LmHead for MtpLmHead {
@@ -312,6 +317,8 @@ impl LmHead for MtpLmHead {
         match self {
             Self::Linear(lm_head) => lm_head.vocab_size(),
             Self::TargetInitializer(lm_head) => lm_head.vocab_size(),
+            #[cfg(feature = "native-backend")]
+            Self::Quantized(lm_head) => lm_head.vocab_size(),
         }
     }
 
@@ -319,8 +326,28 @@ impl LmHead for MtpLmHead {
         match self {
             Self::Linear(lm_head) => lm_head.logits(hidden, out),
             Self::TargetInitializer(lm_head) => lm_head.logits(hidden, out),
+            #[cfg(feature = "native-backend")]
+            Self::Quantized(lm_head) => lm_head.logits(hidden, out),
         }
     }
+}
+
+/// Device on which the int4 draft LM-head `MatMulNBits` projection runs.
+///
+/// The projection is a standalone single-node session built from the target's
+/// own quantised LM-head initializers. It runs *outside* the captured native
+/// decode step (during proposal), so it never affects CUDA-graph capture of the
+/// target decode step.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DraftProjectionDevice {
+    /// Project on the CPU int4 `MatMulNBits` kernel (used by unit tests and the
+    /// native CPU backend).
+    Cpu,
+    /// Project on the native CUDA int4 `MatMulNBits` kernel at the given ordinal.
+    Cuda {
+        #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+        index: u32,
+    },
 }
 
 fn is_dense_float_dtype(dtype: IrDataType) -> bool {
@@ -335,6 +362,7 @@ pub(crate) fn load_target_initializer_adapters(
     embedding_name: &str,
     lm_head_name: &str,
     hidden_size: usize,
+    projection: Option<DraftProjectionDevice>,
 ) -> anyhow::Result<(MtpEmbedder, MtpLmHead, usize)> {
     let (graph, store) =
         onnx_runtime_loader::load_model_with_weights(model_path).with_context(|| {
@@ -361,26 +389,54 @@ pub(crate) fn load_target_initializer_adapters(
         );
     }
     let vocab_size = embedding_dims[0];
+    let embedder = TargetInitializerEmbedder {
+        matrix: TargetInitializerMatrix::new(
+            Arc::clone(&store),
+            embedding_weight,
+            vocab_size,
+            hidden_size,
+        )?,
+    };
     let lm_head_dims = lm_head_weight.dims();
     // The MTP draft head reuses the target's shared LM-head to project its hidden
-    // state into draft logits. This adapter only handles a *dense* [vocab, hidden]
-    // / [hidden, vocab] weight (f32/f16/bf16). An int4 MatMulNBits-quantised
-    // lm_head is stored as a 3-D packed uint8 blob with companion scales /
-    // zero_points and cannot be consumed here: dequantising the full matrix is
-    // multi-GB and a host-side draft GEMV per step is not throughput-viable, so
-    // the draft projection must run on the GPU (baked into the MTP head graph or
-    // sharing the target's quantised kernel). Fail fast with an actionable error
-    // rather than the misleading dense-shape mismatch below.
+    // state into draft logits. A *dense* [vocab, hidden] / [hidden, vocab] weight
+    // (f32/f16/bf16) is projected host-side by `TargetInitializerLmHead`. An int4
+    // MatMulNBits-quantised lm_head is stored as a 3-D packed uint8 blob with
+    // companion scales / zero_points: dequantising the full matrix is multi-GB
+    // and a host-side draft GEMV per step is not throughput-viable, so it is
+    // projected on the GPU (or CPU) via a standalone single-node MatMulNBits
+    // session that reuses the target's own quantised initializers zero-copy —
+    // running *outside* the captured decode step, so capture-safety is preserved.
     if lm_head_dims.len() != 2 || !is_dense_float_dtype(lm_head_weight.dtype()) {
+        #[cfg(feature = "native-backend")]
+        if let Some(projection) = projection {
+            let (lm_head, head_vocab) = build_quantized_draft_lm_head(
+                &graph,
+                Arc::clone(&store),
+                lm_head_name,
+                hidden_size,
+                projection,
+            )?;
+            if head_vocab != vocab_size {
+                anyhow::bail!(
+                    "target quantised LM-head vocabulary {head_vocab} does not match embedding vocabulary {vocab_size}"
+                );
+            }
+            return Ok((
+                MtpEmbedder::TargetInitializer(embedder),
+                MtpLmHead::Quantized(lm_head),
+                vocab_size,
+            ));
+        }
         anyhow::bail!(
             "target LM-head initializer '{lm_head_name}' has shape {lm_head_dims:?} dtype {:?}, \
-             which is not a dense f32/f16/bf16 [vocab, hidden] matrix. Quantised (e.g. int4 \
-             MatMulNBits) shared LM-heads are not yet supported for MTP self-speculation: the \
-             draft LM-head projection must run on the GPU (baked into the MTP head graph or \
-             sharing the target's quantised kernel), not dequantised host-side.",
+             which is not a dense f32/f16/bf16 [vocab, hidden] matrix. A quantised (e.g. int4 \
+             MatMulNBits) shared LM-head requires a GPU/CPU projection device (only the native \
+             backend supplies one); it cannot be dequantised host-side.",
             lm_head_weight.dtype()
         );
     }
+    let _ = projection;
     let (layout, rows, cols) = if lm_head_dims == [hidden_size, vocab_size] {
         (
             LmHeadInitializerLayout::HiddenVocab,
@@ -398,14 +454,6 @@ pub(crate) fn load_target_initializer_adapters(
             "target LM-head initializer '{lm_head_name}' shape {lm_head_dims:?} must be [{hidden_size}, {vocab_size}] or [{vocab_size}, {hidden_size}]"
         );
     };
-    let embedder = TargetInitializerEmbedder {
-        matrix: TargetInitializerMatrix::new(
-            Arc::clone(&store),
-            embedding_weight,
-            vocab_size,
-            hidden_size,
-        )?,
-    };
     let lm_head = TargetInitializerLmHead {
         matrix: TargetInitializerMatrix::new(store, lm_head_weight, rows, cols)?,
         layout,
@@ -416,6 +464,300 @@ pub(crate) fn load_target_initializer_adapters(
         MtpEmbedder::TargetInitializer(embedder),
         MtpLmHead::TargetInitializer(lm_head),
         vocab_size,
+    ))
+}
+
+/// A shared int4 `MatMulNBits` LM-head projected on-device (or on the CPU int4
+/// kernel) for MTP draft-token generation.
+///
+/// The projection is a standalone single-node `InferenceSession` built from the
+/// target model's *own* quantised LM-head initializers (weight / scales /
+/// zero_points), reused zero-copy through the same [`WeightStore`] mmap — no
+/// re-export, no host-side dequantisation. `logits` feeds one hidden vector per
+/// draft step and reads back the full vocabulary logits. This runs during
+/// proposal, *outside* the captured native decode step, so it never perturbs
+/// CUDA-graph capture of the target step (fallbacks stay at zero). Draft-token
+/// exactness is not required for correctness — drafts are verified against the
+/// target, so an imperfect projection only lowers the acceptance rate.
+#[cfg(feature = "native-backend")]
+pub(crate) struct QuantizedDraftLmHead {
+    session: Arc<std::sync::Mutex<onnx_runtime_session::InferenceSession>>,
+    input_name: String,
+    hidden: usize,
+    vocab: usize,
+}
+
+#[cfg(feature = "native-backend")]
+impl std::fmt::Debug for QuantizedDraftLmHead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuantizedDraftLmHead")
+            .field("hidden", &self.hidden)
+            .field("vocab", &self.vocab)
+            .finish()
+    }
+}
+
+#[cfg(feature = "native-backend")]
+impl Clone for QuantizedDraftLmHead {
+    fn clone(&self) -> Self {
+        Self {
+            session: Arc::clone(&self.session),
+            input_name: self.input_name.clone(),
+            hidden: self.hidden,
+            vocab: self.vocab,
+        }
+    }
+}
+
+#[cfg(feature = "native-backend")]
+impl LmHead for QuantizedDraftLmHead {
+    fn vocab_size(&self) -> usize {
+        self.vocab
+    }
+
+    fn logits(&self, hidden: &[f32], out: &mut [f32]) -> anyhow::Result<()> {
+        if hidden.len() != self.hidden {
+            anyhow::bail!(
+                "quantised lm-head input length {} != hidden {}",
+                hidden.len(),
+                self.hidden
+            );
+        }
+        if out.len() != self.vocab {
+            anyhow::bail!(
+                "quantised lm-head output length {} != vocab {}",
+                out.len(),
+                self.vocab
+            );
+        }
+        let input = onnx_runtime_session::Tensor::from_f32(&[1, self.hidden], hidden)
+            .context("build draft lm-head projection input")?;
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|_| anyhow::anyhow!("draft lm-head projection session lock poisoned"))?;
+        let outputs = session
+            .run(&[(self.input_name.as_str(), &input)])
+            .context("run draft lm-head projection")?;
+        let logits = outputs
+            .into_iter()
+            .next()
+            .context("draft lm-head projection produced no output")?;
+        match logits.dtype {
+            IrDataType::Float32 => {
+                let values = logits.to_vec_f32();
+                if values.len() != self.vocab {
+                    anyhow::bail!(
+                        "draft lm-head projection returned {} logits, expected {}",
+                        values.len(),
+                        self.vocab
+                    );
+                }
+                out.copy_from_slice(&values);
+            }
+            other => anyhow::bail!("draft lm-head projection returned unsupported dtype {other:?}"),
+        }
+        Ok(())
+    }
+}
+
+/// Build a [`QuantizedDraftLmHead`] from a loaded target `graph` by locating the
+/// `MatMulNBits` node that consumes `lm_head_name` and cloning it into a
+/// standalone single-node projection session on `projection`.
+///
+/// All shape/quantisation parameters (`K`, `N`, `bits`, `block_size`, the
+/// scales / zero_points inputs) are derived from the discovered node — nothing
+/// is hardcoded. The three quantised initializers are reused zero-copy from the
+/// same [`WeightStore`], which is handed to the projection session so its mmap
+/// stays alive.
+#[cfg(feature = "native-backend")]
+fn build_quantized_draft_lm_head(
+    graph: &onnx_runtime_ir::Graph,
+    store: Arc<WeightStore>,
+    lm_head_name: &str,
+    hidden_size: usize,
+    projection: DraftProjectionDevice,
+) -> anyhow::Result<(QuantizedDraftLmHead, usize)> {
+    use onnx_runtime_ir::{Attribute, Node, NodeId, static_shape};
+
+    // The native loader lowers int4 `MatMulNBits` into an explicit dequant +
+    // dense `MatMul` subgraph (BitShift / BitwiseAnd / Cast / Sub / Mul), so the
+    // loaded IR contains no `MatMulNBits` node to clone. The three quantised
+    // initializers (weight / scales / zero_points) do persist, however, so we
+    // reconstruct a clean single-node `MatMulNBits` projection from them and let
+    // the projection session's EP re-run the quantised GEMV. `weight`/`scales`
+    // are required; `zero_points` is optional (symmetric quantisation).
+    let find_initializer = |name: &str| -> Option<WeightRef> {
+        graph.initializers.iter().find_map(|(&vid, weight)| {
+            (graph.value(vid).name.as_deref() == Some(name)).then(|| weight.clone())
+        })
+    };
+    let weight_ref = find_initializer(lm_head_name)
+        .with_context(|| format!("shared LM-head initializer '{lm_head_name}' was not found"))?;
+    // Companion scales / zero_points follow the `MatMulNBits` export convention:
+    // the same prefix as the packed weight with a `.scales` / `.zero_points`
+    // suffix (e.g. `lm_head.weight` -> `lm_head.scales`).
+    let prefix = lm_head_name
+        .rsplit_once('.')
+        .map(|(head, _)| head)
+        .unwrap_or(lm_head_name);
+    let scales_name = format!("{prefix}.scales");
+    let zero_points_name = format!("{prefix}.zero_points");
+    let scales_ref = find_initializer(&scales_name).with_context(|| {
+        format!(
+            "quantised LM-head '{lm_head_name}' companion scales initializer '{scales_name}' \
+             was not found"
+        )
+    })?;
+    let zero_points_ref = find_initializer(&zero_points_name);
+
+    // Derive all quantisation geometry from the initializer shapes and the
+    // configured hidden size — nothing is hardcoded. The packed weight is
+    // [N, k_blocks, blob] uint8; K = hidden_size; block_size = K / k_blocks;
+    // bits = blob_bytes * 8 / block_size (int4 packs two weights per byte).
+    let weight_dims = weight_ref.dims();
+    if weight_dims.len() != 3 {
+        anyhow::bail!(
+            "quantised LM-head weight '{lm_head_name}' must be a 3-D packed [N, k_blocks, blob] \
+             tensor, got shape {weight_dims:?}"
+        );
+    }
+    let n = weight_dims[0];
+    let k_blocks = weight_dims[1];
+    let blob = weight_dims[2];
+    let k = hidden_size;
+    if k_blocks == 0 || k % k_blocks != 0 {
+        anyhow::bail!(
+            "quantised LM-head weight '{lm_head_name}' k_blocks {k_blocks} does not divide hidden \
+             size {k}"
+        );
+    }
+    let block_size = (k / k_blocks) as i64;
+    if block_size == 0 || (blob * 8) % (block_size as usize) != 0 {
+        anyhow::bail!(
+            "quantised LM-head weight '{lm_head_name}' blob {blob} incompatible with block_size \
+             {block_size}"
+        );
+    }
+    let bits = (blob * 8 / block_size as usize) as i64;
+    let scales_dims = scales_ref.dims().to_vec();
+    if scales_dims != [n, k_blocks] {
+        anyhow::bail!(
+            "quantised LM-head scales '{scales_name}' shape {scales_dims:?} does not match \
+             weight-derived [N={n}, k_blocks={k_blocks}]"
+        );
+    }
+    // The MatMulNBits CUDA kernel requires Float32 scales; the exported artifact
+    // stores them as BFloat16 (or Float16). Convert once, at build time, into an
+    // inline Float32 initializer so the reconstructed projection node satisfies
+    // the kernel's dtype contract. Float32 scales are passed through untouched.
+    let scales_ref = match scales_ref.dtype() {
+        IrDataType::Float32 => scales_ref,
+        dtype @ (IrDataType::BFloat16 | IrDataType::Float16) => {
+            let raw = store.bytes(&scales_ref).with_context(|| {
+                format!("resolve bytes for quantised LM-head scales '{scales_name}'")
+            })?;
+            if raw.len() % 2 != 0 {
+                anyhow::bail!(
+                    "quantised LM-head scales '{scales_name}' byte length {} is not 2-byte aligned",
+                    raw.len()
+                );
+            }
+            let mut f32_bytes = Vec::with_capacity(raw.len() * 2);
+            for chunk in raw.chunks_exact(2) {
+                let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                let value = match dtype {
+                    IrDataType::BFloat16 => half::bf16::from_bits(bits).to_f32(),
+                    _ => half::f16::from_bits(bits).to_f32(),
+                };
+                f32_bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+                IrDataType::Float32,
+                scales_dims.to_vec(),
+                f32_bytes,
+            ))
+        }
+        other => anyhow::bail!(
+            "quantised LM-head scales '{scales_name}' has unsupported dtype {other:?}; \
+             expected Float32, BFloat16, or Float16"
+        ),
+    };
+    let mut projection_graph = onnx_runtime_ir::Graph::default();
+    projection_graph
+        .opset_imports
+        .insert("com.microsoft".to_string(), 1);
+    let hidden_value =
+        projection_graph.create_named_value("draft_hidden", IrDataType::Float32, static_shape([1, k]));
+    projection_graph.add_input(hidden_value);
+    let add_initializer = |graph: &mut onnx_runtime_ir::Graph, name: &str, weight: &WeightRef| {
+        let value = graph.create_named_value(
+            name,
+            weight.dtype(),
+            static_shape(weight.dims().iter().copied()),
+        );
+        graph.set_initializer(value, weight.clone());
+        value
+    };
+    let weight_value = add_initializer(&mut projection_graph, "draft_lm_head.weight", &weight_ref);
+    let scales_value = add_initializer(&mut projection_graph, "draft_lm_head.scales", &scales_ref);
+    let mut inputs = vec![Some(hidden_value), Some(weight_value), Some(scales_value)];
+    if let Some(zero_points_ref) = &zero_points_ref {
+        let zero_points_value =
+            add_initializer(&mut projection_graph, "draft_lm_head.zero_points", zero_points_ref);
+        inputs.push(Some(zero_points_value));
+    }
+    let logits_value = projection_graph.create_named_value(
+        "draft_logits",
+        IrDataType::Float32,
+        static_shape([1, n]),
+    );
+    let mut projection_node = Node::new(NodeId(0), "MatMulNBits", inputs, vec![logits_value]);
+    projection_node.domain = "com.microsoft".to_string();
+    projection_node
+        .attributes
+        .insert("K".to_string(), Attribute::Int(k as i64));
+    projection_node
+        .attributes
+        .insert("N".to_string(), Attribute::Int(n as i64));
+    projection_node
+        .attributes
+        .insert("bits".to_string(), Attribute::Int(bits));
+    projection_node
+        .attributes
+        .insert("block_size".to_string(), Attribute::Int(block_size));
+    projection_graph.insert_node(projection_node);
+    projection_graph.add_output(logits_value);
+
+    let provider: Arc<dyn onnx_runtime_ep_api::ExecutionProvider> = match projection {
+        DraftProjectionDevice::Cpu => {
+            Arc::new(onnx_runtime_ep_cpu::CpuExecutionProvider::new())
+        }
+        #[cfg(feature = "native-cuda")]
+        DraftProjectionDevice::Cuda { index } => Arc::new(
+            onnx_runtime_ep_cuda::CudaExecutionProvider::initialized(index)
+                .context("initialize CUDA EP for int4 draft LM-head projection")?,
+        ),
+        #[cfg(not(feature = "native-cuda"))]
+        DraftProjectionDevice::Cuda { .. } => anyhow::bail!(
+            "int4 draft LM-head projection on CUDA requires the `native-cuda` feature"
+        ),
+    };
+    let session = onnx_runtime_session::InferenceSession::from_graph_with_provider(
+        projection_graph,
+        store,
+        Path::new("."),
+        provider,
+    )
+    .context("build int4 draft LM-head projection session")?;
+    Ok((
+        QuantizedDraftLmHead {
+            session: Arc::new(std::sync::Mutex::new(session)),
+            input_name: "draft_hidden".to_string(),
+            hidden: hidden_size,
+            vocab: n,
+        },
+        n,
     ))
 }
 
@@ -2114,6 +2456,108 @@ mod tests {
     use std::path::Path;
     use std::sync::{Mutex, OnceLock};
 
+    /// The int4 draft LM-head projection primitive must reproduce a `MatMulNBits`
+    /// GEMV from the target's own quantised initializers, argmax-correctly, on
+    /// the CPU int4 kernel — the GPU path shares this exact builder. A one-hot
+    /// hidden vector isolates a single weight column: setting one column's lead
+    /// nibble to the maximum code (15, i.e. +7 after the symmetric zero-point)
+    /// while every other column stays at the zero code (8) makes that column the
+    /// unique argmax, independent of the exact scale, proving the projection
+    /// routes hidden→logits through the real quantised kernel rather than a stub.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn quantized_draft_lm_head_projects_int4_argmax() -> anyhow::Result<()> {
+        use onnx_runtime_ir::{
+            Attribute, DataType, Graph, Node, NodeId, TensorData, WeightRef, static_shape,
+        };
+
+        // K=32 (one block), N=4 columns, symmetric int4 (no zero_points input).
+        let k = 32usize;
+        let n = 4usize;
+        let block_size = 32i64;
+        let k_blocks = 1usize;
+        let blob = 16usize; // block_size / 2, two int4 weights per byte.
+        let target_col = 2usize;
+
+        // Every packed byte is 0x88 → both nibbles are code 8 (zero after the
+        // symmetric zero-point). For the target column, the first weight (k=0,
+        // the low nibble of byte 0) is code 15 (+7).
+        let mut weight = vec![0x88u8; n * k_blocks * blob];
+        weight[target_col * k_blocks * blob] = 0x8F;
+        let scales = vec![1.0f32; n * k_blocks];
+
+        let mut graph = Graph::default();
+        graph.opset_imports.insert("com.microsoft".to_string(), 1);
+        let activation = graph.create_named_value("A", DataType::Float32, static_shape([1, k]));
+        let weight_value =
+            graph.create_named_value("lm_head.weight", DataType::Uint8, static_shape([n, k_blocks, blob]));
+        graph.set_initializer(
+            weight_value,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Uint8,
+                vec![n, k_blocks, blob],
+                weight,
+            )),
+        );
+        let scales_value =
+            graph.create_named_value("lm_head.scales", DataType::Float32, static_shape([n, k_blocks]));
+        graph.set_initializer(
+            scales_value,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![n, k_blocks],
+                scales.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            )),
+        );
+        let logits_value =
+            graph.create_named_value("logits", DataType::Float32, static_shape([1, n]));
+        let mut node = Node::new(
+            NodeId(0),
+            "MatMulNBits",
+            vec![Some(activation), Some(weight_value), Some(scales_value)],
+            vec![logits_value],
+        );
+        node.domain = "com.microsoft".to_string();
+        node.attributes.insert("K".to_string(), Attribute::Int(k as i64));
+        node.attributes.insert("N".to_string(), Attribute::Int(n as i64));
+        node.attributes.insert("bits".to_string(), Attribute::Int(4));
+        node.attributes
+            .insert("block_size".to_string(), Attribute::Int(block_size));
+        graph.insert_node(node);
+
+        let (lm_head, vocab) = build_quantized_draft_lm_head(
+            &graph,
+            Arc::new(WeightStore::new()),
+            "lm_head.weight",
+            k,
+            DraftProjectionDevice::Cpu,
+        )?;
+        assert_eq!(vocab, n);
+        assert_eq!(lm_head.vocab_size(), n);
+
+        // One-hot hidden at k=0 selects each column's lead weight.
+        let mut hidden = vec![0.0f32; k];
+        hidden[0] = 1.0;
+        let mut logits = vec![0.0f32; n];
+        lm_head.logits(&hidden, &mut logits)?;
+
+        let best = argmax(&logits).expect("argmax over non-empty logits");
+        assert_eq!(
+            best, target_col,
+            "int4 draft projection argmax {best} != expected column {target_col}; logits {logits:?}"
+        );
+        for (col, &value) in logits.iter().enumerate() {
+            if col != target_col {
+                assert!(
+                    logits[target_col] > value,
+                    "target column logit {} not strictly greatest vs col {col} = {value}",
+                    logits[target_col]
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// The shared-KV slicer must read each group's `num_kv_heads`/`head_dim`
     /// from the specific target layer it references, not a single global value.
     /// With a heterogeneous cache (layer 0: 2×8 sliding, layer 1: 3×16 full),
@@ -2534,6 +2978,7 @@ mod tests {
             "transformer.wte.weight",
             "lm_head.weight_t",
             16,
+            None,
         )?;
         assert_eq!(vocab_size, 32);
 
