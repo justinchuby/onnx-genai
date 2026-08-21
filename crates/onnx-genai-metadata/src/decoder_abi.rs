@@ -129,21 +129,39 @@ pub fn sole_decoder_component(workflow: &WorkflowSpec) -> Option<&str> {
 }
 
 /// Find the single port of `component` carrying `role`.
+///
+/// The role declaration is what names the port. `declared` is consulted only to
+/// break ties, never to veto: a producer whose `.onnx` artifact is the
+/// authoritative port list may declare the handful of semantic roles — which no
+/// graph carries — without also transcribing a contract for every port. Vetoing
+/// on absence would silently discard an explicit declaration and send the
+/// runtime back to guessing a port by its spelling, which is the one thing this
+/// resolver exists to prevent. A name that no graph exposes is caught against
+/// the live session, which is strictly stronger than any echo of it here.
 fn port_with_role<'a>(
     ports: &'a BTreeMap<String, PortRole>,
     declared: &BTreeMap<String, crate::schema::TensorContract>,
     role: PortRole,
 ) -> Option<&'a str> {
-    let mut found = ports
+    let mut matching = ports
         .iter()
-        .filter(|(port, declared_role)| **declared_role == role && declared.contains_key(*port))
+        .filter(|(_, declared_role)| **declared_role == role)
         .map(|(port, _)| port.as_str());
-    let first = found.next()?;
-    // A duplicated role is a producer error, not a choice to make silently.
-    if found.next().is_some() {
+    let first = matching.next()?;
+    let Some(second) = matching.next() else {
+        return Some(first);
+    };
+    // A duplicated role is a producer error, not a choice to make silently —
+    // unless exactly one of the claimants is a port the component declares.
+    let mut contracted = std::iter::once(first)
+        .chain(std::iter::once(second))
+        .chain(matching)
+        .filter(|port| declared.contains_key(*port));
+    let resolved = contracted.next()?;
+    if contracted.next().is_some() {
         return None;
     }
-    Some(first)
+    Some(resolved)
 }
 
 /// Derive the decode-step ABI of `component` from the canonical workflow.

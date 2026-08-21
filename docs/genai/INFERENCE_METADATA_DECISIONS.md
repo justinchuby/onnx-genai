@@ -1190,6 +1190,46 @@ and a decode step advances the write cursor by exactly one row position. The
 sibling `tests/fixtures/tiny-llm-scatter/` keeps the legacy `model.io` form so
 the import-only path stays covered, and the two are exercised separately.
 
+#### Declare roles; do not transcribe the graph
+
+Making the workflow the sole ABI raises a fair objection from producers: if a
+component's port list must be restated in YAML, the package carries a second
+copy of something the `.onnx` file already states authoritatively, and the two
+can drift. That objection is accepted. The canonical form asks for the part no
+graph carries and nothing more.
+
+A `TensorContract` under `ports.inputs`/`ports.outputs` is **optional**. An ONNX
+artifact already names its inputs, their element types, and their ranks; a
+producer whose artifact is the authority may omit the transcription entirely.
+What an ONNX graph cannot state is which of several same-typed ports carries
+which *meaning* — `input_ids` and `position_ids` are both rank-2 `int64`, and
+nothing in the graph distinguishes the autoregressive sequence from a positional
+index. That is why `ports.roles` is required, and it is one line per role:
+
+```yaml
+ports:
+  roles:
+    input_ids: token_ids
+```
+
+With that single declaration and no contracts at all, `decoder_io()` resolves
+the token port *and* the full `static_cache` ABI — the latter derives from the
+state-service group's port aliases, never from the component's port map. This is
+covered by `declared_roles_alone_yield_the_scatter_abi`, which strips
+`ports.inputs` and `ports.outputs` from the canonical fixture and asserts the
+ABI survives intact.
+
+The resolver therefore treats a role declaration as the naming authority and
+consults the declared contracts only to break a duplicate-role tie. An earlier
+form required a role's port to *also* appear in `ports.inputs`, which quietly
+inverted the intent: a producer who declared `input_ids: token_ids` and stopped
+there had that declaration discarded, and the runtime fell back to matching the
+spelling `input_ids` — reintroducing, in the one place it is least visible, the
+name-guessing this resolver exists to abolish. Absence of a transcription is not
+a claim that a port does not exist. A role naming a port the graph does not
+expose is still caught, against the live session, which is strictly stronger
+than any echo of the graph in YAML.
+
 ---
 
 ## 19. Invariants

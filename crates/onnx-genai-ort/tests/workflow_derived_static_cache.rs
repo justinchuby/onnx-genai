@@ -115,3 +115,58 @@ fn the_scatter_driver_runs_from_the_workflow_derived_abi() {
     decode.step(&[7], &[2]).expect("decode step");
     assert_eq!(decode.current_len(), 3);
 }
+
+/// A component that declares no port map still yields a scatter ABI.
+///
+/// The scatter ABI is a fact about the state service, not about a component's
+/// port list: the control-port names come from the group's `write_indices_ports`
+/// and `kv_length_ports`, and the per-layer buffers from the group's own port
+/// aliases. A producer that treats the `.onnx` file as the authoritative port
+/// list — and so declines to transcribe every input contract into YAML — is
+/// therefore still able to publish a bindable static cache.
+///
+/// This is pinned because the opposite reading is easy to reach: absent and
+/// empty port maps are indistinguishable after `#[serde(default)]`, so a
+/// consumer that treats absence as a claim of non-existence would reject
+/// exactly the producers that declined to duplicate the graph.
+#[test]
+fn declared_roles_alone_yield_the_scatter_abi() {
+    // Remove only the component's port map, leaving the rest of the document
+    // byte-identical, so the assertion isolates that one field.
+    let mut document: serde_yaml::Value = serde_yaml::from_str(include_str!(
+        "../../../tests/fixtures/tiny-llm-scatter-workflow/inference_metadata.yaml"
+    ))
+    .expect("fixture parses");
+    let component = document
+        .get_mut("pipeline")
+        .and_then(|pipeline| pipeline.get_mut("workflow"))
+        .and_then(|workflow| workflow.get_mut("components"))
+        .and_then(|components| components.get_mut("model"))
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .expect("the fixture declares the decoder component");
+    let ports = component
+        .get_mut(serde_yaml::Value::from("ports"))
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .expect("the fixture declares ports");
+    assert!(
+        ports.remove(serde_yaml::Value::from("inputs")).is_some()
+            && ports.remove(serde_yaml::Value::from("outputs")).is_some(),
+        "the fixture must transcribe contracts for their removal to prove anything"
+    );
+
+    let metadata: InferenceMetadata =
+        serde_yaml::from_value(document).expect("a portless component still parses");
+    let io = metadata
+        .decoder_io()
+        .expect("the state service alone derives an ABI");
+    let cache = io
+        .static_cache
+        .as_ref()
+        .expect("the scatter ABI comes from the state group, not the port map");
+    assert_eq!(cache.write_indices_input, "write_indices");
+    assert_eq!(cache.kv_sequence_length_input, "nonpad_kv_seqlen");
+    assert_eq!(cache.key_cache_inputs, ["key_cache.0"]);
+    // The one-line role declaration is honored on its own: the token port is
+    // resolved from `roles`, not guessed from the spelling "input_ids".
+    assert_eq!(io.token_input.as_deref(), Some("input_ids"));
+}
