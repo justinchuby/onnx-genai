@@ -1,0 +1,33 @@
+ir_version: 11
+producer_name: "onnx-genai-comfyui-fixture"
+graph {
+  node {
+    input: "timesteps"
+    output: "schedule"
+    op_type: "Identity"
+  }
+  name: "diffusion_timesteps"
+  initializer {
+    dims: 4
+    data_type: 1
+    name: "timesteps"
+    raw_data: "\000\000\200@\013\273\215?\215\344j>\217\302\365<"
+  }
+  output {
+    name: "schedule"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}

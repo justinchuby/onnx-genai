@@ -1,5 +1,11 @@
 # Examples
 
+## ComfyUI import, converted and executed
+
+[`comfyui-import/`](comfyui-import/) walks a ComfyUI API-format workflow through
+the one-way importer into canonical `pipeline.workflow` metadata and runs it on
+the generic workflow engine, with the fixture package and refusal diagnostics.
+
 ## Real multimodal model contract
 
 [`smolvlm-256m/`](smolvlm-256m/) validates the inference-metadata contract

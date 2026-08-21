@@ -22,12 +22,14 @@ cuda-13000 = ["onnx-genai-ort/cuda-13000", "onnx-genai-engine/cuda-13000"]
 
 [dependencies]
 onnx-genai-metadata = { workspace = true }
+onnx-genai-comfyui-config = { workspace = true }
 onnx-genai-kv = { workspace = true }
 onnx-genai-scheduler = { workspace = true }
 onnx-genai-engine = { path = "../onnx-genai-engine", version = "=0.1.0-dev.5", default-features = false }
 onnx-genai-ort = { path = "../onnx-genai-ort", version = "=0.1.0-dev.5", default-features = false }
 onnx-genai-preprocess = { workspace = true }
 anyhow = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true
