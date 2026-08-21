@@ -957,6 +957,27 @@ jobs:
       - name: Clippy CUDA execution provider
         run: cargo clippy -p onnx-runtime-ep-cuda --features cuda -- -D warnings
 
+      # `onnx-genai-engine`'s CUDA integration layer is gated on `native-cuda`,
+      # and until this step existed no job in any workflow enabled that feature
+      # (it appeared in ci.yml only inside a comment). That left ~167 cfg sites
+      # -- native_decode/{mod,load,cuda,tensor}.rs, memory_authority.rs,
+      # pipeline/* -- never type-checked, linted, or tested, so a change could
+      # break or orphan any of them with every check still green. `main` in fact
+      # already carried a `-D dead-code` violation there, found only by running
+      # this command by hand (#1631).
+      #
+      # Check-only, like the step above: CUDA is dynamically loaded, so no GPU
+      # and no CUDA toolkit are required. `--all-targets` matters -- the defect
+      # this caught is invisible to `--lib` alone, because the accessor's only
+      # caller lives in a `#[cfg(test)]` module.
+      - name: Clippy engine native-CUDA integration
+        run: >-
+          cargo clippy --locked
+          -p onnx-genai-engine
+          --features native-cuda
+          --all-targets
+          -- -D warnings
+
   cuda-compile-windows:
     name: CUDA compile (Windows x86_64)
     needs: changes
