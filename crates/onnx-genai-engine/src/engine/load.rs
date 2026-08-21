@@ -576,8 +576,13 @@ impl Engine {
         // per transposed constant weight) is the third buffer folded into
         // `resident_f32_cache_bytes`, so the same verdict governs it. When
         // declined, the `MatMul`/`Gemm` kernels transpose per call and retain
-        // nothing (byte-identical output, only slower decode) instead of holding
-        // the session-lifetime copies resident over budget.
+        // nothing instead of holding the session-lifetime copies resident over
+        // budget. That is byte-identical everywhere except the x86 f16/bf16
+        // decode GEMV, where admission picks the kernel too: a declined
+        // session reads the [K, N] weight in place with a different (slower,
+        // and further from an f64 reference) accumulation order, so its decode
+        // output differs in the low bits. See
+        // `set_weight_transpose_cache_enabled`.
         onnx_runtime_ep_cpu::set_weight_transpose_cache_enabled(
             memory_strategy_plan.f32_weight_cache_admitted,
         );

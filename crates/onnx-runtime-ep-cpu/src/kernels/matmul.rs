@@ -152,9 +152,19 @@ pub fn weight_transpose_cache_bytes() -> usize {
 /// weight-scaled `K x N` copies never accrue. The engine calls this once at
 /// load from the memory-strategy plan's verdict, beside the identical gates for
 /// the resident dequant f32 cache (#987) and the MLAS SQNBit packed buffer
-/// (#1051), so one admission decision governs all three buffers. Declining is a
-/// pure performance tradeoff: the transpose is byte-identical whether cached or
-/// recomputed, so generated tokens are unchanged.
+/// (#1051), so one admission decision governs all three buffers.
+///
+/// Declining is **not** numerically neutral on the x86 f16/bf16 decode GEMV.
+/// Everywhere else it is a pure performance tradeoff — the transpose is
+/// byte-identical whether cached or recomputed, so generated tokens are
+/// unchanged. At `m == 1` with a 16-bit weight, though, admission decides
+/// *which kernel* runs: admitted takes `gemv_half_nk` over the cached [N, K]
+/// copy, declined reads the [K, N] weight in place through `gemv_half_kn`.
+/// Those accumulate differently (four pairwise accumulators versus one serial
+/// per column), so a declined session's decode output differs in the low bits
+/// — and is 2.7-9.3x further from an f64 reference, not closer. Both are
+/// within the kernel's error envelope; neither is "the exact one". See
+/// `a_declined_transpose_cache_falls_back_to_reading_in_place`.
 pub fn set_weight_transpose_cache_enabled(enabled: bool) {
     weight_transpose::set_cache_enabled(enabled);
 }
@@ -2362,12 +2372,15 @@ impl MatMulKernel {
         // single-token decode was widening and packing the entire weight to
         // multiply it by one row.
         //
-        // B is read in place, in its stored [K, N] order — deliberately *not*
-        // through `transposed_b_f16`. `try_matmul_half` allocates no weight
-        // copy, so a transpose cache here would add a permanent 2*K*N bytes
-        // (272 MB for a 896x151936 lm_head) that the path it replaces never
-        // paid. Reading in place also keeps this available for a
-        // non-constant B, which a prepacked transpose could not serve.
+        // Which of the two GEMVs runs is `half_decode_gemv_dispatch`'s call,
+        // not this site's: a *constant* [K, N] weight is transposed once
+        // (budgeted, see `node_weight_transpose_cache_bytes`) and read by
+        // `gemv_half_nk`, because the in-place [K, N] walk crosses a page
+        // every `p` and runs 1.56-2.98x slower. A non-constant B, or a
+        // declined cache, still reads in place through `gemv_half_kn` — so
+        // this site remains available to a weight a prepacked transpose could
+        // not serve. The transpose costs a permanent 2*K*N bytes (272 MB for
+        // a 896x151936 lm_head), which is exactly why it must stay predicted.
         //
         // No weight is large enough to divert this to the fused GEBP. That
         // handover existed (`half_decode_prefers_gebp`, `k * n >= 1M`) and was
@@ -3178,6 +3191,7 @@ pub(crate) fn reset_half_decode_gemv_calls() {
     HALF_DECODE_GEMV_CALLS.with(|c| c.set(0));
 }
 
+#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
 thread_local! {
     /// Test-only count of decodes that reached the `[N, K]` GEMV *through the
     /// transpose cache*, i.e. from a weight the model stored as `[K, N]`.
