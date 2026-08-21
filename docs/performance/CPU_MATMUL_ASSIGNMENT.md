@@ -1465,10 +1465,63 @@ at ~2.4x.
 
 **Still open, measured but not merged:** (a) the u8 M=1 gap itself, ~2.4x and unmoved; (b) *parallel scaling at m=1* — 8
 threads buy 1.3x where ORT gets 5.8x, because the fused path splits columns and hands every worker a
-page-crossing strided walk of `B`; at m=1 there is no `B` reuse to protect, so a `k` split with
-private accumulators is the shape that streams. (c) The single-thread residual is an
+page-crossing strided walk of `B`. This section originally proposed a `k` split with private
+accumulators as "the shape that streams"; **that was built, measured and did not pay for itself** —
+see [section 17](#17-splitting-k-in-the-fused-decode-gemm-does-not-pay-for-itself-negative-result).
+The loss (b) describes is still open. (c) The single-thread residual is an
 instruction budget: exact full-range 8-bit needs `vpmaddwd` at ~0.25 vector uops/byte, and
 `vpmaddubsw` — which would halve it — saturates unless one operand stays within +/-64
 (`255 * 64 * 2 = 32640` fits `i16`, `255 * 65 * 2` does not), which is precisely why ORT's
 quantizer ships `reduce_range` for non-VNNI AVX2. Full record:
 [`docs/benchmarks/2026-08-21-qlinearmatmul-m1-signedness.md`](../benchmarks/2026-08-21-qlinearmatmul-m1-signedness.md).
+
+### 17. Splitting `k` in the fused decode GEMM does not pay for itself (**negative result**)
+
+[Section 16](#16-qlinearmatmul-decode-had-never-been-measured-on-the-shipped-build-and-the-integer-gemm-branched-on-signedness-per-16-bytes)
+left the m=1 parallel-scaling loss with a named fix: the fused path splits *columns*, so at
+`n = 3584` and eight workers each worker walks 448 contiguous bytes out of every 3584-byte row — a
+stride past a 4 KiB page, which is where the stride prefetcher stops following, with no `A` reuse to
+hide the latency. Splitting **`k`** instead hands each worker whole rows to stream, paid for with one
+private `m * n` `i32` accumulator per band and a reduction.
+
+It was built (twice), it is **correct**, and it does not pay for itself. It is not merged.
+
+The correctness half is worth keeping on the record: accumulation is wrapping `i32`, exactly mod
+2^32, so summing bands in band order is **bit-identical** to summing `k` in one pass — a `k` split
+does not owe a tolerance, it owes an equality, and
+`the_k_split_is_bit_identical_to_the_column_split` asserted it at every thread count.
+
+The performance half: 36 cells (six llama/qwen decode and short-prefill shapes x `t = 1,2,4,8,16,32`),
+three repetitions, two prebuilt binaries alternated, `portable` drift control at 0.999, and the
+`t = 1` rows as a null control because at one thread both binaries execute identical code. That
+control holds to +/-4% on five shapes and **fails on `1x1024x3072` (-29% in one matrix, +14% in the
+other)**, so all five of that shape's cells are dropped — its wins *and* its losses — leaving 25
+counted cells.
+
+* **Hybrid band x column plan, serial reduction: 8 wins, 5 losses, 12 neutral, geomean 0.997.** A
+  wash. And it *inverts its own prediction*: the gain should grow with thread count as the stripe
+  narrows, but `t = 4` is the best column and `t = 32` the worst.
+* **Pool-aligned bands plus a parallel reduction** — the fix implied by the Amdahl term
+  `bands * threads / k`, ~6% at 8 bands and 32 workers — is **worse: 3 wins, 13 losses, 9 neutral,
+  geomean 0.846** (3/12/9 and 0.904 with one unexplained 0.17x cell also excluded).
+
+A second parallel plan, a scratch allocation and a reduction have to earn their place; a geomean of
+0.997 does not buy them.
+
+**Scope, stated honestly.** The experiment moved two things at once — the access pattern *and* the
+addition of scratch — and the best explanation of the v2 result is that the **scratch** is what hurt,
+contending for the same L3 the weights stream through. So the streaming layout itself was never
+measured in isolation, and this does **not** rule out prepacked/reordered `B` (the same idea with the
+scratch cost paid once, outside the call), huge pages, software prefetch, NUMA first-touch, or gating
+the split to only the sub-page-stripe case. What rules those in or out is still owed.
+
+The claim that the fused decode kernel is **instruction-bound inside L3** rests on the aspect-ratio
+sweep in section 16 (12.85 MB at 17-20 GB/s at *every* aspect ratio; a 1 MB L2-resident weight at the
+same 19.5 GB/s), not on this; a confounded A/B corroborates, it does not independently confirm.
+
+The planning consequence: the instruction budget is the term that is measured — `vpmaddwd` at ~0.31
+total uops per byte of `B` (~0.25 counting vector uops only), with `vpmaddubsw` unable to replace it
+at full range — so paths that cut **bytes and uops per weight together**, such as the packed-nibble
+`int4 x int16` kernel consuming 0.5 B/weight in place, are the better next spend. Full record, both
+complete matrices, the controls and the anomaly:
+[`docs/benchmarks/2026-08-21-qgemm-k-split-negative.md`](../benchmarks/2026-08-21-qgemm-k-split-negative.md).
