@@ -2162,6 +2162,79 @@ fn vestigial_window_mask_builder_routes_to_padded_capacity() {
 }
 
 #[test]
+fn deepseek_shape_feeding_slice_window_keeps_logical_width() {
+    use onnx_runtime_ir::static_shape;
+    // DeepSeek-V2-Lite's HF-style causal-mask builder reads `Shape(attention_mask)`
+    // and feeds it into `Sub`→`Slice` query-position arithmetic:
+    //   Slice(CumSum(mask), start = Shape(mask) - q_seq, end = Shape(mask)).
+    // `Shape` returns the *physical* padded width, so freezing the mask to
+    // capacity selects query positions [max_len-q_seq .. max_len) instead of
+    // [0 .. q_seq), producing a non-causal mask and incoherent decode. When the
+    // `Shape` output is consumed like this the binding MUST keep exposing its
+    // logical valid length (regression guard for the CUDA-EP coherence fix).
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let sh = || static_shape([1]);
+
+    let mask = graph.create_named_value("attention_mask", DataType::Int64, sh());
+    graph.add_input(mask);
+    let q = graph.create_named_value("q", DataType::Float32, sh());
+
+    // Physical-extent read that is *consumed* by the window arithmetic.
+    let shp = graph.create_named_value("shp", DataType::Int64, sh());
+    graph.insert_node(Node::new(NodeId(0), "Shape", vec![Some(mask)], vec![shp]));
+    let start = graph.create_named_value("start", DataType::Int64, sh());
+    graph.insert_node(Node::new(NodeId(1), "Sub", vec![Some(shp)], vec![start]));
+
+    // Causal branch: CumSum → Slice(start .. Shape) → Unsqueeze → GreaterOrEqual.
+    let cumsum = graph.create_named_value("cumsum", DataType::Int64, sh());
+    graph.insert_node(Node::new(
+        NodeId(2),
+        "CumSum",
+        vec![Some(mask)],
+        vec![cumsum],
+    ));
+    let sliced = graph.create_named_value("sliced", DataType::Int64, sh());
+    graph.insert_node(Node::new(
+        NodeId(3),
+        "Slice",
+        vec![Some(cumsum), Some(start), Some(shp)],
+        vec![sliced],
+    ));
+    let unsq0 = graph.create_named_value("unsq0", DataType::Int64, sh());
+    graph.insert_node(Node::new(
+        NodeId(4),
+        "Unsqueeze",
+        vec![Some(sliced)],
+        vec![unsq0],
+    ));
+    let ge = graph.create_named_value("ge", DataType::Bool, sh());
+    graph.insert_node(Node::new(
+        NodeId(5),
+        "GreaterOrEqual",
+        vec![Some(unsq0)],
+        vec![ge],
+    ));
+    let where_o = graph.create_named_value("where", DataType::Float32, sh());
+    graph.insert_node(Node::new(NodeId(6), "Where", vec![Some(ge)], vec![where_o]));
+    let mask_bias = graph.create_named_value("mask_bias", DataType::Float32, sh());
+    graph.insert_node(Node::new(
+        NodeId(7),
+        "Unsqueeze",
+        vec![Some(where_o)],
+        vec![mask_bias],
+    ));
+    let attn = graph.create_named_value("attn", DataType::Float32, sh());
+    graph.insert_node(capacity_form_attention(8, q, mask_bias, attn));
+    graph.add_output(attn);
+
+    assert!(
+        !mask_binding_feeds_capacity_form_attention(&graph, mask),
+        "DeepSeek Shape(mask)→Sub→Slice window arithmetic must keep logical width"
+    );
+}
+
+#[test]
 fn minimal_cast_to_capacity_attention_routes_to_padded_capacity() {
     use onnx_runtime_ir::static_shape;
     // The tiny-fixture shape: attention_mask → Cast(bool) → capacity-form Attention.
