@@ -438,6 +438,50 @@ pub(crate) fn nibble_outputs(
     );
 }
 
+/// Wide-path block accumulator taking raw pointers and an already-known group
+/// count.
+///
+/// The slice-taking [`nibble_block_acc_avx2`] rebuilds two bounds-checked
+/// slices per block and then recovers `groups` from `packed.len()` and
+/// re-branches on `group` on every call. At `block_size = 32` a block is a
+/// single 16-byte group -- about ten uops -- so that bookkeeping is amortized
+/// over nothing and dominates. Hoisting it is worth 1.61x on the decode loop at
+/// 1-8 threads; see `docs/benchmarks/2026-08-21-int4-acc4-execution-regime.md`.
+///
+/// # Safety
+///
+/// The host must support AVX2, and the caller must guarantee `groups * 16`
+/// readable bytes at `packed` and `groups * 32` readable elements at
+/// `activation`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn nibble_block_acc_avx2_wide_raw(
+    packed: *const u8,
+    activation: *const i16,
+    groups: usize,
+) -> std::arch::x86_64::__m128i {
+    use std::arch::x86_64::*;
+    let mask = _mm256_set1_epi16(0x000f);
+    let mut accumulator = _mm256_setzero_si256();
+    for index in 0..groups {
+        // SAFETY: guaranteed readable by this function's contract.
+        let bytes = unsafe { _mm_loadu_si128(packed.add(index * 16).cast()) };
+        let widened = _mm256_cvtepu8_epi16(bytes);
+        let low = _mm256_and_si256(widened, mask);
+        let high = _mm256_srli_epi16(widened, 4);
+        // SAFETY: as above.
+        let even = unsafe { _mm256_loadu_si256(activation.add(index * 32).cast()) };
+        // SAFETY: as above.
+        let odd = unsafe { _mm256_loadu_si256(activation.add(index * 32 + 16).cast()) };
+        accumulator = _mm256_add_epi32(accumulator, _mm256_madd_epi16(even, low));
+        accumulator = _mm256_add_epi32(accumulator, _mm256_madd_epi16(odd, high));
+    }
+    _mm_add_epi32(
+        _mm256_castsi256_si128(accumulator),
+        _mm256_extracti128_si256(accumulator, 1),
+    )
+}
+
 /// [`nibble_outputs`] with AVX2 known present, so the block dot inlines.
 ///
 /// # Safety
@@ -465,6 +509,8 @@ unsafe fn nibble_outputs_avx2(
     let zero_row = k_blocks.div_ceil(2);
     let tiles = k_blocks / BLOCK_TILE;
     let tiled_blocks = tiles * BLOCK_TILE;
+    let wide = group >= WIDE_GROUP;
+    let wide_groups = blob / (WIDE_GROUP / 2);
     for (slot, output) in result.iter_mut().zip(outputs) {
         let weights = &packed[output * row_bytes..(output + 1) * row_bytes];
         let row_scales = &scales[output * k_blocks..(output + 1) * k_blocks];
@@ -478,12 +524,23 @@ unsafe fn nibble_outputs_avx2(
                 let block = base + offset;
                 // SAFETY: AVX2 holds by this function's contract, and both
                 // slices are exactly one block long.
-                *lane = unsafe {
-                    nibble_block_acc_avx2(
-                        &weights[block * blob..(block + 1) * blob],
-                        &activation.values[block * block_size..(block + 1) * block_size],
-                        group,
-                    )
+                // SAFETY: `block < k_blocks`, so `blob` bytes of `weights` and
+                // `block_size` activation elements are in bounds, which is
+                // exactly `wide_groups` groups. Both pointers are formed above
+                // the branch on purpose: computing them inside it regressed
+                // block_size 64 to 0.876x.
+                let w = unsafe { weights.as_ptr().add(block * blob) };
+                let a = unsafe { activation.values.as_ptr().add(block * block_size) };
+                *lane = if wide {
+                    unsafe { nibble_block_acc_avx2_wide_raw(w, a, wide_groups) }
+                } else {
+                    unsafe {
+                        nibble_block_acc_avx2(
+                            &weights[block * blob..(block + 1) * blob],
+                            &activation.values[block * block_size..(block + 1) * block_size],
+                            group,
+                        )
+                    }
                 };
             }
             // [sum(l0), sum(l1), sum(l2), sum(l3)] -- one tree for four blocks
