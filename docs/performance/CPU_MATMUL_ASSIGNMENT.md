@@ -1525,3 +1525,78 @@ at full range — so paths that cut **bytes and uops per weight together**, such
 `int4 x int16` kernel consuming 0.5 B/weight in place, are the better next spend. Full record, both
 complete matrices, the controls and the anomaly:
 [`docs/benchmarks/2026-08-21-qgemm-k-split-negative.md`](../benchmarks/2026-08-21-qgemm-k-split-negative.md).
+
+### 18. The packed-nibble `int4 x int16` AVX2 decode kernel pays — but not for the reason it was proposed
+
+[Section 17](#17-splitting-k-in-the-fused-decode-gemm-does-not-pay-for-itself-negative-result) closed
+by naming the next spend: paths that cut **bytes and uops per weight together**, such as a kernel
+consuming the ONNX int4 weight at 0.5 B/weight in place instead of expanding every nibble to a whole
+`i8`. That kernel is built, measured and **merged**. It is **1.2x to 2.4x** faster than the
+expanded-`i8` route it replaces across four block sizes, five llama/qwen geometries and `m = 1..64`,
+with **no losing cell**. Against ORT the same cells go from ~5.8-8.1x behind to ~3.3-5.6x behind: the
+gap is roughly halved, not closed.
+
+The prediction was right about *what* to build and wrong about *why it would win*. Halving the weight
+stream, on its own, bought **1-5%** — nothing. `ONNX_GENAI_PROFILE_OPS=1` put `MatMulNBits` at 99.95%
+of the run, so there was no Amdahl dilution to hide behind; the kernel had genuinely not moved.
+
+A block-size sweep at `t = 1` on a fixed geometry located it. The weight bytes are identical at every
+block size and only the block count changes, yet time tracked `1/block_size` almost exactly. Fitting
+`time = blocks*A + weights*B` gave `A = 17.1 cycles/block` against an inner loop already running at
+**11.1 weights/cycle** — against a uop budget of 12.8. The multiply-accumulate was never the problem.
+At `block_size = 32`, the common case, a block is 32 weights, so ~17 cycles of per-block tail sat on
+top of ~2.5 cycles of arithmetic.
+
+Two changes took `A` to **8.5 cycles/block** and produced the entire result:
+
+1. `is_x86_feature_detected!` was evaluated **per block**. It caches in an atomic and is cheap in
+   isolation, but it sits on a non-`target_feature` call boundary that prevents the AVX2 body from
+   inlining, forcing the accumulator through memory every 32 weights. Hoisting the probe to the row
+   driver and marking that driver `#[target_feature(enable = "avx2")]` fixed both.
+2. Four consecutive `k` blocks now share **one** reduction tree and **one** vector tail. They are
+   contiguous in every array the tail reads — weight scales, activation scales, block sums, and the
+   zero-point nibbles — so the zero-point correction, the `i32`->`f32` convert, the two multiplies and
+   the add all run once on four lanes instead of four times on scalars.
+
+**The transferable finding: at decode block sizes the per-block tail, not the multiply-accumulate, is
+the kernel.** Section 17 measured `vpmaddwd` at ~0.31 uops per byte of `B` and treated that as the
+budget to beat; that number is real but it describes only the part of the loop that was never the
+bottleneck. Any future int4/int8 decode kernel should be costed as `blocks*A + weights*B` with `A`
+measured, and a byte-density change should not be expected to show at all until `A` is down.
+
+`INT4_NIBBLE_MAX_ROWS` was **swept, not asserted**: every `m` from 1 to 64 wins ~2x, and the gate
+ships at 64 because that is the largest `m` with a measurement behind it, not a modelled crossover.
+The route is guarded off VNNI hosts on purpose — there `vpdpbusd` gives the expanded-`i8` route a
+1-uop-per-32-MAC dot and the byte/arithmetic trade may invert, which this host cannot measure.
+
+Three null controls are disclosed, including the one that matters: the `accuracy_level = 0` cells are
+code-identical in both arms and read **+/-5%**, which is the real per-cell floor on this host — worse
+than the +/-0.1% the duplicated-binary null arm reports on its lucky cells. Two cells that first
+contradicted their own shape were re-measured rather than dropped, with the contended reps shown.
+
+Still open and explicitly **not** claimed: ~3.3-5.6x behind ORT remains; `A = 8.5 cycles/block` is
+still 3.4x the inner loop's own cost, and the untried lever is an `N` tile so one activation block
+serves several outputs (which needs a block-major prepack of the scale and zero-point arrays, both
+`N`-major today); VNNI and aarch64 hosts are gated out and untested; Miri cannot execute x86 SIMD, so
+it is **no coverage** for this module rather than a pass. Full record, all matrices, the controls, the
+mutation battery and the harness bug that first reported it green:
+[`docs/benchmarks/2026-08-21-int4-packed-nibble-avx2.md`](../benchmarks/2026-08-21-int4-packed-nibble-avx2.md).
+
+**Reconciliation with the 2026-08-20 rejection.** The same mechanism was built
+and rejected the day before at 1.5x-2.2x *slower*
+(`docs/benchmarks/2026-08-20-int4-nibble-i16-negative.md`, now marked
+superseded). Two kernels, two honest measurements. The differences: that one
+spent ~4 uops per 32 weights restoring `k` order in the **weights**, where this
+one deinterleaves the **activation** once per row (14 uops -> 10); and neither
+kernel's inner loop was the binding cost, so its "instruction-bound" diagnosis
+pointed at the wrong term. Its "the incumbent is already at the DRAM roofline"
+claim does not survive at all -- the 58.7 MB expanded weight is L3-resident on a
+64 MiB L3, and this kernel is 2.37x faster than the arm called saturated.
+
+**The method lesson worth keeping.** Fit `time = blocks*A + weights*B` by sweeping
+block size at fixed weight bytes before concluding a kernel is arithmetic-bound.
+`A` was 17.1 cycles/block against ~2.5 cycles of arithmetic at `block_size = 32`;
+until `A` came down, halving bytes/weight was invisible (v1 measured 1-5%). Two
+changes moved it: hoisting a per-block `is_x86_feature_detected!` off a
+non-`target_feature` call boundary (17.1 -> 15.0) and tiling four `k` blocks
+through one reduction tree and one vector tail (15.0 -> **8.5**).

@@ -1,5 +1,30 @@
 # Packed-nibble int4 x int16 AVX2 decode: built, measured, rejected
 
+> **SUPERSEDED (2026-08-21) — the verdict below is wrong, and one of its
+> explanations is wrong.** A second packed-nibble kernel is **1.2x-2.4x faster**
+> than the incumbent on the same host and shapes, and is merged. See
+> [`2026-08-21-int4-packed-nibble-avx2.md`](2026-08-21-int4-packed-nibble-avx2.md),
+> which reconciles the two in detail. In short:
+>
+> * The kernel measured here spent ~4 uops per 32 weights restoring `k` order in
+>   the **weights** (`unpack` x2 + `cvtepu8_epi16` x2). Deinterleaving the
+>   **activation** once per row instead removes all of them: 14 uops -> 10.
+> * Neither kernel's real bottleneck was the inner loop. Per-**block** cost was
+>   ~17 cycles against ~2.5 cycles of arithmetic at `block_size = 32`; hoisting a
+>   per-block `is_x86_feature_detected!` and tiling four blocks through one
+>   reduction and one vector tail took it to 8.5 and produced most of the win.
+> * **"The incumbent is already at the memory roofline" does not hold.** The
+>   `acc4_int8` arm's 98-102%-of-DRAM figure at block 128 is an L3-resident
+>   working set (58.7 MB expanded, 64 MiB L3) measured against a DRAM
+>   denominator — the exact error this document warns about elsewhere. The new
+>   kernel is 2.37x faster than that arm on that cell, which no bandwidth-
+>   saturated kernel reading half the bytes could be.
+>
+> What still holds: `madd_epi16` retires half the products of `maddubs_epi16`,
+> int16 activations cost two loads per 32 weights, and the accuracy pinning test
+> this work landed. Kept unedited below as the record of what was measured.
+
+
 **Date:** 2026-08-20 · **Owner:** Roy (CPU MatMul) · **Host:** AMD EPYC 9V74,
 32 vCPU (16c/2t), AVX2+FMA+F16C, **no AVX-512/VNNI**, L1d 512 KiB, L2 16 MiB,
 **L3 64 MiB**, 75.8 GB/s DRAM, shared. ORT 1.28.0.
