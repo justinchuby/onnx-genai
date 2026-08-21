@@ -4979,7 +4979,9 @@ fn set_graph_slot_is_non_resetting_and_per_slot_isolated() {
 
     // Seed a distinctive marker into Primary's host capture state.
     let primary_key = ("ai.onnx".to_string(), "PrimaryMark".to_string());
-    exec.cap_mut().capture_quarantine_ops.insert(primary_key.clone());
+    exec.cap_mut()
+        .capture_quarantine_ops
+        .insert(primary_key.clone());
 
     // Flip to Verify: a pure retarget. Verify starts empty (no bleed from
     // Primary), and Primary's marker survives untouched.
@@ -4990,7 +4992,9 @@ fn set_graph_slot_is_non_resetting_and_per_slot_isolated() {
         "Verify slot must not observe Primary's capture state"
     );
     let verify_key = ("ai.onnx".to_string(), "VerifyMark".to_string());
-    exec.cap_mut().capture_quarantine_ops.insert(verify_key.clone());
+    exec.cap_mut()
+        .capture_quarantine_ops
+        .insert(verify_key.clone());
 
     // Flip back to Primary: its marker is still present (the switch did NOT
     // reset it), and Verify's marker did not leak in.
