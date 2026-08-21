@@ -36,7 +36,7 @@
 //!   --features cuda,native-backend --test gemma4_e2b_native_cuda_pipeline_bench \
 //!   -- --ignored --nocapture
 //! ```
-#![cfg(all(feature = "cuda", feature = "native-backend"))]
+#![cfg(feature = "native-cuda")]
 
 use std::path::PathBuf;
 use std::time::Instant;

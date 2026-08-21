@@ -285,12 +285,12 @@ impl NativePipelineDecoder {
         device: crate::native_decode::NativeDecodeDevice,
         io: Option<&onnx_genai_metadata::ModelIoSpec>,
         metadata_max_len: Option<usize>,
-        #[cfg(feature = "cuda")] offload_policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
-        #[cfg(feature = "cuda")] governor: std::sync::Arc<
+        #[cfg(feature = "native-cuda")] offload_policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
+        #[cfg(feature = "native-cuda")] governor: std::sync::Arc<
             dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync,
         >,
     ) -> anyhow::Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         let session = crate::native_decode::NativeDecodeSession::load_with_io_and_cuda_governor(
             path,
             device,
@@ -305,7 +305,7 @@ impl NativePipelineDecoder {
                 path.display()
             )
         })?;
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "native-cuda"))]
         let session = crate::native_decode::NativeDecodeSession::load_with_io(
             path,
             device,

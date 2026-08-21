@@ -90,7 +90,7 @@ pub(super) fn list(models_dir: &Path) -> anyhow::Result<()> {
 pub(super) fn version() {
     println!("onnx-genai {}", env!("CARGO_PKG_VERSION"));
     let mut providers = vec!["cpu"];
-    if cfg!(feature = "cuda") {
+    if cfg!(feature = "ort-cuda") {
         providers.push("cuda");
     }
     println!("execution providers: {}", providers.join(", "));

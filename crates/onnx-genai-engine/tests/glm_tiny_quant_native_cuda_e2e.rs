@@ -30,7 +30,7 @@
 //!   cargo test -p onnx-genai-engine --features cuda,native-backend \
 //!   --test glm_tiny_quant_native_cuda_e2e -- --nocapture
 //! ```
-#![cfg(all(feature = "cuda", feature = "native-backend"))]
+#![cfg(feature = "native-cuda")]
 
 use std::path::{Path, PathBuf};
 

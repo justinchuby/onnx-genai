@@ -51,7 +51,7 @@
 //!   --features cuda,native-backend --test qwen3_0_6b_foundry_native_cuda_lock \
 //!   -- --ignored --nocapture
 //! ```
-#![cfg(all(feature = "cuda", feature = "native-backend"))]
+#![cfg(feature = "native-cuda")]
 
 #[path = "common/decode_lock.rs"]
 mod decode_lock;

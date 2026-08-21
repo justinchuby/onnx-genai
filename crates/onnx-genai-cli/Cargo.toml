@@ -42,14 +42,15 @@ python = ["dep:pyo3"]
 # ONNX Runtime CUDA only: enables ORT's built-in CUDAExecutionProvider (CUDA 13)
 # plus the cudarc GPU sampler, WITHOUT the nxrt-native CUDA kernel crate. This
 # is the wheel-compatible path; GPU ONNX Runtime is provided at runtime by the
-# `onnxruntime-gpu` wheel (`onnx-genai-server[cuda]`), and no CUDA code is bundled.
-cuda = ["onnx-genai-server/ort-cuda"]
+# `onnxruntime-gpu` wheel (`onnx-genai-server[cuda]`), and no CUDA code is
+# bundled, so this builds without a CUDA toolkit.
+ort-cuda = ["onnx-genai-server/ort-cuda"]
 # Native decoder execution for models containing native-only operators.
 native-backend = ["onnx-genai-server/native-backend"]
-# Native CUDA path: enables the native backend and our hand-written CUDA EP
-# (`onnx-runtime-ep-cuda`) through `onnx-genai-server/cuda`. Use this, not
-# `cuda`, when you want the native CUDA kernels compiled into the CLI.
-native-cuda = ["native-backend", "onnx-genai-server/cuda", "dep:onnx-runtime-ep-cuda"]
+# Native CUDA path: our hand-written CUDA EP (`onnx-runtime-ep-cuda`) and the
+# native backend that reaches it. A strict superset of `ort-cuda`. This is the
+# feature to use when measuring our own kernels.
+native-cuda = ["native-backend", "onnx-genai-server/native-cuda", "dep:onnx-runtime-ep-cuda"]
 mlas = ["onnx-genai-server/mlas"]
 cuda-12060 = [
     "onnx-genai/cuda-12060",

@@ -177,7 +177,7 @@ impl PipelineEngine {
                         &ar.decoder,
                         self.native_device.as_ref(),
                         &self.memory_strategy_plan,
-                        #[cfg(feature = "cuda")]
+                        #[cfg(feature = "native-cuda")]
                         std::sync::Arc::new(
                             self.native_cuda_authority
                                 .clone()

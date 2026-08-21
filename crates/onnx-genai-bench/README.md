@@ -52,7 +52,7 @@ The opt-in profiling binaries measure different layers:
   native nxrt decoder-with-past adapter and the same engine decode loop as ORT,
   with forward passes through `onnx-runtime-session::InferenceSession::run`.
   For an identical steady-window native-vs-ORT comparison, build with
-  `--features bench-native,bench-ort,cuda` and run the same command with
+  `--features native-cuda,ort-cuda` and run the same command with
   `--backend native` and `--backend ort`.
 
 The `--steady` path is directly comparable head-to-head: both backends use the
@@ -64,7 +64,7 @@ bytes so an over-budget run cannot be mistaken for a full-resident one.
 
 ```bash
 cargo run --release -p onnx-genai-bench \
-  --features bench-native,bench-ort,cuda \
+  --features native-cuda,ort-cuda \
   --bin profile_native -- \
   --model /path/to/model --ep cuda --backend ort --steady \
   --tokens 128 --warmups 1 --runs 3 --decode-skip 8

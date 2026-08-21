@@ -9,7 +9,7 @@
 //! cargo test -p onnx-genai-engine --features cuda,native-backend \
 //!   --test phi4_mini_divergence -- --ignored --nocapture
 //! ```
-#![cfg(all(feature = "cuda", feature = "native-backend"))]
+#![cfg(feature = "native-cuda")]
 
 #[path = "common/decode_lock.rs"]
 mod decode_lock;

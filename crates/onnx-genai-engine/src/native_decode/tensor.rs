@@ -363,7 +363,7 @@ pub(crate) fn recurrent_state_bytes_per_sequence(
     Ok(total)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 pub(crate) fn recurrent_state_bytes_from_graph(
     graph: &onnx_runtime_ir::Graph,
     io: Option<&onnx_genai_metadata::ModelIoSpec>,
