@@ -11,7 +11,7 @@ use onnx_genai_ort::Tokenizer;
 use onnx_runtime_ir::{DataType, DeviceType, Dim, SymbolId};
 use onnx_runtime_session::{
     CaptureDeclineReport, DecodePrecision, DeviceAllocationCounts, DeviceBindingTransferStats,
-    DeviceGraphCaptureResult, DeviceGraphSlot, DeviceIoBinding, DevicePreference, InferenceSession,
+    DeviceGraphCaptureResult, DeviceIoBinding, DevicePreference, InferenceSession,
     Tensor,
 };
 use onnx_runtime_tracer::{Args, TraceContext, capture_rejected};

@@ -935,6 +935,18 @@ pub struct InferenceSession {
     /// shares `exec`'s `Arc<WeightStore>` and `Arc<dyn ExecutionProvider>`, so a
     /// decode step routed to it binds the identical persistent state buffers.
     decode_inline_exec: Option<executor::Executor>,
+    /// Verify-dedicated sibling executor for native MTP self-speculative decode
+    /// (built lazily by [`InferenceSession::enable_verify_sibling`]). Runs the
+    /// fixed M=k+1 verify forward with its OWN interior device-buffer arena so
+    /// the M=2 verify's JIT-sized interior scratch is never resized by the
+    /// interleaved M=1 base decode on `exec` (the shared-arena clobber that made
+    /// the verify capture decline). Shares `exec`'s `Arc<WeightStore>` and
+    /// `Arc<dyn ExecutionProvider>`, so a verify step routed here binds the
+    /// identical persistent external KV/recurrent-state buffers; it drives the
+    /// EP's [`DeviceGraphSlot::Verify`] slot, independent of `exec`'s `Primary`
+    /// M=1 decode graph. `None` (the default) for every non-MTP session, so an
+    /// ordinary session is byte-identical and pays nothing.
+    verify_exec: Option<executor::Executor>,
     /// EPContext dump config parsed from the `ep.context_*` session options
     /// (§21.4). Drives [`InferenceSession::export_ep_context`]; disabled by
     /// default so an ordinary session never touches the dump path.
@@ -1086,6 +1098,7 @@ impl InferenceSession {
             model_metadata,
             exec,
             decode_inline_exec: None,
+            verify_exec: None,
             ep_context_config,
         })
     }
@@ -1321,6 +1334,100 @@ impl InferenceSession {
             .unwrap_or(&[])
     }
 
+    /// Lazily build the verify-dedicated sibling executor for native MTP
+    /// self-speculative decode. Idempotent: a second call is a no-op. The
+    /// sibling is a structural clone of the main executor's graph with its own
+    /// interior device-buffer arena (so the fixed M=k+1 verify's interior scratch
+    /// is never resized by the interleaved M=1 decode on the main executor), and
+    /// it drives the [`DeviceGraphSlot::Verify`] slot. Also pins the sibling's
+    /// fixed-capacity KV sequence-axis symbols so its captured verify graph
+    /// admits the attention nodes, mirroring the main executor. The main/prefill
+    /// executor is left byte-identical.
+    pub fn enable_verify_sibling(&mut self) -> Result<bool> {
+        if self.verify_exec.is_none() {
+            let mut sibling = self.exec.build_verify_sibling()?;
+            sibling.pin_fixed_capacity_kv_capture_symbols();
+            self.verify_exec = Some(sibling);
+        }
+        Ok(self.verify_exec.is_some())
+    }
+
+    /// Whether the verify-dedicated sibling executor is built and ready to run.
+    pub fn verify_sibling_ready(&self) -> bool {
+        self.verify_exec.is_some()
+    }
+
+    /// Run one fixed M=k+1 verify forward through the verify-dedicated sibling
+    /// executor (eager), binding the identical persistent external device buffers
+    /// `bindings` supplies (KV cache, recurrent/conv state) while the sibling's
+    /// interior scratch stays private. Errors if
+    /// [`Self::enable_verify_sibling`] has not built a sibling.
+    pub fn run_verify_sibling_with_device_bindings(
+        &mut self,
+        inputs: &[(&str, &Tensor)],
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<Vec<Option<Tensor>>> {
+        let exec = self.verify_exec.as_mut().ok_or_else(|| {
+            SessionError::Internal(
+                "verify sibling requested but not built; call enable_verify_sibling first".into(),
+            )
+        })?;
+        exec.run_with_device_bindings(inputs, bindings)
+    }
+
+    /// Capture-record one fixed M=k+1 verify forward of the verify-dedicated
+    /// sibling into its `Verify`-slot device graph. Mirrors
+    /// [`Self::try_capture_with_device_bindings`] but drives the sibling executor,
+    /// whose interior arena is private so the captured graph's baked interior
+    /// pointers are not resized by the interleaved M=1 decode. Errors if
+    /// [`Self::enable_verify_sibling`] has not built a sibling.
+    pub fn try_capture_verify_sibling_with_device_bindings(
+        &mut self,
+        inputs: &[(&str, &Tensor)],
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<DeviceGraphCaptureResult> {
+        let exec = self.verify_exec.as_mut().ok_or_else(|| {
+            SessionError::Internal(
+                "verify sibling capture requested but no sibling built; call enable_verify_sibling first".into(),
+            )
+        })?;
+        exec.try_capture_with_device_bindings(inputs, bindings)
+    }
+
+    /// Replay the verify-dedicated sibling's installed `Verify`-slot device graph.
+    /// Returns `false` when a seam retired the graph this step (logits produced
+    /// eagerly; caller re-warms/re-captures). Errors if
+    /// [`Self::enable_verify_sibling`] has not built a sibling.
+    pub fn replay_verify_sibling_device_graph(
+        &mut self,
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<bool> {
+        let exec = self.verify_exec.as_mut().ok_or_else(|| {
+            SessionError::Internal(
+                "verify sibling replay requested but no sibling built; call enable_verify_sibling first".into(),
+            )
+        })?;
+        exec.replay_device_graph(bindings)
+    }
+
+    /// Invalidate the verify-dedicated sibling's installed device graph. A no-op
+    /// returning `false` when no sibling has been built.
+    pub fn reset_verify_sibling_device_graph(&mut self) -> Result<bool> {
+        match self.verify_exec.as_mut() {
+            Some(exec) => exec.reset_device_graph(),
+            None => Ok(false),
+        }
+    }
+
+    /// Number of captured device-graph segments installed by the most recent
+    /// verify-sibling capture (`0` when no sibling or nothing captured).
+    pub fn verify_sibling_captured_graph_segment_count(&self) -> usize {
+        self.verify_exec
+            .as_ref()
+            .map(executor::Executor::captured_segment_count)
+            .unwrap_or(0)
+    }
+
     /// Allocate a persistent buffer on this session's execution device.
     pub fn allocate_device_binding(
         &self,
@@ -1491,6 +1598,9 @@ impl InferenceSession {
         let mut pinned = self.exec.pin_fixed_capacity_kv_capture_symbols();
         if let Some(inline) = self.decode_inline_exec.as_mut() {
             pinned += inline.pin_fixed_capacity_kv_capture_symbols();
+        }
+        if let Some(verify) = self.verify_exec.as_mut() {
+            pinned += verify.pin_fixed_capacity_kv_capture_symbols();
         }
         pinned
     }

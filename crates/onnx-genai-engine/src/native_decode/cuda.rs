@@ -1484,17 +1484,19 @@ impl NativeDecodeSession {
         if width < 2 || self.has_eager_step_inputs() || !self.has_recurrent_state() {
             return Ok(());
         }
-        // Capturing the M=K verify into the `Verify` graph slot is now sound even
-        // when the interleaved M=1 base decode / commit re-advance run on the
-        // SAME (main) executor. The executor holds per-slot host capture state
-        // (device_graph_signature + schedule + warm-shape/quarantine, indexed by
-        // graph_slot), so an M=1 decode captured into the `Primary` slot no
-        // longer clobbers the `Verify` slot's signature between the verify's
-        // capture and its replay. Both graphs coexist and each replays by shape
-        // key. This lifts the earlier `enable_decode_inline()` gate: on models
-        // whose recurrent Scan is not single-trip-inlineable (no decode-inline
-        // sibling — e.g. this artifact) the M=1 decode simply runs on the main
-        // executor's `Primary` slot while the verify runs on its `Verify` slot.
+        // Capturing the M=K verify into the `Verify` graph slot runs on a
+        // verify-DEDICATED sibling executor (built below) whose interior
+        // device-buffer arena is private. This is what finally makes the verify
+        // graph capturable AND replayable: the interleaved M=1 base decode /
+        // commit re-advance run on the SEPARATE main executor, so they can no
+        // longer resize the shared interior scratch the M=K verify graph baked
+        // (the `Slice [1,2] vs [1,1]` decline). The sibling shares only the
+        // immutable weights + EP with the main executor, binds the identical
+        // persistent external KV/recurrent-state buffers through `state.bindings`,
+        // and drives the EP's independent `Verify` slot — so the M=1 `Primary`
+        // decode graph and the M=K `Verify` graph coexist and each replays by
+        // shape key. This is available for ANY model with recurrent state (the
+        // sibling is a plain structural clone, no decode-inline requirement).
         // Gather the padded binding plan from the live decode bindings (immutable
         // borrow), then allocate (session borrow), then store (state borrow).
         struct VerifyBindingPlan {
@@ -1612,14 +1614,20 @@ impl NativeDecodeSession {
         state.verify_width = Some(width);
         state.verify_graph_phase = DecodeCudaGraphPhase::NeedsWarmup;
 
-        // Pin the main executor's StepScoped workspace at the M=K peak so the
-        // captured verify graph replays against a stable scratch pointer even
-        // though the interleaved M=1 decode step reserves a smaller scratch
-        // (#1647). The graph slot is NOT set here: the main executor stays on
-        // `Primary` for M=1 decode and `run_verify_captured` flips it to `Verify`
-        // only around the verify forward, then back — safe because the executor's
-        // per-slot host capture state keeps both graphs' signatures independent.
-        self.session.set_main_exec_pin_step_workspace(true);
+        // Build the verify-dedicated sibling executor: a structural clone of the
+        // main graph with its OWN interior device-buffer arena, driving the
+        // `Verify` graph slot. The fixed M=k+1 verify forward runs here so its
+        // JIT-sized interior scratch (e.g. the `[1,M]` `Slice` output) is never
+        // resized by the interleaved M=1 base decode on the main executor — the
+        // shared-arena clobber that previously made the verify capture decline.
+        // The sibling shares the main executor's weights + EP, so it binds the
+        // identical persistent external KV/recurrent-state buffers supplied
+        // through `state.bindings`; only interior scratch is private. It always
+        // runs at the constant M=k+1 shape, so its StepScoped workspace is stable
+        // at the M=K peak with no pinning needed (nothing smaller ever runs on
+        // it), and the main executor's M=1 decode keeps its natural (unpinned)
+        // workspace on the `Primary` slot.
+        self.session.enable_verify_sibling()?;
         Ok(())
     }
 
@@ -1683,21 +1691,18 @@ impl NativeDecodeSession {
             }
         }
 
-        // Swap the padded bindings into the persistent vector, retarget the main
-        // executor to the Verify slot, run the verify graph phase (which reads
-        // the logits while swapped in), then restore the Primary slot + swap the
-        // M=1 decode bindings back — unconditionally, even on error. The slot
-        // flip is a pure retarget (per-slot host capture state), so the M=1
-        // decode graph in Primary is untouched and still replays next step.
+        // Swap the padded bindings into the persistent vector, run the verify
+        // graph phase on the verify-DEDICATED sibling executor (which drives the
+        // `Verify` slot and owns its private interior arena), then swap the M=1
+        // decode bindings back — unconditionally, even on error. The main
+        // executor stays on `Primary` throughout: the M=1 decode graph is never
+        // touched by the verify, and the sibling's `Verify` graph coexists with
+        // it (both replay independently by shape key).
         self.cuda
             .as_mut()
             .context("CUDA decode state is not initialized")?
             .swap_verify_bindings();
-        self.session
-            .set_main_exec_graph_slot(DeviceGraphSlot::Verify)?;
         let outcome = self.run_verify_graph_phase(m);
-        self.session
-            .set_main_exec_graph_slot(DeviceGraphSlot::Primary)?;
         self.cuda
             .as_mut()
             .context("CUDA decode state is not initialized")?
@@ -1721,9 +1726,11 @@ impl NativeDecodeSession {
     /// Decide the verify-graph phase after a captured verify graph is retired by
     /// a host-signature clobber. The first couple of clobbers re-warm (in case
     /// the churn was a one-off KV-bucket growth that self-stabilizes), but a
-    /// persistent clobber — the single-executor two-slot contention this build
-    /// cannot yet resolve — latches to `Unsupported` so the verify runs plain
-    /// eager with no recapture overhead (never worse than the pre-option-c path).
+    /// persistent clobber latches to `Unsupported` so the verify runs plain eager
+    /// with no recapture overhead (never worse than the pre-option-c path). With
+    /// the verify-dedicated sibling executor (private interior arena, own `Verify`
+    /// slot), the M=1 decode no longer clobbers this graph, so at steady state
+    /// invalidations should stop and the graph replays every step.
     fn verify_phase_after_invalidation(invalidations: u64) -> DecodeCudaGraphPhase {
         const MAX_VERIFY_RECAPTURES: u64 = 2;
         if invalidations >= MAX_VERIFY_RECAPTURES {
@@ -1740,22 +1747,24 @@ impl NativeDecodeSession {
             .context("CUDA decode state is not initialized")?;
         if !state.graph_enabled {
             self.session
-                .run_with_device_bindings(&[], &mut state.bindings[..])?;
+                .run_verify_sibling_with_device_bindings(&[], &mut state.bindings[..])?;
         } else {
             match state.verify_graph_phase {
                 DecodeCudaGraphPhase::NeedsWarmup => {
-                    // Warm the M=K shape (reserves + — because the main exec is
-                    // pinned — retains the StepScoped scratch) so the capture
-                    // below performs no device alloc/free inside the region.
+                    // Warm the M=K shape on the verify sibling so it JIT-sizes its
+                    // private interior arena to the M=K peak once; the capture
+                    // below then performs no device alloc/free inside the region.
                     self.session
-                        .run_with_device_bindings(&[], &mut state.bindings[..])?;
+                        .run_verify_sibling_with_device_bindings(&[], &mut state.bindings[..])?;
                     state.verify_graph_phase = DecodeCudaGraphPhase::Armed;
                 }
                 DecodeCudaGraphPhase::Armed => {
                     match self
                         .session
-                        .try_capture_with_device_bindings(&[], &mut state.bindings[..])?
-                    {
+                        .try_capture_verify_sibling_with_device_bindings(
+                            &[],
+                            &mut state.bindings[..],
+                        )? {
                         DeviceGraphCaptureResult::Captured(outputs) => {
                             if outputs.iter().any(Option::is_some) {
                                 bail!(
@@ -1779,24 +1788,28 @@ impl NativeDecodeSession {
                             tracing::warn!(
                                 "native CUDA verify graph capture disabled for this generation: {reason}"
                             );
-                            self.session
-                                .run_with_device_bindings(&[], &mut state.bindings[..])?;
+                            self.session.run_verify_sibling_with_device_bindings(
+                                &[],
+                                &mut state.bindings[..],
+                            )?;
                         }
                     }
                 }
                 DecodeCudaGraphPhase::Ready => {
-                    // The main executor now holds PER-SLOT host capture state, so
-                    // the interleaved M=1 decode (Primary slot) no longer clobbers
-                    // this M=K verify graph (Verify slot): each slot keeps its own
-                    // signature/schedule and replays independently. A replay can
-                    // still legitimately retire the graph — e.g. the pinned
-                    // StepScoped workspace grew on the first verify and moved its
-                    // scratch pointer, or a control-flow branch flip — so we keep
-                    // the graceful path: count the invalidation, run eagerly to
-                    // still produce this step's logits, re-warm once (self-
-                    // stabilizing after the workspace settles at the M=K peak),
-                    // and only latch to permanent-eager if churn persists.
-                    match self.session.replay_device_graph(&mut state.bindings[..]) {
+                    // The verify runs on a DEDICATED sibling executor with its own
+                    // interior device-buffer arena and its own `Verify` graph slot,
+                    // so the interleaved M=1 base decode / commit re-advance on the
+                    // main executor (Primary slot) can no longer resize the interior
+                    // scratch this M=K graph baked. A replay can still legitimately
+                    // retire the graph (a control-flow branch flip, or a first-time
+                    // KV-bucket growth), so keep the graceful path: count the
+                    // invalidation, run eagerly to still produce this step's logits,
+                    // re-warm once (self-stabilizing), and only latch to
+                    // permanent-eager if churn persists.
+                    match self
+                        .session
+                        .replay_verify_sibling_device_graph(&mut state.bindings[..])
+                    {
                         Ok(true) => {
                             state.verify_graph_replays += 1;
                         }
@@ -1806,22 +1819,26 @@ impl NativeDecodeSession {
                             state.verify_graph_phase = Self::verify_phase_after_invalidation(
                                 state.verify_graph_invalidations,
                             );
-                            self.session
-                                .run_with_device_bindings(&[], &mut state.bindings[..])?;
+                            self.session.run_verify_sibling_with_device_bindings(
+                                &[],
+                                &mut state.bindings[..],
+                            )?;
                         }
                         Err(_) => {
                             state.verify_graph_invalidations += 1;
                             state.verify_graph_phase = Self::verify_phase_after_invalidation(
                                 state.verify_graph_invalidations,
                             );
-                            self.session
-                                .run_with_device_bindings(&[], &mut state.bindings[..])?;
+                            self.session.run_verify_sibling_with_device_bindings(
+                                &[],
+                                &mut state.bindings[..],
+                            )?;
                         }
                     }
                 }
                 DecodeCudaGraphPhase::Unsupported => {
                     self.session
-                        .run_with_device_bindings(&[], &mut state.bindings[..])?;
+                        .run_verify_sibling_with_device_bindings(&[], &mut state.bindings[..])?;
                 }
             }
         }
