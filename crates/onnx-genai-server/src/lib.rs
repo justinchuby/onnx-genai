@@ -23,6 +23,7 @@ use tracing::Instrument;
 mod audio_input;
 mod cli;
 mod driver;
+mod image_generation;
 mod image_input;
 mod metrics;
 mod models_config;
@@ -69,6 +70,12 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/sessions/{id}", delete(routes::delete_session))
         .route("/v1/completions", post(routes::completions))
         .route("/v1/embeddings", post(routes::embeddings))
+        .route("/v1/images/generations", post(routes::openai_images))
+        .route("/sdapi/v1/txt2img", post(routes::a1111_txt2img))
+        .route("/sdapi/v1/img2img", post(routes::a1111_img2img))
+        .route("/sdapi/v1/sd-models", get(routes::a1111_models))
+        .route("/sdapi/v1/samplers", get(routes::a1111_samplers))
+        .route("/sdapi/v1/options", get(routes::a1111_options))
         .route(
             "/v1/audio/transcriptions",
             post(routes::audio_transcriptions).layer(DefaultBodyLimit::max(25 * 1024 * 1024)),

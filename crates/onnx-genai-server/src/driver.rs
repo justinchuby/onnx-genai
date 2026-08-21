@@ -16,6 +16,7 @@ use onnx_genai_engine::{
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
+use crate::image_generation::{ImageExecutionRequest, ProducedImage};
 use crate::metrics::GenerationMetrics;
 use crate::multimodal::MultimodalInput;
 
@@ -117,6 +118,11 @@ pub(crate) enum DriverCommand {
         input: Option<MultimodalInput>,
         admission: oneshot::Sender<Result<(), DriverFailure>>,
         events: mpsc::Sender<DriverEvent>,
+        permit: OwnedSemaphorePermit,
+    },
+    GenerateImage {
+        request: Box<ImageExecutionRequest>,
+        reply: oneshot::Sender<anyhow::Result<ProducedImage>>,
         permit: OwnedSemaphorePermit,
     },
     GenerateFim {
@@ -506,10 +512,40 @@ impl EngineDriver {
             crate::metrics::generation_queue_cancelled();
             return Err(GenerateSubmitError::DriverStopped);
         }
+
         Ok(DriverGeneration {
             admission: admission_rx,
             events: rx,
         })
+    }
+
+    pub(crate) async fn generate_image(
+        &self,
+        request: ImageExecutionRequest,
+    ) -> Result<anyhow::Result<ProducedImage>, GenerateSubmitError> {
+        let permit = self
+            .generation_capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| GenerateSubmitError::Overloaded)?;
+        let (reply, receiver) = oneshot::channel();
+        crate::metrics::generation_queued();
+        if self
+            .commands
+            .send(DriverCommand::GenerateImage {
+                request: Box::new(request),
+                reply,
+                permit,
+            })
+            .await
+            .is_err()
+        {
+            crate::metrics::generation_queue_cancelled();
+            return Err(GenerateSubmitError::DriverStopped);
+        }
+        receiver
+            .await
+            .map_err(|_| GenerateSubmitError::DriverStopped)
     }
 
     pub(crate) async fn generate_fim(
@@ -667,6 +703,30 @@ fn run_pipeline_driver(
                 events,
                 permit,
             } => run_pipeline_generation(engine, *request, input, admission, events, permit),
+            DriverCommand::GenerateImage {
+                request,
+                reply,
+                permit: _permit,
+            } => {
+                let result = (|| {
+                    let outputs = engine.run_pipeline_outputs(request.into_pipeline()?)?;
+                    let image = engine
+                        .structured_output_for_role(
+                            &outputs,
+                            onnx_genai_engine::pipeline::WorkflowOutputRole::Image,
+                        )
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "workflow completed without emitting its declared image output"
+                            )
+                        })?;
+                    Ok(ProducedImage {
+                        values: image.to_vec_f32_lossy()?,
+                        shape: image.shape().to_vec(),
+                    })
+                })();
+                let _ = reply.send(result);
+            }
             DriverCommand::CreateSession(response) => {
                 let _ = response.send(Err(anyhow::anyhow!(
                     "sessions are not supported by pipeline models"
@@ -1144,6 +1204,7 @@ fn deferred_permit_holder_count(deferred: &VecDeque<DriverCommand>) -> usize {
                 command,
                 DriverCommand::Generate { .. }
                     | DriverCommand::GeneratePipeline { .. }
+                    | DriverCommand::GenerateImage { .. }
                     | DriverCommand::GenerateFim { .. }
             )
         })
@@ -1369,6 +1430,12 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
                 DriverFailure::internal("invalid pipeline generation route for single model");
             let _ = admission.send(Err(failure.clone()));
             let _ = events.try_send(DriverEvent::Error(failure));
+        }
+        DriverCommand::GenerateImage { reply, .. } => {
+            crate::metrics::generation_queue_cancelled();
+            let _ = reply.send(Err(anyhow::anyhow!(
+                "image generation requires a metadata-declared pipeline model"
+            )));
         }
         DriverCommand::Embed {
             input_ids,

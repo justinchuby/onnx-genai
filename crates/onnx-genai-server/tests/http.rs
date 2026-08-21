@@ -2,6 +2,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use onnx_genai::GeneratePrompt;
 use onnx_genai_engine::GenerateConstraint;
 use onnx_genai_server::{
@@ -25,6 +26,47 @@ async fn test_app_with_config(config: ServerConfig) -> axum::Router {
     let state =
         AppState::load_with_config(&fixture_dir(), Some("tiny-llm".to_string()), config).unwrap();
     app(state)
+}
+
+fn diffusion_fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/comfyui_workflows/txt2img_sd15")
+}
+
+async fn image_app() -> axum::Router {
+    let state =
+        AppState::load(&diffusion_fixture_dir(), Some("tiny-diffusion".to_string())).unwrap();
+    app(state)
+}
+
+async fn post_json(app: axum::Router, uri: &str, body: Value) -> axum::response::Response {
+    app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+async fn response_json(response: axum::response::Response) -> (StatusCode, Value) {
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&body)
+            .unwrap_or_else(|_| panic!("non-JSON response: {}", String::from_utf8_lossy(&body))),
+    )
+}
+
+fn assert_png_base64(encoded: &str) {
+    let bytes = STANDARD.decode(encoded).unwrap();
+    assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+    let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (4, 4));
 }
 
 fn sse_data_lines(text: &str) -> Vec<&str> {
@@ -75,6 +117,215 @@ async fn post_completion(app: axum::Router, body: Value) -> axum::response::Resp
     )
     .await
     .unwrap()
+}
+
+#[tokio::test]
+async fn openai_images_executes_metadata_diffusion_pipeline_and_returns_png() {
+    let (status, body) = response_json(
+        post_json(
+            image_app().await,
+            "/v1/images/generations",
+            json!({
+                "model": "tiny-diffusion",
+                "prompt": "a tiny lighthouse",
+                "n": 1,
+                "response_format": "b64_json",
+                "output_format": "png",
+                "background": "opaque"
+            }),
+        )
+        .await,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["created"].as_u64().is_some(), "{body}");
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 1);
+    assert_png_base64(data[0]["b64_json"].as_str().unwrap());
+    assert!(data[0].get("revised_prompt").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn openai_and_a1111_lower_to_equivalent_pipeline_inputs() {
+    let app = image_app().await;
+    let (_, openai) = response_json(
+        post_json(
+            app.clone(),
+            "/v1/images/generations",
+            json!({
+                "model": "tiny-diffusion",
+                "prompt": "equivalent request"
+            }),
+        )
+        .await,
+    )
+    .await;
+    let (status, a1111) = response_json(
+        post_json(
+            app,
+            "/sdapi/v1/txt2img",
+            json!({
+                "prompt": "equivalent request",
+                "negative_prompt": "",
+                "seed": 20260821,
+                "steps": 4,
+                "cfg_scale": 7.5,
+                "sampler_name": "Euler"
+            }),
+        )
+        .await,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{a1111}");
+    assert_eq!(
+        openai["data"][0]["b64_json"], a1111["images"][0],
+        "both schemas must bind the same semantic workflow inputs"
+    );
+}
+
+#[tokio::test]
+async fn a1111_seed_is_deterministic_and_reported() {
+    async fn generate(app: axum::Router, seed: i64) -> Value {
+        let (status, body) = response_json(
+            post_json(
+                app,
+                "/sdapi/v1/txt2img",
+                json!({
+                    "prompt": "seed proof",
+                    "seed": seed,
+                    "steps": 4,
+                    "cfg_scale": 7.5
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+
+    let app = image_app().await;
+    let first = generate(app.clone(), 11).await;
+    let again = generate(app.clone(), 11).await;
+    let other = generate(app, 12).await;
+    assert_eq!(first["images"][0], again["images"][0]);
+    assert_ne!(first["images"][0], other["images"][0]);
+    assert_eq!(first["parameters"]["seed"], 11);
+    let info: Value = serde_json::from_str(first["info"].as_str().unwrap()).unwrap();
+    assert_eq!(info["all_seeds"], json!([11]));
+    assert_png_base64(first["images"][0].as_str().unwrap());
+}
+
+#[tokio::test]
+async fn image_apis_fail_closed_for_unbindable_or_fake_behavior() {
+    let app = image_app().await;
+    for (uri, request, expected) in [
+        (
+            "/v1/images/generations",
+            json!({
+                "model": "tiny-diffusion",
+                "prompt": "x",
+                "response_format": "url"
+            }),
+            "asset store",
+        ),
+        (
+            "/v1/images/generations",
+            json!({
+                "model": "tiny-diffusion",
+                "prompt": "x",
+                "size": "1024x1024"
+            }),
+            "dimension roles",
+        ),
+        (
+            "/v1/images/generations",
+            json!({
+                "model": "tiny-diffusion",
+                "prompt": "x",
+                "output_format": "webp"
+            }),
+            "only `output_format: png`",
+        ),
+        (
+            "/v1/images/generations",
+            json!({
+                "model": "tiny-diffusion",
+                "prompt": "x",
+                "background": "transparent"
+            }),
+            "emits RGB without alpha",
+        ),
+        (
+            "/v1/images/generations",
+            json!({
+                "model": "tiny-diffusion",
+                "prompt": "x",
+                "moderation": "auto"
+            }),
+            "no image moderation pipeline",
+        ),
+        (
+            "/sdapi/v1/txt2img",
+            json!({
+                "prompt": "x",
+                "alwayson_scripts": {"controlnet": {"args": []}}
+            }),
+            "never silently ignored",
+        ),
+        (
+            "/sdapi/v1/img2img",
+            json!({
+                "prompt": "x",
+                "init_images": ["aGVsbG8="],
+                "denoising_strength": 0.5
+            }),
+            "no semantic image/media input",
+        ),
+    ] {
+        let (status, body) = response_json(post_json(app.clone(), uri, request).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(expected),
+            "{body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a1111_discovery_reports_loaded_metadata_capabilities() {
+    let app = image_app().await;
+    for (uri, key, expected) in [
+        ("/sdapi/v1/sd-models", "model_name", "tiny-diffusion"),
+        ("/sdapi/v1/samplers", "name", "euler"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body[0][key], expected);
+    }
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/sdapi/v1/options")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = response_json(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["samples_format"], "png");
+    assert_eq!(body["save_images"], false);
 }
 
 async fn create_http_session(app: axum::Router) -> String {
