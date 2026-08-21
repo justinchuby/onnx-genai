@@ -657,6 +657,56 @@ impl DeviceIoBinding {
         self.buffer().as_ptr()
     }
 
+    /// The execution provider that owns this binding's device allocation.
+    /// Callers use it to allocate device scratch compatible with
+    /// [`Self::snapshot_device_into`] / [`Self::restore_device_from`].
+    pub fn allocator(&self) -> &Arc<dyn ExecutionProvider> {
+        &self.allocator
+    }
+
+    /// Copy the first `bytes` of this binding's device allocation into
+    /// `scratch` (device→device, no host round-trip). Used to snapshot the
+    /// destructive recurrent/conv state before a speculative verify overwrites
+    /// it. `scratch` must be owned by the same EP and hold at least `bytes`.
+    pub fn snapshot_device_into(&self, scratch: &mut DeviceBuffer, bytes: usize) -> Result<()> {
+        let buffer = self.buffer();
+        if bytes > buffer.len() {
+            return Err(SessionError::ExternalBuffer {
+                binding: self.input_name.clone(),
+                reason: format!(
+                    "device snapshot of {bytes} bytes exceeds allocation of {}",
+                    buffer.len()
+                ),
+            });
+        }
+        self.allocator
+            .copy_device_to_device(buffer, 0, scratch, 0, bytes)?;
+        Ok(())
+    }
+
+    /// Copy the first `bytes` of `scratch` back into this binding's device
+    /// allocation (device→device). Inverse of [`Self::snapshot_device_into`];
+    /// leaves the binding shape unchanged so it never invalidates a captured
+    /// decode graph.
+    pub fn restore_device_from(&mut self, scratch: &DeviceBuffer, bytes: usize) -> Result<()> {
+        let buffer = self
+            .buffer
+            .as_mut()
+            .expect("DeviceIoBinding buffer taken only in Drop");
+        if bytes > buffer.len() {
+            return Err(SessionError::ExternalBuffer {
+                binding: self.input_name.clone(),
+                reason: format!(
+                    "device restore of {bytes} bytes exceeds allocation of {}",
+                    buffer.len()
+                ),
+            });
+        }
+        self.allocator
+            .copy_device_to_device(scratch, 0, buffer, 0, bytes)?;
+        Ok(())
+    }
+
     pub fn transfer_stats(&self) -> DeviceBindingTransferStats {
         self.transfer_stats
     }

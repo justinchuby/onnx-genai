@@ -40,6 +40,7 @@ pub use executor::{
 };
 pub use onnx_runtime_ep_api::DeviceGraphSlot;
 pub use onnx_runtime_ep_api::WorkspaceRequirement;
+pub use onnx_runtime_ep_api::DeviceBuffer;
 pub use onnx_runtime_loader::{
     EpContextDumpConfig, EpContextPartition, Model as EncoderModel, ModelMetadata,
 };
