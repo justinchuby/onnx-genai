@@ -2008,12 +2008,14 @@ name = "onnx-genai"
 version = "0.1.0-dev.5"
 dependencies = [
  "anyhow",
+ "onnx-genai-comfyui-config",
  "onnx-genai-engine",
  "onnx-genai-kv",
  "onnx-genai-metadata",
  "onnx-genai-ort",
  "onnx-genai-preprocess",
  "onnx-genai-scheduler",
+ "serde_json",
 ]
 
 [[package]]
@@ -2073,6 +2075,17 @@ dependencies = [
  "tokio",
  "tracing-subscriber",
  "unicode-width 0.2.2",
+]
+
+[[package]]
+name = "onnx-genai-comfyui-config"
+version = "0.1.0-dev.5"
+dependencies = [
+ "onnx-genai-metadata",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

@@ -393,6 +393,27 @@ declares. For packages whose pipeline stops at the latent instead of declaring
 a final VAE phase, add `--vae-decoder <latent-to-image.onnx>` (and
 `--vae-scaling-factor`).
 
+### Import a ComfyUI workflow
+
+A ComfyUI *"Save (API Format)"* export can be lowered into the same canonical
+`pipeline.workflow` metadata a natively exported diffusion package carries (see
+[docs/genai/COMFYUI_IMPORT.md](docs/genai/COMFYUI_IMPORT.md)):
+
+```bash
+# Convert only.
+cargo run -p onnx-genai-comfyui-config --bin comfyui_to_metadata -- \
+  --out models/sd15/inference_metadata.yaml workflow.json
+
+# Convert, then execute on the generic workflow engine.
+cargo run -p onnx-genai --bin run_comfyui -- \
+  --package models/sd15 --output out.ppm workflow.json
+```
+
+Import is one-way and fail-closed, exactly like `genai_config.json`: once the
+metadata exists it is the only source of execution truth, and any node that
+would change the produced image but has no canonical representation is an error
+naming the node and the remedy rather than a silent drop.
+
 ### Reasoning models
 
 Models that emit a chain of thought before the answer are handled automatically.

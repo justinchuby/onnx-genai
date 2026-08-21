@@ -86,7 +86,8 @@ Generation-side design: [`SCHEDULING.md`](genai/SCHEDULING.md),
 [`MODEL_METADATA.md`](genai/MODEL_METADATA.md),
 [`MODEL_PACKAGE.md`](genai/MODEL_PACKAGE.md),
 [`NATIVE_BATCH_DECODE_2B_IMPL_SCOPING.md`](genai/NATIVE_BATCH_DECODE_2B_IMPL_SCOPING.md),
-[`DIFFUSION.md`](genai/DIFFUSION.md).
+[`DIFFUSION.md`](genai/DIFFUSION.md),
+[`COMFYUI_IMPORT.md`](genai/COMFYUI_IMPORT.md).
 
 ### `quantization/`
 Quantized formats and MoE: [`SUB4BIT_QUANT.md`](quantization/SUB4BIT_QUANT.md),
