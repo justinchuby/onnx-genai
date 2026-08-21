@@ -11861,6 +11861,13 @@ mod tests {
     /// reassociation. The `m = 1` path is itself pinned against the `f64`
     /// oracle by `the_packed_nibble_route_stays_inside_the_accuracy_4_envelope`.
     ///
+    /// The *route* half is derived from the dispatch predicate rather than
+    /// pinned to the nibble route, because `uses_vnni_int4_direct()` refuses
+    /// that route on a VNNI host and GitHub's x86 pools mix generations. The
+    /// bit-identity half is not gated: both drivers resolve the same route as
+    /// each other on any host, so the comparison is meaningful everywhere and
+    /// skipping it would delete the numeric check on the newest hardware.
+    ///
     /// Scope, stated because bit-identity tests invite overclaiming: comparing
     /// the two drivers is blind to any defect in the code they share, so this
     /// covers row dispatch, chunking and the column split *only*. Mutating the
@@ -11934,10 +11941,27 @@ mod tests {
                 &mut [y.view_mut()],
             )
             .unwrap();
+        // Derived, not pinned. The nibble branch is gated on
+        // `!dot_kernel.uses_vnni_int4_direct()`, so a VNNI host refuses it and
+        // falls to the expanded-int8 route. Asserting `1` unconditionally made
+        // this test pass or fail on the *generation of the runner* that picked
+        // up the job -- see the `half_prefill_gebp` case for the same defect.
+        //
+        // The int4-direct branch is not the alternative here: this fixture has
+        // zero points, and `supports_int4_direct` is false whenever
+        // `has_zero_points`. So both this `m > 1` driver and the `m = 1` rows
+        // it is compared against take the *same* route as each other on any
+        // host, and the bit-identity assertion below stays meaningful
+        // everywhere. Only the route identity varies, so only it is derived.
+        let expects_nibble = !selected_dot_kernel().uses_vnni_int4_direct();
         let (nibble, _) = int4_routes();
         assert_eq!(
-            nibble, 1,
-            "the m = {m} case must take the packed-nibble route, not a fallback"
+            nibble,
+            usize::from(expects_nibble),
+            "the m = {m} case took {nibble} packed-nibble run(s); this host \
+             (VNNI int4-direct: {}) should take {}",
+            !expects_nibble,
+            usize::from(expects_nibble)
         );
         assert_eq!(
             y.to_f32(),
