@@ -1484,6 +1484,30 @@ pub trait ExecutionProvider: Send + Sync {
     /// Block until all pending work on this EP completes.
     fn sync(&self) -> Result<()>;
 
+    /// Copy `bytes` device→device, from `src[src_offset..]` into
+    /// `dst[dst_offset..]`, both allocations owned by this EP.
+    ///
+    /// The default errors: only device EPs with a native device-to-device copy
+    /// (CUDA) implement it. Used by the speculative recurrent-state snapshot to
+    /// stage the destructive GDN/conv state into device scratch WITHOUT a PCIe
+    /// round-trip through host memory. The copy is stream-ordered on the EP's
+    /// compute stream, so it composes with the surrounding forward passes
+    /// (snapshot before the verify overwrites the state; restore before the
+    /// accepted-token re-advance) with no host synchronization.
+    fn copy_device_to_device(
+        &self,
+        _src: &DeviceBuffer,
+        _src_offset: usize,
+        _dst: &mut DeviceBuffer,
+        _dst_offset: usize,
+        _bytes: usize,
+    ) -> Result<()> {
+        Err(EpError::KernelFailed(format!(
+            "{}: device-to-device copy is not implemented",
+            self.name()
+        )))
+    }
+
     /// EP-specific optimization passes, run after the generic optimizer.
     fn custom_passes(&self) -> Vec<Box<dyn onnx_runtime_optimizer::OptimizationPass>> {
         Vec::new()

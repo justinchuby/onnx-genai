@@ -1,10 +1,19 @@
 # Examples
 
-## Real multimodal model contract
+## ComfyUI import, converted and executed
 
-[`smolvlm-256m/`](smolvlm-256m/) validates the inference-metadata contract
-against Hugging Face's real SmolVLM-256M ONNX export and records the precise
-VLM fit/gap analysis.
+[`comfyui-import/`](comfyui-import/) walks a ComfyUI API-format workflow through
+the one-way importer into canonical `pipeline.workflow` metadata and runs it on
+the generic workflow engine, with the fixture package and refusal diagnostics.
+
+## End-to-end evidence
+
+[`inference_metadata/evidence/`](inference_metadata/evidence/) tracks the actual
+output artifacts of real end-to-end inference-metadata runs — images, metrics
+and run configuration — so the numbers quoted in reviews stay verifiable from
+the tree instead of from an expiring pull-request attachment. See
+[`inference_metadata/evidence/README.md`](inference_metadata/evidence/README.md)
+for the index and for what does and does not belong there.
 
 ## Profile reports
 

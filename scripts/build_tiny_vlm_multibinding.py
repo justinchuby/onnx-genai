@@ -297,8 +297,6 @@ pipeline:
   phases:
     embedding:
       run_on: every_step
-    decoder:
-      run_on: every_step
 """
 
 

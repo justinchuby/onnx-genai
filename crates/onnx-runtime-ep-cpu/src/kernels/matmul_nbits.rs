@@ -9350,7 +9350,7 @@ fn gemv_nk(activation: &[f32], weight_nk: &[f32], result: &mut [f32], k: usize, 
     let compute = |output_start: usize, outputs: &mut [f32]| {
         let weights = &weight_nk[output_start * k..(output_start + outputs.len()) * k];
         for (output, weight) in outputs.iter_mut().zip(weights.chunks_exact(k)) {
-            *output = activation.iter().zip(weight).map(|(&a, &b)| a * b).sum();
+            *output = dot_f32(activation, weight);
         }
     };
     let chunk = output_chunk_len(n, k);
@@ -9359,6 +9359,42 @@ fn gemv_nk(activation: &[f32], weight_nk: &[f32], result: &mut [f32], k: usize, 
     } else {
         compute(0, result);
     }
+}
+
+/// Multiply-accumulate two `f32` slices.
+///
+/// Sixteen independent accumulators, for the same reason [`dot_u8_f32`] has
+/// them: `f32` addition is not associative, so a plain `iter().map().sum()`
+/// forces LLVM to keep one serial accumulator. The loop then cannot vectorize
+/// and issues one FMA per FMA *latency* instead of one per issue slot, which is
+/// an order of magnitude off. This is the whole cost of the production-default
+/// int4 decode GEMV -- measured 5.3x-9.9x on llama/qwen projection shapes, at
+/// identical memory traffic. Before this, that path achieved 3.8-4.0 GB/s
+/// against a ~31-36 GB/s per-CCX ceiling: it was never bandwidth-bound, it was
+/// waiting on a dependency chain.
+///
+/// Reassociating the sum is a change in rounding, not in precision class: the
+/// compute type stays `f32` throughout, no operand is quantized, and the
+/// pairwise-shaped partial sums are *more* accurate than the serial chain they
+/// replace, not less. That is the same trade [`dot_u8_f32`] already makes on
+/// the `accuracy_level = 0` 8-bit decode route.
+#[inline]
+fn dot_f32(activation: &[f32], weight: &[f32]) -> f32 {
+    debug_assert_eq!(weight.len(), activation.len());
+    const LANES: usize = 16;
+    let mut acc = [0.0f32; LANES];
+    let (weight_chunks, weight_tail) = weight.as_chunks::<LANES>();
+    let (activation_chunks, activation_tail) = activation.as_chunks::<LANES>();
+    for (w, a) in weight_chunks.iter().zip(activation_chunks) {
+        for lane in 0..LANES {
+            acc[lane] += w[lane] * a[lane];
+        }
+    }
+    let mut tail = 0.0f32;
+    for (w, a) in weight_tail.iter().zip(activation_tail) {
+        tail += *w * *a;
+    }
+    tail + acc.iter().sum::<f32>()
 }
 
 /// Multiply-accumulate a `u8` weight slice against an `f32` activation slice.
@@ -9986,6 +10022,88 @@ fn error(message: impl Into<String>) -> EpError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reassociated `dot_f32` must be at least as accurate as the serial
+    /// chain it replaced, judged against an `f64` reference.
+    ///
+    /// This is the numerics half of the argument for breaking the reduction
+    /// chain. Reassociating an `f32` sum changes the result, so "it is still
+    /// `f32`" is not on its own a sufficient answer -- the question is which
+    /// order is *closer to the exact sum*. A long serial chain is the worst
+    /// case for `f32` accumulation: the running total grows while the addends
+    /// do not, so each new term is added at a progressively worse exponent and
+    /// error accumulates linearly in `k`. Sixteen accumulators each carry
+    /// `k/16` terms and are combined at the end, which is a shallow pairwise
+    /// tree and errs sublinearly.
+    ///
+    /// The shapes here are the ones where this bites: long `k`, same-sign
+    /// terms, so cancellation cannot mask the drift.
+    #[test]
+    fn reassociated_dot_is_at_least_as_accurate_as_the_serial_chain() {
+        fn serial(a: &[f32], b: &[f32]) -> f32 {
+            a.iter().zip(b).map(|(&x, &y)| x * y).sum()
+        }
+        fn exact(a: &[f32], b: &[f32]) -> f64 {
+            a.iter()
+                .zip(b)
+                .map(|(&x, &y)| f64::from(x) * f64::from(y))
+                .sum()
+        }
+
+        for &k in &[1024usize, 4096, 14336] {
+            // Deterministic, all-positive, and deliberately spread across
+            // exponents so the serial chain's growing-accumulator problem is
+            // visible rather than incidental.
+            let mut state = 0x9E3779B97F4A7C15u64;
+            let mut next = || {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((state >> 40) as f32 / (1u64 << 24) as f32) + 0.5
+            };
+            let a: Vec<f32> = (0..k).map(|_| next()).collect();
+            let b: Vec<f32> = (0..k).map(|_| next()).collect();
+
+            let reference = exact(&a, &b);
+            let serial_err = (f64::from(serial(&a, &b)) - reference).abs();
+            let reassociated_err = (f64::from(dot_f32(&a, &b)) - reference).abs();
+
+            assert!(
+                reassociated_err <= serial_err,
+                "k={k}: reassociated dot is less accurate than the serial chain \
+                 ({reassociated_err:e} vs {serial_err:e} absolute error against \
+                 an f64 reference)"
+            );
+            // Guard against the test passing vacuously on a k where both orders
+            // happen to be exact.
+            assert!(
+                reference.abs() > 0.0,
+                "k={k}: degenerate reference, the comparison proves nothing"
+            );
+        }
+    }
+
+    /// `dot_f32` must agree with the scalar definition on tails and edges.
+    ///
+    /// The 16-lane body plus scalar tail has an obvious failure mode -- losing
+    /// or double-counting the `k % 16` remainder -- that a large-`k` accuracy
+    /// test would hide inside its tolerance. These lengths bracket the lane
+    /// width from every side, including empty.
+    #[test]
+    fn reassociated_dot_handles_every_tail_length() {
+        for k in [0usize, 1, 2, 15, 16, 17, 31, 32, 33, 47, 63, 64, 65] {
+            let a: Vec<f32> = (0..k).map(|i| (i as f32) * 0.25 + 1.0).collect();
+            let b: Vec<f32> = (0..k).map(|i| 2.0 - (i as f32) * 0.125).collect();
+            let reference: f64 = a
+                .iter()
+                .zip(&b)
+                .map(|(&x, &y)| f64::from(x) * f64::from(y))
+                .sum();
+            let got = f64::from(dot_f32(&a, &b));
+            assert!(
+                (got - reference).abs() <= reference.abs() * 1e-6 + 1e-6,
+                "k={k}: dot_f32 gave {got}, expected {reference}"
+            );
+        }
+    }
 
     /// Take the dispatch-probe lock for the duration of a test that reads or
     /// perturbs a `*_TEST_CALLS` counter. See `DISPATCH_PROBE_LOCK`.

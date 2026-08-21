@@ -42,7 +42,12 @@ impl Kernel for ReshapeKernel {
         true
     }
 
-    fn view_outputs(&self, inputs: &[TensorView], num_outputs: usize) -> Option<Vec<ViewOutput>> {
+    fn view_outputs(
+        &self,
+        inputs: &[TensorView],
+        _output_shapes: &[Vec<usize>],
+        num_outputs: usize,
+    ) -> Option<Vec<ViewOutput>> {
         if num_outputs != 1 || inputs.len() != 2 {
             return None;
         }
@@ -135,7 +140,7 @@ mod tests {
         let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
         let shape = Owned::i64(&[2], &[3, 2]);
         let view = ReshapeKernel { allowzero: false }
-            .view_outputs(&[a.view(), shape.view()], 1)
+            .view_outputs(&[a.view(), shape.view()], &[vec![3, 2]], 1)
             .expect("contiguous reshape should be a view")
             .pop()
             .unwrap();

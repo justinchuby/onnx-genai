@@ -118,7 +118,7 @@ impl Engine {
             config.limits.vram_limit,
         )?;
         let metadata = load_inference_metadata(&model_directory)?;
-        let model_io = metadata.model.as_ref().and_then(|model| model.io.as_ref());
+        let model_io = metadata.decoder_io();
         let kv_inputs = model_io
             .and_then(|io| io.kv_inputs.clone())
             .unwrap_or_default();
@@ -219,11 +219,11 @@ impl Engine {
         };
 
         // Stage: metadata and decode-path resolution.
+        let shared_kv = shared_kv_offer(&session, &metadata, &model_directory.model_path);
         let MetadataResolution {
             metadata,
-            metadata_max_context,
             decode_path,
-        } = resolve_metadata_and_decode_path(&session, &model_directory.model_path, metadata)?;
+        } = resolve_metadata_and_decode_path(metadata, shared_kv, session.graph_capture())?;
 
         let tokenizer = {
             let _span = onnx_genai_ort::prof_span!("engine.tokenizer_load");
@@ -242,25 +242,14 @@ impl Engine {
         )?;
         // Stage: draft-model loading. Kept before KV-cache allocation to preserve
         // the original constructor's fallible-step ordering.
-        let draft = load_draft_model(
-            &config,
-            &environment,
-            &session_options,
-            metadata_max_context,
-            &governor,
-        )?;
+        let draft = load_draft_model(&config, &environment, &session_options, &governor)?;
 
         // Stage: runtime KV-cache allocation, granted by the governor built above.
         let kv_cache = allocate_kv_cache(&config, kv_model.as_ref(), &governor)?;
 
         // Stage: speculative-assistant loading (mode resolution then per-mode heads).
-        let (speculative_mode, resolved_mtp_config) = resolve_speculative_mode(
-            config.speculative_mode.clone(),
-            &metadata,
-            &model_directory,
-            &session,
-            draft.is_some(),
-        )?;
+        let (speculative_mode, resolved_mtp_config) =
+            resolve_speculative_mode(config.speculative_mode.clone(), draft.is_some())?;
         let mtp = load_mtp_model(
             resolved_mtp_config,
             &session,
@@ -379,35 +368,19 @@ impl Engine {
         // existing load path unchanged. See #384 and the qwen3.5-27B enablement.
         maybe_fill_hybrid_io_from_graph(&mut metadata, &model_directory.model_path);
         let runtime_caps = onnx_genai_metadata::RuntimeCapabilities::default();
-        if let Err(unsupported) = onnx_genai_metadata::validate(&metadata, &runtime_caps) {
-            anyhow::bail!("Unsupported capabilities: {unsupported:?}");
+        if let Err(errors) = onnx_genai_metadata::validate(&metadata, &runtime_caps) {
+            anyhow::bail!("Invalid inference metadata: {errors:?}");
         }
-        // Metadata-advertised MTP self-speculation seeds its draft head from a
-        // target hidden output (`speculative.target_hidden_output`). The native
-        // decode session only records that hidden state when `model.io.hidden_output`
-        // names it, but MTP artifacts declare the seed solely in the speculative
-        // block. Derive the model-IO hidden output from the speculative target so
-        // the native session materializes the seed; never override an explicit
-        // `model.io.hidden_output`, and leave non-MTP models untouched.
-        let mtp_target_hidden = metadata
-            .speculative
-            .as_ref()
-            .filter(|spec| spec.proposal_type == ProposalType::Mtp)
-            .and_then(|spec| {
-                spec.target_hidden_output
-                    .as_ref()
-                    .filter(|name| !name.is_empty())
-                    .cloned()
-            });
-        // Resolved into an owned value first on purpose: the borrow of
-        // `metadata.speculative` must end before `metadata.model.as_mut()` below,
-        // so this cannot be folded into one `let` chain.
-        if let Some(target_hidden) = mtp_target_hidden
-            && let Some(model) = metadata.model.as_mut()
-            && let Some(io) = model.io.as_mut()
-            && io.hidden_output.as_deref().unwrap_or_default().is_empty()
-        {
-            io.hidden_output = Some(target_hidden);
+        // Native MTP self-speculation seeds its draft head from a target hidden
+        // output. The native decode session only records that hidden state when
+        // the decode ABI names it, but the seed is declared by the MTP sidecar
+        // rather than by the target's own graph contract, so it has to be
+        // carried across. Install it as a *derived* ABI: the package keeps one
+        // serialized representation and gains no second writable statement of
+        // its own ports. An ABI that already names a hidden output wins, and a
+        // directory that declares no MTP sidecar is left exactly as it was.
+        if let Some(seeded) = mtp_seeded_decoder_io(&metadata, &model_directory.root) {
+            metadata.set_derived_decoder_io(seeded);
         }
         let tokenizer = {
             let _span = onnx_genai_ort::prof_span!("engine.tokenizer_load");
@@ -417,7 +390,7 @@ impl Engine {
         let fim_config = load_fim_config_from_model_dir(&model_directory.root)?;
         let kv_model = {
             let _span = onnx_genai_ort::prof_span!("engine.native_kv_model_info");
-            let model_io = metadata.model.as_ref().and_then(|model| model.io.as_ref());
+            let model_io = metadata.decoder_io();
             let kv_inputs = model_io
                 .and_then(|io| io.kv_inputs.clone())
                 .unwrap_or_default();
@@ -435,7 +408,7 @@ impl Engine {
             infer_kv_model_info(&graph_io, model_io, config.page_size, config.kv_cache_dtype)
                 .context("failed to infer native decoder KV geometry from model graph I/O")?
         };
-        let model_io = metadata.model.as_ref().and_then(|model| model.io.as_ref());
+        let model_io = metadata.decoder_io();
         let governor_kv_config = match kv_model.as_ref() {
             Some(kv_model) => governor_native_kv_config(Some(kv_model), &config)?,
             None if model_io_declares_only_fixed_state(model_io) => {
@@ -711,7 +684,7 @@ impl Engine {
                     cuda_memory_governor: std::sync::Arc::new(governor.device_authority()),
                     #[cfg(feature = "native-cuda")]
                     process_memory_manager: governor.process_memory_manager(),
-                    io: metadata.model.as_ref().and_then(|model| model.io.as_ref()),
+                    io: metadata.decoder_io(),
                     metadata_max_len: metadata
                         .model
                         .as_ref()
@@ -958,23 +931,18 @@ impl Engine {
         if let Some(trace) = trace {
             native_session.set_trace_context(trace);
         }
-        let (native_shared_kv_proposer, shared_kv_mode) = load_native_shared_kv_proposer(
-            &metadata,
-            &model_directory.root,
-            native_device.clone(),
-            #[cfg(feature = "native-cuda")]
-            cuda_offload_policy.unwrap_or_else(onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env),
-            #[cfg(feature = "native-cuda")]
-            std::sync::Arc::new(governor.device_authority()),
-            #[cfg(feature = "native-cuda")]
-            governor.process_memory_manager(),
-        )?;
+        let native_shared_kv_proposer = None;
+        // Shared-KV drafting is no longer resolved from the package, so this
+        // path never offers a shared-KV proposer. MTP remains the one native
+        // proposer kind, and the effective mode is decided below once the MTP
+        // loader has reported.
+        let shared_kv_mode = SpeculativeMode::None;
         let environment = {
             let _span = onnx_genai_ort::prof_span!("engine.ort_environment");
             Environment::new("onnx-genai-engine")
                 .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {e}"))?
         };
-        // Metadata-advertised MTP self-speculation: the pure-attention MTP head
+        // Sidecar-declared MTP self-speculation: the pure-attention MTP head
         // loads on the ORT `environment` (ORT CUDA EP), seeded from the native
         // hybrid target's declared hidden output. Yields `None` for every
         // non-MTP model, preserving the plain native load path exactly.
@@ -985,8 +953,9 @@ impl Engine {
             session_options,
             native_device,
         )?;
-        // A model advertises at most one proposer kind; shared-KV and MTP are
-        // mutually exclusive by `speculative.proposal_type`.
+        // A model runs at most one proposer kind; shared-KV drafting and MTP are
+        // mutually exclusive, so at most one of these may be anything but
+        // `None`.
         let speculative_mode = match (&shared_kv_mode, &mtp_mode) {
             (SpeculativeMode::None, mode) => mode.clone(),
             (mode, SpeculativeMode::None) => mode.clone(),
@@ -1009,7 +978,7 @@ impl Engine {
             prefix_cache: PrefixCache::new(),
             token_prefix_cache: Vec::new(),
             kv_model,
-            decode_path: ModelDecodePath::Legacy,
+            decode_path: ModelDecodePath::Generic,
             scheduler,
             governor,
             sessions: HashMap::new(),
@@ -1052,7 +1021,7 @@ impl Engine {
     }
 }
 
-/// Fill `metadata.model.io` from the ONNX graph's declared ports when the
+/// Fill the resolved decode ABI from the ONNX graph's declared ports when the
 /// package's sidecar declares no `io` block AND the graph is a hybrid
 /// linear-attention decoder (exposes recurrent `conv_state`/`recurrent_state`
 /// state pairs).
@@ -1070,16 +1039,14 @@ impl Engine {
 /// This is deliberately attribute/shape-driven, never model-name-gated, and
 /// engages only for the recurrent-hybrid case (the safety gate is a non-empty
 /// derived `state_pairs`, mirroring the native decode driver's
-/// `derive_fallback_io`). A declared `io` block always wins; pure-dense decoders
-/// (no state pairs) are left untouched and keep their existing load path.
+/// `derive_fallback_io`). An already-resolved ABI always wins; pure-dense
+/// decoders (no state pairs) are left untouched and keep their existing load
+/// path. The result is installed as a *derived* ABI rather than written into
+/// the deprecated serialized block, so it stays one representation.
 #[cfg(feature = "native-backend")]
 fn maybe_fill_hybrid_io_from_graph(metadata: &mut InferenceMetadata, model_path: &Path) {
-    // A declared `io` block is always authoritative.
-    if metadata
-        .model
-        .as_ref()
-        .is_some_and(|model| model.io.is_some())
-    {
+    // A workflow-recognized or legacy-declared ABI is always authoritative.
+    if metadata.decoder_io().is_some() {
         return;
     }
     let Some(graph_info) = crate::engine::decoder_graph_info_from_model_path(model_path) else {
@@ -1090,10 +1057,47 @@ fn maybe_fill_hybrid_io_from_graph(metadata: &mut InferenceMetadata, model_path:
     else {
         return;
     };
-    let model = metadata
-        .model
-        .get_or_insert_with(onnx_genai_metadata::ModelCapabilities::default);
-    model.io = Some(io);
+    metadata.set_derived_decoder_io(io);
+}
+
+/// The resolved decode ABI with an MTP sidecar's target hidden output filled in.
+///
+/// `None` unless the package resolves an ABI that names no hidden output *and*
+/// the model directory declares an MTP sidecar that names one, so every other
+/// model keeps exactly the ABI it resolved.
+#[cfg(feature = "native-backend")]
+fn mtp_seeded_decoder_io(
+    metadata: &InferenceMetadata,
+    model_root: &Path,
+) -> Option<onnx_genai_metadata::ModelIoSpec> {
+    let io = metadata.decoder_io()?;
+    let descriptor = onnx_genai_metadata::detect_speculator(model_root)?;
+    let onnx_genai_metadata::SpeculatorProposerStatus::Mtp(spec) = descriptor.proposer else {
+        return None;
+    };
+    decoder_io_seeded_with(io, &spec.target_hidden_output)
+}
+
+/// Name `target_hidden_output` as the ABI's hidden output, or decline.
+///
+/// Declines when the ABI already names one -- a declared port is authoritative
+/// and a sidecar must not redirect the target's own contract -- and when the
+/// sidecar names nothing, which would otherwise install an empty port name that
+/// reads as "declared" everywhere downstream.
+#[cfg(feature = "native-backend")]
+fn decoder_io_seeded_with(
+    io: &onnx_genai_metadata::ModelIoSpec,
+    target_hidden_output: &str,
+) -> Option<onnx_genai_metadata::ModelIoSpec> {
+    if !io.hidden_output.as_deref().unwrap_or_default().is_empty() {
+        return None;
+    }
+    if target_hidden_output.is_empty() {
+        return None;
+    }
+    let mut seeded = io.clone();
+    seeded.hidden_output = Some(target_hidden_output.to_string());
+    Some(seeded)
 }
 
 fn package_selection_from_session_options(
@@ -1120,7 +1124,6 @@ fn package_selection_from_session_options(
 /// Produced by [`resolve_metadata_and_decode_path`] as the first construction stage.
 struct MetadataResolution {
     metadata: InferenceMetadata,
-    metadata_max_context: Option<usize>,
     decode_path: ModelDecodePath,
 }
 
@@ -1144,68 +1147,25 @@ fn load_inference_metadata(model_directory: &ModelDirectory) -> anyhow::Result<I
 }
 
 fn resolve_metadata_and_decode_path(
-    session: &Session,
-    model_path: &Path,
     metadata: InferenceMetadata,
+    shared_kv: crate::decode::SharedKvOffer,
+    capture_requested: bool,
 ) -> anyhow::Result<MetadataResolution> {
     // Validate capabilities
     let runtime_caps = onnx_genai_metadata::RuntimeCapabilities::default();
-    if let Err(unsupported) = onnx_genai_metadata::validate(&metadata, &runtime_caps) {
-        anyhow::bail!("Unsupported capabilities: {unsupported:?}");
+    if let Err(errors) = onnx_genai_metadata::validate(&metadata, &runtime_caps) {
+        anyhow::bail!("Invalid inference metadata: {errors:?}");
     }
 
-    // Optional explicit cap on runtime-owned KV growth. Foundry /
-    // onnxruntime-genai `genai_config.json` models advertise the model's full
-    // `context_length` (e.g. 32k-131k) as their max sequence length. The
-    // shared-buffer decode path pre-allocates at an initial power-of-two bucket
-    // (256 tokens by default, overridden by `ONNX_GENAI_KV_MIN_BUCKET`) and grows
-    // on demand up to the model's declared `max_length`; it does not pre-allocate
-    // the full context. `ONNX_GENAI_KV_MAX_LEN` caps growth below the model
-    // maximum, mirroring the native path's `ONNX_GENAI_CUDA_KV_MAX_LEN`.
-    // Unset = model metadata is the factual ceiling.
-    let kv_shared_buffer_cap = shared_buffer_cap_from_env();
-    let metadata_max_context = metadata
-        .model
-        .as_ref()
-        .and_then(|model| model.max_sequence_length)
-        .map(|max_len| cap_kv_len(max_len, kv_shared_buffer_cap));
-    // Our own inference metadata (inference_metadata.yaml), not
-    // onnxruntime-genai's genai_config.json, drives the runtime-owned
-    // share-buffer KV path for GQA models.
-    let shared_kv_max_len = crate::decode::shared_kv_buffer_len_from_metadata(&metadata)
-        .map(|max_len| cap_kv_len(max_len, kv_shared_buffer_cap));
     let sliding_window = crate::decode::sliding_window_from_metadata(&metadata)?;
     let sink_tokens = crate::decode::sink_tokens_from_metadata(&metadata);
-    // Graph-truth check for the declared sliding window: only a window the
-    // exported decoder graph actually enforces (GQA `local_window_size`) is
-    // treated as active, because the runtime cannot re-apply a mask the export
-    // dropped. Such a model is reclassified as global attention so decode reaches
-    // the capture-stable shared-buffer KV path, and the mismatch is warned about
-    // (it is an export defect, not a harmless quirk). Best-effort: if the graph
-    // cannot be read, the declared window is kept (no regression for real SWA
-    // models).
-    //
-    // The graph is also consulted to decide whether the attention operator can
-    // consume a capacity-padded past (see `graph_accepts_padded_past`), which is
-    // needed for *every* model rather than only for windowed ones — so it is
-    // loaded whenever a share-buffer path is a candidate, not just when a
-    // sliding window is declared. Loading is still best-effort and still skipped
-    // when neither question can be affected by the answer.
-    let needs_graph_for_share_buffer =
-        metadata_max_context.is_some() || shared_kv_max_len.is_some();
-    let decoder_graph = (sliding_window.is_some() || needs_graph_for_share_buffer)
-        .then(|| onnx_runtime_loader::load_model(model_path).ok())
-        .flatten();
     let decode_path = {
         let _span = onnx_genai_ort::prof_span!("engine.detect_decode_path");
         detect_model_decode_path(
-            session,
-            metadata.model.as_ref().and_then(|model| model.io.as_ref()),
-            metadata_max_context,
-            shared_kv_max_len,
+            metadata.decoder_io(),
             sliding_window,
-            decoder_graph.as_ref(),
             sink_tokens,
+            shared_kv,
         )?
     };
     // Report the resolved decode path together with whether the session even
@@ -1216,7 +1176,6 @@ fn resolve_metadata_and_decode_path(
     // therefore compare two backends on two different KV strategies and read
     // like a backend comparison. Emitting this once at load makes it visible in
     // every CLI, server and benchmark run.
-    let capture_requested = session.graph_capture();
     tracing::info!(
         decode_path = %decode_path.summary(),
         graph_capture_requested = capture_requested,
@@ -1228,9 +1187,64 @@ fn resolve_metadata_and_decode_path(
     );
     Ok(MetadataResolution {
         metadata,
-        metadata_max_context,
         decode_path,
     })
+}
+
+/// Resolve what this deployment can offer for an aliased KV buffer.
+///
+/// A shared buffer is a fixed reservation, so it needs a capacity, and the only
+/// capacity known at load time is the one the package declares as its context
+/// window. Without that bound the runtime declines to reserve rather than
+/// guessing a size.
+fn shared_kv_offer(
+    session: &Session,
+    metadata: &InferenceMetadata,
+    model_path: &Path,
+) -> crate::decode::SharedKvOffer {
+    let max_len = metadata
+        .model
+        .as_ref()
+        .and_then(|model| model.max_sequence_length);
+    // The EP capability is necessary but not sufficient. Whether a
+    // capacity-padded past is legal is a property of the attention *operator*:
+    // the standard opset `Attention` derives `total_sequence_length` from the
+    // past tensor's own extent and cross-checks it against the mask, so a
+    // capacity-sized past makes the two disagree and ORT refuses to run. Ask the
+    // graph before offering a shared buffer, so such a model falls back to the
+    // exact-length rebind path instead of failing at the first decode step.
+    //
+    // Best-effort and short-circuited: the graph is only read when a shared
+    // buffer is otherwise on the table, and a graph that cannot be read leaves
+    // the offer as the session alone described it.
+    let ep_supports = session.supports_fixed_capacity_present_binding();
+    let present_binding_supported = ep_supports
+        && (max_len.is_none()
+            || match onnx_runtime_loader::load_model(model_path) {
+                Ok(graph) => {
+                    let accepts = crate::decode::graph_accepts_padded_past(&graph);
+                    let explicit_kv_length =
+                        crate::decode::graph_uses_explicit_kv_length_attention(&graph);
+                    if !accepts {
+                        tracing::debug!(
+                            "decoder graph uses the standard opset Attention op, which \
+                             cross-checks the attention mask against the past KV extent; \
+                             declining the shared KV buffer for this deployment"
+                        );
+                    } else if explicit_kv_length {
+                        tracing::debug!(
+                            "decoder graph uses attention with an explicit valid KV length; \
+                             fixed-capacity present binding is graph-compatible"
+                        );
+                    }
+                    accepts
+                }
+                Err(_) => true,
+            });
+    crate::decode::SharedKvOffer {
+        present_binding_supported,
+        max_len,
+    }
 }
 
 fn build_governor_and_scheduler(
@@ -1242,7 +1256,7 @@ fn build_governor_and_scheduler(
     authority_domain: &DeviceCompatibilityDomain,
 ) -> anyhow::Result<(EngineResourceGovernor, Scheduler)> {
     let governor_kv_config = match (kv_model, decode_path) {
-        (None, ModelDecodePath::StaticCache { .. } | ModelDecodePath::Legacy) => {
+        (None, ModelDecodePath::StaticCache { .. } | ModelDecodePath::Generic) => {
             governor_no_paged_kv_config(config)?
         }
         _ => governor_kv_config(kv_model, config)?,
@@ -1337,8 +1351,8 @@ fn required_bytes_per_token_from_kv_config(
     kv_config.bytes_per_token().map(Some).with_context(|| {
         format!(
             "cannot derive scheduler bytes_per_token because KV page byte geometry is unknown \
-             for {} token(s) per page; fix by declaring model.io.kv_inputs and \
-             model.io.kv_outputs so admission uses real KV memory costs",
+             for {} token(s) per page; fix by declaring kv_inputs and \
+             kv_outputs so admission uses real KV memory costs",
             kv_config.tokens_per_page
         )
     })
@@ -1365,7 +1379,6 @@ fn load_draft_model(
     config: &EngineConfig,
     environment: &Environment,
     session_options: &SessionOptions,
-    metadata_max_context: Option<usize>,
     governor: &EngineResourceGovernor,
 ) -> anyhow::Result<Option<DraftModel>> {
     let draft = if let Some(draft_model_path) = &config.draft_model {
@@ -1376,7 +1389,7 @@ fn load_draft_model(
             .as_deref()
             .map(onnx_genai_metadata::load_metadata)
             .transpose()?
-            .and_then(|metadata| metadata.model.and_then(|model| model.io));
+            .and_then(|metadata| metadata.decoder_io().cloned());
         let draft_session = Session::new(
             environment,
             &draft_directory.model_path,
@@ -1395,15 +1408,7 @@ fn load_draft_model(
             // path were introduced without explicitly loading draft metadata.
             // If a draft model needs its own SWA + sinks, load its
             // inference_metadata.yaml and pass the values from there.
-            detect_model_decode_path(
-                &draft_session,
-                None,
-                metadata_max_context,
-                None,
-                None,
-                None,
-                0,
-            )?;
+            detect_model_decode_path(None, None, 0, crate::decode::SharedKvOffer::default())?;
         let draft_kv_model = infer_kv_model_info(
             &draft_session,
             draft_io.as_ref(),
@@ -2012,32 +2017,11 @@ fn allocate_kv_cache(
 
 fn resolve_speculative_mode(
     requested_mode: SpeculativeMode,
-    metadata: &InferenceMetadata,
-    model_directory: &ModelDirectory,
-    session: &Session,
     draft_present: bool,
 ) -> anyhow::Result<(SpeculativeMode, Option<ResolvedMtpConfig>)> {
     let (speculative_mode, resolved_mtp_config) = match requested_mode {
         SpeculativeMode::None if draft_present => (SpeculativeMode::DraftModel, None),
-        // No explicit mode: adopt a shared-KV draft proposer advertised by
-        // the model's own inference metadata, if the target exposes an f32
-        // hidden output the assistant can be seeded from.
-        SpeculativeMode::None => {
-            if let Some(config) =
-                mtp_config_from_metadata(metadata, &model_directory.root, session)?
-            {
-                (
-                    SpeculativeMode::Mtp(config.public_config.clone()),
-                    Some(config),
-                )
-            } else {
-                (
-                    shared_kv_mode_from_metadata(&model_directory.root, session)
-                        .unwrap_or(SpeculativeMode::None),
-                    None,
-                )
-            }
-        }
+        SpeculativeMode::None => (SpeculativeMode::None, None),
         SpeculativeMode::Mtp(config) => (
             SpeculativeMode::Mtp(config.clone()),
             Some(ResolvedMtpConfig::from_manual(config)),
@@ -2237,29 +2221,37 @@ fn load_native_mtp_proposer(
     session_options: &SessionOptions,
     native_device: crate::native_decode::NativeDecodeDevice,
 ) -> anyhow::Result<(Option<MtpModel>, SpeculativeMode)> {
-    let Some(config) = metadata.speculative.as_ref() else {
+    // The package's workflow describes the *target* graph; the draft head is a
+    // separate artifact the model directory declares for itself in `config.json`.
+    // Discovery is therefore the signal here, and a directory that declares no
+    // speculator simply loads unspeculated.
+    let Some(descriptor) = onnx_genai_metadata::detect_speculator(&model_directory.root) else {
         return Ok((None, SpeculativeMode::None));
     };
-    if config.proposal_type != ProposalType::Mtp {
-        return Ok((None, SpeculativeMode::None));
-    }
-    // The native target exposes no ORT `Session` to interrogate for the target
-    // vocabulary (that is the point of the native EP), so the MTP metadata block
-    // must declare it explicitly.
-    let vocab_size = config.vocab_size.filter(|&value| value > 0).context(
-        "native MTP speculation requires `speculative.vocab_size` in inference metadata",
-    )?;
-    let descriptor =
-        onnx_genai_metadata::resolve_speculator_config(&model_directory.root, config.clone());
     let spec = match descriptor.proposer {
-        SpeculatorProposerStatus::Mtp(spec) => spec,
-        SpeculatorProposerStatus::Unknown(reason) => {
+        onnx_genai_metadata::SpeculatorProposerStatus::Mtp(spec) => spec,
+        // A declaration that cannot be read is an authoring error worth
+        // surfacing. Any other proposer kind is simply not this loader's
+        // business and leaves the native path unspeculated.
+        onnx_genai_metadata::SpeculatorProposerStatus::Unknown(reason) => {
             anyhow::bail!("Invalid native MTP sidecar metadata: {reason}")
         }
-        other => {
-            anyhow::bail!("native MTP metadata resolved to unexpected proposer status {other:?}")
-        }
+        _ => return Ok((None, SpeculativeMode::None)),
     };
+    // The native target exposes no ORT `Session` to interrogate for the target
+    // vocabulary (that is the point of the native EP). The head borrows the
+    // target's own LM-head initializer, so the vocabulary that sizes it is the
+    // target's: read the package's declared capability rather than restating the
+    // same number in a second place that nothing forces to agree.
+    let vocab_size = metadata
+        .model
+        .as_ref()
+        .and_then(|model| model.vocab_size)
+        .filter(|&value| value > 0)
+        .context(
+            "native MTP speculation requires the target vocabulary size; declare \
+             `model.vocab_size` in the package metadata",
+        )?;
     let resolved = ResolvedMtpConfig::from_sidecar_descriptor(&spec, vocab_size);
     validate_resolved_mtp_config(&resolved)?;
     validate_native_mtp_hidden_output(&model_directory.model_path, &resolved)?;
@@ -2535,6 +2527,48 @@ fn load_shared_kv_proposer(
     Ok(shared_kv_proposer)
 }
 
+#[cfg(all(test, feature = "native-backend"))]
+mod mtp_seed_tests {
+    use super::*;
+
+    fn io_with_hidden_output(hidden_output: Option<&str>) -> onnx_genai_metadata::ModelIoSpec {
+        let mut value = serde_json::json!({});
+        if let Some(name) = hidden_output {
+            value["hidden_output"] = serde_json::json!(name);
+        }
+        serde_json::from_value(value).expect("model io spec parses")
+    }
+
+    /// The seed the sidecar names has to reach the ABI, or the native session
+    /// never records the hidden state the draft head is supposed to consume.
+    #[test]
+    fn a_sidecar_seed_names_the_hidden_output_an_abi_left_unset() {
+        let io = io_with_hidden_output(None);
+
+        let seeded = decoder_io_seeded_with(&io, "hidden_states").expect("seed applies");
+
+        assert_eq!(seeded.hidden_output.as_deref(), Some("hidden_states"));
+    }
+
+    /// A declared port is authoritative: a sidecar must not redirect the
+    /// target's own contract at load time.
+    #[test]
+    fn a_declared_hidden_output_outranks_the_sidecar_seed() {
+        let io = io_with_hidden_output(Some("last_hidden_state"));
+
+        assert!(decoder_io_seeded_with(&io, "hidden_states").is_none());
+    }
+
+    /// An empty seed must decline rather than install `""`, which would read as
+    /// a declared port everywhere downstream.
+    #[test]
+    fn an_unnamed_seed_declines_instead_of_declaring_an_empty_port() {
+        let io = io_with_hidden_output(None);
+
+        assert!(decoder_io_seeded_with(&io, "").is_none());
+    }
+}
+
 #[cfg(test)]
 mod pool_sizing_tests {
     use super::*;
@@ -2577,9 +2611,9 @@ mod pool_sizing_tests {
             .canonicalize()?;
         let metadata = onnx_genai_metadata::load_metadata(&metadata_path)?;
         metadata
-            .model
-            .and_then(|model| model.io)
-            .context("tiny-llm fixture must declare model.io")
+            .decoder_io()
+            .cloned()
+            .context("tiny-llm fixture must declare a decode ABI")
     }
 
     fn profile_json(name: &str) -> anyhow::Result<serde_json::Value> {

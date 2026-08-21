@@ -683,6 +683,13 @@ pub(crate) struct DecodeCudaState {
     /// from the declared `init: zeros` state (see `rewind`). Empty for pure-KV
     /// decoders.
     pub(crate) fixed_state_binding_range: std::ops::Range<usize>,
+    /// Device-resident scratch buffers for the speculative recurrent-state
+    /// snapshot, keyed by fixed-state binding index. Allocated lazily on the
+    /// first device snapshot and reused thereafter (state shapes are fixed), so
+    /// snapshotting the destructive GDN/conv state costs one device→device copy
+    /// per binding instead of a PCIe round-trip through host memory. Empty until
+    /// the CUDA device-snapshot path first runs; inert for greedy decode.
+    fixed_state_snapshot_scratch: Vec<(usize, DeviceBuffer)>,
     pub(crate) auxiliary_binding_range: std::ops::Range<usize>,
     pub(crate) input_ids_binding: usize,
     pub(crate) position_ids_binding: Option<usize>,
@@ -4965,6 +4972,7 @@ impl DecodeCudaState {
             base_binding_count,
             kv_binding_range: kv_start..kv_end,
             fixed_state_binding_range: kv_end..fixed_state_end,
+            fixed_state_snapshot_scratch: Vec::new(),
             auxiliary_binding_range: auxiliary_start..auxiliary_end,
             input_ids_binding,
             position_ids_binding,
@@ -5262,6 +5270,7 @@ impl DecodeCudaState {
     ///
     /// `bf16`, non-rank-4, and in-place / CPU-resident caches stay gated to the
     /// non-paged fallback (Inc-D.2 and later) — no silent-wrong paged run.
+    #[allow(dead_code)]
     pub(crate) fn kv_bindings_paged_rank4(&self) -> bool {
         let range = self.kv_binding_range.clone();
         if range.is_empty() {
@@ -5293,6 +5302,7 @@ impl DecodeCudaState {
     /// The binding may be `f32` (Inc-D) or `f16` (Inc-D.1); the raw device bytes
     /// are widened to `f32` with the same `half` convert ORT uses
     /// ([`kv_dtype_to_f32`]) so the mirrored pages are byte-identical to ORT's.
+    #[allow(dead_code)]
     pub(crate) fn read_present_kv(
         &mut self,
         past_name: &str,
@@ -5373,6 +5383,7 @@ impl DecodeCudaState {
     /// marked attendable (the per-step decode only extends `[seq_len, total)`),
     /// and the KV logical length is advanced so the next step appends at
     /// `seq_len`.
+    #[allow(dead_code)]
     pub(crate) fn seed_prefix(
         &mut self,
         session: &mut InferenceSession,
@@ -5491,57 +5502,94 @@ impl DecodeCudaState {
         self.set_logical_len(target_len)
     }
 
-    /// Copy every fixed-size recurrent/conv binding off the device into host
-    /// buffers keyed by binding index, capturing the state as of the last
-    /// committed token. Paired with [`Self::restore_fixed_states`] for
-    /// speculative recurrent-state commit; the bindings are the existing
-    /// `fixed_state_binding_range`, so no layer/dim geometry is hardcoded.
-    pub(crate) fn snapshot_fixed_states(&mut self) -> anyhow::Result<Vec<(usize, Vec<u8>)>> {
-        let mut snapshot = Vec::with_capacity(self.fixed_state_binding_range.len());
+    /// Ensure a device scratch buffer exists for every fixed-state binding,
+    /// sized to that binding's current byte length. Allocated once (state
+    /// shapes are fixed) via the binding's own execution provider, then reused.
+    /// Returns without allocating when there are no fixed-state bindings.
+    fn ensure_fixed_state_snapshot_scratch(&mut self) -> anyhow::Result<()> {
+        if self.fixed_state_snapshot_scratch.len() == self.fixed_state_binding_range.len() {
+            return Ok(());
+        }
+        // 256-byte alignment matches CUDA's native allocation granularity and is
+        // a power of two as `allocate` requires; the copy correctness does not
+        // depend on the base alignment, only on the byte length.
+        const SCRATCH_ALIGN: usize = 256;
+        let mut scratch = Vec::with_capacity(self.fixed_state_binding_range.len());
         for index in self.fixed_state_binding_range.clone() {
-            let binding = &mut self.bindings[index];
+            let binding = &self.bindings[index];
             let bytes = checked_shape_bytes(binding.physical_shape(), binding.dtype)
                 .with_context(|| {
                     format!(
-                        "fixed CUDA decoder state snapshot size overflow for binding {index} shape {:?}",
+                        "fixed CUDA decoder state scratch size overflow for binding {index} shape {:?}",
                         binding.physical_shape()
                     )
                 })?;
-            let host = binding
-                .read_bytes_range(0, bytes)
-                .with_context(|| format!("read device recurrent/conv state for binding {index}"))?;
-            snapshot.push((index, host));
+            let buffer = binding
+                .allocator()
+                .allocate(bytes.max(1), SCRATCH_ALIGN)
+                .with_context(|| format!("allocate device snapshot scratch for binding {index}"))?;
+            scratch.push((index, buffer));
         }
-        Ok(snapshot)
+        self.fixed_state_snapshot_scratch = scratch;
+        Ok(())
     }
 
-    /// Write a [`Self::snapshot_fixed_states`] capture back into the device
-    /// recurrent/conv bindings. Restoring bytes leaves every binding's shape
-    /// unchanged, so this never invalidates a captured decode graph.
-    pub(crate) fn restore_fixed_states(
-        &mut self,
-        snapshot: &[(usize, Vec<u8>)],
-    ) -> anyhow::Result<()> {
-        for (index, host) in snapshot {
-            let binding = self.bindings.get_mut(*index).with_context(|| {
-                format!("recurrent snapshot names out-of-range fixed-state binding {index}")
+    /// Device-resident analogue of [`Self::snapshot_fixed_states`]: stage every
+    /// fixed recurrent/conv binding into its device scratch buffer with a
+    /// stream-ordered device→device copy, avoiding the PCIe round-trip through
+    /// host memory. The snapshot is ordered on the EP stream ahead of the verify
+    /// forward that overwrites the state, so no host synchronization is needed.
+    /// Paired with [`Self::restore_fixed_states_device`].
+    pub(crate) fn snapshot_fixed_states_device(&mut self) -> anyhow::Result<()> {
+        self.ensure_fixed_state_snapshot_scratch()?;
+        for slot in 0..self.fixed_state_snapshot_scratch.len() {
+            let (index, ref mut scratch) = self.fixed_state_snapshot_scratch[slot];
+            let binding = &self.bindings[index];
+            let bytes = checked_shape_bytes(binding.physical_shape(), binding.dtype)
+                .with_context(|| {
+                    format!(
+                        "fixed CUDA decoder state device snapshot size overflow for binding {index} shape {:?}",
+                        binding.physical_shape()
+                    )
+                })?;
+            binding
+                .snapshot_device_into(scratch, bytes)
+                .with_context(|| {
+                    format!("device snapshot of recurrent/conv state for binding {index}")
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Restore a [`Self::snapshot_fixed_states_device`] capture back into the
+    /// device recurrent/conv bindings with a stream-ordered device→device copy.
+    /// Leaves every binding's shape unchanged, so it never invalidates a
+    /// captured decode graph.
+    pub(crate) fn restore_fixed_states_device(&mut self) -> anyhow::Result<()> {
+        if self.fixed_state_snapshot_scratch.len() != self.fixed_state_binding_range.len() {
+            bail!(
+                "device recurrent restore requested before a matching device snapshot (have {} scratch buffers, need {})",
+                self.fixed_state_snapshot_scratch.len(),
+                self.fixed_state_binding_range.len()
+            );
+        }
+        for slot in 0..self.fixed_state_snapshot_scratch.len() {
+            let (index, ref scratch) = self.fixed_state_snapshot_scratch[slot];
+            let binding = self.bindings.get_mut(index).with_context(|| {
+                format!("recurrent device snapshot names out-of-range fixed-state binding {index}")
             })?;
             let bytes = checked_shape_bytes(binding.physical_shape(), binding.dtype)
                 .with_context(|| {
                     format!(
-                        "fixed CUDA decoder state restore size overflow for binding {index} shape {:?}",
+                        "fixed CUDA decoder state device restore size overflow for binding {index} shape {:?}",
                         binding.physical_shape()
                     )
                 })?;
-            if host.len() != bytes {
-                bail!(
-                    "recurrent snapshot for binding {index} has {} bytes but the binding needs {bytes}",
-                    host.len()
-                );
-            }
-            binding.write_bytes(0, host).with_context(|| {
-                format!("restore device recurrent/conv state for binding {index}")
-            })?;
+            binding
+                .restore_device_from(scratch, bytes)
+                .with_context(|| {
+                    format!("device restore of recurrent/conv state for binding {index}")
+                })?;
         }
         Ok(())
     }

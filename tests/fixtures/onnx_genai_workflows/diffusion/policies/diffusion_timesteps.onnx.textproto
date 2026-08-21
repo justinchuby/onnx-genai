@@ -1,0 +1,61 @@
+ir_version: 11
+producer_name: "mobius"
+graph {
+  node {
+    output: "schedule"
+    name: "Constant_node_0"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 30
+        data_type: 1
+        name: "schedule"
+        raw_data: "\000\300yDO#qD\237\206hD\356\351_D>MWD\215\260ND\335\023FD,w=D|\3324D\313=,D\032\241#Dj\004\033D\271g\022D\t\313\tDX.\001DO#\361C\356\351\337C\215\260\316C,w\275C\313=\254Cj\004\233C\t\313\211CO#qC\215\260NC\313=,C\t\313\tC\215\260\316B\t\313\211B\t\313\tB\000\000\000\000"
+      }
+      type: TENSOR
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  name: "diffusion_schedule"
+  output {
+    name: "schedule"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 30
+          }
+        }
+      }
+    }
+  }
+  metadata_props {
+    key: "mobius.generation.policy_contract"
+    value: "{}"
+  }
+  metadata_props {
+    key: "mobius.generation.policy_contract_id"
+    value: "mobius.policy.auxiliary@1"
+  }
+  metadata_props {
+    key: "mobius.generation.policy_effects"
+    value: "[]"
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}

@@ -1,0 +1,320 @@
+# Cosmos3 Edge world-model step: observation + action + persistent latent world state.
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      capabilities:
+      - workflow_ssa
+      - typed_emit
+      - serving_service_contract
+      - session_state_lease
+      - nested_control_flow
+    inputs:
+      request.active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: active
+        required: true
+      request.done:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: done
+        required: true
+      request.accepted_len:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: accepted_len
+        required: true
+      request.observation:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 3
+          - height
+          - width
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: request.observation
+        required: true
+      request.action:
+        contract:
+          dtype: float32
+          rank: 2
+          shape:
+          - batch
+          - action_dim
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: request.action
+        required: true
+      request.world_state:
+        contract:
+          dtype: float32
+          rank: 2
+          shape:
+          - batch
+          - latent_dim
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: world_state
+        required: true
+      request.max_iterations:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: runtime
+          version: '1.0'
+          role: max_iterations
+        source:
+          kind: request
+        required: false
+        default: 8
+      package.continue:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: true
+    outputs:
+      predicted_observation:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 3
+          - height
+          - width
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
+      latent:
+        contract:
+          dtype: float32
+          rank: 2
+          shape:
+          - batch
+          - latent_dim
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
+    components:
+      model:
+        implementation:
+          kind: onnx
+          artifact: cosmos3-edge/world_step.onnx.textproto
+        ports:
+          inputs:
+            world_state:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - latent_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            observation:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - 3
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            action:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - action_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            next_world_state:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - latent_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            predicted_observation:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - 3
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            latent:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - latent_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+    state:
+      world_state:
+        contract:
+          dtype: float32
+          rank: 2
+          shape:
+          - batch
+          - latent_dim
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: session
+        initializer: request.world_state
+        recurrence:
+          kind: invariant
+        management: runtime
+        release_boundary: session
+        service_group: world_state
+      predicted_observation:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 3
+          - height
+          - width
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: request.observation
+        recurrence:
+          kind: invariant
+      latent:
+        contract:
+          dtype: float32
+          rank: 2
+          shape:
+          - batch
+          - latent_dim
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: request.world_state
+        recurrence:
+          kind: invariant
+    steps:
+    - kind: loop
+      steps:
+      - kind: invoke
+        component: model
+        inputs:
+          world_state: world_state
+          observation: request.observation
+          action: request.action
+        outputs:
+          next_world_state: body.world_state
+          predicted_observation: body.predicted_observation
+          latent: body.latent
+      continue_when: package.continue
+      max_iterations: request.max_iterations
+      carried:
+      - cell: world_state
+        next: body.world_state
+      - cell: predicted_observation
+        next: body.predicted_observation
+      - cell: latent
+        next: body.latent
+    - kind: emit
+      value: predicted_observation
+      output: predicted_observation
+      mode: replace
+    - kind: emit
+      value: latent
+      output: latent
+      mode: replace
+    serving:
+      active: request.active
+      done: request.done
+      accepted_len: request.accepted_len
+      state_service:
+        groups:
+          world_state:
+            kind: recurrent
+            layout: bd
+            update:
+              kind: replace
+            ports:
+              model:
+                world_state:
+                  input: world_state
+                  output: next_world_state

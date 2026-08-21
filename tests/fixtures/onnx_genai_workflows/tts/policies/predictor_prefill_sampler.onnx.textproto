@@ -1,0 +1,78 @@
+ir_version: 11
+producer_name: "mobius"
+graph {
+  node {
+    input: "logits"
+    output: "token"
+    name: "ArgMax_node_0"
+    op_type: "ArgMax"
+    attribute {
+      name: "keepdims"
+      i: 0
+      type: INT
+    }
+    attribute {
+      name: "axis"
+      i: -1
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  name: "greedy_sampler"
+  input {
+    name: "logits"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "vocabulary"
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "token"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  metadata_props {
+    key: "mobius.generation.policy_contract"
+    value: "{\"role\": \"token_sampler\", \"mode\": \"greedy\", \"logits\": \"logits\", \"token\": \"token\", \"effect\": \"predictor_prefill_sample\"}"
+  }
+  metadata_props {
+    key: "mobius.generation.policy_contract_id"
+    value: "onnx-genai.token-sampler@1"
+  }
+  metadata_props {
+    key: "mobius.generation.policy_effects"
+    value: "[]"
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}

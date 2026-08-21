@@ -200,7 +200,7 @@ impl Kernel for GatherKernel {
         let num_indices = num_indices as i32;
         let inner = inner as i32;
         let index_is_i64 = i32::from(indices.dtype == DataType::Int64);
-        let capture_error = if capturing {
+        let capture_error = if capturing || self.runtime.eager_sync_deferred() {
             self.runtime.capture_error_ptr()
         } else {
             0

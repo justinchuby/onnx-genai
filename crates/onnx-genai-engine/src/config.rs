@@ -2,9 +2,12 @@
 
 use crate::logits::{StopSequence, TokenId};
 use onnx_genai_kv::{CachePriority, DEFAULT_CHUNK_SIZE, KvDType, LocalTieredConfig, SequenceId};
+use onnx_genai_metadata::{GenerationContract, GenerationDefaults};
+// The sidecar-descriptor mapping is native-only; an ORT-only build imports none
+// of these.
+#[cfg(feature = "native-backend")]
 use onnx_genai_metadata::{
-    GenerationDefaults, MtpHiddenLayout as MetadataMtpHiddenLayout, MtpKvMode as MetadataMtpKvMode,
-    MtpProposerSpec,
+    MtpHiddenLayout as MetadataMtpHiddenLayout, MtpKvMode as MetadataMtpKvMode, MtpProposerSpec,
 };
 use onnx_genai_ort::{Eagle3DraftKvMode, MtpDraftKvMode};
 use onnx_genai_scheduler::{Priority, ResourceLimit, ResourceLimits, SchedulerConfig};
@@ -286,8 +289,18 @@ impl ResolvedMtpConfig {
         }
     }
 
-    /// Resolve metadata-only MTP settings without expanding the stable public
-    /// hand-authored [`MtpConfig`] surface.
+    /// Resolve sidecar-discovered MTP settings without expanding the stable
+    /// public hand-authored [`MtpConfig`] surface.
+    ///
+    /// Everything except the vocabulary comes from the sidecar's own
+    /// declaration; the vocabulary belongs to the *target* (the head borrows the
+    /// target's LM-head initializer), so the caller supplies it from the
+    /// package's declared model capabilities.
+    ///
+    /// Only the native decode path resolves a sidecar proposer, so this stays
+    /// gated with its single consumer rather than sitting dead in an ORT-only
+    /// build.
+    #[cfg(feature = "native-backend")]
     pub(crate) fn from_sidecar_descriptor(spec: &MtpProposerSpec, vocab_size: usize) -> Self {
         let public_config = MtpConfig {
             head_model: spec.model.clone(),
@@ -312,7 +325,7 @@ impl ResolvedMtpConfig {
             hc_mult: spec.hc_mult,
             mtp_hidden_output: spec.mtp_hidden_output.clone(),
             // A head that threads a recurrent state declares its output name; a
-            // pure-attention (proposal-local) head declares none. The metadata
+            // pure-attention (proposal-local) head declares none. The sidecar
             // schema keeps this optional, so honor exactly what was declared
             // rather than inventing a phantom "mtp_state" output the head does
             // not expose (which would make `MtpDecodeSession` reject it).
@@ -1366,6 +1379,97 @@ impl GenerateOptions {
             self.greedy = true;
         }
     }
+
+    /// Resolve sampling controls against a package's generation *contract*.
+    ///
+    /// The contract's defaults are authoritative. A caller may override only the
+    /// fields the package structurally exposes as request-sourced workflow
+    /// inputs, within the bounds those inputs declare. Every other override is
+    /// rejected here rather than silently dropped: a request that asks for a
+    /// temperature the package never wired to an input would otherwise decode at
+    /// the package default while the caller believed their value took effect.
+    ///
+    /// A package with no generation contract at all has no declared override
+    /// surface, so this behaves exactly like
+    /// [`Self::resolve_sampling_defaults`] with no declared defaults — callers
+    /// keep the runtime fallbacks, and nothing is silently discarded.
+    pub fn resolve_generation_contract(
+        &mut self,
+        contract: Option<&GenerationContract>,
+        overrides: &SamplingOverrides,
+    ) -> anyhow::Result<()> {
+        if let Some(contract) = contract {
+            for (field, requested) in requested_overrides(overrides) {
+                let Some(declared) = contract.overrides.get(field) else {
+                    anyhow::bail!(
+                        "generation override '{field}' is not supported by this package. \
+                         Why: a package may only be overridden through fields it declares as \
+                         request-sourced workflow inputs, and this one declares {}. How to fix: \
+                         drop the override, or re-export the package with a workflow input for \
+                         '{field}' listed under generation.overrides",
+                        describe_supported(contract)
+                    );
+                };
+                if let (Some(value), Some(constraint)) = (requested, &declared.constraint)
+                    && (constraint.minimum.is_some_and(|minimum| value < minimum)
+                        || constraint.maximum.is_some_and(|maximum| value > maximum))
+                {
+                    anyhow::bail!(
+                        "generation override '{field}' = {value} is outside the range this \
+                             package declares ({}..={}). Why: the request-sourced workflow input \
+                             '{}' declares bounds the runtime enforces before execution. How to \
+                             fix: choose a value inside the declared range",
+                        constraint
+                            .minimum
+                            .map_or_else(|| "-inf".to_owned(), |bound| bound.to_string()),
+                        constraint
+                            .maximum
+                            .map_or_else(|| "+inf".to_owned(), |bound| bound.to_string()),
+                        declared.input,
+                    );
+                }
+            }
+        }
+        self.resolve_sampling_defaults(
+            contract.and_then(|contract| contract.defaults.as_ref()),
+            overrides,
+        );
+        Ok(())
+    }
+}
+
+/// The generation fields a caller actually asked to override, with the numeric
+/// value when the field has one (`do_sample` is a flag, so it has none).
+fn requested_overrides(overrides: &SamplingOverrides) -> Vec<(&'static str, Option<f64>)> {
+    let mut requested = Vec::new();
+    if overrides.greedy.is_some() {
+        requested.push(("do_sample", None));
+    }
+    if let Some(temperature) = overrides.temperature {
+        requested.push(("temperature", Some(f64::from(temperature))));
+    }
+    if let Some(top_p) = overrides.top_p {
+        requested.push(("top_p", Some(f64::from(top_p))));
+    }
+    if let Some(top_k) = overrides.top_k {
+        requested.push(("top_k", Some(top_k as f64)));
+    }
+    requested
+}
+
+fn describe_supported(contract: &GenerationContract) -> String {
+    if contract.overrides.is_empty() {
+        return "no overridable fields".to_owned();
+    }
+    format!(
+        "only {}",
+        contract
+            .overrides
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 /// Built-in constrained decoding grammars.
@@ -1575,47 +1679,39 @@ pub(crate) fn validate_shared_kv_proposer_config(
 #[cfg(test)]
 mod mtp_config_tests {
     use super::*;
-    use onnx_genai_metadata::{
-        InferenceMetadata, SpeculatorProposerStatus, resolve_speculator_config,
-    };
-    use std::path::Path;
 
+    /// A discovered sidecar spec must survive the hop into the engine's
+    /// resolved config without losing a declared fact.
+    ///
+    /// The native loader no longer reads a metadata speculation block, so this
+    /// mapping is the only place the sidecar's own declarations become
+    /// executable settings: a silent drop here (a layout, an optional state
+    /// output, or the KV lifetime) would surface much later as a head that
+    /// refuses to run.
+    #[cfg(feature = "native-backend")]
     #[test]
-    fn mobius_sidecar_metadata_builds_complete_mtp_config() {
-        let metadata: InferenceMetadata = serde_yaml::from_str(
-            r#"
-speculative:
-  proposal_type: mtp
-  model: mtp/model.onnx
-  num_speculative_tokens: 4
-  target_hidden_output: hidden_states
-  target_hidden_layout: BSHC
-  target_hidden_size: 4096
-  hc_mult: 4
-  mtp_hidden_output: mtp_hidden
-  mtp_state_output: mtp_state
-  kv_mode: proposal_local
-  embedding:
-    source: target_initializer
-    name: model.embed_tokens.weight
-  lm_head:
-    source: target_initializer
-    name: lm_head.weight
-"#,
-        )
-        .expect("metadata parses");
-        let descriptor = resolve_speculator_config(
-            Path::new("/models/deepseek-v4"),
-            metadata.speculative.expect("speculative descriptor"),
-        );
-        let SpeculatorProposerStatus::Mtp(spec) = descriptor.proposer else {
-            panic!("MTP descriptor did not resolve");
+    fn a_discovered_sidecar_maps_onto_the_resolved_config_intact() {
+        let spec = MtpProposerSpec {
+            model: "/models/target/mtp/model.onnx".into(),
+            num_speculative_tokens: 4,
+            target_hidden_output: "hidden_states".into(),
+            target_hidden_layout: MetadataMtpHiddenLayout::Bshc,
+            target_hidden_size: 4096,
+            hc_mult: 4,
+            mtp_hidden_output: "mtp_hidden".into(),
+            mtp_state_output: Some("mtp_state".into()),
+            kv_mode: MetadataMtpKvMode::ProposalLocal,
+            embedding_initializer: "model.embed_tokens.weight".into(),
+            lm_head_initializer: "lm_head.weight".into(),
         };
+
+        // The vocabulary is the target's, not the sidecar's, so it arrives from
+        // the caller rather than from the spec.
         let config = ResolvedMtpConfig::from_sidecar_descriptor(&spec, 129_280);
 
         assert_eq!(
             config.public_config.head_model,
-            Path::new("/models/deepseek-v4/mtp/model.onnx")
+            std::path::Path::new("/models/target/mtp/model.onnx")
         );
         assert_eq!(config.public_config.target_hidden_output, "hidden_states");
         assert_eq!(config.target_hidden_layout, MtpHiddenLayout::Bshc);
@@ -1632,77 +1728,64 @@ speculative:
         assert_eq!(config.hc_mult, 4);
         assert_eq!(config.mtp_hidden_output, "mtp_hidden");
         assert_eq!(config.mtp_state_output.as_deref(), Some("mtp_state"));
-        assert_eq!(config.public_config.kv_mode, MtpDraftKvMode::GrowCache);
-        assert_eq!(config.cache_scope, MtpCacheScope::ProposalLocal);
         assert_eq!(config.public_config.num_speculative_tokens, 4);
+        assert_eq!(config.cache_scope, MtpCacheScope::ProposalLocal);
         validate_resolved_mtp_config(&config).expect("resolved config validates");
     }
 
+    /// A pure-attention (proposal-local) head declares no recurrent state
+    /// output. The `None` has to stay `None`: inventing a phantom `mtp_state`
+    /// name would make the decode session demand an output the head does not
+    /// expose.
+    #[cfg(feature = "native-backend")]
     #[test]
-    fn proposal_local_head_without_declared_state_output_stays_none() {
-        // A pure-attention (proposal-local) MTP head — like the real
-        // Qwen3.8 int4 artifact — declares no `mtp_state_output`. The optional
-        // field must resolve to `None` rather than a phantom "mtp_state" name
-        // that `MtpDecodeSession` would then require the head to expose.
-        let metadata: InferenceMetadata = serde_yaml::from_str(
-            r#"
-speculative:
-  proposal_type: mtp
-  model: mtp/model.onnx
-  num_speculative_tokens: 1
-  target_hidden_output: hidden_states.63
-  target_hidden_layout: BSH
-  target_hidden_size: 5120
-  hc_mult: 1
-  mtp_hidden_output: mtp_hidden
-  kv_mode: proposal_local
-  embedding:
-    source: target_initializer
-    name: model.embed_tokens.weight
-  lm_head:
-    source: target_initializer
-    name: lm_head.weight
-"#,
-        )
-        .expect("metadata parses");
-        let descriptor = resolve_speculator_config(
-            Path::new("/models/qwen38-mtp"),
-            metadata.speculative.expect("speculative descriptor"),
-        );
-        let SpeculatorProposerStatus::Mtp(spec) = descriptor.proposer else {
-            panic!("MTP descriptor did not resolve");
+    fn a_head_that_threads_no_state_keeps_its_absent_state_output() {
+        let spec = MtpProposerSpec {
+            model: "/models/target/mtp/model.onnx".into(),
+            num_speculative_tokens: 1,
+            target_hidden_output: "hidden_states.63".into(),
+            target_hidden_layout: MetadataMtpHiddenLayout::Bsh,
+            target_hidden_size: 5120,
+            hc_mult: 1,
+            mtp_hidden_output: "mtp_hidden".into(),
+            mtp_state_output: None,
+            kv_mode: MetadataMtpKvMode::ProposalLocal,
+            embedding_initializer: "model.embed_tokens.weight".into(),
+            lm_head_initializer: "lm_head.weight".into(),
         };
-        assert_eq!(spec.mtp_state_output, None);
+
         let config = ResolvedMtpConfig::from_sidecar_descriptor(&spec, 248_320);
+
         assert_eq!(config.mtp_state_output, None);
+        assert_eq!(config.target_hidden_layout, MtpHiddenLayout::Bsh);
         assert_eq!(config.hc_mult, 1);
         assert_eq!(config.cache_scope, MtpCacheScope::ProposalLocal);
         validate_resolved_mtp_config(&config).expect("resolved config validates");
     }
 
+    /// `accepted_prefix` is declarable but not executable, so the lifetime must
+    /// arrive intact at the loader that rejects it rather than being flattened
+    /// into the proposal-local default here.
+    #[cfg(feature = "native-backend")]
     #[test]
-    fn malformed_mtp_metadata_is_rejected_before_config_construction() {
-        let metadata: InferenceMetadata = serde_yaml::from_str(
-            r#"
-speculative:
-  proposal_type: mtp
-  model: mtp/model.onnx
-  target_hidden_size: 4096
-  hc_mult: 4
-  embedding:
-    source: target_initializer
-    name: model.embed_tokens.weight
-"#,
-        )
-        .expect("metadata syntax parses");
-        let descriptor = resolve_speculator_config(
-            Path::new("/models/deepseek-v4"),
-            metadata.speculative.expect("speculative descriptor"),
-        );
-        assert_eq!(
-            descriptor.proposer,
-            SpeculatorProposerStatus::Unknown("mtp metadata is missing `lm_head`".into())
-        );
+    fn an_accepted_prefix_lifetime_reaches_the_loader_that_refuses_it() {
+        let spec = MtpProposerSpec {
+            model: "/models/target/mtp/model.onnx".into(),
+            num_speculative_tokens: 2,
+            target_hidden_output: "hidden_states".into(),
+            target_hidden_layout: MetadataMtpHiddenLayout::Bsh,
+            target_hidden_size: 2048,
+            hc_mult: 1,
+            mtp_hidden_output: "mtp_hidden".into(),
+            mtp_state_output: None,
+            kv_mode: MetadataMtpKvMode::AcceptedPrefix,
+            embedding_initializer: "model.embed_tokens.weight".into(),
+            lm_head_initializer: "lm_head.weight".into(),
+        };
+
+        let config = ResolvedMtpConfig::from_sidecar_descriptor(&spec, 1_024);
+
+        assert_eq!(config.cache_scope, MtpCacheScope::AcceptedPrefix);
     }
 
     #[test]
@@ -2022,5 +2105,111 @@ mod sampling_defaults_tests {
             &SamplingOverrides::default(),
         );
         assert!(options.greedy, "model do_sample=false must select greedy");
+    }
+}
+
+#[cfg(test)]
+mod generation_contract_tests {
+    use super::*;
+    use onnx_genai_metadata::{GenerationOverride, GenerationOverrideConstraint};
+
+    fn contract() -> GenerationContract {
+        GenerationContract {
+            defaults: Some(GenerationDefaults {
+                do_sample: Some(true),
+                temperature: Some(0.6),
+                ..GenerationDefaults::default()
+            }),
+            overrides: [(
+                "temperature".to_owned(),
+                GenerationOverride {
+                    input: "request.temperature".to_owned(),
+                    constraint: Some(GenerationOverrideConstraint {
+                        minimum: Some(0.0),
+                        maximum: Some(2.0),
+                    }),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    #[test]
+    fn a_declared_override_within_its_declared_bounds_is_applied() {
+        let mut options = GenerateOptions::default();
+        options
+            .resolve_generation_contract(
+                Some(&contract()),
+                &SamplingOverrides {
+                    temperature: Some(1.25),
+                    ..SamplingOverrides::default()
+                },
+            )
+            .expect("declared override");
+        assert_eq!(options.temperature, 1.25);
+        assert!(!options.greedy);
+    }
+
+    #[test]
+    fn an_undeclared_override_fails_loudly_instead_of_being_dropped() {
+        let mut options = GenerateOptions::default();
+        let error = options
+            .resolve_generation_contract(
+                Some(&contract()),
+                &SamplingOverrides {
+                    top_k: Some(40),
+                    ..SamplingOverrides::default()
+                },
+            )
+            .expect_err("top_k is not wired to a request input");
+        let message = error.to_string();
+        assert!(message.contains("top_k"), "{message}");
+        assert!(message.contains("only temperature"), "{message}");
+    }
+
+    #[test]
+    fn an_override_outside_its_declared_range_fails_loudly() {
+        let mut options = GenerateOptions::default();
+        let error = options
+            .resolve_generation_contract(
+                Some(&contract()),
+                &SamplingOverrides {
+                    temperature: Some(9.0),
+                    ..SamplingOverrides::default()
+                },
+            )
+            .expect_err("9.0 exceeds the declared maximum");
+        let message = error.to_string();
+        assert!(message.contains("request.temperature"), "{message}");
+        assert!(message.contains("0..=2"), "{message}");
+    }
+
+    #[test]
+    fn package_defaults_are_authoritative_when_the_caller_is_silent() {
+        let mut options = GenerateOptions::default();
+        options
+            .resolve_generation_contract(Some(&contract()), &SamplingOverrides::default())
+            .expect("no override requested");
+        assert_eq!(options.temperature, 0.6);
+        assert!(
+            !options.greedy,
+            "declared do_sample: true must win over the runtime fallback"
+        );
+    }
+
+    #[test]
+    fn a_package_without_a_contract_keeps_the_runtime_fallbacks() {
+        let mut options = GenerateOptions::default();
+        options
+            .resolve_generation_contract(
+                None,
+                &SamplingOverrides {
+                    temperature: Some(0.9),
+                    ..SamplingOverrides::default()
+                },
+            )
+            .expect("no contract to violate");
+        assert_eq!(options.temperature, 0.9);
     }
 }

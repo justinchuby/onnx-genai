@@ -284,27 +284,6 @@ impl EngineResourceGovernor {
         )
     }
 
-    pub(crate) fn new_for_shared_pipeline_kv(
-        limits: ResourceLimits,
-        allow_runtime_override: bool,
-        kv_config: ModelKvConfig,
-        existing_device_usage_bytes: u64,
-        cuda_device_index: Option<u32>,
-        provider: Option<&SharedMemoryAuthorityProvider>,
-        domain: &DeviceCompatibilityDomain,
-    ) -> Result<Self, ResourceError> {
-        let capacities = capacity_providers_for_device(&limits, cuda_device_index);
-        Self::new_with_capacities_and_authority(
-            limits,
-            allow_runtime_override,
-            capacities,
-            kv_config,
-            (existing_device_usage_bytes, 0),
-            provider,
-            Some(domain),
-        )
-    }
-
     fn new_with_capacities_and_authority(
         limits: ResourceLimits,
         allow_runtime_override: bool,
@@ -1149,7 +1128,7 @@ mod tests {
     /// so it now probes instead. The assertion is written against the probe
     /// rather than against a fixed device so that it is meaningful on both a GPU
     /// box and a CPU-only one.
-    #[cfg(feature = "native-cuda")]
+    #[cfg(all(feature = "native-backend", feature = "native-cuda"))]
     #[test]
     fn an_undeclared_device_probes_for_an_accelerator_instead_of_assuming_the_cpu() {
         use crate::native_decode::NativeDecodeDevice;

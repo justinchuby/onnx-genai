@@ -275,32 +275,6 @@ fn native_workspace_query_rows(
     prompt_rows.max(verify_rows)
 }
 
-fn metadata_eos_token_ids(metadata: &InferenceMetadata) -> Vec<TokenId> {
-    metadata
-        .tokens
-        .as_ref()
-        .and_then(|tokens| tokens.eos_token_id.as_ref())
-        .into_iter()
-        .flatten()
-        .filter_map(|&id| TokenId::try_from(id).ok())
-        .collect()
-}
-
-#[cfg(test)]
-mod eos_tests {
-    use super::*;
-
-    #[test]
-    fn metadata_eos_token_ids_preserves_multiple_valid_ids() {
-        let metadata: InferenceMetadata = serde_json::from_value(serde_json::json!({
-            "tokens": { "eos_token_id": [151645, -1, 4294967296_u64, 151643] }
-        }))
-        .unwrap();
-
-        assert_eq!(metadata_eos_token_ids(&metadata), vec![151645, 151643]);
-    }
-}
-
 impl Engine {
     fn admit_generate_request_with_scheduler(
         &mut self,
@@ -345,13 +319,7 @@ impl Engine {
     }
 
     fn default_eos_token_ids(&self) -> Vec<TokenId> {
-        let mut ids = metadata_eos_token_ids(&self.metadata);
-        for id in self.tokenizer.eos_token_ids() {
-            if !ids.contains(&id) {
-                ids.push(id);
-            }
-        }
-        ids
+        self.tokenizer.eos_token_ids()
     }
 
     fn apply_eos_defaults(&self, options: &mut GenerateOptions) {
@@ -1376,11 +1344,7 @@ impl Engine {
             .as_deref()
             .context("ORT decoder session is unavailable")?;
         // Bind ports from explicit metadata or unambiguous tensor shapes.
-        let io = self
-            .metadata
-            .model
-            .as_ref()
-            .and_then(|model| model.io.as_ref());
+        let io = self.metadata.decoder_io();
         let fixed_state_budget_bytes = self.governor.snapshot().resolved_limits.host_ram_bytes;
         if matches!(
             &self.speculative_mode,
@@ -1547,7 +1511,7 @@ impl Engine {
                 max_len,
                 ..
             } => max_len,
-            ModelDecodePath::PastPresent { .. } | ModelDecodePath::Legacy => None,
+            ModelDecodePath::PastPresent { .. } | ModelDecodePath::Generic => None,
         }
     }
 
@@ -1912,11 +1876,7 @@ impl Engine {
         let Some(session) = self.session.as_deref() else {
             return false;
         };
-        let io = self
-            .metadata
-            .model
-            .as_ref()
-            .and_then(|model| model.io.as_ref());
+        let io = self.metadata.decoder_io();
         ort_session_has_recurrent_state(session, io)
     }
 
@@ -2492,7 +2452,7 @@ mod tests {
             prefix_cache: PrefixCache::new(),
             token_prefix_cache: Vec::new(),
             kv_model: None,
-            decode_path: ModelDecodePath::Legacy,
+            decode_path: ModelDecodePath::Generic,
             scheduler: Scheduler::with_byte_budget(
                 scheduler_config,
                 onnx_genai_scheduler::ByteBudget::new(10),

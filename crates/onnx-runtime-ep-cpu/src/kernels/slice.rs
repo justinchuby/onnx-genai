@@ -227,7 +227,12 @@ impl Kernel for SliceKernel {
     /// stride), an empty (zero-count) axis, or any parameter read failure. This
     /// is decided purely from `elem_size` and integer inputs — no dtype, vendor,
     /// or model special-casing (RULES §2/§4).
-    fn view_outputs(&self, inputs: &[TensorView], num_outputs: usize) -> Option<Vec<ViewOutput>> {
+    fn view_outputs(
+        &self,
+        inputs: &[TensorView],
+        _output_shapes: &[Vec<usize>],
+        num_outputs: usize,
+    ) -> Option<Vec<ViewOutput>> {
         if num_outputs != 1 || inputs.len() < 3 {
             return None;
         }
@@ -519,7 +524,11 @@ mod tests {
         let ends = Owned::i64(&[1], &[3]);
         let axes = Owned::i64(&[1], &[0]);
         let vo = SliceKernel
-            .view_outputs(&[data.view(), starts.view(), ends.view(), axes.view()], 1)
+            .view_outputs(
+                &[data.view(), starts.view(), ends.view(), axes.view()],
+                &[],
+                1,
+            )
             .expect("pure sub-view should be a view output");
         assert_eq!(vo.len(), 1);
         assert_eq!(vo[0].input_index, 0);
@@ -545,6 +554,7 @@ mod tests {
                     axes.view(),
                     steps.view(),
                 ],
+                &[],
                 1,
             )
             .unwrap();
@@ -571,6 +581,7 @@ mod tests {
                     axes.view(),
                     steps.view(),
                 ],
+                &[],
                 1,
             )
             .unwrap();
@@ -588,7 +599,7 @@ mod tests {
         let ends = Owned::i64(&[1], &[2]);
         assert!(
             SliceKernel
-                .view_outputs(&[data.view(), starts.view(), ends.view()], 1)
+                .view_outputs(&[data.view(), starts.view(), ends.view()], &[], 1)
                 .is_none()
         );
     }
@@ -606,6 +617,7 @@ mod tests {
         let vo = SliceKernel
             .view_outputs(
                 &[strided.view(), starts.view(), ends.view(), axes.view()],
+                &[],
                 1,
             )
             .unwrap();

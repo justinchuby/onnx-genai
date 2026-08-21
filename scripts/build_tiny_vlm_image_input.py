@@ -93,18 +93,11 @@ pipeline:
         strategy:
           kind: single_pass
           model: encoder
-        run_on: prompt_only
       - name: decode_text
         strategy:
           kind: autoregressive
           decoder: decoder
           max_tokens: 4
-        run_on: every_step
-  phases:
-    encoder:
-      run_on: prompt_only
-    decoder:
-      run_on: every_step
   vision:
     image_placeholder_token_id: 3
     image_token_id: 4

@@ -785,3 +785,473 @@ mod segmenter_tests {
         assert!(error.to_string().contains("zero samples"), "{error}");
     }
 }
+
+/// Scalar payload of a preprocessing tensor produced by an audio program.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AudioTensorData {
+    /// Floating-point payload (features, waveforms).
+    Fp32(Vec<f32>),
+    /// Integer payload (valid frame or sample counts).
+    Int64(Vec<i64>),
+}
+
+/// One named tensor produced by an audio preprocessing program.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NamedAudioTensor {
+    /// Workflow SSA value this tensor binds to.
+    pub name: String,
+    /// Tensor shape, batch-leading.
+    pub shape: Vec<i64>,
+    /// Tensor payload.
+    pub data: AudioTensorData,
+}
+
+#[derive(Clone, Debug)]
+struct AudioProgramOutput {
+    name: String,
+    content: String,
+}
+
+/// An executable audio preprocessing program resolved from package metadata.
+///
+/// The program is data, not a model-family branch: the transform list says which
+/// sampling rate to resample to, how long the fixed analysis window is, and what
+/// the log-mel filterbank looks like. Everything the runtime needs to turn
+/// encoded bytes into an encoder feature tensor comes from that declaration.
+#[derive(Debug)]
+pub struct AudioProgram {
+    sample_rate: u32,
+    target_length: Option<usize>,
+    hop_length: usize,
+    extractor: LogMelExtractor,
+    outputs: Vec<AudioProgramOutput>,
+}
+
+impl AudioProgram {
+    /// Resolves an executable program from its typed metadata declaration.
+    pub fn from_program(
+        program: &onnx_genai_metadata::AudioPreprocessingProgram,
+    ) -> Result<Self, AudioPreprocessError> {
+        let mut sample_rate: Option<u32> = None;
+        let mut target_length: Option<usize> = None;
+        let mut num_mel_bins: Option<usize> = None;
+        let mut hop_length = WHISPER_HOP_LENGTH;
+        let mut produced: Vec<String> = Vec::new();
+        let mut decoded = false;
+        let mut mel_produced = false;
+        for transform in &program.transforms {
+            match transform.op.as_str() {
+                "decode" => decoded = true,
+                "resample" => {
+                    sample_rate = Some(transform.sample_rate.ok_or_else(|| {
+                        AudioPreprocessError::InvalidConfig(
+                            "audio 'resample' transform requires sample_rate".to_owned(),
+                        )
+                    })?);
+                }
+                "pad" | "trim" => {
+                    target_length = Some(transform.target_length.ok_or_else(|| {
+                        AudioPreprocessError::InvalidConfig(format!(
+                            "audio '{}' transform requires target_length",
+                            transform.op
+                        ))
+                    })?);
+                    if transform.pad_value.unwrap_or(0.0) != 0.0 {
+                        return Err(AudioPreprocessError::InvalidConfig(
+                            "audio padding only supports silence (pad_value 0)".to_owned(),
+                        ));
+                    }
+                }
+                "log_mel" => {
+                    if !decoded {
+                        return Err(AudioPreprocessError::InvalidConfig(
+                            "audio preprocessing must decode before computing a spectrogram"
+                                .to_owned(),
+                        ));
+                    }
+                    let n_fft = transform.n_fft.unwrap_or(WHISPER_N_FFT);
+                    if n_fft != WHISPER_N_FFT {
+                        return Err(AudioPreprocessError::InvalidConfig(format!(
+                            "unsupported log-mel n_fft {n_fft}; this runtime implements {WHISPER_N_FFT}"
+                        )));
+                    }
+                    hop_length = transform.hop_length.unwrap_or(WHISPER_HOP_LENGTH);
+                    if hop_length != WHISPER_HOP_LENGTH {
+                        return Err(AudioPreprocessError::InvalidConfig(format!(
+                            "unsupported log-mel hop_length {hop_length}; this runtime \
+                             implements {WHISPER_HOP_LENGTH}"
+                        )));
+                    }
+                    if let Some(window) = &transform.window
+                        && window != "hann"
+                    {
+                        return Err(AudioPreprocessError::InvalidConfig(format!(
+                            "unsupported analysis window '{window}'; this runtime implements hann"
+                        )));
+                    }
+                    if let Some(scale) = &transform.mel_scale
+                        && scale != "slaney"
+                    {
+                        return Err(AudioPreprocessError::InvalidConfig(format!(
+                            "unsupported mel scale '{scale}'; this runtime implements slaney"
+                        )));
+                    }
+                    num_mel_bins = Some(transform.num_mel_bins.ok_or_else(|| {
+                        AudioPreprocessError::InvalidConfig(
+                            "audio 'log_mel' transform requires num_mel_bins".to_owned(),
+                        )
+                    })?);
+                    if let Some(rate) = transform.sample_rate {
+                        sample_rate = Some(rate);
+                    }
+                    mel_produced = true;
+                }
+                "normalize" => {
+                    let mode = transform.mode.as_deref().unwrap_or("whisper_log_mel");
+                    if mode != "whisper_log_mel" {
+                        return Err(AudioPreprocessError::InvalidConfig(format!(
+                            "unsupported audio normalization mode '{mode}'"
+                        )));
+                    }
+                    if !mel_produced {
+                        return Err(AudioPreprocessError::InvalidConfig(
+                            "log-mel normalization requires a preceding spectrogram".to_owned(),
+                        ));
+                    }
+                }
+                "emit_valid_frames" | "emit_valid_samples" | "spectrogram" => {}
+                other => {
+                    return Err(AudioPreprocessError::InvalidConfig(format!(
+                        "unsupported audio transform '{other}'"
+                    )));
+                }
+            }
+            if let Some(names) = &transform.outputs {
+                produced.extend(names.iter().cloned());
+            }
+        }
+        if !decoded {
+            return Err(AudioPreprocessError::InvalidConfig(
+                "audio preprocessing must declare a decode transform".to_owned(),
+            ));
+        }
+        let num_mel_bins = num_mel_bins.ok_or_else(|| {
+            AudioPreprocessError::InvalidConfig(
+                "audio preprocessing must declare a log_mel transform".to_owned(),
+            )
+        })?;
+        let sample_rate = sample_rate.unwrap_or(WHISPER_SAMPLE_RATE);
+        let mut outputs = Vec::with_capacity(program.outputs.len());
+        for binding in &program.outputs {
+            if !produced.iter().any(|name| name == &binding.source) {
+                return Err(AudioPreprocessError::InvalidConfig(format!(
+                    "audio output '{}' has no transform producing '{}'",
+                    binding.name, binding.source
+                )));
+            }
+            outputs.push(AudioProgramOutput {
+                name: binding.name.clone(),
+                content: binding.content.clone(),
+            });
+        }
+        Ok(Self {
+            sample_rate,
+            target_length,
+            hop_length,
+            extractor: LogMelExtractor::new(num_mel_bins, sample_rate)?,
+            outputs,
+        })
+    }
+
+    /// Runs the program over a batch of encoded clips, one row per clip.
+    ///
+    /// Every row shares the declared analysis window, so a short clip is padded
+    /// with silence and reports fewer valid frames than the padded row length.
+    /// That keeps the encoder input rectangular while leaving each request's
+    /// true duration recoverable and request-aligned.
+    pub fn run(&self, encoded: &[&[u8]]) -> Result<Vec<NamedAudioTensor>, AudioPreprocessError> {
+        if encoded.is_empty() {
+            return Err(AudioPreprocessError::InvalidConfig(
+                "audio preprocessing requires at least one clip".to_owned(),
+            ));
+        }
+        let mut decoded = Vec::with_capacity(encoded.len());
+        for bytes in encoded {
+            let audio = decode_wav_pcm16(bytes)?;
+            let mut samples = resample(&audio.samples, audio.sample_rate, self.sample_rate)?;
+            let valid_samples = samples.len();
+            if let Some(target) = self.target_length {
+                // resize both pads a short clip with silence and trims a long one.
+                samples.resize(target, 0.0);
+            }
+            decoded.push((samples, valid_samples));
+        }
+        let frames = decoded
+            .iter()
+            .map(|(samples, _)| samples.len() / self.hop_length)
+            .max()
+            .unwrap_or(0);
+        if decoded.len() > 1
+            && decoded
+                .iter()
+                .any(|(samples, _)| samples.len() / self.hop_length != frames)
+        {
+            return Err(AudioPreprocessError::InvalidConfig(
+                "batched audio preprocessing requires a declared fixed analysis window".to_owned(),
+            ));
+        }
+        let n_mels = self.extractor.n_mels;
+        let mut features = Vec::with_capacity(decoded.len() * n_mels * frames);
+        let mut valid_frames = Vec::with_capacity(decoded.len());
+        let mut waveform = Vec::new();
+        for (samples, valid_samples) in &decoded {
+            let mel = self.extractor.extract_resampled(samples);
+            features.extend_from_slice(&mel.data);
+            valid_frames.push(i64::try_from(
+                (valid_samples.div_ceil(self.hop_length)).min(frames),
+            )?);
+            waveform.extend_from_slice(samples);
+        }
+        let batch = i64::try_from(decoded.len())?;
+        let mut tensors = Vec::with_capacity(self.outputs.len());
+        for output in &self.outputs {
+            let tensor = match output.content.as_str() {
+                "audio_features" => NamedAudioTensor {
+                    name: output.name.clone(),
+                    shape: vec![batch, i64::try_from(n_mels)?, i64::try_from(frames)?],
+                    data: AudioTensorData::Fp32(features.clone()),
+                },
+                "valid_frames" => NamedAudioTensor {
+                    name: output.name.clone(),
+                    shape: vec![batch],
+                    data: AudioTensorData::Int64(valid_frames.clone()),
+                },
+                "valid_samples" => NamedAudioTensor {
+                    name: output.name.clone(),
+                    shape: vec![batch],
+                    data: AudioTensorData::Int64(
+                        decoded
+                            .iter()
+                            .map(|(_, valid)| i64::try_from(*valid))
+                            .collect::<Result<Vec<_>, _>>()?,
+                    ),
+                },
+                "waveform" => NamedAudioTensor {
+                    name: output.name.clone(),
+                    shape: vec![batch, i64::try_from(waveform.len() / decoded.len())?],
+                    data: AudioTensorData::Fp32(waveform.clone()),
+                },
+                other => {
+                    return Err(AudioPreprocessError::InvalidConfig(format!(
+                        "unsupported audio output content '{other}'"
+                    )));
+                }
+            };
+            tensors.push(tensor);
+        }
+        Ok(tensors)
+    }
+}
+
+impl From<std::num::TryFromIntError> for AudioPreprocessError {
+    fn from(error: std::num::TryFromIntError) -> Self {
+        Self::InvalidConfig(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod audio_program_tests {
+    use super::*;
+
+    /// A whisper-shaped program with a one-second analysis window.
+    ///
+    /// The window is deliberately short so a test can pad and trim around it
+    /// without synthesizing 30 seconds of audio.
+    const PROGRAM: &str = "
+transforms:
+  - op: decode
+    outputs: [samples]
+  - op: resample
+    inputs: [samples]
+    outputs: [resampled]
+    sample_rate: 16000
+  - op: pad
+    inputs: [resampled]
+    outputs: [windowed]
+    mode: fixed_window
+    target_length: 16000
+    pad_value: 0.0
+  - op: log_mel
+    inputs: [windowed]
+    outputs: [mel]
+    num_mel_bins: 80
+    n_fft: 400
+    hop_length: 160
+    window: hann
+    mel_scale: slaney
+    sample_rate: 16000
+  - op: normalize
+    inputs: [mel]
+    outputs: [features]
+    mode: whisper_log_mel
+  - op: emit_valid_frames
+    inputs: [windowed]
+    outputs: [valid_frames]
+outputs:
+  - source: features
+    name: audio.input_features
+    content: audio_features
+    dtype: float32
+  - source: valid_frames
+    name: audio.valid_frames
+    content: valid_frames
+    dtype: int64
+";
+
+    fn program(text: &str) -> Result<AudioProgram, AudioPreprocessError> {
+        let declared: onnx_genai_metadata::AudioPreprocessingProgram =
+            serde_yaml::from_str(text).expect("the test program must deserialize");
+        AudioProgram::from_program(&declared)
+    }
+
+    fn clip(seconds: f32) -> Vec<u8> {
+        let count = (WHISPER_SAMPLE_RATE as f32 * seconds) as usize;
+        let samples = (0..count)
+            .map(|index| (2.0 * PI * 440.0 * index as f32 / WHISPER_SAMPLE_RATE as f32).sin() * 0.5)
+            .collect::<Vec<_>>();
+        encode_wav_pcm16(&samples, WHISPER_SAMPLE_RATE, 1).expect("wav encoding must succeed")
+    }
+
+    fn features_of(tensors: &[NamedAudioTensor]) -> (&[i64], &[f32]) {
+        let tensor = tensors
+            .iter()
+            .find(|tensor| tensor.name == "audio.input_features")
+            .expect("the program declares a feature output");
+        match &tensor.data {
+            AudioTensorData::Fp32(data) => (&tensor.shape, data),
+            other => panic!("features must be fp32, got {other:?}"),
+        }
+    }
+
+    fn valid_frames_of(tensors: &[NamedAudioTensor]) -> &[i64] {
+        let tensor = tensors
+            .iter()
+            .find(|tensor| tensor.name == "audio.valid_frames")
+            .expect("the program declares a validity output");
+        match &tensor.data {
+            AudioTensorData::Int64(data) => data,
+            other => panic!("valid frames must be int64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_short_clip_is_padded_to_the_declared_window() {
+        let tensors = program(PROGRAM).unwrap().run(&[&clip(0.25)]).unwrap();
+
+        let (shape, data) = features_of(&tensors);
+        // The window, not the clip, sets the row length: 16000 / 160 = 100 frames.
+        assert_eq!(shape, [1, 80, 100]);
+        assert_eq!(data.len(), 80 * 100);
+        assert!(data.iter().all(|value| value.is_finite()));
+        // The true duration stays recoverable: 0.25 s is 25 hops of the window.
+        assert_eq!(valid_frames_of(&tensors), [25]);
+    }
+
+    #[test]
+    fn a_long_clip_is_trimmed_to_the_declared_window() {
+        let tensors = program(PROGRAM).unwrap().run(&[&clip(2.0)]).unwrap();
+
+        let (shape, _) = features_of(&tensors);
+        assert_eq!(shape, [1, 80, 100]);
+        // Validity saturates at the window; it never claims frames that were trimmed.
+        assert_eq!(valid_frames_of(&tensors), [100]);
+    }
+
+    #[test]
+    fn batched_rows_match_their_standalone_runs() {
+        let short = clip(0.25);
+        let long = clip(0.75);
+        let resolved = program(PROGRAM).unwrap();
+
+        let batched = resolved.run(&[&short, &long]).unwrap();
+        let alone_short = resolved.run(&[&short]).unwrap();
+        let alone_long = resolved.run(&[&long]).unwrap();
+
+        let (shape, data) = features_of(&batched);
+        assert_eq!(shape, [2, 80, 100]);
+        // Row order is request order, so encoder states stay aligned with the
+        // decoder rows that consume them.
+        let row = 80 * 100;
+        assert_eq!(&data[..row], features_of(&alone_short).1);
+        assert_eq!(&data[row..], features_of(&alone_long).1);
+        assert_eq!(valid_frames_of(&batched), [25, 75]);
+    }
+
+    #[test]
+    fn batching_without_a_declared_window_is_rejected() {
+        let text = PROGRAM.replace(
+            "  - op: pad\n    inputs: [resampled]\n    outputs: [windowed]\n    mode: \
+             fixed_window\n    target_length: 16000\n    pad_value: 0.0\n",
+            "",
+        );
+        let text = text.replace("inputs: [windowed]", "inputs: [resampled]");
+        let resolved = program(&text).unwrap();
+
+        // One clip per call is still fine without a window.
+        assert!(resolved.run(&[&clip(0.25)]).is_ok());
+
+        let error = resolved
+            .run(&[&clip(0.25), &clip(0.75)])
+            .expect_err("ragged rows cannot form a rectangular feature tensor");
+        assert!(
+            error.to_string().contains("fixed analysis window"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_unsupported_hop_length_is_rejected() {
+        let text = PROGRAM.replace("hop_length: 160", "hop_length: 128");
+
+        let error = program(&text).expect_err("the runtime must not silently retune the STFT");
+
+        assert!(error.to_string().contains("hop_length"), "{error}");
+    }
+
+    #[test]
+    fn an_unsupported_mel_scale_is_rejected() {
+        let text = PROGRAM.replace("mel_scale: slaney", "mel_scale: htk");
+
+        let error = program(&text).expect_err("an unimplemented mel scale must fail closed");
+
+        assert!(error.to_string().contains("mel scale"), "{error}");
+    }
+
+    #[test]
+    fn a_program_without_decode_is_rejected() {
+        let text = PROGRAM.replace("  - op: decode\n    outputs: [samples]\n", "");
+
+        let error = program(&text).expect_err("encoded bytes must be decoded first");
+
+        assert!(error.to_string().contains("decode"), "{error}");
+    }
+
+    #[test]
+    fn an_output_with_no_producing_transform_is_rejected() {
+        let text = PROGRAM.replace("source: valid_frames", "source: never_produced");
+
+        let error = program(&text).expect_err("dangling output sources must fail closed");
+
+        assert!(error.to_string().contains("never_produced"), "{error}");
+    }
+
+    #[test]
+    fn an_empty_batch_is_rejected() {
+        let error = program(PROGRAM)
+            .unwrap()
+            .run(&[])
+            .expect_err("an empty submission has no rows to align");
+
+        assert!(error.to_string().contains("at least one clip"), "{error}");
+    }
+}

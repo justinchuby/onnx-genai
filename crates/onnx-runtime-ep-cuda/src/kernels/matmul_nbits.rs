@@ -329,6 +329,22 @@ const GEMM_F16_TILE: usize = 16;
 /// #1261 via `ONNX_GENAI_DECODE_GEMV_LOOP_MAX_M` rather than trusting this number
 /// on a different GPU.
 const DECODE_GEMV_LOOP_MAX_M_DEFAULT: usize = 8;
+/// The decode GEMVs load activation chunks as `uint4` (8 fp16 values). The base
+/// allocation is aligned, so every per-row sub-view remains 16-byte aligned only
+/// when the row stride `K * sizeof(fp16)` is a multiple of 16 bytes.
+const GEMV_F16_ACTIVATION_VECTOR_ELEMENTS: usize = 8;
+
+fn decode_gemv_loop_rows_aligned(k: usize) -> bool {
+    k.is_multiple_of(GEMV_F16_ACTIVATION_VECTOR_ELEMENTS)
+}
+
+fn marlin_weight_inputs_are_constant(constant_inputs: &[bool], gate_up_swiglu: bool) -> bool {
+    if gate_up_swiglu {
+        constant_inputs.get(1) == Some(&true) && constant_inputs.get(3) == Some(&true)
+    } else {
+        constant_inputs.get(1) == Some(&true)
+    }
+}
 
 /// Resolve the looped-decode-GEMV batch bound, honoring the
 /// `ONNX_GENAI_DECODE_GEMV_LOOP_MAX_M` override (read once per process). Setting
@@ -6733,6 +6749,7 @@ impl KernelFactory for MatMulNBitsFactory {
             block_size,
             accuracy_level,
             accuracy4_workspace,
+            constant_inputs: [false; 8],
             fold_bias_post_round: node
                 .attr(crate::optimizer::MATMUL_NBITS_FOLDED_BIAS_ATTR)
                 .and_then(onnx_runtime_ir::Attribute::as_int)
@@ -6951,6 +6968,9 @@ pub struct MatMulNBitsKernel {
     block_size: usize,
     accuracy_level: i64,
     accuracy4_workspace: Option<Mutex<Accuracy4Workspace>>,
+    /// Session-lifetime graph constants. Marlin's repack cache is keyed by the
+    /// source device pointer, so only immutable weights may enter that cache.
+    constant_inputs: [bool; 8],
     /// Set when this node's bias input came from folding a standalone `Add`
     /// (see [`crate::optimizer::MATMUL_NBITS_FOLDED_BIAS_ATTR`]). The fp16 GEMV
     /// then reproduces the two-op `fp16(fp16(acc) + bias)` rounding.
@@ -6980,6 +7000,10 @@ pub struct MatMulNBitsKernel {
 }
 
 impl MatMulNBitsKernel {
+    fn marlin_weight_inputs_constant(&self) -> bool {
+        marlin_weight_inputs_are_constant(&self.constant_inputs, self.gate_up_swiglu)
+    }
+
     fn run(
         &self,
         inputs: &[TensorView],
@@ -7800,7 +7824,11 @@ impl MatMulNBitsKernel {
             // sync-free, so the batch decode graph captures and replays it.
             // Streaming: the resident weight is read M times from VRAM, not
             // re-streamed, so the weight-offload HtoD 1/N amortization is intact.
-            if m <= decode_gemv_loop_max_m() && !self.gate_up_swiglu && !self.decomposed_silu {
+            if m <= decode_gemv_loop_max_m()
+                && decode_gemv_loop_rows_aligned(self.k)
+                && !self.gate_up_swiglu
+                && !self.decomposed_silu
+            {
                 onnx_runtime_ep_api::record_kernel_variant!(
                     "gemv_f16_batched_loop",
                     "M={} small-batch decode: {} single-row decode GEMV launches (one per row), \
@@ -7927,15 +7955,19 @@ impl MatMulNBitsKernel {
                 }
             }
             // Opt-in Marlin int4 tensor-core GEMM for the M>1 path. Gated on
-            // SM80+, int4, no g_idx (checked above), no fused SwiGLU/RMSNorm
-            // epilogue yet, and `ONNX_GENAI_MARLIN_M_GT_1`. On any ineligibility
-            // or runtime error it falls through to the byte-identical portable
-            // tiled GEMM below (Rule 11 fallback contract).
+            // SM80+, int4, immutable initializer weights, no g_idx (checked
+            // above), no fused SwiGLU/RMSNorm epilogue yet, and
+            // `ONNX_GENAI_MARLIN_M_GT_1`. Runtime weights cannot use Marlin:
+            // its pointer-keyed repack cache is valid only for session-lifetime
+            // constants. On any ineligibility or runtime error it falls through
+            // to the byte-identical portable tiled GEMM below (Rule 11 fallback
+            // contract).
             if marlin_gemm::marlin_m_gt_1_enabled()
                 && self.bits == 4
                 && !self.gate_up_swiglu
                 && !self.decomposed_silu
                 && !self.rmsnorm_prologue
+                && self.marlin_weight_inputs_constant()
                 && marlin_gemm::device_supports_marlin(
                     self.runtime.capabilities().compute_capability(),
                 )
@@ -7992,6 +8024,7 @@ impl MatMulNBitsKernel {
                     && self.bits == 4
                     && !self.gate_up_swiglu
                     && !self.decomposed_silu
+                    && self.marlin_weight_inputs_constant()
                     && marlin_gemm::device_supports_marlin(
                         self.runtime.capabilities().compute_capability(),
                     )
@@ -8215,8 +8248,9 @@ impl MatMulNBitsKernel {
     ///
     /// Eligibility (SM80, int4, no fused SwiGLU/RMSNorm epilogue, opt-in flag)
     /// is checked by the caller; here we validate the numeric shape contract
-    /// (`K` divisible by 16 and by the group size) and ensure the weights are
-    /// repacked into the tensor-core layout exactly once.
+    /// (`K` divisible by 16 and by the group size). The caller also requires B
+    /// to be an immutable graph constant before this pointer-keyed cache is
+    /// entered, then the weight is repacked into the tensor-core layout once.
     #[allow(clippy::too_many_arguments)]
     fn try_launch_marlin_gemm(
         &self,
@@ -9163,6 +9197,7 @@ impl MatMulNBitsKernel {
             // more than 1 ULP. It stays on the prefill/Marlin path (advertised
             // capture-unsafe at M>1) pending a decision on that bound in #1334.
             if m <= decode_gemv_loop_max_m()
+                && decode_gemv_loop_rows_aligned(self.k)
                 && let Some(gamma) = gamma
             {
                 onnx_runtime_ep_api::record_kernel_variant!(
@@ -9271,6 +9306,7 @@ impl MatMulNBitsKernel {
             // tiled gate/up prefill on ineligibility or launch error.
             if marlin_gemm::marlin_m_gt_1_enabled()
                 && self.bits == 4
+                && self.marlin_weight_inputs_constant()
                 && marlin_gemm::device_supports_marlin(
                     self.runtime.capabilities().compute_capability(),
                 )
@@ -11084,6 +11120,12 @@ impl MatMulNBitsKernel {
 }
 
 impl Kernel for MatMulNBitsKernel {
+    fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
+        for (index, is_constant) in self.constant_inputs.iter_mut().enumerate() {
+            *is_constant = constant_inputs.get(index).copied().unwrap_or(false);
+        }
+    }
+
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         self.run(inputs, outputs, None)
     }
@@ -11221,6 +11263,18 @@ mod tests {
     use onnx_runtime_ir::{DataType, DeviceId};
 
     use super::*;
+
+    #[test]
+    fn marlin_repack_requires_constant_weight_inputs() {
+        let mut constant_inputs = [false; 8];
+        assert!(!marlin_weight_inputs_are_constant(&constant_inputs, false));
+        constant_inputs[1] = true;
+        assert!(marlin_weight_inputs_are_constant(&constant_inputs, false));
+
+        assert!(!marlin_weight_inputs_are_constant(&constant_inputs, true));
+        constant_inputs[3] = true;
+        assert!(marlin_weight_inputs_are_constant(&constant_inputs, true));
+    }
 
     /// Guards the `ONNX_GENAI_INTERLEAVE_DEQUANT` / `ONNX_GENAI_GEMV_PIPELINE`
     /// levers, which the interleaved-dequant byte-identity test flips by writing
@@ -11492,6 +11546,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -11737,6 +11792,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -11984,6 +12040,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: true,
             decomposed_silu: decomposed,
@@ -12384,6 +12441,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -12582,6 +12640,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -12916,7 +12975,9 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             return;
         }
 
-        let m = 8usize;
+        // M=16 is the first height above the default looped-GEMV boundary, so
+        // this exercises the Marlin dispatch rather than the M<=8 decode loop.
+        let m = 16usize;
         let k = 4096usize;
         let n = 70usize;
         let block_size = 128usize;
@@ -13066,6 +13127,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -13504,6 +13566,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -14226,6 +14289,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -14379,6 +14443,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 block_size,
                 accuracy_level: 4,
                 accuracy4_workspace: None,
+                constant_inputs: [true; 8],
                 fold_bias_post_round: false,
                 gate_up_swiglu: false,
                 decomposed_silu: false,
@@ -14974,6 +15039,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 block_size,
                 accuracy_level: 4,
                 accuracy4_workspace: None,
+                constant_inputs: [true; 8],
                 fold_bias_post_round: false,
                 gate_up_swiglu: false,
                 decomposed_silu: false,
@@ -15248,6 +15314,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 block_size,
                 accuracy_level: 4,
                 accuracy4_workspace: None,
+                constant_inputs: [true; 8],
                 fold_bias_post_round: false,
                 gate_up_swiglu: true,
                 decomposed_silu: false,
@@ -15924,6 +15991,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -16184,6 +16252,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -16455,6 +16524,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -16472,6 +16542,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            constant_inputs: [true; 8],
             fold_bias_post_round: true,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -16732,6 +16803,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 block_size,
                 accuracy_level: 4,
                 accuracy4_workspace: None,
+                constant_inputs: [true; 8],
                 fold_bias_post_round: false,
                 gate_up_swiglu: false,
                 decomposed_silu: false,
@@ -17120,6 +17192,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -17607,6 +17680,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -17624,6 +17698,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: true,
             decomposed_silu: false,
@@ -18181,6 +18256,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 block_size,
                 accuracy_level: 4,
                 accuracy4_workspace: None,
+                constant_inputs: [true; 8],
                 fold_bias_post_round: false,
                 gate_up_swiglu: true,
                 decomposed_silu: false,
@@ -18198,6 +18274,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 block_size,
                 accuracy_level: 4,
                 accuracy4_workspace: None,
+                constant_inputs: [true; 8],
                 fold_bias_post_round: false,
                 gate_up_swiglu: true,
                 decomposed_silu: false,
@@ -18557,6 +18634,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                             block_size,
                             accuracy_level: 4,
                             accuracy4_workspace: None,
+                            constant_inputs: [true; 8],
                             fold_bias_post_round: false,
                             gate_up_swiglu: true,
                             decomposed_silu: decomposed,
@@ -19012,6 +19090,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 block_size,
                 accuracy_level: 4,
                 accuracy4_workspace: None,
+                constant_inputs: [true; 8],
                 fold_bias_post_round: fold,
                 gate_up_swiglu: false,
                 decomposed_silu: false,
@@ -19377,6 +19456,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             block_size,
             accuracy_level: 0,
             accuracy4_workspace: None,
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -19623,6 +19703,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             block_size,
             accuracy_level: 0,
             accuracy4_workspace: None,
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -19886,6 +19967,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             block_size,
             accuracy_level: 0,
             accuracy4_workspace: None,
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -20338,6 +20420,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                     block_size: BLOCK,
                     accuracy_level: 4,
                     accuracy4_workspace: None,
+                    constant_inputs: [true; 8],
                     fold_bias_post_round: false,
                     gate_up_swiglu: false,
                     decomposed_silu: false,

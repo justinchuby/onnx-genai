@@ -93,6 +93,7 @@ default-members = [
     "crates/onnx-genai-preprocess",
     "crates/onnx-genai-metadata",
     "crates/onnx-genai-genai-config",
+    "crates/onnx-genai-comfyui-config",
     "crates/onnx-genai-runtime-config",
     "crates/onnx-genai-kv",
     "crates/onnx-genai-scheduler",
@@ -263,6 +264,7 @@ async-trait = "0.1"
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
 serde_yaml = "0.9"
 schemars = "1.2"
 tracing = "0.1"

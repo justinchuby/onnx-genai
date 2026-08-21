@@ -1,5 +1,5 @@
 # Decisions — live standing directives
-Last consolidated: 2026-08-20T13-46-00+0000 (Scribe q38 #1569 merge/next-round batch: 5 inbox drops processed; detailed narrative archived to .squad/decisions-archive/2026-08.md; pre-check live size 38009 bytes.)
+Last consolidated: 2026-08-21T17:45:29Z (Scribe MTP/q38 consolidation: 20 inbox drops processed; full details archived to .squad/decisions-archive/2026-08.md; pre-check live size 11226 bytes.)
 
 
 Standing governance rules and active directives. Full narrative is archived; keep this file to current decisions plus durable rules.
@@ -110,3 +110,33 @@ Detailed pre-existing 2026-08-19 narrative remains in `.squad/decisions-archive/
 **By:** Deckard; consolidated by Scribe
 **What:** `CudaLinearAttentionGatingFusion` now absorbs exported `Neg(Exp(A_log))` decay chains for Qwen3.8 Gated-DeltaNet by passing raw `A_log` and computing `-round_store<T>(expf(A_log))` inline when dtype/topology guards pass. The fold fires for q38 bf16 and refuses when the graph runs decay in f32/f16, preserving correctness.
 **Why:** Recovers tiny decode-step launch fragments across the 48-layer stack and landed in PR #1569 after independent validation.
+
+### 2026-08-21: q38 MTP current status — correct but throughput-negative at draft_width=2
+
+**By:** Coordinator, Gaff, Deckard, Sebastian, Roy; consolidated by Scribe
+**What:** Qwen3.8 MTP is now an end-to-end engineering path rather than an export mystery: Roy recovered the Mobius MTP sidecar and corrected metadata schema drift; Gaff landed native MTP/runtime infrastructure through recurrent-state commit, int4 draft LM-head, verify graph slots, and recurrent correctness validation; Sebastian established the current greedy baseline; Deckard ruled out the batched-verify GEMV kernel lever. The measured MTP path is currently **34.3 tok/s** versus greedy around **56 tok/s** in the latest campaign measurements, so MTP is correct/usable for investigation but not a speedup.
+**Why:** Two measured NO-GOs define the current stop line: (1) base-decode fusion is throughput-negative because the base step produces about **0.87 tok/step** and is not redundant; (2) batched verify GEMV is a wash because verify/decode GEMV is latency/occupancy-bound at roughly **19%** of HBM roofline, not weight-bandwidth-bound. Per-step arithmetic (**79.6 ms / 2.67 tok/step**) leaves draft_width=2 with effectively zero headroom to beat greedy even with a perfect verify. Do not spend more time on GEMV→GEMM-cliff or base-fusion hypotheses without a new acceptance/step-cost regime.
+
+### 2026-08-21: MTP export and metadata contract settled
+
+**By:** Roy and Coordinator; consolidated by Scribe
+**What:** Mobius PR #529 recovers the Qwen3.8/Qwen35 MTP head automatically when source GGUF nextn tensors are present, emits `mtp/model.onnx`, shared target initializers, and `SpeculatorConfig` metadata, and fixes the text-only drop of `hidden_states.63`. A real q38 int4 MTP artifact was produced, then metadata drift was corrected from the old `speculator:`/`model_path`/`hidden_threaded` shape to the onnx-genai runtime schema: `speculative:`, `model`, `target_hidden_size`, `target_hidden_layout: BSH`, `hc_mult: 1`, `kv_mode: proposal_local`, and nested embedding/lm_head target-initializer records.
+**Why:** The authoritative consumer contract is `onnx-genai-metadata`; exporter metadata must round-trip through that schema so the runtime binds the sidecar instead of silently falling back to text-only decode. The MTP sidecar is additive and should be emitted iff the GGUF contains the head.
+
+### 2026-08-21: MTP runtime blocker sequence resolved to graph/step-cost, not recurrent correctness
+
+**By:** Gaff and Coordinator; consolidated by Scribe
+**What:** The MTP runtime sequence progressed through native proposer wiring, int4 shared draft LM-head, recurrent commit, second verify graph slot, per-slot executor state, and dedicated verify arena. The suspected recurrent-Scan continuity bug was disproven on the real q38 artifact: the graph has CausalConvWithState/LinearAttention custom ops rather than Scan, and MTP E2E can be token-identical to greedy. Graph-reuse work improved the path from recapture-heavy lows to **34.34 tok/s** with both slots replaying, but the remaining step cost is still too high.
+**Why:** Correctness is no longer the primary blocker; speed is. Future work must attack acceptance/step economics or non-matmul verify overhead, not recurrent rollback correctness or extra weight reuse inside MatMulNBits.
+
+### 2026-08-21: Current q38 baseline and MTP measurement caveat
+
+**By:** Sebastian; consolidated by Scribe
+**What:** On `origin/main` `481f700ee`, q38 int4 greedy decode measured **62.56 tok/s** median-of-5 on idle H200 with CUDA graph capture/replay healthy. The initially attempted MTP E2E on that exact commit was not runnable because native MTP wiring/hidden-output resizing was not yet present and ORT could not load the GDN custom ops; later Gaff runtime work unblocked real MTP runs but at lower throughput than greedy.
+**Why:** Use the freshest same-box greedy baseline when claiming MTP deltas, but do not conflate the early Stage-1 blocker with the later, slower-but-running MTP path.
+
+### 2026-08-21: QMoE all-fp16 CUDA loader blocker resolved
+
+**By:** Copilot; consolidated by Scribe
+**What:** The stale all-fp16 QMoE/fc1 loader blocker is resolved: native CUDA now runs all-fp16 fused QMoE, correcting the older mixed-precision blocker note. Full details are archived in `.squad/decisions-archive/2026-08.md` from `copilot-qmoe-fp16-router-probs-resolved.md`.
+**Why:** Remove the phantom blocker from future routing; QMoE fp16 investigation should proceed from current runtime behavior, not the obsolete loader-rejection premise.

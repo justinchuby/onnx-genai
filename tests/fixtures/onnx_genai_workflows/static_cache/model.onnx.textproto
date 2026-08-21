@@ -1,0 +1,480 @@
+ir_version: 11
+graph {
+  node {
+    input: "input_ids"
+    input: "one_1d"
+    output: "token"
+    op_type: "Squeeze"
+  }
+  node {
+    input: "embedding"
+    input: "token"
+    output: "key_update"
+    op_type: "Gather"
+    attribute {
+      name: "axis"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "key_update"
+    input: "key_update"
+    output: "value_update"
+    op_type: "Mul"
+  }
+  node {
+    input: "input_ids"
+    output: "ids_shape"
+    op_type: "Shape"
+    attribute {
+      name: "end"
+      i: 1
+      type: INT
+    }
+    attribute {
+      name: "start"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "ids_shape"
+    input: "zero_1d"
+    output: "batch_scalar"
+    op_type: "Squeeze"
+  }
+  node {
+    input: "scalar_zero"
+    input: "batch_scalar"
+    input: "scalar_one"
+    output: "rows"
+    op_type: "Range"
+  }
+  node {
+    input: "rows"
+    input: "one_1d"
+    output: "rows_2d"
+    op_type: "Unsqueeze"
+  }
+  node {
+    input: "write_indices"
+    input: "one_1d"
+    output: "writes_2d"
+    op_type: "Unsqueeze"
+  }
+  node {
+    input: "rows_2d"
+    input: "writes_2d"
+    output: "scatter_indices"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: 1
+      type: INT
+    }
+  }
+  node {
+    input: "key_cache"
+    input: "scatter_indices"
+    input: "key_update"
+    output: "updated_key_cache"
+    op_type: "ScatterND"
+  }
+  node {
+    input: "value_cache"
+    input: "scatter_indices"
+    input: "value_update"
+    output: "updated_value_cache"
+    op_type: "ScatterND"
+  }
+  node {
+    input: "key_cache"
+    output: "cap_shape"
+    op_type: "Shape"
+    attribute {
+      name: "end"
+      i: 2
+      type: INT
+    }
+    attribute {
+      name: "start"
+      i: 1
+      type: INT
+    }
+  }
+  node {
+    input: "cap_shape"
+    input: "zero_1d"
+    output: "capacity_scalar"
+    op_type: "Squeeze"
+  }
+  node {
+    input: "scalar_zero"
+    input: "capacity_scalar"
+    input: "scalar_one"
+    output: "slots"
+    op_type: "Range"
+  }
+  node {
+    input: "slots"
+    input: "zero_1d"
+    output: "slots_2d"
+    op_type: "Unsqueeze"
+  }
+  node {
+    input: "cache_lengths"
+    input: "one_1d"
+    output: "lengths_2d"
+    op_type: "Unsqueeze"
+  }
+  node {
+    input: "slots_2d"
+    input: "lengths_2d"
+    output: "valid"
+    op_type: "Less"
+  }
+  node {
+    input: "valid"
+    output: "valid_f32"
+    op_type: "Cast"
+    attribute {
+      name: "to"
+      i: 1
+      type: INT
+    }
+  }
+  node {
+    input: "valid_f32"
+    input: "two_1d"
+    output: "valid_mask"
+    op_type: "Unsqueeze"
+  }
+  node {
+    input: "updated_key_cache"
+    input: "valid_mask"
+    output: "masked_key"
+    op_type: "Mul"
+  }
+  node {
+    input: "updated_value_cache"
+    input: "valid_mask"
+    output: "masked_value"
+    op_type: "Mul"
+  }
+  node {
+    input: "masked_key"
+    input: "one_1d"
+    output: "pooled_key"
+    op_type: "ReduceSum"
+    attribute {
+      name: "keepdims"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "masked_value"
+    input: "one_1d"
+    output: "pooled_value"
+    op_type: "ReduceSum"
+    attribute {
+      name: "keepdims"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "pooled_key"
+    input: "pooled_value"
+    output: "pooled"
+    op_type: "Add"
+  }
+  node {
+    input: "pooled"
+    input: "projection"
+    output: "flat_logits"
+    op_type: "MatMul"
+  }
+  node {
+    input: "flat_logits"
+    input: "one_1d"
+    output: "logits"
+    op_type: "Unsqueeze"
+  }
+  name: "static_cache_decoder"
+  initializer {
+    dims: 8
+    dims: 4
+    data_type: 1
+    name: "embedding"
+    raw_data: "R\026\275>M\177\256>\310\335U>d7R>\"#T>\221\ti>\320%\354\275o\267\204>\201\020J?\314W\311>\010\0163=\344\260\213=\335\025\306\276qe\'=Z\253\327=hg\263>\237v\276\276\346\260<\277\207\221I?\000BI\277$M\346<\027N\247<s\351S?\343\016\200\276\374\013v?P\234\300\276\230\005\350\275\327\331\310\276&Z?\277A\361:=\376\300\250=Y`\333\276"
+  }
+  initializer {
+    dims: 4
+    dims: 8
+    data_type: 1
+    name: "projection"
+    raw_data: "?\301\255<\336w\263>N\336/? x\376\275\261\314\311>\367\205n;5\023\361<i\212\233\276zD\313>\251\237\355\276\274p\256=\023\027\376>\267\236\027\276\344\324}>\261E\241\276\216\215\213?8}\207>\006\303\324\276\r7k\276\204\007B\276?5\360\274\315\323\354\276^\273\033\274y\346\353=\007\323\330>\204D\272\275k*\201\275\342\352g\276v>\001?\320G\022\277\365\2664\277=\377|\277"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "zero_1d"
+    raw_data: "\000\000\000\000\000\000\000\000"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "one_1d"
+    raw_data: "\001\000\000\000\000\000\000\000"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "two_1d"
+    raw_data: "\002\000\000\000\000\000\000\000"
+  }
+  initializer {
+    data_type: 7
+    name: "scalar_zero"
+    raw_data: "\000\000\000\000\000\000\000\000"
+  }
+  initializer {
+    data_type: 7
+    name: "scalar_one"
+    raw_data: "\001\000\000\000\000\000\000\000"
+  }
+  input {
+    name: "input_ids"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "key_cache"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "cache_capacity"
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "value_cache"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "cache_capacity"
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "write_indices"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "cache_lengths"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "logits"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "updated_key_cache"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "cache_capacity"
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "updated_value_cache"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "cache_capacity"
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "embedding"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 8
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "projection"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "zero_1d"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "one_1d"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "two_1d"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "scalar_zero"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+        }
+      }
+    }
+  }
+  value_info {
+    name: "scalar_one"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}

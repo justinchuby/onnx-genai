@@ -24,18 +24,6 @@ pub(crate) struct ResolvedIo {
     pub(crate) kv_pairs: Vec<(String, String)>,
     /// Fixed loop-carried `(input, output)` pairs with replace semantics.
     pub(crate) state_pairs: Vec<(String, String)>,
-    /// Encoder-decoder cross-attention `(decoder_input, encoder_output)` pairs.
-    ///
-    /// The `input` is the decoder's `past_*_cross_%d` graph input; the `output`
-    /// names the ENCODER graph output (`present_*_cross_%d`) that produces the
-    /// value. The encoder runs once as a prompt-phase prologue and its cross-KV
-    /// outputs are STATIC for the whole decode: they encode the full audio/text
-    /// prompt and never grow or change across autoregressive steps, so the
-    /// pipeline binds them once and re-supplies the same tensors every step.
-    /// The output side is therefore intentionally NOT validated against the
-    /// decoder graph here (it is an encoder port, resolved from the shared pool
-    /// by the pipeline).
-    pub(crate) cross_kv_pairs: Vec<(String, String)>,
 }
 
 fn resolve_state_pairs(
@@ -172,50 +160,6 @@ fn resolve_state_pairs(
 /// Resolve encoder-decoder cross-attention KV bindings into
 /// `(decoder_input, encoder_output)` pairs.
 ///
-/// `inputs` are the decoder's `past_*_cross_%d` graph inputs and are validated
-/// against the decoder graph. `outputs` name the ENCODER graph outputs
-/// (`present_*_cross_%d`) that supply each value; they are deliberately NOT
-/// validated against the decoder graph here because they belong to a different
-/// component. The pipeline resolves them from the shared tensor pool after the
-/// encoder prologue and binds the resulting tensors as static decoder inputs on
-/// every step. Cross-KV is computed once from the whole prompt and never
-/// changes across decode steps, which is why it is carried separately from the
-/// growing self-attention `kv_pairs`.
-fn resolve_cross_kv_pairs(
-    session: &dyn GraphIo,
-    inputs: Option<&[String]>,
-    outputs: Option<&[String]>,
-) -> anyhow::Result<Vec<(String, String)>> {
-    match (inputs, outputs) {
-        (Some(inputs), Some(outputs)) => {
-            if inputs.len() != outputs.len() {
-                anyhow::bail!(
-                    "io.cross_kv_inputs ({}) and io.cross_kv_outputs ({}) must have equal length for positional pairing",
-                    inputs.len(),
-                    outputs.len()
-                );
-            }
-            for input in inputs {
-                if !session.inputs().iter().any(|info| info.name == *input) {
-                    anyhow::bail!(
-                        "io.cross_kv_inputs declares decoder input '{input}' but the graph does not expose it; graph inputs: {:?}",
-                        session.input_names()
-                    );
-                }
-            }
-            Ok(inputs
-                .iter()
-                .cloned()
-                .zip(outputs.iter().cloned())
-                .collect())
-        }
-        (None, None) => Ok(Vec::new()),
-        _ => anyhow::bail!(
-            "io.cross_kv_inputs and io.cross_kv_outputs must be declared together for positional pairing"
-        ),
-    }
-}
-
 fn resolve_position_program(
     session: &dyn GraphIo,
     io: &onnx_genai_metadata::ModelIoSpec,
@@ -359,16 +303,17 @@ impl ResolvedIo {
                     .map_err(anyhow::Error::msg)
                     .map(|resolved| resolved.map(|resolved| resolved.name))
             };
-        let token_input = input("model.io.token_input", is_rank_one_or_two_sequence)?;
-        let inputs_embeds_input = input("model.io.inputs_embeds_input", is_rank_three_sequence)?;
+        let token_input = input("token_input", is_rank_one_or_two_sequence)?;
+        let inputs_embeds_input = input("inputs_embeds_input", is_rank_three_sequence)?;
         if token_input.is_none() && inputs_embeds_input.is_none() {
             anyhow::bail!(
-                "cannot resolve the decoder sequence input from tensor shape; declare model.io.sequence_source and its exact model.io.token_input or model.io.inputs_embeds_input"
+                "cannot resolve token_input or inputs_embeds_input from tensor shape; declare the \
+                 port's role in pipeline.workflow.components.<component>.ports.roles"
             );
         }
         let logits_output =
-            output("model.io.logits_output", is_rank_one_to_three_output)?.with_context(|| {
-                "cannot resolve decoder logits from tensor shape; declare model.io.logits_output"
+            output("logits_output", is_rank_one_to_three_output)?.with_context(|| {
+                "cannot resolve logits_output from tensor shape; declare the port's role in pipeline.workflow.components.<component>.ports.roles"
             })?;
         if session.inputs().iter().any(|info| {
             matches!(
@@ -378,7 +323,7 @@ impl ResolvedIo {
                 && Some(info.name.as_str()) != inputs_embeds_input.as_deref()
         }) {
             anyhow::bail!(
-                "decoder exposes stateful floating-point inputs that cannot be paired unambiguously by shape; declare model.io.kv_inputs and model.io.kv_outputs (or model.io.state_pairs)"
+                "decoder exposes stateful floating-point inputs that cannot be paired unambiguously by shape; declare kv_inputs and kv_outputs (or state_pairs)"
             );
         }
         Ok(Self {
@@ -390,7 +335,6 @@ impl ResolvedIo {
             hidden_output: None,
             kv_pairs: Vec::new(),
             state_pairs: Vec::new(),
-            cross_kv_pairs: Vec::new(),
         })
     }
 
@@ -435,11 +379,11 @@ impl ResolvedIo {
                 Some(
                     resolve_input(
                         io.token_input.as_deref(),
-                        "model.io.token_input",
+                        "token_input",
                         is_rank_one_or_two_sequence,
                     )?
                     .context(
-                        "cannot resolve decoder token input from tensor shape; declare model.io.token_input",
+                        "cannot resolve decoder token input from tensor shape; declare token_input",
                     )?,
                 ),
                 io.inputs_embeds_input.clone(),
@@ -449,11 +393,11 @@ impl ResolvedIo {
                 Some(
                     resolve_input(
                         io.inputs_embeds_input.as_deref(),
-                        "model.io.inputs_embeds_input",
+                        "inputs_embeds_input",
                         is_rank_three_sequence,
                     )?
                     .context(
-                        "cannot resolve decoder embedding input from tensor shape; declare model.io.inputs_embeds_input",
+                        "cannot resolve decoder embedding input from tensor shape; declare inputs_embeds_input",
                     )?,
                 ),
             ),
@@ -473,7 +417,7 @@ impl ResolvedIo {
         let logits_output = resolve_port(
             session.outputs(),
             io.logits_output.as_deref(),
-            "model.io.logits_output",
+            "logits_output",
             |tensor| {
                 !occupied_outputs.contains(tensor.name.as_str())
                     && is_rank_one_to_three_output(tensor)
@@ -482,7 +426,7 @@ impl ResolvedIo {
         .map_err(anyhow::Error::msg)?
         .map(|port| port.name)
         .context(
-            "cannot resolve decoder logits from tensor shape; declare model.io.logits_output",
+            "cannot resolve logits_output from tensor shape; declare the port's role in pipeline.workflow.components.<component>.ports.roles",
         )?;
 
         for (label, port) in [
@@ -549,19 +493,6 @@ impl ResolvedIo {
                 "io.kv_inputs and io.kv_outputs must be declared together (positional KV pairing)"
             ),
         };
-        if let Some(update) = io.kv_update.as_deref()
-            && !matches!(update, "append" | "shared_buffer")
-        {
-            anyhow::bail!(
-                "io.kv_update declares unsupported update '{update}'; supported KV updates: append, shared_buffer"
-            );
-        }
-        let cross_kv_pairs = resolve_cross_kv_pairs(
-            session,
-            io.cross_kv_inputs.as_deref(),
-            io.cross_kv_outputs.as_deref(),
-        )?;
-
         let state_pairs = resolve_state_pairs(session, io.state_pairs.as_deref(), &kv_pairs)?;
         let position_ids_input = resolve_position_program(session, io, positions)?;
 
@@ -574,7 +505,6 @@ impl ResolvedIo {
             hidden_output: io.hidden_output.clone(),
             kv_pairs,
             state_pairs,
-            cross_kv_pairs,
         })
     }
 

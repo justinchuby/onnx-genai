@@ -1,0 +1,127 @@
+# Speculative decoding with separate proposer and verifier graph ABIs.
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      capabilities:
+      - workflow_ssa
+      - typed_emit
+    inputs:
+      request.input_ids:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - sequence
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: prompt_tokens
+        source:
+          kind: request
+        required: true
+    outputs:
+      tokens:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - accepted_sequence
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tokens
+        stage: pre_adapter
+    components:
+      proposer:
+        implementation:
+          kind: onnx
+          artifact: speculative/proposer.onnx.textproto
+        ports:
+          inputs:
+            input_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            draft_tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - proposal
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          roles:
+            input_ids: token_ids
+      verifier:
+        implementation:
+          kind: onnx
+          artifact: speculative/verifier.onnx.textproto
+        ports:
+          inputs:
+            prompt_tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            draft_tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - proposal
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            accepted_tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - accepted_sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+    state: {}
+    steps:
+    - kind: invoke
+      component: proposer
+      inputs:
+        input_ids: request.input_ids
+      outputs:
+        draft_tokens: draft.tokens
+    - kind: invoke
+      component: verifier
+      inputs:
+        prompt_tokens: request.input_ids
+        draft_tokens: draft.tokens
+      outputs:
+        accepted_tokens: verified.tokens
+    - kind: emit
+      value: verified.tokens
+      output: tokens
+      mode: replace
+speculative:
+  proposer: proposer
+  target: verifier
+  vocabulary:
+    kind: identical
+  max_proposal_width: 4
+  distribution_preserving: true

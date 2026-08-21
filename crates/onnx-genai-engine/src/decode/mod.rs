@@ -35,17 +35,20 @@ mod values;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use logits::{extract_logits_sequence_with_io, extract_next_token_logits_from_outputs};
+pub(crate) use logits::extract_logits_sequence_with_io;
+#[cfg(test)]
+pub(crate) use logits::extract_next_token_logits_from_outputs;
 #[cfg(feature = "native-backend")]
 pub(crate) use metadata::{KeySequenceLengthsPolicy, key_sequence_lengths_policy};
 pub(crate) use metadata::{
-    detect_model_decode_path, shared_kv_buffer_len_from_metadata, sink_tokens_from_metadata,
+    SharedKvOffer, detect_model_decode_path, graph_accepts_padded_past,
+    graph_uses_explicit_kv_length_attention, sink_tokens_from_metadata,
     sliding_window_from_metadata,
 };
 pub(crate) use state::DecodeState;
 #[cfg(feature = "native-backend")]
 pub(crate) use step::position_ids_from_starts;
-pub(crate) use step::{run_decode_session_logits, run_decode_step, run_decode_step_with_extra};
+pub(crate) use step::{run_decode_session_logits, run_decode_step};
 pub(crate) use token_sampling::{
     DraftProposalRequest, apply_paged_sliding_window, next_session_token_argmax,
     next_session_token_logits, next_session_token_logits_and_hidden,
@@ -58,6 +61,9 @@ use logits::{extract_logits_value_next, extract_logits_value_sequence};
 #[derive(Debug, Clone)]
 /// Model-I/O strategy used to construct the appropriate [`DecodeBackend`].
 pub(crate) enum ModelDecodePath {
+    /// Explicit generic static-cache execution. Metadata loading no longer
+    /// selects this path; callers must opt into the low-level static-cache API.
+    #[allow(dead_code)]
     StaticCache {
         max_len: usize,
     },
@@ -69,7 +75,7 @@ pub(crate) enum ModelDecodePath {
         /// alongside the sliding window. `None`/`0` disables sink retention.
         sink_tokens: Option<usize>,
     },
-    Legacy,
+    Generic,
 }
 
 impl ModelDecodePath {
@@ -115,7 +121,7 @@ impl ModelDecodePath {
                 }
                 out
             }
-            Self::Legacy => "legacy".to_string(),
+            Self::Generic => "generic".to_string(),
         }
     }
 }

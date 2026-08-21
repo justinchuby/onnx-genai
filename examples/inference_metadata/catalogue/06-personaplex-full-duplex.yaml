@@ -1,0 +1,350 @@
+# PersonaPlex full-duplex speech step with independent dialogue and codec recurrent state.
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      capabilities:
+      - workflow_ssa
+      - typed_emit
+      - serving_service_contract
+      - session_state_lease
+    inputs:
+      request.active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: active
+        required: true
+      request.done:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: done
+        required: true
+      request.accepted_len:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: accepted_len
+        required: true
+      request.microphone_audio:
+        contract:
+          dtype: float32
+          rank: 2
+          shape:
+          - batch
+          - audio_samples
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: media
+        source:
+          kind: request
+        required: true
+      request.dialogue_state:
+        contract:
+          dtype: float16
+          rank: 2
+          shape:
+          - batch
+          - hidden
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: dialogue_state
+        required: true
+      request.codec_history:
+        contract:
+          dtype: float16
+          rank: 3
+          shape:
+          - batch
+          - channels
+          - history
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: codec_history
+        required: true
+    outputs:
+      tokens:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - 1
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tokens
+        stage: pre_adapter
+      audio:
+        contract:
+          dtype: float32
+          rank: 2
+          shape:
+          - batch
+          - output_samples
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: audio
+        stage: pre_adapter
+    components:
+      audio_encoder:
+        implementation:
+          kind: onnx
+          artifact: personaplex/audio_encoder.onnx.textproto
+        ports:
+          inputs:
+            microphone_audio:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - audio_samples
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            audio_features:
+              dtype: float16
+              rank: 3
+              shape:
+              - batch
+              - audio_frames
+              - hidden
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      dialogue_model:
+        implementation:
+          kind: onnx
+          artifact: personaplex/dialogue_model.onnx.textproto
+        ports:
+          inputs:
+            audio_features:
+              dtype: float16
+              rank: 3
+              shape:
+              - batch
+              - audio_frames
+              - hidden
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            dialogue_state:
+              dtype: float16
+              rank: 2
+              shape:
+              - batch
+              - hidden
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            response_tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            codec_codes:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - codec_frames
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            next_dialogue_state:
+              dtype: float16
+              rank: 2
+              shape:
+              - batch
+              - hidden
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      speech_decoder:
+        implementation:
+          kind: onnx
+          artifact: personaplex/speech_decoder.onnx.textproto
+        ports:
+          inputs:
+            codec_codes:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - codec_frames
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            codec_history:
+              dtype: float16
+              rank: 3
+              shape:
+              - batch
+              - channels
+              - history
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            speaker_audio:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - output_samples
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            next_codec_history:
+              dtype: float16
+              rank: 3
+              shape:
+              - batch
+              - channels
+              - history
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+    state:
+      dialogue_state:
+        contract:
+          dtype: float16
+          rank: 2
+          shape:
+          - batch
+          - hidden
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: session
+        initializer: request.dialogue_state
+        recurrence:
+          kind: invariant
+        management: runtime
+        release_boundary: session
+        service_group: dialogue_state
+      codec_history:
+        contract:
+          dtype: float16
+          rank: 3
+          shape:
+          - batch
+          - channels
+          - history
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: session
+        initializer: request.codec_history
+        recurrence:
+          kind: invariant
+        management: runtime
+        release_boundary: session
+        service_group: codec_history
+    steps:
+    - kind: invoke
+      component: audio_encoder
+      inputs:
+        microphone_audio: request.microphone_audio
+      outputs:
+        audio_features: duplex.audio_features
+    - kind: invoke
+      component: dialogue_model
+      inputs:
+        audio_features: duplex.audio_features
+        dialogue_state: request.dialogue_state
+      outputs:
+        response_tokens: duplex.tokens
+        codec_codes: duplex.codes
+        next_dialogue_state: duplex.dialogue_state
+    - kind: invoke
+      component: speech_decoder
+      inputs:
+        codec_codes: duplex.codes
+        codec_history: request.codec_history
+      outputs:
+        speaker_audio: duplex.audio
+        next_codec_history: duplex.codec_history
+    - kind: emit
+      value: duplex.tokens
+      output: tokens
+      mode: replace
+    - kind: emit
+      value: duplex.audio
+      output: audio
+      mode: replace
+    serving:
+      active: request.active
+      done: request.done
+      accepted_len: request.accepted_len
+      state_service:
+        groups:
+          dialogue_state:
+            kind: recurrent
+            layout: bd
+            update:
+              kind: replace
+            ports:
+              dialogue_model:
+                dialogue_state:
+                  input: dialogue_state
+                  output: next_dialogue_state
+          codec_history:
+            kind: recurrent
+            layout: bch
+            update:
+              kind: replace
+            ports:
+              speech_decoder:
+                codec_history:
+                  input: codec_history
+                  output: next_codec_history
