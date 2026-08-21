@@ -533,6 +533,57 @@ pub(super) fn is_capacity_form_attention_mask_input(node: &Node, input_index: us
 /// mask a capacity-form `Attention` is designed to consume — which is what lets the
 /// decode step keep a fixed-capacity, capture-stable mask binding.
 pub(super) fn mask_binding_feeds_capacity_form_attention(graph: &Graph, mask: ValueId) -> bool {
+    mask_binding_feeds_capacity_form_attention_impl(graph, mask, ShapeConsumptionPolicy::Disqualify)
+}
+
+/// Whether `mask` feeds *only* the standard additive causal-mask builder cone
+/// terminating at capacity-form `Attention` leaves, **allowing** the builder's
+/// window arithmetic to consume `Shape(mask)` (the DeepSeek-V2-Lite shape, which
+/// [`mask_binding_feeds_capacity_form_attention`] disqualifies from *static*
+/// freezing because `Shape(mask)` leaks the padded width into the multi-token
+/// prefill query-position `Slice`).
+///
+/// This is the weaker "decode-freeze-safe" predicate. It holds exactly when the
+/// mask's only consumers are the additive causal-mask builder + capacity-form
+/// `Attention`, so a **single-token** decode step (`q_seq == 1`) can freeze the
+/// mask to physical capacity even when prefill must expose the logical length:
+///
+/// - The query window is `Slice(CumSum(mask), start = Shape(mask) - q_seq,
+///   end = Shape(mask))`. At `q_seq == 1` this is `[CumSum(mask)[Shape-1]]`,
+///   which equals `total_len` for **any** `Shape >= total_len` because the
+///   `CumSum` prefix-sum plateaus at `total_len` across the zero-padding —
+///   freezing `Shape` to `max_len` yields the identical single query position.
+/// - The key positions and padding branch are width-invariant on the valid
+///   prefix and forced to `-inf` on the padded suffix, exactly as in the frozen
+///   capacity-form case.
+///
+/// Broadcasting logical-width combiners (e.g. GLM-5.2's indexer `Add`) are still
+/// excluded via [`is_additive_mask_builder_op`], so such masks are *not*
+/// decode-freeze-safe and keep exposing their logical length every step.
+pub(super) fn mask_binding_feeds_additive_causal_builder(graph: &Graph, mask: ValueId) -> bool {
+    mask_binding_feeds_capacity_form_attention_impl(graph, mask, ShapeConsumptionPolicy::Allow)
+}
+
+/// How the mask-cone walk treats a `Shape(mask)` consumer whose output is itself
+/// consumed (i.e. `Shape` is not a dead-end physical-extent read).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShapeConsumptionPolicy {
+    /// Disqualify the binding from *static* padded-capacity freezing: a consumed
+    /// `Shape(mask)` leaks the padded width into width-sensitive arithmetic
+    /// (the multi-token prefill query-position window), which must see the
+    /// logical length. Drives `expose_logical_input_shape`.
+    Disqualify,
+    /// Allow a consumed `Shape(mask)`: the cone is still the additive causal-mask
+    /// builder, so a single-token decode step remains freeze-safe (the query
+    /// window saturates). Drives the decode-freeze-safe classification.
+    Allow,
+}
+
+fn mask_binding_feeds_capacity_form_attention_impl(
+    graph: &Graph,
+    mask: ValueId,
+    shape_policy: ShapeConsumptionPolicy,
+) -> bool {
     use std::collections::{HashMap, HashSet, VecDeque};
 
     // value → consumers as (node id, input slot).
@@ -580,8 +631,12 @@ pub(super) fn mask_binding_feeds_capacity_form_attention(graph: &Graph, mask: Va
                 // selects the query-position window — so freezing the mask to
                 // physical capacity picks positions `[max_len-q_seq .. max_len)`
                 // instead of `[0 .. q_seq)`, producing a non-causal mask and
-                // incoherent decode. Expose the logical length in that case.
-                if node.op_type == "Shape" {
+                // incoherent decode. Under `Disqualify` this exposes the logical
+                // length (correct multi-token prefill). Under `Allow` the caller
+                // only needs the weaker decode-freeze-safe guarantee (single-token
+                // `q_seq == 1`, where the window saturates to the same position
+                // regardless of width), so a consumed `Shape` does not disqualify.
+                if node.op_type == "Shape" && shape_policy == ShapeConsumptionPolicy::Disqualify {
                     let shape_output_consumed = node
                         .outputs
                         .iter()
