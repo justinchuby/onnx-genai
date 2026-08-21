@@ -18,12 +18,17 @@
 //!    contiguous ranges the layout gives (`docs/memory/MEMORY_ARCHITECTURE.md`, "KV
 //!    layout and residency"). An independent CPU oracle guards against the two
 //!    GPU paths being symmetrically wrong.
-//! 2. **Admission is private bytes only.** Admitting the second sharer needs
+//! 2. **Request-local fallback.** A third request starts with an incompatible
+//!    target whose prefix granules are already privately committed. The real
+//!    `SharedMapping::commit_shared_prefix` rejects that request on the host,
+//!    before any decode enqueue; the rejected reservation is retired and the
+//!    request continues with fully private KV while its peers keep sharing.
+//! 3. **Admission is private bytes only.** Admitting the second sharer needs
 //!    **zero** incremental owned bytes for the shared prefix
 //!    (`incremental_owned_bytes_for_shared_prefix == 0`), and the governor's
 //!    owned axis rises by only that sequence's private tail — the arithmetic
 //!    (#745) that turns prefix sharing into concurrency (#750).
-//! 3. **Physical bytes are charged once.** Two sequences sharing one prefix
+//! 4. **Physical bytes are charged once.** Two sequences sharing one prefix
 //!    commit strictly fewer physical granules than two independent sequences, by
 //!    exactly `(sharers − 1) × prefix_granules` for each of the K and V caches.
 //!
@@ -222,21 +227,23 @@ struct DecodeInputs {
     total: onnx_runtime_ep_api::DeviceBuffer,
 }
 
+type DecodeStep = (
+    DecodeInputs,
+    Vec<f16>,
+    Vec<Vec<Vec<f16>>>,
+    Vec<Vec<Vec<f16>>>,
+);
+
 /// Build one decode step's non-cache inputs for a sequence whose appended token
 /// is derived from `seed`. Returns the uploaded device inputs plus the logical
 /// K/V (prefix positions plus the appended token) for the CPU oracle.
 fn build_inputs(
     ep: &CudaExecutionProvider,
-    prefix_key: &[Vec<Vec<f16>>],
-    prefix_value: &[Vec<Vec<f16>>],
+    past_key: &[Vec<Vec<f16>>],
+    past_value: &[Vec<Vec<f16>>],
     past_len: usize,
     seed: u32,
-) -> (
-    DecodeInputs,
-    Vec<f16>,
-    Vec<Vec<Vec<f16>>>,
-    Vec<Vec<Vec<f16>>>,
-) {
+) -> DecodeStep {
     let query: Vec<f16> = (0..QUERY_HEADS * HEAD_DIM)
         .map(|i| f16::from_f32((((i as u32 * 17 + seed * 3) % 97) as f32 - 48.0) / 256.0))
         .collect();
@@ -244,8 +251,8 @@ fn build_inputs(
     // The appended token (position past_len) is this sequence's private K/V.
     let mut current_key = vec![f16::ZERO; KV_HEADS * HEAD_DIM];
     let mut current_value = vec![f16::ZERO; KV_HEADS * HEAD_DIM];
-    let mut full_key = prefix_key.to_vec();
-    let mut full_value = prefix_value.to_vec();
+    let mut full_key = past_key.to_vec();
+    let mut full_value = past_value.to_vec();
     for h in 0..KV_HEADS {
         let mut ck = vec![f16::ZERO; HEAD_DIM];
         let mut cv = vec![f16::ZERO; HEAD_DIM];
@@ -420,7 +427,7 @@ fn run_decode(
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
-fn two_sequences_sharing_a_pinned_prefix_match_two_independent_sequences() {
+fn shared_peers_survive_request_local_private_fallback() {
     set_pool_env();
     let ep = require_cuda();
     let context = ep.runtime().cuda_context();
@@ -431,8 +438,8 @@ fn two_sequences_sharing_a_pinned_prefix_match_two_independent_sequences() {
         "test geometry assumes the granule is a whole number of KV tokens"
     );
 
-    // One granule of prefix per binding; a two-granule cache so the appended
-    // token lands in the writable private tail (granule 1), never the read-only
+    // One granule of prefix per binding; a two-granule cache so both decode
+    // tokens land in the writable private tail (granule 1), never the read-only
     // shared prefix (granule 0).
     let prefix_tokens = granule / BYTES_PER_TOKEN;
     let capacity = 2 * prefix_tokens;
@@ -488,92 +495,6 @@ fn two_sequences_sharing_a_pinned_prefix_match_two_independent_sequences() {
     let prefix_value_bytes = typed_bytes(&seed_seqmajor(&prefix_value, prefix_tokens)).to_vec();
     assert_eq!(prefix_key_bytes.len(), granule);
 
-    // Two sequences, each with its own appended token (they are genuinely
-    // different requests that merely share a prefix).
-    let mut seq_inputs = Vec::new();
-    for seq in 0..2u32 {
-        seq_inputs.push(build_inputs(
-            &ep,
-            &prefix_key,
-            &prefix_value,
-            past_len,
-            seq + 1,
-        ));
-    }
-
-    // ------------------------------------------------------------------ //
-    // Independent baseline: each sequence owns a full private KV cache.    //
-    // Measure its committed physical bytes on a dedicated VMM governor.    //
-    // ------------------------------------------------------------------ //
-    let indep_governor = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
-    let indep_alloc = CudaVmmAllocator::new(
-        context.clone(),
-        DeviceKey::device(0),
-        ep.device_id().index as i32,
-        512 << 20,
-        &indep_governor,
-        HOLDER,
-        MemoryRole::KvCache,
-    )
-    .expect("independent VMM allocator");
-    let indep: &dyn DeviceAllocator = &indep_alloc;
-    let indep_backing = indep
-        .as_virtual_backing()
-        .expect("VMM exposes VirtualBacking through the selected allocator");
-
-    let mut independent_out = Vec::new();
-    let mut indep_ptrs = Vec::new();
-    for seq in 0..2usize {
-        // Full private caches: every granule committed (prefix + tail).
-        let full = 0..alloc_bytes;
-        let key_ptr = indep_backing
-            .allocate_committed(alloc_bytes, granule, std::slice::from_ref(&full))
-            .expect("independent key cache");
-        let value_ptr = indep_backing
-            .allocate_committed(alloc_bytes, granule, std::slice::from_ref(&full))
-            .expect("independent value cache");
-        // Seed prefix into granule 0; zero the tail granule.
-        upload_to(&ep, key_ptr.as_ptr() as u64, &prefix_key_bytes);
-        upload_to(&ep, value_ptr.as_ptr() as u64, &prefix_value_bytes);
-        let zero = vec![0u8; granule];
-        upload_to(&ep, key_ptr.as_ptr() as u64 + granule as u64, &zero);
-        upload_to(&ep, value_ptr.as_ptr() as u64 + granule as u64, &zero);
-
-        let out = run_decode(
-            &ep,
-            &seq_inputs[seq].0,
-            key_ptr.as_ptr().cast(),
-            value_ptr.as_ptr().cast(),
-            capacity,
-        );
-        independent_out.push(out);
-        indep_ptrs.push((key_ptr, value_ptr));
-    }
-    let independent_committed = indep_governor.used(Tier::Device);
-    // 2 sequences × (K + V) × 2 granules each.
-    assert_eq!(
-        independent_committed,
-        (2 * 2 * 2 * granule) as u64,
-        "two independent sequences commit a full private prefix + tail for K and V"
-    );
-
-    // Confirm the head-major/CPU oracle: independent GPU output matches an
-    // independent CPU reference so the shared path cannot be symmetrically wrong.
-    for seq in 0..2usize {
-        let (_, query, full_key, full_value) = &seq_inputs[seq];
-        let got = fp16_values(&independent_out[seq]);
-        let expected = cpu_reference(query, full_key, full_value, 1.0);
-        let max_err = got
-            .iter()
-            .zip(&expected)
-            .map(|(g, e)| (g - e).abs())
-            .fold(0.0_f32, f32::max);
-        assert!(
-            max_err < 3e-3,
-            "independent seq-major GPU decode diverged from CPU oracle (seq {seq}): max_abs={max_err:e}"
-        );
-    }
-
     // ------------------------------------------------------------------ //
     // Shared: one pinned prefix (K and V), charged once, mapped read-only //
     // into both sequences through the DeviceAllocator seam (#777).        //
@@ -589,6 +510,9 @@ fn two_sequences_sharing_a_pinned_prefix_match_two_independent_sequences() {
         MemoryRole::KvCache,
     )
     .expect("shared VMM allocator");
+    let shared_stats = shared_alloc
+        .physical_pool_stats()
+        .expect("production allocator installs the physical pool");
     let shared: &dyn DeviceAllocator = &shared_alloc;
     let shared_backing = shared
         .as_virtual_backing()
@@ -598,7 +522,8 @@ fn two_sequences_sharing_a_pinned_prefix_match_two_independent_sequences() {
         .expect("pooled VMM exposes SharedMapping independently");
 
     // Create the two pinned prefixes (K, V) through the production capability
-    // seam and fill each prefix once through its writable owner window.
+    // seam. Their first stream writes are deliberately deferred until after the
+    // request-local fallback decision.
     let key_prefix: Box<dyn SharedDevicePrefix> = shared_mapping
         .create_shared_prefix(granule)
         .expect("pin key prefix");
@@ -607,8 +532,6 @@ fn two_sequences_sharing_a_pinned_prefix_match_two_independent_sequences() {
         .expect("pin value prefix");
     assert_eq!(key_prefix.committed_physical_bytes(), granule as u64);
     assert_eq!(value_prefix.committed_physical_bytes(), granule as u64);
-    upload_to(&ep, key_prefix.device_ptr(), &prefix_key_bytes);
-    upload_to(&ep, value_prefix.device_ptr(), &prefix_value_bytes);
 
     // Two prefixes, charged exactly once on the owned axis.
     assert_eq!(
@@ -617,10 +540,10 @@ fn two_sequences_sharing_a_pinned_prefix_match_two_independent_sequences() {
         "the two shared prefixes (K and V) are charged exactly once each"
     );
 
-    let mut shared_out = Vec::new();
+    let mut actual_out = vec![vec![Vec::new(); 2]; 3];
     let mut shared_ptrs = Vec::new();
     let mut second_sharer_admission = None;
-    for seq in 0..2usize {
+    for request in 0..2usize {
         let owned_before = shared_governor.used(Tier::Device);
 
         // Each sequence commits only its PRIVATE tail granule (granule 1); the
@@ -639,7 +562,7 @@ fn two_sequences_sharing_a_pinned_prefix_match_two_independent_sequences() {
                 .incremental_owned_bytes_for_shared_prefix(key_prefix.as_ref())
                 .expect("key prefix belongs to this mapping capability"),
             0,
-            "admitting sharer {seq} needs zero incremental owned bytes for the key prefix"
+            "admitting sharer {request} needs zero incremental owned bytes for the key prefix"
         );
         assert_eq!(
             shared_mapping
@@ -676,65 +599,288 @@ fn two_sequences_sharing_a_pinned_prefix_match_two_independent_sequences() {
         assert_eq!(
             admission,
             (2 * granule) as u64,
-            "sharer {seq} pays only its two private tail granules"
+            "sharer {request} pays only its two private tail granules"
         );
-        if seq == 1 {
+        if request == 1 {
             second_sharer_admission = Some(admission);
         }
 
-        // Zero the private tail so unread positions are deterministic; the
-        // appended token is written by the kernel at position past_len.
-        let zero = vec![0u8; granule];
+        shared_ptrs.push(Some((key_ptr, value_ptr, alloc_bytes)));
+    }
+
+    // Request 2 first receives a geometrically incompatible target: its prefix
+    // region is already privately committed. This is a legitimate request-local
+    // state (for example, a cache precommitted before prefix lookup completed).
+    // The production SharedMapping seam must reject it synchronously, before
+    // any decode kernel can observe a partially converted cache.
+    let full = 0..alloc_bytes;
+    let fallback_candidate_key = shared_backing
+        .allocate_committed(alloc_bytes, granule, std::slice::from_ref(&full))
+        .expect("fallback candidate key");
+    let fallback_candidate_value = shared_backing
+        .allocate_committed(alloc_bytes, granule, std::slice::from_ref(&full))
+        .expect("fallback candidate value");
+    let before_failed_commit = shared_governor.used(Tier::Device);
+    let mut decode_enqueues = 0usize;
+    let commit_error = shared_mapping
+        .commit_shared_prefix(key_prefix.as_ref(), fallback_candidate_key, alloc_bytes, 0)
+        .expect_err("a shared prefix must not overlay precommitted private KV");
+    assert!(
+        commit_error.to_string().contains("already committed"),
+        "fallback must report the request-local target conflict explicitly: {commit_error}"
+    );
+    assert_eq!(
+        decode_enqueues, 0,
+        "request-local shared-prefix failure must be decided before decode enqueue"
+    );
+    assert_eq!(
+        shared_governor.used(Tier::Device),
+        before_failed_commit,
+        "failed shared commit must not change physical-byte accounting"
+    );
+
+    // The rejected target is already a valid fully private cache, so fallback
+    // keeps it rather than allocating again. No peer mapping is touched and no
+    // transient physical bytes are retained by an allocate/free retry.
+    assert_eq!(
+        shared_governor.used(Tier::Device),
+        (2 * granule + 2 * 2 * granule + 2 * 2 * granule) as u64,
+        "fallback target must remain charged as fully private K/V"
+    );
+
+    let fallback_key = fallback_candidate_key;
+    let fallback_value = fallback_candidate_value;
+
+    // The host-only admission/commit decision is now complete. From this point
+    // onward the harness may enqueue stream copies and real GQA decode work.
+    upload_to(&ep, key_prefix.device_ptr(), &prefix_key_bytes);
+    upload_to(&ep, value_prefix.device_ptr(), &prefix_value_bytes);
+    let zero = vec![0u8; granule];
+    for (key_ptr, value_ptr, _) in shared_ptrs.iter().flatten() {
         upload_to(&ep, key_ptr.as_ptr() as u64 + granule as u64, &zero);
         upload_to(&ep, value_ptr.as_ptr() as u64 + granule as u64, &zero);
+    }
 
-        let out = run_decode(
+    // Three genuinely different requests, each decoded for two tokens. Build
+    // complete logical histories for the independent CPU oracle and upload the
+    // request-specific kernel inputs.
+    let mut request_steps = Vec::new();
+    for request in 0..3u32 {
+        let mut key_history = prefix_key.clone();
+        let mut value_history = prefix_value.clone();
+        let mut steps = Vec::new();
+        for step in 0..2u32 {
+            let seed = 1 + request * 17 + step * 101;
+            let built = build_inputs(
+                &ep,
+                &key_history,
+                &value_history,
+                past_len + step as usize,
+                seed,
+            );
+            key_history = built.2.clone();
+            value_history = built.3.clone();
+            steps.push(built);
+        }
+        request_steps.push(steps);
+    }
+
+    // Independent baseline: each request owns a full private KV cache.
+    let indep_governor = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
+    let indep_alloc = CudaVmmAllocator::new(
+        context.clone(),
+        DeviceKey::device(0),
+        ep.device_id().index as i32,
+        512 << 20,
+        &indep_governor,
+        HOLDER,
+        MemoryRole::KvCache,
+    )
+    .expect("independent VMM allocator");
+    let indep: &dyn DeviceAllocator = &indep_alloc;
+    let indep_backing = indep
+        .as_virtual_backing()
+        .expect("VMM exposes VirtualBacking through the selected allocator");
+
+    let mut indep_ptrs = Vec::new();
+    for _request in 0..3usize {
+        let key_ptr = indep_backing
+            .allocate_committed(alloc_bytes, granule, std::slice::from_ref(&full))
+            .expect("independent key cache");
+        let value_ptr = indep_backing
+            .allocate_committed(alloc_bytes, granule, std::slice::from_ref(&full))
+            .expect("independent value cache");
+        upload_to(&ep, key_ptr.as_ptr() as u64, &prefix_key_bytes);
+        upload_to(&ep, value_ptr.as_ptr() as u64, &prefix_value_bytes);
+        upload_to(&ep, key_ptr.as_ptr() as u64 + granule as u64, &zero);
+        upload_to(&ep, value_ptr.as_ptr() as u64 + granule as u64, &zero);
+        indep_ptrs.push((key_ptr, value_ptr));
+    }
+    let independent_committed = indep_governor.used(Tier::Device);
+    assert_eq!(
+        independent_committed,
+        (3 * 2 * 2 * granule) as u64,
+        "three independent requests commit a full private prefix + tail for K and V"
+    );
+
+    upload_to(&ep, fallback_key.as_ptr() as u64, &prefix_key_bytes);
+    upload_to(&ep, fallback_value.as_ptr() as u64, &prefix_value_bytes);
+    upload_to(&ep, fallback_key.as_ptr() as u64 + granule as u64, &zero);
+    upload_to(&ep, fallback_value.as_ptr() as u64 + granule as u64, &zero);
+    shared_ptrs.push(Some((fallback_key, fallback_value, alloc_bytes)));
+
+    let shared_prefix_key_before = read_from(&ep, key_prefix.device_ptr(), granule);
+    let shared_prefix_value_before = read_from(&ep, value_prefix.device_ptr(), granule);
+
+    // Only after the fallback transaction is settled do any real GQA decode
+    // enqueues occur. First produce fully private GPU references.
+    let mut independent_out = Vec::new();
+    for request in 0..3usize {
+        let (key_ptr, value_ptr) = indep_ptrs[request];
+        let mut outputs = Vec::new();
+        for step in 0..2usize {
+            outputs.push(run_decode(
+                &ep,
+                &request_steps[request][step].0,
+                key_ptr.as_ptr().cast(),
+                value_ptr.as_ptr().cast(),
+                capacity,
+            ));
+            decode_enqueues += 1;
+        }
+        independent_out.push(outputs);
+    }
+
+    // Confirm the CPU oracle: every independent GPU decode step matches an
+    // independent CPU reference so the shared path cannot be symmetrically wrong.
+    for request in 0..3usize {
+        for step in 0..2usize {
+            let (_, query, full_key, full_value) = &request_steps[request][step];
+            let got = fp16_values(&independent_out[request][step]);
+            let expected = cpu_reference(query, full_key, full_value, 1.0);
+            let max_err = got
+                .iter()
+                .zip(&expected)
+                .map(|(g, e)| (g - e).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                max_err < 3e-3,
+                "independent seq-major GPU decode diverged from CPU oracle \
+                 (request {request}, step {step}): max_abs={max_err:e}"
+            );
+        }
+    }
+
+    // Interleave the two shared peers and the private fallback across two
+    // decode rounds. Peer 0 completes and exits first; peer 1 and the fallback
+    // then continue, proving that retiring one shared mapping does not disturb
+    // either surviving request.
+    let before_exit = [(0usize, 0usize), (2, 0), (1, 0), (0, 1)];
+    for (request, step) in before_exit {
+        let (key_ptr, value_ptr, _) = shared_ptrs[request].expect("live request");
+        actual_out[request][step] = run_decode(
             &ep,
-            &seq_inputs[seq].0,
+            &request_steps[request][step].0,
             key_ptr.as_ptr().cast(),
             value_ptr.as_ptr().cast(),
             capacity,
         );
-        shared_out.push(out);
-        shared_ptrs.push((key_ptr, value_ptr, alloc_bytes));
+        decode_enqueues += 1;
     }
 
+    let mapped_before_exit = shared_stats.snapshot().mapped_bytes;
+    let (departed_key, departed_value, departed_bytes) =
+        shared_ptrs[0].take().expect("peer 0 exits once");
+    unsafe {
+        shared_alloc.deallocate(departed_key, departed_bytes, granule);
+        shared_alloc.deallocate(departed_value, departed_bytes, granule);
+    }
+    assert_eq!(
+        shared_stats.snapshot().mapped_bytes,
+        mapped_before_exit - (4 * granule) as u64,
+        "peer exit must retire its K/V shared maps and private tails"
+    );
+
+    for (request, step) in [(2usize, 1usize), (1, 1)] {
+        let (key_ptr, value_ptr, _) = shared_ptrs[request].expect("surviving request");
+        actual_out[request][step] = run_decode(
+            &ep,
+            &request_steps[request][step].0,
+            key_ptr.as_ptr().cast(),
+            value_ptr.as_ptr().cast(),
+            capacity,
+        );
+        decode_enqueues += 1;
+    }
+    assert_eq!(decode_enqueues, 12);
+
     let shared_committed = shared_governor.used(Tier::Device);
-    // 2 prefixes (charged once) + 2 sequences × (K tail + V tail).
+    // 2 prefixes (charged once) + 2 shared peers' private K/V tails + one
+    // fallback request's fully private K/V.
     assert_eq!(
         shared_committed,
-        (2 * granule + 2 * 2 * granule) as u64,
-        "sharing commits one prefix per binding plus a private tail per sequence"
+        (2 * granule + 2 * 2 * granule + 2 * 2 * granule) as u64,
+        "fallback accounting must include shared prefixes, peer tails, and fully private KV"
     );
 
     // ------------------------------------------------------------------ //
-    // The three published results.                                        //
+    // Published correctness and isolation results.                        //
     // ------------------------------------------------------------------ //
 
-    // (1) Byte-identical output, per sequence.
-    for seq in 0..2usize {
-        assert_eq!(
-            shared_out[seq], independent_out[seq],
-            "sequence {seq} sharing a pinned prefix must produce byte-identical decode output to \
-             the independent sequence"
+    // Every interleaved shared/fallback output is byte-identical to the same
+    // request running alone over fully private KV.
+    for step in 0..2usize {
+        assert_ne!(
+            independent_out[0][step], independent_out[1][step],
+            "shared peers need distinct data so cross-request contamination is observable"
+        );
+        assert_ne!(
+            independent_out[0][step], independent_out[2][step],
+            "peer and fallback outputs need distinct data"
+        );
+        assert_ne!(
+            independent_out[1][step], independent_out[2][step],
+            "peer and fallback outputs need distinct data"
         );
     }
+    for request in 0..3usize {
+        for step in 0..2usize {
+            assert_eq!(
+                actual_out[request][step], independent_out[request][step],
+                "request {request} step {step} must match its independent private decode"
+            );
+        }
+    }
 
-    // (3) Physical bytes: sharing removes exactly (sharers - 1) prefix copies
-    // for each of the K and V caches.
+    // The physical K/V prefix owner windows remain byte-for-byte unchanged
+    // after both peers and the fallback request have progressed.
+    assert_eq!(
+        read_from(&ep, key_prefix.device_ptr(), granule),
+        shared_prefix_key_before,
+        "shared physical K prefix must remain immutable"
+    );
+    assert_eq!(
+        read_from(&ep, value_prefix.device_ptr(), granule),
+        shared_prefix_value_before,
+        "shared physical V prefix must remain immutable"
+    );
+
+    // Physical bytes: only the two admitted peers share, removing one prefix
+    // copy for each of K and V. The fallback remains truthfully fully private.
     let prefix_copies_removed = independent_committed - shared_committed;
     assert_eq!(
         prefix_copies_removed,
         (2 * granule) as u64,
-        "sharing across 2 sequences removes one duplicate prefix copy for K and one for V"
+        "two shared peers plus one private fallback remove one K and one V prefix copy"
     );
 
     eprintln!(
-        "gqa_shared_prefix_parity: prefix_tokens={} capacity={} granule={}B\n  \
+        "gqa_shared_prefix_fallback: prefix_tokens={} capacity={} granule={}B\n  \
          committed physical bytes: independent={}B ({} granules), shared={}B ({} granules)\n  \
-         removed by sharing: {}B ({} granules = (C-1)x(K prefix + V prefix))\n  \
+         removed by two-peer sharing: {}B ({} granules)\n  \
          second-sharer admission: {}B (private tails only), prefix incremental owned = 0\n  \
-         output: byte-identical to independent for both sequences",
+         fallback: precommitted target rejected before decode enqueue, then fully private\n  \
+         output: 3 requests x 2 interleaved steps byte-identical to independent + CPU",
         prefix_tokens,
         capacity,
         granule,
@@ -747,8 +893,8 @@ fn two_sequences_sharing_a_pinned_prefix_match_two_independent_sequences() {
         second_sharer_admission.unwrap(),
     );
 
-    // Teardown, no assertions inside any Drop (#777 platform rule): explicit
-    // frees of the still-live reservations before the allocators drop.
+    // Teardown, no assertions inside any Drop (#777 platform rule): explicitly
+    // free live reservations, then prove both ledgers return to zero.
     for (key_ptr, value_ptr) in indep_ptrs {
         // SAFETY: live allocations from `indep_alloc`, no CUDA work in flight.
         unsafe {
@@ -756,7 +902,7 @@ fn two_sequences_sharing_a_pinned_prefix_match_two_independent_sequences() {
             indep_alloc.deallocate(value_ptr, alloc_bytes, granule);
         }
     }
-    for (key_ptr, value_ptr, bytes) in shared_ptrs {
+    for (key_ptr, value_ptr, bytes) in shared_ptrs.into_iter().flatten() {
         // SAFETY: live allocations from `shared_alloc`, no CUDA work in flight.
         unsafe {
             shared_alloc.deallocate(key_ptr, bytes, granule);
@@ -765,12 +911,26 @@ fn two_sequences_sharing_a_pinned_prefix_match_two_independent_sequences() {
     }
     drop(key_prefix);
     drop(value_prefix);
+    drop(shared_alloc);
+    drop(indep_alloc);
+    assert_eq!(
+        shared_governor.used(Tier::Device),
+        0,
+        "shared/fallback cleanup must return all physical-byte accounting"
+    );
+    assert_eq!(
+        indep_governor.used(Tier::Device),
+        0,
+        "independent-reference cleanup must return all physical-byte accounting"
+    );
 
-    for (inputs, ..) in seq_inputs {
-        ep.deallocate(inputs.query).unwrap();
-        ep.deallocate(inputs.current_key).unwrap();
-        ep.deallocate(inputs.current_value).unwrap();
-        ep.deallocate(inputs.seqlens).unwrap();
-        ep.deallocate(inputs.total).unwrap();
+    for steps in request_steps {
+        for (inputs, ..) in steps {
+            ep.deallocate(inputs.query).unwrap();
+            ep.deallocate(inputs.current_key).unwrap();
+            ep.deallocate(inputs.current_value).unwrap();
+            ep.deallocate(inputs.seqlens).unwrap();
+            ep.deallocate(inputs.total).unwrap();
+        }
     }
 }
