@@ -918,13 +918,12 @@ Not measurable on this host, and therefore **not claimed anywhere**:
 
 ## Reproducing
 
-```sh
-export ORT_ROOT=<ort-prebuilt>            # the ort-sys download under target/
-cargo build --release -p onnx-genai-bench --bin bench_prec --features mlas
-LD_LIBRARY_PATH=$ORT_ROOT/lib ./target/release/bench_prec \
-  --model <model>.onnx --runs 11 --warmups 4 \
-  --native-threads 8 --ort-intra-threads 8
-```
+> **The recipe that stood here did not work.** It built a `bench_prec` binary
+> with `--native-threads` / `--ort-intra-threads` flags. No such binary exists,
+> and `git log` finds no commit that ever added or removed one, so the numbers
+> above cannot be reproduced as written. The closest surviving native-vs-ORT
+> harness is `onnx-genai-bench --bin compare`; see
+> [`crates/onnx-genai-bench/README.md`](../../crates/onnx-genai-bench/README.md).
 
 `native/ort` in the result line is the ratio quoted here; `parity` must read `PASS`.
 
