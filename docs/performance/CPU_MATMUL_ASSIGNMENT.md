@@ -1744,3 +1744,89 @@ issue to **0.156 uops/MAC** — the largest identified `m = 1` lever. Blocked on
 constant-`B` pack cache, which the native path lacks entirely
 (`pack_lookup`/`pack_build` are `#[cfg(feature = "mlas")]`). Full record:
 [`docs/benchmarks/2026-08-21-qlinear-u8-m1-instruction-mix.md`](../benchmarks/2026-08-21-qlinear-u8-m1-instruction-mix.md).
+
+### 22. Per-block bookkeeping was 1.68x of the int4 acc4 decode kernel — at block 32, at low thread counts, and nowhere else
+
+`nibble_outputs_avx2` built **two bounds-checked slices per block** and made the
+callee recover its group count from `packed.len()` on every call. Removing that —
+raw pointers hoisted above the `wide` branch, group count hoisted out of the
+block loop — is the whole result. It is bit-identical output.
+
+**The headline does not generalise, and the first draft of it did not
+reproduce.** Re-measured on latest main against the merged baseline, min of 6+
+interleaved repetitions with a per-row A/A control:
+
+| cell | speedup | | cell | speedup |
+|---|---|---|---|---|
+| t=1, block 32 | **1.678x** | | t=8, block 64 | 1.005x |
+| t=4, block 32 | **1.667x** | | t=8, block 128 | 1.003x |
+| t=8, block 32 | 1.141x | | 2 sessions x t=4 | 1.419x |
+| t=16, block 32 | 1.245x | | 4 sessions x t=2 | 1.415x |
+
+Four of the nine rows in the originating draft did not reproduce — three
+optimistic, one (t=16, claimed 1.065x) **pessimistic**. The mechanism explains
+the shape: at block 32 the wide path runs `wide_groups == 1`, so the removed
+fixed cost sat on top of a single ~10-uop group; at block 64/128 it is amortized
+over 2 and 4 groups and measures **nothing**. `accuracy_level = 0` is a 1.000x
+null control at t=1/4/8. **Quote the cell, not a multiplier** (§18 is the same
+lesson from the other side).
+
+**Three measurement defects were found in the originating evidence, and all
+three are protocol, not arithmetic.** (i) The t=8 baseline was its *slow* mode —
+that arm is bimodal at 3.54/5.2 ms while the patched arm is stable, so pairing
+against 5.880 ms produced 1.609x where the reproducible figure is 1.141x.
+(ii) The multi-session rows used the harness's **pooled median per-token
+latency**, which mixes contended and uncontended tokens as sessions
+desynchronise — one baseline repetition read 9.348 ms against a 15.9 ms
+population and the A/A hit **52.7%**. Aggregate throughput is the only valid
+multi-session statistic here, and it moves those rows by ~0.17x. (iii) A cell
+whose min and median disagree in *direction* (t=16: 1.234x vs 0.730x) has not
+been measured; the fix is a longer window (240 tokens -> 1.245x/1.412x), not a
+choice of statistic. Also: `ONNX_GENAI_CPU_DECODE_THREADS=2` is **inert** on this
+harness (identical to `=1`), so any "t=2" row is a duplicate t=1 row.
+
+**Two corrections to this file's host model**, both of which change how earlier
+roofline arguments read: **L3 is 32 MiB per CCX, not 64 MiB shared**, and
+**75.8 GB/s is not achievable** (measured 31-36 GB/s within a CCX, ~56.6 GB/s
+across both). §18's refutation of "the incumbent is at the roofline" stands, but
+its stated reason — that a 58.7 MB working set was L3-resident — is void; the
+supported reason is that the denominator was ~2x the real ceiling. **SMT
+siblings are adjacent pairs**, so physical cores are the even CPUs.
+
+**Unsafe was kept only because safe was measured and is slower.** Three safe
+formulations were built: bounds-checked index sub-slicing **1.340x**, nested
+`chunks_exact` **1.542x**, and the same with a hoisted group count **1.542x** —
+identical to three decimals, which rules out the inner loop shape and localises
+the entire cost to caller-side slice construction. Safe leaves 5-17% of the win
+on the table, so codegen is *not* equivalent. Shipped form confines the unsafe
+to one `#[inline]` function with a stated loop invariant and adds a
+`validate_nibble_outputs` prevalidation pass on the safe entry, so the pointer
+derivations rest on checked arithmetic (`checked_mul` throughout) rather than on
+caller discipline. No integer-pointer round trips.
+
+**The tiled path had never been executed by a test in its own module.**
+`the_kernel_tracks_the_float64_contract` drives `k_blocks <= 3` against
+`BLOCK_TILE = 4`, so the tile loop's trip count was always zero; coverage came
+only from four `matmul_nbits` integration tests one module away. "1607 tests
+pass" was true and vacuous. Six mutations now all die. Two of them only died
+after the *tests* were fixed: `tiles - 1` is an **equivalent mutant** (work
+migrates to the tail loop) and was replaced with `tiled_blocks + 1`, and the
+fail-before-unsafe test had to assert the **panic message** rather than
+`is_err()`, because malformed inputs also trip an incidental bounds check
+*after* the pointers are formed.
+
+**Miri covers this code only if you make it.** `is_x86_feature_detected!("avx2")`
+is **false** under Miri, so a default run takes the generic path and the vector
+tests early-return — vacuous. Under
+`RUSTFLAGS=-C target-feature=+avx2` with `-Zmiri-strict-provenance` Miri
+interprets the intrinsics; that it genuinely covers both raw-pointer derivations
+was proved by injecting an off-by-one group read and a `+8` element offset and
+confirming Miri reports UB for each. Clean as shipped.
+
+**Retired, do not build:** the int4 acc4 **N-tile** (0.94x DRAM-resident, 0.76x
+at full width; its positive number is an L3-residency artifact of undersized
+benchmark shapes) and **bf16 scales / block-major prepack** for throughput
+(0.96x at tile 1; the traffic arithmetic is right and the kernel is not
+traffic-limited where it would help). Both remain defensible for *footprint*;
+neither may be sold as speed. Full record:
+[`docs/benchmarks/2026-08-21-int4-acc4-execution-regime.md`](../benchmarks/2026-08-21-int4-acc4-execution-regime.md).

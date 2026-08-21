@@ -14,9 +14,21 @@ fits in L3, which the real decode never does.
 **What is worth building is a third thing neither lever names.** The kernel
 still pays per-block bookkeeping — two bounds-checked slices constructed per
 block, plus a group count recovered from `packed.len()` on every call. Removing
-it is **1.61x-1.63x on the real decode loop at 1-8 threads**, bit-identical
-output, ~40 lines. That patch is included in this branch and is offered to
-whoever owns the kernel next; see [The recommendation](#the-recommendation).
+it is worth **1.68x at 1-4 threads** and **1.14x-1.25x at 8-16 threads** on the
+real decode loop, bit-identical output; at **block 64 and 128 it is a wash
+(1.00x)**. That patch is in this branch; see
+[The recommendation](#the-recommendation).
+
+> **Re-measured on latest main by Roy (2026-08-21), with corrections.** The
+> original draft of this document claimed a flat "1.61x-1.63x at 1-8 threads"
+> plus 1.212x at block 64. **Four of its nine rows do not reproduce.** The win
+> is real and is *larger* than claimed where it exists (1.678x at t=1), but it
+> is **specific to block_size 32** and it **collapses to ~1.14x at 8 threads**;
+> block 64 and 128 are 1.005x/1.003x, i.e. nothing. The t=16 row was
+> *pessimistic* — the true figure is ~1.245x, not 1.065x. The full corrected
+> matrix, the reason the original t=8 baseline was inflated, and a methodology
+> defect in the multi-session rows are in [Confirmed on the real
+> kernel](#confirmed-on-the-real-kernel).
 
 This extends rather than contradicts #1619, which already found that "most of
 the win is not the byte saving" but "removing per-block overhead". The finding
@@ -206,24 +218,101 @@ group recompute.**
 
 Not a microbenchmark claim. `int4_decode_loop_ab`, `PROBE_ACCURACY=4`,
 1 layer, interleaved A/B with the baseline binary entered twice as an A/A
-control. **Every row below passed its A/A gate** (worst 1.53%); three further
-runs failed theirs and were discarded rather than reported.
+control.
 
-| threads | sessions | block | baseline ms/token | patched | speedup |
+**The table below is the re-measurement on latest main (`f8eb8a3e2`), not the
+original draft's numbers.** Both arms are built from one tree, differing only in
+`int4_nibble.rs`; arm B is the final shipped form (see [Safe formulations were
+tried first](#safe-formulations-were-tried-first)). Estimator is **min over 6+
+interleaved repetitions** — this host takes intermittent one-sided interference
+spikes, and contention can only ever *add* time, so the minimum is the robust
+estimate of uncontended cost. Every row carries its own A/A; rows failing the
+2% gate are not reported as results.
+
+| threads | sessions | block | baseline | patched | speedup | A/A | original draft claimed |
+|---|---|---|---|---|---|---|---|
+| 1 | 1 | 32 | 23.525 ms/tok | 14.016 | **1.678x** | 0.01% | 1.626x — reproduces |
+| 4 | 1 | 32 | 7.963 | 4.777 | **1.667x** | 0.05% | 1.633x — reproduces |
+| 8 | 1 | 32 | 3.542 | 3.104 | **1.141x** | 0.23% | 1.609x — **does not reproduce** |
+| 16 | 1 | 32 | 1.801 | 1.447 | **1.245x** | 0.83% | 1.065x — **draft was pessimistic** |
+| 8 | 1 | 64 | 2.762 | 2.747 | 1.005x | 0.43% | 1.212x — **does not reproduce** |
+| 8 | 1 | 128 | 2.534 | 2.527 | 1.003x | 0.04% | 1.031x — **does not reproduce** |
+| 4 | 2 | 32 | 179.9 tok/s | 255.3 | **1.419x** | 1.75% | 1.497x (different metric) |
+| 2 | 4 | 32 | 175.9 tok/s | 248.9 | **1.415x** | 0.11% | 1.137x (different metric) |
+
+Output is bit-identical. The t=16 row uses a 240-token steady window (see
+[below](#the-t16-row-needed-a-longer-window)); the multi-session rows use
+aggregate throughput, for a reason that is itself a finding:
+
+#### The multi-session rows were measured with an invalid statistic
+
+Column 2 of the harness is the **median per-token latency pooled across
+sessions**. Sessions are spawned together but finish independently, so as soon
+as one session exits, the survivor's remaining tokens run *uncontended* and pull
+the pooled median down. The statistic therefore measures session
+desynchronisation as much as it measures the kernel, and it breaks the
+one-sidedness that makes a minimum meaningful — a baseline repetition read
+**9.348 ms against a 15.9 ms population**, and the resulting A/A was **52.7%**.
+Under this statistic the 2-session cell "measured" 1.591x on one run and failed
+its control on the next.
+
+Aggregate throughput (`sessions * tokens / wall`) is defined over the whole
+window and is insensitive to which session finishes first, so the multi-session
+rows use it, with the **maximum** as the robust estimator. Re-measured that way
+the two cells agree closely with each other (**1.419x** and **1.415x**) and pass
+their controls. The honest multi-session number is therefore ~1.42x, **not** the
+~1.59x the latency statistic suggested.
+
+#### Why the original t=8 row was inflated
+
+At t=8 the *baseline* arm is bimodal — 3.54 ms or ~5.2 ms — while the patched
+arm is stable at 3.10-3.68 ms. The original draft's baseline of **5.880 ms is
+its slow mode**; against the reproducible 3.542 ms fast mode the speedup is
+1.141x, not 1.609x. This is not a dispute about noise handling: the A/A control
+passes at 0.23% because *both* baseline arms reach 3.54 ms reproducibly. Taking
+medians instead would report 1.541x here, which is why the estimator has to be
+stated — the patched kernel is genuinely more robust under load, but that is a
+different claim from being 1.6x faster uncontended, and only the second one is
+what a "1.6x" headline is read as.
+
+#### The t=16 row needed a longer window
+
+At the default 60-token window t=16 gave contradictory estimators — min 1.234x,
+median 0.730x — because the patched arm was bimodal with only 1 sample of 10 in
+its fast mode. Re-run with a **240-token** steady window both estimators agree
+(min 1.245x, median 1.412x, A/A 0.83%), and the figure reproduces across three
+independent runs (1.227x, 1.234x, 1.245x). A cell whose estimators disagree in
+*direction* is a cell that has not been measured yet; the fix is a longer
+window, not a choice of statistic.
+
+#### Where the win is, and is not
+
+The effect is **specific to block_size 32**. At block 32 with the wide path a
+block is exactly one 32-element group (`wide_groups == 1`), so the removed
+bookkeeping — two bounds-checked slice constructions and a group recount — is
+amortized over a single ~10-uop group and dominates it. At block 64 and 128 the
+same fixed cost is spread over 2 and 4 groups *and* the kernel is closer to its
+memory ceiling, leaving **1.005x and 1.003x: nothing**. Any future summary of
+this work that says "1.6x on the int4 acc4 decode kernel" without saying "at
+block 32, at 1-4 threads" is overstating it by up to 1.67x.
+
+#### Null control: `accuracy_level = 0` is untouched
+
+`accuracy_level = 4` is the only value that reaches the packed-nibble route, so
+the same A/B run at `PROBE_ACCURACY=0` is a disclosed null control — it exercises
+the whole harness, both binaries and the same thread counts, and must show
+nothing. It does:
+
+| threads | block | baseline | patched | speedup | A/A |
 |---|---|---|---|---|---|
-| 1 | 1 | 32 | 22.963 | 14.126 | **1.626x** |
-| 2 | 1 | 32 | 23.051 | 14.531 | **1.586x** |
-| 4 | 1 | 32 | 11.545 | 7.071 | **1.633x** |
-| 8 | 1 | 32 | 5.880 | 3.655 | **1.609x** |
-| 16 | 1 | 32 | 4.622 | 4.339 | 1.065x |
-| 8 | 1 | 64 | 3.715 | 3.064 | 1.212x |
-| 8 | 1 | 128 | 2.948 | 2.858 | 1.031x |
-| 8 | 2 | 32 | 5.904 | 3.945 | **1.497x** |
-| 8 | 4 | 32 | 5.964 | 5.247 | 1.137x |
+| 1 | 32 | 56.345 ms/tok | 56.373 | 1.000x | 0.06% |
+| 4 | 32 | 18.843 | 18.887 | 0.998x | 0.27% |
+| 8 | 32 | 8.147 | 8.151 | 1.000x | 0.43% |
 
-Output is bit-identical; `cargo test -p onnx-runtime-ep-cpu --release` passes
-1607 tests, `cargo fmt --check` and `cargo clippy --all-targets -D warnings`
-are clean.
+This is the control that makes the acc4 rows mean something: the same
+measurement apparatus that reports 1.678x at acc4 reports 1.000x at acc0.
+(It also shows acc4 is ~2.4x *faster* than acc0 at t=1 on this shape — 23.5 vs
+56.3 ms/token — which is #1619's result, not this one's.)
 
 Two implementation details cost more than they saved and are recorded so they
 are not re-tried:
@@ -232,41 +321,177 @@ are not re-tried:
   put a `match` inside the block loop and gave **0.945x** — worse than the
   baseline. The trip count is not the problem.
 - The pointer computations must be hoisted **above** the `if wide` branch. With
-  them inside, block 64 regressed to 0.876x; hoisted, it is 1.212x.
+  them inside, block 64 regressed to 0.876x. (The paired "hoisted, it is 1.212x"
+  figure does not reproduce — hoisted block 64 measures 1.005x on latest main,
+  see the table above. What survives is the *ordering*: inside-the-branch is
+  worse than hoisted, so keep them hoisted.)
 
-### The t=16 result is the interesting one
+### Safe formulations were tried first
 
-The patch is worth 1.6x at 1-8 threads and **1.065x at 16**. That is not a
-disappointment, it is a boundary: after the fix, t=8 (3.655) is already within
-**1.09x** of t=16 (4.339 baseline-paired, 3.51 on a quiet host), whereas before
-the fix t=8 -> t=16 still gained 1.27x. **Removing the kernel overhead moves the
-binding constraint off the kernel and onto the memory system and the parallel
-runtime.** This is the same ceiling as the single-session underutilization in
-the scheduler lane, reached from the other side, and it means further *kernel*
-micro-optimization at full width has little left to win.
+The shipped kernel uses raw pointers inside `unsafe`. That is only defensible if
+a safe formulation is actually slower, so three were built and measured before
+the raw form was accepted. All are bit-identical; all A/A gates <= 0.05%;
+single physical core, block 32, min of 6 interleaved repetitions.
+
+| form | ms/token | vs main |
+|---|---|---|
+| main (two bounds-checked slices per block, group recount per call) | 23.525 | 1.000x |
+| **E** — tile `chunks_exact` + bounds-checked index sub-slicing | 17.556 | 1.340x |
+| **C** — nested `chunks_exact` (tile, then block), slice accumulator | 15.254 | 1.542x |
+| **D** — as C, but hoisted group count and an index loop inside | 15.254 | 1.542x |
+| **B** — raw pointers, hoisted group count (the draft's form) | 14.527 | 1.620x |
+| **F** — B, plus `#[inline]` on the split-out kernel and call-site prevalidation | **14.016** | **1.678x** |
+
+Two things follow. **C and D are identical to three decimal places**, which
+rules out the inner accumulator loop's shape as the cost — the entire difference
+between the safe and raw forms is caller-side slice construction, exactly where
+the original attribution said it was. And the safe forms leave **5.1% (C/D) to
+17.0% (E)** of the win on the table, so codegen is demonstrably *not* equivalent
+and the safe version cannot simply be preferred.
+
+The shipped form is therefore raw-pointer, but with the unsafe confined to one
+`#[inline]` function whose contract is stated as a loop invariant, and with a
+**`validate_nibble_outputs` prevalidation pass on the safe entry point** so the
+pointer derivations rest on checked dimensional arithmetic rather than on a
+caller's good behaviour. F is 1.038x faster than B; that margin is the
+`#[inline]`, which lets the kernel inline back into the tile loop it was split
+out of. There are no integer-to-pointer round trips in either form.
+
+### What the tests did not cover
+
+Before this change the tiled AVX2 path **was not executed by a single test in
+its own module**. `the_kernel_tracks_the_float64_contract` drives
+`k_blocks in {1,2,3}`, and the tile loop runs `k_blocks / BLOCK_TILE` iterations
+with `BLOCK_TILE = 4` — so the trip count was always **zero** and every case
+fell through to the scalar tail. The path had coverage only from four
+`matmul_nbits` integration tests one module away. "1607 tests pass" was true and
+said nothing about this loop.
+
+Six mutations were used to check that the new tests actually constrain the
+kernel, each applied to the shipped source and run against the suite:
+
+| mutation | caught by |
+|---|---|
+| `srli` shift 4 -> 2 in the wide kernel | 2 tests |
+| swap even/odd activation halves | 2 tests |
+| load odd half at `+WIDE_GROUP` instead of `+WIDE_GROUP/2` | 2 tests |
+| `groups` -> `groups - 1` (drop the last group) | tiled-path oracle |
+| `tiled_blocks + 1` (tail loop starts one block late) | 3 tests |
+| delete the `validate_nibble_outputs` call | fail-before-unsafe test |
+
+Two notes on honesty here. The first `tiles - 1` mutant used was **equivalent** —
+reducing the tile count only migrates work to the scalar tail and the result
+stays correct — so it was replaced with `tiled_blocks + 1`, which is not.
+And the fail-before-unsafe test initially asserted only `is_err()`, which the
+`novalidate` mutant survived: the malformed inputs also trip an incidental slice
+bounds check *after* the pointers are formed, so `is_err()` proved nothing about
+ordering. It now asserts the **panic message** names the validator.
+
+### Memory-safety validation, and what Miri did and did not cover
+
+`cargo +nightly miri test -p onnx-runtime-ep-cpu --lib int4_nibble` with
+`-Zmiri-strict-provenance` passes all 13 tests. That statement is worthless
+without the following scope check, which was run rather than assumed:
+
+**Miri reports `is_x86_feature_detected!("avx2") == false`.** A default Miri run
+therefore takes the generic path and the two vector tests early-return — the
+unsafe code under review is never executed, and the run is vacuous. Building
+with `RUSTFLAGS="-C target-feature=+avx2"` makes the detection macro fold to
+`true` at compile time and Miri then interprets the AVX2 intrinsics directly.
+
+That the AVX2 path is genuinely covered was then *proved*, not assumed, by
+injecting faults and confirming Miri catches them:
+
+| injected fault | Miri result |
+|---|---|
+| `for index in 0..groups + 1` in `nibble_block_acc_avx2_wide_raw` | UB: "attempting to access 16 bytes, but got `alloc…+0x10` which is at or beyond the end of the allocation of size 16" |
+| `activation.values.as_ptr().add(block * block_size + 8)` in the tile loop | UB: "attempting to access 32 bytes … only 16 bytes from the end of the allocation" |
+
+Both raw-pointer derivations in the change — the callee's and the caller's — are
+therefore inside Miri's coverage under strict provenance, and both are clean as
+shipped. No sanitizer beyond Miri was available on this host.
+
+### Where the ceiling actually binds
+
+The original draft placed the boundary at t=16 ("1.6x at 1-8 threads,
+1.065x at 16") and read that as the kernel handing off to the memory system and
+the parallel runtime. The re-measurement moves the boundary **one octave
+earlier and makes it non-monotonic**: 1.678x / 1.667x at t=1/t=4, then
+**1.141x at t=8**, then back up to **1.245x at t=16**.
+
+The dip at t=8 is not explained by this data and is recorded as open. Its
+proximate cause is that the *baseline* scales superlinearly from t=4 to t=8
+(7.963 -> 3.542 ms, **2.25x from 2x the cores**) while the patched arm scales
+only 1.54x, so the two converge; the patched arm at t=4 (4.777 ms) is already
+doing what the baseline needs 8 threads to reach. A superlinear baseline step
+across 4->8 physical cores is the signature of a working-set/aggregation effect
+— 8 cores span more of one CCX's 32 MiB L3 — but with **no PMU on this host**
+that is a hypothesis, not a finding, and it is left labelled as one.
+
+What does survive from the original reading is the direction: **the kernel is no
+longer the sole binding constraint at full width.** It is simply not true that
+the handoff happens cleanly at 16 threads, and the 1.6x headline does not
+survive past 4.
 
 ## The recommendation
 
 1. **Do not build lever (a).** 0.94x DRAM-resident, 0.76x at full width. Its
    positive number is an L3-residency artifact of small benchmark shapes.
+   **Retired** — see
+   [`2026-08-21-int4-acc4-ntile-design.md`](2026-08-21-int4-acc4-ntile-design.md),
+   which is marked retired rather than deleted so the analytic bound is not
+   re-derived.
 2. **Do not build lever (b) for throughput.** 0.96x/1.10x. The traffic
    arithmetic is correct and the kernel is simply not traffic-limited where it
    would help. If bf16 scales are wanted for *footprint*, that is a separate
-   and defensible case — but it should not be sold as speed.
-3. **Take the per-block bookkeeping instead.** 1.61x-1.63x at 1-8 threads,
-   ~40 lines, bit-identical, all gates green. The patch is on this branch.
-4. **Do not tune the kernel further at t=16 without first moving the runtime
-   ceiling** — at full width the decode loop is no longer kernel-bound.
+   and defensible case — but it should not be sold as speed. **Retired.**
+3. **Take the per-block bookkeeping instead.** **1.678x at t=1, 1.667x at t=4,
+   1.141x at t=8, 1.245x at t=16, ~1.42x multi-session — all at block 32 only;
+   block 64 and 128 are 1.00x.** Bit-identical, all gates green. Shipped in
+   #1628.
+4. **Do not tune this kernel further at block 64/128, or at t>=8, on the
+   strength of this result** — the win is a block-32, low-thread-count effect,
+   and at 8+ threads the decode loop is no longer purely kernel-bound.
+5. **Do not quote a single headline multiplier for this change.** Four of the
+   nine rows in the first draft of this document did not reproduce, in both
+   directions, and the multi-session rows moved by 0.17x once the statistic was
+   corrected. Quote the cell.
 
 ## Reproducing
 
 ```bash
 # real-kernel A/B (arms A0/A1 identical = A/A control; discard if >2% apart)
-PROBE_ACCURACY=4 PROBE_BLOCK=32 PROBE_SESSIONS=1 PROBE_TOKENS=10 PROBE_LAYERS=1 \
+PROBE_ACCURACY=4 PROBE_BLOCK=32 PROBE_SESSIONS=1 PROBE_TOKENS=60 PROBE_LAYERS=1 \
   ONNX_GENAI_CPU_DECODE_THREADS=8 \
   cargo bench -p onnx-runtime-ep-cpu --bench int4_decode_loop_ab
 ```
 
 Pin to even CPUs only (`taskset -c 0,2,4,...`); interleave arms within a cycle
-and take medians across cycles; reject any cycle set whose A/A arms disagree by
-more than 2%. Do not report a single sequential timing on this host.
+(A0, B, A1 per repetition, never arm-at-a-time); reject any repetition set whose
+A/A arms disagree by more than 2%. Do not report a single sequential timing on
+this host.
+
+Five protocol requirements were learned the hard way during the re-measurement
+and are not optional:
+
+1. **Use the minimum over >= 6 repetitions for single-session latency**, not the
+   median. Interference on this host is one-sided, so the minimum estimates the
+   uncontended cost; but 3 repetitions is not enough — a 3-rep t=16 run produced
+   an apparent **0.815x regression** that 6 reps showed to be **1.227x**.
+2. **Use aggregate throughput (column 4), not pooled median latency (column 2),
+   for any `PROBE_SESSIONS > 1` row.** Column 2 mixes contended and uncontended
+   tokens depending on when each session exits; it produced a 52.7% A/A.
+3. **Lengthen the window when estimators disagree in direction.** t=16 at 60
+   tokens gave min 1.234x and median 0.730x; at 240 tokens it gives 1.245x and
+   1.412x. Do not pick the flattering statistic — extend the run.
+4. **Verify that a knob moves what it claims to.**
+   `ONNX_GENAI_CPU_DECODE_THREADS=2` produces timings *identical* to `=1`
+   (23.529 vs 23.527 ms/token), so the t=2 row in the first draft of this
+   document is not a 2-thread measurement and has been dropped rather than
+   restated.
+5. **Run `PROBE_ACCURACY=0` as a null control** for any claim about this kernel.
+   It must read 1.000x; if it does not, the harness is measuring something other
+   than the route under test.
+
+Block size 16 still cannot be measured with this microbenchmark (see
+[Method](#method)).

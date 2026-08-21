@@ -16,6 +16,17 @@ Host: AMD EPYC 9V74, 32 vCPU (16 cores x 2 SMT), AVX2 + FMA + F16C, **no
 AVX-512, no VNNI, no AMX**. L1d 32 KiB/core, L2 1 MiB/core, L3 64 MiB shared,
 75.8 GB/s DRAM. Shared machine; `perf` unavailable.
 
+> **Correction (2026-08-21, from the execution-regime study).** Two of the host
+> figures above are wrong and are corrected in
+> [`2026-08-21-int4-acc4-execution-regime.md`](2026-08-21-int4-acc4-execution-regime.md):
+> **L3 is 32 MiB per CCX, not 64 MiB shared** (two 16-vCPU CCXs, so no single
+> core sees 64 MiB), and **75.8 GB/s is not an achievable figure on this host**
+> — measured ceilings are 31-36 GB/s within one CCX and ~56.6 GB/s (peak 72.5)
+> across both. **SMT siblings are adjacent pairs**, so the physical-core set is
+> the even CPUs; any experiment here that pinned to `0..N` used `N/2` cores with
+> both siblings loaded. See [the affected
+> paragraph](#why-this-contradicts-the-2026-08-20-rejection) for what this changes.
+
 ## The opportunity
 
 On x86-64 the existing int4-direct decode route requires VNNI, `block_size = 32`
@@ -137,14 +148,22 @@ deinterleaved to match, once per row, amortized over all `N` outputs. That is
 
 *Does not survive:* **"the incumbent is already at the memory roofline."** That
 conclusion rests on the `acc4_int8` arm reaching 98-102% of the 75.8 GB/s DRAM
-figure at block 128. But `llama3_8b_mlp` expanded to `i8` is 58.7 MB and this host
-has a **64 MiB L3**, so across 30 back-to-back runs of a single-node model the
-weight is L3-resident and DRAM was never the binding constraint. The document
-warns about exactly this error two paragraphs earlier — "a roofline percentage
-means nothing until you check whether the denominator is the binding constraint"
-— and then rests its central explanation on it. The direct refutation is that this
-kernel is **2.37x faster than that arm** on that cell; nothing can be 2.37x faster
-than a genuinely bandwidth-saturated kernel reading half its bytes.
+figure at block 128. The direct refutation is that this kernel is **2.37x faster
+than that arm** on that cell; nothing can be 2.37x faster than a genuinely
+bandwidth-saturated kernel reading half its bytes.
+
+> **Correction (2026-08-21).** The *reasoning* originally given for this
+> refutation was wrong, even though the refutation itself stands. It argued that
+> `llama3_8b_mlp` expanded to `i8` is 58.7 MB against "a **64 MiB L3**", so the
+> weight was L3-resident and DRAM never bound. L3 is in fact **32 MiB per CCX**,
+> so a 58.7 MB working set is *not* L3-resident and does stream — that argument
+> is void. What survives, and is now the supported reason, is that **75.8 GB/s
+> is not an achievable denominator on this host at all**: measured ceilings are
+> 31-36 GB/s within one CCX and ~56.6 GB/s across both, so an arm reported at
+> "98-102% of 75.8 GB/s" was being scored against a number ~2x its real ceiling.
+> The warning the original document gave itself — "a roofline percentage means
+> nothing until you check whether the denominator is the binding constraint" —
+> applied to the *denominator*, not to residency.
 
 Its rejected mitigation is also worth separating from this one. It tried folding
 each activation group's `i32` partial into an `f32x8` accumulator *inside* a

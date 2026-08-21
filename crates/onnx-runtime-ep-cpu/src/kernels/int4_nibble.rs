@@ -390,6 +390,84 @@ pub(crate) fn zero_point_at(
 /// `scales` the matching `N x k_blocks`, and `zero_points` the optional packed
 /// tensor. Nothing is copied or expanded.
 #[allow(clippy::too_many_arguments)]
+/// Check every length relation the vector paths rely on, before any of them run.
+///
+/// The AVX2 path reaches its weights and activations through `chunks_exact`, so
+/// it cannot read out of bounds whatever it is handed -- but a caller that
+/// passed a `k_blocks` or `block_size` disagreeing with the buffers it also
+/// passed would get a silently *short* answer instead of a diagnosable failure,
+/// because `chunks_exact` stops early and drops the remainder. These relations
+/// hold by construction today (`NibbleActivation::new` is given the same
+/// `k_blocks * block_size` the caller then passes here), but that invariant
+/// spans two functions and nothing enforced it. Checking it costs a dozen
+/// comparisons per output range, against `k_blocks * blob` bytes of work.
+///
+/// Every product is `checked_mul`, so a malformed `k_blocks` cannot wrap into a
+/// small value that then passes a length test it should have failed.
+fn validate_nibble_outputs(
+    activation: &NibbleActivation,
+    packed: &[u8],
+    scales: &[f32],
+    zero_points: Option<&[u8]>,
+    outputs: &std::ops::Range<usize>,
+    result: &[f32],
+    k_blocks: usize,
+    block_size: usize,
+) {
+    assert!(
+        block_size >= MIN_BLOCK_SIZE && block_size.is_power_of_two(),
+        "block_size must be a power of two and at least {MIN_BLOCK_SIZE}, got {block_size}"
+    );
+    assert_eq!(
+        result.len(),
+        outputs.len(),
+        "one result slot per output column"
+    );
+    let padded_k = k_blocks
+        .checked_mul(block_size)
+        .expect("k_blocks * block_size overflows");
+    assert_eq!(
+        activation.values.len(),
+        padded_k,
+        "activation was laid out for a different k_blocks/block_size"
+    );
+    assert_eq!(activation.block_sums.len(), k_blocks, "one block sum each");
+    assert_eq!(activation.scales.len(), k_blocks, "one block scale each");
+
+    let row_bytes = k_blocks
+        .checked_mul(block_size / 2)
+        .expect("k_blocks * blob overflows");
+    let weights_needed = outputs
+        .end
+        .checked_mul(row_bytes)
+        .expect("outputs.end * row_bytes overflows");
+    assert!(
+        packed.len() >= weights_needed,
+        "packed weights hold {} bytes, need {weights_needed}",
+        packed.len()
+    );
+    let scales_needed = outputs
+        .end
+        .checked_mul(k_blocks)
+        .expect("outputs.end * k_blocks overflows");
+    assert!(
+        scales.len() >= scales_needed,
+        "scales hold {}, need {scales_needed}",
+        scales.len()
+    );
+    if let Some(points) = zero_points {
+        let zero_needed = outputs
+            .end
+            .checked_mul(k_blocks.div_ceil(2))
+            .expect("outputs.end * zero_row overflows");
+        assert!(
+            points.len() >= zero_needed,
+            "zero points hold {}, need {zero_needed}",
+            points.len()
+        );
+    }
+}
+
 pub(crate) fn nibble_outputs(
     activation: &NibbleActivation,
     packed: &[u8],
@@ -400,6 +478,16 @@ pub(crate) fn nibble_outputs(
     k_blocks: usize,
     block_size: usize,
 ) {
+    validate_nibble_outputs(
+        activation,
+        packed,
+        scales,
+        zero_points,
+        &outputs,
+        result,
+        k_blocks,
+        block_size,
+    );
     // Detected once per output range rather than once per block. The per-block
     // spelling cost more than the arithmetic it guarded: a `block_size = 32`
     // block is a single 32-nibble group, so the feature probe, the call and the
@@ -438,23 +526,39 @@ pub(crate) fn nibble_outputs(
     );
 }
 
-/// Wide-path block accumulator taking raw pointers and an already-known group
-/// count.
+/// Wide-path block accumulator for exactly one block, over raw pointers.
 ///
-/// The slice-taking [`nibble_block_acc_avx2`] rebuilds two bounds-checked
-/// slices per block and then recovers `groups` from `packed.len()` and
-/// re-branches on `group` on every call. At `block_size = 32` a block is a
-/// single 16-byte group -- about ten uops -- so that bookkeeping is amortized
-/// over nothing and dominates. Hoisting it is worth 1.61x on the decode loop at
-/// 1-8 threads; see `docs/benchmarks/2026-08-21-int4-acc4-execution-regime.md`.
+/// The general [`nibble_block_acc_avx2`] re-derives its group count from
+/// `packed.len()` and re-branches on `group` on every call. At
+/// `block_size = 32` a block is a single 16-byte group -- about ten uops -- so
+/// that bookkeeping is amortized over nothing and dominates. Deciding it once
+/// per output range instead is worth 1.62x on the decode loop at 1-4 threads;
+/// see `docs/benchmarks/2026-08-21-int4-acc4-execution-regime.md`.
+///
+/// **Why raw pointers rather than slices.** Two safe formulations were built
+/// and measured against this one on the real decode loop at one thread, and
+/// neither is free: zipped `chunks_exact` over the tile and the block costs
+/// 5% of the win (1.54x against 1.62x) and bounds-checked sub-slicing of the
+/// tile costs 17% (1.34x). Since safe slicing is not codegen-equivalent here,
+/// the pointers stay -- and the invariant they rest on is instead *enforced*,
+/// once per output range, by [`validate_nibble_outputs`], which is what makes
+/// the call sites' proofs below sound rather than merely conventional.
 ///
 /// # Safety
 ///
 /// The host must support AVX2, and the caller must guarantee `groups * 16`
-/// readable bytes at `packed` and `groups * 32` readable elements at
-/// `activation`.
+/// readable bytes at `packed` and `groups * 32` readable `i16` at `activation`,
+/// both for the whole call. The two pointers need no particular alignment --
+/// every load below is an unaligned `loadu` -- and neither is retained, offset
+/// past those bounds, or converted to an integer.
+///
+/// Loop invariant: on entry to iteration `index`, `0 <= index < groups`, so the
+/// reads are confined to `packed[index * 16 .. index * 16 + 16]` and
+/// `activation[index * 32 .. index * 32 + 32]`; both are within the contracted
+/// bounds because `index + 1 <= groups`. Nothing else is dereferenced.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn nibble_block_acc_avx2_wide_raw(
     packed: *const u8,
     activation: *const i16,
@@ -464,15 +568,20 @@ unsafe fn nibble_block_acc_avx2_wide_raw(
     let mask = _mm256_set1_epi16(0x000f);
     let mut accumulator = _mm256_setzero_si256();
     for index in 0..groups {
-        // SAFETY: guaranteed readable by this function's contract.
-        let bytes = unsafe { _mm_loadu_si128(packed.add(index * 16).cast()) };
+        // SAFETY: `index < groups`, so these 16 bytes lie inside the
+        // `groups * 16` this function's contract guarantees; `loadu` imposes no
+        // alignment requirement.
+        let bytes = unsafe { _mm_loadu_si128(packed.add(index * WIDE_GROUP / 2).cast()) };
         let widened = _mm256_cvtepu8_epi16(bytes);
         let low = _mm256_and_si256(widened, mask);
         let high = _mm256_srli_epi16(widened, 4);
-        // SAFETY: as above.
-        let even = unsafe { _mm256_loadu_si256(activation.add(index * 32).cast()) };
-        // SAFETY: as above.
-        let odd = unsafe { _mm256_loadu_si256(activation.add(index * 32 + 16).cast()) };
+        // SAFETY: `index < groups`, so these 16 `i16` lie inside the
+        // `groups * 32` contracted; unaligned load.
+        let even = unsafe { _mm256_loadu_si256(activation.add(index * WIDE_GROUP).cast()) };
+        // SAFETY: as above, for the second half of the same group.
+        let odd = unsafe {
+            _mm256_loadu_si256(activation.add(index * WIDE_GROUP + WIDE_GROUP / 2).cast())
+        };
         accumulator = _mm256_add_epi32(accumulator, _mm256_madd_epi16(even, low));
         accumulator = _mm256_add_epi32(accumulator, _mm256_madd_epi16(odd, high));
     }
@@ -509,31 +618,60 @@ unsafe fn nibble_outputs_avx2(
     let zero_row = k_blocks.div_ceil(2);
     let tiles = k_blocks / BLOCK_TILE;
     let tiled_blocks = tiles * BLOCK_TILE;
+    // Decided once per output range rather than once per block. `group_for`
+    // returns `WIDE_GROUP` exactly when `block_size >= WIDE_GROUP`, so this is
+    // `block_size >= 32`, and `block_size` is a validated power of two -- hence
+    // `blob` is a whole number of 16-byte groups whenever `wide` holds.
+    // Decided once per output range rather than once per block. `group_for`
+    // returns `WIDE_GROUP` exactly when `block_size >= WIDE_GROUP`, so `wide`
+    // is `block_size >= 32`; `validate_nibble_outputs` has established that
+    // `block_size` is a power of two, so `blob = block_size / 2` is then a
+    // whole number of 16-byte groups and `wide_groups * 16 == blob` exactly.
+    // That exactness is what lets the raw kernel's group count stand in for the
+    // block length; without it the division would truncate and silently drop a
+    // partial group.
     let wide = group >= WIDE_GROUP;
     let wide_groups = blob / (WIDE_GROUP / 2);
+    debug_assert!(!wide || wide_groups * (WIDE_GROUP / 2) == blob);
+    debug_assert!(!wide || wide_groups * WIDE_GROUP == block_size);
     for (slot, output) in result.iter_mut().zip(outputs) {
         let weights = &packed[output * row_bytes..(output + 1) * row_bytes];
         let row_scales = &scales[output * k_blocks..(output + 1) * k_blocks];
         let zero_bytes =
             zero_points.map(|points| &points[output * zero_row..(output + 1) * zero_row]);
         let mut running = _mm_setzero_ps();
+        // A tile is exactly `BLOCK_TILE` consecutive blocks of each buffer, so
+        // both tile streams and the per-block streams inside them come from
+        // `chunks_exact`. That is what replaced the previous revision's raw
+        // pointer arithmetic: the block slices carry their own lengths, no
+        // index is formed that needs a bounds check, and the earlier
+        // `block * blob` / `block * block_size` products -- whose in-range-ness
+        // rested on an invariant asserted in a different function -- are gone.
         for tile in 0..tiles {
             let base = tile * BLOCK_TILE;
             let mut lanes = [_mm_setzero_si128(); BLOCK_TILE];
             for (offset, lane) in lanes.iter_mut().enumerate() {
                 let block = base + offset;
-                // SAFETY: AVX2 holds by this function's contract, and both
-                // slices are exactly one block long.
-                // SAFETY: `block < k_blocks`, so `blob` bytes of `weights` and
-                // `block_size` activation elements are in bounds, which is
-                // exactly `wide_groups` groups. Both pointers are formed above
-                // the branch on purpose: computing them inside it regressed
-                // block_size 64 to 0.876x.
+                // SAFETY (both pointers): `tile < tiles` and `offset <
+                // BLOCK_TILE` give `block < tiles * BLOCK_TILE <= k_blocks`.
+                // `validate_nibble_outputs` has already established, for this
+                // exact `k_blocks`/`block_size`, that `weights` is `k_blocks *
+                // blob` bytes and `activation.values` is `k_blocks *
+                // block_size` elements. So `block * blob + blob <= k_blocks *
+                // blob` and likewise for the activation: each offset is in
+                // bounds and one whole block remains readable past it, which is
+                // `wide_groups` groups. Formed above the `wide` branch on
+                // purpose -- computing them inside it regressed block_size 64
+                // to 0.876x.
                 let w = unsafe { weights.as_ptr().add(block * blob) };
                 let a = unsafe { activation.values.as_ptr().add(block * block_size) };
                 *lane = if wide {
+                    // SAFETY: AVX2 by this function's contract; `wide_groups *
+                    // 16 == blob` bytes and `wide_groups * 32 == block_size`
+                    // elements are readable at `w`/`a` per the paragraph above.
                     unsafe { nibble_block_acc_avx2_wide_raw(w, a, wide_groups) }
                 } else {
+                    // SAFETY: AVX2 as above; both slices are exactly one block.
                     unsafe {
                         nibble_block_acc_avx2(
                             &weights[block * blob..(block + 1) * blob],
@@ -980,6 +1118,248 @@ mod tests {
     /// never emits must not reach the kernel.
     ///
     /// Mutation check: dropping the `is_power_of_two` term admits 48.
+    /// Reduce the wide accumulator the way the tail loop does, so a block's
+    /// four lanes can be compared against the scalar reference as one integer.
+    #[cfg(target_arch = "x86_64")]
+    fn fold_lanes(lanes: std::arch::x86_64::__m128i) -> i32 {
+        use std::arch::x86_64::*;
+        // SAFETY: SSE2 is baseline on x86_64; these are pure register ops.
+        unsafe {
+            let folded = _mm_add_epi32(lanes, _mm_unpackhi_epi64(lanes, lanes));
+            _mm_cvtsi128_si32(_mm_add_epi32(folded, _mm_shuffle_epi32(folded, 0b01)))
+        }
+    }
+
+    /// The split-out wide accumulator is the function the decode loop actually
+    /// runs, and until this test it had no direct coverage at all: every
+    /// `int4_nibble` test drove `k_blocks <= 3`, and `tiles = k_blocks /
+    /// BLOCK_TILE` is then **zero**, so the whole tiled loop was skipped and
+    /// only the scalar tail ran. The mutation below was caught solely by
+    /// `matmul_nbits` integration tests, one module away.
+    ///
+    /// Exhaustive over all 256 packed byte values at every wide block size,
+    /// against the readable reference.
+    ///
+    /// Mutation check: `_mm256_srli_epi16(widened, 4)` -> `5`, or swapping the
+    /// `low`/`high` operands, or dropping the `+ WIDE_GROUP / 2` on the odd
+    /// activation load, each fail this.
+    #[test]
+    fn the_wide_block_accumulator_matches_the_scalar_reference_exhaustively() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if !std::arch::is_x86_feature_detected!("avx2") {
+                return;
+            }
+            for block_size in [32usize, 64, 128] {
+                let blob = block_size / 2;
+                let groups = blob / (WIDE_GROUP / 2);
+                // Every one of the 256 byte values appears in every nibble
+                // position across the sweep of starting offsets.
+                for start in 0..256usize {
+                    let packed: Vec<u8> = (0..blob)
+                        .map(|index| ((start + index) % 256) as u8)
+                        .collect();
+                    let mut source = vec![0i8; block_size];
+                    for (index, slot) in source.iter_mut().enumerate() {
+                        // Walk the whole i8 range, extremes included.
+                        *slot = (((index * 37 + start * 11) % 256) as i64 - 128) as i8;
+                    }
+                    let mut activation = vec![0i16; block_size];
+                    deinterleave_block(&source, &mut activation, WIDE_GROUP);
+                    let reference = nibble_block_dot_reference(&packed, &activation, WIDE_GROUP);
+                    // SAFETY: AVX2 was just detected; `packed` is `groups * 16`
+                    // bytes and `activation` is `groups * 32` `i16` by
+                    // construction, which is this function's whole contract.
+                    let got = unsafe {
+                        nibble_block_acc_avx2_wide_raw(packed.as_ptr(), activation.as_ptr(), groups)
+                    };
+                    assert_eq!(
+                        fold_lanes(got),
+                        reference,
+                        "block_size={block_size} start={start}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Drive `nibble_outputs` with enough blocks to actually enter the tiled
+    /// AVX2 loop (`k_blocks >= BLOCK_TILE`), across every block size, both
+    /// zero-point spellings, ragged tails, and scales chosen to be hostile.
+    ///
+    /// `the_kernel_tracks_the_float64_contract` looks like it covers this and
+    /// does not: its largest `k` is `block_size * 3`, so `tiles` is always 0.
+    ///
+    /// Mutation check: dropping the `wide` branch's hoisted `wide_groups` to
+    /// `wide_groups - 1`, or reducing `tiles` by one, fails this.
+    #[test]
+    fn the_tiled_path_tracks_the_float64_contract() {
+        for block_size in [16usize, 32, 64, 128] {
+            // 4 and 8 are whole tiles; 5, 7 and 9 leave a 1-3 block tail, so
+            // both the tiled loop and the scalar remainder run in one call.
+            for blocks in [4usize, 5, 7, 8, 9] {
+                for ragged in [0usize, 1] {
+                    let k = blocks * block_size - ragged;
+                    let k_blocks = k.div_ceil(block_size);
+                    let padded_k = k_blocks * block_size;
+                    let n = 5;
+                    let packed = bytes(n * k_blocks * (block_size / 2), 0x2b + k as u64);
+                    // Hostile scales: denormal-adjacent, huge, exactly zero
+                    // (which the generic path short-circuits) and negative.
+                    let scales: Vec<f32> = (0..n * k_blocks)
+                        .map(|index| match index % 4 {
+                            0 => 1.0e-30,
+                            1 => 1.0e6,
+                            2 => 0.0,
+                            _ => -3.5e-2,
+                        })
+                        .collect();
+                    let activation = floats(k, 0x77 + k as u64);
+                    for zero_points in [None, Some(bytes(n * k_blocks.div_ceil(2), 0x5a))] {
+                        let prepared = NibbleActivation::new(&activation, padded_k, block_size);
+                        let mut result = vec![0.0f32; n];
+                        nibble_outputs(
+                            &prepared,
+                            &packed,
+                            &scales,
+                            zero_points.as_deref(),
+                            0..n,
+                            &mut result,
+                            k_blocks,
+                            block_size,
+                        );
+                        let expect = oracle(
+                            &activation,
+                            &packed,
+                            &scales,
+                            zero_points.as_deref(),
+                            k,
+                            n,
+                            block_size,
+                        );
+                        let magnitude = expect.iter().fold(0.0f64, |a, b| a.max(b.abs()));
+                        for (output, (got, want)) in result.iter().zip(&expect).enumerate() {
+                            let tolerance = magnitude * 0.05 + 1.0e-3;
+                            assert!(
+                                (f64::from(*got) - want).abs() <= tolerance,
+                                "block_size={block_size} k={k} blocks={blocks} \
+                                 output={output} got={got} want={want}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A caller whose buffers disagree with the `k_blocks`/`block_size` it also
+    /// passed must be stopped by a named assertion *before* any vector path
+    /// forms a pointer from those lengths -- not produce a short answer, and
+    /// not read out of bounds.
+    ///
+    /// This is the check that makes the raw-pointer kernel's safety argument
+    /// hold: its call site proves `block * blob + blob <= weights.len()` from
+    /// relations that, before this, were established in a different function
+    /// and enforced nowhere.
+    ///
+    /// Each case asserts the **message**, not merely that something panicked.
+    /// The first spelling of this test only checked `is_err()` and passed with
+    /// `validate_nibble_outputs` deleted entirely, because these inputs also
+    /// trip an incidental slice bounds check further in -- which proves nothing
+    /// about ordering and nothing about the cases that would instead be silent.
+    #[test]
+    fn malformed_lengths_are_refused_before_any_unsafe_runs() {
+        let block_size = 32;
+        let k_blocks = 8;
+        let n = 3;
+        let padded_k = k_blocks * block_size;
+        let packed = bytes(n * k_blocks * (block_size / 2), 1);
+        let scales = vec![1.0f32; n * k_blocks];
+        let activation = floats(padded_k, 2);
+        let prepared = NibbleActivation::new(&activation, padded_k, block_size);
+        let zero = bytes(n * k_blocks.div_ceil(2), 3);
+
+        let call = |packed: &[u8], scales: &[f32], zero: Option<&[u8]>, kb: usize, bs: usize| {
+            let mut result = vec![0.0f32; n];
+            nibble_outputs(&prepared, packed, scales, zero, 0..n, &mut result, kb, bs);
+        };
+
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(&str, Box<dyn Fn() + std::panic::UnwindSafe>)> = vec![
+            (
+                "activation was laid out for a different k_blocks/block_size",
+                Box::new(|| call(&packed, &scales, Some(&zero), k_blocks + 1, block_size)),
+            ),
+            (
+                "activation was laid out for a different k_blocks/block_size",
+                Box::new(|| call(&packed, &scales, Some(&zero), k_blocks, block_size * 2)),
+            ),
+            (
+                "packed weights hold",
+                Box::new(|| {
+                    call(
+                        &packed[..packed.len() - 1],
+                        &scales,
+                        Some(&zero),
+                        k_blocks,
+                        block_size,
+                    )
+                }),
+            ),
+            (
+                "scales hold",
+                Box::new(|| {
+                    call(
+                        &packed,
+                        &scales[..scales.len() - 1],
+                        Some(&zero),
+                        k_blocks,
+                        block_size,
+                    )
+                }),
+            ),
+            (
+                "zero points hold",
+                Box::new(|| {
+                    call(
+                        &packed,
+                        &scales,
+                        Some(&zero[..zero.len() - 1]),
+                        k_blocks,
+                        block_size,
+                    )
+                }),
+            ),
+            (
+                "block_size must be a power of two",
+                Box::new(|| call(&packed, &scales, Some(&zero), k_blocks, 48)),
+            ),
+        ];
+
+        for (expected, case) in cases {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let outcome = std::panic::catch_unwind(case);
+            std::panic::set_hook(previous);
+            let payload = outcome.expect_err("must be refused, not accepted");
+            let message = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| {
+                    payload
+                        .downcast_ref::<&str>()
+                        .map(|text| (*text).to_owned())
+                })
+                .unwrap_or_default();
+            assert!(
+                message.contains(expected),
+                "expected the validator to reject this with {expected:?}, \
+                 got {message:?} -- an incidental bounds check is not the \
+                 same guarantee, since it runs after pointers are formed"
+            );
+        }
+    }
+
     #[test]
     fn unsupported_block_sizes_are_refused() {
         for block_size in [0usize, 1, 8, 15, 24, 48, 96] {
