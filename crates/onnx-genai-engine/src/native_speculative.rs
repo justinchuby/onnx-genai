@@ -36,8 +36,8 @@ use crate::native_decode::{NativeDecodeSession, NativeProposerSession};
 use crate::processors::ensure_constrained_finish;
 use crate::sampling::sample_greedy;
 use crate::speculative::{
-    LinearEmbedder, NgramProposer, SpeculativeProposer, SpeculativeProposerContext,
-    SpeculativeStats, TokenEmbedder, argmax,
+    LinearEmbedder, MtpEmbedder, MtpLmHead, MtpProposer, NgramProposer, SpeculativeProposer,
+    SpeculativeProposerContext, SpeculativeStats, TokenEmbedder, argmax,
 };
 use anyhow::Context;
 use onnx_genai_ort::Tokenizer;
@@ -68,6 +68,15 @@ enum NativeProposer<'a> {
         session: &'a mut NativeProposerSession,
         embedder: &'a LinearEmbedder,
         groups: &'a [onnx_genai_metadata::SharedKvGroup],
+        hidden_size: usize,
+    },
+    /// MTP self-speculation: the generic [`MtpProposer`] (ORT MTP head +
+    /// shared target embedding / LM head) proposes `guaranteed + K` tokens from
+    /// the native target's last hidden state. `hidden_size` is the expected
+    /// seed width (`hc_mult * hidden`) used to fail fast on a metadata/model
+    /// mismatch before the proposer runs.
+    Mtp {
+        proposer: Box<MtpProposer<'static, MtpEmbedder, MtpLmHead>>,
         hidden_size: usize,
     },
 }
@@ -108,6 +117,31 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 session: proposer_session,
                 embedder,
                 groups,
+                hidden_size,
+            },
+            draft_width: draft_width.max(1),
+        })
+    }
+
+    /// Build an MTP self-speculative driver over `session`.
+    ///
+    /// The generic [`MtpProposer`] owns the ORT MTP-head session plus the shared
+    /// target embedding / LM head; it is seeded each step from the native
+    /// target's declared hidden output (`last_hidden()`), which the Gap-2
+    /// executor fix makes available on the CUDA path.
+    pub(crate) fn new_mtp(
+        session: &'a mut NativeDecodeSession,
+        proposer: MtpProposer<'static, MtpEmbedder, MtpLmHead>,
+        hidden_size: usize,
+        draft_width: usize,
+    ) -> anyhow::Result<Self> {
+        if hidden_size == 0 {
+            anyhow::bail!("native MTP proposer requires a positive target hidden width");
+        }
+        Ok(Self {
+            session,
+            proposer: NativeProposer::Mtp {
+                proposer: Box::new(proposer),
                 hidden_size,
             },
             draft_width: draft_width.max(1),
@@ -264,6 +298,39 @@ impl<'a> NativeSpeculativeDriver<'a> {
                         }
                     }
                     tokens
+                }
+                NativeProposer::Mtp {
+                    proposer,
+                    hidden_size,
+                } => {
+                    let target_hidden = self.session.last_hidden().with_context(|| {
+                        "native MTP proposer requires the target decoder's declared hidden output; the target forward produced no hidden state"
+                    })?;
+                    if target_hidden.len() != *hidden_size {
+                        anyhow::bail!(
+                            "native target hidden output has width {}, but MTP metadata declares hc_mult * hidden = {}; fix speculative.target_hidden_size / hc_mult",
+                            target_hidden.len(),
+                            hidden_size
+                        );
+                    }
+                    let guaranteed = TokenId::try_from(
+                        argmax(&base_logits).context("native target logits were empty")?,
+                    )
+                    .context("native target token id exceeds u32 range")?;
+                    let proposer_context = SpeculativeProposerContext {
+                        width,
+                        context_tokens: &context_tokens,
+                        generated_tokens: &state.generated_tokens,
+                        generated_text: &state.generated_text,
+                        first_step: state.step,
+                        options,
+                        chain,
+                        target_hidden: Some(target_hidden),
+                        target_hidden_layers: None,
+                        guaranteed_token: Some(guaranteed),
+                        shared_kv_slices: None,
+                    };
+                    proposer.propose(&proposer_context)?.tokens
                 }
             };
             draft.truncate(width);
