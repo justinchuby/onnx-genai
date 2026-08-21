@@ -9,7 +9,7 @@ pipeline:
       - loop_induction_values
       - typed_emit
     inputs:
-      request.latent:
+      request.noise:
         contract:
           dtype: float32
           rank: 4
@@ -25,7 +25,7 @@ pipeline:
           kind: opaque
         source:
           kind: application
-          name: latent
+          name: noise
         required: true
       request.max_iterations:
         contract:
@@ -303,7 +303,7 @@ pipeline:
             kind: request_aligned
             axis: 0
         scope: invocation
-        initializer: request.latent
+        initializer: request.noise
         recurrence:
           kind: invariant
       loop_0_active:
