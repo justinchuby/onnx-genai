@@ -137,11 +137,22 @@ impl NativeDecodeSession {
         if let Some(state) = &mut self.cuda {
             // Option (b) default: invalidate the captured decode graph before the
             // KV roll-back (the eager verify path captures nothing, and the plain
-            // M=1 path re-warms cleanly). Option (c) (dormant until WP4) retains
-            // the single fixed-topology M=maxK graph and rewinds contents only —
-            // `state.rewind` mutates just the mask tail + KV logical length, the
-            // same data-driven mutation the captured graph already tolerates.
-            if !state.retain_graph_on_rewind {
+            // M=1 path re-warms cleanly). Two dormant seams (both OFF by default)
+            // would retain the graph across a contents-only rewind instead — the
+            // rewind only zeros the mask tail + truncates the KV logical length,
+            // leaving every binding's physical_shape/device_ptr fixed, so the
+            // captured M=1 graph's replay signature stays valid: `retain_graph_on_rewind`
+            // (option (c) padded verify capture) and `retain_decode_graph_across_spec`
+            // (spec-decode retention). Retention on rewind alone is capture-safe,
+            // but NOT sufficient for a speedup: the eager M>1 verify forward tears
+            // the graph down every step regardless, and retaining across BOTH
+            // sites is capture-unsafe until the verify workspace is pinned (see
+            // the verify site + decision note). A full reset to `target_len == 0`
+            // (between generations) always invalidates so a stale graph never
+            // leaks into the next generation.
+            let retain = state.retain_graph_on_rewind
+                || (state.retain_decode_graph_across_spec && target_len != 0);
+            if !retain {
                 state.invalidate_graph(&mut self.session)?;
             }
             state.rewind(target_len)?;

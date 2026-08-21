@@ -731,6 +731,26 @@ pub(crate) struct DecodeCudaState {
     /// captured graph already tolerates on the M=1 replay path. Kept dormant
     /// (default `false`) until WP4 graduates verify to the captured path.
     pub(crate) retain_graph_on_rewind: bool,
+    /// **Dormant seam (default `false`).** When `true`, the captured M=1 decode
+    /// graph would be retained across a speculative verify+commit cycle instead
+    /// of being torn down twice per step (once by the eager M>1 verify forward,
+    /// once by the commit rewind), the two invalidations that pin MTP at
+    /// `replays=0` (empirically 30 verify + 21 rewind invalidations over 10
+    /// verify steps).
+    ///
+    /// Kept OFF because enabling it is **not capture-safe** as-is: the eager M>1
+    /// verify reserves a larger StepScoped `step_workspace` that is freed after
+    /// the run, so a later M=1 replay reads the captured graph's now-stale
+    /// workspace pointer and yields non-finite logits (GPU-verified; the finite
+    /// guard catches it — no silent corruption). Retaining across the rewind
+    /// alone, or across the verify alone, is safe but useless (the other site
+    /// still tears the graph down, so `replays` stays 0); retaining across both —
+    /// the only config that actually replays — is what corrupts. A real speedup
+    /// requires the M=K verify itself captured into a fixed-shape replayable
+    /// graph with a pinned workspace (option-c padded verify capture), since the
+    /// eager verify otherwise pays the full per-op launch overhead that graphed
+    /// greedy avoids. See the decision note for the GPU evidence and plan.
+    pub(crate) retain_decode_graph_across_spec: bool,
     /// Dormant option (c) scaffolding: the fixed query-row capacity (M=maxK) a
     /// padded single-capture verify graph would be captured at. `None` today —
     /// the eager verify path (option (b)) captures nothing. Set only by the
@@ -1251,7 +1271,21 @@ impl NativeDecodeSession {
             .cuda
             .as_mut()
             .context("CUDA decode state is not initialized")?;
-        state.invalidate_graph(&mut self.session)?;
+        // An eager M>1 verify/prefill forward tears down the captured M=1 decode
+        // graph here so the plain M=1 hot path re-warms cleanly. The dormant
+        // `retain_decode_graph_across_spec` seam (default OFF) would skip this to
+        // let the base-decode graph survive a spec verify+commit cycle — but that
+        // is NOT capture-safe yet: this forward reserves a larger StepScoped
+        // `step_workspace` that is freed (`release_step_workspace`) after the run,
+        // so a subsequent M=1 replay reads the captured graph's now-stale
+        // workspace pointer and produces non-finite logits (GPU-verified; the
+        // finite-check guard catches it). Graduating this to a real speedup needs
+        // the M=K verify itself captured into a fixed-shape replayable graph with
+        // a pinned workspace (option-c padded verify capture), not just retaining
+        // the M=1 graph. Kept as a documented seam; see the decision note.
+        if !state.retain_decode_graph_across_spec {
+            state.invalidate_graph(&mut self.session)?;
+        }
         // Auxiliary graph outputs (e.g. the MTP hidden-state seed
         // `hidden_states.63`) get a persistent device binding whose symbolic
         // query-seq axis is collapsed to `1` for the captured decode step
@@ -4459,6 +4493,11 @@ impl DecodeCudaState {
             graph_fallback_report: None,
             auxiliary_bind_declines: declined_auxiliary,
             retain_graph_on_rewind: false,
+            // Dormant seam (default off): retaining the M=1 graph across a spec
+            // verify+commit cycle is not capture-safe until the M=K verify is
+            // itself captured with a pinned workspace. See the field docs and the
+            // decision note for the GPU evidence.
+            retain_decode_graph_across_spec: false,
             #[cfg(test)]
             padded_query_capacity: None,
             device_token_loop_k,
@@ -5467,6 +5506,20 @@ impl DecodeCudaState {
     #[cfg(test)]
     pub(crate) fn set_retain_graph_on_rewind(&mut self, retain: bool) {
         self.retain_graph_on_rewind = retain;
+    }
+
+    /// Toggle the dormant spec-decode graph-retention seam
+    /// (`retain_decode_graph_across_spec`). Kept off in production because it is
+    /// not capture-safe until the M=K verify is captured with a pinned workspace;
+    /// exposed for the option-c work and its tests. See the field docs.
+    #[cfg(test)]
+    pub(crate) fn set_retain_decode_graph_across_spec(&mut self, retain: bool) {
+        self.retain_decode_graph_across_spec = retain;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retain_decode_graph_across_spec(&self) -> bool {
+        self.retain_decode_graph_across_spec
     }
 
     /// Fixed query-row capacity (M=maxK) of the dormant padded verify capture, or
