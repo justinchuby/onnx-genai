@@ -52,7 +52,15 @@ step_if "G2 test-aarch64-qemu" qemu-aarch64-static "apt install qemu-user-static
   env QEMU_LD_PREFIX=/usr/aarch64-linux-gnu \
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER=qemu-aarch64-static \
       cargo test --locked --target aarch64-unknown-linux-gnu -p onnx-runtime-ep-cpu --lib
-step "H check-win-arm64"    cargo check --locked --target aarch64-pc-windows-msvc -p onnx-runtime-ep-cpu
+# Windows ARM64. Plain `cargo check --target aarch64-pc-windows-msvc` cannot
+# work on Linux: ort-sys runs bindgen over the ORT headers, which #include
+# <stdlib.h>, so it needs the MSVC CRT/SDK headers and dies with
+# "'stdlib.h' file not found". That is a missing toolchain, not a code defect,
+# and reading it as a permanent expected failure hides real breakage. cargo-xwin
+# supplies the CRT/SDK and makes the gate actually meaningful; it also needs the
+# target std (`rustup target add aarch64-pc-windows-msvc`).
+step_if "H check-win-arm64" cargo-xwin "cargo install cargo-xwin && rustup target add aarch64-pc-windows-msvc" \
+  cargo xwin check --locked --target aarch64-pc-windows-msvc -p onnx-runtime-ep-cpu
 step "I ep-cpu-no-default"  cargo test --locked -p onnx-runtime-ep-cpu --no-default-features
 step "J ep-cpu-all-features" cargo check --locked -p onnx-runtime-ep-cpu --all-features
 step "K no-mlas-artifacts"  cargo test --locked -p onnx-runtime-ep-cpu-plugin --test default_artifacts_are_mlas_free
