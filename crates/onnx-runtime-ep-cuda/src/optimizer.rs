@@ -2533,14 +2533,28 @@ impl CudaSkipRmsNormMatMulFusion {
 
         // Identify which data input is produced by a fusable preceding GEMV; the
         // other is the residual.
-        let (preceding_out, residual) = match (
-            self.preceding_gemv(graph, input_value, norm_size),
-            self.preceding_gemv(graph, skip_value, norm_size),
-        ) {
-            (Some(_), Some(_)) => return None,
-            (Some(_), None) => (input_value, skip_value),
-            (None, Some(_)) => (skip_value, input_value),
-            (None, None) => return None,
+        let input_probe = self.preceding_gemv_attributed(graph, input_value, norm_size);
+        let skip_probe = self.preceding_gemv_attributed(graph, skip_value, norm_size);
+        if std::env::var_os("ONNX_GENAI_CUDA_DEBUG_RMSNORM_FOLD").is_some() {
+            let describe = |r: &Result<NodeId, &'static str>| match r {
+                Ok(_) => "OK".to_string(),
+                Err(reason) => (*reason).to_string(),
+            };
+            eprintln!(
+                "rmsnorm_fold_probe: norm={} input={} skip={}",
+                graph
+                    .try_node(skip_id)
+                    .map(|n| n.name.as_str())
+                    .unwrap_or("<unnamed>"),
+                describe(&input_probe),
+                describe(&skip_probe),
+            );
+        }
+        let (preceding_out, residual) = match (input_probe.is_ok(), skip_probe.is_ok()) {
+            (true, true) => return None,
+            (true, false) => (input_value, skip_value),
+            (false, true) => (skip_value, input_value),
+            (false, false) => return None,
         };
         let preceding_id = self.preceding_gemv(graph, preceding_out, norm_size)?;
         if graph.value(residual).dtype != DataType::Float16 {
@@ -2566,6 +2580,17 @@ impl CudaSkipRmsNormMatMulFusion {
         }
         for following_id in &following_ids {
             if !self.following_gemv_is_fusable(graph, *following_id) {
+                if std::env::var_os("ONNX_GENAI_CUDA_DEBUG_RMSNORM_FOLD").is_some() {
+                    let n = graph.node(*following_id);
+                    eprintln!(
+                        "rmsnorm_fold_decline: following GEMV not prologue-capable: op={} name={} inputs={} K={:?} N={:?}",
+                        n.op_type,
+                        n.name,
+                        n.input_values().count(),
+                        n.attr("K").and_then(Attribute::as_int),
+                        n.attr("N").and_then(Attribute::as_int),
+                    );
+                }
                 return None;
             }
         }
@@ -2612,41 +2637,64 @@ impl CudaSkipRmsNormMatMulFusion {
     /// only consumer is the norm, it is not a graph output, and its output width
     /// equals the hidden size (so the residual add is well-shaped).
     fn preceding_gemv(&self, graph: &Graph, value: ValueId, norm_size: usize) -> Option<NodeId> {
-        let producer = graph.try_value(value)?.producer?;
-        let node = graph.try_node(producer)?;
+        self.preceding_gemv_attributed(graph, value, norm_size).ok()
+    }
+
+    /// [`Self::preceding_gemv`] with the decline reason retained.
+    ///
+    /// The reasons are what turns "half the norms do not fold" into an
+    /// actionable finding: inferring them from the pre-optimization graph is
+    /// guesswork, because several of these predicates depend on what earlier
+    /// passes already did to the producer.
+    fn preceding_gemv_attributed(
+        &self,
+        graph: &Graph,
+        value: ValueId,
+        norm_size: usize,
+    ) -> Result<NodeId, &'static str> {
+        let producer = graph
+            .try_value(value)
+            .and_then(|v| v.producer)
+            .ok_or("no producer")?;
+        let node = graph.try_node(producer).ok_or("producer missing")?;
         if node.op_type != "MatMulNBits" || node.domain != MICROSOFT_DOMAIN {
-            return None;
+            return Err("producer is not a com.microsoft MatMulNBits");
         }
-        if node.attr(GATE_UP_SWIGLU_FUSION_ATTR).is_some()
-            || node.attr(MATMUL_NBITS_RMSNORM_PROLOGUE_ATTR).is_some()
-        {
-            return None;
+        if node.attr(GATE_UP_SWIGLU_FUSION_ATTR).is_some() {
+            return Err("producer already carries the gate/up SwiGLU fusion");
+        }
+        if node.attr(MATMUL_NBITS_RMSNORM_PROLOGUE_ATTR).is_some() {
+            return Err("producer already carries an RMSNorm prologue");
         }
         // A/B/scales with an optional asymmetric zero point (slot 3); no group
         // index (slot 4) or pre-existing bias (slot 5), which the residual fold
         // reuses.
         let value_count = node.input_values().count();
-        if !(value_count == 3 || value_count == 4)
-            || node.inputs.iter().skip(4).any(Option::is_some)
-        {
-            return None;
+        if !(value_count == 3 || value_count == 4) {
+            return Err("producer is not the A/B/scales(+zero-points) form");
+        }
+        if node.inputs.iter().skip(4).any(Option::is_some) {
+            return Err("producer has a group index or pre-existing bias");
         }
         // A present zero point (slot 3) must be uint8.
         if let Some(zero_points) = node.inputs.get(3).copied().flatten()
             && graph.try_value(zero_points).map(|value| value.dtype) != Some(DataType::Uint8)
         {
-            return None;
+            return Err("producer zero-points are not uint8");
         }
         if !self.is_fusable_bits_fp16_matmul(graph, node) {
-            return None;
+            return Err("producer is not a fusable int4/int8 fp16 GEMV");
         }
-        if node.attr("N").and_then(Attribute::as_int)? as usize != norm_size {
-            return None;
+        if node.attr("N").and_then(Attribute::as_int).ok_or("no N")? as usize != norm_size {
+            return Err("producer N does not equal the hidden size");
         }
-        if graph.consumers(value).len() != 1 || graph.value(value).is_graph_output {
-            return None;
+        if graph.consumers(value).len() != 1 {
+            return Err("producer output has more than one consumer");
         }
-        Some(producer)
+        if graph.value(value).is_graph_output {
+            return Err("producer output is a graph output");
+        }
+        Ok(producer)
     }
 
     /// A following GEMV is prologue-capable when it is a general int4/int8 fp16
