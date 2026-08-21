@@ -11,8 +11,7 @@ use onnx_genai_ort::Tokenizer;
 use onnx_runtime_ir::{DataType, DeviceType, Dim, SymbolId};
 use onnx_runtime_session::{
     CaptureDeclineReport, DecodePrecision, DeviceAllocationCounts, DeviceBindingTransferStats,
-    DeviceGraphCaptureResult, DeviceIoBinding, DevicePreference, InferenceSession,
-    Tensor,
+    DeviceGraphCaptureResult, DeviceIoBinding, DevicePreference, InferenceSession, Tensor,
 };
 use onnx_runtime_tracer::{Args, TraceContext, capture_rejected};
 use std::collections::{HashMap, HashSet};
