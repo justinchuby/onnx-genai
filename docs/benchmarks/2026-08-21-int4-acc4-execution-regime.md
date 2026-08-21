@@ -14,21 +14,24 @@ fits in L3, which the real decode never does.
 **What is worth building is a third thing neither lever names.** The kernel
 still pays per-block bookkeeping — two bounds-checked slices constructed per
 block, plus a group count recovered from `packed.len()` on every call. Removing
-it is worth **1.68x at t=1 and 1.67x at t=4** and **1.14x-1.25x at 8-16 threads** on the
-real decode loop, bit-identical output; at **block 64 and 128 it is a wash
-(1.00x)**. That patch is in this branch; see
-[The recommendation](#the-recommendation).
+it is worth **1.69x at t=1 and 1.64x at t=4** at block 32, **1.38x at block 64**,
+and **1.24x at t=16**, bit-identical output. It is a **wash at t=8** and at
+**block 16** (which never enters the wide path). That patch is in this branch;
+see [The recommendation](#the-recommendation).
 
 > **Re-measured on latest main by Roy (2026-08-21), with corrections.** The
 > original draft of this document claimed a flat "1.61x-1.63x at 1-8 threads"
-> plus 1.212x at block 64. **Four of its nine rows do not reproduce.** The win
-> is real and is *larger* than claimed where it exists (1.678x at t=1), but it
-> is **specific to block_size 32** and it **collapses to ~1.14x at 8 threads**;
-> block 64 and 128 are 1.005x/1.003x, i.e. nothing. The t=16 row was
-> *pessimistic* — the true figure is ~1.245x, not 1.065x. The full corrected
-> matrix, the reason the original t=8 baseline was inflated, and a methodology
-> defect in the multi-session rows are in [Confirmed on the real
-> kernel](#confirmed-on-the-real-kernel).
+> plus 1.212x at block 64. **Four of its nine rows do not reproduce**, and two
+> of my own first-pass rows did not survive re-measurement against current main
+> either. Current standing: the win is real and *larger* than the draft claimed
+> where it exists (1.686x at t=1), it extends to **block 64 at 1.380x** —
+> my earlier "block-32-specific" reading was itself an artifact of only ever
+> measuring block 64/128 at t=8 — and it is **a wash at t=8** on current main,
+> where the baseline itself got 7.8% faster. The t=16 row was *pessimistic* in
+> the draft; the true figure is ~1.24x, not 1.065x. The full corrected matrix,
+> the re-measurement against current main, the reason the original t=8 baseline
+> was inflated, and a methodology defect in the multi-session rows are in
+> [Confirmed on the real kernel](#confirmed-on-the-real-kernel).
 
 This extends rather than contradicts #1619, which already found that "most of
 the win is not the byte saving" but "removing per-block overhead". The finding
@@ -240,6 +243,54 @@ estimate of uncontended cost. Every row carries its own A/A; rows failing the
 | 4 | 2 | 32 | 179.9 tok/s | 255.3 | **1.419x** | 1.75% | 1.497x (different metric) |
 | 2 | 4 | 32 | 175.9 tok/s | 248.9 | **1.415x** | 0.11% | 1.137x (different metric) |
 
+### Re-measured on current main, and two rows changed
+
+The table above was taken against `f8eb8a3e2`. Main moved eleven commits (the
+native-MTP series) before this could land, so it was re-measured end to end
+against `2f94cba4d` with a freshly built baseline arm. **Stale green is not
+evidence**, and re-running found one reversal and one under-claim:
+
+| threads | block | baseline | patched | speedup | A/A | vs. previous |
+|---|---|---|---|---|---|---|
+| 1 | 32 | 23.535 ms/tok | 13.962 | **1.686x** | 0.00% | 1.678x — holds |
+| 4 | 32 | 6.100 | 3.720 | **1.640x** | 0.16% | 1.667x — holds |
+| 8 | 32 | 3.264 | 3.214 | **1.016x** | 0.03% | 1.141x — **reversed, now a wash** |
+| 16 | 32 | 1.804 | 1.452 | **1.242x** | 0.33% | 1.245x — holds |
+| 1 | 16 | 44.003 | 42.803 | 1.028x | 0.06% | not previously measured |
+| 1 | 64 | 14.515 | 10.517 | **1.380x** | 0.03% | 1.005x @ t=8 — **was under-claimed** |
+| 1 | 128 | 10.251 | 9.392 | **1.091x** | 0.10% | 1.003x @ t=8 — **was under-claimed** |
+
+**The t=8 win is gone.** Two independent runs (1.009x at 240 tokens, 1.016x at
+400 tokens, A/A 0.52% and 0.03%) agree. The cause is visible in the arms: the
+*baseline* got 7.8% faster on new main (3.542 → 3.264) while the patched arm
+barely moved. Something in the MTP series closed this cell's gap for both arms;
+this change no longer buys anything at t=8 and that row is now reported as a
+wash.
+
+**"Block-32-specific" was wrong, and the error was methodological.** Block 64
+and 128 had only ever been measured *at t=8* — the one thread count where
+nothing shows. Measured at t=1, where the mechanism is visible, block 64 gets
+**1.380x** and block 128 **1.091x**. The win covers the two most common
+configurations, not one.
+
+The ladder is exactly what the mechanism predicts. `wide` requires
+`group >= WIDE_GROUP` (32), and `wide_groups = blob / 16`, so the removed fixed
+per-block cost is amortized over 1, 2 and 4 groups at block 32, 64 and 128:
+
+| block | wide? | groups | predicted `1 + F/(n·G)` | measured |
+|---|---|---|---|---|
+| 16 | **no** — `group < WIDE_GROUP` | — | 1.0x (path not taken) | 1.028x |
+| 32 | yes | 1 | (fit: `F = 0.686·G`) | 1.686x |
+| 64 | yes | 2 | 1.343x | 1.380x |
+| 128 | yes | 4 | 1.172x | 1.091x |
+
+Fitting `F` from the block-32 row predicts block 64 within 3% and block 128
+within 7% — the residual is because `G` is not constant across block sizes (the
+absolute baseline cost per group falls as blocks get larger and the activation
+is re-read less often). Block 16 is the control: it never enters the wide path,
+and it measures nothing.
+
+
 Output is bit-identical. The t=16 row uses a 240-token steady window (see
 [below](#the-t16-row-needed-a-longer-window)); the multi-session rows use
 aggregate throughput, for a reason that is itself a finding:
@@ -287,14 +338,23 @@ window, not a choice of statistic.
 
 #### Where the win is, and is not
 
-The effect is **specific to block_size 32**. At block 32 with the wide path a
-block is exactly one 32-element group (`wide_groups == 1`), so the removed
-bookkeeping — two bounds-checked slice constructions and a group recount — is
-amortized over a single ~10-uop group and dominates it. At block 64 and 128 the
-same fixed cost is spread over 2 and 4 groups *and* the kernel is closer to its
-memory ceiling, leaving **1.005x and 1.003x: nothing**. Any future summary of
-this work that says "1.6x on the int4 acc4 decode kernel" without saying "at
-block 32, at 1-4 threads" is overstating it by up to 1.67x.
+The effect scales inversely with the group count, exactly as the mechanism
+implies. At block 32 with the wide path a block is exactly one 32-element group
+(`wide_groups == 1`), so the removed bookkeeping — two bounds-checked slice
+constructions and a group recount — is amortized over a single ~10-uop group and
+dominates it. At block 64 and 128 the same fixed cost is spread over 2 and 4
+groups, giving **1.380x and 1.091x**. At block 16 the kernel does not take the
+wide path at all (`group < WIDE_GROUP`), and it measures **1.028x: nothing**.
+
+**An earlier revision of this document called the win "specific to block_size
+32". That was wrong, and it is worth recording why**, because the error is the
+same class as the three it was written to correct: block 64 and 128 had only
+ever been measured at **t=8**, which is precisely the thread count where this
+change buys nothing on current main. Two independent variables were confounded
+in one cell. Measured at t=1, block 64 is a 1.380x win, not a wash.
+
+Any future summary of this work that says "1.6x on the int4 acc4 decode kernel"
+without saying "at block 32 or 64, and not at 8 threads" is overstating it.
 
 #### Null control: `accuracy_level = 0` is untouched
 

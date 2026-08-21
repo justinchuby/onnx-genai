@@ -1757,18 +1757,31 @@ interleaved repetitions with a per-row A/A control:
 
 | cell | speedup | | cell | speedup |
 |---|---|---|---|---|
-| t=1, block 32 | **1.678x** | | t=8, block 64 | 1.005x |
-| t=4, block 32 | **1.667x** | | t=8, block 128 | 1.003x |
-| t=8, block 32 | 1.141x | | 2 sessions x t=4 | 1.419x |
-| t=16, block 32 | 1.245x | | 4 sessions x t=2 | 1.415x |
+| t=1, block 32 | **1.686x** | | t=1, block 16 | 1.028x |
+| t=4, block 32 | **1.640x** | | t=1, block 64 | **1.380x** |
+| t=8, block 32 | 1.016x | | t=1, block 128 | 1.091x |
+| t=16, block 32 | **1.242x** | | 2 sessions x t=4 | 1.419x |
 
 Four of the nine rows in the originating draft did not reproduce — three
 optimistic, one (t=16, claimed 1.065x) **pessimistic**. The mechanism explains
-the shape: at block 32 the wide path runs `wide_groups == 1`, so the removed
-fixed cost sat on top of a single ~10-uop group; at block 64/128 it is amortized
-over 2 and 4 groups and measures **nothing**. `accuracy_level = 0` is a 1.000x
-null control at t=1/4/8. **Quote the cell, not a multiplier** (§18 is the same
-lesson from the other side).
+the shape exactly: `wide` requires `group >= WIDE_GROUP` (32) and
+`wide_groups = blob/16`, so the removed fixed per-block cost is amortized over
+1, 2 and 4 groups at block 32/64/128 and the path is not taken at all at block
+16. Fitting the fixed cost from the block-32 row predicts block 64 within 3%.
+`accuracy_level = 0` is a 1.000x null control at t=1/4/8. **Quote the cell, not
+a multiplier** (§18 is the same lesson from the other side).
+
+**Two of my own corrections did not survive re-measurement against current
+main, and both failures were mine, not the draft's.** (i) **t=8 reversed to a
+wash.** It read 1.141x against `f8eb8a3e2`; against `2f94cba4d` it is 1.016x
+(two windows, A/A 0.52% and 0.03%). The *baseline* arm got 7.8% faster in the
+native-MTP series while the patched arm did not move, so the cell closed on its
+own. (ii) **"Specific to block_size 32" was wrong**, and wrong the same way the
+three defects below are wrong: block 64 and 128 had only ever been measured **at
+t=8**, the one thread count where this change buys nothing, confounding two
+variables in one cell. At t=1 block 64 is **1.380x**. The rule this yields is
+that a negative result measured at a single point on another axis is not a
+negative result.
 
 **Three measurement defects were found in the originating evidence, and all
 three are protocol, not arithmetic.** (i) The t=8 baseline was its *slow* mode —
