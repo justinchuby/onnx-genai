@@ -2,11 +2,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use onnx_genai_metadata::load_metadata_package;
-use sha2::{Digest, Sha256};
-
-fn checksum(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
 
 fn package_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-fixtures/lora-pr-compat")
@@ -34,7 +29,6 @@ fn phase1_peft_and_phase2_ort_artifacts_load_through_one_manifest() {
         r#"
 schema_version: v1
 adapters:
-  base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:{fingerprint}
   target_manifest:
     targets:
       - id: projection
@@ -62,16 +56,13 @@ adapters:
       index: 0
       identity: phase1.peft
       version: "1"
-      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:{fingerprint}
       rank: 2
       alpha: 4.0
       dtype: float32
       weights:
         - location: adapters/peft/adapter_model.safetensors
           loader_capability: onnx-genai.adapters.hf-peft@1
-          sha256: {peft_weights_sha}
           config_location: adapters/peft/adapter_config.json
-          config_sha256: {peft_config_sha}
           scale_encoding: alpha_over_rank
           format: hf_peft
       bindings: [{{ target: projection, weight_key: projection }}]
@@ -79,14 +70,12 @@ adapters:
       index: 1
       identity: phase2.ort
       version: "1"
-      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:{fingerprint}
       rank: 2
       alpha: 4.0
       dtype: float32
       weights:
         - location: adapters/ort/adapter.onnx_adapter
           loader_capability: onnxruntime.lora-adapter@1
-          sha256: {ort_sha}
           scale_encoding: baked
           format: ort_genai
       bindings: [{{ target: projection, weight_key: projection }}]
@@ -117,11 +106,7 @@ pipeline:
     steps:
       - kind: invoke
         component: decoder
-"#,
-        fingerprint = "a".repeat(64),
-        peft_weights_sha = checksum(safetensors),
-        peft_config_sha = checksum(peft_config),
-        ort_sha = checksum(ort_adapter),
+"#
     );
     fs::write(root.join("inference_metadata.yaml"), metadata).expect("write metadata");
 
@@ -131,7 +116,7 @@ pipeline:
     assert_eq!(service.target_manifest.targets[0].id, "projection");
 
     fs::write(root.join("adapters/ort/adapter.onnx_adapter"), b"corrupt")
-        .expect("corrupt ORT adapter");
-    let error = load_metadata_package(&root).expect_err("checksum mismatch must fail");
-    assert!(error.to_string().contains("checksum mismatch"), "{error}");
+        .expect("replace ORT adapter");
+    load_metadata_package(&root)
+        .expect("artifact bytes may be replaced without rewriting inference metadata");
 }
