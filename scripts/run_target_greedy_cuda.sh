@@ -56,11 +56,15 @@ model:
     head_dim: 256
 YAML
 
-# --- Build (needs the CUDA feature; propagates to onnx-genai-ort/cuda) ---
-cargo build --release -p onnx-genai --bin onnx-genai --features cuda
+# --- Build ---
+# `ort-cuda` is ONNX Runtime's CUDA EP, which is what this script exercises; see
+# docs/build-features.md. The `onnx-genai` binary lives in `onnx-genai-cli`, not
+# in the `onnx-genai` package -- that package only ships the diffusion bins.
+cargo build --release -p onnx-genai-cli --bin onnx-genai --features ort-cuda
 
 # --- Generate ---
+# The model directory is positional; `generate` has no `--model` flag.
 exec "$ROOT/target/release/onnx-genai" generate \
-  --model "$TARGET_DIR" \
   --max-new-tokens "$MAX_NEW_TOKENS" \
+  "$TARGET_DIR" \
   "$PROMPT"
