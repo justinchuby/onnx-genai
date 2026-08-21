@@ -323,6 +323,13 @@ impl LmHead for MtpLmHead {
     }
 }
 
+fn is_dense_float_dtype(dtype: IrDataType) -> bool {
+    matches!(
+        dtype,
+        IrDataType::Float32 | IrDataType::Float16 | IrDataType::BFloat16
+    )
+}
+
 pub(crate) fn load_target_initializer_adapters(
     model_path: &Path,
     embedding_name: &str,
@@ -355,6 +362,25 @@ pub(crate) fn load_target_initializer_adapters(
     }
     let vocab_size = embedding_dims[0];
     let lm_head_dims = lm_head_weight.dims();
+    // The MTP draft head reuses the target's shared LM-head to project its hidden
+    // state into draft logits. This adapter only handles a *dense* [vocab, hidden]
+    // / [hidden, vocab] weight (f32/f16/bf16). An int4 MatMulNBits-quantised
+    // lm_head is stored as a 3-D packed uint8 blob with companion scales /
+    // zero_points and cannot be consumed here: dequantising the full matrix is
+    // multi-GB and a host-side draft GEMV per step is not throughput-viable, so
+    // the draft projection must run on the GPU (baked into the MTP head graph or
+    // sharing the target's quantised kernel). Fail fast with an actionable error
+    // rather than the misleading dense-shape mismatch below.
+    if lm_head_dims.len() != 2 || !is_dense_float_dtype(lm_head_weight.dtype()) {
+        anyhow::bail!(
+            "target LM-head initializer '{lm_head_name}' has shape {lm_head_dims:?} dtype {:?}, \
+             which is not a dense f32/f16/bf16 [vocab, hidden] matrix. Quantised (e.g. int4 \
+             MatMulNBits) shared LM-heads are not yet supported for MTP self-speculation: the \
+             draft LM-head projection must run on the GPU (baked into the MTP head graph or \
+             sharing the target's quantised kernel), not dequantised host-side.",
+            lm_head_weight.dtype()
+        );
+    }
     let (layout, rows, cols) = if lm_head_dims == [hidden_size, vocab_size] {
         (
             LmHeadInitializerLayout::HiddenVocab,

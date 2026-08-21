@@ -67,8 +67,9 @@ pub struct MtpProposerSpec {
     pub hc_mult: usize,
     /// Sidecar output consumed by the shared target LM head.
     pub mtp_hidden_output: String,
-    /// Sidecar recurrent HC-state output.
-    pub mtp_state_output: String,
+    /// Sidecar recurrent HC-state output, if the head threads one. A
+    /// pure-attention (proposal-local) head declares none.
+    pub mtp_state_output: Option<String>,
     /// Sidecar KV lifetime.
     pub kv_mode: MtpKvMode,
     /// Exact target embedding initializer name.
@@ -179,10 +180,7 @@ impl SpeculatorDescriptor {
                 .mtp_hidden_output
                 .clone()
                 .unwrap_or_else(|| "mtp_hidden".into()),
-            mtp_state_output: config
-                .mtp_state_output
-                .clone()
-                .unwrap_or_else(|| "mtp_state".into()),
+            mtp_state_output: config.mtp_state_output.clone(),
             kv_mode: config.kv_mode.unwrap_or(MtpKvMode::ProposalLocal),
             embedding_initializer: embedding.name.clone(),
             lm_head_initializer: lm_head.name.clone(),

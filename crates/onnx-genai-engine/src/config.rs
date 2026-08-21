@@ -311,7 +311,12 @@ impl ResolvedMtpConfig {
             lm_head_weights: MtpWeightSource::TargetInitializer(spec.lm_head_initializer.clone()),
             hc_mult: spec.hc_mult,
             mtp_hidden_output: spec.mtp_hidden_output.clone(),
-            mtp_state_output: Some(spec.mtp_state_output.clone()),
+            // A head that threads a recurrent state declares its output name; a
+            // pure-attention (proposal-local) head declares none. The metadata
+            // schema keeps this optional, so honor exactly what was declared
+            // rather than inventing a phantom "mtp_state" output the head does
+            // not expose (which would make `MtpDecodeSession` reject it).
+            mtp_state_output: spec.mtp_state_output.clone(),
             cache_scope: match spec.kv_mode {
                 MetadataMtpKvMode::ProposalLocal => MtpCacheScope::ProposalLocal,
                 MetadataMtpKvMode::AcceptedPrefix => MtpCacheScope::AcceptedPrefix,
@@ -1630,6 +1635,48 @@ speculative:
         assert_eq!(config.public_config.kv_mode, MtpDraftKvMode::GrowCache);
         assert_eq!(config.cache_scope, MtpCacheScope::ProposalLocal);
         assert_eq!(config.public_config.num_speculative_tokens, 4);
+        validate_resolved_mtp_config(&config).expect("resolved config validates");
+    }
+
+    #[test]
+    fn proposal_local_head_without_declared_state_output_stays_none() {
+        // A pure-attention (proposal-local) MTP head — like the real
+        // Qwen3.8 int4 artifact — declares no `mtp_state_output`. The optional
+        // field must resolve to `None` rather than a phantom "mtp_state" name
+        // that `MtpDecodeSession` would then require the head to expose.
+        let metadata: InferenceMetadata = serde_yaml::from_str(
+            r#"
+speculative:
+  proposal_type: mtp
+  model: mtp/model.onnx
+  num_speculative_tokens: 1
+  target_hidden_output: hidden_states.63
+  target_hidden_layout: BSH
+  target_hidden_size: 5120
+  hc_mult: 1
+  mtp_hidden_output: mtp_hidden
+  kv_mode: proposal_local
+  embedding:
+    source: target_initializer
+    name: model.embed_tokens.weight
+  lm_head:
+    source: target_initializer
+    name: lm_head.weight
+"#,
+        )
+        .expect("metadata parses");
+        let descriptor = resolve_speculator_config(
+            Path::new("/models/qwen38-mtp"),
+            metadata.speculative.expect("speculative descriptor"),
+        );
+        let SpeculatorProposerStatus::Mtp(spec) = descriptor.proposer else {
+            panic!("MTP descriptor did not resolve");
+        };
+        assert_eq!(spec.mtp_state_output, None);
+        let config = ResolvedMtpConfig::from_sidecar_descriptor(&spec, 248_320);
+        assert_eq!(config.mtp_state_output, None);
+        assert_eq!(config.hc_mult, 1);
+        assert_eq!(config.cache_scope, MtpCacheScope::ProposalLocal);
         validate_resolved_mtp_config(&config).expect("resolved config validates");
     }
 

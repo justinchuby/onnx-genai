@@ -60,7 +60,7 @@ pub use crate::config::{
 };
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub(crate) use crate::speculative::{
-    LinearEmbedder, LinearLmHead, MtpEmbedder, MtpLmHead, SpeculativeStats,
+    LinearEmbedder, LinearLmHead, MtpEmbedder, MtpLmHead, MtpProposer, SpeculativeStats,
     load_target_initializer_adapters,
 };
 
