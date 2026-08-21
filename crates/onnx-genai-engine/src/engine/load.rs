@@ -368,30 +368,16 @@ impl Engine {
         if let Err(errors) = onnx_genai_metadata::validate(&metadata, &runtime_caps) {
             anyhow::bail!("Invalid inference metadata: {errors:?}");
         }
-        // Metadata-advertised MTP self-speculation seeds its draft head from a
-        // target hidden output (`speculative.target_hidden_output`). The native
-        // decode session only records that hidden state when `model.io.hidden_output`
-        // names it, but MTP artifacts declare the seed solely in the speculative
-        // block. Derive the model-IO hidden output from the speculative target so
-        // the native session materializes the seed; never override an explicit
-        // `model.io.hidden_output`, and leave non-MTP models untouched.
-        if let Some(spec) = metadata.speculative.as_ref() {
-            if spec.proposal_type == ProposalType::Mtp {
-                if let Some(target_hidden) = spec
-                    .target_hidden_output
-                    .as_ref()
-                    .filter(|name| !name.is_empty())
-                    .cloned()
-                {
-                    if let Some(model) = metadata.model.as_mut() {
-                        if let Some(io) = model.io.as_mut() {
-                            if io.hidden_output.as_deref().unwrap_or_default().is_empty() {
-                                io.hidden_output = Some(target_hidden);
-                            }
-                        }
-                    }
-                }
-            }
+        // Native MTP self-speculation seeds its draft head from a target hidden
+        // output. The native decode session only records that hidden state when
+        // the decode ABI names it, but the seed is declared by the MTP sidecar
+        // rather than by the target's own graph contract, so it has to be
+        // carried across. Install it as a *derived* ABI: the package keeps one
+        // serialized representation and gains no second writable statement of
+        // its own ports. An ABI that already names a hidden output wins, and a
+        // directory that declares no MTP sidecar is left exactly as it was.
+        if let Some(seeded) = mtp_seeded_decoder_io(&metadata, &model_directory.root) {
+            metadata.set_derived_decoder_io(seeded);
         }
         let tokenizer = {
             let _span = onnx_genai_ort::prof_span!("engine.tokenizer_load");
@@ -1067,6 +1053,46 @@ fn maybe_fill_hybrid_io_from_graph(metadata: &mut InferenceMetadata, model_path:
         return;
     };
     metadata.set_derived_decoder_io(io);
+}
+
+/// The resolved decode ABI with an MTP sidecar's target hidden output filled in.
+///
+/// `None` unless the package resolves an ABI that names no hidden output *and*
+/// the model directory declares an MTP sidecar that names one, so every other
+/// model keeps exactly the ABI it resolved.
+#[cfg(feature = "native-backend")]
+fn mtp_seeded_decoder_io(
+    metadata: &InferenceMetadata,
+    model_root: &Path,
+) -> Option<onnx_genai_metadata::ModelIoSpec> {
+    let io = metadata.decoder_io()?;
+    let descriptor = onnx_genai_metadata::detect_speculator(model_root)?;
+    let onnx_genai_metadata::SpeculatorProposerStatus::Mtp(spec) = descriptor.proposer else {
+        return None;
+    };
+    decoder_io_seeded_with(io, &spec.target_hidden_output)
+}
+
+/// Name `target_hidden_output` as the ABI's hidden output, or decline.
+///
+/// Declines when the ABI already names one -- a declared port is authoritative
+/// and a sidecar must not redirect the target's own contract -- and when the
+/// sidecar names nothing, which would otherwise install an empty port name that
+/// reads as "declared" everywhere downstream.
+#[cfg(feature = "native-backend")]
+fn decoder_io_seeded_with(
+    io: &onnx_genai_metadata::ModelIoSpec,
+    target_hidden_output: &str,
+) -> Option<onnx_genai_metadata::ModelIoSpec> {
+    if !io.hidden_output.as_deref().unwrap_or_default().is_empty() {
+        return None;
+    }
+    if target_hidden_output.is_empty() {
+        return None;
+    }
+    let mut seeded = io.clone();
+    seeded.hidden_output = Some(target_hidden_output.to_string());
+    Some(seeded)
 }
 
 fn package_selection_from_session_options(
@@ -2102,18 +2128,8 @@ fn build_mtp_model_from_resolved(
                     read_f32_weights(embedding)?,
                     mtp_config.public_config.vocab_size,
                     mtp_config.public_config.hidden_size,
-                    draft_projection,
-                )?;
-                if vocab_size != mtp_config.public_config.vocab_size {
-                    anyhow::bail!(
-                        "MTP target initializer vocabulary {vocab_size} does not match configured vocabulary {}",
-                        mtp_config.public_config.vocab_size
-                    );
-                }
-                (embedder, lm_head)
-            }
-            _ => anyhow::bail!(
-                "MTP embedding_weights and lm_head_weights must both use files or both use target initializers"
+                )
+                .map_err(|error| anyhow::anyhow!("Invalid MTP embedding weights: {error}"))?,
             ),
             MtpLmHead::Linear(
                 LinearLmHead::new(
@@ -2133,6 +2149,7 @@ fn build_mtp_model_from_resolved(
                 embedding,
                 lm_head,
                 mtp_config.public_config.hidden_size,
+                draft_projection,
             )?;
             if vocab_size != mtp_config.public_config.vocab_size {
                 anyhow::bail!(
@@ -2478,6 +2495,48 @@ fn load_shared_kv_proposer(
         None
     };
     Ok(shared_kv_proposer)
+}
+
+#[cfg(all(test, feature = "native-backend"))]
+mod mtp_seed_tests {
+    use super::*;
+
+    fn io_with_hidden_output(hidden_output: Option<&str>) -> onnx_genai_metadata::ModelIoSpec {
+        let mut value = serde_json::json!({});
+        if let Some(name) = hidden_output {
+            value["hidden_output"] = serde_json::json!(name);
+        }
+        serde_json::from_value(value).expect("model io spec parses")
+    }
+
+    /// The seed the sidecar names has to reach the ABI, or the native session
+    /// never records the hidden state the draft head is supposed to consume.
+    #[test]
+    fn a_sidecar_seed_names_the_hidden_output_an_abi_left_unset() {
+        let io = io_with_hidden_output(None);
+
+        let seeded = decoder_io_seeded_with(&io, "hidden_states").expect("seed applies");
+
+        assert_eq!(seeded.hidden_output.as_deref(), Some("hidden_states"));
+    }
+
+    /// A declared port is authoritative: a sidecar must not redirect the
+    /// target's own contract at load time.
+    #[test]
+    fn a_declared_hidden_output_outranks_the_sidecar_seed() {
+        let io = io_with_hidden_output(Some("last_hidden_state"));
+
+        assert!(decoder_io_seeded_with(&io, "hidden_states").is_none());
+    }
+
+    /// An empty seed must decline rather than install `""`, which would read as
+    /// a declared port everywhere downstream.
+    #[test]
+    fn an_unnamed_seed_declines_instead_of_declaring_an_empty_port() {
+        let io = io_with_hidden_output(None);
+
+        assert!(decoder_io_seeded_with(&io, "").is_none());
+    }
 }
 
 #[cfg(test)]
