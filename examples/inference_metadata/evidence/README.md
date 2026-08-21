@@ -16,6 +16,11 @@ build time and nothing here is a placeholder.
 | Workflow / model | Exact output artifact | Metrics | Hardware / EP | Performance | Proof level |
 | --- | --- | --- | --- | --- | --- |
 | Image edit (flow matching) — [`Qwen/Qwen-Image-Edit-2509`](https://huggingface.co/Qwen/Qwen-Image-Edit-2509) @ `d3968ef930e841f4c73640fb8afa3b306a78167e` | [`qwen-image-edit-2509/runtime.png`](qwen-image-edit-2509/runtime.png) (1216×864 RGB), scored against [`qwen-image-edit-2509/upstream.png`](qwen-image-edit-2509/upstream.png) | PSNR 37.0971 dB, cosine 0.999711, mean abs 0.007391, max abs 0.492333 — [`qwen-image-edit-2509/metrics.json`](qwen-image-edit-2509/metrics.json) | NVIDIA H200, bfloat16, CUDA execution provider | **Pending** — not measured in this run | Full pixel output compared to the upstream `diffusers` reference image ([details](qwen-image-edit-2509/README.md)) |
+| Speech-to-text — Whisper Tiny | [`whisper-tiny/input.wav`](whisper-tiny/input.wav) plus emitted transcript | Exact transcript match; encoder relative L2 `6.58e-06` — [`metrics.json`](whisper-tiny/metrics.json) | Real ONNX and HuggingFace run | **Pending** | Real audio → text, upstream parity ([details](whisper-tiny/README.md)) |
+| Full-duplex speech — PersonaPlex | [`personaplex/runtime.wav`](personaplex/runtime.wav) and [`reference.wav`](personaplex/reference.wav) | Waveform corr `0.9999999999997841`; 48/48 output codes — [`metrics.json`](personaplex/metrics.json) | NVIDIA GPU, CUDA, f32 | p50 1,587.60 ms/step | Real audio output and full per-step parity ([details](personaplex/README.md)) |
+| Text-to-video — tiny CogVideoX | [`cogvideox-tiny/output.gif`](cogvideox-tiny/output.gif), [`contact-sheet.png`](cogvideox-tiny/contact-sheet.png) | PSNR 84.66 dB, corr `0.9999999983` — [`runtime-parity.json`](cogvideox-tiny/runtime-parity.json) | ONNX runtime workflow | 174.36 ms execution, 8.27 s load | Real 17-frame output and runtime parity ([details](cogvideox-tiny/README.md)) |
+| Text-to-image — tiny Stable Diffusion | [`stable-diffusion-tiny/output.png`](stable-diffusion-tiny/output.png) | Exact run parameters — [`run.json`](stable-diffusion-tiny/run.json) | Upstream fixture run | **Pending** | Real generated reference image; no retained runtime render ([details](stable-diffusion-tiny/README.md)) |
+| Protein embeddings — ESM-2 and ProtBert | [`protein-encoders/esm2_similarity.png`](protein-encoders/esm2_similarity.png), [`protbert_similarity.png`](protein-encoders/protbert_similarity.png) | Full CPU/CUDA parity, padding isolation, embeddings — [`EVIDENCE.md`](protein-encoders/EVIDENCE.md) | NVIDIA H200, CPU/CUDA | ESM-2 CUDA up to 628k residues/s; ProtBert measurements included | Real protein → embedding outputs, upstream parity, batching, performance |
 
 `Performance` is deliberately empty rather than estimated. The Qwen-Image-Edit
 run captured numerical fidelity only; no end-to-end latency or throughput was
@@ -54,11 +59,9 @@ instead.
 
 No PNG, audio or video evidence file was tracked anywhere in this repository
 before this directory existed, so nothing needed to be moved or deduplicated.
-Other end-to-end runs on this machine (Whisper, PersonaPlex, protein encoders,
-Foundry) did leave small output artifacts behind, but none of them currently
-ships alongside a verified metric comparing it to an upstream reference. They
-are deliberately left out rather than committed with unclear provenance; each
-can be added later once its own numbers are pinned down.
+The remaining honest gaps are called out per bundle. In particular, the Stable
+Diffusion image is retained reference output rather than a separately saved
+runtime render, and the Whisper run did not retain performance timing.
 
 ## Adding a new entry
 

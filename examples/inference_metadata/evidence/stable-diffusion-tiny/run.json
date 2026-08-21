@@ -1,0 +1,19 @@
+{
+  "model_id": "hf-internal-testing/tiny-stable-diffusion-torch",
+  "revision": "a88cdfbd91f96ec7f61eb7484b652ff0f4ee701d",
+  "scheduler": "euler",
+  "prompts": [
+    "a photo of an astronaut"
+  ],
+  "seeds": [
+    1234
+  ],
+  "steps": 5,
+  "guidance_scale": 7.5,
+  "size": 64,
+  "latent_size": 32,
+  "latent_channels": 4,
+  "vae_scale_factor": 2,
+  "vae_scaling_factor": 0.18215,
+  "init_noise_sigma": 14.614646911621094
+}
