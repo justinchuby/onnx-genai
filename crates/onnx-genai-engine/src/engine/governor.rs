@@ -150,7 +150,10 @@ pub(crate) fn validate_native_decode_device(
             #[cfg(not(feature = "native-cuda"))]
             {
                 anyhow::bail!(
-                    "native decoder backend CUDA device requires building onnx-genai-engine with both the 'native-backend' and 'cuda' features"
+                    "native decoder backend CUDA device requires the 'native-cuda' feature, which \
+                     this build of onnx-genai-engine does not have (it already implies \
+                     'native-backend'); rebuild with `--features native-cuda`, or select a CPU or \
+                     plugin decode device"
                 )
             }
         }
