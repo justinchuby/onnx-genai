@@ -1797,8 +1797,10 @@ siblings are adjacent pairs**, so physical cores are the even CPUs.
 formulations were built: bounds-checked index sub-slicing **1.340x**, nested
 `chunks_exact` **1.542x**, and the same with a hoisted group count **1.542x** —
 identical to three decimals, which rules out the inner loop shape and localises
-the entire cost to caller-side slice construction. Safe leaves 5-17% of the win
-on the table, so codegen is *not* equivalent. Shipped form confines the unsafe
+the entire cost to caller-side slice construction. The best safe form runs
+**8.8% slower** than the shipped one and gives up **13% of the win** (worst:
+25.3% slower, 37% of the win), so codegen is *not* equivalent. Shipped form
+confines the unsafe
 to one `#[inline]` function with a stated loop invariant and adds a
 `validate_nibble_outputs` prevalidation pass on the safe entry, so the pointer
 derivations rest on checked arithmetic (`checked_mul` throughout) rather than on

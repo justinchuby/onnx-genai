@@ -619,10 +619,6 @@ unsafe fn nibble_outputs_avx2(
     let tiles = k_blocks / BLOCK_TILE;
     let tiled_blocks = tiles * BLOCK_TILE;
     // Decided once per output range rather than once per block. `group_for`
-    // returns `WIDE_GROUP` exactly when `block_size >= WIDE_GROUP`, so this is
-    // `block_size >= 32`, and `block_size` is a validated power of two -- hence
-    // `blob` is a whole number of 16-byte groups whenever `wide` holds.
-    // Decided once per output range rather than once per block. `group_for`
     // returns `WIDE_GROUP` exactly when `block_size >= WIDE_GROUP`, so `wide`
     // is `block_size >= 32`; `validate_nibble_outputs` has established that
     // `block_size` is a power of two, so `blob = block_size / 2` is then a
@@ -1191,7 +1187,11 @@ mod tests {
     /// does not: its largest `k` is `block_size * 3`, so `tiles` is always 0.
     ///
     /// Mutation check: dropping the `wide` branch's hoisted `wide_groups` to
-    /// `wide_groups - 1`, or reducing `tiles` by one, fails this.
+    /// `wide_groups - 1`, or starting the scalar tail one block late
+    /// (`tiled_blocks + 1`), fails this. Note that `tiles - 1` is an
+    /// *equivalent* mutant and is deliberately not claimed here: it only
+    /// migrates blocks from the tiled loop into the scalar tail, which computes
+    /// the same dot product, so the result stays correct.
     #[test]
     fn the_tiled_path_tracks_the_float64_contract() {
         for block_size in [16usize, 32, 64, 128] {

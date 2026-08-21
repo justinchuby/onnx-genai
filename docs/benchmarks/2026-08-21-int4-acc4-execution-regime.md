@@ -14,7 +14,7 @@ fits in L3, which the real decode never does.
 **What is worth building is a third thing neither lever names.** The kernel
 still pays per-block bookkeeping — two bounds-checked slices constructed per
 block, plus a group count recovered from `packed.len()` on every call. Removing
-it is worth **1.68x at 1-4 threads** and **1.14x-1.25x at 8-16 threads** on the
+it is worth **1.68x at t=1 and 1.67x at t=4** and **1.14x-1.25x at 8-16 threads** on the
 real decode loop, bit-identical output; at **block 64 and 128 it is a wash
 (1.00x)**. That patch is in this branch; see
 [The recommendation](#the-recommendation).
@@ -339,21 +339,24 @@ single physical core, block 32, min of 6 interleaved repetitions.
 | **E** — tile `chunks_exact` + bounds-checked index sub-slicing | 17.556 | 1.340x |
 | **C** — nested `chunks_exact` (tile, then block), slice accumulator | 15.254 | 1.542x |
 | **D** — as C, but hoisted group count and an index loop inside | 15.254 | 1.542x |
-| **B** — raw pointers, hoisted group count (the draft's form) | 14.527 | 1.620x |
+| **B** — raw pointers, hoisted group count (the draft's form) | 14.527 | 1.619x |
 | **F** — B, plus `#[inline]` on the split-out kernel and call-site prevalidation | **14.016** | **1.678x** |
 
 Two things follow. **C and D are identical to three decimal places**, which
 rules out the inner accumulator loop's shape as the cost — the entire difference
 between the safe and raw forms is caller-side slice construction, exactly where
-the original attribution said it was. And the safe forms leave **5.1% (C/D) to
-17.0% (E)** of the win on the table, so codegen is demonstrably *not* equivalent
-and the safe version cannot simply be preferred.
+the original attribution said it was. And the safe forms are measurably slower
+than the shipped one: the best of them (C/D) runs **8.8% slower** than F and so
+gives up **13.0% of the win** (F saves 9.509 ms/token over main, C/D saves
+8.271); E runs 25.3% slower and gives up 37.2%. Codegen is therefore
+demonstrably *not* equivalent, and the safe version cannot simply be preferred
+on the "if performance is unchanged, prefer safe" rule.
 
 The shipped form is therefore raw-pointer, but with the unsafe confined to one
 `#[inline]` function whose contract is stated as a loop invariant, and with a
 **`validate_nibble_outputs` prevalidation pass on the safe entry point** so the
 pointer derivations rest on checked dimensional arithmetic rather than on a
-caller's good behaviour. F is 1.038x faster than B; that margin is the
+caller's good behaviour. F is 1.036x faster than B; that margin is the
 `#[inline]`, which lets the kernel inline back into the tile loop it was split
 out of. There are no integer-to-pointer round trips in either form.
 
