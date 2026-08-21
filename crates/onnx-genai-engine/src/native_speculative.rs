@@ -428,13 +428,34 @@ impl<'a> NativeSpeculativeDriver<'a> {
             // destructive GDN/conv state stranded at `base + K`; commit it to
             // exactly the accepted prefix instead (snapshot restore + accepted-
             // token re-advance), which also performs the KV rewind. See #1598.
-            match recurrent_snapshot.as_ref() {
-                Some(snapshot) => self.session.commit_recurrent_state_to_accepted(
-                    snapshot,
-                    base,
-                    &draft[..accepted],
-                )?,
-                None => self.session.rewind(base + accepted)?,
+            //
+            // Approach-B fast path (full accept): when EVERY draft token is
+            // accepted, the eager verify forward already advanced BOTH the KV
+            // (`base + K`) and the destructive GDN/conv recurrent state by exactly
+            // those `K == accepted` tokens, and the committed length equals the
+            // current length — so there is nothing to roll back. Skip the KV
+            // rewind, the snapshot restore, AND the accepted-token re-advance
+            // entirely: the verify's own post-state IS the committed state. This
+            // removes the redundant re-advance target forwards on the majority of
+            // steps (every multi-token accept). The snapshot is still taken before
+            // the verify because acceptance is only known after it; it is simply
+            // unused on this path. Only a PARTIAL accept (`accepted < draft.len()`)
+            // needs the snapshot→restore→re-advance rebuild to a shorter prefix.
+            if accepted == draft.len() {
+                debug_assert_eq!(
+                    self.session.current_len(),
+                    base + accepted,
+                    "full-accept commit: verify must leave KV + state at base + accepted"
+                );
+            } else {
+                match recurrent_snapshot.as_ref() {
+                    Some(snapshot) => self.session.commit_recurrent_state_to_accepted(
+                        snapshot,
+                        base,
+                        &draft[..accepted],
+                    )?,
+                    None => self.session.rewind(base + accepted)?,
+                }
             }
 
             // Commit accepted draft tokens followed by the bonus, honoring the
