@@ -640,10 +640,12 @@ impl ExecutionIsland {
     }
 
     fn record_device_memory(&self) {
-        #[cfg(not(any(feature = "cuda", feature = "ort-cuda")))]
+        // `cuda_rt` comes from `onnx-genai-ort/cuda`, which `ort-cuda` enables and
+        // `native-cuda` enables transitively, so this one gate covers both paths.
+        #[cfg(not(feature = "ort-cuda"))]
         return;
 
-        #[cfg(any(feature = "cuda", feature = "ort-cuda"))]
+        #[cfg(feature = "ort-cuda")]
         {
             let Some(device_id) = self.session.cuda_device_id() else {
                 return;
