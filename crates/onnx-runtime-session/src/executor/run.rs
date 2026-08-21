@@ -670,7 +670,10 @@ impl Executor {
                                 self.last_capture_failed_node.take().and_then(|node_id| {
                                     let node = self.graph.node(node_id);
                                     let key = (canonical_domain(node), node.op_type.clone());
-                                    self.cap_mut().capture_quarantine_ops.insert(key).then_some(())
+                                    self.cap_mut()
+                                        .capture_quarantine_ops
+                                        .insert(key)
+                                        .then_some(())
                                 });
                             if quarantined.is_some()
                                 && self.cap().capture_quarantine_ops.len() < max_capture_attempts

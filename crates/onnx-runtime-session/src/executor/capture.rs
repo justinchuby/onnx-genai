@@ -585,7 +585,9 @@ impl Executor {
             {
                 continue;
             }
-            self.cap_mut().capture_warm_seeded.insert(vid, shape.clone());
+            self.cap_mut()
+                .capture_warm_seeded
+                .insert(vid, shape.clone());
             resolved.insert(vid, shape);
         }
     }
