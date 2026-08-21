@@ -1031,7 +1031,13 @@ pub struct StateServiceContract {
 pub struct StateGroupContract {
     /// Semantic kind of the state in this group.
     pub kind: StateKind,
-    pub sequence_axis: usize,
+    /// Axis whose extent represents logical sequence positions.
+    ///
+    /// Required for sequence-growing and indexed-scatter state. Fixed-size
+    /// recurrent state updated by replacement has no logical sequence extent
+    /// and therefore omits this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence_axis: Option<usize>,
     /// Graph-visible element layout of the state tensors.
     pub layout: String,
     /// Semantic state cell holding the current logical length of each row.
@@ -1130,6 +1136,13 @@ pub enum StateUpdate {
     /// The valid region is the whole tensor, so no write cursor is graph-visible
     /// and the buffer's shape carries the length.
     Append,
+    /// Each step replaces the complete fixed-size state tensor.
+    ///
+    /// This is the common discipline for recurrent accumulators, state-space
+    /// carries, and causal-convolution history. The algorithm does not need a
+    /// distinct state kind: separate groups already declare each tensor's
+    /// shape, ports, lifetime, and rollback behavior.
+    Replace,
     /// Each step's positions are scattered into a buffer of FIXED capacity at
     /// destinations the graph reads from `write_indices`.
     ///

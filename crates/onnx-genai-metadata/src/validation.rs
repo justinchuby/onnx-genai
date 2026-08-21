@@ -1778,17 +1778,23 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                 ));
                 continue;
             };
-            if group.sequence_axis >= state.contract.rank {
+            if let Some(sequence_axis) = group.sequence_axis {
+                if sequence_axis >= state.contract.rank {
+                    errors.push(format!(
+                        "state service group '{group_name}' sequence_axis {sequence_axis} is outside state '{name}' rank {}",
+                        state.contract.rank
+                    ));
+                }
+                if dynamic_axis.is_some_and(|axis| axis != sequence_axis) {
+                    errors.push(format!(
+                        "workflow state '{name}' recurrence axis {dynamic_axis:?} disagrees with \
+                         state service group '{group_name}' sequence_axis {sequence_axis}"
+                    ));
+                }
+            } else if dynamic_axis.is_some() {
                 errors.push(format!(
-                    "state service group '{group_name}' sequence_axis {} is outside state '{name}' rank {}",
-                    group.sequence_axis, state.contract.rank
-                ));
-            }
-            if dynamic_axis.is_some_and(|axis| axis != group.sequence_axis) {
-                errors.push(format!(
-                    "workflow state '{name}' recurrence axis {dynamic_axis:?} disagrees with state \
-                     service group '{group_name}' sequence_axis {}",
-                    group.sequence_axis
+                    "workflow state '{name}' varies along axis {dynamic_axis:?}, but state \
+                     service group '{group_name}' declares no sequence_axis"
                 ));
             }
             // Row-scoped model state must remain permutable: without a declared
@@ -3385,6 +3391,31 @@ fn validate_state_update(
     workflow: &crate::schema::WorkflowSpec,
     errors: &mut Vec<String>,
 ) {
+    match &group.update {
+        Some(crate::schema::StateUpdate::Append)
+        | Some(crate::schema::StateUpdate::IndexedScatter { .. })
+            if group.sequence_axis.is_none() =>
+        {
+            errors.push(format!(
+                "state service group '{group_name}' uses a sequence update but declares no \
+                 sequence_axis"
+            ));
+        }
+        Some(crate::schema::StateUpdate::Replace) => {
+            for (cell_name, cell) in &workflow.state {
+                if cell.service_group.as_deref() == Some(group_name)
+                    && !matches!(cell.recurrence, crate::schema::ShapeRecurrence::Invariant)
+                {
+                    errors.push(format!(
+                        "workflow state '{cell_name}' binds replace-updated group '{group_name}' \
+                         but declares a varying shape; replacement state must remain fixed-size"
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
+
     let Some(crate::schema::StateUpdate::IndexedScatter {
         write_indices,
         capacity,

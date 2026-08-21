@@ -635,8 +635,9 @@ slot-allocation algorithm, a device, or an execution provider.
 Removing storage policy must not remove real graph constraints. These are ABI
 facts, and they stay:
 
-- **`sequence_axis` and `layout`** — where the sequence dimension is and how the
-  tensor is laid out;
+- **`sequence_axis` and `layout`** — where a sequence dimension exists and how
+  the tensor is laid out. Fixed-size replacement state has no sequence axis and
+  omits it;
 - **`logical_lengths`** — the graph-visible per-row valid length, when the graph
   exposes one;
 - **`aliasing`** — whether the graph permits, requires, or forbids the runtime
@@ -648,6 +649,65 @@ old flag said *"use one buffer"* — a deployment decision. `aliasing` says
 *"this graph is or is not correct when past and present are the same memory"* —
 a property of the graph. It defaults to `forbidden`, so a graph that never stated
 its aliasing legality is never aliased.
+
+### 12.2a Fixed-size recurrent state
+
+Linear-attention accumulators, state-space carries, and causal-convolution
+history are all fixed-size recurrent state from the runtime's perspective. They
+therefore use the same generic declaration:
+
+```yaml
+state:
+  linear_accumulator:
+    contract:
+      dtype: float16
+      rank: 4
+      shape: [batch, heads, key_feature, value_feature]
+      batch_layout: { kind: request_aligned, axis: 0 }
+    scope: invocation
+    initializer: initializer.linear_accumulator
+    recurrence: { kind: invariant }
+    management: runtime
+    release_boundary: session
+    service_group: linear_recurrence
+  causal_conv_history:
+    contract:
+      dtype: float16
+      rank: 3
+      shape: [batch, channels, kernel_history]
+      batch_layout: { kind: request_aligned, axis: 0 }
+    scope: invocation
+    initializer: initializer.causal_conv_history
+    recurrence: { kind: invariant }
+    management: runtime
+    release_boundary: session
+    service_group: conv_recurrence
+serving:
+  state_service:
+    groups:
+      linear_recurrence:
+        kind: recurrent
+        layout: bhkv
+        update: { kind: replace }
+        ports:
+          decoder:
+            accumulator:
+              { input: recurrent_state, output: updated_recurrent_state }
+      conv_recurrence:
+        kind: recurrent
+        layout: bct
+        update: { kind: replace }
+        ports:
+          decoder:
+            history: { input: conv_state, output: updated_conv_state }
+```
+
+The groups are separate because their shapes, graph ports, checkpoint
+compatibility, and rollback cascade may differ—not because linear attention and
+causal convolution need different serialized state kinds. `replace` means the
+component emits the complete next fixed-size tensor. Such a group omits
+`sequence_axis`; introducing an algorithm-specific kind would add no runtime
+semantic information.
 
 ### 12.2b Fixed-capacity state and the write contract
 
@@ -671,7 +731,7 @@ state_service:
       logical_lengths: cache_lengths     # graph-visible valid prefix per row
       aliasing: permitted
       update:
-        kind: indexed_scatter            # append (default) | indexed_scatter
+        kind: indexed_scatter            # append | replace | indexed_scatter
         write_indices: write_indices     # a rank-1 semantic state cell, one slot per row
         capacity: package.capacity       # a graph-visible integer scalar
         write_indices_ports:             # which input port carries destinations
@@ -1475,7 +1535,8 @@ serving:
         layout: bnsh
       recurrent:
         kind: recurrent
-        sequence_axis: null
+        layout: bhkv
+        update: { kind: replace }
 ```
 
 Each cache-owning graph port binds to one cell in the appropriate group.

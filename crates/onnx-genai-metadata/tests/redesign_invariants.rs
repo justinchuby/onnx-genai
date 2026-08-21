@@ -519,7 +519,7 @@ fn graph_visible_state_representation_is_separate_from_runtime_storage() {
         .expect("serving")
         .state_service
         .groups["decoder_cache"];
-    assert_eq!(group.sequence_axis, 2);
+    assert_eq!(group.sequence_axis, Some(2));
     assert_eq!(group.layout, "bnsh");
 
     // Runtime-private cache representation cannot be declared anywhere: neither

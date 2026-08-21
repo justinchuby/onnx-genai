@@ -1639,7 +1639,12 @@ impl PipelineEngine {
                 "state service group '{group_name}' declares capacity '{capacity}' = 0, so no \
                  write destination is legal"
             );
-            let axis = group.sequence_axis;
+            let axis = group.sequence_axis.with_context(|| {
+                format!(
+                    "state service group '{group_name}' uses indexed_scatter without a \
+                     sequence_axis"
+                )
+            })?;
 
             // The buffers must actually be the size the destinations were
             // computed against. A capacity that disagrees with the bound tensor

@@ -3981,9 +3981,13 @@
           "description": "Prefix reuse and eviction semantics of this group."
         },
         "sequence_axis": {
+          "description": "Axis whose extent represents logical sequence positions.\n\nRequired for sequence-growing and indexed-scatter state. Fixed-size\nrecurrent state updated by replacement has no logical sequence extent\nand therefore omits this field.",
           "format": "uint",
           "minimum": 0,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "total_length": {
           "description": "Graph-visible total-length input, when the component reads one.",
@@ -4006,7 +4010,6 @@
       },
       "required": [
         "kind",
-        "sequence_axis",
         "layout"
       ],
       "type": "object"
@@ -4203,6 +4206,20 @@
           "properties": {
             "kind": {
               "const": "append",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Each step replaces the complete fixed-size state tensor.\n\nThis is the common discipline for recurrent accumulators, state-space\ncarries, and causal-convolution history. The algorithm does not need a\ndistinct state kind: separate groups already declare each tensor's\nshape, ports, lifetime, and rollback behavior.",
+          "properties": {
+            "kind": {
+              "const": "replace",
               "type": "string"
             }
           },
