@@ -67,7 +67,6 @@ fn workflow_manifest_rejects_facts_owned_by_schema_and_onnx_artifacts() {
 const MULTIMODAL_ADAPTER_WORKFLOW: &str = r#"
 schema_version: v1
 adapters:
-  base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   target_manifest:
     targets:
       - id: projection
@@ -93,14 +92,12 @@ adapters:
       index: 0
       identity: red
       version: "1"
-      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       rank: 1
       alpha: 1.0
       dtype: float32
       weights:
         - location: adapters/red/adapter.json
           loader_capability: onnx-genai.adapters.json@1
-          sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
           scale_encoding: alpha_over_rank
           format: json
       bindings:
@@ -675,7 +672,7 @@ pipeline:
 }
 
 #[test]
-fn constraint_dialect_and_exact_tokenizer_bytes_are_representable() {
+fn constraint_dialect_and_tokenizer_artifact_are_representable() {
     let document = r#"
 package:
   tokenizer:
@@ -684,7 +681,6 @@ package:
     byte_level: true
     artifacts:
       - location: tokenizer.json
-        sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     special_tokens:
       bos: { id: 1, content: "<s>" }
       eos: { id: 2, content: "</s>" }

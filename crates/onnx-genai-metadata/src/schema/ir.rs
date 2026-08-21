@@ -249,8 +249,6 @@ pub enum SpeculationSafety {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AdapterServiceContract {
-    /// `onnx-genai-targeted-base-v1:sha256:<lowercase hex>` compatibility fingerprint.
-    pub base_model_fingerprint: String,
     /// Authoritative, architecture-neutral bindings resolved by producer/import tooling.
     pub target_manifest: LoraTargetManifest,
     /// Explicit load-time tooling fallback. Runtime execution never guesses targets.
@@ -293,7 +291,6 @@ pub struct AdapterArtifact {
     pub index: usize,
     pub identity: String,
     pub version: String,
-    pub base_model_fingerprint: String,
     pub rank: usize,
     pub alpha: f64,
     #[schemars(with = "schema_vocabulary::TensorDType")]
@@ -312,14 +309,9 @@ pub struct AdapterWeightArtifact {
     pub location: String,
     /// Loader capability required to normalize this source into the canonical artifact.
     pub loader_capability: String,
-    /// Lowercase SHA-256 of the exact external artifact bytes.
-    pub sha256: String,
     /// PEFT `adapter_config.json` paired with the safetensors file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_location: Option<String>,
-    /// Lowercase SHA-256 of the exact PEFT config bytes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub config_sha256: Option<String>,
     /// Whether alpha/rank remains to be applied or is already baked into B.
     pub scale_encoding: AdapterScaleEncoding,
     #[serde(default)]

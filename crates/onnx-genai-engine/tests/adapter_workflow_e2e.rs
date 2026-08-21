@@ -6,7 +6,6 @@ use onnx_genai_engine::{
     PipelineEngine, PipelineGenerateRequest,
 };
 use onnx_genai_ort::Value;
-use sha2::{Digest, Sha256};
 
 fn package(metadata: &str, red: &[u8], blue: &[u8]) -> anyhow::Result<PathBuf> {
     let root =
@@ -66,11 +65,9 @@ fn run(
 fn heterogeneous_parameter_adapters_match_independent_rows_and_compaction() -> anyhow::Result<()> {
     let red = br#"{"targets":{"projection":{"a":[1.0,0.0],"b":[1.0,2.0]}}}"#;
     let blue = br#"{"targets":{"projection":{"a":[0.0,1.0],"b":[3.0,4.0]}}}"#;
-    let metadata = format!(
-        r#"
+    let metadata = r#"
 schema_version: v1
 adapters:
-  base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   target_manifest:
     targets:
       - id: projection
@@ -91,101 +88,90 @@ adapters:
     max_adapters: 2
   application_capability: onnx-genai.adapters@1
   portable_fallback: true
-  cache: {{ max_entries: 2, eviction: lru }}
+  cache: { max_entries: 2, eviction: lru }
   artifacts:
     red:
       index: 0
       identity: red
       version: "1"
-      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       rank: 1
       alpha: 1.0
       dtype: float32
       weights:
-        - {{ location: adapters/red/adapter.json, loader_capability: onnx-genai.adapters.json@1,
-             sha256: {red_sha}, scale_encoding: alpha_over_rank }}
+        - { location: adapters/red/adapter.json, loader_capability: onnx-genai.adapters.json@1,
+             scale_encoding: alpha_over_rank }
       bindings:
-        - {{ target: projection, weight_key: projection }}
+        - { target: projection, weight_key: projection }
     blue:
       index: 1
       identity: blue
       version: "1"
-      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       rank: 1
       alpha: 1.0
       dtype: float32
       weights:
-        - {{ location: adapters/blue/adapter.json, loader_capability: onnx-genai.adapters.json@1,
-             sha256: {blue_sha}, scale_encoding: alpha_over_rank }}
+        - { location: adapters/blue/adapter.json, loader_capability: onnx-genai.adapters.json@1,
+             scale_encoding: alpha_over_rank }
       bindings:
-        - {{ target: projection, weight_key: projection }}
+        - { target: projection, weight_key: projection }
 pipeline:
   workflow:
     manifest:
-      adapter_abis: {{ onnx-genai.parameter-overlay: "1" }}
+      adapter_abis: { onnx-genai.parameter-overlay: "1" }
       capabilities: [workflow_ssa, typed_emit, parameter_adapters, heterogeneous_adapter_batching]
     inputs:
       request.adapter_segments:
-        contract: {{ dtype: int64, rank: 2, shape: [batch, 2], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
-        role: {{ kind: runtime, version: "1.0", role: adapter_segments }}
-        source: {{ kind: request }}
+        contract: { dtype: int64, rank: 2, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: runtime, version: "1.0", role: adapter_segments }
+        source: { kind: request }
       request.adapter_counts:
-        contract: {{ dtype: int64, rank: 1, shape: [batch], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
-        role: {{ kind: runtime, version: "1.0", role: adapter_counts }}
-        source: {{ kind: request }}
+        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: runtime, version: "1.0", role: adapter_counts }
+        source: { kind: request }
       request.adapter_scales:
-        contract: {{ dtype: float32, rank: 2, shape: [batch, 2], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
-        role: {{ kind: runtime, version: "1.0", role: adapter_scales }}
-        source: {{ kind: request }}
+        contract: { dtype: float32, rank: 2, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: runtime, version: "1.0", role: adapter_scales }
+        source: { kind: request }
       activations:
-        contract: {{ dtype: float32, rank: 2, shape: [batch, 2], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
-        role: {{ kind: opaque }}
-        source: {{ kind: application, name: activations }}
+        contract: { dtype: float32, rank: 2, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: activations }
     outputs:
       result:
-        contract: {{ dtype: float32, rank: 2, shape: [batch, 2], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
+        contract: { dtype: float32, rank: 2, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
         role: tensor
         stage: pre_adapter
     components:
       decoder:
-        implementation: {{ kind: binding }}
-        ports: {{}}
+        implementation: { kind: binding }
+        ports: {}
       overlay:
         implementation:
           kind: adapter
           abi: onnx-genai.parameter-overlay
           version: "1"
-        row_scope: {{ axis: 0, stateful: false }}
+        row_scope: { axis: 0, stateful: false }
         ports:
           inputs:
-            input: {{ dtype: float32, rank: 2, shape: [batch, 2], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
+            input: { dtype: float32, rank: 2, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
           outputs:
-            output: {{ dtype: float32, rank: 2, shape: [batch, 2], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
+            output: { dtype: float32, rank: 2, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
         contract:
           id: onnx-genai.parameter-overlay
           version: "1"
-          bindings: {{ input: input, output: output }}
-          parameters: {{ action: apply, component: decoder, parameter: projection }}
+          bindings: { input: input, output: output }
+          parameters: { action: apply, component: decoder, parameter: projection }
     steps:
       - kind: invoke
         component: overlay
-        inputs: {{ input: activations }}
-        outputs: {{ output: adapted }}
+        inputs: { input: activations }
+        outputs: { output: adapted }
       - kind: emit
         value: adapted
         output: result
         mode: replace
-"#,
-        red_sha = Sha256::digest(red)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>(),
-        blue_sha = Sha256::digest(blue)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>(),
-    );
-    let root = package(&metadata, red, blue)?;
+"#;
+    let root = package(metadata, red, blue)?;
     let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
     let red_only = [AdapterActivation::new("red", 1.0)];
     let none: [AdapterActivation; 0] = [];
