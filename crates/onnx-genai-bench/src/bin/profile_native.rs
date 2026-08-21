@@ -604,6 +604,13 @@ fn print_cuda_observability(
             stats.graph.fallbacks,
             stats.graph.invalidations
         );
+        println!(
+            "cuda_graph_verify: captures={} replays={} fallbacks={} invalidations={}",
+            stats.graph.verify_captures,
+            stats.graph.verify_replays,
+            stats.graph.verify_fallbacks,
+            stats.graph.verify_invalidations
+        );
         if let Some(before) = before {
             println!(
                 "cuda_graph_measured: captures={} replays={} fallbacks={} invalidations={}",
@@ -614,6 +621,25 @@ fn print_cuda_observability(
                     .graph
                     .invalidations
                     .saturating_sub(before.graph.invalidations)
+            );
+            println!(
+                "cuda_graph_verify_measured: captures={} replays={} fallbacks={} invalidations={}",
+                stats
+                    .graph
+                    .verify_captures
+                    .saturating_sub(before.graph.verify_captures),
+                stats
+                    .graph
+                    .verify_replays
+                    .saturating_sub(before.graph.verify_replays),
+                stats
+                    .graph
+                    .verify_fallbacks
+                    .saturating_sub(before.graph.verify_fallbacks),
+                stats
+                    .graph
+                    .verify_invalidations
+                    .saturating_sub(before.graph.verify_invalidations)
             );
         }
         if let Some(reason) = &stats.graph.decline_reason {

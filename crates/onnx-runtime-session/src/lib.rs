@@ -1459,6 +1459,21 @@ impl InferenceSession {
         self.exec.set_graph_slot(slot)
     }
 
+    /// Whether the main executor's StepScoped workspace is pinned across runs.
+    pub fn main_exec_step_workspace_pinned(&self) -> bool {
+        self.exec.step_workspace_pinned()
+    }
+
+    /// Pin (or unpin) the **main** executor's StepScoped workspace across runs.
+    /// Native MTP verify capture pins it so the captured fixed-M verify graph
+    /// replays against a stable scratch pointer even though the M=1 decode step
+    /// (on the sibling executor) reserves a smaller scratch in between (#1647).
+    /// Inert by default; leaving it unpinned keeps every non-verify path
+    /// byte-identical.
+    pub fn set_main_exec_pin_step_workspace(&mut self, pin: bool) {
+        self.exec.set_pin_step_workspace(pin);
+    }
+
     /// Pin the fixed-capacity KV sequence-axis symbols CONSTANT so CUDA-graph
     /// capture ADMITS the attention nodes (`GroupQueryAttention` in particular)
     /// instead of vetoing each as a growing-seq eager seam. Returns the total

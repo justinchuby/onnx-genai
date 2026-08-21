@@ -168,6 +168,17 @@ impl<'a> NativeSpeculativeDriver<'a> {
         }
         self.session.reset()?;
 
+        // Option-c native MTP verify capture: install the fixed-M (=k+1) padded
+        // verify bindings + Verify graph slot ONCE per generation so the M=K
+        // verify forward is captured and replayed instead of recaptured every
+        // step (the pre-#1650 replays=0 pin). Idempotent and a no-op unless this
+        // is an MTP proposer over a graph-enabled hybrid recurrent CUDA session
+        // (`configure_verify_capture` self-guards on all of those). Greedy /
+        // prompt-lookup / pure-attention / CPU paths are entirely unaffected.
+        if matches!(self.proposer, NativeProposer::Mtp { .. }) {
+            self.session.configure_verify_capture(self.draft_width)?;
+        }
+
         let prompt_len = prompt_tokens.len();
         let mut state = DecodeLoopState::new(0, options.seed, options.top_logprobs);
         // Committed tokens not yet folded into the device KV cache. Mirrors
