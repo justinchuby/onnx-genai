@@ -327,7 +327,7 @@ pipeline:
       model:
         implementation:
           kind: onnx
-          artifact: model.onnx
+          artifact: model.onnx.textproto
         ports:
           inputs:
             input_ids:
@@ -398,7 +398,7 @@ pipeline:
       token_sampler:
         implementation:
           kind: onnx
-          artifact: policies/token_sampler.onnx
+          artifact: policies/token_sampler.onnx.textproto
         ports:
           inputs:
             logits:
@@ -514,7 +514,7 @@ pipeline:
       termination:
         implementation:
           kind: onnx
-          artifact: policies/termination.onnx
+          artifact: policies/termination.onnx.textproto
         ports:
           inputs:
             tokens:
@@ -604,7 +604,7 @@ pipeline:
       token_state_update:
         implementation:
           kind: onnx
-          artifact: policies/token_state_update.onnx
+          artifact: policies/token_state_update.onnx.textproto
         ports:
           inputs:
             current:
@@ -666,7 +666,7 @@ pipeline:
       last_token_logits:
         implementation:
           kind: onnx
-          artifact: policies/last_token_logits.onnx
+          artifact: policies/last_token_logits.onnx.textproto
         ports:
           inputs:
             logits:
@@ -692,7 +692,7 @@ pipeline:
       decoder_state_initializer:
         implementation:
           kind: onnx
-          artifact: policies/decoder_state_initializer.onnx
+          artifact: policies/decoder_state_initializer.onnx.textproto
         ports:
           inputs:
             prompt_tokens:
@@ -793,7 +793,7 @@ pipeline:
       decoder_step_update:
         implementation:
           kind: onnx
-          artifact: policies/decoder_step_update.onnx
+          artifact: policies/decoder_step_update.onnx.textproto
         ports:
           inputs:
             attention_mask:
@@ -844,7 +844,7 @@ pipeline:
       cache_length_update:
         implementation:
           kind: onnx
-          artifact: policies/cache_length_update.onnx
+          artifact: policies/cache_length_update.onnx.textproto
         ports:
           inputs:
             left:
@@ -891,7 +891,7 @@ pipeline:
       termination_batch_initializer:
         implementation:
           kind: onnx
-          artifact: policies/termination_batch_initializer.onnx
+          artifact: policies/termination_batch_initializer.onnx.textproto
         ports:
           inputs:
             input_eos_ids:
@@ -961,7 +961,7 @@ pipeline:
       token_to_slot:
         implementation:
           kind: onnx
-          artifact: policies/token_to_slot.onnx
+          artifact: policies/token_to_slot.onnx.textproto
         ports:
           inputs:
             token:
@@ -985,7 +985,7 @@ pipeline:
       generated_length_update:
         implementation:
           kind: onnx
-          artifact: policies/generated_length_update.onnx
+          artifact: policies/generated_length_update.onnx.textproto
         ports:
           inputs:
             left:

@@ -4598,7 +4598,7 @@ fn unaligned_external_qmoe_keeps_route_first_enabled_and_matches_legacy() {
 
     let _restore = RestoreEnv(std::env::var_os(onnx_runtime_ep_cpu::WEIGHT_OFFLOAD_ENV));
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../onnx-runtime-ep-cpu/tests/fixtures/qmoe_weight_offload/model.onnx");
+        .join("../onnx-runtime-ep-cpu/tests/fixtures/qmoe_weight_offload/model.onnx.textproto");
     let input_values: Vec<f32> = (0..64).map(|index| index as f32 * 0.03125 - 1.0).collect();
     let router_values = vec![
         9.0, 0.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 9.0,

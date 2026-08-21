@@ -46,11 +46,11 @@ pipeline:
       encoder:
         implementation:
           kind: onnx
-          artifact: encoder/model.onnx
+          artifact: encoder/model.onnx.textproto
       decoder:
         implementation:
           kind: onnx
-          artifact: decoder/model.onnx
+          artifact: decoder/model.onnx.textproto
     steps:
     - kind: invoke
       component: encoder

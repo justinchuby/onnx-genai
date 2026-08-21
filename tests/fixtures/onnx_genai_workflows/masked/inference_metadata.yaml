@@ -137,11 +137,11 @@ pipeline:
       model:
         implementation:
           kind: onnx
-          artifact: model.onnx
+          artifact: model.onnx.textproto
       masked_update:
         implementation:
           kind: onnx
-          artifact: policies/masked_update.onnx
+          artifact: policies/masked_update.onnx.textproto
         ports:
           inputs:
             current_tokens:

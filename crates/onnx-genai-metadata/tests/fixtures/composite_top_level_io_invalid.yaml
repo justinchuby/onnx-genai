@@ -4,7 +4,7 @@ model:
 pipeline:
   models:
     decoder:
-      filename: decoder.onnx
+      filename: decoder.onnx.textproto
       type: decoder
       io:
         token_input: input_ids

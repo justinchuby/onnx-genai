@@ -832,7 +832,10 @@ mod model_package_tests {
             ..Default::default()
         };
         let directory = ModelDirectory::load_with_package_selection(&root, &selection).unwrap();
-        assert_eq!(directory.model_path, root.join("cpu-fp32/model.onnx"));
+        assert_eq!(
+            directory.model_path,
+            root.join("cpu-fp32/model.onnx.textproto")
+        );
         assert_eq!(
             directory.tokenizer_path,
             root.join(format!(
@@ -847,13 +850,7 @@ mod model_package_tests {
         let root =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
         let directory = ModelDirectory::load(&root).unwrap();
-        // The fixture carries both `model.onnx` and `model.onnx.textproto`.
-        // `prefer_binary_onnx_twins` resolves that pair to the binary, so this
-        // expects the binary. It expected the textproto until now: the loader
-        // changed deliberately and this assertion was never updated, because
-        // this crate's tests do not run in CI. That is fixed in the same change
-        // as this line.
-        assert_eq!(directory.model_path, root.join("model.onnx"));
+        assert_eq!(directory.model_path, root.join("model.onnx.textproto"));
         assert_eq!(directory.tokenizer_path, root.join("tokenizer.json"));
     }
 }
@@ -904,7 +901,7 @@ mod tests {
 
     fn non_dense_logits_fixture() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/tiny-glm52-qmoe-indexshare/model.onnx")
+            .join("../../tests/fixtures/tiny-glm52-qmoe-indexshare/model.onnx.textproto")
     }
 
     #[test]

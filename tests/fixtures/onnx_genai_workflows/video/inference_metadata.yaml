@@ -155,15 +155,15 @@ pipeline:
       transformer:
         implementation:
           kind: onnx
-          artifact: transformer/model.onnx
+          artifact: transformer/model.onnx.textproto
       vae_decoder:
         implementation:
           kind: onnx
-          artifact: vae_decoder/model.onnx
+          artifact: vae_decoder/model.onnx.textproto
       model_input:
         implementation:
           kind: onnx
-          artifact: policies/model_input.onnx
+          artifact: policies/model_input.onnx.textproto
         ports:
           inputs:
             sample:
@@ -198,7 +198,7 @@ pipeline:
       solver_step:
         implementation:
           kind: onnx
-          artifact: policies/solver_step.onnx
+          artifact: policies/solver_step.onnx.textproto
         ports:
           inputs:
             sample:
@@ -251,7 +251,7 @@ pipeline:
       continue_predicate:
         implementation:
           kind: onnx
-          artifact: policies/continue_predicate.onnx
+          artifact: policies/continue_predicate.onnx.textproto
         ports:
           inputs:
             done:
@@ -268,7 +268,7 @@ pipeline:
       video_latent_init:
         implementation:
           kind: onnx
-          artifact: policies/video_latent_init.onnx
+          artifact: policies/video_latent_init.onnx.textproto
         ports:
           inputs:
             noise:
@@ -299,7 +299,7 @@ pipeline:
       schedule_history_append:
         implementation:
           kind: onnx
-          artifact: policies/schedule_history_append.onnx
+          artifact: policies/schedule_history_append.onnx.textproto
         ports:
           inputs:
             history:
@@ -323,7 +323,7 @@ pipeline:
       video_latent_permute:
         implementation:
           kind: onnx
-          artifact: policies/video_latent_permute.onnx
+          artifact: policies/video_latent_permute.onnx.textproto
         ports:
           inputs:
             latent:
@@ -348,7 +348,7 @@ pipeline:
       video_latent_unscale:
         implementation:
           kind: onnx
-          artifact: policies/video_latent_unscale.onnx
+          artifact: policies/video_latent_unscale.onnx.textproto
         ports:
           inputs:
             latent:
@@ -373,7 +373,7 @@ pipeline:
       video_decode_chunks:
         implementation:
           kind: onnx
-          artifact: policies/video_decode_chunks.onnx
+          artifact: policies/video_decode_chunks.onnx.textproto
         ports:
           inputs:
             latent:
@@ -394,7 +394,7 @@ pipeline:
       video_decode_chunk:
         implementation:
           kind: onnx
-          artifact: policies/video_decode_chunk.onnx
+          artifact: policies/video_decode_chunk.onnx.textproto
         ports:
           inputs:
             latent:
@@ -424,7 +424,7 @@ pipeline:
       video_conv_cache_init:
         implementation:
           kind: onnx
-          artifact: policies/video_conv_cache_init.onnx
+          artifact: policies/video_conv_cache_init.onnx.textproto
         ports:
           inputs:
             latent:
@@ -458,7 +458,7 @@ pipeline:
       diffusion_schedule:
         implementation:
           kind: onnx
-          artifact: policies/diffusion_schedule.onnx
+          artifact: policies/diffusion_schedule.onnx.textproto
         ports:
           inputs: {}
           outputs:
@@ -470,7 +470,7 @@ pipeline:
       diffusion_timesteps:
         implementation:
           kind: onnx
-          artifact: policies/diffusion_timesteps.onnx
+          artifact: policies/diffusion_timesteps.onnx.textproto
         ports:
           inputs: {}
           outputs:
@@ -482,7 +482,7 @@ pipeline:
       schedule_lookup:
         implementation:
           kind: onnx
-          artifact: policies/schedule_lookup.onnx
+          artifact: policies/schedule_lookup.onnx.textproto
         ports:
           inputs:
             schedule:

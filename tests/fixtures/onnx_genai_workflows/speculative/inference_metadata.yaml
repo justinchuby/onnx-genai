@@ -281,11 +281,11 @@ pipeline:
       proposer:
         implementation:
           kind: onnx
-          artifact: proposer/model.onnx
+          artifact: proposer/model.onnx.textproto
       verifier:
         implementation:
           kind: onnx
-          artifact: verifier/model.onnx
+          artifact: verifier/model.onnx.textproto
       grammar_clone:
         implementation:
           kind: adapter
@@ -595,7 +595,7 @@ pipeline:
       speculative_acceptance:
         implementation:
           kind: onnx
-          artifact: policies/speculative_acceptance.onnx
+          artifact: policies/speculative_acceptance.onnx.textproto
         ports:
           inputs:
             target_scores:
@@ -699,7 +699,7 @@ pipeline:
       grammar_guidance:
         implementation:
           kind: onnx
-          artifact: policies/grammar_guidance.onnx
+          artifact: policies/grammar_guidance.onnx.textproto
         ports:
           inputs:
             logits:
@@ -750,7 +750,7 @@ pipeline:
       adaptive_k:
         implementation:
           kind: onnx
-          artifact: policies/adaptive_k.onnx
+          artifact: policies/adaptive_k.onnx.textproto
         ports:
           inputs:
             current_k:
@@ -853,7 +853,7 @@ pipeline:
       grammar_length:
         implementation:
           kind: onnx
-          artifact: policies/grammar_length.onnx
+          artifact: policies/grammar_length.onnx.textproto
         ports:
           inputs:
             left:
@@ -884,7 +884,7 @@ pipeline:
       grammar_sampler_logits:
         implementation:
           kind: onnx
-          artifact: policies/grammar_sampler_logits.onnx
+          artifact: policies/grammar_sampler_logits.onnx.textproto
         ports:
           inputs:
             logits:
@@ -910,7 +910,7 @@ pipeline:
       proposal_metrics:
         implementation:
           kind: onnx
-          artifact: policies/proposal_metrics.onnx
+          artifact: policies/proposal_metrics.onnx.textproto
         ports:
           inputs:
             proposed_tokens:
@@ -950,7 +950,7 @@ pipeline:
       cache_length_update:
         implementation:
           kind: onnx
-          artifact: policies/cache_length_update.onnx
+          artifact: policies/cache_length_update.onnx.textproto
         ports:
           inputs:
             left:

@@ -10,7 +10,7 @@ pipeline:
       missing:
         implementation:
           kind: onnx
-          artifact: missing.onnx
+          artifact: missing.onnx.textproto
         ports: {}
     steps:
       - kind: invoke

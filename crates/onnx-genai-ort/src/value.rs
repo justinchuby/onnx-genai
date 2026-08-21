@@ -2053,7 +2053,7 @@ mod cuda_device_write_tests {
 
     const TINY_LLM: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../tests/fixtures/tiny-llm-sharedbuffer/model.onnx"
+        "/../../tests/fixtures/tiny-llm-sharedbuffer/model.onnx.textproto"
     );
 
     /// Build a CUDA session and return its device KV allocator together with the

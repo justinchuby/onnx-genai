@@ -1,0 +1,270 @@
+ir_version: 11
+graph {
+  node {
+    input: "input_ids"
+    output: "batch_1d"
+    op_type: "Shape"
+    attribute {
+      name: "end"
+      i: 1
+      type: INT
+    }
+    attribute {
+      name: "start"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "batch_1d"
+    input: "capacity"
+    input: "width_1d"
+    output: "cache_shape"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "cache_shape"
+    output: "key_cache"
+    op_type: "ConstantOfShape"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        data_type: 1
+        name: "zero"
+        raw_data: "\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    input: "cache_shape"
+    output: "value_cache"
+    op_type: "ConstantOfShape"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        data_type: 1
+        name: "zero"
+        raw_data: "\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    input: "write_indices"
+    input: "one_1d"
+    output: "raw_lengths"
+    op_type: "Add"
+  }
+  node {
+    input: "raw_lengths"
+    input: "capacity"
+    output: "cache_lengths"
+    op_type: "Min"
+  }
+  node {
+    input: "input_ids"
+    input: "last_start"
+    input: "last_end"
+    input: "one_1d"
+    output: "token"
+    op_type: "Slice"
+  }
+  name: "static_cache_state_init"
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "one_1d"
+    raw_data: "\001\000\000\000\000\000\000\000"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "width_1d"
+    raw_data: "\004\000\000\000\000\000\000\000"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "last_start"
+    raw_data: "\377\377\377\377\377\377\377\377"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "last_end"
+    raw_data: "\377\377\377\377\377\377\377\177"
+  }
+  input {
+    name: "input_ids"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "prompt_sequence"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "write_indices"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "capacity"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "key_cache"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "cache_capacity"
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "value_cache"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "cache_capacity"
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "cache_lengths"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "token"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "one_1d"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "width_1d"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "last_start"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "last_end"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}

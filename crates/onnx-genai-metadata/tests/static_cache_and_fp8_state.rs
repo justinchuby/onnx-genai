@@ -1163,7 +1163,11 @@ fn loading_a_package_rejects_a_second_serialized_abi() {
         .join("../../tests/fixtures/tiny-llm-scatter-workflow");
     let staged = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("two-abi-package");
     std::fs::create_dir_all(&staged).expect("staging directory");
-    std::fs::copy(source.join("model.onnx"), staged.join("model.onnx")).expect("artifact copy");
+    std::fs::copy(
+        source.join("model.onnx.textproto"),
+        staged.join("model.onnx.textproto"),
+    )
+    .expect("artifact copy");
 
     // The canonical package, plus the one thing it is not allowed to also carry.
     let canonical = std::fs::read_to_string(source.join("inference_metadata.yaml"))

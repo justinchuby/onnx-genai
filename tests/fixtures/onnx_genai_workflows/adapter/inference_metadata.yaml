@@ -107,7 +107,7 @@ pipeline:
       decoder:
         implementation:
           kind: onnx
-          artifact: model.onnx
+          artifact: model.onnx.textproto
         ports: {}
       overlay:
         implementation:

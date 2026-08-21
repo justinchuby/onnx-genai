@@ -1,0 +1,64 @@
+ir_version: 11
+graph {
+  node {
+    input: "codes"
+    output: "waveform"
+    name: "Identity_node_0"
+    op_type: "Identity"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  name: "decoder"
+  input {
+    name: "codes"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "component.decoder.batch"
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "component.decoder.audio_samples"
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "waveform"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "component.decoder.batch"
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "component.decoder.audio_samples"
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}

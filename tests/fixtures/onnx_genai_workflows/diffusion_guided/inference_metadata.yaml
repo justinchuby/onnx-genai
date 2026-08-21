@@ -209,19 +209,19 @@ pipeline:
       text_encoder:
         implementation:
           kind: onnx
-          artifact: text_encoder/model.onnx
+          artifact: text_encoder/model.onnx.textproto
       denoiser:
         implementation:
           kind: onnx
-          artifact: denoiser/model.onnx
+          artifact: denoiser/model.onnx.textproto
       vae_decoder:
         implementation:
           kind: onnx
-          artifact: vae_decoder/model.onnx
+          artifact: vae_decoder/model.onnx.textproto
       solver_step:
         implementation:
           kind: onnx
-          artifact: policies/solver_step.onnx
+          artifact: policies/solver_step.onnx.textproto
         ports:
           inputs:
             sample:
@@ -307,7 +307,7 @@ pipeline:
       continue_predicate:
         implementation:
           kind: onnx
-          artifact: policies/continue_predicate.onnx
+          artifact: policies/continue_predicate.onnx.textproto
         ports:
           inputs:
             done:
@@ -327,7 +327,7 @@ pipeline:
       diffusion_schedule:
         implementation:
           kind: onnx
-          artifact: policies/diffusion_schedule.onnx
+          artifact: policies/diffusion_schedule.onnx.textproto
         ports:
           inputs: {}
           outputs:
@@ -339,7 +339,7 @@ pipeline:
       diffusion_timesteps:
         implementation:
           kind: onnx
-          artifact: policies/diffusion_timesteps.onnx
+          artifact: policies/diffusion_timesteps.onnx.textproto
         ports:
           inputs: {}
           outputs:
@@ -351,7 +351,7 @@ pipeline:
       schedule_lookup:
         implementation:
           kind: onnx
-          artifact: policies/schedule_lookup.onnx
+          artifact: policies/schedule_lookup.onnx.textproto
         ports:
           inputs:
             schedule:
@@ -379,7 +379,7 @@ pipeline:
       tensor_scale:
         implementation:
           kind: onnx
-          artifact: policies/tensor_scale.onnx
+          artifact: policies/tensor_scale.onnx.textproto
         ports:
           inputs:
             tensor:
@@ -413,7 +413,7 @@ pipeline:
       decoder_input_scale:
         implementation:
           kind: onnx
-          artifact: policies/decoder_input_scale.onnx
+          artifact: policies/decoder_input_scale.onnx.textproto
         ports:
           inputs: {}
           outputs:
@@ -425,7 +425,7 @@ pipeline:
       history_initializer:
         implementation:
           kind: onnx
-          artifact: policies/history_initializer.onnx
+          artifact: policies/history_initializer.onnx.textproto
         ports:
           inputs:
             reference:
@@ -454,7 +454,7 @@ pipeline:
       guidance_combine:
         implementation:
           kind: onnx
-          artifact: policies/guidance_combine.onnx
+          artifact: policies/guidance_combine.onnx.textproto
         ports:
           inputs:
             unconditional:
@@ -510,7 +510,7 @@ pipeline:
       latent_row_shape:
         implementation:
           kind: onnx
-          artifact: policies/latent_row_shape.onnx
+          artifact: policies/latent_row_shape.onnx.textproto
         ports:
           inputs: {}
           outputs:
@@ -522,7 +522,7 @@ pipeline:
       latent_noise:
         implementation:
           kind: onnx
-          artifact: policies/latent_noise.onnx
+          artifact: policies/latent_noise.onnx.textproto
         ports:
           inputs:
             seed:

@@ -194,7 +194,7 @@ pipeline:
       model:
         implementation:
           kind: onnx
-          artifact: model.onnx
+          artifact: model.onnx.textproto
         ports:
           inputs:
             input_ids:
@@ -279,7 +279,7 @@ pipeline:
       state_init:
         implementation:
           kind: onnx
-          artifact: policies/state_init.onnx
+          artifact: policies/state_init.onnx.textproto
         ports:
           inputs:
             input_ids:
@@ -345,7 +345,7 @@ pipeline:
       step_update:
         implementation:
           kind: onnx
-          artifact: policies/step_update.onnx
+          artifact: policies/step_update.onnx.textproto
         ports:
           inputs:
             write_indices:
@@ -421,7 +421,7 @@ pipeline:
       next_token:
         implementation:
           kind: onnx
-          artifact: policies/next_token.onnx
+          artifact: policies/next_token.onnx.textproto
         ports:
           inputs:
             logits:
@@ -447,7 +447,7 @@ pipeline:
       loop_continue:
         implementation:
           kind: onnx
-          artifact: policies/loop_continue.onnx
+          artifact: policies/loop_continue.onnx.textproto
         ports:
           inputs:
             active:

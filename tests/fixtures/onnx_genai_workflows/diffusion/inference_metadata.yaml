@@ -107,19 +107,19 @@ pipeline:
       text_encoder:
         implementation:
           kind: onnx
-          artifact: text_encoder/model.onnx
+          artifact: text_encoder/model.onnx.textproto
       denoiser:
         implementation:
           kind: onnx
-          artifact: denoiser/model.onnx
+          artifact: denoiser/model.onnx.textproto
       vae_decoder:
         implementation:
           kind: onnx
-          artifact: vae_decoder/model.onnx
+          artifact: vae_decoder/model.onnx.textproto
       euler_model_input:
         implementation:
           kind: onnx
-          artifact: policies/euler_model_input.onnx
+          artifact: policies/euler_model_input.onnx.textproto
         ports:
           inputs:
             sample:
@@ -161,7 +161,7 @@ pipeline:
       solver_step:
         implementation:
           kind: onnx
-          artifact: policies/solver_step.onnx
+          artifact: policies/solver_step.onnx.textproto
         ports:
           inputs:
             sample:
@@ -223,7 +223,7 @@ pipeline:
       continue_predicate:
         implementation:
           kind: onnx
-          artifact: policies/continue_predicate.onnx
+          artifact: policies/continue_predicate.onnx.textproto
         ports:
           inputs:
             done:
@@ -243,7 +243,7 @@ pipeline:
       diffusion_schedule:
         implementation:
           kind: onnx
-          artifact: policies/diffusion_schedule.onnx
+          artifact: policies/diffusion_schedule.onnx.textproto
         ports:
           inputs: {}
           outputs:
@@ -255,7 +255,7 @@ pipeline:
       diffusion_timesteps:
         implementation:
           kind: onnx
-          artifact: policies/diffusion_timesteps.onnx
+          artifact: policies/diffusion_timesteps.onnx.textproto
         ports:
           inputs: {}
           outputs:
@@ -267,7 +267,7 @@ pipeline:
       schedule_lookup:
         implementation:
           kind: onnx
-          artifact: policies/schedule_lookup.onnx
+          artifact: policies/schedule_lookup.onnx.textproto
         ports:
           inputs:
             schedule:

@@ -40,7 +40,7 @@ fn scatter_io() -> onnx_genai_metadata::ModelIoSpec {
 
 fn tiny_sharedbuffer_llm() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/tiny-llm-sharedbuffer/model.onnx")
+        .join("../../tests/fixtures/tiny-llm-sharedbuffer/model.onnx.textproto")
 }
 
 /// The graph-port roles the fixture beside the model already declares.

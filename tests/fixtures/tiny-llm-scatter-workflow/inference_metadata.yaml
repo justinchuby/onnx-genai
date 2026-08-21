@@ -117,7 +117,7 @@ pipeline:
         stage: pre_adapter
     components:
       model:
-        implementation: {kind: onnx, artifact: model.onnx}
+        implementation: {kind: onnx, artifact: model.onnx.textproto}
         ports:
           inputs:
             input_ids:

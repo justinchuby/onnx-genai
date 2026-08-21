@@ -250,47 +250,47 @@ pipeline:
       talker:
         implementation:
           kind: onnx
-          artifact: talker/model.onnx
+          artifact: talker/model.onnx.textproto
       code_predictor:
         implementation:
           kind: onnx
-          artifact: code_predictor/model.onnx
+          artifact: code_predictor/model.onnx.textproto
       embedding:
         implementation:
           kind: onnx
-          artifact: embedding/model.onnx
+          artifact: embedding/model.onnx.textproto
       talker_step_embedder:
         implementation:
           kind: onnx
-          artifact: talker_step_embedder/model.onnx
+          artifact: talker_step_embedder/model.onnx.textproto
       talker_prefill_embedder:
         implementation:
           kind: onnx
-          artifact: talker_prefill_embedder/model.onnx
+          artifact: talker_prefill_embedder/model.onnx.textproto
       code_predictor_prefill:
         implementation:
           kind: onnx
-          artifact: code_predictor_prefill/model.onnx
+          artifact: code_predictor_prefill/model.onnx.textproto
       code_predictor_step_embedder:
         implementation:
           kind: onnx
-          artifact: code_predictor_step_embedder/model.onnx
+          artifact: code_predictor_step_embedder/model.onnx.textproto
       code_predictor_indices:
         implementation:
           kind: onnx
-          artifact: code_predictor_indices/model.onnx
+          artifact: code_predictor_indices/model.onnx.textproto
       talker_text_step:
         implementation:
           kind: onnx
-          artifact: talker_text_step/model.onnx
+          artifact: talker_text_step/model.onnx.textproto
       codec:
         implementation:
           kind: onnx
-          artifact: codec/model.onnx
+          artifact: codec/model.onnx.textproto
       last_token_logits:
         implementation:
           kind: onnx
-          artifact: policies/last_token_logits.onnx
+          artifact: policies/last_token_logits.onnx.textproto
         ports:
           inputs:
             logits:
@@ -316,7 +316,7 @@ pipeline:
       setup_talker_sampler:
         implementation:
           kind: onnx
-          artifact: policies/setup_talker_sampler.onnx
+          artifact: policies/setup_talker_sampler.onnx.textproto
         ports:
           inputs:
             logits:
@@ -349,7 +349,7 @@ pipeline:
       setup_predictor_sampler:
         implementation:
           kind: onnx
-          artifact: policies/setup_predictor_sampler.onnx
+          artifact: policies/setup_predictor_sampler.onnx.textproto
         ports:
           inputs:
             logits:
@@ -382,7 +382,7 @@ pipeline:
       talker_sampler:
         implementation:
           kind: onnx
-          artifact: policies/talker_sampler.onnx
+          artifact: policies/talker_sampler.onnx.textproto
         ports:
           inputs:
             logits:
@@ -415,7 +415,7 @@ pipeline:
       predictor_prefill_sampler:
         implementation:
           kind: onnx
-          artifact: policies/predictor_prefill_sampler.onnx
+          artifact: policies/predictor_prefill_sampler.onnx.textproto
         ports:
           inputs:
             logits:
@@ -448,7 +448,7 @@ pipeline:
       predictor_body_sampler:
         implementation:
           kind: onnx
-          artifact: policies/predictor_body_sampler.onnx
+          artifact: policies/predictor_body_sampler.onnx.textproto
         ports:
           inputs:
             logits:
@@ -481,7 +481,7 @@ pipeline:
       continue_predicate:
         implementation:
           kind: onnx
-          artifact: policies/continue_predicate.onnx
+          artifact: policies/continue_predicate.onnx.textproto
         ports:
           inputs:
             done:
@@ -501,7 +501,7 @@ pipeline:
       tts_state_initializer:
         implementation:
           kind: onnx
-          artifact: policies/tts_state_initializer.onnx
+          artifact: policies/tts_state_initializer.onnx.textproto
         ports:
           inputs:
             prompt_tokens:
@@ -545,7 +545,7 @@ pipeline:
       token_to_slot:
         implementation:
           kind: onnx
-          artifact: policies/token_to_slot.onnx
+          artifact: policies/token_to_slot.onnx.textproto
         ports:
           inputs:
             token:
@@ -569,7 +569,7 @@ pipeline:
       code_frame_update:
         implementation:
           kind: onnx
-          artifact: policies/code_frame_update.onnx
+          artifact: policies/code_frame_update.onnx.textproto
         ports:
           inputs:
             frame_codes:
@@ -606,7 +606,7 @@ pipeline:
       code_history_append:
         implementation:
           kind: onnx
-          artifact: policies/code_history_append.onnx
+          artifact: policies/code_history_append.onnx.textproto
         ports:
           inputs:
             history:
@@ -642,7 +642,7 @@ pipeline:
       cache_length_update:
         implementation:
           kind: onnx
-          artifact: policies/cache_length_update.onnx
+          artifact: policies/cache_length_update.onnx.textproto
         ports:
           inputs:
             left:
@@ -673,7 +673,7 @@ pipeline:
       talker_state_initializer:
         implementation:
           kind: onnx
-          artifact: policies/talker_state_initializer.onnx
+          artifact: policies/talker_state_initializer.onnx.textproto
         ports:
           inputs:
             prefill_embeds:
@@ -744,7 +744,7 @@ pipeline:
       predictor_state_initializer:
         implementation:
           kind: onnx
-          artifact: policies/predictor_state_initializer.onnx
+          artifact: policies/predictor_state_initializer.onnx.textproto
         ports:
           inputs:
             prefill_embeds:
@@ -907,7 +907,7 @@ pipeline:
       talker_step_update:
         implementation:
           kind: onnx
-          artifact: policies/talker_step_update.onnx
+          artifact: policies/talker_step_update.onnx.textproto
         ports:
           inputs:
             attention_mask:
@@ -946,7 +946,7 @@ pipeline:
       predictor_step_update:
         implementation:
           kind: onnx
-          artifact: policies/predictor_step_update.onnx
+          artifact: policies/predictor_step_update.onnx.textproto
         ports:
           inputs:
             attention_mask:
@@ -989,7 +989,7 @@ pipeline:
       codec_layout:
         implementation:
           kind: onnx
-          artifact: policies/codec_layout.onnx
+          artifact: policies/codec_layout.onnx.textproto
         ports:
           inputs:
             history:
