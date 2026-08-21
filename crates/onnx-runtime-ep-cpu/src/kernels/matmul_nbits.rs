@@ -35,6 +35,7 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::{Attribute, DataType, Graph, Node};
 use rayon::prelude::*;
 
+use super::int4_nibble;
 use super::matmul::gemm;
 use super::{check_arity, to_dense_bytes, to_dense_f32, to_dense_i64, write_dense_f32};
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
@@ -1763,7 +1764,50 @@ impl Kernel for MatMulNBitsKernel {
                     );
                 })?;
             }
+        } else if self.bits == 4
+            && self.accuracy_level == 4
+            && group_indices.is_none()
+            && !self.weight_prepacked
+            && m <= INT4_NIBBLE_MAX_ROWS
+            && !dot_kernel.uses_vnni_int4_direct()
+            && int4_nibble::supported(self.block_size)
+        {
+            // No VNNI on this host, so the alternative below is
+            // `prepack_int8_weight`, which expands every nibble to a whole
+            // `i8`. Decode reads each weight exactly once, so that expansion
+            // doubles the only stream that matters. This route consumes the
+            // wire layout at 0.5 B/weight instead -- see `int4_nibble`.
+            let owned_weight;
+            let packed_weight = if can_prepack {
+                if let Some(weight) = self.packed_nbits_weight.get() {
+                    weight
+                } else {
+                    let weight = self.prepack_nbits_weight(&inputs[1], &inputs[2], zero_points)?;
+                    let weight = numa_place_nbits(weight, self.n);
+                    let _ = self.packed_nbits_weight.set(weight);
+                    self.packed_nbits_weight
+                        .get()
+                        .expect("constant MatMulNBits packed nibble weight was just initialized")
+                }
+            } else {
+                let built = self.prepack_nbits_weight(&inputs[1], &inputs[2], zero_points)?;
+                owned_weight = numa_place_nbits(built, self.n);
+                &owned_weight
+            };
+            record_int4_route(Int4Route::PackedNibble);
+            with_decode_pool(|| {
+                int4_nibble_matmul(
+                    &activations,
+                    packed_weight,
+                    result,
+                    m,
+                    self.k,
+                    self.n,
+                    self.block_size,
+                );
+            })?;
         } else if self.bits == 4 && self.accuracy_level == 4 && group_indices.is_none() {
+            record_int4_route(Int4Route::ExpandedInt8);
             let owned_weight;
             let int8_weight = if can_prepack {
                 if let Some(weight) = self.int8_weight.get() {
@@ -8572,6 +8616,148 @@ fn quantize_activation(
     (quantized, scales)
 }
 
+/// Rows the packed-nibble route serves before the expanded-`i8` prefill path
+/// takes over.
+///
+/// The nibble kernel re-quantizes and deinterleaves the activation per row and
+/// re-reads the whole weight per row -- it is a GEMV repeated, with no `B`
+/// reuse. That is the right trade exactly while the weight stream dominates,
+/// which is decode and the short prefills that follow it; past that the
+/// expanded-`i8` path's packing amortizes and AMX/VNNI blocking becomes
+/// available. Swept in `docs/benchmarks/2026-08-21-int4-packed-nibble-avx2.md`.
+/// Largest `m` the packed-nibble route serves.
+///
+/// Every `m` up to and including this one was measured a win against the
+/// expanded-`i8` route it replaces (~2x at `m = 1..64`, `qwen3_8b_square`,
+/// `block_size = 32`, 8 threads); past it there is no measurement, so the gate
+/// is the largest `m` with evidence rather than a modelled crossover. The
+/// driver parallelizes over rows without weight reuse, so a real prefill
+/// geometry wants a blocked kernel rather than a wider gate here.
+const INT4_NIBBLE_MAX_ROWS: usize = 64;
+
+/// Which int4 `accuracy_level = 4` route a call took. Test-only: the counters
+/// exist so a route can be asserted rather than inferred from a timing.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Int4Route {
+    /// The packed-nibble AVX2 kernel, 0.5 B/weight.
+    PackedNibble,
+    /// `prepack_int8_weight` + `int8_matmul`, 1 B/weight.
+    ExpandedInt8,
+}
+
+#[cfg(test)]
+thread_local! {
+    static INT4_ROUTES: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+fn record_int4_route(route: Int4Route) {
+    INT4_ROUTES.with(|routes| {
+        let (nibble, int8) = routes.get();
+        routes.set(match route {
+            Int4Route::PackedNibble => (nibble + 1, int8),
+            Int4Route::ExpandedInt8 => (nibble, int8 + 1),
+        });
+    });
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn record_int4_route(_route: Int4Route) {}
+
+#[cfg(not(test))]
+#[derive(Clone, Copy)]
+pub(crate) enum Int4Route {
+    PackedNibble,
+    ExpandedInt8,
+}
+
+/// `(packed nibble, expanded int8)` route counts since [`reset_int4_routes`].
+#[cfg(test)]
+pub(crate) fn int4_routes() -> (usize, usize) {
+    INT4_ROUTES.with(|routes| routes.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_int4_routes() {
+    INT4_ROUTES.with(|routes| routes.set((0, 0)));
+}
+
+/// Packed-nibble int4 GEMV/short-GEMM driver.
+///
+/// Mirrors [`int8_matmul`]'s structure -- one quantized activation per row,
+/// column-parallel when the pool has workers the rows do not use -- but the
+/// weight is the untouched ONNX packed tensor.
+fn int4_nibble_matmul(
+    activations: &[f32],
+    weight: &PackedNBitsWeight,
+    result: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    block_size: usize,
+) {
+    let k_blocks = k.div_ceil(block_size);
+    let padded_k = k_blocks * block_size;
+    debug_assert_eq!(weight.values.len(), n * k_blocks * (block_size / 2));
+    debug_assert_eq!(weight.scales.len(), n * k_blocks);
+
+    if m == 1 {
+        let prepared = int4_nibble::NibbleActivation::new(activations, padded_k, block_size);
+        int4_nibble_row(
+            &prepared, weight, result, k_blocks, block_size, padded_k, true,
+        );
+    } else {
+        let parallel_columns =
+            m < rayon::current_num_threads() && output_chunk_len(n, padded_k) < n;
+        result
+            .par_chunks_mut(n)
+            .zip(activations.par_chunks_exact(k))
+            .for_each(|(output, activation)| {
+                let prepared = int4_nibble::NibbleActivation::new(activation, padded_k, block_size);
+                int4_nibble_row(
+                    &prepared,
+                    weight,
+                    output,
+                    k_blocks,
+                    block_size,
+                    padded_k,
+                    parallel_columns,
+                );
+            });
+    }
+}
+
+fn int4_nibble_row(
+    prepared: &int4_nibble::NibbleActivation,
+    weight: &PackedNBitsWeight,
+    result: &mut [f32],
+    k_blocks: usize,
+    block_size: usize,
+    padded_k: usize,
+    parallel: bool,
+) {
+    let compute = |output_start: usize, outputs: &mut [f32]| {
+        let outputs_len = outputs.len();
+        int4_nibble::nibble_outputs(
+            prepared,
+            &weight.values,
+            &weight.scales,
+            weight.zero_points.as_deref(),
+            output_start..output_start + outputs_len,
+            outputs,
+            k_blocks,
+            block_size,
+        );
+    };
+    if parallel && output_chunk_len(result.len(), padded_k) < result.len() {
+        parallel_output_rows(result, padded_k, compute);
+    } else {
+        compute(0, result);
+    }
+}
+
 fn int8_matmul(
     activations: &[f32],
     weight: &Int8Weight,
@@ -10288,18 +10474,24 @@ mod tests {
     /// rotting into a tautology: if int4 acc4 ever becomes as accurate as the
     /// 8-bit route, this test fails and forces the asymmetry above to be
     /// re-documented rather than quietly closed. (A packed-nibble int16 kernel
-    /// that would have closed it was built and measured -- see
-    /// `docs/benchmarks/2026-08-20-int4-nibble-i16-negative.md` -- and rejected
-    /// on speed, so the asymmetry is a deliberate standing trade, not an
-    /// oversight.)
+    /// does now serve this fixture on AVX2-without-VNNI x86 -- see
+    /// `docs/benchmarks/2026-08-21-int4-packed-nibble-avx2.md`, which supersedes
+    /// the earlier `2026-08-20-int4-nibble-i16-negative.md` rejection -- and the
+    /// band below is unchanged by it. The asymmetry is an `accuracy_level = 4`
+    /// property, not a property of any one kernel: int8 activation quantization
+    /// is what costs the accuracy, and every route here makes it.)
     ///
     /// # Scope
     ///
-    /// The band is measured for the int8-activation route
-    /// (`prepack_int8_weight` -> `int8_matmul`), which is what every x86 host
-    /// takes here: `supports_int4_direct` requires `!has_zero_points` on
-    /// x86_64 and this fixture quantizes asymmetrically, so the result is
-    /// identical across the whole Scalar/AVX2/VNNI ladder. Non-Apple aarch64
+    /// `supports_int4_direct` requires `!has_zero_points` on x86_64 and this
+    /// fixture quantizes asymmetrically, so no x86 host takes the int4-direct
+    /// route and the result is identical across the whole Scalar/AVX2/VNNI
+    /// ladder. Which route *does* serve it depends on the host: an AVX2 host
+    /// without VNNI takes the packed-nibble kernel (`int4_nibble`), and every
+    /// other x86 host the int8-activation route (`prepack_int8_weight` ->
+    /// `int8_matmul`). Both quantize the activation to int8 per block, which is
+    /// where the band comes from, so the number below is a property of
+    /// `accuracy_level = 4` rather than of either kernel. Non-Apple aarch64
     /// defaults `ONNX_GENAI_CPU_ARM64_INT4_DIRECT` on and routes
     /// `accuracy_level = 4` to `kai_sdot_matmul_m1`, a different quantisation
     /// scheme. That route has now been measured against this fixture and lands
@@ -11602,6 +11794,58 @@ mod tests {
         y.to_f32()
     }
 
+    /// [`run_decode_case`] with an explicit zero-point tensor.
+    ///
+    /// `run_decode_case` passes `None` for zero points, so a fixture quantized
+    /// asymmetrically silently runs against ONNX's default of 8 and disagrees
+    /// with its own dequantized reference. Anything asserting asymmetric
+    /// numerics has to go through here.
+    fn run_decode_case_zp(
+        activations: &[f32],
+        packed: &[u8],
+        scales: &[f32],
+        zero_points: &[u8],
+        n: usize,
+        block_size: usize,
+        accuracy_level: Option<i64>,
+    ) -> Vec<f32> {
+        let k = activations.len();
+        let blocks = k.div_ceil(block_size);
+        let zero_point_shape = [n * blocks.div_ceil(2)];
+        let (mut graph, node) = model_node(
+            &[1, k],
+            &[n, blocks, block_size / 2],
+            &[n, blocks],
+            Some(&zero_point_shape),
+            &[1, n],
+            k,
+            n,
+            block_size,
+        );
+        if let Some(level) = accuracy_level {
+            graph
+                .node_mut(node)
+                .attributes
+                .insert("accuracy_level".into(), Attribute::Int(level));
+        }
+        let model = Model::new(&graph);
+        let kernel = CpuExecutionProvider::new()
+            .get_kernel(model.graph.node(node), &[], 1)
+            .unwrap();
+        let a = Owned::f32(&[1, k], activations);
+        let b = Owned::u8(&[n, blocks, block_size / 2], packed);
+        let scales = Owned::f32(&[n, blocks], scales);
+        let points = Owned::u8(&zero_point_shape, zero_points);
+        let mut y = Owned::zeros_f32(&[1, n]);
+        kernel
+            .execute(
+                &[a.view(), b.view(), scales.view(), points.view()],
+                &mut [y.view_mut()],
+            )
+            .unwrap();
+        y.to_f32()
+    }
+
     fn accuracy4_model(m: usize, k: usize, n: usize, block_size: usize) -> (Graph, NodeId) {
         let blocks = k.div_ceil(block_size);
         let (mut graph, node) = model_node(
@@ -11856,6 +12100,247 @@ mod tests {
         );
     }
 
+    /// The packed-nibble kernel reduces activation precision, so it is gated on
+    /// `accuracy_level = 4` and must be **structurally** unreachable below it.
+    ///
+    /// `accuracy_level` 0 and 1 mean "the implementation's choice" and "fp32"
+    /// respectively; ONNX defines neither as licence to quantize activations to
+    /// int8. This asserts the route counter, not a tolerance, because a
+    /// tolerance would pass for a route that merely happened to be accurate on
+    /// one fixture.
+    ///
+    /// Mutation check: widening the route's `self.accuracy_level == 4` to
+    /// `>= 0`, or deleting the term, fails every `accuracy_level` row here.
+    #[test]
+    fn the_packed_nibble_route_is_unreachable_below_accuracy_4() {
+        let _probe = lock_dispatch_probe();
+        let (k, n, block_size) = (128, 8, 32);
+        let activations: Vec<f32> = (0..k)
+            .map(|i| ((i * 11 % 37) as f32 - 18.0) / 9.0)
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 13 % 41) as f32 - 20.0) / 11.0)
+            .collect();
+        let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+        for level in [None, Some(0), Some(1), Some(2), Some(3)] {
+            reset_int4_routes();
+            let _ = run_decode_case(&activations, &packed, &scales, n, block_size, level);
+            assert_eq!(
+                int4_routes(),
+                (0, 0),
+                "accuracy_level={level:?} reached an accuracy-4 int4 route"
+            );
+        }
+    }
+
+    /// The route the packed-nibble kernel is supposed to take, taken -- and the
+    /// expanded-`i8` route it replaces, not taken.
+    ///
+    /// Skipped where the host has a direct int4 kernel (VNNI/SDOT), which keeps
+    /// priority and is a different route entirely.
+    ///
+    /// Mutation check: disabling the branch fails the first assertion. Note
+    /// that the route's `int4_nibble::supported(..)` term is *not* mutation-
+    /// testable from here: node validation already rejects a `block_size` that
+    /// is not a power of two or is below 16, so at the route that term is
+    /// load-bearing only for the runtime AVX2 detection, which an AVX2 host
+    /// cannot exercise negatively. The block-size half of `supported` is
+    /// covered directly by `int4_nibble::unsupported_block_sizes_are_refused`.
+    #[test]
+    fn accuracy4_decode_takes_the_packed_nibble_route() {
+        let _probe = lock_dispatch_probe();
+        if selected_dot_kernel().supports_int4_direct(32, false) || !int4_nibble::supported(32) {
+            return;
+        }
+        let n = 8;
+        for (k, block_size) in [(128usize, 16usize), (128, 32), (256, 64), (256, 128)] {
+            let activations: Vec<f32> = (0..k)
+                .map(|i| ((i * 11 % 37) as f32 - 18.0) / 9.0)
+                .collect();
+            let weights: Vec<f32> = (0..n * k)
+                .map(|i| ((i * 13 % 41) as f32 - 20.0) / 11.0)
+                .collect();
+            let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+            reset_int4_routes();
+            let _ = run_decode_case(&activations, &packed, &scales, n, block_size, Some(4));
+            assert_eq!(
+                int4_routes(),
+                (1, 0),
+                "k={k} block_size={block_size} did not take the packed-nibble route"
+            );
+        }
+    }
+
+    /// Steady-state decode must not repack per `Run`, and concurrent sessions
+    /// sharing one constant weight must fill the cache exactly once.
+    ///
+    /// The route counters are thread-local, so each session asserts its own
+    /// dispatches: every one of its runs took the packed-nibble route and none
+    /// fell through to the expanded-`i8` one. The cache pointer is compared
+    /// across sessions, which is what "packed once" actually means.
+    ///
+    /// Mutation check: taking the `owned_weight` arm unconditionally (i.e.
+    /// prepacking per call rather than through the `OnceLock`) leaves the cache
+    /// empty and fails the pointer assertion.
+    #[test]
+    fn concurrent_decode_sessions_share_one_packed_nibble_prepack() {
+        let _probe = lock_dispatch_probe();
+        if selected_dot_kernel().supports_int4_direct(32, false) || !int4_nibble::supported(32) {
+            return;
+        }
+        // With the `mlas` feature and no native int8 dot, MLAS SQNBit CompInt8
+        // takes accuracy-4 decode for a *constant* weight before this route is
+        // reached -- the same precedence
+        // `matmulnbits_accuracy4_prepack_reuses_selected_weight_format`
+        // documents. The shipped artifact is MLAS-free
+        // (`default_artifacts_are_mlas_free`), so the route under test is the
+        // one production takes; here it simply is not the route being run.
+        #[cfg(feature = "mlas")]
+        if !hand_int8_decode_has_native_dot() {
+            return;
+        }
+        const RUNS: usize = 8;
+        let (k, n, block_size) = (256usize, 16usize, 32usize);
+        let blocks = k / block_size;
+        let activations: Vec<f32> = (0..k)
+            .map(|i| ((i * 11 % 37) as f32 - 18.0) / 9.0)
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 13 % 41) as f32 - 20.0) / 11.0)
+            .collect();
+        let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+        let a = &Owned::f32(&[1, k], &activations);
+        let b = &Owned::u8(&[n, blocks, block_size / 2], &packed);
+        let scales = &Owned::f32(&[n, blocks], &scales);
+
+        let mut reference = accuracy4_kernel(k, n, block_size);
+        reference.set_constant_inputs(&[false, true, true]);
+        let mut y = Owned::zeros_f32(&[1, n]);
+        reference
+            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .unwrap();
+        let expected = y.to_f32();
+
+        for sessions in [1usize, 2, 4] {
+            let mut kernel = accuracy4_kernel(k, n, block_size);
+            kernel.set_constant_inputs(&[false, true, true]);
+            let kernel = &kernel;
+            let observed: Vec<(usize, Vec<f32>)> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..sessions)
+                    .map(|_| {
+                        scope.spawn(move || {
+                            reset_int4_routes();
+                            let mut seen = 0usize;
+                            let mut out = Vec::new();
+                            for _ in 0..RUNS {
+                                let mut y = Owned::zeros_f32(&[1, n]);
+                                kernel
+                                    .execute(
+                                        &[a.view(), b.view(), scales.view()],
+                                        &mut [y.view_mut()],
+                                    )
+                                    .unwrap();
+                                out = y.to_f32();
+                                seen = prepack_cache_ptr(kernel)
+                                    .expect("a decode run must leave the weight cache populated")
+                                    as usize;
+                            }
+                            assert_eq!(
+                                int4_routes(),
+                                (RUNS, 0),
+                                "sessions={sessions}: a session did not take the \
+                                 packed-nibble route on every run"
+                            );
+                            (seen, out)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().expect("a decode session must not panic"))
+                    .collect()
+            });
+            let settled =
+                prepack_cache_ptr(kernel).expect("the weight cache must be populated") as usize;
+            for (seen, out) in &observed {
+                assert_eq!(
+                    *seen, settled,
+                    "sessions={sessions}: a session decoded against a different prepack"
+                );
+                assert_eq!(
+                    out, &expected,
+                    "sessions={sessions}: concurrent decode changed the result"
+                );
+            }
+            assert!(
+                kernel.int8_weight.get().is_none(),
+                "sessions={sessions}: the expanded-i8 weight was built as well"
+            );
+            assert!(
+                kernel.weight_nk.get().is_none(),
+                "sessions={sessions}: the f32 expansion was built as well"
+            );
+        }
+    }
+
+    /// The packed-nibble route must land within the same accuracy envelope the
+    /// route it replaces does, at every block size and with and without an
+    /// explicit zero-point tensor.
+    ///
+    /// The bound is against the **fp32** dequantized reference, not against the
+    /// other int8 route, because the two quantize the activation differently
+    /// (signed vs the `+128` offset spelling) and are not expected to agree bit
+    /// for bit. What must hold is that neither is worse than int8 activation
+    /// quantization allows.
+    #[test]
+    fn the_packed_nibble_route_stays_inside_the_accuracy_4_envelope() {
+        let _probe = lock_dispatch_probe();
+        if !int4_nibble::supported(32) {
+            return;
+        }
+        let n = 8;
+        for (k, block_size) in [
+            (128usize, 16usize),
+            (128, 32),
+            (256, 64),
+            (256, 128),
+            (100, 32),
+        ] {
+            for asymmetric in [false, true] {
+                let activations: Vec<f32> = (0..k)
+                    .map(|i| ((i * 7 % 53) as f32 - 26.0) / 13.0)
+                    .collect();
+                let weights: Vec<f32> = (0..n * k)
+                    .map(|i| ((i * 13 % 41) as f32 - 20.0) / 11.0)
+                    .collect();
+                let (packed, scales, zero_points, dequantized) =
+                    quantize(&weights, n, k, block_size, asymmetric);
+                let expected = reference(&activations, &dequantized, 1, k, n);
+                let got = match &zero_points {
+                    Some(points) => run_decode_case_zp(
+                        &activations,
+                        &packed,
+                        &scales,
+                        points,
+                        n,
+                        block_size,
+                        Some(4),
+                    ),
+                    None => run_decode_case(&activations, &packed, &scales, n, block_size, Some(4)),
+                };
+                let magnitude = expected.iter().fold(0.0f32, |a, b| a.max(b.abs()));
+                for (index, (got, want)) in got.iter().zip(&expected).enumerate() {
+                    let tolerance = magnitude * 0.05 + 1.0e-2;
+                    assert!(
+                        (got - want).abs() <= tolerance,
+                        "k={k} block_size={block_size} asymmetric={asymmetric} \
+                         output={index} got={got} want={want} tolerance={tolerance}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn matmulnbits_accuracy4_prepack_reuses_selected_weight_format() {
         let _probe = lock_dispatch_probe();
@@ -11926,7 +12411,22 @@ mod tests {
                 },
             direct_int4
         );
-        assert_eq!(kernel.int8_weight.get().is_some(), !direct_int4);
+        // Without a direct int4 kernel the fallback is one of two formats, and
+        // which one is a property of the host: where the packed-nibble AVX2
+        // kernel applies it keeps the wire layout at 0.5 B/weight, and only
+        // otherwise is the weight expanded to a whole `i8` each. Exactly one
+        // must be built -- building both would mean the route was decided twice.
+        let nibble = int4_nibble::supported(block_size);
+        assert_eq!(
+            kernel.packed_nbits_weight.get().is_some(),
+            !direct_int4 && nibble,
+            "the packed-nibble cache must be populated exactly when its route runs"
+        );
+        assert_eq!(
+            kernel.int8_weight.get().is_some(),
+            !direct_int4 && !nibble,
+            "the expanded int8 weight must only be built when nothing cheaper applies"
+        );
     }
 
     #[cfg(all(

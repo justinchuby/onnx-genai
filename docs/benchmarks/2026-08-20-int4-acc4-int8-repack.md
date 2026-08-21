@@ -1,5 +1,14 @@
 # int4 acc4 on AVX2 pays an int8 repack and still loses 8.8x (2026-08-20)
 
+> **Outcome of the proposal in §5 (2026-08-21):** the packed-nibble `madd_epi16`
+> kernel sketched here was built twice. The first attempt lost 1.5x-2.2x and was
+> rejected ([`2026-08-20-int4-nibble-i16-negative.md`](2026-08-20-int4-nibble-i16-negative.md));
+> the second is **1.2x-2.4x faster** than the int8 repack and is merged
+> ([`2026-08-21-int4-packed-nibble-avx2.md`](2026-08-21-int4-packed-nibble-avx2.md)).
+> The 4.7x scratch-prototype figure below did **not** transfer: it was an
+> inner-loop-only measurement, and the deciding cost turned out to be per-**block**
+> overhead outside that loop. Treat it as directional, as this document says.
+
 Host: AMD EPYC 9V74, 32 vCPU (16 cores x 2 SMT), AVX2 + FMA + F16C, **no
 AVX-512, no VNNI**, L2 16 MiB, **L3 64 MiB**, 75.8 GB/s DRAM, ORT 1.28.0. All
 cells `t=8`, `--trials 3 --runs 20 --warmups 5`, medians. Native arm is the
