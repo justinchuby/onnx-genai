@@ -1633,7 +1633,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         // reset out-of-band (kernel-variant eviction retires kernels baked into a
         // captured graph and resets both slots). Report the real per-slot liveness
         // so the executor re-warms instead of replaying an emptied slot.
-        Ok(self.runtime.has_graph_executable_in(slot)?)
+        self.runtime.has_graph_executable_in(slot)
     }
 
     fn check_device_capture_error(&self) -> Result<u32> {
@@ -2807,11 +2807,7 @@ extern "C" __global__ void add_one(const float* x, float* y, unsigned long long 
 
         struct CapturableKernel;
         impl Kernel for CapturableKernel {
-            fn execute(
-                &self,
-                _inputs: &[TensorView],
-                _outputs: &mut [TensorMut],
-            ) -> Result<()> {
+            fn execute(&self, _inputs: &[TensorView], _outputs: &mut [TensorMut]) -> Result<()> {
                 Ok(())
             }
             fn capture_support(&self) -> CaptureSupport {
