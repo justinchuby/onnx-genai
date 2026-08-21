@@ -5524,9 +5524,7 @@ impl DecodeCudaState {
             let buffer = binding
                 .allocator()
                 .allocate(bytes.max(1), SCRATCH_ALIGN)
-                .with_context(|| {
-                    format!("allocate device snapshot scratch for binding {index}")
-                })?;
+                .with_context(|| format!("allocate device snapshot scratch for binding {index}"))?;
             scratch.push((index, buffer));
         }
         self.fixed_state_snapshot_scratch = scratch;
