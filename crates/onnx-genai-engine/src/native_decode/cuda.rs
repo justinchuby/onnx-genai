@@ -260,7 +260,7 @@ struct StepOffloadSnapshot {
 
 impl StepOffloadSnapshot {
     fn read() -> Self {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         {
             let stats = onnx_runtime_ep_cuda::global_offload_stats();
             Self {
@@ -278,7 +278,7 @@ impl StepOffloadSnapshot {
                 vram_free_sync_ns: stats.vram_free_sync_ns,
             }
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "native-cuda"))]
         {
             Self::default()
         }
@@ -415,7 +415,7 @@ fn ns_to_ms(ns: u64) -> f64 {
 /// Result of one [`NativeDecodeSession::leverb_phase0_capture_attempt`] call —
 /// a THROWAWAY Lever-B Phase-0 probe (leverb-phase0), not part of any shipping
 /// contract.
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(all(test, feature = "native-cuda"))]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LeverBPhase0CaptureAttempt {
     /// Query rows in the attempted forward (`k_max` for M=K, `1` for M=1).
@@ -462,7 +462,7 @@ pub(crate) struct LeverBPhase0CaptureAttempt {
 /// Per-row greedy argmax over a `[rows, vocab]` logits buffer of raw device
 /// bytes. Supports the three logits dtypes the decoder emits (f32/f16/bf16). Ties
 /// resolve to the lowest index (matching the decoder's argmax tie-break).
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(all(test, feature = "native-cuda"))]
 fn logits_rows_argmax(bytes: &[u8], dtype: DataType, rows: usize, vocab: usize) -> Vec<i64> {
     let mut out = Vec::with_capacity(rows);
     let decode = |b: &[u8]| -> f32 {
@@ -1321,7 +1321,7 @@ impl NativeDecodeSession {
     /// commit KV or advance the logical length: the captured/replayed forward
     /// dirties device KV, and KV-commit correctness is explicitly out of Phase-0
     /// scope, so the caller MUST discard the session afterwards.
-    #[cfg(all(test, feature = "cuda"))]
+    #[cfg(all(test, feature = "native-cuda"))]
     pub(crate) fn leverb_phase0_capture_attempt(
         &mut self,
         m: usize,
@@ -1467,7 +1467,7 @@ impl NativeDecodeSession {
     /// hand-roll a toy graph. The padded token/position/logits bindings are
     /// swapped into the persistent binding vector for the duration of the
     /// attempt and restored before returning.
-    #[cfg(all(test, feature = "cuda"))]
+    #[cfg(all(test, feature = "native-cuda"))]
     pub(crate) fn leverb_increment0_capture_attempt(
         &mut self,
         m: usize,
@@ -1481,7 +1481,7 @@ impl NativeDecodeSession {
     /// records the EAGER warm-forward per-row argmax and the CAPTURED replay
     /// per-row argmax, and compares the raw logits bytes. This fills the
     /// "captured M=K == eager M=K, same Marlin config, no tiled oracle" cell.
-    #[cfg(all(test, feature = "cuda"))]
+    #[cfg(all(test, feature = "native-cuda"))]
     pub(crate) fn leverb_increment0_token_parity_attempt(
         &mut self,
         m: usize,
@@ -1490,7 +1490,7 @@ impl NativeDecodeSession {
         self.leverb_increment0_capture_attempt_inner(m, 1, Some(tokens), true)
     }
 
-    #[cfg(all(test, feature = "cuda"))]
+    #[cfg(all(test, feature = "native-cuda"))]
     fn leverb_increment0_capture_attempt_inner(
         &mut self,
         m: usize,
@@ -3001,7 +3001,7 @@ impl DecodeCudaState {
     /// a regression test can assert it is *actually* exercising the VMM path
     /// rather than silently falling back to the eager path (which would make a
     /// "VMM reservation" assertion prove nothing).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "native-cuda")]
     pub(crate) fn kv_commits_on_demand(&self) -> bool {
         self.kv_commits_on_demand
     }
@@ -4196,7 +4196,7 @@ impl DecodeCudaState {
         let logits_binding = bindings.len();
         bindings.push(logits_device_binding);
 
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         let argmax_words = {
             let vocab = *logits_shape
                 .last()
@@ -4207,7 +4207,7 @@ impl DecodeCudaState {
             // the previous `2 + scratch_words(vocab)` allocation.
             2 * batch + onnx_runtime_ep_cuda::device_argmax_scratch_words(vocab, batch)
         };
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "native-cuda"))]
         let argmax_words = 2 * batch;
         let greedy_result = session.allocate_device_output_binding(
             "__native_greedy_argmax",
@@ -5651,25 +5651,25 @@ fn checked_shape_bytes(shape: &[usize], dtype: DataType) -> Option<usize> {
     dtype.checked_storage_bytes(elements)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn native_cuda_device_barrier(session: &InferenceSession) -> anyhow::Result<()> {
     let _guard = onnx_genai_ort::cuda_rt::DeviceGuard::set(session.device_id().index as i32)?;
     onnx_genai_ort::cuda_rt::device_synchronize()?;
     Ok(())
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "native-cuda"))]
 fn native_cuda_device_barrier(_session: &InferenceSession) -> anyhow::Result<()> {
     bail!("native CUDA KV growth requires the onnx-genai-engine `cuda` feature")
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn native_cuda_memset_zero(dst: usize, bytes: usize) -> anyhow::Result<()> {
     onnx_genai_ort::cuda_rt::memset_zero(dst, bytes)?;
     Ok(())
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "native-cuda"))]
 fn native_cuda_memset_zero(_dst: usize, _bytes: usize) -> anyhow::Result<()> {
     bail!("native CUDA KV growth requires the onnx-genai-engine `cuda` feature")
 }
@@ -5776,7 +5776,7 @@ pub(super) fn kv_growth_byte_layout(
     })
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn copy_kv_prefix_device_to_device(
     dst: usize,
     src: usize,
@@ -5835,7 +5835,7 @@ fn copy_kv_prefix_device_to_device(
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn copy_kv_prefix_device_to_device_in_place(
     ptr: usize,
     old_shape: &[usize],
@@ -5902,14 +5902,14 @@ fn copy_kv_prefix_device_to_device_in_place(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 pub(super) enum InPlaceCopyRoute {
     Noop,
     DeviceToDevice,
     Scratch,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 pub(super) fn in_place_copy_route(
     src_offset: usize,
     dst_offset: usize,
@@ -5927,7 +5927,7 @@ pub(super) fn in_place_copy_route(
     }
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "native-cuda"))]
 fn copy_kv_prefix_device_to_device_in_place(
     _ptr: usize,
     _old_shape: &[usize],
@@ -5939,7 +5939,7 @@ fn copy_kv_prefix_device_to_device_in_place(
     bail!("native CUDA KV growth requires the onnx-genai-engine `cuda` feature")
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn zero_kv_suffix_device(
     ptr: usize,
     shape: &[usize],
@@ -5977,7 +5977,7 @@ fn zero_kv_suffix_device(
     Ok(())
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "native-cuda"))]
 fn zero_kv_suffix_device(
     _ptr: usize,
     _shape: &[usize],
@@ -5988,7 +5988,7 @@ fn zero_kv_suffix_device(
     bail!("native CUDA KV growth requires the onnx-genai-engine `cuda` feature")
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "native-cuda"))]
 fn copy_kv_prefix_device_to_device(
     _dst: usize,
     _src: usize,
@@ -6082,7 +6082,7 @@ pub(crate) fn cuda_kv_capacity_exceeded_message(
     )
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 pub(crate) fn cuda_device_memory_snapshot(
     device_id: i32,
 ) -> anyhow::Result<CudaDeviceMemorySnapshot> {
@@ -6094,7 +6094,7 @@ pub(crate) fn cuda_device_memory_snapshot(
     })
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "native-cuda"))]
 pub(crate) fn cuda_device_memory_snapshot(
     _device_id: i32,
 ) -> anyhow::Result<CudaDeviceMemorySnapshot> {

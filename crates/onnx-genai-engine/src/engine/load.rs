@@ -432,7 +432,7 @@ impl Engine {
             resolve_vram_limit_bytes(&config.limits, native_device.cuda_index())?;
         let residency_ceiling_bytes =
             resolve_memory_strategy_hot_tier_bytes(&config.limits, native_device.cuda_index())?;
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         let required_device_non_weight_bytes = if matches!(
             native_device,
             crate::native_decode::NativeDecodeDevice::Cuda { .. }
@@ -458,13 +458,13 @@ impl Engine {
         } else {
             0
         };
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "native-cuda"))]
         let required_device_non_weight_bytes = 0;
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         let cuda_env_policy = onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env();
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         let memory_strategy_overrides = memory_strategy_overrides_from_cuda_env(cuda_env_policy);
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "native-cuda"))]
         let memory_strategy_overrides = MemoryStrategyOverrides::default();
         let native_cuda_load = matches!(
             native_device,
@@ -509,13 +509,13 @@ impl Engine {
         // (unless the legacy allocator opt-out is set). On other backends the
         // managed path is unavailable, so it stays keyed on an explicit byte
         // limit as before.
-        #[cfg(all(feature = "cuda", feature = "native-backend"))]
+        #[cfg(feature = "native-cuda")]
         let managed_vmm = if native_cuda_load {
             managed_vmm_default_enabled()
         } else {
             explicit_vram_bytes
         };
-        #[cfg(not(all(feature = "cuda", feature = "native-backend")))]
+        #[cfg(not(feature = "native-cuda"))]
         let managed_vmm = explicit_vram_bytes;
         let memory_strategy_plan = build_memory_strategy_plan(MemoryStrategyPlanInput {
             config: &config,
@@ -527,11 +527,11 @@ impl Engine {
             graph: graph_memory,
             required_device_non_weight_bytes,
             minimum_useful_weight_budget_bytes,
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "native-cuda")]
             default_dynamic_device_budget_bytes: Some(
                 onnx_runtime_ep_cuda::DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES,
             ),
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "native-cuda"))]
             default_dynamic_device_budget_bytes: None,
             inferred_policy_enabled: managed_vmm || explicit_vram_bytes,
             managed_vmm,
@@ -596,25 +596,25 @@ impl Engine {
         onnx_runtime_ep_cpu::set_qlinear_packed_b_enabled(
             memory_strategy_plan.f32_weight_cache_admitted,
         );
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         let cuda_offload_resolution =
             cuda_offload_resolution_from_plan(&native_device, &memory_strategy_plan);
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         let cuda_offload_policy = cuda_offload_resolution.map(|resolution| resolution.policy);
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         let governed_physical_pool = uses_governed_physical_pool(
             cuda_offload_resolution,
             dynamic_lending_enabled(),
             onnx_runtime_ep_cuda::vmm_allocator::production_physical_pool_enabled(),
         );
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         let weight_reservation_bytes = cuda_weight_startup_reservation(
             model_weight_bytes,
             cuda_offload_resolution,
             governed_physical_pool,
             governor_kv_config.page_size_bytes,
         );
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         tracing::info!(
             // The device actually resolved, not the compiled-in feature. This
             // line used to say "CUDA" on every run of a CUDA-enabled build,
@@ -629,7 +629,7 @@ impl Engine {
             weight_reservation_bytes,
             "resolved device-memory strategy before governor creation"
         );
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "native-cuda"))]
         let weight_reservation_bytes = device_weight_reservation_for(
             model_weight_bytes,
             None,
@@ -671,9 +671,9 @@ impl Engine {
                 native_device.clone(),
                 crate::native_decode::NativeDecodeLoadOptions {
                     host_cache: governor.weight_offload_host_cache(),
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "native-cuda")]
                     cuda_offload_policy,
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "native-cuda")]
                     cuda_memory_governor: std::sync::Arc::new(governor.device_authority()),
                     io: metadata.model.as_ref().and_then(|model| model.io.as_ref()),
                     metadata_max_len: metadata
@@ -703,7 +703,7 @@ impl Engine {
                 .and_then(|runtime| runtime.chunked_prefill.as_ref())
                 .and_then(|chunked| chunked.chunk_size),
         );
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         let cuda_offload_policy = reconcile_cuda_offload_budget_after_native_load(
             &native_session,
             metadata
@@ -774,7 +774,7 @@ impl Engine {
         // providers do not hold this residency cache, and VMM has already
         // released the weight portion above because its allocator records real
         // commits instead of a standing weight budget.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         if matches!(
             native_device,
             crate::native_decode::NativeDecodeDevice::Cuda { .. }
@@ -1468,7 +1468,7 @@ fn device_weight_reservation_for(
     }
 }
 
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 #[derive(Clone, Copy, Debug)]
 struct CudaOffloadResolution {
     policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
@@ -1476,7 +1476,7 @@ struct CudaOffloadResolution {
     auto_enabled_from_vram_limit: bool,
 }
 
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 fn dynamic_lending_enabled() -> bool {
     !std::env::var("ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING").is_ok_and(|value| {
         matches!(
@@ -1503,7 +1503,7 @@ pub(crate) fn force_managed_weight_streaming_enabled() -> bool {
     )
 }
 
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 pub(crate) fn managed_vmm_default_enabled() -> bool {
     let legacy_allocator_opt_out =
         std::env::var("ONNX_GENAI_LEGACY_ALLOCATOR").is_ok_and(|value| {
@@ -1515,7 +1515,7 @@ pub(crate) fn managed_vmm_default_enabled() -> bool {
     !legacy_allocator_opt_out && dynamic_lending_enabled()
 }
 
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 fn uses_governed_physical_pool(
     resolution: Option<CudaOffloadResolution>,
     lending_enabled: bool,
@@ -1527,7 +1527,7 @@ fn uses_governed_physical_pool(
     })
 }
 
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 fn cuda_weight_startup_reservation(
     model_weight_bytes: u64,
     resolution: Option<CudaOffloadResolution>,
@@ -1554,7 +1554,7 @@ fn cuda_weight_startup_reservation(
     )
 }
 
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 fn cuda_offload_resolution_from_plan(
     native_device: &crate::native_decode::NativeDecodeDevice,
     plan: &MemoryStrategyPlan,
@@ -1587,7 +1587,7 @@ fn cuda_offload_resolution_from_plan(
 /// (prefill and the first decode step), so it is the safe floor to reserve
 /// while everything above it is lent to weights and reclaimed on demand as the
 /// sequence grows (issue #857).
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 fn elastic_kv_floor_context(max_context: usize) -> usize {
     // The engine commits KV in power-of-two buckets whose smallest value is the
     // configured minimum bucket; `kv_capacity_bucket(1, ..)` is that first
@@ -1599,7 +1599,7 @@ fn elastic_kv_floor_context(max_context: usize) -> usize {
 /// VRAM minus the KV floor and recurrent state) less a headroom margin, but
 /// never below what the static full-context reservation would have granted, so
 /// elastic lending is never a regression versus baseline (issue #857).
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 fn elastic_weight_budget_bytes(
     elastic_available_bytes: u64,
     static_baseline_budget_bytes: u64,
@@ -1611,7 +1611,7 @@ fn elastic_weight_budget_bytes(
 }
 
 /// Environment override for the elastic-lending device headroom (issue #857).
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 const ELASTIC_LENDING_HEADROOM_BYTES_ENV: &str = "ONNX_GENAI_ELASTIC_LENDING_HEADROOM_BYTES";
 
 /// Default device bytes kept *unlent* below the managed no-spill limit under
@@ -1632,12 +1632,12 @@ const ELASTIC_LENDING_HEADROOM_BYTES_ENV: &str = "ONNX_GENAI_ELASTIC_LENDING_HEA
 /// our favour it is a cheap follow-up to lower it (or set it to 0) and lend more
 /// aggressively; the reverse mistake — a hidden host-spill regression that only
 /// shows up as wall-clock variance — is not cheap.
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 const DEFAULT_ELASTIC_LENDING_HEADROOM_BYTES: u64 = 512 * 1024 * 1024;
 
 /// The device headroom to keep unlent below the managed no-spill limit under
 /// elastic weight lending (issue #857), honouring the environment override.
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 fn elastic_lending_headroom_bytes() -> u64 {
     std::env::var(ELASTIC_LENDING_HEADROOM_BYTES_ENV)
         .ok()
@@ -1654,7 +1654,7 @@ fn elastic_lending_headroom_bytes() -> u64 {
 /// Without that path the static full-context reservation is the only thing that
 /// guarantees a sequence can reach its declared max context, so lending is
 /// refused.
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 fn elastic_weight_lending_active(
     managed_no_spill: bool,
     commits_on_demand: bool,
@@ -1667,7 +1667,7 @@ fn elastic_weight_lending_active(
 ///
 /// Host-tier KV (a host-accessible EP) contributes nothing to the device weight
 /// budget and returns zero.
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 fn elastic_kv_floor_device_bytes(
     native_session: &crate::native_decode::NativeDecodeSession,
     max_context: Option<usize>,
@@ -1686,7 +1686,7 @@ fn elastic_kv_floor_device_bytes(
     })
 }
 
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 fn reconcile_cuda_offload_budget_after_native_load(
     native_session: &crate::native_decode::NativeDecodeSession,
     max_context: Option<usize>,
@@ -2276,7 +2276,7 @@ fn load_shared_kv_proposer(
 mod pool_sizing_tests {
     use super::*;
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "native-cuda")]
     fn cuda_plan(
         strategy: MemoryStrategy,
         total_weight_bytes: u64,
@@ -2675,7 +2675,7 @@ mod pool_sizing_tests {
         assert_eq!(source, "model.max_sequence_length");
     }
 
-    #[cfg(all(feature = "cuda", feature = "native-backend"))]
+    #[cfg(feature = "native-cuda")]
     #[test]
     fn elastic_lending_requires_reclaim_path_to_be_guaranteed() {
         // Elastic lending is only safe when the reclaim path exists, which is
@@ -2688,7 +2688,7 @@ mod pool_sizing_tests {
         assert!(!elastic_weight_lending_active(true, true, false));
     }
 
-    #[cfg(all(feature = "cuda", feature = "native-backend"))]
+    #[cfg(feature = "native-cuda")]
     #[test]
     fn elastic_kv_floor_is_the_first_bucket_and_never_exceeds_max_context() {
         // The floor is exactly the engine's first KV bucket, capped at the
@@ -2707,7 +2707,7 @@ mod pool_sizing_tests {
         }
     }
 
-    #[cfg(all(feature = "cuda", feature = "native-backend"))]
+    #[cfg(feature = "native-cuda")]
     #[test]
     fn elastic_weight_budget_leaves_headroom_and_never_regresses_below_baseline() {
         // resolved_vram=100, full-context KV reservation=40, floor=4.
@@ -2738,7 +2738,7 @@ mod pool_sizing_tests {
         );
     }
 
-    #[cfg(all(feature = "cuda", feature = "native-backend"))]
+    #[cfg(feature = "native-cuda")]
     #[test]
     fn elastic_lending_headroom_defaults_to_a_conservative_nonzero_margin() {
         // The default must be non-zero so we never lend to the last byte while
@@ -2779,7 +2779,7 @@ mod pool_sizing_tests {
             .expect("a VRAM limit should not reject a host-only execution provider");
     }
 
-    #[cfg(all(feature = "cuda", feature = "native-backend"))]
+    #[cfg(feature = "native-cuda")]
     #[test]
     fn explicit_vram_limit_auto_enables_cuda_weight_offload() {
         let plan = cuda_plan(
@@ -2824,7 +2824,7 @@ mod pool_sizing_tests {
         );
     }
 
-    #[cfg(all(feature = "cuda", feature = "native-backend"))]
+    #[cfg(feature = "native-cuda")]
     #[test]
     fn explicit_weight_offload_device_bytes_overrides_vram_limit_derivation() {
         let plan = cuda_plan(
@@ -2852,7 +2852,7 @@ mod pool_sizing_tests {
         assert!(policy.device_budget_is_override);
     }
 
-    #[cfg(all(feature = "cuda", feature = "native-backend"))]
+    #[cfg(feature = "native-cuda")]
     #[test]
     fn explicit_vram_limit_selects_managed_mode_even_when_weights_fit() {
         let plan = cuda_plan(
@@ -2891,7 +2891,7 @@ mod pool_sizing_tests {
         );
     }
 
-    #[cfg(all(feature = "cuda", feature = "native-backend"))]
+    #[cfg(feature = "native-cuda")]
     #[test]
     fn resident_non_vmm_weights_keep_package_reservation() {
         let resolution = CudaOffloadResolution {

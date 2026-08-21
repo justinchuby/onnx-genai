@@ -197,7 +197,11 @@ backend:
 | Feature | What you get |
 | --- | --- |
 | `--features native-cuda` | **this repo's CUDA EP** (`onnx-runtime-ep-cuda`) |
-| `--features cuda,native-backend` | ORT's CUDA EP; `onnx-runtime-ep-cuda` is **not in the dependency graph at all** |
+| `--features ort-cuda` | ORT's CUDA EP; `onnx-runtime-ep-cuda` is **not in the dependency graph at all** |
+
+The features used to both be spelled `cuda` at different levels (the CLI's `cuda`
+meant ORT, the server's `cuda` meant native), which is how this trap was set. See
+`docs/build-features.md` for the current names.
 
 Building with the second and editing a kernel produces a `cargo build` that
 finishes in under a second and changes nothing, because the crate you edited is

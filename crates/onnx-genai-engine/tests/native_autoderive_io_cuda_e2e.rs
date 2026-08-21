@@ -24,7 +24,7 @@
 //!   --features cuda,native-backend --test native_autoderive_io_cuda_e2e \
 //!   -- --ignored --nocapture
 //! ```
-#![cfg(all(feature = "cuda", feature = "native-backend"))]
+#![cfg(feature = "native-cuda")]
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;

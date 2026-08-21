@@ -2494,7 +2494,7 @@ fn kv_cache_dtype_rejects_garbage_values() {
     }
 }
 
-#[cfg(all(feature = "native-backend", feature = "cuda"))]
+#[cfg(feature = "native-cuda")]
 #[test]
 fn native_device_parser_accepts_cuda_index() {
     use crate::state::parse_native_device;
@@ -2512,7 +2512,7 @@ fn native_device_parser_accepts_cuda_index() {
     assert!(parse_native_device("webgpu").is_err());
 }
 
-#[cfg(all(feature = "native-backend", not(feature = "cuda")))]
+#[cfg(all(feature = "native-backend", not(feature = "native-cuda")))]
 #[test]
 fn native_device_parser_rejects_cuda_without_cuda_feature() {
     use crate::state::parse_native_device;

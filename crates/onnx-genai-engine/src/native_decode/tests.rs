@@ -1,13 +1,13 @@
 use super::kv_commit::KvCommitLayout;
 use super::*;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 use onnx_genai_metadata::LoopStatePair;
 use onnx_genai_metadata::{KvOwnership, ModelIoSpec, SequenceInputKind};
 use onnx_runtime_ir::{Attribute, Graph, Node, NodeId, Shape, SymbolId, TensorData};
 use prost::Message;
 use std::collections::BTreeMap;
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn qwen_cuda_smoke_model_dir() -> Option<std::path::PathBuf> {
     let model_dir = std::env::var_os("ONNX_GENAI_QWEN_CUDA_SMOKE_MODEL")
         .map(std::path::PathBuf::from)
@@ -21,13 +21,13 @@ fn qwen_cuda_smoke_model_dir() -> Option<std::path::PathBuf> {
     Some(model_dir)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 struct EnvVarGuard {
     key: &'static str,
     previous: Option<std::ffi::OsString>,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 impl EnvVarGuard {
     fn set(key: &'static str, value: &str) -> Self {
         let previous = std::env::var_os(key);
@@ -40,7 +40,7 @@ impl EnvVarGuard {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
         // SAFETY: paired with `EnvVarGuard::set`; this test-only guard restores
@@ -337,7 +337,7 @@ fn cuda_kv_capacity_error_explains_source_and_device_memory() {
     assert!(message.contains("ONNX_GENAI_CUDA_KV_MAX_LEN"), "{message}");
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 fn non_power_of_two_kv_growth_routes_overlapping_copies_through_scratch() {
     let inner = 32usize;
@@ -1489,7 +1489,7 @@ fn tiny_shared_kv_embed_proposer(width: usize) -> InferenceSession {
     session_from_graph(graph)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[derive(Clone, Copy)]
 enum AuxOutput {
     /// Static `[1, 1]` auxiliary output produced by `Cast(input_ids)`. The
@@ -1508,7 +1508,7 @@ enum AuxOutput {
     SymbolicTotalSeq,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn capture_safe_cuda_decoder(
     graph_capture: bool,
     max_len: usize,
@@ -1516,7 +1516,7 @@ fn capture_safe_cuda_decoder(
     build_cuda_decoder(graph_capture, max_len, AuxOutput::StaticUnit)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn build_cuda_decoder(
     graph_capture: bool,
     max_len: usize,
@@ -1525,7 +1525,7 @@ fn build_cuda_decoder(
     build_cuda_decoder_with_fixed_state(graph_capture, Some(max_len), aux, false)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn build_cuda_decoder_with_fixed_state(
     graph_capture: bool,
     kv_max_len: Option<usize>,
@@ -1694,7 +1694,7 @@ fn build_cuda_decoder_with_fixed_state(
 /// KV path is unaffected by the extra recurrent state pair, so
 /// `kv_commits_on_demand` stays false and this reproduces the metadata-less
 /// non-VMM construction exactly.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn build_cuda_decoder_unbounded() -> anyhow::Result<NativeDecodeSession> {
     build_cuda_decoder_with_fixed_state(false, None, AuxOutput::StaticUnit, true)
 }
@@ -1709,7 +1709,7 @@ fn build_cuda_decoder_unbounded() -> anyhow::Result<NativeDecodeSession> {
 /// `full_mask_bytes` only inside the `kv_commits_on_demand` (VMM) branch that
 /// consumes it. This test drives the real construction and goes RED (with that
 /// exact overflow error) if the computation is hoisted back out of the branch.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 fn native_cuda_decoder_constructs_with_unbounded_metadata_less_capacity() -> anyhow::Result<()> {
     if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
@@ -1763,7 +1763,7 @@ fn native_cuda_decoder_constructs_with_unbounded_metadata_less_capacity() -> any
 /// `kv_commits_on_demand()` assertion guarantees the test really is on the VMM
 /// path — without it a silent fall back to the eager path would make the test
 /// prove nothing.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 fn native_cuda_vmm_decoder_constructs_with_unbounded_metadata_less_capacity() -> anyhow::Result<()>
 {
@@ -1815,7 +1815,7 @@ fn native_cuda_vmm_decoder_constructs_with_unbounded_metadata_less_capacity() ->
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn binding_addresses(session: &NativeDecodeSession) -> Vec<usize> {
     session
         .cuda
@@ -1835,7 +1835,7 @@ fn binding_addresses(session: &NativeDecodeSession) -> Vec<usize> {
 /// changes the emitted logits on the next generation — the exact signature of
 /// the session-reuse corruption bug. Used by the regression test that a reused
 /// `NativeDecodeSession` re-zeros recurrent state on `reset()`.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn build_cuda_recurrent_logits_decoder(max_len: usize) -> anyhow::Result<NativeDecodeSession> {
     use prost::Message;
 
@@ -1984,7 +1984,7 @@ fn build_cuda_recurrent_logits_decoder(max_len: usize) -> anyhow::Result<NativeD
 /// degenerate output on hybrid LinearAttention models). This test is
 /// non-vacuous: the logits are a direct function of the incoming recurrent
 /// state, so a stale state changes the asserted values.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 fn native_cuda_reused_session_rezeros_recurrent_state() -> anyhow::Result<()> {
     if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
@@ -2026,7 +2026,7 @@ fn native_cuda_reused_session_rezeros_recurrent_state() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn input_update_stats(session: &NativeDecodeSession) -> [DeviceBindingTransferStats; 3] {
     let state = session.cuda.as_ref().expect("CUDA state");
     [
@@ -2036,7 +2036,7 @@ fn input_update_stats(session: &NativeDecodeSession) -> [DeviceBindingTransferSt
     ]
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn assert_single_value_uploads(
     before: [DeviceBindingTransferStats; 3],
     after: [DeviceBindingTransferStats; 3],
@@ -2050,7 +2050,7 @@ fn assert_single_value_uploads(
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn assert_decode_bindings(
     session: &mut NativeDecodeSession,
     addresses: &[usize],
@@ -2089,7 +2089,7 @@ fn assert_decode_bindings(
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn run_capture_safe_decode(
     session: &mut NativeDecodeSession,
     tokens: &[TokenId],
@@ -2724,7 +2724,7 @@ fn unresolved_symbolic_axis_flags_only_non_unit_symbols() {
     );
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 fn native_cuda_binds_rank3_fixed_state_without_changing_growing_kv() -> anyhow::Result<()> {
     if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
@@ -2760,7 +2760,7 @@ fn native_cuda_binds_rank3_fixed_state_without_changing_growing_kv() -> anyhow::
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 #[ignore = "fixture defect, not a product bug (#1284): the synthetic decoder routes growable KV \
 through Cast, not a capacity-form attention op, so `binding_consumers_use_physical_capacity` \
@@ -2849,7 +2849,7 @@ fn native_cuda_capture_replay_is_bit_exact_and_refreshes_decode_inputs() -> anyh
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 #[ignore = "fixture defect, not a product bug (#1284): the synthetic decoder routes growable KV \
 through Cast, not a capacity-form attention op, so `binding_consumers_use_physical_capacity` \
@@ -2911,7 +2911,7 @@ fn native_cuda_symbolic_batch_aux_captures_bit_exact() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 fn native_cuda_symbolic_total_seq_aux_declines_capture_but_decodes_eagerly() -> anyhow::Result<()> {
     // F2 negative case (the F1 path): an auxiliary output whose symbolic dim
@@ -2995,7 +2995,7 @@ fn native_decode_accepts_last_token_only_logits_and_advances_kv() {
     assert_eq!(session.current_len(), 4);
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 fn native_cuda_qwen_decode_matches_cpu_tokens() -> anyhow::Result<()> {
     if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
@@ -3132,7 +3132,7 @@ fn native_cuda_qwen_decode_matches_cpu_tokens() -> anyhow::Result<()> {
 /// range or dropping `committed_ranges` in the plumbing makes the load-time KV
 /// commitment equal the full-context reservation and this test fails; sabotaging
 /// `commits_on_demand()` makes growth replace the bindings and this test fails.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 fn native_cuda_vmm_kv_grows_in_place_and_commits_more_granules() -> anyhow::Result<()> {
     if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
@@ -3223,7 +3223,7 @@ fn native_cuda_vmm_kv_grows_in_place_and_commits_more_granules() -> anyhow::Resu
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 fn native_cuda_verify_rewind_no_kv_corruption() -> anyhow::Result<()> {
     // WP1 exit criterion on real device KV: decode K draft tokens through the
@@ -3648,7 +3648,7 @@ fn decode_inline_never_routes_when_disabled_or_unbuilt() {
 /// `kv_layout` descriptor, with an environment override for residency
 /// diagnostics. Absent metadata means head-major — exactly the historical
 /// behavior — so no currently-loadable model changes its committed geometry.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 fn cuda_kv_layout_resolves_from_metadata_with_env_override() {
     use super::cuda::resolve_cuda_kv_layout;
