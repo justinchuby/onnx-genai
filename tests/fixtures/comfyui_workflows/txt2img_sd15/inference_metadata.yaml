@@ -110,7 +110,9 @@ pipeline:
             kind: request_aligned
             axis: 0
         role:
-          kind: opaque
+          kind: runtime
+          version: '1.0'
+          role: negative_prompt_tokens
         source:
           kind: application
           name: negative_input_ids
@@ -125,7 +127,9 @@ pipeline:
             kind: request_aligned
             axis: 0
         role:
-          kind: opaque
+          kind: runtime
+          version: '1.0'
+          role: guidance_scale
         source:
           kind: application
           name: guidance_scale

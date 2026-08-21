@@ -52,6 +52,7 @@ use crate::{
 
 mod admin;
 mod completions;
+mod images;
 mod multimodal;
 mod sessions;
 
@@ -70,6 +71,9 @@ pub use completions::{
 };
 pub(crate) use completions::{
     chat_completions, collect_generation_result, completions, embeddings,
+};
+pub(crate) use images::{
+    a1111_img2img, a1111_models, a1111_options, a1111_samplers, a1111_txt2img, openai_images,
 };
 pub(crate) use multimodal::audio_transcriptions;
 pub(crate) use sessions::{create_session, delete_session};

@@ -17,6 +17,7 @@ use onnx_genai_ort::{ChatTemplate, Tokenizer};
 
 use crate::{
     driver::EngineDriver,
+    image_generation::ImagePipelineSpec,
     models_config::ModelSpec,
     multimodal::MultimodalSpecs,
     state::{ServerConfig, ServerMemoryAuthorities, build_handle_with_authorities},
@@ -55,6 +56,7 @@ pub(crate) struct ModelHandle {
     /// Declared image/audio input contracts, or `None` for a single decoder
     /// graph. Shared with the CLI so both front ends admit the same inputs.
     pub(crate) multimodal: Option<MultimodalSpecs>,
+    pub(crate) image_pipeline: Option<ImagePipelineSpec>,
     /// Whether the package declares a channel whose content the caller must not
     /// be shown, i.e. whether a generated turn carries private reasoning that
     /// has to be filtered out of everything this server returns.
@@ -85,6 +87,7 @@ pub(crate) struct ModelHandleParts {
     pub(crate) fim_config: Option<FimConfig>,
     pub(crate) pipeline: bool,
     pub(crate) multimodal: Option<MultimodalSpecs>,
+    pub(crate) image_pipeline: Option<ImagePipelineSpec>,
 }
 
 impl ModelHandle {
@@ -100,6 +103,7 @@ impl ModelHandle {
             fim_config,
             pipeline,
             multimodal,
+            image_pipeline,
         } = parts;
         let private_channels = declares_private_channels(&model_dir);
         Self {
@@ -112,6 +116,7 @@ impl ModelHandle {
             fim_config,
             pipeline,
             multimodal,
+            image_pipeline,
             private_channels,
             last_request_at: AtomicU64::new(now_millis()),
             warmed: AtomicBool::new(false),
@@ -869,6 +874,7 @@ mod tests {
             fim_config: None,
             pipeline: false,
             multimodal: None,
+            image_pipeline: None,
             private_channels: false,
             last_request_at: AtomicU64::new(last_request_at),
             warmed: AtomicBool::new(false),

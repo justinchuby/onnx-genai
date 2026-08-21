@@ -499,6 +499,34 @@ Available routes are `GET /health`, `GET /v1/models`,
 `DELETE /v1/sessions/{id}`. Pass a session id as `X-Session-Id` on chat
 requests to reuse persistent context.
 
+#### Image generation
+
+Image generation runs the loaded package's `pipeline.workflow`; it does not
+select a hard-coded diffusion implementation by model name. The workflow must
+declare an `image` output role plus semantic inputs such as `prompt_tokens`,
+`seed`, `max_iterations`, and (when supported) `negative_prompt_tokens`,
+`guidance_scale`, `width`, `height`, `media`, and `denoising_strength`.
+
+```bash
+curl http://127.0.0.1:8080/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"my-diffusion-package","prompt":"a lighthouse","response_format":"b64_json"}'
+
+curl http://127.0.0.1:8080/sdapi/v1/txt2img \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"a lighthouse","negative_prompt":"","seed":42,"steps":20,"cfg_scale":7.5}'
+```
+
+AUTOMATIC1111 compatibility includes `POST /sdapi/v1/txt2img`,
+`POST /sdapi/v1/img2img`, and discovery at `/sdapi/v1/sd-models`,
+`/sdapi/v1/samplers`, and `/sdapi/v1/options`. Images are returned as base64
+PNG. `img2img` is available only when metadata declares image/media and
+denoising-strength inputs. URL responses, server-side image saving, scripts,
+extensions, ControlNet fields, and parameters the package cannot bind are
+rejected explicitly rather than ignored. OpenAI `output_format: png` and opaque
+backgrounds are supported; JPEG/WebP, transparency, and moderation requests are
+rejected because this server does not currently provide those capabilities.
+
 #### Multimodal chat
 
 `POST /v1/chat/completions` accepts OpenAI content parts. Images are sent as
@@ -526,29 +554,6 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 A model that declares no image or audio contract rejects the part with a 400
 naming what it does accept, and unknown part types are named in the error along
 with the supported set.
-
-#### Image generation
-
-`POST /v1/images/generations` renders through a diffusion package's own declared
-denoise loop. Only `b64_json` is returned — the server stores nothing, so it has
-no URL to hand back. `negative_prompt`, `steps`, `guidance_scale`, and `seed`
-are onnx-genai extensions; omitted sampling values fall back to the package's
-declared `num_steps` / `guidance_scale`.
-
-```bash
-curl http://127.0.0.1:8080/v1/images/generations \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "stable-diffusion-1.5",
-    "prompt": "an astronaut riding a horse",
-    "negative_prompt": "blurry, low quality",
-    "size": "512x512",
-    "n": 1,
-    "steps": 25,
-    "guidance_scale": 7.5,
-    "seed": 0
-  }'
-```
 
 #### Speech synthesis
 
