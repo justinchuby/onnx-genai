@@ -74,6 +74,23 @@ Operator spelling alone does not create allocator or storage policy. Conversely,
 graph-visible block table, slot mapping, write index, or logical length cannot be
 hidden as a kernel choice because it is part of the component's typed ABI.
 
+## Port and heterogeneous KV semantics
+
+ONNX component artifacts are authoritative for port dtype, rank, shape, and
+opset imports, so an ONNX-backed component may omit duplicated
+`ports.inputs`/`ports.outputs` contracts. It must still declare semantic
+`ports.roles` for values such as token ids and logits that ONNX cannot
+identify. State ports are classified separately by each state group's aliases:
+`input`, `output`, `role: key|value|combined`, and numeric `layer`.
+
+`layer` orders and pairs buffers; it does not impose geometry. The Gemma 4
+example deliberately uses independent `full_key_heads`, `full_value_heads`,
+`sliding_key_heads`, and `sliding_value_heads` dimensions. A runtime reads each
+actual graph port independently, so layers may have different KV head counts
+and a layer may even expose different K and V head counts. Split groups only
+when update discipline, layout, dtype, sequence axis, lifetime, or rollback
+semantics differ—not merely because two aliases have different shapes.
+
 ## Existing evidence
 
 The separate [Qwen Image Edit evidence record](../evidence/qwen-image-edit-2509/README.md)

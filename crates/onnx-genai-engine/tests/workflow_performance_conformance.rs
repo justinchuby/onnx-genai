@@ -309,8 +309,6 @@ fn workflow_metadata(first_component: &str, first_artifact: &str) -> String {
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: {{ ai.onnx: 13 }}
       adapter_abis: {{}}
       capabilities: [workflow_ssa, typed_emit]
     inputs:

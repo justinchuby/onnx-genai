@@ -122,8 +122,6 @@ adapters:
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: {{ ai.onnx: 24 }}
       adapter_abis: {{ onnx-genai.parameter-overlay: "1" }}
       capabilities: [workflow_ssa, typed_emit, parameter_adapters, heterogeneous_adapter_batching]
     inputs:

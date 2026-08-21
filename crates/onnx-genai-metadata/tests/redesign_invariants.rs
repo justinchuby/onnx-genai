@@ -17,6 +17,20 @@ fn errors(document: &str) -> Vec<String> {
     validate_metadata(&parse(document)).expect_err("metadata must be rejected")
 }
 
+#[test]
+fn workflow_manifest_rejects_facts_owned_by_schema_and_onnx_artifacts() {
+    for duplicated in ["ir_version: '1.0'", "onnx_opsets: {ai.onnx: 24}"] {
+        let document = format!(
+            "schema_version: v1\npipeline:\n  workflow:\n    manifest:\n      \
+             {duplicated}\n    components: {{}}\n    steps: []\n"
+        );
+        let error = serde_yaml::from_str::<InferenceMetadata>(&document)
+            .expect_err("duplicated manifest fact must be rejected")
+            .to_string();
+        assert!(error.contains("unknown field"), "{error}");
+    }
+}
+
 /// A serving decoder with a LoRA service, an externally-suppliable encoder
 /// result, a native grammar component, and a generation-affecting profile.
 /// Every one of those is a cache correctness dependency.
@@ -70,8 +84,6 @@ profiles:
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 24 }
       adapter_abis: { onnx-genai.parameter-overlay: "1" }
       capabilities: [workflow_ssa, typed_emit, parameter_adapters, heterogeneous_adapter_batching]
     inputs:
@@ -275,8 +287,6 @@ fn serving_workflow(
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: {{ ai.onnx: 24 }}
       capabilities: [workflow_ssa, serving_service_contract]
     inputs:
       active:
@@ -593,8 +603,6 @@ generation:
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 24 }
       capabilities: [workflow_ssa]
     inputs:
       request.temperature:
@@ -657,8 +665,6 @@ package:
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 24 }
       adapter_abis: { onnx-genai.grammar-guidance: "1" }
       capabilities: [workflow_ssa]
     inputs: {}
@@ -760,8 +766,6 @@ fn session_scope_and_release_boundaries_remain_normative() {
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 24 }
       capabilities: [workflow_ssa, session_state, session_state_lease]
     inputs:
       seed_state:
@@ -1246,8 +1250,6 @@ preprocessing:
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 24 }
       adapter_abis: { onnx-genai.audio-preprocess: "1" }
       capabilities: [workflow_ssa, typed_emit, audio_preprocessing_program]
     inputs:

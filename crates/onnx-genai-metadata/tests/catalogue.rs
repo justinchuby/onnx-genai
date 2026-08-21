@@ -39,6 +39,34 @@ fn every_catalogue_example_parses_and_validates() {
             .pipeline
             .expect("catalogue example has a workflow")
             .workflow;
+        if path
+            .file_name()
+            .is_some_and(|name| name == std::ffi::OsStr::new("01-gemma4-text-decoder.yaml"))
+        {
+            let full_key = workflow.state["full_key"]
+                .contract
+                .shape
+                .as_ref()
+                .expect("full key shape");
+            let full_value = workflow.state["full_value"]
+                .contract
+                .shape
+                .as_ref()
+                .expect("full value shape");
+            let sliding_key = workflow.state["sliding_key"]
+                .contract
+                .shape
+                .as_ref()
+                .expect("sliding key shape");
+            assert_ne!(
+                full_key[1], full_value[1],
+                "K and V head geometry must remain independently representable"
+            );
+            assert_ne!(
+                full_key[1], sliding_key[1],
+                "different layers must not inherit one package-wide KV head count"
+            );
+        }
         for (name, component) in &workflow.components {
             if let ComponentImplementation::Onnx { artifact } = &component.implementation {
                 assert!(

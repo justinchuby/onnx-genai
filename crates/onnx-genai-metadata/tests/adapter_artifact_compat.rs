@@ -93,8 +93,6 @@ adapters:
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: {{ ai.onnx: 24 }}
       capabilities: [workflow_ssa, parameter_adapters]
     inputs:
       request.lora_segments:

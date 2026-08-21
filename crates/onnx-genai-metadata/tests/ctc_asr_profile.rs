@@ -80,8 +80,6 @@ profiles:
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 24 }
       adapter_abis: { onnx-genai.audio-preprocess: "1" }
       capabilities: [workflow_ssa, typed_emit]
     inputs:
@@ -323,7 +321,6 @@ fn audio_adapter_without_preprocessing_audio_metadata_is_rejected() {
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
       capabilities: [workflow_ssa]
     inputs:
       request.audio:
@@ -368,7 +365,6 @@ preprocessing:
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
       capabilities: [workflow_ssa]
     inputs:
       request.audio:

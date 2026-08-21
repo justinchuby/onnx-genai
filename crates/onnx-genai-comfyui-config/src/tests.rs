@@ -89,7 +89,8 @@ fn converts_core_txt2img_into_canonical_workflow() {
     // the emits. Nothing about it is ComfyUI-shaped.
     assert_eq!(step_kinds(&document), ["loop", "invoke", "emit", "emit"]);
     let workflow = workflow_of(&document);
-    assert_eq!(workflow["manifest"]["ir_version"], json!("1.0"));
+    assert!(workflow["manifest"].get("ir_version").is_none());
+    assert!(workflow["manifest"].get("onnx_opsets").is_none());
     assert_eq!(
         workflow["steps"][0]["max_iterations"],
         json!("request.max_iterations")

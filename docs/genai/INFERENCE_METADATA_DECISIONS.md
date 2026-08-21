@@ -137,6 +137,13 @@ speculative: {...}          # proposer/target compatibility facts
 hardware_requirements: {...}
 ```
 
+`schema_version` versions the workflow syntax together with the rest of the
+document. The workflow manifest therefore carries only facts that are not
+already authoritative elsewhere, such as adapter ABI versions and declared
+capabilities. It does not repeat a workflow `ir_version`, and it does not copy
+ONNX opset imports: every ONNX artifact carries its own exact domain/version
+map, including the case where different components use different opsets.
+
 `pipeline.workflow` is the **sole serialized expression of a package's
 executable graph ABI**, for every package, including one that ships a single
 ONNX file. `model:` carries facts that are true of the package rather than of
@@ -1437,8 +1444,6 @@ schema_version: v1
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 24 }
       capabilities: [workflow_ssa, typed_emit]
     effects:
       decode:

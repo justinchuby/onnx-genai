@@ -18,8 +18,6 @@ use crate::plan::{Conditioning, LatentSource, Prediction, Solver, WorkflowPlan};
 
 /// Canonical latent scale factor applied per denoiser call is package data, so
 /// the emitted workflow only ever names ports, never numbers like this.
-const IR_VERSION: &str = "1.0";
-
 /// A dimension symbol shared by every request-aligned latent tensor.
 const LATENT_HEIGHT: &str = "latent_height";
 const LATENT_WIDTH: &str = "latent_width";
@@ -75,8 +73,6 @@ impl<'a> Lowering<'a> {
         workflow.insert(
             "manifest".to_owned(),
             json!({
-                "ir_version": IR_VERSION,
-                "onnx_opsets": {"ai.onnx": 24},
                 "capabilities": self.capabilities,
             }),
         );

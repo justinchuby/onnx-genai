@@ -663,8 +663,6 @@ preprocessing:
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 13 }
       adapter_abis: { onnx-genai.image-preprocess: "1" }
       capabilities: [workflow_ssa, typed_emit]
     inputs:
@@ -772,8 +770,6 @@ fn optional_media_presence_selects_real_or_empty_features() -> anyhow::Result<()
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 13 }
       capabilities: [workflow_ssa, nested_control_flow, typed_emit, input_presence]
     inputs:
       request.image_features:
@@ -853,8 +849,6 @@ fn workflow_executes_real_greedy_policy_artifact() -> anyhow::Result<()> {
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       capabilities: [workflow_ssa, typed_emit]
     inputs:
@@ -1024,8 +1018,6 @@ fn decoder_present_kv_is_direct_loop_carry() -> anyhow::Result<()> {
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       capabilities: [workflow_ssa, typed_emit, nested_control_flow]
     inputs:
@@ -1130,8 +1122,6 @@ fn pure_policy_chain_lowers_to_one_execution_island() -> anyhow::Result<()> {
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       capabilities: [workflow_ssa, typed_emit]
     inputs:
@@ -1294,8 +1284,6 @@ fn execution_island_references_external_weights_without_inlining() -> anyhow::Re
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       capabilities: [workflow_ssa, typed_emit]
     inputs:
@@ -1386,8 +1374,6 @@ fn execution_island_disambiguates_sanitized_value_names() -> anyhow::Result<()> 
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       capabilities: [workflow_ssa, typed_emit]
     inputs:
@@ -1456,8 +1442,6 @@ fn workflow_scalar_literal_materializes_unbound_symbol_as_singleton() -> anyhow:
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       capabilities: [workflow_ssa, typed_emit]
     inputs:
@@ -1495,8 +1479,6 @@ fn workflow_component_symbols_are_scoped_per_invocation() -> anyhow::Result<()> 
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       capabilities: [workflow_ssa, typed_emit]
     inputs:
@@ -1558,8 +1540,6 @@ fn workflow_component_symbols_ignore_package_dynamic_symbol_names() -> anyhow::R
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       capabilities: [workflow_ssa, typed_emit, bounded_state_growth]
     inputs:
@@ -1639,8 +1619,6 @@ fn workflow_executes_autoregressive_rng_and_eos_loop() -> anyhow::Result<()> {
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       capabilities: [workflow_ssa, typed_emit, nested_control_flow]
     inputs:
@@ -1825,8 +1803,6 @@ fn workflow_executes_diffusion_solver_policy_artifact() -> anyhow::Result<()> {
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       capabilities: [workflow_ssa, typed_emit, nested_control_flow,
                      loop_induction_values]
@@ -1947,8 +1923,6 @@ fn workflow_nested_loops_materialize_lexical_induction_values() -> anyhow::Resul
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       capabilities: [workflow_ssa, typed_emit, nested_control_flow,
                      loop_induction_values]
@@ -2016,8 +1990,6 @@ fn workflow_executes_masked_and_speculative_policy_artifacts() -> anyhow::Result
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       capabilities: [workflow_ssa, typed_emit]
     inputs:
@@ -2087,8 +2059,6 @@ pipeline:
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       capabilities: [workflow_ssa, typed_emit, emit_valid_length]
     inputs:
@@ -2180,8 +2150,6 @@ fn workflow_selects_bounded_state_prefix_through_branch_phi() -> anyhow::Result<
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       capabilities:
         [workflow_ssa, typed_emit, nested_control_flow,
@@ -2313,8 +2281,6 @@ fn workflow_combines_speculation_grammar_and_adaptive_budget() -> anyhow::Result
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 13 }
       adapter_abis: { onnx-genai.grammar-guidance: "1" }
       capabilities:
         [workflow_ssa, typed_emit, emit_valid_length, emit_row_identity,
@@ -2743,8 +2709,6 @@ fn workflow_executes_generic_telemetry_adapter() -> anyhow::Result<()> {
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 13 }
       adapter_abis: { onnx-genai.telemetry: "1" }
       capabilities: [workflow_ssa, typed_emit, telemetry_adapter]
     inputs: {}
@@ -2812,8 +2776,6 @@ fn workflow_threads_loop_branch_effects_and_session_state() -> anyhow::Result<()
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       capabilities:
         [workflow_ssa, typed_emit, streaming_emit,
@@ -3041,8 +3003,6 @@ fn workflow_world_model_checkpoints_and_replays_semantic_state() -> anyhow::Resu
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       capabilities:
         [workflow_ssa, typed_emit, streaming_emit,
@@ -3276,8 +3236,6 @@ fn workflow_branch_joins_speculative_values_and_effects() -> anyhow::Result<()> 
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 24 }
       adapter_abis: {}
       capabilities: [workflow_ssa, typed_emit, streaming_emit, nested_control_flow]
     inputs:

@@ -4904,23 +4904,8 @@
           },
           "type": "array",
           "uniqueItems": true
-        },
-        "ir_version": {
-          "type": "string"
-        },
-        "onnx_opsets": {
-          "additionalProperties": {
-            "format": "uint32",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "default": {},
-          "type": "object"
         }
       },
-      "required": [
-        "ir_version"
-      ],
       "type": "object"
     },
     "WorkflowOutput": {

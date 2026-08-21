@@ -1431,23 +1431,6 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
             return;
         }
     };
-    if workflow.manifest.ir_version != "1.0" {
-        errors.push(format!(
-            "unsupported pipeline.workflow.manifest.ir_version '{}'; this runtime supports 1.0",
-            workflow.manifest.ir_version
-        ));
-    }
-    if workflow.manifest.onnx_opsets.is_empty() {
-        errors.push("pipeline.workflow.manifest.onnx_opsets must not be empty".to_string());
-    }
-    for (domain, version) in &workflow.manifest.onnx_opsets {
-        if domain.trim().is_empty() || *version == 0 {
-            errors.push(format!(
-                "pipeline.workflow.manifest.onnx_opsets contains invalid {domain:?}@{version}"
-            ));
-        }
-    }
-
     /// Check that a workflow tensor names a dtype this format can talk about.
     ///
     /// This is a vocabulary check, not a capability check. Metadata is portable:

@@ -506,9 +506,6 @@ impl Default for AdapterPlanningContract {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowManifest {
-    pub ir_version: String,
-    #[serde(default)]
-    pub onnx_opsets: BTreeMap<String, u32>,
     #[serde(default)]
     pub adapter_abis: BTreeMap<String, String>,
     #[serde(default)]

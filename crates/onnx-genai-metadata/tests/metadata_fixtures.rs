@@ -57,8 +57,6 @@ adapters:
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 24 }
       adapter_abis: { onnx-genai.parameter-overlay: "1" }
       capabilities: [workflow_ssa, parameter_adapters, heterogeneous_adapter_batching]
     inputs:
@@ -248,9 +246,6 @@ schema_version: v1
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets:
-        ai.onnx: 24
       capabilities: [workflow_ssa]
     components:
       noop:
@@ -274,8 +269,6 @@ schema_version: v1
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 24 }
       capabilities: [workflow_ssa, nested_control_flow, input_presence]
     inputs:
       request.image:
@@ -308,8 +301,6 @@ schema_version: v1
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 24 }
       capabilities: [workflow_ssa]
     inputs:
       request.image:
@@ -338,8 +329,6 @@ schema_version: v1
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 24 }
       capabilities: [workflow_ssa, input_presence]
     inputs:
       request.image:
@@ -377,8 +366,6 @@ schema_version: v1
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 24 }
       capabilities: [workflow_ssa, input_presence]
     inputs:
       request.temperature:
@@ -472,8 +459,6 @@ fn serialized_compiler_bookkeeping_is_rejected() {
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: {{ ai.onnx: 24 }}
       capabilities: []
     components: {{}}
     steps: []
@@ -494,8 +479,6 @@ fn emit_valid_length_requires_integer_scalar_or_vector() {
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: {{ ai.onnx: 24 }}
       capabilities: [workflow_ssa, typed_emit, emit_valid_length]
     inputs:
       value:
@@ -546,8 +529,6 @@ fn row_wise_emit_requires_a_request_aligned_batch_layout() {
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: {{ ai.onnx: 24 }}
       capabilities: [workflow_ssa, typed_emit, emit_valid_length]
     inputs:
       value:
@@ -630,8 +611,6 @@ fn removed_row_identity_fields_are_rejected_fail_closed() {
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: {{ ai.onnx: 24 }}
       capabilities: [workflow_ssa]
     inputs:
       value:
@@ -666,8 +645,6 @@ pipeline:
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: {{ ai.onnx: 24 }}
       capabilities: [workflow_ssa]
     inputs: {{}}
     outputs: {{}}
@@ -690,8 +667,6 @@ fn nested_control_loops_preserve_the_request_aligned_emit() {
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 24 }
       capabilities:
         - workflow_ssa
         - linear_effects
@@ -870,8 +845,6 @@ fn advisory_state_may_be_session_scoped_but_is_not_semantic() {
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 24 }
       capabilities: [workflow_ssa, advisory_state, session_state_lease]
     inputs:
       estimate:
@@ -907,8 +880,6 @@ fn state_service_declares_semantics_not_allocator_policy() {
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 24 }
       capabilities: [workflow_ssa, serving_service_contract]
     inputs:
       active:
@@ -1042,8 +1013,6 @@ fn versioned_adapter_contract_rejects_unknown_action() {
 pipeline:
   workflow:
     manifest:
-      ir_version: "1.0"
-      onnx_opsets: { ai.onnx: 24 }
       adapter_abis: { onnx-genai.grammar-guidance: "1" }
       capabilities: []
     components:

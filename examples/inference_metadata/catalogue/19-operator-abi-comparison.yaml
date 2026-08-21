@@ -3,11 +3,6 @@ schema_version: v1
 pipeline:
   workflow:
     manifest:
-      ir_version: '1.0'
-      onnx_opsets:
-        ai.onnx: 24
-        com.microsoft: 1
-        example.paged_attention: 1
       capabilities:
       - workflow_ssa
       - typed_emit
