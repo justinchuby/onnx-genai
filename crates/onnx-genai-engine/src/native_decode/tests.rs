@@ -1412,7 +1412,8 @@ fn native_verify_logits_require_restored_recurrent_state() {
         // WITHOUT restoring the snapshot must DIVERGE from greedy — this is the
         // stale-state artifact that invalidates any verify oracle skipping the
         // restore.
-        spec.rewind(base_len).expect("kv rewind, recurrent left stale");
+        spec.rewind(base_len)
+            .expect("kv rewind, recurrent left stale");
         let stale = spec
             .decode_verify(&drafts, base_len)
             .expect("verify from stale recurrent state");
