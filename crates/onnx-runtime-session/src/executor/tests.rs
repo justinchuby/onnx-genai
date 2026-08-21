@@ -2988,6 +2988,7 @@ fn inference_session_fallback_workspace_grows_retries_and_reuses() {
         model_metadata: crate::ModelMetadata::default(),
         exec,
         decode_inline_exec: None,
+        verify_exec: None,
         ep_context_config: crate::EpContextDumpConfig::default(),
     };
 
@@ -3091,6 +3092,7 @@ fn prepared_session_reprepares_workspace_when_execution_rebuckets() {
         model_metadata: crate::ModelMetadata::default(),
         exec,
         decode_inline_exec: None,
+        verify_exec: None,
         ep_context_config: crate::EpContextDumpConfig::default(),
     };
 
