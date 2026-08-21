@@ -1572,6 +1572,40 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
             &output.contract,
             errors,
         );
+        if let Some(media) = &output.media {
+            if output.role != crate::schema::WorkflowOutputRole::Audio {
+                errors.push(format!(
+                    "workflow output '{name}' declares a media contract but its role is not audio"
+                ));
+            }
+            if media.sample_rate_hz == Some(0) {
+                errors.push(format!(
+                    "workflow output '{name}' media.sample_rate_hz must be greater than zero"
+                ));
+            }
+            if media.channels == Some(0) {
+                errors.push(format!(
+                    "workflow output '{name}' media.channels must be greater than zero"
+                ));
+            }
+            if media.sample_rate_hz.is_none() {
+                errors.push(format!(
+                    "workflow output '{name}' audio media contract must declare sample_rate_hz"
+                ));
+            }
+            if media.channels.is_none() {
+                errors.push(format!(
+                    "workflow output '{name}' audio media contract must declare channels"
+                ));
+            }
+            if media.container == crate::schema::MediaContainer::Wav
+                && output.contract.dtype != "uint8"
+            {
+                errors.push(format!(
+                    "workflow output '{name}' uses the WAV container but its contract dtype is not uint8"
+                ));
+            }
+        }
     }
     for (name, component) in &workflow.components {
         if name.trim().is_empty() || name.contains('.') {

@@ -585,6 +585,14 @@ pub struct WorkflowOutput {
     pub contract: TensorContract,
     pub role: WorkflowOutputRole,
     pub stage: OutputStage,
+    /// Concrete media delivery contract for a post-processing output.
+    ///
+    /// Tensor shape alone cannot distinguish PCM samples from encoded WAV bytes,
+    /// nor can it carry the sample rate and channel count required by an audio
+    /// serving API. This remains architecture-neutral and intentionally contains
+    /// no model-family identifiers or artifact fingerprints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<MediaOutputContract>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
@@ -599,6 +607,41 @@ pub enum WorkflowOutputRole {
     Audio,
     Tensor,
     Event,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MediaOutputContract {
+    pub container: MediaContainer,
+    pub encoding: MediaEncoding,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_rate_hz: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channels: Option<u16>,
+    #[serde(default)]
+    pub delivery: MediaDelivery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaContainer {
+    Raw,
+    Wav,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaEncoding {
+    PcmS16Le,
+    PcmF32Le,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaDelivery {
+    #[default]
+    Buffered,
+    Streaming,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
