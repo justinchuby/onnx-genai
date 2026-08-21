@@ -1714,7 +1714,8 @@ shortfall is latency and **is not attributed** — `perf` is unavailable here.
 `2*k*n` panel write against — a **2.0x cliff** off `m = 4` (0.543 ms ->
 1.090 ms) for 25% more arithmetic. Added row blocking
 and moved the boundary to `2 * MR`. Serial gains **1.46-1.48x / 1.37-1.42x /
-1.16x** at `m = 5/6/8` across two independent runs (both reported, not the
+1.16-1.19x** at `m = 5/6/8` across three independent runs, the last of them on
+the merged latest-main head (both reported, not the
 more flattering one); `m = 1` and `m >= 12` unchanged by construction and
 measured unchanged at 0.998x/1.013x. One-thread null controls repeat to
 **1.5%**; the 8-thread arms are the same code and spread **10%**, so the two

@@ -130,6 +130,24 @@ manufacture findings out of noise.
 This is a real configuration and a real win, but it is **not** the decode shape
 and **not** the multi-threaded one.
 
+### Confirmation on latest main
+
+Re-measured after merging `origin/main` (`9cd2a7d13`) into the branch, since a
+stale measurement is not evidence about the head that ships. Third independent
+run, same protocol, two repetitions, one thread, arms in separate processes
+(`fused_max_rows` is a `OnceLock`, so the two arms cannot be interleaved inside
+one process):
+
+| `m` | 1 | 4 | 5 | 6 | 8 | 12 |
+|---|---|---|---|---|---|---|
+| off (ms) | 0.2053 | 0.5471 | 1.0898 | 1.1612 | 1.2805 | 1.5364 |
+| on (ms) | 0.2024 | 0.5493 | 0.7456 | 0.8422 | 1.0766 | 1.5396 |
+| speedup | 1.01x | 1.00x | **1.46x** | **1.38x** | **1.19x** | 1.00x |
+
+Three null controls (`m = 1`, `4`, `12`) all land inside the 1.5% floor. Across
+all three runs the win is **1.46-1.48x / 1.37-1.42x / 1.16-1.19x** at
+`m = 5/6/8`.
+
 ## 4. `vpmaddubsw`: when it is legal, what it would buy, why it is not here
 
 `vpmaddubsw` computes `sat_i16(u8 * i8 + u8 * i8)`. The saturation is the whole
