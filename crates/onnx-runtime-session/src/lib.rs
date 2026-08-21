@@ -1447,16 +1447,34 @@ impl InferenceSession {
 
     /// Route the **main** executor's CUDA-graph capture/replay/reset to the given
     /// slot. The main executor defaults to [`DeviceGraphSlot::Primary`]; native
-    /// MTP self-speculative decode retargets it to [`DeviceGraphSlot::Verify`] so
-    /// a fixed M=k+1 verify forward captures into an independent slot while the
-    /// decode-inline sibling keeps its M=1 decode graph in Primary. Resets the
-    /// old slot's installed graph on switch; idempotent when already set.
+    /// MTP self-speculative decode retargets it to [`DeviceGraphSlot::Verify`]
+    /// around each fixed M=k+1 verify forward so that forward captures/replays
+    /// into an independent slot, then switches back to `Primary` for the M=1
+    /// decode. Because the executor now holds **per-slot** host capture state,
+    /// the switch is a pure retarget — it does NOT reset the other slot's
+    /// installed graph — so `Primary` (M=1) and `Verify` (M=k+1) graphs coexist
+    /// and each replays across steps.
     ///
     /// Safe to leave at Primary (the default) for every non-MTP path, which keeps
     /// greedy byte-identical: all main-exec graph calls then route to the same
     /// single slot they always did.
     pub fn set_main_exec_graph_slot(&mut self, slot: DeviceGraphSlot) -> Result<()> {
         self.exec.set_graph_slot(slot)
+    }
+
+    /// Whether the main executor's StepScoped workspace is pinned across runs.
+    pub fn main_exec_step_workspace_pinned(&self) -> bool {
+        self.exec.step_workspace_pinned()
+    }
+
+    /// Pin (or unpin) the **main** executor's StepScoped workspace across runs.
+    /// Native MTP verify capture pins it so the captured fixed-M verify graph
+    /// replays against a stable scratch pointer even though the M=1 decode step
+    /// (on the sibling executor) reserves a smaller scratch in between (#1647).
+    /// Inert by default; leaving it unpinned keeps every non-verify path
+    /// byte-identical.
+    pub fn set_main_exec_pin_step_workspace(&mut self, pin: bool) {
+        self.exec.set_pin_step_workspace(pin);
     }
 
     /// Pin the fixed-capacity KV sequence-axis symbols CONSTANT so CUDA-graph

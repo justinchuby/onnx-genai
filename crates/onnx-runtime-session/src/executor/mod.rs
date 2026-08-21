@@ -707,7 +707,7 @@ impl Drop for Executor {
         // model's packed buffers.
         onnx_runtime_ep_cpu::kernels::matmul_nbits::clear_mlas_packed_caches();
         let _ = self.ep.reset_device_graph_in(self.graph_slot);
-        self.device_graph_signature = None;
+        self.cap_mut().device_graph_signature = None;
         // Free every buffer via the owning EP (DeviceBuffer has no Drop).
         for (_, buf) in self.buffers.drain() {
             let _ = self.ep.deallocate(buf);

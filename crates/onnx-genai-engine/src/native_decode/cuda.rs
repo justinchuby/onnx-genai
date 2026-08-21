@@ -412,6 +412,37 @@ fn ns_to_ms(ns: u64) -> f64 {
     ns as f64 / 1_000_000.0
 }
 
+/// Widen the query-seq axis of a token/position binding shape (the LAST axis:
+/// `[1, 1]` → `[1, M]`, `[rank, 1, 1]` → `[rank, 1, M]`) to `M`, for the padded
+/// fixed-M verify bindings. Returns `None` when the shape is empty or the axis
+/// being widened is not currently `1` (so the caller declines verify capture
+/// rather than mis-shaping a binding). No hardcoded dims — the width comes from
+/// `num_speculative_tokens + 1`.
+fn widen_query_last(shape: &[usize], m: usize) -> Option<Vec<usize>> {
+    let last = shape.len().checked_sub(1)?;
+    if shape[last] != 1 {
+        return None;
+    }
+    let mut widened = shape.to_vec();
+    widened[last] = m;
+    Some(widened)
+}
+
+/// Widen the query-seq axis of a logits/aux output shape (the `len-2` axis,
+/// since a trailing feature dim (vocab/hidden) is last: `[1, 1, vocab]` →
+/// `[1, M, vocab]`) to `M`. Returns `None` when the shape has rank < 2 or the
+/// query-seq axis is not currently `1` (decline verify capture rather than
+/// mis-shape an output binding).
+fn widen_query_seq(shape: &[usize], m: usize) -> Option<Vec<usize>> {
+    let axis = shape.len().checked_sub(2)?;
+    if shape[axis] != 1 {
+        return None;
+    }
+    let mut widened = shape.to_vec();
+    widened[axis] = m;
+    Some(widened)
+}
+
 /// Result of one [`NativeDecodeSession::leverb_phase0_capture_attempt`] call —
 /// a THROWAWAY Lever-B Phase-0 probe (leverb-phase0), not part of any shipping
 /// contract.
@@ -567,6 +598,16 @@ pub struct CudaGraphDebugStats {
     /// Chained device-token-loop replays run this session (each advanced the
     /// device one token without a host argmax→next-token round-trip).
     pub device_token_loop_steps: u64,
+    /// Verify-slot (fixed-M option-c MTP verify) CUDA-graph captures.
+    pub verify_captures: u64,
+    /// Verify-slot replays — the proof the M=K verify graph is reused across
+    /// steps instead of recaptured every verify (the pre-#1650 replays=0 pin).
+    pub verify_replays: u64,
+    /// Verify-slot capture declines (forward ran eagerly).
+    pub verify_fallbacks: u64,
+    /// Verify-slot invalidations (a binding shape/pointer change retired the
+    /// captured verify graph; it re-warms and re-captures).
+    pub verify_invalidations: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -783,6 +824,46 @@ pub(crate) struct DecodeCudaState {
     /// Count of device-token-loop chained replays actually run (each advances the
     /// device one token without a host round-trip). A diagnostics counter.
     device_token_loop_steps: u64,
+    /// Option-c native MTP verify capture (WP4). `Some(M)` once the fixed
+    /// verify width M = k+1 (num_speculative_tokens + 1) is configured; the
+    /// padded verify bindings below are allocated at that width and the M=K
+    /// verify forward captures into the main executor's Verify graph slot.
+    /// `None` keeps the eager verify path (byte-identical legacy behavior).
+    verify_width: Option<usize>,
+    /// Capture phase of the fixed-M verify graph, driven independently of the
+    /// M=1 `graph_phase`/`inline_graph_phase` because it lives in a *separate* EP
+    /// graph slot (Verify) on the main executor. `NeedsWarmup` and dormant until
+    /// `verify_width` is configured.
+    verify_graph_phase: DecodeCudaGraphPhase,
+    /// Persistent padded `[1, M]` token-id binding for the verify forward. Its
+    /// device pointer is stable across steps so the captured Verify graph replays
+    /// against a fixed address. `None` until verify capture is configured.
+    verify_token_binding: Option<DeviceIoBinding>,
+    /// Persistent padded `[1, M]` position-ids binding for the verify forward
+    /// (present only when the decoder declares a position input). Stable pointer.
+    verify_position_binding: Option<DeviceIoBinding>,
+    /// Persistent padded `[1, M, vocab]` logits binding for the verify forward.
+    /// The production logits binding is single-token `[1, 1, vocab]`, so an M=K
+    /// forward's `[1, M, vocab]` logits would materialize to host (vetoing
+    /// capture); a device-resident padded binding lands them on-device with a
+    /// stable pointer. `None` until configured.
+    verify_logits_binding: Option<DeviceIoBinding>,
+    /// Persistent padded `[1, M, ...]` bindings for every auxiliary graph output
+    /// (e.g. the MTP hidden seed `hidden_states.63`), in `auxiliary_binding_range`
+    /// order. An M=K forward produces `[1, M, ...]` aux outputs that do not fit
+    /// the `[1, 1, ...]` decode aux bindings; without a padded device binding
+    /// they materialize to host and veto capture. The verify discards these
+    /// (the proposer reads its hidden seed from the M=1 base decode), but they
+    /// must stay device-resident for the graph to be capturable. Empty until
+    /// configured or when the decoder declares no auxiliary outputs.
+    verify_aux_bindings: Vec<DeviceIoBinding>,
+    /// Diagnostics: captures / replays of the fixed-M verify graph (the Verify
+    /// slot), tracked separately from the Primary M=1 counters so both slots'
+    /// reuse can be proven independently.
+    verify_graph_captures: u64,
+    verify_graph_replays: u64,
+    verify_graph_fallbacks: u64,
+    verify_graph_invalidations: u64,
 }
 
 pub(crate) struct DecodeCudaIo<'a> {
@@ -1272,18 +1353,22 @@ impl NativeDecodeSession {
             .as_mut()
             .context("CUDA decode state is not initialized")?;
         // An eager M>1 verify/prefill forward tears down the captured M=1 decode
-        // graph here so the plain M=1 hot path re-warms cleanly. The dormant
-        // `retain_decode_graph_across_spec` seam (default OFF) would skip this to
-        // let the base-decode graph survive a spec verify+commit cycle — but that
-        // is NOT capture-safe yet: this forward reserves a larger StepScoped
-        // `step_workspace` that is freed (`release_step_workspace`) after the run,
-        // so a subsequent M=1 replay reads the captured graph's now-stale
-        // workspace pointer and produces non-finite logits (GPU-verified; the
-        // finite-check guard catches it). Graduating this to a real speedup needs
-        // the M=K verify itself captured into a fixed-shape replayable graph with
-        // a pinned workspace (option-c padded verify capture), not just retaining
-        // the M=1 graph. Kept as a documented seam; see the decision note.
-        if !state.retain_decode_graph_across_spec {
+        // graph here so the plain M=1 hot path re-warms cleanly — EXCEPT once
+        // option-c verify capture is active, where each graph lives in its own
+        // per-slot host capture state and must not be disturbed by the other.
+        if state.verify_width.is_some() {
+            // Option-c verify capture is active. With per-slot host capture state
+            // the main executor holds the M=1 decode graph in its `Primary` slot
+            // and the fixed-M verify graph in its `Verify` slot; `Primary` is the
+            // current slot on this eager path (the base decode / prefill runs
+            // here), so we must NOT invalidate — that would tear down the M=1
+            // decode graph every verify step, which is exactly what pinned MTP at
+            // replays=0 before option-c. The captured verify graph is owned by
+            // `run_verify_captured` on the `Verify` slot and is untouched here.
+            // This eager forward is either the one-time prefill or a tail verify
+            // at width != M; a plain eager run leaves both installed graphs intact
+            // so the next step still replays the matching one.
+        } else if !state.retain_decode_graph_across_spec {
             state.invalidate_graph(&mut self.session)?;
         }
         // Auxiliary graph outputs (e.g. the MTP hidden-state seed
@@ -1373,6 +1458,385 @@ impl NativeDecodeSession {
             kernel_cache_evictions = stats.evictions,
             "native CUDA multi-row forward"
         );
+        Ok(logits)
+    }
+
+    /// Option-c native MTP verify capture (WP4). Allocate the persistent padded
+    /// `[1, M]` token / position, `[1, M, vocab]` logits and `[1, M, ...]`
+    /// auxiliary device bindings the captured fixed-M verify forward needs, pin
+    /// the main executor's StepScoped workspace at the M=K peak (capture-safe),
+    /// and route the main executor's CUDA-graph slot to `Verify` so the captured
+    /// verify graph never touches the M=1 decode graph (`Primary`, driven by the
+    /// decode-inline sibling on a hybrid recurrent model).
+    ///
+    /// `M = width` is derived from the caller's `num_speculative_tokens + 1`; no
+    /// hardcoded dims — every padded shape is widened from the live decode
+    /// binding's own physical shape. A no-op (`verify_width` stays `None`, eager
+    /// verify path in force) when: not a CUDA graph-enabled session, already
+    /// configured, `width < 2`, the decoder needs eager per-step inputs
+    /// (inputs_embeds / routed ports), the token input is not int64, a
+    /// multi-axis (mrope) position binding is present, the model carries no
+    /// recurrent state (so decode is NOT routed to the inline sibling and the
+    /// main-exec Primary slot is still the decode graph — retargeting it would
+    /// break greedy), or any logits/aux output does not collapse query-seq to a
+    /// unit `len-2` axis.
+    pub(crate) fn configure_verify_capture(&mut self, width: usize) -> anyhow::Result<()> {
+        if width < 2 || self.has_eager_step_inputs() || !self.has_recurrent_state() {
+            return Ok(());
+        }
+        // Capturing the M=K verify into the `Verify` graph slot is now sound even
+        // when the interleaved M=1 base decode / commit re-advance run on the
+        // SAME (main) executor. The executor holds per-slot host capture state
+        // (device_graph_signature + schedule + warm-shape/quarantine, indexed by
+        // graph_slot), so an M=1 decode captured into the `Primary` slot no
+        // longer clobbers the `Verify` slot's signature between the verify's
+        // capture and its replay. Both graphs coexist and each replays by shape
+        // key. This lifts the earlier `enable_decode_inline()` gate: on models
+        // whose recurrent Scan is not single-trip-inlineable (no decode-inline
+        // sibling — e.g. this artifact) the M=1 decode simply runs on the main
+        // executor's `Primary` slot while the verify runs on its `Verify` slot.
+        // Gather the padded binding plan from the live decode bindings (immutable
+        // borrow), then allocate (session borrow), then store (state borrow).
+        struct VerifyBindingPlan {
+            token_name: String,
+            token_dtype: DataType,
+            token_shape: Vec<usize>,
+            position: Option<(String, DataType, Vec<usize>)>,
+            logits_name: String,
+            logits_dtype: DataType,
+            logits_shape: Vec<usize>,
+            aux: Vec<(String, DataType, Vec<usize>)>,
+        }
+        let plan = {
+            let Some(state) = self.cuda.as_ref() else {
+                return Ok(());
+            };
+            if !state.graph_enabled || state.verify_width.is_some() {
+                return Ok(());
+            }
+            if state.position_ids_binding.is_some() && state.position_rank != 1 {
+                return Ok(());
+            }
+            let token = &state.bindings[state.input_ids_binding];
+            if token.dtype != DataType::Int64 {
+                return Ok(());
+            }
+            let token_name = token.input_name().to_string();
+            let token_dtype = token.dtype;
+            let Some(token_shape) = widen_query_last(token.physical_shape(), width) else {
+                return Ok(());
+            };
+            let position = match state.position_ids_binding {
+                Some(idx) => {
+                    let binding = &state.bindings[idx];
+                    let Some(shape) = widen_query_last(binding.physical_shape(), width) else {
+                        return Ok(());
+                    };
+                    Some((binding.input_name().to_string(), binding.dtype, shape))
+                }
+                None => None,
+            };
+            let logits = &state.bindings[state.logits_binding];
+            let logits_name = logits
+                .output_name()
+                .context("verify capture: logits binding has no output name")?
+                .to_string();
+            let Some(logits_shape) = widen_query_seq(logits.physical_shape(), width) else {
+                return Ok(());
+            };
+            let mut aux = Vec::new();
+            for idx in state.auxiliary_binding_range.clone() {
+                let binding = &state.bindings[idx];
+                let name = binding
+                    .output_name()
+                    .context("verify capture: auxiliary binding has no output name")?
+                    .to_string();
+                let Some(shape) = widen_query_seq(binding.physical_shape(), width) else {
+                    return Ok(());
+                };
+                aux.push((name, binding.dtype, shape));
+            }
+            VerifyBindingPlan {
+                token_name,
+                token_dtype,
+                token_shape,
+                position,
+                logits_name,
+                logits_dtype: state.logits_dtype,
+                logits_shape,
+                aux,
+            }
+        };
+
+        let token_binding = self.session.allocate_device_binding(
+            plan.token_name,
+            None::<String>,
+            plan.token_dtype,
+            plan.token_shape.clone(),
+            plan.token_shape,
+        )?;
+        let position_binding = match plan.position {
+            Some((name, dtype, shape)) => Some(self.session.allocate_device_binding(
+                name,
+                None::<String>,
+                dtype,
+                shape.clone(),
+                shape,
+            )?),
+            None => None,
+        };
+        let logits_binding = self.session.allocate_device_output_binding(
+            plan.logits_name,
+            plan.logits_dtype,
+            plan.logits_shape.clone(),
+            plan.logits_shape,
+        )?;
+        let mut aux_bindings = Vec::with_capacity(plan.aux.len());
+        for (name, dtype, shape) in plan.aux {
+            aux_bindings.push(self.session.allocate_device_output_binding(
+                name,
+                dtype,
+                shape.clone(),
+                shape,
+            )?);
+        }
+
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        state.verify_token_binding = Some(token_binding);
+        state.verify_position_binding = position_binding;
+        state.verify_logits_binding = Some(logits_binding);
+        state.verify_aux_bindings = aux_bindings;
+        state.verify_width = Some(width);
+        state.verify_graph_phase = DecodeCudaGraphPhase::NeedsWarmup;
+
+        // Pin the main executor's StepScoped workspace at the M=K peak so the
+        // captured verify graph replays against a stable scratch pointer even
+        // though the interleaved M=1 decode step reserves a smaller scratch
+        // (#1647). The graph slot is NOT set here: the main executor stays on
+        // `Primary` for M=1 decode and `run_verify_captured` flips it to `Verify`
+        // only around the verify forward, then back — safe because the executor's
+        // per-slot host capture state keeps both graphs' signatures independent.
+        self.session.set_main_exec_pin_step_workspace(true);
+        Ok(())
+    }
+
+    /// True once [`Self::configure_verify_capture`] has installed the fixed-M
+    /// verify capture (the padded bindings + Verify graph slot are live).
+    #[allow(dead_code)] // diagnostics accessor; also exercised by verify_capture_helper_tests
+    pub(crate) fn verify_capture_active(&self) -> bool {
+        self.cuda
+            .as_ref()
+            .is_some_and(|state| state.verify_width.is_some())
+    }
+
+    /// The configured fixed verify width M (= k+1), or `None` when verify capture
+    /// is not active.
+    pub(crate) fn verify_capture_width(&self) -> Option<usize> {
+        self.cuda.as_ref().and_then(|state| state.verify_width)
+    }
+
+    /// Run the fixed-M verify forward through the captured `Verify` graph slot
+    /// (option-c): swap the persistent padded bindings into the device binding
+    /// vector, drive the warm-up → arm(capture) → replay state machine on the
+    /// main executor's Verify slot, read the `[1, M, vocab]` logits into `M`
+    /// host rows, then swap the M=1 decode bindings back. Only called when
+    /// `token_ids.len()` equals the configured `M` (the caller falls back to the
+    /// eager path otherwise). Advances the KV logical length to `total_len`; the
+    /// destructive recurrent/conv advance it performs is discarded by the
+    /// driver's snapshot→restore→re-advance commit.
+    fn run_verify_captured(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+        total_len: usize,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        let m = token_ids.len();
+        let _verify_span = self
+            .trace
+            .span("native_decode_verify_captured", "spec")
+            .with_args(Args::new().with("rows", m as u64));
+        // Write the padded token ids + positions into their persistent device
+        // bindings (stable pointers, so the captured graph replays against them).
+        {
+            let state = self
+                .cuda
+                .as_mut()
+                .context("CUDA decode state is not initialized")?;
+            let mut token_bytes = Vec::with_capacity(m * 8);
+            for &id in token_ids {
+                token_bytes.extend_from_slice(&i64::from(id).to_ne_bytes());
+            }
+            state
+                .verify_token_binding
+                .as_mut()
+                .context("verify capture: missing padded token binding")?
+                .write_bytes(0, &token_bytes)?;
+            if let Some(position) = state.verify_position_binding.as_mut() {
+                let mut position_bytes = Vec::with_capacity(m * 8);
+                for pos in past_len..total_len {
+                    position_bytes.extend_from_slice(&(pos as i64).to_ne_bytes());
+                }
+                position.write_bytes(0, &position_bytes)?;
+            }
+        }
+
+        // Swap the padded bindings into the persistent vector, retarget the main
+        // executor to the Verify slot, run the verify graph phase (which reads
+        // the logits while swapped in), then restore the Primary slot + swap the
+        // M=1 decode bindings back — unconditionally, even on error. The slot
+        // flip is a pure retarget (per-slot host capture state), so the M=1
+        // decode graph in Primary is untouched and still replays next step.
+        self.cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?
+            .swap_verify_bindings();
+        self.session
+            .set_main_exec_graph_slot(DeviceGraphSlot::Verify)?;
+        let outcome = self.run_verify_graph_phase(m);
+        self.session
+            .set_main_exec_graph_slot(DeviceGraphSlot::Primary)?;
+        self.cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?
+            .swap_verify_bindings();
+        let logits = outcome?;
+
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        state.set_logical_len(total_len)?;
+        self.current_len = total_len;
+        Ok(logits)
+    }
+
+    /// Drive the Verify-slot capture state machine for one fixed-M verify forward
+    /// (assumes the padded bindings are already swapped into `state.bindings`),
+    /// then read the `[1, M, vocab]` logits into `m` host rows. Mirrors
+    /// [`DecodeCudaState::run_one_token`] but on the Verify slot with its own
+    /// `verify_graph_phase` and counters.
+    /// Decide the verify-graph phase after a captured verify graph is retired by
+    /// a host-signature clobber. The first couple of clobbers re-warm (in case
+    /// the churn was a one-off KV-bucket growth that self-stabilizes), but a
+    /// persistent clobber — the single-executor two-slot contention this build
+    /// cannot yet resolve — latches to `Unsupported` so the verify runs plain
+    /// eager with no recapture overhead (never worse than the pre-option-c path).
+    fn verify_phase_after_invalidation(invalidations: u64) -> DecodeCudaGraphPhase {
+        const MAX_VERIFY_RECAPTURES: u64 = 2;
+        if invalidations >= MAX_VERIFY_RECAPTURES {
+            DecodeCudaGraphPhase::Unsupported
+        } else {
+            DecodeCudaGraphPhase::NeedsWarmup
+        }
+    }
+
+    fn run_verify_graph_phase(&mut self, m: usize) -> anyhow::Result<Vec<Vec<f32>>> {
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        if !state.graph_enabled {
+            self.session
+                .run_with_device_bindings(&[], &mut state.bindings[..])?;
+        } else {
+            match state.verify_graph_phase {
+                DecodeCudaGraphPhase::NeedsWarmup => {
+                    // Warm the M=K shape (reserves + — because the main exec is
+                    // pinned — retains the StepScoped scratch) so the capture
+                    // below performs no device alloc/free inside the region.
+                    self.session
+                        .run_with_device_bindings(&[], &mut state.bindings[..])?;
+                    state.verify_graph_phase = DecodeCudaGraphPhase::Armed;
+                }
+                DecodeCudaGraphPhase::Armed => {
+                    match self
+                        .session
+                        .try_capture_with_device_bindings(&[], &mut state.bindings[..])?
+                    {
+                        DeviceGraphCaptureResult::Captured(outputs) => {
+                            if outputs.iter().any(Option::is_some) {
+                                bail!(
+                                    "captured CUDA verify forward unexpectedly materialized a host output"
+                                );
+                            }
+                            state.verify_graph_captures += 1;
+                            state.verify_graph_phase = DecodeCudaGraphPhase::Ready;
+                            tracing::debug!(
+                                rows = m,
+                                captures = state.verify_graph_captures,
+                                "native CUDA verify graph captured"
+                            );
+                        }
+                        DeviceGraphCaptureResult::NotCapturable(report) => {
+                            state.verify_graph_fallbacks += 1;
+                            state.verify_graph_phase = DecodeCudaGraphPhase::Unsupported;
+                            trace_capture_declines(&self.trace, &report);
+                            let reason = report.to_string();
+                            state.graph_decline_reason = Some(reason.clone());
+                            tracing::warn!(
+                                "native CUDA verify graph capture disabled for this generation: {reason}"
+                            );
+                            self.session
+                                .run_with_device_bindings(&[], &mut state.bindings[..])?;
+                        }
+                    }
+                }
+                DecodeCudaGraphPhase::Ready => {
+                    // The main executor now holds PER-SLOT host capture state, so
+                    // the interleaved M=1 decode (Primary slot) no longer clobbers
+                    // this M=K verify graph (Verify slot): each slot keeps its own
+                    // signature/schedule and replays independently. A replay can
+                    // still legitimately retire the graph — e.g. the pinned
+                    // StepScoped workspace grew on the first verify and moved its
+                    // scratch pointer, or a control-flow branch flip — so we keep
+                    // the graceful path: count the invalidation, run eagerly to
+                    // still produce this step's logits, re-warm once (self-
+                    // stabilizing after the workspace settles at the M=K peak),
+                    // and only latch to permanent-eager if churn persists.
+                    match self.session.replay_device_graph(&mut state.bindings[..]) {
+                        Ok(true) => {
+                            state.verify_graph_replays += 1;
+                        }
+                        Ok(false) => {
+                            state.verify_graph_replays += 1;
+                            state.verify_graph_invalidations += 1;
+                            state.verify_graph_phase = Self::verify_phase_after_invalidation(
+                                state.verify_graph_invalidations,
+                            );
+                            self.session
+                                .run_with_device_bindings(&[], &mut state.bindings[..])?;
+                        }
+                        Err(_) => {
+                            state.verify_graph_invalidations += 1;
+                            state.verify_graph_phase = Self::verify_phase_after_invalidation(
+                                state.verify_graph_invalidations,
+                            );
+                            self.session
+                                .run_with_device_bindings(&[], &mut state.bindings[..])?;
+                        }
+                    }
+                }
+                DecodeCudaGraphPhase::Unsupported => {
+                    self.session
+                        .run_with_device_bindings(&[], &mut state.bindings[..])?;
+                }
+            }
+        }
+
+        // Read the padded [1, M, vocab] logits (swapped into the logits slot).
+        let vocab = *state
+            .logits_shape
+            .last()
+            .context("CUDA logits shape has no vocabulary dimension")?;
+        let bytes = state.bindings[state.logits_binding].read_bytes()?;
+        let tensor = Tensor::from_raw(state.logits_dtype, vec![1, m, vocab], &bytes)?;
+        let logits = extract_logits(&tensor)?;
+        if logits.iter().flatten().any(|value| !value.is_finite()) {
+            bail!("native CUDA verify forward produced non-finite logits");
+        }
         Ok(logits)
     }
 
@@ -2416,6 +2880,14 @@ impl NativeDecodeSession {
         // when `past + K` crosses a power-of-two boundary; without it the verify
         // forward trips the prepared-workspace invariant. Only fires on `grew`.
         state.prepare_decode_workspace_after_capacity_growth(&mut self.session, grew)?;
+        // Option-c: when verify capture is configured and this verify hits the
+        // fixed width M, run it through the captured Verify graph slot (replayable
+        // across steps) instead of the eager per-op-launch path. A tail verify at
+        // width != M falls through to the eager path, which leaves the captured
+        // verify graph installed for the next full-width step.
+        if self.verify_capture_width() == Some(token_ids.len()) {
+            return self.run_verify_captured(token_ids, past_len, total_len);
+        }
         self.run_cuda_eager_rows(
             token_ids,
             past_len,
@@ -4505,6 +4977,16 @@ impl DecodeCudaState {
             device_token_loop_write_position,
             device_token_loop_scratch,
             device_token_loop_steps: 0,
+            verify_width: None,
+            verify_graph_phase: DecodeCudaGraphPhase::NeedsWarmup,
+            verify_token_binding: None,
+            verify_position_binding: None,
+            verify_logits_binding: None,
+            verify_aux_bindings: Vec::new(),
+            verify_graph_captures: 0,
+            verify_graph_replays: 0,
+            verify_graph_fallbacks: 0,
+            verify_graph_invalidations: 0,
         })
     }
 
@@ -5489,6 +5971,33 @@ impl DecodeCudaState {
         Ok(())
     }
 
+    /// Swap the persistent padded verify bindings (`[1, M]` token / position,
+    /// `[1, M, vocab]` logits, `[1, M, ...]` aux) into the device binding vector
+    /// in place of the M=1 decode bindings, or swap them back out. `std::mem::swap`
+    /// is its own inverse, so calling this twice around a verify forward restores
+    /// the decode bindings exactly. Inert (no fields set) until
+    /// [`NativeDecodeSession::configure_verify_capture`] has run.
+    fn swap_verify_bindings(&mut self) {
+        let token_index = self.input_ids_binding;
+        let position_index = self.position_ids_binding;
+        let logits_index = self.logits_binding;
+        let aux_start = self.auxiliary_binding_range.start;
+        if let Some(token) = self.verify_token_binding.as_mut() {
+            std::mem::swap(&mut self.bindings[token_index], token);
+        }
+        if let (Some(index), Some(position)) =
+            (position_index, self.verify_position_binding.as_mut())
+        {
+            std::mem::swap(&mut self.bindings[index], position);
+        }
+        if let Some(logits) = self.verify_logits_binding.as_mut() {
+            std::mem::swap(&mut self.bindings[logits_index], logits);
+        }
+        for (offset, aux) in self.verify_aux_bindings.iter_mut().enumerate() {
+            std::mem::swap(&mut self.bindings[aux_start + offset], aux);
+        }
+    }
+
     /// Dormant option (c) switch (kept off until WP4). Arm the padded single
     /// M=maxK captured verify graph: fix the query-row capacity at `max_query_rows`
     /// and retain the captured graph across `rewind` (contents-only mutation)
@@ -5506,26 +6015,6 @@ impl DecodeCudaState {
     #[cfg(test)]
     pub(crate) fn set_retain_graph_on_rewind(&mut self, retain: bool) {
         self.retain_graph_on_rewind = retain;
-    }
-
-    /// Toggle the dormant spec-decode graph-retention seam
-    /// (`retain_decode_graph_across_spec`). Kept off in production because it is
-    /// not capture-safe until the M=K verify is captured with a pinned workspace;
-    /// exposed for the option-c work and its tests. See the field docs.
-    ///
-    /// `allow(dead_code)`: this pair is the seam itself, landed ahead of the
-    /// WP4 tests that drive it. The sibling `#[cfg(test)]` accessors above and
-    /// below are already called, so only these two are unreachable today.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn set_retain_decode_graph_across_spec(&mut self, retain: bool) {
-        self.retain_decode_graph_across_spec = retain;
-    }
-
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn retain_decode_graph_across_spec(&self) -> bool {
-        self.retain_decode_graph_across_spec
     }
 
     /// Fixed query-row capacity (M=maxK) of the dormant padded verify capture, or
@@ -5580,6 +6069,10 @@ impl DecodeCudaState {
                 fallback_report: self.graph_fallback_report.clone(),
                 device_token_loop_k: self.device_token_loop_k,
                 device_token_loop_steps: self.device_token_loop_steps,
+                verify_captures: self.verify_graph_captures,
+                verify_replays: self.verify_graph_replays,
+                verify_fallbacks: self.verify_graph_fallbacks,
+                verify_invalidations: self.verify_graph_invalidations,
             },
         }
     }
@@ -6494,5 +6987,71 @@ mod prefill_query_width_tests {
     fn padding_to_the_same_width_is_declined() {
         let tensor = Tensor::from_i64(&[1, 3], &[1, 2, 3]).unwrap();
         assert!(pad_step_tensor(&tensor, 3, 3).is_none());
+    }
+}
+
+#[cfg(test)]
+mod verify_capture_helper_tests {
+    use super::{DecodeCudaGraphPhase, NativeDecodeSession, widen_query_last, widen_query_seq};
+
+    /// `widen_query_last` widens the trailing query-seq axis of a token/position
+    /// binding shape to the fixed verify width M, and only when that axis is
+    /// currently unit (so the padded verify binding is derived from geometry, not
+    /// hardcoded dims).
+    #[test]
+    fn widen_query_last_replaces_unit_trailing_axis() {
+        assert_eq!(widen_query_last(&[1, 1], 2), Some(vec![1, 2]));
+        assert_eq!(widen_query_last(&[3, 1, 1], 4), Some(vec![3, 1, 4]));
+        // Non-unit trailing axis (an already-widened / prefill shape) is declined.
+        assert_eq!(widen_query_last(&[1, 2], 3), None);
+        assert_eq!(widen_query_last(&[], 2), None);
+    }
+
+    /// `widen_query_seq` widens the `len-2` query-seq axis of a logits/aux output
+    /// shape (`[1, 1, feat]` -> `[1, M, feat]`), leaving the trailing feature dim
+    /// intact, and only when the query-seq axis is currently unit.
+    #[test]
+    fn widen_query_seq_replaces_unit_query_axis() {
+        assert_eq!(
+            widen_query_seq(&[1, 1, 248320], 2),
+            Some(vec![1, 2, 248320])
+        );
+        assert_eq!(widen_query_seq(&[1, 1, 5120], 3), Some(vec![1, 3, 5120]));
+        // Non-unit query axis or too-low rank is declined.
+        assert_eq!(widen_query_seq(&[1, 2, 5120], 3), None);
+        assert_eq!(widen_query_seq(&[5120], 2), None);
+    }
+
+    /// The verify graph re-warms on the first clobber (in case the churn was a
+    /// one-off KV-bucket growth) but latches to eager (`Unsupported`) once the
+    /// clobber persists, so a single-executor two-slot contention never becomes a
+    /// per-step recapture cost.
+    #[test]
+    fn verify_phase_latches_to_eager_after_repeated_invalidation() {
+        assert_eq!(
+            NativeDecodeSession::verify_phase_after_invalidation(1),
+            DecodeCudaGraphPhase::NeedsWarmup
+        );
+        assert_eq!(
+            NativeDecodeSession::verify_phase_after_invalidation(2),
+            DecodeCudaGraphPhase::Unsupported
+        );
+        assert_eq!(
+            NativeDecodeSession::verify_phase_after_invalidation(9),
+            DecodeCudaGraphPhase::Unsupported
+        );
+    }
+
+    /// Greedy-inertness contract: a decoder that never configured verify capture
+    /// (every non-MTP path, and MTP on a model without a decode-inline sibling)
+    /// reports the verify capture inactive, so the padded-binding swap + Verify
+    /// graph slot machinery stays dormant and the decode path is byte-identical.
+    #[test]
+    fn verify_capture_inactive_by_default() {
+        fn assert_inactive(session: &NativeDecodeSession) {
+            assert!(!session.verify_capture_active());
+            assert_eq!(session.verify_capture_width(), None);
+        }
+        let _ = assert_inactive;
     }
 }

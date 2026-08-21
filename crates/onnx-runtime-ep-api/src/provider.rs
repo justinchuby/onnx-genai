@@ -70,6 +70,24 @@ pub enum DeviceGraphSlot {
     Verify,
 }
 
+impl DeviceGraphSlot {
+    /// Number of distinct captured-graph slots. Used to size per-slot host
+    /// capture-state arrays on the executor so `Primary` (M=1 decode) and
+    /// `Verify` (M=k+1) graphs can coexist without clobbering each other.
+    pub const COUNT: usize = 2;
+
+    /// Dense array index for this slot (`Primary` = 0, `Verify` = 1). `Primary`
+    /// is index 0 so the historical single-slot code path — which only ever
+    /// touches `Primary` — maps to slot 0 and stays byte-identical.
+    #[inline]
+    pub const fn index(self) -> usize {
+        match self {
+            DeviceGraphSlot::Primary => 0,
+            DeviceGraphSlot::Verify => 1,
+        }
+    }
+}
+
 /// Opaque, namespaced configuration passed to [`ExecutionProvider::initialize`].
 #[derive(Clone, Debug, Default)]
 pub struct EpConfig {
