@@ -1105,3 +1105,39 @@ fn two_ports_may_not_claim_the_same_layer() {
         "{errors:?}"
     );
 }
+
+/// The canonical static-cache package validates as a whole package, on disk.
+///
+/// Every other test here validates a YAML string. That leaves the property a
+/// producer actually depends on untested: that the package *directory* — with
+/// its ONNX artifact resolved and inspected — passes the same
+/// `load_metadata_package` entry point the `validate_metadata` binary calls.
+/// The fixture is the worked example for adopting the canonical form, so it has
+/// to survive the path a producer will take, not just the one the unit tests do.
+///
+/// Its shape is deliberately the minimum: no top-level `model:` block, one
+/// ONNX-backed component whose only declaration is a single `ports.roles` entry,
+/// and a state service that carries the whole fixed-capacity ABI.
+#[test]
+fn the_canonical_static_cache_package_validates_on_disk() {
+    let package = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/tiny-llm-scatter-workflow");
+    let metadata = onnx_genai_metadata::load_metadata_package(&package)
+        .expect("the canonical package validates as a directory, artifact included");
+
+    // No second ABI: the package carries no `model:` block at all.
+    assert!(metadata.model.is_none());
+
+    // The static-cache ABI is still fully resolved, derived from the workflow.
+    let io = metadata
+        .decoder_io()
+        .expect("the workflow alone resolves the decoder ABI");
+    let cache = io
+        .static_cache
+        .as_ref()
+        .expect("the state service supplies the fixed-capacity ABI");
+    assert_eq!(cache.write_indices_input, "write_indices");
+    assert_eq!(cache.kv_sequence_length_input, "nonpad_kv_seqlen");
+    assert_eq!(cache.key_cache_inputs.len(), cache.value_cache_inputs.len());
+    assert_eq!(cache.key_cache_inputs.len(), cache.key_cache_outputs.len());
+}
