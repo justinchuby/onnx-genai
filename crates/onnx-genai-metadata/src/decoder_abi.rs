@@ -80,7 +80,7 @@ impl<'a> GroupPorts<'a> {
     }
 }
 
-fn is_self_attention(kind: StateKind) -> bool {
+pub(crate) fn is_self_attention(kind: StateKind) -> bool {
     matches!(
         kind,
         StateKind::FullAttention | StateKind::SlidingAttention | StateKind::MultiLatentAttention

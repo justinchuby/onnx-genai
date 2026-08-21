@@ -146,6 +146,8 @@ pipeline:
       model:
         implementation: {kind: onnx, artifact: model.onnx}
         ports:
+          roles:
+            input_ids: token_ids
           inputs:
             input_ids:
               dtype: int64

@@ -1863,6 +1863,9 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
             }
             validate_state_update(group_name, group, workflow, errors);
             validate_state_port_layers(group_name, group, errors);
+            validate_attention_component_declares_sequence_role(
+                group_name, group, workflow, errors,
+            );
             for cascade in &group.capabilities.cascade {
                 if !state_service.groups.contains_key(cascade) {
                     errors.push(format!(
@@ -3971,3 +3974,81 @@ pub enum MetadataError {
 
 // Re-export at crate level
 pub use MetadataError as Error;
+
+/// A component that owns attention state must say which port carries the
+/// sequence.
+///
+/// Every field of the decode ABI is resolved by role, so a component that
+/// declares none yields no ABI at all — `decoder_io()` returns `None` and the
+/// runtime falls back to inferring ports from shapes. That fallback is the
+/// behaviour the canonical form exists to remove, and reaching it by omission
+/// is silent: the document validates, the package loads, and the degradation
+/// only shows up as wrong ports much later.
+///
+/// Transcribed `ports.inputs`/`ports.outputs` contracts do not help here and
+/// are not required. An ONNX artifact already states its port names, types, and
+/// ranks; what it cannot state is which of several same-typed ports is the
+/// autoregressive sequence — `input_ids` and `position_ids` are both rank-2
+/// `int64`. So the obligation is exactly one line of `ports.roles`, and it is
+/// only owed by components the workflow says own attention state.
+fn validate_attention_component_declares_sequence_role(
+    group_name: &str,
+    group: &crate::schema::StateGroupContract,
+    workflow: &WorkflowSpec,
+    errors: &mut Vec<String>,
+) {
+    if !crate::decoder_abi::is_self_attention(group.kind) {
+        return;
+    }
+    // Only a package that depends on the single-decoder lowering can be hurt by
+    // a missing role. A workflow with several neural components — an
+    // encoder-decoder pair, a speculative draft and verifier, a TTS talker and
+    // code predictor — executes each one through its own invoke bindings, and
+    // `decoder_io()` deliberately declines to nominate one of them as "the"
+    // decoder. Those components own attention state without ever being asked
+    // for a decode ABI, so demanding a sequence role from them would be
+    // demanding a declaration nothing reads.
+    let neural_components = workflow
+        .components
+        .values()
+        .filter(|component| {
+            matches!(
+                component.implementation,
+                crate::schema::ComponentImplementation::Onnx { .. }
+            )
+        })
+        .count();
+    if neural_components != 1 {
+        return;
+    }
+    for component_name in group.ports.keys() {
+        let Some(component) = workflow.components.get(component_name) else {
+            continue;
+        };
+        if !matches!(
+            component.implementation,
+            crate::schema::ComponentImplementation::Onnx { .. }
+        ) {
+            continue;
+        }
+        let declares_sequence = component.ports.roles.values().any(|role| {
+            matches!(
+                role,
+                crate::schema::PortRole::TokenIds | crate::schema::PortRole::InputsEmbeds
+            )
+        });
+        if !declares_sequence {
+            errors.push(format!(
+                "state service group '{group_name}' gives component '{component_name}' attention \
+                 state, and it is the only neural component in the workflow, so the package \
+                 depends on resolving a decode ABI from it; it declares no token_ids or \
+                 inputs_embeds role, which leaves that ABI empty and silently falls back to \
+                 inferring ports from shapes. Add \
+                 pipeline.workflow.components.{component_name}.ports.roles mapping the sequence \
+                 port to token_ids (or inputs_embeds). Port contracts are optional and do not \
+                 substitute: a graph states its port names and types, but not which one carries \
+                 the sequence"
+            ));
+        }
+    }
+}

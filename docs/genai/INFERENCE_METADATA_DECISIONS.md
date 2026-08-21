@@ -1230,6 +1230,22 @@ a claim that a port does not exist. A role naming a port the graph does not
 expose is still caught, against the live session, which is strictly stronger
 than any echo of the graph in YAML.
 
+The inverse mistake is the more tempting one, so it is now rejected rather than
+tolerated. A producer migrating to the workflow-only form may reasonably assume
+transcribing a full `TensorContract` for every port is the *more* complete
+declaration and that roles are optional shorthand. It is the other way around:
+contracts without roles resolve nothing, `decoder_io()` returns `None`, and the
+runtime silently falls back to inferring ports from shapes — the behaviour this
+form exists to remove. That failure used to validate cleanly. When a workflow's
+*only* neural component owns attention state, the package depends on the
+single-decoder lowering, so a missing `token_ids`/`inputs_embeds` role is now a
+validation error naming the component and the role. Workflows with several
+neural components — an encoder-decoder pair, a speculative draft and verifier, a
+TTS talker and code predictor — are exempt: each is driven through its own
+invoke bindings, `decoder_io()` deliberately declines to nominate one as "the"
+decoder, and requiring a declaration nothing reads would be noise.
+`port_contracts_do_not_substitute_for_a_declared_role` pins this.
+
 ---
 
 ## 19. Invariants

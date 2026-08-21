@@ -934,7 +934,7 @@ pipeline:
     components:
       decoder:
         implementation: { kind: onnx, artifact: decoder.onnx }
-        ports: {}
+        ports: { roles: { input_ids: token_ids } }
     state:
       cache:
         contract: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }

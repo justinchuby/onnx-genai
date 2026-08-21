@@ -170,3 +170,59 @@ fn declared_roles_alone_yield_the_scatter_abi() {
     // resolved from `roles`, not guessed from the spelling "input_ids".
     assert_eq!(io.token_input.as_deref(), Some("input_ids"));
 }
+
+/// Transcribed port contracts do not substitute for a declared role.
+///
+/// A producer migrating to the workflow-only form may reasonably assume that
+/// writing full `TensorContract`s for every port is the *more* complete
+/// declaration, and that roles are the optional shorthand. It is the other way
+/// around. Every field of the decode ABI is resolved by role, so contracts
+/// without roles resolve nothing: `decoder_io()` returns `None` and the runtime
+/// silently falls back to inferring ports from shapes — the behaviour the
+/// canonical form exists to remove.
+///
+/// That failure used to be invisible: the document validated. It is now
+/// rejected at validation, naming the component and the missing role, so the
+/// mistake surfaces where it is cheap to fix instead of as wrong ports at
+/// inference time.
+#[test]
+fn port_contracts_do_not_substitute_for_a_declared_role() {
+    let mut document: serde_yaml::Value = serde_yaml::from_str(include_str!(
+        "../../../tests/fixtures/tiny-llm-scatter-workflow/inference_metadata.yaml"
+    ))
+    .expect("the canonical package parses");
+    let component = document
+        .get_mut("pipeline")
+        .and_then(|value| value.get_mut("workflow"))
+        .and_then(|value| value.get_mut("components"))
+        .and_then(|value| value.get_mut("model"))
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .expect("the canonical package declares the model component");
+    let ports = component
+        .get_mut(serde_yaml::Value::from("ports"))
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .expect("the fixture declares ports");
+    // Drop only the roles, leaving every transcribed contract in place.
+    assert!(
+        ports.remove(serde_yaml::Value::from("roles")).is_some(),
+        "the fixture must declare roles for their removal to prove anything"
+    );
+
+    let metadata: InferenceMetadata =
+        serde_yaml::from_str(&serde_yaml::to_string(&document).expect("re-serializes"))
+            .expect("the roleless document still parses");
+
+    assert!(
+        metadata.decoder_io().is_none(),
+        "contracts alone resolve no ABI, which is exactly why this must not validate"
+    );
+
+    let errors = onnx_genai_metadata::validation::validate_metadata(&metadata)
+        .expect_err("a sole decoder that declares no sequence role is rejected");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("declares no token_ids or inputs_embeds role")),
+        "the rejection must name the missing role, got: {errors:?}"
+    );
+}
