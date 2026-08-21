@@ -60,7 +60,7 @@ ONNX_GENAI_ORT_LIB_DIR=/path/to/ort/providers \
 ONNX_GENAI_WORKFLOW_PERF_EP=cuda \
 ONNX_GENAI_WORKFLOW_PERF_ITERS=200 \
 ONNX_GENAI_WORKFLOW_PERF_SAMPLES=5 \
-cargo test -p onnx-genai-engine --features cuda,cuda-13000 \
+cargo test -p onnx-genai-engine --features native-cuda,cuda-13000 \
   --test workflow_performance_conformance -- --ignored --nocapture
 ```
 
