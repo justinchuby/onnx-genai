@@ -3,7 +3,8 @@
 //! Pure code motion from `decode.rs`.
 
 use super::metadata::{
-    KeySequenceLengthsPolicy, key_sequence_lengths_policy, sliding_window_from_metadata,
+    KeySequenceLengthsPolicy, graph_accepts_padded_past, key_sequence_lengths_policy,
+    sliding_window_from_metadata,
 };
 use super::step::{build_position_step, decode_step_layout};
 use super::values::{slice_value_axis, zero_state_value};
@@ -182,6 +183,30 @@ fn kv_axis_slicing_keeps_requested_suffix_in_order() {
         suffix.to_vec_f32().unwrap(),
         vec![20.0, 21.0, 30.0, 31.0, 40.0, 41.0]
     );
+}
+
+/// Build a single-node decoder graph with one `GroupQueryAttention` op. When
+/// `local_window_size` is `Some(w)`, the op carries that attribute; when `None`,
+/// the op has no window attribute (global attention).
+fn gqa_graph(local_window_size: Option<i64>) -> onnx_runtime_ir::Graph {
+    use onnx_runtime_ir::{Attribute, Graph, Node};
+    let mut graph = Graph::default();
+    graph.nodes.insert_with(|id| {
+        let mut node = Node::new(id, "GroupQueryAttention", vec![], vec![]);
+        node.domain = "com.microsoft".to_string();
+        node.attributes
+            .insert("num_heads".to_string(), Attribute::Int(32));
+        node.attributes
+            .insert("kv_num_heads".to_string(), Attribute::Int(2));
+        node.attributes
+            .insert("do_rotary".to_string(), Attribute::Int(1));
+        if let Some(window) = local_window_size {
+            node.attributes
+                .insert("local_window_size".to_string(), Attribute::Int(window));
+        }
+        node
+    });
+    graph
 }
 
 /// A decoder graph whose attention is the **standard opset** `Attention`

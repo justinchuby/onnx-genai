@@ -216,7 +216,7 @@ impl Engine {
         };
 
         // Stage: metadata and decode-path resolution.
-        let shared_kv = shared_kv_offer(&session, &metadata);
+        let shared_kv = shared_kv_offer(&session, &metadata, &model_directory.model_path);
         let MetadataResolution {
             metadata,
             decode_path,
@@ -1146,13 +1146,43 @@ fn resolve_metadata_and_decode_path(
 fn shared_kv_offer(
     session: &Session,
     metadata: &InferenceMetadata,
+    model_path: &Path,
 ) -> crate::decode::SharedKvOffer {
+    let max_len = metadata
+        .model
+        .as_ref()
+        .and_then(|model| model.max_sequence_length);
+    // The EP capability is necessary but not sufficient. Whether a
+    // capacity-padded past is legal is a property of the attention *operator*:
+    // the standard opset `Attention` derives `total_sequence_length` from the
+    // past tensor's own extent and cross-checks it against the mask, so a
+    // capacity-sized past makes the two disagree and ORT refuses to run. Ask the
+    // graph before offering a shared buffer, so such a model falls back to the
+    // exact-length rebind path instead of failing at the first decode step.
+    //
+    // Best-effort and short-circuited: the graph is only read when a shared
+    // buffer is otherwise on the table, and a graph that cannot be read leaves
+    // the offer as the session alone described it.
+    let ep_supports = session.supports_fixed_capacity_present_binding();
+    let present_binding_supported = ep_supports
+        && (max_len.is_none()
+            || match onnx_runtime_loader::load_model(model_path) {
+                Ok(graph) => {
+                    let accepts = crate::decode::graph_accepts_padded_past(&graph);
+                    if !accepts {
+                        tracing::debug!(
+                            "decoder graph uses the standard opset Attention op, which \
+                             cross-checks the attention mask against the past KV extent; \
+                             declining the shared KV buffer for this deployment"
+                        );
+                    }
+                    accepts
+                }
+                Err(_) => true,
+            });
     crate::decode::SharedKvOffer {
-        present_binding_supported: session.supports_fixed_capacity_present_binding(),
-        max_len: metadata
-            .model
-            .as_ref()
-            .and_then(|model| model.max_sequence_length),
+        present_binding_supported,
+        max_len,
     }
 }
 

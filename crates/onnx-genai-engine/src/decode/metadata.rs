@@ -366,4 +366,57 @@ mod aliasing_tests {
             }
         ));
     }
+
+    #[test]
+    fn a_standard_attention_graph_withdraws_the_offer_even_when_the_package_permits_aliasing() {
+        // Three facts must agree before a buffer is aliased, not two: the PACKAGE
+        // permits it, the EP can bind a fixed-capacity present, and the graph's
+        // attention OPERATOR can read a capacity-padded past. The third is the one
+        // that is invisible in metadata and in EP capabilities alike, so it is
+        // checked against the graph itself when the offer is built.
+        //
+        // This reproduces the composition `shared_kv_offer` performs: a permitting
+        // package on a fully capable provider must still fall back to the exact
+        // length rebind path when the graph carries the standard opset
+        // `Attention`, which cross-checks `total_sequence_length` against the mask
+        // and would otherwise fail at the first decode step.
+        use super::graph_accepts_padded_past;
+        use onnx_runtime_ir::{Attribute, Graph, Node};
+
+        let standard_attention = {
+            let mut graph = Graph::default();
+            graph.nodes.insert_with(|id| {
+                let mut node = Node::new(id, "Attention", vec![], vec![]);
+                node.domain = String::new();
+                node.attributes
+                    .insert("is_causal".to_string(), Attribute::Int(1));
+                node
+            });
+            graph
+        };
+        assert!(
+            !graph_accepts_padded_past(&standard_attention),
+            "standard opset Attention must reject a padded past"
+        );
+
+        let ep_is_capable = true;
+        let offer = SharedKvOffer {
+            present_binding_supported: ep_is_capable
+                && graph_accepts_padded_past(&standard_attention),
+            max_len: Some(4096),
+        };
+        let path =
+            detect_model_decode_path(Some(&kv_io(Some(StateAliasing::Permitted))), None, 0, offer)
+                .expect("decode path");
+        assert!(
+            matches!(
+                path,
+                ModelDecodePath::PastPresent {
+                    shared_buffer: false,
+                    ..
+                }
+            ),
+            "an operator that cannot read a padded past must not be given one"
+        );
+    }
 }
