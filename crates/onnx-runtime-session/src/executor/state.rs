@@ -1,5 +1,65 @@
 use super::*;
 
+/// Host-side captured-graph bookkeeping for ONE [`DeviceGraphSlot`]. The
+/// executor holds one of these per slot (see [`Executor::slot_capture`]) so the
+/// M=1 `Primary` decode graph and the M=k+1 `Verify` speculative-verify graph
+/// can be captured, seeded, and replayed independently on the same EP/stream
+/// without either step overwriting the other's signature/schedule/warm-shape
+/// state — the fix for the `replays=0` MTP verify blocker (a single shared set
+/// of these fields let the M=1 decode clobber the Verify slot between its
+/// capture and replay). `Primary` maps to index 0, so a greedy decode (which
+/// only ever drives `Primary`) sees byte-identical bookkeeping to the historical
+/// single-field layout.
+#[derive(Default)]
+pub(crate) struct SlotCaptureState {
+    /// Binding signature (I/O name + dtype + physical shape + device ptr) the
+    /// installed graph for this slot was captured under; a replay whose bindings
+    /// differ retires the graph. `None` when no device graph is installed.
+    pub(super) device_graph_signature: Option<Vec<DeviceBindingSignature>>,
+    /// The captured-segment schedule from the most recent successful capture,
+    /// reused to interleave segment replays with eager seam nodes on each
+    /// subsequent step. `None` when no device graph is installed.
+    pub(super) capture_schedule: Option<CaptureSchedule>,
+    /// Structured segment-boundary reasons from the most recent capture, retained
+    /// for diagnostics after `capture_schedule` is taken for replay.
+    pub(super) capture_segmentation: Vec<CaptureDecline>,
+    /// Concrete control-flow output shapes the most recent capture assumed (a
+    /// snapshot of the seeded shapes from [`Executor::control_flow_output_values`]).
+    /// On replay the control-flow seam re-executes eagerly; if it now produces a
+    /// different shape (a branch flip, e.g. LongRoPE short↔long at the context
+    /// threshold) the installed graph's baked device pointers are stale, so the
+    /// step falls back to eager and the graph is retired for re-capture.
+    pub(super) capture_cf_shapes: HashMap<ValueId, Vec<usize>>,
+    /// Persistent-binding signature the most recent eager warmup ran under (see
+    /// [`ExternalBindings::capture_signature`]). Capture-mode shape seeding only
+    /// trusts the warm just-in-time shapes recorded in [`Executor::buffer_shapes`]
+    /// when a later step presents this exact signature, so any changed pointer
+    /// or capacity withholds the seed instead of baking a stale shape.
+    pub(super) capture_warm_signature: Option<Vec<ExternalCaptureSig>>,
+    /// Every value's concrete just-in-time shape as resolved by the most recent
+    /// eager warmup. The data-dependent decode shapes we seed for capture are
+    /// JIT-sized on the compute path (which populates `buffers` but not
+    /// [`Executor::buffer_shapes`]), so the authoritative warm geometry is
+    /// snapshotted from the eager run's fully-resolved shape map, not the buffer
+    /// bookkeeping.
+    pub(super) capture_warm_shapes: HashMap<ValueId, Vec<usize>>,
+    /// The warm decode shapes actually seeded into the most recent capture. After
+    /// the capture pass re-resolves each node's true shape, a divergence here
+    /// means the warm seed was stale for this step, so the graph is retired and
+    /// the caller re-warms/re-captures rather than replaying a stale shape.
+    pub(super) capture_warm_seeded: HashMap<ValueId, Vec<usize>>,
+    /// `(domain, op_type)` pairs whose kernel aborted device-graph *recording*
+    /// during a capture pass (e.g. it declared `CaptureSupport::Supported` but
+    /// issued a stream synchronize, which CUDA rejects mid-capture). Warm-decode
+    /// shape seeding can admit such a node once its output shape is known; if the
+    /// resulting capture fails, the offending op-type is quarantined here and
+    /// [`Executor::node_capture_reason`] then forces every node of that op-type
+    /// to a forced eager seam, so the capture is re-planned and the remaining
+    /// genuinely-capturable ops still fold. Grows monotonically within an
+    /// executor: a kernel that breaks recording once breaks it every time.
+    pub(super) capture_quarantine_ops: HashSet<(String, String)>,
+}
+
 /// The compiled, runnable graph: buffers + plan + kernel cache. Owned by the
 /// public [`InferenceSession`](crate::InferenceSession).
 pub(crate) struct Executor {
@@ -81,14 +141,14 @@ pub(crate) struct Executor {
     /// skipped. A predicate flip re-runs the branch (and, on an output-shape
     /// change, retires the captured graph via the existing seam invalidation).
     pub(super) if_last_predicate: HashMap<NodeId, bool>,
-    pub(super) device_graph_signature: Option<Vec<DeviceBindingSignature>>,
-    /// The captured-segment schedule from the most recent successful capture,
-    /// reused to interleave segment replays with eager seam nodes on each
-    /// subsequent step. `None` when no device graph is installed.
-    pub(super) capture_schedule: Option<CaptureSchedule>,
-    /// Structured segment-boundary reasons from the most recent capture, retained
-    /// for diagnostics after `capture_schedule` is taken for replay.
-    pub(super) capture_segmentation: Vec<CaptureDecline>,
+    /// Per-slot host-side captured-graph bookkeeping, indexed by
+    /// [`Self::graph_slot`]'s [`DeviceGraphSlot::index`]. Splitting these fields
+    /// off per slot lets the M=1 `Primary` decode graph and the M=k+1 `Verify`
+    /// speculative-verify graph coexist on one executor without clobbering each
+    /// other's captured signature/schedule/warm state every step (the `replays=0`
+    /// MTP blocker). Greedy only ever drives `Primary` (index 0), so its
+    /// bookkeeping stays byte-identical to the historical single-field layout.
+    pub(super) slot_capture: [SlotCaptureState; DeviceGraphSlot::COUNT],
     /// Output value ids of every control-flow (`If`/`Loop`/`Scan`) node. ONNX
     /// shape inference cannot statically resolve a control-flow output whose
     /// branches declare different shapes (e.g. LongRoPE's `If` selecting a short
@@ -99,40 +159,6 @@ pub(crate) struct Executor {
     /// shape from the prior run for capture planning, folding those consumers
     /// back into captured segments. Computed once at build.
     pub(super) control_flow_output_values: HashSet<ValueId>,
-    /// Concrete control-flow output shapes the most recent capture assumed (a
-    /// snapshot of the seeded shapes from [`Self::control_flow_output_values`]).
-    /// On replay the control-flow seam re-executes eagerly; if it now produces a
-    /// different shape (a branch flip, e.g. LongRoPE short↔long at the context
-    /// threshold) the installed graph's baked device pointers are stale, so the
-    /// step falls back to eager and the graph is retired for re-capture.
-    pub(super) capture_cf_shapes: HashMap<ValueId, Vec<usize>>,
-    /// Persistent-binding signature the most recent eager warmup ran under (see
-    /// [`ExternalBindings::capture_signature`]). Capture-mode shape seeding only
-    /// trusts the warm just-in-time shapes recorded in [`Self::buffer_shapes`]
-    /// when a later step presents this exact signature, so any changed pointer
-    /// or capacity withholds the seed instead of baking a stale shape.
-    pub(super) capture_warm_signature: Option<Vec<ExternalCaptureSig>>,
-    /// Every value's concrete just-in-time shape as resolved by the most recent
-    /// eager warmup. The data-dependent decode shapes we seed for capture are
-    /// JIT-sized on the compute path (which populates `buffers` but not
-    /// [`Self::buffer_shapes`]), so the authoritative warm geometry is snapshotted
-    /// from the eager run's fully-resolved shape map, not the buffer bookkeeping.
-    pub(super) capture_warm_shapes: HashMap<ValueId, Vec<usize>>,
-    /// The warm decode shapes actually seeded into the most recent capture. After
-    /// the capture pass re-resolves each node's true shape, a divergence here
-    /// means the warm seed was stale for this step, so the graph is retired and
-    /// the caller re-warms/re-captures rather than replaying a stale shape.
-    pub(super) capture_warm_seeded: HashMap<ValueId, Vec<usize>>,
-    /// `(domain, op_type)` pairs whose kernel aborted device-graph *recording*
-    /// during a capture pass (e.g. it declared `CaptureSupport::Supported` but
-    /// issued a stream synchronize, which CUDA rejects mid-capture). Warm-decode
-    /// shape seeding can admit such a node once its output shape is known; if the
-    /// resulting capture fails, the offending op-type is quarantined here and
-    /// [`Self::node_capture_reason`] then forces every node of that op-type to a
-    /// forced eager seam, so the capture is re-planned and the remaining
-    /// genuinely-capturable ops still fold. Grows monotonically within an
-    /// executor: a kernel that breaks recording once breaks it every time.
-    pub(super) capture_quarantine_ops: HashSet<(String, String)>,
     /// Build-time set of GROWING symbols: the KV/past/total-sequence-length
     /// symbols on the sequence axis of attention `present`/`past` KV caches (GQA,
     /// default `Attention`, `IndexShare`, `CompressedSparseAttention` — incl. the

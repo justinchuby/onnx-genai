@@ -1447,10 +1447,13 @@ impl InferenceSession {
 
     /// Route the **main** executor's CUDA-graph capture/replay/reset to the given
     /// slot. The main executor defaults to [`DeviceGraphSlot::Primary`]; native
-    /// MTP self-speculative decode retargets it to [`DeviceGraphSlot::Verify`] so
-    /// a fixed M=k+1 verify forward captures into an independent slot while the
-    /// decode-inline sibling keeps its M=1 decode graph in Primary. Resets the
-    /// old slot's installed graph on switch; idempotent when already set.
+    /// MTP self-speculative decode retargets it to [`DeviceGraphSlot::Verify`]
+    /// around each fixed M=k+1 verify forward so that forward captures/replays
+    /// into an independent slot, then switches back to `Primary` for the M=1
+    /// decode. Because the executor now holds **per-slot** host capture state,
+    /// the switch is a pure retarget — it does NOT reset the other slot's
+    /// installed graph — so `Primary` (M=1) and `Verify` (M=k+1) graphs coexist
+    /// and each replays across steps.
     ///
     /// Safe to leave at Primary (the default) for every non-MTP path, which keeps
     /// greedy byte-identical: all main-exec graph calls then route to the same

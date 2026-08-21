@@ -4935,7 +4935,8 @@ fn quarantined_op_type_is_forced_to_a_capture_recording_failed_seam() {
     // Quarantine the Cast op-type (as the capture retry loop does after a
     // kernel aborts recording) and re-check: it is now a forced eager seam
     // regardless of its resolved shapes or kernel capability.
-    exec.capture_quarantine_ops
+    exec.cap_mut()
+        .capture_quarantine_ops
         .insert(("ai.onnx".to_string(), "Cast".to_string()));
     let post = exec.node_capture_reason(&exec.plan[cast_pi], &resolved);
     assert_eq!(
