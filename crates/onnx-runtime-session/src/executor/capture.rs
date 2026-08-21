@@ -559,10 +559,10 @@ impl Executor {
         resolved: &mut HashMap<ValueId, Vec<usize>>,
         external: &ExternalBindings,
     ) {
-        self.capture_warm_seeded.clear();
+        self.cap_mut().capture_warm_seeded.clear();
         // Trust the warm just-in-time shapes only for the exact signature they
         // were derived under; otherwise leave values unresolved (eager seams).
-        if self.capture_warm_signature.as_ref() != Some(&external.capture_signature()) {
+        if self.cap().capture_warm_signature.as_ref() != Some(&external.capture_signature()) {
             return;
         }
         let external_values: HashSet<ValueId> = external
@@ -572,6 +572,7 @@ impl Executor {
             .copied()
             .collect();
         let warm: Vec<(ValueId, Vec<usize>)> = self
+            .cap()
             .capture_warm_shapes
             .iter()
             .map(|(&vid, shape)| (vid, shape.clone()))
@@ -584,7 +585,7 @@ impl Executor {
             {
                 continue;
             }
-            self.capture_warm_seeded.insert(vid, shape.clone());
+            self.cap_mut().capture_warm_seeded.insert(vid, shape.clone());
             resolved.insert(vid, shape);
         }
     }
@@ -604,7 +605,7 @@ impl Executor {
             return false;
         }
         self.plan[pi].outputs.iter().any(|out| {
-            match (self.capture_cf_shapes.get(out), resolved.get(out)) {
+            match (self.cap().capture_cf_shapes.get(out), resolved.get(out)) {
                 (Some(captured), Some(current)) => captured != current,
                 (Some(_), None) => true,
                 _ => false,
@@ -623,6 +624,7 @@ impl Executor {
         // to an eager seam so warm-decode shape seeding can still fold the rest of
         // the graph instead of one mislabeled kernel aborting the whole capture.
         if self
+            .cap()
             .capture_quarantine_ops
             .contains(&(canonical_domain(node), node.op_type.clone()))
         {
