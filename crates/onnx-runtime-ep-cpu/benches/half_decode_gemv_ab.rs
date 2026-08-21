@@ -52,7 +52,7 @@ use std::time::Instant;
 use common::{FloatDType, Tensor};
 use onnx_runtime_ep_api::{ExecutionProvider, Kernel};
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
-use onnx_runtime_ir::{Node, NodeId};
+use onnx_runtime_ir::{Attribute, Node, NodeId};
 
 fn floats(len: usize, seed: f32) -> Vec<f32> {
     (0..len)
@@ -81,6 +81,22 @@ fn build_kernel(m: usize, k: usize, n: usize) -> Box<dyn Kernel> {
     let mut kernel = CpuExecutionProvider::new()
         .get_kernel(&node, &[vec![m, k], vec![k, n]], 1)
         .expect("CPU EP must register MatMul");
+    kernel.set_constant_inputs(&[false, true]);
+    kernel
+}
+
+/// `Gemm` with `transB = 1` -- the `[N, K]` stored order every `nn.Linear`
+/// export produces, and the one `MatMul` cannot express.
+///
+/// The `[K, N]` arm above cannot reach the `[N, K]` GEMV at all, so without
+/// this the transposed route had no benchmark row. That is the coverage gap
+/// that let a `bf16` decode sit on the blocked GEMM unmeasured.
+fn build_gemm_transb(m: usize, k: usize, n: usize) -> Box<dyn Kernel> {
+    let mut node = Node::new(NodeId(0), "Gemm", vec![], vec![]);
+    node.attributes.insert("transB".into(), Attribute::Int(1));
+    let mut kernel = CpuExecutionProvider::new()
+        .get_kernel(&node, &[vec![m, k], vec![n, k]], 1)
+        .expect("CPU EP must register Gemm");
     kernel.set_constant_inputs(&[false, true]);
     kernel
 }
@@ -175,8 +191,13 @@ fn main() {
         "dtype", "shape", "k", "n", "cold_ms", "steady_ms", "GB/s", "gflops", "max_rel", "digest"
     );
     let m = 1;
+    let trans_b = std::env::var("PROBE_OP").as_deref() == Ok("gemm_transb");
     for dtype in [FloatDType::F32, FloatDType::F16, FloatDType::Bf16] {
         for &(label, k, n) in &shapes {
+            if trans_b {
+                run_transposed(dtype, label, m, k, n);
+                continue;
+            }
             let b = Tensor::floats(dtype, &[k, n], &floats(k * n, 0.3));
             let a = Tensor::floats(dtype, &[m, k], &floats(m * k, 1.1));
             let mut out = Tensor::zeros(dtype, &[m, n]);
@@ -223,4 +244,66 @@ fn main() {
             );
         }
     }
+}
+
+/// One transposed-`Gemm` row, timed exactly like the `[K, N]` arm above.
+///
+/// The weight is generated in `[K, N]` and transposed into `[N, K]` so the
+/// values -- and therefore the reference and the digest -- are identical to the
+/// untransposed row of the same shape. A route that silently reinterpreted the
+/// bit patterns would move `max_rel`, not just the timing.
+fn run_transposed(dtype: FloatDType, label: &str, m: usize, k: usize, n: usize) {
+    let values = floats(k * n, 0.3);
+    let mut transposed = vec![0.0f32; n * k];
+    for p in 0..k {
+        for j in 0..n {
+            transposed[j * k + p] = values[p * n + j];
+        }
+    }
+    let b = Tensor::floats(dtype, &[n, k], &transposed);
+    let a = Tensor::floats(dtype, &[m, k], &floats(m * k, 1.1));
+    let mut out = Tensor::zeros(dtype, &[m, n]);
+    let ins = vec![a.view(), b.view()];
+
+    let cold = median(
+        (0..3)
+            .map(|_| {
+                let kernel = build_gemm_transb(m, k, n);
+                let start = Instant::now();
+                kernel
+                    .execute(&ins, &mut [out.view_mut()])
+                    .expect("execute");
+                start.elapsed().as_secs_f64() * 1e3
+            })
+            .collect(),
+    );
+
+    let kernel = build_gemm_transb(m, k, n);
+    for _ in 0..2 {
+        kernel.execute(&ins, &mut [out.view_mut()]).expect("warmup");
+    }
+    let steady = median(
+        (0..7)
+            .map(|_| {
+                let start = Instant::now();
+                kernel
+                    .execute(&ins, &mut [out.view_mut()])
+                    .expect("execute");
+                start.elapsed().as_secs_f64() * 1e3
+            })
+            .collect(),
+    );
+
+    let reference_b = Tensor::floats(dtype, &[k, n], &values);
+    let weight_bytes = (k * n * dtype.size_of()) as f64;
+    let got = out.to_f32();
+    println!(
+        "{:>6} {label:>8} {k:>6} {n:>7} {cold:>10.3} {steady:>10.3} {:>9.1} \
+         {:>8.2} {:>10.2e} {:>18}",
+        dtype.name(),
+        weight_bytes / (steady * 1e6),
+        (2.0 * m as f64 * k as f64 * n as f64) / (steady * 1e6),
+        max_relative_deviation(&got, &reference(&a, &reference_b, m, k, n)),
+        digest(&got)
+    );
 }

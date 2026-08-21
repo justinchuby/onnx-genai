@@ -1600,3 +1600,48 @@ until `A` came down, halving bytes/weight was invisible (v1 measured 1-5%). Two
 changes moved it: hoisting a per-block `is_x86_feature_detected!` off a
 non-`target_feature` call boundary (17.1 -> 15.0) and tiling four `k` blocks
 through one reduction tree and one vector tail (15.0 -> **8.5**).
+
+### 19. The `[N, K]` decode GEMV existed only in an `f16` spelling, and a transposed `bf16` decode paid 21x-101x for it
+
+The asymmetry §15 recorded as still open, closed. `Gemm` with `transB = 1` on a
+`bf16` weight declined the decode GEMV and fell to the portable path: **0.038 ms
+-> 0.810 ms** at `k=1024, n=768`, **3.42 ms -> 201.9 ms** at a 896x151936
+`lm_head`, 21x-101x across the `full` shape set at 8 threads.
+
+**It was never a policy question.** §15 called it "kernel coverage, not policy"
+and that was exactly right. The `[K, N]` stripe kernel had already been made
+per-format by a macro — `#[target_feature]` is an attribute on a concrete
+function, and `bf16` must not be made to ask for the `f16c` unit it widens
+without — but the `[N, K]` row kernel never got the same treatment. So `trans_b`
+was selecting on **dtype** where it should have been selecting on **layout**.
+The `[N, K]` row dot is now instantiated per format from one macro
+(`dot_row_simd_f16` / `dot_row_simd_bf16`), `HalfFormat` is threaded through
+`gemv_f16_nk` -> `gemv_half_nk` and `dot_row_scalar`, and the
+`(!trans_b || format == HalfFormat::F16)` term is deleted. Both operators, both
+stored orders and both 16-bit formats reach one backend.
+
+**Why nothing caught it.** The transposed route had **no benchmark row at all** —
+`half_decode_gemv_ab` built a `MatMul`, which cannot express `transB`. That is
+the third time this file records an unmeasured region behind a gate (cf. §11,
+§12, §14), and the repair is the same shape: `PROBE_OP=gemm_transb` now builds a
+`Gemm` node with the weight transposed into `[N, K]`, so the route has a row.
+
+**The pins are numeric, not just route counters**, because reading a `bf16`
+weight through the `f16` kernel does not fault — it silently reinterprets every
+bit pattern. `a_transposed_bf16_decode_takes_the_same_gemv_as_f16` checks the
+route *and* an `f64`-referenced bound, `kn_and_nk_agree_on_the_same_bf16_weight`
+checks the two stored orders against each other, and
+`nk_simd_and_scalar_rows_agree_bit_for_bit` now runs both formats. Forcing the
+`f16` kernel fails the first two and nothing else, which is the mutation that
+matters.
+
+**Disclosed:** the `f32` null control on this shared host spans 0.795-1.264
+(+-26%). Several GB/s figures read above the 75.8 GB/s DRAM number, and the
+reason is **not** uniform: the mid-size rows are L3-resident (a 4096x4096 `bf16`
+weight is 33.6 MB against a 64 MiB L3), but the 896x151936 `lm_head` is 272 MB
+and cannot be — its 79.5 GB/s is a ~5% overshoot of a quoted DRAM figure that is
+itself approximate. Neither reading is a roofline violation and neither is
+evidence of one; a bandwidth percentage means nothing until the denominator is
+shown to bind, which is the error §18 had to correct in the other direction.
+Full record:
+[`docs/benchmarks/2026-08-21-gemm-transposed-bf16-decode-gemv.md`](../benchmarks/2026-08-21-gemm-transposed-bf16-decode-gemv.md).
