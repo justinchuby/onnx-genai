@@ -4946,6 +4946,65 @@ fn quarantined_op_type_is_forced_to_a_capture_recording_failed_seam() {
     );
 }
 
+/// Per-slot host capture state isolates `Primary` (M=1 decode / greedy) from
+/// `Verify` (M=k+1 speculative verify). Retargeting the graph slot is a pure
+/// pointer move that must NOT reset the other slot — that is the invariant that
+/// lets the two captured graphs coexist and, crucially, keeps greedy (which only
+/// ever drives `Primary`) byte-identical when MTP flips the executor to `Verify`
+/// and back around each verify forward.
+#[test]
+fn set_graph_slot_is_non_resetting_and_per_slot_isolated() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let x = graph.create_named_value("x", DataType::Int64, static_shape([4]));
+    graph.add_input(x);
+    let y = graph.create_named_value("y", DataType::Float32, static_shape([4]));
+    let mut cast = Node::new(NodeId(0), "Cast", vec![Some(x)], vec![y]);
+    cast.attributes
+        .insert("to".into(), Attribute::Int(DataType::Float32 as i64));
+    graph.insert_node(cast);
+    graph.add_output(y);
+
+    let mut exec = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+    )
+    .unwrap();
+
+    // The main executor defaults to Primary (greedy's only slot).
+    assert_eq!(exec.graph_slot(), DeviceGraphSlot::Primary);
+    assert_eq!(DeviceGraphSlot::Primary.index(), 0);
+    assert_eq!(DeviceGraphSlot::Verify.index(), 1);
+
+    // Seed a distinctive marker into Primary's host capture state.
+    let primary_key = ("ai.onnx".to_string(), "PrimaryMark".to_string());
+    exec.cap_mut().capture_quarantine_ops.insert(primary_key.clone());
+
+    // Flip to Verify: a pure retarget. Verify starts empty (no bleed from
+    // Primary), and Primary's marker survives untouched.
+    exec.set_graph_slot(DeviceGraphSlot::Verify).unwrap();
+    assert_eq!(exec.graph_slot(), DeviceGraphSlot::Verify);
+    assert!(
+        exec.cap().capture_quarantine_ops.is_empty(),
+        "Verify slot must not observe Primary's capture state"
+    );
+    let verify_key = ("ai.onnx".to_string(), "VerifyMark".to_string());
+    exec.cap_mut().capture_quarantine_ops.insert(verify_key.clone());
+
+    // Flip back to Primary: its marker is still present (the switch did NOT
+    // reset it), and Verify's marker did not leak in.
+    exec.set_graph_slot(DeviceGraphSlot::Primary).unwrap();
+    assert!(
+        exec.cap().capture_quarantine_ops.contains(&primary_key),
+        "switching slots must not reset Primary's host capture state"
+    );
+    assert!(
+        !exec.cap().capture_quarantine_ops.contains(&verify_key),
+        "Verify's capture state must not leak into Primary"
+    );
+}
+
 // ===================================================================
 // F5 Stage 1 — steady-state decode-plan memo guard tests.
 // ===================================================================
