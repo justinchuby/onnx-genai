@@ -37,7 +37,7 @@
 //! sweep of `RAYON_NUM_THREADS` therefore holds the width fixed while appearing
 //! to vary it, and reports a flat line that reads exactly like "this kernel
 //! does not scale". It does scale: measured here at block 32, accuracy 4,
-//! 8 threads -> 5.90 ms/token and 16 -> 3.32 ms/token (1.78x, +-0.7% over
+//! 8 threads -> 5.90 ms/token and 16 -> 3.32 ms/token (1.77x, +-0.7% over
 //! three interleaved repetitions). The default width already resolves to 16 on
 //! a 32-vCPU host, for both the persistent and the flat pool.
 
