@@ -365,10 +365,9 @@ impl PipelineModelDirectory {
             let mut resolved = Vec::with_capacity(tokenizer.artifacts.len());
             for artifact in &tokenizer.artifacts {
                 resolved.push(
-                    onnx_genai_metadata::resolve_hashed_package_artifact(
+                    onnx_genai_metadata::resolve_package_artifact(
                         root,
                         &artifact.location,
-                        &artifact.sha256,
                         "package tokenizer",
                     )
                     .map_err(|error| OrtError::InvalidArgument(error.to_string()))?,
@@ -926,8 +925,6 @@ mod tests {
     use std::fs;
 
     const TOKENIZER_BYTES: &[u8] = b"{}";
-    const TOKENIZER_SHA256: &str =
-        "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
 
     fn copy_directory(source: &Path, destination: &Path) {
         fs::create_dir_all(destination).unwrap();
@@ -943,7 +940,7 @@ mod tests {
         }
     }
 
-    fn staged_pipeline(name: &str, location: &str, checksum: Option<&str>) -> PathBuf {
+    fn staged_pipeline(name: &str, location: &str) -> PathBuf {
         let source = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/onnx_genai_workflows/static_cache");
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -953,12 +950,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         copy_directory(&source, &root);
         let mut metadata = fs::read_to_string(source.join("inference_metadata.yaml")).unwrap();
-        let artifact = match checksum {
-            Some(checksum) => {
-                format!("    artifacts:\n    - location: {location}\n      sha256: '{checksum}'\n")
-            }
-            None => format!("    artifacts:\n    - location: {location}\n"),
-        };
+        let artifact = format!("    artifacts:\n    - location: {location}\n");
         metadata = metadata.replace(
             "    byte_level: true\n",
             &format!("    byte_level: true\n{artifact}"),
@@ -987,11 +979,7 @@ mod tests {
 
     #[test]
     fn pipeline_resolves_nested_declared_tokenizer_artifact() {
-        let root = staged_pipeline(
-            "nested",
-            "assets/tokenizers/tokenizer.json",
-            Some(TOKENIZER_SHA256),
-        );
+        let root = staged_pipeline("nested", "assets/tokenizers/tokenizer.json");
         write_tokenizer(&root, "assets/tokenizers/tokenizer.json", TOKENIZER_BYTES);
 
         let directory = PipelineModelDirectory::load(&root).unwrap();
@@ -1006,30 +994,37 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_rejects_wrong_tokenizer_checksum() {
-        let root = staged_pipeline("wrong-hash", "tokenizer.json", Some(&"0".repeat(64)));
+    fn pipeline_allows_declared_tokenizer_bytes_to_be_replaced() {
+        let root = staged_pipeline("replaceable", "tokenizer.json");
         write_tokenizer(&root, "tokenizer.json", TOKENIZER_BYTES);
+        PipelineModelDirectory::load(&root).unwrap();
 
-        let error = PipelineModelDirectory::load(&root).unwrap_err().to_string();
-        assert!(error.contains("checksum mismatch"), "{error}");
+        fs::write(root.join("tokenizer.json"), b"{\"replacement\":true}").unwrap();
+        let directory = PipelineModelDirectory::load(&root).unwrap();
+        assert_eq!(
+            directory.tokenizer_paths.shared,
+            Some(root.join("tokenizer.json").canonicalize().unwrap())
+        );
     }
 
     #[test]
-    fn pipeline_rejects_missing_tokenizer_checksum() {
-        let root = staged_pipeline("missing-hash", "tokenizer.json", None);
+    fn pipeline_rejects_retired_tokenizer_hash_field() {
+        let root = staged_pipeline("retired-hash", "tokenizer.json");
         write_tokenizer(&root, "tokenizer.json", TOKENIZER_BYTES);
+        let metadata_path = root.join("inference_metadata.yaml");
+        let metadata = fs::read_to_string(&metadata_path).unwrap().replace(
+            "    - location: tokenizer.json\n",
+            "    - location: tokenizer.json\n      sha256: retired\n",
+        );
+        fs::write(metadata_path, metadata).unwrap();
 
         let error = PipelineModelDirectory::load(&root).unwrap_err().to_string();
-        assert!(error.contains("missing field `sha256`"), "{error}");
+        assert!(error.contains("unknown field `sha256`"), "{error}");
     }
 
     #[test]
     fn pipeline_rejects_missing_declared_tokenizer_file() {
-        let root = staged_pipeline(
-            "missing-file",
-            "nested/tokenizer.json",
-            Some(TOKENIZER_SHA256),
-        );
+        let root = staged_pipeline("missing-file", "nested/tokenizer.json");
 
         let error = PipelineModelDirectory::load(&root).unwrap_err().to_string();
         assert!(error.contains("cannot be opened"), "{error}");
@@ -1038,11 +1033,7 @@ mod tests {
 
     #[test]
     fn pipeline_rejects_declared_tokenizer_directory() {
-        let root = staged_pipeline(
-            "not-a-file",
-            "nested/tokenizer.json",
-            Some(TOKENIZER_SHA256),
-        );
+        let root = staged_pipeline("not-a-file", "nested/tokenizer.json");
         fs::create_dir_all(root.join("nested/tokenizer.json")).unwrap();
 
         let error = PipelineModelDirectory::load(&root).unwrap_err().to_string();
@@ -1051,11 +1042,7 @@ mod tests {
 
     #[test]
     fn pipeline_rejects_tokenizer_path_escape() {
-        let root = staged_pipeline(
-            "escape",
-            "../escaped-tokenizer.json",
-            Some(TOKENIZER_SHA256),
-        );
+        let root = staged_pipeline("escape", "../escaped-tokenizer.json");
         fs::write(
             root.parent().unwrap().join("escaped-tokenizer.json"),
             TOKENIZER_BYTES,
@@ -1068,11 +1055,7 @@ mod tests {
 
     #[test]
     fn declared_tokenizer_is_not_overridden_by_unrelated_root_file() {
-        let root = staged_pipeline(
-            "explicit-beats-root",
-            "nested/tokenizer.json",
-            Some(TOKENIZER_SHA256),
-        );
+        let root = staged_pipeline("explicit-beats-root", "nested/tokenizer.json");
         write_tokenizer(&root, "nested/tokenizer.json", TOKENIZER_BYTES);
         fs::write(root.join("tokenizer.json"), b"unrelated").unwrap();
 

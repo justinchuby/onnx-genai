@@ -348,7 +348,6 @@ package:
     byte_level: true
     artifacts:
     - location: tokenizer.json
-      sha256: '0000000000000000000000000000000000000000000000000000000000000000'
     special_tokens:
       bos: {id: 1, content: <s>}
       eos: {id: 2, content: </s>}
@@ -711,7 +710,6 @@ package:
     byte_level: true
     artifacts:
     - location: tokenizer.json
-      sha256: '0000000000000000000000000000000000000000000000000000000000000000'
     special_tokens:
       bos: {id: 1, content: <s>}
       eos: {id: 2, content: </s>}

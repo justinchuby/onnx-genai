@@ -3,7 +3,6 @@ use onnx_genai_metadata::{InferenceMetadata, WorkflowNode, compile_workflow, val
 const ADAPTER_WORKFLOW: &str = r#"
 schema_version: v1
 adapters:
-  base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   target_manifest:
     targets:
       - id: projection
@@ -40,7 +39,6 @@ adapters:
       index: 0
       identity: red
       version: "1"
-      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       rank: 1
       alpha: 1.0
       dtype: float32
@@ -48,7 +46,6 @@ adapters:
       weights:
         - location: adapters/red/adapter.json
           loader_capability: onnx-genai.adapters.json@1
-          sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
           scale_encoding: alpha_over_rank
           format: json
       bindings:
@@ -131,28 +128,79 @@ fn workflow_custom_op_admission_fields_are_rejected() {
 
 #[test]
 fn adapter_service_rejects_incompatible_or_unsafe_artifacts() {
-    let invalid = ADAPTER_WORKFLOW
-        .replace(
-            "base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n      rank",
-            "base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n      rank",
-        )
-        .replace(
-            "location: adapters/red/adapter.json",
-            "location: ../outside/red.json",
-        );
+    let invalid = ADAPTER_WORKFLOW.replace(
+        "location: adapters/red/adapter.json",
+        "location: ../outside/red.json",
+    );
     let metadata: InferenceMetadata =
         serde_yaml::from_str(&invalid).expect("invalid adapter workflow parses");
     let errors = validate_metadata(&metadata).expect_err("invalid adapter workflow must fail");
     assert!(
         errors
             .iter()
-            .any(|error| error.contains("does not match service fingerprint"))
-    );
-    assert!(
-        errors
-            .iter()
             .any(|error| error.contains("must be under package path adapters/red/"))
     );
+}
+
+#[test]
+fn retired_artifact_hash_fields_are_rejected_as_unknown() {
+    for (name, document, field) in [
+        (
+            "component",
+            r#"
+pipeline:
+  workflow:
+    components:
+      model:
+        implementation: {kind: onnx, artifact: model.onnx, sha256: retired}
+        ports: {}
+    steps: []
+"#
+            .to_string(),
+            "sha256",
+        ),
+        (
+            "tokenizer",
+            r#"
+package:
+  tokenizer:
+    algorithm: bpe
+    vocab_size: 1
+    artifacts:
+      - {location: tokenizer.json, sha256: retired}
+"#
+            .to_string(),
+            "sha256",
+        ),
+        (
+            "adapter service",
+            ADAPTER_WORKFLOW.replace(
+                "adapters:\n",
+                "adapters:\n  base_model_fingerprint: retired\n",
+            ),
+            "base_model_fingerprint",
+        ),
+        (
+            "adapter artifact",
+            ADAPTER_WORKFLOW.replace(
+                "          loader_capability: onnx-genai.adapters.json@1\n",
+                "          loader_capability: onnx-genai.adapters.json@1\n          sha256: retired\n",
+            ),
+            "sha256",
+        ),
+        (
+            "adapter config",
+            ADAPTER_WORKFLOW.replace(
+                "          loader_capability: onnx-genai.adapters.json@1\n",
+                "          loader_capability: onnx-genai.adapters.json@1\n          config_sha256: retired\n",
+            ),
+            "config_sha256",
+        ),
+    ] {
+        let error = serde_yaml::from_str::<InferenceMetadata>(&document)
+            .expect_err(&format!("retired {name} field must be rejected"));
+        assert!(error.to_string().contains(field), "{name}: {error}");
+    }
 }
 
 #[test]

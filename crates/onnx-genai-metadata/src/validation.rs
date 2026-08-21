@@ -880,16 +880,6 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
     }
 }
 
-fn valid_adapter_base_fingerprint(value: &str) -> bool {
-    let Some(digest) = value.strip_prefix("onnx-genai-targeted-base-v1:sha256:") else {
-        return false;
-    };
-    digest.len() == 64
-        && digest
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn validate_adapter_selection_input(
     workflow: &WorkflowSpec,
@@ -958,13 +948,6 @@ fn validate_adapter_service(
     workflow: Option<&WorkflowSpec>,
     errors: &mut Vec<String>,
 ) {
-    if !valid_adapter_base_fingerprint(&service.base_model_fingerprint) {
-        errors.push(
-            "adapters.base_model_fingerprint must be \
-             onnx-genai-targeted-base-v1:sha256:<64 lowercase hexadecimal characters>"
-                .into(),
-        );
-    }
     if service.application_capability.trim().is_empty() {
         errors.push("adapters.application_capability must not be empty".into());
     } else if service.application_capability != "onnx-genai.adapters@1" {
@@ -1166,12 +1149,6 @@ fn validate_adapter_service(
                 artifact.identity, artifact.version
             ));
         }
-        if artifact.base_model_fingerprint != service.base_model_fingerprint {
-            errors.push(format!(
-                "{path}.base_model_fingerprint '{}' does not match service fingerprint '{}'",
-                artifact.base_model_fingerprint, service.base_model_fingerprint
-            ));
-        }
         if artifact.rank == 0 {
             errors.push(format!("{path}.rank must be greater than zero"));
         }
@@ -1249,20 +1226,10 @@ fn validate_adapter_service(
                     "{path}.weights[{index}].scale_encoding must be baked for ort_genai"
                 )),
             }
-            if weight.sha256.len() != 64
-                || !weight
-                    .sha256
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-            {
-                errors.push(format!(
-                    "{path}.weights[{index}].sha256 must be 64 lowercase hexadecimal characters"
-                ));
-            }
             let peft = weight.format == crate::schema::AdapterWeightFormat::HfPeft;
-            if peft != weight.config_location.is_some() || peft != weight.config_sha256.is_some() {
+            if peft != weight.config_location.is_some() {
                 errors.push(format!(
-                    "{path}.weights[{index}] hf_peft requires config_location and config_sha256; other formats forbid them"
+                    "{path}.weights[{index}] hf_peft requires config_location; other formats forbid it"
                 ));
             }
             if let Some(config_location) = &weight.config_location
@@ -1274,16 +1241,6 @@ fn validate_adapter_service(
             {
                 errors.push(format!(
                     "{path}.weights[{index}].config_location must be under package path adapters/{name}/"
-                ));
-            }
-            if let Some(config_sha256) = &weight.config_sha256
-                && (config_sha256.len() != 64
-                    || !config_sha256
-                        .bytes()
-                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
-            {
-                errors.push(format!(
-                    "{path}.weights[{index}].config_sha256 must be 64 lowercase hexadecimal characters"
                 ));
             }
         }

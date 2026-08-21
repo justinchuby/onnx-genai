@@ -6,7 +6,6 @@ use onnx_genai_engine::{
     PipelineEngine, PipelineGenerateRequest,
 };
 use onnx_genai_ort::Value;
-use sha2::{Digest, Sha256};
 
 fn package(metadata: &str, red: &[u8], blue: &[u8]) -> anyhow::Result<PathBuf> {
     let root =
@@ -70,7 +69,6 @@ fn heterogeneous_parameter_adapters_match_independent_rows_and_compaction() -> a
         r#"
 schema_version: v1
 adapters:
-  base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   target_manifest:
     targets:
       - id: projection
@@ -97,26 +95,24 @@ adapters:
       index: 0
       identity: red
       version: "1"
-      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       rank: 1
       alpha: 1.0
       dtype: float32
       weights:
         - {{ location: adapters/red/adapter.json, loader_capability: onnx-genai.adapters.json@1,
-             sha256: {red_sha}, scale_encoding: alpha_over_rank }}
+             scale_encoding: alpha_over_rank }}
       bindings:
         - {{ target: projection, weight_key: projection }}
     blue:
       index: 1
       identity: blue
       version: "1"
-      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       rank: 1
       alpha: 1.0
       dtype: float32
       weights:
         - {{ location: adapters/blue/adapter.json, loader_capability: onnx-genai.adapters.json@1,
-             sha256: {blue_sha}, scale_encoding: alpha_over_rank }}
+             scale_encoding: alpha_over_rank }}
       bindings:
         - {{ target: projection, weight_key: projection }}
 pipeline:
@@ -175,15 +171,7 @@ pipeline:
         value: adapted
         output: result
         mode: replace
-"#,
-        red_sha = Sha256::digest(red)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>(),
-        blue_sha = Sha256::digest(blue)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>(),
+"#
     );
     let root = package(&metadata, red, blue)?;
     let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;

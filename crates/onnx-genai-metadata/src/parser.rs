@@ -442,17 +442,14 @@ fn validate_adapter_artifacts(
 ) -> Result<(), crate::MetadataError> {
     for (alias, artifact) in &service.artifacts {
         for (index, source) in artifact.weights.iter().enumerate() {
-            let mut files = vec![("weights", source.location.as_str(), source.sha256.as_str())];
-            if let (Some(location), Some(checksum)) =
-                (&source.config_location, &source.config_sha256)
-            {
-                files.push(("config", location.as_str(), checksum.as_str()));
+            let mut files = vec![("weights", source.location.as_str())];
+            if let Some(location) = &source.config_location {
+                files.push(("config", location.as_str()));
             }
-            for (kind, location, expected) in files {
-                resolve_hashed_package_artifact(
+            for (kind, location) in files {
+                resolve_package_artifact(
                     root,
                     location,
-                    expected,
                     &format!("adapter '{alias}' source {index} {kind}"),
                 )?;
             }
@@ -461,18 +458,15 @@ fn validate_adapter_artifacts(
     Ok(())
 }
 
-/// Resolve one package-relative file and verify its exact SHA-256.
+/// Resolve one package-relative file.
 ///
 /// Canonicalizing both paths rejects symlink and `..` escapes. Callers receive
-/// the canonical file path so the bytes verified here are the bytes they load.
-pub fn resolve_hashed_package_artifact(
+/// the canonical file path so they load the exact confined file admitted here.
+pub fn resolve_package_artifact(
     root: &Path,
     location: &str,
-    expected_sha256: &str,
     description: &str,
 ) -> Result<PathBuf, crate::MetadataError> {
-    use sha2::{Digest, Sha256};
-
     let root = root.canonicalize().map_err(crate::MetadataError::Io)?;
     let candidate = root.join(location);
     let resolved = candidate.canonicalize().map_err(|error| {
@@ -491,13 +485,6 @@ pub fn resolve_hashed_package_artifact(
         return Err(crate::MetadataError::Parse(format!(
             "{description} artifact '{}' is not a file",
             resolved.display()
-        )));
-    }
-    let bytes = std::fs::read(&resolved).map_err(crate::MetadataError::Io)?;
-    let actual = format!("{:x}", Sha256::digest(&bytes));
-    if actual != expected_sha256 {
-        return Err(crate::MetadataError::Parse(format!(
-            "{description} artifact checksum mismatch: expected {expected_sha256}, got {actual}"
         )));
     }
     Ok(resolved)
