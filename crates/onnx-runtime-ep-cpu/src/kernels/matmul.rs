@@ -227,26 +227,48 @@ fn node_weight_transpose_cache_bytes(node: &Node, graph: &Graph) -> u64 {
     }
     // All platforms: `Gemm` with `transB != 0` transposes a constant `B[N,K]`
     // to `[K,N]` and caches it as f32 (`gemm.rs:119`).
+    // Whether this binary contains the x86 16-bit decode GEMV, which transposes
+    // a constant `[K, N]` f16/bf16 weight once so both stored orders can share
+    // the `[N, K]` kernel (`half_decode_gemv_dispatch`).
+    let x86_half_decode = cfg!(any(target_arch = "x86", target_arch = "x86_64"));
+    let half = |dtype: DataType| matches!(dtype, DataType::Float16 | DataType::BFloat16);
+
     if node.op_type == "Gemm" {
         let trans_b = node.attr("transB").and_then(Attribute::as_int).unwrap_or(0) != 0;
-        if !trans_b {
-            return 0;
-        }
-        let Some((numel, _dtype)) = constant_b_numel(node, graph) else {
+        let Some((numel, dtype)) = constant_b_numel(node, graph) else {
             return 0;
         };
-        return numel.saturating_mul(4);
+        // All platforms: `transB != 0` transposes a constant `B[N,K]` to `[K,N]`
+        // and caches it as f32 (`gemm.rs:119`).
+        if trans_b {
+            return numel.saturating_mul(4);
+        }
+        // x86: `transB == 0` holds the weight in the layout the decode GEMV
+        // wants to leave behind, so a 16-bit constant is transposed to `[N, K]`
+        // and cached at its stored width. Nothing is retained for other dtypes:
+        // they never reach this route.
+        if x86_half_decode && half(dtype) {
+            return numel.saturating_mul(2);
+        }
+        return 0;
     }
-    // Apple only: `MatMul` / `FusedMatMulBias` cache a constant `B`'s transpose
-    // in the Accelerate paths (see the function docs). Compiled out elsewhere so
-    // the predictor matches the kernels actually present in this binary.
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
     if node.op_type == "MatMul" || node.op_type == "FusedMatMulBias" {
         let Some((numel, dtype)) = constant_b_numel(node, graph) else {
             return 0;
         };
-        let elem = if dtype == DataType::Float16 { 2 } else { 4 };
-        return numel.saturating_mul(elem);
+        // Apple: both ops cache a constant `B`'s transpose in the Accelerate
+        // paths (see the function docs).
+        if cfg!(any(target_os = "macos", target_os = "ios")) {
+            let elem = if dtype == DataType::Float16 { 2 } else { 4 };
+            return numel.saturating_mul(elem);
+        }
+        // x86 elsewhere: only `MatMul` reaches the decode GEMV --
+        // `FusedMatMulBias` has no 16-bit GEMV on this target and retains
+        // nothing, so counting it would over-budget every fused projection.
+        if x86_half_decode && node.op_type == "MatMul" && half(dtype) {
+            return numel.saturating_mul(2);
+        }
+        return 0;
     }
     0
 }
@@ -612,10 +634,6 @@ pub(crate) struct MatMulPrepack {
     /// was computed for. Stores the raw u16 bit patterns of half::f16 in N×K
     /// layout, read directly from the mmap'd model file without widening to
     /// f32. Only populated when B is a constant Float16 input.
-    #[cfg_attr(
-        not(any(target_os = "macos", target_os = "ios")),
-        allow(dead_code, reason = "consumed only by the Apple Accelerate paths")
-    )]
     transposed_b_f16: OnceLock<(WeightTransposeKey, Arc<Vec<u16>>)>,
     /// Lazily-computed contiguous f16 copy of B for non-contiguous weight
     /// matrices (e.g. lm_head vocab projection stored column-major in the ONNX
@@ -764,8 +782,12 @@ impl MatMulPrepack {
     /// [`transposed_b`](Self::transposed_b) apply: every `Some` is exactly
     /// `n * k` elements long.
     #[cfg_attr(
-        not(any(target_os = "macos", target_os = "ios")),
-        allow(dead_code, reason = "consumed only by the Apple Accelerate paths")
+        not(any(target_os = "macos", target_os = "ios", test)),
+        allow(
+            dead_code,
+            reason = "the f16-only spelling is consumed by the Apple Accelerate paths; \
+                      every other caller goes through `transposed_b_half`"
+        )
     )]
     pub(crate) fn transposed_b_f16(
         &self,
@@ -773,9 +795,30 @@ impl MatMulPrepack {
         k: usize,
         n: usize,
     ) -> Option<&[u16]> {
+        self.transposed_b_half(b_view, k, n, HalfFormat::F16)
+    }
+
+    /// [`transposed_b_f16`](Self::transposed_b_f16) for either 16-bit format.
+    ///
+    /// The transpose itself is a pure permutation of `u16` bit patterns, so it
+    /// is dtype-agnostic -- but serving it is not. `format` names the
+    /// interpretation the *caller* is about to apply, and the view's dtype must
+    /// match it exactly: handing `bf16` bits to an `f16` GEMV would silently
+    /// reinterpret every weight rather than fail, so the check is what keeps
+    /// one shared cache from becoming a type confusion.
+    pub(crate) fn transposed_b_half(
+        &self,
+        b_view: &TensorView,
+        k: usize,
+        n: usize,
+        format: HalfFormat,
+    ) -> Option<&[u16]> {
         use onnx_runtime_ir::DataType;
-        if !self.constant_inputs[1] || b_view.dtype != DataType::Float16 || !b_view.is_contiguous()
-        {
+        let expected = match format {
+            HalfFormat::F16 => DataType::Float16,
+            HalfFormat::Bf16 => DataType::BFloat16,
+        };
+        if !self.constant_inputs[1] || b_view.dtype != expected || !b_view.is_contiguous() {
             return None;
         }
         // #1056: declined cache -> recompute per call, retain nothing.
@@ -792,9 +835,16 @@ impl MatMulPrepack {
         // SAFETY: `b_view` is a contiguous Float16 view whose element count was
         // just checked to equal `k * n`, and it stays live for this call.
         let src = unsafe { std::slice::from_raw_parts(b_view.data_ptr::<u16>(), numel) };
-        let key = WeightTransposeKey::new(src.as_ptr(), k, n);
+        // The tag keeps `f16` and `bf16` apart in the shared `u16` cache; the
+        // dtype check above only proves what *this* view is, not what a hit on
+        // a recycled address was built from.
+        let tag = match format {
+            HalfFormat::F16 => 0,
+            HalfFormat::Bf16 => 1,
+        };
+        let key = WeightTransposeKey::tagged(src.as_ptr(), k, n, tag);
         let (cached_key, bt) = self.transposed_b_f16.get_or_init(|| {
-            let bt = weight_transpose::cached_transpose_f16(src, k, n)
+            let bt = weight_transpose::cached_transpose_half(src, k, n, tag)
                 .expect("length was validated against [k, n] above");
             (key, bt)
         });
@@ -2361,7 +2411,17 @@ impl MatMulKernel {
                 };
                 let mut result = vec![0.0f32; geom.n];
                 count_half_decode_gemv();
-                half_gemv::gemv_half_kn(format, &a_dense, b_bits, &mut result, geom.k, geom.n);
+                half_decode_gemv_dispatch(
+                    format,
+                    &self.prepack,
+                    &inputs[1],
+                    &a_dense,
+                    b_bits,
+                    &mut result,
+                    geom.k,
+                    geom.n,
+                    false,
+                );
                 return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
             }
         }
@@ -3116,6 +3176,90 @@ pub(crate) fn half_decode_gemv_calls() -> u64 {
 #[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
 pub(crate) fn reset_half_decode_gemv_calls() {
     HALF_DECODE_GEMV_CALLS.with(|c| c.set(0));
+}
+
+thread_local! {
+    /// Test-only count of decodes that reached the `[N, K]` GEMV *through the
+    /// transpose cache*, i.e. from a weight the model stored as `[K, N]`.
+    ///
+    /// Separate from `HALF_DECODE_GEMV_CALLS` on purpose: that counter says a
+    /// GEMV ran, this one says *which layout kernel* served it. Only the pair
+    /// distinguishes the three routes a 16-bit decode can take.
+    static HALF_DECODE_TRANSPOSED_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+pub(crate) fn half_decode_transposed_calls() -> u64 {
+    HALF_DECODE_TRANSPOSED_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+pub(crate) fn reset_half_decode_transposed_calls() {
+    HALF_DECODE_TRANSPOSED_CALLS.with(|c| c.set(0));
+}
+
+/// Serve one `m == 1` 16-bit decode from whichever layout kernel is best for
+/// the weight as stored, for every operator that has one.
+///
+/// `trans_b` describes storage, not intent: `true` means the weight is already
+/// `[N, K]`, which is the layout `gemv_half_nk` wants. When it is `false` the
+/// weight is `[K, N]`, and the choice is between reading it in place with
+/// `gemv_half_kn` or transposing it once into the prepack cache and using the
+/// `[N, K]` kernel for the rest of the session.
+///
+/// Measured on this AVX2 host at `t = 1`, transposing wins on *both* axes,
+/// which is why it is preferred whenever the cache admits it:
+///
+/// | shape (k x n)  | `kn` in place | `nk` transposed | speedup |
+/// |----------------|---------------|-----------------|---------|
+/// | 4096 x 6144    | 5022 us       | 1688 us         | 2.98x   |
+/// | 4096 x 4096    | 1967 us       | 979 us          | 2.01x   |
+/// | 4096 x 14336   | 11332 us      | 3939 us         | 2.88x   |
+/// | 14336 x 4096   | 11015 us      | 7068 us         | 1.56x   |
+///
+/// The reason is the traversal, not the arithmetic. `[K, N]` walks a column
+/// tile with an `n * 2`-byte stride between consecutive `p`; at `n = 6144`
+/// that is 12 KiB, so consecutive reads land on different pages and the
+/// hardware prefetcher -- which does not cross a page boundary -- cannot run
+/// ahead. `[N, K]` makes every output one contiguous `k`-element dot instead.
+/// The in-place kernel sustains 10.0-17.1 GB/s where the transposed one
+/// reaches 16.6-34.3 GB/s over identical byte counts.
+///
+/// Accuracy moves the same way: `[K, N]` carries one serial accumulator per
+/// column across the whole contraction, `[N, K]` carries four and combines
+/// them pairwise, so the transposed kernel is *also* 2.7-9.3x closer to the
+/// `f64` reference. This route therefore has no accuracy trade to weigh.
+///
+/// Falls back to reading `[K, N]` in place when the weight is not a constant
+/// initializer (a transpose per call would cost more than it saves) or when
+/// the `#1056` cache governor declines the footprint.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one call site per operator; the operands are the GEMV's own"
+)]
+pub(crate) fn half_decode_gemv_dispatch(
+    format: HalfFormat,
+    prepack: &MatMulPrepack,
+    b_view: &TensorView,
+    a: &[f32],
+    b_bits: &[u16],
+    out: &mut [f32],
+    k: usize,
+    n: usize,
+    trans_b: bool,
+) {
+    if trans_b {
+        half_gemv::gemv_half_nk(format, a, b_bits, out, k, n);
+        return;
+    }
+    if let Some(bt) = prepack.transposed_b_half(b_view, k, n, format) {
+        #[cfg(test)]
+        HALF_DECODE_TRANSPOSED_CALLS.with(|c| c.set(c.get() + 1));
+        half_gemv::gemv_half_nk(format, a, bt, out, k, n);
+        return;
+    }
+    half_gemv::gemv_half_kn(format, a, b_bits, out, k, n);
 }
 
 /// Compute `A @ B` (numpy semantics: batched, broadcast leading dims, 1-D
@@ -5625,16 +5769,35 @@ mod tests {
                 0,
                 "{format:?} M=1 on a {k}x{n} weight must not pack"
             );
-            // The GEMV's whole justification is reading B in place: a widened
-            // or transposed copy would defeat it.
+            // The GEMV must never widen B to f32 -- that is 4x the stored
+            // weight and was the cost `try_matmul_half` existed to avoid.
             assert!(
                 !kernel.prepack.dense[1].is_filled(),
                 "{format:?} decode must not widen B to f32"
             );
-            assert!(
-                kernel.prepack.transposed_b_f16.get().is_none(),
-                "{format:?} decode must not materialise a transposed weight"
-            );
+            // It *may* hold one transpose at the stored width, because the
+            // `[N, K]` kernel is 1.6x-2.9x faster and 2.7x-9.3x more accurate
+            // than reading `[K, N]` in place. What must never happen is that
+            // copy being unbudgeted: the memory plan sizes this buffer from
+            // `weight_transpose_cache_predicted_bytes`, so the prediction has
+            // to cover whatever the kernel actually retained. This assertion
+            // replaces an older "must not transpose at all" -- the concern it
+            // encoded (a silent, weight-scaled resident buffer) is preserved,
+            // and now checked against the number the plan budgets.
+            if let Some((_, bt)) = kernel.prepack.transposed_b_f16.get() {
+                assert_eq!(
+                    bt.len(),
+                    k * n,
+                    "{format:?} a retained transpose must be exactly the weight"
+                );
+                let (node, graph) = half_matmul_node(format, k, n);
+                let predicted = node_weight_transpose_cache_bytes(&node, &graph);
+                assert!(
+                    predicted >= (bt.len() * 2) as u64,
+                    "{format:?} retained {} bytes but the plan predicted {predicted}",
+                    bt.len() * 2
+                );
+            }
 
             let want = naive_matmul(&a_data, &b_data, 1, k, n);
             for (index, (g, w)) in out.to_f32().iter().zip(&want).enumerate() {
@@ -5815,12 +5978,49 @@ mod tests {
         }
     }
 
-    /// The GEMV must not allocate a weight copy: it reads B straight from the
-    /// stored `[K, N]` layout. Pinned because a transposed variant would cost
-    /// a permanent `2 * K * N` bytes that `try_matmul_half` never paid.
+    /// A single-node `MatMul` graph with a constant 2-D `B` of `format`'s
+    /// dtype, so a test can ask the predictor what the plan would budget for
+    /// the very shape it just ran.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    fn half_matmul_node(format: HalfFormat, k: usize, n: usize) -> (Node, Graph) {
+        use onnx_runtime_ir::{NodeId, TensorData, WeightRef, static_shape};
+        let dtype = match format {
+            HalfFormat::F16 => DataType::Float16,
+            HalfFormat::Bf16 => DataType::BFloat16,
+        };
+        let mut graph = Graph::new();
+        let a = graph.create_named_value("A", dtype, static_shape([1, k]));
+        let b = graph.create_named_value("B", dtype, static_shape([k, n]));
+        let y = graph.create_named_value("Y", DataType::Float32, static_shape([1, n]));
+        graph.add_input(a);
+        graph.add_input(b);
+        let node = Node::new(NodeId(0), "MatMul", vec![Some(a), Some(b)], vec![y]);
+        graph.insert_node(node.clone());
+        graph.add_output(y);
+        graph.set_initializer(
+            b,
+            WeightRef::Inline(TensorData::from_raw(
+                dtype,
+                vec![k, n],
+                vec![0u8; k * n * 2],
+            )),
+        );
+        (node, graph)
+    }
+
+    /// The GEMV must never *widen* the weight, and any transpose it does keep
+    /// must be one the memory plan predicted.
+    ///
+    /// This test used to assert that no transpose was retained at all. That
+    /// policy was measured and reversed: the `[N, K]` kernel is 1.6x-2.9x
+    /// faster and 2.7x-9.3x more accurate than reading `[K, N]` in place, so
+    /// the `2 * K * N` copy now buys something. The property worth keeping is
+    /// the one the old assertion was really protecting -- that a resident,
+    /// weight-scaled buffer can never appear without the plan knowing -- so
+    /// that is what it checks now, against the predictor itself.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[test]
-    fn f16_decode_gemv_does_not_cache_a_copy_of_the_weight() {
+    fn f16_decode_gemv_keeps_only_a_budgeted_transpose() {
         let k = 64usize;
         let n = 8usize;
         let a_data: Vec<f32> = (0..k).map(|i| ((i % 5) as f32 - 2.0) / 4.0).collect();
@@ -5842,12 +6042,19 @@ mod tests {
         }
         if half_gemv::simd_available(HalfFormat::F16) {
             assert!(
-                kernel.prepack.transposed_b_f16.get().is_none(),
-                "the GEMV must read B in place, not through a transpose cache"
-            );
-            assert!(
                 !kernel.prepack.dense[1].is_filled(),
                 "the GEMV must not widen B to f32"
+            );
+            let retained = kernel
+                .prepack
+                .transposed_b_f16
+                .get()
+                .map_or(0, |(_, bt)| bt.len() * 2) as u64;
+            let (node, graph) = half_matmul_node(HalfFormat::F16, k, n);
+            let predicted = node_weight_transpose_cache_bytes(&node, &graph);
+            assert!(
+                predicted >= retained,
+                "retained {retained} transpose bytes the plan did not predict ({predicted})"
             );
         }
     }
