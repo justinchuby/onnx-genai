@@ -2518,10 +2518,18 @@ fn native_device_parser_rejects_cuda_without_cuda_feature() {
     use crate::state::parse_native_device;
 
     assert!(parse_native_device("cpu").is_ok());
+    // Assert the facts, not the sentence: the message must name the feature that
+    // actually gates this path and give a usable rebuild command. The previous
+    // assertion pinned `'cuda' feature`, a name that no longer exists, so it kept
+    // passing after the rename while the message became unactionable.
+    let message = parse_native_device("cuda:0").unwrap_err();
     assert!(
-        parse_native_device("cuda:0")
-            .unwrap_err()
-            .contains("'cuda' feature")
+        message.contains("native-cuda"),
+        "message must name the real gating feature: {message}"
+    );
+    assert!(
+        message.contains("--features native-cuda"),
+        "message must give a usable rebuild command: {message}"
     );
 }
 

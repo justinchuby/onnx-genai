@@ -318,7 +318,12 @@ fn parse_native_cuda_device(index: Option<u32>) -> Result<NativeDecodeDevice, St
 
 #[cfg(all(feature = "native-backend", not(feature = "native-cuda")))]
 fn parse_native_cuda_device(_index: Option<u32>) -> Result<NativeDecodeDevice, String> {
-    Err("native CUDA requires building onnx-genai-server with the 'cuda' feature".to_string())
+    Err(
+        "native CUDA requires the 'native-cuda' feature, which this build of onnx-genai-server \
+         does not have (it already implies 'native-backend'); rebuild with \
+         `--features native-cuda`, or use `--native-device cpu`"
+            .to_string(),
+    )
 }
 
 #[derive(Clone)]

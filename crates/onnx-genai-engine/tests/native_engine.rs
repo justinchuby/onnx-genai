@@ -157,11 +157,18 @@ fn native_backend_rejects_cuda_without_cuda_feature() {
     .err()
     .expect("native CUDA must require the CUDA feature");
     let message = format!("{error:#}");
+    // Assert the facts a reader needs, not the sentence: the message must name
+    // the feature that actually gates this path and give a command that works.
+    // The previous assertion pinned a literal sentence naming a `'cuda'` feature
+    // that no longer exists, so it kept passing after the rename while the
+    // message it guarded had become unactionable.
     assert!(
-        message.contains(
-            "requires building onnx-genai-engine with both the 'native-backend' and 'cuda' features"
-        ),
-        "{message}"
+        message.contains("native-cuda"),
+        "message must name the real gating feature: {message}"
+    );
+    assert!(
+        message.contains("--features native-cuda"),
+        "message must give a usable rebuild command: {message}"
     );
 }
 
