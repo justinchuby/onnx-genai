@@ -339,6 +339,11 @@ impl LmHead for MtpLmHead {
 /// decode step (during proposal), so it never affects CUDA-graph capture of the
 /// target decode step.
 #[derive(Debug, Clone, Copy)]
+// Outside `native-backend` the only constructions left are in `#[cfg(test)]`
+// (`load.rs`'s `load_native_mtp_proposer` is itself gated on that feature), so
+// the lib target sees both variants as never constructed. Same reason the
+// `index` field below is gated -- one level up.
+#[cfg_attr(not(feature = "native-backend"), allow(dead_code))]
 pub(crate) enum DraftProjectionDevice {
     /// Project on the CPU int4 `MatMulNBits` kernel (used by unit tests and the
     /// native CPU backend).
@@ -626,7 +631,7 @@ fn build_quantized_draft_lm_head(
     let k_blocks = weight_dims[1];
     let blob = weight_dims[2];
     let k = hidden_size;
-    if k_blocks == 0 || k % k_blocks != 0 {
+    if k_blocks == 0 || !k.is_multiple_of(k_blocks) {
         anyhow::bail!(
             "quantised LM-head weight '{lm_head_name}' k_blocks {k_blocks} does not divide hidden \
              size {k}"
@@ -687,8 +692,11 @@ fn build_quantized_draft_lm_head(
     projection_graph
         .opset_imports
         .insert("com.microsoft".to_string(), 1);
-    let hidden_value =
-        projection_graph.create_named_value("draft_hidden", IrDataType::Float32, static_shape([1, k]));
+    let hidden_value = projection_graph.create_named_value(
+        "draft_hidden",
+        IrDataType::Float32,
+        static_shape([1, k]),
+    );
     projection_graph.add_input(hidden_value);
     let add_initializer = |graph: &mut onnx_runtime_ir::Graph, name: &str, weight: &WeightRef| {
         let value = graph.create_named_value(
@@ -703,8 +711,11 @@ fn build_quantized_draft_lm_head(
     let scales_value = add_initializer(&mut projection_graph, "draft_lm_head.scales", &scales_ref);
     let mut inputs = vec![Some(hidden_value), Some(weight_value), Some(scales_value)];
     if let Some(zero_points_ref) = &zero_points_ref {
-        let zero_points_value =
-            add_initializer(&mut projection_graph, "draft_lm_head.zero_points", zero_points_ref);
+        let zero_points_value = add_initializer(
+            &mut projection_graph,
+            "draft_lm_head.zero_points",
+            zero_points_ref,
+        );
         inputs.push(Some(zero_points_value));
     }
     let logits_value = projection_graph.create_named_value(
@@ -730,9 +741,7 @@ fn build_quantized_draft_lm_head(
     projection_graph.add_output(logits_value);
 
     let provider: Arc<dyn onnx_runtime_ep_api::ExecutionProvider> = match projection {
-        DraftProjectionDevice::Cpu => {
-            Arc::new(onnx_runtime_ep_cpu::CpuExecutionProvider::new())
-        }
+        DraftProjectionDevice::Cpu => Arc::new(onnx_runtime_ep_cpu::CpuExecutionProvider::new()),
         #[cfg(feature = "native-cuda")]
         DraftProjectionDevice::Cuda { index } => Arc::new(
             onnx_runtime_ep_cuda::CudaExecutionProvider::initialized(index)
@@ -2489,8 +2498,11 @@ mod tests {
         let mut graph = Graph::default();
         graph.opset_imports.insert("com.microsoft".to_string(), 1);
         let activation = graph.create_named_value("A", DataType::Float32, static_shape([1, k]));
-        let weight_value =
-            graph.create_named_value("lm_head.weight", DataType::Uint8, static_shape([n, k_blocks, blob]));
+        let weight_value = graph.create_named_value(
+            "lm_head.weight",
+            DataType::Uint8,
+            static_shape([n, k_blocks, blob]),
+        );
         graph.set_initializer(
             weight_value,
             WeightRef::Inline(TensorData::from_raw(
@@ -2499,8 +2511,11 @@ mod tests {
                 weight,
             )),
         );
-        let scales_value =
-            graph.create_named_value("lm_head.scales", DataType::Float32, static_shape([n, k_blocks]));
+        let scales_value = graph.create_named_value(
+            "lm_head.scales",
+            DataType::Float32,
+            static_shape([n, k_blocks]),
+        );
         graph.set_initializer(
             scales_value,
             WeightRef::Inline(TensorData::from_raw(
@@ -2518,9 +2533,12 @@ mod tests {
             vec![logits_value],
         );
         node.domain = "com.microsoft".to_string();
-        node.attributes.insert("K".to_string(), Attribute::Int(k as i64));
-        node.attributes.insert("N".to_string(), Attribute::Int(n as i64));
-        node.attributes.insert("bits".to_string(), Attribute::Int(4));
+        node.attributes
+            .insert("K".to_string(), Attribute::Int(k as i64));
+        node.attributes
+            .insert("N".to_string(), Attribute::Int(n as i64));
+        node.attributes
+            .insert("bits".to_string(), Attribute::Int(4));
         node.attributes
             .insert("block_size".to_string(), Attribute::Int(block_size));
         graph.insert_node(node);
