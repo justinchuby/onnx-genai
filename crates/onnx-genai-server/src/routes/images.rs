@@ -16,6 +16,7 @@ use crate::image_generation::{
 };
 
 const MAX_IMAGES_PER_REQUEST: usize = 8;
+const IMAGE_RANGE_RELATIVE_EPSILON: f32 = 1.0e-5;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -580,15 +581,19 @@ fn encode_png(
         .fold((f32::INFINITY, f32::NEG_INFINITY), |(min, max), value| {
             (min.min(*value), max.max(*value))
         });
-    let (range_minimum, range_maximum) = match value_range {
+    let (range_minimum, range_maximum): (f32, f32) = match value_range {
         ImageOutputValueRange::ZeroToOne => (0.0, 1.0),
         ImageOutputValueRange::NegativeOneToOne => (-1.0, 1.0),
         ImageOutputValueRange::ZeroTo255 => (0.0, 255.0),
     };
+    // GPU kernels can overshoot a mathematically bounded activation by a few
+    // ulps. Validate against the declared range with a small scale-relative
+    // tolerance, then clamp only that numerical noise during quantization.
+    let tolerance = IMAGE_RANGE_RELATIVE_EPSILON * (range_maximum - range_minimum).abs().max(1.0);
     if !minimum.is_finite()
         || !maximum.is_finite()
-        || minimum < range_minimum
-        || maximum > range_maximum
+        || minimum < range_minimum - tolerance
+        || maximum > range_maximum + tolerance
     {
         return Err(ApiError::internal(format!(
             "image output violates declared {value_range:?} pixel range: [{minimum}, {maximum}]"
@@ -931,5 +936,49 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.message.contains("violates declared ZeroToOne"));
+    }
+
+    #[test]
+    fn numerical_noise_at_declared_range_boundaries_is_clamped() {
+        let zero_to_one = encode_png(
+            ProducedImage {
+                values: vec![-5.0e-6, 0.5, 1.0 + 5.0e-6],
+                shape: vec![1, 3, 1, 1],
+            },
+            ImageOutputValueRange::ZeroToOne,
+        )
+        .unwrap();
+        let negative_one_to_one = encode_png(
+            ProducedImage {
+                values: vec![-1.0 - 5.0e-6, 0.0, 1.0 + 5.0e-6],
+                shape: vec![1, 3, 1, 1],
+            },
+            ImageOutputValueRange::NegativeOneToOne,
+        )
+        .unwrap();
+
+        assert_eq!(decode_pixel(&zero_to_one), [0, 128, 255]);
+        assert_eq!(decode_pixel(&negative_one_to_one), [0, 128, 255]);
+    }
+
+    #[test]
+    fn material_range_violations_are_not_treated_as_numerical_noise() {
+        for (values, value_range) in [
+            (vec![-1.0e-3, 0.0, 1.0], ImageOutputValueRange::ZeroToOne),
+            (
+                vec![-1.001, 0.0, 1.0],
+                ImageOutputValueRange::NegativeOneToOne,
+            ),
+        ] {
+            let error = encode_png(
+                ProducedImage {
+                    values,
+                    shape: vec![1, 3, 1, 1],
+                },
+                value_range,
+            )
+            .unwrap_err();
+            assert!(error.message.contains("violates declared"));
+        }
     }
 }

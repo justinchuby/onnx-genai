@@ -509,6 +509,8 @@ declare an `image` output role plus semantic inputs such as `prompt_tokens`,
 Every image output must also declare its architecture-neutral `value_range`
 (`zero_to_one`, `negative_one_to_one`, or `zero_to_255`); the server validates
 that contract and never guesses normalization from generated pixel content.
+Values within a small scale-relative floating-point tolerance of the declared
+endpoints are clamped as numerical noise; material range violations fail.
 
 ```bash
 curl http://127.0.0.1:8080/v1/images/generations \
