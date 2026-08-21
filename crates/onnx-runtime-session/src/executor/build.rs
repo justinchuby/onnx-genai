@@ -743,6 +743,17 @@ impl Executor {
         registry.infer_graph(&mut graph, &opset_imports, MergePolicy::Permissive)?;
         let mut sibling = Self::build(graph, Arc::clone(&self.weights), Arc::clone(&self.ep))?;
         sibling.graph_slot = DeviceGraphSlot::Verify;
+        // Pin the sibling's StepScoped workspace. The sibling ONLY ever runs the
+        // fixed M=k+1 verify shape, so its workspace is reserved once at that peak
+        // and never needs to grow or shrink. Its captured verify graph bakes the
+        // workspace device pointer, so it must NOT be freed between replays:
+        // without the pin, `release_step_workspace` returns the workspace to the
+        // shared EP arena after each step, the interleaved M=1 decode on the main
+        // executor reserves that same freed slot, and the next verify replay reads
+        // reallocated memory (a nondeterministic illegal access, #1647's stale-ptr
+        // hazard). Pinning keeps the sibling's scratch pointer stable for every
+        // replay.
+        sibling.pin_step_workspace = true;
         Ok(sibling)
     }
 

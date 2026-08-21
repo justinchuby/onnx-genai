@@ -1357,17 +1357,17 @@ impl NativeDecodeSession {
         // option-c verify capture is active, where each graph lives in its own
         // per-slot host capture state and must not be disturbed by the other.
         if state.verify_width.is_some() {
-            // Option-c verify capture is active. With per-slot host capture state
-            // the main executor holds the M=1 decode graph in its `Primary` slot
-            // and the fixed-M verify graph in its `Verify` slot; `Primary` is the
-            // current slot on this eager path (the base decode / prefill runs
-            // here), so we must NOT invalidate — that would tear down the M=1
-            // decode graph every verify step, which is exactly what pinned MTP at
-            // replays=0 before option-c. The captured verify graph is owned by
-            // `run_verify_captured` on the `Verify` slot and is untouched here.
-            // This eager forward is either the one-time prefill or a tail verify
-            // at width != M; a plain eager run leaves both installed graphs intact
-            // so the next step still replays the matching one.
+            // Option-c verify capture is active. The fixed-M verify forward runs
+            // on a DEDICATED sibling executor (its own `Verify` slot + private
+            // interior arena), so this eager path — the base decode / prefill on
+            // the MAIN executor's `Primary` slot — must NOT invalidate: tearing
+            // down the M=1 decode graph every verify step is exactly what pinned
+            // MTP at replays=0 before option-c, and the sibling's captured verify
+            // graph is independent of anything that happens here. This eager
+            // forward is either the one-time prefill or a tail verify at width
+            // != M; a plain eager run leaves both installed graphs (the main
+            // Primary M=1 and the sibling Verify M=K) intact so the next step
+            // still replays the matching one.
         } else if !state.retain_decode_graph_across_spec {
             state.invalidate_graph(&mut self.session)?;
         }
@@ -1623,10 +1623,10 @@ impl NativeDecodeSession {
         // The sibling shares the main executor's weights + EP, so it binds the
         // identical persistent external KV/recurrent-state buffers supplied
         // through `state.bindings`; only interior scratch is private. It always
-        // runs at the constant M=k+1 shape, so its StepScoped workspace is stable
-        // at the M=K peak with no pinning needed (nothing smaller ever runs on
-        // it), and the main executor's M=1 decode keeps its natural (unpinned)
-        // workspace on the `Primary` slot.
+        // runs at the constant M=k+1 shape, and its StepScoped workspace is pinned
+        // (in `build_verify_sibling`) so its captured graph's scratch pointer is
+        // stable across replays; the main executor's M=1 decode keeps its natural
+        // (unpinned) workspace on the `Primary` slot.
         self.session.enable_verify_sibling()?;
         Ok(())
     }
@@ -5982,10 +5982,28 @@ impl DecodeCudaState {
         // the sibling executor's host-side capture schedule so a routed decode
         // step re-warms rather than replaying a graph the EP has dropped.
         session.reset_decode_inline_device_graph()?;
+        // NOTE: the verify-dedicated sibling is deliberately NOT reset here. Its
+        // captured M=K graph binds only the (fixed-capacity, non-moving) external
+        // KV/state buffers plus its own private interior arena, so the per-step
+        // Primary teardowns on this path (the M=1 decode / spec-rewind churn)
+        // leave it valid — resetting it every step would pin the verify at
+        // replays=0. It is reset out-of-band ONLY at the generation-reset
+        // boundary (`rewind` to len 0), where the recurrent/conv states are
+        // re-zeroed, via `reset_verify_graph` — see `rewind`.
         self.graph_phase = DecodeCudaGraphPhase::NeedsWarmup;
         self.inline_graph_phase = DecodeCudaGraphPhase::NeedsWarmup;
         self.graph_invalidations += 1;
         Ok(())
+    }
+
+    /// Re-arm the verify-dedicated sibling's capture phase to `NeedsWarmup`.
+    /// Called at the generation-reset boundary (`rewind` to len 0) so a verify
+    /// graph captured in the previous generation is re-warmed + recaptured next
+    /// generation rather than replayed against reset recurrent/conv state. The
+    /// caller separately resets the sibling executor's device graph via
+    /// [`InferenceSession::reset_verify_sibling_device_graph`].
+    pub(crate) fn reset_verify_graph_phase(&mut self) {
+        self.verify_graph_phase = DecodeCudaGraphPhase::NeedsWarmup;
     }
 
     /// Swap the persistent padded verify bindings (`[1, M]` token / position,
