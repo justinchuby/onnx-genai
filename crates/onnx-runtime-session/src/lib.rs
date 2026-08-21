@@ -39,6 +39,7 @@ pub use executor::{
     reset_exec_phase_profile,
 };
 pub use onnx_runtime_ep_api::WorkspaceRequirement;
+pub use onnx_runtime_ep_api::DeviceGraphSlot;
 pub use onnx_runtime_loader::{
     EpContextDumpConfig, EpContextPartition, Model as EncoderModel, ModelMetadata,
 };
@@ -1439,6 +1440,25 @@ impl InferenceSession {
         self.exec.reset_device_graph()
     }
 
+    /// Which captured-graph slot the main executor currently drives.
+    pub fn main_exec_graph_slot(&self) -> DeviceGraphSlot {
+        self.exec.graph_slot()
+    }
+
+    /// Route the **main** executor's CUDA-graph capture/replay/reset to the given
+    /// slot. The main executor defaults to [`DeviceGraphSlot::Primary`]; native
+    /// MTP self-speculative decode retargets it to [`DeviceGraphSlot::Verify`] so
+    /// a fixed M=k+1 verify forward captures into an independent slot while the
+    /// decode-inline sibling keeps its M=1 decode graph in Primary. Resets the
+    /// old slot's installed graph on switch; idempotent when already set.
+    ///
+    /// Safe to leave at Primary (the default) for every non-MTP path, which keeps
+    /// greedy byte-identical: all main-exec graph calls then route to the same
+    /// single slot they always did.
+    pub fn set_main_exec_graph_slot(&mut self, slot: DeviceGraphSlot) -> Result<()> {
+        self.exec.set_graph_slot(slot)
+    }
+
     /// Pin the fixed-capacity KV sequence-axis symbols CONSTANT so CUDA-graph
     /// capture ADMITS the attention nodes (`GroupQueryAttention` in particular)
     /// instead of vetoing each as a growing-seq eager seam. Returns the total
@@ -1795,6 +1815,100 @@ mod device_binding_tests {
         assert_eq!(session.device_allocation_counts().unwrap(), before);
         assert!(session.reset_device_graph().unwrap());
 
+        input_write(&mut bindings[0], 31);
+        assert!(matches!(
+            session
+                .try_capture_with_device_bindings(&[], &mut bindings)
+                .unwrap(),
+            DeviceGraphCaptureResult::Captured(_)
+        ));
+        assert_eq!(read_bound_f32(&mut bindings[1]), 31.0);
+        input_write(&mut bindings[0], 47);
+        session.replay_device_graph(&mut bindings).unwrap();
+        assert_eq!(read_bound_f32(&mut bindings[1]), 47.0);
+        assert!(session.reset_device_graph().unwrap());
+    }
+
+    /// The main executor can drive the **Verify** captured-graph slot (the second
+    /// independent slot added for option-c) end-to-end through the session +
+    /// executor layers, not just at the raw EP: retargeting the slot, capturing,
+    /// replaying with persistent I/O, and resetting all succeed on the Verify
+    /// slot exactly as they do on Primary. This is the executor-level lift of the
+    /// EP-level `primary_and_verify_graph_slots_are_independent` proof — the
+    /// plumbing native MTP verify capture will drive.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn main_exec_drives_verify_graph_slot_end_to_end() {
+        let Ok(mut ep) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) else {
+            eprintln!("skipping session Verify-slot test: CUDA runtime unavailable");
+            return;
+        };
+        onnx_runtime_ep_api::ExecutionProvider::initialize(&mut ep, &Default::default()).unwrap();
+
+        let mut graph = Graph::new();
+        graph.opset_imports.insert("".into(), 13);
+        let input = graph.create_named_value("input", DataType::Int64, static_shape([1]));
+        graph.add_input(input);
+        let output = graph.create_named_value("output", DataType::Float32, static_shape([1]));
+        let mut cast = Node::new(NodeId(0), "Cast", vec![Some(input)], vec![output]);
+        cast.attributes
+            .insert("to".into(), Attribute::Int(DataType::Float32 as i64));
+        graph.insert_node(cast);
+        graph.add_output(output);
+
+        let mut session = InferenceSession::from_parts(
+            graph,
+            std::sync::Arc::new(onnx_runtime_loader::WeightStore::new()),
+            Path::new("."),
+            EpContextDumpConfig::default(),
+            ModelMetadata::default(),
+            std::sync::Arc::new(ep),
+        )
+        .unwrap();
+
+        // Default routing is Primary; retarget the main executor to Verify.
+        assert_eq!(session.main_exec_graph_slot(), DeviceGraphSlot::Primary);
+        session
+            .set_main_exec_graph_slot(DeviceGraphSlot::Verify)
+            .unwrap();
+        assert_eq!(session.main_exec_graph_slot(), DeviceGraphSlot::Verify);
+
+        let mut input = session
+            .allocate_device_binding("input", None::<String>, DataType::Int64, vec![1], vec![1])
+            .unwrap();
+        let output = session
+            .allocate_device_output_binding("output", DataType::Float32, vec![1], vec![1])
+            .unwrap();
+        input.write_bytes(0, &7i64.to_le_bytes()).unwrap();
+        let mut bindings = vec![input, output];
+        session
+            .run_with_device_bindings(&[], &mut bindings)
+            .unwrap();
+
+        // Capture into the Verify slot and replay with persistent I/O (no new
+        // device allocations across the replay) — the same guarantees Primary has.
+        input_write(&mut bindings[0], 11);
+        assert!(matches!(
+            session
+                .try_capture_with_device_bindings(&[], &mut bindings)
+                .unwrap(),
+            DeviceGraphCaptureResult::Captured(_)
+        ));
+        assert_eq!(read_bound_f32(&mut bindings[1]), 11.0);
+
+        let before = session.device_allocation_counts().unwrap();
+        input_write(&mut bindings[0], 23);
+        session.replay_device_graph(&mut bindings).unwrap();
+        assert_eq!(read_bound_f32(&mut bindings[1]), 23.0);
+        assert_eq!(session.device_allocation_counts().unwrap(), before);
+        assert!(session.reset_device_graph().unwrap());
+
+        // Switching back to Primary keeps the API working (resets the Verify slot
+        // on the way out) — proving the retarget is reversible and inert.
+        session
+            .set_main_exec_graph_slot(DeviceGraphSlot::Primary)
+            .unwrap();
+        assert_eq!(session.main_exec_graph_slot(), DeviceGraphSlot::Primary);
         input_write(&mut bindings[0], 31);
         assert!(matches!(
             session
