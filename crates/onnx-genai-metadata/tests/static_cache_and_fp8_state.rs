@@ -1141,3 +1141,46 @@ fn the_canonical_static_cache_package_validates_on_disk() {
     assert_eq!(cache.key_cache_inputs.len(), cache.value_cache_inputs.len());
     assert_eq!(cache.key_cache_inputs.len(), cache.key_cache_outputs.len());
 }
+
+/// Loading a package enforces the document-level invariants, not just the
+/// pipeline-scoped ones.
+///
+/// `load_metadata_package` used to run only `validate_pipeline_spec`, which by
+/// construction cannot see a rule about `model` and `pipeline` together. The
+/// ban on carrying both a `model.io` block and a workflow therefore held only
+/// for callers who reached for `validate_metadata` directly — which excluded
+/// every producer loading a package from disk, and excluded the
+/// `validate_metadata` binary itself. A package with two conflicting ABIs
+/// reported `valid`, and at runtime `decoder_io()` silently resolved the
+/// workflow and ignored the `model.io` the producer believed it had published.
+/// That is exactly the divergence the rule exists to prevent, so the rule has
+/// to be reachable from the path producers actually run.
+#[test]
+fn loading_a_package_rejects_a_second_serialized_abi() {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/tiny-llm-scatter-workflow");
+    let staged = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("two-abi-package");
+    std::fs::create_dir_all(&staged).expect("staging directory");
+    std::fs::copy(source.join("model.onnx"), staged.join("model.onnx")).expect("artifact copy");
+
+    // The canonical package, plus the one thing it is not allowed to also carry.
+    let canonical = std::fs::read_to_string(source.join("inference_metadata.yaml"))
+        .expect("canonical metadata");
+    std::fs::write(
+        staged.join("inference_metadata.yaml"),
+        format!("model:\n  io:\n    token_input: input_ids\n{canonical}"),
+    )
+    .expect("staged metadata");
+
+    let error = onnx_genai_metadata::load_metadata_package(&staged)
+        .expect_err("a package carrying both a model.io block and a workflow is rejected");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("both declare this package's executable graph ABI"),
+        "the rejection must name the conflict, got: {rendered}"
+    );
+
+    // The same package without the second ABI is the canonical form and loads.
+    onnx_genai_metadata::load_metadata_package(&source)
+        .expect("the workflow-only package is the canonical form");
+}

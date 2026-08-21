@@ -1234,7 +1234,13 @@ than any echo of the graph in YAML.
 
 ## 19. Invariants
 
-A conforming document satisfies all of these. Each is validator-enforced.
+A conforming document satisfies all of these. Each is validator-enforced, and
+enforced on the path a producer actually runs: `load_metadata_package` — the
+entry point behind the `validate_metadata` binary and behind package loading —
+checks the document-level invariants, not only the pipeline-scoped ones. A rule
+reachable only from a direct `validate_metadata` call is not an invariant, it is
+a suggestion; the ban on a second serialized ABI was briefly in that state and
+`loading_a_package_rejects_a_second_serialized_abi` now holds it in place.
 
 1. **No serialized row identity.** Row axis and layout are derivable from
    `batch_layout`; native compaction (`compact`/`release`) is a mandatory ABI.
