@@ -20,7 +20,7 @@ wheel libs on `LD_LIBRARY_PATH` so cuBLAS/cuDNN resolve, and CUDA on `PATH`).
 Build once, then run the steady-state decode loop:
 
 ```bash
-cargo build --release -p onnx-genai-bench --features bench-native,cuda --bin profile_native
+cargo build --release -p onnx-genai-bench --features native-cuda --bin profile_native
 profile_native --model <model-dir> --ep cuda --steady --warmups 1 --runs 3 --tokens 128
 ```
 

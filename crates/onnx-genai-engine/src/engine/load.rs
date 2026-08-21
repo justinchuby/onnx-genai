@@ -1130,8 +1130,18 @@ fn resolve_metadata_and_decode_path(
     // (it is an export defect, not a harmless quirk). Best-effort: if the graph
     // cannot be read, the declared window is kept (no regression for real SWA
     // models).
-    let decoder_graph =
-        sliding_window.and_then(|_| onnx_runtime_loader::load_model(model_path).ok());
+    //
+    // The graph is also consulted to decide whether the attention operator can
+    // consume a capacity-padded past (see `graph_accepts_padded_past`), which is
+    // needed for *every* model rather than only for windowed ones — so it is
+    // loaded whenever a share-buffer path is a candidate, not just when a
+    // sliding window is declared. Loading is still best-effort and still skipped
+    // when neither question can be affected by the answer.
+    let needs_graph_for_share_buffer =
+        metadata_max_context.is_some() || shared_kv_max_len.is_some();
+    let decoder_graph = (sliding_window.is_some() || needs_graph_for_share_buffer)
+        .then(|| onnx_runtime_loader::load_model(model_path).ok())
+        .flatten();
     let decode_path = {
         let _span = onnx_genai_ort::prof_span!("engine.detect_decode_path");
         detect_model_decode_path(

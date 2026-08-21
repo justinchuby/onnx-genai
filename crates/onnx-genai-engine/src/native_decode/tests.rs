@@ -1077,6 +1077,86 @@ fn native_recurrent_snapshot_requires_recurrent_state() {
 }
 
 #[test]
+fn native_verify_then_recurrent_commit_matches_accepted_prefix_replay() {
+    // The exact sequence the native speculative driver now performs on a hybrid
+    // recurrent target: snapshot the pre-draft recurrent/conv state, run the
+    // K-token verify window through `decode_verify` (the driver's real call,
+    // which destructively advances the rolling state by K), then commit to the
+    // `j` accepted tokens. The committed recurrent state must be byte-identical
+    // to a fresh session that decoded only base ++ draft[..j]. Crucially, the
+    // pre-#1598 behaviour (a plain `rewind` to base+j after the verify window)
+    // leaves the recurrent state stranded at the K-token value and DIVERGES —
+    // the negative control below proves the commit is load-bearing, not cosmetic.
+    let base_tokens = [5u32, 7, 9];
+    let draft_tokens = [2u32, 4, 6]; // k = 3 speculative drafts
+    let k = draft_tokens.len();
+
+    for &j in &[0usize, 1, k] {
+        // Oracle: a fresh session advanced by exactly the j accepted tokens.
+        let mut oracle = NativeDecodeSession::from_session(mutating_hybrid_decoder())
+            .expect("oracle hybrid decoder loads");
+        oracle
+            .decode_argmax(&base_tokens, 0)
+            .expect("oracle prefill");
+        let base_len = oracle.current_len();
+        if j > 0 {
+            oracle
+                .decode_argmax(&draft_tokens[..j], base_len)
+                .expect("oracle accepted-prefix advance");
+        }
+        let oracle_state = recurrent_state_bytes(&oracle);
+
+        // Driver path: prefill base, snapshot, verify K via `decode_verify`,
+        // then commit to the accepted prefix.
+        let mut spec = NativeDecodeSession::from_session(mutating_hybrid_decoder())
+            .expect("spec hybrid decoder loads");
+        spec.decode_argmax(&base_tokens, 0).expect("spec prefill");
+        assert_eq!(spec.current_len(), base_len, "same base length");
+        let snapshot = spec
+            .snapshot_recurrent_state()
+            .expect("snapshot pre-draft recurrent state");
+        spec.decode_verify(&draft_tokens, base_len)
+            .expect("verify window advances all k drafts eagerly");
+        assert_eq!(
+            spec.current_len(),
+            base_len + k,
+            "verify advances current_len to base + k"
+        );
+
+        // Negative control: a plain rewind (the pre-#1598 accept path) would
+        // leave the destructive recurrent state at its post-verify (k-token)
+        // value, diverging from the j-accepted oracle whenever j < k.
+        if j < k {
+            let mut stale = NativeDecodeSession::from_session(mutating_hybrid_decoder())
+                .expect("stale hybrid decoder loads");
+            stale.decode_argmax(&base_tokens, 0).expect("stale prefill");
+            stale
+                .decode_verify(&draft_tokens, base_len)
+                .expect("stale verify");
+            stale.rewind(base_len + j).expect("stale plain rewind");
+            assert_ne!(
+                recurrent_state_bytes(&stale),
+                oracle_state,
+                "plain rewind must strand the recurrent state (j={j}); commit is load-bearing"
+            );
+        }
+
+        spec.commit_recurrent_state_to_accepted(&snapshot, base_len, &draft_tokens[..j])
+            .expect("commit recurrent state to accepted prefix");
+        assert_eq!(
+            spec.current_len(),
+            base_len + j,
+            "committed logical length equals base + accepted (j={j})"
+        );
+        assert_eq!(
+            recurrent_state_bytes(&spec),
+            oracle_state,
+            "verify+commit recurrent state must byte-match a base++accepted replay (j={j})"
+        );
+    }
+}
+
+#[test]
 fn native_decoder_auto_derives_hybrid_state_io() {
     // A hybrid decoder with NO declared `io:` must load via the graph-derived
     // fallback: token/mask/position/logits bound by conventional name, dense KV

@@ -78,6 +78,45 @@ pub(crate) fn draft_decode_input_tokens(
     }
 }
 
+/// Whether the decoder graph's attention op can consume a **padded** past KV
+/// buffer, i.e. one whose sequence extent is the runtime-owned capacity rather
+/// than the number of valid tokens.
+///
+/// This is the property the share-buffer path actually requires, and it is a
+/// property of the *operator*, not of the execution provider. `GroupQueryAttention`
+/// and friends take an explicit valid-length input (`seqlens_k` / `total_sequence_length`)
+/// and write the new step in place at that offset, so a fixed-capacity past is
+/// exactly what they expect. The standard opset `Attention` has no such input:
+/// it derives `total_sequence_length` from the past tensor's own sequence
+/// dimension and cross-checks it against the attention mask, so a capacity-padded
+/// past makes the two disagree and ORT rejects the run with
+/// `inconsistent total_sequence_length (between attn_mask and past_key and past_value)`.
+///
+/// Returning `false` routes the model to `ZeroCopyRebind`, which feeds the past
+/// at its exact logical length — correct for both operator families, at the cost
+/// of the growing-KV rebind the share-buffer path avoids.
+///
+/// When no graph is available for inspection this returns `true`, preserving the
+/// previous behaviour for callers that cannot supply one.
+pub(crate) fn graph_accepts_padded_past(graph: &onnx_runtime_ir::Graph) -> bool {
+    fn node_rejects_padded_past(node: &onnx_runtime_ir::Node) -> bool {
+        // The standard opset `Attention` (domain "" / "ai.onnx") is the case that
+        // cross-checks. The `com.microsoft` attention ops take an explicit valid
+        // length and are fine with a padded past.
+        if node.op_type == "Attention" && matches!(node.domain.as_str(), "" | "ai.onnx") {
+            return true;
+        }
+        node.attributes.values().any(|attr| match attr {
+            onnx_runtime_ir::Attribute::Graph(subgraph) => !graph_accepts_padded_past(subgraph),
+            onnx_runtime_ir::Attribute::Graphs(subgraphs) => {
+                subgraphs.iter().any(|sub| !graph_accepts_padded_past(sub))
+            }
+            _ => false,
+        })
+    }
+    !graph.nodes.values().any(node_rejects_padded_past)
+}
+
 pub(crate) fn detect_model_decode_path(
     session: &Session,
     io: Option<&onnx_genai_metadata::ModelIoSpec>,
@@ -165,7 +204,23 @@ pub(crate) fn detect_model_decode_path(
         // predicate (not `is_metal()`) is the sole gate: the Metal plugin
         // declares no such support by default, so it stays on `ZeroCopyRebind`
         // until opted in — see `Session::supports_fixed_capacity_present_binding`.
-        let supports_present_binding = session.supports_fixed_capacity_present_binding();
+        //
+        // The EP predicate is necessary but not sufficient: the *operator* must
+        // also accept a capacity-padded past. The standard opset `Attention`
+        // does not (it derives `total_sequence_length` from the past tensor and
+        // cross-checks it against the mask), so such a graph is routed to
+        // `ZeroCopyRebind` regardless of what the EP or the metadata allow.
+        // See [`graph_accepts_padded_past`].
+        let accepts_padded_past = sliding_window_graph.is_none_or(graph_accepts_padded_past);
+        if !accepts_padded_past {
+            tracing::debug!(
+                "decoder graph uses the standard opset Attention op, which cross-checks the \
+                 attention mask against the past KV extent; using ZeroCopyRebind instead of the \
+                 shared KV buffer"
+            );
+        }
+        let supports_present_binding =
+            session.supports_fixed_capacity_present_binding() && accepts_padded_past;
         if let (DecodeKvMode::SharedBuffer, Some(max_len)) = (
             decode_kv_mode_from_shared_buffer_len(shared_kv_max_len, supports_present_binding),
             shared_kv_max_len,

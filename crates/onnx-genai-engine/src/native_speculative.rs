@@ -296,6 +296,20 @@ impl<'a> NativeSpeculativeDriver<'a> {
             stats.verification_steps += 1;
             stats.proposed_tokens += draft.len();
 
+            // A hybrid decoder's Gated-DeltaNet recurrent (SSM) + conv1d state is
+            // a destructive rolling cache with no per-step history to prefix-slice,
+            // so `rewind` alone cannot roll it back after a rejected draft. Snapshot
+            // it at the committed boundary (`base`) BEFORE the verify window
+            // destructively advances it by K, so the accept path can rebuild the
+            // committed state from exactly the accepted prefix. Inert (returns
+            // `None`) for every pure-attention decoder — those keep the plain
+            // `rewind`.
+            let recurrent_snapshot = if self.session.has_recurrent_state() {
+                Some(self.session.snapshot_recurrent_state()?)
+            } else {
+                None
+            };
+
             // Eager M=K verify pass: one target row per draft position (predicts
             // the token AFTER each draft token). current_len advances to base + K.
             let rows = self.session.decode_verify(&draft, base)?;
@@ -331,8 +345,19 @@ impl<'a> NativeSpeculativeDriver<'a> {
 
             // Roll the device KV back to the committed length: accepted draft
             // columns stay resident, unaccepted columns are dropped, and the bonus
-            // token trails in `pending` (fed on the next step).
-            self.session.rewind(base + accepted)?;
+            // token trails in `pending` (fed on the next step). For a hybrid
+            // recurrent decoder the KV prefix-slice alone would leave the
+            // destructive GDN/conv state stranded at `base + K`; commit it to
+            // exactly the accepted prefix instead (snapshot restore + accepted-
+            // token re-advance), which also performs the KV rewind. See #1598.
+            match recurrent_snapshot.as_ref() {
+                Some(snapshot) => self.session.commit_recurrent_state_to_accepted(
+                    snapshot,
+                    base,
+                    &draft[..accepted],
+                )?,
+                None => self.session.rewind(base + accepted)?,
+            }
 
             // Commit accepted draft tokens followed by the bonus, honoring the
             // same per-token `max_new_tokens` / context-limit / EOS / stop

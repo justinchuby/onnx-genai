@@ -4,8 +4,9 @@
 
 use super::metadata::{
     KeySequenceLengthsPolicy, decode_kv_mode_from_shared_buffer_len, effective_sliding_window,
-    graph_enforces_sliding_window, is_group_query_attention, is_share_buffer_kv_dtype,
-    key_sequence_lengths_policy, shared_kv_buffer_len_from_metadata, sliding_window_from_metadata,
+    graph_accepts_padded_past, graph_enforces_sliding_window, is_group_query_attention,
+    is_share_buffer_kv_dtype, key_sequence_lengths_policy, shared_kv_buffer_len_from_metadata,
+    sliding_window_from_metadata,
 };
 use super::step::{build_position_step, decode_step_layout};
 use super::values::{slice_value_axis, zero_state_value};
@@ -536,4 +537,63 @@ fn kv_axis_slicing_keeps_requested_suffix_in_order() {
         suffix.to_vec_f32().unwrap(),
         vec![20.0, 21.0, 30.0, 31.0, 40.0, 41.0]
     );
+}
+
+/// A decoder graph whose attention is the **standard opset** `Attention`
+/// (domain `""`), the operator that derives `total_sequence_length` from the
+/// past KV tensor and cross-checks it against the attention mask.
+fn standard_attention_graph(domain: &str) -> onnx_runtime_ir::Graph {
+    use onnx_runtime_ir::{Attribute, Graph, Node};
+    let mut graph = Graph::default();
+    graph.nodes.insert_with(|id| {
+        let mut node = Node::new(id, "Attention", vec![], vec![]);
+        node.domain = domain.to_string();
+        node.attributes
+            .insert("is_causal".to_string(), Attribute::Int(1));
+        node.attributes
+            .insert("kv_num_heads".to_string(), Attribute::Int(8));
+        node.attributes
+            .insert("q_num_heads".to_string(), Attribute::Int(16));
+        node
+    });
+    graph
+}
+
+#[test]
+fn standard_attention_graph_rejects_a_capacity_padded_past() {
+    // The share-buffer path binds `past_key_values.*` at the runtime-owned
+    // capacity, not at the valid length. The standard opset `Attention` has no
+    // valid-length input, so ORT computes total_sequence_length from that padded
+    // extent and rejects the run when it disagrees with the mask:
+    //   "inconsistent total_sequence_length (between attn_mask and past_key ...)"
+    // Both spellings of the default domain must be caught.
+    assert!(!graph_accepts_padded_past(&standard_attention_graph("")));
+    assert!(!graph_accepts_padded_past(&standard_attention_graph(
+        "ai.onnx"
+    )));
+}
+
+#[test]
+fn group_query_attention_graph_accepts_a_capacity_padded_past() {
+    // GQA takes an explicit valid length (`seqlens_k`) and writes the new step in
+    // place at that offset, so a fixed-capacity past is exactly its contract.
+    // This is the case the share-buffer path was designed for and must keep.
+    assert!(graph_accepts_padded_past(&gqa_graph(None)));
+    assert!(graph_accepts_padded_past(&gqa_graph(Some(4096))));
+}
+
+#[test]
+fn a_single_standard_attention_node_disqualifies_a_mixed_graph() {
+    // One cross-checking op is enough to break the whole decode step, so the
+    // predicate must be "all ops accept" rather than "any op accepts".
+    use onnx_runtime_ir::{Attribute, Node};
+    let mut graph = gqa_graph(None);
+    graph.nodes.insert_with(|id| {
+        let mut node = Node::new(id, "Attention", vec![], vec![]);
+        node.domain = String::new();
+        node.attributes
+            .insert("is_causal".to_string(), Attribute::Int(1));
+        node
+    });
+    assert!(!graph_accepts_padded_past(&graph));
 }

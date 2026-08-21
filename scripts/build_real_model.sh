@@ -53,5 +53,5 @@ cat <<EOF
 
 Built $MODEL_ID at $OUT_DIR.
 Smoke test:
-  cargo run -p onnx-genai --bin onnx-genai -- generate --model "$OUT_DIR" --max-new-tokens 30 "Once upon a time"
+  cargo run -p onnx-genai-cli --bin onnx-genai -- generate --max-new-tokens 30 "$OUT_DIR" "Once upon a time"
 EOF
