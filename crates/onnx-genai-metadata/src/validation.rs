@@ -3563,7 +3563,7 @@ fn validate_state_port_layers(
                 by_role.entry(role).or_default().push((label, alias.layer));
             }
         }
-        for (role, aliases) in by_role {
+        for (role, aliases) in &by_role {
             if aliases.len() < 2 {
                 continue;
             }
@@ -3584,7 +3584,7 @@ fn validate_state_port_layers(
                 continue;
             }
             let mut seen = BTreeSet::new();
-            for (label, layer) in &aliases {
+            for (label, layer) in aliases {
                 let Some(layer) = layer else { continue };
                 if !seen.insert(*layer) {
                     errors.push(format!(
@@ -3594,6 +3594,45 @@ fn validate_state_port_layers(
                     ));
                 }
             }
+        }
+
+        let is_attention = matches!(
+            group.kind,
+            crate::schema::StateKind::FullAttention
+                | crate::schema::StateKind::SlidingAttention
+                | crate::schema::StateKind::MultiLatentAttention
+                | crate::schema::StateKind::CrossAttention
+        );
+        let key_aliases = by_role.get(&crate::schema::StatePortRole::Key);
+        let value_aliases = by_role.get(&crate::schema::StatePortRole::Value);
+        if !is_attention || (key_aliases.is_none() && value_aliases.is_none()) {
+            continue;
+        }
+
+        let layers = |aliases: Option<&Vec<(&String, Option<usize>)>>| {
+            aliases
+                .into_iter()
+                .flatten()
+                .map(|(_, layer)| layer.unwrap_or(0))
+                .collect::<BTreeSet<_>>()
+        };
+        let key_layers = layers(key_aliases);
+        let value_layers = layers(value_aliases);
+        if key_layers != value_layers {
+            let missing_values = key_layers
+                .difference(&value_layers)
+                .copied()
+                .collect::<Vec<_>>();
+            let missing_keys = value_layers
+                .difference(&key_layers)
+                .copied()
+                .collect::<Vec<_>>();
+            errors.push(format!(
+                "state service group '{group_name}' component '{component_name}' must bind \
+                 exactly one key and one value alias for the same attention layers; key layers \
+                 are {key_layers:?}, value layers are {value_layers:?}, missing value layers \
+                 are {missing_values:?}, missing key layers are {missing_keys:?}"
+            ));
         }
     }
 }
