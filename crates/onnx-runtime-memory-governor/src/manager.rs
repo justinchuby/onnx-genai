@@ -11,9 +11,12 @@
 //!
 //! Registration is serialized by one manager registration gate and may then
 //! enter the registry. The manager state lock is never held while entering the
-//! registry. Allocation-book and process-quota locks are independent and are
-//! never held while calling a governor, holder, allocator, capability, queue, or
-//! fence. Pressure responders and allocation callbacks always run with every
+//! registry. A finite process-limit transition takes the registration gate,
+//! then the tier quota gate, allocation book, and allocation charge locks in
+//! that order. Publication takes the quota gate before the allocation book;
+//! settlement never retains a charge lock while entering either. No manager
+//! lock is held while calling a governor, holder, allocator, capability, queue,
+//! or fence. Pressure responders and allocation callbacks always run with every
 //! manager and registry lock dropped. The registry's own rule remains stricter:
 //! its registry and per-mechanism locks are never held together.
 
@@ -143,23 +146,6 @@ impl ProcessQuota {
 
     fn available(&self, tier: Tier) -> u64 {
         self.limit(tier).saturating_sub(self.used(tier))
-    }
-
-    fn set_limit(&self, tier: Tier, bytes: u64) -> Result<(), MemoryError> {
-        let _gate = self.lock(tier);
-        let used = self.used[tier.index()].load(Ordering::Acquire);
-        if used > bytes {
-            return Err(MemoryError::TierExhausted {
-                tier: tier.name(),
-                requested: 0,
-                used,
-                limit: bytes,
-                available: 0,
-                role: MemoryRole::Activation,
-            });
-        }
-        self.limits[tier.index()].store(bytes, Ordering::Release);
-        Ok(())
     }
 
     fn reserve(
@@ -594,7 +580,30 @@ impl ProcessMemoryManager {
     }
 
     pub fn set_process_limit(&self, tier: Tier, bytes: u64) -> Result<(), MemoryError> {
-        self.inner.book.quota.set_limit(tier, bytes)
+        // Authority delegation and a finite-limit transition both create parent
+        // coverage. Serialize them so the transition sees the canonical set of
+        // authorities whose allocations are already covered by a delegation.
+        let _registration = self
+            .inner
+            .registration_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let authorities = {
+            let state = self.inner.lock_state();
+            state.authorities.values().cloned().collect::<Vec<_>>()
+        };
+        let delegated = authorities
+            .into_iter()
+            .filter_map(|authority| {
+                authority
+                    .process_delegations
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .contains_key(&tier)
+                    .then_some(authority.id)
+            })
+            .collect::<HashSet<_>>();
+        self.inner.book.set_process_limit(tier, bytes, &delegated)
     }
 
     pub fn process_limit(&self, tier: Tier) -> u64 {
@@ -1717,6 +1726,42 @@ impl ScopedMemoryBinding {
                 Arc::from(error.to_string()),
             ));
         }
+        let mut request = request;
+        let mut process_lease = process_lease;
+        let mut authority_lease = authority_lease;
+        if let Some(lease) = process_lease.as_mut() {
+            lease.shrink(
+                request
+                    .process_reserve_bytes
+                    .saturating_sub(publication.process_reserved_bytes),
+            );
+        }
+        if let Some(lease) = authority_lease.as_mut() {
+            lease.shrink(
+                request
+                    .authority_reserve_bytes
+                    .saturating_sub(publication.charged_bytes),
+            );
+        }
+        request.process_reserve_bytes = publication.process_reserved_bytes;
+        request.authority_reserve_bytes = publication.charged_bytes;
+
+        // Close the unlimited -> finite race between final validation and
+        // publication. A transition either sees this allocation in the book or
+        // completes first and makes the second validation enforce finite parent
+        // coverage; it can never miss an unleased authority-managed charge.
+        let quota_gate = self.manager.book.quota.lock(request.tier);
+        if let Err(error) = self.validate_publication(&request, &publication) {
+            drop(quota_gate);
+            return Err(self.rollback_after_failure(
+                request,
+                owner,
+                process_lease,
+                authority_lease,
+                "publish",
+                Arc::from(error.to_string()),
+            ));
+        }
         let shared_physical = publication
             .shared_physical
             .unwrap_or(SharedPhysicalIdentity {
@@ -1734,18 +1779,18 @@ impl ScopedMemoryBinding {
             tier: request.tier,
             role: request.role,
             mode: request.charge_mode,
-            state: ManagedAllocationState::Provisional,
+            state: ManagedAllocationState::Live,
             process_lease,
             authority_lease,
-            charged_bytes: request.authority_reserve_bytes,
-            process_reserved_bytes: request.process_reserve_bytes,
+            charged_bytes: publication.charged_bytes,
+            process_reserved_bytes: publication.process_reserved_bytes,
             physical_bytes: publication.physical_bytes,
             mapped_bytes: publication.mapped_bytes,
             unattributed_bytes: publication.unattributed_bytes,
             shared_physical,
         }));
-        charge.publish(&publication);
         self.manager.book.publish(&charge);
+        drop(quota_gate);
         let settlement = AllocationSettlementToken::new(Arc::clone(&self.manager.book), charge);
         Ok(ManagedAllocation {
             owner: Some(owner),
@@ -2516,39 +2561,6 @@ impl ChargeCell {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn publish(&self, publication: &AllocationPublication) {
-        let (mut process_lease, mut authority_lease, process_refund, authority_refund) = {
-            let mut state = self.lock();
-            let process_refund = state
-                .process_reserved_bytes
-                .saturating_sub(publication.process_reserved_bytes);
-            let authority_refund = state
-                .charged_bytes
-                .saturating_sub(publication.charged_bytes);
-            (
-                state.process_lease.take(),
-                state.authority_lease.take(),
-                process_refund,
-                authority_refund,
-            )
-        };
-        if let Some(lease) = process_lease.as_mut() {
-            lease.shrink(process_refund);
-        }
-        if let Some(lease) = authority_lease.as_mut() {
-            lease.shrink(authority_refund);
-        }
-        let mut state = self.lock();
-        state.process_lease = process_lease;
-        state.authority_lease = authority_lease;
-        state.process_reserved_bytes = publication.process_reserved_bytes;
-        state.charged_bytes = publication.charged_bytes;
-        state.physical_bytes = publication.physical_bytes;
-        state.mapped_bytes = publication.mapped_bytes;
-        state.unattributed_bytes = publication.unattributed_bytes;
-        state.state = ManagedAllocationState::Live;
-    }
-
     fn mark_queued(&self) {
         let mut state = self.lock();
         if state.state == ManagedAllocationState::Live {
@@ -2733,6 +2745,16 @@ impl ChargeCell {
             }
         }
     }
+
+    fn wait_until_not_settling(&self) {
+        let mut state = self.lock();
+        while state.state == ManagedAllocationState::Settling {
+            state = self
+                .wake
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
 }
 
 impl Drop for ChargeCell {
@@ -2793,6 +2815,123 @@ impl SettlementBook {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn set_process_limit(
+        &self,
+        tier: Tier,
+        bytes: u64,
+        delegated: &HashSet<ProcessAuthorityId>,
+    ) -> Result<(), MemoryError> {
+        loop {
+            let quota_gate = self.quota.lock(tier);
+            let mut book = self.lock();
+            book.live.retain(|_, charge| charge.strong_count() != 0);
+            let mut charges = book
+                .live
+                .values()
+                .filter_map(Weak::upgrade)
+                .chain(book.quarantined.values().cloned())
+                .collect::<Vec<_>>();
+            charges.sort_by_key(|charge| format!("{:?}", charge.snapshot().identity));
+            charges.dedup_by_key(|charge| charge.snapshot().identity);
+            let mut states = charges
+                .iter()
+                .map(|charge| charge.lock())
+                .collect::<Vec<_>>();
+
+            if let Some(settling) = states
+                .iter()
+                .position(|state| state.state == ManagedAllocationState::Settling)
+            {
+                drop(states);
+                drop(book);
+                drop(quota_gate);
+                charges[settling].wait_until_not_settling();
+                continue;
+            }
+
+            let mut additions = Vec::with_capacity(states.len());
+            let mut additional = 0_u64;
+            for state in &states {
+                let covered_by_delegation = delegated.contains(&state.authority);
+                let terminal = matches!(
+                    state.state,
+                    ManagedAllocationState::Released | ManagedAllocationState::ContextTerminated
+                );
+                let leased = state.process_lease.as_ref().map_or(0, |lease| lease.bytes);
+                let uncovered = if state.tier == tier
+                    && state.mode == AllocationChargeMode::AuthorityManaged
+                    && !covered_by_delegation
+                    && !terminal
+                {
+                    state.charged_bytes.saturating_sub(leased)
+                } else {
+                    0
+                };
+                additional =
+                    additional
+                        .checked_add(uncovered)
+                        .ok_or(MemoryError::InvalidRequest {
+                            tier: tier.name(),
+                            requested: uncovered,
+                            reason: "live authority-managed process coverage overflows its byte counter",
+                        })?;
+                let covered = leased
+                    .checked_add(uncovered)
+                    .ok_or(MemoryError::InvalidRequest {
+                        tier: tier.name(),
+                        requested: uncovered,
+                        reason: "the allocation process lease overflows its byte counter",
+                    })?;
+                let reserved = state.process_reserved_bytes.checked_add(uncovered).ok_or(
+                    MemoryError::InvalidRequest {
+                        tier: tier.name(),
+                        requested: uncovered,
+                        reason: "the allocation process reservation overflows its byte counter",
+                    },
+                )?;
+                additions.push((uncovered, covered, reserved));
+            }
+            let index = tier.index();
+            let used = self.quota.used[index].load(Ordering::Acquire);
+            let next = used
+                .checked_add(additional)
+                .ok_or(MemoryError::InvalidRequest {
+                    tier: tier.name(),
+                    requested: additional,
+                    reason: "the process memory reservation overflows its byte counter",
+                })?;
+            if next > bytes {
+                return Err(MemoryError::TierExhausted {
+                    tier: tier.name(),
+                    requested: 0,
+                    used: next,
+                    limit: bytes,
+                    available: 0,
+                    role: MemoryRole::Activation,
+                });
+            }
+
+            for (state, (addition, covered, reserved)) in states.iter_mut().zip(additions) {
+                if addition == 0 {
+                    continue;
+                }
+                if let Some(lease) = state.process_lease.as_mut() {
+                    lease.bytes = covered;
+                } else {
+                    state.process_lease = Some(ProcessQuotaLease {
+                        quota: Arc::clone(&self.quota),
+                        tier,
+                        bytes: addition,
+                    });
+                }
+                state.process_reserved_bytes = reserved;
+            }
+            self.quota.used[index].store(next, Ordering::Release);
+            self.quota.limits[index].store(bytes, Ordering::Release);
+            return Ok(());
+        }
     }
 
     fn publish(&self, charge: &Arc<ChargeCell>) {

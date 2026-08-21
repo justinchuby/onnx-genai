@@ -319,15 +319,26 @@ impl ModelMemoryPlan {
     /// holder never held that many -- a caller correcting a double count needs
     /// to know what it actually corrected.
     ///
-    /// Gated with its only caller: the native decode path is where an
-    /// on-demand allocator is asked about, and an ungated helper is dead code
-    /// in every other build.
-    #[cfg(feature = "native-backend")]
+    /// One holder may have several entries: workflow source sessions and their
+    /// linked execution islands are admitted in separate phases. Release spans
+    /// those entries so refunding a declined island maximum cannot stop at the
+    /// source-session claim.
     pub(crate) fn release(&mut self, holder: Holder, bytes: u64) -> u64 {
-        let Some(entry) = self.entries.iter_mut().find(|entry| entry.holder == holder) else {
-            return 0;
-        };
-        entry.lease.shrink(bytes)
+        let mut remaining = bytes;
+        let mut released = 0_u64;
+        for entry in self
+            .entries
+            .iter_mut()
+            .filter(|entry| entry.holder == holder)
+        {
+            let shrunk = entry.lease.shrink(remaining);
+            released = released.saturating_add(shrunk);
+            remaining -= shrunk;
+            if remaining == 0 {
+                break;
+            }
+        }
+        released
     }
 
     /// Give the startup weight reservation back before the provider adopts it.
@@ -714,6 +725,23 @@ mod tests {
         assert!(matches!(refused, MemoryError::TierExhausted { .. }));
 
         assert_eq!(plan.bytes_on(Tier::Device), reservation + 500);
+    }
+
+    #[test]
+    fn releasing_a_holder_spans_each_reservation_entry() {
+        let governor = governor(1000);
+        let mut plan = ModelMemoryPlan::new(governor.clone());
+        plan.reserve(Holder::FixedDeviceReservation, 100)
+            .expect("source session fits");
+        plan.reserve(Holder::FixedDeviceReservation, 75)
+            .expect("linked sessions fit");
+
+        assert_eq!(
+            plan.release(Holder::FixedDeviceReservation, 125),
+            125,
+            "releasing an unused linked-session maximum must not stop at the source entry"
+        );
+        assert_eq!(governor.used(Tier::Device), 50);
     }
 
     /// A holder's tier is a property of the holder, not a call-site argument.

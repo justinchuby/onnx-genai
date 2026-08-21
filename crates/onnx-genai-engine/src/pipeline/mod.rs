@@ -2,9 +2,10 @@
 
 use crate::decode::clone_value;
 use crate::engine::{
-    Engine, EngineConfig, EngineResourceGovernor, MemoryStrategyPlanInput, analyze_model_memory,
-    build_memory_strategy_plan, combine_graph_memory, component_governor, log_memory_strategy_plan,
-    requested_decode_backend, resolve_memory_strategy_hot_tier_bytes, resolve_vram_limit_bytes,
+    Engine, EngineConfig, EngineResourceGovernor, Holder, MemoryStrategyPlanInput,
+    analyze_model_memory, build_memory_strategy_plan, combine_graph_memory, component_governor,
+    log_memory_strategy_plan, requested_decode_backend, resolve_memory_strategy_hot_tier_bytes,
+    resolve_vram_limit_bytes,
 };
 use crate::memory_authority::{MemoryAuthorityProvider, SharedMemoryAuthorityProvider};
 use crate::{
@@ -194,6 +195,21 @@ pub fn validate_pipeline_backend_request(
     Ok(backend)
 }
 
+fn workflow_initializer_reservation_bytes(
+    source_session_bytes: u64,
+    linked_session_initializer_bytes: u64,
+    runtime_managed: bool,
+) -> anyhow::Result<u64> {
+    let maximum_residency = source_session_bytes
+        .checked_add(linked_session_initializer_bytes)
+        .context("workflow initializer reservation size overflow")?;
+    Ok(if runtime_managed {
+        0
+    } else {
+        maximum_residency
+    })
+}
+
 impl Engine {
     pub fn from_pipeline_dir(
         pipeline_dir: &Path,
@@ -334,13 +350,23 @@ impl PipelineEngine {
             force_managed_weight_streaming: crate::engine::force_managed_weight_streaming_enabled(),
         });
         log_memory_strategy_plan(&memory_strategy_plan, "workflow");
+        let runtime_manages_initializer_residency = !memory_strategy_plan.advisory_only
+            && memory_strategy_plan.runtime_application().managed_no_spill;
+        let source_initializer_reservation = workflow_initializer_reservation_bytes(
+            model_weights_bytes,
+            0,
+            runtime_manages_initializer_residency,
+        )?;
         // Reserve every component's package bytes before constructing the first
-        // session.
+        // session. CPU and ordinary ORT-CUDA sessions both own their initializer
+        // residency, so both need the fixed claim. A non-advisory managed VMM
+        // charges committed initializer pages itself and must not be charged a
+        // second time here.
         let resource_governor = component_governor(
             &config,
             None,
             model_weights_bytes,
-            model_weights_bytes,
+            source_initializer_reservation,
             None,
             authority_provider.as_ref(),
             &authority_domain,
@@ -366,13 +392,76 @@ impl PipelineEngine {
         let aliasable_output_values =
             workflow::compile_aliasable_output_values(&compiled_workflow.graph);
         let bridge_graph = compiled_workflow.graph.clone();
-        let execution_islands = islands::plan_execution_islands(
-            &mut compiled_workflow.graph,
+        // Source sessions stay resident when fusion adds linked sessions. Dry-run
+        // the same island linker before constructing any linked session and
+        // reserve the exact initializer payload of every island that can reach
+        // session creation. This is a topology-derived maximum: a component
+        // invoked in two different islands contributes twice, while a candidate
+        // the linker rejects contributes nothing.
+        let maximum_island_initializer_bytes = islands::maximum_execution_island_initializer_bytes(
+            &compiled_workflow.graph,
             &workflow,
             &models,
-            &aliasable_output_values,
-        )
-        .map_err(|error| anyhow::anyhow!("Failed to plan workflow execution islands: {error}"))?;
+        )?;
+        let maximum_initializer_reservation = workflow_initializer_reservation_bytes(
+            model_weights_bytes,
+            maximum_island_initializer_bytes,
+            runtime_manages_initializer_residency,
+        )?;
+        let additional_initializer_reservation = maximum_initializer_reservation
+            .checked_sub(source_initializer_reservation)
+            .context("workflow initializer reservation accounting underflow")?;
+        let island_reservation_admitted = match resource_governor.plan().reserve(
+            Holder::FixedDeviceReservation,
+            additional_initializer_reservation,
+        ) {
+            Ok(_) => true,
+            Err(error) => {
+                tracing::warn!(
+                    additional_initializer_reservation,
+                    %error,
+                    "workflow execution-island fusion declined because duplicate initializer \
+                     residency was not admitted"
+                );
+                false
+            }
+        };
+        let execution_islands = if island_reservation_admitted {
+            islands::plan_execution_islands(
+                &mut compiled_workflow.graph,
+                &workflow,
+                &models,
+                &aliasable_output_values,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!("Failed to plan workflow execution islands: {error}")
+            })?
+        } else {
+            Vec::new()
+        };
+        let live_island_initializer_bytes =
+            islands::execution_island_initializer_bytes(&execution_islands)?;
+        let live_initializer_reservation = workflow_initializer_reservation_bytes(
+            model_weights_bytes,
+            live_island_initializer_bytes,
+            runtime_manages_initializer_residency,
+        )?;
+        let unused_initializer_reservation = if island_reservation_admitted {
+            maximum_initializer_reservation
+                .checked_sub(live_initializer_reservation)
+                .context("live workflow initializer residency exceeded its admitted maximum")?
+        } else {
+            0
+        };
+        let released = resource_governor.plan().release(
+            Holder::FixedDeviceReservation,
+            unused_initializer_reservation,
+        );
+        anyhow::ensure!(
+            released == unused_initializer_reservation,
+            "workflow initializer reservation release mismatch: requested \
+             {unused_initializer_reservation} bytes, released {released}"
+        );
         let island_components = execution_islands
             .iter()
             .flat_map(|island| island.components().iter().cloned())
@@ -733,5 +822,35 @@ impl PipelineEngine {
             logprobs: None,
             budget_cap: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::workflow_initializer_reservation_bytes;
+
+    #[test]
+    fn fused_workflow_reserves_source_and_every_linked_initializer_copy() {
+        assert_eq!(
+            workflow_initializer_reservation_bytes(100, 75, false).unwrap(),
+            175
+        );
+    }
+
+    #[test]
+    fn managed_vmm_does_not_double_charge_initializer_residency() {
+        assert_eq!(
+            workflow_initializer_reservation_bytes(100, 75, true).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn workflow_initializer_reservation_rejects_overflow() {
+        assert!(workflow_initializer_reservation_bytes(u64::MAX, 1, false).is_err());
+        assert!(
+            workflow_initializer_reservation_bytes(u64::MAX, 1, true).is_err(),
+            "managed accounting still validates the topology-derived maximum"
+        );
     }
 }

@@ -1230,6 +1230,150 @@ fn authority_managed_charge_requires_parent_delegation_under_a_finite_limit() {
     assert_eq!(fixture.manager.process_used(Tier::Host), 512);
 }
 
+#[test]
+fn finite_limit_adopts_unlimited_authority_managed_charges_without_double_counting() {
+    let fixture = Fixture::new(DeviceKey::HOST, 1024, unlimited());
+    let binding = fixture.manager.bind_registered(&fixture.mechanism).unwrap();
+    let allocation = binding
+        .allocate(
+            AllocationRequest::authority_managed(
+                128,
+                64,
+                Tier::Host,
+                MemoryRole::Weights,
+                fixture.holder.clone(),
+                128,
+            )
+            .with_process_reservation(32),
+            AllocationPublication {
+                charged_bytes: 128,
+                process_reserved_bytes: 32,
+                physical_bytes: None,
+                mapped_bytes: Some(128),
+                unattributed_bytes: 0,
+                shared_physical: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(fixture.manager.process_used(Tier::Host), 32);
+
+    fixture.manager.set_process_limit(Tier::Host, 128).unwrap();
+    assert_eq!(fixture.manager.process_limit(Tier::Host), 128);
+    assert_eq!(
+        fixture.manager.process_used(Tier::Host),
+        128,
+        "the transition must add only the 96 unleased bytes"
+    );
+
+    allocation.release_now().unwrap();
+    assert_eq!(fixture.manager.process_used(Tier::Host), 0);
+}
+
+#[test]
+fn failed_unlimited_to_finite_transition_is_atomic_and_retryable_after_release() {
+    let fixture = Fixture::new(DeviceKey::HOST, 1024, unlimited());
+    let binding = fixture.manager.bind_registered(&fixture.mechanism).unwrap();
+    let allocate = || {
+        binding
+            .allocate(
+                AllocationRequest::authority_managed(
+                    128,
+                    64,
+                    Tier::Host,
+                    MemoryRole::Weights,
+                    fixture.holder.clone(),
+                    128,
+                ),
+                AllocationPublication {
+                    charged_bytes: 128,
+                    process_reserved_bytes: 0,
+                    physical_bytes: None,
+                    mapped_bytes: Some(128),
+                    unattributed_bytes: 0,
+                    shared_physical: None,
+                },
+            )
+            .unwrap()
+    };
+    let first = allocate();
+    let second = allocate();
+
+    let error = fixture
+        .manager
+        .set_process_limit(Tier::Host, 128)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MemoryError::TierExhausted { used: 256, .. }
+    ));
+    assert_eq!(fixture.manager.process_limit(Tier::Host), u64::MAX);
+    assert_eq!(
+        fixture.manager.process_used(Tier::Host),
+        0,
+        "a rejected transition must not install partial retroactive leases"
+    );
+
+    first.release_now().unwrap();
+    fixture.manager.set_process_limit(Tier::Host, 128).unwrap();
+    assert_eq!(fixture.manager.process_used(Tier::Host), 128);
+    second.release_now().unwrap();
+    assert_eq!(fixture.manager.process_used(Tier::Host), 0);
+}
+
+#[test]
+fn finite_limit_racing_unlimited_publication_cannot_miss_the_live_charge() {
+    let fixture = Fixture::new(DeviceKey::HOST, 1024, unlimited());
+    let binding = fixture.manager.bind_registered(&fixture.mechanism).unwrap();
+    let holder = fixture.holder.clone();
+    let entered = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    let transaction = {
+        let entered = Arc::clone(&entered);
+        let resume = Arc::clone(&resume);
+        thread::spawn(move || {
+            binding.allocate_with(
+                AllocationRequest::authority_managed(
+                    128,
+                    64,
+                    Tier::Host,
+                    MemoryRole::Weights,
+                    holder,
+                    128,
+                ),
+                |context| context.allocate_owning(),
+                |_| {
+                    entered.wait();
+                    resume.wait();
+                    Ok(AllocationPublication {
+                        charged_bytes: 128,
+                        process_reserved_bytes: 0,
+                        physical_bytes: None,
+                        mapped_bytes: Some(128),
+                        unattributed_bytes: 0,
+                        shared_physical: None,
+                    })
+                },
+            )
+        })
+    };
+
+    entered.wait();
+    fixture.manager.set_process_limit(Tier::Host, 64).unwrap();
+    resume.wait();
+    let error = transaction.join().unwrap().unwrap_err();
+    assert!(matches!(
+        error,
+        AllocationTransactionError::Step {
+            stage: "publish",
+            ..
+        }
+    ));
+    assert_eq!(fixture.manager.process_limit(Tier::Host), 64);
+    assert_eq!(fixture.manager.process_used(Tier::Host), 0);
+    assert_eq!(fixture.governor.used(Tier::Host), 0);
+    assert!(fixture.manager.snapshot().unwrap().allocations.is_empty());
+}
+
 #[derive(Debug)]
 struct ReentrantReclaimer {
     manager: ProcessMemoryManager,
