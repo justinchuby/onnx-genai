@@ -205,6 +205,15 @@ geometry at the widest block — the case with the least weight traffic to save.
 
 ### Row crossover, `qwen3_8b_square`, bs=32, `t = 8`
 
+Its `m = 1` row reads **1.66x** where the table above reads **1.78x** for the same
+cell. Same shape, two harnesses: the block-size table is an `ab.py` run with the
+two arms interleaved rep-by-rep, this one is a direct timing of each binary in
+turn. A 7% spread between harnesses on one cell is above the +-5.5% single-cell
+floor, so neither number is quotable to two digits on its own -- which is why the
+verdict rests on 20 cells with no losing one, not on any single cell. Both
+harnesses agree on the sign and on roughly-1.7x for this shape.
+
+
 | `m` | final ms | base ms | ratio |
 | --- | --- | --- | --- |
 | 1 | 0.248 | 0.412 | 1.66x |

@@ -11846,6 +11846,106 @@ mod tests {
         y.to_f32()
     }
 
+    /// The `m > 1` nibble driver is production-reachable (the gate admits
+    /// `m <= INT4_NIBBLE_MAX_ROWS`), but every route test above uses `m = 1`,
+    /// and the pre-existing multi-row tests all have `k_blocks <= 3` -- so the
+    /// four-block tile, the nested column split and zero points were never
+    /// exercised together off the single-row path. This case does all three at
+    /// once: `k_blocks = 8` (two full tiles), asymmetric zero points, and `n`
+    /// wide enough to make the column split reachable.
+    ///
+    /// It asserts bit-identity with the same rows run one at a time through the
+    /// `m = 1` path, which is the stronger claim available here: both call
+    /// `int4_nibble_row`, and `parallel_columns` only partitions the output
+    /// range, so any per-output difference would be a real defect rather than a
+    /// reassociation. The `m = 1` path is itself pinned against the `f64`
+    /// oracle by `the_packed_nibble_route_stays_inside_the_accuracy_4_envelope`.
+    ///
+    /// Scope, stated because bit-identity tests invite overclaiming: comparing
+    /// the two drivers is blind to any defect in the code they share, so this
+    /// covers row dispatch, chunking and the column split *only*. Mutating the
+    /// tile's `hadd` tree (swapping two lanes, so block dots meet the wrong
+    /// scales) leaves it green and is caught by the `f64` envelope test
+    /// instead. Mutating the row chunking (every row reading row 0's
+    /// activation) is caught here and by nothing else.
+    #[test]
+    fn the_packed_nibble_route_agrees_row_by_row_above_one_row() {
+        let _probe = lock_dispatch_probe();
+        if !int4_nibble::supported(32) {
+            return;
+        }
+        let (m, k, n, block_size) = (4usize, 256usize, 96usize, 32usize);
+        let blocks = k / block_size;
+        let packed: Vec<u8> = (0..n * blocks * (block_size / 2))
+            .map(|i| ((i * 2654435761usize) % 251) as u8)
+            .collect();
+        let scales: Vec<f32> = (0..n * blocks)
+            .map(|i| 0.01 + ((i * 40503usize) % 97) as f32 / 4000.0)
+            .collect();
+        let zero_points: Vec<u8> = (0..n * blocks.div_ceil(2))
+            .map(|i| ((i * 2246822519usize) % 253) as u8)
+            .collect();
+        let activations: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 22695477usize) % 1000) as f32 / 500.0 - 1.0)
+            .collect();
+
+        let expected: Vec<f32> = (0..m)
+            .flat_map(|row| {
+                run_decode_case_zp(
+                    &activations[row * k..(row + 1) * k],
+                    &packed,
+                    &scales,
+                    &zero_points,
+                    n,
+                    block_size,
+                    Some(4),
+                )
+            })
+            .collect();
+
+        let zero_point_shape = [n * blocks.div_ceil(2)];
+        let (mut graph, node) = model_node(
+            &[m, k],
+            &[n, blocks, block_size / 2],
+            &[n, blocks],
+            Some(&zero_point_shape),
+            &[m, n],
+            k,
+            n,
+            block_size,
+        );
+        graph
+            .node_mut(node)
+            .attributes
+            .insert("accuracy_level".into(), Attribute::Int(4));
+        let model = Model::new(&graph);
+        let kernel = CpuExecutionProvider::new()
+            .get_kernel(model.graph.node(node), &[], 1)
+            .unwrap();
+        let a = Owned::f32(&[m, k], &activations);
+        let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
+        let s = Owned::f32(&[n, blocks], &scales);
+        let z = Owned::u8(&zero_point_shape, &zero_points);
+        let mut y = Owned::zeros_f32(&[m, n]);
+        reset_int4_routes();
+        kernel
+            .execute(
+                &[a.view(), b.view(), s.view(), z.view()],
+                &mut [y.view_mut()],
+            )
+            .unwrap();
+        let (nibble, _) = int4_routes();
+        assert_eq!(
+            nibble, 1,
+            "the m = {m} case must take the packed-nibble route, not a fallback"
+        );
+        assert_eq!(
+            y.to_f32(),
+            expected,
+            "the multi-row driver must agree bit-for-bit with the same rows run singly"
+        );
+    }
+
     fn accuracy4_model(m: usize, k: usize, n: usize, block_size: usize) -> (Graph, NodeId) {
         let blocks = k.div_ceil(block_size);
         let (mut graph, node) = model_node(
