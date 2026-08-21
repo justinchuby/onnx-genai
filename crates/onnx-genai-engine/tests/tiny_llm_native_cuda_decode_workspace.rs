@@ -35,7 +35,7 @@
 //! skips cleanly when no CUDA device / runtime is present, so it is safe in
 //! CPU-only CI, but it *runs* on a GPU box. Reverting either half of the fix
 //! turns it red (the `generate` call returns the workspace error above).
-#![cfg(all(feature = "cuda", feature = "native-backend"))]
+#![cfg(feature = "native-cuda")]
 
 use std::path::PathBuf;
 

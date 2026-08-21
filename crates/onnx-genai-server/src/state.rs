@@ -150,12 +150,12 @@ impl ServerMemoryAuthorities {
             .iter()
             .map(DeviceMemoryAuthority::pause_reconfiguration)
             .collect::<Vec<_>>();
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         let pool_gates = ordered
             .iter()
             .map(DeviceMemoryAuthority::physical_pool_operation_gate)
             .collect::<Vec<_>>();
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         let _pool_operations = pool_gates
             .iter()
             .map(|gate| {
@@ -318,12 +318,12 @@ pub fn parse_native_device(s: &str) -> Result<NativeDecodeDevice, String> {
     ))
 }
 
-#[cfg(all(feature = "native-backend", feature = "cuda"))]
+#[cfg(feature = "native-cuda")]
 fn parse_native_cuda_device(index: Option<u32>) -> Result<NativeDecodeDevice, String> {
     Ok(NativeDecodeDevice::Cuda { index })
 }
 
-#[cfg(all(feature = "native-backend", not(feature = "cuda")))]
+#[cfg(all(feature = "native-backend", not(feature = "native-cuda")))]
 fn parse_native_cuda_device(_index: Option<u32>) -> Result<NativeDecodeDevice, String> {
     Err("native CUDA requires building onnx-genai-server with the 'cuda' feature".to_string())
 }
@@ -899,7 +899,7 @@ mod authority_tests {
         assert_eq!(future.limit_bytes(), 100);
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "native-cuda")]
     #[test]
     fn failed_multi_device_preflight_does_not_trim_an_earlier_pool() {
         use cudarc::driver::CudaContext;

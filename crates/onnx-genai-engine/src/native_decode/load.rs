@@ -2,12 +2,12 @@ use super::*;
 
 pub(crate) struct NativeDecodeLoadOptions<'a> {
     pub(crate) host_cache: onnx_runtime_ep_cpu::WeightOffloadHostCache,
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "native-cuda")]
     pub(crate) cuda_offload_policy: Option<onnx_runtime_ep_cuda::DeviceOffloadPolicy>,
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "native-cuda")]
     pub(crate) cuda_memory_governor:
         Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "native-cuda")]
     pub(crate) process_memory_manager: onnx_runtime_memory_governor::ProcessMemoryManager,
     pub(crate) io: Option<&'a ModelIoSpec>,
     pub(crate) metadata_max_len: Option<usize>,
@@ -108,7 +108,7 @@ impl NativeDecodeSession {
                 .context("initialize native CPU execution provider")?;
             builder = builder.execution_provider(Arc::new(ep));
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         if let NativeDecodeDevice::Cuda { index } = device {
             let policy = options
                 .cuda_offload_policy
@@ -150,23 +150,23 @@ impl NativeDecodeSession {
                 metadata_max_len: options.metadata_max_len,
                 graph_capture: None,
                 weight_offload_enabled: {
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "native-cuda")]
                     {
                         options.cuda_offload_policy.map(|policy| policy.enabled)
                     }
-                    #[cfg(not(feature = "cuda"))]
+                    #[cfg(not(feature = "native-cuda"))]
                     {
                         None
                     }
                 },
                 weight_offload_stable_va: {
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "native-cuda")]
                     {
                         options
                             .cuda_offload_policy
                             .map(|policy| policy.enabled && policy.managed_no_spill)
                     }
-                    #[cfg(not(feature = "cuda"))]
+                    #[cfg(not(feature = "native-cuda"))]
                     {
                         None
                     }
@@ -254,7 +254,7 @@ impl NativeDecodeSession {
     /// and routed step inputs are bound from metadata rather than guessed from
     /// tensor shapes. The pipeline's native device-KV decoder (inc2b) uses this so
     /// an `inputs_embeds` decoder with no token input loads correctly.
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "native-cuda"))]
     pub(crate) fn load_with_io(
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
@@ -275,7 +275,7 @@ impl NativeDecodeSession {
         )
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "native-cuda")]
     pub(crate) fn load_with_io_and_cuda_governor(
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
@@ -304,7 +304,7 @@ impl NativeDecodeSession {
     /// probe drive a real metadata-declared decoder (e.g. glm-4-9b, whose two
     /// rank-2 int64 inputs are ambiguous under shape-only autoderive) directly at
     /// the `NativeDecodeSession` layer, without standing up a full pipeline.
-    #[cfg(all(test, feature = "cuda"))]
+    #[cfg(all(test, feature = "native-cuda"))]
     pub(crate) fn load_with_cuda_options_and_io_spec(
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
@@ -319,18 +319,18 @@ impl NativeDecodeSession {
         device: NativeDecodeDevice,
         mut options: NativeDecodeCudaOptions,
         io: Option<&ModelIoSpec>,
-        #[cfg(feature = "cuda")] cuda_governor: Option<
+        #[cfg(feature = "native-cuda")] cuda_governor: Option<
             Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
         >,
-        #[cfg(not(feature = "cuda"))] _cuda_governor: Option<()>,
-        #[cfg(feature = "cuda")] cuda_manager: Option<
+        #[cfg(not(feature = "native-cuda"))] _cuda_governor: Option<()>,
+        #[cfg(feature = "native-cuda")] cuda_manager: Option<
             onnx_runtime_memory_governor::ProcessMemoryManager,
         >,
-        #[cfg(not(feature = "cuda"))] _cuda_manager: Option<()>,
-        #[cfg(feature = "cuda")] cuda_offload_policy: Option<
+        #[cfg(not(feature = "native-cuda"))] _cuda_manager: Option<()>,
+        #[cfg(feature = "native-cuda")] cuda_offload_policy: Option<
             onnx_runtime_ep_cuda::DeviceOffloadPolicy,
         >,
-        #[cfg(not(feature = "cuda"))] _cuda_offload_policy: Option<()>,
+        #[cfg(not(feature = "native-cuda"))] _cuda_offload_policy: Option<()>,
     ) -> anyhow::Result<Self> {
         if options.metadata_max_len.is_none() {
             options.metadata_max_len = native_metadata_max_len_from_model_path(path.as_ref());
@@ -340,7 +340,7 @@ impl NativeDecodeSession {
         // stable virtual addresses. Record that here — where the effective
         // offload policy is known — so the decode session can keep whole-step
         // CUDA graph capture ON while offload is active.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         if let Some(policy) = cuda_offload_policy {
             options.weight_offload_stable_va = Some(policy.enabled && policy.managed_no_spill);
         }
@@ -352,7 +352,7 @@ impl NativeDecodeSession {
         };
         let path = path.as_ref();
         let mut builder = InferenceSession::builder().model(path).device(preference);
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         if let (NativeDecodeDevice::Cuda { index }, Some(governor)) = (&device, cuda_governor) {
             let policy = cuda_offload_policy
                 .unwrap_or_else(onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env);
@@ -837,11 +837,11 @@ impl NativeDecodeSession {
             // Live weight offload is a CUDA-EP feature and is mutually exclusive
             // with graph capture; when the CUDA EP isn't compiled in there is no
             // pager, so offload is unconditionally off here.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "native-cuda")]
             let weight_offload_enabled = cuda_options
                 .weight_offload_enabled
                 .unwrap_or_else(|| onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env().enabled);
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "native-cuda"))]
             let weight_offload_enabled = false;
             // Issue #716: offload no longer forces capture OFF when it runs on
             // the stable-VA VMM paging path. Pass the three-state Option through

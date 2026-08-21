@@ -1438,7 +1438,7 @@ impl Engine {
     /// anything (`reserved_bytes > 0, commits == 0`), which is the bug #659 hid
     /// behind a log line for an entire release.
     pub fn vmm_arena_stats(&self) -> Option<crate::VmmArenaStats> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         {
             let stats = onnx_runtime_ep_cuda::vmm_allocator::global_vmm_stats();
             Some(crate::VmmArenaStats {
@@ -1453,7 +1453,7 @@ impl Engine {
                 unaccounted_committed_bytes: stats.unaccounted_committed_bytes,
             })
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "native-cuda"))]
         {
             None
         }

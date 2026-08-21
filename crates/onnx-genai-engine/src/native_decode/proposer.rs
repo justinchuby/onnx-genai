@@ -84,7 +84,7 @@ impl NativeProposerSession {
             crate::native_component::NativeSessionMemory::SelfProvisioned(governor) => {
                 (build_self_provisioned()?, None, governor)
             }
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "native-cuda")]
             crate::native_component::NativeSessionMemory::GovernedCuda {
                 policy,
                 governor,

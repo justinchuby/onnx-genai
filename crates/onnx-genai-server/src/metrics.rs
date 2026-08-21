@@ -333,7 +333,7 @@ pub(crate) fn encode_prometheus() -> String {
     output
 }
 
-#[cfg(all(feature = "metrics", feature = "cuda"))]
+#[cfg(all(feature = "metrics", feature = "native-cuda"))]
 fn encode_weight_offload() -> String {
     let mut output = String::new();
     let stats = onnx_runtime_ep_cuda::global_offload_stats();
@@ -385,7 +385,7 @@ fn encode_weight_offload() -> String {
     output
 }
 
-#[cfg(not(all(feature = "metrics", feature = "cuda")))]
+#[cfg(not(all(feature = "metrics", feature = "native-cuda")))]
 fn encode_weight_offload() -> String {
     String::new()
 }
@@ -863,7 +863,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "native-cuda")]
     #[test]
     fn cuda_weight_offload_metrics_are_process_activity_only() {
         let output = encode_weight_offload();

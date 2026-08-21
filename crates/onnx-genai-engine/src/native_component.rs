@@ -27,7 +27,7 @@ use onnx_genai_metadata::{
 use onnx_runtime_ir::{DataType as IrDataType, Dim};
 use onnx_runtime_session::{DevicePreference, InferenceSession, IoMeta, Tensor};
 use std::path::Path;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 use std::sync::Arc;
 
 const BACKEND: &str = "native";
@@ -117,7 +117,7 @@ pub enum NativeSessionMemory<'a> {
     /// The engine's shared CUDA authority builds an already-governed provider.
     /// Falls back to a self-provisioned session on a non-CUDA device, where
     /// there is no device authority to build one around.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "native-cuda")]
     GovernedCuda {
         policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
         governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
@@ -207,7 +207,7 @@ impl NativeComponentSession {
             NativeSessionMemory::SelfProvisioned(governor) => {
                 (build_self_provisioned()?, None, governor)
             }
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "native-cuda")]
             NativeSessionMemory::GovernedCuda {
                 policy,
                 governor,

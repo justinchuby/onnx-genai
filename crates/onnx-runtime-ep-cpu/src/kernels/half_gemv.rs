@@ -206,7 +206,7 @@ fn stripe_scalar(
 
 #[cfg(test)]
 thread_local! {
-    /// Counts [`gemv_f16_nk`] entries so a caller's test can assert *which*
+    /// Counts [`gemv_half_nk`] entries so a caller's test can assert *which*
     /// route served a call. Values alone cannot: the blocked fallback computes
     /// the same thing, only two orders of magnitude slower, which is the
     /// entire point.
@@ -227,8 +227,8 @@ thread_local! {
 /// still giving a 3584-row projection 448 tasks to spread over the pool.
 const ROW_STRIPE: usize = 8;
 
-/// `out[j] = sum_p a[p] * b[j * k + p]`, with `b` the `[N, K]` row-major f16
-/// weight exactly as stored — no transpose, no copy, no cache.
+/// `out[j] = sum_p a[p] * b[j * k + p]`, with `b` the `[N, K]` row-major
+/// `format` weight exactly as stored — no transpose, no copy, no cache.
 ///
 /// This is the layout `Gemm`'s `transB = 1` holds, which is what essentially
 /// every `nn.Linear` export produces. It is a *better* layout for a GEMV than
@@ -260,15 +260,24 @@ const ROW_STRIPE: usize = 8;
 /// # Panics
 /// When `b` is shorter than `k * n`, for the same memory-safety reason
 /// [`gemv_half_kn`] panics.
-pub(crate) fn gemv_f16_nk(a: &[f32], b: &[u16], out: &mut [f32], k: usize, n: usize) {
+pub(crate) fn gemv_half_nk(
+    format: HalfFormat,
+    a: &[f32],
+    b: &[u16],
+    out: &mut [f32],
+    k: usize,
+    n: usize,
+) {
     #[cfg(test)]
     NK_GEMV_CALLS.with(|calls| calls.set(calls.get() + 1));
     debug_assert_eq!(a.len(), k);
     debug_assert_eq!(out.len(), n);
-    let weights = k.checked_mul(n).expect("f16 GEMV geometry overflows usize");
+    let weights = k
+        .checked_mul(n)
+        .expect("half GEMV geometry overflows usize");
     assert!(
         b.len() >= weights && a.len() >= k,
-        "f16 GEMV operands are too small for k={k} n={n}: a={} b={}",
+        "half GEMV operands are too small for k={k} n={n}: a={} b={}",
         a.len(),
         b.len()
     );
@@ -280,16 +289,21 @@ pub(crate) fn gemv_f16_nk(a: &[f32], b: &[u16], out: &mut [f32], k: usize, n: us
         return;
     }
 
-    let simd = simd_available(HalfFormat::F16);
+    let simd = simd_available(format);
     let rows = |j0: usize, acc: &mut [f32]| {
         for (offset, slot) in acc.iter_mut().enumerate() {
             let row = &b[(j0 + offset) * k..(j0 + offset) * k + k];
             *slot = if simd {
-                // SAFETY: `simd_available(F16)` confirmed f16c + avx2 + fma, and
-                // `row` was just sliced to exactly `k` elements.
-                unsafe { dot_row_simd(a, row, k) }
+                // SAFETY: `simd_available(format)` confirmed this format's
+                // feature set -- f16c + avx2 + fma for `f16`, avx2 + fma for
+                // `bf16`, which is why the two arms cannot share one call --
+                // and `row` was just sliced to exactly `k` elements.
+                match format {
+                    HalfFormat::F16 => unsafe { dot_row_simd_f16(a, row, k) },
+                    HalfFormat::Bf16 => unsafe { dot_row_simd_bf16(a, row, k) },
+                }
             } else {
-                dot_row_scalar(a, row, k)
+                dot_row_scalar(format, a, row, k)
             };
         }
     };
@@ -309,9 +323,9 @@ pub(crate) fn gemv_f16_nk(a: &[f32], b: &[u16], out: &mut [f32], k: usize, n: us
         });
 }
 
-/// Reference for one `[N, K]` row, in the exact order [`gemv_f16_nk`] documents.
-fn dot_row_scalar(a: &[f32], row: &[u16], k: usize) -> f32 {
-    let widen = |p: usize| half::f16::from_bits(row[p]).to_f32();
+/// Reference for one `[N, K]` row, in the exact order [`gemv_half_nk`] documents.
+fn dot_row_scalar(format: HalfFormat, a: &[f32], row: &[u16], k: usize) -> f32 {
+    let widen = |p: usize| widen_scalar(format, row[p]);
     let mut acc = [[0.0f32; 8]; 4];
     // Groups of 8 consumed by the four-chain loop; whatever is left over runs
     // into chain 0, exactly as the 8-wide SIMD loop does.
@@ -339,56 +353,67 @@ fn dot_row_scalar(a: &[f32], row: &[u16], k: usize) -> f32 {
     total
 }
 
-/// F16C + FMA dot product of one contiguous `[N, K]` row against `a`.
+/// The vectorised `[N, K]` row dot, written once and instantiated per format.
 ///
-/// # Safety
-/// The running CPU must support `f16c`, `avx2` and `fma` (see
-/// [`simd_available`]); `a.len() >= k` and `row.len() >= k`.
-#[target_feature(enable = "f16c,avx2,fma")]
-unsafe fn dot_row_simd(a: &[f32], row: &[u16], k: usize) -> f32 {
-    #[cfg(target_arch = "x86")]
-    use std::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
+/// A macro for the same reason [`stripe_simd_fn`] is one: `#[target_feature]`
+/// is an attribute on a concrete function, and `bf16` must not be made to ask
+/// for `f16c` it does not use.
+///
+/// Four independent accumulator chains so the 4-cycle FMA latency does not
+/// serialise a kernel whose real limit is weight bandwidth. The summation
+/// order is the five-step one [`gemv_half_nk`] documents, and the scalar tail
+/// uses `widen_scalar($format, ..)` with the same fused multiply-add, so
+/// [`dot_row_scalar`] reproduces it bit for bit in either format.
+macro_rules! dot_row_simd_fn {
+    ($name:ident, $features:literal, $format:expr, $widen8:expr) => {
+        /// # Safety
+        /// The running CPU must support every feature named in the
+        /// `target_feature` attribute (see [`simd_available`]);
+        /// `a.len() >= k` and `row.len() >= k`.
+        #[target_feature(enable = $features)]
+        unsafe fn $name(a: &[f32], row: &[u16], k: usize) -> f32 {
+            #[cfg(target_arch = "x86")]
+            use std::arch::x86::*;
+            #[cfg(target_arch = "x86_64")]
+            use std::arch::x86_64::*;
 
-    let ap = a.as_ptr();
-    let bp = row.as_ptr();
-    unsafe {
-        let mut acc = [_mm256_setzero_ps(); 4];
-        let mut p = 0;
-        // Four independent chains so the 4-cycle FMA latency does not serialise
-        // a kernel whose real limit is weight bandwidth.
-        while p + 32 <= k {
-            for (c, slot) in acc.iter_mut().enumerate() {
-                let h = _mm_loadu_si128(bp.add(p + c * 8) as *const __m128i);
-                let bw = _mm256_cvtph_ps(h);
-                let av = _mm256_loadu_ps(ap.add(p + c * 8));
-                *slot = _mm256_fmadd_ps(bw, av, *slot);
+            let ap = a.as_ptr();
+            let bp = row.as_ptr();
+            unsafe {
+                let mut acc = [_mm256_setzero_ps(); 4];
+                let mut p = 0;
+                while p + 32 <= k {
+                    for (c, slot) in acc.iter_mut().enumerate() {
+                        let bw = $widen8(bp.add(p + c * 8));
+                        let av = _mm256_loadu_ps(ap.add(p + c * 8));
+                        *slot = _mm256_fmadd_ps(bw, av, *slot);
+                    }
+                    p += 32;
+                }
+                while p + 8 <= k {
+                    let bw = $widen8(bp.add(p));
+                    let av = _mm256_loadu_ps(ap.add(p));
+                    acc[0] = _mm256_fmadd_ps(bw, av, acc[0]);
+                    p += 8;
+                }
+
+                let combined =
+                    _mm256_add_ps(_mm256_add_ps(acc[0], acc[1]), _mm256_add_ps(acc[2], acc[3]));
+                let mut lanes = [0.0f32; 8];
+                _mm256_storeu_ps(lanes.as_mut_ptr(), combined);
+                let mut total = 0.0f32;
+                for lane in lanes {
+                    total += lane;
+                }
+                while p < k {
+                    let bv = widen_scalar($format, *bp.add(p));
+                    total = bv.mul_add(*ap.add(p), total);
+                    p += 1;
+                }
+                total
             }
-            p += 32;
         }
-        while p + 8 <= k {
-            let h = _mm_loadu_si128(bp.add(p) as *const __m128i);
-            let bw = _mm256_cvtph_ps(h);
-            let av = _mm256_loadu_ps(ap.add(p));
-            acc[0] = _mm256_fmadd_ps(bw, av, acc[0]);
-            p += 8;
-        }
-
-        let combined = _mm256_add_ps(_mm256_add_ps(acc[0], acc[1]), _mm256_add_ps(acc[2], acc[3]));
-        let mut lanes = [0.0f32; 8];
-        _mm256_storeu_ps(lanes.as_mut_ptr(), combined);
-        let mut total = 0.0f32;
-        for lane in lanes {
-            total += lane;
-        }
-        while p < k {
-            let bv = half::f16::from_bits(*bp.add(p)).to_f32();
-            total = bv.mul_add(*ap.add(p), total);
-            p += 1;
-        }
-        total
-    }
+    };
 }
 
 /// F16C + FMA stripe kernel.
@@ -526,6 +551,14 @@ stripe_simd_fn!(
     widen8_f16
 );
 stripe_simd_fn!(stripe_simd_bf16, "avx2,fma", HalfFormat::Bf16, widen8_bf16);
+
+dot_row_simd_fn!(
+    dot_row_simd_f16,
+    "f16c,avx2,fma",
+    HalfFormat::F16,
+    widen8_f16
+);
+dot_row_simd_fn!(dot_row_simd_bf16, "avx2,fma", HalfFormat::Bf16, widen8_bf16);
 
 #[cfg(test)]
 mod tests {
@@ -876,7 +909,7 @@ mod tests {
         let b = halfv(HalfFormat::F16, &[1.0, 3.0, 5.0, 2.0, 4.0, 6.0]);
         let a = [1.0f32, 10.0, 100.0];
         let mut out = vec![0.0f32; n];
-        gemv_f16_nk(&a, &b, &mut out, k, n);
+        gemv_half_nk(HalfFormat::F16, &a, &b, &mut out, k, n);
         assert_eq!(out, vec![531.0, 642.0]);
     }
 
@@ -905,7 +938,7 @@ mod tests {
             let mut from_kn = vec![0.0f32; n];
             gemv_half_kn(HalfFormat::F16, &a, &kn, &mut from_kn, k, n);
             let mut from_nk = vec![0.0f32; n];
-            gemv_f16_nk(&a, &nk, &mut from_nk, k, n);
+            gemv_half_nk(HalfFormat::F16, &a, &nk, &mut from_nk, k, n);
             for (lhs, rhs) in from_kn.iter().zip(&from_nk) {
                 assert!(
                     (lhs - rhs).abs() <= 1e-5 * (1.0 + lhs.abs()),
@@ -920,19 +953,58 @@ mod tests {
         // The documented reduction order is the contract; `dot_row_scalar` is
         // its executable statement, so the vector path must match it exactly at
         // every `k` around the 32- and 8-element loop boundaries.
-        if !simd_available(HalfFormat::F16) {
+        for format in [HalfFormat::F16, HalfFormat::Bf16] {
+            if !simd_available(format) {
+                continue;
+            }
+            for k in [
+                1usize, 7, 8, 9, 31, 32, 33, 39, 40, 64, 65, 96, 127, 128, 3584,
+            ] {
+                let a = sample(k, 31);
+                let row = halfv(format, &sample(k, 37));
+                let scalar = dot_row_scalar(format, &a, &row, k);
+                // SAFETY: guarded by `simd_available(format)`; `a` and `row`
+                // both hold exactly `k` elements.
+                let simd = match format {
+                    HalfFormat::F16 => unsafe { dot_row_simd_f16(&a, &row, k) },
+                    HalfFormat::Bf16 => unsafe { dot_row_simd_bf16(&a, &row, k) },
+                };
+                assert_eq!(simd.to_bits(), scalar.to_bits(), "{format:?} k={k}");
+            }
+        }
+    }
+
+    /// The two stored orders must agree in **both** formats.
+    ///
+    /// `kn_and_nk_agree_on_the_same_weight` covers `f16`; this is the `bf16`
+    /// twin, and it is the test that would have caught reading a `bf16` weight
+    /// through the `f16` kernel — the failure mode admitting the transposed
+    /// route could have introduced, since that misread faults on nothing.
+    #[test]
+    fn kn_and_nk_agree_on_the_same_bf16_weight() {
+        if !simd_available(HalfFormat::Bf16) {
             return;
         }
-        for k in [
-            1usize, 7, 8, 9, 31, 32, 33, 39, 40, 64, 65, 96, 127, 128, 3584,
-        ] {
-            let a = sample(k, 31);
-            let row = halfv(HalfFormat::F16, &sample(k, 37));
-            let scalar = dot_row_scalar(&a, &row, k);
-            // SAFETY: guarded by `simd_available(F16)`; `a` and `row` both hold
-            // exactly `k` elements.
-            let simd = unsafe { dot_row_simd(&a, &row, k) };
-            assert_eq!(simd.to_bits(), scalar.to_bits(), "k={k}");
+        for (k, n) in [(1usize, 5usize), (8, 64), (33, 130), (300, 133), (512, 96)] {
+            let a = sample(k, 61);
+            let values = sample(k * n, 67);
+            let kn = halfv(HalfFormat::Bf16, &values);
+            let mut nk = vec![0u16; n * k];
+            for p in 0..k {
+                for j in 0..n {
+                    nk[j * k + p] = kn[p * n + j];
+                }
+            }
+            let mut from_kn = vec![0.0f32; n];
+            gemv_half_kn(HalfFormat::Bf16, &a, &kn, &mut from_kn, k, n);
+            let mut from_nk = vec![0.0f32; n];
+            gemv_half_nk(HalfFormat::Bf16, &a, &nk, &mut from_nk, k, n);
+            for (lhs, rhs) in from_kn.iter().zip(&from_nk) {
+                assert!(
+                    (lhs - rhs).abs() <= 1e-5 * (1.0 + lhs.abs()),
+                    "k={k} n={n}: {lhs} vs {rhs}"
+                );
+            }
         }
     }
 
@@ -945,14 +1017,14 @@ mod tests {
         let a = sample(k, 41);
         let b = halfv(HalfFormat::F16, &sample(k * n, 43));
         let mut reference = vec![0.0f32; n];
-        gemv_f16_nk(&a, &b, &mut reference, k, n);
+        gemv_half_nk(HalfFormat::F16, &a, &b, &mut reference, k, n);
         for threads in [1usize, 2, 3, 8] {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .build()
                 .expect("pool");
             let mut out = vec![0.0f32; n];
-            pool.install(|| gemv_f16_nk(&a, &b, &mut out, k, n));
+            pool.install(|| gemv_half_nk(HalfFormat::F16, &a, &b, &mut out, k, n));
             assert_eq!(bits(&out), bits(&reference), "threads={threads}");
         }
     }
@@ -961,7 +1033,7 @@ mod tests {
     #[should_panic(expected = "operands are too small")]
     fn a_short_nk_weight_panics_rather_than_reading_out_of_bounds() {
         let mut out = vec![0.0f32; 4];
-        gemv_f16_nk(&[1.0, 2.0], &[0u16; 5], &mut out, 2, 4);
+        gemv_half_nk(HalfFormat::F16, &[1.0, 2.0], &[0u16; 5], &mut out, 2, 4);
     }
 
     #[test]
@@ -969,7 +1041,7 @@ mod tests {
         // k = 0 writes zeros without reading any weight; n = 13 leaves the last
         // ROW_STRIPE chunk partial.
         let mut out = vec![f32::NAN; 13];
-        gemv_f16_nk(&[], &[], &mut out, 0, 13);
+        gemv_half_nk(HalfFormat::F16, &[], &[], &mut out, 0, 13);
         assert_eq!(out, vec![0.0f32; 13]);
 
         let k = 5;
@@ -977,9 +1049,9 @@ mod tests {
         let a = sample(k, 47);
         let b = halfv(HalfFormat::F16, &sample(k * n, 53));
         let mut out = vec![0.0f32; n];
-        gemv_f16_nk(&a, &b, &mut out, k, n);
+        gemv_half_nk(HalfFormat::F16, &a, &b, &mut out, k, n);
         for (j, got) in out.iter().enumerate() {
-            let want = dot_row_scalar(&a, &b[j * k..j * k + k], k);
+            let want = dot_row_scalar(HalfFormat::F16, &a, &b[j * k..j * k + k], k);
             assert_eq!(got.to_bits(), want.to_bits(), "row {j}");
         }
     }

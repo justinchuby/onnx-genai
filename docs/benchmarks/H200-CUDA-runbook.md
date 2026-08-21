@@ -200,7 +200,7 @@ After the forwarding alias (`cuda = ["onnx-genai-ort/cuda"]`) is added to
 `onnx-genai-server`, the shorthand is:
 
 ```bash
-cargo run --release --features cuda -p onnx-genai-server -- \
+cargo run --release --features ort-cuda -p onnx-genai-server -- \
   --model models/qwen2.5-0.5b-cuda \
   --model-id qwen2.5-0.5b-cuda \
   --addr 127.0.0.1:8080
@@ -212,7 +212,7 @@ On startup, confirm the log shows **effective execution providers = [Cuda, Cpu]*
 - The ORT build has no CUDA EP, or `LD_LIBRARY_PATH` is missing CUDA/cuDNN, or
 - the binary was built without `--features onnx-genai-ort/cuda` (then
   `ONNX_GENAI_EP=cuda` returns *"CUDA support not compiled in; rebuild with
-  --features cuda"*).
+  --features ort-cuda"*).
 
 ---
 

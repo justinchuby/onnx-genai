@@ -85,7 +85,7 @@ impl DeviceMemoryAuthority {
     }
 
     pub fn trim_unmapped_bytes(&self, bytes: u64) -> anyhow::Result<u64> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         {
             onnx_runtime_ep_cuda::virtual_memory::trim_physical_handle_pools(
                 self.authority_id(),
@@ -94,7 +94,7 @@ impl DeviceMemoryAuthority {
             .map_err(anyhow::Error::new)
         }
 
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "native-cuda"))]
         {
             let _ = bytes;
             Ok(0)
@@ -102,20 +102,20 @@ impl DeviceMemoryAuthority {
     }
 
     pub fn releasable_unmapped_bytes(&self) -> u64 {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         {
             onnx_runtime_ep_cuda::virtual_memory::pooled_unmapped_bytes_for_authority(
                 self.authority_id(),
             )
         }
 
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "native-cuda"))]
         {
             0
         }
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "native-cuda")]
     pub fn physical_pool_operation_gate(&self) -> std::sync::Arc<std::sync::RwLock<()>> {
         onnx_runtime_ep_cuda::virtual_memory::physical_pool_authority_gate(self.authority_id())
     }
@@ -126,9 +126,9 @@ impl DeviceMemoryAuthority {
     pub fn try_set_limit_bytes(&self, bytes: u64) -> anyhow::Result<()> {
         let _mapped_growth = self.governor.pause_mapped_growth()?;
         let guard = self.pause_reconfiguration();
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         let pool_gate = self.physical_pool_operation_gate();
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         let _pool_operations = pool_gate
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());

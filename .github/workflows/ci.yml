@@ -11,8 +11,10 @@
 # -- see https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks
 # So "Fast (Linux x86_64)" and "Rust quality" -- the two required checks --
 # still report a conclusion on every PR, just without doing the expensive
-# work when nothing but docs changed. Schedule and workflow_dispatch runs are
-# unaffected: `changes` doesn't run for them, so docs_only stays unset/false.
+# work when nothing but docs changed. Schedule and workflow_dispatch runs get
+# full CI: `changes` runs for them too and leaves docs_only=false, because it
+# only diffs for pull_request and push. (It must run for them -- see the note
+# on the job itself.)
 name: CI
 
 on:
@@ -39,11 +41,19 @@ jobs:
   changes:
     name: Detect change scope
     runs-on: ubuntu-latest
-    # Only classify pull_request/push diffs. schedule and workflow_dispatch
-    # runs skip this job entirely, so `needs.changes.outputs.docs_only` is
-    # empty for them and every `if: needs.changes.outputs.docs_only != 'true'`
-    # below evaluates true -- full CI, unchanged.
-    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    # This job must run for *every* event. It used to be gated on
+    # `github.event_name == 'pull_request' || github.event_name == 'push'`,
+    # with a comment claiming schedule and workflow_dispatch runs would skip
+    # only this job and still get full CI. That was wrong: every job below is
+    # `needs: changes` with a plain `if:` (no `always()`/`!cancelled()`), and
+    # GitHub skips a job whose `needs` dependency was skipped, whatever its
+    # own `if:` says. So gating this job skipped the entire workflow -- which
+    # silently made both the nightly `schedule` and `workflow_dispatch` no-ops
+    # that reported success without running a single check.
+    #
+    # There is nothing to gate on anyway: the classify step below only diffs
+    # for pull_request and push, and leaves docs_only=false for every other
+    # event, so schedule and workflow_dispatch get full CI by construction.
     outputs:
       docs_only: ${{ steps.filter.outputs.docs_only }}
     steps:
@@ -119,12 +129,13 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
-      - name: Install Rust stable toolchain
+      - name: Install the pinned Rust toolchain
         id: rust-toolchain
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal --component clippy,rustfmt
-          rustup default stable
+          # The toolchain, and its components, come from rust-toolchain.toml so CI
+          # and contributors resolve the same rustc. See that file for why.
+          rustup toolchain install
           echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
       - name: Resolve cargo cache target
         id: cache-target
@@ -247,14 +258,17 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
-      # Keep CI on Rust stable deliberately: this follows Rust's stability promise
-      # without freezing security fixes; the cache key records the resolved rustc release.
-      - name: Install Rust stable toolchain
+      # The Rust toolchain is pinned in rust-toolchain.toml so a runner image
+      # rolling forward cannot turn `-D warnings` red with no commit to blame,
+      # and so a contributor sees the same lints CI does. The cache key still
+      # records the resolved rustc release. See rust-toolchain.toml for why.
+      - name: Install the pinned Rust toolchain
         id: rust-toolchain
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal --component clippy,rustfmt
-          rustup default stable
+          # The toolchain, and its components, come from rust-toolchain.toml so CI
+          # and contributors resolve the same rustc. See that file for why.
+          rustup toolchain install
           echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
       # actions/cache is GitHub-owned, so it is acceptable where personally-owned
       # cargo cache actions are not. Include OS, runner arch, actual target triple,
@@ -451,12 +465,13 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
-      - name: Install Rust stable toolchain
+      - name: Install the pinned Rust toolchain
         id: rust-toolchain
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal --component clippy,rustfmt,llvm-tools-preview
-          rustup default stable
+          # The toolchain, and its components, come from rust-toolchain.toml so CI
+          # and contributors resolve the same rustc. See that file for why.
+          rustup toolchain install
           echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
       - name: Resolve cargo cache target
         id: cache-target
@@ -558,12 +573,13 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
-      - name: Install Rust stable toolchain
+      - name: Install the pinned Rust toolchain
         id: rust-toolchain
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal --component clippy,rustfmt
-          rustup default stable
+          # The toolchain, and its components, come from rust-toolchain.toml so CI
+          # and contributors resolve the same rustc. See that file for why.
+          rustup toolchain install
           echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
       - name: Resolve cargo cache target
         id: cache-target
@@ -650,12 +666,13 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
-      - name: Install Rust stable toolchain
+      - name: Install the pinned Rust toolchain
         id: rust-toolchain
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          # The toolchain, and its components, come from rust-toolchain.toml so CI
+          # and contributors resolve the same rustc. See that file for why.
+          rustup toolchain install
           echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
       - name: Resolve cargo cache target
         id: cache-target
@@ -727,14 +744,17 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
-      # Keep CI on Rust stable deliberately: this follows Rust's stability promise
-      # without freezing security fixes; the cache key records the resolved rustc release.
-      - name: Install Rust stable toolchain
+      # The Rust toolchain is pinned in rust-toolchain.toml so a runner image
+      # rolling forward cannot turn `-D warnings` red with no commit to blame,
+      # and so a contributor sees the same lints CI does. The cache key still
+      # records the resolved rustc release. See rust-toolchain.toml for why.
+      - name: Install the pinned Rust toolchain
         id: rust-toolchain
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal --component clippy,rustfmt,llvm-tools-preview
-          rustup default stable
+          # The toolchain, and its components, come from rust-toolchain.toml so CI
+          # and contributors resolve the same rustc. See that file for why.
+          rustup toolchain install
           echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
       # actions/cache is GitHub-owned, so it is acceptable where personally-owned
       # cargo cache actions are not. Include OS, runner arch, actual target triple,
@@ -815,7 +835,7 @@ jobs:
           $(python .github/scripts/workspace_test_packages.py cargo-args ort-backed)
       # `native-backend` is CPU-runnable: it selects the native CPU EP/session
       # crates, while CUDA-only engine integration tests are behind
-      # required-features = ["cuda", "native-backend"] and are not selected here.
+      # required-features = ["native-cuda"] and are not selected here.
       - name: Test onnx-genai-engine native backend
         run: cargo test --locked -p onnx-genai-engine --features native-backend
       # `!cancelled()` rather than the implicit `success()`: this is the only
@@ -869,14 +889,17 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
-      # Keep CI on Rust stable deliberately: this follows Rust's stability promise
-      # without freezing security fixes; the cache key records the resolved rustc release.
-      - name: Install Rust stable toolchain
+      # The Rust toolchain is pinned in rust-toolchain.toml so a runner image
+      # rolling forward cannot turn `-D warnings` red with no commit to blame,
+      # and so a contributor sees the same lints CI does. The cache key still
+      # records the resolved rustc release. See rust-toolchain.toml for why.
+      - name: Install the pinned Rust toolchain
         id: rust-toolchain
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal --component clippy,rustfmt
-          rustup default stable
+          # The toolchain, and its components, come from rust-toolchain.toml so CI
+          # and contributors resolve the same rustc. See that file for why.
+          rustup toolchain install
           echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
       # actions/cache is GitHub-owned, so it is acceptable where personally-owned
       # cargo cache actions are not. Include OS, runner arch, actual target triple,
@@ -946,14 +969,17 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
-      # Keep CI on Rust stable deliberately: this follows Rust's stability promise
-      # without freezing security fixes; the cache key records the resolved rustc release.
-      - name: Install Rust stable toolchain
+      # The Rust toolchain is pinned in rust-toolchain.toml so a runner image
+      # rolling forward cannot turn `-D warnings` red with no commit to blame,
+      # and so a contributor sees the same lints CI does. The cache key still
+      # records the resolved rustc release. See rust-toolchain.toml for why.
+      - name: Install the pinned Rust toolchain
         id: rust-toolchain
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal --component clippy,rustfmt
-          rustup default stable
+          # The toolchain, and its components, come from rust-toolchain.toml so CI
+          # and contributors resolve the same rustc. See that file for why.
+          rustup toolchain install
           echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
       # actions/cache is GitHub-owned, so it is acceptable where personally-owned
       # cargo cache actions are not. Include OS, runner arch, actual target triple,

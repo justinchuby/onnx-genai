@@ -1525,3 +1525,222 @@ at full range — so paths that cut **bytes and uops per weight together**, such
 `int4 x int16` kernel consuming 0.5 B/weight in place, are the better next spend. Full record, both
 complete matrices, the controls and the anomaly:
 [`docs/benchmarks/2026-08-21-qgemm-k-split-negative.md`](../benchmarks/2026-08-21-qgemm-k-split-negative.md).
+
+### 18. The packed-nibble `int4 x int16` AVX2 decode kernel pays — but not for the reason it was proposed
+
+[Section 17](#17-splitting-k-in-the-fused-decode-gemm-does-not-pay-for-itself-negative-result) closed
+by naming the next spend: paths that cut **bytes and uops per weight together**, such as a kernel
+consuming the ONNX int4 weight at 0.5 B/weight in place instead of expanding every nibble to a whole
+`i8`. That kernel is built, measured and **merged**. It is **1.2x to 2.4x** faster than the
+expanded-`i8` route it replaces across four block sizes, five llama/qwen geometries and `m = 1..64`,
+with **no losing cell**. Against ORT the same cells go from ~5.8-8.1x behind to ~3.3-5.6x behind: the
+gap is roughly halved, not closed.
+
+The prediction was right about *what* to build and wrong about *why it would win*. Halving the weight
+stream, on its own, bought **1-5%** — nothing. `ONNX_GENAI_PROFILE_OPS=1` put `MatMulNBits` at 99.95%
+of the run, so there was no Amdahl dilution to hide behind; the kernel had genuinely not moved.
+
+A block-size sweep at `t = 1` on a fixed geometry located it. The weight bytes are identical at every
+block size and only the block count changes, yet time tracked `1/block_size` almost exactly. Fitting
+`time = blocks*A + weights*B` gave `A = 17.1 cycles/block` against an inner loop already running at
+**11.1 weights/cycle** — against a uop budget of 12.8. The multiply-accumulate was never the problem.
+At `block_size = 32`, the common case, a block is 32 weights, so ~17 cycles of per-block tail sat on
+top of ~2.5 cycles of arithmetic.
+
+Two changes took `A` to **8.5 cycles/block** and produced the entire result:
+
+1. `is_x86_feature_detected!` was evaluated **per block**. It caches in an atomic and is cheap in
+   isolation, but it sits on a non-`target_feature` call boundary that prevents the AVX2 body from
+   inlining, forcing the accumulator through memory every 32 weights. Hoisting the probe to the row
+   driver and marking that driver `#[target_feature(enable = "avx2")]` fixed both.
+2. Four consecutive `k` blocks now share **one** reduction tree and **one** vector tail. They are
+   contiguous in every array the tail reads — weight scales, activation scales, block sums, and the
+   zero-point nibbles — so the zero-point correction, the `i32`->`f32` convert, the two multiplies and
+   the add all run once on four lanes instead of four times on scalars.
+
+**The transferable finding: at decode block sizes the per-block tail, not the multiply-accumulate, is
+the kernel.** Section 17 measured `vpmaddwd` at ~0.31 uops per byte of `B` and treated that as the
+budget to beat; that number is real but it describes only the part of the loop that was never the
+bottleneck. Any future int4/int8 decode kernel should be costed as `blocks*A + weights*B` with `A`
+measured, and a byte-density change should not be expected to show at all until `A` is down.
+
+`INT4_NIBBLE_MAX_ROWS` was **swept, not asserted**: every `m` from 1 to 64 wins ~2x, and the gate
+ships at 64 because that is the largest `m` with a measurement behind it, not a modelled crossover.
+The route is guarded off VNNI hosts on purpose — there `vpdpbusd` gives the expanded-`i8` route a
+1-uop-per-32-MAC dot and the byte/arithmetic trade may invert, which this host cannot measure.
+
+Three null controls are disclosed, including the one that matters: the `accuracy_level = 0` cells are
+code-identical in both arms and read **+/-5%**, which is the real per-cell floor on this host — worse
+than the +/-0.1% the duplicated-binary null arm reports on its lucky cells. Two cells that first
+contradicted their own shape were re-measured rather than dropped, with the contended reps shown.
+
+Still open and explicitly **not** claimed: ~3.3-5.6x behind ORT remains; `A = 8.5 cycles/block` is
+still 3.4x the inner loop's own cost, and the untried lever is an `N` tile so one activation block
+serves several outputs (which needs a block-major prepack of the scale and zero-point arrays, both
+`N`-major today); VNNI and aarch64 hosts are gated out and untested; Miri cannot execute x86 SIMD, so
+it is **no coverage** for this module rather than a pass. Full record, all matrices, the controls, the
+mutation battery and the harness bug that first reported it green:
+[`docs/benchmarks/2026-08-21-int4-packed-nibble-avx2.md`](../benchmarks/2026-08-21-int4-packed-nibble-avx2.md).
+
+**Reconciliation with the 2026-08-20 rejection.** The same mechanism was built
+and rejected the day before at 1.5x-2.2x *slower*
+(`docs/benchmarks/2026-08-20-int4-nibble-i16-negative.md`, now marked
+superseded). Two kernels, two honest measurements. The differences: that one
+spent ~4 uops per 32 weights restoring `k` order in the **weights**, where this
+one deinterleaves the **activation** once per row (14 uops -> 10); and neither
+kernel's inner loop was the binding cost, so its "instruction-bound" diagnosis
+pointed at the wrong term. Its "the incumbent is already at the DRAM roofline"
+claim does not survive at all -- the 58.7 MB expanded weight is L3-resident on a
+64 MiB L3, and this kernel is 2.37x faster than the arm called saturated.
+
+**The method lesson worth keeping.** Fit `time = blocks*A + weights*B` by sweeping
+block size at fixed weight bytes before concluding a kernel is arithmetic-bound.
+`A` was 17.1 cycles/block against ~2.5 cycles of arithmetic at `block_size = 32`;
+until `A` came down, halving bytes/weight was invisible (v1 measured 1-5%). Two
+changes moved it: hoisting a per-block `is_x86_feature_detected!` off a
+non-`target_feature` call boundary (17.1 -> 15.0) and tiling four `k` blocks
+through one reduction tree and one vector tail (15.0 -> **8.5**).
+
+### 19. The `[N, K]` decode GEMV existed only in an `f16` spelling, and a transposed `bf16` decode paid 21x-101x for it
+
+The asymmetry §15 recorded as still open, closed. `Gemm` with `transB = 1` on a
+`bf16` weight declined the decode GEMV and fell to the portable path: **0.038 ms
+-> 0.810 ms** at `k=1024, n=768`, **3.42 ms -> 201.9 ms** at a 896x151936
+`lm_head`, 21x-101x across the `full` shape set at 8 threads.
+
+**It was never a policy question.** §15 called it "kernel coverage, not policy"
+and that was exactly right. The `[K, N]` stripe kernel had already been made
+per-format by a macro — `#[target_feature]` is an attribute on a concrete
+function, and `bf16` must not be made to ask for the `f16c` unit it widens
+without — but the `[N, K]` row kernel never got the same treatment. So `trans_b`
+was selecting on **dtype** where it should have been selecting on **layout**.
+The `[N, K]` row dot is now instantiated per format from one macro
+(`dot_row_simd_f16` / `dot_row_simd_bf16`), `HalfFormat` is threaded through
+`gemv_f16_nk` -> `gemv_half_nk` and `dot_row_scalar`, and the
+`(!trans_b || format == HalfFormat::F16)` term is deleted. Both operators, both
+stored orders and both 16-bit formats reach one backend.
+
+**Why nothing caught it.** The transposed route had **no benchmark row at all** —
+`half_decode_gemv_ab` built a `MatMul`, which cannot express `transB`. That is
+the third time this file records an unmeasured region behind a gate (cf. §11,
+§12, §14), and the repair is the same shape: `PROBE_OP=gemm_transb` now builds a
+`Gemm` node with the weight transposed into `[N, K]`, so the route has a row.
+
+**The pins are numeric, not just route counters**, because reading a `bf16`
+weight through the `f16` kernel does not fault — it silently reinterprets every
+bit pattern. `a_transposed_bf16_decode_takes_the_same_gemv_as_f16` checks the
+route *and* an `f64`-referenced bound, `kn_and_nk_agree_on_the_same_bf16_weight`
+checks the two stored orders against each other, and
+`nk_simd_and_scalar_rows_agree_bit_for_bit` now runs both formats. Forcing the
+`f16` kernel fails the first two and nothing else, which is the mutation that
+matters.
+
+**Disclosed:** the `f32` null control on this shared host spans 0.795-1.264
+(+-26%). Several GB/s figures read above the 75.8 GB/s DRAM number, and the
+reason is **not** uniform: the mid-size rows are L3-resident (a 4096x4096 `bf16`
+weight is 33.6 MB against a 64 MiB L3), but the 896x151936 `lm_head` is 272 MB
+and cannot be — its 79.5 GB/s is a ~5% overshoot of a quoted DRAM figure that is
+itself approximate. Neither reading is a roofline violation and neither is
+evidence of one; a bandwidth percentage means nothing until the denominator is
+shown to bind, which is the error §18 had to correct in the other direction.
+Full record:
+[`docs/benchmarks/2026-08-21-gemm-transposed-bf16-decode-gemv.md`](../benchmarks/2026-08-21-gemm-transposed-bf16-decode-gemv.md).
+
+### 20. Int4 acc4 N-tile — designed, bounded, not built; two hypotheses closed
+
+Investigated the block-major scale/zero-point N-tile over #1619's packed-nibble
+kernel. **Not built**, and the reason is recorded rather than hidden: the
+analytic case is ~15% (a ~62→~53 uop reduction per 4 (block, column) pairs,
+against §18's finding that the per-block term is 78% of runtime at block 32),
+but §18's uop model **mispredicts measured per-block cost by 2.8x**, so it
+cannot adjudicate a 15% delta. The tile also removes instructions, not the
+139.7 MB/token that must cross the memory system, and the measurement that
+would have bounded that failed on a contended host (block 128 at 32 threads
+spread 1.135–9.035 ms, 8x). MLAS uses `NCols = 4`, so this is a statement about
+available evidence, not about the design.
+
+Two cheaper hypotheses were tested and **both are closed negative**:
+
+- *"The kernel does not thread-scale."* An artifact: `RAYON_NUM_THREADS` does
+  not size the decode pool (`configured_decode_threads` reads
+  `available_parallelism` and `ONNX_GENAI_CPU_DECODE_THREADS`). The real knob
+  gives 22.949/22.893/11.584/5.866/3.302 ms/token at 1/2/4/8/16 threads —
+  8→16 is **1.77x, ±0.7% over three interleaved repetitions**. (t=1≡t=2 is
+  unexplained and recorded as an open question, not an explanation.)
+- *"Production is stuck on the narrow flat pool, so 1.77x is free."* False.
+  `default_persistent_threads(32)` is 16 and `PERSISTENT_POOL_DEFAULT` is
+  `true`, so `is_forced()` holds; every pool configuration reachable from this
+  harness measures 3.23–3.42 ms/token = t=16, never t=8 (5.87–5.91) nor the
+  6-wide flat default. **No pool-default change is proposed.** Note this is
+  *not* a persistent-vs-flat A/B: `PROBE_SPMD` does not move the pool under the
+  default policy, an earlier draft wrongly labelled an arm "flat", and
+  adversarial review caught it — a 6-wide pool cannot produce a 16-wide time.
+
+**Shipped:** `PROBE_ACCURACY` in `int4_decode_loop_ab`. The bench hard-coded
+`accuracy_level = 0`, and 4 is the only value reaching the packed-nibble route,
+so #1619 had **no decode-loop row at all** — only single-op benches, which is
+the wrong shape for a decode gate. The bench header now also documents the
+`RAYON_NUM_THREADS` trap, because a wrong "does not scale" verdict is one
+env-var name away.
+
+**Next lever, unmeasured and deliberately unranked:** at block 32 the f32
+scales are 27.26 MB against 109.05 MB of packed weights — with zero points,
+**22% of all bytes moved**. Storing them as bf16 in a block-major prepack
+removes ~10% of traffic, converting ~1:1 into time *wherever the kernel is
+bandwidth-bound*, without touching the integer dot's exactness. It is **not**
+claimed to be worth more than the N-tile: the two bet on opposite unmeasured
+regimes (the byte lever pays only if bandwidth-bound; the N-tile is discounted
+only if it is). Establish the regime on a quiet host first. Full record:
+[`docs/benchmarks/2026-08-21-int4-acc4-ntile-design.md`](../benchmarks/2026-08-21-int4-acc4-ntile-design.md).
+
+### 21. QLinearMatMul u8 — instruction mix, the `m = 5` cliff, and `vpmaddubsw`
+
+**Instruction decomposition.** The pack-free kernel costs `6 + 4R` uops per `R`
+rows of 32 multiply-accumulates: two load+`cvtepu8_epi16` pairs, two `unpack`
+to build `k` pairs, then `madd`+`add` per row. At `m = 1` that is **0.3125
+uops/MAC of which only 40% is arithmetic** — the six-uop preamble is fixed per
+32 weights and has nobody to amortise against. The packed kernel is `2 + 4R`
+(0.1875 at `R = 1`, **1.67x denser**), which is what the panel buys.
+
+**`m = 1` is issue-bound, not bandwidth-bound**, for `k = n <= 2048`:
+`1x2048x2048` and `4x2048x2048` read the *identical* 4.19 MB of `B` yet differ
+**2.86x**, so time tracks arithmetic, not bytes. Memory only begins to bind at
+`1x4096x4096` (16.8 MB of `B`), where throughput falls 21.08 → 14.72 GMAC/s.
+Static model predicts 12.8 MAC/cycle against a measured 21 GMAC/s; the ~⅓
+shortfall is latency and **is not attributed** — `perf` is unavailable here.
+
+**Shipped:** the pack-free kernel had no row blocking, so `fused = m <= MR` sent
+`m = 5` to the packed path with two row blocks and nothing to amortise a
+`2*k*n` panel write against — a **2.0x cliff** off `m = 4` (0.543 ms ->
+1.090 ms) for 25% more arithmetic. Added row blocking
+and moved the boundary to `2 * MR`. Serial gains **1.46-1.48x / 1.37-1.42x /
+1.16-1.19x** at `m = 5/6/8` across three independent runs, the last of them on
+the merged latest-main head (both reported, not the
+more flattering one); `m = 1` and `m >= 12` unchanged by construction and
+measured unchanged at 0.998x/1.013x. One-thread null controls repeat to
+**1.5%**; the 8-thread arms are the same code and spread **10%**, so the two
+floors must not be interchanged.
+
+**First reversal, and it inverted the rule.** The boundary drafted at 16 on
+one-thread evidence **loses 0.87x/0.79x at `m = 5/8` on eight threads**.
+Serially the pack is latency on the critical path; across the pool every worker
+has its own issue width but one shared memory system, so the pack-free path's
+extra sweep of `B` per row block binds and the L2-resident panel wins. The gate
+is therefore `m <= MR || (!parallel && m <= 2 * MR)` — above `MR` the right
+answer is a function of thread count, not of `m`. The 8-thread arms are the
+same code, which calibrates this harness's noise floor at **±10%**.
+
+**`vpmaddubsw` — legality derived, benefit quantified, not built.** It cannot
+consume today's operands: `A` is centred into `[-255, 255]` and so cannot be the
+unsigned operand. Legal form is raw `u8` `A` against a prepacked centred-`i8`
+`B' = b - zb`, with `sum_k a·B' − za·sum_k B'` (exact; the column sum is a
+prepack constant). Saturation is safe iff `|B'_k| + |B'_{k+1}| <= 128.5`, i.e.
+**guaranteed when every `|B'| <= 64`** — exactly reduce-range 7-bit weights. At
+full range it is *false*, not tight (`255*127*2 = 64770`). **The contract should
+be proven by scanning the constant weight at prepack, not trusted from
+metadata**; on failure the kernel keeps exact `vpmaddwd`. Payoff: the `k`-pair
+interleave is unavoidable either way, but doing it in the *byte* domain halves
+issue to **0.156 uops/MAC** — the largest identified `m = 1` lever. Blocked on a
+constant-`B` pack cache, which the native path lacks entirely
+(`pack_lookup`/`pack_build` are `#[cfg(feature = "mlas")]`). Full record:
+[`docs/benchmarks/2026-08-21-qlinear-u8-m1-instruction-mix.md`](../benchmarks/2026-08-21-qlinear-u8-m1-instruction-mix.md).

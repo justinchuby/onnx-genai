@@ -18,7 +18,7 @@
 //!
 //! `GLM_TINY_QMOE_E2E_DIR` may override the committed fixture. Missing fixture
 //! files skip cleanly so source packages that omit binary fixtures remain green.
-#![cfg(all(feature = "cuda", feature = "native-backend"))]
+#![cfg(feature = "native-cuda")]
 
 use std::path::{Path, PathBuf};
 

@@ -25,11 +25,11 @@ pub(crate) fn load_native_shared_kv_proposer(
     metadata: &InferenceMetadata,
     model_dir: &Path,
     device: crate::native_decode::NativeDecodeDevice,
-    #[cfg(feature = "cuda")] policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
-    #[cfg(feature = "cuda")] governor: Arc<
+    #[cfg(feature = "native-cuda")] policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
+    #[cfg(feature = "native-cuda")] governor: Arc<
         dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync,
     >,
-    #[cfg(feature = "cuda")] manager: onnx_runtime_memory_governor::ProcessMemoryManager,
+    #[cfg(feature = "native-cuda")] manager: onnx_runtime_memory_governor::ProcessMemoryManager,
 ) -> anyhow::Result<(Option<NativeSharedKvProposerModel>, SpeculativeMode)> {
     let Some(config) = metadata.speculative.as_ref() else {
         return Ok((None, SpeculativeMode::None));
@@ -79,13 +79,13 @@ pub(crate) fn load_native_shared_kv_proposer(
     let weights = read_f32_weights(&spec.input_embedding)?;
     let embedder = LinearEmbedder::new(weights, spec.vocab_size, spec.backbone_hidden_size)
         .context("build native shared-KV target embedding lookup")?;
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "native-cuda")]
     let memory = crate::native_component::NativeSessionMemory::GovernedCuda {
         policy,
         governor,
         manager,
     };
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "native-cuda"))]
     let memory = crate::native_component::NativeSessionMemory::SelfProvisioned(None);
     let session = crate::native_decode::NativeProposerSession::load(
         &spec.model,

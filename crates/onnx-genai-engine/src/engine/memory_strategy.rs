@@ -839,7 +839,7 @@ fn unenforced_budget_overrun(plan: &MemoryStrategyPlan) -> Option<(u64, f64)> {
     Some((budget, percent))
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 pub(crate) fn memory_strategy_overrides_from_cuda_env(
     policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
 ) -> MemoryStrategyOverrides {
@@ -859,7 +859,7 @@ pub(crate) fn memory_strategy_overrides_from_cuda_env(
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 pub(crate) fn cuda_policy_from_memory_strategy_plan(
     plan: &MemoryStrategyPlan,
 ) -> onnx_runtime_ep_cuda::DeviceOffloadPolicy {

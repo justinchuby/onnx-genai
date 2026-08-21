@@ -32,7 +32,7 @@ pub(crate) fn resolve_native_decode_device(
             // (#1064, #1551). A declaration that isn't there is an absence of
             // information, not a preference, so probe for a usable device
             // instead. `--device cpu` remains the way to ask for the CPU.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "native-cuda")]
             if onnx_runtime_ep_cuda::CudaExecutionProvider::is_available(0) {
                 let device = NativeDecodeDevice::Cuda { index: Some(0) };
                 log_resolved_native_decode_device(
@@ -143,11 +143,11 @@ pub(crate) fn validate_native_decode_device(
             Ok(device)
         }
         crate::native_decode::NativeDecodeDevice::Cuda { .. } => {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "native-cuda")]
             {
                 Ok(device)
             }
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "native-cuda"))]
             {
                 anyhow::bail!(
                     "native decoder backend CUDA device requires building onnx-genai-engine with both the 'native-backend' and 'cuda' features"
@@ -782,7 +782,7 @@ pub(crate) fn fallback_capacity_providers(limits: &ResourceLimits) -> CapacityPr
 /// query is unavailable (no driver, query failure, or a nonsense zero total)
 /// so the caller reports the device tier as *unknown* rather than fabricating a
 /// capacity.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 pub(crate) fn real_cuda_vram_capacity(device_index: u32) -> Option<(u64, u64)> {
     let device_id = i32::try_from(device_index).ok()?;
     match onnx_genai_ort::cuda_rt::device_memory_info(device_id) {
@@ -901,13 +901,13 @@ pub(crate) fn clamp_ceiling_to_usable_vram(
 /// is *measured* or *unknown*, so every consumer — the decode governor and the
 /// server's device-limit resolution alike — shares one honest answer (#947).
 pub(crate) fn device_vram_capacity(cuda_device_index: Option<u32>) -> Arc<dyn CapacityProvider> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "native-cuda")]
     if let Some(index) = cuda_device_index
         && let Some((total, free)) = real_cuda_vram_capacity(index)
     {
         return Arc::new(FixedCapacity::new(total, free));
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "native-cuda"))]
     let _ = cuda_device_index;
     Arc::new(onnx_genai_scheduler::UnknownCapacity)
 }
@@ -1124,7 +1124,7 @@ mod tests {
             NativeDecodeDevice::Cpu,
             "an explicit CPU request must survive accelerator detection"
         );
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         assert_eq!(
             resolve_native_decode_device(
                 Some(NativeDecodeDevice::Cuda { index: Some(2) }),
@@ -1146,7 +1146,7 @@ mod tests {
     /// so it now probes instead. The assertion is written against the probe
     /// rather than against a fixed device so that it is meaningful on both a GPU
     /// box and a CPU-only one.
-    #[cfg(all(feature = "native-backend", feature = "cuda"))]
+    #[cfg(feature = "native-cuda")]
     #[test]
     fn an_undeclared_device_probes_for_an_accelerator_instead_of_assuming_the_cpu() {
         use crate::native_decode::NativeDecodeDevice;
@@ -1342,7 +1342,7 @@ mod tests {
     // with a visible device, a `Fraction(0.90)` must resolve against the true
     // device total, not a provisional cap — otherwise any model larger than
     // ~7.2 GiB fails to load resident even on a 143 GiB H200.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "native-cuda")]
     #[test]
     fn real_cuda_capacity_lifts_fraction_above_provisional_cap() {
         // Historic 8 GiB provisional cap this test guards against regressing to.

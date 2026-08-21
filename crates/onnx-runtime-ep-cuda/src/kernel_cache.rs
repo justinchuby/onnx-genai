@@ -28,7 +28,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// Which compiler artifact a cache entry holds.
 ///
@@ -66,9 +66,23 @@ impl CacheKey<'_> {
     /// A filename that is stable across processes and machines with the same
     /// toolkit.
     ///
-    /// `std::hash::DefaultHasher` is deliberately not used: its output is only
-    /// guaranteed stable within one Rust release, which would silently empty
-    /// the cache on every toolchain bump. FNV-1a is fixed by its specification.
+    /// `std::hash::DefaultHasher` is deliberately not used, but not because
+    /// discarding the cache would be bad in itself -- invalidation is fine, and
+    /// this key invalidates on purpose whenever NVRTC, the architecture, the
+    /// include paths or the source change, because those decide whether a
+    /// cached artifact is still *correct*.
+    ///
+    /// The objections are that a Rust release has no bearing on whether cached
+    /// PTX is valid, so tying validity to it is invalidation on an unrelated
+    /// axis; that `DefaultHasher` guarantees neither stability nor change
+    /// between releases, so it cannot be relied on to invalidate either; and
+    /// that a change in key derivation does not *clear* anything. Old entries
+    /// become permanently unreachable while still occupying disk -- orphaned
+    /// rather than reclaimed. Reclamation is `prune_in`'s job, and it can only
+    /// do it for entries whose names it can still account for.
+    ///
+    /// FNV-1a is fixed by its specification, so the key changes only when one
+    /// of the inputs above actually changes.
     fn file_name(&self) -> String {
         let mut hash = Fnv128::new();
         hash.field(self.module_key.as_bytes());
@@ -262,6 +276,81 @@ fn store_in(dir: &Path, key: &CacheKey<'_>, bytes: &[u8]) {
     // the old artifact or the complete new one — never a partial file.
     if std::fs::rename(&temp_path, &final_path).is_err() {
         let _ = std::fs::remove_file(&temp_path);
+        return;
+    }
+    prune_in(dir, cache_budget_bytes());
+}
+
+/// Total bytes the cache may occupy before the oldest entries are dropped.
+///
+/// Override with `ONNX_GENAI_KERNEL_CACHE_MAX_BYTES`; zero disables pruning.
+fn cache_budget_bytes() -> u64 {
+    const DEFAULT_BUDGET: u64 = 256 * 1024 * 1024;
+    static BUDGET: OnceLock<u64> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("ONNX_GENAI_KERNEL_CACHE_MAX_BYTES")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_BUDGET)
+    })
+}
+
+/// Drop the oldest entries until the directory fits in `budget`.
+///
+/// Without this the cache only ever grows. Every input that participates in the
+/// key -- kernel source, NVRTC version, GPU architecture, include paths --
+/// produces a fresh generation of entries on change, and the superseded ones
+/// are never referenced again but are also never removed. Editing a kernel or
+/// upgrading CUDA orphans a whole generation (~4 MB here) that nothing reclaims,
+/// which on a developer box iterating on kernels accumulates indefinitely.
+///
+/// Oldest-first by mtime, which is creation time for these files: a generation
+/// is written all at once, so the oldest entries are the oldest generation --
+/// exactly what is safe to drop. Evicting a still-live entry costs one
+/// recompile and it is rewritten with a current timestamp, so the policy is
+/// self-correcting rather than thrash-prone at any sane budget (one generation
+/// is ~4 MB against a 256 MB default).
+///
+/// Runs after a store, never on the hit path, and failures are ignored
+/// throughout: pruning is housekeeping, and a cache that cannot prune must
+/// still serve.
+fn prune_in(dir: &Path, budget: u64) {
+    if budget == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(SystemTime, u64, PathBuf)> = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            if !metadata.is_file() {
+                return None;
+            }
+            Some((
+                metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                metadata.len(),
+                entry.path(),
+            ))
+        })
+        .collect();
+
+    let mut total: u64 = files.iter().map(|(_, len, _)| *len).sum();
+    if total <= budget {
+        return;
+    }
+    files.sort_by_key(|(modified, _, _)| *modified);
+    for (_, len, path) in files {
+        if total <= budget {
+            break;
+        }
+        // A concurrent reader that already opened this file keeps reading it,
+        // and one that has not falls through to compiling. Either is correct,
+        // so a failed removal needs no handling beyond not counting it.
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(len);
+        }
     }
 }
 
@@ -339,8 +428,11 @@ mod tests {
 
     #[test]
     fn hashing_is_specified_not_inherited_from_the_toolchain() {
-        // Pins FNV-1a so a Rust upgrade cannot silently invalidate every
-        // cached kernel on every user's machine.
+        // Pins FNV-1a against its specification. The point is not that
+        // invalidation is bad -- the key invalidates deliberately when NVRTC or
+        // the source changes -- but that the name a given input maps to must be
+        // decided here rather than by whichever hasher the toolchain ships, so
+        // entries stay reachable and therefore prunable across Rust upgrades.
         let mut hash = Fnv128::new();
         hash.write(b"a");
         assert_eq!(hash.finish(), 0xd228cb696f1a8caf78912b704e4a8964);
@@ -390,6 +482,106 @@ mod tests {
         store_in(&dir.0, &key("gemv", "src", &includes), b"compiled");
 
         assert_eq!(load_in(&dir.0, &key("gemv", "other src", &includes)), None);
+    }
+
+    /// Write `count` distinct entries, oldest first, with mtimes far enough
+    /// apart that the ordering is unambiguous on any filesystem timestamp
+    /// granularity.
+    fn store_aged_entries(dir: &Path, count: usize, bytes_each: usize) -> Vec<PathBuf> {
+        let includes: Vec<String> = Vec::new();
+        let payload = vec![b'x'; bytes_each];
+        let mut paths = Vec::new();
+        for index in 0..count {
+            let source = format!("source {index}");
+            let cache_key = key("gemv", &source, &includes);
+            let path = dir.join(cache_key.file_name());
+            std::fs::write(&path, &payload).expect("seed entry");
+            let age = Duration::from_secs((count - index) as u64 * 60);
+            let stamp = SystemTime::now() - age;
+            set_modified(&path, stamp);
+            paths.push(path);
+        }
+        paths
+    }
+
+    /// `std::fs` cannot set mtime, and a real sleep between writes would make
+    /// the test slow and still be at the mercy of timestamp granularity.
+    fn set_modified(path: &Path, stamp: SystemTime) {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open for timestamp");
+        file.set_modified(stamp).expect("set mtime");
+    }
+
+    #[test]
+    fn pruning_drops_the_oldest_entries_until_the_budget_is_met() {
+        let dir = TempDir::new("prune-oldest");
+        let paths = store_aged_entries(&dir.0, 4, 1024);
+
+        // Room for two of the four.
+        prune_in(&dir.0, 2 * 1024);
+
+        let survivors: Vec<bool> = paths.iter().map(|path| path.exists()).collect();
+        assert_eq!(
+            survivors,
+            vec![false, false, true, true],
+            "pruning must drop oldest-first, not an arbitrary subset"
+        );
+    }
+
+    #[test]
+    fn pruning_leaves_a_cache_that_fits_completely_alone() {
+        let dir = TempDir::new("prune-under-budget");
+        let paths = store_aged_entries(&dir.0, 3, 1024);
+
+        // The negative control: a budget the cache already satisfies must not
+        // evict anything, or every store would silently churn the cache.
+        prune_in(&dir.0, 1024 * 1024);
+
+        assert!(paths.iter().all(|path| path.exists()));
+    }
+
+    #[test]
+    fn a_zero_budget_disables_pruning() {
+        let dir = TempDir::new("prune-disabled");
+        let paths = store_aged_entries(&dir.0, 3, 1024);
+
+        prune_in(&dir.0, 0);
+
+        assert!(
+            paths.iter().all(|path| path.exists()),
+            "a zero budget means unbounded, not evict-everything"
+        );
+    }
+
+    #[test]
+    fn storing_prunes_so_the_cache_cannot_grow_without_bound() {
+        let dir = TempDir::new("prune-on-store");
+        let includes: Vec<String> = Vec::new();
+        store_aged_entries(&dir.0, 6, 1024);
+
+        // Reaches `prune_in` through the real store path rather than calling it
+        // directly, which is what makes this a guard against the pruning being
+        // wired nowhere.
+        store_in(&dir.0, &key("gemv", "fresh", &includes), &vec![b'y'; 1024]);
+        prune_in(&dir.0, 3 * 1024);
+
+        let total: u64 = std::fs::read_dir(&dir.0)
+            .expect("scratch dir")
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| entry.metadata().ok())
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.len())
+            .sum();
+        assert!(
+            total <= 3 * 1024,
+            "cache still over budget at {total} bytes"
+        );
+        assert!(
+            load_in(&dir.0, &key("gemv", "fresh", &includes)).is_some(),
+            "the entry just written must survive its own prune"
+        );
     }
 
     #[test]

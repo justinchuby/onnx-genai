@@ -16,7 +16,7 @@
 //!   --test phi35_fp16_decode_parity -- --ignored --nocapture
 //! # Select a single config in a fresh process: PARITY_ONE=ort|native_model|native_fp16
 //! ```
-#![cfg(all(feature = "cuda", feature = "native-backend"))]
+#![cfg(feature = "native-cuda")]
 
 use onnx_genai_engine::{
     DecodePrecision, Engine, EngineConfig, EngineDecodeBackend, GeneratePrompt, GenerateRequest,

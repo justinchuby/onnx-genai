@@ -99,15 +99,15 @@ impl GemmKernel {
         // f16 route at every weight -- `half_decode_route_tests` pins that,
         // and pins the `bf16` pair too.
         //
-        // A transposed weight is the one remaining asymmetry, and it is a
-        // kernel-coverage fact rather than a policy: `gemv_f16_nk` is `f16`
-        // only, so a transposed `bf16` decode falls through to the blocked
-        // GEMM below exactly as it did before.
+        // The transposed `bf16` asymmetry §15 left open is closed: the `[N, K]`
+        // GEMV is instantiated per format from one macro, the way the `[K, N]`
+        // stripe already was, so `trans_b` now picks a layout rather than a
+        // dtype. Both operators, both stored orders and both 16-bit formats
+        // reach the same GEMV backend.
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         if m == 1
             && b.is_contiguous()
             && b.numel() == k.saturating_mul(n)
-            && (!trans_b || format == HalfFormat::F16)
             && half_gemv::simd_available(format)
             && matmul::half_decode_gemv_enabled()
         {
@@ -123,7 +123,7 @@ impl GemmKernel {
                 let mut result = vec![0.0f32; n];
                 count_half_decode_gemv();
                 if trans_b {
-                    half_gemv::gemv_f16_nk(&a_dense, b_bits, &mut result, k, n);
+                    half_gemv::gemv_half_nk(format, &a_dense, b_bits, &mut result, k, n);
                 } else {
                     half_gemv::gemv_half_kn(format, &a_dense, b_bits, &mut result, k, n);
                 }
@@ -1453,15 +1453,18 @@ mod half_decode_route_tests {
         }
     }
 
-    /// A *transposed* `bf16` decode still declines, and must stay correct.
+    /// A *transposed* `bf16` decode now takes the `[N, K]` GEMV, and the
+    /// numerics are what prove the weight is read as `bf16` and not as `f16`.
     ///
-    /// This is kernel coverage, not policy: `gemv_f16_nk` reads `[N, K]` as
-    /// `f16` bit patterns and there is no `bf16` twin, so admitting it would
-    /// silently reinterpret the weight. The guard is the `format ==
-    /// HalfFormat::F16` term on the decode arm; delete it and this test fails
-    /// on the numerics, which is the failure mode that matters.
+    /// This test used to assert the opposite. The decline was kernel coverage,
+    /// not policy — the `[N, K]` GEMV existed only in an `f16` spelling — so
+    /// the fix was to instantiate it per format rather than to keep gating on
+    /// dtype. Reading a `bf16` weight through the `f16` kernel would not fault;
+    /// it would silently reinterpret every bit pattern, which is why the route
+    /// assertion alone is not enough and the error bound is checked against an
+    /// `f64` reference built from the untransposed operand.
     #[test]
-    fn transposed_bf16_decode_declines_the_gemv_but_stays_correct() {
+    fn a_transposed_bf16_decode_takes_the_same_gemv_as_f16() {
         if !half_gemv::simd_available(HalfFormat::Bf16) {
             return;
         }
@@ -1476,13 +1479,14 @@ mod half_decode_route_tests {
         }
         let (out, gemv) = decode_gemm_bf16(k, n, &a, &nk, true);
         assert_eq!(
-            gemv, 0,
-            "a transposed bf16 decode must not reach the f16-only [N, K] GEMV"
+            gemv, 1,
+            "a transposed bf16 decode must reach the [N, K] GEMV, not the blocked GEMM"
         );
         let worst = worst_rel(&out, &reference_bf16(k, n, &a, &kn));
         assert!(
             worst <= 8e-3,
-            "transposed bf16 decode disagrees by {worst:e}"
+            "transposed bf16 decode disagrees by {worst:e} -- \
+             an f16 reinterpretation of the weight would land here"
         );
     }
 

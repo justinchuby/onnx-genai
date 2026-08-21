@@ -1,7 +1,7 @@
 //! Temporary CPU-vs-CUDA divergence probe for real DeepSeek-V2-Lite int4.
 //! Runs the same greedy prompt on native CPU and native CUDA and reports the
 //! first differing generated-token index. Investigation harness only.
-#![cfg(all(feature = "native-backend", feature = "cuda"))]
+#![cfg(feature = "native-cuda")]
 
 use std::path::PathBuf;
 

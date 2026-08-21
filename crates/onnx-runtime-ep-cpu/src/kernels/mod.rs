@@ -534,6 +534,7 @@ pub mod hardmax;
 pub mod identity;
 pub mod index_share;
 pub mod indexing;
+pub(crate) mod int4_nibble;
 pub mod is_inf;
 pub mod is_nan;
 pub mod layernorm;

@@ -138,3 +138,9 @@ bench-bins/
 /ort-glm-stage/
 /ort-glm-cache/
 /bench-logs/
+
+# Roy's local benchmark scratch (see docs/benchmarks/*): raw arm dumps and
+# machine-specific binary paths, never repo content.
+.rg_*
+.rv_*
+.roy_*

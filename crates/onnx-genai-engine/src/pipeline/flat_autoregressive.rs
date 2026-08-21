@@ -177,13 +177,13 @@ impl PipelineEngine {
                         &ar.decoder,
                         self.native_device.as_ref(),
                         &self.memory_strategy_plan,
-                        #[cfg(feature = "cuda")]
+                        #[cfg(feature = "native-cuda")]
                         std::sync::Arc::new(
                             self.native_cuda_authority
                                 .clone()
                                 .unwrap_or_else(|| self.resource_governor.device_authority()),
                         ),
-                        #[cfg(feature = "cuda")]
+                        #[cfg(feature = "native-cuda")]
                         self.resource_governor.process_memory_manager(),
                     )?),
                 }
@@ -357,17 +357,17 @@ impl PipelineEngine {
                         &binding.component,
                         native_step_components,
                         &native_step_device,
-                        #[cfg(feature = "cuda")]
+                        #[cfg(feature = "native-cuda")]
                         crate::engine::cuda_policy_from_memory_strategy_plan(
                             &self.memory_strategy_plan,
                         ),
-                        #[cfg(feature = "cuda")]
+                        #[cfg(feature = "native-cuda")]
                         std::sync::Arc::new(
                             self.native_cuda_authority
                                 .clone()
                                 .unwrap_or_else(|| self.resource_governor.device_authority()),
                         ),
-                        #[cfg(feature = "cuda")]
+                        #[cfg(feature = "native-cuda")]
                         self.resource_governor.process_memory_manager(),
                     )?;
                 Ok((binding, component))

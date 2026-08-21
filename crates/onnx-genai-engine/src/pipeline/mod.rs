@@ -287,7 +287,7 @@ pub struct PipelineEngine {
     )]
     native_prompt_sessions:
         RefCell<BTreeMap<String, Box<dyn onnx_genai_metadata::ComponentSession>>>,
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "native-cuda")]
     native_cuda_authority: Option<crate::memory_authority::DeviceMemoryAuthority>,
 }
 
@@ -508,11 +508,11 @@ fn build_step_component_session<'a>(
     native_components: &BTreeSet<String>,
     #[cfg_attr(not(feature = "native-backend"), allow(unused_variables))]
     native_device: &crate::native_decode_device::NativeDecodeDevice,
-    #[cfg(feature = "cuda")] policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
-    #[cfg(feature = "cuda")] governor: std::sync::Arc<
+    #[cfg(feature = "native-cuda")] policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
+    #[cfg(feature = "native-cuda")] governor: std::sync::Arc<
         dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync,
     >,
-    #[cfg(feature = "cuda")] manager: onnx_runtime_memory_governor::ProcessMemoryManager,
+    #[cfg(feature = "native-cuda")] manager: onnx_runtime_memory_governor::ProcessMemoryManager,
 ) -> anyhow::Result<Box<dyn onnx_genai_metadata::ComponentSession + 'a>> {
     if native_components.contains(component) {
         #[cfg(feature = "native-backend")]
@@ -539,13 +539,13 @@ fn build_step_component_session<'a>(
             // components are built before the resource governor, which is itself
             // sized from the models on disk. The lazily loaded prompt components
             // (routing.rs) are the ones that can and do adopt it.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "native-cuda")]
             let memory = crate::native_component::NativeSessionMemory::GovernedCuda {
                 policy,
                 governor,
                 manager,
             };
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "native-cuda"))]
             let memory = crate::native_component::NativeSessionMemory::SelfProvisioned(None);
             let native = crate::native_component::NativeComponentSession::load(
                 path,
@@ -655,14 +655,14 @@ fn build_native_pipeline_decoder(
     decoder: &str,
     config_device: Option<&crate::native_decode_device::NativeDecodeDevice>,
     memory_strategy_plan: &MemoryStrategyPlan,
-    #[cfg(feature = "cuda")] governor: std::sync::Arc<
+    #[cfg(feature = "native-cuda")] governor: std::sync::Arc<
         dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync,
     >,
-    #[cfg(feature = "cuda")] manager: onnx_runtime_memory_governor::ProcessMemoryManager,
+    #[cfg(feature = "native-cuda")] manager: onnx_runtime_memory_governor::ProcessMemoryManager,
 ) -> anyhow::Result<Box<dyn PipelineDecoderComponent + 'static>> {
     #[cfg(feature = "native-backend")]
     {
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "native-cuda"))]
         let _ = memory_strategy_plan;
         let path =
             models.directory.model_paths.get(decoder).with_context(|| {
@@ -687,11 +687,11 @@ fn build_native_pipeline_decoder(
             native_decoder_device(config_device),
             io,
             pipeline_metadata_max_len(&models.directory),
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "native-cuda")]
             crate::engine::cuda_policy_from_memory_strategy_plan(memory_strategy_plan),
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "native-cuda")]
             governor,
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "native-cuda")]
             manager,
         )?;
         // #1362: the pipeline's ORT decoders have always honored the declared
@@ -1030,13 +1030,13 @@ impl PipelineEngine {
         // when the native CUDA pipeline path is active; otherwise the
         // provisional 8 GiB constant would cap leases far below a large model's
         // resident weights on any GPU.
-        #[cfg(all(feature = "cuda", feature = "native-backend"))]
+        #[cfg(feature = "native-cuda")]
         let pipeline_cuda_index = if backend == PipelineBackend::Native {
             native_decoder_device(resolved_native_device.as_ref()).cuda_index()
         } else {
             None
         };
-        #[cfg(not(all(feature = "cuda", feature = "native-backend")))]
+        #[cfg(not(feature = "native-cuda"))]
         let pipeline_cuda_index: Option<u32> = None;
         // The device (VRAM) capacity stays honestly `None` when it cannot be
         // measured (#947): it is reported verbatim as `resolved_device_budget`
@@ -1048,19 +1048,19 @@ impl PipelineEngine {
         let resolved_vram_bytes = resolve_vram_limit_bytes(&config.limits, pipeline_cuda_index)?;
         let residency_ceiling_bytes =
             resolve_memory_strategy_hot_tier_bytes(&config.limits, pipeline_cuda_index)?;
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         let memory_strategy_overrides = crate::engine::memory_strategy_overrides_from_cuda_env(
             onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env(),
         );
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "native-cuda"))]
         let memory_strategy_overrides = crate::engine::MemoryStrategyOverrides::default();
-        #[cfg(all(feature = "cuda", feature = "native-backend"))]
+        #[cfg(feature = "native-cuda")]
         let native_cuda_plan = backend == PipelineBackend::Native
             && matches!(
                 native_decoder_device(resolved_native_device.as_ref()),
                 crate::native_decode_device::NativeDecodeDevice::Cuda { .. }
             );
-        #[cfg(not(all(feature = "cuda", feature = "native-backend")))]
+        #[cfg(not(feature = "native-cuda"))]
         let native_cuda_plan = false;
         // #971: on the native CPU pipeline path each component's MatMulNBits
         // kernel may build a resident dequantised f32 weight cache held for the
@@ -1089,13 +1089,13 @@ impl PipelineEngine {
         // #755: managed no-spill VMM is the default on the native CUDA pipeline
         // path unless the legacy allocator opt-out is set. Other backends keep
         // the pre-#755 explicit-byte-limit trigger.
-        #[cfg(all(feature = "cuda", feature = "native-backend"))]
+        #[cfg(feature = "native-cuda")]
         let pipeline_managed_vmm = if native_cuda_plan {
             crate::engine::managed_vmm_default_enabled()
         } else {
             matches!(config.limits.vram_limit, crate::ResourceLimit::Bytes(_))
         };
-        #[cfg(not(all(feature = "cuda", feature = "native-backend")))]
+        #[cfg(not(feature = "native-cuda"))]
         let pipeline_managed_vmm =
             matches!(config.limits.vram_limit, crate::ResourceLimit::Bytes(_));
         let memory_strategy_plan = build_memory_strategy_plan(MemoryStrategyPlanInput {
@@ -1108,11 +1108,11 @@ impl PipelineEngine {
             graph: graph_memory,
             required_device_non_weight_bytes: 0,
             minimum_useful_weight_budget_bytes,
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "native-cuda")]
             default_dynamic_device_budget_bytes: Some(
                 onnx_runtime_ep_cuda::DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES,
             ),
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "native-cuda"))]
             default_dynamic_device_budget_bytes: None,
             inferred_policy_enabled: pipeline_managed_vmm
                 || matches!(config.limits.vram_limit, crate::ResourceLimit::Bytes(_)),
@@ -1138,7 +1138,7 @@ impl PipelineEngine {
         onnx_runtime_ep_cpu::set_mlas_sqnbit_packing_enabled(
             memory_strategy_plan.f32_weight_cache_admitted,
         );
-        #[cfg(all(feature = "cuda", feature = "native-backend"))]
+        #[cfg(feature = "native-cuda")]
         let authority_domain = if backend == PipelineBackend::Native {
             match native_decoder_device(resolved_native_device.as_ref()) {
                 crate::native_decode_device::NativeDecodeDevice::Cuda { index } => {
@@ -1169,7 +1169,7 @@ impl PipelineEngine {
             authority_provider.as_ref(),
             &authority_domain,
         )?;
-        #[cfg(all(feature = "cuda", feature = "native-backend"))]
+        #[cfg(feature = "native-cuda")]
         let native_cuda_authority = if backend == PipelineBackend::Native {
             match native_decoder_device(resolved_native_device.as_ref()) {
                 crate::native_decode_device::NativeDecodeDevice::Cuda { .. } => {
@@ -1180,7 +1180,7 @@ impl PipelineEngine {
         } else {
             None
         };
-        #[cfg(all(feature = "cuda", not(feature = "native-backend")))]
+        #[cfg(all(feature = "native-cuda", not(feature = "native-backend")))]
         let native_cuda_authority = None;
         if backend == PipelineBackend::Native {
             // The native backend constructs every declared component through the
@@ -1386,13 +1386,13 @@ impl PipelineEngine {
             #[cfg(not(feature = "native-backend"))]
             native_device: config.native_device.clone(),
             native_prompt_sessions: RefCell::new(BTreeMap::new()),
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "native-cuda")]
             native_cuda_authority,
         })
     }
 
     pub fn resource_snapshot(&self) -> onnx_genai_scheduler::GovernorSnapshot {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         {
             let mut snapshot = self.resource_governor.snapshot();
             if let Some(authority) = &self.native_cuda_authority {
@@ -1403,7 +1403,7 @@ impl PipelineEngine {
             }
             snapshot
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "native-cuda"))]
         {
             self.resource_governor.snapshot()
         }
@@ -1418,7 +1418,7 @@ impl PipelineEngine {
     }
 
     pub fn device_authority(&self) -> crate::memory_authority::DeviceMemoryAuthority {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         if let Some(authority) = &self.native_cuda_authority {
             return authority.clone();
         }
