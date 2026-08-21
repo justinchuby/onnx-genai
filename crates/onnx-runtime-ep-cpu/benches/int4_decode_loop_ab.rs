@@ -24,9 +24,22 @@
 //!   gate to `borrowed_affine_int4_matmul`; 32/64/128 route to
 //!   `borrowed_affine_int4_matmul_nblock`, a different and much stronger
 //!   competitor.
+//! - `PROBE_ACCURACY` -- `accuracy_level` (default 0). **4 is the only value
+//!   that reaches the packed-nibble kernel**, so without this axis that route
+//!   had no decode-loop row at all and only ever appeared in single-op benches.
 //! - `PROBE_SESSIONS` -- concurrent decode loops (default 1).
 //! - `PROBE_TOKENS` -- measured tokens per session (default 64).
 //! - `PROBE_LAYERS` -- projection chains per token (default 1).
+//!
+//! To vary the decode pool width, set **`ONNX_GENAI_CPU_DECODE_THREADS`**.
+//! `RAYON_NUM_THREADS` does *not* size this pool -- `configured_decode_threads`
+//! reads `available_parallelism` and `ONNX_GENAI_CPU_DECODE_THREADS` only. A
+//! sweep of `RAYON_NUM_THREADS` therefore holds the width fixed while appearing
+//! to vary it, and reports a flat line that reads exactly like "this kernel
+//! does not scale". It does scale: measured here at block 32, accuracy 4,
+//! 8 threads -> 5.90 ms/token and 16 -> 3.32 ms/token (1.78x, +-0.7% over
+//! three interleaved repetitions). The default width already resolves to 16 on
+//! a 32-vCPU host, for both the persistent and the flat pool.
 
 mod common;
 
@@ -71,7 +84,7 @@ fn median(mut samples: Vec<f64>) -> f64 {
     samples[samples.len() / 2]
 }
 
-fn build_kernel(k: usize, n: usize, block_size: usize) -> Box<dyn Kernel> {
+fn build_kernel(k: usize, n: usize, block_size: usize, accuracy: i64) -> Box<dyn Kernel> {
     let blocks = k.div_ceil(block_size);
     let blob = block_size / 2;
     let shapes = vec![vec![1, k], vec![n, blocks, blob], vec![n, blocks]];
@@ -82,7 +95,7 @@ fn build_kernel(k: usize, n: usize, block_size: usize) -> Box<dyn Kernel> {
         ("N", Attribute::Int(n as i64)),
         ("bits", Attribute::Int(4)),
         ("block_size", Attribute::Int(block_size as i64)),
-        ("accuracy_level", Attribute::Int(0)),
+        ("accuracy_level", Attribute::Int(accuracy)),
     ] {
         node.attributes.insert(name.into(), value);
     }
@@ -106,6 +119,10 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(32);
+    let accuracy: i64 = std::env::var("PROBE_ACCURACY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let sessions: usize = std::env::var("PROBE_SESSIONS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -146,7 +163,7 @@ fn main() {
         .collect();
 
     println!(
-        "block_size={block_size} sessions={sessions} tokens={tokens} layers={layers} spmd={spmd}"
+        "block_size={block_size} accuracy={accuracy} sessions={sessions} tokens={tokens} layers={layers} spmd={spmd}"
     );
     println!(
         "{:>10} {:>12} {:>12} {:>14}",
@@ -161,7 +178,7 @@ fn main() {
         let mut outputs: Vec<Tensor> = Vec::new();
         for _ in 0..layers {
             for weight in &weights {
-                kernels.push(build_kernel(weight.k, weight.n, block_size));
+                kernels.push(build_kernel(weight.k, weight.n, block_size, accuracy));
                 activations.push(Tensor::floats(
                     common::FloatDType::F32,
                     &[1, weight.k],
