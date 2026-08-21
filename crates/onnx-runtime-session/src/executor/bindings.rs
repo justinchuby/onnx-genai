@@ -791,10 +791,30 @@ impl Executor {
     }
 
     pub(super) fn release_step_workspace(&mut self) -> Result<()> {
+        // When pinned (an installed fixed-shape verify graph baked this buffer's
+        // address), keep the StepScoped scratch alive so a later replay reads a
+        // valid pointer. `reserve_prepared_workspace` reuses it whenever the next
+        // requirement fits, so the pointer stays stable across replays.
+        if self.pin_step_workspace {
+            return Ok(());
+        }
         if let Some(workspace) = self.step_workspace.take() {
             self.ep.deallocate(workspace.buffer)?;
         }
         Ok(())
+    }
+
+    /// Whether this executor's StepScoped workspace is pinned across runs.
+    pub(crate) fn step_workspace_pinned(&self) -> bool {
+        self.pin_step_workspace
+    }
+
+    /// Pin (or unpin) this executor's StepScoped workspace across runs. Pinning
+    /// keeps the reserved scratch buffer alive so a captured fixed-shape graph
+    /// (the M=K speculative verify) replays against a stable pointer; unpinning
+    /// frees it on the next release. See [`Self::pin_step_workspace`].
+    pub(crate) fn set_pin_step_workspace(&mut self, pin: bool) {
+        self.pin_step_workspace = pin;
     }
 
     /// Bind the graph's symbols to concrete sizes from the actual bound-input

@@ -320,6 +320,17 @@ pub(crate) struct Executor {
     pub(super) kernel_bindings: Vec<Option<KernelKey>>,
     pub(super) persistent_workspace: Option<PreparedWorkspace>,
     pub(super) step_workspace: Option<PreparedWorkspace>,
+    /// When set, [`Executor::release_step_workspace`] is a no-op: the StepScoped
+    /// `step_workspace` buffer is kept alive between runs instead of being freed
+    /// after each one. A captured device graph bakes the physical address of the
+    /// StepScoped scratch it reads; if that buffer is freed and re-reserved
+    /// between the capture and a later replay (as happens once a larger M=K
+    /// speculative verify forward reserves a bigger scratch than the M=1 decode),
+    /// the replay reads a stale pointer and produces non-finite logits (#1647).
+    /// Pinning the workspace at the M=K peak keeps the pointer stable across
+    /// replays. Inert by default (`false`) so every non-verify executor frees its
+    /// StepScoped scratch exactly as before.
+    pub(super) pin_step_workspace: bool,
     /// Non-owning view of an enclosing executor's prepared workspace. Nested
     /// control-flow executors run sequentially, so they may reuse the parent's
     /// peak allocation without reserving or allocating a second buffer.
