@@ -1023,7 +1023,28 @@ state service group inherits that group's `rollback_positions` bound, and
 `cascade` is walked transitively. The validator rejects a speculative region
 whose effects or state cannot roll back to `max_proposal_width`.
 
-### 13.5 Automatic enablement
+### 13.5 Hybrid linear-attention targets
+
+A Qwen3.5-style target combines sequence-growing attention KV with fixed-size
+linear-attention and causal-convolution state. All three advance while the
+target scores a proposal, so all three belong in `rollback_state`.
+
+Attention KV can discard a rejected suffix along its sequence axis. A
+replacement accumulator or convolution history has no sequence axis and cannot
+be truncated. To commit only `accepted_len`, the runtime must either retain the
+replacement state produced at every proposal prefix or restore the
+pre-proposal snapshot and replay the accepted prefix. The metadata expresses
+this capability with a sufficient `rollback_positions` bound, `snapshot: true`,
+and a `cascade` connecting all affected groups; it does not prescribe which
+runtime algorithm implements the rollback.
+
+The complete config is
+[`20-qwen3_5-hybrid-speculative-decoding.yaml`](../../examples/inference_metadata/catalogue/20-qwen3_5-hybrid-speculative-decoding.yaml).
+Its proposer is independent and recomputed from committed tokens. A persistent
+draft model needs its own state groups in `rollback_state`; mutable target state
+is not `shared_state` unless both graph ABIs truly share that exact state.
+
+### 13.6 Automatic enablement
 
 The runtime auto-enables speculation only when **every component** in the
 workflow declares `bitwise` or `distribution_preserving` equivalence

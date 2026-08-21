@@ -30,6 +30,35 @@ non-schema keys.
 | 17 | [Causal convolution](17-causal-convolution-recurrent.yaml) | Separate accumulator/history recurrent groups |
 | 18 | [Static cache](18-static-cache-indexed-scatter.yaml) | Fixed capacity, logical lengths, indexed scatter |
 | 19 | [Operator ABI comparison](19-operator-abi-comparison.yaml) | Graph-visible operator/port distinctions |
+| 20 | [Qwen3.5 hybrid speculative decode](20-qwen3_5-hybrid-speculative-decoding.yaml) | Full-attention KV plus linear/conv replacement state with atomic rollback |
+
+## Qwen3.5 hybrid state and speculative decoding
+
+Qwen3.5-style hybrid decoders do not have one homogeneous cache. The example
+declares three target-owned groups:
+
+- attention KV is sequence-growing `full_attention` state with `update: append`;
+- the linear-attention accumulator is fixed-size `recurrent` state with
+  `update: replace` and no `sequence_axis`;
+- causal-convolution history is another fixed-size `recurrent` replacement
+  group because it has different shape and graph ports.
+
+For a proposal of at most four positions, `speculative.rollback_state` names
+every affected target state cell. Each group declares `rollback_positions: 4`,
+and `cascade` makes the three groups one atomic rollback unit. Rejecting a suffix
+therefore truncates the attention KV to the accepted length, but it **cannot**
+slice either replacement tensor: the runtime must restore a per-prefix snapshot
+or restore the pre-proposal snapshot and replay the accepted prefix. The
+metadata declares that both strategies are legal through the rollback and
+snapshot capabilities; it does not choose one.
+
+The example uses an independent proposer whose state is recomputed from
+committed tokens. A persistent draft model must declare its own KV, linear, and
+convolution groups and add those cells to `rollback_state` as well. Mutable
+target recurrent state must not be listed in `shared_state` merely to save
+memory: it is shareable only when proposer and target genuinely use the same
+graph-visible state ABI and the whole shared group obeys the same rollback
+bound.
 
 ## Attention/operator ABI matrix
 

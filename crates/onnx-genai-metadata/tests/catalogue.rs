@@ -19,7 +19,7 @@ fn every_catalogue_example_parses_and_validates() {
 
     assert_eq!(
         examples.len(),
-        19,
+        20,
         "catalogue must cover all requested cases"
     );
     for path in examples {
