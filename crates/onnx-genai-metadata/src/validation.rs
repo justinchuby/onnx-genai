@@ -2350,6 +2350,67 @@ fn validate_speculative_rollback(metadata: &InferenceMetadata, errors: &mut Vec<
             ));
         }
     }
+    if let crate::schema::SpeculativeProposalExecution::Chained {
+        token_embedding_input,
+        logits_output,
+        recurrent,
+    } = &speculative.proposal_execution
+        && let Some(proposer) = workflow.components.get(&speculative.proposer)
+    {
+        if !proposer.ports.inputs.contains_key(token_embedding_input) {
+            errors.push(format!(
+                "speculative chained proposer input '{token_embedding_input}' is not an input \
+                 port of component '{}'",
+                speculative.proposer
+            ));
+        }
+        if !proposer.ports.outputs.contains_key(logits_output) {
+            errors.push(format!(
+                "speculative chained proposer logits '{logits_output}' is not an output port of \
+                 component '{}'",
+                speculative.proposer
+            ));
+        }
+        if recurrent.is_empty() {
+            errors.push(
+                "speculative chained proposal must declare at least one recurrent binding"
+                    .to_string(),
+            );
+        }
+        let mut states = BTreeSet::new();
+        for binding in recurrent {
+            if !states.insert(&binding.state) {
+                errors.push(format!(
+                    "speculative chained proposal repeats recurrent state '{}'",
+                    binding.state
+                ));
+            }
+            if !workflow.state.contains_key(&binding.state) {
+                errors.push(format!(
+                    "speculative chained proposal references unknown recurrent state '{}'",
+                    binding.state
+                ));
+            }
+            if !speculative.rollback_state.contains(&binding.state) {
+                errors.push(format!(
+                    "speculative chained recurrent state '{}' must be listed in rollback_state",
+                    binding.state
+                ));
+            }
+            if !proposer.ports.inputs.contains_key(&binding.input) {
+                errors.push(format!(
+                    "speculative chained recurrence input '{}' is not an input port of component '{}'",
+                    binding.input, speculative.proposer
+                ));
+            }
+            if !proposer.ports.outputs.contains_key(&binding.output) {
+                errors.push(format!(
+                    "speculative chained recurrence output '{}' is not an output port of component '{}'",
+                    binding.output, speculative.proposer
+                ));
+            }
+        }
+    }
     let declared_groups = workflow
         .serving
         .as_ref()

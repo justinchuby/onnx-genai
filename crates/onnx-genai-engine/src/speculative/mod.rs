@@ -1157,6 +1157,7 @@ where
 pub struct Eagle3Proposer<'a, E = LinearEmbedder> {
     session: Eagle3DecodeSession<'a>,
     embedder: E,
+    token_map: Option<Vec<TokenId>>,
 }
 
 impl<'a, E> Eagle3Proposer<'a, E>
@@ -1177,7 +1178,24 @@ where
                 embedder.hidden_size()
             );
         }
-        Ok(Self { session, embedder })
+        Ok(Self {
+            session,
+            embedder,
+            token_map: None,
+        })
+    }
+
+    /// Translate proposer vocabulary ids before embedding and verification.
+    pub fn with_token_map(mut self, token_map: Vec<TokenId>) -> anyhow::Result<Self> {
+        if token_map.len() < self.session.signature().draft_vocab_size {
+            anyhow::bail!(
+                "proposer token map has {} entries but logits expose {} ids",
+                token_map.len(),
+                self.session.signature().draft_vocab_size
+            );
+        }
+        self.token_map = Some(token_map);
+        Ok(self)
     }
 }
 
@@ -1237,10 +1255,15 @@ where
                 .session
                 .step(&embedding, &fused_hidden, &running_hidden, position)
                 .map_err(|error| anyhow::anyhow!("EAGLE-3 proposal step failed: {error}"))?;
-            let token = TokenId::try_from(
-                argmax(&output.logits).context("EAGLE-3 head produced empty draft logits")?,
-            )
-            .context("EAGLE-3 token id exceeds u32 range")?;
+            let draft_id =
+                argmax(&output.logits).context("EAGLE-3 head produced empty draft logits")?;
+            let token = if let Some(token_map) = &self.token_map {
+                *token_map
+                    .get(draft_id)
+                    .context("proposer token id is absent from the declared vocabulary map")?
+            } else {
+                TokenId::try_from(draft_id).context("EAGLE-3 token id exceeds u32 range")?
+            };
             tokens.push(token);
             previous_token = token;
             running_hidden = output.hidden;
@@ -2022,16 +2045,18 @@ impl Engine {
                     .eagle3
                     .as_ref()
                     .context("EAGLE-3 speculation requested without a loaded EAGLE-3 head")?;
-                Eagle3Proposer::new(
+                let mut proposer = Eagle3Proposer::new(
                     &eagle3.session,
                     Eagle3DecodeOptions {
                         kv_mode: eagle3.kv_mode,
                         batch_size: 1,
                     },
                     eagle3.embedder.clone(),
-                )?
-                .propose(&proposer_context)?
-                .tokens
+                )?;
+                if let Some(token_map) = &eagle3.token_map {
+                    proposer = proposer.with_token_map(token_map.clone())?;
+                }
+                proposer.propose(&proposer_context)?.tokens
             }
             SpeculativeMode::SharedKv(_) => {
                 let assistant = self.shared_kv_proposer.as_ref().context(
@@ -3124,6 +3149,56 @@ mod tests {
     }
 
     #[test]
+    fn chained_proposer_applies_declared_vocabulary_mapping() -> anyhow::Result<()> {
+        const HIDDEN: usize = 16;
+        const VOCAB: usize = 32;
+        let _guard = eagle3_test_lock()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("chained proposer test lock poisoned"))?;
+        let head = load_eagle3_head()?;
+        let layers = vec![
+            lcg_weights(0x1000_0001, HIDDEN),
+            lcg_weights(0x2000_0002, HIDDEN),
+            lcg_weights(0x3000_0003, HIDDEN),
+        ];
+        let options = GenerateOptions::default();
+        let chain = ProcessorChain::new();
+        let context = SpeculativeProposerContext {
+            width: 2,
+            context_tokens: &[1, 2],
+            generated_tokens: &[],
+            generated_text: "",
+            first_step: 0,
+            options: &options,
+            chain: &chain,
+            target_hidden: Some(&layers[2]),
+            target_hidden_layers: Some(&layers),
+            guaranteed_token: Some(7),
+            shared_kv_slices: None,
+        };
+        let weights = lcg_weights(0x5555_6666, VOCAB * HIDDEN);
+        let mut plain = Eagle3Proposer::new(
+            &head,
+            Eagle3DecodeOptions::default(),
+            LinearEmbedder::new(weights.clone(), VOCAB, HIDDEN)?,
+        )?;
+        let plain = plain.propose(&context)?;
+        let map = (0..VOCAB as TokenId)
+            .map(|token| token ^ 1)
+            .collect::<Vec<_>>();
+        let mut mapped = Eagle3Proposer::new(
+            &head,
+            Eagle3DecodeOptions::default(),
+            LinearEmbedder::new(weights, VOCAB, HIDDEN)?,
+        )?
+        .with_token_map(map.clone())?;
+        let mapped = mapped.propose(&context)?;
+        assert_eq!(mapped.tokens[0], plain.tokens[0]);
+        assert_eq!(mapped.tokens[1], map[plain.tokens[1] as usize]);
+        Ok(())
+    }
+
+    #[test]
     fn eagle3_proposer_accept_then_propose_resets_draft_state() -> anyhow::Result<()> {
         const HIDDEN: usize = 16;
         const VOCAB: usize = 32;
@@ -3196,6 +3271,7 @@ mod tests {
             head_model: "eagle3.onnx".into(),
             target_hidden_outputs: vec!["low".into(), "mid".into(), "high".into()],
             embedding_weights: "embed.f32".into(),
+            token_map: None,
             vocab_size: 32,
             hidden_size: 16,
             kv_mode: onnx_genai_ort::Eagle3DraftKvMode::HiddenThreaded,
