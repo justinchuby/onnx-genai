@@ -198,6 +198,12 @@ impl RecurrentStateSnapshot {
     }
 }
 
+/// Opaque public handle wrapping a [`RecurrentStateSnapshot`], returned by
+/// [`NativeDecodeSession::snapshot_recurrent_state_public`] so out-of-crate
+/// diagnostics can restore recurrent/conv state around an eager verify forward
+/// without exposing the snapshot internals.
+pub struct NativeRecurrentSnapshot(RecurrentStateSnapshot);
+
 /// State of the Inc-1b PR-2 decode-specialized inlined-body plan for a session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DecodeInlineState {
@@ -1097,6 +1103,34 @@ impl NativeDecodeSession {
         <Self as DecodeBackend>::decode(self, token_ids, past_len)
     }
 
+    /// Whether this decoder carries destructive recurrent/conv state (a hybrid
+    /// GDN + attention model). Exposed for diagnostics (e.g. `verify_logits_probe`)
+    /// so a caller that rewinds the attention KV can also restore the recurrent
+    /// state to the correct committed boundary before an eager verify forward,
+    /// exactly as the speculative driver does around a draft window.
+    pub fn has_recurrent_state_public(&self) -> bool {
+        self.has_recurrent_state()
+    }
+
+    /// Snapshot the destructive recurrent/conv state at the current committed
+    /// length. See [`Self::snapshot_recurrent_state`]. Public, opaque handle for
+    /// diagnostics that must restore recurrent state around an eager verify.
+    pub fn snapshot_recurrent_state_public(
+        &mut self,
+    ) -> anyhow::Result<NativeRecurrentSnapshot> {
+        Ok(NativeRecurrentSnapshot(self.snapshot_recurrent_state()?))
+    }
+
+    /// Restore the recurrent/conv bindings from a [`NativeRecurrentSnapshot`],
+    /// leaving attention KV and the logical length untouched (the caller drives
+    /// the KV rewind separately). See [`Self::restore_recurrent_state`].
+    pub fn restore_recurrent_state_public(
+        &mut self,
+        snapshot: &NativeRecurrentSnapshot,
+    ) -> anyhow::Result<()> {
+        self.restore_recurrent_state(&snapshot.0)
+    }
+
     /// Batch-N greedy decode step (stage 2b-impl-4, #750). Steps the pinned
     /// `batch` sequences together — one token per sequence — and returns the
     /// `batch` selected token ids. Requires a CUDA decode session pinned at the
@@ -1299,8 +1333,20 @@ impl NativeDecodeSession {
     /// decoder never builds a sibling, never retries, and stays byte-identical
     /// on the main path.
     ///
+    /// "Byte-identical" here is the *inline-sibling-vs-main-executor* property,
+    /// verified by the Scan-equivalence tests
+    /// (`decode_inline_sibling_is_byte_exact_with_scan_and_preserves_state` and
+    /// its persistent-state sibling): when a single-trip `Scan` IS lowered, the
+    /// sibling reproduces the main executor's result exactly, including a
+    /// non-zero loop-carried recurrent state. It is NOT a claim that the main
+    /// executor mishandles recurrent state — it does not (confirmed on the real
+    /// Qwen3 GDN hybrid, whose recurrence is expressed as ordinary custom ops
+    /// with top-level `past/present` state I/O and therefore has NO `Scan` at
+    /// all: it latches `Disabled` and runs entirely on the main executor, eager
+    /// multi-token verify forwards included, bit-matching an m=1 greedy step).
+    ///
     /// A build failure is non-fatal: it latches `Disabled` and decode proceeds
-    /// on the byte-identical main (Scan child-session) executor.
+    /// on the main executor.
     fn maybe_enable_decode_inline(&mut self, token_ids: &[TokenId]) {
         if self.decode_inline != DecodeInlineState::Untried {
             return;

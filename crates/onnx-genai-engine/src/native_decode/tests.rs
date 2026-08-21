@@ -1156,6 +1156,290 @@ fn native_verify_then_recurrent_commit_matches_accepted_prefix_replay() {
     }
 }
 
+/// A hybrid recurrent decoder whose `logits` DEPEND on the incoming (past)
+/// recurrent state: `logits[b,s,0] = input_ids[b,s] + reduce_sum(conv_state)`.
+///
+/// `mutating_hybrid_decoder` proves the *state* is committed correctly, but its
+/// logits are state-independent, so it cannot observe the failure mode that once
+/// misled a diagnosis: an eager multi-token verify forward run from a STALE
+/// (non-restored) recurrent state emits *different* logits than an m=1 greedy
+/// step from the correct committed state. This fixture makes that dependence
+/// observable so the regression below can assert the driver's snapshot→verify→
+/// restore contract is load-bearing for the emitted logits, not only the state.
+fn state_coupled_hybrid_decoder() -> InferenceSession {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 13);
+    let batch = graph.intern_symbol("batch");
+    let sequence = graph.intern_symbol("sequence");
+    let total = graph.intern_symbol("total");
+    let past = graph.intern_symbol("past");
+    let shape = |dims: &[Dim]| -> Shape { dims.to_vec() };
+
+    let input_ids = graph.create_named_value(
+        "input_ids",
+        DataType::Int64,
+        shape(&[batch.into(), sequence.into()]),
+    );
+    let attention_mask = graph.create_named_value(
+        "attention_mask",
+        DataType::Int64,
+        shape(&[batch.into(), total.into()]),
+    );
+    let position_ids = graph.create_named_value(
+        "position_ids",
+        DataType::Int64,
+        shape(&[batch.into(), sequence.into()]),
+    );
+    let conv_state = graph.create_named_value(
+        "past_key_values.0.conv_state",
+        DataType::Float32,
+        shape(&[batch.into(), 4.into(), 3.into()]),
+    );
+    let recurrent_state = graph.create_named_value(
+        "past_key_values.0.recurrent_state",
+        DataType::Float32,
+        shape(&[batch.into(), 2.into(), 4.into(), 4.into()]),
+    );
+    let past_key = graph.create_named_value(
+        "past_key_values.1.key",
+        DataType::Float32,
+        shape(&[batch.into(), 1.into(), past.into(), 1.into()]),
+    );
+    let past_value = graph.create_named_value(
+        "past_key_values.1.value",
+        DataType::Float32,
+        shape(&[batch.into(), 1.into(), past.into(), 1.into()]),
+    );
+    for input in [
+        input_ids,
+        attention_mask,
+        position_ids,
+        conv_state,
+        recurrent_state,
+        past_key,
+        past_value,
+    ] {
+        graph.add_input(input);
+    }
+
+    let cast = graph.create_value(DataType::Float32, shape(&[batch.into(), sequence.into()]));
+    insert_op(
+        &mut graph,
+        "Cast",
+        vec![input_ids],
+        cast,
+        &[("to", Attribute::Int(1))],
+    );
+    // Per-forward token-sum accumulator, broadcast into each recurrent state.
+    let token_sum = graph.create_value(DataType::Float32, shape(&[batch.into(), 1.into()]));
+    insert_op(
+        &mut graph,
+        "ReduceSum",
+        vec![cast],
+        token_sum,
+        &[
+            ("axes", Attribute::Ints(vec![1])),
+            ("keepdims", Attribute::Int(1)),
+        ],
+    );
+    // logits_base[b,s,0] = input_ids[b,s].
+    let logits_base = graph.create_value(
+        DataType::Float32,
+        shape(&[batch.into(), sequence.into(), 1.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Unsqueeze",
+        vec![cast],
+        logits_base,
+        &[("axes", Attribute::Ints(vec![2]))],
+    );
+    // state_scalar[b,1,1] = reduce_sum over the PAST conv_state feature axes.
+    let state_scalar = graph.create_value(
+        DataType::Float32,
+        shape(&[batch.into(), 1.into(), 1.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "ReduceSum",
+        vec![conv_state],
+        state_scalar,
+        &[
+            ("axes", Attribute::Ints(vec![1, 2])),
+            ("keepdims", Attribute::Int(1)),
+        ],
+    );
+    // logits[b,s,0] = input_ids[b,s] + reduce_sum(conv_state): a step-invariant
+    // read of the loop-carried recurrent state, so a stale state is observable.
+    let logits = graph.create_named_value(
+        "logits",
+        DataType::Float32,
+        shape(&[batch.into(), sequence.into(), 1.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Add",
+        vec![logits_base, state_scalar],
+        logits,
+        &[],
+    );
+
+    let current_kv = graph.create_value(
+        DataType::Float32,
+        shape(&[batch.into(), 1.into(), sequence.into(), 1.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Unsqueeze",
+        vec![cast],
+        current_kv,
+        &[("axes", Attribute::Ints(vec![1, 3]))],
+    );
+    // Recurrent states advance by accumulating the per-forward token sum.
+    let present_conv = graph.create_named_value(
+        "present.0.conv_state",
+        DataType::Float32,
+        shape(&[batch.into(), 4.into(), 3.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Add",
+        vec![conv_state, token_sum],
+        present_conv,
+        &[],
+    );
+    let present_recurrent = graph.create_named_value(
+        "present.0.recurrent_state",
+        DataType::Float32,
+        shape(&[batch.into(), 2.into(), 4.into(), 4.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Add",
+        vec![recurrent_state, token_sum],
+        present_recurrent,
+        &[],
+    );
+    let present_key = graph.create_named_value(
+        "present.1.key",
+        DataType::Float32,
+        shape(&[batch.into(), 1.into(), total.into(), 1.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Concat",
+        vec![past_key, current_kv],
+        present_key,
+        &[("axis", Attribute::Int(2))],
+    );
+    let present_value = graph.create_named_value(
+        "present.1.value",
+        DataType::Float32,
+        shape(&[batch.into(), 1.into(), total.into(), 1.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Concat",
+        vec![past_value, current_kv],
+        present_value,
+        &[("axis", Attribute::Int(2))],
+    );
+    for output in [
+        logits,
+        present_conv,
+        present_recurrent,
+        present_key,
+        present_value,
+    ] {
+        graph.add_output(output);
+    }
+    InferenceSession::from_graph(graph).expect("build state-coupled hybrid decoder")
+}
+
+#[test]
+fn native_verify_logits_require_restored_recurrent_state() {
+    // Regression oracle for the speculative driver's snapshot→verify→restore
+    // contract on a hybrid recurrent target, at the emitted-logits level.
+    //
+    // The driver snapshots the pre-draft recurrent/conv state, runs the eager
+    // verify window from the CURRENT committed state, and — on the accept path —
+    // restores that snapshot before re-advancing by the accepted tokens. This
+    // test proves the restore is load-bearing for the verify *logits*: an eager
+    // verify run from the correctly-committed state is bit-identical to an m=1
+    // greedy step, while the SAME verify run from a stale (non-restored)
+    // recurrent state diverges. (An earlier diagnosis mistook the stale-state
+    // artifact of a verify probe that skipped this restore for a non-existent
+    // "main-exec recurrent continuity" bug; this fixes the probe's oracle and
+    // pins the true contract.)
+    let base_tokens = [5u32, 7, 9];
+    for k in [1usize, 3] {
+        let drafts: Vec<u32> = (0..k).map(|i| 2 * (i as u32 + 1)).collect();
+
+        // Reference: the m=1 greedy logit row at `base_len` from the committed
+        // state S_base (the row a plain greedy step would emit).
+        let mut reference = NativeDecodeSession::from_session(state_coupled_hybrid_decoder())
+            .expect("reference hybrid decoder loads");
+        reference
+            .decode_argmax(&base_tokens, 0)
+            .expect("reference prefill");
+        let base_len = reference.current_len();
+        let m1 = reference
+            .decode(&[drafts[0]], base_len)
+            .expect("reference m=1 greedy step");
+        let m1_row0 = m1[0][0];
+
+        let mut spec = NativeDecodeSession::from_session(state_coupled_hybrid_decoder())
+            .expect("spec hybrid decoder loads");
+        spec.decode_argmax(&base_tokens, 0).expect("spec prefill");
+        assert_eq!(spec.current_len(), base_len);
+        let snapshot = spec
+            .snapshot_recurrent_state()
+            .expect("snapshot pre-draft recurrent state");
+
+        // (1) Verify from the CURRENT committed state (== S_base) matches greedy.
+        let good = spec
+            .decode_verify(&drafts, base_len)
+            .expect("verify from committed state");
+        assert_eq!(
+            good[0][0].to_bits(),
+            m1_row0.to_bits(),
+            "verify row 0 from the committed recurrent state must bit-match the m=1 greedy \
+             logit (k={k})"
+        );
+
+        // (2) Negative control: a plain KV rewind leaves the destructive
+        // recurrent state stranded at its post-verify value; verifying again
+        // WITHOUT restoring the snapshot must DIVERGE from greedy — this is the
+        // stale-state artifact that invalidates any verify oracle skipping the
+        // restore.
+        spec.rewind(base_len).expect("kv rewind, recurrent left stale");
+        let stale = spec
+            .decode_verify(&drafts, base_len)
+            .expect("verify from stale recurrent state");
+        assert_ne!(
+            stale[0][0].to_bits(),
+            m1_row0.to_bits(),
+            "verify row 0 from a STALE recurrent state must diverge from greedy — the restore \
+             is load-bearing (k={k})"
+        );
+
+        // (3) Restoring the snapshot before the verify reinstates bit-identity,
+        // exactly as the driver's commit path does.
+        spec.rewind(base_len).expect("kv rewind before restore");
+        spec.restore_recurrent_state(&snapshot)
+            .expect("restore recurrent state to S_base");
+        let restored = spec
+            .decode_verify(&drafts, base_len)
+            .expect("verify from restored recurrent state");
+        assert_eq!(
+            restored[0][0].to_bits(),
+            m1_row0.to_bits(),
+            "verify row 0 after restoring the committed recurrent state must bit-match the m=1 \
+             greedy logit (k={k})"
+        );
+    }
+}
+
 #[test]
 fn native_decoder_auto_derives_hybrid_state_io() {
     // A hybrid decoder with NO declared `io:` must load via the graph-derived
