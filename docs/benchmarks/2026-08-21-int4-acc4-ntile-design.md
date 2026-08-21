@@ -1,7 +1,22 @@
 # Int4 acc4 N-tile: design, analytic bound, and two closed hypotheses
 
+> **RETIRED 2026-08-21 — do not build the N-tile.** This document designed and
+> analytically bounded the N-tile; it was subsequently *measured* and is a
+> **loss**: 0.94x in the production DRAM-resident regime and 0.76x at full
+> width, its only positive number being an L3-residency artifact of undersized
+> benchmark shapes. The companion lever, **bf16 scales / block-major prepack, is
+> likewise retired** as a wash (0.96x at tile 1, and its 1.10x at tile 8 only
+> recovers part of what the N-tile itself loses). Evidence and the mechanism are
+> in
+> [`2026-08-21-int4-acc4-execution-regime.md`](2026-08-21-int4-acc4-execution-regime.md);
+> what was built instead is the per-block bookkeeping removal (#1628). The
+> design below is kept only so the bound is not re-derived from scratch.
+
 **Date:** 2026-08-21 · **Owner:** Roy (CPU MatMul) · **Host:** AMD EPYC 9V74,
-32 vCPU (16c x 2 SMT), AVX2/FMA/F16C, **no AVX-512/VNNI**, 64 MiB L3.
+32 vCPU (16c x 2 SMT), AVX2/FMA/F16C, **no AVX-512/VNNI**, ~~64 MiB L3~~
+**32 MiB L3 per CCX** (two 16-vCPU CCXs; corrected 2026-08-21 — no single core
+sees 64 MiB, which is precisely why the N-tile's residency-dependent win does
+not survive contact with production shapes).
 
 **Verdict: the N-tile is designed and analytically bounded, but not built.**
 Two cheaper hypotheses raised along the way were tested and **both are closed

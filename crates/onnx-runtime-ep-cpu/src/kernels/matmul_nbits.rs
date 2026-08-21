@@ -18197,6 +18197,26 @@ mod tests {
         }
     }
 
+    /// Render a spawned child's exit status for a failure message.
+    ///
+    /// A child killed by a hard fault — the Windows ARM64
+    /// `STATUS_ACCESS_VIOLATION` (`0xC0000005`) described on
+    /// [`parity_worker_count`] — unwinds nothing: it prints no panic line and
+    /// leaves stderr completely empty. Its stdout simply stops mid-test. So the
+    /// stdout/stderr pair these assertions report cannot, on its own,
+    /// distinguish "the child crashed" from "the child's assertion failed", and
+    /// the two want opposite responses.
+    ///
+    /// The exit status is the only evidence that survives a fault, and NTSTATUS
+    /// codes are unrecognisable in the signed decimal `code()` returns
+    /// (`0xC0000005` prints as `-1073741819`), so render hex as well.
+    fn child_status_detail(status: &std::process::ExitStatus) -> String {
+        match status.code() {
+            Some(code) => format!("{status} (code {code}, {:#010x})", code as u32),
+            None => format!("{status} (no exit code; killed by a signal)"),
+        }
+    }
+
     fn parity_child_output_mode(mode: SpmdParityMode) -> Vec<u8> {
         let workers = parity_worker_count().to_string();
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
@@ -18229,7 +18249,8 @@ mod tests {
         let output = command.output().expect("run SPMD parity child process");
         assert!(
             output.status.success(),
-            "SPMD parity child failed (persistent={persistent}):\nstdout:\n{}\nstderr:\n{}",
+            "SPMD parity child failed (persistent={persistent}, workers={workers}, status={}):\nstdout:\n{}\nstderr:\n{}",
+            child_status_detail(&output.status),
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -18371,7 +18392,8 @@ mod tests {
             .expect("run MLAS-shard parity child process");
         assert!(
             output.status.success(),
-            "MLAS-shard parity child failed (no_shard={no_shard}):\nstdout:\n{}\nstderr:\n{}",
+            "MLAS-shard parity child failed (no_shard={no_shard}, status={}):\nstdout:\n{}\nstderr:\n{}",
+            child_status_detail(&output.status),
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -18636,7 +18658,8 @@ mod tests {
             .expect("run MLAS prefill parity child process");
         assert!(
             output.status.success(),
-            "MLAS prefill parity child failed (serial={serial}):\nstdout:\n{}\nstderr:\n{}",
+            "MLAS prefill parity child failed (serial={serial}, status={}):\nstdout:\n{}\nstderr:\n{}",
+            child_status_detail(&output.status),
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -19048,8 +19071,9 @@ mod tests {
             // still surfaced with full scenario/stdout/stderr context.
             assert!(
                 output.status.success(),
-                "affinity-defer child failed (scenario={scenario}):\nstdout:\n{stdout}\n\
-                 stderr:\n{stderr}"
+                "affinity-defer child failed (scenario={scenario}, status={}):\nstdout:\n{stdout}\n\
+                 stderr:\n{stderr}",
+                child_status_detail(&output.status)
             );
             assert!(
                 stdout.contains(&format!("{AFFINITY_DEFER_MARKER}ok")),
