@@ -16,6 +16,7 @@ pipeline:
           container: wav
           encoding: pcm_s16_le
           sample_rate_hz: 32000
+          source_sample_rate_hz: 44100
           channels: 2
           delivery: buffered
     components:
@@ -44,7 +45,7 @@ fn buffered_stereo_wav_contract_parses_and_validates() {
 #[test]
 fn wav_contract_requires_encoded_bytes_and_physical_audio_properties() {
     for invalid in [
-        AUDIO_WORKFLOW.replace("dtype: uint8", "dtype: float32"),
+        AUDIO_WORKFLOW.replace("stage: post_adapter", "stage: pre_adapter"),
         AUDIO_WORKFLOW.replace("sample_rate_hz: 32000", "sample_rate_hz: 0"),
         AUDIO_WORKFLOW.replace("channels: 2", "channels: 0"),
         AUDIO_WORKFLOW.replace("role: audio", "role: tensor"),
@@ -56,6 +57,20 @@ fn wav_contract_requires_encoded_bytes_and_physical_audio_properties() {
             "invalid media contract must fail admission"
         );
     }
+}
+
+#[test]
+fn pre_adapter_float_waveform_may_declare_api_boundary_resampling() {
+    let document = AUDIO_WORKFLOW
+        .replace("dtype: uint8", "dtype: float32")
+        .replace(
+            "rank: 1, shape: [wav_bytes]",
+            "rank: 3, shape: [1, 2, samples]",
+        )
+        .replace("stage: post_adapter", "stage: pre_adapter");
+    let metadata: InferenceMetadata =
+        serde_yaml::from_str(&document).expect("float waveform workflow parses");
+    validate_metadata(&metadata).expect("float waveform delivery contract validates");
 }
 
 #[test]
@@ -111,6 +126,7 @@ pipeline:
           container: wav
           encoding: pcm_s16_le
           sample_rate_hz: 32000
+          source_sample_rate_hz: 44100
           channels: 2
           delivery: buffered
     components:

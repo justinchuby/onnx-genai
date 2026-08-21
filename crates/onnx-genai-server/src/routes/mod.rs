@@ -54,6 +54,7 @@ mod admin;
 mod completions;
 mod multimodal;
 mod sessions;
+mod speech;
 
 #[cfg(feature = "metrics")]
 pub(crate) use admin::prometheus_metrics;
@@ -73,6 +74,7 @@ pub(crate) use completions::{
 };
 pub(crate) use multimodal::audio_transcriptions;
 pub(crate) use sessions::{create_session, delete_session};
+pub(crate) use speech::audio_speech;
 
 const SESSION_ID_HEADER: &str = "x-session-id";
 const MAX_SESSION_ID_LEN: usize = 128;
@@ -552,6 +554,7 @@ fn map_generate_submit_error(err: GenerateSubmitError) -> ApiError {
             "generation capacity exceeded; retry after the server finishes queued work",
         ),
         GenerateSubmitError::DriverStopped => ApiError::internal("engine driver stopped"),
+        GenerateSubmitError::Failed(error) => generation_failure(error),
     }
 }
 

@@ -31,6 +31,7 @@ mod registry;
 mod routes;
 pub mod runtime_args;
 mod session;
+mod speech;
 mod sse;
 mod state;
 mod types;
@@ -50,13 +51,13 @@ pub use runtime_args::{
 pub use state::parse_native_device;
 pub use state::{AppState, ServerConfig, default_node_id, parse_kv_cache_dtype};
 pub use types::{
-    AudioTranscriptionResponse, ChatChoice, ChatCompletionRequest, ChatCompletionResponse,
-    ChatLogprobs, ChatMessage, ChatMessageContent, ChatMessageContentPart, ChatMessageToolCall,
-    ChatMessageToolCallFunction, ChatTokenLogprob, ChatTool, ChatToolFunction, ChatTopLogprob,
-    CompletionChoice, CompletionLogprobs, CompletionRequest, CompletionResponse, EmbeddingData,
-    EmbeddingEncodingFormat, EmbeddingInput, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage,
-    EmbeddingVector, ImageUrl, InputAudio, JsonSchemaSpec, ResponseFormat, StopInput, ToolChoice,
-    ToolChoiceFunction, ToolChoiceMode, ToolChoiceSpecific, Usage,
+    AudioSpeechRequest, AudioTranscriptionResponse, ChatChoice, ChatCompletionRequest,
+    ChatCompletionResponse, ChatLogprobs, ChatMessage, ChatMessageContent, ChatMessageContentPart,
+    ChatMessageToolCall, ChatMessageToolCallFunction, ChatTokenLogprob, ChatTool, ChatToolFunction,
+    ChatTopLogprob, CompletionChoice, CompletionLogprobs, CompletionRequest, CompletionResponse,
+    EmbeddingData, EmbeddingEncodingFormat, EmbeddingInput, EmbeddingRequest, EmbeddingResponse,
+    EmbeddingUsage, EmbeddingVector, ImageUrl, InputAudio, JsonSchemaSpec, ResponseFormat,
+    StopInput, ToolChoice, ToolChoiceFunction, ToolChoiceMode, ToolChoiceSpecific, Usage,
 };
 
 pub fn app(state: AppState) -> Router {
@@ -73,6 +74,7 @@ pub fn app(state: AppState) -> Router {
             "/v1/audio/transcriptions",
             post(routes::audio_transcriptions).layer(DefaultBodyLimit::max(25 * 1024 * 1024)),
         )
+        .route("/v1/audio/speech", post(routes::audio_speech))
         .route("/v1/chat/completions", post(routes::chat_completions));
     if state.config.enable_debug_endpoints {
         router = router

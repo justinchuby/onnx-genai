@@ -27,12 +27,14 @@ use std::sync::Arc;
 
 mod adapters;
 mod arg_reduce;
+mod audio;
 mod islands;
 mod row_state;
 mod workflow;
 
 pub use adapters::{AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection};
 pub use arg_reduce::{ArgReduceRewrites, WideArgReduceLowering, lower_degenerate_arg_reductions};
+pub use audio::{EncodedAudio, encode_pcm16_wav, resample_planar};
 pub use islands::ExecutionIslandDiagnostic;
 pub use onnx_genai_metadata::WorkflowOutputRole;
 pub use row_state::{RowScopedState, RowTable, check_selection, gather_rows};

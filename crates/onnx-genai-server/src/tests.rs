@@ -1012,6 +1012,70 @@ async fn transcription_multipart_against_non_audio_model_returns_400() {
 }
 
 #[tokio::test]
+async fn speech_endpoint_rejects_streaming_before_execution() {
+    let response = app(tiny_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/speech")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "input": "lyrics",
+                        "instructions": "music description",
+                        "response_format": "wav",
+                        "stream": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("stream=true")
+    );
+}
+
+#[tokio::test]
+async fn speech_endpoint_accepts_only_wav_delivery() {
+    let response = app(tiny_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/speech")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "input": "lyrics",
+                        "response_format": "mp3"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("response_format=wav")
+    );
+}
+
+#[tokio::test]
 #[ignore = "synthetic Whisper-contract smoke test; run explicitly for audio server validation"]
 async fn audio_endpoints_route_through_tiny_whisper_pipeline() {
     let model_dir =

@@ -614,8 +614,13 @@ pub enum WorkflowOutputRole {
 pub struct MediaOutputContract {
     pub container: MediaContainer,
     pub encoding: MediaEncoding,
+    /// Sample rate of the encoded response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample_rate_hz: Option<u32>,
+    /// Sample rate of a pre-adapter waveform. When it differs from
+    /// `sample_rate_hz`, the API boundary resamples before encoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_sample_rate_hz: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channels: Option<u16>,
     #[serde(default)]

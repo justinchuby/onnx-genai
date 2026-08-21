@@ -1583,6 +1583,11 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                     "workflow output '{name}' media.sample_rate_hz must be greater than zero"
                 ));
             }
+            if media.source_sample_rate_hz == Some(0) {
+                errors.push(format!(
+                    "workflow output '{name}' media.source_sample_rate_hz must be greater than zero"
+                ));
+            }
             if media.channels == Some(0) {
                 errors.push(format!(
                     "workflow output '{name}' media.channels must be greater than zero"
@@ -1598,12 +1603,25 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                     "workflow output '{name}' audio media contract must declare channels"
                 ));
             }
-            if media.container == crate::schema::MediaContainer::Wav
-                && output.contract.dtype != "uint8"
-            {
-                errors.push(format!(
-                    "workflow output '{name}' uses the WAV container but its contract dtype is not uint8"
-                ));
+            if media.container == crate::schema::MediaContainer::Wav {
+                match output.stage {
+                    crate::schema::OutputStage::PostAdapter if output.contract.dtype != "uint8" => {
+                        errors.push(format!(
+                            "workflow output '{name}' is a post-adapter WAV but its contract dtype is not uint8"
+                        ));
+                    }
+                    crate::schema::OutputStage::PreAdapter
+                        if !matches!(
+                            output.contract.dtype.as_str(),
+                            "float32" | "fp32" | "float16" | "fp16" | "bfloat16" | "bf16"
+                        ) =>
+                    {
+                        errors.push(format!(
+                            "workflow output '{name}' is a pre-adapter WAV source but its contract dtype is not floating point"
+                        ));
+                    }
+                    _ => {}
+                }
             }
         }
     }

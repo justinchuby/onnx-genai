@@ -545,7 +545,8 @@ impl AppState {
             fim_config,
             pipeline: false,
             multimodal: None,
-        });
+        })
+        .expect("test model handle");
         let registry = ModelRegistry::from_handle(Arc::new(handle), config.clone());
         Self {
             registry,
@@ -697,7 +698,7 @@ pub(crate) fn build_handle_with_authorities(
     enforce_requested_max_batch(&engine, config.max_batch)?;
     let requested_max_batch = config.max_batch.unwrap_or(DEFAULT_MAX_BATCH);
     let engine_driver = EngineDriver::start(engine, requested_max_batch, config.max_queue_depth);
-    Ok(ModelHandle::new(ModelHandleParts {
+    ModelHandle::new(ModelHandleParts {
         id: model_id,
         model_dir: model_dir.to_path_buf(),
         engine: engine_driver,
@@ -708,7 +709,7 @@ pub(crate) fn build_handle_with_authorities(
         fim_config,
         pipeline: false,
         multimodal: None,
-    }))
+    })
 }
 
 fn build_pipeline_handle(
@@ -734,7 +735,7 @@ fn build_pipeline_handle(
     // superseded generation metadata surfaces, so the pipeline path resolves
     // sampling from request options only — same as the non-pipeline path above.
     let generation_defaults = None;
-    Ok(ModelHandle::new(ModelHandleParts {
+    ModelHandle::new(ModelHandleParts {
         id: model_id,
         model_dir: model_dir.to_path_buf(),
         engine: EngineDriver::start_pipeline(engine, config.max_queue_depth),
@@ -745,7 +746,7 @@ fn build_pipeline_handle(
         fim_config: None,
         pipeline: true,
         multimodal: Some(multimodal),
-    }))
+    })
 }
 
 #[cfg(test)]

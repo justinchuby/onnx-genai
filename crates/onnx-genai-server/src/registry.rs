@@ -55,6 +55,7 @@ pub(crate) struct ModelHandle {
     /// Declared image/audio input contracts, or `None` for a single decoder
     /// graph. Shared with the CLI so both front ends admit the same inputs.
     pub(crate) multimodal: Option<MultimodalSpecs>,
+    pub(crate) speech_prompt: Option<Arc<crate::speech::SpeechPromptProcessor>>,
     /// Whether the package declares a channel whose content the caller must not
     /// be shown, i.e. whether a generated turn carries private reasoning that
     /// has to be filtered out of everything this server returns.
@@ -88,7 +89,7 @@ pub(crate) struct ModelHandleParts {
 }
 
 impl ModelHandle {
-    pub(crate) fn new(parts: ModelHandleParts) -> Self {
+    pub(crate) fn new(parts: ModelHandleParts) -> anyhow::Result<Self> {
         let ModelHandleParts {
             id,
             model_dir,
@@ -102,7 +103,8 @@ impl ModelHandle {
             multimodal,
         } = parts;
         let private_channels = declares_private_channels(&model_dir);
-        Self {
+        let speech_prompt = crate::speech::load_speech_prompt_processor(&model_dir)?;
+        Ok(Self {
             id,
             engine,
             tokenizer,
@@ -112,11 +114,12 @@ impl ModelHandle {
             fim_config,
             pipeline,
             multimodal,
+            speech_prompt,
             private_channels,
             last_request_at: AtomicU64::new(now_millis()),
             warmed: AtomicBool::new(false),
             warmup_lock: std::sync::Mutex::new(()),
-        }
+        })
     }
 
     /// Run exactly one deterministic token generation to initialize lazy runtime
@@ -869,6 +872,7 @@ mod tests {
             fim_config: None,
             pipeline: false,
             multimodal: None,
+            speech_prompt: None,
             private_channels: false,
             last_request_at: AtomicU64::new(last_request_at),
             warmed: AtomicBool::new(false),

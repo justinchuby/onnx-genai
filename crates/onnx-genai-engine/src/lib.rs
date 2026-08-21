@@ -165,7 +165,7 @@ pub struct VmmArenaStats {
 #[cfg(feature = "native-backend")]
 pub use onnx_runtime_session::DecodePrecision;
 pub use pipeline::{
-    AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection, PipelineEngine,
+    AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection, EncodedAudio, PipelineEngine,
     PipelineGenerateRequest, PipelineTensors, RowScopedState, RowTable, WorkflowSessionCheckpoint,
     is_missing_required_input, validate_pipeline_backend_request,
 };
