@@ -327,7 +327,7 @@ impl Executor {
                     RunMode::Capture => {
                         {
                             let kernels = self.collect_segment_kernels(seg, resolved)?;
-                            ep.begin_device_graph_capture(&kernels)?;
+                            ep.begin_device_graph_capture_in(self.graph_slot, &kernels)?;
                         }
                         // Any early return (`?`) while recording this segment
                         // must end the stream capture before it propagates —
@@ -336,7 +336,8 @@ impl Executor {
                         // is rejected while capturing). The guard aborts the
                         // capture on drop; `disarm()` hands off to the normal
                         // `end_device_graph_capture()` on the success path.
-                        let mut capture_guard = SegmentCaptureGuard::arm(ep.as_ref());
+                        let mut capture_guard =
+                            SegmentCaptureGuard::arm(ep.as_ref(), self.graph_slot);
                         for pi in seg.start..seg.end {
                             let node_id = self.plan[pi].node_id;
                             if let Err(error) = self.exec_plan_node(
@@ -355,11 +356,11 @@ impl Executor {
                             }
                         }
                         capture_guard.disarm();
-                        ep.end_device_graph_capture()?;
-                        ep.replay_device_graph_segment(seg.graph_index)?;
+                        ep.end_device_graph_capture_in(self.graph_slot)?;
+                        ep.replay_device_graph_segment_in(self.graph_slot, seg.graph_index)?;
                     }
                     RunMode::Replay => {
-                        ep.replay_device_graph_segment(seg.graph_index)?;
+                        ep.replay_device_graph_segment_in(self.graph_slot, seg.graph_index)?;
                     }
                     RunMode::Eager => {
                         unreachable!("eager runs never build a segment schedule")

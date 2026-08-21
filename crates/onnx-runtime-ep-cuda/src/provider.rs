@@ -42,9 +42,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use onnx_runtime_ep_api::{
-    BoundBufferOwnership, Cost, DeviceBuffer, EpConfig, EpError, ExecutionProvider,
-    ExecutionProviderCapabilities, Fence, HostToDeviceCopier, Kernel, KernelMatch, LazyWeight,
-    OpRegistry, PagedWeight, Result, WorkspaceAllocation, deny, structural_input_bytes,
+    BoundBufferOwnership, Cost, DeviceBuffer, DeviceGraphSlot, EpConfig, EpError,
+    ExecutionProvider, ExecutionProviderCapabilities, Fence, HostToDeviceCopier, Kernel,
+    KernelMatch, LazyWeight, OpRegistry, PagedWeight, Result, WorkspaceAllocation, deny,
+    structural_input_bytes,
 };
 use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout};
 use onnx_runtime_memory_governor::{
@@ -3096,6 +3097,38 @@ impl ExecutionProvider for CudaExecutionProvider {
         // re-capture) is the explicit host reset point for the capture-error
         // latch, so a fresh generation always starts un-poisoned.
         let invalidated = self.runtime.reset_graph()?;
+        self.runtime.reset_capture_error()?;
+        Ok(invalidated)
+    }
+
+    fn begin_device_graph_capture_in(
+        &self,
+        slot: DeviceGraphSlot,
+        kernels: &[&dyn Kernel],
+    ) -> Result<()> {
+        self.runtime.begin_graph_capture_in(slot, kernels)
+    }
+
+    fn end_device_graph_capture_in(&self, slot: DeviceGraphSlot) -> Result<()> {
+        self.runtime.end_graph_capture_in(slot)
+    }
+
+    fn abort_device_graph_capture_in(&self, slot: DeviceGraphSlot) -> Result<()> {
+        self.runtime.abort_graph_capture_in(slot)
+    }
+
+    fn replay_device_graph_in(&self, slot: DeviceGraphSlot) -> Result<()> {
+        self.runtime.replay_graph_in(slot)
+    }
+
+    fn replay_device_graph_segment_in(&self, slot: DeviceGraphSlot, index: usize) -> Result<()> {
+        self.runtime.replay_graph_segment_in(slot, index)
+    }
+
+    fn reset_device_graph_in(&self, slot: DeviceGraphSlot) -> Result<bool> {
+        // Mirror `reset_device_graph`'s capture-error latch reset for whichever
+        // slot is torn down, so re-capture into that slot starts un-poisoned.
+        let invalidated = self.runtime.reset_graph_in(slot)?;
         self.runtime.reset_capture_error()?;
         Ok(invalidated)
     }

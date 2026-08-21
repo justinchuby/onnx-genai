@@ -480,6 +480,7 @@ impl Executor {
             graph,
             weights,
             ep,
+            graph_slot: DeviceGraphSlot::Primary,
             weight_handles,
             prefetch_issue_nodes: std::sync::Mutex::new(HashMap::new()),
             prefetch_lookahead_nodes: dense_weight_prefetch_lookahead_nodes(),

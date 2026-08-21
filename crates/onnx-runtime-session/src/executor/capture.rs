@@ -365,12 +365,17 @@ impl OpCaptureTrace<'_> {
 /// [`disarm`]: SegmentCaptureGuard::disarm
 pub(super) struct SegmentCaptureGuard<'a> {
     pub(super) ep: &'a dyn ExecutionProvider,
+    pub(super) slot: DeviceGraphSlot,
     pub(super) armed: bool,
 }
 
 impl<'a> SegmentCaptureGuard<'a> {
-    pub(super) fn arm(ep: &'a dyn ExecutionProvider) -> Self {
-        Self { ep, armed: true }
+    pub(super) fn arm(ep: &'a dyn ExecutionProvider, slot: DeviceGraphSlot) -> Self {
+        Self {
+            ep,
+            slot,
+            armed: true,
+        }
     }
 
     pub(super) fn disarm(&mut self) {
@@ -383,7 +388,7 @@ impl Drop for SegmentCaptureGuard<'_> {
         if self.armed {
             // Best-effort: the abort itself may fail, but the caller is already
             // unwinding a capture failure and will reset the lifecycle next.
-            let _ = self.ep.abort_device_graph_capture();
+            let _ = self.ep.abort_device_graph_capture_in(self.slot);
         }
     }
 }

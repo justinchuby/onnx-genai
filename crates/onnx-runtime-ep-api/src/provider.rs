@@ -45,6 +45,31 @@ impl ArgmaxTieBreak {
     }
 }
 
+/// Which captured device-graph slot an EP graph operation targets.
+///
+/// A decode EP historically owns exactly one captured graph (the `Primary`
+/// slot): the shape-invariant M=1 decode step it replays every token. MTP
+/// self-speculative decode adds a *second*, differently-shaped forward — the
+/// fixed-width `M = k+1` verify step — that must be captured and replayed
+/// independently of the M=1 step, because the two graphs bake different query
+/// geometries and cannot share one slot without invalidating each other every
+/// step (the empirically-measured `replays=0` MTP blocker; see
+/// `gaff-mtp-graph-retain-capture-unsafe-blocker.md`). `Verify` names that
+/// second slot so the executor can hold and replay both graphs by shape key on
+/// the same EP/stream (one CUDA graph per shape, no per-step recapture).
+///
+/// EPs that support only a single captured graph (the historical behaviour)
+/// accept `Primary` and reject `Verify`; the CUDA EP owns one
+/// [`CudaGraphLifecycle`](../../onnx_runtime_ep_cuda) per slot.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum DeviceGraphSlot {
+    /// The shape-invariant M=1 decode graph (the only slot before MTP).
+    #[default]
+    Primary,
+    /// The fixed-width `M = k+1` speculative verify graph.
+    Verify,
+}
+
 /// Opaque, namespaced configuration passed to [`ExecutionProvider::initialize`].
 #[derive(Clone, Debug, Default)]
 pub struct EpConfig {
@@ -1156,6 +1181,78 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(false)
     }
 
+    /// Slot-parameterized [`begin_device_graph_capture`]. The default routes the
+    /// [`DeviceGraphSlot::Primary`] slot to the single-slot method and rejects
+    /// any other slot, so EPs that own only one captured graph are unchanged.
+    /// Multi-slot EPs (the CUDA EP) override this to record into the named slot.
+    ///
+    /// [`begin_device_graph_capture`]: ExecutionProvider::begin_device_graph_capture
+    fn begin_device_graph_capture_in(
+        &self,
+        slot: DeviceGraphSlot,
+        kernels: &[&dyn Kernel],
+    ) -> Result<()> {
+        match slot {
+            DeviceGraphSlot::Primary => self.begin_device_graph_capture(kernels),
+            other => Err(unsupported_graph_slot(self.name(), other)),
+        }
+    }
+
+    /// Slot-parameterized [`end_device_graph_capture`].
+    ///
+    /// [`end_device_graph_capture`]: ExecutionProvider::end_device_graph_capture
+    fn end_device_graph_capture_in(&self, slot: DeviceGraphSlot) -> Result<()> {
+        match slot {
+            DeviceGraphSlot::Primary => self.end_device_graph_capture(),
+            other => Err(unsupported_graph_slot(self.name(), other)),
+        }
+    }
+
+    /// Slot-parameterized [`abort_device_graph_capture`].
+    ///
+    /// [`abort_device_graph_capture`]: ExecutionProvider::abort_device_graph_capture
+    fn abort_device_graph_capture_in(&self, slot: DeviceGraphSlot) -> Result<()> {
+        match slot {
+            DeviceGraphSlot::Primary => self.abort_device_graph_capture(),
+            other => Err(unsupported_graph_slot(self.name(), other)),
+        }
+    }
+
+    /// Slot-parameterized [`replay_device_graph`].
+    ///
+    /// [`replay_device_graph`]: ExecutionProvider::replay_device_graph
+    fn replay_device_graph_in(&self, slot: DeviceGraphSlot) -> Result<()> {
+        match slot {
+            DeviceGraphSlot::Primary => self.replay_device_graph(),
+            other => Err(unsupported_graph_slot(self.name(), other)),
+        }
+    }
+
+    /// Slot-parameterized [`replay_device_graph_segment`].
+    ///
+    /// [`replay_device_graph_segment`]: ExecutionProvider::replay_device_graph_segment
+    fn replay_device_graph_segment_in(&self, slot: DeviceGraphSlot, index: usize) -> Result<()> {
+        match slot {
+            DeviceGraphSlot::Primary => self.replay_device_graph_segment(index),
+            other => Err(unsupported_graph_slot(self.name(), other)),
+        }
+    }
+
+    /// Slot-parameterized [`reset_device_graph`]. A multi-slot EP resets only the
+    /// named slot, leaving the other slot's installed graph intact.
+    ///
+    /// [`reset_device_graph`]: ExecutionProvider::reset_device_graph
+    fn reset_device_graph_in(&self, slot: DeviceGraphSlot) -> Result<bool> {
+        match slot {
+            DeviceGraphSlot::Primary => self.reset_device_graph(),
+            // No graph is ever installed in a non-Primary slot on a single-slot
+            // EP, so there is nothing to reset (mirrors `reset_device_graph`'s
+            // "no graph" return rather than erroring, so unconditional
+            // per-slot reset sweeps are safe on every EP).
+            DeviceGraphSlot::Verify => Ok(false),
+        }
+    }
+
     /// Read (without clearing) any latching device-side capture-safety error a
     /// captured kernel recorded during graph replay, as a raw violation bitmask
     /// (zero when none). EPs without device graphs report no error.
@@ -1407,6 +1504,13 @@ pub trait ExecutionProvider: Send + Sync {
             ep: self.name().to_string(),
         })
     }
+}
+
+/// Error for a graph-slot operation on an EP that does not own that slot.
+fn unsupported_graph_slot(ep: &str, slot: DeviceGraphSlot) -> EpError {
+    EpError::KernelFailed(format!(
+        "{ep}: device graph slot {slot:?} is not supported (this EP owns only the Primary slot)"
+    ))
 }
 
 fn is_control_flow_or_sequence(node: &Node) -> bool {
