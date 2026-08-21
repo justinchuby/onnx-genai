@@ -1815,15 +1815,17 @@ impl NativeDecodeSession {
                         Ok(false) => {
                             state.verify_graph_replays += 1;
                             state.verify_graph_invalidations += 1;
-                            state.verify_graph_phase =
-                                Self::verify_phase_after_invalidation(state.verify_graph_invalidations);
+                            state.verify_graph_phase = Self::verify_phase_after_invalidation(
+                                state.verify_graph_invalidations,
+                            );
                             self.session
                                 .run_with_device_bindings(&[], &mut state.bindings[..])?;
                         }
                         Err(_) => {
                             state.verify_graph_invalidations += 1;
-                            state.verify_graph_phase =
-                                Self::verify_phase_after_invalidation(state.verify_graph_invalidations);
+                            state.verify_graph_phase = Self::verify_phase_after_invalidation(
+                                state.verify_graph_invalidations,
+                            );
                             self.session
                                 .run_with_device_bindings(&[], &mut state.bindings[..])?;
                         }
@@ -7042,7 +7044,10 @@ mod verify_capture_helper_tests {
     /// intact, and only when the query-seq axis is currently unit.
     #[test]
     fn widen_query_seq_replaces_unit_query_axis() {
-        assert_eq!(widen_query_seq(&[1, 1, 248320], 2), Some(vec![1, 2, 248320]));
+        assert_eq!(
+            widen_query_seq(&[1, 1, 248320], 2),
+            Some(vec![1, 2, 248320])
+        );
         assert_eq!(widen_query_seq(&[1, 1, 5120], 3), Some(vec![1, 3, 5120]));
         // Non-unit query axis or too-low rank is declined.
         assert_eq!(widen_query_seq(&[1, 2, 5120], 3), None);
