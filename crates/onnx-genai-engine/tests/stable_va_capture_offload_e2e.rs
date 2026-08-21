@@ -25,7 +25,7 @@
 //! cargo test -p onnx-genai-engine --features cuda,native-backend \
 //!   --test stable_va_capture_offload_e2e -- --ignored --nocapture
 //! ```
-#![cfg(all(feature = "cuda", feature = "native-backend"))]
+#![cfg(feature = "native-cuda")]
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

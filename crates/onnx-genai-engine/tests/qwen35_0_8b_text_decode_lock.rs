@@ -44,7 +44,7 @@
 //!   --features native-backend,cuda --test qwen35_0_8b_text_decode_lock \
 //!   -- --ignored --test-threads=1 --nocapture
 //! ```
-#![cfg(all(feature = "native-backend", feature = "cuda"))]
+#![cfg(feature = "native-cuda")]
 
 #[path = "common/decode_lock.rs"]
 mod decode_lock;

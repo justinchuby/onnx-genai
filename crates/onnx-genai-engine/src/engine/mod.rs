@@ -80,7 +80,7 @@ mod speculative_load;
 pub(crate) use decode_backend::*;
 pub(crate) use governor::*;
 pub use governor::{EngineGovernorError, EngineResourceGovernor, resolve_device_vram_limit_bytes};
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 pub(crate) use load::managed_vmm_default_enabled;
 pub(crate) use load::{
     force_managed_weight_streaming_enabled, kv_pages_for_budget, session_device_domain,

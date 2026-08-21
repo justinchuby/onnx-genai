@@ -28,7 +28,7 @@
 //! cargo test -p onnx-genai-engine --features cuda,native-backend \
 //!   --test qwen3_0_6b_capture_step_inputs_decline -- --ignored --nocapture
 //! ```
-#![cfg(all(feature = "cuda", feature = "native-backend"))]
+#![cfg(feature = "native-cuda")]
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;

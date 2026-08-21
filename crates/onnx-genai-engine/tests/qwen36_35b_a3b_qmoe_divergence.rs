@@ -89,7 +89,7 @@
 //! CUDA_VISIBLE_DEVICES=0 cargo test -p onnx-genai-engine --features native-backend,cuda \
 //!   --test qwen36_35b_a3b_qmoe_divergence -- --ignored --nocapture
 //! ```
-#![cfg(all(feature = "native-backend", feature = "cuda"))]
+#![cfg(feature = "native-cuda")]
 
 use std::path::{Path, PathBuf};
 

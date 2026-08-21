@@ -96,7 +96,7 @@ fn load(model_dir: &std::path::Path, graph_capture: bool, kv_max: usize) -> Nati
     .expect("load decoder")
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 #[ignore = "Lever-B phase0 GPU probe; run deliberately with --ignored on a verified-idle H200"]
 fn leverb_phase0_capture_probe() -> anyhow::Result<()> {

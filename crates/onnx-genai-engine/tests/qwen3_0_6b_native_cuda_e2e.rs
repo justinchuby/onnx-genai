@@ -10,7 +10,7 @@
 //!   --features cuda,native-backend --test qwen3_0_6b_native_cuda_e2e \
 //!   -- --ignored --nocapture
 //! ```
-#![cfg(all(feature = "cuda", feature = "native-backend"))]
+#![cfg(feature = "native-cuda")]
 
 use std::path::{Path, PathBuf};
 

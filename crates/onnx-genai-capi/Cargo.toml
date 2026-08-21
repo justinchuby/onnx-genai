@@ -15,10 +15,11 @@ crate-type = ["lib", "cdylib", "staticlib"]
 
 [features]
 default = []
-# Forward the engine's CUDA feature. This compiles the native CUDA EP crate for
-# shared use, but does not enable the engine's optional `native-backend`, so the
-# C ABI remains on the ORT-backed path unless a separate feature selects native.
-cuda = ["onnx-genai-engine/cuda"]
+# ONNX Runtime's CUDA EP. The C ABI has no native-backend path, and no code in
+# this crate references `onnx-runtime-ep-cuda`, so forwarding the engine's
+# `native-cuda` here would compile a whole CUDA EP that nothing can call and
+# impose a CUDA toolkit on the build for nothing.
+ort-cuda = ["onnx-genai-engine/ort-cuda"]
 
 [dependencies]
 onnx-genai-engine = { workspace = true }

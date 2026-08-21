@@ -325,7 +325,7 @@ impl ModelMemoryPlan {
     /// fits (#704).
     #[cfg(feature = "native-backend")]
     #[cfg_attr(
-        all(not(feature = "cuda"), not(test)),
+        all(not(feature = "native-cuda"), not(test)),
         expect(
             dead_code,
             reason = "the production caller is the CUDA weight-offload adoption path; the \

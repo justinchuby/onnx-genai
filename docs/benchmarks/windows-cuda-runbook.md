@@ -114,7 +114,7 @@ Build the native profiler once (the `cuda` feature enables the CUDA EP; the
 default `cuda-13000` API-version feature is already on):
 
 ```powershell
-cargo build --release -p onnx-genai-bench --features bench-native,cuda --bin profile_native
+cargo build --release -p onnx-genai-bench --features native-cuda --bin profile_native
 ```
 
 Then, in the **same shell** as the §1 block, run one short decode. Validated

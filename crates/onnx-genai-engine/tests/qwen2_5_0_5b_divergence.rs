@@ -9,7 +9,7 @@
 //!   --features native-backend,cuda --test qwen2_5_0_5b_divergence \
 //!   -- --ignored --nocapture
 //! ```
-#![cfg(all(feature = "native-backend", feature = "cuda"))]
+#![cfg(feature = "native-cuda")]
 
 #[path = "common/decode_lock.rs"]
 mod decode_lock;

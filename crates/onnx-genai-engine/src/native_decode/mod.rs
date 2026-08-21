@@ -28,12 +28,12 @@ mod load;
 mod paged_gqa;
 mod proposer;
 mod tensor;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 pub(crate) use tensor::recurrent_state_bytes_from_graph;
 #[cfg(test)]
 mod tests;
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(all(test, feature = "native-cuda"))]
 mod leverb_phase0_probe;
 
 use backend::*;
@@ -43,7 +43,7 @@ use cuda::DecodeCudaState;
 use cuda::*;
 pub use cuda::{CudaGraphDebugStats, CudaKvDebugStats, RaggedLogitsStep};
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 pub(crate) fn configured_cuda_kv_max_len() -> anyhow::Result<Option<usize>> {
     cuda::cuda_kv_max_len_from_env()
 }

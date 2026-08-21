@@ -125,7 +125,7 @@ fn deepseek_v2_tiny_native_cpu_eager_decode_locks_anchor_ids() -> anyhow::Result
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 fn deepseek_v2_tiny_native_cuda_matches_cpu_under_current_graph_policy() -> anyhow::Result<()> {
     let Some(dir) = fixture_dir() else {

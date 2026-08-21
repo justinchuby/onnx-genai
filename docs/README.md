@@ -10,6 +10,7 @@ give you a stale answer.
 |---|---|
 | What the project is and how it is put together | [`architecture/DESIGN.md`](architecture/DESIGN.md) |
 | What currently works, with numbers | [`status/PROGRESS.md`](status/PROGRESS.md) |
+| Which CUDA feature to build with, and why there are two | [`build-features.md`](build-features.md) |
 | Why memory is arranged the way it is | [`memory/MEMORY_ARCHITECTURE.md`](memory/MEMORY_ARCHITECTURE.md) |
 | The proposed cross-stack memory contracts | [`memory/MEMORY_MANAGEMENT_MODEL_DESIGN.md`](memory/MEMORY_MANAGEMENT_MODEL_DESIGN.md) |
 
