@@ -994,7 +994,7 @@ impl Executor {
             .as_ref()
             .is_none_or(CaptureSchedule::is_single_graph);
         if single_graph {
-            self.ep.replay_device_graph()?;
+            self.ep.replay_device_graph_in(self.graph_slot)?;
             return Ok(true);
         }
         let result = self.run_scoped_mode(&[], &HashMap::new(), &external, RunMode::Replay);
@@ -1017,7 +1017,30 @@ impl Executor {
         self.capture_schedule = None;
         self.capture_cf_shapes.clear();
         self.capture_warm_seeded.clear();
-        Ok(self.ep.reset_device_graph()?)
+        Ok(self.ep.reset_device_graph_in(self.graph_slot)?)
+    }
+
+    /// Which of the EP's captured-graph slots this executor drives.
+    pub(crate) fn graph_slot(&self) -> DeviceGraphSlot {
+        self.graph_slot
+    }
+
+    /// Retarget this executor's captured-graph slot. Resets the currently
+    /// installed graph on the *old* slot first (its host-side capture state
+    /// belongs to that slot), so a subsequent capture records cleanly into the
+    /// new slot. Idempotent when `slot` already matches. Used to route the main
+    /// executor's verify forward to [`DeviceGraphSlot::Verify`] while the
+    /// decode-inline sibling keeps [`DeviceGraphSlot::Primary`].
+    pub(crate) fn set_graph_slot(&mut self, slot: DeviceGraphSlot) -> Result<()> {
+        if self.graph_slot == slot {
+            return Ok(());
+        }
+        // Clear any graph + host capture bookkeeping on the current slot before
+        // switching, so we never leave a dangling installed graph the new slot
+        // would not track.
+        self.reset_device_graph()?;
+        self.graph_slot = slot;
+        Ok(())
     }
 
     /// Structured segment-boundary reasons from the most recent capture: one

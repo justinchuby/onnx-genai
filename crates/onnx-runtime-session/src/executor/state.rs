@@ -15,6 +15,16 @@ pub(crate) struct Executor {
     /// dropped afterwards — no use-after-free regardless of field drop order.
     pub(super) weights: Arc<WeightStore>,
     pub(super) ep: Arc<dyn ExecutionProvider>,
+    /// Which of the EP's captured-graph slots this executor drives. Every
+    /// executor gets its own independent CUDA-graph slot on the shared EP: the
+    /// main/inline decode executors default to [`DeviceGraphSlot::Primary`]
+    /// (byte-identical to the historical single-slot behaviour), while a
+    /// verify-dedicated sibling drives [`DeviceGraphSlot::Verify`] so a fixed
+    /// M=k+1 speculative verify graph can be captured and replayed without
+    /// invalidating the M=1 decode graph every step (option-c). All EP graph
+    /// calls this executor makes route through this slot; defaulting to Primary
+    /// keeps the field inert unless a caller explicitly retargets it.
+    pub(super) graph_slot: DeviceGraphSlot,
     /// Lazy external initializers available only at the nxrt fused-MoE boundary.
     /// Stock EPs ignore this map and keep receiving the resident buffers below.
     pub(super) weight_handles: HashMap<ValueId, WeightHandle>,

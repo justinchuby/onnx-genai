@@ -13,6 +13,7 @@ use std::time::Instant;
 use cudarc::driver::sys::{CUdevice_attribute, CUdeviceptr, CUfunction_attribute_enum};
 use cudarc::driver::{CudaContext, CudaEvent, CudaFunction, CudaModule, CudaStream, LaunchConfig};
 
+use onnx_runtime_ep_api::DeviceGraphSlot;
 use onnx_runtime_ep_api::EpError;
 use onnx_runtime_ep_api::Kernel;
 use onnx_runtime_ep_api::Result;
@@ -326,6 +327,7 @@ pub struct CudaRuntime {
     /// default-stream barrier.
     copy_stream: Arc<CudaStream>,
     graph: CudaGraphLifecycle,
+    verify_graph: CudaGraphLifecycle,
     blas: CublasLt,
     cudnn: CudnnBackend,
     ordinal: u32,
@@ -511,11 +513,17 @@ impl CudaRuntime {
         let blas = CublasLt::new()?;
         let cudnn = CudnnBackend::new(stream.clone());
         let graph = CudaGraphLifecycle::new(stream.clone());
+        // Second captured-graph slot for the MTP fixed-width verify forward,
+        // held independently of `graph` (the M=1 decode step) on the same
+        // compute stream so both shapes can be replayed by shape key without
+        // per-step recapture (see `DeviceGraphSlot`).
+        let verify_graph = CudaGraphLifecycle::new(stream.clone());
         Self {
             context,
             stream,
             copy_stream,
             graph,
+            verify_graph,
             blas,
             cudnn,
             ordinal,
@@ -692,6 +700,62 @@ impl CudaRuntime {
     /// Driver-reported capture status for the EP stream.
     pub fn graph_capture_status(&self) -> Result<cudarc::driver::sys::CUstreamCaptureStatus> {
         self.graph.capture_status()
+    }
+
+    /// The [`CudaGraphLifecycle`] backing a given [`DeviceGraphSlot`]. Both slots
+    /// share this runtime's single compute stream; only one may be *capturing* at
+    /// a time (enforced per-lifecycle), but each may independently hold an
+    /// instantiated executable ready to replay.
+    fn graph_slot(&self, slot: DeviceGraphSlot) -> &CudaGraphLifecycle {
+        match slot {
+            DeviceGraphSlot::Primary => &self.graph,
+            DeviceGraphSlot::Verify => &self.verify_graph,
+        }
+    }
+
+    /// Slot-aware [`begin_graph_capture`](Self::begin_graph_capture).
+    pub fn begin_graph_capture_in(
+        &self,
+        slot: DeviceGraphSlot,
+        kernels: &[&dyn Kernel],
+    ) -> Result<()> {
+        crate::capture::require_subgraph_graph_capturable(kernels)?;
+        self.graph_slot(slot).begin()
+    }
+
+    /// Slot-aware [`end_graph_capture`](Self::end_graph_capture).
+    pub fn end_graph_capture_in(&self, slot: DeviceGraphSlot) -> Result<()> {
+        self.graph_slot(slot).end()
+    }
+
+    /// Slot-aware [`abort_graph_capture`](Self::abort_graph_capture).
+    pub fn abort_graph_capture_in(&self, slot: DeviceGraphSlot) -> Result<()> {
+        self.graph_slot(slot).abort()
+    }
+
+    /// Slot-aware [`replay_graph`](Self::replay_graph).
+    pub fn replay_graph_in(&self, slot: DeviceGraphSlot) -> Result<()> {
+        self.graph_slot(slot).replay()
+    }
+
+    /// Slot-aware [`replay_graph_segment`](Self::replay_graph_segment).
+    pub fn replay_graph_segment_in(&self, slot: DeviceGraphSlot, index: usize) -> Result<()> {
+        self.graph_slot(slot).replay_segment(index)
+    }
+
+    /// Slot-aware [`graph_segment_count`](Self::graph_segment_count).
+    pub fn graph_segment_count_in(&self, slot: DeviceGraphSlot) -> Result<usize> {
+        self.graph_slot(slot).segment_count()
+    }
+
+    /// Slot-aware [`reset_graph`](Self::reset_graph).
+    pub fn reset_graph_in(&self, slot: DeviceGraphSlot) -> Result<bool> {
+        self.graph_slot(slot).reset()
+    }
+
+    /// Slot-aware [`has_graph_executable`](Self::has_graph_executable).
+    pub fn has_graph_executable_in(&self, slot: DeviceGraphSlot) -> Result<bool> {
+        self.graph_slot(slot).has_executable()
     }
 
     /// Snapshot explicit device allocation/free calls made through this runtime.
