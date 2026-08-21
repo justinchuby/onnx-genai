@@ -19,10 +19,10 @@
 //!    layout and residency"). An independent CPU oracle guards against the two
 //!    GPU paths being symmetrically wrong.
 //! 2. **Request-local fallback.** A third request starts with an incompatible
-//!    target whose prefix granules are already privately committed. The real
-//!    `SharedMapping::commit_shared_prefix` rejects that request on the host,
-//!    before any decode enqueue; the rejected reservation is retired and the
-//!    request continues with fully private KV while its peers keep sharing.
+//!    value target whose prefix granule is already privately committed. The
+//!    production K/V pair transaction rolls back the key mapping, reports that
+//!    private fallback is safe, and the request continues with fully private KV
+//!    while its peers keep sharing.
 //! 3. **Admission is private bytes only.** Admitting the second sharer needs
 //!    **zero** incremental owned bytes for the shared prefix
 //!    (`incremental_owned_bytes_for_shared_prefix == 0`), and the governor's
@@ -62,8 +62,8 @@ use onnx_runtime_ep_cuda::{CudaExecutionProvider, GroupQueryAttentionKernel};
 use onnx_runtime_ir::{DataType, compute_contiguous_strides};
 use onnx_runtime_memory_governor::{
     DeviceAllocator, DeviceKey, HolderId, KvFragmentation, LeaseLedger, LedgerGovernor,
-    MemoryGovernor, MemoryRole, ModelKvGeometry, SharedDevicePrefix, Tier,
-    evaluate_prefix_shareability,
+    MemoryGovernor, MemoryRole, ModelKvGeometry, SharedDevicePrefix, SharedPrefixCommitTarget,
+    Tier, commit_shared_prefix_pair, evaluate_prefix_shareability,
 };
 
 const BATCH: usize = 1;
@@ -573,13 +573,26 @@ fn shared_peers_survive_request_local_private_fallback() {
 
         let owned_after_private = shared_governor.used(Tier::Device);
 
-        // Map each shared prefix read-only into this sequence at offset 0.
-        let kc = shared_mapping
-            .commit_shared_prefix(key_prefix.as_ref(), key_ptr, alloc_bytes, 0)
-            .expect("map key prefix into sequence");
-        let vc = shared_mapping
-            .commit_shared_prefix(value_prefix.as_ref(), value_ptr, alloc_bytes, 0)
-            .expect("map value prefix into sequence");
+        // Map K and V as one admission transaction. A caller never receives a
+        // half-converted cache if the second map fails.
+        let [kc, vc] = commit_shared_prefix_pair(
+            shared,
+            SharedPrefixCommitTarget {
+                prefix: key_prefix.as_ref(),
+                ptr: key_ptr,
+                allocation_bytes: alloc_bytes,
+                align: granule,
+                byte_offset: 0,
+            },
+            SharedPrefixCommitTarget {
+                prefix: value_prefix.as_ref(),
+                ptr: value_ptr,
+                allocation_bytes: alloc_bytes,
+                align: granule,
+                byte_offset: 0,
+            },
+        )
+        .expect("map K/V prefix pair into sequence");
         assert_eq!(
             kc.additional_owned_bytes, 0,
             "the shared map charges no owned bytes"
@@ -608,30 +621,53 @@ fn shared_peers_survive_request_local_private_fallback() {
         shared_ptrs.push(Some((key_ptr, value_ptr, alloc_bytes)));
     }
 
-    // Request 2 first receives a geometrically incompatible target: its prefix
-    // region is already privately committed. This is a legitimate request-local
-    // state (for example, a cache precommitted before prefix lookup completed).
-    // The production SharedMapping seam must reject it synchronously, before
-    // any decode kernel can observe a partially converted cache.
+    // Request 2 has an empty key prefix target but a precommitted value prefix.
+    // The first map therefore succeeds and the second fails, forcing the
+    // production pair transaction to prove it can restore all-private topology.
+    let tail = granule..alloc_bytes;
     let full = 0..alloc_bytes;
     let fallback_candidate_key = shared_backing
-        .allocate_committed(alloc_bytes, granule, std::slice::from_ref(&full))
+        .allocate_committed(alloc_bytes, granule, std::slice::from_ref(&tail))
         .expect("fallback candidate key");
     let fallback_candidate_value = shared_backing
         .allocate_committed(alloc_bytes, granule, std::slice::from_ref(&full))
         .expect("fallback candidate value");
     let before_failed_commit = shared_governor.used(Tier::Device);
-    let mut decode_enqueues = 0usize;
-    let commit_error = shared_mapping
-        .commit_shared_prefix(key_prefix.as_ref(), fallback_candidate_key, alloc_bytes, 0)
-        .expect_err("a shared prefix must not overlay precommitted private KV");
+    let commit_error = commit_shared_prefix_pair(
+        shared,
+        SharedPrefixCommitTarget {
+            prefix: key_prefix.as_ref(),
+            ptr: fallback_candidate_key,
+            allocation_bytes: alloc_bytes,
+            align: granule,
+            byte_offset: 0,
+        },
+        SharedPrefixCommitTarget {
+            prefix: value_prefix.as_ref(),
+            ptr: fallback_candidate_value,
+            allocation_bytes: alloc_bytes,
+            align: granule,
+            byte_offset: 0,
+        },
+    )
+    .expect_err("precommitted V must roll back the successful K shared map");
+    assert!(
+        commit_error.private_fallback_is_safe(),
+        "a request may fall back only after the pair transaction removed K"
+    );
     assert!(
         commit_error.to_string().contains("already committed"),
         "fallback must report the request-local target conflict explicitly: {commit_error}"
     );
     assert_eq!(
-        decode_enqueues, 0,
-        "request-local shared-prefix failure must be decided before decode enqueue"
+        shared_backing.allocation_committed_bytes(fallback_candidate_key, alloc_bytes, granule),
+        granule,
+        "failed V commit must roll K back to its private tail only"
+    );
+    assert_eq!(
+        shared_backing.allocation_committed_bytes(fallback_candidate_value, alloc_bytes, granule),
+        alloc_bytes,
+        "the pre-existing private V allocation remains intact"
     );
     assert_eq!(
         shared_governor.used(Tier::Device),
@@ -639,9 +675,11 @@ fn shared_peers_survive_request_local_private_fallback() {
         "failed shared commit must not change physical-byte accounting"
     );
 
-    // The rejected target is already a valid fully private cache, so fallback
-    // keeps it rather than allocating again. No peer mapping is touched and no
-    // transient physical bytes are retained by an allocate/free retry.
+    // Complete K privately only after the pair transaction explicitly says
+    // fallback is safe. V was already fully private; no peer mapping is touched.
+    shared_backing
+        .commit_allocation_range(fallback_candidate_key, alloc_bytes, granule, 0, granule)
+        .expect("commit private K prefix after shared-pair refusal");
     assert_eq!(
         shared_governor.used(Tier::Device),
         (2 * granule + 2 * 2 * granule + 2 * 2 * granule) as u64,
@@ -734,6 +772,7 @@ fn shared_peers_survive_request_local_private_fallback() {
 
     // Only after the fallback transaction is settled do any real GQA decode
     // enqueues occur. First produce fully private GPU references.
+    let mut decode_enqueues = 0usize;
     let mut independent_out = Vec::new();
     for request in 0..3usize {
         let (key_ptr, value_ptr) = indep_ptrs[request];
@@ -879,7 +918,7 @@ fn shared_peers_survive_request_local_private_fallback() {
          committed physical bytes: independent={}B ({} granules), shared={}B ({} granules)\n  \
          removed by two-peer sharing: {}B ({} granules)\n  \
          second-sharer admission: {}B (private tails only), prefix incremental owned = 0\n  \
-         fallback: precommitted target rejected before decode enqueue, then fully private\n  \
+         fallback: failed V share rolled K back before enqueue, then both stayed private\n  \
          output: 3 requests x 2 interleaved steps byte-identical to independent + CPU",
         prefix_tokens,
         capacity,

@@ -102,6 +102,11 @@ pub trait SharedMapping: Send + Sync + Debug {
         prefix: &dyn SharedDevicePrefix,
     ) -> Result<u64, MemoryError>;
 
+    /// Map the prefix transactionally.
+    ///
+    /// Returning `Err` must leave no mapping from this call in the target
+    /// allocation. Admission coordinators rely on that invariant to reject the
+    /// first half of a K/V pair without exposing partially shared state.
     fn commit_shared_prefix(
         &self,
         prefix: &dyn SharedDevicePrefix,

@@ -379,7 +379,19 @@ detection, no COW):
   sequence's own private granule charges it.
 - **Copy-engine writes fault without corruption** — synchronous and asynchronous
   copy paths are non-sticky. The isolated Q3 kernel-store probe separately
-  records the sticky kill finding that keeps the production capability disabled.
+  records the sticky kill finding: protection is fail-stop, not a recoverable
+  kernel-error boundary.
+- **K/V admission is all-or-private** — the governor's
+  `commit_shared_prefix_pair` rolls K back if V cannot be shared. Only a
+  successful rollback permits request-local private fallback; rollback failure
+  marks the partially converted target unusable.
+- **Fatal faults require process isolation** —
+  `vmm_process_fault_isolation_gpu.rs` waits for a healthy importer's kernel to
+  publish a device-side `started` flag, confirms its completion event is
+  `CUDA_ERROR_NOT_READY`, faults a second process, then releases the device gate
+  and verifies the in-flight result, fresh CUDA work, and shared bytes.
+  Replacement workers, owner exit, imported-handle lifetime, restart, and
+  descriptor cleanup are covered too.
 - **Unsupported requests error rather than mis-map** — misaligned offset,
   over-long prefix, mapping over a committed granule, and mapping under an open
   capture all return `Err` and leave the region clean.
@@ -394,10 +406,14 @@ context.
 now physically share a pinned prefix across independent sequence reservations,
 charged once, read-only, with the correct union lifetime and admission
 arithmetic — the capacity mechanism (roughly doubled admissible concurrency for a
-large shared system prompt) exists at the allocator layer. What it does **not**
-yet do: nothing constructs a sequence's KV as `shared prefix + private tail` in
-the engine, nothing detects that two requests share a prefix, and nothing handles
-divergence past the shared region. Those are the increments below.
+large shared system prompt) exists at the allocator layer. The governor also
+provides an all-or-private K/V commit transaction so a request-local admission
+failure cannot expose half-shared KV. What it does **not** yet do: nothing
+constructs a sequence's KV as `shared prefix + private tail` in the engine,
+nothing detects that two requests share a prefix, and nothing handles divergence
+past the shared region. The current server remains in-process, so containing an
+arbitrary fatal kernel fault still requires the future worker-process integration
+proven feasible by the process-isolation GPU test.
 
 ## Smallest next increment
 

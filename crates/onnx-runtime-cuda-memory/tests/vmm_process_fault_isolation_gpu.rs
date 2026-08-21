@@ -71,21 +71,25 @@ copy_complete:
     ret;
 }
 
-.visible .entry spin_store(
-    .param .u64 destination,
-    .param .u64 cycles
+.visible .entry wait_store(
+    .param .u64 started_flag,
+    .param .u64 release_flag,
+    .param .u64 destination
 ) {
     .reg .pred %waiting;
-    .reg .b64 %destination, %cycles, %start, %now, %elapsed;
+    .reg .b32 %release;
+    .reg .b64 %started_flag, %release_flag, %destination;
 
+    ld.param.u64 %started_flag, [started_flag];
+    ld.param.u64 %release_flag, [release_flag];
     ld.param.u64 %destination, [destination];
-    ld.param.u64 %cycles, [cycles];
-    mov.u64 %start, %clock64;
-spin:
-    mov.u64 %now, %clock64;
-    sub.u64 %elapsed, %now, %start;
-    setp.lt.u64 %waiting, %elapsed, %cycles;
-    @%waiting bra spin;
+    st.global.volatile.u32 [%started_flag], 1;
+    membar.sys;
+wait:
+    ld.global.volatile.u32 %release, [%release_flag];
+    setp.eq.u32 %waiting, %release, 0;
+    @%waiting bra wait;
+    membar.sys;
     st.global.u8 [%destination], 0x44;
     ret;
 }
@@ -283,19 +287,46 @@ fn fresh_work() -> u8 {
     value
 }
 
-fn launch_inflight_work() -> (cu::CUmodule, cu::CUdeviceptr) {
-    let (module, function) = load_function(c"spin_store");
+struct InflightWork {
+    module: cu::CUmodule,
+    destination: cu::CUdeviceptr,
+    completion: cu::CUevent,
+    host_flags: *mut u32,
+}
+
+fn launch_inflight_work() -> InflightWork {
+    const CU_MEMHOSTALLOC_DEVICEMAP: u32 = 2;
+
+    let (module, function) = load_function(c"wait_store");
     let mut destination = 0;
     check("cuMemAlloc in-flight", unsafe {
         cu::cuMemAlloc_v2(&mut destination, 1)
     });
+    let mut host_flags = std::ptr::null_mut::<c_void>();
+    check("cuMemHostAlloc in-flight gate", unsafe {
+        cu::cuMemHostAlloc(
+            &mut host_flags,
+            2 * std::mem::size_of::<u32>(),
+            CU_MEMHOSTALLOC_DEVICEMAP,
+        )
+    });
+    let host_flags = host_flags.cast::<u32>();
+    // SAFETY: cuMemHostAlloc returned writable host memory for two u32 flags.
+    unsafe {
+        std::ptr::write_volatile(host_flags, 0);
+        std::ptr::write_volatile(host_flags.add(1), 0);
+    }
+    let mut flags_device_ptr = 0;
+    check("cuMemHostGetDevicePointer in-flight gate", unsafe {
+        cu::cuMemHostGetDevicePointer_v2(&mut flags_device_ptr, host_flags.cast::<c_void>(), 0)
+    });
+    let mut started_arg = flags_device_ptr;
+    let mut release_arg = flags_device_ptr + std::mem::size_of::<u32>() as u64;
     let mut destination_arg = destination;
-    // About 200 ms on A100: long enough for the other process to fault while
-    // this kernel is demonstrably still executing.
-    let mut cycles_arg = 300_000_000u64;
     let mut params = [
+        (&mut started_arg as *mut cu::CUdeviceptr).cast(),
+        (&mut release_arg as *mut cu::CUdeviceptr).cast(),
         (&mut destination_arg as *mut cu::CUdeviceptr).cast(),
-        (&mut cycles_arg as *mut u64).cast(),
     ];
     check("cuLaunchKernel in-flight", unsafe {
         cu::cuLaunchKernel(
@@ -312,22 +343,60 @@ fn launch_inflight_work() -> (cu::CUmodule, cu::CUdeviceptr) {
             std::ptr::null_mut(),
         )
     });
-    (module, destination)
+    let mut completion = std::ptr::null_mut();
+    check("cuEventCreate in-flight", unsafe {
+        cu::cuEventCreate(
+            &mut completion,
+            cu::CUevent_flags::CU_EVENT_DISABLE_TIMING as u32,
+        )
+    });
+    check("cuEventRecord in-flight", unsafe {
+        cu::cuEventRecord(completion, std::ptr::null_mut())
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while unsafe { std::ptr::read_volatile(host_flags) } == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the gated kernel never reported that it started executing"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        unsafe { cu::cuEventQuery(completion) },
+        cu::CUresult::CUDA_ERROR_NOT_READY,
+        "the started kernel must remain gated while the peer faults"
+    );
+    InflightWork {
+        module,
+        destination,
+        completion,
+        host_flags,
+    }
 }
 
-fn finish_inflight_work(module: cu::CUmodule, destination: cu::CUdeviceptr) -> u8 {
-    check("cuCtxSynchronize in-flight", unsafe {
-        cu::cuCtxSynchronize()
+fn finish_inflight_work(work: InflightWork) -> u8 {
+    // The kernel cannot finish until this host-mapped flag changes. Releasing
+    // it only after the faulting process exits proves overlap without timing.
+    unsafe { std::ptr::write_volatile(work.host_flags.add(1), 1) };
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    check("cuEventSynchronize in-flight", unsafe {
+        cu::cuEventSynchronize(work.completion)
     });
     let mut value = 0u8;
     check("cuMemcpyDtoH in-flight", unsafe {
-        cu::cuMemcpyDtoH_v2((&mut value as *mut u8).cast(), destination, 1)
+        cu::cuMemcpyDtoH_v2((&mut value as *mut u8).cast(), work.destination, 1)
     });
     check("cuMemFree in-flight", unsafe {
-        cu::cuMemFree_v2(destination)
+        cu::cuMemFree_v2(work.destination)
+    });
+    check("cuEventDestroy in-flight", unsafe {
+        cu::cuEventDestroy_v2(work.completion)
+    });
+    check("cuMemFreeHost in-flight gate", unsafe {
+        cu::cuMemFreeHost(work.host_flags.cast::<c_void>())
     });
     check("cuModuleUnload in-flight", unsafe {
-        cu::cuModuleUnload(module)
+        cu::cuModuleUnload(work.module)
     });
     value
 }
@@ -424,7 +493,7 @@ fn child_role() {
     let before = device_read(alias, SAMPLE_BYTES);
     assert!(before.iter().all(|&b| b == MARKER));
     eprintln!("child: imported same physical allocation and read marker=0x{MARKER:02x}");
-    let (inflight_module, inflight_destination) = launch_inflight_work();
+    let inflight = launch_inflight_work();
     socket.write_all(b"R").unwrap();
     let mut sig = [0];
     socket.read_exact(&mut sig).unwrap();
@@ -434,10 +503,10 @@ fn child_role() {
         0,
         "faulting owner must exit before child recovery"
     );
+    let inflight = finish_inflight_work(inflight);
     let sync = unsafe { cu::cuCtxSynchronize() };
     eprintln!("child after parent fault: synchronize={sync:?}");
     check("child sync after fault", sync);
-    let inflight = finish_inflight_work(inflight_module, inflight_destination);
     let fresh = fresh_work();
     let after = device_read(alias, SAMPLE_BYTES);
     assert_eq!(fresh, 0x33);

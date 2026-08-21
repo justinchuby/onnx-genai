@@ -75,6 +75,7 @@ pub mod allocator;
 pub mod large_alloc_cache;
 pub mod manager;
 pub mod shareability;
+pub mod shared_prefix;
 
 pub use allocator::{
     AllocationCommitRange, AllocationGeneration, AllocationIdentity, AllocationReleaseOutcome,
@@ -108,6 +109,9 @@ pub use onnx_runtime_memory_api::{MemoryError, MemoryRole, Tier};
 pub use shareability::{
     KvFragmentation, ModelKvGeometry, PrefixShareability, evaluate_geometry_shareability,
     evaluate_prefix_shareability,
+};
+pub use shared_prefix::{
+    SharedPrefixCommitTarget, SharedPrefixPairCommitError, commit_shared_prefix_pair,
 };
 
 use std::collections::{BTreeMap, VecDeque};

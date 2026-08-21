@@ -1037,14 +1037,18 @@ kernel fault. Measured answers are in
 `SharedMapping` capability; pool-less allocators report `None`. The
 **seq-major** fused fp16 GQA GPU parity test
 (`crates/onnx-runtime-ep-cuda/tests/gqa_shared_prefix_parity_gpu.rs`) drives the
-real kernel over shared-prefix VMM KV and proves two sequences sharing one pinned
-seq-major prefix (`layers × 2` contiguous ranges) produce **byte-identical**
-output to two independent sequences. Measured at KV_HEADS=8, HEAD_DIM=128, f16,
-1024-token prefix + 1024-token private tail per sequence: independent = 8
-granules (16,777,216 B), shared = 6 granules (12,582,912 B); the prefix is
+real kernel over shared-prefix VMM KV and proves two sharing requests plus one
+private-fallback request, each decoded for two interleaved steps, produce
+**byte-identical** output to independent GPU caches and the CPU reference.
+Measured at KV_HEADS=8, HEAD_DIM=128, f16, 1024-token prefix + 1024-token private
+tail per sequence: independent = 12 granules (25,165,824 B), shared-plus-fallback
+= 10 granules (20,971,520 B); the prefix is
 charged **once** (`incremental_owned_bytes_for_shared_prefix` = 0) and the second
 sharer's admission is **only its private bytes** (4,194,304 B = its two private
 tails), so sharing removes `(C−1)×(K_prefix+V_prefix)` = 2 granules.
+`commit_shared_prefix_pair` makes K/V admission all-or-private: when the V map
+is rejected, it decommits the successful K map before permitting private
+fallback. A rollback failure is explicitly non-fallbackable.
 
 **What remains structural.** The *engine generation loop* cannot yet call this
 seam automatically: `persistent_state_shapes` in
@@ -1056,6 +1060,8 @@ use. Hash-based automatic detection, token-major (one multi-map per sequence),
 and copy-on-write at divergence remain the later increments named below. The
 delivered consumer is explicit (a caller declares the shared prefix) and is
 restricted to prefixes that are read-only for the sharers' lifetime.
+This test and transaction API prove the allocator/governor seam; the live server
+request path does not yet consume physical shared-prefix metadata.
 
 #### Layout belongs to the KV owner
 
