@@ -1051,6 +1051,17 @@ static KAI_SDOT_M1_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 static DISPATCH_PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(all(test, feature = "mlas"))]
 static MLAS_SQNBIT_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
+/// Counts entries to the register-blocked int4 decode kernel, so a test can
+/// assert the `accuracy_level = 0` default actually *reaches* it. #1104 added
+/// the kernel behind a default-off toggle and nothing asserted which route
+/// production took, so it stayed dormant; this makes the default route a
+/// checked property instead of a comment.
+///
+/// `target_arch` is part of the gate because the N-blocked kernel is x86-only,
+/// so on aarch64 this static would be dead code and the cross-compile lane
+/// builds tests with `-D warnings`.
+#[cfg(all(test, target_arch = "x86_64"))]
+static BORROWED_INT4_NBLOCK_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// Positive-proof counters for the zero-copy borrowed int4 decode path (#979).
 /// Split by symmetry so a test can assert the *symmetric* branch is the one that
 /// executed, not merely that some path avoided the resident `weight_nk` f32
@@ -1557,6 +1568,8 @@ impl Kernel for MatMulNBitsKernel {
                     && !matches!(dot_kernel, DotKernel::Scalar)
                     && self.block_size.is_multiple_of(32)
                 {
+                    #[cfg(all(test, target_arch = "x86_64"))]
+                    BORROWED_INT4_NBLOCK_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
                     borrowed_affine_int4_matmul_nblock(
                         &activations,
                         packed,
@@ -6939,20 +6952,51 @@ fn borrowed_scales<'a>(view: &TensorView<'a>) -> Option<BorrowedScales<'a>> {
 
 /// A/B toggle for the register-blocked ("N-blocked") borrowed int4 decode
 /// kernel that absorbs MLAS SQNBit CompFp32's activation-reuse locality without
-/// a resident packed copy. `1`/`on` enables it; unset or `0`/`off` keeps the
-/// per-column path. Default off so the shipped borrowed path is unchanged until
-/// the win is measured, exactly like the `ONNX_GENAI_CPU_MM_MLAS_QNBIT` and
-/// `#994` toggles that preceded it. Production is the only writer of process
-/// state here: this is a read-only env probe, never mutated at runtime.
+/// a resident packed copy. **On by default**; set
+/// `ONNX_GENAI_CPU_MM_INT4_NBLK=0` (or `off`) to fall back to the per-column
+/// path in the same binary. Production is the only writer of process state
+/// here: this is a read-only env probe, never mutated at runtime.
+///
+/// It shipped default *off* in #1104 "until the win is measured", and then the
+/// measurement never happened, so `accuracy_level = 0` — the production
+/// default — kept taking the per-column path for the whole time this kernel
+/// sat in the tree. Route counters instrumented from operator entry through
+/// the kernel confirm it: at `accuracy_level = 0` every call reached the
+/// borrowed guard and every one of them went to `borrowed_affine_int4_matmul`,
+/// with `nblock = 0`.
+///
+/// Measured on the decode A/B (`int4_decode_loop_ab`, `accuracy_level = 0`,
+/// block 32, min of 6 interleaved reps, pinned to physical cores):
+///
+/// | route | t=1 | t=4 | vs per-column |
+/// |---|---|---|---|
+/// | per-column (previous default) | 56.528 | 28.518 | 1.00x |
+/// | N-blocked, group of 1 | 55.156 | 27.861 | 1.02x |
+/// | N-blocked, group of 2 | 47.679 | 23.885 | 1.19x |
+/// | N-blocked, group of 4 | 38.114 | 19.238 | **1.48x** |
+///
+/// The group-of-1 row is the attribution, and it rules out the explanation
+/// the structure suggests. Restructuring the reduction — keeping the scale in
+/// a vector accumulator and reducing once per column instead of once per
+/// 32-weight block — is worth **1.02x, i.e. nothing measurable**, even though
+/// the per-column path's hreduce (`extractf128`/`movehl`/`shuffle`, each
+/// dependent on the last) sits on the critical path every four FMAs. The
+/// block loop has enough independent work across blocks for the out-of-order
+/// engine to hide it.
+///
+/// The win is entirely the **four-column activation reuse**: 1.45x from group
+/// 1 to group 4. At `m == 1` each activation vector is loaded once and fed to
+/// four columns' FMAs, so the load count per useful FMA drops 4x. That also
+/// matches #1104's independently measured 1.46x end-to-end on a 14B model.
 #[cfg(target_arch = "x86_64")]
 fn borrowed_int4_nblock_enabled() -> bool {
     std::env::var("ONNX_GENAI_CPU_MM_INT4_NBLK")
         .ok()
         .map(|value| {
             let value = value.trim();
-            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("off")
+            value.is_empty() || (value != "0" && !value.eq_ignore_ascii_case("off"))
         })
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 /// Register-blocked borrowed int4 matmul. Reads the *same* zero-copy mmap int4
@@ -11124,6 +11168,219 @@ mod tests {
             }
         }
         (packed, scales, asymmetric.then_some(zps), dequantized)
+    }
+
+    /// #1104 shipped the register-blocked int4 decode kernel behind a
+    /// default-*off* env toggle, and nothing in the suite asserted which route
+    /// `accuracy_level = 0` actually took. The kernel therefore sat unused in
+    /// the tree while the production default kept paying the per-block
+    /// horizontal reduction it was written to remove. Every parity test still
+    /// passed, because they all call the kernel directly.
+    ///
+    /// This asserts the *route*, not the arithmetic: a plain decode-shaped
+    /// `accuracy_level = 0` call must land in the N-blocked kernel. Flipping
+    /// the default back off fails this test.
+    ///
+    /// Excluded under `feature = "mlas"`, where `mlas_sqnbit_owns_fp32_compute`
+    /// legitimately claims `accuracy_level = 0` before the borrowed guard is
+    /// reached, so the borrowed route is *correctly* not taken. The shipped
+    /// default artifact links no MLAS, which is the configuration this asserts.
+    #[cfg(all(target_arch = "x86_64", not(feature = "mlas")))]
+    #[test]
+    fn acc0_decode_reaches_the_nblocked_kernel_by_default() {
+        if matches!(selected_dot_kernel(), DotKernel::Scalar) {
+            return;
+        }
+        // Reads a process-global counter delta, so it must not be handed
+        // another test's dispatch.
+        let _probe = lock_dispatch_probe();
+        let (k, n, block_size) = (128usize, 8usize, 32usize);
+        let a_values: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) / 7.0).collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 23 % 47) as f32 - 19.0) / 12.0)
+            .collect();
+        let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+        let dequantized = dequantize_reference(&packed, &scales, None, n, k, block_size);
+        let mut kernel = test_kernel(k, n, block_size);
+        kernel.set_constant_inputs(&[false, true, true]);
+
+        let a = Owned::f32(&[1, k], &a_values);
+        let b = Owned::u8(&[n, k / block_size, block_size / 2], &packed);
+        let scales_t = Owned::f32(&[n, k / block_size], &scales);
+        let mut y = Owned::zeros_f32(&[1, n]);
+        let before = BORROWED_INT4_NBLOCK_TEST_CALLS.load(Ordering::Relaxed);
+        kernel
+            .execute(&[a.view(), b.view(), scales_t.view()], &mut [y.view_mut()])
+            .unwrap();
+
+        assert_close(&y.to_f32(), &reference(&a_values, &dequantized, 1, k, n));
+        assert!(
+            BORROWED_INT4_NBLOCK_TEST_CALLS.load(Ordering::Relaxed) > before,
+            "accuracy_level=0 int4 decode must reach the register-blocked kernel \
+             by default; it is 1.48x the per-column path at block 32"
+        );
+    }
+
+    /// The N-blocked kernel becomes the `accuracy_level = 0` default, so
+    /// "matches the old path within 1e-3" is not a strong enough contract: it
+    /// would let a *less* accurate kernel ship as long as it stayed close to
+    /// the one it replaced. This measures both against an f64 reference.
+    ///
+    /// I expected the replacement to be *at least as accurate*. It is not, and
+    /// the guard below is sized to the measurement rather than to the hope.
+    /// Worst observed relative error, over the cases below:
+    ///
+    /// | case | per-column | N-blocked |
+    /// |---|---|---|
+    /// | k=4096 bs=32 asym | 6.739e-6 | 2.422e-5 |
+    /// | k=256 bs=32 asym | 1.676e-6 | 6.197e-6 |
+    /// | k=512 bs=32 sym gain=1024 | 2.899e-5 | 3.983e-5 |
+    /// | k=1024 bs=128 sym gain=256 | 1.186e-6 | 1.186e-6 |
+    ///
+    /// N-blocked is up to **3.70x** worse in relative terms. That is the
+    /// separated correction described below, and it is a real (if small) cost
+    /// of the 1.48x. It stays at 2.4e-5 worst case — two orders inside the
+    /// 1e-3 the borrowed-path parity tests already accept for this route, and
+    /// the `accuracy_level = 0` contract itself is preserved exactly: both
+    /// paths are pure f32 FMA over f32 activations, and neither is ever
+    /// diverted through an int8/int16 kernel.
+    ///
+    /// The two differ structurally, not just by reassociation. The per-column
+    /// path forms `(dot - actsum*zp) * scale` per block and accumulates that
+    /// in one serial f32 chain. The N-blocked path accumulates `sum(dot*scale)`
+    /// and `sum(actsum*zp*scale)` separately and subtracts once at the end,
+    /// which is where catastrophic cancellation would show up if it were a
+    /// problem: with unsigned nibbles `0..=15` and the symmetric midpoint 8,
+    /// those two running sums are of comparable magnitude and the answer is
+    /// their difference. The `hostile` case below is built to maximise exactly
+    /// that cancellation (large activations, near-midpoint quantised weights),
+    /// so the comparison is made where the separated form is weakest.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn nblock_holds_the_f32_contract_against_f64() {
+        if matches!(selected_dot_kernel(), DotKernel::Scalar) {
+            return;
+        }
+        let mut rng: u64 = 0xD1B54A32D192ED03;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            ((rng >> 40) as f32 / (1u32 << 24) as f32) - 0.5
+        };
+        // (m, k, n, block_size, activation_gain, hostile)
+        let cases: &[(usize, usize, usize, usize, f32, bool)] = &[
+            (1, 4096, 8, 32, 1.0, false),
+            (1, 4096, 8, 32, 1.0, true),
+            (1, 2048, 12, 64, 64.0, true),
+            (1, 1024, 5, 128, 1.0, false),
+            (1, 1024, 5, 128, 256.0, true),
+            (1, 512, 4, 32, 1024.0, true),
+            (2, 256, 9, 32, 1.0, false),
+        ];
+        for &(m, k, n, block_size, gain, hostile) in cases {
+            for &asymmetric in &[false, true] {
+                // A hostile case pins the quantised weights near the midpoint
+                // so `dot` and the zero-point correction nearly cancel.
+                let weights_nk: Vec<f32> = (0..n * k)
+                    .map(|_| if hostile { next() * 0.002 } else { next() })
+                    .collect();
+                let activations: Vec<f32> = (0..m * k).map(|_| next() * gain).collect();
+                let (packed, scales, zps, _dq) =
+                    quantize(&weights_nk, n, k, block_size, asymmetric);
+                let zp_slice = zps.as_deref();
+                let bias: Vec<f32> = (0..n).map(|_| next()).collect();
+                let layout = NBitsLayout {
+                    bits: 4,
+                    block_size,
+                };
+                let blocks = k.div_ceil(block_size);
+                let blob = layout.packed_block_size();
+
+                // f64 reference over the exact affine dequantisation contract.
+                let mut reference = vec![0.0f64; m * n];
+                for row in 0..m {
+                    for col in 0..n {
+                        let mut acc = bias[col] as f64;
+                        for block in 0..blocks {
+                            let scale = scales[col * blocks + block] as f64;
+                            let zp = layout.zero_point(
+                                zp_slice.map(|z| {
+                                    &z[col * layout.zero_point_row_size(blocks)
+                                        ..(col + 1) * layout.zero_point_row_size(blocks)]
+                                }),
+                                block,
+                            ) as f64;
+                            let start = block * block_size;
+                            let valid = k.saturating_sub(start).min(block_size);
+                            for j in 0..valid {
+                                let byte = packed[(col * blocks + block) * blob + j / 2];
+                                let q = if j % 2 == 0 { byte & 0x0f } else { byte >> 4 } as f64;
+                                acc += activations[row * k + start + j] as f64 * (q - zp) * scale;
+                            }
+                        }
+                        reference[row * n + col] = acc;
+                    }
+                }
+
+                let mut per_column = vec![0.0f32; m * n];
+                borrowed_affine_int4_matmul(
+                    &activations,
+                    &packed,
+                    BorrowedScales::F32(&scales),
+                    zp_slice,
+                    Some(&bias),
+                    &mut per_column,
+                    m,
+                    k,
+                    n,
+                    block_size,
+                    selected_dot_kernel(),
+                );
+                let mut nblocked = vec![0.0f32; m * n];
+                borrowed_affine_int4_matmul_nblock(
+                    &activations,
+                    &packed,
+                    BorrowedScales::F32(&scales),
+                    zp_slice,
+                    Some(&bias),
+                    &mut nblocked,
+                    m,
+                    k,
+                    n,
+                    block_size,
+                );
+
+                let err = |got: &[f32]| -> f64 {
+                    got.iter()
+                        .zip(reference.iter())
+                        .map(|(g, r)| {
+                            let scale = r.abs().max(1e-6);
+                            ((*g as f64) - r).abs() / scale
+                        })
+                        .fold(0.0f64, f64::max)
+                };
+                let (e_col, e_nbl) = (err(&per_column), err(&nblocked));
+                // Regression bound, not an equality claim: the measured
+                // worst ratio is 3.70x, and this fires if the separated
+                // correction ever degrades materially past that. Set at 8x so
+                // an AVX-512 host — where the per-column path uses the 512-bit
+                // block dot and so has its own error profile, while N-blocked
+                // is AVX2-only — does not trip it spuriously.
+                assert!(
+                    e_nbl <= e_col.max(1e-6) * 8.0,
+                    "m={m} k={k} n={n} block={block_size} asym={asymmetric} \
+                     gain={gain} hostile={hostile}: n-blocked rel err {e_nbl:e} \
+                     regressed past 8x per-column {e_col:e}"
+                );
+                assert!(
+                    e_nbl < 1e-3,
+                    "m={m} k={k} n={n} block={block_size} asym={asymmetric} \
+                     gain={gain} hostile={hostile}: n-blocked rel err {e_nbl:e} \
+                     exceeds the f32 contract"
+                );
+            }
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
