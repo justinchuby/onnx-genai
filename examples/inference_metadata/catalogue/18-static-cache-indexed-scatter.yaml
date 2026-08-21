@@ -1,0 +1,304 @@
+# Fixed-capacity KV cache with graph-visible indexed-scatter destinations and logical lengths.
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      ir_version: '1.0'
+      onnx_opsets:
+        ai.onnx: 24
+      capabilities:
+      - workflow_ssa
+      - typed_emit
+      - serving_service_contract
+    inputs:
+      request.active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: active
+        required: true
+      request.done:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: done
+        required: true
+      request.accepted_len:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: accepted_len
+        required: true
+      request.input_ids:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - 1
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: prompt_tokens
+        source:
+          kind: request
+        required: true
+      request.cache:
+        contract:
+          dtype: float16
+          rank: 4
+          shape:
+          - batch
+          - heads
+          - capacity
+          - head_dim
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: cache
+        required: true
+      request.write_indices:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: write_indices
+        required: true
+      request.cache_lengths:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: cache_lengths
+        required: true
+      package.capacity:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 2048
+    outputs:
+      logits:
+        contract:
+          dtype: float16
+          rank: 3
+          shape:
+          - batch
+          - sequence
+          - vocab
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
+    components:
+      decoder:
+        implementation:
+          kind: onnx
+          artifact: static_cache/decoder.onnx.textproto
+        ports:
+          inputs:
+            input_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            past_cache:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - capacity
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            write_indices:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            cache_lengths:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            logits:
+              dtype: float16
+              rank: 3
+              shape:
+              - batch
+              - sequence
+              - vocab
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            present_cache:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - capacity
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          roles:
+            input_ids: token_ids
+            logits: logits
+    state:
+      cache:
+        contract:
+          dtype: float16
+          rank: 4
+          shape:
+          - batch
+          - heads
+          - capacity
+          - head_dim
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: request.cache
+        recurrence:
+          kind: invariant
+        management: runtime
+        release_boundary: invocation
+        service_group: static_cache
+      write_indices:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: request.write_indices
+        recurrence:
+          kind: invariant
+      cache_lengths:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: request.cache_lengths
+        recurrence:
+          kind: invariant
+    steps:
+    - kind: invoke
+      component: decoder
+      inputs:
+        input_ids: request.input_ids
+        past_cache: request.cache
+        write_indices: request.write_indices
+        cache_lengths: request.cache_lengths
+      outputs:
+        logits: decoder.logits
+        present_cache: decoder.cache
+    - kind: emit
+      value: decoder.logits
+      output: logits
+      mode: replace
+    serving:
+      active: request.active
+      done: request.done
+      accepted_len: request.accepted_len
+      state_service:
+        groups:
+          static_cache:
+            kind: full_attention
+            sequence_axis: 2
+            layout: bnsh
+            logical_lengths: cache_lengths
+            update:
+              kind: indexed_scatter
+              write_indices: write_indices
+              capacity: package.capacity
+              write_indices_ports:
+                decoder: write_indices
+              kv_length_ports:
+                decoder: cache_lengths
+            ports:
+              decoder:
+                cache:
+                  input: past_cache
+                  output: present_cache
+                  role: combined
+                  layer: 0

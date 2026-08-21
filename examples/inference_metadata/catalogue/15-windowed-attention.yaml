@@ -1,0 +1,279 @@
+# Windowed attention contrast: local non-streaming operator has no state; streaming attention has bounded sliding state.
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      ir_version: '1.0'
+      onnx_opsets:
+        ai.onnx: 24
+      capabilities:
+      - workflow_ssa
+      - typed_emit
+      - serving_service_contract
+    inputs:
+      request.active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: active
+        required: true
+      request.done:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: done
+        required: true
+      request.accepted_len:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: accepted_len
+        required: true
+      request.local_input:
+        contract:
+          dtype: float16
+          rank: 3
+          shape:
+          - batch
+          - window
+          - hidden
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: request.local_input
+        required: true
+      request.stream_input:
+        contract:
+          dtype: float16
+          rank: 3
+          shape:
+          - batch
+          - window
+          - hidden
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: request.stream_input
+        required: true
+      request.streaming_cache:
+        contract:
+          dtype: float16
+          rank: 4
+          shape:
+          - batch
+          - heads
+          - window
+          - head_dim
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: streaming_cache
+        required: true
+    outputs:
+      local_output:
+        contract:
+          dtype: float16
+          rank: 3
+          shape:
+          - batch
+          - sequence
+          - hidden
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
+      streaming_output:
+        contract:
+          dtype: float16
+          rank: 3
+          shape:
+          - batch
+          - sequence
+          - hidden
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
+    components:
+      non_streaming_local_attention:
+        implementation:
+          kind: onnx
+          artifact: windowed/local_attention.onnx.textproto
+        ports:
+          inputs:
+            input:
+              dtype: float16
+              rank: 3
+              shape:
+              - batch
+              - window
+              - hidden
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            output:
+              dtype: float16
+              rank: 3
+              shape:
+              - batch
+              - sequence
+              - hidden
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      streaming_attention:
+        implementation:
+          kind: onnx
+          artifact: windowed/streaming_attention.onnx.textproto
+        ports:
+          inputs:
+            input:
+              dtype: float16
+              rank: 3
+              shape:
+              - batch
+              - window
+              - hidden
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            past_window:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - window
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            output:
+              dtype: float16
+              rank: 3
+              shape:
+              - batch
+              - sequence
+              - hidden
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            present_window:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - window
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+    state:
+      streaming_cache:
+        contract:
+          dtype: float16
+          rank: 4
+          shape:
+          - batch
+          - heads
+          - window
+          - head_dim
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: request.streaming_cache
+        recurrence:
+          kind: invariant
+        management: runtime
+        release_boundary: invocation
+        service_group: streaming_sliding
+    steps:
+    - kind: invoke
+      component: non_streaming_local_attention
+      inputs:
+        input: request.local_input
+      outputs:
+        output: local.output
+    - kind: invoke
+      component: streaming_attention
+      inputs:
+        input: request.stream_input
+        past_window: request.streaming_cache
+      outputs:
+        output: stream.output
+        present_window: stream.cache
+    - kind: emit
+      value: local.output
+      output: local_output
+      mode: replace
+    - kind: emit
+      value: stream.output
+      output: streaming_output
+      mode: replace
+    serving:
+      active: request.active
+      done: request.done
+      accepted_len: request.accepted_len
+      state_service:
+        groups:
+          streaming_sliding:
+            kind: sliding_attention
+            sequence_axis: 2
+            layout: bnsh
+            update:
+              kind: append
+            reuse:
+              prefix_reusable: true
+              evictable_prefix: true
+            ports:
+              streaming_attention:
+                streaming_cache:
+                  input: past_window
+                  output: present_window
+                  role: combined
+                  layer: 0

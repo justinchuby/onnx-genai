@@ -1,0 +1,158 @@
+# Wav2Vec2 encoder-only ASR with explicit CTC decoding profile.
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      ir_version: '1.0'
+      onnx_opsets:
+        ai.onnx: 24
+      capabilities:
+      - workflow_ssa
+      - typed_emit
+    inputs:
+      request.input_values:
+        contract:
+          dtype: float32
+          rank: 2
+          shape:
+          - batch
+          - samples
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: media
+        source:
+          kind: request
+        required: true
+      request.attention_mask:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - samples
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: request.attention_mask
+        required: true
+    outputs:
+      logits:
+        contract:
+          dtype: float32
+          rank: 3
+          shape:
+          - batch
+          - frames
+          - vocab
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
+      frame_lengths:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
+    components:
+      encoder:
+        implementation:
+          kind: onnx
+          artifact: wav2vec2/encoder_ctc.onnx.textproto
+        ports:
+          inputs:
+            input_values:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - samples
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            attention_mask:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - samples
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            logits:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - frames
+              - vocab
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            frame_lengths:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+    state: {}
+    steps:
+    - kind: invoke
+      component: encoder
+      inputs:
+        input_values: request.input_values
+        attention_mask: request.attention_mask
+      outputs:
+        logits: ctc.logits
+        frame_lengths: ctc.lengths
+    - kind: emit
+      value: ctc.logits
+      output: logits
+      mode: replace
+    - kind: emit
+      value: ctc.lengths
+      output: frame_lengths
+      mode: replace
+profiles:
+  transcription:
+    kind: transcription
+    version: '1.0'
+    outputs:
+      logits: logits
+      frame_lengths: frame_lengths
+    batch_invariance: padding_sensitive
+    decoding:
+      kind: ctc
+      blank_id: 0
+      collapse_repeats: true
+      time_axis: 1
+      class_axis: 2
+      lengths: frame_lengths
+      vocabulary:
+        source: inline
+        size: 4
+        tokens:
+        - <blank>
+        - A
+        - B
+        - '|'
+        word_delimiter: '|'
+        ignored_tokens:
+        - <blank>

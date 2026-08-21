@@ -1,0 +1,423 @@
+# Gemma 4 text decoder; mixed global and sliding-window KV groups.
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      ir_version: '1.0'
+      onnx_opsets:
+        ai.onnx: 24
+      capabilities:
+      - workflow_ssa
+      - typed_emit
+      - serving_service_contract
+    inputs:
+      request.active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: active
+        required: true
+      request.done:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: done
+        required: true
+      request.accepted_len:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: accepted_len
+        required: true
+      request.input_ids:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - sequence
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: prompt_tokens
+        source:
+          kind: request
+        required: true
+      request.full_key:
+        contract:
+          dtype: float16
+          rank: 4
+          shape:
+          - batch
+          - heads
+          - sequence
+          - head_dim
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: full_key
+        required: true
+      request.full_value:
+        contract:
+          dtype: float16
+          rank: 4
+          shape:
+          - batch
+          - heads
+          - sequence
+          - head_dim
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: full_value
+        required: true
+      request.sliding_key:
+        contract:
+          dtype: float16
+          rank: 4
+          shape:
+          - batch
+          - heads
+          - sequence
+          - head_dim
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: sliding_key
+        required: true
+      request.sliding_value:
+        contract:
+          dtype: float16
+          rank: 4
+          shape:
+          - batch
+          - heads
+          - sequence
+          - head_dim
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: sliding_value
+        required: true
+    outputs:
+      logits:
+        contract:
+          dtype: float16
+          rank: 3
+          shape:
+          - batch
+          - sequence
+          - vocab
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
+    components:
+      decoder:
+        implementation:
+          kind: onnx
+          artifact: gemma4/decoder.onnx.textproto
+        ports:
+          inputs:
+            input_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            full_key:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            full_value:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            sliding_key:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            sliding_value:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            logits:
+              dtype: float16
+              rank: 3
+              shape:
+              - batch
+              - sequence
+              - vocab
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            next_full_key:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            next_full_value:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            next_sliding_key:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            next_sliding_value:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          roles:
+            input_ids: token_ids
+            logits: logits
+    state:
+      full_key:
+        contract:
+          dtype: float16
+          rank: 4
+          shape:
+          - batch
+          - heads
+          - sequence
+          - head_dim
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: request.full_key
+        recurrence:
+          kind: invariant
+        management: runtime
+        release_boundary: invocation
+        service_group: full_attention
+      full_value:
+        contract:
+          dtype: float16
+          rank: 4
+          shape:
+          - batch
+          - heads
+          - sequence
+          - head_dim
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: request.full_value
+        recurrence:
+          kind: invariant
+        management: runtime
+        release_boundary: invocation
+        service_group: full_attention
+      sliding_key:
+        contract:
+          dtype: float16
+          rank: 4
+          shape:
+          - batch
+          - heads
+          - sequence
+          - head_dim
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: request.sliding_key
+        recurrence:
+          kind: invariant
+        management: runtime
+        release_boundary: invocation
+        service_group: sliding_attention
+      sliding_value:
+        contract:
+          dtype: float16
+          rank: 4
+          shape:
+          - batch
+          - heads
+          - sequence
+          - head_dim
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: request.sliding_value
+        recurrence:
+          kind: invariant
+        management: runtime
+        release_boundary: invocation
+        service_group: sliding_attention
+    steps:
+    - kind: invoke
+      component: decoder
+      inputs:
+        input_ids: request.input_ids
+        full_key: request.full_key
+        full_value: request.full_value
+        sliding_key: request.sliding_key
+        sliding_value: request.sliding_value
+      outputs:
+        logits: decoder.logits
+        next_full_key: decoder.full_key
+        next_full_value: decoder.full_value
+        next_sliding_key: decoder.sliding_key
+        next_sliding_value: decoder.sliding_value
+    - kind: emit
+      value: decoder.logits
+      output: logits
+      mode: replace
+    serving:
+      active: request.active
+      done: request.done
+      accepted_len: request.accepted_len
+      state_service:
+        groups:
+          full_attention:
+            kind: full_attention
+            sequence_axis: 2
+            layout: bnsh
+            update:
+              kind: append
+            reuse:
+              prefix_reusable: true
+              evictable_prefix: false
+            ports:
+              decoder:
+                full_key:
+                  input: full_key
+                  output: next_full_key
+                  role: key
+                  layer: 0
+                full_value:
+                  input: full_value
+                  output: next_full_value
+                  role: value
+                  layer: 0
+          sliding_attention:
+            kind: sliding_attention
+            sequence_axis: 2
+            layout: bnsh
+            update:
+              kind: append
+            reuse:
+              prefix_reusable: true
+              evictable_prefix: true
+            ports:
+              decoder:
+                sliding_key:
+                  input: sliding_key
+                  output: next_sliding_key
+                  role: key
+                  layer: 1
+                sliding_value:
+                  input: sliding_value
+                  output: next_sliding_value
+                  role: value
+                  layer: 1

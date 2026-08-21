@@ -1,0 +1,206 @@
+# Linear attention uses generic recurrent state, replacement update, and no sequence_axis.
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      ir_version: '1.0'
+      onnx_opsets:
+        ai.onnx: 24
+      capabilities:
+      - workflow_ssa
+      - typed_emit
+      - serving_service_contract
+    inputs:
+      request.active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: active
+        required: true
+      request.done:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: done
+        required: true
+      request.accepted_len:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: accepted_len
+        required: true
+      request.hidden_states:
+        contract:
+          dtype: float16
+          rank: 3
+          shape:
+          - batch
+          - 1
+          - hidden
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: request.hidden_states
+        required: true
+      request.linear_accumulator:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - heads
+          - feature
+          - value
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: linear_accumulator
+        required: true
+    outputs:
+      hidden_states:
+        contract:
+          dtype: float16
+          rank: 3
+          shape:
+          - batch
+          - 1
+          - hidden
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
+    components:
+      model:
+        implementation:
+          kind: onnx
+          artifact: linear_attention/step.onnx.textproto
+        ports:
+          inputs:
+            accumulator:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - feature
+              - value
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            hidden_states:
+              dtype: float16
+              rank: 3
+              shape:
+              - batch
+              - 1
+              - hidden
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            next_accumulator:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - feature
+              - value
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            output:
+              dtype: float16
+              rank: 3
+              shape:
+              - batch
+              - 1
+              - hidden
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+    state:
+      linear_accumulator:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - heads
+          - feature
+          - value
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: request.linear_accumulator
+        recurrence:
+          kind: invariant
+        management: runtime
+        release_boundary: invocation
+        service_group: linear_accumulator
+    steps:
+    - kind: invoke
+      component: model
+      inputs:
+        accumulator: request.linear_accumulator
+        hidden_states: request.hidden_states
+      outputs:
+        output: model.output
+        next_accumulator: model.linear_accumulator
+    - kind: emit
+      value: model.output
+      output: hidden_states
+      mode: replace
+    serving:
+      active: request.active
+      done: request.done
+      accepted_len: request.accepted_len
+      state_service:
+        groups:
+          linear_accumulator:
+            kind: recurrent
+            layout: bhfv
+            update:
+              kind: replace
+            ports:
+              model:
+                linear_accumulator:
+                  input: accumulator
+                  output: next_accumulator
