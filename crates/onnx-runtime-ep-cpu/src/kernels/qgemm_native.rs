@@ -100,14 +100,18 @@ const PARALLEL_MIN_WORK: usize = 1 << 16;
 /// The boundary used to sit at `MR` itself, because the pack-free kernel had no
 /// row blocking and physically could not take a fifth row. That put `m = 5` on
 /// the packed path with two row blocks and nothing to amortise against, and it
-/// measured as a **1.47x cliff** off `m = 4` for 25% more arithmetic.
+/// measured as a **2.0x cliff** off `m = 4` (0.543 ms -> 1.090 ms) for 25%
+/// more arithmetic.
 ///
 /// Where the crossover actually lands was measured, not predicted, at
 /// `k = n = 2048` on **one thread** (packed / fused, two repetitions):
 ///
-/// | `m` | 5 | 6 | 8 | 9 | 10 | 11 | 12 | 16 |
-/// |---|---|---|---|---|---|---|---|---|
-/// | fused speedup | 1.47x | 1.42x | 1.15x | 1.06x | 1.02x | 0.90x | 0.94x | 0.83x |
+/// | `m` | 4 | 5 | 6 | 8 | 9 | 10 | 11 | 12 | 16 |
+/// |---|---|---|---|---|---|---|---|---|---|
+/// | fused speedup | 0.99x | 1.48x | 1.42x | 1.16x | 1.06x | 1.02x | 0.90x | 0.94x | 0.84x |
+///
+/// `m = 4` is the null control -- the same path in both arms -- so its 0.99x
+/// is the one-thread noise floor, about 1.5%.
 ///
 /// So the pack does start repaying itself, at around ten rows. The default is
 /// `2 * MR` rather than the last winning row: it is a whole number of row
@@ -1084,10 +1088,13 @@ mod tests {
         // so this must cross a block boundary (5), land exactly on one (8, 16)
         // and step past the last fused row (17) into the packed path.
         // Above `MR` the pack-free kernel is reached only when the call is not
-        // being split, so half of these shapes would silently run the *packed*
-        // path under the ambient global pool and this test would cover nothing
-        // new. One worker forces the row-blocked path; the ambient pool then
-        // re-checks the same shapes on the packed path.
+        // being split, so these shapes would otherwise silently run the
+        // *packed* path under the ambient global pool and this test would cover
+        // nothing new. One worker forces the row-blocked path for the shapes
+        // that can reach it -- 5, 7 and 8, which block as [4,1], [4,3] and
+        // [4,4]. Past `fused_max_rows` (9, 12, 16, 17) both arms are packed, so
+        // those rows check the packed path against the oracle and nothing more.
+        // The ambient arm re-checks every shape on the packed path.
         let serial = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
             .build()

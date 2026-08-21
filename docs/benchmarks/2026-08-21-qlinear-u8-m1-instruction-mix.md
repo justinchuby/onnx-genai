@@ -8,7 +8,8 @@ the emitted intrinsics, not a hardware counter. Where a static count and a
 measurement disagree, the measurement wins and the disagreement is stated.
 
 **Shipped: one mechanism, and it is narrow.** Serial `QLinearMatMul` at
-`MR < m <= 2 * MR` gets **1.16-1.46x**. **`m = 1` is not improved by this
+`MR < m <= 2 * MR` gets **1.16-1.48x** (`m = 8` to `m = 5`), across two
+independent runs. **`m = 1` is not improved by this
 change at all** -- see §4 for what it would take, and why that is a separate,
 unbuilt piece of work.
 
@@ -63,12 +64,20 @@ I am not going to guess at it.**
 ## 3. The `m = 5` cliff (the shipped fix)
 
 `fused = m <= MR` sent `m = 5` to the packed path, which then had two row
-blocks and nothing to amortise a `2 * k * n`-byte panel write against. Measured
+blocks and nothing to amortise a `2 * k * n`-byte panel write against. The
+packed path costs 0.543 ms at `m = 4` and 1.090 ms at `m = 5` -- a **2.0x
+cliff for 25% more arithmetic**. Measured
 at `k = n = 2048`, one thread, packed vs pack-free, two repetitions:
 
 | `m` | 4 | 5 | 6 | 8 | 9 | 10 | 11 | 12 | 16 |
 |---|---|---|---|---|---|---|---|---|---|
-| pack-free speedup | 1.00x | **1.47x** | **1.42x** | **1.15x** | 1.06x | 1.02x | 0.90x | 0.94x | 0.83x |
+| pack-free speedup | 0.99x | **1.48x** | **1.42x** | **1.16x** | 1.06x | 1.02x | 0.90x | 0.94x | 0.84x |
+
+Every cell is the mean of two repetitions divided by the mean of two. `m = 4`
+is a **null control**: both arms run the identical path there, so its 0.99x is
+this harness's one-thread noise floor -- **about 1.5%**, and 0.2% on the `m = 1`
+control in the confirmation run below. That floor is what the `m = 8` claim has
+to clear, and 16% clears it by an order of magnitude.
 
 The pack does repay itself -- at about ten rows, not five. Fix: give the
 pack-free kernel a row-block loop (it previously dispatched on exact `m` and
@@ -88,8 +97,12 @@ so what binds is the pack-free path's extra sweep of `B` per row block, and the
 packed panel -- written once, re-read from L2 -- wins from `MR + 1` up. The
 same shape wants **opposite answers at one thread and at eight**.
 
-So the gate is `m <= MR || (!parallel && m <= 2 * MR)`. Final state, two
-repetitions:
+So the gate is `m <= MR || (!parallel && m <= 2 * MR)`. Final state -- a
+**separate confirmation run** from the boundary sweep above, so its ratios
+differ slightly from that table's (`m = 5/6/8` land at 1.46x/1.37x/1.16x here
+against 1.48x/1.42x/1.16x there). Both runs are reported rather than the more
+flattering one; the honest headline is the range across them, and for `m = 6`
+that is **1.37-1.42x**. Two repetitions:
 
 | shape | 1 thread before | 1 thread after | 8 threads before | 8 threads after |
 |---|---|---|---|---|
@@ -100,9 +113,17 @@ repetitions:
 | `12x2048x2048` | 1.516 / 1.551 | 1.522 / 1.508 | 0.337 / 0.343 | 0.347 / 0.321 |
 
 `m = 1` and `m = 12` are unchanged by construction (both stay on the path they
-were already taking) and measure unchanged. At 8 threads the two arms are the
-*same code*, so the spread there is this harness's noise floor on this host:
-**about +-10%**, which is worth remembering before believing any single cell.
+were already taking) and measure unchanged -- 0.998x and 1.013x, two more null
+controls.
+
+**Two different noise floors, and they must not be confused.** At one thread
+the same-path controls (`m = 1`, `m = 4`, `m = 12`) repeat to within **1.5%**.
+At 8 threads the two arms are also the same code, and there they spread by
+**about 10%** -- so the 8-thread columns above say nothing at all, and are
+printed only to show the parallel regression is gone. Applying the 8-thread
+figure to the one-thread cells would understate them by nearly an order of
+magnitude; applying the one-thread figure to the 8-thread cells would
+manufacture findings out of noise.
 
 **Scope, stated honestly.** `m * n * k` for these shapes is far above
 `PARALLEL_MIN_WORK`, so `!parallel` here means a genuinely single-worker pool.

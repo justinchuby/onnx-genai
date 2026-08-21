@@ -1711,10 +1711,14 @@ shortfall is latency and **is not attributed** — `perf` is unavailable here.
 
 **Shipped:** the pack-free kernel had no row blocking, so `fused = m <= MR` sent
 `m = 5` to the packed path with two row blocks and nothing to amortise a
-`2*k*n` panel write against — a **1.47x cliff** off `m = 4`. Added row blocking
-and moved the boundary to `2 * MR`. Serial gains 1.47x/1.42x/1.15x at
-`m = 5/6/8`; `m = 1` and `m >= 12` unchanged by construction and measured
-unchanged.
+`2*k*n` panel write against — a **2.0x cliff** off `m = 4` (0.543 ms ->
+1.090 ms) for 25% more arithmetic. Added row blocking
+and moved the boundary to `2 * MR`. Serial gains **1.46-1.48x / 1.37-1.42x /
+1.16x** at `m = 5/6/8` across two independent runs (both reported, not the
+more flattering one); `m = 1` and `m >= 12` unchanged by construction and
+measured unchanged at 0.998x/1.013x. One-thread null controls repeat to
+**1.5%**; the 8-thread arms are the same code and spread **10%**, so the two
+floors must not be interchanged.
 
 **First reversal, and it inverted the rule.** The boundary drafted at 16 on
 one-thread evidence **loses 0.87x/0.79x at `m = 5/8` on eight threads**.
