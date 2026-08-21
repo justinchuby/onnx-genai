@@ -524,7 +524,11 @@ mod tests {
         let ends = Owned::i64(&[1], &[3]);
         let axes = Owned::i64(&[1], &[0]);
         let vo = SliceKernel
-            .view_outputs(&[data.view(), starts.view(), ends.view(), axes.view()], &[], 1)
+            .view_outputs(
+                &[data.view(), starts.view(), ends.view(), axes.view()],
+                &[],
+                1,
+            )
             .expect("pure sub-view should be a view output");
         assert_eq!(vo.len(), 1);
         assert_eq!(vo[0].input_index, 0);
