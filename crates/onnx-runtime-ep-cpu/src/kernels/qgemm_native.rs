@@ -86,6 +86,70 @@ const KC: usize = 512;
 /// and below this it costs more than the split saves.
 const PARALLEL_MIN_WORK: usize = 1 << 16;
 
+/// Rows up to which the pack-free kernel runs, in blocks of [`MR`].
+///
+/// The pack is not free: it writes `2 * k * n` bytes of widened `B` and then
+/// re-reads that panel once per row block, so its traffic is
+/// `3 * k * n + ceil(m / MR) * 2 * k * n` against the pack-free path's
+/// `ceil(m / MR) * k * n`. What the pack buys back is arithmetic density --
+/// its panel is pre-widened and pre-interleaved, so the inner loop is
+/// `2 + 4 * R` uops per `R` rows of 32 multiply-accumulates against the
+/// pack-free `6 + 4 * R`. Density wins only once the panel is re-read enough
+/// times to amortise writing it, which is many row blocks, not one.
+///
+/// The boundary used to sit at `MR` itself, because the pack-free kernel had no
+/// row blocking and physically could not take a fifth row. That put `m = 5` on
+/// the packed path with two row blocks and nothing to amortise against, and it
+/// measured as a **1.47x cliff** off `m = 4` for 25% more arithmetic.
+///
+/// Where the crossover actually lands was measured, not predicted, at
+/// `k = n = 2048` on **one thread** (packed / fused, two repetitions):
+///
+/// | `m` | 5 | 6 | 8 | 9 | 10 | 11 | 12 | 16 |
+/// |---|---|---|---|---|---|---|---|---|
+/// | fused speedup | 1.47x | 1.42x | 1.15x | 1.06x | 1.02x | 0.90x | 0.94x | 0.83x |
+///
+/// So the pack does start repaying itself, at around ten rows. The default is
+/// `2 * MR` rather than the last winning row: it is a whole number of row
+/// blocks, it captures every unambiguous win, and it leaves the tied region
+/// (9, 10) and the losing region (11 and up) on the packed path. An earlier
+/// draft defaulted to 16 and **regressed `m = 12` by 6% and `m = 16` by 17%**;
+/// the measurement above is what caught it.
+///
+/// **This bound only applies when the call is not being split**, and that
+/// restriction is not a hedge -- it is a measured reversal. Re-run across the
+/// pool, the same extension *loses*:
+///
+/// | `m`, 8 threads | 5 | 8 |
+/// |---|---|---|
+/// | fused speedup | 0.87x | 0.79x |
+///
+/// Serially the pack is latency on the critical path, so avoiding it wins.
+/// Across the pool every worker has its own issue width but they share one
+/// memory system, so what binds is the pack-free path's extra sweep of `B` per
+/// row block, and the packed panel -- written once, then re-read from L2 --
+/// wins from `MR + 1` up. Hence the `!parallel` term at the call site: above
+/// `MR` the right answer is a function of the thread count, not of `m` alone.
+///
+/// Override with `ONNX_GENAI_CPU_QGEMM_FUSED_ROWS` to A/B the boundary; `0`
+/// restores the historical `m <= MR`.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn fused_max_rows() -> usize {
+    use std::sync::OnceLock;
+    static ROWS: OnceLock<usize> = OnceLock::new();
+    *ROWS.get_or_init(|| {
+        std::env::var("ONNX_GENAI_CPU_QGEMM_FUSED_ROWS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .map(|rows| if rows == 0 { MR } else { rows })
+            .unwrap_or(FUSED_MAX_ROWS)
+    })
+}
+
+/// Default for [`fused_max_rows`]. See that function for the derivation.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const FUSED_MAX_ROWS: usize = 2 * MR;
+
 /// `products[i][j] += sum_k (a[i][k] - za[i]) * b[k][j] - zb[j] * sum_k (a[i][k] - za[i])`.
 ///
 /// `products` must be `m * n` and is accumulated into, so the caller decides
@@ -267,14 +331,25 @@ unsafe fn accumulate_products_avx2(
     }
 
     let parallel = rayon::current_num_threads() > 1 && m * n * k >= PARALLEL_MIN_WORK;
-    // Packing `B` pays for itself by being re-read once per row block. At
-    // `m <= MR` there is exactly one row block, so the panel would be written
-    // and read once each and the pack would be pure overhead -- and it is not
-    // small overhead: it is `2 * k * n` bytes of stores against a GEMV that
-    // only reads `k * n`. Decode is `m == 1`, so this is the hot shape, not a
-    // corner. The fused kernel below does the same interleave in registers and
-    // feeds `vpmaddwd` directly, never spilling a panel.
-    let fused = m <= MR;
+    // Packing `B` pays for itself only by being re-read many times. Its traffic
+    // is `3 * k * n + ceil(m / MR) * 2 * k * n` -- it writes a widened panel and
+    // re-reads it per row block -- against the pack-free path's
+    // `ceil(m / MR) * k * n`. What it buys is density: a pre-widened,
+    // pre-interleaved panel costs `2 + 4 * R` uops per `R` rows of 32
+    // multiply-accumulates where the pack-free kernel costs `6 + 4 * R`, the
+    // difference being the load/widen/interleave the pack has already done.
+    // Density only repays the write once the panel is re-read enough times.
+    //
+    // How many times that is depends on whether the call is being split. Run
+    // serially, the pack is pure latency on the critical path and the pack-free
+    // kernel wins up to about ten rows. Split across the pool, every worker has
+    // its own compute but they all share one memory system, so the pack-free
+    // path's extra sweep of `B` per row block is what binds and the packed
+    // panel -- read from L2, written once -- wins from `MR + 1` upward. The
+    // same shape therefore wants opposite answers at one thread and at eight,
+    // which is why this reads `parallel` and not just `m`. See
+    // [`fused_max_rows`] for the measured crossover in both regimes.
+    let fused = m <= MR || (!parallel && m <= fused_max_rows());
     // The packed path re-reads its panel per row block, so a panel that fits L2
     // is what matters and `NC` is fixed. The fused path reads every byte of its
     // block exactly once, so splitting the columns further only re-walks `B`:
@@ -319,40 +394,46 @@ unsafe fn accumulate_products_avx2(
         if fused {
             // SAFETY: AVX2 is guaranteed by the caller. The kernel reads
             // `b[row * n + n0 .. + nc]` for `row < k` and `a_pairs[r * pairs +
-            // p]` for `r < m <= MR` and `p < pairs`, and writes `products[r * n
-            // + n0 .. + nc]`, which is this task's column block.
+            // p]` for `r < rows <= MR` and `p < pairs`, both offset to this row
+            // group, and writes `products[(m0 + r) * n + n0 .. + nc]`, which is
+            // this task's column block and no other row group's rows.
             //
             // The tile count per row falls as the row count rises so that the
             // `2 * R * T` accumulators keep fitting the register file.
-            unsafe {
-                let a_pairs = a_pairs.as_ptr();
-                let out = base.at(n0);
-                match (m, b.signed) {
-                    (1, false) => {
-                        accumulate_fused::<1, 4, false>(b, a_pairs, pairs, n, n0, nc, k, out)
-                    }
-                    (1, true) => {
-                        accumulate_fused::<1, 4, true>(b, a_pairs, pairs, n, n0, nc, k, out)
-                    }
-                    (2, false) => {
-                        accumulate_fused::<2, 2, false>(b, a_pairs, pairs, n, n0, nc, k, out)
-                    }
-                    (2, true) => {
-                        accumulate_fused::<2, 2, true>(b, a_pairs, pairs, n, n0, nc, k, out)
-                    }
-                    (3, false) => {
-                        accumulate_fused::<3, 1, false>(b, a_pairs, pairs, n, n0, nc, k, out)
-                    }
-                    (3, true) => {
-                        accumulate_fused::<3, 1, true>(b, a_pairs, pairs, n, n0, nc, k, out)
-                    }
-                    (_, false) => {
-                        accumulate_fused::<4, 1, false>(b, a_pairs, pairs, n, n0, nc, k, out)
-                    }
-                    (_, true) => {
-                        accumulate_fused::<4, 1, true>(b, a_pairs, pairs, n, n0, nc, k, out)
+            let mut row = 0;
+            while row < mc {
+                let rows = MR.min(mc - row);
+                unsafe {
+                    let a_pairs = a_pairs.as_ptr().add((m0 + row) * pairs);
+                    let out = base.at((m0 + row) * n + n0);
+                    match (rows, b.signed) {
+                        (1, false) => {
+                            accumulate_fused::<1, 4, false>(b, a_pairs, pairs, n, n0, nc, k, out)
+                        }
+                        (1, true) => {
+                            accumulate_fused::<1, 4, true>(b, a_pairs, pairs, n, n0, nc, k, out)
+                        }
+                        (2, false) => {
+                            accumulate_fused::<2, 2, false>(b, a_pairs, pairs, n, n0, nc, k, out)
+                        }
+                        (2, true) => {
+                            accumulate_fused::<2, 2, true>(b, a_pairs, pairs, n, n0, nc, k, out)
+                        }
+                        (3, false) => {
+                            accumulate_fused::<3, 1, false>(b, a_pairs, pairs, n, n0, nc, k, out)
+                        }
+                        (3, true) => {
+                            accumulate_fused::<3, 1, true>(b, a_pairs, pairs, n, n0, nc, k, out)
+                        }
+                        (_, false) => {
+                            accumulate_fused::<4, 1, false>(b, a_pairs, pairs, n, n0, nc, k, out)
+                        }
+                        (_, true) => {
+                            accumulate_fused::<4, 1, true>(b, a_pairs, pairs, n, n0, nc, k, out)
+                        }
                     }
                 }
+                row += MR;
             }
             return;
         }
@@ -999,7 +1080,19 @@ mod tests {
             return;
         }
         let (k, n) = (1031usize, 279usize);
-        for m in 1..=MR {
+        // Past `MR` the kernel row-blocks rather than handing off to the pack,
+        // so this must cross a block boundary (5), land exactly on one (8, 16)
+        // and step past the last fused row (17) into the packed path.
+        // Above `MR` the pack-free kernel is reached only when the call is not
+        // being split, so half of these shapes would silently run the *packed*
+        // path under the ambient global pool and this test would cover nothing
+        // new. One worker forces the row-blocked path; the ambient pool then
+        // re-checks the same shapes on the packed path.
+        let serial = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        for m in [1, 2, 3, 4, 5, 7, 8, 9, 12, 16, 17] {
             let a_bytes = bytes(m * k, 0x5150_4948);
             let b_bytes = bytes(k * n, 0x0f1e_2d3c);
             for (a_signed, b_signed) in [(false, false), (true, true), (false, true)] {
@@ -1013,15 +1106,24 @@ mod tests {
                 };
                 let az = zero_points(m, a_signed, 0x9999_1111);
 
-                let mut simd = vec![0i32; m * n];
-                // SAFETY: guarded by the feature probe above.
-                unsafe { accumulate_products_avx2(a, b, &az, m, k, n, &mut simd) };
                 let mut portable = vec![0i32; m * n];
                 accumulate_products_scalar(a, b, &az, m, k, n, &mut portable);
-                assert_eq!(
-                    simd, portable,
-                    "m={m} a_signed={a_signed} b_signed={b_signed}: pack-free and portable disagree"
-                );
+                for (workers, label) in [(1usize, "row-blocked"), (0, "ambient")] {
+                    let mut simd = vec![0i32; m * n];
+                    // SAFETY: guarded by the feature probe above.
+                    let mut run =
+                        || unsafe { accumulate_products_avx2(a, b, &az, m, k, n, &mut simd) };
+                    if workers == 1 {
+                        serial.install(&mut run);
+                    } else {
+                        run();
+                    }
+                    assert_eq!(
+                        simd, portable,
+                        "m={m} a_signed={a_signed} b_signed={b_signed} {label}: \
+                         pack-free and portable disagree"
+                    );
+                }
             }
         }
     }

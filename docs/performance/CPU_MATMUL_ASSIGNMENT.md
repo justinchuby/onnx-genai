@@ -1692,3 +1692,50 @@ claimed to be worth more than the N-tile: the two bet on opposite unmeasured
 regimes (the byte lever pays only if bandwidth-bound; the N-tile is discounted
 only if it is). Establish the regime on a quiet host first. Full record:
 [`docs/benchmarks/2026-08-21-int4-acc4-ntile-design.md`](../benchmarks/2026-08-21-int4-acc4-ntile-design.md).
+
+### 21. QLinearMatMul u8 — instruction mix, the `m = 5` cliff, and `vpmaddubsw`
+
+**Instruction decomposition.** The pack-free kernel costs `6 + 4R` uops per `R`
+rows of 32 multiply-accumulates: two load+`cvtepu8_epi16` pairs, two `unpack`
+to build `k` pairs, then `madd`+`add` per row. At `m = 1` that is **0.3125
+uops/MAC of which only 40% is arithmetic** — the six-uop preamble is fixed per
+32 weights and has nobody to amortise against. The packed kernel is `2 + 4R`
+(0.1875 at `R = 1`, **1.67x denser**), which is what the panel buys.
+
+**`m = 1` is issue-bound, not bandwidth-bound**, for `k = n <= 2048`:
+`1x2048x2048` and `4x2048x2048` read the *identical* 4.19 MB of `B` yet differ
+**2.86x**, so time tracks arithmetic, not bytes. Memory only begins to bind at
+`1x4096x4096` (16.8 MB of `B`), where throughput falls 21.08 → 14.72 GMAC/s.
+Static model predicts 12.8 MAC/cycle against a measured 21 GMAC/s; the ~⅓
+shortfall is latency and **is not attributed** — `perf` is unavailable here.
+
+**Shipped:** the pack-free kernel had no row blocking, so `fused = m <= MR` sent
+`m = 5` to the packed path with two row blocks and nothing to amortise a
+`2*k*n` panel write against — a **1.47x cliff** off `m = 4`. Added row blocking
+and moved the boundary to `2 * MR`. Serial gains 1.47x/1.42x/1.15x at
+`m = 5/6/8`; `m = 1` and `m >= 12` unchanged by construction and measured
+unchanged.
+
+**First reversal, and it inverted the rule.** The boundary drafted at 16 on
+one-thread evidence **loses 0.87x/0.79x at `m = 5/8` on eight threads**.
+Serially the pack is latency on the critical path; across the pool every worker
+has its own issue width but one shared memory system, so the pack-free path's
+extra sweep of `B` per row block binds and the L2-resident panel wins. The gate
+is therefore `m <= MR || (!parallel && m <= 2 * MR)` — above `MR` the right
+answer is a function of thread count, not of `m`. The 8-thread arms are the
+same code, which calibrates this harness's noise floor at **±10%**.
+
+**`vpmaddubsw` — legality derived, benefit quantified, not built.** It cannot
+consume today's operands: `A` is centred into `[-255, 255]` and so cannot be the
+unsigned operand. Legal form is raw `u8` `A` against a prepacked centred-`i8`
+`B' = b - zb`, with `sum_k a·B' − za·sum_k B'` (exact; the column sum is a
+prepack constant). Saturation is safe iff `|B'_k| + |B'_{k+1}| <= 128.5`, i.e.
+**guaranteed when every `|B'| <= 64`** — exactly reduce-range 7-bit weights. At
+full range it is *false*, not tight (`255*127*2 = 64770`). **The contract should
+be proven by scanning the constant weight at prepack, not trusted from
+metadata**; on failure the kernel keeps exact `vpmaddwd`. Payoff: the `k`-pair
+interleave is unavoidable either way, but doing it in the *byte* domain halves
+issue to **0.156 uops/MAC** — the largest identified `m = 1` lever. Blocked on a
+constant-`B` pack cache, which the native path lacks entirely
+(`pack_lookup`/`pack_build` are `#[cfg(feature = "mlas")]`). Full record:
+[`docs/benchmarks/2026-08-21-qlinear-u8-m1-instruction-mix.md`](../benchmarks/2026-08-21-qlinear-u8-m1-instruction-mix.md).
