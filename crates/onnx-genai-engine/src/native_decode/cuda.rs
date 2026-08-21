@@ -1252,13 +1252,30 @@ impl NativeDecodeSession {
             .as_mut()
             .context("CUDA decode state is not initialized")?;
         state.invalidate_graph(&mut self.session)?;
+        // Auxiliary graph outputs (e.g. the MTP hidden-state seed
+        // `hidden_states.63`) get a persistent device binding whose symbolic
+        // query-seq axis is collapsed to `1` for the captured decode step
+        // (`persistent_output_shape`). A multi-row eager forward (`m > 1`
+        // prefill/verify) produces `[1, m, hidden]`, which cannot fit that
+        // `[1, 1, hidden]` binding, so we EXCLUDE the auxiliary tail from the
+        // device-binding slice here and let those outputs materialize to host
+        // this step — mirroring how `logits` (bound past `base_binding_count`)
+        // already materializes. The captured single-token path keeps the
+        // persistent binding (it produces `m == 1`), preserving capture-safety.
+        // For pure-attention models with no auxiliary outputs this range is
+        // empty and the slice is byte-identical to `..base_binding_count`.
+        let aux_start = state.auxiliary_binding_range.start;
+        let aux_names = state.bindings[state.auxiliary_binding_range.clone()]
+            .iter()
+            .filter_map(|binding| binding.output_name().map(str::to_owned))
+            .collect::<HashSet<_>>();
         let bindings = owned
             .iter()
             .map(|(name, tensor)| (name.as_str(), tensor))
             .collect::<Vec<_>>();
         let outputs = match self
             .session
-            .run_with_device_bindings(&bindings, &mut state.bindings[..state.base_binding_count])
+            .run_with_device_bindings(&bindings, &mut state.bindings[..aux_start])
         {
             Ok(outputs) => outputs,
             Err(error) => {
@@ -1282,12 +1299,31 @@ impl NativeDecodeSession {
         let logits = named
             .remove(&self.logits)
             .with_context(|| format!("native decoder omitted logits output '{}'", self.logits))?;
-        if !named.is_empty() {
+        // The declared hidden seed (if any) materialized to host because it is an
+        // auxiliary output; record its last row so the MTP proposer can read it
+        // via `last_hidden()`. Inert when no hidden output is declared.
+        let hidden = self
+            .hidden_output
+            .as_ref()
+            .and_then(|name| named.remove(name.as_str()));
+        // Every remaining materialized output must be an auxiliary output we
+        // deliberately excluded from the device slice; a non-auxiliary
+        // materialization signals a real binding bug and must still fail.
+        if let Some(unexpected) = named.keys().find(|name| !aux_names.contains(name.as_str())) {
             bail!(
-                "native CUDA {error_context} unexpectedly materialized bound outputs: {:?}",
-                named.keys().collect::<Vec<_>>()
+                "native CUDA {error_context} unexpectedly materialized bound output '{unexpected}'"
             );
         }
+        self.last_hidden = match (&self.hidden_output, hidden) {
+            (Some(name), Some(tensor)) => Some(
+                extract_last_row(&tensor)
+                    .with_context(|| format!("read native decoder hidden output '{name}'"))?,
+            ),
+            (Some(name), None) => {
+                bail!("native decoder omitted declared hidden output '{name}'")
+            }
+            (None, _) => None,
+        };
         let logits = extract_logits(&logits)?;
         if logits.iter().flatten().any(|value| !value.is_finite()) {
             bail!("native decoder produced non-finite logits");
@@ -1921,6 +1957,9 @@ impl NativeDecodeSession {
                 if let Some(profile) = step_profile {
                     profile.finish("decode_inline", step_wall);
                 }
+                if let Some(hidden_output) = self.hidden_output.as_deref() {
+                    self.last_hidden = Some(read_aux_hidden_last_row(state, hidden_output)?);
+                }
                 state.set_logical_len(total_len)?;
                 self.current_len = total_len;
                 return Ok(logits);
@@ -1959,6 +1998,9 @@ impl NativeDecodeSession {
             step_wall.finite_check_ms = finite_check_start.elapsed().as_secs_f64() * 1_000.0;
             if let Some(profile) = step_profile {
                 profile.finish("decode", step_wall);
+            }
+            if let Some(hidden_output) = self.hidden_output.as_deref() {
+                self.last_hidden = Some(read_aux_hidden_last_row(state, hidden_output)?);
             }
             state.set_logical_len(total_len)?;
             self.current_len = total_len;
@@ -3001,7 +3043,12 @@ impl DecodeCudaState {
     /// a regression test can assert it is *actually* exercising the VMM path
     /// rather than silently falling back to the eager path (which would make a
     /// "VMM reservation" assertion prove nothing).
-    #[cfg(feature = "native-cuda")]
+    ///
+    /// `cfg(test)` as well as the feature: its only caller is the assertion in
+    /// `native_decode::tests`, so in the plain `lib` target it is genuinely
+    /// dead and `-D dead-code` rejects it. It is `pub(crate)`, so no integration
+    /// test outside this crate could reach it anyway.
+    #[cfg(all(feature = "native-cuda", test))]
     pub(crate) fn kv_commits_on_demand(&self) -> bool {
         self.kv_commits_on_demand
     }
@@ -5649,6 +5696,34 @@ fn checked_shape_bytes(shape: &[usize], dtype: DataType) -> Option<usize> {
         .iter()
         .try_fold(1usize, |product, &dim| product.checked_mul(dim))?;
     dtype.checked_storage_bytes(elements)
+}
+
+/// Read the last row of a declared hidden-state auxiliary output from its
+/// persistent CUDA device binding (the captured single-token decode step leaves
+/// this output device-resident). Used to seed the MTP proposer with the target's
+/// hidden state after a captured decode step; the eager multi-row path reads the
+/// same value from the host-materialized output instead. Locating the binding by
+/// its declared output name keeps this free of hardcoded layer/dim assumptions.
+fn read_aux_hidden_last_row(
+    state: &mut DecodeCudaState,
+    hidden_output: &str,
+) -> anyhow::Result<Vec<f32>> {
+    let index = state
+        .auxiliary_binding_range
+        .clone()
+        .find(|&index| state.bindings[index].output_name() == Some(hidden_output))
+        .with_context(|| {
+            format!(
+                "declared hidden output '{hidden_output}' has no persistent CUDA auxiliary binding; the MTP hidden seed must be a bound graph output"
+            )
+        })?;
+    let binding = &mut state.bindings[index];
+    let dtype = binding.dtype;
+    let shape = binding.physical_shape().to_vec();
+    let bytes = binding.read_bytes()?;
+    let tensor = Tensor::from_raw(dtype, shape, &bytes)?;
+    extract_last_row(&tensor)
+        .with_context(|| format!("read native decoder hidden output '{hidden_output}'"))
 }
 
 #[cfg(feature = "native-cuda")]
