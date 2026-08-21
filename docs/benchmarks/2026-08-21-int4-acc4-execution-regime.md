@@ -314,6 +314,70 @@ measurement apparatus that reports 1.678x at acc4 reports 1.000x at acc0.
 (It also shows acc4 is ~2.4x *faster* than acc0 at t=1 on this shape — 23.5 vs
 56.3 ms/token — which is #1619's result, not this one's.)
 
+## Where this leaves the ORT gap
+
+A speedup against our own previous self is not the number the assignment asks
+for. `benches/ort_baseline.py` only covers f32 ops, so I built the ORT
+counterpart of this harness directly: one ONNX graph holding the same five
+llama3-8B `MatMulNBits` projections, same `K`/`N`, same `block_size=32`, same
+`accuracy_level`, `m=1`, CPU EP, `intra_op_num_threads` matched, and **one
+`Run` == one decode token** so the unit is the same. Median per token,
+min-of-3-reps, same host and same session as the native numbers.
+
+The attribute is honoured rather than assumed: ORT at `accuracy_level=0` costs
+30.632 ms against 7.822 ms at `accuracy_level=4`, a 3.9x separation, so ORT is
+genuinely running its int8-activation path in the acc4 rows.
+
+| threads | ORT acc4 | native, main | native, this PR | gap before | **gap after** |
+|---|---|---|---|---|---|
+| 1 | 7.822 ms/tok | 23.525 | 14.016 | 3.01x | **1.79x** |
+| 4 | 2.154 | 7.963 | 4.777 | 3.70x | **2.22x** |
+| 8 | 1.249 | 3.542 | 3.104 | 2.84x | **2.49x** |
+| 16 | 1.227 | 1.801 | 1.447 | 1.47x | **1.18x** |
+
+So this change takes the single-thread deficit from **3.01x to 1.79x**, which is
+the largest single step any int4 decode change has produced so far, and at t=16
+brings us to **1.18x** — near parity, though see the caveat below about *why*
+that row flatters us.
+
+Three things this table says that the headline speedup does not:
+
+- **ORT saturates by t=8** (1.249 → 1.227 from 8 to 16 threads, 2%). Our t=16
+  row looks good partly because ORT has stopped scaling, not only because we
+  got faster. Parity at t=16 is worth much less than the same ratio at t=1.
+- **The worst remaining row is t=8 at 2.49x**, and that is the same t=8 anomaly
+  the speedup table shows (1.141x where t=4 gets 1.667x). Whatever costs us at
+  t=8 is now the top of the list.
+- **Zero-points cost ORT 29%** — 10.041 ms with per-block zero-points against
+  7.822 without, at t=1. Every row above is measured *without* zero-points,
+  which is ORT's fastest configuration and therefore the harder comparison. Our
+  kernel handles the zero-point case in the same loop; comparing there would
+  make us look better and is not the number I am reporting.
+
+Caveat on comparability: ORT's figure includes per-`Run` binding and allocation
+for a five-node graph, and ours includes `with_decode_pool_scope` entry. Neither
+is free and they are not the same overhead. At t=1, where a token costs 8-14 ms,
+that framing cost is small relative to the gap; at t=16, where a token costs
+~1.2 ms, it is not obviously small, so **the 1.18x row carries more uncertainty
+than the 1.79x row.** I am not claiming parity at t=16 on this evidence.
+
+### The default path is untouched and is now the worse gap
+
+This kernel is gated to `accuracy_level = 4`. Production default is
+`accuracy_level = 0`, and measuring both sides there on the same host:
+
+| threads | ORT acc0 | native acc0 | gap |
+|---|---|---|---|
+| 1 | 30.632 ms/tok | 56.307 | **1.84x** |
+| 8 | — | 14.091 | — |
+
+So the honest summary is that we have moved the *opt-in* path from 3.01x to
+1.79x and left the *default* path at 1.84x, where it was. Those two numbers
+being nearly equal is a coincidence of this shape, not a shared cause: the acc4
+gap is now dominated by the t=8 scaling anomaly, while the acc0 gap is a
+different kernel entirely. **Closing acc0 is a separate, larger piece of work
+and nothing here should be read as progress on it.**
+
 Two implementation details cost more than they saved and are recorded so they
 are not re-tried:
 
@@ -467,6 +531,11 @@ survive past 4.
 PROBE_ACCURACY=4 PROBE_BLOCK=32 PROBE_SESSIONS=1 PROBE_TOKENS=60 PROBE_LAYERS=1 \
   ONNX_GENAI_CPU_DECODE_THREADS=8 \
   cargo bench -p onnx-runtime-ep-cpu --bench int4_decode_loop_ab
+
+# the ORT side of the gap table, same shapes / block size / accuracy_level,
+# one Run == one decode token
+python3 crates/onnx-runtime-ep-cpu/benches/ort_matmulnbits_baseline.py \
+  --threads 8 --block 32 --accuracy 4 --tokens 48 --reps 3
 ```
 
 Pin to even CPUs only (`taskset -c 0,2,4,...`); interleave arms within a cycle

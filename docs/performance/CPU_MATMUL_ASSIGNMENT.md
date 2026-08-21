@@ -1830,5 +1830,36 @@ at full width; its positive number is an L3-residency artifact of undersized
 benchmark shapes) and **bf16 scales / block-major prepack** for throughput
 (0.96x at tile 1; the traffic arithmetic is right and the kernel is not
 traffic-limited where it would help). Both remain defensible for *footprint*;
-neither may be sold as speed. Full record:
+neither may be sold as speed.
+
+**The gap against ORT, which is the number that actually matters.** There was no
+int4 ORT baseline in the tree — `benches/ort_baseline.py` is f32-only — so one
+was added as `benches/ort_matmulnbits_baseline.py`: the same five projections in
+one graph, matched `block_size`/`accuracy_level`/thread count, one `Run` per
+token. ORT's `accuracy_level` is honoured rather than assumed (30.632 ms at
+acc0 vs 7.822 ms at acc4, 3.9x apart).
+
+| threads | ORT acc4 | native before | native after | before | **after** |
+|---|---|---|---|---|---|
+| 1 | 7.822 ms/tok | 23.525 | 14.016 | 3.01x | **1.79x** |
+| 4 | 2.154 | 7.963 | 4.777 | 3.70x | **2.22x** |
+| 8 | 1.249 | 3.542 | 3.104 | 2.84x | **2.49x** |
+| 16 | 1.227 | 1.801 | 1.447 | 1.47x | **1.18x** |
+
+Three qualifications travel with that table. **ORT saturates by t=8** (1.249 ->
+1.227 to t=16), so the t=16 row flatters us — parity there is worth much less
+than the same ratio at t=1, and per-`Run` framing overhead is not negligible at
+~1.2 ms/token, so that row carries the most uncertainty. **The worst remaining
+row is t=8 at 2.49x**, the same anomaly that shows as 1.141x in the speedup
+table; that is now the top of the list. And every row is measured **without**
+zero-points, which is ORT's fastest configuration (they cost ORT 29%: 10.041 vs
+7.822 ms) and therefore the harder comparison.
+
+**The default path did not move and is now the bigger target.** This kernel is
+gated to `accuracy_level = 4`; production default is 0, where native is 56.307
+ms/token against ORT's 30.632 — **1.84x**, unchanged. That it nearly equals the
+new acc4 gap is a coincidence of this shape, not a shared cause. Nothing here is
+progress on acc0.
+
+Full record:
 [`docs/benchmarks/2026-08-21-int4-acc4-execution-regime.md`](../benchmarks/2026-08-21-int4-acc4-execution-regime.md).
