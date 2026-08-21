@@ -60,9 +60,13 @@ pub use crate::config::{
 };
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub(crate) use crate::speculative::{
-    LinearEmbedder, LinearLmHead, MtpEmbedder, MtpLmHead, MtpProposer, SpeculativeStats,
+    LinearEmbedder, LinearLmHead, MtpEmbedder, MtpLmHead, SpeculativeStats,
     load_target_initializer_adapters,
 };
+// The MTP proposer is driven only from the native decode path; an ORT-only
+// build has no consumer for it and would see an unused import.
+#[cfg(feature = "native-backend")]
+pub(crate) use crate::speculative::MtpProposer;
 
 mod decode_backend;
 mod governor;
@@ -80,8 +84,6 @@ mod speculative_load;
 pub(crate) use decode_backend::*;
 pub(crate) use governor::*;
 pub use governor::{EngineGovernorError, EngineResourceGovernor, resolve_device_vram_limit_bytes};
-#[cfg(feature = "native-cuda")]
-pub(crate) use load::managed_vmm_default_enabled;
 pub(crate) use load::{
     force_managed_weight_streaming_enabled, session_device_domain, validate_shared_authority_limit,
 };

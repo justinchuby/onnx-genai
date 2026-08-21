@@ -941,13 +941,17 @@ impl Engine {
             native_session.set_trace_context(trace);
         }
         let native_shared_kv_proposer = None;
-        let speculative_mode = SpeculativeMode::None;
+        // Shared-KV drafting is no longer resolved from the package, so this
+        // path never offers a shared-KV proposer. MTP remains the one native
+        // proposer kind, and the effective mode is decided below once the MTP
+        // loader has reported.
+        let shared_kv_mode = SpeculativeMode::None;
         let environment = {
             let _span = onnx_genai_ort::prof_span!("engine.ort_environment");
             Environment::new("onnx-genai-engine")
                 .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {e}"))?
         };
-        // Metadata-advertised MTP self-speculation: the pure-attention MTP head
+        // Sidecar-declared MTP self-speculation: the pure-attention MTP head
         // loads on the ORT `environment` (ORT CUDA EP), seeded from the native
         // hybrid target's declared hidden output. Yields `None` for every
         // non-MTP model, preserving the plain native load path exactly.
@@ -958,8 +962,9 @@ impl Engine {
             session_options,
             native_device,
         )?;
-        // A model advertises at most one proposer kind; shared-KV and MTP are
-        // mutually exclusive by `speculative.proposal_type`.
+        // A model runs at most one proposer kind; shared-KV drafting and MTP are
+        // mutually exclusive, so at most one of these may be anything but
+        // `None`.
         let speculative_mode = match (&shared_kv_mode, &mtp_mode) {
             (SpeculativeMode::None, mode) => mode.clone(),
             (mode, SpeculativeMode::None) => mode.clone(),
@@ -2070,54 +2075,32 @@ fn build_mtp_model_from_resolved(
         &mtp_config.public_config.head_model,
         session_options.clone(),
     )
-        .map_err(|error| anyhow::anyhow!("Failed to load MTP head: {error}"))?;
-        let decode_options = onnx_genai_ort::MtpDecodeOptions {
-            kv_mode: mtp_config.public_config.kv_mode,
-            batch_size: 1,
-            hc_mult: mtp_config.hc_mult,
-            hidden_state_rank4: mtp_config.target_hidden_layout == MtpHiddenLayout::Bshc,
-            hidden_output: mtp_config.mtp_hidden_output.clone(),
-            state_output: mtp_config.mtp_state_output.clone(),
-        };
-        let head_signature = MtpDecodeSession::new(&head_session, decode_options)
-            .map_err(|error| anyhow::anyhow!("Failed to inspect MTP head: {error}"))?
-            .signature()
-            .clone();
-        if head_signature.hidden_size != mtp_config.public_config.hidden_size {
-            anyhow::bail!(
-                "MTP head hidden size {} does not match configured target hidden size {}",
-                head_signature.hidden_size,
-                mtp_config.public_config.hidden_size
-            );
-        }
-        let (embedder, lm_head) = match (&mtp_config.embedding_weights, &mtp_config.lm_head_weights)
-        {
-            (MtpWeightSource::File(embedding), MtpWeightSource::File(lm_head)) => (
-                MtpEmbedder::Linear(
-                    LinearEmbedder::new(
-                        read_f32_weights(embedding)?,
-                        mtp_config.public_config.vocab_size,
-                        mtp_config.public_config.hidden_size,
-                    )
-                    .map_err(|error| anyhow::anyhow!("Invalid MTP embedding weights: {error}"))?,
-                ),
-                MtpLmHead::Linear(
-                    LinearLmHead::new(
-                        read_f32_weights(lm_head)?,
-                        mtp_config.public_config.hidden_size,
-                        mtp_config.public_config.vocab_size,
-                    )
-                    .map_err(|error| anyhow::anyhow!("Invalid MTP LM-head weights: {error}"))?,
-                ),
-            ),
-            (
-                MtpWeightSource::TargetInitializer(embedding),
-                MtpWeightSource::TargetInitializer(lm_head),
-            ) => {
-                let (embedder, lm_head, vocab_size) = load_target_initializer_adapters(
-                    &model_directory.model_path,
-                    embedding,
-                    lm_head,
+    .map_err(|error| anyhow::anyhow!("Failed to load MTP head: {error}"))?;
+    let decode_options = onnx_genai_ort::MtpDecodeOptions {
+        kv_mode: mtp_config.public_config.kv_mode,
+        batch_size: 1,
+        hc_mult: mtp_config.hc_mult,
+        hidden_state_rank4: mtp_config.target_hidden_layout == MtpHiddenLayout::Bshc,
+        hidden_output: mtp_config.mtp_hidden_output.clone(),
+        state_output: mtp_config.mtp_state_output.clone(),
+    };
+    let head_signature = MtpDecodeSession::new(&head_session, decode_options)
+        .map_err(|error| anyhow::anyhow!("Failed to inspect MTP head: {error}"))?
+        .signature()
+        .clone();
+    if head_signature.hidden_size != mtp_config.public_config.hidden_size {
+        anyhow::bail!(
+            "MTP head hidden size {} does not match configured target hidden size {}",
+            head_signature.hidden_size,
+            mtp_config.public_config.hidden_size
+        );
+    }
+    let (embedder, lm_head) = match (&mtp_config.embedding_weights, &mtp_config.lm_head_weights) {
+        (MtpWeightSource::File(embedding), MtpWeightSource::File(lm_head)) => (
+            MtpEmbedder::Linear(
+                LinearEmbedder::new(
+                    read_f32_weights(embedding)?,
+                    mtp_config.public_config.vocab_size,
                     mtp_config.public_config.hidden_size,
                     draft_projection,
                 )?;
@@ -2132,17 +2115,47 @@ fn build_mtp_model_from_resolved(
             _ => anyhow::bail!(
                 "MTP embedding_weights and lm_head_weights must both use files or both use target initializers"
             ),
-        };
-        Ok(MtpModel {
-            config: mtp_config.public_config.clone(),
-            runtime_config: mtp_config.clone(),
-            session: Arc::new(head_session),
-            embedder,
-            lm_head,
-            hidden_output: mtp_config.public_config.target_hidden_output.clone(),
-            kv_mode: mtp_config.public_config.kv_mode,
-            num_speculative_tokens: mtp_config.public_config.num_speculative_tokens,
-        })
+            MtpLmHead::Linear(
+                LinearLmHead::new(
+                    read_f32_weights(lm_head)?,
+                    mtp_config.public_config.hidden_size,
+                    mtp_config.public_config.vocab_size,
+                )
+                .map_err(|error| anyhow::anyhow!("Invalid MTP LM-head weights: {error}"))?,
+            ),
+        ),
+        (
+            MtpWeightSource::TargetInitializer(embedding),
+            MtpWeightSource::TargetInitializer(lm_head),
+        ) => {
+            let (embedder, lm_head, vocab_size) = load_target_initializer_adapters(
+                &model_directory.model_path,
+                embedding,
+                lm_head,
+                mtp_config.public_config.hidden_size,
+            )?;
+            if vocab_size != mtp_config.public_config.vocab_size {
+                anyhow::bail!(
+                    "MTP target initializer vocabulary {vocab_size} does not match configured vocabulary {}",
+                    mtp_config.public_config.vocab_size
+                );
+            }
+            (embedder, lm_head)
+        }
+        _ => anyhow::bail!(
+            "MTP embedding_weights and lm_head_weights must both use files or both use target initializers"
+        ),
+    };
+    Ok(MtpModel {
+        config: mtp_config.public_config.clone(),
+        runtime_config: mtp_config.clone(),
+        session: Arc::new(head_session),
+        embedder,
+        lm_head,
+        hidden_output: mtp_config.public_config.target_hidden_output.clone(),
+        kv_mode: mtp_config.public_config.kv_mode,
+        num_speculative_tokens: mtp_config.public_config.num_speculative_tokens,
+    })
 }
 
 /// Resolve and build a native-backend MTP proposer from a model directory's
@@ -2161,30 +2174,37 @@ fn load_native_mtp_proposer(
     session_options: &SessionOptions,
     native_device: crate::native_decode::NativeDecodeDevice,
 ) -> anyhow::Result<(Option<MtpModel>, SpeculativeMode)> {
-    let Some(config) = metadata.speculative.as_ref() else {
+    // The package's workflow describes the *target* graph; the draft head is a
+    // separate artifact the model directory declares for itself in `config.json`.
+    // Discovery is therefore the signal here, and a directory that declares no
+    // speculator simply loads unspeculated.
+    let Some(descriptor) = onnx_genai_metadata::detect_speculator(&model_directory.root) else {
         return Ok((None, SpeculativeMode::None));
     };
-    if config.proposal_type != ProposalType::Mtp {
-        return Ok((None, SpeculativeMode::None));
-    }
-    // The native target exposes no ORT `Session` to interrogate for the target
-    // vocabulary (that is the point of the native EP), so the MTP metadata block
-    // must declare it explicitly.
-    let vocab_size = config
-        .vocab_size
-        .filter(|&value| value > 0)
-        .context("native MTP speculation requires `speculative.vocab_size` in inference metadata")?;
-    let descriptor =
-        onnx_genai_metadata::resolve_speculator_config(&model_directory.root, config.clone());
     let spec = match descriptor.proposer {
-        SpeculatorProposerStatus::Mtp(spec) => spec,
-        SpeculatorProposerStatus::Unknown(reason) => {
+        onnx_genai_metadata::SpeculatorProposerStatus::Mtp(spec) => spec,
+        // A declaration that cannot be read is an authoring error worth
+        // surfacing. Any other proposer kind is simply not this loader's
+        // business and leaves the native path unspeculated.
+        onnx_genai_metadata::SpeculatorProposerStatus::Unknown(reason) => {
             anyhow::bail!("Invalid native MTP sidecar metadata: {reason}")
         }
-        other => {
-            anyhow::bail!("native MTP metadata resolved to unexpected proposer status {other:?}")
-        }
+        _ => return Ok((None, SpeculativeMode::None)),
     };
+    // The native target exposes no ORT `Session` to interrogate for the target
+    // vocabulary (that is the point of the native EP). The head borrows the
+    // target's own LM-head initializer, so the vocabulary that sizes it is the
+    // target's: read the package's declared capability rather than restating the
+    // same number in a second place that nothing forces to agree.
+    let vocab_size = metadata
+        .model
+        .as_ref()
+        .and_then(|model| model.vocab_size)
+        .filter(|&value| value > 0)
+        .context(
+            "native MTP speculation requires the target vocabulary size; declare \
+             `model.vocab_size` in the package metadata",
+        )?;
     let resolved = ResolvedMtpConfig::from_sidecar_descriptor(&spec, vocab_size);
     validate_resolved_mtp_config(&resolved)?;
     validate_native_mtp_hidden_output(&model_directory.model_path, &resolved)?;

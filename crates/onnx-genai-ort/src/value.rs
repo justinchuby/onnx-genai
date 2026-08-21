@@ -873,7 +873,7 @@ impl Value {
                 }
                 (true, true) => unreachable!(),
             }
-            return Ok(());
+            Ok(())
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -906,11 +906,11 @@ impl Value {
                     OrtError::InvalidArgument("CUDA tensor copy byte size overflows".into())
                 })?;
             let _guard = crate::cuda_rt::DeviceGuard::set(device_id)?;
-            return crate::cuda_rt::memcpy_device_to_device_async(
+            crate::cuda_rt::memcpy_device_to_device_async(
                 self.data_ptr_addr()?,
                 source.data_ptr_addr()?,
                 bytes,
-            );
+            )
         }
         #[cfg(not(feature = "cuda"))]
         {

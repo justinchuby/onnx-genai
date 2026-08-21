@@ -268,28 +268,6 @@ impl NativeDecodeSession {
         )
     }
 
-    #[cfg(feature = "native-cuda")]
-    pub(crate) fn load_with_io_and_cuda_governor(
-        path: impl AsRef<Path>,
-        device: NativeDecodeDevice,
-        io: Option<&ModelIoSpec>,
-        metadata_max_len: Option<usize>,
-        offload_policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
-        governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
-    ) -> anyhow::Result<Self> {
-        Self::load_with_cuda_options_and_io(
-            path,
-            device,
-            NativeDecodeCudaOptions {
-                metadata_max_len,
-                ..NativeDecodeCudaOptions::default()
-            },
-            io,
-            Some(governor),
-            Some(offload_policy),
-        )
-    }
-
     /// Test-support (leverb-phase0): load with an explicit [`ModelIoSpec`] and
     /// custom CUDA options but no offload governor. Lets the `#[ignore]`d Lever-B
     /// probe drive a real metadata-declared decoder (e.g. glm-4-9b, whose two
