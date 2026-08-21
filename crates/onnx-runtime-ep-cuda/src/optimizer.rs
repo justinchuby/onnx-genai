@@ -1952,7 +1952,12 @@ impl OptimizationPass for CudaMatMulNBitsBiasFusion {
                 plan.matmul_inputs[0],
                 plan.matmul_inputs[1],
                 plan.matmul_inputs[2],
-                None,
+                // Zero-points, when the source node had them. The folded bias is
+                // an output-side epilogue and does not interact with dequant, so
+                // this input passes straight through.
+                plan.matmul_inputs[3],
+                // Group index: the fold declines any node that has one, so this
+                // slot is always empty here.
                 None,
                 Some(plan.bias),
             ];
@@ -1972,7 +1977,7 @@ impl OptimizationPass for CudaMatMulNBitsBiasFusion {
 struct BiasFoldPlan {
     add_id: NodeId,
     matmul_id: NodeId,
-    matmul_inputs: [Option<ValueId>; 3],
+    matmul_inputs: [Option<ValueId>; 4],
     matmul_out: ValueId,
     add_out: ValueId,
     bias: ValueId,
@@ -2005,12 +2010,39 @@ impl CudaMatMulNBitsBiasFusion {
         }
 
         let matmul = graph.node(matmul_id);
-        // Only the plain A/B/scales form is eligible: no zero-points, group
-        // index, or pre-existing bias.
-        let present: Vec<ValueId> = matmul.input_values().collect();
-        if present.len() != 3 || matmul.inputs.iter().skip(3).any(Option::is_some) {
+        // The folded bias is an output-side epilogue — the kernel reproduces
+        // `fp16(fp16(acc) + bias)` after the GEMV completes (see
+        // `fold_bias_post_round`) — so it is orthogonal to how the weights were
+        // dequantized. Zero-points are therefore fine; what must be absent is a
+        // group index (input 4, which the fused entry does not thread through)
+        // and a pre-existing bias (input 5, which this fold would double-apply).
+        //
+        // This gate used to require exactly the A/B/scales form, which silently
+        // excluded every asymmetrically-quantized model. On qwen2.5-0.5B that
+        // left 72 QKV bias `Add`s running as separate kernels at ~24% of decode
+        // time, each costing about as much as the int4 GEMV it followed.
+        const MATMUL_NBITS_ZERO_POINTS_INPUT: usize = 3;
+        const MATMUL_NBITS_GROUP_INDEX_INPUT: usize = 4;
+        if matmul.inputs.len() > MATMUL_NBITS_GROUP_INDEX_INPUT
+            && matmul
+                .inputs
+                .iter()
+                .skip(MATMUL_NBITS_GROUP_INDEX_INPUT)
+                .any(Option::is_some)
+        {
             return None;
         }
+        if matmul.inputs.get(0).copied().flatten().is_none()
+            || matmul.inputs.get(1).copied().flatten().is_none()
+            || matmul.inputs.get(2).copied().flatten().is_none()
+        {
+            return None;
+        }
+        let zero_points = matmul
+            .inputs
+            .get(MATMUL_NBITS_ZERO_POINTS_INPUT)
+            .copied()
+            .flatten();
         let n = matmul.attr("N").and_then(Attribute::as_int)? as usize;
 
         // Bias must be a persistent 1-D `[N]` initializer whose element type
@@ -2037,7 +2069,12 @@ impl CudaMatMulNBitsBiasFusion {
         Some(BiasFoldPlan {
             add_id,
             matmul_id,
-            matmul_inputs: [matmul.inputs[0], matmul.inputs[1], matmul.inputs[2]],
+            matmul_inputs: [
+                matmul.inputs[0],
+                matmul.inputs[1],
+                matmul.inputs[2],
+                zero_points,
+            ],
             matmul_out,
             add_out,
             bias,
@@ -5045,6 +5082,75 @@ mod tests {
         graph
     }
 
+    /// `qkv_bias_graph` with one extra optional `MatMulNBits` input wired at
+    /// `slot` (3 = zero-points, 4 = group index), built as part of the node so
+    /// the graph's input edges stay consistent. Returns the graph and the id of
+    /// the extra input.
+    fn qkv_bias_graph_with_extra_input(dtype: DataType, n: usize, slot: usize) -> (Graph, ValueId) {
+        let k = 896usize;
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        graph.opset_imports.insert(MICROSOFT_DOMAIN.into(), 1);
+        let x = value(&mut graph, "x", dtype, k);
+        let packed = vec1d(&mut graph, "packed", DataType::Uint8, n * (k / 32) * 16);
+        let scales = vec1d(&mut graph, "scales", dtype, n * (k / 32));
+        let is_group_index = slot == 4;
+        let extra_dtype = if is_group_index {
+            DataType::Int32
+        } else {
+            DataType::Uint8
+        };
+        let extra_elems = if is_group_index { k } else { n * (k / 32) };
+        let extra_bytes = extra_elems * if is_group_index { 4 } else { 1 };
+        let extra = vec1d(&mut graph, "extra", extra_dtype, extra_elems);
+        let mm_out = value(&mut graph, "mm_out", dtype, n);
+        let bias = vec1d(&mut graph, "bias", dtype, n);
+        let out = value(&mut graph, "out", dtype, n);
+        graph.add_input(x);
+        graph.set_initializer(
+            packed,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Uint8,
+                vec![n * (k / 32) * 16],
+                vec![0u8; n * (k / 32) * 16],
+            )),
+        );
+        graph.set_initializer(
+            scales,
+            WeightRef::Inline(TensorData::from_raw(
+                dtype,
+                vec![n * (k / 32)],
+                vec![0u8; n * (k / 32) * 2],
+            )),
+        );
+        graph.set_initializer(
+            extra,
+            WeightRef::Inline(TensorData::from_raw(
+                extra_dtype,
+                vec![extra_elems],
+                vec![0u8; extra_bytes],
+            )),
+        );
+        graph.set_initializer(
+            bias,
+            WeightRef::Inline(TensorData::from_raw(dtype, vec![n], vec![0u8; n * 2])),
+        );
+        let mut inputs = vec![Some(x), Some(packed), Some(scales)];
+        while inputs.len() < slot {
+            inputs.push(None);
+        }
+        inputs.push(Some(extra));
+        graph.insert_node(matmul_nbits(inputs, mm_out, k, n));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(mm_out), Some(bias)],
+            vec![out],
+        ));
+        graph.add_output(out);
+        (graph, extra)
+    }
+
     #[test]
     fn folds_qkv_bias_into_matmul_nbits() {
         let mut graph = qkv_bias_graph(DataType::Float16, 1152, true);
@@ -7872,5 +7978,48 @@ mod tests {
         assert!(la.attr(FUSE_BETA_SIGMOID_ATTR).is_none());
         assert!(la.attr(FUSE_DECAY_SOFTPLUS_ATTR).is_none());
         assert_eq!(la.inputs.len(), 6);
+    }
+    #[test]
+    fn folds_bias_for_asymmetrically_quantized_weights() {
+        // The folded bias is an output-side epilogue, so it is orthogonal to how
+        // the weights were dequantized: a zero-points input must not block it.
+        // Requiring exactly the A/B/scales form silently excluded every
+        // asymmetrically-quantized model — on qwen2.5-0.5B that left 72 QKV bias
+        // `Add`s as separate kernels at ~24% of decode time.
+        let (mut graph, zp) = qkv_bias_graph_with_extra_input(DataType::Float16, 1152, 3);
+
+        CudaMatMulNBitsBiasFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(graph.num_nodes(), 1, "the Add must be folded away");
+        let fused = graph.nodes.values().next().expect("fused node");
+        assert_eq!(
+            fused
+                .attr(MATMUL_NBITS_FOLDED_BIAS_ATTR)
+                .and_then(Attribute::as_int),
+            Some(1)
+        );
+        assert_eq!(
+            fused.inputs[3],
+            Some(zp),
+            "zero-points must survive the fold"
+        );
+        assert!(fused.inputs[5].is_some(), "bias must be wired at index 5");
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn does_not_fold_bias_when_a_group_index_is_present() {
+        // The fused entry does not thread a group index through, so that form
+        // must still decline — the widened gate must not have become "anything
+        // goes".
+        let (mut graph, _gidx) = qkv_bias_graph_with_extra_input(DataType::Float16, 1152, 4);
+
+        CudaMatMulNBitsBiasFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(graph.num_nodes(), 2, "a group index must block the fold");
     }
 }
