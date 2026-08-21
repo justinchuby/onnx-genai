@@ -72,6 +72,54 @@ pub(crate) enum ModelDecodePath {
     Legacy,
 }
 
+impl ModelDecodePath {
+    /// One-line summary of the decode path actually chosen, for startup
+    /// reporting.
+    ///
+    /// This exists because the choice is invisible at the call site and silently
+    /// changes what a measurement means. ORT CUDA-graph capture needs **two**
+    /// things, and only one of them is the `enable_cuda_graph` request: the
+    /// decode session captures only on `DecodeKvMode::SharedBuffer` (see
+    /// `will_sample_on_device`). `PastPresent { shared_buffer: false }` rebinds a
+    /// growing past every step, so it runs uncaptured no matter what the session
+    /// options say, and per-token cost scales with context.
+    ///
+    /// Measured consequence: a native-vs-ORT benchmark can put captured,
+    /// fixed-capacity native against uncaptured, growing-KV ORT and read like a
+    /// backend comparison. Nothing in the output said so before this line.
+    pub fn summary(&self) -> String {
+        match self {
+            Self::StaticCache { max_len } => {
+                format!("static-cache max_len={max_len}")
+            }
+            Self::PastPresent {
+                shared_buffer,
+                max_len,
+                sliding_window,
+                sink_tokens,
+            } => {
+                let kv = if *shared_buffer {
+                    "shared-buffer (fixed capacity, capture-eligible)"
+                } else {
+                    "zero-copy-rebind (growing past, capture-ineligible)"
+                };
+                let mut out = format!("past-present kv={kv}");
+                if let Some(max_len) = max_len {
+                    out.push_str(&format!(" max_len={max_len}"));
+                }
+                if let Some(window) = sliding_window {
+                    out.push_str(&format!(" sliding_window={window}"));
+                }
+                if let Some(sinks) = sink_tokens {
+                    out.push_str(&format!(" sink_tokens={sinks}"));
+                }
+                out
+            }
+            Self::Legacy => "legacy".to_string(),
+        }
+    }
+}
+
 /// Engine-facing boundary over low-level ORT forward-pass/KV-buffer sessions.
 ///
 /// Implementations produce logits and maintain or rewind their local KV buffer
