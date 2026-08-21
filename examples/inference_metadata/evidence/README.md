@@ -34,10 +34,10 @@ directions on purpose.
 
 **Graph fixtures stay text.** Model fixtures under `tests/fixtures/` are stored
 as ONNX protobuf TextFormat (`*.onnx.textproto`) so that a graph change shows up
-as a reviewable diff. `.gitignore` ignores `*.onnx` precisely to keep that
-property, and the handful of fixtures that must stay binary are each listed
-there with a written reason. Nothing in this directory changes that: no graph
-is added here in binary form.
+as a reviewable diff. `.gitignore` ignores `*.onnx` precisely to keep that property, and the fixture
+guard rejects any checked-in binary graph. External weight files remain
+allowed beside a TextFormat graph. Nothing in this directory changes that: no
+graph is added here in binary form.
 
 **Evidence media stays binary, and that is intentional.** A PNG, a WAV or an MP4
 is the *result* being asserted, not a source artifact, and it has no meaningful

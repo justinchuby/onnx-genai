@@ -1,6 +1,8 @@
 //! Fixed-size recurrent state uses one generic replacement discipline.
 
-use onnx_genai_metadata::{StateGroupContract, StateKind, StateUpdate};
+use onnx_genai_metadata::{
+    InferenceMetadata, StateGroupContract, StateKind, StateUpdate, validate_metadata,
+};
 
 #[test]
 fn recurrent_replace_group_needs_no_sequence_axis() {
@@ -33,4 +35,24 @@ update:
     let group: StateGroupContract = serde_yaml::from_str(yaml).expect("state group parses");
     assert_eq!(group.sequence_axis, Some(2));
     assert_eq!(group.update, Some(StateUpdate::Append));
+}
+
+#[test]
+fn replace_state_rejects_a_sequence_axis() {
+    let yaml = include_str!(
+        "../../../examples/inference_metadata/catalogue/16-linear-attention-recurrent.yaml"
+    )
+    .replacen(
+        "kind: recurrent\n            layout: bhfv",
+        "kind: recurrent\n            sequence_axis: 2\n            layout: bhfv",
+        1,
+    );
+    let metadata: InferenceMetadata = serde_yaml::from_str(&yaml).expect("metadata parses");
+    let errors = validate_metadata(&metadata).expect_err("replace state with an axis is invalid");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("replace") && error.contains("sequence_axis")),
+        "unexpected validation errors: {errors:?}"
+    );
 }

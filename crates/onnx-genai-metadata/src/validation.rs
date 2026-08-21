@@ -3402,6 +3402,12 @@ fn validate_state_update(
             ));
         }
         Some(crate::schema::StateUpdate::Replace) => {
+            if group.sequence_axis.is_some() {
+                errors.push(format!(
+                    "state service group '{group_name}' uses replace for fixed-size state but \
+                     declares sequence_axis"
+                ));
+            }
             for (cell_name, cell) in &workflow.state {
                 if cell.service_group.as_deref() == Some(group_name)
                     && !matches!(cell.recurrence, crate::schema::ShapeRecurrence::Invariant)
