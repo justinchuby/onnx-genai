@@ -95,11 +95,11 @@ python3 scripts/ort_ab/gen_grid.py --out /path/to/models/grid
 python3 scripts/ort_ab/gen_moe.py --out-dir /path/to/models/moe --tokens 1 32 512
 ```
 
-`gen_f16_gemv.py` additionally takes `--op {matmul,gemm}`, and the two are not
-interchangeable. A decode `MatMul` reaches the half GEMV only below
-`HALF_PREFILL_GEBP_MIN_WEIGHT` (1,048,576 elements); at or above it the fused
-widen-pack GEBP takes decode instead, so the larger `--op matmul` cells need
-`ONNX_GENAI_CPU_MM_HALF_GEBP=0` to reach the GEMV at all. `--op gemm` emits
+`gen_f16_gemv.py` additionally takes `--op {matmul,gemm}`. Since #1613 both ops
+take the half decode GEMV at every `m == 1` weight size -- the
+`HALF_PREFILL_GEBP_MIN_WEIGHT` handover to the fused widen-pack GEBP was
+retired for decode because it measured as a loss -- so neither op needs
+`ONNX_GENAI_CPU_MM_HALF_GEBP=0` to reach the GEMV any more. `--op gemm` emits
 `Gemm` with `transB=0`, which has no weight gate and therefore measures the
 GEMV as a default build actually runs it.
 
