@@ -2032,7 +2032,7 @@ impl CudaMatMulNBitsBiasFusion {
         {
             return None;
         }
-        if matmul.inputs.get(0).copied().flatten().is_none()
+        if matmul.inputs.first().copied().flatten().is_none()
             || matmul.inputs.get(1).copied().flatten().is_none()
             || matmul.inputs.get(2).copied().flatten().is_none()
         {
