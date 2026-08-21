@@ -567,7 +567,29 @@ pub(super) fn mask_binding_feeds_capacity_form_attention(graph: &Graph, mask: Va
         for &(node_id, slot) in consumers.get(&value).map_or(&[][..], Vec::as_slice) {
             let node = graph.node(node_id);
             if kernel_input_uses_padded_capacity(node, slot) {
-                // `Shape`/`ReduceSum`: reads the physical extent — safe leaf.
+                // `ReduceSum(mask)` is genuinely padding-invariant (0-padding
+                // sums to nothing, so it yields the *logical* valid length
+                // regardless of physical width) — an unconditional safe leaf.
+                //
+                // `Shape(mask)`, however, returns the *physical* width. It is a
+                // safe leaf only when its result is a dead end: if anything
+                // consumes the `Shape` output the padded `max_len` leaks into
+                // width-sensitive arithmetic. DeepSeek-V2-Lite's HF-style causal
+                // mask builder does exactly this —
+                // `Slice(CumSum(mask), start = Shape(mask) - q_seq, end = Shape(mask))`
+                // selects the query-position window — so freezing the mask to
+                // physical capacity picks positions `[max_len-q_seq .. max_len)`
+                // instead of `[0 .. q_seq)`, producing a non-causal mask and
+                // incoherent decode. Expose the logical length in that case.
+                if node.op_type == "Shape" {
+                    let shape_output_consumed = node
+                        .outputs
+                        .iter()
+                        .any(|out| consumers.contains_key(out));
+                    if shape_output_consumed {
+                        return false;
+                    }
+                }
                 continue;
             }
             if is_capacity_form_attention_mask_input(node, slot) {
