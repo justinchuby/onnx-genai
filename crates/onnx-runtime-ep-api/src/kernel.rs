@@ -625,8 +625,13 @@ pub trait Kernel: Send {
     /// Attempt to express this node's outputs as zero-copy [`ViewOutput`]s over
     /// its inputs instead of computing bytes (the layout/movement-op fast path).
     ///
-    /// `inputs` carries the real (possibly already-strided) input views and
-    /// `num_outputs` is the node's output arity. Returning:
+    /// `inputs` carries the real (possibly already-strided) input views,
+    /// `output_shapes` carries the executor-resolved concrete shape of every
+    /// output (already computed by shape inference, so a kernel need not — and
+    /// on a device EP during CUDA-graph capture must not — re-derive a
+    /// data-dependent output shape from a device-resident shape operand), and
+    /// `num_outputs` is the node's output arity (`== output_shapes.len()`).
+    /// Returning:
     /// * `None` — the default — means "compute normally": the executor allocates
     ///   output buffers and calls [`Kernel::execute`].
     /// * `Some(specs)` means every output is a view; `specs.len()` MUST equal
@@ -634,8 +639,13 @@ pub trait Kernel: Send {
     ///   return `None` (all-or-nothing) so correctness never regresses.
     ///
     /// When `Some` is returned, [`Kernel::execute`] is **not** invoked.
-    fn view_outputs(&self, inputs: &[TensorView], num_outputs: usize) -> Option<Vec<ViewOutput>> {
-        let _ = (inputs, num_outputs);
+    fn view_outputs(
+        &self,
+        inputs: &[TensorView],
+        output_shapes: &[Vec<usize>],
+        num_outputs: usize,
+    ) -> Option<Vec<ViewOutput>> {
+        let _ = (inputs, output_shapes, num_outputs);
         None
     }
 

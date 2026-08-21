@@ -4,7 +4,7 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView, ViewOutput};
 use onnx_runtime_ir::{Attribute, DataType, Node, compute_contiguous_strides};
 
 use super::elementwise::{broadcast_strides, u64_bytes};
@@ -385,6 +385,60 @@ impl Kernel for ReshapeKernel {
 
     fn supports_strided_input(&self, _idx: usize) -> bool {
         false
+    }
+
+    /// Zero-copy fast path: a `Reshape` of a dense/contiguous input is a pure
+    /// metadata reinterpretation of the same device bytes, so alias the input's
+    /// backing buffer instead of issuing a full device-to-device copy (the
+    /// dominant per-forward cost measured on decode — 416 calls/forward). The
+    /// executor records the alias, pins the source buffer for the lifetime of
+    /// the view's consumers, and skips both allocation and `execute`.
+    ///
+    /// Capture-safety: this launches nothing, so nothing is recorded into either
+    /// device-graph slot — a view is trivially replay-stable (the pinned source
+    /// keeps a fixed pointer across capture and every replay; the Stage-2 buffer
+    /// signature rebuilds the plan if a source is ever reallocated). The
+    /// executor-resolved `output_shapes` is authoritative, so we never read the
+    /// device-resident shape operand (`inputs[1]`) — a host sync that would be
+    /// illegal during capture. Warming the capture signature here keeps
+    /// `capture_support()` reporting `Supported` so the classifier folds this
+    /// node into the surrounding captured segment rather than an eager seam.
+    fn view_outputs(
+        &self,
+        inputs: &[TensorView],
+        output_shapes: &[Vec<usize>],
+        num_outputs: usize,
+    ) -> Option<Vec<ViewOutput>> {
+        if num_outputs != 1 || output_shapes.len() != 1 {
+            return None;
+        }
+        let data = inputs.first()?;
+        // Sub-byte / zero-width element types have no fixed element stride, and a
+        // strided input cannot be flattened to a contiguous view without moving
+        // bytes: fall back to the copy path in both cases.
+        if data.dtype.byte_size() == 0 || !data.is_contiguous() {
+            return None;
+        }
+        let shape = output_shapes[0].clone();
+        // A reshape preserves element count; guard against any shape-inference
+        // disagreement (and integer overflow) before aliasing.
+        let out_numel = shape.iter().try_fold(1usize, |n, &d| n.checked_mul(d))?;
+        if out_numel != data.numel() {
+            return None;
+        }
+        if let Ok(mut warmed) = self.warmed_signature.lock() {
+            *warmed = Some(ReshapeCaptureSignature {
+                dtype: data.dtype,
+                input_shape: data.shape.to_vec(),
+                output_shape: shape.clone(),
+            });
+        }
+        Some(vec![ViewOutput {
+            input_index: 0,
+            strides: compute_contiguous_strides(&shape),
+            shape,
+            byte_offset: data.byte_offset,
+        }])
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {

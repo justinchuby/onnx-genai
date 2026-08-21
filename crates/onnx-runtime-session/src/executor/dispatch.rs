@@ -357,6 +357,12 @@ impl Executor {
                         }
                         capture_guard.disarm();
                         ep.end_device_graph_capture_in(self.graph_slot)?;
+                        // Capture is closed: syncs are legal again. Free any
+                        // view-owner buffers that `install_view_outputs` parked
+                        // while recording (freeing mid-capture is rejected).
+                        for old in self.capture_deferred_frees.drain(..) {
+                            ep.deallocate(old)?;
+                        }
                         ep.replay_device_graph_segment_in(self.graph_slot, seg.graph_index)?;
                     }
                     RunMode::Replay => {
@@ -514,6 +520,8 @@ impl Executor {
             shared_buffers: &mut self.shared_buffers,
             views_meta: &mut self.views,
             pinned: &mut self.pinned,
+            capture_deferred_frees: &mut self.capture_deferred_frees,
+            capturing: matches!(capture, OpCaptureTrace::Captured),
             persistent_workspace: &mut self.persistent_workspace,
             step_workspace: &mut self.step_workspace,
             inherited_workspace: self
@@ -614,7 +622,7 @@ impl Executor {
         // Ask the kernel whether its outputs are strided views over its inputs
         // (a layout/movement op such as Slice). If so, record view metadata
         // aliasing the source buffer and skip compute + allocation entirely.
-        if !has_lazy_inputs && let Some(specs) = kernel.view_outputs(&views, outputs.len()) {
+        if !has_lazy_inputs && let Some(specs) = kernel.view_outputs(&views, &output_shapes, outputs.len()) {
             if outputs
                 .iter()
                 .any(|output| external.outputs.contains_key(output))
@@ -1317,6 +1325,14 @@ struct KernelDispatchContext<'a> {
     shared_buffers: &'a mut HashMap<ValueId, Arc<SharedTensorBuffer>>,
     views_meta: &'a mut HashMap<ValueId, ValueView>,
     pinned: &'a mut HashSet<ValueId>,
+    /// Stale view-owner buffers parked here instead of freed while a captured
+    /// segment is being recorded (freeing synchronizes, which stream capture
+    /// forbids). Flushed by the caller once capture closes. See
+    /// [`super::state`]`::capture_deferred_frees`.
+    capture_deferred_frees: &'a mut Vec<DeviceBuffer>,
+    /// True while this node is recorded into a device graph
+    /// ([`OpCaptureTrace::Captured`]): buffer frees must be deferred, not issued.
+    capturing: bool,
     persistent_workspace: &'a mut Option<PreparedWorkspace>,
     step_workspace: &'a mut Option<PreparedWorkspace>,
     inherited_workspace: Option<WorkspaceView>,
@@ -1416,7 +1432,15 @@ impl KernelDispatchContext<'_> {
                 ovid.0
             );
             if let Some(old) = self.buffers.remove(&ovid) {
-                self.ep.deallocate(old)?;
+                // Freeing synchronizes the copy stream (pooled unmap), which is
+                // illegal while a device graph is recording. During capture we
+                // park the now-orphaned buffer and let the caller free it once
+                // capture closes; outside capture we free immediately.
+                if self.capturing {
+                    self.capture_deferred_frees.push(old);
+                } else {
+                    self.ep.deallocate(old)?;
+                }
             }
             self.shared_buffers.remove(&ovid);
             self.buffer_shapes.remove(&ovid);
