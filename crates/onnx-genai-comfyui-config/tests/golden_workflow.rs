@@ -1,9 +1,10 @@
 //! The checked-in converted package must stay exactly what the importer emits.
 //!
 //! Conversion is deterministic by construction: the same workflow and the same
-//! options always produce byte-identical YAML. That is what makes the golden
-//! document under `tests/fixtures/comfyui_workflows/` a regression test on the
-//! converter rather than a snapshot that drifts on its own.
+//! options always produce identical YAML, except for the checkout's native line
+//! endings. That is what makes the golden document under
+//! `tests/fixtures/comfyui_workflows/` a regression test on the converter rather
+//! than a snapshot that drifts on its own.
 //!
 //! This test needs no ONNX Runtime. The executable half of the same fixture is
 //! `crates/onnx-genai-engine/tests/comfyui_workflow_e2e.rs`.
@@ -29,6 +30,22 @@ fn options() -> ConvertOptions {
     }
 }
 
+fn normalize_line_endings(document: &str) -> String {
+    document.replace("\r\n", "\n")
+}
+
+#[test]
+fn golden_comparison_normalizes_only_platform_line_endings() {
+    assert_eq!(
+        normalize_line_endings("schema_version: v1\r\npipeline:\r\n"),
+        normalize_line_endings("schema_version: v1\npipeline:\n")
+    );
+    assert_ne!(
+        normalize_line_endings("schema_version: v1\r\npipeline:\r\n"),
+        normalize_line_endings("schema_version: v1\nmodel:\n")
+    );
+}
+
 #[test]
 fn golden_metadata_matches_a_fresh_conversion() {
     let (_, document, report) =
@@ -36,7 +53,11 @@ fn golden_metadata_matches_a_fresh_conversion() {
     let regenerated = to_yaml(&document).expect("yaml");
     let checked_in = std::fs::read_to_string(package().join("inference_metadata.yaml"))
         .expect("inference_metadata.yaml");
-    assert_eq!(regenerated, checked_in, "{REGENERATE}");
+    assert_eq!(
+        normalize_line_endings(&regenerated),
+        normalize_line_endings(&checked_in),
+        "{REGENERATE}"
+    );
     assert!(
         report.ignored_nodes.is_empty(),
         "the fixture workflow should have no unreachable nodes: {:?}",
