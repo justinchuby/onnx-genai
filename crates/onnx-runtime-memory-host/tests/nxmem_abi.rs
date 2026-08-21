@@ -49,8 +49,8 @@ use onnx_runtime_memory_host::{
 #[path = "support/testplugin.rs"]
 mod testplugin;
 use testplugin::{
-    drain_calls, parked_state_is_set, published_structured_slot, structured_releases,
-    terminal_releases, testplugin_path,
+    drain_calls, parked_state_is_set, prefix_backing_frees, published_structured_slot,
+    structured_releases, terminal_releases, testplugin_path,
 };
 
 /// Serialises the whole suite.
@@ -1057,6 +1057,79 @@ fn a_shared_prefix_is_reference_counted_and_costed_once() {
     // SAFETY: live allocation with matching parameters.
     let outcome = unsafe { allocator.release(ptr, 64 * 1024, 4096) };
     assert!(matches!(outcome, AllocationReleaseOutcome::Complete { .. }));
+}
+
+#[test]
+fn shared_prefix_backing_survives_handle_and_mapping_release_in_either_order() {
+    let _serial = serial();
+    let plugin = load();
+    let allocator = open(
+        &plugin,
+        "lazy",
+        NXMEM_CAP_ALLOCATOR | NXMEM_CAP_VIRTUAL_BACKING | NXMEM_CAP_SHARED_MAPPING,
+    );
+    let shared = allocator
+        .as_shared_mapping()
+        .expect("shared mapping was required at open time");
+
+    for handle_first in [true, false] {
+        let frees_before = prefix_backing_frees(&plugin);
+        let mut prefix = Some(
+            shared
+                .create_shared_prefix(16 * 1024)
+                .expect("creating a shared prefix"),
+        );
+        let mapping = prefix.as_ref().expect("prefix").device_ptr() as *mut u8;
+        // SAFETY: the live prefix publishes at least 16 KiB at this address.
+        unsafe { mapping.write_volatile(0x5A) };
+        let ptr = allocator.allocate(64 * 1024, 4096).expect("allocation");
+        shared
+            .commit_shared_prefix(prefix.as_ref().expect("prefix").as_ref(), ptr, 64 * 1024, 0)
+            .expect("committing the prefix");
+
+        if handle_first {
+            drop(prefix.take());
+            assert_eq!(
+                prefix_backing_frees(&plugin),
+                frees_before,
+                "a committed mapping must retain backing after the last handle is released"
+            );
+            // SAFETY: the live mapping retained the backing, as asserted above.
+            unsafe {
+                assert_eq!(mapping.read_volatile(), 0x5A);
+                mapping.write_volatile(0xA5);
+                assert_eq!(mapping.read_volatile(), 0xA5);
+            }
+            // SAFETY: live allocation with matching parameters.
+            let outcome = unsafe { allocator.release(ptr, 64 * 1024, 4096) };
+            assert!(matches!(outcome, AllocationReleaseOutcome::Complete { .. }));
+        } else {
+            // SAFETY: live allocation with matching parameters.
+            let outcome = unsafe { allocator.release(ptr, 64 * 1024, 4096) };
+            assert!(matches!(outcome, AllocationReleaseOutcome::Complete { .. }));
+            assert_eq!(
+                prefix_backing_frees(&plugin),
+                frees_before,
+                "the live handle must retain backing after its mapping is released"
+            );
+            // SAFETY: the live handle retained the backing, as asserted above.
+            unsafe {
+                assert_eq!(mapping.read_volatile(), 0x5A);
+                mapping.write_volatile(0xA5);
+                assert_eq!(mapping.read_volatile(), 0xA5);
+            }
+            drop(prefix.take());
+        }
+
+        assert_eq!(
+            prefix_backing_frees(&plugin),
+            frees_before + 1,
+            "the backing is freed exactly once after both lifetime axes retire"
+        );
+    }
+
+    drop(allocator);
+    plugin.try_unload().expect("all prefix state retired");
 }
 
 /// **A committed prefix is a live *view*, and the unload gate is told about

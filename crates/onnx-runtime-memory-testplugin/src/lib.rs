@@ -563,7 +563,7 @@ pub const MECHANISM_NAMES: &[&str] = &[
 
 // ─── allocator state ────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Block {
     address: usize,
     bytes: usize,
@@ -574,7 +574,7 @@ struct Block {
     /// Each one is a plugin-side *view*: a window onto shared physical bytes
     /// that lives inside this allocation and dies with it. This is what
     /// `NxmemUnloadReport::live_views` counts.
-    views: u64,
+    views: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -591,6 +591,7 @@ struct Prefix {
     bytes: usize,
     address: usize,
     references: u64,
+    mapping_references: u64,
 }
 
 /// The plugin-side state of one opened mechanism.
@@ -708,6 +709,17 @@ fn free_block(block: Block) {
     unsafe { dealloc(block.address as *mut u8, layout) };
 }
 
+fn free_prefix(prefix: Prefix) {
+    free_block(Block {
+        address: prefix.address,
+        bytes: prefix.bytes,
+        align: PREFIX_ALIGN,
+        committed: prefix.bytes,
+        views: Vec::new(),
+    });
+    PREFIX_BACKING_FREES.fetch_add(1, Ordering::AcqRel);
+}
+
 /// Retire the views a block carried, at the moment it stops being live.
 ///
 /// A view's life is bounded by the allocation it looks into: once the host has
@@ -715,13 +727,52 @@ fn free_block(block: Block) {
 /// physical bytes have been freed yet. Retiring here rather than in
 /// [`free_block`] keeps the count honest for a *deferred* release, where the
 /// allocation leaves the live set long before the bytes do.
-fn retire_block_views(block: &Block) {
-    if block.views == 0 {
-        return;
+fn retire_block_views(inner: &mut AllocatorInner, block: &Block) -> Vec<Prefix> {
+    if block.views.is_empty() {
+        return Vec::new();
     }
     counters()
         .live_views
-        .fetch_sub(block.views, Ordering::AcqRel);
+        .fetch_sub(block.views.len() as u64, Ordering::AcqRel);
+
+    let mut freed = Vec::new();
+    for handle in &block.views {
+        let remove = match inner.prefixes.get_mut(handle) {
+            Some(prefix) => {
+                prefix.mapping_references = prefix
+                    .mapping_references
+                    .checked_sub(1)
+                    .expect("a committed prefix mapping retires exactly once");
+                prefix.references == 0 && prefix.mapping_references == 0
+            }
+            None => {
+                debug_assert!(false, "live block referenced missing prefix {handle}");
+                false
+            }
+        };
+        if remove {
+            freed.push(inner.prefixes.remove(handle).expect("just seen"));
+        }
+    }
+    freed
+}
+
+fn free_prefixes(prefixes: Vec<Prefix>) {
+    for prefix in prefixes {
+        free_prefix(prefix);
+    }
+}
+
+/// How many shared-prefix backing allocations have actually been freed.
+static PREFIX_BACKING_FREES: AtomicU64 = AtomicU64::new(0);
+
+/// Exported name of [`NxmemTestpluginPrefixBackingFrees`].
+pub const SYMBOL_PREFIX_BACKING_FREES: &[u8] = b"NxmemTestpluginPrefixBackingFrees\0";
+
+/// Test-only introspection for exact shared-prefix backing lifetime.
+#[unsafe(no_mangle)]
+pub extern "C" fn NxmemTestpluginPrefixBackingFrees() -> u64 {
+    PREFIX_BACKING_FREES.load(Ordering::Acquire)
 }
 
 /// # Safety
@@ -850,8 +901,9 @@ unsafe fn allocate_inner(
             bytes,
             align,
             committed: committed.min(bytes),
-            views: 0,
+            views: Vec::new(),
         };
+        let committed = block.committed;
         match state.inner.lock() {
             Ok(mut inner) => {
                 inner.blocks.insert(request.allocation_id, block);
@@ -870,8 +922,8 @@ unsafe fn allocate_inner(
 
         let mut result = NxmemAllocResult::zeroed();
         result.ptr = raw;
-        result.owned_bytes = block.committed as u64;
-        result.mapped_bytes = block.committed as u64;
+        result.owned_bytes = committed as u64;
+        result.mapped_bytes = committed as u64;
         // SAFETY: checked non-null above.
         unsafe { *result_out = result };
         NxmemStatus::ok()
@@ -897,8 +949,14 @@ unsafe extern "C" fn plugin_deallocate(
         if let Err(status) = state.check(allocation) {
             return status;
         }
-        let block = match state.inner.lock() {
-            Ok(mut inner) => inner.blocks.remove(&allocation.allocation_id),
+        let (block, freed_prefixes) = match state.inner.lock() {
+            Ok(mut inner) => {
+                let block = inner.blocks.remove(&allocation.allocation_id);
+                let freed = block
+                    .as_ref()
+                    .map_or_else(Vec::new, |block| retire_block_views(&mut inner, block));
+                (block, freed)
+            }
             Err(_) => {
                 return NxmemStatus::with_message(
                     NxmemStatusCode::InternalError,
@@ -912,7 +970,7 @@ unsafe extern "C" fn plugin_deallocate(
                 "testplugin: that allocation id is not live on this mechanism",
             );
         };
-        retire_block_views(&block);
+        free_prefixes(freed_prefixes);
         let unmapped = block.committed as u64;
         free_block(block);
         counters().live_allocations.fetch_sub(1, Ordering::AcqRel);
@@ -942,8 +1000,14 @@ unsafe extern "C" fn plugin_release_allocation(
         if let Err(status) = state.check(allocation) {
             return status;
         }
-        let block = match state.inner.lock() {
-            Ok(mut inner) => inner.blocks.remove(&allocation.allocation_id),
+        let (block, freed_prefixes) = match state.inner.lock() {
+            Ok(mut inner) => {
+                let block = inner.blocks.remove(&allocation.allocation_id);
+                let freed = block
+                    .as_ref()
+                    .map_or_else(Vec::new, |block| retire_block_views(&mut inner, block));
+                (block, freed)
+            }
             Err(_) => {
                 return NxmemStatus::with_message(
                     NxmemStatusCode::InternalError,
@@ -966,7 +1030,7 @@ unsafe extern "C" fn plugin_release_allocation(
             return NxmemStatus::ok();
         };
 
-        retire_block_views(&block);
+        free_prefixes(freed_prefixes);
         let unmapped = block.committed as u64;
         let bytes = block.bytes as u64;
 
@@ -1022,7 +1086,7 @@ fn retire_queued(state: &AllocatorState, queued: QueuedRelease) -> Result<(), Nx
         bytes: queued.bytes,
         align: queued.align,
         committed: queued.bytes,
-        views: 0,
+        views: Vec::new(),
     });
     counters().live_allocations.fetch_sub(1, Ordering::AcqRel);
     counters().queued_releases.fetch_sub(1, Ordering::AcqRel);
@@ -1077,7 +1141,7 @@ unsafe extern "C" fn plugin_enqueue_release(
             );
         }
         let ticket = next_ticket();
-        match state.inner.lock() {
+        let freed_prefixes = match state.inner.lock() {
             Ok(mut inner) => {
                 let Some(block) = inner.blocks.remove(&allocation.allocation_id) else {
                     return NxmemStatus::with_message(
@@ -1085,7 +1149,7 @@ unsafe extern "C" fn plugin_enqueue_release(
                         "testplugin: that allocation id is not live on this mechanism",
                     );
                 };
-                retire_block_views(&block);
+                let freed = retire_block_views(&mut inner, &block);
                 inner.queue.push(QueuedRelease {
                     ticket,
                     allocation_id: allocation.allocation_id,
@@ -1093,6 +1157,7 @@ unsafe extern "C" fn plugin_enqueue_release(
                     bytes: block.bytes,
                     align: block.align,
                 });
+                freed
             }
             Err(_) => {
                 return NxmemStatus::with_message(
@@ -1100,7 +1165,8 @@ unsafe extern "C" fn plugin_enqueue_release(
                     "testplugin: allocator state is poisoned",
                 );
             }
-        }
+        };
+        free_prefixes(freed_prefixes);
         // A queued release still names this context, so it takes its own
         // reference. That is what keeps the mechanism — and, through the
         // host's `Arc<PluginModule>`, the module itself — pinned until the
@@ -1309,24 +1375,26 @@ fn release_state(state: &AllocatorState) {
     );
     // Reclaim anything still outstanding rather than leaking it.
     if let Ok(mut inner) = state.inner.lock() {
-        for (_, block) in inner.blocks.drain() {
-            retire_block_views(&block);
+        let blocks: Vec<Block> = inner.blocks.drain().map(|(_, block)| block).collect();
+        for block in blocks {
+            let prefixes = retire_block_views(&mut inner, &block);
+            free_prefixes(prefixes);
             free_block(block);
             counters().live_allocations.fetch_sub(1, Ordering::AcqRel);
         }
-        let queued: Vec<QueuedRelease> = inner.queue.drain(..).collect();
+        let queued = std::mem::take(&mut inner.queue);
         for entry in queued {
             free_block(Block {
                 address: entry.address,
                 bytes: entry.bytes,
                 align: entry.align,
                 committed: entry.bytes,
-                views: 0,
+                views: Vec::new(),
             });
             counters().live_allocations.fetch_sub(1, Ordering::AcqRel);
             counters().queued_releases.fetch_sub(1, Ordering::AcqRel);
         }
-        let retained: Vec<Block> = inner.retained.drain(..).collect();
+        let retained = std::mem::take(&mut inner.retained);
         for block in retained {
             free_block(block);
         }
@@ -1335,13 +1403,7 @@ fn release_state(state: &AllocatorState) {
             counters()
                 .live_capabilities
                 .fetch_sub(prefix.references, Ordering::AcqRel);
-            free_block(Block {
-                address: prefix.address,
-                bytes: prefix.bytes,
-                align: PREFIX_ALIGN,
-                committed: prefix.bytes,
-                views: 0,
-            });
+            free_prefix(prefix);
         }
     }
     counters().live_allocators.fetch_sub(1, Ordering::AcqRel);
@@ -1613,6 +1675,7 @@ unsafe extern "C" fn plugin_create_shared_prefix(
                         bytes: bytes as usize,
                         address: raw as usize,
                         references: 1,
+                        mapping_references: 0,
                     },
                 );
             }
@@ -1663,14 +1726,14 @@ unsafe extern "C" fn plugin_retain_shared_prefix(
         }
         match state.inner.lock() {
             Ok(mut inner) => match inner.prefixes.get_mut(&handle.handle) {
-                Some(prefix) => {
+                Some(prefix) if prefix.references > 0 => {
                     prefix.references += 1;
                     counters().live_capabilities.fetch_add(1, Ordering::AcqRel);
                     NxmemStatus::ok()
                 }
-                None => NxmemStatus::with_message(
+                _ => NxmemStatus::with_message(
                     NxmemStatusCode::UnknownAllocation,
-                    "testplugin: that prefix is not live on this mechanism",
+                    "testplugin: that prefix has no live handle on this mechanism",
                 ),
             },
             Err(_) => NxmemStatus::with_message(
@@ -1701,7 +1764,7 @@ unsafe extern "C" fn plugin_release_shared_prefix(
                 "testplugin: that prefix belongs to another mechanism",
             );
         }
-        match state.inner.lock() {
+        let freed = match state.inner.lock() {
             Ok(mut inner) => {
                 let Some(prefix) = inner.prefixes.get_mut(&handle.handle) else {
                     return NxmemStatus::with_message(
@@ -1709,25 +1772,31 @@ unsafe extern "C" fn plugin_release_shared_prefix(
                         "testplugin: that prefix is not live on this mechanism",
                     );
                 };
+                if prefix.references == 0 {
+                    return NxmemStatus::with_message(
+                        NxmemStatusCode::UnknownAllocation,
+                        "testplugin: that prefix handle was already released",
+                    );
+                }
                 prefix.references -= 1;
                 counters().live_capabilities.fetch_sub(1, Ordering::AcqRel);
-                if prefix.references == 0 {
-                    let prefix = inner.prefixes.remove(&handle.handle).expect("just seen");
-                    free_block(Block {
-                        address: prefix.address,
-                        bytes: prefix.bytes,
-                        align: PREFIX_ALIGN,
-                        committed: prefix.bytes,
-                        views: 0,
-                    });
+                if prefix.references == 0 && prefix.mapping_references == 0 {
+                    Some(inner.prefixes.remove(&handle.handle).expect("just seen"))
+                } else {
+                    None
                 }
-                NxmemStatus::ok()
             }
-            Err(_) => NxmemStatus::with_message(
-                NxmemStatusCode::InternalError,
-                "testplugin: allocator state is poisoned",
-            ),
+            Err(_) => {
+                return NxmemStatus::with_message(
+                    NxmemStatusCode::InternalError,
+                    "testplugin: allocator state is poisoned",
+                );
+            }
+        };
+        if let Some(prefix) = freed {
+            free_prefix(prefix);
         }
+        NxmemStatus::ok()
     })
 }
 
@@ -1761,7 +1830,10 @@ unsafe extern "C" fn plugin_incremental_owned_bytes(
             );
         }
         let known = match state.inner.lock() {
-            Ok(inner) => inner.prefixes.contains_key(&handle.handle),
+            Ok(inner) => inner
+                .prefixes
+                .get(&handle.handle)
+                .is_some_and(|prefix| prefix.references > 0),
             Err(_) => false,
         };
         if !known {
@@ -1804,14 +1876,23 @@ unsafe extern "C" fn plugin_commit_shared_prefix(
         }
         let prefix_bytes = match state.inner.lock() {
             Ok(mut inner) => {
-                let Some(prefix) = inner.prefixes.get(&request.prefix.handle).copied() else {
+                let AllocatorInner {
+                    blocks, prefixes, ..
+                } = &mut *inner;
+                let Some(prefix) = prefixes.get_mut(&request.prefix.handle) else {
                     return NxmemStatus::with_message(
                         NxmemStatusCode::UnknownAllocation,
                         "testplugin: that prefix is not live on this mechanism",
                     );
                 };
+                if prefix.references == 0 {
+                    return NxmemStatus::with_message(
+                        NxmemStatusCode::UnknownAllocation,
+                        "testplugin: that prefix handle was already released",
+                    );
+                }
                 let end = request.byte_offset as usize + prefix.bytes;
-                let Some(block) = inner.blocks.get_mut(&request.allocation.allocation_id) else {
+                let Some(block) = blocks.get_mut(&request.allocation.allocation_id) else {
                     return NxmemStatus::with_message(
                         NxmemStatusCode::UnknownAllocation,
                         "testplugin: that allocation id is not live on this mechanism",
@@ -1827,7 +1908,8 @@ unsafe extern "C" fn plugin_commit_shared_prefix(
                 // A committed prefix is a live plugin-side view into this
                 // allocation. It is exactly the object `live_views` names, and
                 // it retires when the allocation does.
-                block.views += 1;
+                prefix.mapping_references += 1;
+                block.views.push(request.prefix.handle);
                 counters().live_views.fetch_add(1, Ordering::AcqRel);
                 prefix.bytes as u64
             }
@@ -2207,6 +2289,21 @@ pub extern "C" fn NxmemTestpluginFactoryReleases() -> u64 {
     FACTORY_RELEASES.load(Ordering::Acquire)
 }
 
+/// One-based factory slot that should omit its required open slot.
+///
+/// Test-only fault injection. Zero disables it.
+static FACTORY_VALIDATION_FAULT_SLOT: AtomicU64 = AtomicU64::new(0);
+
+/// The name of the factory-validation fault injection symbol.
+pub const SYMBOL_FACTORY_VALIDATION_FAULT_SLOT: &[u8] =
+    b"NxmemTestpluginSetFactoryValidationFaultSlot\0";
+
+/// Make one later factory enumeration fail host-side validation.
+#[unsafe(no_mangle)]
+pub extern "C" fn NxmemTestpluginSetFactoryValidationFaultSlot(slot: u64) {
+    FACTORY_VALIDATION_FAULT_SLOT.store(slot, Ordering::Release);
+}
+
 /// The name of the drain-call introspection symbol.
 pub const SYMBOL_DRAIN_CALLS: &[u8] = b"NxmemTestpluginDrainCalls\0";
 
@@ -2369,6 +2466,17 @@ fn build_factory_table() -> Vec<NxmemAllocatorFactoryVtable> {
     }
 }
 
+fn invalid_factory_vtable() -> &'static NxmemAllocatorFactoryVtable {
+    static VTABLE: OnceLock<FactoryTable> = OnceLock::new();
+    &VTABLE
+        .get_or_init(|| {
+            let mut vtable = factory_vtables()[0];
+            vtable.open_allocator = None;
+            FactoryTable(vec![vtable])
+        })
+        .0[0]
+}
+
 // ─── entry points ───────────────────────────────────────────────────────────
 
 fn negotiate_impl(
@@ -2413,9 +2521,15 @@ fn create_factories_impl(
     let vtables = factory_vtables();
     let count = (vtables.len() as u64).min(max_factories);
     for (index, vtable) in vtables.iter().take(count as usize).enumerate() {
+        let published = if FACTORY_VALIDATION_FAULT_SLOT.load(Ordering::Acquire) == index as u64 + 1
+        {
+            invalid_factory_vtable()
+        } else {
+            vtable
+        };
         // SAFETY: the host promises `max_factories` writable slots and `count`
         // never exceeds it.
-        unsafe { *out_factories.add(index) = vtable as *const _ };
+        unsafe { *out_factories.add(index) = published as *const _ };
     }
     // SAFETY: checked non-null above.
     unsafe { *out_count = count };

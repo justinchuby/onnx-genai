@@ -251,6 +251,132 @@ impl Drop for PluginFactory {
     }
 }
 
+/// Owns one factory pointer from the instant enumeration transfers it.
+///
+/// Validation is deliberately a later step. A plugin returns the whole array
+/// in one ownership transfer, so wrapping entries only as validation reaches
+/// them leaves the failing and unvisited suffix without a `release` owner.
+struct TransferredFactory {
+    raw: *const NxmemAllocatorFactoryVtable,
+    minor: u32,
+    module: Arc<PluginModule>,
+    release: Option<(
+        unsafe extern "C" fn(*mut core::ffi::c_void),
+        *mut core::ffi::c_void,
+    )>,
+    armed: bool,
+}
+
+impl TransferredFactory {
+    /// Take ownership of one pointer returned by successful enumeration.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must be null or one of the factory pointers the plugin just
+    /// transferred, and a non-null pointer must remain valid until release.
+    unsafe fn new(
+        raw: *const NxmemAllocatorFactoryVtable,
+        minor: u32,
+        module: Arc<PluginModule>,
+    ) -> Self {
+        Self {
+            raw,
+            minor,
+            module,
+            // SAFETY: delegated to this constructor's contract.
+            release: unsafe { factory_release_fields(raw) },
+            armed: true,
+        }
+    }
+
+    fn validate(mut self, path: &str) -> Result<PluginFactory, PluginError> {
+        // SAFETY: the plugin wrote this pointer in response to enumeration.
+        // `read_prefix` null-checks, alignment-checks, and size-checks it
+        // before reading any field, and copies rather than borrowing.
+        let vtable = unsafe { NxmemAllocatorFactoryVtable::read_prefix(self.raw, self.minor) }
+            .map_err(|status| PluginError::call("factory vtable", status))?;
+
+        let device = device_key(vtable.device).ok_or_else(|| PluginError::Contract {
+            path: path.to_string(),
+            reason: format!(
+                "a factory declared tier code {} which this host does not know; tiers are never \
+                 guessed",
+                vtable.device.tier
+            ),
+        })?;
+
+        // SAFETY: the contract requires `name` to be a NUL-terminated UTF-8
+        // string that stays valid until the factory's final `release`.
+        let name = unsafe { read_c_string(vtable.name) }.ok_or_else(|| PluginError::Contract {
+            path: path.to_string(),
+            reason: String::from("a factory published a null or non-UTF-8 name"),
+        })?;
+
+        let factory = PluginFactory {
+            name,
+            device,
+            capability_flags: vtable.capability_flags,
+            vtable,
+            module: Arc::clone(&self.module),
+        };
+        // The accepted factory now owns the one release debt.
+        self.armed = false;
+        Ok(factory)
+    }
+}
+
+impl Drop for TransferredFactory {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some((release, ctx)) = self.release else {
+            eprintln!(
+                "nxmem: WARNING: a transferred factory vtable from {} did not expose a readable \
+                 release slot; it cannot be returned safely",
+                self.module.path().display()
+            );
+            return;
+        };
+        // SAFETY: `ctx` and `release` came from this transferred factory,
+        // which has not been accepted or released elsewhere.
+        unsafe { release(ctx) };
+    }
+}
+
+/// Read only the fields needed to repay a transferred factory's release debt.
+///
+/// This intentionally skips semantic validation such as the required
+/// `open_allocator` slot. Those checks are why validation may fail, but a
+/// factory that still exposes `release` must be returned on that failure.
+///
+/// # Safety
+///
+/// `raw` must be null or a factory pointer transferred by the plugin.
+unsafe fn factory_release_fields(
+    raw: *const NxmemAllocatorFactoryVtable,
+) -> Option<(
+    unsafe extern "C" fn(*mut core::ffi::c_void),
+    *mut core::ffi::c_void,
+)> {
+    if raw.is_null()
+        || !(raw as usize).is_multiple_of(core::mem::align_of::<NxmemAllocatorFactoryVtable>())
+    {
+        return None;
+    }
+    // SAFETY: the pointer is non-null and the factory contract makes the
+    // leading size word readable.
+    let declared_size = unsafe { raw.cast::<u32>().read_unaligned() } as usize;
+    if declared_size < NxmemAllocatorFactoryVtable::MIN_STRUCT_SIZE_MINOR_0 {
+        return None;
+    }
+    // SAFETY: the declared size reaches through `release`, so both fields are
+    // readable. Unaligned reads avoid creating references across the ABI.
+    let ctx = unsafe { core::ptr::addr_of!((*raw).ctx).read_unaligned() };
+    let release = unsafe { core::ptr::addr_of!((*raw).release).read_unaligned() }?;
+    Some((release, ctx))
+}
+
 /// A loaded plugin and the mechanisms it publishes.
 ///
 /// # Shutting one down
@@ -596,6 +722,19 @@ fn enumerate_factories(
     if !status.is_ok() {
         return Err(PluginError::call("NxmemCreateAllocatorFactories", status));
     }
+
+    let minor = module.negotiated.minor;
+    // Take ownership of every pointer the plugin wrote before inspecting any
+    // one factory. Entries beyond a dishonest `count` are released too: a
+    // non-null pointer was still transferred even if the count omitted it.
+    let mut transferred: [Option<TransferredFactory>; MAX_FACTORIES] =
+        std::array::from_fn(|index| {
+            (!raw[index].is_null()).then(|| {
+                // SAFETY: this is a non-null pointer written by the
+                // successful enumeration call above.
+                unsafe { TransferredFactory::new(raw[index], minor, Arc::clone(module)) }
+            })
+        });
     if count > MAX_FACTORIES as u64 {
         return Err(PluginError::Contract {
             path: path.to_string(),
@@ -606,39 +745,14 @@ fn enumerate_factories(
         });
     }
 
-    let minor = module.negotiated.minor;
     let mut factories = Vec::with_capacity(count as usize);
-    for slot in raw.iter().take(count as usize) {
-        // SAFETY: the plugin wrote this pointer in response to the call above.
-        // `read_prefix` null-checks, alignment-checks, and size-checks it
-        // before reading any field, and copies rather than borrowing.
-        let vtable = unsafe { NxmemAllocatorFactoryVtable::read_prefix(*slot, minor) }
-            .map_err(|status| PluginError::call("factory vtable", status))?;
-
-        let device = device_key(vtable.device).ok_or_else(|| PluginError::Contract {
-            path: path.to_string(),
-            reason: format!(
-                "a factory declared tier code {} which this host does not know; tiers are never \
-                 guessed",
-                vtable.device.tier
-            ),
-        })?;
-
-        // SAFETY: the contract requires `name` to be a NUL-terminated UTF-8
-        // string that stays valid until the factory's final `release`, which
-        // this host has not called yet.
-        let name = unsafe { read_c_string(vtable.name) }.ok_or_else(|| PluginError::Contract {
-            path: path.to_string(),
-            reason: String::from("a factory published a null or non-UTF-8 name"),
-        })?;
-
-        factories.push(PluginFactory {
-            name,
-            device,
-            capability_flags: vtable.capability_flags,
-            vtable,
-            module: Arc::clone(module),
+    for slot in transferred.iter_mut().take(count as usize) {
+        let factory = slot.take().unwrap_or_else(|| {
+            // SAFETY: null is explicitly accepted so validation can report the
+            // malformed counted slot through the normal path.
+            unsafe { TransferredFactory::new(core::ptr::null(), minor, Arc::clone(module)) }
         });
+        factories.push(factory.validate(path)?);
     }
     Ok(factories)
 }

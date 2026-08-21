@@ -120,6 +120,21 @@ pub fn terminal_releases(plugin: &onnx_runtime_memory_host::MemoryPlugin) -> u64
     unsafe { symbol() }
 }
 
+/// How many shared-prefix backing allocations the loaded module has freed.
+pub fn prefix_backing_frees(plugin: &onnx_runtime_memory_host::MemoryPlugin) -> u64 {
+    // SAFETY: the symbol is an `extern "C" fn() -> u64`, and `plugin` pins the
+    // module for the whole borrow.
+    let symbol: libloading::Symbol<'_, unsafe extern "C" fn() -> u64> = unsafe {
+        plugin
+            .module()
+            .library()
+            .get(onnx_runtime_memory_testplugin::SYMBOL_PREFIX_BACKING_FREES)
+    }
+    .expect("the test plugin exports its prefix-backing free counter");
+    // SAFETY: as above.
+    unsafe { symbol() }
+}
+
 /// How many of the host's terminal free calls went through the **minor-1**
 /// structured slot rather than the baseline `deallocate` slot.
 pub fn structured_releases(plugin: &onnx_runtime_memory_host::MemoryPlugin) -> u64 {

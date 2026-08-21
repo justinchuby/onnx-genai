@@ -438,6 +438,7 @@ pub fn contiguous_runs(mut blocks: Vec<MappedBlock>) -> Vec<Vec<MappedBlock>> {
 /// Which driver operation a scripted fault targets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DriverOperation {
+    BindContext,
     Unmap,
     Remap,
     Dispose,
@@ -446,6 +447,7 @@ pub enum DriverOperation {
 impl DriverOperation {
     pub const fn name(self) -> &'static str {
         match self {
+            Self::BindContext => "cuCtxSetCurrent",
             Self::Unmap => "cuMemUnmap",
             Self::Remap => "cuMemMap",
             Self::Dispose => "cuMemRelease",

@@ -96,6 +96,43 @@ use cudarc::driver::CudaContext;
 /// an unbound thread is a driver error rather than a silent wrong answer.
 pub type TeardownSynchronizer = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
+static TEARDOWN_CONTEXT_BIND_FAILURES: AtomicU64 = AtomicU64::new(0);
+static TEARDOWN_BIND_RETAINED_RESERVATIONS: AtomicU64 = AtomicU64::new(0);
+static TEARDOWN_BIND_RETAINED_ADDRESS_BYTES: AtomicU64 = AtomicU64::new(0);
+static TEARDOWN_BIND_RETAINED_HANDLES: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide diagnostics for CUDA teardown that could not bind its context.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CudaTeardownStats {
+    /// Context-bind failures observed by reservation or physical-pool teardown.
+    pub context_bind_failures: u64,
+    /// Address reservations retained because their context could not be bound.
+    pub retained_reservations: u64,
+    /// Virtual address bytes retained after context-bind failure.
+    pub retained_address_bytes: u64,
+    /// Physical handles retained after context-bind failure.
+    pub retained_handles: u64,
+}
+
+/// Read the process-wide CUDA teardown diagnostics.
+pub fn cuda_teardown_stats() -> CudaTeardownStats {
+    CudaTeardownStats {
+        context_bind_failures: TEARDOWN_CONTEXT_BIND_FAILURES.load(Ordering::Relaxed),
+        retained_reservations: TEARDOWN_BIND_RETAINED_RESERVATIONS.load(Ordering::Relaxed),
+        retained_address_bytes: TEARDOWN_BIND_RETAINED_ADDRESS_BYTES.load(Ordering::Relaxed),
+        retained_handles: TEARDOWN_BIND_RETAINED_HANDLES.load(Ordering::Relaxed),
+    }
+}
+
+fn note_teardown_bind_failure(reservation_bytes: usize, handles: usize) {
+    TEARDOWN_CONTEXT_BIND_FAILURES.fetch_add(1, Ordering::Relaxed);
+    if reservation_bytes > 0 {
+        TEARDOWN_BIND_RETAINED_RESERVATIONS.fetch_add(1, Ordering::Relaxed);
+        TEARDOWN_BIND_RETAINED_ADDRESS_BYTES.fetch_add(reservation_bytes as u64, Ordering::Relaxed);
+    }
+    TEARDOWN_BIND_RETAINED_HANDLES.fetch_add(handles as u64, Ordering::Relaxed);
+}
+
 /// A reservation teardown, detached from the reservation that owned it.
 ///
 /// `CudaReservation::Drop` cannot wait for in-flight kernels and copies — a
@@ -118,6 +155,8 @@ pub struct ReservationTeardownTicket {
     pool: Option<Arc<PhysicalHandlePool>>,
     blocks: Vec<MappedBlock>,
     quarantined: Vec<MappedBlock>,
+    #[cfg(any(test, feature = "gpu-tests"))]
+    faults: Option<Arc<crate::release::DriverFaultPlan>>,
     /// Cleared by `execute`, so `Drop` only retains a genuinely abandoned
     /// ticket.
     armed: bool,
@@ -168,6 +207,26 @@ impl ReservationTeardownReport {
 }
 
 impl ReservationTeardownTicket {
+    fn injected_fault(&self, operation: DriverOperation) -> Option<DriverFault> {
+        #[cfg(any(test, feature = "gpu-tests"))]
+        if let Some(plan) = self.faults.as_ref()
+            && plan.should_fail(operation)
+        {
+            return Some(crate::release::DriverFaultPlan::fault(operation));
+        }
+        let _ = operation;
+        None
+    }
+
+    fn bind_context(&self) -> Result<(), String> {
+        if let Some(fault) = self.injected_fault(DriverOperation::BindContext) {
+            return Err(fault.to_string());
+        }
+        self.context
+            .bind_to_thread()
+            .map_err(|error| error.to_string())
+    }
+
     /// Bytes of address space this ticket owns.
     pub fn len(&self) -> usize {
         self.len
@@ -205,21 +264,40 @@ impl ReservationTeardownTicket {
     /// that ordering. Nothing here waits on a device.
     pub fn execute_outcome(mut self) -> ReservationTeardownOutcome {
         self.armed = false;
+        if let Err(error) = self.bind_context() {
+            let retained = self.blocks.len() + self.quarantined.len();
+            note_teardown_bind_failure(self.len, retained);
+            eprintln!(
+                "cuda_ep: WARNING: could not bind the owning CUDA context for teardown of a {} B \
+                 reservation at {:#x}: {error}; retaining its address range and {retained} \
+                 physical handle(s) without issuing CUDA unmap, release, or address-free calls",
+                self.len, self.base
+            );
+            self.armed = true;
+            return ReservationTeardownOutcome {
+                report: ReservationTeardownReport {
+                    unmapped_bytes: 0,
+                    retained_blocks: retained,
+                    address_range_freed: false,
+                },
+                retained: Some(self),
+            };
+        }
         // `cuMemUnmap`/`cuMemRelease` synchronize the device, which invalidates
         // a CUDA graph capture running on *any* thread. See `capture_gate`.
         // This teardown path did not exist when #1612 added the gate, and it is
         // the one most likely to run concurrently with a capture: it is driven
         // by the deferred-release queue rather than by a caller's commit.
         let _section = crate::capture_gate::synchronizing_section();
-        let _ = self.context.bind_to_thread();
         let mut retained_mapped = Vec::new();
         let mut retained_unmapped = std::mem::take(&mut self.quarantined);
         let mut unmapped = 0_u64;
         for block in std::mem::take(&mut self.blocks) {
             // SAFETY: each block was mapped by `commit` into this reservation
             // and is unmapped exactly once here.
-            if unsafe { cu::cuMemUnmap(self.base + block.offset as u64, block.len) }
-                != cu::CUresult::CUDA_SUCCESS
+            if self.injected_fault(DriverOperation::Unmap).is_some()
+                || unsafe { cu::cuMemUnmap(self.base + block.offset as u64, block.len) }
+                    != cu::CUresult::CUDA_SUCCESS
             {
                 // Still mapped. The address range must not be freed under a
                 // live mapping, so record it and keep the reservation.
@@ -227,7 +305,12 @@ impl ReservationTeardownTicket {
                 continue;
             }
             unmapped = unmapped.saturating_add(block.len as u64);
-            if let Some(pool) = &self.pool {
+            if self.injected_fault(DriverOperation::Dispose).is_some() {
+                if let Some(pool) = &self.pool {
+                    let _ = pool.retain_unmapped_handle(block.handle);
+                }
+                retained_unmapped.push(block);
+            } else if let Some(pool) = &self.pool {
                 if !pool.return_after_unmap(block.handle, true).is_settled() {
                     retained_unmapped.push(block);
                 }
@@ -339,6 +422,8 @@ impl Drop for ReservationTeardownTicket {
             pool: self.pool.clone(),
             blocks: std::mem::take(&mut self.blocks),
             quarantined: std::mem::take(&mut self.quarantined),
+            #[cfg(any(test, feature = "gpu-tests"))]
+            faults: self.faults.clone(),
             armed: false,
         };
         Box::leak(Box::new(retained));
@@ -398,7 +483,8 @@ pub struct CudaVirtualBacking {
     /// ordered their own work.
     reservation_queue: Option<Weak<dyn DeferredReservationQueue>>,
     /// Instance-scoped driver fault plan, for tests that must prove what
-    /// happens when `cuMemUnmap`, `cuMemMap` or `cuMemRelease` refuses.
+    /// happens when context binding, `cuMemUnmap`, `cuMemMap` or
+    /// `cuMemRelease` refuses.
     ///
     /// Compiled only for this crate's own tests and for the `gpu-tests`
     /// feature, so a production build has neither the field nor the branch.
@@ -2010,7 +2096,24 @@ impl Drop for PhysicalHandlePool {
                 state.lease.take(),
             )
         };
-        let _ = self.context.bind_to_thread();
+        if let Err(error) = self.context.bind_to_thread() {
+            let retained = handles.len() + retained_handles.len();
+            note_teardown_bind_failure(0, retained);
+            eprintln!(
+                "cuda_ep: WARNING: physical handle pool could not bind its owning CUDA context \
+                 during teardown: {error}; retaining {retained} handle(s) ({} B) without issuing \
+                 cuMemRelease",
+                retained.saturating_mul(self.granularity)
+            );
+            retained_handles.extend(handles);
+            if !retained_handles.is_empty() {
+                Box::leak(retained_handles.into_boxed_slice());
+            }
+            if let Some(lease) = lease.take() {
+                Box::leak(Box::new(lease));
+            }
+            return;
+        }
         let mut release_failed = false;
         for handle in handles {
             if unsafe { cu::cuMemRelease(handle) } == cu::CUresult::CUDA_SUCCESS {
@@ -2125,6 +2228,8 @@ pub struct CudaReservation {
     teardown_synchronizer: Option<TeardownSynchronizer>,
     /// Queue that owns this reservation's teardown, when one is installed.
     reservation_queue: Option<Weak<dyn DeferredReservationQueue>>,
+    #[cfg(any(test, feature = "gpu-tests"))]
+    faults: Option<Arc<crate::release::DriverFaultPlan>>,
     /// Every block currently mapped into this reservation.
     blocks: Vec<MappedBlock>,
     /// Blocks that were unmapped but whose physical handle could not be given
@@ -2226,6 +2331,8 @@ impl CudaReservation {
             len: self.len,
             context: Arc::clone(&self.context),
             pool: self.pool.clone(),
+            #[cfg(any(test, feature = "gpu-tests"))]
+            faults: self.faults.clone(),
             blocks: std::mem::take(&mut self.blocks),
             quarantined: std::mem::take(&mut self.quarantined),
             armed: true,
@@ -2342,6 +2449,8 @@ unsafe impl VirtualBacking for CudaVirtualBacking {
             pool: self.pool.clone(),
             teardown_synchronizer: self.teardown_synchronizer.clone(),
             reservation_queue: self.reservation_queue.clone(),
+            #[cfg(any(test, feature = "gpu-tests"))]
+            faults: self.faults.clone(),
             blocks: Vec::new(),
             quarantined: Vec::new(),
         })
