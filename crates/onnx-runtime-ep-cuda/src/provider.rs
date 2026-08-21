@@ -1508,6 +1508,65 @@ impl ExecutionProvider for CudaExecutionProvider {
         unsafe { self.runtime.dtoh(dst, cuptr(src.as_ptr())) }
     }
 
+    fn copy_device_to_device(
+        &self,
+        src: &DeviceBuffer,
+        src_offset: usize,
+        dst: &mut DeviceBuffer,
+        dst_offset: usize,
+        bytes: usize,
+    ) -> Result<()> {
+        assert_eq!(
+            src.device(),
+            self.device,
+            "cuda_ep::copy_device_to_device: foreign src buffer"
+        );
+        assert_eq!(
+            dst.device(),
+            self.device,
+            "cuda_ep::copy_device_to_device: foreign dst buffer"
+        );
+        if bytes == 0 {
+            return Ok(());
+        }
+        let src_end = src_offset.checked_add(bytes).ok_or_else(|| {
+            EpError::KernelFailed("cuda_ep::copy_device_to_device: src range overflows".into())
+        })?;
+        if src_end > src.len() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep::copy_device_to_device: src range {src_offset}..{src_end} exceeds {}",
+                src.len()
+            )));
+        }
+        let dst_end = dst_offset.checked_add(bytes).ok_or_else(|| {
+            EpError::KernelFailed("cuda_ep::copy_device_to_device: dst range overflows".into())
+        })?;
+        if dst_end > dst.len() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep::copy_device_to_device: dst range {dst_offset}..{dst_end} exceeds {}",
+                dst.len()
+            )));
+        }
+        let src_ptr = cuptr(src.as_ptr())
+            .checked_add(src_offset as u64)
+            .ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep::copy_device_to_device: src pointer offset overflows".into(),
+                )
+            })?;
+        let dst_ptr = cuptr(dst.as_mut_ptr())
+            .checked_add(dst_offset as u64)
+            .ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep::copy_device_to_device: dst pointer offset overflows".into(),
+                )
+            })?;
+        // SAFETY: both pointers name checked byte ranges within live device
+        // allocations that outlive the enqueued copy; the copy is ordered on the
+        // EP stream against the surrounding forward passes that read/write them.
+        unsafe { self.runtime.dtod_async(src_ptr, dst_ptr, bytes) }
+    }
+
     fn begin_device_graph_capture(&self, kernels: &[&dyn Kernel]) -> Result<()> {
         self.runtime.begin_graph_capture(kernels)
     }
