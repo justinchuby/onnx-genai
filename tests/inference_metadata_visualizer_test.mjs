@@ -17,10 +17,14 @@ vm.runInContext(script("vendor-js-yaml"), context);
 vm.runInContext(script("visualizer-helpers"), context);
 const H = context.VisualizerHelpers;
 
-test("is a genuinely offline single-file visualizer with pinned license notices", () => {
-  for (const tag of html.match(/<(?:script|link|img)\b[^>]*>/gi) ?? []) {
-    assert.doesNotMatch(tag, /\bsrc=["']https?:|\bhref=["']https?:|<script[^>]+\bsrc=/i);
-  }
+test("is a single page with one integrity-pinned CDN dependency and license notices", () => {
+  const external = html.match(/<(?:script|link|img)\b[^>]*(?:src|href)=["']https?:[^>]*>/gi) ?? [];
+  assert.equal(external.length, 1);
+  assert.match(external[0], /src="https:\/\/cdn\.jsdelivr\.net\/npm\/mermaid@11\.12\.0\/dist\/mermaid\.min\.js"/);
+  assert.match(external[0], /integrity="sha384-o\+g\/BxPwhi0C3RK7oQBxQuNimeafQ3GE\/ST4iT2BxVI4Wzt60SH4pq9iXVYujjaS"/);
+  assert.match(external[0], /crossorigin="anonymous"/);
+  assert.match(external[0], /referrerpolicy="no-referrer"/);
+  assert.match(html, /script-src 'unsafe-inline' https:\/\/cdn\.jsdelivr\.net;/);
   assert.match(html, /connect-src 'none'/);
   assert.match(html, /js-yaml 4\.1\.0, MIT License/);
   assert.match(html, /Mermaid 11\.12\.0, MIT License/);

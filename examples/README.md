@@ -4,8 +4,10 @@
 
 Open [`inference_metadata/visualizer.html`](inference_metadata/visualizer.html)
 directly from disk to inspect YAML or JSON inference metadata. The responsive
-single-file viewer is fully offline and includes workflow, state/serving,
-media, advanced capability, diagnostics, and recursive full-document views.
+single-page viewer includes workflow, state/serving, media, advanced capability,
+diagnostics, and recursive full-document views. YAML parsing stays embedded;
+workflow graph rendering loads pinned Mermaid 11.12.0 from jsDelivr with
+Subresource Integrity, and falls back to safe graph text when it is unavailable.
 
 ## ComfyUI import, converted and executed
 
