@@ -10380,6 +10380,9 @@ fn error(message: impl Into<String>) -> EpError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{
+        STATUS_ACCESS_VIOLATION, child_status_detail, is_environmental_access_violation_crash,
+    };
 
     /// The reassociated `dot_f32` must be at least as accurate as the serial
     /// chain it replaced, judged against an `f64` reference.
@@ -19324,26 +19327,6 @@ mod tests {
         }
     }
 
-    /// Render a spawned child's exit status for a failure message.
-    ///
-    /// A child killed by a hard fault — the Windows ARM64
-    /// `STATUS_ACCESS_VIOLATION` (`0xC0000005`) described on
-    /// [`parity_worker_count`] — unwinds nothing: it prints no panic line and
-    /// leaves stderr completely empty. Its stdout simply stops mid-test. So the
-    /// stdout/stderr pair these assertions report cannot, on its own,
-    /// distinguish "the child crashed" from "the child's assertion failed", and
-    /// the two want opposite responses.
-    ///
-    /// The exit status is the only evidence that survives a fault, and NTSTATUS
-    /// codes are unrecognisable in the signed decimal `code()` returns
-    /// (`0xC0000005` prints as `-1073741819`), so render hex as well.
-    fn child_status_detail(status: &std::process::ExitStatus) -> String {
-        match status.code() {
-            Some(code) => format!("{status} (code {code}, {:#010x})", code as u32),
-            None => format!("{status} (no exit code; killed by a signal)"),
-        }
-    }
-
     fn parity_child_output_mode(mode: SpmdParityMode) -> Vec<u8> {
         let workers = parity_worker_count().to_string();
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
@@ -20357,55 +20340,11 @@ mod tests {
         println!("{AFFINITY_DEFER_MARKER}ok");
     }
 
-    /// The NTSTATUS code Windows reports for `STATUS_ACCESS_VIOLATION`
-    /// (`0xC0000005`) surfaced through `ExitStatus::code()` as a signed `i32`.
-    /// `ExitStatus::code()` is cross-platform, so this constant compiles on every
-    /// target; the crash it names only ever occurs on native Windows ARM64.
-    const STATUS_ACCESS_VIOLATION: i32 = -1_073_741_819;
-
     /// Total attempts allowed for a single affinity-defer child run before we give
     /// up and surface a failure. One nominal attempt plus two retries: the
     /// environmental crash is rare, so a small bound reliably rides through it
     /// without masking a persistent problem.
     const AFFINITY_DEFER_CHILD_MAX_ATTEMPTS: u32 = 3;
-
-    /// Classify an unsuccessful affinity-defer child exit as the *known
-    /// environmental* `STATUS_ACCESS_VIOLATION` crash (retryable) versus a real
-    /// test failure (not retryable). Extracted as a pure function so the exact
-    /// signature is unit-testable and the retry stays narrowly scoped.
-    ///
-    /// All four conditions must hold to treat the exit as the environmental flake:
-    ///   1. the child exited unsuccessfully (`success` is `false`), AND
-    ///   2. it emitted no `success_marker`, AND
-    ///   3. its stderr shows no Rust panic (no `panicked at` / `assertion`
-    ///      text) — a genuine assertion failure must fail fast, never retry, AND
-    ///   4. the exit code is exactly the Windows `STATUS_ACCESS_VIOLATION`
-    ///      NTSTATUS. Matching that specific code keeps the retry Windows-only in
-    ///      practice while the code stays portable.
-    ///
-    /// `success_marker` is the stdout token a child prints once it has actually
-    /// completed its work, so a fault raised *after* the result was already
-    /// emitted is correctly classified as non-environmental. Each caller passes
-    /// its own marker, because more than one child-spawning helper needs this
-    /// classification and they do not share a marker.
-    fn is_environmental_access_violation_crash(
-        success: bool,
-        exit_code: Option<i32>,
-        stdout: &str,
-        stderr: &str,
-        success_marker: &str,
-    ) -> bool {
-        if success {
-            return false;
-        }
-        if stdout.contains(success_marker) {
-            return false;
-        }
-        if stderr.contains("panicked at") || stderr.contains("assertion") {
-            return false;
-        }
-        exit_code == Some(STATUS_ACCESS_VIOLATION)
-    }
 
     fn run_affinity_defer_child(scenario: &str, affinity: &str, forced: bool) {
         // Worker/Rayon thread count for the child. The `forced` scenario builds
