@@ -19548,6 +19548,15 @@ mod tests {
             .env("RAYON_NUM_THREADS", &width)
             .env(crate::decode_spmd::PERSISTENT_POOL_ENV, "1")
             .env_remove(crate::decode_affinity::DECODE_AFFINITY_ENV)
+            // The exact assertion assumes the `Fixed` schedule. Under `mlas` a
+            // work-stealing pool spawns a thread per shard with no inline
+            // dispatcher, so it never reclaims the reserved CPU and a fully
+            // subscribed request realizes `allowed - 1` lanes. Measured: with
+            // `--features mlas` and a steal schedule, width 32 builds 31. No
+            // lane runs this test that way today, so don't weaken the
+            // assertion for it -- just refuse to inherit the schedule, the
+            // same way this spawn refuses to inherit an affinity override.
+            .env_remove(crate::decode_spmd::DECODE_SCHEDULE_ENV)
             .env_remove(SPMD_PARITY_CHILD_ENV);
 
         // Bounded retry scoped to *exactly* the known environmental crash
@@ -19659,6 +19668,7 @@ mod tests {
             widths.push(allowed_now);
         }
 
+        let mut saw_full_subscription = false;
         for requested in widths {
             let report = realized_width_report(requested);
             assert_eq!(
@@ -19697,12 +19707,29 @@ mod tests {
                 continue;
             }
 
+            saw_full_subscription |= report.allowed >= 2 && effective >= report.allowed;
+
             assert_eq!(
                 report.workers, effective,
                 "requested width {requested} realized {} compute lanes, not the {effective} \
                  it asked for ({report:?}) -- a decode benchmark row labelled t={requested} \
                  would be reporting a width it never ran",
                 report.workers
+            );
+        }
+
+        // Say out loud when only the easy half ran. On a host with more allowed
+        // CPUs than the probe cap, no swept width reaches full subscription --
+        // so the dispatcher-shard path that #1746 broke goes unexercised and a
+        // green run here would mean less than it appears to. Derive this from
+        // what the children reported rather than from host assumptions, and
+        // only require it where the probe was actually capable of firing.
+        if (2..=SPMD_WIDTH_FULL_SUBSCRIPTION_CAP).contains(&allowed_now) {
+            assert!(
+                saw_full_subscription,
+                "no swept width reached full subscription on a {allowed_now}-CPU cpuset, so \
+                 the reservation path went untested and only the no-op half of the contract \
+                 was checked -- the full-subscription probe is not doing its job"
             );
         }
     }
