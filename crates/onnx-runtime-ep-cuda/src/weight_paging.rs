@@ -2267,6 +2267,13 @@ pub struct CudaWeightPager<'a, S: MmapRegionSource + ?Sized> {
 
 impl<'a, S: MmapRegionSource + ?Sized> CudaWeightPager<'a, S> {
     pub fn new(runtime: Arc<CudaRuntime>, source: &'a S) -> Self {
+        // Marking here rather than at the call sites is what makes it
+        // unmissable: a pager cannot exist on a runtime without that runtime
+        // knowing its weights may be paged. The pages this builds are retired
+        // through `free_raw`/`deallocate_span` rather than the provider's
+        // `deallocate`, so the interleave cache is never told an address died
+        // and must refuse to key on one. See [`crate::interleave_cache`].
+        runtime.set_weights_may_be_paged();
         Self {
             runtime,
             queue: None,
@@ -2947,6 +2954,10 @@ impl CudaWeightResidency {
     /// out, and neither side can see the other's.
     pub fn new(runtime: Arc<CudaRuntime>, budget_bytes: u64) -> Self {
         replace_global_budget(0, budget_bytes);
+        // See `CudaWeightPager::new`: a runtime that can page weights must say
+        // so before anything can page one, so the interleave cache stops
+        // keying on addresses this will recycle.
+        runtime.set_weights_may_be_paged();
         Self {
             runtime: Arc::clone(&runtime),
             queue: None,

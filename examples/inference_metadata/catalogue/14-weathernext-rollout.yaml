@@ -5,6 +5,7 @@ pipeline:
     manifest:
       capabilities:
       - workflow_ssa
+      - linear_effects
       - typed_emit
       - serving_service_contract
       - session_state_lease

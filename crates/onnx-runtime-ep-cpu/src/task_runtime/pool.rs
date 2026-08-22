@@ -179,6 +179,13 @@ pub struct PoolCounters {
     pub spin_hits: u64,
     /// Task bodies that panicked.
     pub panics: u64,
+    /// Fan-outs whose dispatcher outran its own slot and had to wait for a
+    /// straggler claimed by someone else.
+    pub straggler_waits: u64,
+    /// Times a waiting dispatcher exhausted `DISPATCHER_YIELD_STRIDE` spins and
+    /// yielded. Only reachable when the straggler's claimant is descheduled,
+    /// so this is a direct oversubscription signal.
+    pub straggler_yields: u64,
 }
 
 #[derive(Default)]
@@ -187,6 +194,8 @@ struct AtomicCounters {
     tasks: AtomicU64,
     tasks_by_dispatcher: AtomicU64,
     slot_exhausted: AtomicU64,
+    straggler_waits: AtomicU64,
+    straggler_yields: AtomicU64,
     parks: AtomicU64,
     spin_hits: AtomicU64,
     panics: AtomicU64,
@@ -199,6 +208,8 @@ impl AtomicCounters {
             tasks: self.tasks.load(Ordering::Relaxed),
             tasks_by_dispatcher: self.tasks_by_dispatcher.load(Ordering::Relaxed),
             slot_exhausted: self.slot_exhausted.load(Ordering::Relaxed),
+            straggler_waits: self.straggler_waits.load(Ordering::Relaxed),
+            straggler_yields: self.straggler_yields.load(Ordering::Relaxed),
             parks: self.parks.load(Ordering::Relaxed),
             spin_hits: self.spin_hits.load(Ordering::Relaxed),
             panics: self.panics.load(Ordering::Relaxed),
@@ -544,10 +555,20 @@ impl TaskPool {
             .fetch_add(ran, Ordering::Relaxed);
 
         let mut spins = 0u32;
+        if slot.remaining.0.load(Ordering::Acquire) != 0 {
+            self.shared
+                .counters
+                .straggler_waits
+                .fetch_add(1, Ordering::Relaxed);
+        }
         while slot.remaining.0.load(Ordering::Acquire) != 0 {
             std::hint::spin_loop();
             spins = spins.wrapping_add(1);
             if spins.is_multiple_of(DISPATCHER_YIELD_STRIDE) {
+                self.shared
+                    .counters
+                    .straggler_yields
+                    .fetch_add(1, Ordering::Relaxed);
                 // Only reached under oversubscription, where a claimant is
                 // descheduled; yielding lets it finish instead of us spinning
                 // against it.
@@ -638,6 +659,44 @@ mod tests {
                 assert_eq!(count.load(Ordering::Relaxed), 1, "index {i} of {total}");
             }
         }
+    }
+
+    /// A dispatcher that outruns its own slot must record the wait.
+    ///
+    /// `straggler_waits` is what distinguishes "this fan-out was absorbed by
+    /// the dispatcher" from "the dispatcher finished its share and then blocked
+    /// on someone else's task", and only the second shape can put a scheduler
+    /// timeslice into the tail -- which is why the counter exists.
+    ///
+    /// Which thread ends up holding the last task is genuinely the scheduler's
+    /// choice, so a single fan-out cannot be forced into the second shape. The
+    /// property under test is therefore the aggregate one: over many fan-outs
+    /// wide enough to require every worker, the dispatcher must at some point
+    /// have been the one left waiting. Retrying rather than sleeping keeps this
+    /// deterministic in the sense that matters -- it cannot pass for the wrong
+    /// reason, and it does not encode a timing assumption.
+    #[test]
+    fn a_dispatcher_waiting_for_a_straggler_records_it() {
+        let pool = TaskPool::new(4);
+        if pool.width() < 2 {
+            return;
+        }
+        let before = pool.shared.counters.snapshot().straggler_waits;
+        let wanted = pool.width();
+        for _ in 0..200 {
+            let arrived = AtomicUsize::new(0);
+            assert!(
+                pool.dispatch(wanted, &|_| rendezvous(&arrived, wanted)),
+                "pool declined a width-sized fan-out"
+            );
+            if pool.shared.counters.snapshot().straggler_waits > before {
+                return;
+            }
+        }
+        panic!(
+            "200 fan-outs that every worker had to join, and the dispatcher was \
+             never recorded as waiting for one of them"
+        );
     }
 
     #[test]

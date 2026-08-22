@@ -127,6 +127,7 @@ fn unconditional_syncs_are_limited_to_capture_unsupported_paths() {
         "block_quantized_moe.rs::execute_with_workspace".to_string(),
         "fused_gemm.rs::run".to_string(),
         "gemm.rs::run".to_string(),
+        "matmul_nbits.rs::run".to_string(),
         "mod_op.rs::run".to_string(),
         "nary.rs::run".to_string(),
         "nonzero.rs::execute".to_string(),
