@@ -23,8 +23,9 @@ on a moving target:
   package that actually uses `proposal_execution`; the committed `speculative`
   fixture uses the old `max_proposal_width` form. gemma4-real-packages has now
   built the tiny executable **`gemma4_chained`** target+assistant fixture on the
-  `#1716` schema (branch `justinchuby/gemma4-chained-fixture` off
-  `copilot/gemma4-e2b-metadata`, commit `c9c62bcd`): committed
+  final `#1716` schema (branch `justinchuby/gemma4-chained-fixture`, commit
+  `8a66e2c8` — merges the `#1716` tip `9f47bb69` and makes the folded carry
+  explicit): committed
   `inference_metadata.yaml` + `target/` + `assistant/` `*.onnx.textproto` (reused
   proven `tiny-gemma4-assistant` graphs — hidden 16, 2H 32, vocab 32, kv_heads 2,
   head_dim 8, 2 layers), greedy/logits-emit/f32/standard ops (ORT ∩ native-CPU
@@ -56,18 +57,23 @@ on a moving target:
   real-model chained fixture or a dedicated embed-gather unit check), so the
   parity suite never implies embed-building is proven when it isn't.
 
-  **Open contract items (both gemma4-metadata-audit's fields, ruling pending):**
-  (1) the **direction** of `port_bindings.target_hidden_context` — this PR and
-  gemma4-real-packages both read it as destination-naming (the fused
-  `inputs_embeds` port) with `carry_0` sourced from `target.hidden_states.0` by
-  the folded-carry convention, but the field owner must ratify so metadata and
-  interpreter agree verbatim. (2) **Where the interpreter sources the embedding
-  table for real models** — the fixture omits `speculative.shared_weights`
-  (strict form: the drafter graph does not read an embedding initializer), so for
-  real models the chained construct must build `embed(token)` from the target's
-  in-model embedding (or a named field), which the field owner should pin (no
-  model-name gate). Moot for this fixture (embed unused), but required before the
-  real-model emitter PR.
+  **Contract items — RESOLVED by the final `#1716` schema (`8a66e2c8`), verified
+  in `crates/onnx-genai-metadata/src/validation.rs`.** Both are now explicit,
+  mandatory, ratified fields on `proposal_execution` (required whenever
+  `folded_carry_output` is set — validation rejects a folded proposal missing
+  either), so the Phase-1 chained driver reads them directly with no convention
+  inference and no model-name gate:
+  (1) **`folded_carry_seed: {component, output}`** names carry_0's source — in the
+  fixture `{component: target, output: hidden_states.0}` (validated: the component
+  is a declared workflow component and `output` is one of its output ports). This
+  supersedes the earlier `port_bindings.target_hidden_context` ambiguity: carry_0
+  is now unambiguously the named target output.
+  (2) **`token_embedding: {component, table}`** names where `embed(last_token)`
+  (the fused input's leading H) is gathered from — in the fixture
+  `{component: target, table: hidden_table}` (validated: declared component).
+  Generalizes to real models (names the target's in-model embedding table, no
+  per-model gate); for this tiny fixture the drafter ignores the embed half, so it
+  is exercised structurally but doesn't perturb the greedy tokens.
 - **`#1716` is not on `main` — the remaining gate.** Its branch
   (`copilot/gemma4-e2b-metadata`) is ~50k insertions, still evolving (tip added a
   26B MoE example), and edits the interpreter seam this PR owns
@@ -183,9 +189,11 @@ that constructs and runs a canonical workflow.
   `SpeculativeProposalExecution::Chained` (onnx-genai `#1696`, with
   `folded_carry_output` **or** `recurrent`), the interpreter owns: build the
   fused `inputs_embeds` = `concat(embed(last_token)[leading H], carry[trailing
-  H])`; thread `carry_0 = target.hidden_states.0` (confirmed from the fixture
-  graph; named via `port_bindings.target_hidden_context` — **field direction
-  pending gemma4-metadata-audit's ratification**, read as destination-naming),
+  H])`, gathering the embedding from the target table named by
+  `proposal_execution.token_embedding` (`{component, table}`); thread `carry_0`
+  from the target output named by `proposal_execution.folded_carry_seed`
+  (`{component, output}` — in the fixture `target.hidden_states.0`; both fields
+  ratified + validated in the final `#1716` schema, so no convention inference),
   `carry_k = folded_carry_output(k-1)`;
   drive the chain to `max_proposal_width`;
   and treat the folded carry as **not** a rollback state cell (recomputed from
