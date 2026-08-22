@@ -101,6 +101,28 @@ fn build_gemm_transb(m: usize, k: usize, n: usize) -> Box<dyn Kernel> {
     kernel
 }
 
+/// `FusedMatMulBias` -- the optimizer's fusion of `MatMul + Add(bias)`, and the
+/// form most real projections actually take, because almost every `nn.Linear`
+/// has a bias.
+///
+/// It had **no row in any benchmark** before #1702. That is why its divergence
+/// from `MatMul` survived #1687: the two arms above cover `MatMul` and `Gemm`,
+/// so a reader would reasonably conclude every decode GEMV was measured, while
+/// the operator carrying most of a model's projections was not exercised at
+/// all. A gate with no row below/at/above it is not a measured gate.
+fn build_fused_matmul_bias(m: usize, k: usize, n: usize) -> Box<dyn Kernel> {
+    let mut node = Node::new(NodeId(0), "FusedMatMulBias", vec![], vec![]);
+    // The fusion lives in `com.microsoft`, not the default domain -- a plain
+    // `Node::new` gets `NoEpForOp` here, which is itself a small piece of
+    // evidence that nothing had ever built this kernel from a bench.
+    node.domain = "com.microsoft".to_string();
+    let mut kernel = CpuExecutionProvider::new()
+        .get_kernel(&node, &[vec![m, k], vec![k, n], vec![n]], 1)
+        .expect("CPU EP must register FusedMatMulBias");
+    kernel.set_constant_inputs(&[false, true, true]);
+    kernel
+}
+
 /// Same GEMM in `f32` on the already-narrowed operand values, through the same
 /// production kernel: the conformance reference every half arm is measured
 /// against.
@@ -192,10 +214,15 @@ fn main() {
     );
     let m = 1;
     let trans_b = std::env::var("PROBE_OP").as_deref() == Ok("gemm_transb");
+    let fused_bias = std::env::var("PROBE_OP").as_deref() == Ok("fused_matmul_bias");
     for dtype in [FloatDType::F32, FloatDType::F16, FloatDType::Bf16] {
         for &(label, k, n) in &shapes {
             if trans_b {
                 run_transposed(dtype, label, m, k, n);
+                continue;
+            }
+            if fused_bias {
+                run_fused_bias(dtype, label, m, k, n);
                 continue;
             }
             let b = Tensor::floats(dtype, &[k, n], &floats(k * n, 0.3));
@@ -304,6 +331,78 @@ fn run_transposed(dtype: FloatDType, label: &str, m: usize, k: usize, n: usize) 
         weight_bytes / (steady * 1e6),
         (2.0 * m as f64 * k as f64 * n as f64) / (steady * 1e6),
         max_relative_deviation(&got, &reference(&a, &reference_b, m, k, n)),
+        digest(&got)
+    );
+}
+
+/// One `FusedMatMulBias` row, timed exactly like the `[K, N]` `MatMul` arm.
+///
+/// The weight, the activation and the shape are byte-identical to that arm, so
+/// the only difference between the two rows is the operator — which is the
+/// whole point. `max_rel` is measured against the *same* f32 `MatMul`
+/// reference plus the bias, so a route that changed accumulation order or
+/// applied the bias in the wrong place moves the column rather than passing
+/// quietly.
+///
+/// The bias is deliberately non-zero and non-uniform. A zero bias would make
+/// this row indistinguishable from `MatMul` even if the epilogue were dropped
+/// entirely, which is the kind of control that cannot detect the thing it
+/// exists to detect (ledger §25).
+fn run_fused_bias(dtype: FloatDType, label: &str, m: usize, k: usize, n: usize) {
+    let b_values = floats(k * n, 0.3);
+    let bias_values = floats(n, 2.7);
+    let b = Tensor::floats(dtype, &[k, n], &b_values);
+    let a = Tensor::floats(dtype, &[m, k], &floats(m * k, 1.1));
+    let bias = Tensor::floats(dtype, &[n], &bias_values);
+    let mut out = Tensor::zeros(dtype, &[m, n]);
+    let ins = vec![a.view(), b.view(), bias.view()];
+
+    let cold = median(
+        (0..3)
+            .map(|_| {
+                let kernel = build_fused_matmul_bias(m, k, n);
+                let start = Instant::now();
+                kernel
+                    .execute(&ins, &mut [out.view_mut()])
+                    .expect("execute");
+                start.elapsed().as_secs_f64() * 1e3
+            })
+            .collect(),
+    );
+
+    let kernel = build_fused_matmul_bias(m, k, n);
+    for _ in 0..2 {
+        kernel.execute(&ins, &mut [out.view_mut()]).expect("warmup");
+    }
+    let steady = median(
+        (0..7)
+            .map(|_| {
+                let start = Instant::now();
+                kernel
+                    .execute(&ins, &mut [out.view_mut()])
+                    .expect("execute");
+                start.elapsed().as_secs_f64() * 1e3
+            })
+            .collect(),
+    );
+
+    // The bias is narrowed to `dtype` and widened back, exactly as the kernel
+    // sees it, so the reference does not credit the arm with precision the
+    // stored bias does not have.
+    let mut want = reference(&a, &b, m, k, n);
+    let bias_seen = bias.to_f32();
+    for (index, value) in want.iter_mut().enumerate() {
+        *value += bias_seen[index % n];
+    }
+    let weight_bytes = (k * n * dtype.size_of()) as f64;
+    let got = out.to_f32();
+    println!(
+        "{:>6} {label:>8} {k:>6} {n:>7} {cold:>10.3} {steady:>10.3} {:>9.1} \
+         {:>8.2} {:>10.2e} {:>18}",
+        dtype.name(),
+        weight_bytes / (steady * 1e6),
+        (2.0 * m as f64 * k as f64 * n as f64) / (steady * 1e6),
+        max_relative_deviation(&got, &want),
         digest(&got)
     );
 }
