@@ -6342,6 +6342,14 @@ impl crate::interleave_cache::InterleaveDevice for CudaRuntime {
     fn interleave_is_capturing(&self) -> Result<bool> {
         self.is_capturing()
     }
+
+    fn interleave_frees_are_observed(&self) -> bool {
+        !self.weights_may_be_paged()
+    }
+
+    fn interleave_drain_before_free(&self) -> Result<()> {
+        self.drain_for_unmap()
+    }
 }
 
 /// Launch the once-per-weight int4 nibble-interleave pass over `bytes` bytes

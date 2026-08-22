@@ -77,6 +77,11 @@ PR*.md
 /bench-seqmajor/target/
 bench-bins/
 
+# Per-crate scratch written by tests at runtime (e.g. the weight-handle fixtures
+# in onnx-runtime-session). Only /target is ignored above, so these nested dirs
+# would otherwise be picked up by a `git add -A crates/`.
+crates/*/target/
+
 # Sebastian marlin-bench scratch: re-exported ORT-genai glm package + staging (large, reproducible)
 /ort-glm-build/
 /ort-glm-stage/
