@@ -64,12 +64,12 @@ pub use tensor::{
     DevicePtr, DevicePtrMut, ExternalMmapRegion, TensorBacking, TensorMut, TensorView,
 };
 pub use weight::{
-    ExecutionProviderCapabilities, LazyDeviceWeightBinder, LazyWeight, LazyWeightBoundary,
-    LazyWeightCandidate, MmapRegionSource, NXRT_WEIGHT_PAGING_CAPABILITY, NegotiatedWeight,
-    PagedWeight, Phase3aHostOnlyBinder, ResidencyDecision, ResidencyDegradationReason,
-    ResidencyPlan, ResidencyPolicy, ResidencyPolicyInput, ResidentWeight,
-    ResidentWeightMaterializer, WeightHandle, WeightHandleError, WholeBankResidentPolicy,
-    lazy_weight_candidates, plan_residency,
+    AdmissionPolicyInput, EvictionClass, ExecutionProviderCapabilities, LazyDeviceWeightBinder,
+    LazyWeight, LazyWeightBoundary, LazyWeightCandidate, MmapRegionSource,
+    NXRT_WEIGHT_PAGING_CAPABILITY, NegotiatedWeight, PagedWeight, Phase3aHostOnlyBinder,
+    ResidencyDecision, ResidencyDegradationReason, ResidencyPlan, ResidencyPolicy,
+    ResidencyPolicyInput, ResidentWeight, ResidentWeightMaterializer, WeightHandle,
+    WeightHandleError, WholeBankResidentPolicy, lazy_weight_candidates, plan_residency,
 };
 
 // Re-export the device vocabulary from the IR so EP authors have one import.

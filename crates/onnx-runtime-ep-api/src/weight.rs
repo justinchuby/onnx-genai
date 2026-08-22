@@ -587,9 +587,44 @@ pub struct ResidencyPolicyInput<'a> {
     pub budget_bytes: Option<u64>,
 }
 
+/// Eviction-order class a policy assigns to spans admitted at one
+/// [`LazyWeightBoundary`]. This names *which* churn population an admitted
+/// span joins; it never touches an `Arc`, a page, or a byte — the executing
+/// cache (e.g. `onnx-runtime-ep-cuda::weight_paging::CudaWeightResidency`)
+/// still owns victim selection, admission, and eviction mechanics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvictionClass {
+    /// Ordinary least-recently-used churn population.
+    Lru,
+    /// Retained ahead of LRU churn (still evictable to avoid OOM, but never
+    /// chosen ahead of an ordinary LRU victim) — today's scan-resistant dense
+    /// path.
+    StableResident,
+}
+
+/// Structural, per-admission inputs for the static hot-set pin decision.
+/// Deliberately carries only byte-length and *caller-supplied* live-state
+/// snapshots (already-pinned membership, bytes pinned so far) rather than
+/// letting the policy reach into cache internals directly — the policy
+/// remains a pure decision function of these inputs, never a second owner of
+/// the pin set itself.
+#[derive(Clone, Copy, Debug)]
+pub struct AdmissionPolicyInput {
+    /// Opaque per-weight identity key (stable within one cache instance).
+    pub key: u64,
+    /// Byte length of the span being admitted.
+    pub len_bytes: u64,
+    /// Whether `key` is already in the executing cache's pinned set.
+    pub already_pinned: bool,
+    /// Total bytes already committed to the pinned set (excluding `key`).
+    pub pinned_bytes_used: u64,
+}
+
 /// A pluggable placement/admission/eviction/prefetch/resize *decision*
 /// surface. A policy answers "which experts (if any) does this value split
-/// into for planning purposes", nothing else.
+/// into for planning purposes", "which churn population does this boundary's
+/// spans join", and "should this specific span enter the static hot set",
+/// nothing else.
 ///
 /// Implementations must not allocate, copy, synchronize, or hold VA/pointer
 /// state — see the module-level `ResidencyPlan` doc for why that split is
@@ -600,6 +635,22 @@ pub trait ResidencyPolicy: Send + Sync {
 
     /// Decide one value's residency for planning purposes only.
     fn decide(&self, input: &ResidencyPolicyInput<'_>) -> ResidencyDecision;
+
+    /// Eviction-order class for spans admitted at `boundary`. Default: always
+    /// ordinary LRU (today's non-scan-resistant behavior) — a policy opts
+    /// into stable-resident treatment explicitly.
+    fn eviction_class(&self, boundary: LazyWeightBoundary) -> EvictionClass {
+        let _ = boundary;
+        EvictionClass::Lru
+    }
+
+    /// Whether to admit this span into the static hot-set pin, once and for
+    /// the life of the cache. Default: never pin (today's byte-identical
+    /// default with no pin configuration engaged).
+    fn should_pin(&self, input: &AdmissionPolicyInput) -> bool {
+        let _ = input;
+        false
+    }
 }
 
 /// The only shipped policy today: always keep every candidate value fully

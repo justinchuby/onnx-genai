@@ -2925,20 +2925,110 @@ impl WeightResidencyPolicy {
     }
 }
 
+impl From<onnx_runtime_ep_api::EvictionClass> for WeightEvictionPolicy {
+    fn from(class: onnx_runtime_ep_api::EvictionClass) -> Self {
+        match class {
+            onnx_runtime_ep_api::EvictionClass::Lru => WeightEvictionPolicy::Lru,
+            onnx_runtime_ep_api::EvictionClass::StableResident => {
+                WeightEvictionPolicy::StableResident
+            }
+        }
+    }
+}
+
+/// The concrete, shipped [`onnx_runtime_ep_api::ResidencyPolicy`] for the CUDA
+/// weight-offload cache. This is the *decision* authority migrated out of the
+/// two call sites it used to live in directly:
+///
+///   - `eviction_for_boundary` (now [`Self::eviction_class`]): which churn
+///     population (LRU vs. scan-resistant stable-resident) a boundary's spans
+///     join.
+///   - the `pin_this` computation inside `admit_committed_span` (now
+///     [`Self::should_pin`]): whether one admitted span enters the static
+///     hot-set pin, given the caller's already-pinned snapshot.
+///
+/// It never allocates, copies, evicts, or holds VA/pointer state — victim
+/// selection (`next_evictable_key`/`smallest_evictable`/
+/// `evictable_key_by_probe`), admission bookkeeping (`mark_pinned`), and the
+/// byte-aware/eviction-order diagnostic probes stay exclusively in
+/// [`CudaWeightResidency`]/[`ResidencyInner`] because they require live
+/// `Arc::strong_count`/slot-idle runtime state this pure policy is not given
+/// and must not reach for.
+///
+/// `evict_order_probe` (#888) and `byte_aware` (#837 item 3, rejected) are
+/// deliberately NOT part of this policy: both are off-by-default diagnostic
+/// experiments, not the shipped decision surface this slice migrates.
+#[derive(Clone, Copy, Debug)]
+struct CudaHotSetResidencyPolicy {
+    scan_resistant_dense: bool,
+    static_pin_keys: Option<&'static HashSet<u64>>,
+    static_pin_config: Option<(u64, u64)>,
+}
+
+impl CudaHotSetResidencyPolicy {
+    /// Build the policy from the process environment, matching
+    /// `DeviceOffloadPolicy::from_env`'s `scan_resistant_dense` plus the two
+    /// independent static-pin activation paths (`static_pin_keys` takes
+    /// priority over `static_pin_config` when both are set, exactly as the
+    /// pre-migration `pin_this` computation did).
+    fn from_env(scan_resistant_dense: bool) -> Self {
+        Self {
+            scan_resistant_dense,
+            static_pin_keys: static_pin_keys(),
+            static_pin_config: static_pin_config(),
+        }
+    }
+}
+
+impl onnx_runtime_ep_api::ResidencyPolicy for CudaHotSetResidencyPolicy {
+    fn name(&self) -> &'static str {
+        "cuda_hot_set"
+    }
+
+    fn decide(
+        &self,
+        input: &onnx_runtime_ep_api::ResidencyPolicyInput<'_>,
+    ) -> onnx_runtime_ep_api::ResidencyDecision {
+        // This policy does not yet split per-expert placement; it only
+        // migrates eviction-class/pin admission. Delegate to the whole-bank
+        // default so its plan-shaped output is unchanged from today.
+        onnx_runtime_ep_api::WholeBankResidentPolicy.decide(input)
+    }
+
+    fn eviction_class(&self, boundary: LazyWeightBoundary) -> onnx_runtime_ep_api::EvictionClass {
+        if self.scan_resistant_dense
+            && matches!(
+                boundary,
+                LazyWeightBoundary::MatMul | LazyWeightBoundary::MatMulNBits
+            )
+        {
+            onnx_runtime_ep_api::EvictionClass::StableResident
+        } else {
+            onnx_runtime_ep_api::EvictionClass::Lru
+        }
+    }
+
+    fn should_pin(&self, input: &onnx_runtime_ep_api::AdmissionPolicyInput) -> bool {
+        if let Some(keys) = self.static_pin_keys {
+            keys.contains(&input.key) && !input.already_pinned
+        } else if let Some((threshold, budget)) = self.static_pin_config {
+            input.len_bytes >= threshold
+                && !input.already_pinned
+                && input.pinned_bytes_used.saturating_add(input.len_bytes) <= budget
+        } else {
+            false
+        }
+    }
+}
+
 fn eviction_for_boundary(
     scan_resistant_dense: bool,
     boundary: LazyWeightBoundary,
 ) -> WeightEvictionPolicy {
-    if scan_resistant_dense
-        && matches!(
-            boundary,
-            LazyWeightBoundary::MatMul | LazyWeightBoundary::MatMulNBits
-        )
-    {
-        WeightEvictionPolicy::StableResident
-    } else {
-        WeightEvictionPolicy::Lru
-    }
+    use onnx_runtime_ep_api::ResidencyPolicy as _;
+    CudaHotSetResidencyPolicy::from_env(scan_resistant_dense)
+        .eviction_class(boundary)
+        .into()
 }
 
 impl CudaWeightResidency {
@@ -4165,17 +4255,22 @@ impl CudaWeightResidency {
         // to fit right now) so that a qualifying tensor which fits early — before
         // the budget fills — is still protected from later churn eviction, which
         // is what keeps it out of the evict-and-re-admit corruption population.
-        let pin_this = if let Some(keys) = static_pin_keys() {
-            keys.contains(&key) && !inner.pinned.contains(&key)
-        } else {
-            match static_pin_config() {
-                Some((threshold, budget)) => {
-                    (len as u64) >= threshold
-                        && !inner.pinned.contains(&key)
-                        && inner.pinned_bytes.saturating_add(len as u64) <= budget
-                }
-                None => false,
-            }
+        let pin_this = {
+            use onnx_runtime_ep_api::ResidencyPolicy as _;
+            // #82 migration: this used to be an inline `pin_this` computation
+            // reading `static_pin_keys`/`static_pin_config` directly. It now
+            // delegates to `CudaHotSetResidencyPolicy::should_pin`, which is a
+            // pure function of the same env-derived config plus an explicit
+            // snapshot of live pin state — `admit_committed_span` remains the
+            // sole executing authority; the policy only answers the question.
+            CudaHotSetResidencyPolicy::from_env(self.scan_resistant_dense).should_pin(
+                &onnx_runtime_ep_api::AdmissionPolicyInput {
+                    key,
+                    len_bytes: len as u64,
+                    already_pinned: inner.pinned.contains(&key),
+                    pinned_bytes_used: inner.pinned_bytes,
+                },
+            )
         };
         loop {
             let required_owned = physical
@@ -6866,5 +6961,179 @@ mod tests {
         assert_eq!(moe.hits, 178);
         assert_eq!(moe.page_ins, 62);
         assert_eq!(moe.evictions, 59);
+    }
+
+    // -- #82 migration: CudaHotSetResidencyPolicy agreement + unit coverage --
+
+    #[test]
+    fn hot_set_policy_eviction_class_agrees_with_old_eviction_for_boundary() {
+        use onnx_runtime_ep_api::{EvictionClass, ResidencyPolicy as _};
+
+        // Every (scan_resistant_dense, boundary) combination this crate
+        // exercises must select the same eviction population the
+        // pre-migration free function did (still present as a thin delegate
+        // for this exact regression).
+        let boundaries = [
+            LazyWeightBoundary::MatMul,
+            LazyWeightBoundary::MatMulNBits,
+            LazyWeightBoundary::QMoe,
+        ];
+        for scan_resistant_dense in [false, true] {
+            for boundary in boundaries {
+                let old = eviction_for_boundary(scan_resistant_dense, boundary);
+                let new = CudaHotSetResidencyPolicy::from_env(scan_resistant_dense)
+                    .eviction_class(boundary);
+                let new_as_old: WeightEvictionPolicy = new.into();
+                assert_eq!(
+                    old, new_as_old,
+                    "policy disagrees with legacy eviction_for_boundary for \
+                     scan_resistant_dense={scan_resistant_dense} boundary={boundary:?}"
+                );
+                match boundary {
+                    LazyWeightBoundary::MatMul | LazyWeightBoundary::MatMulNBits
+                        if scan_resistant_dense =>
+                    {
+                        assert_eq!(new, EvictionClass::StableResident);
+                    }
+                    _ => assert_eq!(new, EvictionClass::Lru),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hot_set_policy_defaults_never_pin_matching_shipped_env() {
+        use onnx_runtime_ep_api::{AdmissionPolicyInput, ResidencyPolicy as _};
+
+        // No pin env vars set in this test process: both activation paths are
+        // `None`, so the policy must never recommend a pin, matching the
+        // shipped size-blind default exactly.
+        let policy = CudaHotSetResidencyPolicy {
+            scan_resistant_dense: true,
+            static_pin_keys: None,
+            static_pin_config: None,
+        };
+        assert!(!policy.should_pin(&AdmissionPolicyInput {
+            key: 7,
+            len_bytes: u64::MAX,
+            already_pinned: false,
+            pinned_bytes_used: 0,
+        }));
+    }
+
+    #[test]
+    fn hot_set_policy_pin_keys_take_priority_over_threshold() {
+        use onnx_runtime_ep_api::{AdmissionPolicyInput, ResidencyPolicy as _};
+
+        let mut keys = HashSet::new();
+        keys.insert(42u64);
+        let keys: &'static HashSet<u64> = Box::leak(Box::new(keys));
+        let policy = CudaHotSetResidencyPolicy {
+            scan_resistant_dense: false,
+            static_pin_keys: Some(keys),
+            // Threshold path would reject this tiny span; the explicit
+            // key allow-list must still win and admit it.
+            static_pin_config: Some((u64::MAX, u64::MAX)),
+        };
+        assert!(policy.should_pin(&AdmissionPolicyInput {
+            key: 42,
+            len_bytes: 1,
+            already_pinned: false,
+            pinned_bytes_used: 0,
+        }));
+        // A key outside the allow-list is never pinned even though the
+        // threshold path (if consulted) would have nothing to say either way.
+        assert!(!policy.should_pin(&AdmissionPolicyInput {
+            key: 43,
+            len_bytes: 1,
+            already_pinned: false,
+            pinned_bytes_used: 0,
+        }));
+        // Already pinned: never re-pin (idempotent, matches legacy `pin_this`).
+        assert!(!policy.should_pin(&AdmissionPolicyInput {
+            key: 42,
+            len_bytes: 1,
+            already_pinned: true,
+            pinned_bytes_used: 0,
+        }));
+    }
+
+    #[test]
+    fn hot_set_policy_threshold_path_respects_budget() {
+        use onnx_runtime_ep_api::{AdmissionPolicyInput, ResidencyPolicy as _};
+
+        let policy = CudaHotSetResidencyPolicy {
+            scan_resistant_dense: false,
+            static_pin_keys: None,
+            static_pin_config: Some((100, 250)),
+        };
+        // Below threshold: never pins regardless of budget headroom.
+        assert!(!policy.should_pin(&AdmissionPolicyInput {
+            key: 1,
+            len_bytes: 99,
+            already_pinned: false,
+            pinned_bytes_used: 0,
+        }));
+        // At/above threshold and within budget: pins.
+        assert!(policy.should_pin(&AdmissionPolicyInput {
+            key: 1,
+            len_bytes: 200,
+            already_pinned: false,
+            pinned_bytes_used: 0,
+        }));
+        // At/above threshold but would exceed budget: does not pin.
+        assert!(!policy.should_pin(&AdmissionPolicyInput {
+            key: 1,
+            len_bytes: 200,
+            already_pinned: false,
+            pinned_bytes_used: 100,
+        }));
+    }
+
+    #[test]
+    fn hot_set_policy_decide_delegates_to_whole_bank_default() {
+        use onnx_runtime_ep_api::{ResidencyDecision, ResidencyPolicy as _};
+
+        // This slice migrates eviction-class/pin admission only; per-expert
+        // placement is unchanged, so `decide()` must still produce the
+        // byte-identical whole-bank plan the default policy would.
+        let policy = CudaHotSetResidencyPolicy {
+            scan_resistant_dense: true,
+            static_pin_keys: None,
+            static_pin_config: None,
+        };
+        let layout = onnx_runtime_loader::ExpertTensorLayout {
+            version: 1,
+            experts: 3,
+            rows_per_expert: 2,
+            storage_elements_per_row: 4,
+            order: onnx_runtime_loader::ExpertStorageOrder::ExpertMajor,
+            quantization: Some(onnx_runtime_loader::ExpertQuantization {
+                bits: 4,
+                block_size: 16,
+                blocks_per_row: 1,
+            }),
+        };
+        let weight = onnx_runtime_ir::WeightRef::External {
+            path: std::path::PathBuf::from("/nonexistent/weights.bin"),
+            offset: 16,
+            length: layout.experts * layout.rows_per_expert * layout.storage_elements_per_row,
+            dtype: DataType::Uint8,
+            dims: vec![
+                layout.experts,
+                layout.rows_per_expert,
+                layout.storage_elements_per_row,
+            ],
+        };
+        let catalog = onnx_runtime_loader::WeightRegionCatalog::classify(&weight, layout);
+        let input = onnx_runtime_ep_api::ResidencyPolicyInput {
+            boundary: LazyWeightBoundary::QMoe,
+            catalog: &catalog,
+            budget_bytes: None,
+        };
+        assert_eq!(
+            policy.decide(&input),
+            ResidencyDecision::WholeBankResident { reason: None }
+        );
     }
 }
