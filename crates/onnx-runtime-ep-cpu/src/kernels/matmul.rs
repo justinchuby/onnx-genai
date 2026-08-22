@@ -5393,7 +5393,7 @@ mod tests {
         // comparison below is a real guard: it proves the first call populated
         // the cache and the second reused it (rather than repopulating).
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        let ptr_before = kernel.prepack.transposed_b_f16.get().unwrap().1.as_ptr();
+        let ptr_before = kernel.prepack.transposed_b_f16.get().unwrap().2.as_ptr();
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         let ptr_before = kernel.prepack.dense[1].filled().unwrap().as_ptr();
 
@@ -5407,7 +5407,7 @@ mod tests {
         // The pointer must be unchanged — the OnceLock was already populated.
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         assert_eq!(
-            kernel.prepack.transposed_b_f16.get().unwrap().1.as_ptr(),
+            kernel.prepack.transposed_b_f16.get().unwrap().2.as_ptr(),
             ptr_before,
             "transposed_b_f16 cache was reallocated on the second execute"
         );
