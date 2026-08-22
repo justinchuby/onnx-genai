@@ -200,6 +200,7 @@ fn assistant_speculative_contract_is_chained_pruned_and_rewindable() {
             logits_output,
             recurrent,
             folded_carry_output,
+            ..
         } => {
             assert_eq!(token_embedding_input, "inputs_embeds");
             assert_eq!(logits_output, "draft_logits");
@@ -394,6 +395,113 @@ fn a_target_hidden_context_must_be_a_proposer_input() {
                 && error.contains("not an input port")
         ),
         "expected a context-input-port error, got: {errors:?}"
+    );
+}
+
+/// The folded carry's carry_0 source is explicit: a `folded_carry_output`
+/// without a `folded_carry_seed` naming the target output that seeds it is
+/// rejected, so the runtime never infers "the target hidden output".
+#[test]
+fn a_folded_carry_requires_an_explicit_seed() {
+    let mutated = ASSISTANT.replace(
+        "    folded_carry_seed: {component: target, output: hidden}\n",
+        "",
+    );
+    assert_ne!(
+        mutated, ASSISTANT,
+        "the folded_carry_seed line must be present"
+    );
+    let metadata = serde_yaml::from_str::<InferenceMetadata>(&mutated).expect("mutated parses");
+    let errors = validate_metadata(&metadata).expect_err("a folded carry with no seed must fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("folded_carry_seed")),
+        "expected a missing-seed error, got: {errors:?}"
+    );
+}
+
+/// The seed must name a real target output: an unknown component or a port that
+/// is not an output of it is rejected.
+#[test]
+fn a_folded_carry_seed_must_name_a_real_target_output() {
+    let unknown_component = ASSISTANT.replace(
+        "folded_carry_seed: {component: target, output: hidden}",
+        "folded_carry_seed: {component: ghost, output: hidden}",
+    );
+    assert_ne!(
+        unknown_component, ASSISTANT,
+        "the seed line must be present"
+    );
+    let metadata =
+        serde_yaml::from_str::<InferenceMetadata>(&unknown_component).expect("mutated parses");
+    let errors =
+        validate_metadata(&metadata).expect_err("a seed on an unknown component must fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("folded_carry_seed component")
+                && error.contains("not a declared")),
+        "expected an unknown-seed-component error, got: {errors:?}"
+    );
+
+    let bad_output = ASSISTANT.replace(
+        "folded_carry_seed: {component: target, output: hidden}",
+        "folded_carry_seed: {component: target, output: not_an_output}",
+    );
+    let metadata = serde_yaml::from_str::<InferenceMetadata>(&bad_output).expect("mutated parses");
+    let errors = validate_metadata(&metadata).expect_err("a seed naming a non-output must fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("folded_carry_seed output")
+                && error.contains("not an output port")),
+        "expected a seed-output-port error, got: {errors:?}"
+    );
+}
+
+/// The embedding source is explicit: a `folded_carry_output` without a
+/// `token_embedding` naming where `embed(last_token)` is gathered is rejected,
+/// so the runtime never extracts an in-model initializer heuristically.
+#[test]
+fn a_folded_carry_requires_an_explicit_token_embedding() {
+    let mutated = ASSISTANT.replace(
+        "    token_embedding: {component: target, table: model.embed_tokens.weight}\n",
+        "",
+    );
+    assert_ne!(
+        mutated, ASSISTANT,
+        "the token_embedding line must be present"
+    );
+    let metadata = serde_yaml::from_str::<InferenceMetadata>(&mutated).expect("mutated parses");
+    let errors =
+        validate_metadata(&metadata).expect_err("a folded carry with no token_embedding must fail");
+    assert!(
+        errors.iter().any(|error| error.contains("token_embedding")),
+        "expected a missing-embedding error, got: {errors:?}"
+    );
+}
+
+/// The embedding source must name a real component.
+#[test]
+fn a_token_embedding_must_name_a_real_component() {
+    let mutated = ASSISTANT.replace(
+        "token_embedding: {component: target, table: model.embed_tokens.weight}",
+        "token_embedding: {component: ghost, table: model.embed_tokens.weight}",
+    );
+    assert_ne!(
+        mutated, ASSISTANT,
+        "the token_embedding line must be present"
+    );
+    let metadata = serde_yaml::from_str::<InferenceMetadata>(&mutated).expect("mutated parses");
+    let errors = validate_metadata(&metadata)
+        .expect_err("a token_embedding on an unknown component must fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("token_embedding component")
+                && error.contains("not a declared")),
+        "expected an unknown-embedding-component error, got: {errors:?}"
     );
 }
 

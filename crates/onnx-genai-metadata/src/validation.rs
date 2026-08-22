@@ -2380,6 +2380,8 @@ fn validate_speculative_rollback(metadata: &InferenceMetadata, errors: &mut Vec<
         logits_output,
         recurrent,
         folded_carry_output,
+        folded_carry_seed,
+        token_embedding,
     } = &speculative.proposal_execution
         && let Some(proposer) = workflow.components.get(&speculative.proposer)
     {
@@ -2413,17 +2415,18 @@ fn validate_speculative_rollback(metadata: &InferenceMetadata, errors: &mut Vec<
                 speculative.proposer
             ));
         }
-        // A folded carry has no input port and no workflow state cell: its only
-        // anchor is the first-step target context named by
-        // `port_bindings.target_hidden_context`. Without that binding the runtime
-        // has no seed for the fused input, so a folded_carry_output is
-        // underspecified — reject it fail-closed. When present, the context must
-        // name the proposer input port the carry re-enters through.
+        // A folded carry is pinned by three explicit ports so a runtime never
+        // infers by convention: the DESTINATION it lands in
+        // (`port_bindings.target_hidden_context`, a proposer input port), the
+        // carry_0 SOURCE (`folded_carry_seed`, a target output), and the
+        // embedding table for the fused input's leading half (`token_embedding`).
+        // Each is required when a folded carry is declared.
         if folded_carry_output.is_some() {
             match speculative.port_bindings.get("target_hidden_context") {
                 None => errors.push(
                     "speculative chained proposal declares a folded_carry_output but no \
-                     port_bindings.target_hidden_context to seed the first-step carry"
+                     port_bindings.target_hidden_context naming the destination proposer input \
+                     port the carry lands in"
                         .to_string(),
                 ),
                 Some(context_port) => {
@@ -2432,6 +2435,45 @@ fn validate_speculative_rollback(metadata: &InferenceMetadata, errors: &mut Vec<
                             "speculative port_bindings.target_hidden_context '{context_port}' is \
                              not an input port of proposer component '{}'",
                             speculative.proposer
+                        ));
+                    }
+                }
+            }
+            match folded_carry_seed {
+                None => errors.push(
+                    "speculative chained proposal declares a folded_carry_output but no \
+                     folded_carry_seed naming the target output that seeds carry_0"
+                        .to_string(),
+                ),
+                Some(seed) => match workflow.components.get(&seed.component) {
+                    None => errors.push(format!(
+                        "speculative folded_carry_seed component '{}' is not a declared workflow \
+                         component",
+                        seed.component
+                    )),
+                    Some(seed_component) => {
+                        if !seed_component.ports.outputs.contains_key(&seed.output) {
+                            errors.push(format!(
+                                "speculative folded_carry_seed output '{}' is not an output port \
+                                 of component '{}'",
+                                seed.output, seed.component
+                            ));
+                        }
+                    }
+                },
+            }
+            match token_embedding {
+                None => errors.push(
+                    "speculative chained proposal declares a folded_carry_output but no \
+                     token_embedding naming where embed(last_token) is gathered from"
+                        .to_string(),
+                ),
+                Some(embedding) => {
+                    if !workflow.components.contains_key(&embedding.component) {
+                        errors.push(format!(
+                            "speculative token_embedding component '{}' is not a declared \
+                             workflow component",
+                            embedding.component
                         ));
                     }
                 }

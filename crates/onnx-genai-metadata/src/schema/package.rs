@@ -425,24 +425,78 @@ pub enum SpeculativeProposalExecution {
         /// through its own input port.
         #[serde(default)]
         recurrent: Vec<SpeculativeRecurrenceBinding>,
-        /// A loop-carried activation the proposer emits but re-consumes WITHOUT
-        /// a separate input port: it re-enters as the trailing segment of
-        /// `token_embedding_input`. The proposer's fused input is
-        /// `concat(token_embedding, carry)`, so the carry has no port and no
-        /// workflow state cell of its own. Before the proposer has produced a
-        /// carry the fold is seeded by the target's own per-token hidden output
-        /// (carry_0); `port_bindings.target_hidden_context` names the proposer
-        /// INPUT PORT that seed — and every later carry — re-enters through (for
-        /// a folded carry that port is the fused `token_embedding_input` itself,
-        /// and the carry occupies its trailing half). It is a destination port,
-        /// NOT the source value. Each step then replaces the carry with this
-        /// output. Because a folded carry is recomputed from committed tokens on
+        /// Proposer OUTPUT port producing the folded carry for the NEXT step
+        /// (carry_k, k>=1). The carry has no dedicated input port: it re-enters
+        /// as the trailing segment of the proposer's fused
+        /// `token_embedding_input` (`concat(embed(last_token), carry)`), so it
+        /// owns no workflow state cell. Three ports pin the fold EXPLICITLY, so
+        /// a runtime never infers by convention:
+        ///   * DESTINATION: `port_bindings.target_hidden_context` names the
+        ///     proposer input port the carry lands in (for a folded carry, the
+        ///     fused `token_embedding_input` itself; its trailing half).
+        ///   * carry_0 SOURCE: `folded_carry_seed` names the target output read
+        ///     as the carry on the first step.
+        ///   * carry_k SOURCE: this field, the proposer output on every later
+        ///     step.
+        /// Because a folded carry is recomputed from committed tokens on
         /// rejection rather than restored, it does not appear in
         /// `rollback_state`. A chained proposer declares at least one of
         /// `recurrent` or `folded_carry_output`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         folded_carry_output: Option<String>,
+        /// carry_0 seed: the target component OUTPUT read as the folded carry on
+        /// the FIRST step, before the proposer has produced a carry. Named
+        /// explicitly (`component` + `output`) so a runtime reads it rather than
+        /// inferring "the target hidden output" by convention. Required whenever
+        /// `folded_carry_output` is present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folded_carry_seed: Option<SpeculativeValueRef>,
+        /// Where a runtime obtains `embed(last_token)` for the LEADING half of
+        /// the fused `token_embedding_input`. A folded-carry proposer graph
+        /// consumes only the fused input, so it reads no embedding initializer of
+        /// its own and `speculative.shared_weights` stays empty; this names the
+        /// model-agnostic embedding table the runtime gathers the leading half
+        /// from (never extracted heuristically from a graph). Required whenever
+        /// `folded_carry_output` is present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token_embedding: Option<TokenEmbeddingSource>,
     },
+}
+
+/// An explicit reference to a value a workflow component produces.
+///
+/// Both halves are named so a speculative runtime resolves the value from the
+/// declared graph I/O, never by string convention or shape guessing.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SpeculativeValueRef {
+    /// The workflow component that produces the value.
+    #[schemars(length(min = 1))]
+    pub component: String,
+    /// The declared output port of that component carrying the value.
+    #[schemars(length(min = 1))]
+    pub output: String,
+}
+
+/// Explicit, model-agnostic source of the token embedding a chained proposer
+/// folds into the leading half of its fused input.
+///
+/// A folded-carry proposer never reads an embedding initializer inside its own
+/// graph, so the table cannot be recovered from the proposer graph. This names
+/// the component whose embedding the runtime reuses and the initializer that
+/// holds it, so gathering `embed(last_token)` is a declared contract rather than
+/// a per-model heuristic.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TokenEmbeddingSource {
+    /// The workflow component whose token-embedding table is reused (e.g. the
+    /// target, whose vocabulary the proposer shares).
+    #[schemars(length(min = 1))]
+    pub component: String,
+    /// The named embedding table (graph initializer) on that component, e.g.
+    /// `model.embed_tokens.weight`. A `[vocab, hidden]` row-major matrix.
+    #[schemars(length(min = 1))]
+    pub table: String,
 }
 
 /// One loop-carried proposer value in a chained proposal.

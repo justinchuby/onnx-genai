@@ -289,6 +289,12 @@ speculative:
     # fused `inputs_embeds`), not the source value. The carry has no workflow
     # state cell and is recomputed on rejection, so it is not in `rollback_state`.
     folded_carry_output: next_projected_state
+    # carry_0 SOURCE: the target output read as the fold's first-step seed
+    # (role-tagged hidden_states above), named explicitly so it is not inferred.
+    folded_carry_seed: {component: target, output: hidden}
+    # embed(last_token) for the fused input's LEADING half: the drafter graph
+    # reads only inputs_embeds, so name the target embedding table explicitly.
+    token_embedding: {component: target, table: model.embed_tokens.weight}
   port_bindings:
     # Destination proposer input port carry_0 (and every later carry) re-enters
     # through; for a folded carry this is the fused token_embedding_input itself.
