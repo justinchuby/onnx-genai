@@ -123,9 +123,152 @@ test("diagnostics identify missing image value range without claiming schema val
 });
 
 test("HTML exposes all purpose-built views and user actions", () => {
-  for (const text of ["Document & capabilities", "Model, package & execution", "Workflow DAG / control flow",
+  for (const text of ["Document & capabilities", "Model, package & execution", "Workflow control-flow graph",
     "Nested loop & conditional timeline", "Serving state groups & K/V aliases", "Preprocessing, tokenizer & media",
     "Policy component help", "Adapters, speculative execution & deployment", "Export JSON", "Print", "Reset"]) {
     assert.ok(html.includes(text), text);
   }
+});
+
+// --- Blocker 1: Mermaid labels must never let metadata inject graph/HTML syntax.
+const decodeMermaidLabel = quoted => {
+  assert.match(quoted, /^"(?:#\d+;)*"$/, `label is not pure numeric entities: ${quoted}`);
+  const inner = quoted.slice(1, -1);
+  const codes = inner ? inner.split(";").filter(Boolean).map(t => Number(t.slice(1))) : [];
+  return String.fromCodePoint(...codes);
+};
+
+test("mermaidText encodes every character as a numeric entity and round-trips for display", () => {
+  const adversarial = [
+    'A] --> Evil[pwn]',            // bracket + edge-arrow node injection
+    'a{b}c|d',                     // rhombus braces + edge-label pipe
+    'q"uote and ; semicolon',      // string break-out + statement separator
+    "line1\nline2\ttab",           // newline / tab control characters
+    '<img src=x onerror=alert(1)>',// HTML event handler
+    '<script>globalThis.pwned=1</script>', // script element
+    'javascript:alert(1)',         // dangerous URL scheme
+    'A & B --- C ==> D',           // ampersand + open/thick links
+    'id@{shape: rect}',            // Mermaid @-metadata syntax
+    'héllo · 世界 · 😀 · \u202Ereversed', // Unicode incl. astral + bidi control
+  ];
+  for (const payload of adversarial) {
+    const label = H.mermaidText(payload);
+    // Only viewer-generated digits/#/; survive; no metadata glyph reaches Mermaid.
+    assert.match(label, /^"(?:#\d+;)*"$/, payload);
+    assert.doesNotMatch(label.slice(1, -1), /[\[\]{}()|<>&"`]/, payload);
+    assert.doesNotMatch(label, /-->|---|==>|javascript:|onerror|<script|<img|alert/i, payload);
+    // Display is preserved: decoding reproduces the whitespace-collapsed text.
+    const expected = payload.replace(/\s+/g, " ").trim();
+    assert.equal(decodeMermaidLabel(label), expected, payload);
+  }
+  // Empty / nullish labels degrade to a safe placeholder, still fully encoded.
+  assert.equal(decodeMermaidLabel(H.mermaidText("")), "unnamed");
+  assert.equal(decodeMermaidLabel(H.mermaidText(null)), "unnamed");
+});
+
+test("adversarial workflow labels inject no Mermaid nodes, edges, or markup", () => {
+  const payload = 'X"] --> pwned[bad]{q}|e; <img src=x onerror=alert(1)> A-->B';
+  const value = H.parseMetadata(JSON.stringify({
+    schema_version: "v1",
+    pipeline: {workflow: {steps: [{kind: "invoke", component: payload}]}},
+  }));
+  const graph = H.workflowGraph(value);
+  // A single declared step must yield exactly one node and zero edges.
+  assert.equal(graph.nodes.length, 1);
+  assert.equal(graph.edges.length, 0);
+  const src = H.buildMermaid(value);
+  assert.match(src, /^flowchart TD/);
+  // Exactly one node line, no viewer or injected edge lines.
+  assert.equal(src.split("\n").filter(l => /-->/.test(l)).length, 0);
+  assert.doesNotMatch(src, /pwned|onerror|<img|alert\(1\)|javascript:/i);
+  // The only bracket/brace/pipe characters are the viewer-built node wrapper.
+  const nodeLine = src.split("\n").find(l => /^\s*s0/.test(l));
+  const label = nodeLine.match(/^\s*s0\[("(?:#\d+;)*")\]$/);
+  assert.ok(label, nodeLine);
+  assert.equal(decodeMermaidLabel(label[1]), '1. invoke · ' + payload);
+});
+
+// --- Blocker 2: structured control-flow graph with correct edges, not a linear chain.
+const nodeId = (graph, titleSubstring) => {
+  const found = graph.nodes.filter(n => n.title.includes(titleSubstring));
+  assert.equal(found.length, 1, `expected exactly one node containing ${titleSubstring}`);
+  return found[0].id;
+};
+const hasEdge = (graph, from, to, label) =>
+  graph.edges.some(e => e.from === from && e.to === to && (e.label ?? null) === (label ?? null));
+
+test("conditional steps emit then/else branch edges that rejoin the following step", () => {
+  const value = H.parseMetadata(`schema_version: v1
+pipeline:
+  workflow:
+    steps:
+      - kind: conditional
+        then:
+          - {kind: invoke, component: ThenComponent}
+        else:
+          - {kind: invoke, component: ElseComponent}
+      - {kind: invoke, component: AfterComponent}
+`);
+  const g = H.workflowGraph(value);
+  const cond = nodeId(g, "conditional");
+  const thenN = nodeId(g, "ThenComponent");
+  const elseN = nodeId(g, "ElseComponent");
+  const after = nodeId(g, "AfterComponent");
+  // Decision fans out to both arms, and both arms converge on the next sibling.
+  assert.ok(hasEdge(g, cond, thenN, "then"));
+  assert.ok(hasEdge(g, cond, elseN, "else"));
+  assert.ok(hasEdge(g, thenN, after, null));
+  assert.ok(hasEdge(g, elseN, after, null));
+  // No misleading straight-line chain: the decision never links directly to next.
+  assert.ok(!hasEdge(g, cond, after, null));
+  assert.equal(g.edges.length, 4);
+});
+
+test("on_true/on_false conditionals branch and an absent arm falls through", () => {
+  const value = H.parseMetadata(`schema_version: v1
+pipeline:
+  workflow:
+    steps:
+      - kind: if
+        on_true:
+          - {kind: invoke, component: TrueBranch}
+      - {kind: invoke, component: JoinComponent}
+`);
+  const g = H.workflowGraph(value);
+  const cond = nodeId(g, "1. if");
+  const truth = nodeId(g, "TrueBranch");
+  const join = nodeId(g, "JoinComponent");
+  assert.ok(hasEdge(g, cond, truth, "on_true"));
+  assert.ok(hasEdge(g, truth, join, null));
+  // The missing false arm falls through directly to the join step, labelled "else".
+  assert.ok(hasEdge(g, cond, join, "else"));
+  assert.equal(g.edges.length, 3);
+});
+
+test("loop steps emit body, back-edge, and exit edges around the loop node", () => {
+  const value = H.parseMetadata(`schema_version: v1
+pipeline:
+  workflow:
+    steps:
+      - kind: loop
+        setup:
+          - {kind: invoke, component: InitComponent}
+        steps:
+          - {kind: invoke, component: BodyComponent}
+      - {kind: invoke, component: ExitComponent}
+`);
+  const g = H.workflowGraph(value);
+  const loop = nodeId(g, "1. loop");
+  const init = nodeId(g, "InitComponent");
+  const body = nodeId(g, "BodyComponent");
+  const exit = nodeId(g, "ExitComponent");
+  // Setup runs once into the loop; body carries a back-edge; exit leaves the loop.
+  assert.equal(g.entry, init);
+  assert.ok(hasEdge(g, init, loop, null));
+  assert.ok(hasEdge(g, loop, body, "body"));
+  assert.ok(hasEdge(g, body, loop, "repeat"));
+  assert.ok(hasEdge(g, loop, exit, "exit"));
+  // The loop must not be flattened into a straight line through its body.
+  assert.ok(!hasEdge(g, body, exit, null));
+  assert.equal(g.edges.length, 4);
 });

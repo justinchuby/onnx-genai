@@ -1,0 +1,54 @@
+name: Visualizer test
+
+# The main CI workflow classifies an examples/tests-only change as docs_only
+# (or simply never compiles a browser HTML file) and runs no check against the
+# offline inference-metadata visualizer. That leaves its security and leaf-
+# accounting guarantees -- pinned Mermaid CDN/SRI/CSP, no metadata-driven
+# Mermaid syntax, entity-encoded labels, structured control-flow edges, and
+# 100% metadata leaf coverage -- enforced only by a test nobody runs. This job
+# runs that test so those invariants cannot regress unnoticed.
+
+on:
+  pull_request:
+    paths:
+      - "examples/inference_metadata/visualizer.html"
+      - "tests/inference_metadata_visualizer_test.mjs"
+      - "tests/fixtures/**/inference_metadata.yaml"
+      - ".github/workflows/visualizer-test.yml"
+  push:
+    branches: [main]
+    paths:
+      - "examples/inference_metadata/visualizer.html"
+      - "tests/inference_metadata_visualizer_test.mjs"
+      - "tests/fixtures/**/inference_metadata.yaml"
+      - ".github/workflows/visualizer-test.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  node-test:
+    name: Node security and leaf-accounting tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # No install step: the test uses only the Node standard library
+      # (node:test, node:assert, node:fs, node:vm) and the js-yaml/visualizer
+      # code embedded in the page, so there is nothing to fetch or build.
+      - name: Run visualizer tests
+        run: node --test tests/inference_metadata_visualizer_test.mjs
+
+      # Guard against stray whitespace / leftover conflict markers in the
+      # tracked visualizer sources, matching the PR's own diff check.
+      - name: Whitespace and conflict-marker check
+        run: git diff --check "$(git hash-object -t tree /dev/null)" HEAD -- examples/inference_metadata/visualizer.html tests/inference_metadata_visualizer_test.mjs

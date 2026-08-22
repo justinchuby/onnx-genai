@@ -76,11 +76,71 @@
     (Array.isArray(steps)?steps:[]).forEach((step,index)=>{if(!isObj(step))return;const item={step,index,parent,depth:parent?parent.depth+1:0};out.push(item);if(Array.isArray(step.setup))flattenSteps(step.setup,out,item);if(Array.isArray(step.steps))flattenSteps(step.steps,out,item);for(const k of ["then","else","body","on_true","on_false"])if(Array.isArray(step[k]))flattenSteps(step[k],out,item)});
     return out;
   }
-  function stepTitle(step,index){const kind=safeLabel(step.kind||"step");const target=step.component||step.output||step.cell||step.value||"";return (index+1)+". "+kind+(target?" · "+safeLabel(target):"")}
+  function stepTitle(step,index){const kind=String(step.kind||"step");const target=step.component||step.output||step.cell||step.value||"";return (index+1)+". "+kind+(target?" · "+String(target):"")}
+  // Mermaid label safety: every metadata code point is emitted as a numeric
+  // HTML entity (#<codepoint>;) inside a double-quoted label. No raw metadata
+  // character ever reaches the Mermaid grammar, so brackets, edge arrows
+  // (-->), quotes, braces, pipes, ampersands, semicolons, HTML tags, newlines,
+  // and arbitrary Unicode cannot inject nodes, edges, or markup. Mermaid decodes
+  // the entities back to the original glyphs at render time, so display is exact.
+  const BRANCH_KINDS=new Set(["conditional","if","branch","switch","select","case"]);
+  const LOOP_KINDS=new Set(["loop","while","for","repeat","foreach","until"]);
+  function stepShapeKind(kind){return BRANCH_KINDS.has(kind)?"branch":LOOP_KINDS.has(kind)?"loop":"step"}
+  function mermaidText(value,max=80){
+    const collapsed=String(value??"").replace(/\s+/g," ").trim()||"unnamed";
+    let out="",count=0;
+    for(const ch of collapsed){if(count++>=max)break;out+="#"+ch.codePointAt(0)+";"}
+    return '"'+out+'"';
+  }
+  // Structured control-flow graph. Instead of chaining the depth-first step list
+  // into a single misleading line, this walks the workflow recursively and emits
+  // semantically correct edges: sequential fall-through, conditional then/else
+  // (and on_true/on_false) arms that rejoin the following step, and loops whose
+  // body carries a back-edge to the loop node plus a labelled exit edge. Because
+  // loops introduce back-edges, the result is a control-flow graph, not a DAG.
+  function workflowGraph(d){
+    const w=workflowOf(d),nodes=[],edges=[],seenEdge=new Set();
+    let counter=0;
+    const add=(title,kind)=>{const id="s"+(counter++);nodes.push({id,title,kind});return id};
+    const link=(from,to,label)=>{if(!from||!to)return;const key=from+"\u0000"+to+"\u0000"+(label||"");if(seenEdge.has(key))return;seenEdge.add(key);edges.push({from,to,label:label||null})};
+    const armsOf=step=>{const out=[];for(const [key,label] of [["then","then"],["on_true","on_true"],["else","else"],["on_false","on_false"]])if(Array.isArray(step[key]))out.push({label,steps:step[key]});return out};
+    function sequence(steps){
+      const arr=(Array.isArray(steps)?steps:[]).filter(isObj);
+      let entry=null,exits=[];
+      arr.forEach((step,index)=>{const node=renderStep(step,index);if(!node)return;if(!entry)entry=node.entry;for(const e of exits)link(e.id,node.entry,e.label);exits=node.exits});
+      return {entry,exits,empty:!entry};
+    }
+    function renderStep(step,index){
+      const kind=String(step.kind||"step"),shape=stepShapeKind(kind),id=add(stepTitle(step,index),shape);
+      if(shape==="loop"){
+        const before=sequence(step.setup),body=sequence(step.steps||step.body||step.loop||step.do);
+        if(body.empty)link(id,id,"repeat");
+        else{link(id,body.entry,"body");for(const e of body.exits)link(e.id,id,e.label||"repeat")}
+        if(before.empty)return {entry:id,exits:[{id,label:"exit"}]};
+        for(const e of before.exits)link(e.id,id,e.label);
+        return {entry:before.entry,exits:[{id,label:"exit"}]};
+      }
+      if(shape==="branch"){
+        const arms=armsOf(step);if(!arms.length)return {entry:id,exits:[{id}]};
+        const exits=[];let hasThen=false,hasElse=false;
+        for(const arm of arms){const side=arm.label==="then"||arm.label==="on_true"?"then":"else";if(side==="then")hasThen=true;else hasElse=true;const seq=sequence(arm.steps);if(seq.empty){exits.push({id,label:arm.label});continue}link(id,seq.entry,arm.label);for(const e of seq.exits)exits.push(e)}
+        if(hasThen&&!hasElse)exits.push({id,label:"else"});
+        if(hasElse&&!hasThen)exits.push({id,label:"then"});
+        return {entry:id,exits};
+      }
+      const nested=[];if(Array.isArray(step.setup))nested.push(...step.setup);if(Array.isArray(step.steps))nested.push(...step.steps);
+      if(nested.length){const seq=sequence(nested);if(!seq.empty){link(id,seq.entry,"steps");return {entry:id,exits:seq.exits}}}
+      return {entry:id,exits:[{id}]};
+    }
+    const top=sequence(w&&w.steps);
+    return {nodes,edges,entry:top.entry,empty:top.empty};
+  }
   function buildMermaid(d){
-    const w=workflowOf(d),flat=flattenSteps(w&&w.steps),lines=["flowchart TD"],ids=[];
-    flat.forEach((x,i)=>{const id=stableId("step:"+i+":"+stepTitle(x.step,x.index));ids.push(id);const shape=["loop","while","conditional","if"].includes(String(x.step.kind))?`{${safeLabel(stepTitle(x.step,x.index))}}`:`[${safeLabel(stepTitle(x.step,x.index))}]`;lines.push("  "+id+shape);if(i)lines.push("  "+ids[i-1]+" --> "+id)});
-    if(!flat.length)lines.push("  empty[No workflow steps declared]");
+    const g=workflowGraph(d),lines=["flowchart TD"];
+    if(g.empty){lines.push('  empty['+mermaidText("No workflow steps declared")+"]");return lines.join("\n")}
+    for(const n of g.nodes){const label=mermaidText(n.title);lines.push("  "+n.id+(n.kind==="branch"?"{"+label+"}":n.kind==="loop"?"{{"+label+"}}":"["+label+"]"))}
+    // Edge labels are a fixed viewer vocabulary ([a-z_]+); they never contain metadata.
+    for(const e of g.edges)lines.push("  "+e.from+(e.label?" -->|"+e.label+"| ":" --> ")+e.to);
     return lines.join("\n");
   }
   function kvLayers(d){
@@ -105,7 +165,7 @@
     const has=s=>paths.some(p=>p.includes(s));
     return {workflow:w,components,leaves,steps:flattenSteps(w?.steps),kv:kvLayers(d),adapters:d.adapters||null,speculative:d.speculative||null,preprocessing:d.preprocessing||null,package:d.package||null,generation:d.generation||null,model:d.model||null,features:{loops:flattenSteps(w?.steps).some(x=>/loop|while|conditional|if/.test(x.step.kind||"")),adapters:has("adapter"),media:has("image")||has("audio")||has("media"),speculative:has("specul")||has("rollback"),distributed:has("distributed")||has("shard"),quantization:has("quant"),hardware:has("hardware")||has("execution_provider"),profiles:has("profile")}};
   }
-  root.VisualizerHelpers={parseMetadata,enumerateLeaves,stableId,safeLabel,workflowOf,flattenSteps,buildMermaid,kvLayers,diagnostics,featureSummary,pathKey,isObj,own};
+  root.VisualizerHelpers={parseMetadata,enumerateLeaves,stableId,safeLabel,mermaidText,workflowOf,flattenSteps,workflowGraph,buildMermaid,kvLayers,diagnostics,featureSummary,pathKey,isObj,own};
 })(typeof globalThis!=="undefined"?globalThis:this);
 </script>
 <script>
@@ -202,7 +262,7 @@ future_extension: {enabled: false, zero: 0, nothing: null, empty_text: "", empty
     root.append(section("Inputs, outputs & roles","Request/package sources, tensor contracts, required/default values, output roles and stages.",io));
     const cards=el("div",{class:"grid"});for(const [name,c] of Object.entries(f.components)){const card=el("article",{class:"card"},el("div",{class:"eyebrow"},c?.implementation?.kind||"unspecified implementation"),el("h3",{},name),objectCard("Implementation",c?.implementation||{}),el("div",{class:"ports"},el("div",{},el("h4",{},"Inputs"),portList(c?.ports?.inputs)),el("div",{},el("h4",{},"Outputs"),portList(c?.ports?.outputs))));if(c?.ports?.roles)card.append(objectCard("Roles",c.ports.roles));cards.append(card)}if(!cards.children.length)cards.append(objectCard("Components","No workflow components declared."));
     root.append(section("Components & implementation kind","Executable units, ABI/artifact identity, port geometry, and semantic roles.",cards));
-    const flow=el("div",{class:"flow","aria-label":"Workflow directed graph"});root.append(section("Workflow DAG / control flow","Mermaid 11.12.0 renders only viewer-generated syntax from sanitized structural labels.",flow));renderGraph(flow);
+    const flow=el("div",{class:"flow","aria-label":"Workflow control-flow graph"});root.append(section("Workflow control-flow graph","Mermaid 11.12.0 renders a viewer-built control-flow graph (sequential, conditional then/else, and looping back-edges) whose labels are numeric-entity encoded, so metadata cannot inject graph syntax. Back-edges mean this is a control-flow graph, not a DAG.",flow));renderGraph(flow);
     root.append(section("Nested loop & conditional timeline","Recursive setup/body/branch steps preserve the declared control-flow nesting.",timeline(f.workflow?.steps)));
   }
   function renderState(f){
