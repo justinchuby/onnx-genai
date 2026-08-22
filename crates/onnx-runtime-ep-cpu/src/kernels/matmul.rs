@@ -533,8 +533,17 @@ fn node_matmul_dense_cache_bytes(node: &Node, graph: &Graph) -> u64 {
     // is accounted separately. FusedMatMulBias is included because the optimiser
     // may already have fused a `MatMul + Add` before this predictor runs, and it
     // holds the identical `dense` cache.
-    if !node.is_default_domain() || (node.op_type != "MatMul" && node.op_type != "FusedMatMulBias")
-    {
+    //
+    // `MatMul` ships in the default domain; `FusedMatMulBias` ships in the
+    // optimizer's contrib domain (`com.microsoft`). A blanket
+    // `!node.is_default_domain()` bail would silently zero every
+    // `FusedMatMulBias` node here exactly as it once did in
+    // `node_weight_transpose_cache_bytes` (#1702) — the very defect that
+    // predictor's fix removed. Each op is gated to the domain it actually
+    // ships in instead of one shared domain check.
+    let is_matmul = node.op_type == "MatMul" && node.is_default_domain();
+    let is_fused_bias = node.op_type == "FusedMatMulBias" && node.domain == "com.microsoft";
+    if !is_matmul && !is_fused_bias {
         return 0;
     }
     let mut total = 0_u64;
@@ -3763,6 +3772,57 @@ mod tests {
             matmul_dense_cache_predicted_bytes(&dense_matmul_graph(k, n, DataType::Float16, false)),
             0,
             "a non-constant operand is never memoised as a weight"
+        );
+    }
+
+    /// Mutation guard: `FusedMatMulBias` ships in the optimizer's
+    /// `com.microsoft` domain, never the default domain. A predictor gated on
+    /// `node.is_default_domain()` alone silently zeros every fused node here —
+    /// the exact defect #1702 fixed in `node_weight_transpose_cache_bytes` but
+    /// which this predictor still carried until this test caught it. `MatMul`
+    /// (default domain) and `FusedMatMulBias` (`com.microsoft`) with identical
+    /// geometry must be budgeted identically.
+    #[test]
+    fn fused_matmul_bias_dense_cache_is_budgeted_in_its_shipping_domain() {
+        use onnx_runtime_ir::{NodeId, TensorData, WeightRef, static_shape};
+        let (k, n) = (10usize, 7usize);
+
+        let matmul_bytes =
+            matmul_dense_cache_predicted_bytes(&dense_matmul_graph(k, n, DataType::Float16, true));
+        assert_ne!(matmul_bytes, 0, "sanity: MatMul itself must be budgeted");
+
+        let mut graph = Graph::new();
+        let a = graph.create_named_value("A", DataType::Float32, static_shape([1, k]));
+        let b = graph.create_named_value("B", DataType::Float16, static_shape([k, n]));
+        let bias = graph.create_named_value("C", DataType::Float32, static_shape([n]));
+        let y = graph.create_named_value("Y", DataType::Float32, static_shape([1, n]));
+        graph.add_input(a);
+        graph.add_input(b);
+        graph.add_input(bias);
+        let mut node = Node::new(
+            NodeId(0),
+            "FusedMatMulBias",
+            vec![Some(a), Some(b), Some(bias)],
+            vec![y],
+        );
+        node.domain = "com.microsoft".to_string();
+        graph.insert_node(node);
+        graph.add_output(y);
+        graph.set_initializer(
+            b,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float16,
+                vec![k, n],
+                vec![0u8; k * n * 2],
+            )),
+        );
+
+        let fused_bytes = matmul_dense_cache_predicted_bytes(&graph);
+        assert_eq!(
+            fused_bytes, matmul_bytes,
+            "FusedMatMulBias must be budgeted exactly like MatMul in its \
+             shipping (`com.microsoft`) domain -- a 0 here means the domain \
+             gate silently excludes every fused node again"
         );
     }
 

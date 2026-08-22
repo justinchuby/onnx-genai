@@ -2186,14 +2186,23 @@ Live reconciliation (`retained_transpose_bytes_are_bytes_the_plan_predicted`)
 closes the loop from the executing kernel's side, so the predictor and the
 kernel cannot agree on a number neither produces.
 
-### Honest limits
+### Honest limits (updated after Opus review)
 
-* `node_matmul_dense_cache_bytes` still counts `FusedMatMulBias` at
-  `4 * numel * MATMUL_DENSE_DECODE_INSTANTIATIONS`. After this change the decode
-  path no longer fills it, so on a decode-only workload that is now an
-  **over**-prediction. Over-budgeting is the #1056-mandated safe direction and
-  prefill still fills it, so it is left alone deliberately rather than tightened
-  on a guess; it is recorded here so the next person does not rediscover it.
+* `node_matmul_dense_cache_bytes` had a second, independent instance of the
+  same domain-gate defect #1702 fixed in `node_weight_transpose_cache_bytes`:
+  its blanket `!node.is_default_domain()` bail silently zeroed every
+  `FusedMatMulBias` node (which always ships in `com.microsoft`), so it was an
+  **under**-prediction, not the over-prediction this section originally
+  claimed. Fixed by gating each op to the domain it actually ships in
+  (`node.op_type == "MatMul" && node.is_default_domain()` /
+  `node.op_type == "FusedMatMulBias" && node.domain == "com.microsoft"`), with
+  `fused_matmul_bias_dense_cache_is_budgeted_in_its_shipping_domain` guarding
+  the regression. With that fixed, the predictor now counts `FusedMatMulBias`
+  at `4 * numel * MATMUL_DENSE_DECODE_INSTANTIATIONS` as documented; since the
+  decode path no longer fills that cache (it takes `try_half_decode_gemv`
+  instead), this is now correctly an **over**-prediction on decode-only
+  workloads — the #1056-mandated safe direction — and prefill still fills it,
+  so it is left alone deliberately rather than tightened on a guess.
 * The `after/MatMul` ratios include two cells at 0.89x and 1.04x-1.09x on the
   smallest shapes, where absolute times are 20-30 microseconds and run-to-run
   noise exceeds the difference. Parity is claimed on the model-shaped rows
