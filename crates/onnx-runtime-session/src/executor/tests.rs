@@ -8352,3 +8352,125 @@ fn weight_derived_caches_are_cleared_before_their_buffers_are_freed() {
         );
     }
 }
+
+#[test]
+fn qmoe_residency_plan_default_policy_matches_whole_bank_resident_for_pageable_candidates() {
+    let (graph, weights, _path) = qmoe_expert_region_fixture();
+    let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let ep = WeightDeliveryEp::new(true, deliveries);
+    let executor = Executor::build(graph, weights, Arc::new(ep)).unwrap();
+
+    let plan = executor.residency_plan();
+    let candidates = executor.expert_region_candidates();
+    assert_eq!(plan.policy_name(), "whole_bank_resident");
+    // Same cardinality as the expert region candidates: the plan covers
+    // exactly the values that have a QMoE catalog, no more, no fewer.
+    assert_eq!(plan.len(), candidates.len());
+    assert_eq!(plan.resident_count(), plan.len());
+    assert_eq!(plan.degraded_count(), 0);
+    for value in candidates.keys() {
+        assert_eq!(
+            plan.decision(*value),
+            Some(&onnx_runtime_ep_api::ResidencyDecision::WholeBankResident { reason: None })
+        );
+    }
+
+    // Existing behavior fully unchanged: still one lazy handle per
+    // initializer, each with exactly one region.
+    assert_eq!(executor.weight_handles.len(), 2);
+}
+
+#[test]
+fn qmoe_residency_plan_surfaces_non_pageable_reason_without_changing_handles() {
+    let (mut graph, weights, path) = qmoe_expert_region_fixture();
+    let packed_value = graph
+        .initializers
+        .keys()
+        .copied()
+        .find(|value| graph.value(*value).name.as_deref() == Some("fc1_packed"))
+        .expect("fc1_packed initializer must exist");
+    graph.set_initializer(
+        packed_value,
+        WeightRef::External {
+            path: path.clone(),
+            offset: 0,
+            length: 24,
+            dtype: DataType::Uint8,
+            dims: vec![6, 4],
+        },
+    );
+
+    let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let ep = WeightDeliveryEp::new(true, deliveries);
+    let executor = Executor::build(graph, weights, Arc::new(ep)).unwrap();
+
+    let plan = executor.residency_plan();
+    match plan.decision(packed_value) {
+        Some(onnx_runtime_ep_api::ResidencyDecision::WholeBankResident {
+            reason:
+                Some(onnx_runtime_ep_api::ResidencyDegradationReason::NonPageableCatalog(reason)),
+        }) => {
+            assert_eq!(
+                reason,
+                &onnx_runtime_loader::NonPageableReason::NotExpertMajor
+            );
+        }
+        other => panic!("expected non-pageable whole-bank reason, got {other:?}"),
+    }
+    assert_eq!(
+        plan.degraded_count(),
+        1,
+        "non-pageable reason counts as degraded"
+    );
+    assert_eq!(executor.weight_handles.len(), 2);
+}
+
+/// Prove the residency-policy seam is substitutable at the executor's own
+/// candidate/boundary wiring, without any production dispatch path consuming
+/// the result -- this is the "test-only alternate policy" required to show
+/// the trait is not an inert marker.
+#[test]
+fn qmoe_residency_plan_seam_is_substitutable_with_an_alternate_policy() {
+    use onnx_runtime_ep_api::{ResidencyDecision, ResidencyPolicy, ResidencyPolicyInput};
+
+    struct AlwaysSplit;
+    impl ResidencyPolicy for AlwaysSplit {
+        fn name(&self) -> &'static str {
+            "test_always_split"
+        }
+        fn decide(&self, input: &ResidencyPolicyInput<'_>) -> ResidencyDecision {
+            if input.catalog.is_pageable() {
+                ResidencyDecision::PerExpertCandidate {
+                    experts: (0..input.catalog.layout().experts).collect(),
+                }
+            } else {
+                ResidencyDecision::WholeBankResident { reason: None }
+            }
+        }
+    }
+
+    let (graph, weights, _path) = qmoe_expert_region_fixture();
+    let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let ep = WeightDeliveryEp::new(true, deliveries);
+    let executor = Executor::build(graph, weights, Arc::new(ep)).unwrap();
+
+    let candidates = executor.expert_region_candidates();
+    let plan =
+        crate::executor::build::plan_residency_with(&executor.graph, candidates, &AlwaysSplit);
+    assert_eq!(plan.policy_name(), "test_always_split");
+    assert!(!plan.is_empty());
+    for value in candidates.keys() {
+        assert!(matches!(
+            plan.decision(*value),
+            Some(ResidencyDecision::PerExpertCandidate { .. })
+        ));
+    }
+
+    // Substituting the policy must not touch the default plan stored on the
+    // executor, nor the weight-handle/binding output.
+    assert_eq!(
+        executor.residency_plan().policy_name(),
+        "whole_bank_resident"
+    );
+    assert_eq!(executor.weight_handles.len(), 2);
+}

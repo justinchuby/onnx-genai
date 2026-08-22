@@ -433,6 +433,46 @@ pub(super) fn build_lazy_weight_handles_and_candidates(
     Ok((handles, candidates))
 }
 
+/// Build the default [`onnx_runtime_ep_api::ResidencyPlan`] for this build's
+/// per-expert region candidates.
+///
+/// This is the one call site where a plan is *created*. It always uses
+/// [`onnx_runtime_ep_api::WholeBankResidentPolicy`] today — the only shipped
+/// policy — so the produced plan is handle-for-handle/byte-for-byte
+/// equivalent to pre-#82 behavior: every candidate value resolves to
+/// `WholeBankResident`. A future slice may take the policy as a parameter;
+/// this slice intentionally does not expose that knob outside tests.
+pub(super) fn plan_default_residency(
+    graph: &Graph,
+    candidates: &HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
+) -> onnx_runtime_ep_api::ResidencyPlan {
+    plan_residency_with(
+        graph,
+        candidates,
+        &onnx_runtime_ep_api::WholeBankResidentPolicy,
+    )
+}
+
+/// Test/measurement seam: build a plan with an arbitrary
+/// [`onnx_runtime_ep_api::ResidencyPolicy`], to prove the boundary is
+/// substitutable without wiring a second production call site.
+pub(super) fn plan_residency_with(
+    graph: &Graph,
+    candidates: &HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
+    policy: &dyn onnx_runtime_ep_api::ResidencyPolicy,
+) -> onnx_runtime_ep_api::ResidencyPlan {
+    let boundary_by_value: HashMap<ValueId, LazyWeightBoundary> = lazy_weight_candidates(graph)
+        .into_iter()
+        .map(|candidate| (candidate.value, candidate.boundary))
+        .collect();
+    let inputs = candidates.iter().filter_map(|(value, catalog)| {
+        boundary_by_value
+            .get(value)
+            .map(|&boundary| (*value, boundary, catalog))
+    });
+    onnx_runtime_ep_api::plan_residency(inputs, policy, None)
+}
+
 /// Derive an [`onnx_runtime_loader::ExpertTensorLayout`] for every QMoE
 /// expert-bank initializer value in `graph`, keyed by the initializer's
 /// [`ValueId`].
@@ -592,6 +632,15 @@ impl Executor {
         &self.expert_region_candidates
     }
 
+    /// The default [`onnx_runtime_ep_api::ResidencyPlan`] built for this
+    /// executor's expert region candidates. Read-only outside tests today —
+    /// no dispatch-time consumer exists yet; this exposes the plan purely
+    /// for telemetry/measurement and future policy wiring.
+    #[cfg(test)]
+    pub(super) fn residency_plan(&self) -> &onnx_runtime_ep_api::ResidencyPlan {
+        &self.residency_plan
+    }
+
     /// Compile a graph + weights into a runnable executor on the CPU EP.
     pub(crate) fn build(
         graph: Graph,
@@ -631,6 +680,21 @@ impl Executor {
             (handles, candidates)
         };
 
+        let residency_plan = {
+            let mut span = trace_span("session.residency_plan", "session");
+            let plan = plan_default_residency(&graph, &expert_region_candidates);
+            if let Some(span) = span.as_mut() {
+                span.set_args(
+                    Args::new()
+                        .with("policy", plan.policy_name().to_string())
+                        .with("resident", plan.resident_count() as u64)
+                        .with("degraded", plan.degraded_count() as u64)
+                        .with("total", plan.len() as u64),
+                );
+            }
+            plan
+        };
+
         let (mut value_shapes, mut value_dtypes, buffers, buffer_shapes) =
             Self::materialize_initializers(&graph, &weights, ep.as_ref(), &weight_handles)?;
 
@@ -666,6 +730,7 @@ impl Executor {
             graph_slot: DeviceGraphSlot::Primary,
             weight_handles,
             expert_region_candidates,
+            residency_plan,
             prefetch_issue_nodes: std::sync::Mutex::new(HashMap::new()),
             prefetch_lookahead_nodes: dense_weight_prefetch_lookahead_nodes(),
             buffers,
