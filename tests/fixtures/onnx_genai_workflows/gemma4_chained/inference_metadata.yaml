@@ -309,7 +309,18 @@ pipeline:
 speculative:
   proposer: assistant
   target: target
-  proposal_execution: {kind: chained, token_embedding_input: inputs_embeds, logits_output: logits, folded_carry_output: projected_state}
+  proposal_execution:
+    kind: chained
+    token_embedding_input: inputs_embeds
+    logits_output: logits
+    folded_carry_output: projected_state
+    # carry_0 SOURCE: the target's per-token hidden output (this tiny target
+    # exposes hidden_states.0 = Gather(hidden_table, input_ids)), named
+    # explicitly so it is not convention-inferred.
+    folded_carry_seed: {component: target, output: hidden_states.0}
+    # embed(last_token) for the fused input's LEADING half; the drafter graph
+    # reads only inputs_embeds, so name the target embedding table explicitly.
+    token_embedding: {component: target, table: hidden_table}
   port_bindings: {target_hidden_context: inputs_embeds}
   shared_state: [full_attention, sliding_attention]
   vocabulary: {kind: identical}
