@@ -583,6 +583,8 @@ pub struct CudaGraphDebugStats {
     /// graph survived a growth (#804-style named reporting).
     pub growth_keeps: u64,
     pub allocation_counts: DeviceAllocationCounts,
+    /// Opt-in source attribution for eager allocations outside DeviceAllocator.
+    pub raw_allocation_sites: Vec<onnx_runtime_ep_cuda::CudaRawAllocationSiteStats>,
     /// Named decode-level predicate that declined capture, whether before the
     /// first attempt or during the runtime capture audit.
     pub decline_reason: Option<String>,
@@ -6197,6 +6199,7 @@ impl DecodeCudaState {
                 invalidations: self.graph_invalidations,
                 growth_keeps: self.graph_growth_keeps,
                 allocation_counts: session.device_allocation_counts().unwrap_or_default(),
+                raw_allocation_sites: session.raw_device_allocation_site_stats(),
                 decline_reason: self.graph_decline_reason.clone(),
                 growth_decision: self.graph_growth_decision.clone(),
                 fallback_report: self.graph_fallback_report.clone(),

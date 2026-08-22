@@ -3,7 +3,7 @@
 //! [`CudaExecutionProvider`] and shared (via `Arc`) into every kernel the
 //! provider hands out, so the whole EP drives a single device + stream.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, CString, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,7 +16,7 @@ use cudarc::driver::{CudaContext, CudaEvent, CudaFunction, CudaModule, CudaStrea
 use onnx_runtime_ep_api::DeviceGraphSlot;
 use onnx_runtime_ep_api::EpError;
 use onnx_runtime_ep_api::Kernel;
-use onnx_runtime_ep_api::Result;
+use onnx_runtime_ep_api::{RawDeviceAllocationSiteStats, Result};
 
 use crate::blas::CublasLt;
 use crate::cudnn::CudnnBackend;
@@ -288,6 +288,12 @@ fn dynamic_shared_memory_optin(
 /// request — which is what to set when bisecting a suspected reuse bug.
 pub const CUDA_RAW_POOL_BYTES_ENV: &str = "ONNX_GENAI_CUDA_RAW_POOL_BYTES";
 
+/// Enable source-attributed profiling for [`CudaRuntime::alloc_raw`].
+///
+/// The disabled path performs no map lookup or locking. This is intentionally
+/// opt-in because pool hits may occur on kernel dispatch paths.
+pub const CUDA_RAW_ALLOCATION_PROFILE_ENV: &str = "ONNX_GENAI_PROFILE_CUDA_RAW_ALLOCATIONS";
+
 /// Default bound on device bytes held in the `alloc_raw` pool.
 ///
 /// Sized for the transient scratch one prefill chunk holds rather than for the
@@ -300,6 +306,81 @@ fn raw_pool_limit_bytes() -> u64 {
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_RAW_POOL_BYTES)
+}
+
+fn raw_allocation_profile_enabled() -> bool {
+    std::env::var_os(CUDA_RAW_ALLOCATION_PROFILE_ENV).is_some_and(|value| {
+        matches!(
+            value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct RawAllocationSite {
+    file: &'static str,
+    line: u32,
+}
+
+#[derive(Debug, Default)]
+struct RawAllocationProfile {
+    enabled: bool,
+    sites: Mutex<BTreeMap<RawAllocationSite, RawDeviceAllocationSiteStats>>,
+}
+
+impl RawAllocationProfile {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            sites: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn record(
+        &self,
+        location: &'static std::panic::Location<'static>,
+        requested: usize,
+        class: usize,
+        pool_hit: bool,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let key = RawAllocationSite {
+            file: location.file(),
+            line: location.line(),
+        };
+        let mut sites = self
+            .sites
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let site = sites
+            .entry(key)
+            .or_insert_with(|| RawDeviceAllocationSiteStats {
+                file: key.file,
+                line: key.line,
+                ..RawDeviceAllocationSiteStats::default()
+            });
+        site.requests = site.requests.saturating_add(1);
+        site.requested_bytes = site.requested_bytes.saturating_add(requested as u64);
+        if pool_hit {
+            site.pool_hits = site.pool_hits.saturating_add(1);
+            site.pool_hit_bytes = site.pool_hit_bytes.saturating_add(class as u64);
+        } else {
+            site.driver_allocations = site.driver_allocations.saturating_add(1);
+            site.driver_bytes = site.driver_bytes.saturating_add(class as u64);
+        }
+    }
+
+    fn snapshot(&self) -> Vec<RawDeviceAllocationSiteStats> {
+        self.sites
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
 }
 
 /// Round a raw allocation to the size class the pool keys on.
@@ -365,6 +446,7 @@ pub struct CudaRuntime {
     /// 32-layer 1.8B model, the per-call path put hundreds of MiB of raw
     /// device memory behind a prefill that needed 32 MiB.
     shared_blas_workspace: Mutex<Option<CUdeviceptr>>,
+    raw_allocation_profile: RawAllocationProfile,
     host_to_device_copies: AtomicU64,
     device_to_host_copies: AtomicU64,
     async_host_to_device_copies: AtomicU64,
@@ -550,6 +632,7 @@ impl CudaRuntime {
             raw_pool_retained: AtomicU64::new(0),
             raw_pool_hits: AtomicU64::new(0),
             shared_blas_workspace: Mutex::new(None),
+            raw_allocation_profile: RawAllocationProfile::new(raw_allocation_profile_enabled()),
             host_to_device_copies: AtomicU64::new(0),
             device_to_host_copies: AtomicU64::new(0),
             async_host_to_device_copies: AtomicU64::new(0),
@@ -775,6 +858,11 @@ impl CudaRuntime {
             allocations: self.allocations.load(Ordering::Relaxed),
             frees: self.frees.load(Ordering::Relaxed),
         }
+    }
+
+    /// Snapshot source-attributed [`Self::alloc_raw`] activity.
+    pub fn raw_allocation_site_stats(&self) -> Vec<RawDeviceAllocationSiteStats> {
+        self.raw_allocation_profile.snapshot()
     }
 
     /// Snapshot explicit host/device transfer calls made through this runtime.
@@ -1266,11 +1354,16 @@ impl CudaRuntime {
 
     /// Allocate `bytes` (>= 1) of device memory, returning the raw device
     /// pointer. Binds the context first.
+    #[track_caller]
     pub fn alloc_raw(&self, bytes: usize) -> Result<CUdeviceptr> {
+        let location = std::panic::Location::caller();
         self.bind()?;
-        let class = raw_pool_size_class(bytes.max(1));
+        let requested = bytes.max(1);
+        let class = raw_pool_size_class(requested);
         if let Some(ptr) = self.take_pooled(class) {
             self.raw_pool_hits.fetch_add(1, Ordering::Relaxed);
+            self.raw_allocation_profile
+                .record(location, requested, class, true);
             return Ok(ptr);
         }
         // Past the pool: this path makes a real `cuMemAlloc`, which
@@ -1295,6 +1388,8 @@ impl CudaRuntime {
             .unwrap_or_else(|e| e.into_inner())
             .insert(ptr, class);
         self.allocations.fetch_add(1, Ordering::Relaxed);
+        self.raw_allocation_profile
+            .record(location, requested, class, false);
         Ok(ptr)
     }
 
@@ -1856,6 +1951,37 @@ pub fn raw_ptr(dptr: CUdeviceptr) -> *mut c_void {
 mod tests {
     use super::*;
     use cudarc::driver::PushKernelArg;
+
+    #[test]
+    fn raw_allocation_profile_attributes_driver_and_pool_paths() {
+        let profile = RawAllocationProfile::new(true);
+        let location = std::panic::Location::caller();
+        profile.record(location, 513, 1024, false);
+        profile.record(location, 700, 1024, true);
+
+        let sites = profile.snapshot();
+        assert_eq!(sites.len(), 1);
+        assert_eq!(
+            sites[0],
+            RawDeviceAllocationSiteStats {
+                file: location.file(),
+                line: location.line(),
+                requests: 2,
+                requested_bytes: 1213,
+                driver_allocations: 1,
+                driver_bytes: 1024,
+                pool_hits: 1,
+                pool_hit_bytes: 1024,
+            }
+        );
+    }
+
+    #[test]
+    fn disabled_raw_allocation_profile_has_no_hot_path_state() {
+        let profile = RawAllocationProfile::new(false);
+        profile.record(std::panic::Location::caller(), 4096, 4096, false);
+        assert!(profile.snapshot().is_empty());
+    }
 
     /// The pool hands a recycled block to a *different* request than the one it
     /// was carved for, so the only thing standing between reuse and a buffer

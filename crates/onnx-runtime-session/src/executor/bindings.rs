@@ -1112,6 +1112,12 @@ impl Executor {
             .map(|(allocations, frees)| DeviceAllocationCounts { allocations, frees })
     }
 
+    pub(crate) fn raw_device_allocation_site_stats(
+        &self,
+    ) -> Vec<onnx_runtime_ep_api::RawDeviceAllocationSiteStats> {
+        self.ep.raw_device_allocation_site_stats()
+    }
+
     /// Place any long-lived device memory the provider holds under `governor`.
     /// Whether the memory this executor's provider hands out commits
     /// physically as it is used. See

@@ -3220,6 +3220,12 @@ impl ExecutionProvider for CudaExecutionProvider {
         ))
     }
 
+    fn raw_device_allocation_site_stats(
+        &self,
+    ) -> Vec<onnx_runtime_ep_api::RawDeviceAllocationSiteStats> {
+        self.runtime.raw_allocation_site_stats()
+    }
+
     fn reserve_workspace(
         &self,
         bytes: u64,
