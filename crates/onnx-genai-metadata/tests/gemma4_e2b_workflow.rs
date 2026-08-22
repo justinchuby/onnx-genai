@@ -212,18 +212,15 @@ fn assistant_speculative_contract_is_chained_pruned_and_rewindable() {
     assert!(speculative.shared_state.contains("full_attention"));
     assert!(speculative.shared_state.contains("sliding_attention"));
 
-    // Sparse / pruned LM head: a prefix-ordered subset of the target vocabulary.
+    // Full-vocab drafter: the centroid pruning is graph-internal, so the
+    // vocabulary relationship is identical (the drafter emits the target axis).
     match &speculative.vocabulary {
-        SpeculativeVocabulary::Subset {
-            proposer_vocab_size,
-        } => {
-            assert_eq!(*proposer_vocab_size, 24)
-        }
-        other => panic!("expected a pruned subset vocabulary, got {other:?}"),
+        SpeculativeVocabulary::Identical => {}
+        other => panic!("expected an identical vocabulary, got {other:?}"),
     }
     assert!(
         !speculative.distribution_preserving,
-        "a pruned drafter is opt-in"
+        "a lossy centroid drafter is opt-in"
     );
 
     // Every rewound cell is bound to a group covered to the proposal width.
