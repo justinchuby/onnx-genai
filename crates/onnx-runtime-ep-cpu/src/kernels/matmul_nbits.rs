@@ -12016,7 +12016,6 @@ mod tests {
                 "{value:?} must disable the blocked int4 prefill"
             );
         }
-        env.remove_var("ONNX_GENAI_CPU_MM_INT4_PREFILL");
     }
 
     /// The column fan-out must be *byte-identical* to the same kernel run
