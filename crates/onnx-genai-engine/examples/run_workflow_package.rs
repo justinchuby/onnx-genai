@@ -80,6 +80,7 @@ fn load_value(base: &Path, spec: &InputSpec) -> anyhow::Result<Value> {
                 .collect();
             Value::from_slice_i64(&ints, &spec.shape)?
         }
+        "u8" => Value::from_raw_bytes(bytes, &spec.shape, DataType::Uint8)?,
         "bool" => Value::from_raw_bytes(bytes, &spec.shape, DataType::Bool)?,
         other => anyhow::bail!("unsupported dtype {other}"),
     };
@@ -110,15 +111,20 @@ fn run_spec(engine: &mut PipelineEngine, spec_path: &Path, load_ms: f64) -> anyh
     std::fs::create_dir_all(&out_dir)?;
     let mut manifest = serde_json::Map::new();
     for (name, value) in outputs.iter() {
-        let floats = value.to_vec_f32()?;
-        let mut bytes = Vec::with_capacity(floats.len() * 4);
-        for float in &floats {
-            bytes.extend_from_slice(&float.to_le_bytes());
-        }
+        let (dtype, suffix) = match value.dtype() {
+            DataType::Float32 => ("float32", "f32"),
+            DataType::Float16 => ("float16", "f16"),
+            DataType::BFloat16 => ("bfloat16", "bf16"),
+            DataType::Int64 => ("int64", "i64"),
+            DataType::Uint8 => ("uint8", "u8"),
+            DataType::Bool => ("bool", "bool"),
+            other => anyhow::bail!("unsupported output dtype {other:?} for '{name}'"),
+        };
+        let bytes = value.to_raw_bytes()?;
         std::fs::write(out_dir.join(format!("{name}.bin")), bytes)?;
         manifest.insert(
             name.clone(),
-            serde_json::json!({"shape": value.shape(), "dtype": "f32"}),
+            serde_json::json!({"shape": value.shape(), "dtype": dtype, "suffix": suffix}),
         );
     }
     manifest.insert(
