@@ -543,6 +543,45 @@ fn native_recurring_edges_reuse_resident_sessions() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Speculative decode expressed as a workflow (draft → verify → accept/reject →
+/// correction), driven by the one interpreter. This is the pattern the Gemma4
+/// target+assistant speculative workflow (#1716/#1696) relies on: the
+/// accept/reject/rollback semantics live in the backend-agnostic interpreter,
+/// so the *same* package is a single parity case on ORT and native — the native
+/// executor only runs component forward passes, it never re-derives speculative
+/// or state-transition semantics.
+#[test]
+fn speculative_workflow_parity() -> anyhow::Result<()> {
+    let root = fixture("speculative");
+    let request = || -> anyhow::Result<PipelineGenerateRequest> {
+        Ok(PipelineGenerateRequest::new(GenerateRequest {
+            prompt: GeneratePrompt::TokenIds(vec![1, 2, 3, 4]),
+            options: GenerateOptions {
+                max_new_tokens: 1,
+                ..Default::default()
+            },
+        })
+        .with_input(
+            "verifier.past_key_values.0.key",
+            Value::from_slice_f32(&[], &[1, 2, 0, 8])?,
+        )
+        .with_input("grammar.initial_state", Value::from_slice_i64(&[0], &[1])?)
+        .with_input(
+            "grammar.transition_table",
+            Value::from_slice_i64(&[0; 32], &[1, 32])?,
+        )
+        .with_input("adaptive.current_k", Value::from_slice_i64(&[4], &[1])?)
+        .with_input(
+            "adaptive.estimates",
+            Value::from_slice_f32(&[0.0; 24], &[1, 24])?,
+        )
+        .with_input("telemetry.draft_ms", Value::from_slice_f32(&[1.0], &[1])?)
+        .with_input("telemetry.target_ms", Value::from_slice_f32(&[1.0], &[1])?))
+    };
+    assert_parity(&root, request, &["tokens.row.0"])?;
+    Ok(())
+}
+
 /// Fail closed: a native-unsupported op must produce an actionable error naming
 /// the component and the offending dtype — never a silent fall back to ORT. The
 /// checked `decoder` package's RNG sampler casts to uint64, which the native CPU
