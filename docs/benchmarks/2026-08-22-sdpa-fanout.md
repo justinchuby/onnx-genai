@@ -105,9 +105,13 @@ Two cells that looked like t=4 regressions in matrix 2 (+32%, +27.5%) inverted t
 
 **233.6 ms → 30.7 ms (7.6x)**, process CPU 137% → 956%, parity PASS.
 
+Sourcing caveat: this is a **2-repeat** focused A/B, the thinnest sample in this document. The best-replicated win — median of 3 trials with a 0.2% null arm — is `bert_base_s384` at -83.4%, i.e. **6.0x**. Both numbers are real; 6.0x is the one to quote if only one is quoted.
+
 ### `llama_decode_past1023`, t=16 — the issue's own headline cell
 
-This one barely moves, and the profile says why: it is **51% `__memmove_avx_unaligned_erms`**, under `concat_cache` and `load_bnsh`. SDPA is ~5.5% of samples, roughly 23% of wall on the critical path. **Amdahl bounds any SDPA fix on this shape at ~1.3x**, so the -14% observed is close to the ceiling.
+This one barely moves, and the profile says why: it is **51% `__memmove_avx_unaligned_erms`**, under `concat_cache` and `load_bnsh`. SDPA is ~5.5% of samples, roughly 23% of wall on the critical path. **Amdahl bounds any SDPA fix on this shape at ~1.3x.**
+
+The best-replicated measurement of that cell is the 11-trial re-measure in §5: **-21.7% at t=8**, i.e. 1.28x, essentially at the Amdahl ceiling. The t=16 column of the 3-trial matrix reads +12.0% with a +21.7% null arm and carries no information. An earlier draft of this document and of §45.9 quoted "-14%", which is traceable to neither table; it was a stale figure from the 3-trial run and is corrected here rather than left standing.
 
 The flat t=1→t=16 scaling reported in #1718 was real, but on decode-with-past shapes the KV-cache concat is the larger term, and this PR does not address it.
 
@@ -123,13 +127,23 @@ Every claim below was verified by deliberately breaking the code and confirming 
 | F2 | head/batch decomposition corrupted | **independent `sdpa_f32_scalar` oracle** |
 | F3 | task run offset ignored | bit-identity vs `force_serial()` |
 | F4 | `v_head_size == 0` guard removed | zero-width no-op test (panics in `chunk_runs_mut`) |
+| F5 | `v_head_size` and `rows` swapped at the decode dispatch | decode-scope parity test |
 
-**F2 is the interesting one: it was initially NOT caught.** The serial control and the parallel route share the same per-row body, so bit-identity falsifies *partitioning* bugs but is blind to *addressing* bugs — a wrong row decomposition is wrong identically on both arms. The fix was to compare against `sdpa_f32_scalar`, a genuinely independent implementation, inside the same test. This is recorded because the first version of the test suite would have shipped green with a corrupted head mapping.
+**F5 was added after review, and the gap it closes was real.** The first version of this
+suite had *no* test that entered a decode scope, so the decode branch of the router —
+the route #1718 is actually about — shipped with zero coverage. That branch is
+guarded internally by `debug_assert_eq!(result.len(), row_len * num_rows)`, which is
+**symmetric** in its two arguments, so swapping `v_head_size` and `rows` at the call
+site compiles *and* passes the assert. The new test uses a shape with
+`rows = 259 != v_head_size = 48` and compares against a serial run; the swap is
+caught. None of F1–F4 catch it.
+
+**F2 is the other interesting one: it was initially NOT caught.** The serial control and the parallel route share the same per-row body, so bit-identity falsifies *partitioning* bugs but is blind to *addressing* bugs — a wrong row decomposition is wrong identically on both arms. The fix was to compare against `sdpa_f32_scalar`, a genuinely independent implementation, inside the same test. This is recorded because the first version of the test suite would have shipped green with a corrupted head mapping.
 
 ## 8. Validation
 
 - `cargo test --locked` over the `offline-linux` package set — **4595 passed, 0 failed**
-- `cargo test -p onnx-runtime-ep-cpu --lib` — 1601 passed, 0 failed
+- `cargo test -p onnx-runtime-ep-cpu --lib` — 1602 passed, 0 failed
 - `cargo fmt --all -- --check`
 - `cargo clippy --locked --all-targets` over the offline-linux set, `-D warnings`
 - `cargo clippy --all-targets --target aarch64-unknown-linux-gnu -p onnx-runtime-ep-cpu -- -D warnings`
@@ -137,11 +151,13 @@ Every claim below was verified by deliberately breaking the code and confirming 
 - `cargo test -p onnx-runtime-ep-cpu --features mlas --lib sdpa` — 27 passed
 - Miri: this change adds **no new `unsafe`**. The pointer split lives in `chunk_runs_mut`, which the existing `task_runtime` Miri lane already covers. Running Miri over the new SDPA tests is infeasible (~46 M MACs).
 
-macOS is believed unaffected — `sdpa_f32_simd` is only reached there for `q_seq == 1 && kv_seq * max(d, dv) <= 8192`, i.e. ≤ 0.52 M MACs, always below the floor. That is **reasoned, not measured**; no Apple hardware was available.
+macOS behaviour is **reasoned, not measured** — no Apple hardware was available.
+
+An earlier draft claimed macOS was unaffected because `sdpa_f32_simd` is reached there only for `q_seq == 1 && kv_seq * max(d, dv) <= 8192`, "always below the floor". **That argument is wrong** and is corrected here: the 8192 bound is *per row*, while the floor is on `rows * work_per_row` with `rows = batch * num_heads * q_seq`. A batch-8, 32-head decode reaches ~4.2 Mi and would fan out. The correct statement is narrower: macOS single-stream decode (the common case, `batch = 1`) stays below the floor and is unaffected, while batched macOS decode *will* take the new route. Correctness is identical either way — the output is bit-identical regardless of the split — so the untested part is a performance question, not a numerical one.
 
 ## 9. Bottom line
 
-- Large, robust win on every prefill/encoder shape at t ≥ 4, peaking at **7.6x** on the SDPA-dominated cell.
+- Large, robust win on every prefill/encoder shape at t ≥ 4: **6.0x** on the best-replicated cell (`bert_base_s384`, 3 trials, 0.2% null), and **7.6x** on the SDPA-dominated `llama_prefill_s512_causal` in a thinner 2-repeat focused A/B.
 - Modest, noise-limited win on decode shapes, bounded by Amdahl because decode-with-past is memmove-dominated.
 - t=1 unchanged; no new `unsafe`; bit-identical output; no global Rayon reintroduced.
 - The issue's headline cell is only ~23% SDPA. The remaining scaling gap on decode belongs to `concat_cache`, not to this kernel.

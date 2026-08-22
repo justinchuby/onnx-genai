@@ -324,6 +324,21 @@ static SDPA_SIMD_TEST_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::
 static SDPA_SIMD_TEST_FANOUTS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Test counter: incremented only when the fan-out went through the *decode*
+/// pool, as opposed to the task runtime.
+///
+/// The two routes are separate branches and only one of them runs in an
+/// unscoped test, so a single counter cannot tell them apart. Without this the
+/// decode branch -- the one #1718 is actually about -- has no coverage at all,
+/// and a defect confined to it (an argument swap at the dispatch, say) would
+/// leave every other test green.
+#[cfg(all(
+    test,
+    any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+))]
+static SDPA_SIMD_TEST_DECODE_FANOUTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Test counter: incremented when the Accelerate (cblas_sgemm/AMX) SDPA fast
 /// path fires on macOS/iOS.
 #[cfg(all(
@@ -1247,7 +1262,10 @@ fn sdpa_f32_simd(
             row_body,
         );
         #[cfg(test)]
-        SDPA_SIMD_TEST_FANOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            SDPA_SIMD_TEST_FANOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            SDPA_SIMD_TEST_DECODE_FANOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         return;
     }
     let backend =
@@ -3750,6 +3768,87 @@ mod tests {
                  vacuous for the ones that did not"
             );
         }
+    }
+
+    /// The decode branch of the router is a *different* dispatch from the task
+    /// runtime one, and no other test enters a decode scope, so without this
+    /// case the route #1718 is actually about ships untested.
+    ///
+    /// The shape is chosen so `rows != v_head_size` while `rows * v_head_size`
+    /// still equals `y.len()`. `decode_parallel_output_row_blocks` guards itself
+    /// with `debug_assert_eq!(result.len(), row_len * num_rows)`, which is
+    /// symmetric in its two arguments -- so a `v_head_size <-> rows` swap at the
+    /// call site would compile *and* pass that assert. Only comparing the values
+    /// against a serial run catches it.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn parallel_sdpa_under_an_active_decode_scope_matches_serial() {
+        use std::sync::atomic::Ordering;
+
+        // rows = 7 * 37 = 259, v_head_size = 48: distinct, neither a multiple of
+        // the other. Work is 259 * 257 * (64 + 48) = 7.45 Mi MACs, above the
+        // fan-out floor, so this genuinely dispatches.
+        let (batch, heads, kv_heads, q_seq, kv_seq, dh, dv) =
+            (1usize, 7usize, 7usize, 37usize, 257usize, 64usize, 48usize);
+        let rows = batch * heads * q_seq;
+        assert_ne!(rows, dv, "the swap falsifier needs asymmetric extents");
+
+        let q = deterministic_values(batch * heads * q_seq * dh, 0x8100, 0.55);
+        let k = deterministic_values(batch * kv_heads * kv_seq * dh, 0x8200, 0.45);
+        let v = deterministic_values(batch * kv_heads * kv_seq * dv, 0x8300, 0.35);
+        let tensors = SdpaTensors {
+            q: &q,
+            k: &k,
+            v: &v,
+            batch,
+            num_heads: heads,
+            num_kv_heads: kv_heads,
+            q_seq,
+            kv_seq,
+            head_size: dh,
+            v_head_size: dv,
+        };
+        let cfg = SdpaConfig {
+            scale: ScaleMode::PostDot(0.125),
+            softcap: None,
+            causal: true,
+            past_seq: kv_seq - q_seq,
+            causal_fill: f32::NEG_INFINITY,
+        };
+
+        let mut serial = vec![0.0f32; rows * dv];
+        {
+            let _forced = crate::task_runtime::testing::force_serial();
+            sdpa_f32_simd(&tensors, &cfg, &NoBias, &NoMask, &mut serial);
+        }
+
+        let before = SDPA_SIMD_TEST_DECODE_FANOUTS.load(Ordering::Relaxed);
+        let (routed_to_decode, decoded) =
+            crate::kernels::matmul_nbits::with_decode_pool_scope(true, || {
+                let active = crate::kernels::matmul_nbits::decode_pool_active();
+                let mut y = vec![0.0f32; rows * dv];
+                sdpa_f32_simd(&tensors, &cfg, &NoBias, &NoMask, &mut y);
+                (active, y)
+            });
+
+        assert_eq!(
+            decoded, serial,
+            "decode-pool fan-out must be bit-identical to serial"
+        );
+
+        // A host too small to build the decode pool falls through to the task
+        // runtime; say so rather than passing quietly, because a silent skip
+        // here is how the branch stayed uncovered in the first place.
+        assert!(
+            routed_to_decode,
+            "with_decode_pool_scope(true) did not activate a decode pool, so the \
+             decode branch was not exercised on this host"
+        );
+        assert_eq!(
+            SDPA_SIMD_TEST_DECODE_FANOUTS.load(Ordering::Relaxed),
+            before + 1,
+            "the decode scope must route through decode_parallel_output_row_blocks"
+        );
     }
 
     /// A zero-width value head is degenerate but reachable: this route has no

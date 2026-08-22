@@ -4797,7 +4797,9 @@ threshold derivation and the falsifiers are in
 [`2026-08-22-sdpa-fanout.md`](2026-08-22-sdpa-fanout.md). The prefill and encoder
 cells above move -48% to -83% at t >= 4; `llama_prefill_s512_causal` — profiled at
 ~73% SDPA on the critical path — goes **233.6 ms -> 30.7 ms (7.6x)** at t=16 with
-process CPU rising 137% -> 956%.
+process CPU rising 137% -> 956%. That 7.6x is a 2-repeat focused A/B; the
+best-replicated win is `bert_base_s384` at -83.4% (6.0x, median of 3, 0.2% null
+arm).
 
 **But 45.8's "it is worth roughly the thread count" is wrong for the decode cells,
 and the correction matters more than the win.** Profiling
@@ -4805,8 +4807,8 @@ and the correction matters more than the win.** Profiling
 thread-scaling control — shows it is **51% `__memmove_avx_unaligned_erms`**, under
 `concat_cache` and `load_bnsh`. `sdpa_f32_simd` is ~5.5% of samples, roughly 23%
 of wall. Amdahl therefore bounds *any* SDPA fix on that shape at about **1.3x**,
-not 16x, and the measured result (-14% at t=8, 11 trials) is close to that
-ceiling.
+not 16x, and the best-replicated measurement of that cell (**-21.7% at t=8**,
+11 trials, null arm +6.0%) sits essentially at that ceiling.
 
 The flat `native_p50` column was real and the code observation was correct. What
 did not follow is the sizing: a flat native column tells you parallelism is
