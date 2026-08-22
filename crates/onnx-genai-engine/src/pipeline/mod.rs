@@ -394,11 +394,36 @@ impl PipelineEngine {
         // before the workflow planner can determine capture eligibility.
         let mut component_session_options = session_options.clone();
         component_session_options.graph_capture = false;
-        let models = PipelineModels::load_with_component_options(
-            pipeline_dir,
-            component_session_options,
-            session_options,
-        )
+        // Under Native, every component executes on a native `InferenceSession`
+        // (see `native_component`), so building an ORT `Session` for each one is
+        // redundant, pulls in the ORT runtime unnecessarily, double-loads
+        // weights, and misreports the execution provider — and a native-only
+        // operator would make ORT reject the graph at load. Build ORT sessions
+        // only for the ORT backend; under Native, load backend-neutral graph I/O
+        // only (`PipelineModels::graph_io_metadata`) so the package's I/O
+        // contract stays available without an ORT session.
+        #[cfg(feature = "native-backend")]
+        let native_device = if decode_backend == EngineDecodeBackend::Native {
+            Some(crate::engine::resolve_native_decode_device(
+                config.native_device.clone(),
+                &session_options,
+            )?)
+        } else {
+            None
+        };
+        let models = if decode_backend == EngineDecodeBackend::Native {
+            PipelineModels::load_with_ort_session_filter(
+                pipeline_dir,
+                component_session_options,
+                |_| false,
+            )
+        } else {
+            PipelineModels::load_with_component_options(
+                pipeline_dir,
+                component_session_options,
+                session_options,
+            )
+        }
         .map_err(|error| anyhow::anyhow!("Failed to load workflow components: {error}"))?;
 
         let workflow = directory.spec.workflow;
@@ -492,12 +517,17 @@ impl PipelineEngine {
         let device_bridge_components =
             workflow::compile_device_bridge_components(&bridge_graph, &island_components);
         // Load a native session per component only when the native backend was
-        // requested; the ORT `PipelineModels` above stays authoritative for
-        // graph I/O metadata either way.
+        // requested, bound to the resolved native device/EP. The ORT
+        // `PipelineModels` above holds only backend-neutral graph I/O in that
+        // case (no ORT sessions were built).
         #[cfg(feature = "native-backend")]
         let native_components = if decode_backend == EngineDecodeBackend::Native {
+            let device = native_device
+                .as_ref()
+                .expect("native device is resolved when the decode backend is Native");
             Some(RefCell::new(native_component::NativeComponentSet::load(
                 &directory.model_paths,
+                device,
             )?))
         } else {
             None
@@ -570,6 +600,13 @@ impl PipelineEngine {
 
     /// Execution-provider placement reported by the loaded component sessions.
     pub fn execution_provider_status(&self) -> String {
+        // Under the native backend no ORT sessions exist; report the native
+        // device the components actually run on instead of an empty/"native"
+        // placeholder derived from an absent ORT session set.
+        #[cfg(feature = "native-backend")]
+        if let Some(native) = self.native_components.as_ref() {
+            return native.borrow().device_label().to_string();
+        }
         let mut summaries = self
             .models
             .sessions

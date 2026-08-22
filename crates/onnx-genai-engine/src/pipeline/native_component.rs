@@ -27,11 +27,14 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Context;
 use onnx_genai_ort::{DataType, Value};
 use onnx_runtime_ir::DataType as IrDataType;
-use onnx_runtime_session::{InferenceSession, Tensor};
+use onnx_runtime_session::{DevicePreference, InferenceSession, Tensor};
+
+use crate::native_decode::NativeDecodeDevice;
 
 /// Faithful ORT→IR element-type mapping for a value entering a native graph.
 ///
@@ -113,10 +116,30 @@ fn native_shape(component: &str, port: &str, shape: &[i64]) -> anyhow::Result<Ve
 
 /// Bridge a workflow value into a native input tensor.
 ///
-/// On CPU the value is host-resident, so this reads its little-endian element
-/// bytes directly — the same on-wire form the native `Tensor` stores — without
-/// the host-resident `ComponentTensor` detour.
+/// A host-resident value is bridged through its little-endian element bytes —
+/// the same on-wire form the native `Tensor` stores, and for a CPU device there
+/// is no round-trip (both sides are host memory). A device-resident value (a
+/// CUDA `Value`) is **not** silently copied to the host: the device-resident
+/// `Value → Tensor` bridge is not wired yet, so this fails closed with an
+/// actionable diagnostic rather than reading device memory as host bytes. The
+/// native runtime has the device-tensor APIs to build that bridge
+/// (`Tensor::from_borrowed_parts_with_guard`), so this is an explicit
+/// not-yet-wired boundary, not a permanent CPU-only limit.
 fn value_to_native_tensor(component: &str, port: &str, value: &Value) -> anyhow::Result<Tensor> {
+    if !value.is_host_resident().with_context(|| {
+        format!(
+            "native workflow component '{component}' could not classify input '{port}' residency"
+        )
+    })? {
+        anyhow::bail!(
+            "native workflow component '{component}' received a device-resident input for port \
+             '{port}' (device {}); the device-resident Value->Tensor bridge is not wired yet, so \
+             the native backend fails closed rather than silently host-copying. Run this workflow \
+             on the CPU native device or the ORT backend, or wire the device bridge \
+             (Tensor::from_borrowed_parts_with_guard).",
+            value.device_id().unwrap_or(-1)
+        );
+    }
     let dtype = ir_dtype_from_ort(value.dtype());
     let shape = native_shape(component, port, value.shape())?;
     let bytes = value.to_raw_bytes().with_context(|| {
@@ -131,7 +154,25 @@ fn value_to_native_tensor(component: &str, port: &str, value: &Value) -> anyhow:
 }
 
 /// Bridge a native output tensor back into a workflow value.
+///
+/// A host-accessible tensor is bridged through its element bytes. A
+/// device-resident output (a native CUDA tensor) is **not** read as host bytes
+/// (`Tensor::as_bytes` is documented host-only and would be unsound); the
+/// device-resident `Tensor → Value` bridge is not wired yet, so this fails
+/// closed. The building blocks exist (`Tensor::device_ptr` +
+/// `Value::from_external_memory`), so this is an explicit not-yet-wired
+/// boundary, not a permanent CPU-only limit.
 fn native_tensor_to_value(component: &str, port: &str, tensor: &Tensor) -> anyhow::Result<Value> {
+    if !tensor.device().is_host_accessible() {
+        anyhow::bail!(
+            "native workflow component '{component}' produced a device-resident output '{port}' \
+             on device {:?}; the device-resident Tensor->Value bridge is not wired yet, so the \
+             native backend fails closed rather than reading device memory as host bytes. Run on \
+             the CPU native device or the ORT backend, or wire the device bridge \
+             (Value::from_external_memory).",
+            tensor.device()
+        );
+    }
     let dtype = ort_dtype_from_ir(component, port, tensor.dtype)?;
     let shape: Vec<i64> = tensor.shape.iter().map(|&dim| dim as i64).collect();
     Value::from_raw_bytes(tensor.as_bytes().to_vec(), &shape, dtype).with_context(|| {
@@ -149,22 +190,30 @@ struct NativeComponent {
 }
 
 /// Every declared ONNX component of a workflow package, loaded as a native
-/// [`InferenceSession`]. Held for the life of the [`PipelineEngine`], so a
-/// component invoked once per loop iteration reuses one session.
+/// [`InferenceSession`] bound to the engine's resolved native device/EP. Held
+/// for the life of the [`PipelineEngine`], so a component invoked once per loop
+/// iteration reuses one session.
 pub(crate) struct NativeComponentSet {
     components: HashMap<String, NativeComponent>,
+    device_label: String,
     run_count: u64,
 }
 
 impl NativeComponentSet {
-    /// Load a native session for every component model file in the package.
+    /// Load a native session for every component model file in the package,
+    /// bound to the resolved native `device` (and its execution provider) —
+    /// **not** ORT and **not** an auto-detected CPU EP.
     ///
-    /// These are the same on-disk graphs the ORT `PipelineModels` loads, so the
-    /// native and ORT backends execute byte-identical component logic.
-    pub(crate) fn load(model_paths: &BTreeMap<String, PathBuf>) -> anyhow::Result<Self> {
+    /// These are the same on-disk graphs the ORT `PipelineModels` inspects for
+    /// I/O, so the native and ORT backends execute byte-identical component
+    /// logic; only the executor differs.
+    pub(crate) fn load(
+        model_paths: &BTreeMap<String, PathBuf>,
+        device: &NativeDecodeDevice,
+    ) -> anyhow::Result<Self> {
         let mut components = HashMap::with_capacity(model_paths.len());
         for (component, path) in model_paths {
-            let session = load_native_component(component, path)?;
+            let session = load_native_component(component, path, device)?;
             let output_names = session.outputs().iter().map(|io| io.name.clone()).collect();
             components.insert(
                 component.clone(),
@@ -176,8 +225,15 @@ impl NativeComponentSet {
         }
         Ok(Self {
             components,
+            device_label: native_device_label(device),
             run_count: 0,
         })
+    }
+
+    /// Diagnostic label of the native device these sessions run on, used by
+    /// `execution_provider_status` so a Native engine reports its real device.
+    pub(crate) fn device_label(&self) -> &str {
+        &self.device_label
     }
 
     /// Number of native component invocations performed so far.
@@ -246,8 +302,66 @@ impl NativeComponentSet {
     }
 }
 
-fn load_native_component(component: &str, path: &Path) -> anyhow::Result<InferenceSession> {
-    InferenceSession::load(path).with_context(|| {
+/// Human-readable label of a resolved native device, for EP-status reporting.
+fn native_device_label(device: &NativeDecodeDevice) -> String {
+    match device {
+        NativeDecodeDevice::Cpu => "native-cpu".to_string(),
+        NativeDecodeDevice::Cuda { index } => format!("native-cuda:{}", index.unwrap_or(0)),
+        NativeDecodeDevice::Plugin { provider_name, .. } => {
+            format!("native-plugin:{provider_name}")
+        }
+    }
+}
+
+/// Build a native `InferenceSession` for one component bound to `device`'s
+/// **explicit** execution provider — never ORT and never an auto-detected CPU
+/// EP (which would silently ignore a requested CUDA device). Mirrors the
+/// device→EP selection the native decode path uses in `native_decode/load.rs`.
+fn load_native_component(
+    component: &str,
+    path: &Path,
+    device: &NativeDecodeDevice,
+) -> anyhow::Result<InferenceSession> {
+    let mut builder = InferenceSession::builder().model(path);
+    match device {
+        NativeDecodeDevice::Cpu => {
+            builder = builder
+                .device(DevicePreference::Cpu)
+                .execution_provider(Arc::new(onnx_runtime_ep_cpu::CpuExecutionProvider::new()));
+        }
+        #[cfg(feature = "native-cuda")]
+        NativeDecodeDevice::Cuda { index } => {
+            let ordinal = index.unwrap_or(0);
+            let ep = onnx_runtime_ep_cuda::CudaExecutionProvider::initialized(ordinal)
+                .with_context(|| {
+                    format!(
+                        "initialize native CUDA execution provider (device {ordinal}) for \
+                         workflow component '{component}'"
+                    )
+                })?;
+            builder = builder
+                .device(DevicePreference::Gpu {
+                    index: Some(ordinal),
+                })
+                .execution_provider(Arc::new(ep));
+        }
+        #[cfg(not(feature = "native-cuda"))]
+        NativeDecodeDevice::Cuda { .. } => {
+            anyhow::bail!(
+                "native workflow component '{component}' requested a CUDA device, but this build \
+                 lacks the `native-cuda` feature. Rebuild with --features native-cuda, or select \
+                 the CPU native device / the ORT backend."
+            );
+        }
+        NativeDecodeDevice::Plugin { .. } => {
+            anyhow::bail!(
+                "native workflow component '{component}' requested a plugin execution provider, \
+                 which the native workflow backend does not support yet; use the CPU or CUDA \
+                 native device, or the ORT backend."
+            );
+        }
+    }
+    builder.build().with_context(|| {
         format!(
             "native workflow backend failed to load component '{component}' from '{}'. If this \
              component uses operators the native backend does not implement, run the workflow on \

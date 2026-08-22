@@ -176,11 +176,37 @@ invariants are observable through a per-backend run counter.
     "duplicate old symbol just in case" that Rule 3 forbids. The still-useful
     `DataType ⇔ ir::DataType` mapping is retained where the native bridge needs
     it.
-* **Follow-up boundary A — native CUDA device residency.** Wire
-  `Tensor::device_ptr()` → `Value::from_external_memory` (and the reverse) behind
-  `native-cuda`, with ownership/lifetime guards, so device tensors alias
-  zero-copy. Until then the native backend is CPU-first and CUDA execution-island
-  optimizations remain ORT-only (fail-closed under Native).
+  * **Rubber-duck fix 1 — no ORT sessions under Native.** `PipelineEngine::build`
+    now loads component graphs with `PipelineModels::load_with_ort_session_filter(
+    …, |_| false)` under Native, so **zero** ORT `Session`s are constructed — the
+    package's I/O contract stays available as backend-neutral `graph_io_metadata`
+    (read from the ONNX graph without instantiating ORT). This removes the ORT
+    dependency / double load / misreported EP, and lets a package whose component
+    ORT would reject at load run natively. `execution_provider_status()` reports
+    the real native device. (`native_backend_builds_no_ort_sessions`,
+    `ort_backend_builds_ort_sessions`.)
+  * **Rubber-duck fix 2 — explicit device/provider + fail-closed residency.** The
+    native executor no longer calls `InferenceSession::load` (which auto-detects a
+    CPU EP and ignores the requested device). It resolves the device via
+    `resolve_native_decode_device(config.native_device, …)` and builds each
+    session with the explicit EP (`CpuExecutionProvider` / `CudaExecutionProvider`),
+    mirroring `native_decode/load.rs`. The `Value ⇄ Tensor` bridge now gates on
+    residency: a host value/tensor round-trips through bytes (no device round-trip
+    on CPU), and a **device-resident** value/tensor **fails closed** with an
+    actionable diagnostic instead of reading device memory as host bytes
+    (`Tensor::as_bytes` is host-only) or silently host-copying. This is an
+    explicit not-yet-wired boundary, not a permanent CPU-only limit — see
+    boundary A.
+* **Follow-up boundary A — native CUDA device-resident bridge.** The device/EP is
+  now propagated and device tensors fail closed (above); what remains is the
+  zero-copy value bridge: wire `Tensor::device_ptr()` →
+  `Value::from_external_memory` (and `Value` device ptr →
+  `Tensor::from_borrowed_parts_with_guard`) behind `native-cuda`, with
+  ownership/lifetime guards, so device tensors alias zero-copy and native-CUDA
+  workflows run end-to-end. Root-caused: the native runtime **has** these device
+  APIs, so this is a wiring task (plus a CUDA fixture), not a fundamental limit.
+  CUDA execution-island optimizations remain ORT-only until then (fail-closed
+  under Native).
 * **Follow-up boundary B — specialized AR executor.** Recognize the canonical
   single-decoder `Loop` and delegate it to `run_decode_loop` /
   `NativeDecodeSession` as a specialized component executor (device sampling

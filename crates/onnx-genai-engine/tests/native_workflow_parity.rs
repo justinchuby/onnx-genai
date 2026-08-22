@@ -582,6 +582,55 @@ fn speculative_workflow_parity() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Blocker 1: under the Native backend the pipeline builds **zero** ORT
+/// component sessions — components execute on native `InferenceSession`s, and
+/// the package's I/O contract stays available as backend-neutral graph I/O
+/// metadata. Because no ORT session is constructed, a package whose component
+/// ORT would reject at load (a native-only operator) still loads and runs
+/// natively; here we prove the structural invariant (no ORT sessions) plus a
+/// successful native run, and that the engine reports its real native device
+/// rather than an ORT EP.
+#[test]
+fn native_backend_builds_no_ort_sessions() -> anyhow::Result<()> {
+    let root = fixture("static_cache");
+    let mut engine = native_engine(&root)?;
+    assert!(
+        engine.models().sessions.is_empty(),
+        "Native must build zero ORT component sessions, found {}",
+        engine.models().sessions.len()
+    );
+    assert!(
+        !engine.models().graph_io_metadata.is_empty(),
+        "Native must still expose backend-neutral graph I/O metadata for the components"
+    );
+    let output = engine.run_pipeline(static_cache_request(2)?)?;
+    assert_eq!(output["cache_lengths"].to_vec_i64()?, vec![3, 6]);
+    assert!(engine.native_component_run_count().unwrap_or(0) > 0);
+    // Blocker 2: the engine reports the explicit native device it resolved and
+    // ran on, not an ORT EP and not an empty placeholder.
+    assert_eq!(engine.execution_provider_status(), "native-cpu");
+    Ok(())
+}
+
+/// Contrast: the ORT backend DOES build ORT component sessions (and reports an
+/// ORT execution provider), so the "no ORT sessions" invariant above is a real
+/// Native-only property, not an artifact of an empty package.
+#[test]
+fn ort_backend_builds_ort_sessions() -> anyhow::Result<()> {
+    let root = fixture("static_cache");
+    let engine = ort_engine(&root)?;
+    assert!(
+        !engine.models().sessions.is_empty(),
+        "ORT must build component sessions"
+    );
+    assert_ne!(
+        engine.execution_provider_status(),
+        "native-cpu",
+        "ORT must not report the native device"
+    );
+    Ok(())
+}
+
 /// Fail closed: a native-unsupported op must produce an actionable error naming
 /// the component and the offending dtype — never a silent fall back to ORT. The
 /// checked `decoder` package's RNG sampler casts to uint64, which the native CPU
