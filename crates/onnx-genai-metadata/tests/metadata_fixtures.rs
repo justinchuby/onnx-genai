@@ -1085,3 +1085,43 @@ pipeline:
         "{errors:?}"
     );
 }
+
+/// A package may declare workflow capabilities a given runtime does not
+/// implement. Those are a capability-negotiation question, not a malformed
+/// document, and must be reported apart from structural defects so a caller
+/// that never exercises them can still load the model.
+///
+/// Regression guard for the bare decoder that was rejected with
+/// `Invalid inference metadata: ["bounded_state_recurrence", "emit_valid_length",
+/// "linear_effects", ...]` — eight capability names presented as validation
+/// errors on a model that decoded correctly once they were dropped.
+#[test]
+fn unsupported_capabilities_are_reported_apart_from_structural_defects() {
+    use onnx_genai_metadata::{RuntimeCapabilities, validate_structure_and_capabilities};
+
+    let metadata: InferenceMetadata = serde_yaml::from_str(
+        r#"
+required_capabilities: [kv_cache, grouped_query_attention, some_future_feature]
+"#,
+    )
+    .expect("parse metadata");
+
+    let report =
+        validate_structure_and_capabilities(&metadata, &RuntimeCapabilities::default());
+
+    assert!(
+        report.structural.is_empty(),
+        "a well-formed document must report no structural defects, got {:?}",
+        report.structural
+    );
+    assert_eq!(
+        report.unsupported_capabilities,
+        vec!["some_future_feature".to_string()],
+        "only the capability this runtime lacks should be listed; kv_cache and \
+         grouped_query_attention are supported"
+    );
+
+    // The strict entry point still folds both together, so callers that want
+    // all-or-nothing keep their behaviour.
+    assert!(onnx_genai_metadata::validate(&metadata, &RuntimeCapabilities::default()).is_err());
+}
