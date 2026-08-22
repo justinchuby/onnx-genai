@@ -250,3 +250,12 @@ pipeline:
         "the local codebook decoder is stateless growing-length recomputation"
     );
 }
+
+#[test]
+fn fixed_guidance_rows_have_an_explicit_request_expansion_layout() {
+    let layout: onnx_genai_metadata::BatchLayout =
+        serde_yaml::from_str("kind: request_expanded\naxis: 0\nfactor: 2\n")
+            .expect("expanded request layout parses");
+    assert_eq!(layout.request_axis(), Some(0));
+    assert_eq!(layout.request_expansion_factor(), 2);
+}

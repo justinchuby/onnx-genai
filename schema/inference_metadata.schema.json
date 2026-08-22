@@ -896,6 +896,32 @@
         },
         {
           "additionalProperties": false,
+          "description": "Each request owns a fixed-size contiguous group on ``axis`` (for\nexample conditional/unconditional classifier-free-guidance rows).",
+          "properties": {
+            "axis": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "factor": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "request_expanded",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "axis",
+            "factor"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "properties": {
             "axis": {
               "description": "Packed axis of this value.",

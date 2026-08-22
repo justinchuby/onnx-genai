@@ -3753,10 +3753,11 @@ fn merge_inactive_rows(
             .get(batch_axis)
             .context("mixed active row carry batch axis exceeds tensor rank")?,
     )?;
+    let expansion = state.contract.batch_layout.request_expansion_factor();
     anyhow::ensure!(
-        active.len() == rows,
-        "loop active mask has {} rows for state batch {rows}",
-        active.len()
+        active.len().saturating_mul(expansion) == rows,
+        "loop active mask has {} requests with expansion {expansion} for state batch {rows}",
+        active.len(),
     );
     anyhow::ensure!(
         next.shape().get(batch_axis) == current.shape().get(batch_axis),
@@ -3807,7 +3808,7 @@ fn merge_inactive_rows(
     let mut merged = next.to_raw_bytes()?;
     for current_index in 0..current.numel() {
         let row = (current_index / current_strides[batch_axis]) % current_shape[batch_axis];
-        if active[row] {
+        if active[row / expansion] {
             continue;
         }
         let mut remainder = current_index;
@@ -4093,6 +4094,24 @@ mod workflow_scalar_tests {
         let merged = merge_inactive_rows(&current, &next, &[true, false], &state)
             .expect("merge active rows");
         assert_eq!(merged.to_vec_i64().expect("merged values"), [10, 20, 3, 4]);
+    }
+
+    #[test]
+    fn inactive_requests_keep_all_of_their_expanded_guidance_rows() {
+        let current = Value::from_slice_i64(&[1, 2, 3, 4, 5, 6, 7, 8], &[4, 2]).expect("current");
+        let next = Value::from_slice_i64(&[10, 20, 30, 40, 50, 60, 70, 80], &[4, 2]).expect("next");
+        let state: onnx_genai_metadata::WorkflowStateCell = serde_yaml::from_str(
+            "contract: { dtype: int64, rank: 2, shape: [guidance_rows, 2], batch_layout: { \
+             kind: request_expanded, axis: 0, factor: 2 } }\nscope: invocation\ninitializer: \
+             initial\nrecurrence: { kind: invariant }",
+        )
+        .expect("state");
+        let merged = merge_inactive_rows(&current, &next, &[true, false], &state)
+            .expect("merge expanded request rows");
+        assert_eq!(
+            merged.to_vec_i64().expect("merged values"),
+            [10, 20, 30, 40, 5, 6, 7, 8]
+        );
     }
 
     #[test]

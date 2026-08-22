@@ -40,6 +40,12 @@ pub enum BatchLayout {
     RequestAligned {
         axis: usize,
     },
+    /// Each request owns a fixed-size contiguous group on ``axis`` (for
+    /// example conditional/unconditional classifier-free-guidance rows).
+    RequestExpanded {
+        axis: usize,
+        factor: usize,
+    },
     TokenPacked {
         /// Request-aligned value holding the exclusive prefix offset of each request's items.
         offsets: String,
@@ -59,8 +65,16 @@ impl BatchLayout {
     /// Axis permuted when the runtime compacts the batch, if any.
     pub fn request_axis(&self) -> Option<usize> {
         match self {
-            Self::RequestAligned { axis } => Some(*axis),
+            Self::RequestAligned { axis } | Self::RequestExpanded { axis, .. } => Some(*axis),
             Self::Shared | Self::TokenPacked { .. } | Self::RuntimeSequenceState => None,
+        }
+    }
+
+    /// Number of contiguous tensor rows owned by each request.
+    pub fn request_expansion_factor(&self) -> usize {
+        match self {
+            Self::RequestExpanded { factor, .. } => *factor,
+            _ => 1,
         }
     }
 
