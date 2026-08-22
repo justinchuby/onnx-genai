@@ -1,109 +1,53 @@
 # Workflow-runtime unification: making `pipeline.workflow` the sole runtime
 
-Status: **ratified; execution gated on one remaining dependency (`#1716` on
-`main`).** The parent has ratified REPLACE + DELETE (no compatibility facade, no
-permanent delegator) and assigned this consolidation — across
-`speculative/mod.rs`, the direct `Engine`, server/CLI/bench/C-API callers, and
-the two legacy speculative tests — to the owner of PR #1723. The second gate
-condition (an executable chained fixture) is now **satisfied** — see §Execution
-gate. This document is the authoritative plan for collapsing the two execution
-engines (`Engine` text-generation and `PipelineEngine` workflow) into **one**
-canonical `pipeline.workflow` runtime with a single state/session model, a single
-sampling/stopping/decode policy, and ORT/native backend executors beneath it. It
-supersedes the "staged follow-up boundaries" framing in
+Status: **Phase 0 and Phase 1 have landed; Phase 1b and Phases 2-4 are
+the remaining work, itemized by symbol in §3 and §6.** The parent ratified REPLACE + DELETE (no
+compatibility facade, no permanent delegator) and assigned this consolidation to
+the owner of PR #1723. Its two gate conditions are both satisfied: `#1716` is on
+`main` (`7b79b3f5`), merged here (never rebased), and the hermetic executable
+chained fixture is committed. This document is the authoritative plan for
+collapsing the two execution engines (`Engine` text-generation and
+`PipelineEngine` workflow) into **one** canonical `pipeline.workflow` runtime
+with a single state/session model, a single sampling/stopping/decode policy, and
+ORT/native backend executors beneath it. It supersedes the "staged follow-up
+boundaries" framing in
 [`NATIVE_WORKFLOW_BACKEND.md`](NATIVE_WORKFLOW_BACKEND.md), which introduced the
 backend-neutral component seam this plan builds on.
 
-**Execution gate (measured, `2026-08-22`).** Phases 1–4 are blocked on two
-external dependencies that are not yet ready, so they cannot be *implemented and
-tested* in isolation without regressing production text generation or building
-on a moving target:
-- **The executable chained fixture now exists (`2026-08-22`), but `#1716` is
-  still the gate.** Proving ORT/native parity for the chained proposer needs a
-  package that actually uses `proposal_execution`; the committed `speculative`
-  fixture uses the old `max_proposal_width` form. gemma4-real-packages has now
-  built the tiny executable **`gemma4_chained`** target+assistant fixture on the
-  final `#1716` schema (branch `justinchuby/gemma4-chained-fixture`, commit
-  `8a66e2c8` — merges the `#1716` tip `9f47bb69` and makes the folded carry
-  explicit): committed
-  `inference_metadata.yaml` + `target/` + `assistant/` `*.onnx.textproto` (reused
-  proven `tiny-gemma4-assistant` graphs — hidden 16, 2H 32, vocab 32, kv_heads 2,
-  head_dim 8, 2 layers), greedy/logits-emit/f32/standard ops (ORT ∩ native-CPU
-  safe, op-safety inherited from `gemma4_assistant_full.rs`). Its contract is the
-  agreed chained ABI: assistant = `inputs_embeds[b,q,2H]` + read-only
-  `shared_kv.{full,sliding}_attention.{k,v}` (output-less pure reader) → `logits`
-  + `projected_state` (folded carry); `proposal_execution {chained,
-  folded_carry_output: projected_state}`; `rollback_state` = the 4 target KV
-  cells (folded carry excluded). Static contract review by this PR: **accepted,
-  no regen**. Phase 1 wires it into `native_workflow_parity.rs` as a required
-  `assert_parity_with(root, native_engine|native_cuda_engine, …)` case.
+**The chained-proposer contract, as executed.** The Phase-1 driver reads every
+field it needs from `speculative.proposal_execution` and never infers by
+convention or model name:
 
-  **Ground-truth semantics confirmed** (gemma4-real-packages, from the graph
-  slice values + embedding-file size): `carry_0 = target.hidden_states.0` (H=16);
-  each proposer step `inputs_embeds[b,q,2H] = concat(embed(last_token)[0:16],
-  carry[16:32])` — embed is the **leading** H, carry the **trailing** H (pinned
-  by the assistant graph's `Slice starts=[16] ends=[32] axis=2`);
-  `input_embedding.f32` is `[vocab=32, hidden=16]`, the row-gather table.
-  `steps` = the single-pass body; the `speculative:` block is the loop driver;
-  the Phase-1 chained construct **overrides** `inputs_embeds` each proposer step
-  (`request.inputs_embeds` is only the single-pass binding). **Coverage boundary
-  to respect:** this tiny drafter reads *only* the carry half — `embed[0:16]` is
-  present to satisfy the 2H ABI but is **unused** by the graph, so the fixture's
-  greedy tokens depend on the carry chain (`hidden_states.0 → projected_state →
-  …`) and the read-only borrowed KV, **not** on embedding-gather correctness.
-  That cleanly isolates folded-carry threading + borrowed-KV + accept/reject/
-  rollback (exactly what this parity case must prove), but means embed-gather
-  correctness is **not** validated here — Phase 1 covers that separately (a
-  real-model chained fixture or a dedicated embed-gather unit check), so the
-  parity suite never implies embed-building is proven when it isn't.
+| contract field | driver use |
+|---|---|
+| `token_embedding_input` | the fused proposer input the chain rebuilds each step |
+| `logits_output` | the draft distribution the chain argmaxes |
+| `recurrent[]` `{state, input, output}` | loop-carried state cells threaded and checkpointed |
+| `folded_carry_output` | carry_k for every step k >= 1 |
+| `folded_carry_seed` `{component, output}` | carry_0, read from the target output it names |
+| `token_embedding` `{component, table}` | the initializer `embed(last_token)` is gathered from |
+| `port_bindings.target_hidden_context` | validated to equal `token_embedding_input` for a folded carry |
+| `max_proposal_width` | the bound a requested width is checked against |
+| `rollback_state` | the cells a rejection truncates, on each cell's own serving `sequence_axis` |
 
-  **Contract items — RESOLVED by the final `#1716` schema (`8a66e2c8`), verified
-  in `crates/onnx-genai-metadata/src/validation.rs`.** Both are now explicit,
-  mandatory, ratified fields on `proposal_execution` (required whenever
-  `folded_carry_output` is set — validation rejects a folded proposal missing
-  either), so the Phase-1 chained driver reads them directly with no convention
-  inference and no model-name gate:
-  (1) **`folded_carry_seed: {component, output}`** names carry_0's source — in the
-  fixture `{component: target, output: hidden_states.0}` (validated: the component
-  is a declared workflow component and `output` is one of its output ports). This
-  supersedes the earlier `port_bindings.target_hidden_context` ambiguity: carry_0
-  is now unambiguously the named target output.
-  (2) **`token_embedding: {component, table}`** names where `embed(last_token)`
-  (the fused input's leading H) is gathered from — in the fixture
-  `{component: target, table: hidden_table}` (validated: declared component).
-  Generalizes to real models (names the target's in-model embedding table, no
-  per-model gate); for this tiny fixture the drafter ignores the embed half, so it
-  is exercised structurally but doesn't perturb the greedy tokens.
+The hermetic `gemma4_chained` fixture (imported from gemma4-real-packages @
+`8a66e2c8`) exercises the folded-carry shape end to end; `gemma4_chained_mixed`
+adds heterogeneous per-layer KV geometry (sliding head_dim 8, full head_dim 16).
+The identical contract shape is on the published real Gemma4-E2B packages
+(`folded_carry_seed: {component: target, output: hidden_states.34}`,
+`token_embedding: {component: target, table: model.embed_tokens.weight}`), so
+the same field-reading driver serves both — the "no model-name gate" invariant,
+confirmed empirically rather than asserted.
 
-  **Scale validation (real Gemma4-E2B packages, `2026-08-22`).** The identical
-  contract shape is now on the published real models — the same field-reading
-  Phase-1 driver serves both, confirming the "no model-name gate" invariant
-  empirically. The parent kept the schema strict (`folded_carry_seed` must name a
-  *real* target output — no request-input escape hatch); mobius gemma4 now honors
-  `output_layer_indices` and emits the post-final-norm hidden (== HF
-  `hidden_states[-1]`) as `hidden_states.{idx}` (mobius PR #546 @ `710d4927`,
-  backward-compatible). Real E2B `proposal_execution` carries
-  `folded_carry_seed: {component: target, output: hidden_states.34}` and
-  `token_embedding: {component: target, table: model.embed_tokens.weight}`
-  (`[262144,1536]` fp16) — real ports, no placeholders. Packages (do-not-merge,
-  user-published): target `onnx-genai-example-gemma4-e2b @ 19583bf0`, assistant
-  `…-assistant @ 4b6f1533`, speculative `…-speculative @ 3e5d3b6a`; all pass
-  `#1716` `validate_metadata` + jsonschema, L4 hidden ONNX-vs-HF cos 0.999999.
-  These are the coordinates for an optional real-model scale-validation case
-  *after* the tiny-fixture parity case lands; the tiny `gemma4_chained @
-  8a66e2c8` stays the required, hermetic Phase-1 parity fixture.
-  (`copilot/gemma4-e2b-metadata`) is ~50k insertions, still evolving (tip added a
-  26B MoE example), and edits the interpreter seam this PR owns
-  (`pipeline/islands.rs` +246, `pipeline/mod.rs` +138, `pipeline/workflow.rs`
-  +12, `speculative/mod.rs` +94). Starting the interpreter chained/AR work now
-  guarantees a conflict on a moving target. The agreed order is: `#1716` lands on
-  `main` → this PR merges `main` (never rebase) → consolidation proceeds.
-
-The AR/chained interpreter node is a real integration, not a small add:
-`SessionDecodeLoopBackend` (the ORT `DecodeLoopBackend`) is tied to `Engine`
-state (`session`/`kv_cache`/`scheduler`/`session_id`/`state`), so lifting decode
-under the interpreter moves that decode core, which is exactly why it must land
-after `#1716` (to avoid re-doing it against the seam edits above).
+**Coverage boundary to respect.** The tiny drafter's graph slices only the carry
+half of its fused input (`Slice starts=[16] ends=[32] axis=2`), so its greedy
+tokens depend on the carry chain and the borrowed read-only KV, **not** on
+embedding-gather correctness. That cleanly isolates folded-carry threading +
+borrowed KV + accept/reject/rollback, but means the parity case cannot prove the
+gather. `gemma4_chained_workflow::token_embedding_gather_matches_the_declared_table`
+proves it separately, against the package's own second copy of the table
+(`input_embedding.f32` vs the target's `hidden_table` initializer), so the parity
+suite never implies embed-building is proven when it isn't.
 
 Read [`RULES.md`](../../RULES.md). Rule 3 forbids retaining compatibility shims
 for our pre-release APIs; this plan **removes** them rather than keeping two
@@ -190,54 +134,79 @@ that constructs and runs a canonical workflow.
   `close_session`. Proven by the existing native decode/session tests and the
   bench build. No behavior change — the shims already delegated.
 
-- **Phase 1 — autoregressive-decode node beneath the interpreter.** Add a
-  workflow node kind (or a specialized component executor) that runs
-  `run_decode_loop` against a decoder component, so an AR loop expressed in a
-  workflow reuses the *one* decode policy (rich Rust sampling, KV, speculative)
-  instead of the fixture's ONNX policy graphs. Backend executors stay
-  `DecodeLoopBackend` (ORT) / native. Proven by parity: the `decoder` fixture
-  output via the AR node equals the direct `Engine` output.
+- **Phase 1 — chained speculative proposal driving in the interpreter — LANDED.**
+  The folded/threaded draft loop used to live in a direct-`Engine` Rust
+  `propose()` bound to ORT `Session`s, which the backend-neutral component seam
+  could not drive — a fork. It now lives in
+  `crates/onnx-genai-engine/src/pipeline/speculative.rs`, and every proposer step
+  runs through `PipelineEngine::invoke_component_values` ->
+  `invoke_onnx_component`, so ORT and native execute the identical chain.
 
-  This phase also **lifts the chained speculative proposer into the
-  interpreter** so it stops being an ORT-only path. Today the folded/threaded
-  draft loop lives in a direct-`Engine` Rust `propose()`
-  (`speculative/mod.rs:1273-1356`: `inputs_embeds = concat(embedding(last_token),
-  carry)`), which native (the component seam) cannot drive — a fork. Keyed by
-  `SpeculativeProposalExecution::Chained` (onnx-genai `#1696`, with
-  `folded_carry_output` **or** `recurrent`), the interpreter owns: build the
-  fused `inputs_embeds` = `concat(embed(last_token)[leading H], carry[trailing
-  H])`, gathering the embedding from the target table named by
-  `proposal_execution.token_embedding` (`{component, table}`); thread `carry_0`
-  from the target output named by `proposal_execution.folded_carry_seed`
-  (`{component, output}` — in the fixture `target.hidden_states.0`; both fields
-  ratified + validated in the final `#1716` schema, so no convention inference),
-  `carry_k = folded_carry_output(k-1)`;
-  drive the chain to `max_proposal_width`;
-  and treat the folded carry as **not** a rollback state cell (recomputed from
-  committed tokens on rejection, never restored). Only the per-step forward pass
-  is per-backend (`invoke_onnx_component`). The old `SpeculatorConfig` proposer
-  path   is deleted once this lands (Rule 3; confirmed non-dependency by onnx-genai
-  `#1716` — examples 22/24 assert only the contract, not which runtime drives
-  them). Proven by the executable **`gemma4_chained`** target+assistant fixture
-  (committed by gemma4-real-packages on the `#1716` schema; see §Execution gate)
-  wired into `native_workflow_parity.rs` as a **required ORT/native (and, since
-  its shapes resolve from bound input symbols, native-CUDA device-resident)
-  parity case** — greedy exact-token accept/reject/rollback bit-for-bit — plus
-  the catalogue examples 22 (`recurrent`) / 24 (`folded`) asserting the
-  `gemma4_e2b_workflow.rs` invariants (shared `kv_ownership`, no KV transitions,
-  `state_pairs: None` for the cacheless drafter, read-only borrowed KV with zero
-  writeback).
+  What the interpreter owns, all read from the contract (see the table above):
+  the fused `concat(embed(last_token)[leading], carry[trailing])`; carry_0 from
+  the target output `folded_carry_seed` names and `carry_k =
+  folded_carry_output(k-1)`; `recurrent[]` state threaded and checkpointed; the
+  chain driven up to `max_proposal_width`; acceptance
+  (`accept_chained_proposal`); and rollback of the declared `rollback_state`
+  cells (`rollback_speculative_state`), with the folded carry deliberately
+  **excluded** — it is recomputed from committed tokens, never restored.
 
-  Phase-1 preconditions (cross-PR; ratify with the parent + the
-  `speculative/mod.rs` / `#1696` owners before deleting the old path):
-  - The parent ratifies **"replace + delete the old `SpeculatorConfig` proposer
-    path"** as the official direction and assigns single ownership of the
-    interpreter seam (`pipeline/workflow.rs`) + the chained-wiring, so no two PRs
-    edit it.
-  - Pre-existing gates on the old direct-`Engine` speculative path —
-    `gemma4_assistant_full`, `chained_proposer_real` — are **re-pointed** at the
-    interpreter `Chained` construct (or become the ORT/native parity cases above)
-    in the same change, so the deletion drops no coverage.
+  Two interpreter facts had to become explicit for this to work:
+  * `PipelineEngine::run_pipeline_retained` keeps a pass's whole SSA map, so a
+    proposal binds the proposer's borrowed read-only shared KV and masks from
+    the values the workflow itself bound. Declared package outputs are still
+    host-materialized exactly as `run_pipeline` returns them; internal values
+    stay where the backend produced them, so a native-CUDA chain keeps its carry
+    and KV device-resident.
+  * Island fusion elides values no later step reads, which swallowed exactly
+    those tensors. `plan_execution_islands` now takes an externally-used set
+    computed from the declared contract, so a speculative package keeps them
+    live and a package without a chained proposer contributes nothing.
+  * Proposer ports that share the fused input's position symbol narrow to the
+    step's single position, derived from the declared port contracts — so a
+    borrowed-KV drafter's `kv_sequence`-keyed mask is untouched while its
+    `sequence`-keyed position ids are narrowed.
+
+  Deleted with it (Rule 3, no facade): `SpeculativeMode::SharedKv`,
+  `SharedKvProposerConfig`, `SharedKvBinding`,
+  `validate_shared_kv_proposer_config`, `SharedKvProposer` and its `propose()`,
+  `SharedKvProposerModel`, `load_shared_kv_proposer`,
+  `shared_kv_slices_from_materialized`, `NativeSharedKvProposerModel` /
+  `NativeSpeculationKind::SharedKv` (already unreachable — the field was
+  hard-wired to `None` at load), `onnx-genai-ort::shared_kv_proposer`,
+  `onnx-genai-ort::gemma4_assistant` (the model-name-gated
+  `Gemma4SharedKvSpec` / `Gemma4AssistantSignature` path, an orphan file never
+  compiled), `native_decode::proposer` and `NativeDecodeSession::shared_kv_inputs`,
+  `SpeculativeProposerContext::shared_kv_slices`, and the metadata parser's
+  `SharedKvProposerSpec` / `resolve_shared_kv`. A legacy
+  `proposal_type: shared_kv` block still parses but degrades to `Unknown` with a
+  diagnostic naming the contract that replaced it.
+
+  Re-pointed gates (no coverage dropped): `gemma4_assistant_full` ->
+  `gemma4_chained_workflow::speculative_decode_equals_greedy_decode` plus the
+  ORT/native/CUDA parity case; `gemma4_assistant_mixed` ->
+  `gemma4_chained_workflow::mixed_head_dim_speculative_decode_equals_greedy_decode`
+  on the new `gemma4_chained_mixed` package. `chained_proposer_real` is an
+  EAGLE-3 chain gated on `ONNX_GENAI_CHAINED_SPEC_PACKAGE` and never touched the
+  shared-KV path, so it is unaffected and stays as-is.
+
+  Proven by `gemma4_chained_workflow` (8 cases) and
+  `native_workflow_parity::chained_speculative_proposal_parity{,_native_cuda}` —
+  identical proposals, identical accept/reject/rollback paths, and identical
+  tokens on ORT, native-CPU, and device-resident native-CUDA (H200).
+
+- **Phase 1b — autoregressive-decode node beneath the interpreter — REMAINING.**
+  Add a specialized component executor that runs `run_decode_loop` against a
+  decoder component, so an AR loop expressed in a workflow reuses the *one*
+  decode policy (rich Rust sampling, KV, speculative) instead of the fixture's
+  ONNX policy graphs. Backend executors stay `DecodeLoopBackend` (ORT) / native.
+  Concretely: recognize a canonical single-decoder `WorkflowNode::Loop` in
+  `pipeline/workflow.rs::run_workflow_node`, and delegate it to
+  `decode_loop.rs::run_decode_loop` with a `DecodeLoopBackend` built over
+  `invoke_component_values`. Proven by parity: the `decoder` fixture output via
+  the AR node equals the direct `Engine` output. This is independent of the
+  chained lift above (which drives proposal, not the token loop) and is the
+  prerequisite for Phase 2.
 
 - **Phase 2 — canonical single-decoder workflow synthesis.** Add a Rust
   synthesizer that turns a plain `model.io`/introspected decoder into a minimal
@@ -260,11 +229,6 @@ that constructs and runs a canonical workflow.
   Remove now-dead config flags/branches and the tests that pinned the deleted
   legacy paths.
 
-Shared infrastructure that both engines already use — `engine/load.rs`,
-`governor.rs`, `memory_strategy.rs`, `memory_plan.rs`, `metadata.rs`,
-`placement.rs`, `session_state.rs` — is **kept**; it is not duplicated
-orchestration.
-
 ## 4. Migration notes for callers
 
 - `Engine::create_native_session()` → `Engine::create_session()` (native backend
@@ -285,3 +249,69 @@ first green test — leaving production text generation and the OpenAI server AP
 regressed in the interim. That trades the one thing this refactor must not
 trade: correctness with full tests. The phases above each keep the tree green
 and each carry their proof.
+
+## 6. Remaining code, by symbol
+
+Phases 1b-4 are code, not a plan. This is the exact surface each one has to
+touch, so the next change starts from a list rather than a survey.
+
+**Phase 1b — AR decode node.**
+- `crates/onnx-genai-engine/src/pipeline/workflow.rs`: recognize a canonical
+  single-decoder `WorkflowNode::Loop` in `run_workflow_node` and delegate it.
+- `crates/onnx-genai-engine/src/decode_loop.rs`: `run_decode_loop`,
+  `DecodeLoopBackend`, `SessionDecodeLoopBackend` — the decode core to lift. It
+  is tied to `Engine` state (`session` / `kv_cache` / `scheduler` / `session_id`
+  / `state`), so the lift means moving that core, not calling it in place.
+- `crates/onnx-genai-engine/src/processors.rs`: `select_next_token*`,
+  `finish_reason_after_token`, `commit_selected_token` — the one sampling /
+  stopping / commit policy, already shared; it must stay the only one.
+- Proof: the `decoder` fixture through the AR node equals the direct `Engine`
+  output, on ORT and native.
+
+**Phase 2 — canonical single-decoder workflow synthesis.**
+- New: a `WorkflowSpec` synthesizer over `decode/metadata.rs::ModelIoSpec` /
+  `engine/metadata.rs` introspection. Today only `decoder_abi` /
+  `compile_workflow` exist, and both *lower an existing* workflow; nothing
+  synthesizes one.
+- `crates/onnx-genai-engine/src/engine/load.rs::Engine::from_pretrained` builds
+  it and runs it through the interpreter.
+- Capability gap to close first: `pipeline.workflow` has no representation for
+  paged KV, the batch scheduler, multi-turn sessions, FIM, connector KV, or the
+  rich Rust sampler (DRY, Mirostat, XTC, penalties, grammar). The workflow
+  decoder fixture expresses sampling as ONNX policy graphs, which are strictly
+  less capable. Phase 1b's AR node is what lets the synthesized workflow reuse
+  the Rust sampler instead of needing an ONNX one.
+
+**Phase 3 — migrate callers.**
+- `crates/onnx-genai-server/src/routes/completions.rs`: the
+  `if handle.pipeline { … } else { … }` dispatch at lines 9, 342, 444, 615
+  collapses into one path.
+- `crates/onnx-genai-cli/src/interactive.rs` (`PipelineEngine::from_dir_with_session_options`)
+  and `src/transcribe.rs` already use `PipelineEngine`; the plain-decoder CLI
+  path is what moves.
+- `crates/onnx-genai-bench/src/bin/profile_native.rs`: the `--pipeline` flag
+  stops being a mode (note its current
+  "`--speculative` is not supported on the `--pipeline` path" bail — Phase 1
+  removes the reason for it).
+- `crates/onnx-genai-capi` and `crates/onnx-genai-python`: neither references
+  `PipelineEngine` today; both route through `Engine`, so they follow whatever
+  `Engine::from_pretrained` becomes in Phase 2 rather than needing their own
+  migration.
+
+**Phase 4 — collapse `Engine`.**
+- `crates/onnx-genai-engine/src/engine/runtime.rs`: the parallel generate /
+  session routing, `native_speculation_plan` dispatch, and the FIM / connector /
+  batching entry points fold into the workflow runtime or its shared infra.
+- `crates/onnx-genai-engine/src/native_speculative.rs`: `NativeSpeculativeDriver`
+  is the last native-side token loop that is not `run_decode_loop`; after
+  Phase 1b it should be a `DecodeLoopBackend`, not a peer loop.
+- `crates/onnx-genai-engine/src/speculative/mod.rs`: `SpeculativeProposer` and
+  its remaining implementations (`MtpProposer`, `Eagle3Proposer`,
+  `DraftModelProposer`, `NgramProposer`) become interpreter constructs keyed by
+  contract, the way `Chained` already is.
+- Then delete the now-dead config flags/branches and the tests pinning them.
+
+Shared infrastructure both engines already use — `engine/load.rs`,
+`governor.rs`, `memory_strategy.rs`, `memory_plan.rs`, `metadata.rs`,
+`placement.rs`, `session_state.rs` — is **kept**; it is not duplicated
+orchestration.

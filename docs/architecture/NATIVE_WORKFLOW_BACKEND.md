@@ -233,12 +233,16 @@ invariants are observable through a per-backend run counter.
   `Engine`'s bespoke native session lifecycle and ORT/native routing as a thin
   façade over a synthesized canonical single-decoder workflow, so
   `engine/runtime.rs` stops being a second orchestrator.
-* **Follow-up boundary D — Gemma4 target+assistant.** Drive the
-  `Gemma4SharedKvSpec` / `Gemma4AssistantSignature` metadata (target-owned KV
+* **Follow-up boundary D — Gemma4 target+assistant — DONE.** Target-owned KV
   groups, read-only shared KV consumed by a cacheless assistant, heterogeneous
-  full/sliding groups, target hidden-state handoff, nested speculative
-  accept/reject/rollback) through the same seam with no model-name conditional,
-  reusing the existing `Gemma4AssistantDecodeSession` beneath the interpreter.
+  full/sliding groups, target hidden-state handoff, and speculative
+  accept/reject/rollback now run through the same seam with **no model-name
+  conditional**: `pipeline::speculative` reads `speculative.proposal_execution`
+  (`folded_carry_seed`, `folded_carry_output`, `token_embedding`, `recurrent[]`)
+  and drives the proposer through `invoke_component_values`. The model-name-gated
+  `Gemma4SharedKvSpec` / `Gemma4AssistantSignature` path and the whole
+  `SharedKvProposerConfig` orchestration beneath it are deleted, not wrapped.
+  See [`WORKFLOW_RUNTIME_UNIFICATION.md`](WORKFLOW_RUNTIME_UNIFICATION.md).
 
 Each boundary is independently landable and independently testable; none require
 re-opening the interpreter.
