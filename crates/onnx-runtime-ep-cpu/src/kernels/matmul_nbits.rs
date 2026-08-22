@@ -1320,6 +1320,40 @@ impl NBitsLayout {
     }
 }
 
+/// Decode one **int4** zero point without the generic layout's integer divisions.
+///
+/// [`NBitsLayout::zero_point`] is generic over `bits`, so it reaches
+/// `unpack`, which computes `8 / bits`, `index / values_per_byte` and
+/// `index % values_per_byte` from a runtime field. Every int4 decode kernel
+/// carries `#[target_feature(enable = "avx2,fma")]`, which stops it being
+/// inlined into its un-annotated caller, so `bits` stays opaque across that
+/// boundary and LLVM cannot fold those into shifts. The result is real integer
+/// division in an epilogue that runs once per `(block, column)` -- for a
+/// 4096-deep row at `block_size = 32` that is 128 blocks x 4 columns of
+/// division per output group, and `div` is both long-latency and poorly
+/// pipelined.
+///
+/// With `bits == 4` the whole computation is a shift and a mask. This is
+/// **bit-identical** to `layout.zero_point(points, block)` for `bits == 4`, not
+/// an approximation: `values_per_byte` is `8 / 4 == 2`, so `index / 2` is
+/// `index >> 1` and `index % 2` is `index & 1`; the shift amount
+/// `(index % 2) * bits` is `(block & 1) << 2`; `mask()` is `0x0f`; and the
+/// absent-zero-point default `1 << (bits - 1)` is `8`. Indexing is the same
+/// element, so out-of-range blocks still panic identically.
+///
+/// `int4_zero_point_matches_the_generic_layout` pins the equivalence over every
+/// block index and both zero-point states, so a future change to either
+/// definition cannot silently diverge. Exactness matters here beyond tidiness:
+/// this feeds the acc0 route, whose contract is exact agreement with the scalar
+/// reference (#1676).
+#[inline(always)]
+fn int4_zero_point(zero_points: Option<&[u8]>, block: usize) -> u8 {
+    match zero_points {
+        Some(points) => (points[block >> 1] >> ((block & 1) << 2)) & 0x0f,
+        None => 8,
+    }
+}
+
 struct PackedNBitsRow<'a> {
     values: &'a [u8],
     scales: &'a [f32],
@@ -7414,7 +7448,7 @@ unsafe fn borrowed_int4_nblock4_avx2(
                 let block_values =
                     &packed_rows[c][block * packed_block_size..(block + 1) * packed_block_size];
                 let scale = scales.get(scale_bases[c] + block);
-                let zero_point = layout.zero_point(zp_rows[c], block) as f32;
+                let zero_point = int4_zero_point(zp_rows[c], block) as f32;
                 let mut dot = 0.0f32;
                 for (byte_index, &byte) in block_values.iter().enumerate() {
                     let within = byte_index * 2;
@@ -7467,7 +7501,7 @@ unsafe fn borrowed_int4_nblock4_avx2(
         }
         for c in 0..group {
             let scale = scales.get(scale_bases[c] + block);
-            let zero_point = layout.zero_point(zp_rows[c], block) as f32;
+            let zero_point = int4_zero_point(zp_rows[c], block) as f32;
             acc[c] = _mm256_fmadd_ps(blk[c], _mm256_set1_ps(scale), acc[c]);
             correction[c] += scale * zero_point * activation_sums[block];
         }
@@ -7521,7 +7555,7 @@ fn borrowed_int4_output_element(
         let block_values = &packed_row
             [block * layout.packed_block_size()..(block + 1) * layout.packed_block_size()];
         let scale = scales.get(scale_base + block);
-        let zero_point = layout.zero_point(zp_row, block) as f32;
+        let zero_point = int4_zero_point(zp_row, block) as f32;
         let mut dot;
         #[cfg(target_arch = "aarch64")]
         if valid == 32 && block_size == 32 {
@@ -7910,7 +7944,7 @@ unsafe fn borrowed_int4_rowblock_avx2(
         let depth_start = block * block_size;
         let valid = k.saturating_sub(depth_start).min(block_size);
         let scale = scales.get(scale_base + block);
-        let zero_point = layout.zero_point(zp_row, block) as f32;
+        let zero_point = int4_zero_point(zp_row, block) as f32;
         let block_values = &packed_row[block * packed_block_size..(block + 1) * packed_block_size];
 
         if valid != block_size || !block_size.is_multiple_of(32) {
@@ -10396,6 +10430,50 @@ mod tests {
     ///
     /// The shapes here are the ones where this bites: long `k`, same-sign
     /// terms, so cancellation cannot mask the drift.
+    /// Pins `int4_zero_point` bit-identical to the generic
+    /// `NBitsLayout::zero_point` it specialises.
+    ///
+    /// The specialisation exists to delete two runtime integer divisions from
+    /// an epilogue that runs once per `(block, column)`; the divisions come
+    /// from `bits` being opaque across the kernels' `#[target_feature]`
+    /// boundary. That is a pure code-generation change and must not move a
+    /// single result bit, because it feeds the exact-accuracy acc0 route
+    /// (#1676), whose whole contract is agreeing with the scalar reference
+    /// exactly. A one-nibble divergence here would be an accuracy regression
+    /// disguised as an optimisation.
+    ///
+    /// Both zero-point states and every nibble position are covered: the packed
+    /// byte holds two blocks, so an off-by-one in the shift or the index swaps
+    /// even and odd blocks -- which a run of equal zero points would hide, hence
+    /// the distinct per-nibble values.
+    #[test]
+    fn int4_zero_point_matches_the_generic_layout() {
+        let layout = NBitsLayout {
+            bits: 4,
+            block_size: 32,
+        };
+        // Distinct low/high nibbles per byte, so even and odd blocks can never
+        // be confused for one another.
+        let packed: Vec<u8> = (0u8..64)
+            .map(|i| (i.wrapping_mul(7) & 0x0f) | ((i.wrapping_mul(11) & 0x0f) << 4))
+            .collect();
+
+        for block in 0..packed.len() * 2 {
+            assert_eq!(
+                int4_zero_point(Some(&packed), block),
+                layout.zero_point(Some(&packed), block),
+                "block {block}: specialised int4 decode diverged from the generic layout"
+            );
+        }
+
+        // The absent-zero-point default must also match, at every block, and be
+        // the int4 midpoint rather than whatever the last `Some` returned.
+        for block in 0..8 {
+            assert_eq!(int4_zero_point(None, block), layout.zero_point(None, block));
+            assert_eq!(int4_zero_point(None, block), 8);
+        }
+    }
+
     #[test]
     fn reassociated_dot_is_at_least_as_accurate_as_the_serial_chain() {
         fn serial(a: &[f32], b: &[f32]) -> f32 {
