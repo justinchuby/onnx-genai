@@ -364,13 +364,13 @@ pub struct CudaRuntime {
     /// dependency. See [`CudaRuntime::record_copy_fence`].
     fences: Mutex<HashMap<u64, CudaEvent>>,
     next_fence_id: AtomicU64,
-    /// Persistent four-byte device word into which capture-safe kernels latch an
-    /// out-of-range bounds violation detected during CUDA-graph replay. It is set
-    /// (via `atomicOr`) by device kernels and never auto-cleared on the device;
-    /// only an explicit host [`CudaRuntime::reset_capture_error`] (invoked on
-    /// graph reset / re-capture) returns it to zero. The host reads it at the
-    /// existing per-step logits sync so a poisoned replay becomes a hard error
-    /// before the produced token is consumed.
+    /// Persistent four-byte device word into which kernels latch an out-of-range
+    /// bounds violation during deferred eager execution or CUDA-graph replay. It
+    /// is set (via `atomicOr`) and never auto-cleared on the device;
+    /// only an explicit host [`CudaRuntime::reset_capture_error`] returns it to
+    /// zero. Session request boundaries and graph reset/re-capture use that reset.
+    /// The host reads it after a request synchronization so eager or captured
+    /// validation failures become hard errors before outputs are consumed.
     capture_error: CUdeviceptr,
     /// When set, the public [`CudaRuntime::synchronize`] becomes a no-op so the
     /// redundant trailing per-op eager device syncs (issued by kernels on the
@@ -677,10 +677,9 @@ impl CudaRuntime {
     /// Read the latching capture-error word device → host, returning the raw
     /// violation bitmask (zero when no capture-safe kernel has tripped).
     ///
-    /// This does not clear the latch: once set, every subsequent captured replay
-    /// stays poisoned until [`CudaRuntime::reset_capture_error`]. Callers invoke
-    /// this at the per-step logits D2H sync, so the trailing stream synchronize
-    /// is already satisfied and no additional serialization is introduced.
+    /// This does not clear the latch: once set, subsequent work stays poisoned
+    /// until [`CudaRuntime::reset_capture_error`]. Callers invoke this only after
+    /// a request-level host synchronization boundary.
     pub fn check_capture_error(&self) -> Result<u32> {
         let mut bytes = [0_u8; std::mem::size_of::<u32>()];
         // SAFETY: `capture_error` is a live four-byte device allocation owned by
@@ -690,7 +689,7 @@ impl CudaRuntime {
     }
 
     /// Clear the latching capture-error word back to the un-poisoned state.
-    /// Invoked on graph reset / re-capture so a fresh generation starts clean.
+    /// Invoked at session request boundaries and on graph reset / re-capture.
     pub fn reset_capture_error(&self) -> Result<()> {
         // SAFETY: `capture_error` is a live four-byte device allocation owned by
         // this runtime for its whole lifetime.

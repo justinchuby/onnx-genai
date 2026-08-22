@@ -693,7 +693,7 @@ fn comparison_claims_integer_dtypes_and_rejects_unsupported_dtype() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
-fn binary_fixed_decode_shape_captures_replays_and_gates_other_paths() {
+fn binary_static_shape_metadata_captures_replays_and_tracks_signatures() {
     let ep = require_cuda();
     let runtime = ep.runtime();
     let device = ep.device_id();
@@ -732,9 +732,10 @@ fn binary_fixed_decode_shape_captures_replays_and_gates_other_paths() {
             device,
         ),
     ];
-    let kernel = ep
+    let mut kernel = ep
         .get_kernel(&Node::new(NodeId(0), "Add", vec![], vec![]), &[], 17)
         .unwrap();
+    kernel.set_capture_seq_independent(true);
     assert!(!kernel.cuda_graph_compatible());
 
     let output = TensorMut::new(
@@ -898,19 +899,26 @@ fn binary_fixed_decode_shape_captures_replays_and_gates_other_paths() {
     kernel
         .execute(&prefill_inputs, &mut [prefill_output])
         .unwrap();
-    assert!(!kernel.cuda_graph_compatible());
+    assert!(kernel.cuda_graph_compatible());
     let after_shape_change = runtime.allocation_counts();
     assert_eq!(
         after_shape_change.allocations,
         before_shape_change.allocations + 1
     );
-    assert_eq!(after_shape_change.frees, before_shape_change.frees + 1);
+    assert_eq!(after_shape_change.frees, before_shape_change.frees);
+    assert!(
+        ep.release_queue()
+            .wait_until_idle(std::time::Duration::from_secs(30)),
+        "replaced broadcast metadata must eventually be released: {:?}",
+        ep.deferred_release_stats()
+    );
 
-    let before_kernel_drop = runtime.allocation_counts();
     drop(kernel);
-    assert_eq!(
-        runtime.allocation_counts().frees,
-        before_kernel_drop.frees + 1
+    assert!(
+        ep.release_queue()
+            .wait_until_idle(std::time::Duration::from_secs(30)),
+        "live broadcast metadata must be released with the kernel: {:?}",
+        ep.deferred_release_stats()
     );
     ep.deallocate(prefill_a).unwrap();
     ep.deallocate(prefill_y).unwrap();

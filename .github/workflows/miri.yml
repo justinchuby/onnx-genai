@@ -12,6 +12,7 @@ on:
       - crates/onnx-runtime-session/**
       - crates/onnx-runtime-capi/**
       - crates/onnx-runtime-memory/**
+      - crates/onnx-runtime-memory-api/**
       - crates/onnx-runtime-dlpack/**
   push:
     branches:
@@ -27,6 +28,7 @@ on:
       - crates/onnx-runtime-session/**
       - crates/onnx-runtime-capi/**
       - crates/onnx-runtime-memory/**
+      - crates/onnx-runtime-memory-api/**
       - crates/onnx-runtime-dlpack/**
   schedule:
     - cron: "17 10 * * 1"
@@ -91,6 +93,15 @@ jobs:
             cargo +nightly miri test --locked -p onnx-runtime-memory
           run_miri "onnx-runtime-dlpack full" \
             cargo +nightly miri test --locked -p onnx-runtime-dlpack
+
+          # onnx-runtime-memory-api is the binding/ownership seam: raw addresses
+          # crossing an allocator trait, generation-checked release, and
+          # quarantine that deliberately retains ownership instead of freeing.
+          # Miri's leak check is the only thing here that distinguishes
+          # "deliberately retained" from "lost", which is exactly the property
+          # this crate claims, so it runs the full crate rather than a subset.
+          run_miri "onnx-runtime-memory-api full" \
+            cargo +nightly miri test --locked -p onnx-runtime-memory-api
 
           # onnx-runtime-ep-api has Linux-only legacy plugin-loader tests that
           # compile and dlopen C fixtures; Miri cannot execute that native path.

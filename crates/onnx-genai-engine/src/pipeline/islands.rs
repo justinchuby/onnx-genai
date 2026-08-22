@@ -78,6 +78,7 @@ pub(crate) struct ExecutionIsland {
     device_allocator: Option<Allocator>,
     linked_node_count: usize,
     external_initializer_bytes: u64,
+    initializer_bytes: u64,
     next_graph_id: Cell<i32>,
     runs: Cell<u64>,
     session_runs: Cell<u64>,
@@ -775,6 +776,129 @@ pub(crate) fn plan_execution_islands(
     Ok(islands)
 }
 
+pub(crate) fn maximum_execution_island_initializer_bytes(
+    graph: &WorkflowNode,
+    workflow: &WorkflowSpec,
+    models: &onnx_genai_ort::PipelineModels,
+) -> anyhow::Result<u64> {
+    let mut uses = HashMap::<String, usize>::new();
+    collect_value_uses(graph, &mut uses);
+    let mut next_island_id = 0;
+    maximum_node_initializer_bytes(graph, workflow, models, &uses, &mut next_island_id)
+}
+
+fn maximum_node_initializer_bytes(
+    node: &WorkflowNode,
+    workflow: &WorkflowSpec,
+    models: &onnx_genai_ort::PipelineModels,
+    uses: &HashMap<String, usize>,
+    next_island_id: &mut usize,
+) -> anyhow::Result<u64> {
+    match node {
+        WorkflowNode::Sequence { nodes } => {
+            let mut total = 0_u64;
+            for child in nodes {
+                total = total
+                    .checked_add(maximum_node_initializer_bytes(
+                        child,
+                        workflow,
+                        models,
+                        uses,
+                        next_island_id,
+                    )?)
+                    .context("workflow execution-island initializer size overflow")?;
+            }
+            let mut index = 0;
+            while index < nodes.len() {
+                let Some(device) = pure_onnx_device(&nodes[index], workflow, models) else {
+                    index += 1;
+                    continue;
+                };
+                let start = index;
+                index += 1;
+                while index < nodes.len()
+                    && pure_onnx_device(&nodes[index], workflow, models).as_deref()
+                        == Some(device.as_str())
+                {
+                    index += 1;
+                }
+                if index - start < 2 {
+                    continue;
+                }
+                let invocations = nodes[start..index]
+                    .iter()
+                    .map(island_invocation)
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                let Ok(linked) = link_execution_island_model(
+                    *next_island_id,
+                    &device,
+                    &invocations,
+                    models,
+                    uses,
+                ) else {
+                    continue;
+                };
+                *next_island_id += 1;
+                total = total
+                    .checked_add(linked.initializer_bytes)
+                    .context("workflow execution-island initializer size overflow")?;
+            }
+            Ok(total)
+        }
+        WorkflowNode::Loop { setup, body, .. } => {
+            maximum_node_initializer_bytes(setup, workflow, models, uses, next_island_id)?
+                .checked_add(maximum_node_initializer_bytes(
+                    body,
+                    workflow,
+                    models,
+                    uses,
+                    next_island_id,
+                )?)
+                .context("workflow execution-island initializer size overflow")
+        }
+        WorkflowNode::Branch { cases, default, .. } => {
+            let mut total = 0_u64;
+            for case in cases.values() {
+                total = total
+                    .checked_add(maximum_node_initializer_bytes(
+                        case,
+                        workflow,
+                        models,
+                        uses,
+                        next_island_id,
+                    )?)
+                    .context("workflow execution-island initializer size overflow")?;
+            }
+            if let Some(default) = default {
+                total = total
+                    .checked_add(maximum_node_initializer_bytes(
+                        default,
+                        workflow,
+                        models,
+                        uses,
+                        next_island_id,
+                    )?)
+                    .context("workflow execution-island initializer size overflow")?;
+            }
+            Ok(total)
+        }
+        WorkflowNode::Invoke { .. }
+        | WorkflowNode::Emit { .. }
+        | WorkflowNode::Transfer { .. }
+        | WorkflowNode::ExecutionIsland { .. } => Ok(0),
+    }
+}
+
+pub(crate) fn execution_island_initializer_bytes(
+    islands: &[ExecutionIsland],
+) -> anyhow::Result<u64> {
+    islands.iter().try_fold(0_u64, |total, island| {
+        total
+            .checked_add(island.initializer_bytes)
+            .context("workflow execution-island initializer size overflow")
+    })
+}
+
 fn lower_node(
     node: &mut WorkflowNode,
     workflow: &WorkflowSpec,
@@ -1263,37 +1387,9 @@ fn build_execution_island(
     uses: &HashMap<String, usize>,
     aliasable_output_values: &HashSet<String>,
 ) -> anyhow::Result<ExecutionIsland> {
-    let internal_uses = invocations
-        .iter()
-        .flat_map(|invoke| invoke.inputs.values())
-        .fold(HashMap::<String, usize>::new(), |mut uses, value| {
-            *uses.entry(value.clone()).or_default() += 1;
-            uses
-        });
-    let produced = invocations
-        .iter()
-        .flat_map(|invoke| invoke.outputs.values().cloned())
-        .collect::<HashSet<_>>();
-    let boundary_outputs = produced
-        .iter()
-        .filter(|value| {
-            uses.get(*value).copied().unwrap_or_default()
-                > internal_uses.get(*value).copied().unwrap_or_default()
-        })
-        .cloned()
-        .collect::<HashSet<_>>();
-    let linked = link_models(
-        id,
-        &invocations,
-        models,
-        &boundary_outputs,
-        device.starts_with("cuda:"),
-    )?;
+    let linked = link_execution_island_model(id, device, &invocations, models, uses)?;
     let mut options = models.session_options();
     let capture_requested = options.graph_capture;
-    if !linked.external_files.is_empty() && !(device.starts_with("cuda:") && capture_requested) {
-        bail!("file-backed external-data fusion requires ORT-managed CUDA graph capture");
-    }
     let mut shared_buffer_inputs = HashMap::new();
     if let Some(serving) = &workflow.serving {
         // The package declares whether writing `present` into the `past`
@@ -1380,7 +1476,15 @@ fn build_execution_island(
     let capture_eligible = structurally_capture_eligible
         && capture_session_failure.is_none()
         && device_allocator.is_some();
-    let external_initializer_bytes = linked.external_files.iter().map(|file| file.len).sum();
+    let external_initializer_bytes =
+        linked
+            .external_files
+            .iter()
+            .try_fold(0_u64, |total, file| {
+                total
+                    .checked_add(file.len)
+                    .context("linked external initializer size overflow")
+            })?;
     let components = invocations
         .iter()
         .map(|invoke| invoke.component.clone())
@@ -1423,6 +1527,7 @@ fn build_execution_island(
         device_allocator,
         linked_node_count: linked.node_count,
         external_initializer_bytes,
+        initializer_bytes: linked.initializer_bytes,
         next_graph_id: Cell::new((id as i32).saturating_mul(1000)),
         runs: Cell::new(0),
         session_runs: Cell::new(0),
@@ -1461,6 +1566,46 @@ fn build_execution_island(
     })
 }
 
+fn link_execution_island_model(
+    id: usize,
+    device: &str,
+    invocations: &[IslandInvocation],
+    models: &onnx_genai_ort::PipelineModels,
+    uses: &HashMap<String, usize>,
+) -> anyhow::Result<LinkedModel> {
+    let internal_uses = invocations
+        .iter()
+        .flat_map(|invoke| invoke.inputs.values())
+        .fold(HashMap::<String, usize>::new(), |mut uses, value| {
+            *uses.entry(value.clone()).or_default() += 1;
+            uses
+        });
+    let produced = invocations
+        .iter()
+        .flat_map(|invoke| invoke.outputs.values().cloned())
+        .collect::<HashSet<_>>();
+    let boundary_outputs = produced
+        .iter()
+        .filter(|value| {
+            uses.get(*value).copied().unwrap_or_default()
+                > internal_uses.get(*value).copied().unwrap_or_default()
+        })
+        .cloned()
+        .collect::<HashSet<_>>();
+    let linked = link_models(
+        id,
+        invocations,
+        models,
+        &boundary_outputs,
+        device.starts_with("cuda:"),
+    )?;
+    let capture_requested = models.session_options().graph_capture;
+    if !linked.external_files.is_empty() && !(device.starts_with("cuda:") && capture_requested) {
+        bail!("file-backed external-data fusion requires ORT-managed CUDA graph capture");
+    }
+    Ok(linked)
+}
+
 struct LinkedModel {
     bytes: Vec<u8>,
     inputs: BTreeMap<String, String>,
@@ -1468,6 +1613,7 @@ struct LinkedModel {
     capture_declines: Vec<String>,
     external_files: Vec<LinkedExternalFile>,
     node_count: usize,
+    initializer_bytes: u64,
 }
 
 struct LinkedExternalFile {
@@ -1862,6 +2008,7 @@ fn link_models(
         bail!("execution island has no externally used outputs");
     }
     let node_count = graph.node.len();
+    let initializer_bytes = linked_initializer_bytes(&model)?;
     Ok(LinkedModel {
         bytes: model.encode_to_vec(),
         inputs: fused_inputs,
@@ -1869,7 +2016,16 @@ fn link_models(
         capture_declines,
         external_files: external_files.into_values().collect(),
         node_count,
+        initializer_bytes,
     })
+}
+
+fn linked_initializer_bytes(model: &ModelProto) -> anyhow::Result<u64> {
+    let initializer_bytes = onnx_runtime_loader::weights::referenced_weight_bytes(model);
+    initializer_bytes
+        .inline
+        .checked_add(initializer_bytes.external)
+        .context("linked execution-island initializer size overflow")
 }
 
 /// Namespace artifact-local symbolic dimensions before models share one graph.
@@ -2275,6 +2431,7 @@ mod tests {
             capture_declines: Vec::new(),
             external_files: files.into_values().collect(),
             node_count: 0,
+            initializer_bytes: 16,
         });
         let linked_paths = (0..4)
             .map(|_| {
@@ -2309,6 +2466,25 @@ mod tests {
         std::fs::remove_dir_all(test_root).unwrap();
         std::fs::remove_dir_all(linked_directory).unwrap();
         std::fs::remove_dir_all(replacement_linked_directory).unwrap();
+    }
+
+    #[test]
+    fn fused_session_residency_counts_each_linked_initializer_copy() {
+        let initializer = || TensorProto {
+            data_type: 1,
+            dims: vec![1],
+            raw_data: vec![0; 4],
+            ..Default::default()
+        };
+        let linked = ModelProto {
+            graph: Some(GraphProto {
+                initializer: vec![initializer(), initializer()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(linked_initializer_bytes(&linked).unwrap(), 8);
     }
 
     #[test]
