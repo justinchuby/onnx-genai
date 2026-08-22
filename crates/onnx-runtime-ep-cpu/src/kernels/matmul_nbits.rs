@@ -4747,6 +4747,19 @@ pub(crate) fn spmd_decode_active() -> Option<&'static crate::decode_spmd::SpmdDe
     }
 }
 
+/// Whether *some* bounded decode pool owns this thread's forward pass.
+///
+/// The routing predicate for kernels that are not themselves decode
+/// projections but run inside a decode forward — attention, above all. When it
+/// is true the decode workers are resident and (under the SPMD scope) spinning,
+/// so a fan-out belongs on [`decode_parallel_output_row_blocks`] rather than on
+/// any second executor that would compete with them for the same cores. When it
+/// is false there is no decode pool to contend with and the task runtime is the
+/// right home. Keys off the active scope, never off op or model identity.
+pub(crate) fn decode_pool_active() -> bool {
+    spmd_decode_active().is_some() || numa_decode_active().is_some()
+}
+
 #[cfg(test)]
 static SPMD_TEST_DISPATCHES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
