@@ -62,7 +62,7 @@ fn selection_matches_execution_provider_and_precision_in_manifest_order() {
     assert_eq!(selected.variant_name, "cpu-fp16");
     assert_eq!(
         selected.model_path,
-        fixture_canonical("valid-package").join("cpu-fp16/model.onnx")
+        fixture_canonical("valid-package").join("cpu-fp16/model.onnx.textproto")
     );
 }
 

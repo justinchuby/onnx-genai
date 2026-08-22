@@ -15,7 +15,13 @@ harness's own synthetic pattern, fed identically to both runtimes.
 `MatMulNBits` slot order (com.microsoft):
   0 A  1 B  2 scales  3 zero_points  4 g_idx  5 bias
 `B` is `[n, n_blocks_per_col, blob_size]` uint8 with `blob_size = block_size/2`
-for 4-bit, and `scales` is `[n * n_blocks_per_col]`.
+for 4-bit and `blob_size = block_size` for 8-bit, and `scales` is
+`[n * n_blocks_per_col]`.
+
+8-bit cells exist because `docs/performance/CPU_MATMUL_ASSIGNMENT.md` carries
+8-bit `MatMulNBits` rows that no generator here could reproduce: the matrix said
+"gap (static M)" for wide 8-bit prefill with nothing in the tree able to
+re-measure it.
 """
 
 from __future__ import annotations
@@ -35,10 +41,16 @@ NBITS_SHAPES = {
     "qwen3_0p6b_mlp": (1024, 6144),
     "llama3_8b_qkv": (4096, 6144),
     "llama3_8b_mlp": (4096, 14336),
+    # The square geometry `docs/performance/CPU_MATMUL_ASSIGNMENT.md` quotes
+    # every `MatMulNBits` row at (Qwen3-8B hidden size). Kept here so a row of
+    # that matrix can be re-measured at the geometry it claims, rather than at a
+    # nearby projection shape.
+    "qwen3_8b_square": (3584, 3584),
 }
 
 # Token counts: 1 = decode, the rest walk prefill up through the caches.
-NBITS_TOKENS = (1, 8, 128, 512)
+# 256 is the assignment matrix's first pure-prefill row.
+NBITS_TOKENS = (1, 8, 128, 256, 512)
 
 # Dense f32 MatMul cells, [m, k] x [k, n].
 DENSE_SHAPES = {
@@ -51,9 +63,19 @@ DENSE_SHAPES = {
 BLOCK_SIZE = 32
 
 
-def build_matmul_nbits(path: Path, *, tokens: int, k: int, n: int) -> None:
-    blocks = (k + BLOCK_SIZE - 1) // BLOCK_SIZE
-    blob = BLOCK_SIZE // 2
+def build_matmul_nbits(
+    path: Path,
+    *,
+    tokens: int,
+    k: int,
+    n: int,
+    bits: int = 4,
+    block_size: int = BLOCK_SIZE,
+    accuracy_level: int = 0,
+) -> None:
+    blocks = (k + block_size - 1) // block_size
+    # One byte holds two 4-bit weights, or one 8-bit weight.
+    blob = block_size // (8 // bits)
 
     rng = np.random.default_rng(0x5EBA5)
     b = rng.integers(0, 256, size=(n, blocks, blob), dtype=np.uint8)
@@ -69,9 +91,9 @@ def build_matmul_nbits(path: Path, *, tokens: int, k: int, n: int) -> None:
         name="matmul_nbits",
         K=k,
         N=n,
-        bits=4,
-        block_size=BLOCK_SIZE,
-        accuracy_level=0,
+        bits=bits,
+        block_size=block_size,
+        accuracy_level=accuracy_level,
     )
     graph = helper.make_graph(
         [node],
@@ -110,14 +132,46 @@ def build_matmul(path: Path, *, m: int, k: int, n: int) -> None:
     onnx.save(model, str(path))
 
 
-def main(out: Path) -> None:
+def main(
+    out: Path,
+    block_size: int = BLOCK_SIZE,
+    tokens_list: tuple[int, ...] = NBITS_TOKENS,
+    accuracy_level: int = 0,
+) -> None:
     out.mkdir(parents=True, exist_ok=True)
     made = []
-    for name, (k, n) in NBITS_SHAPES.items():
-        for tokens in NBITS_TOKENS:
-            path = out / f"gemm_nbits_{name}_t{tokens}.onnx"
-            build_matmul_nbits(path, tokens=tokens, k=k, n=n)
-            made.append(path)
+    # A non-default block size is tagged into the stem so both sets can share a
+    # directory. They are different cells rather than repeats: a block size the
+    # column-blocked kernels reject routes on
+    # `INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED` instead of the size-aware pair.
+    tag = "" if block_size == BLOCK_SIZE else f"_b{block_size}"
+    # `accuracy_level` selects the ONNX compute type, and the EP gates every
+    # reduced-precision activation route on it (`accuracy_level >= 2`). Pinned
+    # at 0 this generator could only ever emit CompFp32 models, so no A/B cell
+    # could reach those routes at all -- they were unmeasurable, not merely
+    # unmeasured.
+    if accuracy_level:
+        tag += f"_a{accuracy_level}"
+    for bits in (4, 8):
+        stem = "nbits" if bits == 4 else "nbits8"
+        for name, (k, n) in NBITS_SHAPES.items():
+            for tokens in tokens_list:
+                path = out / f"gemm_{stem}{tag}_{name}_t{tokens}.onnx"
+                build_matmul_nbits(
+                    path,
+                    tokens=tokens,
+                    k=k,
+                    n=n,
+                    bits=bits,
+                    block_size=block_size,
+                    accuracy_level=accuracy_level,
+                )
+                made.append(path)
+    if tag:
+        # The dense f32 cells do not vary with quantization block size.
+        for p in made:
+            print(p)
+        return
     for name, (m, k, n) in DENSE_SHAPES.items():
         path = out / f"gemm_dense_{name}.onnx"
         build_matmul(path, m=m, k=k, n=n)
@@ -129,4 +183,37 @@ def main(out: Path) -> None:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", type=Path, default=Path(__file__).resolve().parent / "models" / "gemm")
-    main(ap.parse_args().out)
+    ap.add_argument(
+        "--block-size",
+        type=int,
+        default=BLOCK_SIZE,
+        help="MatMulNBits quantization block size. 16 is the ONNX minimum and "
+        "is the size the column-blocked int4 kernels reject, so it is the one "
+        "that exercises INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED",
+    )
+    ap.add_argument(
+        "--tokens",
+        type=int,
+        nargs="+",
+        default=list(NBITS_TOKENS),
+        help="token counts to emit. The default grid steps 1 -> 8, which "
+        "straddles every int4 prefill row gate (they sit at 2..6), so those "
+        "retunes are invisible to it; pass the rows explicitly to measure one",
+    )
+    ap.add_argument(
+        "--accuracy-level",
+        type=int,
+        default=0,
+        help=(
+            "MatMulNBits accuracy_level (ONNX compute type). The EP allows a "
+            "reduced-precision activation only at >= 2, so the default of 0 "
+            "makes every int16/int8-activation route unreachable -- pass 4 to "
+            "measure them"
+        ),
+    )
+    args = ap.parse_args()
+    # MatMulNBits requires a power-of-two block size of at least 16; emitting
+    # anything else produces a graph that is invalid rather than interesting.
+    if args.block_size < 16 or args.block_size & (args.block_size - 1):
+        ap.error("--block-size must be a power of two >= 16")
+    main(args.out, args.block_size, tuple(args.tokens), args.accuracy_level)

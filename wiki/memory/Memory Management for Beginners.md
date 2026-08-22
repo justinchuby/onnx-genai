@@ -158,8 +158,10 @@ trait VirtualBacking: Send + Sync {
 
 ## “拆分 capabilities”是什么意思
 
-当前 `DeviceAllocator` 同时包含普通分配、lazy commit/decommit、
-committed-byte 查询、mapped-capacity 协作和 shared-prefix 等方法。
+Phase 2 已经把这些职责拆开：`DeviceAllocator` 只包含 device identity、
+普通 allocation 和整个 allocation 的最终 release。lazy commit/decommit 与
+committed-byte 查询属于可选 `VirtualBacking`；shared-prefix 属于独立可选
+`SharedMapping`。
 
 大多数普通 allocator 不支持高级功能，只能依赖默认实现。例如：
 
@@ -184,25 +186,27 @@ fn commit_allocation_range(...) -> Result<()> {
 - 真正支持物理页共享的实现才提供 `SharedMapping`；
 - 不支持某项能力时明确返回 absence 或 error，而不是成功 no-op。
 
-概念接口可以是：
+实际发现入口在已经选中的 allocator reference 上：
 
 ```rust
-trait DeviceMemoryMechanism {
-    fn allocator(&self) -> &dyn DeviceAllocator;
-    fn virtual_backing(&self) -> Option<&dyn VirtualBacking>;
-    fn shared_mapping(&self) -> Option<&dyn SharedMapping>;
+trait DeviceAllocator {
+    fn as_virtual_backing(&self) -> Option<&dyn VirtualBacking>;
+    fn as_shared_mapping(&self) -> Option<&dyn SharedMapping>;
 }
 ```
 
 调用方必须显式处理 fallback：
 
 ```rust
-let Some(backing) = mechanism.virtual_backing() else {
+let Some(backing) = allocator.as_virtual_backing() else {
     return use_eager_allocation_path();
 };
 ```
 
-这不是已经接受的最终 API，只用于说明能力应显式协商。
+能力 coherence 是 raw-pointer allocator 边界上的 trusted contract：
+返回的 capability 必须与该 allocator 使用同一 mechanism/device，整个
+allocation 的最终 release 仍走 `DeviceAllocator`/EP。Rust 不会结构性证明
+恶意 wrapper 的多个 inner 一致；runtime identity heuristic 不被当成安全证明。
 
 ## 为什么 SharedMapping 应再次独立
 
@@ -285,6 +289,55 @@ allocator 真正释放
 因此 RAII 是可行的，但 `Drop` 应负责排队，而不是在任意线程上直接
 同步整个 GPU 或立即 free。
 
+## CUDA 的内建机制只有 VMM 一种
+
+从 memory refactor 的最后一个阶段（issue #1186 Phase 7）开始，**CUDA EP 内建的
+device 内存机制只有 VMM arena**。原先那个 eager 的 `cuMemAlloc` allocator
+（`CudaDeviceAllocator`）以及用来在两者之间切换的开关 `ONNX_GENAI_CUDA_VMM`
+都已经删除。
+
+### 这意味着什么
+
+- **默认就是 VMM**，不需要设置任何环境变量。
+- **没有静默回退**。如果 driver 或设备不支持 VMM，provider 会在*构造时*
+  直接报错，并说明失败的 device、driver 的原话，以及支持边界。它不会退回到一个
+  不受 ledger 记账的 eager allocator 上继续跑 —— 那种“看起来能跑，但账本是错的”
+  才是最难排查的状态。
+- **注入外部 allocator 仍然完全支持**。删掉的是内建实现，不是
+  `DeviceAllocator` 这个能力。
+
+### 仍然可以注入自己的 allocator
+
+`DeviceAllocator` trait 没有任何变化。想要 eager `cuMemAlloc` 行为的调用方可以
+自己实现一个再注入：
+
+```rust
+let provider = CudaExecutionProvider::new(0)?
+    .with_memory(Arc::new(MyEagerAllocator::new(context)));
+```
+
+注入是**权威的**：成功之后内建 arena 会被退役，之后所有 device 内存都来自注入的
+allocator。这里有两条规则：
+
+1. allocator 必须服务同一个 device，否则调用直接被拒绝 —— 一个 host 指针在
+   kernel 里解引用之前不会有任何征兆。
+2. 如果当前机制已经发出过内存，注入会被拒绝。已经发出的指针必须由发出它的机制
+   回收，中途换掉会让它变成孤儿。
+
+被拒绝时会返回 `Err`，不会出现“调用成功但被忽略”的情况。
+
+## 内建 VMM arena 的既定约束
+
+这些不是可调参数，而是当前实现的边界，排查问题时值得先知道：
+
+| 项目 | 值 | 说明 |
+| --- | --- | --- |
+| 虚拟地址预留 | 64 GiB（standalone 路径） | 只占地址空间，不占显存 |
+| 物理 granularity | 2 MiB | driver 报告的最小映射单位；所有 commit 向上取整到它。这不是能力探测：driver 拒绝查询或报告 0 时一律回退到 2 MiB，因此不支持 VMM 的设备由 `cuMemAddressReserve` 在构造时检出，而不是由它检出 |
+| 保留物理 handle 池 | standalone/plugin 路径与启用动态借还的 governor 路径默认开启，大小 256 MiB；未启用动态借还的 governor 路径仅在 `ONNX_GENAI_CUDA_PHYSICAL_HANDLE_POOL_BYTES` 为正整数字节数时开启 | 该环境变量是覆盖默认值而非开启池，所以在上述两条默认开启的路径上，不设置它也会保留显存。池归 authority 所有；0 或无法解析视为回退到该路径的默认值，而不是"大小为 0 的池" |
+| 拆除同步 | 释放 handle 前等待在途 stream 工作完成 | 见 `deferred_release` |
+| 设备丢失 | driver 报错向上传播，不重试、不静默丢弃 | |
+
 ## 为什么不添加 `ExecutionProvider::allocator()`
 
 ### 一个 EP 可能有多个内存域
@@ -294,9 +347,10 @@ allocator 真正释放
 
 ### 有效 allocator 可能切换
 
-CUDA EP 可能先使用普通 `cuMemAlloc`，之后安装 VMM arena。外部缓存旧
-allocator，再用它释放新 allocator 创建的 pointer，会造成
-cross-allocator free。
+CUDA EP 默认使用内建的 VMM arena，但调用方可以通过
+`CudaExecutionProvider::with_memory` 注入自己的 allocator，此时内建 arena 会被
+**替换**（见下一节）。外部缓存旧 allocator，再用它释放新 allocator 创建的
+pointer，会造成 cross-allocator free。
 
 ### 裸 allocator 容易绕过 Governor
 
@@ -471,5 +525,5 @@ onnx-runtime-memory-api
 - [Memory Architecture](../../docs/memory/MEMORY_ARCHITECTURE.md)
 - [Memory Management Model Design](../../docs/memory/MEMORY_MANAGEMENT_MODEL_DESIGN.md)
 - [Weight Offload](../../docs/memory/WEIGHT_OFFLOAD.md)
-- [`DeviceAllocator` implementation](../../crates/onnx-runtime-memory-governor/src/allocator.rs)
+- [`DeviceAllocator` implementation](../../crates/onnx-runtime-memory-api/src/allocator.rs)
 - [`ExecutionProvider` and `DeviceBuffer`](../../crates/onnx-runtime-ep-api/src/provider.rs)

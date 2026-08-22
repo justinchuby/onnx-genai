@@ -85,6 +85,7 @@ impl Job {
 struct Shared {
     epoch: AtomicUsize,
     ready: AtomicUsize,
+    observed: AtomicUsize,
     remaining: AtomicUsize,
     active: AtomicUsize,
     shutdown: AtomicBool,
@@ -122,6 +123,7 @@ impl WorkStealingThreadPool {
         let shared = Arc::new(Shared {
             epoch: AtomicUsize::new(0),
             ready: AtomicUsize::new(0),
+            observed: AtomicUsize::new(0),
             remaining: AtomicUsize::new(0),
             active: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
@@ -228,6 +230,7 @@ impl WorkStealingThreadPool {
             };
         }
 
+        self.shared.observed.store(0, Ordering::Relaxed);
         self.shared.remaining.store(claims, Ordering::Release);
         self.shared.epoch.fetch_add(1, Ordering::Release);
         for worker in self
@@ -243,6 +246,7 @@ impl WorkStealingThreadPool {
             self.shared.panicked.store(true, Ordering::Release);
         }
         wait_for_completion(&self.shared);
+        wait_for_workers(&self.shared);
         if self.shared.panicked.load(Ordering::Acquire) {
             wait_for_active(&self.shared);
         }
@@ -284,6 +288,7 @@ fn worker_loop(shared: Arc<Shared>, worker_id: usize) {
         if result.is_err() {
             shared.panicked.store(true, Ordering::Release);
         }
+        shared.observed.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -321,6 +326,37 @@ fn wait_for_completion(shared: &Shared) {
 
 fn wait_for_active(shared: &Shared) {
     while shared.active.load(Ordering::Acquire) != 0 {
+        std::hint::spin_loop();
+    }
+}
+
+/// Blocks until every worker has *left* `run_job`, not merely until the last
+/// block has run.
+///
+/// This looks redundant next to [`wait_for_completion`] and is not. Completion
+/// only means `remaining` reached zero — the worker that decremented it is
+/// still inside `run_job`, holding a by-value copy of the old [`Job`] and
+/// looping in `claim_iterations` against the *shared* counters. If the
+/// dispatcher returned there and released `dispatch_lock`, the next
+/// `parallel_for` (another rayon thread, since MLAS fans out under rayon in
+/// `sdpa_f32_fast`) would republish the loop bounds and bump the epoch while
+/// that straggler was still live. The straggler would then claim a block of
+/// the *new* range and:
+///
+/// 1. decrement the new job's `remaining` without running the new closure, so
+///    `wait_for_completion` returns early and a partition never executes —
+///    leaving a `beta = 0` SGEMM's output rows unwritten; and
+/// 2. invoke the *old* closure with an index from the new range, writing
+///    through raw pointers past the end of the previous GEMM's `C`.
+///
+/// Those are exactly the two symptoms of #1685 (an 8-row hole of exact `0.0`
+/// in SDPA output, and an intermittent SIGSEGV). Waiting for
+/// `observed == worker_count` before the caller clears the `Job` and drops the
+/// lock closes both. `crates/mlas-sys/tests/concurrent_dispatch.rs` fails
+/// within milliseconds if this call is removed.
+fn wait_for_workers(shared: &Shared) {
+    let worker_count = shared.thread_count.saturating_sub(1);
+    while shared.observed.load(Ordering::Acquire) != worker_count {
         std::hint::spin_loop();
     }
 }

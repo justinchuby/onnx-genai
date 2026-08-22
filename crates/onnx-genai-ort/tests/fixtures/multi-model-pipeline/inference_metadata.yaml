@@ -22,7 +22,5 @@ pipeline:
     stages:
       - name: encode
         strategy: { kind: single_pass, model: encoder }
-        run_on: prompt_only
       - name: decode
         strategy: { kind: autoregressive, decoder: decoder, max_tokens: 16 }
-        run_on: every_step

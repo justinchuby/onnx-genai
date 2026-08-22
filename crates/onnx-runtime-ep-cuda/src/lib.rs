@@ -81,20 +81,25 @@ pub mod arch;
 pub mod blas;
 pub mod capture;
 pub mod cudnn;
+pub mod deferred_release;
 mod dynamic_library;
 pub mod error;
 mod graph;
+pub(crate) mod interleave_cache;
+pub mod kernel_cache;
 pub mod kernels;
 mod optimizer;
 pub mod pinned_pool;
 pub mod provider;
 pub mod runtime;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod trace;
 // Device memory moved to `onnx-runtime-cuda-memory`: an execution provider is
 // about operators, and where the memory came from is a separate question that
 // a caller with no interest in kernels may need to answer. Re-exported so the
 // move is not a breaking change for anyone already reaching for these paths.
-pub use onnx_runtime_cuda_memory::{device_allocator, virtual_memory, vmm_allocator};
+pub use onnx_runtime_cuda_memory::{virtual_memory, vmm_allocator};
 pub mod weight_paging;
 
 pub use capture::{require_subgraph_graph_capturable, subgraph_graph_capturable};
@@ -138,4 +143,5 @@ pub use weight_paging::{
 pub fn device_argmax_scratch_words(elements: usize, batch: usize) -> usize {
     kernels::device_argmax::scratch_words(elements, batch)
 }
+pub use onnx_runtime_ep_api::RawDeviceAllocationSiteStats as CudaRawAllocationSiteStats;
 pub use runtime::{CudaAllocationCounts, CudaRuntime};

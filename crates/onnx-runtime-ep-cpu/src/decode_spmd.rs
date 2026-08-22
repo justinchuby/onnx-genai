@@ -93,7 +93,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::decode_affinity::{NodeShard, NumaTopology};
-use crate::kernels::matmul_nbits::output_chunk_len;
+use crate::kernels::matmul_nbits::output_chunk_len_for;
 
 /// Environment switch selecting the persistent SPMD decode pool policy:
 /// **unset (the default) or `=1`** uses the persistent SPMD pool deterministically
@@ -811,12 +811,16 @@ impl SpmdDecodePools {
     /// flat path hands to `par_chunks_mut`, so the arithmetic is identical.
     /// Tiny ops (below the flat path's parallelization threshold) run serially
     /// on the dispatcher, so the same set of ops parallelize as before.
+    ///
+    /// The serial threshold is sized from [`Self::total_workers`], the executor
+    /// that will actually run the fan-out, and *not* from the ambient Rayon
+    /// width -- this pool is not a Rayon pool. See [`output_chunk_len_for`].
     pub fn dispatch_output_rows<F>(&self, result: &mut [f32], k: usize, compute: &F)
     where
         F: Fn(usize, &mut [f32]) + Sync,
     {
         let n = result.len();
-        if self.total_workers <= 1 || output_chunk_len(n, k) >= n {
+        if self.total_workers <= 1 || output_chunk_len_for(self.total_workers, n, k) >= n {
             compute(0, result);
             return;
         }
@@ -2187,6 +2191,63 @@ mod tests {
             expected_start += len;
         }
         assert_eq!(expected_start, 2048);
+    }
+
+    #[test]
+    fn dispatch_output_rows_fans_out_under_a_narrow_ambient_rayon_pool() {
+        // The regression guard for the call site itself: `dispatch_output_rows`
+        // must decide serial-vs-parallel from *its own* `total_workers`, not
+        // from whatever Rayon pool happens to be installed on the calling
+        // thread. Sizing it from the ambient width means a narrow ambient pool
+        // (`RAYON_NUM_THREADS=1`, or any caller inside a one-thread install)
+        // silently collapses the whole dispatch onto the dispatcher thread
+        // while every SPMD worker sits spinning -- measured at 14.2x on the
+        // qwen int4 decode loop.
+        //
+        // Reverting the call site to the ambient-width rule turns this test
+        // red; the `output_chunk_len_for` unit tests alone would not notice.
+        let pool = single_group_pool(4);
+        assert!(
+            pool.total_workers > 1,
+            "the test pool must be wide enough to fan out"
+        );
+        let n = 4096usize;
+        let k = 1024usize;
+
+        let threads: std::sync::Mutex<std::collections::HashSet<thread::ThreadId>> =
+            std::sync::Mutex::new(std::collections::HashSet::new());
+        let compute = |output_start: usize, outputs: &mut [f32]| {
+            threads
+                .lock()
+                .expect("thread-id set")
+                .insert(thread::current().id());
+            for (offset, out) in outputs.iter_mut().enumerate() {
+                *out = (output_start + offset) as f32;
+            }
+        };
+
+        // The ambient pool must be genuinely one thread wide *on the thread that
+        // calls the dispatch*, which is what `install` guarantees.
+        let narrow = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("one-thread ambient pool");
+        let mut sharded = vec![0.0f32; n];
+        narrow.install(|| pool.dispatch_output_rows(&mut sharded, k, &compute));
+
+        // A serial short-circuit runs `compute` exactly once, on one thread; a
+        // fan-out runs it once per worker. Counting distinct threads therefore
+        // separates the two regardless of which thread drove the dispatch.
+        let observed = threads.lock().expect("thread-id set").len();
+        assert!(
+            observed > 1,
+            "a {}-worker SPMD pool must still fan out when the ambient Rayon \
+             pool is one thread wide, but `compute` ran on {observed} thread(s)",
+            pool.total_workers
+        );
+        for (index, value) in sharded.iter().enumerate() {
+            assert_eq!(*value, index as f32, "row {index} was not written once");
+        }
     }
 
     #[test]

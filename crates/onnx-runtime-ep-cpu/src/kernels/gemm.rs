@@ -55,6 +55,14 @@ impl GemmKernel {
     ///
     /// Returns `None` whenever neither applies, leaving the portable blocked
     /// half GEMM to serve the call exactly as before.
+    ///
+    /// `#[inline(never)]` is load-bearing and was **measured**, not assumed.
+    /// Carrying a second kernel made this body large enough that inlining it
+    /// into [`GemmKernel::execute`] cost the `M = 128` `transB` prefill 12%
+    /// (69.7 -> 78.9 ms, median of 10 per-run minima) -- a path this function
+    /// declines outright and never touches. It is a once-per-execute dispatch
+    /// probe returning an `Option`, so there is nothing to inline it for.
+    #[inline(never)]
     fn try_half_fast_path(
         &self,
         a: &TensorView,
@@ -62,31 +70,88 @@ impl GemmKernel {
         m: usize,
         k: usize,
         n: usize,
+        trans_b: bool,
     ) -> Result<Option<Vec<f32>>> {
-        if a.dtype != DataType::Float16 || b.dtype != DataType::Float16 {
+        // `bf16` is admitted here as well as `f16`. It was not, and the
+        // asymmetry cost the same decode a different kernel depending on op:
+        // `MatMul` serves a `bf16` `m == 1` from the same GEMV, while `Gemm`
+        // fell into the portable blocked half GEMM.
+        let Some(format) = matmul::half_storage_format(a.dtype, b.dtype) else {
             return Ok(None);
-        }
+        };
+        // The only reader of `format` is the decode arm below, which is x86
+        // only, so off x86 it is bound and never used -- the same reason
+        // `m`, `k` and `n` are discarded on the fallthrough paths.
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        let _ = format;
 
         // Decode: read B in place as f16 rather than widening K*N floats for a
         // single row. Memory-bound, and measured at parity with ORT in MatMul.
+        // Both stored orders have a kernel, so `trans_b` picks one rather than
+        // disqualifying the call — see the dispatch comment in `execute`.
+        //
+        // No weight diverts this to the fused GEBP. `MatMul` used to divert at
+        // `k * n >= 1M` and `Gemm` never did -- the divergence #1381 recorded.
+        // Re-measured through both production kernels the divert is a loss
+        // (1.3x-5.0x at 8 threads), so it was retired from `MatMul` rather
+        // than copied here, and the two ops now take the same **f16** route at
+        // every weight -- `half_decode_route_tests` pins that. `bf16` is a
+        // f16 route at every weight -- `half_decode_route_tests` pins that,
+        // and pins the `bf16` pair too.
+        //
+        // The transposed `bf16` asymmetry §15 left open is closed: the `[N, K]`
+        // GEMV is instantiated per format from one macro, the way the `[K, N]`
+        // stripe already was, so `trans_b` now picks a layout rather than a
+        // dtype. Both operators, both stored orders and both 16-bit formats
+        // reach the same GEMV backend.
+        //
+        // Reaching the same *backend* is not the same as reaching the same
+        // *kernel*, which is what was still divergent: `trans_b` chose between
+        // two kernels differing by up to 2.98x in speed and 9.3x in accuracy,
+        // so equivalent math was still priced -- and rounded -- by how the
+        // exporter happened to store the weight. `half_decode_gemv_dispatch`
+        // closes that: a constant `[K, N]` weight is transposed once into the
+        // prepack cache so both stored orders run the same `[N, K]` kernel,
+        // bit for bit. Its doc comment carries the measurements.
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         if m == 1
             && b.is_contiguous()
             && b.numel() == k.saturating_mul(n)
-            && half_gemv::simd_available()
+            && half_gemv::simd_available(format)
+            && matmul::half_decode_gemv_enabled()
         {
             b.validate()?;
             let a_dense = self.prepack.dense(0, a)?;
             if a_dense.len() == k {
-                // SAFETY: `b` was just validated as a contiguous Float16 view
-                // whose element count equals `k * n`. `f16` is transparent over
-                // `u16`, so reading its storage as raw bit patterns is sound,
-                // and the view outlives this call.
+                // SAFETY: `b` was just validated as a contiguous view of a
+                // 16-bit float dtype (`half_storage_format` admits only
+                // `Float16`/`BFloat16`) whose element count equals `k * n`.
+                // Both are transparent over `u16`, so reading their storage as
+                // raw bit patterns is sound, and the view outlives this call.
                 let b_bits = unsafe { std::slice::from_raw_parts(b.data_ptr::<u16>(), k * n) };
                 let mut result = vec![0.0f32; n];
-                half_gemv::gemv_f16_kn(&a_dense, b_bits, &mut result, k, n);
+                count_half_decode_gemv();
+                matmul::half_decode_gemv_dispatch(
+                    format,
+                    &self.prepack,
+                    b,
+                    &a_dense,
+                    b_bits,
+                    &mut result,
+                    k,
+                    n,
+                    trans_b,
+                );
                 return Ok(Some(result));
             }
+        }
+
+        // Everything past here reads B as [K, N], so a transposed weight would
+        // have to be materialised first -- which is the trade the module header
+        // of `half_gemv` explains is not worth making.
+        if trans_b {
+            let _ = (m, k, n);
+            return Ok(None);
         }
 
         #[cfg(feature = "mlas")]
@@ -156,19 +221,21 @@ impl Kernel for GemmKernel {
             flops
         });
 
-        // f16 fast paths, shared with `MatMul`. Only the untransposed case
-        // qualifies: both read B in its stored [K, N] order, and materialising
-        // a transpose first would give back what they save.
+        // f16 fast paths, shared with `MatMul`. `trans_a` still disqualifies —
+        // A is a single row at decode, so transposing it is meaningless, and
+        // the packed prefill path wants it untransposed. `trans_b` no longer
+        // does: at M = 1 a `[N, K]` weight is the *better* GEMV layout, because
+        // every output element is one contiguous dot product.
         //
         // Without these, an f16 `Gemm` falls into the portable blocked half
         // GEMM, which is the worst dense region measured anywhere in this EP:
         // at K=N=3584 it was 6.57x slower than ORT at M=1/1 thread and 46.67x
         // at M=1/8 threads, because that path never scales with thread count on
         // a single-row problem (10.07 ms at 1 thread, 10.26 ms at 8).
-        let half_fast_path: Option<Vec<f32>> = if self.trans_a || self.trans_b {
+        let half_fast_path: Option<Vec<f32>> = if self.trans_a {
             None
         } else {
-            self.try_half_fast_path(&inputs[0], &inputs[1], m, k, n)?
+            self.try_half_fast_path(&inputs[0], &inputs[1], m, k, n, self.trans_b)?
         };
 
         let mut out = if let Some(mut half_output) = half_fast_path {
@@ -287,6 +354,32 @@ fn try_half_gemm(
         n,
     );
     Ok(Some(output))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only count of `m == 1` f16 decodes served by the GEMV, so a test
+    /// can assert *which route* ran rather than only that the numbers are
+    /// plausible -- every route here agrees to half-precision rounding, so the
+    /// numbers alone cannot tell them apart.
+    static HALF_DECODE_GEMV_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+fn count_half_decode_gemv() {
+    #[cfg(test)]
+    HALF_DECODE_GEMV_CALLS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+fn half_decode_gemv_calls() -> u64 {
+    HALF_DECODE_GEMV_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+fn reset_half_decode_gemv_calls() {
+    HALF_DECODE_GEMV_CALLS.with(|c| c.set(0));
 }
 
 #[cfg(test)]
@@ -437,6 +530,80 @@ mod tests {
         (out.to_f32(), packed)
     }
 
+    /// An f16 `Gemm` decode with `transB = 1` -- the layout every `nn.Linear`
+    /// export produces -- takes the `[N, K]` GEMV and agrees with the same
+    /// logical matrix stored untransposed.
+    ///
+    /// Before this route existed, `trans_b` disqualified the f16 fast path
+    /// outright and the call fell into the portable blocked half GEMM. That is
+    /// not a small difference: at K=N=3584 it measured 32-36 ms against ORT's
+    /// 0.24-1.5 ms, and it did not improve with thread count at all.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn half_decode_gemm_takes_the_nk_gemv_when_b_is_transposed() {
+        let (m, k, n) = (1usize, 67usize, 41usize);
+        let a: Vec<f32> = (0..m * k).map(|i| (i % 13) as f32 * 0.125 - 0.5).collect();
+        let kn: Vec<f32> = (0..k * n).map(|i| (i % 17) as f32 * 0.0625 - 0.5).collect();
+        let mut nk = vec![0.0f32; n * k];
+        for p in 0..k {
+            for j in 0..n {
+                nk[j * k + p] = kn[p * n + j];
+            }
+        }
+
+        let before = super::half_gemv::NK_GEMV_CALLS.with(|calls| calls.get());
+        let (transposed, _) = run_half_gemm(m, k, n, &a, &nk, true);
+        let took_the_gemv = super::half_gemv::NK_GEMV_CALLS.with(|calls| calls.get()) == before + 1;
+        assert!(
+            took_the_gemv || !super::half_gemv::simd_available(HalfFormat::F16),
+            "an f16 transB decode must reach the [N, K] GEMV on an f16c host"
+        );
+
+        let (straight, _) = run_half_gemm(m, k, n, &a, &kn, false);
+        for (lhs, rhs) in transposed.iter().zip(&straight) {
+            assert!(
+                (lhs - rhs).abs() <= 1e-3 * (1.0 + lhs.abs()),
+                "transB={lhs} vs transB=0 {rhs}"
+            );
+        }
+    }
+
+    /// Prefill is untouched: `transB = 1` at `M > 1` still declines the f16
+    /// fast path, because everything past the GEMV reads B as `[K, N]`.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn half_prefill_gemm_does_not_take_the_nk_gemv() {
+        let (m, k, n) = (4usize, 67usize, 41usize);
+        let a: Vec<f32> = (0..m * k).map(|i| (i % 13) as f32 * 0.125 - 0.5).collect();
+        let nk: Vec<f32> = (0..n * k).map(|i| (i % 17) as f32 * 0.0625 - 0.5).collect();
+
+        let before = super::half_gemv::NK_GEMV_CALLS.with(|calls| calls.get());
+        let (out, _) = run_half_gemm(m, k, n, &a, &nk, true);
+        assert_eq!(
+            super::half_gemv::NK_GEMV_CALLS.with(|calls| calls.get()),
+            before,
+            "the GEMV is a decode kernel and must not claim an M > 1 call"
+        );
+
+        let mut want = vec![0.0f32; m * n];
+        for row in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0f32;
+                for p in 0..k {
+                    acc += half::f16::from_f32(a[row * k + p]).to_f32()
+                        * half::f16::from_f32(nk[j * k + p]).to_f32();
+                }
+                want[row * n + j] = acc;
+            }
+        }
+        for (got, expected) in out.iter().zip(&want) {
+            assert!(
+                (got - expected).abs() <= 1e-2 * (1.0 + expected.abs()),
+                "{got} vs {expected}"
+            );
+        }
+    }
+
     fn reference_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
         let mut c = vec![0.0f32; m * n];
         for i in 0..m {
@@ -508,9 +675,13 @@ mod tests {
         }
     }
 
-    /// A transposed B keeps the blocked half GEMM. Both fast paths read B in
-    /// its stored [K, N] order, so materialising a transpose first would give
-    /// back exactly what they save.
+    /// A transposed B at **`M > 1`** keeps the blocked half GEMM: the decode
+    /// GEMV declines anything but a single row, and everything past it reads B
+    /// as `[K, N]`, so a transpose would have to be materialised first.
+    ///
+    /// At `M == 1` this is no longer true -- see
+    /// `half_decode_gemm_takes_the_nk_gemv_when_b_is_transposed`, which is why
+    /// this test pins `m = 4`.
     #[test]
     fn gemm_f16_transposed_b_keeps_the_blocked_path() {
         let (m, k, n) = (4usize, 6usize, 3usize);
@@ -960,7 +1131,12 @@ mod tests {
         // concurrent allocation can share `b_ptr`.
         crate::kernels::weight_transpose::f32_cache_evict(b_ptr, n, k);
 
-        let run = |m: usize| -> Vec<f32> {
+        // The kernel is returned and held, because an entry is resident for as
+        // long as the kernel that installed it (#1726): a prepack evicts its
+        // keys on drop so that no entry can outlive the weight whose address
+        // keys it. A session holds its kernels for its lifetime, so this models
+        // production; dropping them here would measure a torn-down session.
+        let run = |m: usize| -> (Vec<f32>, GemmKernel) {
             let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.007).cos()).collect();
             let a = Owned::f32(&[m, k], &a_data);
             let mut y = Owned::zeros_f32(&[m, n]);
@@ -975,13 +1151,31 @@ mod tests {
             kernel
                 .execute(&[a.view(), b.view()], &mut [y.view_mut()])
                 .unwrap();
-            y.to_f32()
+            (y.to_f32(), kernel)
         };
 
-        let before = matmul::weight_transpose_cache_bytes();
-        let _prefill = run(4);
-        let _decode = run(1);
-        let after = matmul::weight_transpose_cache_bytes();
+        let (_prefill, prefill_kernel) = run(4);
+        let (_decode, decode_kernel) = run(1);
+
+        // The executed kernels' entry must still be resident, checked *before*
+        // the measuring lookup below -- `cached_transpose_f32` installs on a
+        // miss, so asking afterwards would answer `true` even if nothing had
+        // been retained, and the check would prove nothing.
+        //
+        // Stated against this weight's key rather than as a delta between two
+        // reads of the process-global total. Under the parallel harness that
+        // total is not monotonic: since #1726 a prepack evicts the entry it
+        // installed when it drops, so an unrelated concurrent test finishing
+        // mid-test legitimately *lowers* it, and `after >= before + predicted`
+        // then fails for a reason that has nothing to do with this weight.
+        // Residency here plus `actual == predicted` below states the same fact
+        // -- exactly `predicted` bytes for this weight are held in the global
+        // cache -- without depending on unrelated churn (#1056 isolation).
+        assert!(
+            crate::kernels::weight_transpose::f32_cache_contains(b.view().data_ptr::<f32>(), n, k),
+            "the transpose must be resident in the global cache while the \
+             kernels that installed it are alive"
+        );
 
         // The process-global byte total is shared across the parallel test
         // harness, so a *concurrent* test caching an unrelated weight can also
@@ -1005,9 +1199,11 @@ mod tests {
         );
         // And that copy is genuinely part of the global total the plan budgets.
         assert!(
-            after >= before + predicted as usize,
-            "the cached transpose must be reflected in the global byte total"
+            matmul::weight_transpose_cache_bytes() >= predicted as usize,
+            "the global byte total must account for at least this weight's \
+             resident transpose"
         );
+        drop((prefill_kernel, decode_kernel));
     }
 
     /// #1056 decline contract: when the cache is declined, a constant `transB`
@@ -1043,7 +1239,10 @@ mod tests {
             "precondition: this weight's key must start absent"
         );
 
-        let run = || -> Vec<f32> {
+        // Returns the kernel so residency is probed while the installer is
+        // still alive: entries are evicted when the owning prepack drops, so
+        // that none can outlive the weight whose address keys it (#1726).
+        let run = || -> (Vec<f32>, GemmKernel) {
             let a = Owned::f32(&[m, k], &a_data);
             let mut y = Owned::zeros_f32(&[m, n]);
             let mut kernel = GemmKernel {
@@ -1057,7 +1256,7 @@ mod tests {
             kernel
                 .execute(&[a.view(), b.view()], &mut [y.view_mut()])
                 .unwrap();
-            y.to_f32()
+            (y.to_f32(), kernel)
         };
 
         // Declined: this weight's transpose must not be resident afterward.
@@ -1066,11 +1265,12 @@ mod tests {
         // concurrent test caching an unrelated weight cannot mask a leak.
         let declined = {
             let _decline = crate::kernels::weight_transpose::CacheEnabledScope::new(false);
-            let out = run();
+            let (out, kernel) = run();
             assert!(
                 !crate::kernels::weight_transpose::f32_cache_contains(b_ptr, n, k),
                 "a declined transpose cache must retain nothing for this weight"
             );
+            drop(kernel);
             out
         };
 
@@ -1079,16 +1279,572 @@ mod tests {
         // differ only in retention, not in numerics.
         let admitted = {
             let _admit = crate::kernels::weight_transpose::CacheEnabledScope::new(true);
-            let out = run();
+            let (out, kernel) = run();
             assert!(
                 crate::kernels::weight_transpose::f32_cache_contains(b_ptr, n, k),
-                "an admitted transpose cache must retain this weight"
+                "an admitted transpose cache must retain this weight while the \
+                 kernel that installed it is alive"
             );
+            drop(kernel);
             out
         };
         assert_eq!(
             declined, admitted,
             "declining the transpose cache must not change results"
         );
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod half_decode_route_tests {
+    use super::*;
+    use crate::kernels::testutil::Owned;
+
+    /// `Gemm` at `m == 1` run through the real kernel. Returns the output and
+    /// the number of decode-GEMV calls it made, so a test asserts *which*
+    /// kernel ran and not only that the numbers are plausible.
+    fn decode_gemm(k: usize, n: usize, a: &[f32], b: &[f32], trans_b: bool) -> (Vec<f32>, u64) {
+        let a_t = Owned::f16(&[1, k], a);
+        let b_t = if trans_b {
+            Owned::f16(&[n, k], b)
+        } else {
+            Owned::f16(&[k, n], b)
+        };
+        let mut out = Owned::zeros_f32(&[1, n]);
+        let mut kernel = GemmKernel {
+            alpha: 1.0,
+            beta: 1.0,
+            trans_a: false,
+            trans_b,
+            prepack: MatMulPrepack::default(),
+        };
+        kernel.set_constant_inputs(&[false, true]);
+        super::reset_half_decode_gemv_calls();
+        kernel
+            .execute(&[a_t.view(), b_t.view()], &mut [out.view_mut()])
+            .unwrap();
+        (out.to_f32(), super::half_decode_gemv_calls())
+    }
+
+    /// The same logical decode through `MatMul`, for the route-agreement test.
+    fn decode_matmul(k: usize, n: usize, a: &[f32], b: &[f32]) -> (Vec<f32>, u64) {
+        let a_t = Owned::f16(&[1, k], a);
+        let b_t = Owned::f16(&[k, n], b);
+        let mut out = Owned::zeros_f32(&[1, n]);
+        let mut kernel = matmul::MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+        matmul::reset_half_decode_gemv_calls();
+        kernel
+            .execute(&[a_t.view(), b_t.view()], &mut [out.view_mut()])
+            .unwrap();
+        (out.to_f32(), matmul::half_decode_gemv_calls())
+    }
+
+    /// `f64` reference over the *narrowed* operand values, so the only error
+    /// the tolerance has to absorb is the kernel's own accumulation order.
+    fn reference(k: usize, n: usize, a: &[f32], b: &[f32]) -> Vec<f64> {
+        let narrow = |v: &[f32]| -> Vec<f64> {
+            v.iter()
+                .map(|&x| f64::from(half::f16::from_f32(x).to_f32()))
+                .collect()
+        };
+        let (a, b) = (narrow(a), narrow(b));
+        let mut out = vec![0.0f64; n];
+        for (p, &av) in a.iter().enumerate().take(k) {
+            for j in 0..n {
+                out[j] += av * b[p * n + j];
+            }
+        }
+        out
+    }
+
+    fn operand(len: usize, seed: f32) -> Vec<f32> {
+        (0..len)
+            .map(|i| ((i as f32) * 0.0137 + seed).sin() * 0.5)
+            .collect()
+    }
+
+    fn worst_rel(got: &[f32], want: &[f64]) -> f64 {
+        got.iter()
+            .zip(want)
+            .map(|(&got, &want)| (f64::from(got) - want).abs() / (1.0 + want.abs()))
+            .fold(0.0f64, f64::max)
+    }
+
+    /// #1381, the part that survived: equivalent math must reach the same
+    /// *kernel*, not merely the same module.
+    ///
+    /// Reaching one backend was not enough. `trans_b` still chose between the
+    /// `[K, N]` and `[N, K]` GEMVs, which are not interchangeable: measured on
+    /// AVX2 at `t = 1` the `[K, N]` kernel is 1.56x-2.98x slower (it strides
+    /// `n * 2` bytes between consecutive `p`, so at `n = 6144` every read
+    /// crosses a page and the prefetcher cannot run ahead) and 2.7x-9.3x less
+    /// accurate (one serial accumulator per column against four combined
+    /// pairwise). So the same logical projection was priced -- and rounded --
+    /// by how the exporter happened to store the weight.
+    ///
+    /// With a constant weight transposed once into the prepack cache, all
+    /// three spellings run the `[N, K]` kernel over identical values, so they
+    /// now agree *bit for bit* rather than to a tolerance. That is the
+    /// property worth pinning: a tolerance would pass even if they diverged
+    /// again.
+    #[test]
+    fn every_operator_and_stored_order_decode_bit_identically() {
+        // Thread-local admit, the #1056 isolation idiom: this test asserts the
+        // *admitted* route, so it must not inherit whatever verdict another
+        // test left on the process-global, and must not write that global
+        // itself (which would race every concurrent reader).
+        let _admit = crate::kernels::weight_transpose::CacheEnabledScope::new(true);
+        for &(k, n) in &[(259usize, 131usize), (512, 512), (777, 333)] {
+            let a = operand(k, 0.25);
+            let b_kn = operand(k * n, 1.75);
+            let mut b_nk = vec![0.0f32; k * n];
+            for p in 0..k {
+                for j in 0..n {
+                    b_nk[j * k + p] = b_kn[p * n + j];
+                }
+            }
+
+            matmul::reset_half_decode_transposed_calls();
+            let (gemm_kn, gemm_kn_calls) = decode_gemm(k, n, &a, &b_kn, false);
+            let transposed_after_kn = matmul::half_decode_transposed_calls();
+            let (gemm_nk, gemm_nk_calls) = decode_gemm(k, n, &a, &b_nk, true);
+            let (mm_kn, mm_calls) = decode_matmul(k, n, &a, &b_kn);
+
+            assert_eq!(
+                (gemm_kn_calls, gemm_nk_calls, mm_calls),
+                (1, 1, 1),
+                "{k}x{n}: every spelling must be served by the decode GEMV"
+            );
+            assert_eq!(
+                transposed_after_kn, 1,
+                "{k}x{n}: a constant [K, N] weight must reach the [N, K] kernel \
+                 through the transpose cache, not be read in place"
+            );
+
+            for (index, ((&kn, &nk), &mm)) in gemm_kn
+                .iter()
+                .zip(gemm_nk.iter())
+                .zip(mm_kn.iter())
+                .enumerate()
+            {
+                assert_eq!(
+                    kn.to_bits(),
+                    nk.to_bits(),
+                    "{k}x{n}[{index}]: Gemm transB=0 gave {kn}, transB=1 gave {nk}"
+                );
+                assert_eq!(
+                    kn.to_bits(),
+                    mm.to_bits(),
+                    "{k}x{n}[{index}]: Gemm gave {kn}, MatMul gave {mm}"
+                );
+            }
+        }
+    }
+
+    /// Declining the transpose cache (#1056) must fall back, not fail.
+    ///
+    /// The plan can refuse the footprint on a large model, and then the
+    /// `[K, N]` weight has to be read in place again. That path must still be
+    /// taken, still be correct, and -- unlike the admitted one -- must retain
+    /// nothing.
+    #[test]
+    fn a_declined_transpose_cache_falls_back_to_reading_in_place() {
+        use crate::kernels::weight_transpose::CacheEnabledScope;
+        let (k, n) = (263usize, 137usize);
+        let a = operand(k, 0.5);
+        let b_kn = operand(k * n, 2.25);
+
+        let _decline = CacheEnabledScope::new(false);
+        matmul::reset_half_decode_transposed_calls();
+        let (out, calls) = decode_gemm(k, n, &a, &b_kn, false);
+
+        assert_eq!(calls, 1, "the decode GEMV must still serve the call");
+        assert_eq!(
+            matmul::half_decode_transposed_calls(),
+            0,
+            "a declined cache must not reach the transposed kernel"
+        );
+        let want = reference(k, n, &a, &b_kn);
+        let worst = worst_rel(&out, &want);
+        assert!(
+            worst <= 2e-3,
+            "declined-cache fallback drifted from the f64 reference: {worst:e}"
+        );
+    }
+
+    /// #1381: `MatMul` and `Gemm` must take the *same* `m == 1` f16 route.
+    ///
+    /// They did not. `MatMul` diverted to the fused widen-pack GEBP once
+    /// `k * n` reached 1M and `Gemm` stayed on the decode GEMV at every
+    /// weight, so the identical operation had two kernels and two costs
+    /// depending on which op the exporter emitted. Re-measuring picked the
+    /// GEMV, so this asserts *both* ops reach it -- above and below the weight
+    /// where the divert used to happen, and out to a 45M `mlp` shape.
+    ///
+    /// Fails loudly if either side re-acquires a weight-dependent divert: the
+    /// counter is incremented by the GEMV arm alone.
+    #[test]
+    fn gemm_and_matmul_take_the_same_decode_route() {
+        if !half_gemv::simd_available(HalfFormat::F16) {
+            return;
+        }
+        // 1024x1024 is exactly the weight the retired divert triggered at;
+        // 1024x768 the largest below it; the rest are decode shapes from a
+        // 7B-class graph, every one of which the divert used to claim.
+        for (k, n) in [
+            (64usize, 64usize),
+            (1024, 768),
+            (1024, 1024),
+            (1024, 2048),
+            (4096, 4096),
+        ] {
+            let a = operand(k, 0.25);
+            let b = operand(k * n, -0.5);
+
+            let (gemm_out, gemm_gemv) = decode_gemm(k, n, &a, &b, false);
+            assert_eq!(
+                gemm_gemv, 1,
+                "k={k} n={n}: Gemm must serve an m == 1 f16 decode with the GEMV"
+            );
+
+            let (matmul_out, matmul_gemv) = decode_matmul(k, n, &a, &b);
+            assert_eq!(
+                matmul_gemv, 1,
+                "k={k} n={n}: MatMul must serve an m == 1 f16 decode with the GEMV"
+            );
+
+            assert_eq!(
+                gemm_out, matmul_out,
+                "k={k} n={n}: Gemm and MatMul decode must be bit-identical"
+            );
+
+            let worst = worst_rel(&gemm_out, &reference(k, n, &a, &b));
+            assert!(
+                worst <= 2e-3,
+                "k={k} n={n}: decode disagrees with the f64 reference by {worst:e}"
+            );
+        }
+    }
+
+    /// A transposed weight is `[N, K]` and keeps its own GEMV at every size.
+    ///
+    /// Worth pinning separately because the `[N, K]` arm is the layout every
+    /// `nn.Linear` export produces, and because declining it drops `Gemm` into
+    /// the portable blocked half GEMM -- there is no other fast path past this
+    /// point without the `mlas` feature.
+    #[test]
+    fn transposed_decode_keeps_its_gemv_at_every_weight() {
+        if !half_gemv::simd_available(HalfFormat::F16) {
+            return;
+        }
+        for (k, n) in [(1024usize, 2048usize), (4096, 4096)] {
+            let a = operand(k, 0.25);
+            let kn = operand(k * n, -0.5);
+            let mut nk = vec![0.0f32; n * k];
+            for p in 0..k {
+                for j in 0..n {
+                    nk[j * k + p] = kn[p * n + j];
+                }
+            }
+            let (out, gemv) = decode_gemm(k, n, &a, &nk, true);
+            assert_eq!(gemv, 1, "k={k} n={n}: a transB decode must reach the GEMV");
+
+            let worst = worst_rel(&out, &reference(k, n, &a, &kn));
+            assert!(
+                worst <= 2e-3,
+                "k={k} n={n}: transB decode disagrees by {worst:e}"
+            );
+        }
+    }
+
+    /// A `bf16` decode through `Gemm`, which used to be excluded by dtype.
+    ///
+    /// `MatMul` served a `bf16` `m == 1` from the decode GEMV and `Gemm` did
+    /// not -- its fast path required both operands to be `Float16` -- so the
+    /// identical decode landed in the portable blocked half GEMM, the slowest
+    /// dense region measured anywhere in this EP. This pins the pair the same
+    /// way the `f16` test above does: both ops on the GEMV, bit-identical to
+    /// each other, and inside tolerance of an `f64` reference taken over the
+    /// *bf16-narrowed* operand values.
+    #[test]
+    fn bf16_decode_takes_the_same_gemv_in_both_ops() {
+        if !half_gemv::simd_available(HalfFormat::Bf16) {
+            return;
+        }
+        for (k, n) in [(64usize, 64usize), (1024, 1024), (2048, 3072)] {
+            let a = operand(k, 0.25);
+            let b = operand(k * n, -0.5);
+
+            let (gemm_out, gemm_gemv) = decode_gemm_bf16(k, n, &a, &b, false);
+            assert_eq!(
+                gemm_gemv, 1,
+                "k={k} n={n}: Gemm must serve an m == 1 bf16 decode with the GEMV"
+            );
+
+            let (matmul_out, matmul_gemv) = decode_matmul_bf16(k, n, &a, &b);
+            assert_eq!(
+                matmul_gemv, 1,
+                "k={k} n={n}: MatMul must serve an m == 1 bf16 decode with the GEMV"
+            );
+
+            assert_eq!(
+                gemm_out, matmul_out,
+                "k={k} n={n}: Gemm and MatMul bf16 decode must be bit-identical"
+            );
+
+            let worst = worst_rel(&gemm_out, &reference_bf16(k, n, &a, &b));
+            assert!(
+                worst <= 8e-3,
+                "k={k} n={n}: bf16 decode disagrees with the f64 reference by {worst:e}"
+            );
+        }
+    }
+
+    /// A *transposed* `bf16` decode now takes the `[N, K]` GEMV, and the
+    /// numerics are what prove the weight is read as `bf16` and not as `f16`.
+    ///
+    /// This test used to assert the opposite. The decline was kernel coverage,
+    /// not policy — the `[N, K]` GEMV existed only in an `f16` spelling — so
+    /// the fix was to instantiate it per format rather than to keep gating on
+    /// dtype. Reading a `bf16` weight through the `f16` kernel would not fault;
+    /// it would silently reinterpret every bit pattern, which is why the route
+    /// assertion alone is not enough and the error bound is checked against an
+    /// `f64` reference built from the untransposed operand.
+    #[test]
+    fn a_transposed_bf16_decode_takes_the_same_gemv_as_f16() {
+        if !half_gemv::simd_available(HalfFormat::Bf16) {
+            return;
+        }
+        let (k, n) = (512usize, 256usize);
+        let a = operand(k, 0.25);
+        let kn = operand(k * n, -0.5);
+        let mut nk = vec![0.0f32; n * k];
+        for p in 0..k {
+            for j in 0..n {
+                nk[j * k + p] = kn[p * n + j];
+            }
+        }
+        let (out, gemv) = decode_gemm_bf16(k, n, &a, &nk, true);
+        assert_eq!(
+            gemv, 1,
+            "a transposed bf16 decode must reach the [N, K] GEMV, not the blocked GEMM"
+        );
+        let worst = worst_rel(&out, &reference_bf16(k, n, &a, &kn));
+        assert!(
+            worst <= 8e-3,
+            "transposed bf16 decode disagrees by {worst:e} -- \
+             an f16 reinterpretation of the weight would land here"
+        );
+    }
+
+    /// `m > 1` is not decode and must not be counted as such in either dtype.
+    ///
+    /// The counter is the instrument the two tests above read, so a change
+    /// that made it fire for a prefill would make them pass vacuously.
+    #[test]
+    fn a_multi_row_half_gemm_is_not_counted_as_decode() {
+        if !half_gemv::simd_available(HalfFormat::F16) {
+            return;
+        }
+        let (m, k, n) = (4usize, 256usize, 128usize);
+        let a = Owned::f16(&[m, k], &operand(m * k, 0.25));
+        let b = Owned::f16(&[k, n], &operand(k * n, -0.5));
+        let mut out = Owned::zeros_f32(&[m, n]);
+        let mut kernel = GemmKernel {
+            alpha: 1.0,
+            beta: 1.0,
+            trans_a: false,
+            trans_b: false,
+            prepack: MatMulPrepack::default(),
+        };
+        kernel.set_constant_inputs(&[false, true]);
+        super::reset_half_decode_gemv_calls();
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(
+            super::half_decode_gemv_calls(),
+            0,
+            "an m = 4 half Gemm is a prefill and must not touch the decode GEMV"
+        );
+    }
+
+    /// `bf16` twin of [`decode_gemm`].
+    fn decode_gemm_bf16(
+        k: usize,
+        n: usize,
+        a: &[f32],
+        b: &[f32],
+        trans_b: bool,
+    ) -> (Vec<f32>, u64) {
+        let a_t = Owned::bf16(&[1, k], a);
+        let b_t = if trans_b {
+            Owned::bf16(&[n, k], b)
+        } else {
+            Owned::bf16(&[k, n], b)
+        };
+        let mut out = Owned::zeros_f32(&[1, n]);
+        let mut kernel = GemmKernel {
+            alpha: 1.0,
+            beta: 1.0,
+            trans_a: false,
+            trans_b,
+            prepack: MatMulPrepack::default(),
+        };
+        kernel.set_constant_inputs(&[false, true]);
+        super::reset_half_decode_gemv_calls();
+        kernel
+            .execute(&[a_t.view(), b_t.view()], &mut [out.view_mut()])
+            .unwrap();
+        (out.to_f32(), super::half_decode_gemv_calls())
+    }
+
+    /// `bf16` twin of [`decode_matmul`].
+    fn decode_matmul_bf16(k: usize, n: usize, a: &[f32], b: &[f32]) -> (Vec<f32>, u64) {
+        let a_t = Owned::bf16(&[1, k], a);
+        let b_t = Owned::bf16(&[k, n], b);
+        let mut out = Owned::zeros_f32(&[1, n]);
+        let mut kernel = matmul::MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+        matmul::reset_half_decode_gemv_calls();
+        kernel
+            .execute(&[a_t.view(), b_t.view()], &mut [out.view_mut()])
+            .unwrap();
+        (out.to_f32(), matmul::half_decode_gemv_calls())
+    }
+
+    /// `f64` reference over the *bf16-narrowed* operand values.
+    fn reference_bf16(k: usize, n: usize, a: &[f32], b: &[f32]) -> Vec<f64> {
+        let narrow = |v: &[f32]| -> Vec<f64> {
+            v.iter()
+                .map(|&x| f64::from(half::bf16::from_f32(x).to_f32()))
+                .collect()
+        };
+        let (a, b) = (narrow(a), narrow(b));
+        let mut out = vec![0.0f64; n];
+        for (p, &av) in a.iter().enumerate().take(k) {
+            for j in 0..n {
+                out[j] += av * b[p * n + j];
+            }
+        }
+        out
+    }
+}
+
+/// Production-path A/B for the `m == 1` f16 `Gemm` decode route.
+///
+/// Both arms come out of one build, selected by environment, because
+/// `half_prefill_gebp_enabled` is a process-wide `OnceLock` -- so one arm per
+/// process, exactly as `benches/half_decode_gemv_ab.rs` does it for `MatMul`:
+///
+/// ```text
+/// ONNX_GENAI_CPU_MM_HALF_GEBP=0 cargo test -p onnx-runtime-ep-cpu --release --lib \
+///     bench_gemm_half_decode_route -- --ignored --nocapture   # GEMV (pre-change)
+/// cargo test -p onnx-runtime-ep-cpu --release --lib \
+///     bench_gemm_half_decode_route -- --ignored --nocapture   # shipped routing
+/// ```
+///
+/// The `f32` row runs the same shape through the same kernel on a path neither
+/// arm can move, so it says whether a difference between two processes is the
+/// route or the machine.
+#[cfg(all(test, target_arch = "x86_64"))]
+mod half_decode_route_bench {
+    use super::*;
+    use crate::kernels::testutil::Owned;
+    use std::time::Instant;
+
+    fn median(mut samples: Vec<f64>) -> f64 {
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        samples[samples.len() / 2]
+    }
+
+    fn operand(len: usize, seed: f32) -> Vec<f32> {
+        (0..len)
+            .map(|i| ((i as f32) * 0.0137 + seed).sin() * 0.5)
+            .collect()
+    }
+
+    fn time_decode(dtype: DataType, k: usize, n: usize, reps: usize) -> (f64, f64, u64) {
+        let a_data = operand(k, 0.25);
+        let b_data = operand(k * n, -0.5);
+        let (a, b) = match dtype {
+            DataType::Float16 => (Owned::f16(&[1, k], &a_data), Owned::f16(&[k, n], &b_data)),
+            DataType::BFloat16 => (Owned::bf16(&[1, k], &a_data), Owned::bf16(&[k, n], &b_data)),
+            _ => (Owned::f32(&[1, k], &a_data), Owned::f32(&[k, n], &b_data)),
+        };
+        let mut out = Owned::zeros_f32(&[1, n]);
+        let mut kernel = GemmKernel {
+            alpha: 1.0,
+            beta: 1.0,
+            trans_a: false,
+            trans_b: false,
+            prepack: MatMulPrepack::default(),
+        };
+        kernel.set_constant_inputs(&[false, true]);
+
+        // Cold: the first Run of a session, weight not yet resident.
+        super::reset_half_decode_gemv_calls();
+        let start = Instant::now();
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        let cold = start.elapsed().as_secs_f64() * 1e3;
+        let gemv = super::half_decode_gemv_calls();
+
+        let mut samples = Vec::with_capacity(reps);
+        for _ in 0..reps {
+            let start = Instant::now();
+            kernel
+                .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+                .unwrap();
+            samples.push(start.elapsed().as_secs_f64() * 1e3);
+        }
+        (cold, median(samples), gemv)
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_gemm_half_decode_route() {
+        let shapes: [(&str, usize, usize); 8] = [
+            ("k1024n768", 1024, 768),
+            ("k1024n1024", 1024, 1024),
+            ("k1024n2048", 1024, 2048),
+            ("k2048n1024", 2048, 1024),
+            ("k512n4096", 512, 4096),
+            ("qwen_qkv", 3584, 4608),
+            ("llama_mlp", 4096, 11008),
+            ("llama_qkv", 4096, 4096),
+        ];
+        let reps: usize = std::env::var("REPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(25);
+        println!(
+            "gemv={} gebp={} threads={}",
+            std::env::var("ONNX_GENAI_CPU_MM_HALF_GEMV").unwrap_or_else(|_| "default(on)".into()),
+            std::env::var("ONNX_GENAI_CPU_MM_HALF_GEBP").unwrap_or_else(|_| "default(on)".into()),
+            rayon::current_num_threads()
+        );
+        let dtype = match std::env::var("PROBE_DTYPE").as_deref() {
+            Ok("bf16") => DataType::BFloat16,
+            _ => DataType::Float16,
+        };
+        println!(
+            "{:>12} {:>7} {:>7} {:>9} {:>10} {:>8} {:>7}",
+            "shape", "k", "n", "cold_ms", "steady_ms", "GB/s", "route"
+        );
+        for (name, k, n) in shapes {
+            let (cold, steady, gemv) = time_decode(dtype, k, n, reps);
+            let route = if gemv == 1 { "gemv" } else { "other" };
+            let gb = (2 * k * n) as f64 / (steady * 1e-3) / 1e9;
+            println!("{name:>12} {k:>7} {n:>7} {cold:>9.3} {steady:>10.3} {gb:>8.1} {route:>7}");
+            let (cold, steady, _) = time_decode(DataType::Float32, k, n, reps.min(10));
+            let gb = (4 * k * n) as f64 / (steady * 1e-3) / 1e9;
+            println!(
+                "{:>12} {k:>7} {n:>7} {cold:>9.3} {steady:>10.3} {gb:>8.1} {:>7}",
+                "  ^f32 ctl", "ctl"
+            );
+        }
     }
 }

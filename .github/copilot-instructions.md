@@ -2,6 +2,8 @@
 
 You are working on a project that uses **Squad**, an AI team framework. When picking up issues autonomously, follow these guidelines.
 
+> **Read [`AGENTS.md`](../AGENTS.md) first.** It is the entry point for agents and points at [`RULES.md`](../RULES.md), the normative project rules that bind every contributor. This file covers Squad coordination only; `RULES.md` governs what the code may look like, and a rule violation is review-blocking even when the code works.
+
 ## Coordinator Canary Check
 
 **IMPORTANT — run this check on EVERY session start, before doing any work:**

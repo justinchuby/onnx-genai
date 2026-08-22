@@ -46,7 +46,8 @@ fn logits_output_by_exclusion(
     })?;
     if non_cache.next().is_some() {
         return Err(OrtError::InvalidArgument(
-            "static-cache model exposes multiple non-cache outputs; declare model.io.logits_output"
+            "static-cache model exposes multiple non-cache outputs, so logits_output is \
+             ambiguous; give the port the logits role in pipeline.workflow.components.<component>.ports.roles"
                 .into(),
         ));
     }
@@ -1344,9 +1345,6 @@ mod tests {
         let outputs = names(&["scores", "hidden", "updated_key_cache.0"]);
         let cache: HashSet<&str> = ["updated_key_cache.0"].into_iter().collect();
         let error = logits_output_by_exclusion(&outputs, &cache).unwrap_err();
-        assert!(
-            format!("{error:?}").contains("model.io.logits_output"),
-            "{error:?}"
-        );
+        assert!(format!("{error:?}").contains("logits_output"), "{error:?}");
     }
 }

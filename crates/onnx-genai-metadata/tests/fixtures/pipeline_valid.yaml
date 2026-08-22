@@ -3,11 +3,11 @@ required_capabilities:
 pipeline:
   models:
     vision_encoder:
-      filename: vision_encoder.onnx
+      filename: vision_encoder.onnx.textproto
       type: encoder
       device_preference: gpu
     decoder:
-      filename: decoder.onnx
+      filename: decoder.onnx.textproto
       type: decoder
       tokenizer: tokenizer.json
   dataflow:
@@ -22,15 +22,8 @@ pipeline:
         strategy:
           kind: single_pass
           model: vision_encoder
-        run_on: prompt_only
       - name: decode_text
         strategy:
           kind: autoregressive
           decoder: decoder
           max_tokens: 128
-        run_on: every_step
-  phases:
-    vision_encoder:
-      run_on: prompt_only
-    decoder:
-      run_on: every_step

@@ -207,8 +207,10 @@ fn full_roundtrip_matches_reference() {
     assert_eq!(data_len, 4 * 4); // 4 f32
     let out_bytes = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, data_len) };
     let got: Vec<f32> = out_bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect();
     let want = reference(&x_data);
     for (g, w) in got.iter().zip(&want) {

@@ -1,0 +1,107 @@
+# PROTBERT protein encoder; residue embeddings, no persistent decode state.
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      capabilities:
+      - workflow_ssa
+      - typed_emit
+    inputs:
+      request.residue_ids:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - residues
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: request.residue_ids
+        required: true
+      request.attention_mask:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - residues
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: request.attention_mask
+        required: true
+    outputs:
+      embeddings:
+        contract:
+          dtype: float32
+          rank: 3
+          shape:
+          - batch
+          - residues
+          - hidden
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
+    components:
+      encoder:
+        implementation:
+          kind: onnx
+          artifact: protbert/encoder.onnx.textproto
+        ports:
+          inputs:
+            input_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - residues
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            attention_mask:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - residues
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            last_hidden_state:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - residues
+              - hidden
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          roles:
+            input_ids: token_ids
+            last_hidden_state: hidden_states
+    state: {}
+    steps:
+    - kind: invoke
+      component: encoder
+      inputs:
+        input_ids: request.residue_ids
+        attention_mask: request.attention_mask
+      outputs:
+        last_hidden_state: protein.embeddings
+    - kind: emit
+      value: protein.embeddings
+      output: embeddings
+      mode: replace

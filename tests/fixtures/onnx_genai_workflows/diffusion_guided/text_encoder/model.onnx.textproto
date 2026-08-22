@@ -1,0 +1,260 @@
+ir_version: 11
+graph {
+  node {
+    input: "input_ids"
+    output: "v_Shape_0"
+    name: "Shape_node_0"
+    op_type: "Shape"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    output: "v_Constant_1"
+    name: "Constant_node_1"
+    op_type: "Constant"
+    attribute {
+      name: "value_ints"
+      ints: 32
+      type: INTS
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "v_Shape_0"
+    input: "v_Constant_1"
+    output: "v_Concat_2"
+    name: "Concat_node_2"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: 0
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "input_ids"
+    input: "const_1d_0"
+    output: "v_Unsqueeze_3"
+    name: "Unsqueeze_node_3"
+    op_type: "Unsqueeze"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "v_Unsqueeze_3"
+    output: "v_Cast_4"
+    name: "Cast_node_4"
+    op_type: "Cast"
+    attribute {
+      name: "to"
+      i: 1
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "v_Cast_4"
+    input: "v_Concat_2"
+    output: "encoder_hidden_states"
+    name: "Expand_node_5"
+    op_type: "Expand"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  name: "text_encoder"
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "const_1d_0"
+    raw_data: "\002\000\000\000\000\000\000\000"
+  }
+  input {
+    name: "input_ids"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "component.text_encoder.batch"
+          }
+          dim {
+            dim_param: "component.text_encoder.prompt_sequence"
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "encoder_hidden_states"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "component.text_encoder.batch"
+          }
+          dim {
+            dim_param: "component.text_encoder.prompt_sequence"
+          }
+          dim {
+            dim_value: 32
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "const_1d_0"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Shape_0"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 2
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Constant_1"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Concat_2"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 3
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Unsqueeze_3"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+          }
+          dim {
+          }
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Cast_4"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+          }
+          dim {
+          }
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}

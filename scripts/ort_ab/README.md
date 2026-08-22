@@ -81,9 +81,11 @@ performance cliff that only trained weights would trigger.
 | `gen_gqa.py` | `com.microsoft::GroupQueryAttention`, one node, fully static shapes |
 | `gen_grid.py` | the GQA decode/prefill grid across four model geometries |
 | `gen_l3sweep.py` | GQA decode graphs whose per-head attended-KV working set lands on 1/2/4/8/16/32 MiB, for cache-topology sweeps |
-| `gen_mha.py` | `com.microsoft::MultiHeadAttention` (the operator the vectorised `sdpa_f32` path serves) |
+| `gen_mha.py` | `com.microsoft::MultiHeadAttention` (the operator the vectorised `sdpa_f32` path serves), 16 cells: 7 bidirectional encoder/prefill shapes, 3 causal (`unidirectional=1`) decoder prefills, 5 decode shapes (`q_seq = 1`, KV 128/1024/4096, batched), and one 8-token chunk |
 | `gen_moe.py` | `com.microsoft::MoE` / `QMoE`, top-k routing, grouped experts |
 | `gen_transforms.py` | the transforms that *surround* attention: `Softmax`, `RotaryEmbedding`, KV-cache `Concat`, BSNH↔BNSH `Transpose` |
+| `gen_f16_gemv.py` | decode-shaped (`M = 1`) f16 `MatMul` or `Gemm` (`--op`), sweeping the weight working set from L2-resident to past LLC |
+| `gen_f16_nt.py` | f16 `Gemm` prefill cells emitted **twice** — `transB = 1` and `transB = 0` over the same array pre-transposed — so the storage layout is the only variable |
 
 Each takes an output directory:
 
@@ -92,6 +94,14 @@ python3 scripts/ort_ab/gen_transforms.py --out /path/to/models/transforms
 python3 scripts/ort_ab/gen_grid.py --out /path/to/models/grid
 python3 scripts/ort_ab/gen_moe.py --out-dir /path/to/models/moe --tokens 1 32 512
 ```
+
+`gen_f16_gemv.py` additionally takes `--op {matmul,gemm}`. Since #1613 both ops
+take the half decode GEMV at every `m == 1` weight size -- the
+`HALF_PREFILL_GEBP_MIN_WEIGHT` handover to the fused widen-pack GEBP was
+retired for decode because it measured as a loss -- so neither op needs
+`ONNX_GENAI_CPU_MM_HALF_GEBP=0` to reach the GEMV any more. `--op gemm` emits
+`Gemm` with `transB=0`, which has no weight gate and therefore measures the
+GEMV as a default build actually runs it.
 
 `gen_gqa.py` bakes semantically-constrained integer inputs (`seqlens_k`,
 `total_sequence_length`) as **initializers**, because the harness would
@@ -137,6 +147,14 @@ python3 scripts/ort_ab/ab.py \
 
   and any arm whose delta is inside the null delta is printed as
   `WITHIN NOISE` instead of a number to paste into a table.
+* `--native-only` — run every arm with `--native-only` so no ORT session exists
+  in the child at all, and compare native times directly instead of
+  `native/ort`. **Use this for any native-vs-native A/B.** ORT's intra-op pool
+  spin-waits, so a paired run steals cores from the native arm: on the f16 GEMV
+  cells it depressed the native median by up to 6x and pushed the null control
+  to 27%, which was larger than most of the effects under test. The CSV marks
+  these runs with `native_only=1`, and in that mode the `ratio` column holds
+  native milliseconds rather than a ratio.
 * `--threads` — passed through as **both** `--native-threads N` and
   `--ort-intra-threads N`, so the two runtimes get matched pool widths.
   `--native-threads` sets `ONNX_GENAI_CPU_DECODE_THREADS` (a decode-pool width
@@ -165,6 +183,13 @@ arms within one run, never across sessions.
 
 ## Caveats
 
+* **A paired run depresses the native arm on small cells.** ORT's intra-op pool
+  spin-waits, so on short kernels the two arms are not merely measured together
+  but *compete*; the effect has been measured at up to 6x on f16 GEMV cells.
+  Where the claim is a native-vs-native A/B, or where the cell is short, measure
+  the arms separately with `bench_generic --native-only` / `--ort-only` and use
+  the paired mode only to confirm `parity=PASS`. `--ort-only` synthesizes the
+  same dtypes as the paired path (f32, f16, i32, i64, u8, i8).
 * The driver **raises** if a cell produces no result line, rather than silently
   dropping it. Under heavy host contention a cell can fail this way; re-run it
   standalone before concluding anything.

@@ -311,34 +311,243 @@ fn activates_mlas(feature: &str) -> bool {
     feature.to_ascii_lowercase().contains("mlas")
 }
 
+struct WorkspaceResolution {
+    packages: HashSet<String>,
+    features: HashMap<String, HashSet<String>>,
+}
+
+/// Resolve workspace package features from `cargo metadata --no-deps`.
+///
+/// Cargo's `--no-deps` output contains every workspace manifest, including
+/// dependency feature requests, but deliberately carries no resolve graph. This
+/// fixed-point walk supplies the small part of resolver-v2 needed by this gate:
+/// normal/build dependencies, defaults, optional `dep:` edges, and dependency
+/// feature forwarding. Registry packages cannot introduce a path dependency on
+/// this workspace's unpublished `mlas-sys`, so they are intentionally leaves.
+fn resolve_workspace_defaults(
+    metadata: &serde_json::Value,
+    root_name: &str,
+) -> Result<WorkspaceResolution, String> {
+    let package_values = metadata["packages"]
+        .as_array()
+        .ok_or("cargo metadata listed no workspace packages")?;
+    let packages_by_name: HashMap<&str, &serde_json::Value> = package_values
+        .iter()
+        .filter_map(|package| Some((package["name"].as_str()?, package)))
+        .collect();
+    if !packages_by_name.contains_key(root_name) {
+        return Err(format!(
+            "cargo metadata did not list root package `{root_name}`"
+        ));
+    }
+
+    let mut resolution = WorkspaceResolution {
+        packages: HashSet::from([root_name.to_string()]),
+        features: HashMap::new(),
+    };
+    resolution
+        .features
+        .entry(root_name.to_string())
+        .or_default()
+        .insert("default".to_string());
+
+    loop {
+        let before_packages = resolution.packages.len();
+        let before_features: usize = resolution.features.values().map(HashSet::len).sum();
+
+        // Expand local feature aliases to a fixed point.
+        for package_name in resolution.packages.clone() {
+            let package = packages_by_name[package_name.as_str()];
+            let Some(feature_table) = package["features"].as_object() else {
+                continue;
+            };
+            let active = resolution
+                .features
+                .get(&package_name)
+                .cloned()
+                .unwrap_or_default();
+            for feature in active {
+                let Some(members) = feature_table.get(&feature).and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                for member in members.iter().filter_map(|v| v.as_str()) {
+                    if !member.starts_with("dep:")
+                        && !member.contains('/')
+                        && feature_table.contains_key(member)
+                    {
+                        resolution
+                            .features
+                            .entry(package_name.clone())
+                            .or_default()
+                            .insert(member.to_string());
+                    }
+                }
+            }
+        }
+
+        // Activate dependency edges and the features requested across them.
+        for package_name in resolution.packages.clone() {
+            let package = packages_by_name[package_name.as_str()];
+            let active_features = resolution
+                .features
+                .get(&package_name)
+                .cloned()
+                .unwrap_or_default();
+            let feature_members: Vec<&str> = package["features"]
+                .as_object()
+                .into_iter()
+                .flat_map(|table| {
+                    active_features
+                        .iter()
+                        .filter_map(|feature| table.get(feature)?.as_array())
+                        .flatten()
+                        .filter_map(|member| member.as_str())
+                })
+                .collect();
+
+            for dependency in package["dependencies"].as_array().into_iter().flatten() {
+                if dependency["kind"].as_str() == Some("dev") {
+                    continue;
+                }
+                let dependency_name = dependency["name"]
+                    .as_str()
+                    .ok_or("dependency had no package name")?;
+                let alias = dependency["rename"].as_str().unwrap_or(dependency_name);
+                let optional = dependency["optional"].as_bool().unwrap_or(false);
+                let explicitly_enabled = feature_members.iter().any(|member| {
+                    *member == format!("dep:{alias}")
+                        || member
+                            .strip_prefix(alias)
+                            .is_some_and(|suffix| suffix.starts_with('/'))
+                });
+                if optional && !explicitly_enabled {
+                    continue;
+                }
+
+                // External packages are leaves for this workspace-only policy.
+                if !packages_by_name.contains_key(dependency_name) {
+                    continue;
+                }
+                resolution.packages.insert(dependency_name.to_string());
+                let dependency_features = resolution
+                    .features
+                    .entry(dependency_name.to_string())
+                    .or_default();
+                if dependency["uses_default_features"].as_bool() != Some(false) {
+                    dependency_features.insert("default".to_string());
+                }
+                for feature in dependency["features"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_str())
+                {
+                    dependency_features.insert(feature.to_string());
+                }
+                for member in &feature_members {
+                    let Some((member_alias, feature)) = member.split_once('/') else {
+                        continue;
+                    };
+                    if member_alias.trim_end_matches('?') == alias
+                        && (!member_alias.ends_with('?')
+                            || resolution.packages.contains(dependency_name))
+                    {
+                        dependency_features.insert(feature.to_string());
+                    }
+                }
+            }
+        }
+
+        let after_features: usize = resolution.features.values().map(HashSet::len).sum();
+        if resolution.packages.len() == before_packages && after_features == before_features {
+            return Ok(resolution);
+        }
+    }
+}
+
+fn resolver_fixture() -> serde_json::Value {
+    serde_json::json!({
+        "packages": [
+            {
+                "name": "plugin",
+                "features": {},
+                "dependencies": [{
+                    "name": "ep",
+                    "rename": null,
+                    "kind": null,
+                    "optional": false,
+                    "uses_default_features": true,
+                    "features": []
+                }]
+            },
+            {
+                "name": "ep",
+                "features": {
+                    "default": ["full"],
+                    "full": [],
+                    "mlas": ["dep:mlas-sys"]
+                },
+                "dependencies": [{
+                    "name": "mlas-sys",
+                    "rename": null,
+                    "kind": null,
+                    "optional": true,
+                    "uses_default_features": true,
+                    "features": []
+                }]
+            },
+            {
+                "name": "mlas-sys",
+                "features": {},
+                "dependencies": []
+            }
+        ]
+    })
+}
+
+#[test]
+fn workspace_default_resolver_keeps_optional_dependencies_off() {
+    let resolved = resolve_workspace_defaults(&resolver_fixture(), "plugin").unwrap();
+    assert!(resolved.packages.contains("ep"));
+    assert!(resolved.features["ep"].contains("full"));
+    assert!(!resolved.packages.contains("mlas-sys"));
+}
+
+#[test]
+fn workspace_default_resolver_detects_both_mlas_activation_paths() {
+    let mut unconditional = resolver_fixture();
+    unconditional["packages"][1]["dependencies"][0]["optional"] = false.into();
+    let resolved = resolve_workspace_defaults(&unconditional, "plugin").unwrap();
+    assert!(resolved.packages.contains("mlas-sys"));
+
+    let mut feature_forwarded = resolver_fixture();
+    feature_forwarded["packages"][0]["dependencies"][0]["features"] = serde_json::json!(["mlas"]);
+    let resolved = resolve_workspace_defaults(&feature_forwarded, "plugin").unwrap();
+    assert!(resolved.features["ep"].contains("mlas"));
+    assert!(resolved.packages.contains("mlas-sys"));
+}
+
 /// A default build resolves no `mlas-sys` at all.
 ///
-/// The feature check above reads manifests; this one reads what Cargo actually
-/// decided. They can disagree: an unconditional (non-`optional`) dependency, a
-/// `dep:` alias, or a third crate in the workspace enabling
-/// `onnx-runtime-ep-cpu/mlas` would all leave every `default` list innocent and
-/// still compile the vendored C++ into the build.
+/// The feature checks above inspect `default` lists; this one resolves the
+/// plugin's complete workspace dependency and feature closure. They can
+/// disagree: an unconditional (non-`optional`) dependency, a `dep:` alias, or a
+/// dependency declaration enabling `onnx-runtime-ep-cpu/mlas` would all leave
+/// every `default` list innocent and still compile the vendored C++.
 #[test]
 fn a_default_build_resolves_no_mlas_sys() {
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
         .expect("workspace root exists above this crate");
-    let Some(host) = host_triple() else {
-        return;
-    };
     let output =
         std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()))
             .args([
                 "metadata",
                 "--format-version",
                 "1",
+                "--no-deps",
                 "--offline",
-                "--no-default-features",
-                "--features",
-                "",
-                "--filter-platform",
-                &host,
             ])
             .current_dir(&workspace_root)
             .output();
@@ -358,105 +567,29 @@ fn a_default_build_resolves_no_mlas_sys() {
 
     let metadata: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("cargo metadata emits JSON");
-
-    let nodes = metadata["resolve"]["nodes"]
-        .as_array()
-        .expect("a full `cargo metadata` carries a resolve graph");
-
-    // The EP's own resolved feature set is the direct statement: `mlas` absent
-    // here means nothing in the workspace turned it on for a default build.
-    let ep_features: Vec<String> = nodes
-        .iter()
-        .find(|node| {
-            node["id"]
-                .as_str()
-                .is_some_and(|id| id.contains("onnx-runtime-ep-cpu#"))
-        })
-        .and_then(|node| node["features"].as_array())
-        .map(|features| {
-            features
-                .iter()
-                .filter_map(|f| Some(f.as_str()?.to_string()))
-                .collect()
-        })
-        .expect("onnx-runtime-ep-cpu is in the resolve graph");
+    let resolution = resolve_workspace_defaults(&metadata, "onnx-runtime-ep-cpu-plugin")
+        .unwrap_or_else(|e| panic!("resolve default plugin features: {e}"));
+    let ep_features = resolution
+        .features
+        .get("onnx-runtime-ep-cpu")
+        .expect("the default plugin reaches onnx-runtime-ep-cpu");
     assert!(
-        !ep_features.is_empty(),
-        "probe read no resolved features, so the assertion below would pass vacuously"
+        ep_features.contains("full"),
+        "the resolver did not activate the CPU EP's default `full` feature: {ep_features:?}"
     );
     assert!(
-        !ep_features.iter().any(|f| f == "mlas"),
+        !ep_features.contains("mlas"),
         "a default workspace build resolved `mlas` on onnx-runtime-ep-cpu: {ep_features:?}"
     );
-
-    // And no edge from the shipped plugin reaches mlas-sys.
-    let version_of: HashMap<String, String> = metadata["packages"]
-        .as_array()
-        .expect("cargo metadata lists packages")
-        .iter()
-        .filter_map(|package| {
-            Some((
-                package["id"].as_str()?.to_string(),
-                format!(
-                    "{}@{}",
-                    package["name"].as_str()?,
-                    package["version"].as_str()?
-                ),
-            ))
-        })
-        .collect();
-    let edges: HashMap<String, Vec<String>> = nodes
-        .iter()
-        .filter_map(|node| {
-            Some((
-                node["id"].as_str()?.to_string(),
-                node["dependencies"]
-                    .as_array()?
-                    .iter()
-                    .filter_map(|dep| Some(dep.as_str()?.to_string()))
-                    .collect(),
-            ))
-        })
-        .collect();
-
-    let root = metadata["packages"]
-        .as_array()
-        .and_then(|packages| {
-            packages
-                .iter()
-                .find(|package| package["name"] == "onnx-runtime-ep-cpu-plugin")
-        })
-        .and_then(|package| package["id"].as_str())
-        .expect("this crate is in the metadata")
-        .to_string();
-
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut queue = vec![root];
-    let mut copies: Vec<String> = Vec::new();
-    while let Some(id) = queue.pop() {
-        if !seen.insert(id.clone()) {
-            continue;
-        }
-        if version_of
-            .get(&id)
-            .is_some_and(|nv| nv.starts_with("mlas-sys@"))
-        {
-            copies.push(version_of[&id].clone());
-        }
-        queue.extend(edges.get(&id).into_iter().flatten().cloned());
-    }
-
-    // The walk has to be load-bearing: a renamed root or a metadata format
-    // change would otherwise leave `copies` empty and pass for the wrong
-    // reason.
     assert!(
-        seen.len() > 1,
-        "reachability walk found no dependencies of the plugin at all — the graph was \
-         not traversed, so the count below would be meaningless"
+        resolution.packages.len() > 5,
+        "default resolution reached only {} workspace packages, so the probe was \
+         effectively vacuous",
+        resolution.packages.len()
     );
     assert!(
-        copies.is_empty(),
-        "a default build of the shipped plugin reaches mlas-sys: {copies:?}"
+        !resolution.packages.contains("mlas-sys"),
+        "a default build of the shipped plugin reaches mlas-sys"
     );
 }
 
@@ -677,33 +810,6 @@ _ZN19onnx_runtime_ep_cpu7backend10CpuBackend4Mlas17h0123456789abcdefE t 1a2bc0 2
     );
 }
 
-/// The triple this test process runs on.
-///
-/// `cargo metadata` without `--filter-platform` insists on resolving the
-/// dependency graph of every target Cargo has ever heard of — Android, wasm —
-/// which an `--offline` lane has no reason to have vendored. That made the gate
-/// fail for a reason with nothing to do with MLAS. Filtering to the host keeps
-/// the resolve honest (it is the platform whose artifact is being probed) and
-/// resolvable from a cache that only ever built for it.
-fn host_triple() -> Option<String> {
-    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
-    let output = match std::process::Command::new(rustc).arg("-vV").output() {
-        Ok(o) if o.status.success() => o,
-        Ok(o) => {
-            return gate_probe_failed(&format!(
-                "rustc -vV failed: {}",
-                String::from_utf8_lossy(&o.stderr)
-            ));
-        }
-        Err(e) => return gate_probe_failed(&format!("rustc is not runnable: {e}")),
-    };
-    let text = String::from_utf8_lossy(&output.stdout).into_owned();
-    match text.lines().find_map(|line| line.strip_prefix("host: ")) {
-        Some(triple) if !triple.trim().is_empty() => Some(triple.trim().to_string()),
-        _ => gate_probe_failed("rustc -vV printed no host triple"),
-    }
-}
-
 /// `nm` output, or `None` with a skip message when `nm` is unavailable.
 fn nm(path: &Path, args: &[&str]) -> Option<String> {
     match std::process::Command::new("nm")
@@ -738,10 +844,22 @@ fn gate_must_run() -> bool {
 /// failure mode as measuring a configuration nobody ships. Where the gate is
 /// required, an unusable probe is therefore a failure and not a skip.
 fn gate_probe_failed(why: &str) -> Option<String> {
+    // A lane that builds only a subset of the workspace caches only that
+    // subset's packages, but the resolve probe reads every manifest in the
+    // lockfile. That shows up here as an `--offline` download failure for some
+    // crate with no connection to MLAS, which reads like a mystery unless the
+    // remedy is named at the point of failure.
+    let hint = if why.contains("--offline was specified") {
+        "\nhint: this is a missing package in the local registry, not an MLAS \
+         finding. A lane that builds part of the workspace must run \
+         `cargo fetch --locked` before the probe reads the whole resolve."
+    } else {
+        ""
+    };
     assert!(
         !gate_must_run(),
         "the MLAS-free gate could not run its probe on the configuration it \
-         exists to check ({why}); passing here would prove nothing"
+         exists to check ({why}); passing here would prove nothing{hint}"
     );
     eprintln!("⏭ skipped — {why}");
     None

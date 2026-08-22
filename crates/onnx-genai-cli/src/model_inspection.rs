@@ -43,10 +43,6 @@ pub(super) fn show(model: &Path) -> anyhow::Result<()> {
     if genai_config.is_file() {
         println!("genai config:    {}", genai_config.display());
     }
-    if directory.speculator.is_some() {
-        println!("speculator:      detected");
-    }
-
     if let Some(metadata_path) = &directory.metadata_path {
         show_metadata(metadata_path)?;
     }
@@ -90,7 +86,7 @@ pub(super) fn list(models_dir: &Path) -> anyhow::Result<()> {
 pub(super) fn version() {
     println!("onnx-genai {}", env!("CARGO_PKG_VERSION"));
     let mut providers = vec!["cpu"];
-    if cfg!(feature = "cuda") {
+    if cfg!(feature = "ort-cuda") {
         providers.push("cuda");
     }
     println!("execution providers: {}", providers.join(", "));

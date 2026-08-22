@@ -85,6 +85,30 @@ criterion = "0.5"
 onnx-runtime-operator-selection = { workspace = true }
 
 [[bench]]
+name = "half_prefill_route_ab"
+harness = false
+
+[[bench]]
+name = "half_decode_gemv_ab"
+harness = false
+
+[[bench]]
+name = "int4_prefill_route_ab"
+harness = false
+
+[[bench]]
+name = "int4_decode_loop_ab"
+harness = false
+
+[[bench]]
+name = "int4_acc0_attribution"
+harness = false
+
+[[bench]]
+name = "int8_prefill_route_ab"
+harness = false
+
+[[bench]]
 name = "kernels"
 harness = false
 
@@ -99,6 +123,9 @@ harness = false
 [[bench]]
 name = "sdpa_simd"
 harness = false
+
+[[bench]]
+name = "matmul_nbits_prefill_ab"
 
 # The absorption gate. Native and the MLAS reference in one binary, interleaved,
 # so a claimed native win is measured against the route it claims to replace.

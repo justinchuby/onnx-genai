@@ -47,6 +47,9 @@ pub(crate) fn invalid_arg_status(message: &str) -> *mut ort::OrtStatus {
 
 /// Create an `OrtStatus` with an explicit error code.
 pub(crate) fn status_with_code(code: ort::OrtErrorCode, message: &str) -> *mut ort::OrtStatus {
+    crate::dispatch_probe::count(crate::dispatch_probe::Event::StatusCreated);
+    let _probe = crate::dispatch_probe::Phase::StatusCrossing.enter();
+    crate::dispatch_probe::count(crate::dispatch_probe::Event::DispatchAlloc);
     let c_msg = CString::new(message).unwrap_or_else(|_| CString::new("unknown error").unwrap());
     let api = host_api();
     if api.is_null() {
@@ -55,7 +58,10 @@ pub(crate) fn status_with_code(code: ort::OrtErrorCode, message: &str) -> *mut o
     // SAFETY: api was set during CreateEpFactories and is process-lifetime valid.
     unsafe {
         match (*api).CreateStatus {
-            Some(create_status) => create_status(code, c_msg.as_ptr()),
+            Some(create_status) => {
+                crate::dispatch_probe::ort_call();
+                create_status(code, c_msg.as_ptr())
+            }
             None => ptr::null_mut(),
         }
     }

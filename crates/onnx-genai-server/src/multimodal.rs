@@ -1,36 +1,35 @@
-//! Public multimodal (image + audio) input plumbing for pipeline models.
-//!
-//! The OpenAI-compatible server and the `onnx-genai` CLI both need to turn a
-//! user-supplied image or audio clip into the tensors a pipeline package
-//! declares, and to expand image placeholder tokens in the prompt. That
-//! contract is derived entirely from typed metadata (`preprocessing.image`,
-//! `pipeline.vision`, and the components' declared graph inputs) — never from a
-//! model, vendor, or architecture name.
-//!
-//! This module is the single home for that derivation so both front ends stay
-//! behaviorally identical.
+//! Generic media binding for workflow package inputs.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use onnx_genai_engine::PipelineGenerateRequest;
-use onnx_genai_metadata::PipelineStrategy;
-use onnx_genai_ort::{
-    DataType, PipelineModelDirectory, PipelineModels, TensorInfo, Tokenizer, Value,
-};
-use onnx_genai_preprocess::image::packed::ImageExpansionSummary;
-
-use crate::image_input::{VisionOutputBinding, metadata_dtype};
+use onnx_genai_metadata::{RuntimeInputRole, SemanticInputRole, TensorDimension};
+use onnx_genai_ort::{DataType, PipelineModelDirectory, PipelineModels, Tokenizer, Value};
+use onnx_genai_preprocess::audio::WHISPER_N_FRAMES;
 
 pub use crate::audio_input::{AudioInputSpec, AudioTensor, preprocess_samples, preprocess_wav};
-pub use crate::image_input::{
-    ImageBundle, ImageTensor, MAX_EXPANDED_PROMPT_TOKENS, VisionInputSpec, image_tensor_value,
-    preprocess_encoded_images,
-};
+pub use crate::image_input::MAX_EXPANDED_PROMPT_TOKENS;
 
-/// Image and audio input contracts declared by one pipeline package.
-///
-/// Both fields are `None` for a pipeline that declares neither modality.
+#[derive(Debug, Clone)]
+pub struct VisionInputSpec {
+    input: String,
+    /// The prompt token the package expands into one image's token run.
+    ///
+    /// Declared as the `image_placeholder` special token. Without it the
+    /// package states no place in the token stream for its image features, and
+    /// binding an image is refused rather than silently ignored.
+    placeholder_token_id: Option<u32>,
+    /// The package's own image program, used to size each placeholder run.
+    program: Option<Box<onnx_genai_metadata::ImagePreprocessingProgram>>,
+}
+
+impl VisionInputSpec {
+    pub fn placeholder_token_id(&self) -> Option<u32> {
+        self.placeholder_token_id
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MultimodalSpecs {
     pub vision: Option<VisionInputSpec>,
@@ -38,14 +37,10 @@ pub struct MultimodalSpecs {
 }
 
 impl MultimodalSpecs {
-    /// Returns true when the package accepts neither image nor audio input.
     pub fn is_empty(&self) -> bool {
         self.vision.is_none() && self.audio.is_none()
     }
 
-    /// Human-readable list of the modalities this package accepts, e.g.
-    /// `"text + image"`. Quoted in rejection messages so a caller learns the
-    /// model's actual capability from the error alone.
     pub fn accepted_modalities(&self) -> String {
         let mut modalities = vec!["text"];
         if self.vision.is_some() {
@@ -57,10 +52,6 @@ impl MultimodalSpecs {
         modalities.join(" + ")
     }
 
-    /// The single non-text modality this package declares, if exactly one.
-    ///
-    /// Lets a front end turn a bare "missing required pipeline input" into
-    /// advice about the attachment the caller most likely forgot.
     pub fn sole_modality(&self) -> Option<&'static str> {
         match (self.vision.is_some(), self.audio.is_some()) {
             (true, false) => Some("image"),
@@ -70,295 +61,175 @@ impl MultimodalSpecs {
     }
 }
 
-/// Reject an attachment set the model cannot consume.
-///
-/// `specs` is `None` for a single decoder graph, which is text-only by
-/// construction. This is the one definition of the admission policy: the CLI
-/// and the HTTP API both call it, so a caller gets the same answer and the same
-/// wording whichever front end they use.
 pub fn admit_attachments(
     specs: Option<&MultimodalSpecs>,
     model: &str,
     images: usize,
     audio: usize,
 ) -> anyhow::Result<()> {
-    if images > 0 && audio > 0 {
+    if images > 1 {
         anyhow::bail!(
-            "What: image and audio input were combined for {model}. \
-             Why: a pipeline consumes one non-text modality per generation, so both cannot be bound at once. \
-             How: send them separately."
+            "workflow package '{model}' accepts one encoded media tensor per request; bind a \
+             multi-image application tensor explicitly when the package declares one"
         );
     }
-    if audio > 1 {
-        anyhow::bail!(
-            "What: {audio} audio clips were rejected for {model}. \
-             Why: an audio pipeline transcribes one clip per generation. \
-             How: send one clip at a time."
-        );
+    if audio > 1 || (images > 0 && audio > 0) {
+        anyhow::bail!("workflow package '{model}' accepts one media attachment per request");
     }
-    let accepted = specs.map_or_else(|| "text".to_string(), MultimodalSpecs::accepted_modalities);
     if images > 0 && specs.is_none_or(|specs| specs.vision.is_none()) {
-        anyhow::bail!(
-            "What: image input was rejected for {model}. \
-             Why: it accepts {accepted} input; {}. \
-             How: use a vision-language package, or send the prompt as text only.",
-            match specs {
-                None =>
-                    "it is a single decoder graph, not a multi-component pipeline, so it has no image encoder to bind",
-                Some(_) =>
-                    "its package declares no image preprocessing program (`preprocessing.image` bound to a component input, plus `pipeline.vision`)",
-            }
-        );
+        anyhow::bail!("workflow package '{model}' declares no typed image media input");
     }
     if audio > 0 && specs.is_none_or(|specs| specs.audio.is_none()) {
-        anyhow::bail!(
-            "What: audio input was rejected for {model}. \
-             Why: it accepts {accepted} input; {}. \
-             How: use a speech package, or send the prompt as text only.",
-            match specs {
-                None =>
-                    "it is a single decoder graph, not a multi-component pipeline, so it has no audio encoder to bind",
-                Some(_) => "no component of its package declares an `input_features` audio input",
-            }
-        );
+        anyhow::bail!("workflow package '{model}' declares no typed audio media input");
     }
     Ok(())
 }
 
-/// Preprocessed, model-ready non-text input for one generation.
-///
-/// This is the single implementation of "attachments become pipeline inputs".
-/// The CLI builds one from local files and binds it immediately; the server
-/// builds one from fetched URLs or base64 payloads and sends it to the engine
-/// thread, which binds it there. Both get identical preprocessing, identical
-/// placeholder expansion, and identical validation.
 #[derive(Debug)]
 pub struct MultimodalInput {
     tensors: Vec<PreparedTensor>,
-    image_summaries: Vec<ImageExpansionSummary>,
-    presence_keys: Vec<String>,
 }
 
 #[derive(Debug)]
 enum PreparedTensor {
-    Image(ImageTensor),
-    Audio(AudioTensor),
-}
-
-impl PreparedTensor {
-    fn endpoint(&self) -> &str {
-        match self {
-            Self::Image(tensor) => &tensor.endpoint,
-            Self::Audio(tensor) => &tensor.endpoint,
-        }
-    }
-
-    fn into_value(self) -> anyhow::Result<Value> {
-        match self {
-            Self::Image(tensor) => image_tensor_value(tensor),
-            Self::Audio(tensor) => {
-                Value::from_vec_f32(tensor.data, &tensor.shape).with_context(|| {
-                    format!(
-                        "What: audio endpoint '{}' tensor construction failed. \
-                     Why: the extracted features did not fill the declared shape. \
-                     How: report this as an audio preprocessing bug.",
-                        tensor.endpoint
-                    )
-                })
-            }
-        }
-    }
+    EncodedImage {
+        name: String,
+        bytes: Vec<u8>,
+    },
+    EncodedAudio {
+        name: String,
+        bytes: Vec<u8>,
+    },
+    Audio {
+        name: String,
+        data: Vec<f32>,
+        shape: Vec<i64>,
+    },
 }
 
 impl MultimodalInput {
-    /// Preprocess `images` (encoded bytes, in prompt order) and expand every
-    /// image placeholder in `prompt_token_ids` into its declared token run.
-    ///
-    /// `prompt_token_ids` is replaced with the expanded sequence, because the
-    /// expansion is what the decoder must actually see.
     pub fn from_images(
         spec: &VisionInputSpec,
         images: &[Vec<u8>],
         prompt_token_ids: &mut Vec<u32>,
         max_prompt_tokens: usize,
     ) -> anyhow::Result<Self> {
-        // Check the prompt before decoding pixels: a placeholder mistake is
-        // cheap to report and the caller can fix it without touching the files.
-        ensure_placeholders(spec, prompt_token_ids, images.len())?;
-        let bundle = preprocess_encoded_images(images, spec)?;
-        *prompt_token_ids = spec.expand_prompt(prompt_token_ids, &bundle, max_prompt_tokens)?;
+        if images.len() != 1 {
+            anyhow::bail!("workflow image binding requires exactly one encoded image tensor");
+        }
+        expand_image_placeholders(spec, &images[0], prompt_token_ids)?;
+        if prompt_token_ids.len() > max_prompt_tokens {
+            anyhow::bail!("prompt exceeds the declared context budget");
+        }
         Ok(Self {
-            tensors: bundle
-                .tensors
-                .into_iter()
-                .map(PreparedTensor::Image)
-                .collect(),
-            image_summaries: bundle.images,
-            presence_keys: spec.presence_keys().to_vec(),
+            tensors: vec![PreparedTensor::EncodedImage {
+                name: spec.input.clone(),
+                bytes: images[0].clone(),
+            }],
         })
     }
 
-    /// Preprocess one PCM16 WAV clip into the package's declared audio input.
     pub fn from_wav(spec: &AudioInputSpec, bytes: &[u8]) -> anyhow::Result<Self> {
+        if spec.encoded {
+            return Ok(Self {
+                tensors: vec![PreparedTensor::EncodedAudio {
+                    name: spec.endpoint.clone(),
+                    bytes: bytes.to_vec(),
+                }],
+            });
+        }
+        let tensor = preprocess_wav(bytes, spec)?;
         Ok(Self {
-            tensors: vec![PreparedTensor::Audio(preprocess_wav(bytes, spec)?)],
-            image_summaries: Vec::new(),
-            presence_keys: Vec::new(),
+            tensors: vec![PreparedTensor::Audio {
+                name: tensor.endpoint,
+                data: tensor.data,
+                shape: tensor.shape,
+            }],
         })
     }
 
-    /// Preprocess raw `[-1, 1]` mono samples, for callers streaming audio.
     pub fn from_samples(
         spec: &AudioInputSpec,
         samples: &[f32],
         sample_rate: u32,
     ) -> anyhow::Result<Self> {
+        if spec.encoded {
+            // The package's own program decodes a container, so a caller that
+            // holds bare samples has to hand one back.
+            let bytes = crate::audio_input::encode_samples_wav(samples, sample_rate)?;
+            return Ok(Self {
+                tensors: vec![PreparedTensor::EncodedAudio {
+                    name: spec.endpoint.clone(),
+                    bytes,
+                }],
+            });
+        }
+        let tensor = preprocess_samples(samples, sample_rate, spec)?;
         Ok(Self {
-            tensors: vec![PreparedTensor::Audio(preprocess_samples(
-                samples,
-                sample_rate,
-                spec,
-            )?)],
-            image_summaries: Vec::new(),
-            presence_keys: Vec::new(),
+            tensors: vec![PreparedTensor::Audio {
+                name: tensor.endpoint,
+                data: tensor.data,
+                shape: tensor.shape,
+            }],
         })
     }
 
-    /// Bind every prepared tensor onto `request`, failing closed on a duplicate
-    /// endpoint or an image ordering that no longer matches the prompt.
     pub fn bind(
         self,
         mut request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineGenerateRequest> {
-        let has_images = !self.image_summaries.is_empty();
-        for (prompt_index, summary) in self.image_summaries.iter().enumerate() {
-            if summary.image_index != prompt_index {
-                anyhow::bail!(
-                    "What: pipeline image admission ordering is inconsistent. \
-                     Why: prompt image {prompt_index} carries expansion summary index {}. \
-                     How: preserve image content parts, tensor packing, and summaries in prompt order.",
-                    summary.image_index
-                );
-            }
-        }
-        let mut endpoints = std::collections::HashSet::with_capacity(self.tensors.len());
         for tensor in self.tensors {
-            let endpoint = tensor.endpoint().to_string();
-            if !endpoints.insert(endpoint.clone()) {
-                anyhow::bail!(
-                    "What: pipeline tensor injection rejected a duplicate endpoint. \
-                     Why: '{endpoint}' was supplied more than once. \
-                     How: declare each preprocessing output endpoint exactly once."
-                );
-            }
-            request = request.with_input(endpoint, tensor.into_value()?);
-        }
-        if has_images {
-            for key in self.presence_keys {
-                request = request.with_presence(key);
-            }
+            let (name, value) = match tensor {
+                PreparedTensor::EncodedImage { name, bytes } => {
+                    let shape = [i64::try_from(bytes.len()).context("encoded image is too large")?];
+                    let value = Value::from_raw_bytes(bytes, &shape, DataType::Uint8)?;
+                    (name, value)
+                }
+
+                PreparedTensor::EncodedAudio { name, bytes } => {
+                    let shape = [i64::try_from(bytes.len()).context("encoded audio is too large")?];
+                    let value = Value::from_raw_bytes(bytes, &shape, DataType::Uint8)?;
+                    (name, value)
+                }
+
+                PreparedTensor::Audio { name, data, shape } => {
+                    (name, Value::from_vec_f32(data, &shape)?)
+                }
+            };
+            request = request.with_input(name, value);
         }
         Ok(request)
     }
 }
 
-/// Longest audio, in seconds, the model's declared input window accepts.
-///
-/// Derived from the declared frame count at Whisper's 10 ms hop, so the caller
-/// never has to assume a 30-second window.
 pub fn audio_window_seconds(spec: &AudioInputSpec) -> f32 {
-    spec.n_frames as f32 * onnx_genai_preprocess::audio::WHISPER_HOP_LENGTH as f32
-        / onnx_genai_preprocess::audio::WHISPER_SAMPLE_RATE as f32
+    spec.n_frames as f32 * 160.0 / 16_000.0
 }
 
-/// Give the prompt one image placeholder per attached image.
-///
-/// Expansion needs exactly one placeholder token per image, in prompt order.
-/// Requiring the caller to type a model's private placeholder spelling (`<image>`,
-/// `<|image_pad|>`, …) is a bad contract: they would have to read the package's
-/// metadata to write a prompt. So a prompt that positions the placeholders
-/// itself is honored, and a prompt that mentions none gets them prepended — the
-/// conventional "images, then the question about them" order.
-///
-/// A partial set is rejected rather than topped up: the caller clearly meant to
-/// position them, and guessing where the rest belong would silently change which
-/// image a sentence refers to.
-fn ensure_placeholders(
-    spec: &VisionInputSpec,
-    prompt_token_ids: &mut Vec<u32>,
-    images: usize,
-) -> anyhow::Result<()> {
-    let Some(placeholder) = spec.placeholder_token_id() else {
-        return Ok(());
-    };
-    let present = prompt_token_ids
-        .iter()
-        .filter(|&&token| token == placeholder)
-        .count();
-    match placeholder_action(placeholder, present, images) {
-        PlaceholderAction::Keep => Ok(()),
-        PlaceholderAction::Prepend(count) => {
-            let mut prompt = vec![placeholder; count];
-            prompt.append(prompt_token_ids);
-            *prompt_token_ids = prompt;
-            Ok(())
-        }
-        PlaceholderAction::Mismatch => anyhow::bail!(
-            "What: the prompt's image placeholders do not match the {images} image(s) supplied. \
-             Why: it positions {present} of them, so the images and the text cannot be lined up. \
-             How: write exactly one placeholder per image, or none at all to have them prepended in order."
-        ),
-    }
-}
-
-/// What to do about a prompt's image placeholders.
-#[derive(Debug, PartialEq, Eq)]
-enum PlaceholderAction {
-    /// The prompt already positions them; honor it.
-    Keep,
-    /// The prompt positions none; prepend this many.
-    Prepend(usize),
-    /// A partial set: refuse rather than guess where the rest belong.
-    Mismatch,
-}
-
-fn placeholder_action(_placeholder: u32, present: usize, images: usize) -> PlaceholderAction {
-    match (present, images) {
-        (present, images) if present == images => PlaceholderAction::Keep,
-        (0, images) => PlaceholderAction::Prepend(images),
-        _ => PlaceholderAction::Mismatch,
-    }
-}
-
-/// Token budget available to image placeholder expansion.
-///
-/// Bounded by the model's context minus the tokens the caller reserved for the
-/// response, and never above [`MAX_EXPANDED_PROMPT_TOKENS`].
 pub fn expansion_token_budget(
     model_max_context: Option<usize>,
     max_tokens: usize,
 ) -> anyhow::Result<usize> {
-    let limit = match model_max_context {
-        Some(max_context) => max_context.checked_sub(max_tokens).with_context(|| {
-            format!(
-                "What: an image request cannot fit within the model context. \
-                 Why: max_tokens ({max_tokens}) already exceeds the model context limit ({max_context}) before prompt and image tokens are counted. \
-                 How: reduce max_tokens below the model context limit."
-            )
-        })?,
-        None => MAX_EXPANDED_PROMPT_TOKENS,
-    };
+    let limit = model_max_context
+        .map(|context| {
+            context
+                .checked_sub(max_tokens)
+                .context("max_tokens exceeds model context")
+        })
+        .transpose()?
+        .unwrap_or(MAX_EXPANDED_PROMPT_TOKENS);
     Ok(limit.min(MAX_EXPANDED_PROMPT_TOKENS))
 }
 
-/// Everything an in-process front end needs to drive a pipeline package's
-/// prompt and multimodal inputs.
 #[derive(Debug, Clone)]
 pub struct PipelineSetup {
-    /// Tokenizer used for the pipeline's decoder prompt.
     pub tokenizer_path: PathBuf,
-    /// Declared image and audio input contracts.
     pub multimodal: MultimodalSpecs,
+    /// Sampling regime the package declares for itself, if any.
+    ///
+    /// Carried here because the package's own metadata is the only place that
+    /// states it; the execution engine is loaded separately and never sees it.
+    pub generation_defaults: Option<onnx_genai_metadata::GenerationDefaults>,
 }
 
 /// Resolve the prompt tokenizer and multimodal input contracts for `model_dir`,
@@ -368,16 +239,7 @@ pub struct PipelineSetup {
 /// sessions or materializing weights; callers load the execution engine
 /// separately with their selected backend.
 pub fn load(model_dir: &Path) -> anyhow::Result<Option<PipelineSetup>> {
-    let Some(directory) =
-        PipelineModelDirectory::load_if_declared(model_dir).with_context(|| {
-            format!(
-                "What: the pipeline package at {} could not be inspected. \
-             Why: its declared metadata could not be resolved. \
-             How: verify inference_metadata.yaml (or genai_config.json) is present and valid.",
-                model_dir.display()
-            )
-        })?
-    else {
+    let Some(directory) = PipelineModelDirectory::load_if_declared(model_dir)? else {
         return Ok(None);
     };
     let models = PipelineModels::load_with_ort_session_filter(
@@ -389,51 +251,41 @@ pub fn load(model_dir: &Path) -> anyhow::Result<Option<PipelineSetup>> {
         anyhow::anyhow!(
             "What: the pipeline components at {} could not be inspected. \
              Why: {error}. \
-             How: verify every component file named in pipeline.models exists and is a valid ONNX model.",
+             How: verify every component file named in pipeline.workflow.components exists and is a valid ONNX model.",
             model_dir.display()
         )
     })?;
-    let multimodal = build(&directory, &models)?;
     Ok(Some(PipelineSetup {
+        generation_defaults: directory
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.generation.as_ref())
+            .and_then(|generation| generation.defaults.clone()),
         tokenizer_path: tokenizer_path(model_dir, &directory)?,
-        multimodal,
+        multimodal: build(&directory, &models)?,
     }))
 }
 
-/// Resolve a pipeline package's prompt tokenizer: the decoder component's own
-/// tokenizer when declared, otherwise the package's shared tokenizer.
 pub fn tokenizer_path(
     model_dir: &Path,
     directory: &PipelineModelDirectory,
 ) -> anyhow::Result<PathBuf> {
     directory
-        .spec
-        .models
-        .values()
-        .find(|component| component.role == "decoder")
-        .and_then(|component| component.tokenizer.as_ref())
-        .map(|path| model_dir.join(path))
-        .or_else(|| directory.tokenizer_paths.shared.clone())
-        .with_context(|| {
-            format!(
-                "What: the pipeline package at {} has no prompt tokenizer. \
-                 Why: no component declares role 'decoder' with a tokenizer, and the package ships no shared tokenizer.json. \
-                 How: add tokenizer.json to the package or declare a tokenizer on the decoder component.",
-                model_dir.display()
-            )
+        .tokenizer_paths
+        .shared
+        .clone()
+        .or_else(|| {
+            let path = model_dir.join("tokenizer.json");
+            path.is_file().then_some(path)
         })
+        .context("workflow package requires tokenizer.json for text convenience APIs")
 }
 
-/// Build the decoder prompt for an audio (speech-to-text) pipeline.
-///
-/// The transcription prompt is a token sequence, not user text: the audio
-/// features carry the content. Optional `language` selects a language token
-/// when the tokenizer declares one.
 pub fn audio_decoder_prompt(
     tokenizer: &Tokenizer,
     language: Option<&str>,
 ) -> anyhow::Result<Vec<u32>> {
-    let mut token_ids = vec![
+    let mut tokens = vec![
         tokenizer
             .token_id("<|startoftranscript|>")
             .or_else(|| tokenizer.eos_token_id())
@@ -441,398 +293,503 @@ pub fn audio_decoder_prompt(
     ];
     if let Some(language) = language.filter(|value| !value.is_empty()) {
         let token = format!("<|{}|>", language.to_ascii_lowercase());
-        token_ids.push(tokenizer.token_id(&token).with_context(|| {
-            format!(
-                "What: the requested transcription language was rejected. \
-                 Why: this model's tokenizer declares no '{token}' token. \
-                 How: omit the language or choose one the model supports."
-            )
-        })?);
+        tokens.push(
+            tokenizer
+                .token_id(&token)
+                .with_context(|| format!("missing token '{token}'"))?,
+        );
     }
     for token in ["<|transcribe|>", "<|notimestamps|>"] {
-        if let Some(token_id) = tokenizer.token_id(token) {
-            token_ids.push(token_id);
+        if let Some(id) = tokenizer.token_id(token) {
+            tokens.push(id);
         }
     }
-    Ok(token_ids)
+    Ok(tokens)
 }
 
-/// Derive the image and audio contracts from an already-resolved pipeline
-/// directory and its loaded component graphs.
 pub fn build(
     directory: &PipelineModelDirectory,
-    models: &PipelineModels,
+    _models: &PipelineModels,
 ) -> anyhow::Result<MultimodalSpecs> {
-    Ok(MultimodalSpecs {
-        vision: build_vision(directory, models)?,
-        audio: build_audio(directory, models)?,
-    })
+    derive_specs(
+        &directory.spec.workflow,
+        directory.preprocessing.as_ref(),
+        image_placeholder_token_id(directory.metadata.as_ref()),
+    )
 }
 
-fn build_vision(
-    directory: &PipelineModelDirectory,
-    models: &PipelineModels,
-) -> anyhow::Result<Option<VisionInputSpec>> {
-    let Some(program) = directory
-        .preprocessing
+/// The token a package declares as its expandable image placeholder.
+///
+/// This is an ordinary tokenizer fact, keyed by semantic role like `bos` and
+/// `eos`, so a package states it once and every front end reads the same value.
+fn image_placeholder_token_id(
+    metadata: Option<&onnx_genai_metadata::InferenceMetadata>,
+) -> Option<u32> {
+    metadata?
+        .package
+        .as_ref()?
+        .tokenizer
+        .as_ref()?
+        .special_tokens
+        .get(IMAGE_PLACEHOLDER_ROLE)
+        .map(|token| token.id)
+}
+
+/// Semantic role naming the prompt token that stands for one whole image.
+pub const IMAGE_PLACEHOLDER_ROLE: &str = "image_placeholder";
+
+/// Replace each declared image placeholder with that image's token run.
+///
+/// The run length is a property of the preprocessed image, not of the package:
+/// the package's own image program decides the patch grid, and the patch grid
+/// decides how many image tokens the prompt must reserve. Running the program
+/// here is what lets a caller state one placeholder and get a correctly sized
+/// prompt, which is the only way the embedding component can scatter the vision
+/// features into the token stream.
+fn expand_image_placeholders(
+    spec: &VisionInputSpec,
+    encoded: &[u8],
+    prompt_token_ids: &mut Vec<u32>,
+) -> anyhow::Result<()> {
+    let placeholder = spec.placeholder_token_id.with_context(|| {
+        format!(
+            "What: this package accepts an image but cannot place it in the prompt. \
+             Why: it declares no `{IMAGE_PLACEHOLDER_ROLE}` special token, so there is no \
+             token for the image's features to replace, and the encoded image would be \
+             preprocessed and then ignored. \
+             How: declare package.tokenizer.special_tokens.{IMAGE_PLACEHOLDER_ROLE}."
+        )
+    })?;
+    let program = spec
+        .program
         .as_ref()
-        .and_then(|preprocessing| preprocessing.image.as_ref())
-    else {
-        return Ok(None);
-    };
-    let vision = directory.spec.vision.as_ref().context(
-        "What: typed image processor binding discovery failed. \
-         Why: preprocessing.image is declared, but pipeline.vision has no placeholder expansion contract. \
-         How: add typed pipeline.vision metadata before serving image chat requests.",
-    )?;
-    let mut bindings = Vec::new();
-    let mut pixel_shape = None;
-    let mut endpoints = std::collections::HashSet::new();
-    for output in &program.outputs {
-        let resolved = resolve_image_output(models, &output.name)?;
-        let Some((endpoint, input)) = resolved else {
-            if output.optional.unwrap_or(false) {
-                continue;
-            }
-            anyhow::bail!(
-                "What: image processor endpoint '{}' is missing. \
-                 Why: preprocessing.image.outputs declares content '{}' dtype '{}' but no ONNX component input matches that metadata endpoint. \
-                 How: name the exact component.input endpoint or add the missing graph input operation.",
-                output.name,
-                output.content,
-                output.dtype
-            );
-        };
-        let declared_dtype = metadata_dtype(&output.dtype)?;
-        if input.dtype != declared_dtype {
-            anyhow::bail!(
-                "What: image processor endpoint '{endpoint}' has an incompatible dtype. \
-                 Why: typed metadata declares {:?}, but the ONNX input expects {:?} shape {:?}. \
-                 How: correct preprocessing.image.outputs '{}' dtype or the graph input type.",
-                declared_dtype,
-                input.dtype,
-                input.shape,
-                output.name
-            );
-        }
-        if !endpoints.insert(endpoint.clone()) {
-            anyhow::bail!(
-                "What: image processor endpoint '{endpoint}' is bound more than once. \
-                 Why: multiple preprocessing.image.outputs resolve to the same ONNX input. \
-                 How: give every typed output a unique component.input endpoint."
-            );
-        }
-        if output.content == "pixels" && pixel_shape.is_none() {
-            pixel_shape = Some(input.shape.clone());
-        }
-        bindings.push(VisionOutputBinding {
-            metadata_name: output.name.clone(),
-            endpoint,
-            content: output.content.clone(),
-            dtype: declared_dtype,
-            shape: input.shape.clone(),
-        });
+        .context("image binding requires the package's preprocessing.image program")?;
+    let occurrences = prompt_token_ids
+        .iter()
+        .filter(|token| **token == placeholder)
+        .count();
+    if occurrences != 1 {
+        anyhow::bail!(
+            "What: the prompt carries {occurrences} image placeholder token(s) but one image \
+             was attached. Why: each attached image is expanded from exactly one placeholder. \
+             How: include the model's image placeholder token once per image."
+        );
     }
-    let pixel_shape = pixel_shape.context(
-        "What: image processor initialization failed. \
-         Why: preprocessing.image.outputs has no resolved content='pixels' endpoint with an expected dtype/shape. \
-         How: declare a pixels output bound to the pipeline's primary image tensor input.",
-    )?;
-    let presence_keys = image_presence_keys(directory, &bindings)?;
-    VisionInputSpec::from_program(bindings, &pixel_shape, program, vision, presence_keys).map(Some)
-}
-
-fn image_presence_keys(
-    directory: &PipelineModelDirectory,
-    bindings: &[VisionOutputBinding],
-) -> anyhow::Result<Vec<String>> {
-    let mut keys = std::collections::BTreeSet::new();
-    for binding in bindings {
-        let (component, input) = binding.endpoint.split_once('.').with_context(|| {
-            format!(
-                "image preprocessing endpoint '{}' is not component.input",
-                binding.endpoint
-            )
-        })?;
-        if let Some(key) = directory
-            .spec
-            .phases
-            .get(component)
-            .and_then(|phase| phase.when_present.as_ref())
-        {
-            keys.insert(key.clone());
-        }
-        if let Some(key) = directory
-            .spec
-            .models
-            .get(component)
-            .and_then(|model| model.io.as_ref())
-            .and_then(|io| io.optional_inputs.get(input))
-            .map(|optional| &optional.presence)
-        {
-            keys.insert(key.clone());
-        }
-    }
-    Ok(keys.into_iter().collect())
-}
-
-fn build_audio(
-    directory: &PipelineModelDirectory,
-    models: &PipelineModels,
-) -> anyhow::Result<Option<AudioInputSpec>> {
-    let audio_inputs = models
-        .directory
-        .model_paths
-        .keys()
-        .filter_map(|component| {
-            models
-                .graph_io(component)
-                .map(|graph| (component.as_str(), graph))
-        })
-        .flat_map(|(component, graph)| {
-            graph.inputs().iter().filter_map(move |input| {
-                (input.name == "input_features")
-                    .then_some((format!("{component}.{}", input.name), input))
-            })
+    let pixels = program
+        .outputs
+        .iter()
+        .find(|output| output.content == "pixels")
+        .context("preprocessing.image must declare a pixels output")?;
+    let shape = pixels
+        .contract
+        .as_ref()
+        .context("preprocessing.image pixels output must declare a TensorContract")?
+        .shape
+        .as_ref()
+        .context("preprocessing.image pixels output must declare a shape")?
+        .iter()
+        .map(|dim| match dim {
+            TensorDimension::Fixed(value) => *value,
+            TensorDimension::Symbol(_) => -1,
         })
         .collect::<Vec<_>>();
-    let pipeline_max_tokens = strategy_max_tokens(&directory.spec.strategy);
-    match audio_inputs.as_slice() {
-        [] => Ok(None),
-        [(endpoint, input)] => {
-            if input.dtype != DataType::Float32 {
+    let bundle =
+        onnx_genai_preprocess::image::ImagePreprocessor::from_input_and_program(&shape, program)?
+            .preprocess_encoded([encoded])?;
+    let summary = bundle
+        .images
+        .first()
+        .context("image preprocessing produced no image summary")?;
+    let tokens = summary.image_token_count()?.context(
+        "What: the image's prompt token run could not be sized. \
+         Why: this package's image program emits tiles rather than a patch grid, and the \
+         tokens-per-tile count is a package fact preprocessing cannot recover. \
+         How: use a patchifying image program, or expand the placeholder before calling.",
+    )?;
+    let position = prompt_token_ids
+        .iter()
+        .position(|token| *token == placeholder)
+        .expect("placeholder occurrence counted above");
+    // One placeholder becomes `tokens` copies of itself: the embedding component
+    // matches on the token id to decide where the vision features land.
+    prompt_token_ids.splice(
+        position..position + 1,
+        std::iter::repeat_n(placeholder, tokens),
+    );
+    Ok(())
+}
+
+/// Bind the package's media workflow inputs to the server's media front ends.
+///
+/// Both front ends are derived from the same `media` runtime inputs and are
+/// told apart by their declared contract, never by a port name.
+fn derive_specs(
+    workflow: &onnx_genai_metadata::WorkflowSpec,
+    preprocessing: Option<&onnx_genai_metadata::PreprocessingSpec>,
+    placeholder_token_id: Option<u32>,
+) -> anyhow::Result<MultimodalSpecs> {
+    let media_inputs = workflow
+        .inputs
+        .iter()
+        .filter(|(_, input)| {
+            matches!(
+                &input.role,
+                SemanticInputRole::Runtime {
+                    role: RuntimeInputRole::Media,
+                    ..
+                }
+            )
+        })
+        .collect::<Vec<_>>();
+    let encoded_media = media_inputs
+        .iter()
+        .find(|(_, input)| input.contract.dtype == "uint8" && input.contract.rank == 1);
+    let vision = if let Some(program) = preprocessing.and_then(|p| p.image.as_ref()) {
+        let (name, _input) = encoded_media
+            .context("preprocessing.image requires a uint8 rank-1 media workflow input")?;
+        Some(VisionInputSpec {
+            input: (*name).clone(),
+            placeholder_token_id,
+            program: Some(Box::new(program.clone())),
+        })
+    } else {
+        None
+    };
+    // Audio binds from whatever the package declares, in one of two shapes.
+    //
+    // A package that owns its own feature extraction declares a
+    // `preprocessing.audio` program and takes rank-1 encoded bytes; the
+    // program's feature output contract states the mel geometry, so the server
+    // reads the bins and window length off it rather than guessing them.
+    //
+    // A package that hands the server an already-featurized log-mel tensor
+    // declares a rank-3 float32 media input instead and no audio program;
+    // there the contract's own shape states the geometry. Either way the
+    // distinguishing fact is a declared contract, never a port name.
+    let audio = match preprocessing.and_then(|p| p.audio.as_ref()) {
+        Some(program) if vision.is_none() => {
+            let (name, _input) = encoded_media
+                .context("preprocessing.audio requires a uint8 rank-1 media workflow input")?;
+            let features = program
+                .outputs
+                .iter()
+                .find(|output| output.content == "audio_features")
+                .context("preprocessing.audio must declare an audio_features output")?;
+            let contract = features.contract.as_ref().with_context(|| {
+                format!(
+                    "preprocessing.audio output '{}' must declare a TensorContract",
+                    features.name
+                )
+            })?;
+            if contract.rank != 3 {
                 anyhow::bail!(
-                    "audio input '{endpoint}' must be Float32, but the model declares {:?}",
-                    input.dtype
+                    "preprocessing.audio output '{}' must be rank 3 [batch, mel, frames]",
+                    features.name
                 );
             }
-            AudioInputSpec::from_input(endpoint.clone(), &input.shape, pipeline_max_tokens)
-                .map(Some)
+            let dimension = |index: usize| {
+                contract
+                    .shape
+                    .as_ref()
+                    .and_then(|shape| shape.get(index))
+                    .and_then(|value| match value {
+                        TensorDimension::Fixed(size) => usize::try_from(*size).ok(),
+                        TensorDimension::Symbol(_) => None,
+                    })
+            };
+            let n_mels = dimension(1).context(
+                "preprocessing.audio must declare a concrete mel-bin count in its feature contract",
+            )?;
+            let n_frames = dimension(2).unwrap_or(WHISPER_N_FRAMES);
+            Some(AudioInputSpec::from_encoded_input(
+                (*name).clone(),
+                n_mels,
+                n_frames,
+                None,
+            ))
         }
-        _ => anyhow::bail!("pipeline declares multiple input_features inputs"),
-    }
-}
-
-/// Maximum tokens declared by a strategy, searching composite child stages.
-pub(crate) fn strategy_max_tokens(strategy: &PipelineStrategy) -> Option<usize> {
-    strategy.max_tokens.or_else(|| {
-        strategy
-            .stages
+        _ => media_inputs
             .iter()
-            .find_map(|stage| strategy_max_tokens(&stage.strategy))
-    })
-}
+            .find(|(_, input)| input.contract.dtype == "float32" && input.contract.rank == 3)
+            .map(|(name, input)| {
+                let shape = input
+                    .contract
+                    .shape
+                    .as_ref()
+                    .map(|dims| {
+                        dims.iter()
+                            .map(|dim| match dim {
+                                // A symbolic dimension is unknown at load time; -1 is
+                                // how `from_input` already spells "dynamic", and it
+                                // rejects a symbolic mel axis rather than assuming one.
+                                TensorDimension::Fixed(value) => *value,
+                                TensorDimension::Symbol(_) => -1,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .with_context(|| {
+                        format!(
+                            "audio media input '{name}' must declare `contract.shape` \
+                             [batch, mel, frames]; rank alone cannot state the mel-bin count \
+                             the feature extractor must produce"
+                        )
+                    })?;
+                AudioInputSpec::from_input((*name).clone(), &shape, None)
+            })
+            .transpose()?,
+    };
 
-fn resolve_image_output<'a>(
-    models: &'a PipelineModels,
-    metadata_endpoint: &str,
-) -> anyhow::Result<Option<(String, &'a TensorInfo)>> {
-    if let Some((component, input_name)) = metadata_endpoint.split_once('.')
-        && let Some(graph) = models.graph_io(component)
-    {
-        return Ok(graph
-            .inputs()
-            .iter()
-            .find(|input| input.name == input_name)
-            .map(|input| (metadata_endpoint.to_string(), input)));
-    }
-
-    let matches = models
-        .directory
-        .model_paths
-        .keys()
-        .filter_map(|component| {
-            models
-                .graph_io(component)
-                .map(|graph| (component.as_str(), graph))
-        })
-        .flat_map(|(component, graph)| {
-            graph
-                .inputs()
-                .iter()
-                .filter(move |input| input.name == metadata_endpoint)
-                .map(move |input| (format!("{component}.{}", input.name), input))
-        })
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [] => Ok(None),
-        [(endpoint, input)] => Ok(Some((endpoint.clone(), *input))),
-        _ => anyhow::bail!(
-            "What: image processor endpoint '{metadata_endpoint}' is ambiguous. \
-             Why: {} ONNX component inputs share that unqualified name. \
-             How: use an exact component.input name in preprocessing.image.outputs.",
-            matches.len()
-        ),
-    }
+    Ok(MultimodalSpecs { vision, audio })
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod media_binding_tests {
+    use onnx_genai_metadata::{PreprocessingSpec, WorkflowSpec};
 
-    fn audio_only() -> MultimodalSpecs {
-        MultimodalSpecs {
-            vision: None,
-            audio: Some(
-                AudioInputSpec::from_input(
-                    "encoder.input_features".to_string(),
-                    &[1, 80, 3000],
-                    None,
-                )
-                .expect("a valid audio contract"),
-            ),
+    use super::derive_specs;
+
+    /// A workflow declaring exactly the given `media` runtime inputs.
+    fn workflow(inputs: serde_json::Value) -> WorkflowSpec {
+        serde_json::from_value(serde_json::json!({
+            "manifest": { "capabilities": ["workflow_ssa"] },
+            "inputs": inputs,
+            "outputs": {},
+            "components": {},
+            "steps": [],
+        }))
+        .expect("workflow spec")
+    }
+
+    fn media(contract: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "role": { "kind": "runtime", "version": "1", "role": "media" },
+            "source": { "kind": "request" },
+            "contract": contract,
+        })
+    }
+
+    #[test]
+    fn a_rank_3_float_media_input_binds_the_audio_front_end() {
+        // Whisper-shaped packages take an already-featurized log-mel tensor. The
+        // server owns mel extraction, so the contract's own shape is what states
+        // the geometry it must produce.
+        let workflow = workflow(serde_json::json!({
+            "audio_features": media(serde_json::json!({
+                "dtype": "float32",
+                "rank": 3,
+                "shape": [1, 80, 3000],
+            })),
+        }));
+        let specs = derive_specs(&workflow, None, None).expect("specs");
+        let audio = specs.audio.expect("audio spec");
+        assert_eq!(audio.endpoint, "audio_features");
+        assert_eq!(audio.n_mels, 80);
+        assert_eq!(audio.n_frames, 3000);
+        assert!(specs.vision.is_none());
+    }
+
+    #[test]
+    fn an_audio_contract_without_a_shape_is_refused_by_name() {
+        // Rank alone cannot state the mel-bin count, and guessing 80 would make
+        // a 128-mel model produce silent garbage. Fail with the key to declare.
+        let workflow = workflow(serde_json::json!({
+            "audio_features": media(serde_json::json!({ "dtype": "float32", "rank": 3 })),
+        }));
+        let error = derive_specs(&workflow, None, None).expect_err("must refuse");
+        assert!(format!("{error:#}").contains("contract.shape"), "{error:#}");
+    }
+
+    #[test]
+    fn an_image_package_binds_vision_and_leaves_audio_unbound() {
+        let workflow = workflow(serde_json::json!({
+            "image_bytes": media(serde_json::json!({ "dtype": "uint8", "rank": 1 })),
+        }));
+        let preprocessing: PreprocessingSpec = serde_json::from_value(serde_json::json!({
+            "image": {
+                "transforms": [{ "op": "decode_rgb", "outputs": ["pixels"] }],
+                "outputs": [{
+                    "source": "pixels",
+                    "name": "image.pixel_values",
+                    "content": "pixels",
+                    "dtype": "float32",
+                }],
+            },
+        }))
+        .expect("preprocessing");
+        let specs = derive_specs(&workflow, Some(&preprocessing), None).expect("specs");
+        assert!(specs.vision.is_some());
+        assert!(specs.audio.is_none());
+    }
+
+    #[test]
+    fn a_workflow_with_no_media_inputs_binds_nothing() {
+        let specs = derive_specs(&workflow(serde_json::json!({})), None, None).expect("specs");
+        assert!(specs.is_empty());
+    }
+
+    /// A patchifying image program sized like the real Qwen-VL processor.
+    fn patchifying_preprocessing() -> PreprocessingSpec {
+        serde_json::from_value(serde_json::json!({
+            "image": {
+                "transforms": [
+                    { "op": "decode_rgb", "outputs": ["t0"] },
+                    {
+                        "op": "resize",
+                        "mode": "pixel_area",
+                        "min_pixels": 65536,
+                        "max_pixels": 16777216,
+                        "size_multiple": 32,
+                        "inputs": ["t0"],
+                        "outputs": ["t1"],
+                    },
+                    {
+                        "op": "patchify",
+                        "patch_size": 16,
+                        "flatten": true,
+                        "temporal_patch_size": 2,
+                        "merge_size": 2,
+                        "channel_order": "channels_first",
+                        "inputs": ["t1"],
+                        "outputs": ["t2"],
+                    },
+                ],
+                "outputs": [{
+                    "source": "t2",
+                    "name": "image.pixel_values",
+                    "content": "pixels",
+                    "dtype": "float32",
+                    "contract": { "dtype": "float32", "rank": 2, "shape": ["num_patches", 1536] },
+                }],
+            },
+        }))
+        .expect("preprocessing")
+    }
+
+    fn image_workflow() -> WorkflowSpec {
+        workflow(serde_json::json!({
+            "image_bytes": media(serde_json::json!({ "dtype": "uint8", "rank": 1 })),
+        }))
+    }
+
+    /// A 64x64 solid PNG, small enough to inline and large enough to patchify.
+    fn encoded_png() -> Vec<u8> {
+        let mut raw = Vec::new();
+        for _ in 0..64 {
+            raw.push(0u8);
+            raw.extend(std::iter::repeat_n(128u8, 64 * 3));
         }
-    }
-
-    fn vision_only() -> MultimodalSpecs {
-        MultimodalSpecs {
-            vision: Some(
-                VisionInputSpec::from_input("encoder.pixel_values".to_string(), &[1, 3, 4, 4])
-                    .expect("a valid vision contract"),
-            ),
-            audio: None,
-        }
-    }
-
-    fn expect_rejection(result: anyhow::Result<()>) -> String {
-        let message = result
-            .expect_err("the attachment must be rejected")
-            .to_string();
-        assert!(message.contains("What:"), "message: {message}");
-        assert!(message.contains("Why:"), "message: {message}");
-        assert!(message.contains("How:"), "message: {message}");
-        message
-    }
-
-    #[test]
-    fn a_single_decoder_graph_accepts_text_only() {
-        assert!(admit_attachments(None, "the model", 0, 0).is_ok());
-
-        let message = expect_rejection(admit_attachments(None, "the model", 1, 0));
-        assert!(message.contains("single decoder graph"), "{message}");
-        assert!(message.contains("it accepts text input"), "{message}");
-
-        let message = expect_rejection(admit_attachments(None, "the model", 0, 1));
-        assert!(message.contains("single decoder graph"), "{message}");
-    }
-
-    #[test]
-    fn a_pipeline_admits_only_the_modalities_it_declares() {
-        let vision = vision_only();
-        assert!(admit_attachments(Some(&vision), "the model", 2, 0).is_ok());
-        let message = expect_rejection(admit_attachments(Some(&vision), "the model", 0, 1));
-        assert!(message.contains("input_features"), "{message}");
-        assert!(
-            message.contains("it accepts text + image input"),
-            "{message}"
-        );
-
-        let audio = audio_only();
-        assert!(admit_attachments(Some(&audio), "the model", 0, 1).is_ok());
-        let message = expect_rejection(admit_attachments(Some(&audio), "the model", 1, 0));
-        assert!(message.contains("preprocessing.image"), "{message}");
-        assert!(
-            message.contains("it accepts text + audio input"),
-            "{message}"
-        );
-    }
-
-    #[test]
-    fn modalities_cannot_be_mixed_and_audio_is_one_clip_at_a_time() {
-        let both = MultimodalSpecs {
-            vision: vision_only().vision,
-            audio: audio_only().audio,
+        let mut png = vec![137, 80, 78, 71, 13, 10, 26, 10];
+        let mut chunk = |kind: &[u8], data: Vec<u8>| {
+            png.extend((data.len() as u32).to_be_bytes());
+            let mut body = kind.to_vec();
+            body.extend(&data);
+            png.extend(&body);
+            png.extend(crc32(&body).to_be_bytes());
         };
-        assert_eq!(both.accepted_modalities(), "text + image + audio");
-        assert_eq!(both.sole_modality(), None);
-
-        let message = expect_rejection(admit_attachments(Some(&both), "the model", 1, 1));
-        assert!(message.contains("send them separately"), "{message}");
-
-        let message = expect_rejection(admit_attachments(Some(&both), "the model", 0, 2));
-        assert!(message.contains("one clip"), "{message}");
+        let mut ihdr = Vec::new();
+        ihdr.extend(64u32.to_be_bytes());
+        ihdr.extend(64u32.to_be_bytes());
+        ihdr.extend([8, 2, 0, 0, 0]);
+        chunk(b"IHDR", ihdr);
+        chunk(b"IDAT", deflate_stored(&raw));
+        chunk(b"IEND", Vec::new());
+        png
     }
 
-    #[test]
-    fn sole_modality_names_the_attachment_a_caller_likely_forgot() {
-        assert_eq!(vision_only().sole_modality(), Some("image"));
-        assert_eq!(audio_only().sole_modality(), Some("audio"));
-        assert_eq!(
-            MultimodalSpecs {
-                vision: None,
-                audio: None
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffffu32;
+        for byte in data {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
             }
-            .sole_modality(),
-            None
+        }
+        !crc
+    }
+
+    /// zlib stream with stored (uncompressed) deflate blocks.
+    fn deflate_stored(data: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x78, 0x01];
+        for (index, block) in data.chunks(65535).enumerate() {
+            let last = u8::from((index + 1) * 65535 >= data.len());
+            out.push(last);
+            out.extend((block.len() as u16).to_le_bytes());
+            out.extend((!(block.len() as u16)).to_le_bytes());
+            out.extend(block);
+        }
+        let mut a = 1u32;
+        let mut b = 0u32;
+        for byte in data {
+            a = (a + u32::from(*byte)) % 65521;
+            b = (b + a) % 65521;
+        }
+        out.extend(((b << 16) | a).to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn a_declared_placeholder_expands_to_the_image_token_run() {
+        // The run length is a property of the preprocessed image, so the server
+        // runs the package's own program to size it. Without this the vision
+        // features have nowhere to land and the image is silently ignored.
+        let preprocessing = patchifying_preprocessing();
+        let specs = derive_specs(&image_workflow(), Some(&preprocessing), Some(7)).expect("specs");
+        let vision = specs.vision.expect("vision spec");
+        assert_eq!(vision.placeholder_token_id(), Some(7));
+        let mut prompt = vec![1u32, 7, 2];
+        super::MultimodalInput::from_images(&vision, &[encoded_png()], &mut prompt, 4096)
+            .expect("bind");
+        // 64x64 is below the program's 65536 min_pixels, so it is scaled up to
+        // 256x256: a 16x16 grid of 16px patches, merged 2x2 into 64 tokens.
+        assert_eq!(prompt.len(), 2 + 64, "prompt: {prompt:?}");
+        assert_eq!(prompt[0], 1);
+        assert_eq!(prompt[prompt.len() - 1], 2);
+        assert!(prompt[1..prompt.len() - 1].iter().all(|token| *token == 7));
+    }
+
+    #[test]
+    fn an_image_without_a_declared_placeholder_is_refused_by_name() {
+        // Silently dropping the image is worse than refusing it: the model would
+        // answer confidently from text alone and the caller could not tell.
+        let preprocessing = patchifying_preprocessing();
+        let specs = derive_specs(&image_workflow(), Some(&preprocessing), None).expect("specs");
+        let vision = specs.vision.expect("vision spec");
+        let mut prompt = vec![1u32, 2];
+        let error =
+            super::MultimodalInput::from_images(&vision, &[encoded_png()], &mut prompt, 4096)
+                .expect_err("must refuse");
+        assert!(
+            format!("{error:#}").contains("image_placeholder"),
+            "{error:#}"
         );
     }
 
     #[test]
-    fn placeholders_are_prepended_when_the_prompt_writes_none() {
-        let spec = vision_only().vision.expect("a vision contract");
-        // The test spec carries no expansion contract, so exercise the rule
-        // directly against a known placeholder id.
-        let mut prompt = vec![10_u32, 11];
-        assert!(ensure_placeholders(&spec, &mut prompt, 2).is_ok());
-        // Without a declared placeholder the prompt is left untouched.
-        assert_eq!(prompt, vec![10, 11]);
-    }
-
-    #[test]
-    fn binding_images_activates_the_image_presence_key() {
-        let input = MultimodalInput {
-            tensors: Vec::new(),
-            image_summaries: vec![ImageExpansionSummary {
-                image_index: 0,
-                original_size: (1, 1),
-                tile_grid: onnx_genai_preprocess::image::TileGrid {
-                    columns: 1,
-                    rows: 1,
-                },
-                tile_count: 1,
-                expansion_count: 1,
-                patch_grid: None,
-                spatial_merge_size: 1,
-                tensor_offset: 0,
-                tensor_length: 1,
-            }],
-            presence_keys: vec!["image_features".to_string()],
-        };
-        let request = input
-            .bind(PipelineGenerateRequest::new(
-                onnx_genai::GenerateRequest::new(onnx_genai::GeneratePrompt::TokenIds(vec![0])),
-            ))
-            .expect("image presence is bound");
-
-        assert!(request.present.contains("image_features"));
-        assert!(!request.present.contains("image"));
-    }
-
-    #[test]
-    fn placeholder_rules_accept_a_full_set_and_reject_a_partial_one() {
-        // Exercised through the pure rule so it does not need a package that
-        // declares a multi-image tensor axis.
-        assert_eq!(placeholder_action(3, 0, 2), PlaceholderAction::Prepend(2));
-        assert_eq!(placeholder_action(3, 2, 2), PlaceholderAction::Keep);
-        assert_eq!(placeholder_action(3, 1, 2), PlaceholderAction::Mismatch);
-        assert_eq!(placeholder_action(3, 3, 2), PlaceholderAction::Mismatch);
-        // No images: a prompt that mentions none is fine.
-        assert_eq!(placeholder_action(3, 0, 0), PlaceholderAction::Keep);
-    }
-
-    #[test]
-    fn the_expansion_budget_reserves_room_for_the_response() {
-        assert_eq!(expansion_token_budget(Some(4096), 512).unwrap(), 3584);
-        // No declared context: fall back to the hard cap.
-        assert_eq!(
-            expansion_token_budget(None, 512).unwrap(),
-            MAX_EXPANDED_PROMPT_TOKENS
+    fn a_prompt_without_the_placeholder_is_refused() {
+        let preprocessing = patchifying_preprocessing();
+        let specs = derive_specs(&image_workflow(), Some(&preprocessing), Some(7)).expect("specs");
+        let vision = specs.vision.expect("vision spec");
+        let mut prompt = vec![1u32, 2];
+        let error =
+            super::MultimodalInput::from_images(&vision, &[encoded_png()], &mut prompt, 4096)
+                .expect_err("must refuse");
+        assert!(
+            format!("{error:#}").contains("0 image placeholder token(s)"),
+            "{error:#}"
         );
-        // A context smaller than the reservation is a user error, not a clamp.
-        let message = expansion_token_budget(Some(128), 256)
-            .expect_err("an impossible reservation must fail")
-            .to_string();
-        assert!(message.contains("What:"), "{message}");
-        assert!(message.contains("How:"), "{message}");
+    }
+
+    #[test]
+    fn an_expanded_prompt_over_budget_is_refused() {
+        // The budget must be checked after expansion: one placeholder token can
+        // become hundreds, and the pre-expansion length says nothing about it.
+        let preprocessing = patchifying_preprocessing();
+        let specs = derive_specs(&image_workflow(), Some(&preprocessing), Some(7)).expect("specs");
+        let vision = specs.vision.expect("vision spec");
+        let mut prompt = vec![7u32];
+        let error = super::MultimodalInput::from_images(&vision, &[encoded_png()], &mut prompt, 3)
+            .expect_err("must refuse");
+        assert!(format!("{error:#}").contains("context budget"), "{error:#}");
     }
 }

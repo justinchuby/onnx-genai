@@ -1,0 +1,131 @@
+ir_version: 11
+producer_name: "onnx-genai-comfyui-fixture"
+graph {
+  node {
+    input: "schedule"
+    input: "step"
+    output: "sigma"
+    op_type: "Gather"
+    attribute {
+      name: "axis"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "sigma"
+    input: "row_shape_4d"
+    output: "sigma_row"
+    op_type: "Reshape"
+  }
+  node {
+    input: "sigma_row"
+    input: "sigma_row"
+    output: "sigma_sq"
+    op_type: "Mul"
+  }
+  node {
+    input: "sigma_sq"
+    input: "one"
+    output: "denominator_sq"
+    op_type: "Add"
+  }
+  node {
+    input: "denominator_sq"
+    output: "denominator"
+    op_type: "Sqrt"
+  }
+  node {
+    input: "sample"
+    input: "denominator"
+    output: "model_input"
+    op_type: "Div"
+  }
+  name: "model_input"
+  initializer {
+    dims: 4
+    data_type: 7
+    name: "row_shape_4d"
+    raw_data: "\377\377\377\377\377\377\377\377\001\000\000\000\000\000\000\000\001\000\000\000\000\000\000\000\001\000\000\000\000\000\000\000"
+  }
+  initializer {
+    dims: 1
+    data_type: 1
+    name: "one"
+    raw_data: "\000\000\200?"
+  }
+  input {
+    name: "sample"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "step"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "schedule"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "schedule_length"
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "model_input"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}

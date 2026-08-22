@@ -12,8 +12,10 @@
 use std::sync::Arc;
 
 use cudarc::driver::CudaContext;
+use onnx_runtime_cuda_memory::release::{DriverFaultPlan, DriverOperation};
 use onnx_runtime_cuda_memory::virtual_memory::{
-    CudaVirtualBacking, PhysicalHandlePool, physical_pool_authority_gate,
+    CudaVirtualBacking, DeferredReservationQueue, PhysicalHandlePool, ReservationEnqueueError,
+    ReservationTeardownTicket, cuda_teardown_stats, physical_pool_authority_gate,
     trim_physical_handle_pools,
 };
 use onnx_runtime_memory_governor::{
@@ -22,6 +24,42 @@ use onnx_runtime_memory_governor::{
 use onnx_runtime_virtual_memory::{VirtualBacking, VirtualBuffer};
 
 const HOLDER: HolderId = HolderId::new(11);
+
+#[derive(Debug, Default)]
+struct CapturingTeardownQueue(std::sync::Mutex<Option<ReservationTeardownTicket>>);
+
+impl CapturingTeardownQueue {
+    fn take(&self) -> ReservationTeardownTicket {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .expect("reservation drop enqueued its teardown ticket")
+    }
+}
+
+impl DeferredReservationQueue for CapturingTeardownQueue {
+    fn enqueue_reservation(
+        &self,
+        ticket: ReservationTeardownTicket,
+    ) -> Result<(), ReservationEnqueueError> {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ticket);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "gpu-tests")]
+fn with_faults(backing: CudaVirtualBacking, plan: Arc<DriverFaultPlan>) -> CudaVirtualBacking {
+    backing.with_driver_faults(plan)
+}
+
+#[cfg(not(feature = "gpu-tests"))]
+fn with_faults(_backing: CudaVirtualBacking, _plan: Arc<DriverFaultPlan>) -> CudaVirtualBacking {
+    unreachable!("driver fault injection is only compiled under the gpu-tests feature")
+}
 
 /// A CUDA context, or `None` on a machine with no driver.
 ///
@@ -424,6 +462,64 @@ fn failed_teardown_synchronization_never_reuses_or_releases_a_live_handle() {
     assert_eq!(snapshot.mapped_bytes, granule as u64);
     assert_eq!(snapshot.pooled_unmapped_bytes, 0);
     assert_eq!(snapshot.total_owned_bytes, granule as u64);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn teardown_bind_failure_retains_exact_ownership_without_destructive_cuda_calls() {
+    let context = CudaContext::new(0).expect("CUDA driver");
+    let plan = Arc::new(DriverFaultPlan::new().fail_nth(DriverOperation::BindContext, 1));
+    let queue = Arc::new(CapturingTeardownQueue::default());
+    let backing = with_faults(
+        CudaVirtualBacking::new(context, 0).with_reservation_queue(queue.clone()),
+        Arc::clone(&plan),
+    );
+    let granule = backing.granularity();
+    let mut reservation = backing.reserve(granule).expect("reservation");
+    backing
+        .commit(&mut reservation, 0, granule)
+        .expect("one mapped granule");
+    let stats_before = cuda_teardown_stats();
+
+    drop(reservation);
+    let outcome = queue.take().execute_outcome();
+
+    assert_eq!(outcome.report.unmapped_bytes, 0);
+    assert_eq!(outcome.report.retained_blocks, 1);
+    assert!(!outcome.report.address_range_freed);
+    assert_eq!(plan.calls(DriverOperation::BindContext), 1);
+    assert_eq!(plan.calls(DriverOperation::Unmap), 0);
+    assert_eq!(plan.calls(DriverOperation::Dispose), 0);
+    let stats_after = cuda_teardown_stats();
+    assert_eq!(
+        stats_after.context_bind_failures,
+        stats_before.context_bind_failures + 1
+    );
+    assert_eq!(
+        stats_after.retained_reservations,
+        stats_before.retained_reservations + 1
+    );
+    assert_eq!(
+        stats_after.retained_address_bytes,
+        stats_before.retained_address_bytes + granule as u64
+    );
+    assert_eq!(
+        stats_after.retained_handles,
+        stats_before.retained_handles + 1
+    );
+
+    let retained = outcome
+        .retained
+        .expect("the exact reservation and handle ownership comes back");
+    let cleanup = retained.execute_outcome();
+    assert!(cleanup.report.is_complete(), "{:?}", cleanup.report);
+    assert!(cleanup.retained.is_none());
+    assert_eq!(plan.calls(DriverOperation::BindContext), 2);
+    assert_eq!(plan.calls(DriverOperation::Unmap), 1);
+    assert_eq!(plan.calls(DriverOperation::Dispose), 1);
 }
 
 #[cfg_attr(

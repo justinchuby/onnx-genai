@@ -1,0 +1,133 @@
+ir_version: 11
+producer_name: "mobius"
+graph {
+  node {
+    input: "scale"
+    output: "v_Cast_0"
+    name: "Cast_node_0"
+    op_type: "Cast"
+    attribute {
+      name: "to"
+      i: 1
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "tensor"
+    input: "v_Cast_0"
+    output: "scaled"
+    name: "Mul_node_1"
+    op_type: "Mul"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  name: "tensor_scale"
+  input {
+    name: "tensor"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "channels"
+          }
+          dim {
+            dim_param: "height"
+          }
+          dim {
+            dim_param: "width"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "scale"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "scaled"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "channels"
+          }
+          dim {
+            dim_param: "height"
+          }
+          dim {
+            dim_param: "width"
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Cast_0"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  metadata_props {
+    key: "mobius.generation.policy_contract"
+    value: "{}"
+  }
+  metadata_props {
+    key: "mobius.generation.policy_contract_id"
+    value: "mobius.policy.auxiliary@1"
+  }
+  metadata_props {
+    key: "mobius.generation.policy_effects"
+    value: "[]"
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}

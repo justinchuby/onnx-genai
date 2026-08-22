@@ -139,8 +139,9 @@ pub fn load_model_with_weights(
 /// path-based loader entry accept git-friendly textproto fixtures while keeping
 /// binary `.onnx` loading unchanged.
 ///
-/// Note: textproto has no model-directory context for external weights, so
-/// textproto fixtures must inline all initializer data.
+/// Path-based callers still pass this file's parent directory to the weight
+/// loader, so TextFormat graphs may reference external initializer data just
+/// like binary ONNX graphs.
 pub fn read_model_binary(path: impl AsRef<Path>) -> Result<Vec<u8>, LoaderError> {
     let path = path.as_ref();
     let mut span = trace_span("load.read_model_binary", "load");

@@ -1,0 +1,313 @@
+ir_version: 11
+producer_name: "mobius"
+graph {
+  node {
+    input: "active"
+    output: "v_Shape_0"
+    name: "Shape_node_0"
+    op_type: "Shape"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    output: "v_Constant_1"
+    name: "Constant_node_1"
+    op_type: "Constant"
+    attribute {
+      name: "value_int"
+      i: 0
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "input_max_iterations"
+    input: "v_Constant_1"
+    output: "v_Greater_2"
+    name: "Greater_node_2"
+    op_type: "Greater"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "fallback_max_iterations"
+    input: "v_Shape_0"
+    output: "v_Expand_3"
+    name: "Expand_node_3"
+    op_type: "Expand"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "v_Greater_2"
+    input: "input_max_iterations"
+    input: "v_Expand_3"
+    output: "max_iterations"
+    name: "Where_node_4"
+    op_type: "Where"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "input_eos_ids"
+    output: "row_eos_ids"
+    name: "Identity_node_5"
+    op_type: "Identity"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "input_eos_lengths"
+    output: "eos_lengths"
+    name: "Identity_node_6"
+    op_type: "Identity"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  name: "termination_batch_initializer"
+  input {
+    name: "input_eos_ids"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "num_eos"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "input_eos_lengths"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "input_max_iterations"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "fallback_max_iterations"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "active"
+    type {
+      tensor_type {
+        elem_type: 9
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "row_eos_ids"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "num_eos"
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "eos_lengths"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "max_iterations"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Shape_0"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Constant_1"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Greater_2"
+    type {
+      tensor_type {
+        elem_type: 9
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Expand_3"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+          }
+        }
+      }
+    }
+  }
+  metadata_props {
+    key: "mobius.generation.policy_contract"
+    value: "{}"
+  }
+  metadata_props {
+    key: "mobius.generation.policy_contract_id"
+    value: "mobius.policy.auxiliary@1"
+  }
+  metadata_props {
+    key: "mobius.generation.policy_effects"
+    value: "[]"
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}

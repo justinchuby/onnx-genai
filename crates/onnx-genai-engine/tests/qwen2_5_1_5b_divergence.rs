@@ -29,7 +29,7 @@
 //!   --features native-backend,cuda --test qwen2_5_1_5b_divergence \
 //!   -- --ignored --nocapture
 //! ```
-#![cfg(all(feature = "native-backend", feature = "cuda"))]
+#![cfg(feature = "native-cuda")]
 
 use std::path::{Path, PathBuf};
 

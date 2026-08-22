@@ -24,6 +24,24 @@
 //! asynchronous write, which is issued **and** synced on the *same* created
 //! stream so one `cuStreamSynchronize` is a total order over it. Run this
 //! binary single-threaded (`--test-threads=1`).
+//!
+//! # Shared-prefix fallback coverage matrix
+//!
+//! | Edge | Test |
+//! |---|---|
+//! | First-map rejection: capture, overlap, offset/length geometry | `unsupported_shared_prefix_requests_error_rather_than_mismap` |
+//! | Wrong logical device / physical-pool authority | `foreign_device_and_authority_prefixes_are_not_free_and_are_rejected` |
+//! | Repeated private fallback; bounded pool/ref/mapping accounting | `repeated_precommitted_fallback_reuses_without_leaking` |
+//! | Repeated deferred release drains before physical-handle reuse | `provider::tests::standalone_vmm_scratch_reuse_pools_committed_memory_and_does_not_scale_cumemcreate` |
+//! | One- and two-granule prefix/tail boundaries | `one_and_two_granule_prefix_boundaries_map_and_cleanup` |
+//! | Owner/sharer lifetime, including one sharer exiting first | `n_sequences_share_one_pinned_prefix_charged_once_alive_until_last` |
+//! | Peer + private-fallback fp16 GQA isolation | `gqa_shared_prefix_parity_gpu::shared_peers_survive_request_local_private_fallback` |
+//!
+//! The current instance-scoped `DriverFaultPlan` injects release `Unmap`,
+//! rollback `Remap`, and `Dispose` failures; it has no initial shared-map or
+//! `cuMemSetAccess` injection point. Partial multi-granule shared-map rollback
+//! therefore remains unforced here rather than being simulated by a new,
+//! test-only production seam.
 
 use std::panic::AssertUnwindSafe;
 use std::ptr::NonNull;
@@ -36,7 +54,7 @@ use onnx_runtime_cuda_memory::vmm_allocator::{
 };
 use onnx_runtime_memory_governor::{
     DeviceAllocator, DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole,
-    Tier,
+    Tier, VirtualBacking,
 };
 
 const HOLDER: HolderId = HolderId::new(777);
@@ -246,7 +264,9 @@ fn n_sequences_share_one_pinned_prefix_charged_once_alive_until_last() {
         let ptr = allocate_sequence(&allocator, granule, SEQ_GRANULES);
         let owned_before = governor.used(Tier::Device);
         assert_eq!(
-            allocator.incremental_owned_bytes_for_shared_prefix(&prefix),
+            allocator
+                .incremental_owned_bytes_for_shared_prefix(&prefix)
+                .expect("same-device same-authority prefix"),
             0,
             "admitting sharer {n} must need zero incremental owned bytes for the prefix"
         );
@@ -370,7 +390,9 @@ fn admitting_a_sharer_costs_only_private_bytes() {
 
     // Mapping the shared prefix at offset 0 is free on the owned axis.
     assert_eq!(
-        allocator.incremental_owned_bytes_for_shared_prefix(&prefix),
+        allocator
+            .incremental_owned_bytes_for_shared_prefix(&prefix)
+            .expect("same-device same-authority prefix"),
         0
     );
     allocator
@@ -508,54 +530,90 @@ fn unsupported_shared_prefix_requests_error_rather_than_mismap() {
 
     let governor = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
     let allocator = allocator(&governor, 64 << 20);
+    let stats = allocator
+        .physical_pool_stats()
+        .expect("production allocator installs the pool");
     let prefix = allocator
         .create_shared_prefix(granule)
         .expect("pinned shared prefix");
     let bytes = granule * 2;
+    write_host(prefix.device_ptr(), PREFIX_MARKER, PROBE_LEN);
+
+    let healthy = allocate_sequence(&allocator, granule, 2);
+    allocator
+        .commit_shared_prefix(&prefix, healthy, bytes, 0)
+        .expect("healthy peer map");
 
     // Misaligned offset: a shared prefix maps whole granules.
     let a = allocate_sequence(&allocator, granule, 2);
+    let before = stats.snapshot();
+    let used_before = governor.used(Tier::Device);
+    let error = allocator
+        .commit_shared_prefix(&prefix, a, bytes, granule / 2)
+        .expect_err("a non-granule-aligned offset must error");
     assert!(
-        allocator
-            .commit_shared_prefix(&prefix, a, bytes, granule / 2)
-            .is_err(),
-        "a non-granule-aligned offset must error"
+        error.to_string().contains("not granule-aligned"),
+        "misalignment must be classified explicitly: {error}"
     );
+    assert_eq!(stats.snapshot().mapped_bytes, before.mapped_bytes);
+    assert_eq!(governor.used(Tier::Device), used_before);
 
     // Would not fit inside the allocation.
+    let before = stats.snapshot();
+    let used_before = governor.used(Tier::Device);
+    let error = allocator
+        .commit_shared_prefix(&prefix, a, bytes, bytes)
+        .expect_err("a prefix that does not fit must error");
     assert!(
-        allocator
-            .commit_shared_prefix(&prefix, a, bytes, bytes)
-            .is_err(),
-        "a prefix that does not fit must error"
+        error.to_string().contains("exceeds the allocation"),
+        "overlong geometry must be classified explicitly: {error}"
     );
+    assert_eq!(stats.snapshot().mapped_bytes, before.mapped_bytes);
+    assert_eq!(governor.used(Tier::Device), used_before);
 
     // Overlay onto an already-committed granule: never overwrite live KV.
     let b = allocator
         .allocate_committed(bytes, granule, std::slice::from_ref(&(0..bytes)))
         .expect("fully committed sequence");
+    let before = stats.snapshot();
+    let used_before = governor.used(Tier::Device);
+    let error = allocator
+        .commit_shared_prefix(&prefix, b, bytes, 0)
+        .expect_err("mapping over a committed granule must error");
     assert!(
-        allocator
-            .commit_shared_prefix(&prefix, b, bytes, 0)
-            .is_err(),
-        "mapping over a committed granule must error, never overlay live KV"
+        error.to_string().contains("already committed"),
+        "overlap must be classified explicitly: {error}"
     );
+    assert_eq!(stats.snapshot().mapped_bytes, before.mapped_bytes);
+    assert_eq!(governor.used(Tier::Device), used_before);
 
     // A graph capture is declared open: mapping is not proven replayable.
     let c = allocate_sequence(&allocator, granule, 2);
+    let before = stats.snapshot();
+    let used_before = governor.used(Tier::Device);
     {
         let _capture = allocator.enter_graph_capture();
+        let error = allocator
+            .commit_shared_prefix(&prefix, c, bytes, 0)
+            .expect_err("mapping a shared prefix while capture is open must error");
         assert!(
-            allocator
-                .commit_shared_prefix(&prefix, c, bytes, 0)
-                .is_err(),
-            "mapping a shared prefix while a capture is open must error"
+            error.to_string().contains("graph capture is open"),
+            "capture-open refusal must be classified explicitly: {error}"
         );
     }
+    assert_eq!(stats.snapshot().mapped_bytes, before.mapped_bytes);
+    assert_eq!(governor.used(Tier::Device), used_before);
     // Once the capture guard lifts, the same map succeeds.
     allocator
         .commit_shared_prefix(&prefix, c, bytes, 0)
         .expect("mapping succeeds once the capture guard is gone");
+
+    assert!(
+        read_host(healthy.as_ptr() as u64, PROBE_LEN)
+            .iter()
+            .all(|&byte| byte == PREFIX_MARKER),
+        "all request-local refusals must leave the healthy peer unchanged"
+    );
 
     // An allocator without the production pool cannot express a shared prefix.
     let detached = CudaVmmAllocator::detached(
@@ -571,12 +629,294 @@ fn unsupported_shared_prefix_requests_error_rather_than_mismap() {
         detached.create_shared_prefix(granule).is_err(),
         "a shared prefix requires the production physical-handle pool"
     );
+    assert!(
+        DeviceAllocator::as_shared_mapping(&detached).is_none(),
+        "a detached/pool-less allocator must not advertise SharedMapping"
+    );
+    assert!(
+        DeviceAllocator::as_shared_mapping(&allocator).is_some(),
+        "a pooled allocator must advertise SharedMapping"
+    );
 
     // SAFETY: live pointers from this allocator, no CUDA work in flight.
     unsafe {
         allocator.deallocate(a, bytes, granule);
         allocator.deallocate(b, bytes, granule);
         allocator.deallocate(c, bytes, granule);
+        allocator.deallocate(healthy, bytes, granule);
     }
     drop(prefix);
+    drop(allocator);
+    let torn_down = stats.snapshot();
+    assert_eq!(torn_down.mapped_bytes, 0);
+    assert_eq!(torn_down.pooled_unmapped_bytes, 0);
+    assert_eq!(torn_down.total_owned_bytes, 0);
+    assert_eq!(torn_down.creates, torn_down.releases);
+    assert_eq!(governor.used(Tier::Device), 0);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn repeated_precommitted_fallback_reuses_without_leaking() {
+    set_pool_env();
+    let context = require_cuda();
+    context.bind_to_thread().expect("bind CUDA context");
+    let granule = granularity(0);
+
+    let governor = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
+    let allocator = allocator(&governor, 64 << 20);
+    let stats = allocator
+        .physical_pool_stats()
+        .expect("production allocator installs the pool");
+    let prefix = allocator
+        .create_shared_prefix(granule)
+        .expect("pinned shared prefix");
+    write_host(prefix.device_ptr(), PREFIX_MARKER, PROBE_LEN);
+
+    let bytes = 2 * granule;
+    let full = 0..bytes;
+    let mut steady_state = None;
+    for cycle in 0..16u8 {
+        let private = allocator
+            .allocate_committed(bytes, granule, std::slice::from_ref(&full))
+            .expect("fully private fallback target");
+        let before = stats.snapshot();
+        let error = allocator
+            .commit_shared_prefix(&prefix, private, bytes, 0)
+            .expect_err("precommitted target must fall back");
+        assert!(
+            error.to_string().contains("already committed"),
+            "cycle {cycle} must report the overlap classification: {error}"
+        );
+        assert_eq!(
+            stats.snapshot(),
+            before,
+            "cycle {cycle} refusal must not add a mapping, handle, or shared reference"
+        );
+
+        let private_marker = cycle.wrapping_add(1);
+        write_host(private.as_ptr() as u64, private_marker, PROBE_LEN);
+        assert!(
+            read_host(private.as_ptr() as u64, PROBE_LEN)
+                .iter()
+                .all(|&byte| byte == private_marker),
+            "cycle {cycle} must continue over private KV"
+        );
+        assert!(
+            read_host(prefix.device_ptr(), PROBE_LEN)
+                .iter()
+                .all(|&byte| byte == PREFIX_MARKER),
+            "cycle {cycle} private fallback must not contaminate the shared prefix"
+        );
+
+        unsafe { allocator.deallocate(private, bytes, granule) };
+        let after = stats.snapshot();
+        assert_eq!(
+            after.mapped_bytes, granule as u64,
+            "only the shared-prefix owner window remains mapped after cycle {cycle}"
+        );
+        assert_eq!(after.quarantined_bytes, 0);
+        assert_eq!(after.quarantined_handles, 0);
+        if let Some(expected) = steady_state {
+            assert_eq!(
+                after.total_owned_bytes, expected,
+                "repeated fallback must reuse retained handles rather than grow ownership"
+            );
+        } else {
+            steady_state = Some(after.total_owned_bytes);
+        }
+        assert_eq!(
+            governor.used(Tier::Device),
+            after.total_owned_bytes,
+            "ledger and physical-pool ownership must agree after cycle {cycle}"
+        );
+    }
+    assert!(
+        stats.snapshot().pool_hits >= 30,
+        "cycles after the first must reuse both private-cache granules"
+    );
+
+    drop(prefix);
+    drop(allocator);
+    let torn_down = stats.snapshot();
+    assert_eq!(torn_down.mapped_bytes, 0);
+    assert_eq!(torn_down.pooled_unmapped_bytes, 0);
+    assert_eq!(torn_down.total_owned_bytes, 0);
+    assert_eq!(torn_down.quarantined_bytes, 0);
+    assert_eq!(torn_down.creates, torn_down.releases);
+    assert_eq!(governor.used(Tier::Device), 0);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn one_and_two_granule_prefix_boundaries_map_and_cleanup() {
+    set_pool_env();
+    let context = require_cuda();
+    context.bind_to_thread().expect("bind CUDA context");
+    let granule = granularity(0);
+
+    let governor = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
+    let allocator = allocator(&governor, 64 << 20);
+    let stats = allocator
+        .physical_pool_stats()
+        .expect("production allocator installs the pool");
+
+    for prefix_granules in [1usize, 2] {
+        let prefix_bytes = prefix_granules * granule;
+        let tail_bytes = prefix_granules * granule;
+        let bytes = prefix_bytes + tail_bytes;
+        let marker = PREFIX_MARKER.wrapping_add(prefix_granules as u8);
+        let prefix = allocator
+            .create_shared_prefix(prefix_bytes)
+            .expect("boundary prefix");
+        write_host(prefix.device_ptr(), marker, prefix_bytes);
+        let private_tail = prefix_bytes..bytes;
+        let sequence = allocator
+            .allocate_committed(bytes, granule, std::slice::from_ref(&private_tail))
+            .expect("boundary sequence");
+        let commit = allocator
+            .commit_shared_prefix(&prefix, sequence, bytes, 0)
+            .expect("boundary prefix map");
+        assert_eq!(commit.granules, prefix_granules);
+        assert_eq!(
+            commit.newly_mapped_bytes, prefix_bytes as u64,
+            "the exact prefix boundary must be mapped"
+        );
+        assert!(
+            read_host(sequence.as_ptr() as u64, PROBE_LEN)
+                .iter()
+                .all(|&byte| byte == marker)
+        );
+        assert!(
+            read_host(
+                sequence.as_ptr() as u64 + prefix_bytes as u64 - PROBE_LEN as u64,
+                PROBE_LEN,
+            )
+            .iter()
+            .all(|&byte| byte == marker),
+            "the final bytes of the {prefix_granules}-granule prefix must be shared"
+        );
+
+        unsafe { allocator.deallocate(sequence, bytes, granule) };
+        drop(prefix);
+        assert_eq!(stats.snapshot().quarantined_bytes, 0);
+    }
+
+    drop(allocator);
+    let torn_down = stats.snapshot();
+    assert_eq!(torn_down.mapped_bytes, 0);
+    assert_eq!(torn_down.pooled_unmapped_bytes, 0);
+    assert_eq!(torn_down.total_owned_bytes, 0);
+    assert_eq!(torn_down.creates, torn_down.releases);
+    assert_eq!(governor.used(Tier::Device), 0);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn foreign_device_and_authority_prefixes_are_not_free_and_are_rejected() {
+    set_pool_env();
+    let context = require_cuda();
+    context.bind_to_thread().expect("bind CUDA context");
+    let granule = granularity(0);
+
+    let governor_a = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
+    let allocator_a = allocator(&governor_a, 64 << 20);
+    let stats_a = allocator_a
+        .physical_pool_stats()
+        .expect("allocator a uses the production pool");
+    let prefix = allocator_a
+        .create_shared_prefix(granule)
+        .expect("prefix on allocator a");
+    write_host(prefix.device_ptr(), PREFIX_MARKER, PROBE_LEN);
+    let healthy = allocate_sequence(&allocator_a, granule, 2);
+    allocator_a
+        .commit_shared_prefix(&prefix, healthy, 2 * granule, 0)
+        .expect("healthy peer");
+
+    let governor_b = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
+    let wrong_device = CudaVmmAllocator::new(
+        context,
+        DeviceKey::device(1),
+        0,
+        64 << 20,
+        &governor_b,
+        HOLDER,
+        MemoryRole::KvCache,
+    )
+    .expect("logical device-one allocator");
+    let stats_b = wrong_device
+        .physical_pool_stats()
+        .expect("wrong-device allocator uses a production pool");
+    let before_b = stats_b.snapshot();
+    let error = wrong_device
+        .incremental_owned_bytes_for_shared_prefix(&prefix)
+        .expect_err("a wrong-device prefix must be rejected before cost");
+    assert!(
+        error.to_string().contains("belongs to device"),
+        "wrong-device cost refusal must be classified explicitly: {error}"
+    );
+    let error = wrong_device
+        .commit_shared_prefix(&prefix, NonNull::dangling(), granule, 0)
+        .expect_err("wrong-device mapping must be rejected");
+    assert!(
+        error.to_string().contains("belongs to device"),
+        "wrong-device commit refusal must be classified explicitly: {error}"
+    );
+    assert_eq!(stats_b.snapshot(), before_b);
+    assert_eq!(governor_b.used(Tier::Device), 0);
+
+    let governor_c = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
+    let wrong_authority = allocator(&governor_c, 64 << 20);
+    let stats_c = wrong_authority
+        .physical_pool_stats()
+        .expect("wrong-authority allocator uses a production pool");
+    assert_ne!(
+        allocator_a.physical_pool_authority(),
+        wrong_authority.physical_pool_authority()
+    );
+    let before_c = stats_c.snapshot();
+    let error = wrong_authority
+        .incremental_owned_bytes_for_shared_prefix(&prefix)
+        .expect_err("a wrong-authority prefix must be rejected before cost");
+    assert!(
+        error.to_string().contains("different pool authority"),
+        "wrong-authority cost refusal must be classified explicitly: {error}"
+    );
+    let error = wrong_authority
+        .commit_shared_prefix(&prefix, NonNull::dangling(), granule, 0)
+        .expect_err("wrong-authority mapping must be rejected");
+    assert!(
+        error.to_string().contains("different pool authority"),
+        "wrong-authority commit refusal must be classified explicitly: {error}"
+    );
+    assert_eq!(stats_c.snapshot(), before_c);
+    assert_eq!(governor_c.used(Tier::Device), 0);
+
+    assert!(
+        read_host(healthy.as_ptr() as u64, PROBE_LEN)
+            .iter()
+            .all(|&byte| byte == PREFIX_MARKER),
+        "foreign-device and foreign-authority refusals must not disturb a healthy peer"
+    );
+
+    unsafe { allocator_a.deallocate(healthy, 2 * granule, granule) };
+    drop(prefix);
+    drop(wrong_authority);
+    drop(wrong_device);
+    drop(allocator_a);
+    assert_eq!(stats_a.snapshot().total_owned_bytes, 0);
+    assert_eq!(stats_b.snapshot().total_owned_bytes, 0);
+    assert_eq!(stats_c.snapshot().total_owned_bytes, 0);
+    assert_eq!(governor_a.used(Tier::Device), 0);
+    assert_eq!(governor_b.used(Tier::Device), 0);
+    assert_eq!(governor_c.used(Tier::Device), 0);
 }

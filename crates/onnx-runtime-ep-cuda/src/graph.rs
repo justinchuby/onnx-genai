@@ -7,6 +7,7 @@ use cudarc::driver::sys::{
     CUgraph, CUgraphExec, CUgraphInstantiate_flags, CUstreamCaptureMode, CUstreamCaptureStatus,
 };
 use cudarc::driver::{CudaStream, result};
+use onnx_runtime_cuda_memory::capture_gate::CaptureExclusion;
 use onnx_runtime_ep_api::{EpError, Result};
 
 use crate::error::driver_err;
@@ -119,6 +120,10 @@ pub(crate) struct CudaGraphLifecycle {
 /// The capture flag and the ordered list of installed segment executables.
 struct LifecycleState {
     capture: CaptureState,
+    /// Held for the whole capture region so no other thread performs a
+    /// device-synchronizing memory operation that would invalidate it. Set in
+    /// `begin`, cleared on every exit from capture (`end`, `abort`, reset).
+    exclusion: Option<CaptureExclusion>,
     segments: Vec<CapturedGraph>,
 }
 
@@ -135,6 +140,7 @@ impl CudaGraphLifecycle {
             stream,
             state: Mutex::new(LifecycleState {
                 capture: CaptureState::Idle,
+                exclusion: None,
                 segments: Vec::new(),
             }),
         }
@@ -161,10 +167,17 @@ impl CudaGraphLifecycle {
             }
         }
 
+        // Acquire *before* `cuStreamBeginCapture`: taking it afterwards leaves a
+        // window in which the capture is live and unprotected. THREAD_LOCAL mode
+        // relaxes CUDA's legality check on unsafe calls, not the fact that a
+        // device-wide synchronization anywhere in the process invalidates this
+        // capture.
+        let exclusion = CaptureExclusion::acquire();
         self.stream
             .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
             .map_err(|error| driver_err("begin CUDA graph stream capture", error))?;
         state.capture = CaptureState::Capturing(std::thread::current().id());
+        state.exclusion = Some(exclusion);
         Ok(())
     }
 
@@ -191,6 +204,10 @@ impl CudaGraphLifecycle {
         // Clear the capture flag even when end/instantiate fails. CUDA has ended
         // or invalidated the capture at that point, and no executable is usable.
         state.capture = CaptureState::Idle;
+        // Bind rather than clear: the stream is still capturing until
+        // `end_capture` returns, and `?` below must not skip the release. As a
+        // local, it drops at every exit from this function and never earlier.
+        let _exclusion = state.exclusion.take();
         let graph = CapturedGraph::end_capture(
             &self.stream,
             CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY,
@@ -271,6 +288,9 @@ impl CudaGraphLifecycle {
         // Clear the flag unconditionally: once we call end_capture the stream is
         // no longer capturing regardless of whether a usable graph came back.
         state.capture = CaptureState::Idle;
+        // Released once this function returns, i.e. after `end_capture` has
+        // taken the stream out of capture mode. See `end`.
+        let _exclusion = state.exclusion.take();
         // End the stream capture to drain the half-recorded graph, then drop it.
         // A mid-capture failure invalidates the capture, so end_capture may
         // report an error — but it still takes the stream out of capture mode,
@@ -557,14 +577,25 @@ extern "C" __global__ void add_one(const float* x, float* y, unsigned long long 
         runtime.reset_graph().unwrap();
 
         // --- NEGATIVE: the SAME excursion INSIDE an active capture -----------
-        // A host-consuming D2H needs a stream sync; that sync is illegal while
+        // A host-consuming D2H needs a stream drain; that drain is illegal while
         // capturing and invalidates the graph. This is why a monolithic capture
         // ACROSS the excursion cannot work and segmentation is mandatory.
+        //
+        // The drain has to be the *unconditional* one. `synchronize()` has been
+        // a no-op by default since eager-sync deferral landed (#1383), so it can
+        // neither invalidate a capture nor be relied on to detect one. What
+        // actually makes the excursion illegal is `dtoh`'s internal
+        // `force_synchronize`, which `drain_for_unmap` is the public spelling
+        // of -- so that is what the negative case must exercise.
         runtime.begin_graph_capture(&[&capturable]).unwrap();
         launch_add_one(&runtime, &function, buf0, buf1, n);
         assert!(
-            runtime.synchronize().is_err(),
-            "a host-consuming sync inside active capture must invalidate it"
+            runtime.synchronize().is_ok(),
+            "the deferred synchronize is a no-op and must not be mistaken for a capture barrier"
+        );
+        assert!(
+            runtime.drain_for_unmap().is_err(),
+            "a host-consuming drain inside active capture must invalidate it"
         );
         runtime.abort_graph_capture().unwrap();
         runtime.reset_graph().ok();
@@ -833,15 +864,21 @@ extern "C" __global__ void add_one(const float* x, float* y, unsigned long long 
         // --- Reproduce a mid-segment kernel failure during capture ----------
         // Begin recording and launch one node into the segment, then trip the
         // exact illegal operation a Supported-but-unconditionally-syncing kernel
-        // would perform inside a captured segment: a stream synchronize during
-        // capture. This invalidates the capture (CUDA_ERROR_STREAM_CAPTURE_*),
+        // would perform inside a captured segment: an unconditional stream drain
+        // during capture. This invalidates the capture (CUDA_ERROR_STREAM_CAPTURE_*),
         // which is the error that reaches the executor's cleanup path.
+        //
+        // It has to be the unconditional drain. `synchronize()` has been a no-op
+        // by default since eager-sync deferral landed (#1383), so a kernel that
+        // calls it does not invalidate anything; the kernels that still force a
+        // drain are the ones that go through `force_synchronize`, of which
+        // `drain_for_unmap` is the public spelling.
         runtime.begin_graph_capture(&[&capturable]).unwrap();
         launch_add_one(&runtime, &function, input_ptr, output_ptr, n);
         assert!(runtime.is_capturing().unwrap());
         assert!(
-            runtime.synchronize().is_err(),
-            "a stream synchronize mid-capture is illegal and must error"
+            runtime.drain_for_unmap().is_err(),
+            "an unconditional stream drain mid-capture is illegal and must error"
         );
 
         // The wedge: while the stream is still (invalidly) capturing, reset is
@@ -940,6 +977,116 @@ extern "C" __global__ void add_one(const float* x, float* y, unsigned long long 
         unsafe {
             runtime.free_raw(output_ptr).unwrap();
             runtime.free_raw(input_ptr).unwrap();
+        }
+    }
+
+    /// The runtime owns two independent captured-graph slots (`Primary` for the
+    /// M=1 decode step, `Verify` for the MTP fixed-width verify step). This is
+    /// the enabling invariant for replaying two differently-shaped decode graphs
+    /// by shape key without per-step recapture: capturing/replaying/resetting one
+    /// slot must never disturb the other's installed executable, even though both
+    /// launch on the same compute stream.
+    #[test]
+    fn primary_and_verify_graph_slots_are_independent() {
+        use onnx_runtime_ep_api::DeviceGraphSlot;
+
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping two-slot graph test: CUDA runtime unavailable");
+            return;
+        };
+        let function = runtime.nvrtc_function(MODULE, SOURCE, "add_one").unwrap();
+        let n = 32usize;
+        let size = n * std::mem::size_of::<f32>();
+        let p_in = runtime.alloc_raw(size).unwrap();
+        let p_out = runtime.alloc_raw(size).unwrap();
+        let v_in = runtime.alloc_raw(size).unwrap();
+        let v_mid = runtime.alloc_raw(size).unwrap();
+        let v_out = runtime.alloc_raw(size).unwrap();
+        let base = (0..n).map(|i| i as f32).collect::<Vec<_>>();
+        // SAFETY: each pointer covers the whole slice.
+        unsafe {
+            runtime.htod(bytes(&base), p_in).unwrap();
+            runtime.htod(bytes(&base), v_in).unwrap();
+        }
+        let capturable = TestKernel { capturable: true };
+
+        // Primary slot: a single add_one (out = in + 1).
+        runtime
+            .begin_graph_capture_in(DeviceGraphSlot::Primary, &[&capturable])
+            .unwrap();
+        launch_add_one(&runtime, &function, p_in, p_out, n);
+        runtime
+            .end_graph_capture_in(DeviceGraphSlot::Primary)
+            .unwrap();
+
+        // Verify slot: a different shape/topology (two chained add_one,
+        // out = in + 2) captured while Primary already holds an executable.
+        runtime
+            .begin_graph_capture_in(DeviceGraphSlot::Verify, &[&capturable])
+            .unwrap();
+        launch_add_one(&runtime, &function, v_in, v_mid, n);
+        launch_add_one(&runtime, &function, v_mid, v_out, n);
+        runtime
+            .end_graph_capture_in(DeviceGraphSlot::Verify)
+            .unwrap();
+
+        // Both slots hold an executable simultaneously.
+        assert!(
+            runtime
+                .has_graph_executable_in(DeviceGraphSlot::Primary)
+                .unwrap()
+        );
+        assert!(
+            runtime
+                .has_graph_executable_in(DeviceGraphSlot::Verify)
+                .unwrap()
+        );
+
+        // Each slot replays its own graph independently, interleaved.
+        for _ in 0..3 {
+            runtime.replay_graph_in(DeviceGraphSlot::Primary).unwrap();
+            runtime.replay_graph_in(DeviceGraphSlot::Verify).unwrap();
+        }
+        runtime.synchronize().unwrap();
+        assert_eq!(
+            read_f32(&runtime, p_out, n),
+            base.iter().map(|v| v + 1.0).collect::<Vec<_>>(),
+            "Primary slot must apply +1"
+        );
+        assert_eq!(
+            read_f32(&runtime, v_out, n),
+            base.iter().map(|v| v + 2.0).collect::<Vec<_>>(),
+            "Verify slot must apply +2, undisturbed by Primary replays"
+        );
+
+        // Resetting Primary leaves Verify's installed executable intact.
+        assert!(runtime.reset_graph_in(DeviceGraphSlot::Primary).unwrap());
+        assert!(
+            !runtime
+                .has_graph_executable_in(DeviceGraphSlot::Primary)
+                .unwrap()
+        );
+        assert!(
+            runtime
+                .has_graph_executable_in(DeviceGraphSlot::Verify)
+                .unwrap(),
+            "resetting Primary must not tear down the Verify slot"
+        );
+        runtime.replay_graph_in(DeviceGraphSlot::Verify).unwrap();
+        runtime.synchronize().unwrap();
+        assert_eq!(
+            read_f32(&runtime, v_out, n),
+            base.iter().map(|v| v + 2.0).collect::<Vec<_>>(),
+        );
+
+        assert!(runtime.reset_graph_in(DeviceGraphSlot::Verify).unwrap());
+        // SAFETY: both slots reset, dropping all graph ownership before free.
+        unsafe {
+            runtime.free_raw(v_out).unwrap();
+            runtime.free_raw(v_mid).unwrap();
+            runtime.free_raw(v_in).unwrap();
+            runtime.free_raw(p_out).unwrap();
+            runtime.free_raw(p_in).unwrap();
         }
     }
 }

@@ -30,7 +30,7 @@
 //! `position_ids` and must construct the rank-3 mrope coordinates this hybrid
 //! decoder declares before native CUDA can drive it. See
 //! `.squad/decisions/inbox/cohaagen-hybrid-loader.md`.
-#![cfg(all(feature = "cuda", feature = "native-backend"))]
+#![cfg(feature = "native-cuda")]
 
 use std::path::PathBuf;
 

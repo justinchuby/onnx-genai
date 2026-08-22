@@ -9,7 +9,7 @@
           "ep": "CPUExecutionProvider",
           "executor_info": {
             "ort": {
-              "model_file": "model.onnx"
+              "model_file": "model.onnx.textproto"
             }
           }
         }

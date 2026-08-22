@@ -36,8 +36,8 @@ use crate::native_decode::{NativeDecodeSession, NativeProposerSession};
 use crate::processors::ensure_constrained_finish;
 use crate::sampling::sample_greedy;
 use crate::speculative::{
-    LinearEmbedder, NgramProposer, SpeculativeProposer, SpeculativeProposerContext,
-    SpeculativeStats, TokenEmbedder, argmax,
+    LinearEmbedder, MtpEmbedder, MtpLmHead, MtpProposer, NgramProposer, SpeculativeProposer,
+    SpeculativeProposerContext, SpeculativeStats, TokenEmbedder, argmax,
 };
 use anyhow::Context;
 use onnx_genai_ort::Tokenizer;
@@ -68,6 +68,15 @@ enum NativeProposer<'a> {
         session: &'a mut NativeProposerSession,
         embedder: &'a LinearEmbedder,
         groups: &'a [onnx_genai_metadata::SharedKvGroup],
+        hidden_size: usize,
+    },
+    /// MTP self-speculation: the generic [`MtpProposer`] (ORT MTP head +
+    /// shared target embedding / LM head) proposes `guaranteed + K` tokens from
+    /// the native target's last hidden state. `hidden_size` is the expected
+    /// seed width (`hc_mult * hidden`) used to fail fast on a metadata/model
+    /// mismatch before the proposer runs.
+    Mtp {
+        proposer: Box<MtpProposer<'static, MtpEmbedder, MtpLmHead>>,
         hidden_size: usize,
     },
 }
@@ -114,6 +123,31 @@ impl<'a> NativeSpeculativeDriver<'a> {
         })
     }
 
+    /// Build an MTP self-speculative driver over `session`.
+    ///
+    /// The generic [`MtpProposer`] owns the ORT MTP-head session plus the shared
+    /// target embedding / LM head; it is seeded each step from the native
+    /// target's declared hidden output (`last_hidden()`), which the Gap-2
+    /// executor fix makes available on the CUDA path.
+    pub(crate) fn new_mtp(
+        session: &'a mut NativeDecodeSession,
+        proposer: MtpProposer<'static, MtpEmbedder, MtpLmHead>,
+        hidden_size: usize,
+        draft_width: usize,
+    ) -> anyhow::Result<Self> {
+        if hidden_size == 0 {
+            anyhow::bail!("native MTP proposer requires a positive target hidden width");
+        }
+        Ok(Self {
+            session,
+            proposer: NativeProposer::Mtp {
+                proposer: Box::new(proposer),
+                hidden_size,
+            },
+            draft_width: draft_width.max(1),
+        })
+    }
+
     /// Drive greedy speculative generation, streaming committed tokens to
     /// `callback` and accumulating verification diagnostics into `stats`.
     ///
@@ -134,6 +168,29 @@ impl<'a> NativeSpeculativeDriver<'a> {
         }
         self.session.reset()?;
 
+        // Option-c native MTP verify capture: install the fixed-M (=k+1) padded
+        // verify bindings + Verify graph slot ONCE per generation so the M=K
+        // verify forward is captured and replayed instead of recaptured every
+        // step (the pre-#1650 replays=0 pin). Idempotent and a no-op unless this
+        // is an MTP proposer over a graph-enabled hybrid recurrent CUDA session
+        // (`configure_verify_capture` self-guards on all of those). Greedy /
+        // prompt-lookup / pure-attention / CPU paths are entirely unaffected.
+        if matches!(self.proposer, NativeProposer::Mtp { .. }) {
+            self.session.configure_verify_capture(self.draft_width)?;
+        }
+
+        // Env-gated per-phase timing to ground the base-decode-fusion analysis.
+        // ONNX_GENAI_PROFILE_SPEC_PHASES=1 prints cumulative ms for the base
+        // decode / propose / verify / commit phases at the end of generation.
+        // Inert (no Instant calls) unless the env var is set.
+        let phase_profile = std::env::var("ONNX_GENAI_PROFILE_SPEC_PHASES").is_ok();
+        let mut t_base = 0f64;
+        let mut t_propose = 0f64;
+        let mut t_verify = 0f64;
+        let mut t_commit = 0f64;
+        let mut n_base = 0usize;
+        let mut n_verify = 0usize;
+
         let prompt_len = prompt_tokens.len();
         let mut state = DecodeLoopState::new(0, options.seed, options.top_logprobs);
         // Committed tokens not yet folded into the device KV cache. Mirrors
@@ -143,6 +200,13 @@ impl<'a> NativeSpeculativeDriver<'a> {
 
         loop {
             if state.generated_tokens.len() >= options.max_new_tokens {
+                if phase_profile {
+                    eprintln!(
+                        "spec_phases: base={t_base:.1}ms/{n_base} propose={t_propose:.1}ms verify={t_verify:.1}ms/{n_verify} commit={t_commit:.1}ms | per_base={:.3}ms per_verify={:.3}ms",
+                        t_base / n_base.max(1) as f64,
+                        t_verify / n_verify.max(1) as f64,
+                    );
+                }
                 ensure_constrained_finish(options, &state.generated_text, FinishReason::MaxTokens)?;
                 return finish_result(
                     tokenizer,
@@ -167,11 +231,16 @@ impl<'a> NativeSpeculativeDriver<'a> {
             // Fold the trailing committed token(s) into the KV and read the
             // target's next-token distribution for the first uncommitted position.
             let past = self.session.current_len();
+            let t0 = phase_profile.then(std::time::Instant::now);
             let base_logits = self
                 .session
                 .decode(&pending, past)?
                 .pop()
                 .context("native speculative decode produced no base logits")?;
+            if let Some(t0) = t0 {
+                t_base += t0.elapsed().as_secs_f64() * 1e3;
+                n_base += 1;
+            }
             pending.clear();
             let base = self.session.current_len();
             debug_assert_eq!(base, context_len);
@@ -189,6 +258,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 .copied()
                 .chain(state.generated_tokens.iter().copied())
                 .collect();
+            let tp = phase_profile.then(std::time::Instant::now);
             let mut draft = match &mut self.proposer {
                 NativeProposer::PromptLookup(proposer) => {
                     let proposer_context = SpeculativeProposerContext {
@@ -217,7 +287,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
                     })?;
                     if target_hidden.len() != *hidden_size {
                         anyhow::bail!(
-                            "native target hidden output has width {}, but shared-KV metadata declares backbone_hidden_size {}; fix model.io.hidden_output or speculative.backbone_hidden_size",
+                            "native target hidden output has width {}, but shared-KV metadata declares backbone_hidden_size {}; fix hidden_output or speculative.backbone_hidden_size",
                             target_hidden.len(),
                             hidden_size
                         );
@@ -265,8 +335,44 @@ impl<'a> NativeSpeculativeDriver<'a> {
                     }
                     tokens
                 }
+                NativeProposer::Mtp {
+                    proposer,
+                    hidden_size,
+                } => {
+                    let target_hidden = self.session.last_hidden().with_context(|| {
+                        "native MTP proposer requires the target decoder's declared hidden output; the target forward produced no hidden state"
+                    })?;
+                    if target_hidden.len() != *hidden_size {
+                        anyhow::bail!(
+                            "native target hidden output has width {}, but MTP metadata declares hc_mult * hidden = {}; fix speculative.target_hidden_size / hc_mult",
+                            target_hidden.len(),
+                            hidden_size
+                        );
+                    }
+                    let guaranteed = TokenId::try_from(
+                        argmax(&base_logits).context("native target logits were empty")?,
+                    )
+                    .context("native target token id exceeds u32 range")?;
+                    let proposer_context = SpeculativeProposerContext {
+                        width,
+                        context_tokens: &context_tokens,
+                        generated_tokens: &state.generated_tokens,
+                        generated_text: &state.generated_text,
+                        first_step: state.step,
+                        options,
+                        chain,
+                        target_hidden: Some(target_hidden),
+                        target_hidden_layers: None,
+                        guaranteed_token: Some(guaranteed),
+                        shared_kv_slices: None,
+                    };
+                    proposer.propose(&proposer_context)?.tokens
+                }
             };
             draft.truncate(width);
+            if let Some(tp) = tp {
+                t_propose += tp.elapsed().as_secs_f64() * 1e3;
+            }
 
             if draft.is_empty() {
                 // No proposal: fall back to a single plain greedy step. Worst case
@@ -296,9 +402,28 @@ impl<'a> NativeSpeculativeDriver<'a> {
             stats.verification_steps += 1;
             stats.proposed_tokens += draft.len();
 
+            // A hybrid decoder's Gated-DeltaNet recurrent (SSM) + conv1d state is
+            // a destructive rolling cache with no per-step history to prefix-slice,
+            // so `rewind` alone cannot roll it back after a rejected draft. Snapshot
+            // it at the committed boundary (`base`) BEFORE the verify window
+            // destructively advances it by K, so the accept path can rebuild the
+            // committed state from exactly the accepted prefix. Inert (returns
+            // `None`) for every pure-attention decoder — those keep the plain
+            // `rewind`.
+            let recurrent_snapshot = if self.session.has_recurrent_state() {
+                Some(self.session.snapshot_recurrent_state()?)
+            } else {
+                None
+            };
+
             // Eager M=K verify pass: one target row per draft position (predicts
             // the token AFTER each draft token). current_len advances to base + K.
+            let tv = phase_profile.then(std::time::Instant::now);
             let rows = self.session.decode_verify(&draft, base)?;
+            if let Some(tv) = tv {
+                t_verify += tv.elapsed().as_secs_f64() * 1e3;
+                n_verify += 1;
+            }
 
             // ==== WP3 device-accept seam ====
             // Host argmax over the [K+1, vocab] rows. `target_tokens[idx]` is the
@@ -331,8 +456,44 @@ impl<'a> NativeSpeculativeDriver<'a> {
 
             // Roll the device KV back to the committed length: accepted draft
             // columns stay resident, unaccepted columns are dropped, and the bonus
-            // token trails in `pending` (fed on the next step).
-            self.session.rewind(base + accepted)?;
+            // token trails in `pending` (fed on the next step). For a hybrid
+            // recurrent decoder the KV prefix-slice alone would leave the
+            // destructive GDN/conv state stranded at `base + K`; commit it to
+            // exactly the accepted prefix instead (snapshot restore + accepted-
+            // token re-advance), which also performs the KV rewind. See #1598.
+            //
+            // Approach-B fast path (full accept): when EVERY draft token is
+            // accepted, the eager verify forward already advanced BOTH the KV
+            // (`base + K`) and the destructive GDN/conv recurrent state by exactly
+            // those `K == accepted` tokens, and the committed length equals the
+            // current length — so there is nothing to roll back. Skip the KV
+            // rewind, the snapshot restore, AND the accepted-token re-advance
+            // entirely: the verify's own post-state IS the committed state. This
+            // removes the redundant re-advance target forwards on the majority of
+            // steps (every multi-token accept). The snapshot is still taken before
+            // the verify because acceptance is only known after it; it is simply
+            // unused on this path. Only a PARTIAL accept (`accepted < draft.len()`)
+            // needs the snapshot→restore→re-advance rebuild to a shorter prefix.
+            let tc = phase_profile.then(std::time::Instant::now);
+            if accepted == draft.len() {
+                debug_assert_eq!(
+                    self.session.current_len(),
+                    base + accepted,
+                    "full-accept commit: verify must leave KV + state at base + accepted"
+                );
+            } else {
+                match recurrent_snapshot.as_ref() {
+                    Some(snapshot) => self.session.commit_recurrent_state_to_accepted(
+                        snapshot,
+                        base,
+                        &draft[..accepted],
+                    )?,
+                    None => self.session.rewind(base + accepted)?,
+                }
+            }
+            if let Some(tc) = tc {
+                t_commit += tc.elapsed().as_secs_f64() * 1e3;
+            }
 
             // Commit accepted draft tokens followed by the bonus, honoring the
             // same per-token `max_new_tokens` / context-limit / EOS / stop

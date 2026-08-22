@@ -534,6 +534,7 @@ pub mod hardmax;
 pub mod identity;
 pub mod index_share;
 pub mod indexing;
+pub(crate) mod int4_nibble;
 pub mod is_inf;
 pub mod is_nan;
 pub mod layernorm;
@@ -551,6 +552,7 @@ pub mod onehot;
 pub mod packed_multi_head_attention;
 pub mod packed_varlen_attention;
 pub mod pad;
+pub(crate) mod qgemm_native;
 pub mod qlinear_matmul;
 pub mod qmoe;
 pub mod quantization;
@@ -1932,6 +1934,13 @@ pub(crate) mod testutil {
     }
 
     impl Owned {
+        fn evict_stale_half_transpose(bytes: &[u8], shape: &[usize], tag: u16) {
+            let [k, n] = shape else {
+                return;
+            };
+            super::weight_transpose::half_cache_evict(bytes.as_ptr().cast(), *k, *n, tag);
+        }
+
         pub fn f32(shape: &[usize], data: &[f32]) -> Self {
             let strides = compute_contiguous_strides(shape);
             let mut bytes = Vec::with_capacity(data.len() * 4);
@@ -1995,6 +2004,7 @@ pub(crate) mod testutil {
             for &v in data {
                 bytes.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
             }
+            Self::evict_stale_half_transpose(&bytes, shape, 0);
             Self {
                 bytes,
                 shape: shape.to_vec(),
@@ -2011,6 +2021,7 @@ pub(crate) mod testutil {
             for &b in bits {
                 bytes.extend_from_slice(&b.to_le_bytes());
             }
+            Self::evict_stale_half_transpose(&bytes, shape, 0);
             Self {
                 bytes,
                 shape: shape.to_vec(),
@@ -2026,6 +2037,7 @@ pub(crate) mod testutil {
             for &v in data {
                 bytes.extend_from_slice(&half::bf16::from_f32(v).to_le_bytes());
             }
+            Self::evict_stale_half_transpose(&bytes, shape, 1);
             Self {
                 bytes,
                 shape: shape.to_vec(),
@@ -2041,6 +2053,7 @@ pub(crate) mod testutil {
             for &b in bits {
                 bytes.extend_from_slice(&b.to_le_bytes());
             }
+            Self::evict_stale_half_transpose(&bytes, shape, 1);
             Self {
                 bytes,
                 shape: shape.to_vec(),
@@ -2120,28 +2133,36 @@ pub(crate) mod testutil {
 
         pub fn to_f32(&self) -> Vec<f32> {
             self.bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect()
         }
 
         pub fn to_f64(&self) -> Vec<f64> {
             self.bytes
-                .chunks_exact(8)
-                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| f64::from_le_bytes(*c))
                 .collect()
         }
 
         pub fn to_i64(&self) -> Vec<i64> {
             self.bytes
-                .chunks_exact(8)
-                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| i64::from_le_bytes(*c))
                 .collect()
         }
 
         pub fn to_i32(&self) -> Vec<i32> {
             self.bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect()
         }
@@ -2153,7 +2174,9 @@ pub(crate) mod testutil {
         /// Widen an f16 buffer to f32 for comparison.
         pub fn to_f16_as_f32(&self) -> Vec<f32> {
             self.bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
                 .collect()
         }
@@ -2162,7 +2185,9 @@ pub(crate) mod testutil {
         /// f32-reinterpret corruption of NaN/inf/denormal inputs).
         pub fn to_u16_bits(&self) -> Vec<u16> {
             self.bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect()
         }
@@ -2170,7 +2195,9 @@ pub(crate) mod testutil {
         /// Widen a bf16 buffer to f32 for comparison.
         pub fn to_bf16_as_f32(&self) -> Vec<f32> {
             self.bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
                 .collect()
         }

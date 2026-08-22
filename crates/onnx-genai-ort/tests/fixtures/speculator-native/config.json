@@ -1,6 +1,0 @@
-{
-  "speculator_config": {
-    "proposal_type": "eagle3",
-    "num_speculative_tokens": 9
-  }
-}

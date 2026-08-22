@@ -1,0 +1,118 @@
+ir_version: 11
+producer_name: "onnx-genai-comfyui-fixture"
+graph {
+  node {
+    input: "conditional"
+    input: "unconditional"
+    output: "difference"
+    op_type: "Sub"
+  }
+  node {
+    input: "scale"
+    input: "row_shape_4d"
+    output: "scale_row"
+    op_type: "Reshape"
+  }
+  node {
+    input: "difference"
+    input: "scale_row"
+    output: "guided"
+    op_type: "Mul"
+  }
+  node {
+    input: "unconditional"
+    input: "guided"
+    output: "estimate"
+    op_type: "Add"
+  }
+  name: "guidance_combine"
+  initializer {
+    dims: 4
+    data_type: 7
+    name: "row_shape_4d"
+    raw_data: "\377\377\377\377\377\377\377\377\001\000\000\000\000\000\000\000\001\000\000\000\000\000\000\000\001\000\000\000\000\000\000\000"
+  }
+  input {
+    name: "unconditional"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "conditional"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "scale"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "estimate"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}

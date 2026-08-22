@@ -1,0 +1,160 @@
+ir_version: 11
+producer_name: "mobius"
+graph {
+  node {
+    output: "v_Constant_0"
+    name: "Constant_node_0"
+    op_type: "Constant"
+    attribute {
+      name: "value_ints"
+      ints: 1
+      type: INTS
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "timestep"
+    input: "v_Constant_0"
+    output: "v_Unsqueeze_1"
+    name: "Unsqueeze_node_1"
+    op_type: "Unsqueeze"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "history"
+    input: "v_Unsqueeze_1"
+    output: "next"
+    name: "Concat_node_2"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: 1
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  name: "schedule_history_append"
+  input {
+    name: "history"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "history"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "timestep"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "next"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "history"
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Constant_0"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Unsqueeze_1"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  metadata_props {
+    key: "mobius.generation.policy_contract"
+    value: "{}"
+  }
+  metadata_props {
+    key: "mobius.generation.policy_contract_id"
+    value: "mobius.policy.auxiliary@1"
+  }
+  metadata_props {
+    key: "mobius.generation.policy_effects"
+    value: "[]"
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}

@@ -25,7 +25,7 @@
     108
   ],
   "files": {
-    "model.onnx": 185662,
+    "model.onnx.textproto": 185662,
     "model.onnx.data": 187648,
     "inference_metadata.yaml": 189,
     "tokenizer.json": 4680

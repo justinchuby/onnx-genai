@@ -1,0 +1,59 @@
+# The Rust toolchain for this repository, for contributors and CI alike.
+#
+# # Why this file exists
+#
+# Every blocking gate in `.github/workflows/ci.yml` runs under `-D warnings`,
+# either as a `RUSTFLAGS` or as a trailing `-- -D warnings` on clippy. That
+# turns any *newly* warn-by-default lint in a new stable release into an
+# immediate CI failure on code that was clean the day before, with no change
+# to the code itself. `cargo fmt --all -- --check` has the same property: a new
+# rustfmt re-flows lines the previous one left alone.
+#
+# While CI resolved `stable` at job time, the resolved version depended on when
+# a runner image happened to roll forward, so `main` could go red with no
+# commit to blame -- and a contributor on the older stable could not reproduce
+# it, nor even see the lint. Rust 1.98.0 did this four times in a row:
+#
+#   * #1604 -- `cargo fmt` drift plus `manual_slice_fill`, `needless_late_init`
+#   * #1609 -- `collapsible_if` x5 in qmoe.rs (from #1602), plus ep-cpu lints
+#   * #1615 -- `collapsible_if` in runtime.rs (from #1612)
+#   * #1603 -- `chunks_exact_to_as_chunks` across 12 crates
+#
+# Each fixed the symptom; none could stop the next one. Formatting is the
+# self-perpetuating case: whoever formats next re-flows the file the other way,
+# so an unpinned rustfmt makes the tree oscillate.
+#
+# # What this does and does not freeze
+#
+# This pins the *toolchain*, which is what decides lint and formatting
+# behaviour. It does not pin dependencies -- `cargo update` and the security
+# audit in `.github/workflows/audit.yml` are unaffected, so advisories are
+# still surfaced and fixable on the normal schedule.
+#
+# The previous policy note said CI tracked `stable` "without freezing security
+# fixes". That conflated two separable things: security fixes reach this repo
+# through dependency updates, whereas the recurring breakage came from new
+# warn-by-default *lints*. Pinning the toolchain stops the second without
+# affecting the first.
+#
+# # Upgrading
+#
+# Bump `channel` in one commit, with the resulting lint and formatting fixes in
+# that same commit. That makes a toolchain move a reviewable, attributable
+# change rather than something that lands on whoever pushes next. CI and every
+# contributor move together, so "green on my machine" means green.
+#
+# An explicit `+toolchain` still wins over this file, so `.github/workflows/
+# miri.yml`'s `cargo +nightly` is unaffected.
+
+[toolchain]
+# Matches what CI runners had resolved `stable` to when this was pinned:
+# `rustc 1.98.0 (88d9e12ae 2026-08-18)`, read from the job logs and confirmed
+# byte-identical to a local `rustup toolchain install 1.98.0`.
+channel = "1.98.0"
+profile = "minimal"
+# `profile = "minimal"` omits clippy and rustfmt, and `cargo llvm-cov` in the
+# coverage jobs needs `llvm-tools-preview`. rustup installs everything listed
+# here when it materializes the toolchain, so CI does not have to add them
+# per-job -- and cannot add them to the wrong toolchain by doing so.
+components = ["clippy", "rustfmt", "llvm-tools-preview"]

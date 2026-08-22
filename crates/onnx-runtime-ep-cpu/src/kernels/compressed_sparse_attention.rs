@@ -1815,7 +1815,7 @@ fn fp4_roundtrip(values: &mut [f32]) -> Result<Vec<u8>> {
         .checked_mul(FP4_E2M1_PACKED_BYTES + 1)
         .ok_or_else(|| error("FP4 index packed width overflow"))?;
     let mut packed = Vec::with_capacity(packed_width);
-    for block in values.chunks_exact_mut(FP4_E2M1_BLOCK_SIZE) {
+    for block in values.as_chunks_mut::<FP4_E2M1_BLOCK_SIZE>().0 {
         let input = block.to_vec();
         let mut exponent = 0u8;
         let mut codes = [0u8; FP4_E2M1_PACKED_BYTES];
@@ -3246,7 +3246,7 @@ fn dequantize_cache(
             let destination = output
                 .get_mut(output_tail..output_tail_end)
                 .ok_or_else(|| error("dequantized BF16 RoPE tail is out of bounds"))?;
-            for (bytes, value) in source.chunks_exact(2).zip(destination) {
+            for (bytes, value) in source.as_chunks::<2>().0.iter().zip(destination) {
                 *value = half::bf16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32();
             }
         }
@@ -4156,7 +4156,7 @@ mod tests {
             let scale_power = (amax / 6.0).log2().ceil() as i32;
             let scale = 2.0f32.powi(scale_power);
             packed.push((scale_power + 127) as u8);
-            for pair in source.chunks_exact(2) {
+            for pair in source.as_chunks::<2>().0 {
                 let mut byte = 0u8;
                 for (nibble, &value) in pair.iter().enumerate() {
                     let normalized = (value / scale).clamp(-6.0, 6.0);
@@ -4344,7 +4344,10 @@ mod tests {
 
             let pre_fp8 = finalized.clone();
             let mut packed = Vec::with_capacity(STORED_WIDTH);
-            for block in finalized[..DIM - ROPE_DIM].chunks_exact_mut(FP8_E4M3_BLOCK_SIZE) {
+            for block in finalized[..DIM - ROPE_DIM]
+                .as_chunks_mut::<FP8_E4M3_BLOCK_SIZE>()
+                .0
+            {
                 let amax = block
                     .iter()
                     .map(|value| value.abs())
@@ -4772,7 +4775,7 @@ mod tests {
         }
         fn oracle_fp4(values: &mut [f32]) -> Vec<u8> {
             let mut packed = Vec::new();
-            for block in values.chunks_exact_mut(32) {
+            for block in values.as_chunks_mut::<32>().0 {
                 let amax = block
                     .iter()
                     .map(|value| value.abs())
@@ -4780,7 +4783,7 @@ mod tests {
                 let power = (amax / 6.0).log2().ceil() as i32;
                 let scale = 2.0f32.powi(power);
                 packed.push((power + 127) as u8);
-                for pair in block.chunks_exact_mut(2) {
+                for pair in block.as_chunks_mut::<2>().0 {
                     let low = encode_fp4((pair[0] / scale).clamp(-6.0, 6.0));
                     let high = encode_fp4((pair[1] / scale).clamp(-6.0, 6.0));
                     packed.push(low | high << 4);
@@ -4819,7 +4822,7 @@ mod tests {
             oracle_rope(&mut record[D - RD..], block_start);
             let pre_fp8 = record.clone();
             let mut packed = Vec::new();
-            for block in record[..D - RD].chunks_exact_mut(64) {
+            for block in record[..D - RD].as_chunks_mut::<64>().0 {
                 let amax = block
                     .iter()
                     .map(|value| value.abs())

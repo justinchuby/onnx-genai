@@ -50,7 +50,7 @@
 //!   --features native-backend,cuda --test gemma4_e2b_head_dim_512_decode_lock \
 //!   -- --ignored --test-threads=1 --nocapture
 //! ```
-#![cfg(all(feature = "native-backend", feature = "cuda"))]
+#![cfg(feature = "native-cuda")]
 
 #[path = "common/decode_lock.rs"]
 mod decode_lock;

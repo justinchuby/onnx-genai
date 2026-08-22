@@ -49,10 +49,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use onnx_runtime_ep_api::{
-    CaptureRegionShapeStatus, DeviceBuffer, DevicePtr, DevicePtrMut, EpError, ExecutionProvider,
-    ExternalMmapRegion, Kernel, KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary,
-    ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMetadata, TensorMut, TensorView,
-    WeightHandle, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView, lazy_weight_candidates,
+    CaptureRegionShapeStatus, DeviceBuffer, DeviceGraphSlot, DevicePtr, DevicePtrMut, EpError,
+    ExecutionProvider, ExternalMmapRegion, Kernel, KernelInput, KernelMatch, LazyWeight,
+    LazyWeightBoundary, ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMetadata,
+    TensorMut, TensorView, WeightHandle, WorkspaceAllocation, WorkspaceLifetime,
+    WorkspaceRequirement, WorkspaceView, lazy_weight_candidates,
 };
 
 type OptionalTensorSpecs = Vec<Option<(DataType, Vec<usize>)>>;
@@ -518,6 +519,16 @@ pub(crate) struct NodePlan {
     pub inplace_dead_inputs: Vec<bool>,
     /// Lazy weight inputs this node may ask the EP to page at dispatch time.
     pub lazy_weight_inputs: Vec<ValueId>,
+    /// Intermediate values whose last consumer is this node, and whose buffers
+    /// may therefore be released once it has run.
+    ///
+    /// Distinct from [`NodePlan::inplace_dead_inputs`], which only ever lets a
+    /// kernel overwrite an input whose shape and dtype already match its output.
+    /// That covers elementwise chains and nothing else, so before this list
+    /// existed every intermediate buffer a graph produced stayed resident for the
+    /// whole run: a 2545-node vision encoder held all 2545 of them at once and
+    /// spent ~20x the memory its live set needs.
+    pub dead_after: Vec<ValueId>,
 }
 
 /// Map a [`crate::sequence::SequenceError`] into an actionable `SessionError`.
@@ -695,8 +706,8 @@ impl Drop for Executor {
         // mmap recycles an address for a same-shaped weight must not inherit this
         // model's packed buffers.
         onnx_runtime_ep_cpu::kernels::matmul_nbits::clear_mlas_packed_caches();
-        let _ = self.ep.reset_device_graph();
-        self.device_graph_signature = None;
+        let _ = self.ep.reset_device_graph_in(self.graph_slot);
+        self.cap_mut().device_graph_signature = None;
         // Free every buffer via the owning EP (DeviceBuffer has no Drop).
         for (_, buf) in self.buffers.drain() {
             let _ = self.ep.deallocate(buf);
@@ -709,10 +720,10 @@ impl Drop for Executor {
             let _ = self.ep.deallocate(buf);
         }
         if let Some(workspace) = self.persistent_workspace.take() {
-            let _ = self.ep.deallocate(workspace.buffer);
+            let _ = self.ep.deallocate_workspace(workspace.buffer);
         }
         if let Some(workspace) = self.step_workspace.take() {
-            let _ = self.ep.deallocate(workspace.buffer);
+            let _ = self.ep.deallocate_workspace(workspace.buffer);
         }
         self.shared_buffers.clear();
     }

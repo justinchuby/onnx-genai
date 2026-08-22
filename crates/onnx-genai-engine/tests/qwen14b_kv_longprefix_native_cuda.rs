@@ -111,7 +111,7 @@
 //!   --test qwen14b_kv_longprefix_native_cuda \
 //!   -- --ignored --nocapture --test-threads=1
 //! ```
-#![cfg(all(feature = "cuda", feature = "native-backend"))]
+#![cfg(feature = "native-cuda")]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

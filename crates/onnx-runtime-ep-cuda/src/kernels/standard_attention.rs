@@ -170,6 +170,7 @@ const ATTN_SPLIT_MIN_CHUNK: u64 = 128;
 fn attention_split_config(
     is_decode: bool,
     dev_length_eligible: bool,
+    is_causal: bool,
     want_qk: bool,
     cap: u64,
     total_rows: u64,
@@ -194,7 +195,22 @@ fn attention_split_config(
     // Split only on the capture-safe fixed-capacity decode route, and never when
     // the raw QK scores are an observable output (the score scratch is reused as
     // per-key storage inside the split kernel).
-    if !enabled || !is_decode || !dev_length_eligible || want_qk || cap == 0 {
+    //
+    // Also never for the causal form. The multi-split path reorders the fp32
+    // key reduction (chunk-local online softmax merged by `attention_combine`)
+    // versus the monolithic `attention_row` serial ascending reduction. That is
+    // a legitimately different — but not bit-identical — fp32 result, and at a
+    // near-tie between the top-1 and top-2 logits it can flip the greedy argmax.
+    // The monolithic reduction is the reference: it matches both the parent CUDA
+    // build and an independent CPU dense-prefill oracle token-for-token, whereas
+    // the split reduction diverges at such a tie (measured on granite-1b: the
+    // decode stream flips at the first near-tie once causal decode is routed
+    // through the split kernel). The non-causal fixed-capacity decode has always
+    // taken the split path, so its byte-identity baseline already includes it;
+    // gating the causal form out keeps the newly capture-enabled causal decode
+    // bit-for-bit equal to the pre-capture monolithic path while still capturing
+    // (the split is a throughput optimization, not a capture requirement).
+    if !enabled || !is_decode || !dev_length_eligible || is_causal || want_qk || cap == 0 {
         return None;
     }
     attention_split_geometry(chunk_override, cap, total_rows)
@@ -506,7 +522,13 @@ extern "C" __global__ void attention_row(
   }
 
   // Stage 3: attention mask + causal frontier + padding frontier.
-  const long long offset = offsets[b];
+  // When the valid length is read on-device (`dev_len`), the causal frontier is
+  // derived from it too (`offset = total_seq - q_seq`, i.e. the on-device past
+  // length) rather than the host `offsets[b]`, which under a frozen fixed-
+  // capacity binding reports the padded capacity. Query row `i` (absolute
+  // position `past + i`) attends keys `[0, past + i]`.
+  const long long offset =
+      (dev_len != nullptr) ? (long long)total_seq - (long long)q_seq : offsets[b];
   const long long pad_limit = pad_limits[b];
   const long long causal_limit = (long long)i + offset;
   for (unsigned long long j = tid; j < total_seq; j += nthreads) {
@@ -658,7 +680,11 @@ extern "C" __global__ void attention_split(
   const unsigned long long qoff = q_is_3d
       ? (b * q_seq + i) * (q_heads * head_size) + qh * head_size
       : ((b * q_heads + qh) * q_seq + i) * head_size;
-  const long long offset = offsets[b];
+  // See `attention_row`: with an on-device valid length the causal frontier is
+  // derived on-device (`total_seq - q_seq`) instead of the host `offsets[b]`,
+  // which reports padded capacity under a frozen fixed-capacity binding.
+  const long long offset =
+      (dev_len != nullptr) ? (long long)total_seq - (long long)q_seq : offsets[b];
   const long long pad_limit = pad_limits[b];
   const long long causal_limit = (long long)i + offset;
   const bool single = (total_seq <= chunk);
@@ -1239,18 +1265,19 @@ fn std_attention_carve(
 }
 
 /// Static route signal for staged dense KV growth. On the session's
-/// mask-driven, non-causal fixed-capacity decode contract, the mask key width
-/// and past-cache sequence extent are the same physical capacity, so execution
-/// takes the fixed-stride append path (`stage_key/value == false`). Other
-/// in-op-cache routes may grow a dense aliased cache and reserve only the
-/// present outputs that actually exist. Actual pointer aliasing is checked by
-/// `run`; a non-aliased dispatch can safely consume less than this conservative
-/// dense-route reservation.
+/// mask-driven fixed-capacity decode contract, the mask key width and past-cache
+/// sequence extent are the same physical capacity, so execution takes the
+/// fixed-stride append path (`stage_key/value == false`) in both the causal and
+/// non-causal form. Other in-op-cache routes may grow a dense aliased cache and
+/// reserve only the present outputs that actually exist. Actual pointer aliasing
+/// is checked by `run`; a non-aliased dispatch can safely consume less than this
+/// conservative dense-route reservation.
 fn std_attention_staging_route(
     inputs: &[TensorMetadata<'_>],
     is_causal: bool,
     output_count: usize,
 ) -> (bool, bool) {
+    let _ = is_causal;
     let has_past_key = inputs.get(4).is_some_and(|input| input.present);
     let has_past_value = inputs.get(5).is_some_and(|input| input.present);
     if !has_past_key || !has_past_value {
@@ -1266,8 +1293,13 @@ fn std_attention_staging_route(
         .get(3)
         .filter(|mask| mask.present)
         .and_then(|mask| mask.shape.last().copied());
-    let fixed_capacity_append = !is_causal
-        && past_key_capacity.is_some()
+    // Fixed-capacity append when the past caches and the mask all share one
+    // physical key width (the frozen decode contract). The `is_causal` attribute
+    // is irrelevant: for a growing eager cache the past extent (valid length) and
+    // the mask width (valid length + current) differ, so this stays false there
+    // regardless of causality; it only holds once the KV+mask are frozen to a
+    // common capacity, where execution appends in place without staging.
+    let fixed_capacity_append = past_key_capacity.is_some()
         && past_key_capacity == past_value_capacity
         && past_key_capacity == mask_key_capacity;
     if fixed_capacity_append {
@@ -2169,13 +2201,19 @@ impl StandardAttentionKernel {
             // (whose extent is frozen when a CUDA graph is captured). Scanning
             // the LAST query row makes it correct for BOTH phases — prefill
             // returns prompt_len, decode returns total_seq (row 0 would report 1
-            // under a causal prefill mask). Eligible only for the fixed-capacity,
-            // mask-masked (non-causal) fixed-slot-append path; every other path
-            // passes a null pointer and keeps the host-derived length, so
-            // eager/dense/GQA are bit-for-bit unchanged.
+            // under a causal prefill mask). Eligible for the fixed-capacity,
+            // masked fixed-slot-append path in BOTH causal and non-causal form:
+            // the standard additive causal-mask builder (`Where(And(mask, causal),
+            // 0, -inf)`) is frozen to physical capacity alongside the KV, so its
+            // last-row frontier is the true valid length regardless of the op's
+            // `is_causal` attribute (the causal frontier and the padding frontier
+            // coincide at the last query row). When `dev_len` is set the causal
+            // offset and score-loop extent are both derived from it (see
+            // `attention_row`), so no host length leaks into a captured causal
+            // decode. Every other path passes a null pointer and keeps the
+            // host-derived length, so eager/dense/GQA are bit-for-bit unchanged.
             let dev_length_eligible = has_past_key
                 && has_past_value
-                && !self.is_causal
                 && mask.kind != 0
                 && capacity_key
                 && capacity_value
@@ -2200,6 +2238,7 @@ impl StandardAttentionKernel {
             let split_cfg = attention_split_config(
                 q_seq == 1,
                 dev_length_eligible,
+                self.is_causal,
                 want_qk,
                 key_cap as u64,
                 total_rows_u,

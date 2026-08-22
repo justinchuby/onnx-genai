@@ -5,7 +5,7 @@ Build and run the committed four-model greedy-decode regression:
 ```bash
 source .cudaenv.sh
 cargo build --release -p onnx-genai-bench \
-  --features bench-native,cuda --bin profile_native
+  --features native-cuda --bin profile_native
 python3 scripts/check_native_ort_parity.py --gpu 0
 ```
 

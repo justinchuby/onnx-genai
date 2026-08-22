@@ -16,12 +16,14 @@ impl SamplingRng {
         Self { rng }
     }
 
-    pub(crate) fn for_row(seed: Option<u64>, row_index: usize) -> Self {
-        Self::new(seed.map(|seed| seed.wrapping_add(row_index as u64)))
+    pub(crate) fn for_row(seed: Option<u64>, _row_index: usize) -> Self {
+        // A request's deterministic stream must not depend on which physical
+        // continuous-batch slot happens to host it.
+        Self::new(seed)
     }
 
     pub(crate) fn value_for(&mut self, options: &GenerateOptions) -> f32 {
-        if options.greedy || options.temperature == 0.0 {
+        if options.selects_greedily() {
             0.0
         } else {
             self.rng.random()
@@ -100,7 +102,7 @@ pub(crate) fn default_sampler_for_options(
     options: &GenerateOptions,
     rng_value: f32,
 ) -> DefaultSampler {
-    if options.greedy || options.temperature == 0.0 {
+    if options.selects_greedily() {
         DefaultSampler::Greedy(GreedySampler)
     } else {
         DefaultSampler::Categorical(CategoricalSampler::new(rng_value))

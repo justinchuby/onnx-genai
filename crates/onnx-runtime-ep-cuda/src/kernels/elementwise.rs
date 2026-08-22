@@ -764,7 +764,10 @@ impl BroadcastMetadataCache {
             ));
         }
         if self.ptr != 0 {
-            self.runtime.synchronize()?;
+            // Shape churn retires storage an earlier launch may still read.
+            // Unlike trailing per-op eager synchronization, this lifetime
+            // boundary cannot be deferred.
+            self.runtime.drain_for_unmap()?;
         }
 
         let metadata = broadcast_metadata(a_shape, b_shape, out_shape);
@@ -1339,13 +1342,7 @@ mod tests {
 
     #[test]
     fn silu_mul_f16_matches_reference_with_half2_tail() {
-        let previous_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let runtime = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
-            .ok()
-            .flatten();
-        std::panic::set_hook(previous_hook);
-        let Some(runtime) = runtime else {
+        let Some(runtime) = crate::test_support::maybe_runtime() else {
             eprintln!("skipping fused SiluMul fp16 parity test: CUDA runtime unavailable");
             return;
         };
@@ -1439,13 +1436,7 @@ mod tests {
 
     #[test]
     fn decomposed_silu_mul_bf16_is_byte_exact_vs_two_op_bf16_reference() {
-        let previous_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let runtime = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
-            .ok()
-            .flatten();
-        std::panic::set_hook(previous_hook);
-        let Some(runtime) = runtime else {
+        let Some(runtime) = crate::test_support::maybe_runtime() else {
             eprintln!("skipping decomposed SiluMul bf16 parity test: CUDA runtime unavailable");
             return;
         };
@@ -1648,20 +1639,15 @@ mod claim_probes {
     use std::ffi::c_void;
     use std::sync::{Arc, Mutex};
 
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
     use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, Kernel, TensorMut, TensorView};
     use onnx_runtime_ir::{DataType, DeviceId};
 
-    use super::{BinaryKernel, BinaryOp, BroadcastMetadataCache};
+    use super::{BinaryKernel, BinaryOp, BroadcastMetadataCache, broadcast_metadata, u64_bytes};
     use crate::CudaRuntime;
 
     fn maybe_runtime() -> Option<Arc<CudaRuntime>> {
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let rt = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
-            .ok()
-            .flatten();
-        std::panic::set_hook(previous);
-        rt
+        crate::test_support::maybe_runtime()
     }
 
     fn run_i32_binary(runtime: &Arc<CudaRuntime>, op: BinaryOp, a: &[i32], b: &[i32]) -> Vec<i32> {
@@ -1754,6 +1740,83 @@ mod claim_probes {
                 .collect();
             let actual = run_i32_binary(&runtime, op, &a, &b);
             assert_eq!(actual, expected, "i32 {op:?} diverged on GPU");
+        }
+    }
+
+    #[test]
+    fn broadcast_metadata_shape_churn_waits_before_recycling_old_storage() {
+        let Some(runtime) = maybe_runtime() else {
+            eprintln!("skipping broadcast metadata lifetime probe: CUDA runtime unavailable");
+            return;
+        };
+        runtime.set_defer_eager_sync(true);
+        let read_after_delay = runtime
+            .nvrtc_function(
+                "broadcast_metadata_lifetime_test",
+                r#"
+extern "C" __global__ void read_after_delay(
+    const unsigned long long* metadata,
+    unsigned long long* out,
+    long long spin) {
+    long long start = clock64();
+    while (clock64() - start < spin) { }
+    *out = metadata[1];
+}
+"#,
+                "read_after_delay",
+            )
+            .unwrap();
+
+        let old_a = [1usize, 2];
+        let old_b = [2usize];
+        let old_out = [1usize, 2];
+        let new_a = [1usize, 4];
+        let new_b = [4usize];
+        let new_out = [1usize, 4];
+        let metadata_bytes = u64_bytes(&broadcast_metadata(&old_a, &old_b, &old_out)).len();
+
+        let mut cache = BroadcastMetadataCache::new(runtime.clone());
+        let old_ptr = cache.prepare(&old_a, &old_b, &old_out).unwrap();
+        let out_ptr = runtime.alloc_raw(std::mem::size_of::<u64>()).unwrap();
+
+        // Keep one same-class allocation pooled so replacement itself cannot
+        // synchronize through a fresh cuMemAlloc and accidentally hide the bug.
+        let spare = runtime.alloc_raw(metadata_bytes).unwrap();
+        unsafe { runtime.free_raw(spare).unwrap() };
+
+        let spin: i64 = 100_000_000;
+        let mut launch = runtime.stream().launch_builder(&read_after_delay);
+        launch.arg(&old_ptr).arg(&out_ptr).arg(&spin);
+        unsafe { launch.launch(LaunchConfig::for_num_elems(1)).unwrap() };
+
+        let hits_before = runtime.raw_pool_hits();
+        cache.prepare(&new_a, &new_b, &new_out).unwrap();
+        assert!(
+            runtime.raw_pool_hits() > hits_before,
+            "metadata replacement must use the prewarmed pool rather than a synchronizing allocation"
+        );
+
+        // The old block is now eligible for reuse, but only after prepare's
+        // lifetime barrier proved the delayed reader completed.
+        let recycled = runtime.alloc_raw(metadata_bytes).unwrap();
+        assert_eq!(
+            recycled, old_ptr,
+            "the test must recycle the exact retired metadata allocation"
+        );
+        let poison = vec![u64::MAX; metadata_bytes / std::mem::size_of::<u64>()];
+        unsafe { runtime.htod(u64_bytes(&poison), recycled).unwrap() };
+
+        let mut observed = [0_u8; std::mem::size_of::<u64>()];
+        unsafe { runtime.dtoh(&mut observed, out_ptr).unwrap() };
+        assert_eq!(
+            u64::from_ne_bytes(observed),
+            old_out[1] as u64,
+            "the in-flight launch read recycled metadata instead of its original shape"
+        );
+
+        unsafe {
+            runtime.free_raw(recycled).unwrap();
+            runtime.free_raw(out_ptr).unwrap();
         }
     }
 }

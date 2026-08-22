@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use onnx_runtime_ep_api::{
     CaptureSupport, Cost, EpConfig, EpError, ExecutionProviderCapabilities, Fence, Kernel,
@@ -7,6 +7,264 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_memory_governor::MemoryRole;
 
 use super::*;
+
+struct DeferredValidationKernel {
+    fail_next: Arc<AtomicBool>,
+    validation_latch: Arc<AtomicU32>,
+    executions: Arc<AtomicUsize>,
+}
+
+impl Kernel for DeferredValidationKernel {
+    fn execute(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+    ) -> onnx_runtime_ep_api::Result<()> {
+        if inputs.len() != 1
+            || outputs.len() != 1
+            || inputs[0].byte_size() != outputs[0].byte_size()
+        {
+            return Err(EpError::KernelFailed(
+                "deferred validation test kernel received invalid I/O".into(),
+            ));
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                inputs[0].data.0.cast::<u8>(),
+                outputs[0].data.0.cast::<u8>(),
+                inputs[0].byte_size(),
+            );
+        }
+        self.executions.fetch_add(1, Ordering::Relaxed);
+        if self.fail_next.swap(false, Ordering::Relaxed) {
+            self.validation_latch.store(0x40, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+}
+
+struct DeferredValidationEp {
+    cpu: CpuExecutionProvider,
+    fail_next: Arc<AtomicBool>,
+    validation_latch: Arc<AtomicU32>,
+    executions: Arc<AtomicUsize>,
+    synchronized_executions: Arc<AtomicUsize>,
+    resets: Arc<AtomicUsize>,
+    reset_failure_at: Arc<AtomicUsize>,
+}
+
+impl DeferredValidationEp {
+    fn new() -> Self {
+        let mut cpu = CpuExecutionProvider::new();
+        cpu.initialize(&EpConfig::default()).unwrap();
+        Self {
+            cpu,
+            fail_next: Arc::new(AtomicBool::new(true)),
+            validation_latch: Arc::new(AtomicU32::new(0)),
+            executions: Arc::new(AtomicUsize::new(0)),
+            synchronized_executions: Arc::new(AtomicUsize::new(0)),
+            resets: Arc::new(AtomicUsize::new(0)),
+            reset_failure_at: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl ExecutionProvider for DeferredValidationEp {
+    fn name(&self) -> &str {
+        "deferred_validation_test_ep"
+    }
+
+    fn device_type(&self) -> DeviceType {
+        DeviceType::Cpu
+    }
+
+    fn device_id(&self) -> onnx_runtime_ir::DeviceId {
+        onnx_runtime_ir::DeviceId::cpu()
+    }
+
+    fn initialize(&mut self, _config: &EpConfig) -> onnx_runtime_ep_api::Result<()> {
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> onnx_runtime_ep_api::Result<()> {
+        Ok(())
+    }
+
+    fn supports_op(
+        &self,
+        op: &Node,
+        _opset: u64,
+        _shapes: &[Shape],
+        _input_dtypes: &[DataType],
+        _layouts: &[TensorLayout],
+    ) -> KernelMatch {
+        if op.op_type == "DeferredValidation" {
+            KernelMatch::Supported {
+                cost: Cost::ZERO,
+                required_input_layouts: None,
+                output_layouts: vec![TensorLayout::contiguous()],
+            }
+        } else {
+            KernelMatch::unsupported("test EP only supports DeferredValidation")
+        }
+    }
+
+    fn get_kernel(
+        &self,
+        _op: &Node,
+        _shapes: &[Vec<usize>],
+        _opset: u64,
+    ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
+        Ok(Box::new(DeferredValidationKernel {
+            fail_next: Arc::clone(&self.fail_next),
+            validation_latch: Arc::clone(&self.validation_latch),
+            executions: Arc::clone(&self.executions),
+        }))
+    }
+
+    fn allocate(&self, size: usize, alignment: usize) -> onnx_runtime_ep_api::Result<DeviceBuffer> {
+        self.cpu.allocate(size, alignment)
+    }
+
+    fn deallocate(&self, buffer: DeviceBuffer) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.deallocate(buffer)
+    }
+
+    fn copy(
+        &self,
+        src: &DeviceBuffer,
+        dst: &mut DeviceBuffer,
+        size: usize,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.copy(src, dst, size)
+    }
+
+    fn copy_async(
+        &self,
+        src: &DeviceBuffer,
+        dst: &mut DeviceBuffer,
+        size: usize,
+    ) -> onnx_runtime_ep_api::Result<Fence> {
+        self.cpu.copy_async(src, dst, size)
+    }
+
+    fn sync(&self) -> onnx_runtime_ep_api::Result<()> {
+        self.synchronized_executions
+            .store(self.executions.load(Ordering::Relaxed), Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn reset_device_validation_error(&self) -> onnx_runtime_ep_api::Result<()> {
+        let call = self.resets.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.reset_failure_at.load(Ordering::Relaxed) == call {
+            return Err(EpError::KernelFailed(
+                "forced device validation reset failure".into(),
+            ));
+        }
+        self.validation_latch.store(0, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn check_device_capture_error(&self) -> onnx_runtime_ep_api::Result<u32> {
+        if self.synchronized_executions.load(Ordering::Relaxed)
+            != self.executions.load(Ordering::Relaxed)
+        {
+            return Err(EpError::KernelFailed(
+                "device validation latch checked before synchronization".into(),
+            ));
+        }
+        Ok(self.validation_latch.load(Ordering::Relaxed))
+    }
+}
+
+#[test]
+fn deferred_device_validation_is_request_local_and_checked_after_sync() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let input = graph.create_named_value("input", DataType::Float32, static_shape([2]));
+    graph.add_input(input);
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([2]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "DeferredValidation",
+        vec![Some(input)],
+        vec![output],
+    ));
+    graph.add_output(output);
+
+    let ep = Arc::new(DeferredValidationEp::new());
+    let resets = Arc::clone(&ep.resets);
+    let executions = Arc::clone(&ep.executions);
+    let synchronized = Arc::clone(&ep.synchronized_executions);
+    let mut executor = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        ep as Arc<dyn ExecutionProvider>,
+    )
+    .unwrap();
+    let input = Tensor::from_f32(&[2], &[3.0, 7.0]).unwrap();
+
+    let first = executor.run(&[("input", &input)]).unwrap_err();
+    assert!(
+        first
+            .to_string()
+            .contains("device validation failed (flags=0x40)"),
+        "the run that set the deferred latch must fail after synchronization: {first}"
+    );
+
+    let second = executor
+        .run(&[("input", &input)])
+        .expect("the prior run's validation latch must not poison a healthy request");
+    assert_eq!(second[0].to_vec_f32(), vec![3.0, 7.0]);
+    assert_eq!(executions.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        synchronized.load(Ordering::Relaxed),
+        executions.load(Ordering::Relaxed),
+        "validation must be checked only after the request synchronization boundary"
+    );
+    assert_eq!(
+        resets.load(Ordering::Relaxed),
+        4,
+        "each request must reset the latch before execution and after checking it"
+    );
+}
+
+#[test]
+fn device_validation_reset_failure_is_not_ignored_after_a_run() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let input = graph.create_named_value("input", DataType::Float32, static_shape([1]));
+    graph.add_input(input);
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "DeferredValidation",
+        vec![Some(input)],
+        vec![output],
+    ));
+    graph.add_output(output);
+
+    let ep = Arc::new(DeferredValidationEp::new());
+    ep.fail_next.store(false, Ordering::Relaxed);
+    ep.reset_failure_at.store(2, Ordering::Relaxed);
+    let mut executor = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        Arc::clone(&ep) as Arc<dyn ExecutionProvider>,
+    )
+    .unwrap();
+    let input = Tensor::from_f32(&[1], &[5.0]).unwrap();
+
+    let error = executor.run(&[("input", &input)]).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("forced device validation reset failure"),
+        "the post-run latch reset error must propagate: {error}"
+    );
+    assert_eq!(ep.executions.load(Ordering::Relaxed), 1);
+    assert_eq!(ep.resets.load(Ordering::Relaxed), 2);
+}
 
 #[test]
 fn phase_profile_gating_and_accumulation() {
@@ -1248,10 +1506,19 @@ fn growing_symbol_alias_keeps_downstream_consumer_eager() {
         growing.contains(&seq_kv),
         "the growing KV symbol must be collected, got {growing:?}"
     );
+    // The broadcast of the growing `seq_kv` against `batch` cannot claim the two
+    // are equal, so inference names the result with a fresh extent derived from
+    // both. What must hold either way is that whatever symbol lands on the
+    // aliasing op's OUTPUT is itself disqualifying — otherwise the downstream
+    // consumer, which only ever sees that symbol, would look capture-eligible.
+    let alias_rep = match graph.value(aliased_out).shape[0] {
+        Dim::Symbolic(s) => s,
+        ref other => panic!("expected a symbolic aliased extent, got {other:?}"),
+    };
     assert!(
-        growing.contains(&batch),
-        "the representative `batch` unified with a growing symbol must be in the CLOSED growing \
-         set, got {growing:?}"
+        growing.contains(&alias_rep),
+        "the extent a growing symbol broadcast into must be in the CLOSED growing set, \
+         got {growing:?} for {alias_rep:?}"
     );
     assert!(
         !node_capture_seq_independent(&graph, &aliased_op, &growing),
@@ -1346,11 +1613,15 @@ fn matmul_batch_alias_keeps_downstream_consumer_eager() {
         growing.contains(&seq_kv),
         "the growing KV symbol must be collected, got {growing:?}"
     );
+    let matmul_rep = match graph.value(matmul_out).shape[0] {
+        Dim::Symbolic(s) => s,
+        ref other => panic!("expected a symbolic MatMul batch extent, got {other:?}"),
+    };
     assert!(
-        growing.contains(&batch),
-        "the representative `batch` a MatMul batch-dim broadcast unified with the growing \
-         `seq_kv` must be in the CLOSED growing set — this FAILS on an elementwise-only closure, \
-         got {growing:?}"
+        growing.contains(&matmul_rep),
+        "the extent a MatMul batch-dim broadcast folded the growing `seq_kv` into must be in the \
+         CLOSED growing set — this FAILS on an elementwise-only closure, got {growing:?} for \
+         {matmul_rep:?}"
     );
     assert!(
         !node_capture_seq_independent(&graph, &consumer, &growing),
@@ -1994,9 +2265,36 @@ fn only_capacity_aware_inputs_keep_physical_capacity() {
     assert!(!kernel_input_uses_padded_capacity(&indexer_cast, 0));
 }
 
+/// A decline is only actionable if it names the consumer that caused it.
+/// `describe_non_padded_consumer` is the single place that formats that name,
+/// and it is derived from the same allowlist as the predicate so the two cannot
+/// drift apart.
+#[test]
+fn non_padded_consumers_are_named_for_attribution() {
+    let mut cast = Node::new(NodeId(0), "Cast", vec![], vec![]);
+    cast.name = "model/Cast_node_5".to_string();
+    assert_eq!(
+        describe_non_padded_consumer(&cast, 0).as_deref(),
+        Some("model/Cast_node_5(Cast)[input 0]")
+    );
+
+    // A capacity-safe consumer is not an offender and must not be reported,
+    // otherwise every model would look like it had a blocker.
+    let shape = Node::new(NodeId(1), "Shape", vec![], vec![]);
+    assert_eq!(describe_non_padded_consumer(&shape, 0), None);
+
+    // Non-zero slots are outside the allowlist regardless of op type, and an
+    // unnamed node still has to produce a usable message.
+    let unnamed = Node::new(NodeId(2), "Shape", vec![], vec![]);
+    assert_eq!(
+        describe_non_padded_consumer(&unnamed, 1).as_deref(),
+        Some("<unnamed>(Shape)[input 1]")
+    );
+}
+
 // A capacity-form default-domain `Attention`: mask at input 3, KV cache at
-// inputs 4/5, no `is_causal` attribute — so it derives the valid length from the
-// mask frontier and binds the KV cache at physical capacity.
+// inputs 4/5 — so it derives the valid length from the mask frontier and binds
+// the KV cache at physical capacity, in either the causal or non-causal form.
 fn capacity_form_attention(id: u32, q: ValueId, mask: ValueId, out: ValueId) -> Node {
     Node::new(
         NodeId(id),
@@ -2009,8 +2307,9 @@ fn capacity_form_attention(id: u32, q: ValueId, mask: ValueId, out: ValueId) -> 
 #[test]
 fn capacity_form_attention_mask_input_classifier() {
     // The mask slot (input 3) of a capacity-form `Attention` is a valid frozen-mask
-    // leaf; input 3 of a causal-attribute `Attention` (which reads the cache extent
-    // as the valid length) is not, and neither is a non-mask slot.
+    // leaf in both the non-causal and causal form (the frozen additive mask carries
+    // the valid length on-device either way); a non-mask slot is not, and neither is
+    // a masked `Attention` that lacks the KV cache bindings.
     let q = ValueId(0);
     let capacity = capacity_form_attention(0, q, q, q);
     assert!(is_capacity_form_attention_mask_input(&capacity, 3));
@@ -2022,9 +2321,20 @@ fn capacity_form_attention_mask_input_classifier() {
         .attributes
         .insert("is_causal".into(), Attribute::Int(1));
     assert!(
-        !is_capacity_form_attention_mask_input(&causal, 3),
-        "an is_causal Attention reads the cache extent as valid length, not the mask frontier"
+        is_capacity_form_attention_mask_input(&causal, 3),
+        "a frozen causal additive mask carries the valid length at its last-row frontier, \
+         so the causal capacity-form Attention is a valid frozen-mask leaf"
     );
+
+    // A masked `Attention` with no past KV bindings (inputs 4/5 absent) is not a
+    // capacity-form leaf regardless of causality.
+    let mask_only = Node::new(
+        NodeId(2),
+        "Attention",
+        vec![Some(q), Some(q), Some(q), Some(q)],
+        vec![q],
+    );
+    assert!(!is_capacity_form_attention_mask_input(&mask_only, 3));
 }
 
 // Build the standard additive causal-mask builder cone feeding a capacity-form
@@ -2137,6 +2447,199 @@ fn vestigial_window_mask_builder_routes_to_padded_capacity() {
 }
 
 #[test]
+fn deepseek_shape_feeding_slice_window_keeps_logical_width() {
+    use onnx_runtime_ir::static_shape;
+    // DeepSeek-V2-Lite's HF-style causal-mask builder reads `Shape(attention_mask)`
+    // and feeds it into `Sub`→`Slice` query-position arithmetic:
+    //   Slice(CumSum(mask), start = Shape(mask) - q_seq, end = Shape(mask)).
+    // `Shape` returns the *physical* padded width, so freezing the mask to
+    // capacity selects query positions [max_len-q_seq .. max_len) instead of
+    // [0 .. q_seq), producing a non-causal mask and incoherent decode. When the
+    // `Shape` output is consumed like this the binding MUST keep exposing its
+    // logical valid length (regression guard for the CUDA-EP coherence fix).
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let sh = || static_shape([1]);
+
+    let mask = graph.create_named_value("attention_mask", DataType::Int64, sh());
+    graph.add_input(mask);
+    let q = graph.create_named_value("q", DataType::Float32, sh());
+
+    // Physical-extent read that is *consumed* by the window arithmetic.
+    let shp = graph.create_named_value("shp", DataType::Int64, sh());
+    graph.insert_node(Node::new(NodeId(0), "Shape", vec![Some(mask)], vec![shp]));
+    let start = graph.create_named_value("start", DataType::Int64, sh());
+    graph.insert_node(Node::new(NodeId(1), "Sub", vec![Some(shp)], vec![start]));
+
+    // Causal branch: CumSum → Slice(start .. Shape) → Unsqueeze → GreaterOrEqual.
+    let cumsum = graph.create_named_value("cumsum", DataType::Int64, sh());
+    graph.insert_node(Node::new(
+        NodeId(2),
+        "CumSum",
+        vec![Some(mask)],
+        vec![cumsum],
+    ));
+    let sliced = graph.create_named_value("sliced", DataType::Int64, sh());
+    graph.insert_node(Node::new(
+        NodeId(3),
+        "Slice",
+        vec![Some(cumsum), Some(start), Some(shp)],
+        vec![sliced],
+    ));
+    let unsq0 = graph.create_named_value("unsq0", DataType::Int64, sh());
+    graph.insert_node(Node::new(
+        NodeId(4),
+        "Unsqueeze",
+        vec![Some(sliced)],
+        vec![unsq0],
+    ));
+    let ge = graph.create_named_value("ge", DataType::Bool, sh());
+    graph.insert_node(Node::new(
+        NodeId(5),
+        "GreaterOrEqual",
+        vec![Some(unsq0)],
+        vec![ge],
+    ));
+    let where_o = graph.create_named_value("where", DataType::Float32, sh());
+    graph.insert_node(Node::new(NodeId(6), "Where", vec![Some(ge)], vec![where_o]));
+    let mask_bias = graph.create_named_value("mask_bias", DataType::Float32, sh());
+    graph.insert_node(Node::new(
+        NodeId(7),
+        "Unsqueeze",
+        vec![Some(where_o)],
+        vec![mask_bias],
+    ));
+    let attn = graph.create_named_value("attn", DataType::Float32, sh());
+    graph.insert_node(capacity_form_attention(8, q, mask_bias, attn));
+    graph.add_output(attn);
+
+    assert!(
+        !mask_binding_feeds_capacity_form_attention(&graph, mask),
+        "DeepSeek Shape(mask)→Sub→Slice window arithmetic must keep logical width"
+    );
+}
+
+/// Build `attention_mask → Cast → Unsqueeze → Expand(target) → Unsqueeze →
+/// capacity-form Attention`, the HY-MT1.5 mask builder. `mask_derived_target`
+/// picks whether the `Expand` target shape is built from `Shape(mask)` (the real
+/// model) or from an unrelated value.
+fn expand_mask_builder_graph(mask_derived_target: bool) -> (Graph, ValueId) {
+    use onnx_runtime_ir::static_shape;
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let sh = || static_shape([1]);
+
+    let mask = graph.create_named_value("attention_mask", DataType::Int64, sh());
+    graph.add_input(mask);
+    let q = graph.create_named_value("q", DataType::Float32, sh());
+    let other = graph.create_named_value("input_ids", DataType::Int64, sh());
+    graph.add_input(other);
+
+    let cast = graph.create_named_value("cast", DataType::Float32, sh());
+    graph.insert_node(Node::new(NodeId(0), "Cast", vec![Some(mask)], vec![cast]));
+    let unsq = graph.create_named_value("unsq", DataType::Float32, sh());
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "Unsqueeze",
+        vec![Some(cast)],
+        vec![unsq],
+    ));
+
+    // Target axes: batch/query from `input_ids`, and the mask length axis from
+    // either `Shape(mask)` (self-consistent) or `Shape(input_ids)` (not).
+    let shape_other = graph.create_named_value("shape_other", DataType::Int64, sh());
+    graph.insert_node(Node::new(
+        NodeId(2),
+        "Shape",
+        vec![Some(other)],
+        vec![shape_other],
+    ));
+    let len_axis = if mask_derived_target {
+        let shape_mask = graph.create_named_value("shape_mask", DataType::Int64, sh());
+        graph.insert_node(Node::new(
+            NodeId(3),
+            "Shape",
+            vec![Some(mask)],
+            vec![shape_mask],
+        ));
+        shape_mask
+    } else {
+        let shape_other2 = graph.create_named_value("shape_other2", DataType::Int64, sh());
+        graph.insert_node(Node::new(
+            NodeId(3),
+            "Shape",
+            vec![Some(other)],
+            vec![shape_other2],
+        ));
+        shape_other2
+    };
+    let target = graph.create_named_value("target", DataType::Int64, sh());
+    graph.insert_node(Node::new(
+        NodeId(4),
+        "Concat",
+        vec![Some(shape_other), Some(len_axis)],
+        vec![target],
+    ));
+
+    let expanded = graph.create_named_value("expanded", DataType::Float32, sh());
+    graph.insert_node(Node::new(
+        NodeId(5),
+        "Expand",
+        vec![Some(unsq), Some(target)],
+        vec![expanded],
+    ));
+    let mask_bias = graph.create_named_value("mask_bias", DataType::Float32, sh());
+    graph.insert_node(Node::new(
+        NodeId(6),
+        "Unsqueeze",
+        vec![Some(expanded)],
+        vec![mask_bias],
+    ));
+    let attn = graph.create_named_value("attn", DataType::Float32, sh());
+    graph.insert_node(capacity_form_attention(7, q, mask_bias, attn));
+    graph.add_output(attn);
+    (graph, mask)
+}
+
+/// HY-MT1.5's builder broadcasts the mask with `Expand`, whose target shape
+/// carries the mask length axis from `Shape(mask)` itself. Freezing is then a
+/// uniform substitution — the mask is expanded to exactly its own frozen width —
+/// so the binding is decode-freeze-safe and the decode step may capture.
+///
+/// Static freezing is still refused, because `Shape(mask)` is *consumed*: the
+/// multi-token prefill window needs the logical length. Only the weaker
+/// decode-time predicate holds.
+#[test]
+fn expand_with_mask_derived_target_is_decode_freeze_safe() {
+    let (graph, mask) = expand_mask_builder_graph(true);
+    assert!(
+        mask_binding_feeds_additive_causal_builder(&graph, mask),
+        "an Expand whose target length axis comes from Shape(mask) must be decode-freeze-safe"
+    );
+    assert!(
+        !mask_binding_feeds_capacity_form_attention(&graph, mask),
+        "a consumed Shape(mask) must still refuse *static* freezing"
+    );
+}
+
+/// The same builder, but the `Expand` target sources the length axis from
+/// somewhere the substitution does not reach. A mask frozen to `max_len` could
+/// not broadcast against a target still carrying the logical length, so this
+/// must be refused under both policies.
+#[test]
+fn expand_with_foreign_target_is_rejected() {
+    let (graph, mask) = expand_mask_builder_graph(false);
+    assert!(
+        !mask_binding_feeds_additive_causal_builder(&graph, mask),
+        "an Expand target not derived from Shape(mask) must not be freeze-safe"
+    );
+    assert!(
+        !mask_binding_feeds_capacity_form_attention(&graph, mask),
+        "an Expand target not derived from Shape(mask) must not be statically freezable"
+    );
+}
+
+#[test]
 fn minimal_cast_to_capacity_attention_routes_to_padded_capacity() {
     use onnx_runtime_ir::static_shape;
     // The tiny-fixture shape: attention_mask → Cast(bool) → capacity-form Attention.
@@ -2190,26 +2693,20 @@ fn glm_indexer_add_mask_keeps_logical_width() {
 #[test]
 fn mask_builder_without_capacity_attention_is_rejected() {
     use onnx_runtime_ir::static_shape;
-    // A mask cone that ends at an is_causal Attention (reads cache extent as valid
-    // length), or reaches no Attention at all, must not be classified padded-safe.
+    // A mask cone that reaches no `Attention` at all (only a Cast to a graph
+    // output) must not be classified padded-safe: there is no capacity-form
+    // consumer, so the mask keeps exposing its logical valid length.
     let mut graph = Graph::new();
     graph.opset_imports.insert(String::new(), 17);
     let sh = || static_shape([1]);
     let mask = graph.create_named_value("attention_mask", DataType::Int64, sh());
     graph.add_input(mask);
-    let q = graph.create_named_value("q", DataType::Float32, sh());
     let cast = graph.create_named_value("cast", DataType::Float32, sh());
     graph.insert_node(Node::new(NodeId(0), "Cast", vec![Some(mask)], vec![cast]));
-    let attn = graph.create_named_value("attn", DataType::Float32, sh());
-    let mut causal = capacity_form_attention(1, q, cast, attn);
-    causal
-        .attributes
-        .insert("is_causal".into(), Attribute::Int(1));
-    graph.insert_node(causal);
-    graph.add_output(attn);
+    graph.add_output(cast);
     assert!(
         !mask_binding_feeds_capacity_form_attention(&graph, mask),
-        "an is_causal terminal Attention is not a capacity-form mask consumer"
+        "a mask cone reaching no capacity-form Attention is not padded-safe"
     );
 }
 
@@ -2285,6 +2782,202 @@ fn mask_builder_to_attention_without_past_kv_is_rejected() {
     assert!(
         !mask_binding_feeds_capacity_form_attention(&graph, mask),
         "a mask cone reaching only a KV-less Attention must not be padded-safe"
+    );
+}
+
+// Build the DeepSeek-V2-Lite additive causal-mask builder cone with SYMBOLIC
+// shapes (the MLA / HF-causal-mask topology), so the mask/bias length symbol is
+// visible to the capture classifier. Returns the graph, the `attention_mask`
+// binding, the mask/bias length symbol, and the capacity-form `Attention` node.
+fn v2lite_symbolic_mask_graph() -> (Graph, ValueId, SymbolId, Node) {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    // The mask / total-sequence length axis (the symbol whose non-pinning keeps
+    // the whole cone + Attention eager). Lives on the mask input and its cone,
+    // NOT on any KV slot.
+    let seq = graph.create_symbol(None);
+    let m2 = |b, s| vec![sym(b), sym(s)];
+    let m3 = |b, s| vec![sym(b), st(1), sym(s)];
+
+    let mask = graph.create_named_value("attention_mask", DataType::Int64, m2(batch, seq));
+    graph.add_input(mask);
+    let cumsum = graph.create_named_value("cumsum", DataType::Int64, m2(batch, seq));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "CumSum",
+        vec![Some(mask)],
+        vec![cumsum],
+    ));
+    let unsq0 = graph.create_named_value("unsq0", DataType::Int64, m3(batch, seq));
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "Unsqueeze",
+        vec![Some(cumsum)],
+        vec![unsq0],
+    ));
+    let ge = graph.create_named_value("ge", DataType::Bool, m3(batch, seq));
+    graph.insert_node(Node::new(
+        NodeId(2),
+        "GreaterOrEqual",
+        vec![Some(unsq0)],
+        vec![ge],
+    ));
+    let unsq1 = graph.create_named_value("unsq1", DataType::Int64, m3(batch, seq));
+    graph.insert_node(Node::new(
+        NodeId(3),
+        "Unsqueeze",
+        vec![Some(mask)],
+        vec![unsq1],
+    ));
+    let padbool = graph.create_named_value("padbool", DataType::Bool, m3(batch, seq));
+    graph.insert_node(Node::new(
+        NodeId(4),
+        "Cast",
+        vec![Some(unsq1)],
+        vec![padbool],
+    ));
+    let and = graph.create_named_value("and", DataType::Bool, m3(batch, seq));
+    graph.insert_node(Node::new(
+        NodeId(5),
+        "And",
+        vec![Some(ge), Some(padbool)],
+        vec![and],
+    ));
+    let where_o = graph.create_named_value("where", DataType::Float32, m3(batch, seq));
+    graph.insert_node(Node::new(
+        NodeId(6),
+        "Where",
+        vec![Some(and)],
+        vec![where_o],
+    ));
+    let cast_o = graph.create_named_value("cast", DataType::Float32, m3(batch, seq));
+    graph.insert_node(Node::new(
+        NodeId(7),
+        "Cast",
+        vec![Some(where_o)],
+        vec![cast_o],
+    ));
+    let bias = graph.create_named_value(
+        "mask_bias",
+        DataType::Float32,
+        vec![sym(batch), st(1), st(1), sym(seq)],
+    );
+    graph.insert_node(Node::new(
+        NodeId(8),
+        "Unsqueeze",
+        vec![Some(cast_o)],
+        vec![bias],
+    ));
+
+    // Capacity-form `Attention` consuming the additive bias (input 3) with past
+    // KV bindings at inputs 4/5.
+    let q = graph.create_named_value("q", DataType::Float32, vec![sym(batch), st(1), st(256)]);
+    let attn =
+        graph.create_named_value("attn", DataType::Float32, vec![sym(batch), st(1), st(256)]);
+    let node = capacity_form_attention(10, q, bias, attn);
+    graph.insert_node(node.clone());
+    graph.add_output(attn);
+    (graph, mask, seq, node)
+}
+
+#[test]
+fn freeze_safe_mask_symbols_are_collected_and_admit_the_attention() {
+    // The DeepSeek-V2-Lite decode-freeze-safe mask/bias length symbol is NOT a
+    // KV-slot symbol, so `collect_capacity_pinned_kv_symbols` misses it and it
+    // keeps the whole causal-mask cone + every Attention that consumes the bias
+    // eager. `collect_freeze_safe_mask_symbols` recovers it, and pinning it makes
+    // the Attention capture-eligible.
+    let (mut graph, mask, seq, attn) = v2lite_symbolic_mask_graph();
+
+    // Precondition: this binding is classified decode-freeze-safe.
+    assert!(
+        mask_binding_feeds_additive_causal_builder(&graph, mask),
+        "the symbolic v2lite mask cone must be decode-freeze-safe"
+    );
+
+    // Make the mask/bias length symbol disqualifying (as inference minting does
+    // for the real model) so the Attention is baseline-eager on its bias edge.
+    graph.symbol_opaque.push(seq);
+    let baseline = compute_capture_disqualifying_symbols(&graph);
+    assert!(
+        baseline.contains(&seq),
+        "the mask/bias length symbol must be disqualifying baseline, got {baseline:?}"
+    );
+    assert!(
+        !node_capture_seq_independent(&graph, &attn, &baseline),
+        "without the pin the bias-consuming Attention must stay eager"
+    );
+
+    // The KV-slot pin alone does NOT recover the mask/bias symbol.
+    let kv_pinned = collect_capacity_pinned_kv_symbols(&graph);
+    assert!(
+        !kv_pinned.contains(&seq),
+        "the mask/bias symbol lives off the KV slots, so the KV pin must miss it, got {kv_pinned:?}"
+    );
+
+    // The freeze-safe mask collector recovers it.
+    let mask_pinned = collect_freeze_safe_mask_symbols(&graph);
+    assert!(
+        mask_pinned.contains(&seq),
+        "collect_freeze_safe_mask_symbols must recover the mask/bias length symbol, got {mask_pinned:?}"
+    );
+
+    // Pinning it excludes it from the disqualifying set and admits the Attention.
+    let mut pinned = kv_pinned;
+    pinned.extend(mask_pinned);
+    let pinned_set = compute_capture_disqualifying_symbols_excluding(&graph, &pinned);
+    assert!(
+        !pinned_set.contains(&seq),
+        "the pinned mask/bias symbol must be excluded from the disqualifying set, got {pinned_set:?}"
+    );
+    assert!(
+        node_capture_seq_independent(&graph, &attn, &pinned_set),
+        "with the freeze-safe mask pin the Attention must be capture-eligible"
+    );
+
+    // Idempotent.
+    assert_eq!(
+        collect_freeze_safe_mask_symbols(&graph),
+        collect_freeze_safe_mask_symbols(&graph),
+    );
+}
+
+#[test]
+fn freeze_safe_mask_symbols_empty_for_non_freeze_safe_masks() {
+    // GLM-5.2's indexer mixes the mask into a logical-width score via `Add` (not
+    // an additive-mask-builder op), so the cone is NOT decode-freeze-safe and no
+    // symbol is collected — the mask keeps exposing its logical length every step
+    // and its symbol must never be pinned into capture.
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let sym = Dim::Symbolic;
+    let batch = graph.create_symbol(None);
+    let seq = graph.create_symbol(None);
+    let sh = |b, s| vec![sym(b), sym(s)];
+    let mask = graph.create_named_value("attention_mask", DataType::Int64, sh(batch, seq));
+    graph.add_input(mask);
+    let score = graph.create_named_value("indexer_score", DataType::Float32, sh(batch, seq));
+    let cast = graph.create_named_value("cast", DataType::Float32, sh(batch, seq));
+    graph.insert_node(Node::new(NodeId(0), "Cast", vec![Some(mask)], vec![cast]));
+    let add = graph.create_named_value("add", DataType::Float32, sh(batch, seq));
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "Add",
+        vec![Some(cast), Some(score)],
+        vec![add],
+    ));
+    graph.add_output(add);
+    assert!(
+        !mask_binding_feeds_additive_causal_builder(&graph, mask),
+        "the GLM indexer Add cone must NOT be decode-freeze-safe"
+    );
+    assert!(
+        collect_freeze_safe_mask_symbols(&graph).is_empty(),
+        "a non-freeze-safe mask must contribute no pinned symbols"
     );
 }
 
@@ -2969,6 +3662,7 @@ fn inference_session_fallback_workspace_grows_retries_and_reuses() {
         model_metadata: crate::ModelMetadata::default(),
         exec,
         decode_inline_exec: None,
+        verify_exec: None,
         ep_context_config: crate::EpContextDumpConfig::default(),
     };
 
@@ -3072,6 +3766,7 @@ fn prepared_session_reprepares_workspace_when_execution_rebuckets() {
         model_metadata: crate::ModelMetadata::default(),
         exec,
         decode_inline_exec: None,
+        verify_exec: None,
         ep_context_config: crate::EpContextDumpConfig::default(),
     };
 
@@ -4577,7 +5272,7 @@ fn unaligned_external_qmoe_keeps_route_first_enabled_and_matches_legacy() {
 
     let _restore = RestoreEnv(std::env::var_os(onnx_runtime_ep_cpu::WEIGHT_OFFLOAD_ENV));
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../onnx-runtime-ep-cpu/tests/fixtures/qmoe_weight_offload/model.onnx");
+        .join("../onnx-runtime-ep-cpu/tests/fixtures/qmoe_weight_offload/model.onnx.textproto");
     let input_values: Vec<f32> = (0..64).map(|index| index as f32 * 0.03125 - 1.0).collect();
     let router_values = vec![
         9.0, 0.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 9.0,
@@ -4916,13 +5611,77 @@ fn quarantined_op_type_is_forced_to_a_capture_recording_failed_seam() {
     // Quarantine the Cast op-type (as the capture retry loop does after a
     // kernel aborts recording) and re-check: it is now a forced eager seam
     // regardless of its resolved shapes or kernel capability.
-    exec.capture_quarantine_ops
+    exec.cap_mut()
+        .capture_quarantine_ops
         .insert(("ai.onnx".to_string(), "Cast".to_string()));
     let post = exec.node_capture_reason(&exec.plan[cast_pi], &resolved);
     assert_eq!(
         post.and_then(|decline| decline.seam_reason),
         Some(SeamReason::CaptureRecordingFailed),
         "a quarantined op-type must be forced to a CaptureRecordingFailed eager seam"
+    );
+}
+
+/// Per-slot host capture state isolates `Primary` (M=1 decode / greedy) from
+/// `Verify` (M=k+1 speculative verify). Retargeting the graph slot is a pure
+/// pointer move that must NOT reset the other slot — that is the invariant that
+/// lets the two captured graphs coexist and, crucially, keeps greedy (which only
+/// ever drives `Primary`) byte-identical when MTP flips the executor to `Verify`
+/// and back around each verify forward.
+#[test]
+fn set_graph_slot_is_non_resetting_and_per_slot_isolated() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let x = graph.create_named_value("x", DataType::Int64, static_shape([4]));
+    graph.add_input(x);
+    let y = graph.create_named_value("y", DataType::Float32, static_shape([4]));
+    let mut cast = Node::new(NodeId(0), "Cast", vec![Some(x)], vec![y]);
+    cast.attributes
+        .insert("to".into(), Attribute::Int(DataType::Float32 as i64));
+    graph.insert_node(cast);
+    graph.add_output(y);
+
+    let mut exec = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+    )
+    .unwrap();
+
+    // The main executor defaults to Primary (greedy's only slot).
+    assert_eq!(exec.graph_slot(), DeviceGraphSlot::Primary);
+    assert_eq!(DeviceGraphSlot::Primary.index(), 0);
+    assert_eq!(DeviceGraphSlot::Verify.index(), 1);
+
+    // Seed a distinctive marker into Primary's host capture state.
+    let primary_key = ("ai.onnx".to_string(), "PrimaryMark".to_string());
+    exec.cap_mut()
+        .capture_quarantine_ops
+        .insert(primary_key.clone());
+
+    // Flip to Verify: a pure retarget. Verify starts empty (no bleed from
+    // Primary), and Primary's marker survives untouched.
+    exec.set_graph_slot(DeviceGraphSlot::Verify).unwrap();
+    assert_eq!(exec.graph_slot(), DeviceGraphSlot::Verify);
+    assert!(
+        exec.cap().capture_quarantine_ops.is_empty(),
+        "Verify slot must not observe Primary's capture state"
+    );
+    let verify_key = ("ai.onnx".to_string(), "VerifyMark".to_string());
+    exec.cap_mut()
+        .capture_quarantine_ops
+        .insert(verify_key.clone());
+
+    // Flip back to Primary: its marker is still present (the switch did NOT
+    // reset it), and Verify's marker did not leak in.
+    exec.set_graph_slot(DeviceGraphSlot::Primary).unwrap();
+    assert!(
+        exec.cap().capture_quarantine_ops.contains(&primary_key),
+        "switching slots must not reset Primary's host capture state"
+    );
+    assert!(
+        !exec.cap().capture_quarantine_ops.contains(&verify_key),
+        "Verify's capture state must not leak into Primary"
     );
 }
 
@@ -6488,9 +7247,11 @@ fn gqa_fixed_capacity_kv_seq_symbol_is_pinned_and_admits_the_node() {
 // attention op does NOT read its cache as physical capacity — must NOT be pinned,
 // so its symbol stays disqualifying and the node stays eager.
 //
-// (1) A default-domain, CAUSAL `Attention` derives past length from the growing
-//     cache extent (not from a mask frontier), so its cache is not physical
-//     capacity: not pinned.
+// (1) A default-domain CAUSAL `Attention` with NO mask input (input 3 absent)
+//     derives past length from the growing cache extent (there is no mask
+//     frontier to read), so its cache is not physical capacity: not pinned.
+//     (A causal Attention WITH a frozen additive mask input IS a capacity form —
+//     covered by the classifier tests above.)
 // (2) `CompressedSparseAttention` has NO past-KV inputs (its records grow from
 //     total_sequence_length), so it cannot be a capacity form: not pinned.
 #[test]
@@ -7390,4 +8151,41 @@ fn prepare_workspace_resolves_deepseek_additive_mask_query_axis_exactly() {
         .resolve_planned_workspace_input_shape(mask, &symbols, NodeId(14), &attention, 3)
         .unwrap();
     assert_eq!(resolved, PlannedInputShape::Exact(vec![1, 1, 1, 2048]));
+}
+
+/// Weight-derived caches must be drained before the buffers they are keyed on
+/// are freed (#1726, #1735).
+///
+/// Both caches key entries on a weight's address and hold no claim on the memory
+/// there, so an entry that outlives its buffer can be served to whatever lands on
+/// that address next -- the right route, another model's numbers. Per-owner
+/// eviction closes the within-executor case; this ordering is what closes the
+/// cross-executor one, and it is invisible at runtime: reversing it produces no
+/// error, just a window in which a recycled address inherits stale entries.
+///
+/// Asserted over the source because the failure has no observable signal to
+/// probe for. Reversing the order in `Executor::drop` fails this test.
+#[test]
+fn weight_derived_caches_are_cleared_before_their_buffers_are_freed() {
+    let source = include_str!("mod.rs");
+    let drop_body = source
+        .split_once("impl Drop for Executor {")
+        .expect("Executor has a Drop impl")
+        .1;
+    let free = drop_body
+        .find("self.buffers.drain()")
+        .expect("the drop body frees the executor's buffers");
+    for clear in [
+        "clear_weight_transpose_caches()",
+        "clear_mlas_packed_caches()",
+    ] {
+        let at = drop_body
+            .find(clear)
+            .unwrap_or_else(|| panic!("the drop body must call {clear}"));
+        assert!(
+            at < free,
+            "{clear} runs after the buffers it protects are freed, leaving \
+             entries keyed on addresses the allocator may hand to the next model"
+        );
+    }
 }

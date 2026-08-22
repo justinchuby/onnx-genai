@@ -1,89 +1,62 @@
-# Gaff — History (compacted 2026-08-12)
+# Gaff — History (compacted 2026-08-19T16:40Z)
 
 ## Project context
 - Review specialist for onnx-genai correctness, runtime/loader boundaries, transactional semantics, and validation quality.
-- Joined 2026-07-12 after phases 1-4, tool use/grammar/chat-template, Qwen2.5-0.5B, Hermes E2E, and static-cache KV work were established.
+- Joined 2026-07-12. In gaff-13 wave, role expanded to kernel fusion engineering (CUDA, capture-safe).
 
-## Condensed prior record through 2026-08-11
-- Reviewed and approved multiple ORT2 loader, shape-inference, fused-domain, EPContext, C-ABI, external-data, and conformance changes after checking byte fidelity, dispatch invariants, path confinement, FFI behavior, and model-backed tests.
-- Used reviewer lockout discipline on real blockers: unauthenticated debug exposure, MatMul+Add fusion shape guard gaps, duplicate EPContext primary identity over-rejection, unsupported-op user-facing opset leakage, and thread/benchmark provenance issues.
-- Reviewed env var verifier false-positive, #31973 AVX2 LayerNorm, multiple rounds of PR #762 CUDA EP.
-- Helped consolidate performance and CUDA/native guidance; benchmark comparisons must be matched and reproducible.
-- CLI is a development/maintainer harness; `docs/research/cli/00-backlog.md` is the backlog source of truth.
-- PR #762 lockout chain (Sapper rejection → Nabil B1/B3/S4 fix → conditional pass → final ready) verified all four B items. Verify API absence before deferring — MemoryDevice_GetDeviceId existed in ORT 1.27 bindings.
+## Condensed prior record through 2026-08-14
 
-_Pre-2026-08-11 detailed dated entries archived to `history-archive.md`._
+**Review work (2026-08-11 to 2026-08-14):**
+- PR #762 (CUDA EP correctness): four rounds of focused delta review across commits c1d2556b5…bb280c0ea; substantive findings (test helper duplication, `validate_write_dtype` dead in production, `find_ort_lib_dir` drift) flagged non-blocking; ready-to-leave-draft verdict delivered.
+- microsoft/onnxruntime #31988 (LayerNorm perf): two review passes (pre/post Chew guard, commit a4aa076657); bit-identicality + routing invariance confirmed; kept draft pending GPU benchmarks on ≥2 GPU generations.
+- PR #31973 (evidence-accuracy fix): accuracy figures reproduced to 4 sig figs; nullptr MeanOut fix confirmed; test counts 41/2/43 verified; one nit (RMSNorm 3.3× figure optimistic vs measured 2.84×).
+- PR #960 (Marlin int4 M>1 GEMM, Deckard): 🟢 APPROVE. Rule 11 PASS (genuinely opt-in, SM80-gated, byte-identical fallback). Capture-safety valve family sound (4 caches, one contract). Env-var honesty PASS. Zero blocking defects.
 
-## 2026-08-11 — PR #762 final scoped delta review
+**Durable rules reinforced:**
+- Env-var honesty + byte-identical default-OFF fallback = portability contract for any tier-scoped kernel.
+- Reviewer lockout discipline: real blockers transfer revision ownership; do not revise own rejected artifacts.
+- Benchmark comparisons must be matched and reproducible; `validate_write_dtype` dead-in-production pattern must be flagged even if non-blocking.
 
-**Task:** Final delta review of commits `c1d2556b5` through `bb280c0ea`.
+_Detailed dated entries for 2026-08-11 through 2026-08-14 moved to history-archive.md._
 
-**Verdict:** No blockers. Ready.
+## 2026-08-19T16:40Z — SSM-reduce fusion + CudaRsqrtFusion (gaff-13, PR #1486)
 
-- EP name `"cpu_ep"` originates from `provider.rs:120`, distinct from ORT's `"CPUExecutionProvider"`.
-- `disable_cpu_ep_fallback=1` set before session creation in both test files.
-- `Session_GetEpGraphAssignmentInfo` + subgraph/node iteration logic correct in both copies.
-- BL1 shape assertions intact: mean/inv_std `[2, 3, 1]`, values `[2.5, 6.5, 10.5, 14.5, 18.5, 22.5]`.
-- No CUDA hardware claims in docs.
-- Substantive finding: helper duplication in test files — tech debt for follow-up.
+- **SSM-reduce fusion:** Routed f16 ReduceSum/ReduceMean to NVRTC block-reduction (cuDNN gate narrowed to fp32 only). Eliminates 3-kernel fp32 round-trip (20.7% of decoded GPU time per Deckard's per-op profile). Result: 214.4 → 231.6 tok/s (+7.4%), byte-identical, captures=4. Reclaim 0.346 ms = exactly Deckard's 0.3–0.4 ms prediction.
+- **CudaRsqrtFusion (glue-tail):** Collapsed `Sqrt+Reciprocal` → `rsqrt` (clean algebraic fusion, bit-identical, capture-safe, general). Largest glue buckets (mul 9%, transpose/split ~8%) rejected as layout-invasive or graph-structure-dependent. Result: 231.6 → 233.6 tok/s (+0.8%).
+- **Combined PR #1486:** 214.4 → 233.6 tok/s (**+8.9%**), byte-identical greedy tokens, captures=4 preserved.
+- **Lesson reinforced:** Profiling-guided fusion (Deckard's per-op profile → fix hypothesis → implementation) beats speculative fusion. Validate with a faithful captured-graph profile (nsys `--cuda-graph-trace=node`) before building any fusion.
 
-## 2026-08-11 — Review of microsoft/onnxruntime #31988 (initial)
+## 2026-08-19T18:20Z — LinearAttention decode fusion assigned (Deckard attribution)
 
-**Commit:** a4aa076657 | **Verdict:** SUBSTANTIVE — keep as draft
+Deckard's kernel attribution (deckard-8, 2026-08-19) identified the **gated-delta LinearAttention decode path as the active #1 lever** for closing the ~24% native-vs-ORT gap on qwen3.5-0.8b-hybrid fp16io. The decomposed native path (fp32 cuDNN ReduceSum + transpose/split/concat data-shuffle + reciprocal/sqrt/sigmoid/softplus/mul gating chain) costs ~700–900 µs/step vs ORT's fused `LinearAttentionDecodeColKernel` at ~250 µs/step. Task: fuse native's path into one fp16 kernel to recover ~650–900 µs/step → est. ~250–256 tok/s, closing most of the gap to ORT ~284–296. Int4 GEMV latency-hiding is #2 after this. Coordinator has dispatched Gaff to implement.
 
-- Bit-identicality: confirmed by tracing kernel warp assignment and reduction tree.
-- Routing invariance: confirmed — guard at line ~763 preserves n%8 requirement; pinning test non-vacuous.
-- Wide-n invariance: safe — threshold arithmetic correct, no overflow risk.
-- All 3 instantiations reachable; failsafe adequate; no persona leaks or perf claims.
-- One nit: "fills the target" comment misleading at very small n.
-- Recommendation: keep as draft until GPU benchmarks available.
+## 2026-08-19T19:00Z — LinearAttention fp32 ReduceSum fusion (gaff-14, PR #1495)
 
-## 2026-08-12 — Fresh review of microsoft/onnxruntime #31988 (post-Chew guard, a4aa076657)
+- **ReduceSum fusion (fp32):** Routed the fp32 cuDNN ReduceSum in the gated-delta LinearAttention decode path onto the NVRTC block reduction (fp32 analogue of #1486). Result: 200.95 → 209.71 tok/s (**+4.36%**), byte-identical, golden lock PASS. Coordinator independently re-validated on GPU0 (22.77 s). Admin-merged (squash); worktree swept.
 
-**Verdict:** SUBSTANTIVE — keep as draft. No blockers.
+## 2026-08-19T19:45Z — LinearAttention gating chain fusion (gaff-15, PR #1496)
 
-- Bit-identicality, routing invariance, wide-n invariance: all confirmed.
-- All 3 instantiations reachable; failsafe adequate.
-- Recommendation: keep draft until GPU benchmarks on ≥2 GPU generations.
+- **CudaLinearAttentionGatingFusion (structural pass):** Folds beta (Sigmoid) and decay (exp·Softplus) gate chains into the LinearAttention kernel epilogue. Drops ~5 elementwise nodes/layer × 18 layers from captured decode graph. Result: 229.4 → 237.4 tok/s (**+3.4%**), byte-identical, golden lock PASS. Coordinator independently re-validated on GPU0 (32.62 s). Admin-merged (squash). 3 new unit tests. Opt-out: `ONNX_GENAI_CUDA_DISABLE_LINATTN_GATING_FUSION=1`.
+- **Sub-lever #2 (layout / L2-norm addressing) — DEFERRED:** Needs a dedicated byte-lock harness before attempting: (1) ORT ReduceSum exact summation order inside LA loop (byte-divergence risk); (2) strided-input plumbing (`supports_strided_input=false` — large blast radius). Out of clean scope; should be tackled in isolation.
 
-## 2026-08-12 — Delta review PR #762 (commits 2106ac0..3826e11 + 8b3197e)
+## 2026-08-19T20:00Z — int4 MatMulNBits GEMV occupancy gate (gaff-16, PR #1501)
 
-**Scope:** Focused delta on 7 test-integrity items closed by Rachael/Coco/Isidore.  
-**Verdict:** Ready to leave draft. No blockers.
+- **Occupancy-gated GEMV entry selection:** Routes well-occupied launches (`ceil(N/cols) >= mp_count*32`, e.g. LM head N=248320) to low-register plain entry (−14%: 98.8→85.0 µs/call); keeps prefetch-pipelined entry for grid-starved projections (already at byte-identical floor ~4.3–4.7 µs/call). Gate keys on N/launch-width/SM-count — capture-safe. Byte-identical golden lock PASS. Coordinator re-validated GPU0 (33.06 s). Admin-merged (squash, 2026-08-19). Opt-out: `ONNX_GENAI_GEMV_PIPE_WELLOCC=0`.
+- **End-to-end result:** +1.3–1.6 tok/s (~242→243.5 tok/s). Grid-starved projections at floor; split-K barred (fp32 reduction reorder → not byte-identical).
+- **4-win session arc:** #1486 (+8.9%) → #1495 (+4.36%) → #1496 (+3.4%) → #1501 (+1.3–1.6 tok/s). Native fp16io decode now ~243.5 tok/s vs ORT eager ~290 (−16% gap; ORT ~1.19× ahead).
 
-- Gate coverage: genuinely closed (all 4 panic conditions verified).
-- `scratch_alloc_bytes`: single source of truth, canaries prove correctness.
-- `validate_write_dtype`: dead in production (tests-only) — flagged as SUBSTANTIVE, not blocking.
-- `find_ort_lib_dir`: 3 copies, one already drifted — flagged as SUBSTANTIVE follow-up.
-- CUDA `i32::MAX`: safe for current op list; over-claim risk only on future additions.
-- Vtable negative test: non-vacuous (both arms of the atomic flag exercised).
-- Compile-time routing rejection: correct and conservative.
+## 2026-08-19T20:30Z — LinearAttention warp-cooperative rewrite (gaff-16, PR #1503)
 
-## 2026-08-12 — PR #762 delta review (focused, no blockers)
+- **Warp-cooperative kernel rewrite:** Replaced per-thread `sc[MAX_D_K=256]` local-memory state array with warp-cooperative layout (one warp per state column, d_k rows in lane registers). Replaced serial 128-iter d_k loops with `__shfl_xor` warp reductions. Local-load sectors 163,840 → 0, local-store 98,304 → 0. Kernel −42% (21,664 → 12,510 ns), SM util 1.31% → 13.3%, occupancy 12.0% → 21.2%.
+- **End-to-end:** +7.4–10.6 tok/s (~240 → ~249 tok/s, +3.2%). Native ~249 vs ORT ~290 (~1.16× ORT-ahead). Coordinator re-validated golden lock GPU0 (35.01 s). Admin-merged (squash, 2026-08-19). Opt-out: `ONNX_GENAI_CUDA_DISABLE_LINATTN_WARP_COOP=1`. Worktrees swept.
+- **CRITICAL FINDING — lock tests assert token-IDs, NOT bit-exact bytes:** `qwen35_*_text_decode_lock` assert `Vec<u32>` argmax. Warp-shuffle reduction reorder is ULP-divergent but argmax-stable. qwen3.5-0.8b + qwen3.5-2b PASS, oracle-parity suite PASS (all update rules, d_k=128/96/130). **De-risk: future ULP-divergent kernel rewrites (warp reductions, reduction-order changes) are not barred by the lock gate — validate ≥2 models for argmax stability, not bit-identity.**
+- **5-win session arc complete (#1486/#1495/#1496/#1501/#1503):** ~214 → ~249 tok/s (+16.4%). Remaining gap to ORT is per-layer launch/fusion structure — diminishing-returns territory.
 
-Focused delta review of 5 commits. Verdict: ready to leave draft. Two substantive (non-blocking): `validate_write_dtype` dead in production; `find_ort_lib_dir` had one drifted copy in `layernorm_dynamic_axis.rs`. Both addressed by Freysa. Gate coverage, scratch_alloc_bytes, CUDA i32::MAX, vtable test, compile-time routing: all genuinely closed.
+## 2026-08-19T21:15Z — Shuffle-fusion honest floor (gaff-16, PR #1511 closed)
 
-## 2026-08-12 — PR #31973 evidence-accuracy review (focused delta)
+Attempted CUDA no-op Transpose zero-copy views for the data-shuffle lever; no code shipped. The view path fired but mutates buffer lifetimes mid-capture, aborting graph recording and fragmenting decode capture 16→70 segments. `movement.rs` was reverted and docs-only PR #1511 was closed. Reusable finding: captured decode already amortizes tiny movement kernels; attribute with captured-replay profiling, not eager kernel counts.
 
-Reviewed HEAD `fbf322f76b` — the evidence-accuracy fix commit. Built from clean, ran all three validation commands. Accuracy figures (B1 regression, sweep) reproduced exactly. Benchmark `nullptr` MeanOut fix confirmed against production code. One nit: RMSNorm ~3.3x at NormSize 256 is optimistic (measured ~2.84x). NormSize 15 RMSNorm "~0.83x regression" measured as 1.00x — body is conservative, adequate. No persona leaks. 41/2/43 test counts confirmed. Verdict: ready to leave draft, no blockers.
 
-## 2026-08-12 — PR #31973 evidence-accuracy review (focused delta)
+## 2026-08-20T00:15Z — Symmetric int8 GEMV split-K grid-fill (PR #1516)
 
-Focused evidence review of Mariette's B1+B2 fixes (HEAD `fbf322f76b`). Reproduced all four accuracy figures to 4 significant figures. Confirmed `nullptr` MeanOut matches production. Dispatch assertion fires. No stale claims found. Test counts 41/2/43 confirmed on fresh build. One nit: RMSNorm ~3.3x at NormSize 256 is ~14% above measured ~2.84x; body says ~0.83x at NormSize 15, measured 1.00x (body is conservative). Coordinator widened variance disclosure to ~15%. Verdict: ready to leave draft, no blockers.
-
-## 2026-08-14 — PR #960 Marlin int4 M>1 GEMM quality/portability review 🟢 APPROVE
-Reviewed Deckard's Marlin M>1 GEMM for quality / Rule 11 portability / capture-safety / build hygiene (numerics
-= Chew; the B\*=2.16 plateau is an accepted honest plateau, not a defect). Frozen head `a11facbc` (code
-`3735d57e`). **Zero blocking defects.** Rule 11 PASS: genuinely opt-in (`ONNX_GENAI_MARLIN_M_GT_1` default OFF,
-checked first at all three M>1 dispatch seams), SM80 guard correct (`device_supports_marlin` ANDed at every call
-site — even a force-set env var on <SM80 falls through to the portable tiled GEMM), and Marlin-OFF is provably
-byte-identical to the prior tiled path; any runtime ineligibility/launch error also falls through. Env-var honesty
-PASS: both knobs read & wired (`verify_documented_env_vars.py` EXIT 0). Capture-safety valve family sound: four
-caches share one contract — cache-hit → warm (no alloc/sync ⇒ capture-safe); cold miss while `is_capturing()` →
-return Err so caller falls back, never alloc inside capture; pre-warm forward populates them. GQA M>1 Fused flash
-path + SkipLN latch relaxation both verified capture-safe (on-device totals, no host read-back, shape-keyed cache
-rejects mid-capture shape change). `cargo fmt` + the exact CUDA and engine `-D warnings` clippy gates clean; all
-`unsafe` blocks carry SAFETY justifications. One trivial `cfg(test)`-only `clippy::unusual_byte_groupings` note
-(`0xcafef00d_1234_5678u64`) — outside the CUDA CI gate (no `--all-targets`), does not break CI, trivially fixable.
-Rule reinforced: env-var honesty + a byte-identical default-OFF fallback are the portability contract for any
-tier-scoped kernel.
+Landed the final GEMV lever: symmetric int8 `MatMulNBits` now uses split-K for grid-starved decode projections, general and capture-safe, opt-out `ONNX_GENAI_CUDA_DISABLE_INT8_SYMMETRIC_SPLITK=1`. Bias-fusion was honestly a no-op (already on main; Qwen3.5 exports bias-free). Result: qwen3.5-0.8b-hybrid fp16io **254.0 → 263.8 tok/s** (+3.9%, +9.8 tok/s); ncu N=1024 **11424→8049 ns** and N=2048 **6065→4877 ns** with occupancy roughly doubled. Golden token-ID locks passed on 0.8b and 2b; PR #1516 merged at `ec695d897`.

@@ -605,9 +605,12 @@ fn infer_mtp_kv_pairs(session: &Session) -> Result<Vec<MtpKvPair>> {
         else {
             continue;
         };
-        if input.dtype != DataType::Float32 && input.dtype != DataType::Float16 {
+        if input.dtype != DataType::Float32
+            && input.dtype != DataType::Float16
+            && input.dtype != DataType::BFloat16
+        {
             return Err(OrtError::InvalidArgument(format!(
-                "MTP KV input '{}' must be Float32 or Float16, got {:?}",
+                "MTP KV input '{}' must be Float32, Float16, or BFloat16, got {:?}",
                 input.name, input.dtype
             )));
         }

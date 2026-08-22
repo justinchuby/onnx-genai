@@ -26,6 +26,68 @@ fn committed_inference_metadata_schema_is_current() {
     );
 }
 
+#[test]
+fn generated_schema_preserves_all_root_constraints() {
+    let schema: serde_json::Value =
+        serde_json::from_str(&inference_metadata_schema_json().expect("schema serializes"))
+            .expect("generated schema is JSON");
+    let constraints = schema["allOf"].as_array().expect("root allOf array");
+
+    assert!(constraints.iter().any(|constraint| {
+        constraint["not"]["required"] == serde_json::json!(["pipeline", "model"])
+            && constraint["not"]["properties"]["model"]["required"] == serde_json::json!(["io"])
+    }));
+
+    let serialized = serde_json::to_string(&schema).expect("schema serializes");
+    for removed in [
+        "PipelineStrategy",
+        "PipelineStrategyKind",
+        "PhaseConfig",
+        "PhaseRunOn",
+        "SchedulerSpec",
+        "PolicyComponentContract",
+        "AdapterComponentContract",
+        "ProgramOperation",
+        "ControlFlow",
+        "WorkflowNode",
+        "WorkflowLoopCarry",
+        "EffectTransition",
+    ] {
+        assert!(
+            !serialized.contains(removed),
+            "generated schema still exposes removed legacy definition {removed}"
+        );
+    }
+    for compiler_field in [
+        "initial_effects",
+        "effect_name",
+        "read_effect",
+        "write_effect",
+        "body_input",
+        "body_output",
+    ] {
+        assert!(
+            !serialized.contains(&format!("\"{compiler_field}\"")),
+            "generated schema exposes compiler bookkeeping field {compiler_field}"
+        );
+    }
+    assert!(!serialized.contains("\"kind\":{\"const\":\"transfer\""));
+    assert!(!serialized.contains("\"kind\":{\"const\":\"execution_island\""));
+    assert!(serialized.contains("\"application_overridable\""));
+    assert!(serialized.contains("\"sampling_min_p\""));
+    assert!(!serialized.contains("\"custom_op_versions\""));
+    assert!(!serialized.contains("\"custom_ops\""));
+    assert!(schema["properties"]["adapters"].is_object());
+    assert!(
+        schema["$defs"]["WorkflowSpec"]["properties"]["adapters"].is_null(),
+        "adapter catalog must have one top-level source of truth"
+    );
+    assert!(serialized.contains("\"LoraTargetManifest\""));
+    assert!(serialized.contains("\"hf_peft\""));
+    assert!(serialized.contains("\"segments\""));
+    assert!(!serialized.contains("\"adapter_ids\""));
+}
+
 fn schema_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")

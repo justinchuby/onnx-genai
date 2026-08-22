@@ -95,6 +95,23 @@ pub trait LogitProcessor: Send + Sync {
     fn signal(&self, _context: &ProcessorContext) -> Option<ProcessorSignal> {
         None
     }
+
+    /// Whether this processor is guaranteed to leave the position of the maximum
+    /// logit unchanged, for every possible input.
+    ///
+    /// This is what lets greedy decoding skip the chain and take the device
+    /// argmax, which never materializes logits on the host at all.
+    ///
+    /// The bar is deliberately "does not touch the logits", not "probably keeps
+    /// the maximum". The sampling warpers are not built for a greedy request in
+    /// the first place (see `build_processor_chain`), so they never need this
+    /// exemption, and claiming one for them would be reasoning nobody exercises.
+    /// What can still appear in a greedy chain is the penalties, DRY,
+    /// constraints, and stop sequences -- and of those only the stop-sequence
+    /// processor leaves logits alone.
+    fn preserves_argmax(&self) -> bool {
+        false
+    }
 }
 
 /// Ordered chain of logit processors.
@@ -124,6 +141,20 @@ impl ProcessorChain {
     /// vocabulary on the host.
     pub fn is_empty(&self) -> bool {
         self.processors.is_empty()
+    }
+
+    /// Whether greedy selection over the raw logits gives the same token as
+    /// greedy selection over this chain's output.
+    ///
+    /// An empty chain trivially qualifies, and so does a greedy request that
+    /// only carries stop sequences -- which is what a chat template leaves
+    /// behind once the sampling warpers are dropped. Requiring literal
+    /// emptiness here denied the device argmax to every model shipping a chat
+    /// template, which is nearly all of them.
+    pub fn preserves_argmax(&self) -> bool {
+        self.processors
+            .iter()
+            .all(|processor| processor.preserves_argmax())
     }
 
     pub fn add_constraint(
@@ -1026,6 +1057,14 @@ impl StopSequenceProcessor {
 
 impl LogitProcessor for StopSequenceProcessor {
     fn process(&self, _logits: &mut [f32], _context: &ProcessorContext) {}
+
+    /// This processor never touches the logits -- it exists only for its
+    /// [`signal`](Self::signal), which the loop reads through
+    /// `finish_reason_after_token` on every step whether or not the chain was
+    /// applied. So skipping the chain here loses nothing.
+    fn preserves_argmax(&self) -> bool {
+        true
+    }
 
     fn signal(&self, context: &ProcessorContext) -> Option<ProcessorSignal> {
         self.sequences

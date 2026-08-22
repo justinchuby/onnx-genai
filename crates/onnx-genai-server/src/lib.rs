@@ -20,9 +20,12 @@ use axum::{
 };
 use tracing::Instrument;
 
+const MEDIA_UPLOAD_BODY_LIMIT: usize = 25 * 1024 * 1024;
+
 mod audio_input;
 mod cli;
 mod driver;
+mod image_generation;
 mod image_input;
 mod metrics;
 mod models_config;
@@ -55,10 +58,8 @@ pub use types::{
     ChatMessageToolCallFunction, ChatTokenLogprob, ChatTool, ChatToolFunction, ChatTopLogprob,
     CompletionChoice, CompletionLogprobs, CompletionRequest, CompletionResponse, EmbeddingData,
     EmbeddingEncodingFormat, EmbeddingInput, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage,
-    EmbeddingVector, ImageData, ImageGenerationRequest, ImageGenerationResponse,
-    ImageResponseFormat, ImageUrl, InputAudio, JsonSchemaSpec, ResponseFormat, SpeechRequest,
-    SpeechResponseFormat, StopInput, ToolChoice, ToolChoiceFunction, ToolChoiceMode,
-    ToolChoiceSpecific, Usage,
+    EmbeddingVector, ImageUrl, InputAudio, JsonSchemaSpec, ResponseFormat, StopInput, ToolChoice,
+    ToolChoiceFunction, ToolChoiceMode, ToolChoiceSpecific, Usage,
 };
 
 pub fn app(state: AppState) -> Router {
@@ -72,12 +73,26 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/completions", post(routes::completions))
         .route("/v1/embeddings", post(routes::embeddings))
         .route(
-            "/v1/audio/transcriptions",
-            post(routes::audio_transcriptions).layer(DefaultBodyLimit::max(25 * 1024 * 1024)),
+            "/v1/images/generations",
+            post(routes::openai_images).layer(DefaultBodyLimit::max(MEDIA_UPLOAD_BODY_LIMIT)),
         )
-        .route("/v1/chat/completions", post(routes::chat_completions))
-        .route("/v1/images/generations", post(routes::image_generations))
-        .route("/v1/audio/speech", post(routes::audio_speech));
+        .route(
+            "/sdapi/v1/txt2img",
+            post(routes::a1111_txt2img).layer(DefaultBodyLimit::max(MEDIA_UPLOAD_BODY_LIMIT)),
+        )
+        .route(
+            "/sdapi/v1/img2img",
+            post(routes::a1111_img2img).layer(DefaultBodyLimit::max(MEDIA_UPLOAD_BODY_LIMIT)),
+        )
+        .route("/sdapi/v1/sd-models", get(routes::a1111_models))
+        .route("/sdapi/v1/samplers", get(routes::a1111_samplers))
+        .route("/sdapi/v1/options", get(routes::a1111_options))
+        .route(
+            "/v1/audio/transcriptions",
+            post(routes::audio_transcriptions)
+                .layer(DefaultBodyLimit::max(MEDIA_UPLOAD_BODY_LIMIT)),
+        )
+        .route("/v1/chat/completions", post(routes::chat_completions));
     if state.config.enable_debug_endpoints {
         router = router
             .route("/v1/debug/config", get(routes::debug_config))

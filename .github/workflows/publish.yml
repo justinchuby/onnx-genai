@@ -173,6 +173,7 @@ jobs:
           publish_crate onnx-std
           publish_crate onnx-runtime-optimizer
           publish_crate onnx-runtime-cpuinfo
+          publish_crate onnx-runtime-memory-api
           publish_crate onnx-runtime-memory-governor
           publish_crate onnx-runtime-virtual-memory
           publish_crate onnx-runtime-memory
@@ -344,7 +345,7 @@ jobs:
       # when we add `cuda` we must re-add every feature the package needs to build
       # its pyo3 module. onnx-genai (extension) has non-optional pyo3, so `cuda`
       # alone is enough. onnx-genai-server (CLI) has optional pyo3 behind the
-      # `python` feature, so it needs `python,cuda` or maturin sees no bindings and
+      # `python` feature, so it needs `python,ort-cuda` or maturin sees no bindings and
       # fails installing cffi. macOS builds no cuda feature (pyproject applies).
       - name: Select build features
         shell: bash
@@ -352,7 +353,7 @@ jobs:
           if [ "${{ matrix.platform.cuda }}" != "true" ]; then
             echo "CIBW_CONFIG_SETTINGS=" >> "$GITHUB_ENV"
           elif [ "${{ matrix.package }}" = "onnx-genai-server" ]; then
-            echo "CIBW_CONFIG_SETTINGS=build-args=--features build-args=python,cuda" >> "$GITHUB_ENV"
+            echo "CIBW_CONFIG_SETTINGS=build-args=--features build-args=python,ort-cuda" >> "$GITHUB_ENV"
           else
             echo "CIBW_CONFIG_SETTINGS=build-args=--features build-args=cuda" >> "$GITHUB_ENV"
           fi

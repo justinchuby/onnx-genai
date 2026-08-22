@@ -1,0 +1,21 @@
+[package]
+name = "onnx-runtime-memory-host"
+description = "Dynamic loader and Rust-trait adapter for nxmem memory plugins"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "memory", "allocator", "plugin", "ffi"]
+categories = ["memory-management"]
+
+[dependencies]
+libloading = { workspace = true }
+onnx-runtime-memory-abi = { workspace = true }
+onnx-runtime-memory-api = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+onnx-runtime-memory-testplugin = { workspace = true }
+
+[lints]
+workspace = true

@@ -22,7 +22,7 @@
 //!   --features cuda,native-backend --test qwen2_5_0_5b_managed_vmm_default_e2e \
 //!   -- --ignored --nocapture
 //! ```
-#![cfg(all(feature = "cuda", feature = "native-backend"))]
+#![cfg(feature = "native-cuda")]
 
 use std::path::{Path, PathBuf};
 
