@@ -132,6 +132,9 @@ pub const DECODE_SCHEDULE_ENV: &str = "ONNX_GENAI_CPU_DECODE_SCHEDULE";
 /// default, which targets coarse parallel regions rather than per-token decode.
 const DEFAULT_BLOCKTIME: Duration = Duration::from_micros(500);
 
+/// Environment variable naming the worker active-spin window, in microseconds.
+const DECODE_BLOCKTIME_ENV: &str = "ONNX_GENAI_CPU_DECODE_BLOCKTIME_US";
+
 /// Pure `spin_loop` iterations at the start of the active window before the
 /// worker begins yielding the core to co-tenants between clock checks. A
 /// crossbeam-`Backoff`-style ramp: hammer the sense line first to catch the
@@ -152,15 +155,23 @@ const CLOCK_CHECK_STRIDE: u32 = 1 << 6;
 /// (maximally polite, higher wake latency). Unset uses [`DEFAULT_BLOCKTIME`].
 fn decode_blocktime() -> Duration {
     static V: OnceLock<Duration> = OnceLock::new();
-    *V.get_or_init(
-        || match std::env::var("ONNX_GENAI_CPU_DECODE_BLOCKTIME_US") {
-            Ok(raw) => match raw.trim().parse::<u64>() {
-                Ok(us) => Duration::from_micros(us),
-                Err(_) => DEFAULT_BLOCKTIME,
-            },
-            Err(_) => DEFAULT_BLOCKTIME,
-        },
-    )
+    *V.get_or_init(|| parse_decode_blocktime(std::env::var(DECODE_BLOCKTIME_ENV).ok().as_deref()))
+}
+
+/// Parse a [`DECODE_BLOCKTIME_ENV`] value, falling back to
+/// [`DEFAULT_BLOCKTIME`] for anything unset or unparseable.
+///
+/// Split out from [`decode_blocktime`] so the policy is testable without the
+/// environment. That is not a stylistic preference: `decode_blocktime` latches
+/// into a `OnceLock` on first `worker_wait`, so a test that set the variable and
+/// called it twice would compare the first value against itself and pass while
+/// measuring nothing -- the same latched-control defect as #1736. Testing the
+/// pure function cannot silently degrade that way, and `cargo test` runs a
+/// binary's tests on parallel threads where `set_var` racing another thread's
+/// `getenv` is a data race Rust 2024 forbids outright.
+fn parse_decode_blocktime(raw: Option<&str>) -> Duration {
+    raw.and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map_or(DEFAULT_BLOCKTIME, Duration::from_micros)
 }
 
 /// Spin iterations the (single, never-idle) dispatcher busy-waits on the
@@ -2267,6 +2278,65 @@ mod tests {
         assert_eq!(
             decode_schedule_from_raw(Some("bogus")),
             DecodeSchedule::Fixed
+        );
+    }
+
+    #[test]
+    fn an_unset_or_unparseable_blocktime_uses_the_default() {
+        assert_eq!(parse_decode_blocktime(None), DEFAULT_BLOCKTIME);
+        // Every rejected spelling must land on the default rather than on zero:
+        // silently parking immediately is a real behaviour change, not a
+        // conservative fallback.
+        for raw in [
+            "",
+            "   ",
+            "abc",
+            "-1",
+            "1.5",
+            "500us",
+            "18446744073709551616",
+        ] {
+            assert_eq!(
+                parse_decode_blocktime(Some(raw)),
+                DEFAULT_BLOCKTIME,
+                "{raw:?} is not a microsecond count and must fall back"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_zero_blocktime_parks_immediately_rather_than_taking_the_default() {
+        // Load-bearing, and the reason this policy is worth a test at all: the
+        // sibling knob `steal_tiles_per_worker` filters `> 0` and treats zero as
+        // "unset". Blocktime must not, because `0` is the one setting that makes
+        // a worker park without spinning -- the maximally-polite mode used to
+        // measure park/wake latency. Folding it into the default would silently
+        // give every such run a 500us spin window and make the measurement
+        // impossible while still appearing to work.
+        assert_eq!(parse_decode_blocktime(Some("0")), Duration::ZERO);
+        assert_ne!(parse_decode_blocktime(Some("0")), DEFAULT_BLOCKTIME);
+    }
+
+    #[test]
+    fn a_blocktime_is_read_as_microseconds_and_tolerates_surrounding_space() {
+        assert_eq!(
+            parse_decode_blocktime(Some("250")),
+            Duration::from_micros(250)
+        );
+        assert_eq!(
+            parse_decode_blocktime(Some(" 250\n")),
+            Duration::from_micros(250)
+        );
+        // Pins the unit. Reading the same digits as millis or nanos would be a
+        // 1000x error in either direction and every one of the tests above would
+        // still pass.
+        assert_ne!(
+            parse_decode_blocktime(Some("250")),
+            Duration::from_millis(250)
+        );
+        assert_ne!(
+            parse_decode_blocktime(Some("250")),
+            Duration::from_nanos(250)
         );
     }
 
