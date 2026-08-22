@@ -116,3 +116,18 @@ The repository’s active `main` ruleset requires linear history; the non-author
 - No hard runtime dependency on a specific vendor toolkit, driver, or arch beyond the declared minimum—keep the graceful-degradation contract consistent with Rule 2 and Rule 5.
 
 See [`docs/portability/2026-07-25-cuda-consumer-gpu-audit.md`](docs/portability/2026-07-25-cuda-consumer-gpu-audit.md), [`docs/architecture/CROSS_PLATFORM.md`](docs/architecture/CROSS_PLATFORM.md), [`docs/benchmarks/2026-07-25-gqa-decode-avx512.md`](docs/benchmarks/2026-07-25-gqa-decode-avx512.md), and [`docs/research/lowbit-quant-feasibility.md`](docs/research/lowbit-quant-feasibility.md).
+
+## 12. Reduce entropy: derive the rule from first principles
+
+**When a new case does not fit, find the principle that decides it and state that once—do not append another special case. Every branch added instead of a principle raises the entropy the next contributor must hold in their head.**
+
+- **Diagnose before extending.** If a predicate, dispatch table, or allowlist rejects something it should accept, first ask *what property* actually makes the accepted cases safe. Extend the mechanism only after that property is written down.
+- **One question, one mechanism.** If two or more code paths are answering the same underlying question, they are duplicated state, not defence in depth. Collapse them into a single classification with an explicit result, so a new case is decided by the rule rather than by which branch happens to run first.
+- **Enumerate properties, not syntax.** An allowlist of op types, model names, or shapes encodes what has been *seen*; it silently mis-answers everything unseen. Gate on the operand, topology, or capability that actually determines correctness.
+- **Simplification must not cost correctness.** A reorganisation that loses an existing guard is a regression regardless of how much cleaner it reads: keep the tests that pinned the old behaviour, and add one for the case that motivated the change.
+- **Simplification must not cost performance.** Prefer a rule computed once over a general mechanism re-derived per element on a hot path; measure when a hot path is touched (Rule 4).
+- **Carry the reason.** A rejecting rule should return *why* it rejected, not just `false` — the reason is what lets the next model be diagnosed instead of guessed at (Rule 1, Rule 5).
+
+Worked example. The CUDA-EP mask-capacity predicate had accumulated an op allowlist plus a separate `Shape`-consumption policy; a third model then needed `Expand`. Adding a third branch would have made the next model add a fourth. The principle underneath all three was one sentence — *freezing the mask is a uniform substitution of `max_len` for the logical length `L`, sound exactly when no consumer sources that axis from outside the substitution and the padded lanes are neutralised before reaching a consumer that is not padding-aware* — so the walk now classifies each consumer edge once (sink / invariant leaf / propagate / mixes-with-reason). The previously special-cased rejection falls out of the general rule, which makes it harder to get wrong, not merely shorter.
+
+See Rule 4 (do not rewrite what already works — simplify the decision, not the proven kernel), Rule 5 (explicit, inspectable behavior), and Rule 9 (tests track behavior).
