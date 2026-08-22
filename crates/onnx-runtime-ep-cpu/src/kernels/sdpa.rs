@@ -311,84 +311,66 @@ const MIN_SDPA_WORK_PER_TASK: usize = 64 * 1024;
 ))]
 static SDPA_SIMD_TEST_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-// Test counter: incremented when `sdpa_f32_simd` actually fans its output rows
-// out, as opposed to running them serially.
-//
-// Separate from `SDPA_SIMD_TEST_HITS` so a parity test can assert the parallel
-// path was *exercised*. Without it a routing mistake that quietly reverted to
-// serial would leave every numeric test passing.
-//
-// Thread-local, not a process-wide atomic, because one of the assertions is an
-// equality -- "this shape must *not* have fanned out" -- and a process-wide
-// counter would let a concurrently running test move it. The increments all
-// happen on the thread that called `sdpa_f32_simd`, so a thread-local counts
-// exactly the calls the asserting test made.
+/// Test counter: incremented when [`sdpa_f32_simd`] actually fans its output
+/// rows out, as opposed to running them serially.
+///
+/// Separate from `SDPA_SIMD_TEST_HITS` so a parity test can assert the parallel
+/// path was *exercised*. Without it a routing mistake that quietly reverted to
+/// serial would leave every numeric test passing.
+///
+/// Process-wide rather than thread-local on purpose. A thread-local would be
+/// invisible to `scripts/check_dispatch_reachability.py`, which requires an
+/// atomic and would therefore stop enforcing that a test reads this at all --
+/// that is opting out of the lint, not satisfying it. The race a thread-local
+/// would have avoided (one assertion here is an equality, "this shape must
+/// *not* have fanned out", which a concurrent test could falsify) is handled
+/// instead by `SDPA_FANOUT_TEST_LOCK`, the same way `group_query_attention`
+/// handles its counters.
 #[cfg(all(
     test,
     any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
 ))]
-thread_local! {
-    static SDPA_SIMD_TEST_FANOUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
+static SDPA_SIMD_TEST_DISPATCHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
-/// Fan-outs [`sdpa_f32_simd`] has performed on this thread.
+/// Test counter: incremented only when the fan-out went through the *decode*
+/// pool, as opposed to the task runtime.
+///
+/// The two routes are separate branches and only one of them runs in an
+/// unscoped test, so a single counter cannot tell them apart. Without this the
+/// decode branch -- the one #1718 is actually about -- has no coverage at all,
+/// and a defect confined to it (an argument swap at the dispatch, say) would
+/// leave every other test green.
+///
+/// Being process-wide also matters here for a second reason:
+/// `with_decode_pool_scope` runs its closure on a pool worker, so the increment
+/// lands on a different thread from the asserting test.
 #[cfg(all(
     test,
     any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
 ))]
-fn sdpa_simd_test_fanouts() -> usize {
-    SDPA_SIMD_TEST_FANOUTS.with(std::cell::Cell::get)
-}
+static SDPA_SIMD_DECODE_TEST_DISPATCHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
-/// Records that [`sdpa_f32_simd`] fanned out on this thread.
+/// Serialises every test that asserts on the fan-out counters above.
+///
+/// Held for the whole body, not just across the call under test: a test that
+/// asserts "this shape did *not* fan out" is falsified by any concurrent test
+/// that fans out at all, so both arms have to be inside the lock.
 #[cfg(all(
     test,
     any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
 ))]
-fn note_sdpa_simd_test_fanout() {
-    SDPA_SIMD_TEST_FANOUTS.with(|slot| slot.set(slot.get() + 1));
-}
+static SDPA_FANOUT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-// Test counter: incremented only when the fan-out went through the *decode*
-// pool, as opposed to the task runtime.
-//
-// The two routes are separate branches and only one of them runs in an unscoped
-// test, so a single counter cannot tell them apart. Without this the decode
-// branch -- the one #1718 is actually about -- has no coverage at all, and a
-// defect confined to it (an argument swap at the dispatch, say) would leave
-// every other test green.
-//
-// Thread-local for the same reason as `SDPA_SIMD_TEST_FANOUTS`. Note the
-// consequence for the caller: `with_decode_pool_scope` runs its closure on a
-// pool worker, so the increment lands on *that* thread's slot, not the test
-// thread's. The asserting test therefore has to sample the counter from inside
-// the scope. That is stricter than a process-wide atomic, not weaker -- it
-// cannot be moved by a concurrently running test.
 #[cfg(all(
     test,
     any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
 ))]
-thread_local! {
-    static SDPA_SIMD_TEST_DECODE_FANOUTS: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
-}
-
-/// Decode-route fan-outs [`sdpa_f32_simd`] has performed on this thread.
-#[cfg(all(
-    test,
-    any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
-))]
-fn sdpa_simd_test_decode_fanouts() -> usize {
-    SDPA_SIMD_TEST_DECODE_FANOUTS.with(std::cell::Cell::get)
-}
-
-/// Records that [`sdpa_f32_simd`] fanned out through the decode pool.
-#[cfg(all(
-    test,
-    any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
-))]
-fn note_sdpa_simd_test_decode_fanout() {
-    SDPA_SIMD_TEST_DECODE_FANOUTS.with(|slot| slot.set(slot.get() + 1));
+fn sdpa_fanout_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    SDPA_FANOUT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Test counter: incremented when the Accelerate (cblas_sgemm/AMX) SDPA fast
@@ -1281,24 +1263,20 @@ fn sdpa_f32_simd(
     // permits, since it degrades a nested dispatch to inline execution. Moving
     // the buffer makes the nested call allocate its own instead of aborting the
     // forward pass.
-    thread_local! {
-        static ROW_SCORES: std::cell::Cell<Vec<f32>> =
-            const { std::cell::Cell::new(Vec::new()) };
-    }
     let row_body = |row: usize, y_row: &mut [f32]| {
-        let mut scores = ROW_SCORES.with(std::cell::Cell::take);
-        sdpa_simd_row(
-            row,
-            t,
-            cfg,
-            bias,
-            mask,
-            combined_scale,
-            heads_per_kv,
-            &mut scores,
-            y_row,
-        );
-        ROW_SCORES.with(|slot| slot.set(scores));
+        with_row_scores(|scores| {
+            sdpa_simd_row(
+                row,
+                t,
+                cfg,
+                bias,
+                mask,
+                combined_scale,
+                heads_per_kv,
+                scores,
+                y_row,
+            );
+        });
     };
 
     // Under an active decode scope the forward runs on the engine thread while
@@ -1315,8 +1293,8 @@ fn sdpa_f32_simd(
         );
         #[cfg(test)]
         {
-            note_sdpa_simd_test_fanout();
-            note_sdpa_simd_test_decode_fanout();
+            SDPA_SIMD_TEST_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            SDPA_SIMD_DECODE_TEST_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         return;
     }
@@ -1328,10 +1306,75 @@ fn sdpa_f32_simd(
         });
     #[cfg(test)]
     if backend != crate::task_runtime::Backend::Serial {
-        note_sdpa_simd_test_fanout();
+        SDPA_SIMD_TEST_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     #[cfg(not(test))]
     let _ = backend;
+}
+
+/// Largest score buffer kept alive between calls, in `f32` elements.
+///
+/// **Per-process ceiling: `MAX_RETAINED_ROW_SCORES * 4 B * threads`.** The
+/// buffer is thread-local, so a single constant is *not* the exposure -- it is
+/// retained once per worker that ever runs this kernel, for the life of the
+/// process. At 8192 floats that is 32 KiB per thread: **512 KiB** at the
+/// default 16-physical-core budget, **2 MiB** at a 64-thread budget.
+///
+/// The cap exists because the natural size here is `kv_seq`, which is
+/// unbounded -- a 128k-context model would otherwise retain 512 KiB per worker
+/// (8 MiB across 16) permanently, having sized it from one long request.
+///
+/// Above the cap the buffer is dropped instead of retained, so those shapes
+/// allocate once per row again. That is deliberate and cheap: a row at
+/// `kv_seq > 8192` already costs at least `8192 * (head_size + v_head_size)`
+/// MACs, so one allocation is a rounding error against it. Retention only ever
+/// mattered for the many-short-rows case, which is prefill, and prefill
+/// `kv_seq` is under the cap on every production shape measured in
+/// `docs/benchmarks/2026-08-22-sdpa-fanout.md`.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+const MAX_RETAINED_ROW_SCORES: usize = 8192;
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+thread_local! {
+    /// Softmax scratch for one attention row, reused across rows on this thread.
+    ///
+    /// Taken out of the slot and put back rather than borrowed across the body.
+    /// A `RefCell` borrow held across `sdpa_simd_row` would panic if this thread
+    /// ever ran a second row re-entrantly -- which the decode pool explicitly
+    /// permits, since it degrades a nested dispatch to inline execution. Moving
+    /// the buffer makes the nested call allocate its own instead of aborting the
+    /// forward pass.
+    static ROW_SCORES: std::cell::Cell<Vec<f32>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+/// Runs `f` with this thread's score scratch, returning it to the slot only if
+/// it is still within [`MAX_RETAINED_ROW_SCORES`].
+///
+/// One scratch per worker rather than per row: the score vector is `kv_seq`
+/// floats, and at decode-with-long-past shapes that is a multi-kilobyte
+/// allocation that would otherwise land in the hot loop once per output row.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+fn with_row_scores<R>(f: impl FnOnce(&mut Vec<f32>) -> R) -> R {
+    let mut scores = ROW_SCORES.with(std::cell::Cell::take);
+    let out = f(&mut scores);
+    if scores.capacity() <= MAX_RETAINED_ROW_SCORES {
+        ROW_SCORES.with(|slot| slot.set(scores));
+    }
+    out
+}
+
+/// Elements this thread currently retains in [`ROW_SCORES`].
+#[cfg(all(
+    test,
+    any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+))]
+fn retained_row_scores() -> usize {
+    ROW_SCORES.with(|slot| {
+        let scores = slot.take();
+        let held = scores.capacity();
+        slot.set(scores);
+        held
+    })
 }
 
 /// Smallest number of output rows worth handing to another thread, or `None` to
@@ -3631,6 +3674,9 @@ mod tests {
     #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
     #[test]
     fn parallel_sdpa_is_bit_identical_to_serial_across_shapes() {
+        use std::sync::atomic::Ordering;
+
+        let _serialise = sdpa_fanout_test_guard();
         struct Case {
             name: &'static str,
             batch: usize,
@@ -3780,10 +3826,10 @@ mod tests {
                 sdpa_f32_simd(&tensors, &case.cfg, bias_ref, mask_ref, &mut serial);
             }
 
-            let before = sdpa_simd_test_fanouts();
+            let before = SDPA_SIMD_TEST_DISPATCHES.load(Ordering::Relaxed);
             let mut parallel = vec![f32::NAN; y_len];
             sdpa_f32_simd(&tensors, &case.cfg, bias_ref, mask_ref, &mut parallel);
-            if sdpa_simd_test_fanouts() != before {
+            if SDPA_SIMD_TEST_DISPATCHES.load(Ordering::Relaxed) != before {
                 fanned_out += 1;
             }
 
@@ -3833,6 +3879,9 @@ mod tests {
     #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
     #[test]
     fn parallel_sdpa_under_an_active_decode_scope_matches_serial() {
+        use std::sync::atomic::Ordering;
+
+        let _serialise = sdpa_fanout_test_guard();
         // rows = 7 * 37 = 259, v_head_size = 48: distinct, neither a multiple of
         // the other. Work is 259 * 257 * (64 + 48) = 7.45 Mi MACs, above the
         // fan-out floor, so this genuinely dispatches.
@@ -3870,16 +3919,13 @@ mod tests {
             sdpa_f32_simd(&tensors, &cfg, &NoBias, &NoMask, &mut serial);
         }
 
-        // Sampled inside the scope: the closure runs on a decode-pool worker, so
-        // the thread-local increment lands on that worker's slot rather than
-        // this test thread's.
-        let (routed_to_decode, decode_fanouts, decoded) =
+        let before = SDPA_SIMD_DECODE_TEST_DISPATCHES.load(Ordering::Relaxed);
+        let (routed_to_decode, decoded) =
             crate::kernels::matmul_nbits::with_decode_pool_scope(true, || {
                 let active = crate::kernels::matmul_nbits::decode_pool_active();
-                let before = sdpa_simd_test_decode_fanouts();
                 let mut y = vec![0.0f32; rows * dv];
                 sdpa_f32_simd(&tensors, &cfg, &NoBias, &NoMask, &mut y);
-                (active, sdpa_simd_test_decode_fanouts() - before, y)
+                (active, y)
             });
 
         assert_eq!(
@@ -3896,9 +3942,97 @@ mod tests {
              decode branch was not exercised on this host"
         );
         assert_eq!(
-            decode_fanouts, 1,
+            SDPA_SIMD_DECODE_TEST_DISPATCHES.load(Ordering::Relaxed),
+            before + 1,
             "the decode scope must route through decode_parallel_output_row_blocks"
         );
+    }
+
+    /// The score scratch is thread-local, so the process holds one per worker
+    /// that ever ran this kernel. This drives it from four threads so the xN
+    /// multiplier is actually observable -- a single-instantiation test cannot
+    /// see it, which is how the factor goes unmeasured.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn retained_row_scores_are_bounded_per_thread_and_so_bound_the_process() {
+        const THREADS: usize = 4;
+
+        fn retained_after(kv_seq: usize) -> usize {
+            let (batch, heads, q_seq, dh, dv) = (1usize, 2usize, 3usize, 8usize, 8usize);
+            let q = deterministic_values(batch * heads * q_seq * dh, 0x9100, 0.5);
+            let k = deterministic_values(batch * heads * kv_seq * dh, 0x9200, 0.5);
+            let v = deterministic_values(batch * heads * kv_seq * dv, 0x9300, 0.5);
+            let tensors = SdpaTensors {
+                q: &q,
+                k: &k,
+                v: &v,
+                batch,
+                num_heads: heads,
+                num_kv_heads: heads,
+                q_seq,
+                kv_seq,
+                head_size: dh,
+                v_head_size: dv,
+            };
+            let cfg = SdpaConfig {
+                scale: ScaleMode::PostDot(0.125),
+                softcap: None,
+                causal: false,
+                past_seq: 0,
+                causal_fill: f32::NEG_INFINITY,
+            };
+            // Drive `row_body` directly rather than through the router: the
+            // router would fan these rows onto *other* threads, and then this
+            // thread's slot would report nothing.
+            let mut y = vec![0.0f32; batch * heads * q_seq * dv];
+            for (row, y_row) in y.chunks_mut(dv).enumerate() {
+                with_row_scores(|scores| {
+                    sdpa_simd_row(
+                        row, &tensors, &cfg, &NoBias, &NoMask, 0.125, 1, scores, y_row,
+                    );
+                });
+            }
+            retained_row_scores()
+        }
+
+        // Under the cap: every thread retains its own buffer, so the process
+        // exposure really is per-thread x threads and not one shared buffer.
+        let under = MAX_RETAINED_ROW_SCORES / 2;
+        let held: Vec<usize> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| scope.spawn(move || retained_after(under)))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(held.len(), THREADS);
+        for slot in &held {
+            assert!(
+                *slot >= under,
+                "a thread under the cap should retain its scratch, got {slot}"
+            );
+            assert!(*slot <= MAX_RETAINED_ROW_SCORES, "retained {slot} elements");
+        }
+        // The multiplier is the point: N threads hold N buffers, not one.
+        assert!(held.iter().sum::<usize>() >= THREADS * under);
+
+        // Over the cap: dropped rather than retained, so the ceiling holds
+        // however long the context gets.
+        let over = MAX_RETAINED_ROW_SCORES + 1024;
+        let held_over: Vec<usize> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| scope.spawn(move || retained_after(over)))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for slot in &held_over {
+            assert_eq!(*slot, 0, "over-cap scratch must not be retained");
+        }
+
+        // The bound this PR actually promises, stated as bytes.
+        let ceiling_bytes = THREADS * MAX_RETAINED_ROW_SCORES * size_of::<f32>();
+        assert_eq!(ceiling_bytes, THREADS * 32 * 1024);
+        let worst = held.iter().chain(held_over.iter()).copied().max().unwrap();
+        assert!(worst * size_of::<f32>() * THREADS <= ceiling_bytes);
     }
 
     /// A zero-width value head is degenerate but reachable: this route has no
@@ -3941,6 +4075,9 @@ mod tests {
     #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
     #[test]
     fn tiny_sdpa_shapes_stay_serial() {
+        use std::sync::atomic::Ordering;
+
+        let _serialise = sdpa_fanout_test_guard();
         let (batch, heads, q_seq, kv_seq, dh) = (1usize, 2usize, 1usize, 8usize, 16usize);
         let q = deterministic_values(batch * heads * q_seq * dh, 0x6100, 0.7);
         let k = deterministic_values(batch * heads * kv_seq * dh, 0x6200, 0.7);
@@ -3965,10 +4102,10 @@ mod tests {
             causal_fill: f32::NEG_INFINITY,
         };
         let mut y = vec![f32::NAN; batch * heads * q_seq * dh];
-        let before = sdpa_simd_test_fanouts();
+        let before = SDPA_SIMD_TEST_DISPATCHES.load(Ordering::Relaxed);
         sdpa_f32_simd(&tensors, &cfg, &NoBias, &NoMask, &mut y);
         assert_eq!(
-            sdpa_simd_test_fanouts(),
+            SDPA_SIMD_TEST_DISPATCHES.load(Ordering::Relaxed),
             before,
             "a {kv_seq}-key, {heads}-head shape must not wake a pool"
         );
