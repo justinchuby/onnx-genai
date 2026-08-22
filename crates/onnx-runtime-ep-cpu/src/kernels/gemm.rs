@@ -1154,10 +1154,28 @@ mod tests {
             (y.to_f32(), kernel)
         };
 
-        let before = matmul::weight_transpose_cache_bytes();
         let (_prefill, prefill_kernel) = run(4);
         let (_decode, decode_kernel) = run(1);
-        let after = matmul::weight_transpose_cache_bytes();
+
+        // The executed kernels' entry must still be resident, checked *before*
+        // the measuring lookup below -- `cached_transpose_f32` installs on a
+        // miss, so asking afterwards would answer `true` even if nothing had
+        // been retained, and the check would prove nothing.
+        //
+        // Stated against this weight's key rather than as a delta between two
+        // reads of the process-global total. Under the parallel harness that
+        // total is not monotonic: since #1726 a prepack evicts the entry it
+        // installed when it drops, so an unrelated concurrent test finishing
+        // mid-test legitimately *lowers* it, and `after >= before + predicted`
+        // then fails for a reason that has nothing to do with this weight.
+        // Residency here plus `actual == predicted` below states the same fact
+        // -- exactly `predicted` bytes for this weight are held in the global
+        // cache -- without depending on unrelated churn (#1056 isolation).
+        assert!(
+            crate::kernels::weight_transpose::f32_cache_contains(b.view().data_ptr::<f32>(), n, k),
+            "the transpose must be resident in the global cache while the \
+             kernels that installed it are alive"
+        );
 
         // The process-global byte total is shared across the parallel test
         // harness, so a *concurrent* test caching an unrelated weight can also
@@ -1181,8 +1199,9 @@ mod tests {
         );
         // And that copy is genuinely part of the global total the plan budgets.
         assert!(
-            after >= before + predicted as usize,
-            "the cached transpose must be reflected in the global byte total"
+            matmul::weight_transpose_cache_bytes() >= predicted as usize,
+            "the global byte total must account for at least this weight's \
+             resident transpose"
         );
         drop((prefill_kernel, decode_kernel));
     }
