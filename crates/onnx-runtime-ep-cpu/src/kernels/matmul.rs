@@ -6068,12 +6068,10 @@ mod tests {
     /// did run -- it just read another weight's bytes. That is #1726's exact
     /// signature: right route, values that are not a function of the inputs.
     ///
-    /// The rounds matter. A `1024 x 1024` f16 weight is 2 MiB, which glibc
-    /// serves by `mmap` at first; freeing it raises the dynamic mmap threshold
-    /// so later same-size requests come from the brk heap, where the address is
-    /// promptly reused. The first rounds therefore establish the recycling that
-    /// the later rounds detect, which is why one allocate/free pair is not
-    /// enough to see this.
+    /// Reusing one owning buffer makes the address collision deterministic on
+    /// every allocator and platform. The first kernel must evict the transpose
+    /// it installed when it drops; after the bytes are replaced in place, a
+    /// second kernel at the same address must transpose the new weight.
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn a_recycled_weight_address_must_not_serve_the_previous_weights_transpose() {
@@ -6092,61 +6090,38 @@ mod tests {
         let want_first = naive_matmul(&a_data, &first_data, 1, k, n);
         let want_second = naive_matmul(&a_data, &second_data, 1, k, n);
 
-        let decode = |b_data: &[f32]| -> (Vec<f32>, usize) {
+        let mut weight = Owned::f16(&[k, n], &first_data);
+        let decode = |weight: &Owned| -> Vec<f32> {
             let a = Owned::f16(&[1, k], &a_data);
-            let b = Owned::f16(&[k, n], b_data);
-            let addr = b.view().data_ptr::<u16>() as usize;
             let mut out = Owned::zeros_f32(&[1, n]);
             let mut kernel = MatMulKernel::default();
             kernel.set_constant_inputs(&[false, true]);
             kernel
-                .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+                .execute(&[a.view(), weight.view()], &mut [out.view_mut()])
                 .unwrap();
-            (out.to_f32(), addr)
+            out.to_f32()
         };
 
-        let mut seen: Vec<(usize, bool)> = Vec::new();
-        let mut recycled_across_weights = false;
-        for round in 0..8 {
-            let (first_half, want) = if round % 2 == 0 {
-                (true, &want_first)
-            } else {
-                (false, &want_second)
-            };
-            let data: &[f32] = if first_half {
-                &first_data
-            } else {
-                &second_data
-            };
-            let (got, addr) = decode(data);
-            // Only a *cross-weight* reuse recreates the hazard: the same weight
-            // landing on its own former address would be served a transpose of
-            // identical bytes and prove nothing.
-            let recycled = seen
-                .iter()
-                .any(|&(seen_addr, seen_first)| seen_addr == addr && seen_first != first_half);
-            recycled_across_weights |= recycled;
-            seen.push((addr, first_half));
-            for (index, (g, w)) in got.iter().zip(want).enumerate() {
-                assert!(
-                    (g - w).abs() <= 2e-2 * (1.0 + w.abs()),
-                    "round {round} column {index}: {g} != {w} (address {addr:#x} \
-                     recycled={recycled}) -- a transpose cached for a previous \
-                     weight at this address was served to this one"
-                );
-            }
+        for (index, (got, want)) in decode(&weight).iter().zip(&want_first).enumerate() {
+            assert!(
+                (got - want).abs() <= 2e-2 * (1.0 + want.abs()),
+                "first weight column {index}: {got} != {want}"
+            );
         }
-        // Without this the test could pass by never recreating the hazard --
-        // a silent regression into proving nothing. Reuse by the *same* weight
-        // does not count, so this cannot be satisfied vacuously by an allocator
-        // that happens to hand back one buffer's own address.
-        assert!(
-            recycled_across_weights,
-            "no address was reused across weights in {} rounds, so this run did \
-             not exercise the recycling hazard it exists to catch; addresses: {:#x?}",
-            seen.len(),
-            seen
-        );
+
+        let address = weight.bytes.as_ptr();
+        for (bytes, value) in weight.bytes.chunks_exact_mut(2).zip(&second_data) {
+            bytes.copy_from_slice(&half::f16::from_f32(*value).to_le_bytes());
+        }
+        assert_eq!(weight.bytes.as_ptr(), address);
+
+        for (index, (got, want)) in decode(&weight).iter().zip(&want_second).enumerate() {
+            assert!(
+                (got - want).abs() <= 2e-2 * (1.0 + want.abs()),
+                "second weight column {index}: {got} != {want} -- a transpose cached for \
+                     the previous weight at this address was served to this one"
+            );
+        }
     }
 
     /// A prewarmed transpose must survive the drop of a kernel that merely
