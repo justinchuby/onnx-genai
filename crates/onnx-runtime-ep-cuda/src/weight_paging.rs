@@ -177,6 +177,13 @@ fn eviction_made_committed_progress(
         || after_required_mapped < before_required_mapped
 }
 
+fn vmm_committed_authority_matches(
+    allocator: &crate::vmm_allocator::CudaVmmAllocator,
+    governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
+) -> bool {
+    allocator.committed_byte_authority() == Some(governor.authority_id())
+}
+
 /// Snapshot of the process-global weight-offload counters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GlobalOffloadStats {
@@ -3102,7 +3109,7 @@ impl CudaWeightResidency {
         self
     }
 
-    /// Use the production VMM arena and its existing physical-memory authority
+    /// Use the production VMM arena and its existing committed-byte authority
     /// for weight pages. The configured cache budget remains an observability
     /// value; admission is governed by incremental authority-owned bytes, not
     /// by a second private lease.
@@ -3118,11 +3125,13 @@ impl CudaWeightResidency {
                     .into(),
             ));
         }
-        if allocator.physical_pool_authority() != Some(governor.authority_id()) {
-            return Err(WeightHandleError::DeviceBinding(
-                "VMM weight residency and its governor must share one physical-memory authority"
-                    .into(),
-            ));
+        if !vmm_committed_authority_matches(allocator.as_ref(), governor.as_ref()) {
+            return Err(WeightHandleError::DeviceBinding(format!(
+                "VMM weight residency and its governor must share one committed-byte \
+                     authority (allocator: {:?}, governor: {:?})",
+                allocator.committed_byte_authority(),
+                governor.authority_id()
+            )));
         }
         let _ = self.physical.set(PhysicalAdmission {
             allocator,
@@ -3143,11 +3152,13 @@ impl CudaWeightResidency {
                     .into(),
             ));
         }
-        if allocator.physical_pool_authority() != Some(governor.authority_id()) {
-            return Err(WeightHandleError::DeviceBinding(
-                "VMM weight residency and its governor must share one physical-memory authority"
-                    .into(),
-            ));
+        if !vmm_committed_authority_matches(allocator.as_ref(), governor.as_ref()) {
+            return Err(WeightHandleError::DeviceBinding(format!(
+                "VMM weight residency and its governor must share one committed-byte \
+                     authority (allocator: {:?}, governor: {:?})",
+                allocator.committed_byte_authority(),
+                governor.authority_id()
+            )));
         }
         self.physical
             .set(PhysicalAdmission {
@@ -4637,6 +4648,7 @@ impl ResidencyInner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::EnvVarGuard;
 
     /// `reset_global_offload_stats` clears the window counters and leaves every
     /// live gauge alone -- including the process-lifetime peak, which it must
@@ -5028,12 +5040,11 @@ mod tests {
             DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole,
         };
 
-        unsafe {
-            std::env::set_var(
-                crate::vmm_allocator::CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV,
-                (64usize << 20).to_string(),
-            );
-        }
+        let mut env = EnvVarGuard::acquire();
+        env.set(
+            crate::vmm_allocator::CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV,
+            &(64usize << 20).to_string(),
+        );
         let Ok(runtime) = CudaRuntime::new(0).map(Arc::new) else {
             eprintln!(
                 "SKIPPED (CUDA runtime dependencies unavailable): VMM weight admission GPU test"
@@ -5207,12 +5218,11 @@ mod tests {
             DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryRole,
         };
 
-        unsafe {
-            std::env::set_var(
-                crate::vmm_allocator::CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV,
-                (64usize << 20).to_string(),
-            );
-        }
+        let mut env = EnvVarGuard::acquire();
+        env.set(
+            crate::vmm_allocator::CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV,
+            &(64usize << 20).to_string(),
+        );
         let Ok(runtime) = CudaRuntime::new(0).map(Arc::new) else {
             eprintln!("SKIPPED (CUDA runtime dependencies unavailable): stable-VA repage GPU test");
             return;
