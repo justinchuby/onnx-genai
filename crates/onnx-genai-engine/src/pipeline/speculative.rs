@@ -788,16 +788,13 @@ fn target_state_output(workflow: &WorkflowSpec, component: &str, cell: &str) -> 
     })
 }
 
+/// One component's `invoke` bindings: input ports then output ports, each
+/// mapping a declared port name to the SSA value the workflow bound it to.
+type ComponentBindings = (BTreeMap<String, String>, BTreeMap<String, String>);
+
 /// The workflow's own `invoke` bindings for a component, port -> SSA value.
-fn component_invocation(
-    workflow: &WorkflowSpec,
-    component: &str,
-) -> Option<(BTreeMap<String, String>, BTreeMap<String, String>)> {
-    fn walk(
-        steps: &[WorkflowStep],
-        component: &str,
-        found: &mut Option<(BTreeMap<String, String>, BTreeMap<String, String>)>,
-    ) {
+fn component_invocation(workflow: &WorkflowSpec, component: &str) -> Option<ComponentBindings> {
+    fn walk(steps: &[WorkflowStep], component: &str, found: &mut Option<ComponentBindings>) {
         for step in steps {
             match step {
                 WorkflowStep::Invoke {
