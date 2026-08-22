@@ -31,6 +31,9 @@
 //!   capture region, from `begin` through `end`/`abort`.
 //! * Every code path that can synchronize the device takes
 //!   [`synchronizing_section`] first.
+//! * Callback paths that cannot block, or that may run on the capture thread,
+//!   use [`run_or_defer_synchronizing`] so capture-unsafe work is owned by the
+//!   gate and runs immediately after capture instead.
 //!
 //! Captures exclude synchronizers; synchronizers exclude captures; synchronizers
 //! run concurrently with one another. That is a writer-preferring reader/writer
@@ -62,6 +65,7 @@
 //! graph rather than per token.
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex, OnceLock};
 
 /// Reader/writer counts for the gate.
@@ -75,6 +79,10 @@ struct GateState {
     captures_waiting: u32,
     /// Whether a thread currently holds the capture exclusion.
     capturing: bool,
+    /// Capture-unsafe work submitted while a capture is live. The outermost
+    /// capture guard drains it after ending capture while still excluding the
+    /// next capture.
+    deferred: VecDeque<Box<dyn FnOnce() + Send + 'static>>,
 }
 
 fn gate() -> &'static (Mutex<GateState>, Condvar) {
@@ -178,11 +186,31 @@ impl Drop for CaptureExclusion {
         let (_, condvar) = gate();
         let mut state = lock_state();
         state.capturing = false;
+        let deferred = std::mem::take(&mut state.deferred);
+        if !deferred.is_empty() {
+            state.synchronizers += 1;
+        }
         if self.yielded_own_section {
             state.synchronizers += 1;
         }
         drop(state);
         condvar.notify_all();
+        if !deferred.is_empty() {
+            SHARED_DEPTH.with(|depth| depth.set(depth.get() + 1));
+            for action in deferred {
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)).is_err() {
+                    eprintln!("cuda capture gate: deferred synchronizing action panicked");
+                }
+            }
+            SHARED_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+            let mut state = lock_state();
+            state.synchronizers = state.synchronizers.saturating_sub(1);
+            let drained = state.synchronizers == 0;
+            drop(state);
+            if drained {
+                condvar.notify_all();
+            }
+        }
     }
 }
 
@@ -243,6 +271,41 @@ pub fn synchronizing_section() -> Option<SynchronizingSection> {
     }
     state.synchronizers += 1;
     Some(SynchronizingSection { outermost: true })
+}
+
+/// Execute capture-unsafe work now, or defer it until the active capture ends.
+///
+/// Unlike [`synchronizing_section`], this never blocks behind an already-live
+/// capture and never lets the capturing thread use its re-entrancy carve-out to
+/// invoke a capture-unsafe API. The action runs under synchronizer ownership,
+/// either immediately or while the outermost capture guard drains its queue.
+///
+/// Returns `true` when the action was deferred.
+pub fn run_or_defer_synchronizing(action: impl FnOnce() + Send + 'static) -> bool {
+    if CAPTURE_DEPTH.with(Cell::get) > 0 {
+        lock_state().deferred.push_back(Box::new(action));
+        return true;
+    }
+
+    let (_, condvar) = gate();
+    let mut state = lock_state();
+    while !state.capturing && state.captures_waiting > 0 {
+        state = condvar
+            .wait(state)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+    if state.capturing {
+        state.deferred.push_back(Box::new(action));
+        return true;
+    }
+    state.synchronizers += 1;
+    drop(state);
+
+    SHARED_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    let section = SynchronizingSection { outermost: true };
+    action();
+    drop(section);
+    false
 }
 
 #[cfg(test)]
@@ -324,6 +387,42 @@ mod tests {
             synchronizing_section().is_none(),
             "the capturing thread must bypass the gate rather than queue on it"
         );
+    }
+
+    #[test]
+    fn capture_unsafe_action_from_capture_thread_is_deferred_until_capture_ends() {
+        let _serial = serialized();
+        let ran = Arc::new(AtomicBool::new(false));
+        let capture = CaptureExclusion::acquire();
+        let flag = Arc::clone(&ran);
+        assert!(run_or_defer_synchronizing(move || {
+            flag.store(true, Ordering::SeqCst);
+        }));
+        assert!(!ran.load(Ordering::SeqCst));
+        drop(capture);
+        assert!(ran.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn capture_unsafe_action_from_another_thread_does_not_block_on_capture() {
+        let _serial = serialized();
+        let capture = CaptureExclusion::acquire();
+        let submitted = Arc::new(AtomicBool::new(false));
+        let ran = Arc::new(AtomicBool::new(false));
+        let submitted_flag = Arc::clone(&submitted);
+        let ran_flag = Arc::clone(&ran);
+        let worker = std::thread::spawn(move || {
+            let deferred = run_or_defer_synchronizing(move || {
+                ran_flag.store(true, Ordering::SeqCst);
+            });
+            assert!(deferred);
+            submitted_flag.store(true, Ordering::SeqCst);
+        });
+        worker.join().expect("deferred submitter panicked");
+        assert!(submitted.load(Ordering::SeqCst));
+        assert!(!ran.load(Ordering::SeqCst));
+        drop(capture);
+        assert!(ran.load(Ordering::SeqCst));
     }
 
     #[test]

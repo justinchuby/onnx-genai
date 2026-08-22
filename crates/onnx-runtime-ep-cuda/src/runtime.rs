@@ -43,6 +43,57 @@ pub struct CudaTransferCounts {
     pub async_host_to_device: u64,
 }
 
+/// Whether a failed measured H2D operation can still be using its source and
+/// destination.
+#[derive(Debug)]
+pub enum FailedHtodCompletion {
+    /// No copy was successfully submitted.
+    NotSubmitted,
+    /// A fallback copy-stream synchronization proved the submitted copy ended.
+    Completed(CopyCompleted),
+    /// A copy was submitted and the fallback synchronization also failed.
+    MayBeInFlight,
+}
+
+/// Failure from [`CudaRuntime::htod_async_elapsed_ms`] with ordering evidence.
+#[derive(Debug)]
+pub struct HtodAsyncElapsedError {
+    detail: String,
+    completion: FailedHtodCompletion,
+}
+
+impl HtodAsyncElapsedError {
+    pub fn into_parts(self) -> (String, FailedHtodCompletion) {
+        (self.detail, self.completion)
+    }
+}
+
+impl std::fmt::Display for HtodAsyncElapsedError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for HtodAsyncElapsedError {}
+
+fn classify_submitted_htod_failure(
+    error: String,
+    synchronization: std::result::Result<(), String>,
+) -> HtodAsyncElapsedError {
+    match synchronization {
+        Ok(()) => HtodAsyncElapsedError {
+            detail: format!("{error}; copy-stream completion was established before rollback"),
+            completion: FailedHtodCompletion::Completed(CopyCompleted::new()),
+        },
+        Err(sync_error) => HtodAsyncElapsedError {
+            detail: format!(
+                "{error}; cuStreamSynchronize(copy) could not establish completion: {sync_error}"
+            ),
+            completion: FailedHtodCompletion::MayBeInFlight,
+        },
+    }
+}
+
 fn nvrtc_include_paths() -> Vec<String> {
     let mut candidates = Vec::<PathBuf>::new();
     for variable in ["CUDA_HOME", "CUDA_PATH"] {
@@ -1654,40 +1705,80 @@ impl CudaRuntime {
         &self,
         src: &[u8],
         dst: CUdeviceptr,
-    ) -> Result<(f32, CopyCompleted)> {
-        self.bind()?;
+    ) -> std::result::Result<(f32, CopyCompleted), HtodAsyncElapsedError> {
+        self.bind().map_err(|error| HtodAsyncElapsedError {
+            detail: error.to_string(),
+            completion: FailedHtodCompletion::NotSubmitted,
+        })?;
         if src.is_empty() {
             return Ok((0.0, CopyCompleted::new()));
         }
         let start = self
             .context
             .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
-            .map_err(|e| driver_err("cuEventCreate(start)", e))?;
+            .map_err(|error| HtodAsyncElapsedError {
+                detail: driver_err("cuEventCreate(start)", error).to_string(),
+                completion: FailedHtodCompletion::NotSubmitted,
+            })?;
         let end = self
             .context
             .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
-            .map_err(|e| driver_err("cuEventCreate(end)", e))?;
+            .map_err(|error| HtodAsyncElapsedError {
+                detail: driver_err("cuEventCreate(end)", error).to_string(),
+                completion: FailedHtodCompletion::NotSubmitted,
+            })?;
         start
             .record(&self.copy_stream)
-            .map_err(|e| driver_err("cuEventRecord(start)", e))?;
+            .map_err(|error| HtodAsyncElapsedError {
+                detail: driver_err("cuEventRecord(start)", error).to_string(),
+                completion: FailedHtodCompletion::NotSubmitted,
+            })?;
         // SAFETY: caller guarantees `dst` covers `src.len()` bytes. The source
         // must remain live until `end.elapsed_ms` returns, which this method
         // enforces by synchronizing the end event before returning.
         unsafe {
             cudarc::driver::result::memcpy_htod_async(dst, src, self.copy_stream.cu_stream())
         }
-        .map_err(|e| driver_err("cuMemcpyHtoDAsync", e))?;
-        end.record(&self.copy_stream)
-            .map_err(|e| driver_err("cuEventRecord(end)", e))?;
+        .map_err(|error| HtodAsyncElapsedError {
+            detail: driver_err("cuMemcpyHtoDAsync", error).to_string(),
+            completion: FailedHtodCompletion::NotSubmitted,
+        })?;
+        if let Err(error) = end.record(&self.copy_stream) {
+            return Err(self.settle_submitted_htod_failure(driver_err("cuEventRecord(end)", error)));
+        }
         // `elapsed_ms` host-synchronizes the end event (cudarc `Event::elapsed_ms`
         // calls `end.synchronize()`), so on return the copy is complete on the
         // host timeline — which is exactly what `CopyCompleted` attests.
-        let elapsed_ms = start
-            .elapsed_ms(&end)
-            .map_err(|e| driver_err("cuEventElapsedTime", e))?;
+        let elapsed_ms = match start.elapsed_ms(&end) {
+            Ok(elapsed_ms) => elapsed_ms,
+            Err(error) => {
+                return Err(
+                    self.settle_submitted_htod_failure(driver_err("cuEventElapsedTime", error))
+                );
+            }
+        };
         self.async_host_to_device_copies
             .fetch_add(1, Ordering::Relaxed);
         Ok((elapsed_ms, CopyCompleted::new()))
+    }
+
+    fn settle_submitted_htod_failure(&self, error: EpError) -> HtodAsyncElapsedError {
+        let Some(_section) = capture_gate::synchronizing_section() else {
+            return classify_submitted_htod_failure(
+                error.to_string(),
+                Err(
+                    "the copy failed on the active capture thread; synchronization was deferred \
+                     to preserve capture"
+                        .into(),
+                ),
+            );
+        };
+        classify_submitted_htod_failure(
+            error.to_string(),
+            self.copy_stream
+                .synchronize()
+                .map_err(|sync_error| sync_error.to_string()),
+        )
     }
 
     /// Enqueue an asynchronous device → device copy on the transfer stream, so
@@ -1708,6 +1799,7 @@ impl CudaRuntime {
         if bytes == 0 {
             return Ok(());
         }
+
         // SAFETY: bound context; both endpoints cover `bytes` and the copy is
         // ordered on the runtime-owned transfer stream.
         unsafe {
@@ -1830,6 +1922,7 @@ impl CudaRuntime {
 /// `htod_async` + deferred fence, no `CopyCompleted` is available at the reuse
 /// site, so the code **fails to compile** until the author threads the witness
 /// through after awaiting the fence — the hazard cannot be reached by accident.
+#[derive(Debug)]
 #[must_use = "a CopyCompleted witness exists to gate pinned-buffer reuse; dropping it is pointless"]
 pub struct CopyCompleted(());
 
@@ -1951,6 +2044,26 @@ pub fn raw_ptr(dptr: CUdeviceptr) -> *mut c_void {
 mod tests {
     use super::*;
     use cudarc::driver::PushKernelArg;
+
+    #[test]
+    fn submitted_htod_failure_reports_completion_after_fallback_sync() {
+        let error =
+            classify_submitted_htod_failure("injected end-event record failure".into(), Ok(()));
+        let (detail, completion) = error.into_parts();
+        assert!(detail.contains("completion was established"));
+        assert!(matches!(completion, FailedHtodCompletion::Completed(_)));
+    }
+
+    #[test]
+    fn submitted_htod_failure_reports_possible_in_flight_copy_when_sync_fails() {
+        let error = classify_submitted_htod_failure(
+            "injected end-event record failure".into(),
+            Err("injected copy-stream synchronization failure".into()),
+        );
+        let (detail, completion) = error.into_parts();
+        assert!(detail.contains("could not establish completion"));
+        assert!(matches!(completion, FailedHtodCompletion::MayBeInFlight));
+    }
 
     #[test]
     fn raw_allocation_profile_attributes_driver_and_pool_paths() {

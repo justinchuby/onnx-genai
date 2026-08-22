@@ -611,15 +611,21 @@ unsafe extern "C" fn managed_cuda_free(
         }
         return;
     }
-    // ORT's registered device allocator is the backing allocator beneath its
-    // arena. `Free` has no stream argument, while `AllocOnStream` only lends an
-    // OrtSyncStream for the duration of the allocation callback. The bridge
-    // forces `use_ep_level_unified_stream=1`, but retaining that raw stream
-    // handle past the callback would still be a lifetime bug. Match CUDA's
-    // ordinary `cudaFree` safety contract instead: synchronize the durable,
-    // process-lifetime context before unmapping VMM pages. CUDA graph capture
-    // keeps arena allocations live through capture/replay, so these backing
-    // frees occur only after ORT has ended the capture window.
+    // `Free` has no durable stream token, so match cudaFree ordering with a
+    // context synchronization. A free may arrive during an unrelated capture
+    // in the same primary context, though, and cuCtxSynchronize would invalidate
+    // that capture. The process-wide capture gate therefore either executes the
+    // whole synchronize+release sequence now or owns it until capture ends.
+    let state = Arc::clone(&allocator.state);
+    onnx_runtime_cuda_memory::capture_gate::run_or_defer_synchronizing(move || {
+        release_stream_ordered_allocation(&state, live.allocation);
+    });
+}
+
+fn release_stream_ordered_allocation(
+    state: &ManagedCudaOrtAllocatorState,
+    allocation: ManagedAllocation,
+) {
     if let Err(error) = state
         .context
         .bind_to_thread()
@@ -629,10 +635,10 @@ unsafe extern "C" fn managed_cuda_free(
             "onnx-genai-ort: WARNING: managed CUDA allocator could not establish device \
              quiescence before release: {error}; retaining the allocation"
         );
-        quarantine_live_allocation(state, live.allocation);
+        quarantine_live_allocation(state, allocation);
         return;
     }
-    if let Err(error) = live.allocation.release_now() {
+    if let Err(error) = allocation.release_now() {
         let (error, _allocation) = error.into_parts();
         eprintln!(
             "onnx-genai-ort: WARNING: managed CUDA allocator could not release a quiescent \
@@ -849,6 +855,7 @@ fn manager_error(operation: &str, error: AllocationTransactionError) -> OrtError
 mod tests {
     use super::*;
     use onnx_runtime_memory_governor::HostAllocator;
+    use std::sync::Barrier;
 
     #[derive(Debug)]
     struct Pin;
@@ -894,5 +901,69 @@ mod tests {
         let snapshot = manager.snapshot().expect("snapshot");
         assert_eq!(snapshot.authority_count, 0);
         assert!(snapshot.mechanism_snapshots.is_empty());
+    }
+
+    #[test]
+    fn managed_free_is_deferred_while_concurrent_capture_replays_then_settles() {
+        let Ok(context) = CudaContext::new(0).map(Arc::new) else {
+            eprintln!("SKIPPED (CUDA runtime dependencies unavailable): managed free capture test");
+            return;
+        };
+        context.bind_to_thread().expect("bind CUDA context");
+        let stream = context.new_stream().expect("capture stream");
+        let mut ptr = 0;
+        let result = unsafe { cu::cuMemAlloc_v2(&mut ptr, 256) };
+        if result != cu::CUresult::CUDA_SUCCESS {
+            eprintln!("SKIPPED (CUDA allocation unavailable): {result:?}");
+            return;
+        }
+
+        let capture_ready = Arc::new(Barrier::new(2));
+        let free_submitted = Arc::new(Barrier::new(2));
+        let charge = Arc::new(AtomicU64::new(256));
+        let worker_charge = Arc::clone(&charge);
+        let worker_context = Arc::clone(&context);
+        let worker_ready = Arc::clone(&capture_ready);
+        let worker_submitted = Arc::clone(&free_submitted);
+
+        let exclusion = onnx_runtime_cuda_memory::capture_gate::CaptureExclusion::acquire();
+        stream
+            .begin_capture(cu::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            .expect("begin capture");
+        unsafe {
+            cudarc::driver::result::memset_d8_async(ptr, 0x5a, 256, stream.cu_stream())
+                .expect("captured memset");
+        }
+        let worker = std::thread::spawn(move || {
+            worker_ready.wait();
+            assert!(
+                onnx_runtime_cuda_memory::capture_gate::run_or_defer_synchronizing(move || {
+                    worker_context.bind_to_thread().expect("bind free context");
+                    worker_context
+                        .synchronize()
+                        .expect("managed free synchronize");
+                    worker_charge.fetch_sub(256, Ordering::Release);
+                })
+            );
+            worker_submitted.wait();
+        });
+        capture_ready.wait();
+        free_submitted.wait();
+        assert_eq!(charge.load(Ordering::Acquire), 256);
+        let graph = stream
+            .end_capture(
+                cu::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+            )
+            .expect("end capture")
+            .expect("captured graph");
+        drop(exclusion);
+        worker.join().expect("managed free thread");
+        assert_eq!(charge.load(Ordering::Acquire), 0);
+        graph.launch().expect("replay captured graph");
+        stream.synchronize().expect("replay completion");
+
+        let _section = onnx_runtime_cuda_memory::capture_gate::synchronizing_section();
+        let free_result = unsafe { cu::cuMemFree_v2(ptr) };
+        assert_eq!(free_result, cu::CUresult::CUDA_SUCCESS);
     }
 }
