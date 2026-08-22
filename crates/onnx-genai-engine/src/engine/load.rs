@@ -368,8 +368,17 @@ impl Engine {
         // existing load path unchanged. See #384 and the qwen3.5-27B enablement.
         maybe_fill_hybrid_io_from_graph(&mut metadata, &model_directory.model_path);
         let runtime_caps = onnx_genai_metadata::RuntimeCapabilities::default();
-        if let Err(errors) = onnx_genai_metadata::validate(&metadata, &runtime_caps) {
-            anyhow::bail!("Invalid inference metadata: {errors:?}");
+        let report =
+            onnx_genai_metadata::validate_structure_and_capabilities(&metadata, &runtime_caps);
+        if !report.structural.is_empty() {
+            anyhow::bail!("Invalid inference metadata: {:?}", report.structural);
+        }
+        if !report.unsupported_capabilities.is_empty() {
+            tracing::info!(
+                "inference metadata declares capabilities this runtime does not implement: {}; \
+                 continuing because the decode path does not exercise them",
+                report.unsupported_capabilities.join(", ")
+            );
         }
         // Native MTP self-speculation seeds its draft head from a target hidden
         // output. The native decode session only records that hidden state when
@@ -1156,10 +1165,23 @@ fn resolve_metadata_and_decode_path(
     shared_kv: crate::decode::SharedKvOffer,
     capture_requested: bool,
 ) -> anyhow::Result<MetadataResolution> {
-    // Validate capabilities
+    // Structural defects mean the document does not describe a runnable model,
+    // so they stay fatal. Unsupported capabilities are a different question:
+    // this is the bare-decoder decode path, which never reaches workflow
+    // features like `workflow_ssa` or `serving_service_contract`, so refusing
+    // to load over them rejects packages that would run correctly. Report them
+    // and continue.
     let runtime_caps = onnx_genai_metadata::RuntimeCapabilities::default();
-    if let Err(errors) = onnx_genai_metadata::validate(&metadata, &runtime_caps) {
-        anyhow::bail!("Invalid inference metadata: {errors:?}");
+    let report = onnx_genai_metadata::validate_structure_and_capabilities(&metadata, &runtime_caps);
+    if !report.structural.is_empty() {
+        anyhow::bail!("Invalid inference metadata: {:?}", report.structural);
+    }
+    if !report.unsupported_capabilities.is_empty() {
+        tracing::info!(
+            "inference metadata declares capabilities this runtime does not implement: {}; \
+             continuing because the decode path does not exercise them",
+            report.unsupported_capabilities.join(", ")
+        );
     }
 
     let sliding_window = crate::decode::sliding_window_from_metadata(&metadata)?;
