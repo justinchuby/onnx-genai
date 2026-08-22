@@ -23,21 +23,31 @@ One process per launch, arms interleaved round-robin, per-rep load guard on the
 instantaneous runnable count (`/proc/loadavg` field 4), cells over the guard
 discarded rather than kept (7 discarded in the published run).
 
-| width | ms/token (min) | tok/s | speedup vs `=1` |
-|---:|---:|---:|---:|
-| 1 | 40.039 | 24.7 | 1.00x |
-| 2 | **20.447** | **48.6** | **1.96x** |
-| 4 | 10.442 | 94.8 | 3.83x |
-| 8 | 5.326 | 187.8 | 7.52x |
-| 16 | 4.324 | 231.3 | 9.26x |
+| width | ms/token (min) | tok/s | speedup vs `=1` | reps | spread |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 40.039 | 24.7 | 1.00x | 2 | 2.1% |
+| 2 | **20.447** | **48.6** | **1.96x** | 6 | 1.7% |
+| 4 | 10.442 | 94.8 | 3.83x *(provisional)* | 2 | **46.4%** |
+| 8 | 5.326 | 187.8 | 7.52x | 3 | 3.1% |
+| 16 | 4.324 | 231.3 | 9.26x | 2 | 1.2% |
 
 **A/A null control (both arms at width 2): 0.6%.** The 1.96x clears it by more
 than two orders of magnitude. `=2` reproduced at 20.447 / 20.575 / 20.562 /
 20.636 ms/token across three independent windows, including one contended one.
 
-Scaling is near-linear to `t=8` and then knees into `t=16` (7.52x to 9.26x — only
-1.23x for the last doubling), which is the memory-bandwidth plateau the pool
-default is sized for, not a dispatch failure.
+**The `t=4` cell is not measured and is marked provisional.** Its two reps were
+10.442 and 15.283 — a 46.4% spread, bimodal in the way this host is known to be
+per process launch. The minimum is quoted for consistency with the other rows,
+but by the standard this repository already sets — "do not pick the flattering
+statistic, extend the run", and a cell whose estimators disagree in direction has
+not been measured — 3.83x is a waypoint awaiting reps, not a result. It is not
+load-bearing for anything below.
+
+The shape of the curve is therefore: a solid 1.96x at `t=2`, solid points at
+`t=8` and `t=16`, and a knee into `t=16` (7.52x to 9.26x — only 1.23x for the
+last doubling) consistent with the memory-bandwidth plateau the pool default is
+sized for. Whether the `t=1`-to-`t=8` segment is *linear* depends on the
+unmeasured `t=4` point and is not claimed here.
 
 ## The parked-worker reading is falsified directly
 
