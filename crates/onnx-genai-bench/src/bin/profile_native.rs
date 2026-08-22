@@ -693,6 +693,18 @@ fn print_cuda_observability(
                     .saturating_sub(before.graph.verify_invalidations)
             );
         }
+        print_raw_allocation_profile(
+            "cuda_raw_alloc_total",
+            &stats.graph.raw_allocation_sites,
+            None,
+        );
+        if let Some(before) = before {
+            print_raw_allocation_profile(
+                "cuda_raw_alloc_measured",
+                &stats.graph.raw_allocation_sites,
+                Some(&before.graph.raw_allocation_sites),
+            );
+        }
         if let Some(reason) = &stats.graph.decline_reason {
             println!("cuda_graph_decline_reason: {reason}");
         }
@@ -708,6 +720,85 @@ fn print_cuda_observability(
                 stats.graph.device_token_loop_k, stats.graph.device_token_loop_steps
             );
         }
+    }
+}
+
+fn print_raw_allocation_profile(
+    label: &str,
+    sites: &[onnx_runtime_ep_cuda::CudaRawAllocationSiteStats],
+    before: Option<&[onnx_runtime_ep_cuda::CudaRawAllocationSiteStats]>,
+) {
+    let mut deltas = sites
+        .iter()
+        .filter_map(|site| {
+            let prior = before.and_then(|before| {
+                before
+                    .iter()
+                    .find(|prior| prior.file == site.file && prior.line == site.line)
+            });
+            let delta = onnx_runtime_ep_cuda::CudaRawAllocationSiteStats {
+                file: site.file,
+                line: site.line,
+                requests: site
+                    .requests
+                    .saturating_sub(prior.map_or(0, |prior| prior.requests)),
+                requested_bytes: site
+                    .requested_bytes
+                    .saturating_sub(prior.map_or(0, |prior| prior.requested_bytes)),
+                driver_allocations: site
+                    .driver_allocations
+                    .saturating_sub(prior.map_or(0, |prior| prior.driver_allocations)),
+                driver_bytes: site
+                    .driver_bytes
+                    .saturating_sub(prior.map_or(0, |prior| prior.driver_bytes)),
+                pool_hits: site
+                    .pool_hits
+                    .saturating_sub(prior.map_or(0, |prior| prior.pool_hits)),
+                pool_hit_bytes: site
+                    .pool_hit_bytes
+                    .saturating_sub(prior.map_or(0, |prior| prior.pool_hit_bytes)),
+            };
+            (delta.requests > 0).then_some(delta)
+        })
+        .collect::<Vec<_>>();
+    if deltas.is_empty() {
+        return;
+    }
+    deltas.sort_unstable_by(|left, right| {
+        right
+            .driver_bytes
+            .cmp(&left.driver_bytes)
+            .then_with(|| right.pool_hit_bytes.cmp(&left.pool_hit_bytes))
+            .then_with(|| left.file.cmp(right.file))
+            .then_with(|| left.line.cmp(&right.line))
+    });
+    let requests = deltas.iter().map(|site| site.requests).sum::<u64>();
+    let requested_bytes = deltas.iter().map(|site| site.requested_bytes).sum::<u64>();
+    let driver_allocations = deltas
+        .iter()
+        .map(|site| site.driver_allocations)
+        .sum::<u64>();
+    let driver_bytes = deltas.iter().map(|site| site.driver_bytes).sum::<u64>();
+    let pool_hits = deltas.iter().map(|site| site.pool_hits).sum::<u64>();
+    let pool_hit_bytes = deltas.iter().map(|site| site.pool_hit_bytes).sum::<u64>();
+    println!(
+        "{label}: requests={requests} requested_bytes={requested_bytes} \
+         driver_allocations={driver_allocations} driver_bytes={driver_bytes} \
+         pool_hits={pool_hits} pool_hit_bytes={pool_hit_bytes}"
+    );
+    for site in deltas {
+        println!(
+            "{label}_site: {}:{} requests={} requested_bytes={} driver_allocations={} \
+             driver_bytes={} pool_hits={} pool_hit_bytes={}",
+            site.file,
+            site.line,
+            site.requests,
+            site.requested_bytes,
+            site.driver_allocations,
+            site.driver_bytes,
+            site.pool_hits,
+            site.pool_hit_bytes
+        );
     }
 }
 

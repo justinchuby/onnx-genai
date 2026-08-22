@@ -80,6 +80,7 @@ pub(super) fn append_execution_providers(
             session_options,
             provider,
             options.graph_capture,
+            options.forces_cuda_unified_stream(),
             &options.cuda_attention_mode,
             &available,
         )
@@ -97,6 +98,7 @@ pub(super) fn append_execution_provider(
     session_options: *mut onnx_genai_ort_sys::OrtSessionOptions,
     provider: &ResolvedEp,
     graph_capture: bool,
+    force_cuda_unified_stream: bool,
     cuda_attention_mode: &CudaAttentionMode,
     available: &[String],
 ) -> Result<()> {
@@ -108,6 +110,7 @@ pub(super) fn append_execution_provider(
             session_options,
             *device_id,
             graph_capture,
+            force_cuda_unified_stream,
             cuda_attention_mode,
             available,
         ),
@@ -116,6 +119,7 @@ pub(super) fn append_execution_provider(
             let _ = (
                 session_options,
                 graph_capture,
+                force_cuda_unified_stream,
                 cuda_attention_mode,
                 available,
             );

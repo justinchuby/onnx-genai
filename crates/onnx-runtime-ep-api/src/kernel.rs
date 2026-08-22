@@ -581,6 +581,22 @@ pub trait Kernel: Send {
         Ok(WorkspaceRequirement::NONE)
     }
 
+    /// Refine the workspace requirement with runtime-visible tensor inputs.
+    ///
+    /// Prepare-only reservation walks have only [`TensorMetadata`], so
+    /// [`Kernel::workspace_requirement`] remains the planning hook. Execution
+    /// dispatch, though, may already hold device views whose *values* determine
+    /// the exact scratch size (for example a reduction whose axes come from an
+    /// input tensor). The default preserves the metadata-only contract.
+    fn workspace_requirement_for_execution(
+        &self,
+        inputs: &[TensorView],
+        metadata: &[TensorMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
+        let _ = inputs;
+        self.workspace_requirement(metadata)
+    }
+
     /// Execute using workspace prepared before request admission.
     fn execute_with_workspace(
         &self,
