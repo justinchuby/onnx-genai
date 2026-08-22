@@ -450,8 +450,11 @@ fn shared_state_pixel_flow_request(
     sequence: usize,
     text_only: bool,
     image: Option<Vec<u8>>,
+    seed: i64,
 ) -> anyhow::Result<PipelineGenerateRequest> {
     let sequence_i64 = i64::try_from(sequence)?;
+    let negative_sequence = (sequence / 2).max(1);
+    let negative_sequence_i64 = i64::try_from(negative_sequence)?;
     let mut image_mask = vec![0_u8; sequence];
     if image.is_some() {
         image_mask.fill(1);
@@ -466,7 +469,7 @@ fn shared_state_pixel_flow_request(
     )
     .with_input(
         "request.negative_prompt_tokens",
-        Value::from_slice_i64(&vec![0; sequence], &[1, sequence_i64])?,
+        Value::from_slice_i64(&vec![0; negative_sequence], &[1, negative_sequence_i64])?,
     )
     .with_input(
         "request.image_mask",
@@ -474,13 +477,15 @@ fn shared_state_pixel_flow_request(
     )
     .with_input(
         "request.negative_image_mask",
-        Value::from_raw_bytes(vec![0; sequence], &[1, sequence_i64], DataType::Bool)?,
+        Value::from_raw_bytes(
+            vec![0; negative_sequence],
+            &[1, negative_sequence_i64],
+            DataType::Bool,
+        )?,
     )
-    .with_input(
-        "request.latent",
-        Value::from_slice_f32(&vec![0.25; 3 * 32 * 32], &[1, 3, 32, 32])?,
-    )
-    .with_input("request.noise_scale", Value::from_slice_f32(&[1.0], &[1])?)
+    .with_input("request.seed", Value::from_slice_i64(&[seed], &[1])?)
+    .with_input("request.width", Value::from_slice_i64(&[32], &[1])?)
+    .with_input("request.height", Value::from_slice_i64(&[32], &[1])?)
     .with_input(
         "request.guidance_scale",
         Value::from_slice_f32(&[2.0], &[1])?,
@@ -504,20 +509,27 @@ fn mobius_shared_state_pixel_flow_executes_text_and_generation_paths() -> anyhow
     let mut engine =
         Engine::from_pipeline_dir(&root("shared_state_pixel_flow")?, EngineConfig::default())?;
 
-    let text = engine.run_pipeline_outputs(shared_state_pixel_flow_request(2, true, None)?)?;
+    let text = engine.run_pipeline_outputs(shared_state_pixel_flow_request(2, true, None, 7)?)?;
     assert_eq!(text["logits"].shape(), [1, 2, 64]);
 
     let generated =
-        engine.run_pipeline_outputs(shared_state_pixel_flow_request(2, false, None)?)?;
+        engine.run_pipeline_outputs(shared_state_pixel_flow_request(2, false, None, 7)?)?;
     assert_eq!(generated["image"].shape(), [1, 3, 32, 32]);
     assert!(
         generated["image"]
             .to_vec_f32()?
             .iter()
-            .all(|value| value.is_finite())
+            .all(|value| value.is_finite() && (-1.0..=1.0).contains(value))
     );
     let diagnostic = engine.workflow_performance_diagnostic();
     assert_eq!(diagnostic.last_loop_iterations, 2);
+
+    let repeated =
+        engine.run_pipeline_outputs(shared_state_pixel_flow_request(2, false, None, 7)?)?;
+    assert_eq!(
+        repeated["image"].to_vec_f32()?,
+        generated["image"].to_vec_f32()?
+    );
     Ok(())
 }
 
@@ -533,13 +545,13 @@ fn mobius_shared_state_pixel_flow_executes_reference_image_edit() -> anyhow::Res
     // 512x512 preprocessing with 32x32 pixels per merged token yields 256
     // reference-image features, one for each true scatter position.
     let output =
-        engine.run_pipeline_outputs(shared_state_pixel_flow_request(256, false, Some(png))?)?;
+        engine.run_pipeline_outputs(shared_state_pixel_flow_request(256, false, Some(png), 7)?)?;
     assert_eq!(output["image"].shape(), [1, 3, 32, 32]);
     assert!(
         output["image"]
             .to_vec_f32()?
             .iter()
-            .all(|value| value.is_finite())
+            .all(|value| value.is_finite() && (-1.0..=1.0).contains(value))
     );
     Ok(())
 }

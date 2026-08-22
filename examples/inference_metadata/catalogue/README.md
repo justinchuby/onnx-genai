@@ -41,7 +41,14 @@ then bind those groups with `access: read_only`, so alternating CFG branches can
 reuse the frozen prefixes without pretending that discarded graph outputs are
 state transitions. The same pattern applies to unified any-to-any architectures
 whose later stages consume, but must not advance, state produced by an earlier
-stage.
+stage. Conditional and unconditional prefixes may have different sequence
+lengths. The workflow derives resolution-aware initial noise from semantic
+seed/width/height inputs, while retaining an optional caller-supplied latent
+for controlled parity runs, and clamps the final image to its declared range.
+
+A 49 GB mixed-precision production package exercised this exact metadata
+pattern on H200 for text prefill, 512x512 text-to-image, and reference-image
+editing: <https://huggingface.co/justinchuby/sensenova-u1.5-8b-mot-onnx-canonical>.
 
 ## Qwen3.5 hybrid state and speculative decoding
 
