@@ -1950,6 +1950,13 @@ pub(crate) mod testutil {
     /// Eviction is scoped to *this* buffer's address so a live weight's entry
     /// is never discarded -- the cache-accounting tests assert that an executed
     /// kernel's transpose is still resident.
+    ///
+    /// `bytes.as_ptr()` is the right address because every weight the caches
+    /// admit is a contiguous view at `byte_offset` 0, so `view().data_ptr()` --
+    /// which is what the key is built from -- is this same pointer. A weight
+    /// cached through an offset or sub-slice view would key on `base + offset`
+    /// and slip past this; nothing does so today, and the f16 path admits only
+    /// contiguous views.
     impl Drop for Owned {
         fn drop(&mut self) {
             crate::kernels::weight_transpose::evict_address(self.bytes.as_ptr() as usize);
