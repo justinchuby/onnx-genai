@@ -691,6 +691,19 @@ pub trait HostToDeviceCopier: Send + Sync {
     unsafe fn copy_host_to_device(&self, src: &[u8], dst: *mut c_void) -> Result<()>;
 }
 
+/// Source-attributed device allocations made outside an EP's allocator seam.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RawDeviceAllocationSiteStats {
+    pub file: &'static str,
+    pub line: u32,
+    pub requests: u64,
+    pub requested_bytes: u64,
+    pub driver_allocations: u64,
+    pub driver_bytes: u64,
+    pub pool_hits: u64,
+    pub pool_hit_bytes: u64,
+}
+
 /// The core EP interface. Every backend crate implements this (§4.1).
 pub trait ExecutionProvider: Send + Sync {
     /// EP identifier (snake_case, e.g. `"cpu_ep"`, `"cuda_ep"`).
@@ -1312,6 +1325,11 @@ pub trait ExecutionProvider: Send + Sync {
     /// Explicit device allocation/free counters, when the EP exposes them.
     fn device_allocation_counts(&self) -> Option<(u64, u64)> {
         None
+    }
+
+    /// Opt-in attribution for allocations made outside [`Self::allocate`].
+    fn raw_device_allocation_site_stats(&self) -> Vec<RawDeviceAllocationSiteStats> {
+        Vec::new()
     }
 
     /// Reserve governed bytes for executor-owned kernel workspace.

@@ -167,6 +167,10 @@ pub struct PipelineEngine {
     adapter_cache: RefCell<adapters::AdapterCache>,
     active_adapter_context: RefCell<Option<adapters::AdapterRunContext>>,
     preprocessing: Option<PreprocessingSpec>,
+    /// Kept last so the ORT environment, its registered allocator bridge, and
+    /// their plugin/provider teardown outlive every component and execution-island
+    /// session that may still call back into them.
+    _ort_environment: Option<Arc<onnx_genai_ort::Environment>>,
 }
 
 impl Drop for PipelineEngine {
@@ -210,6 +214,57 @@ fn workflow_initializer_reservation_bytes(
     })
 }
 
+#[cfg(feature = "ort-cuda")]
+fn managed_cuda_bridge_device_id(
+    session_options: &SessionOptions,
+    authority_provider: Option<&SharedMemoryAuthorityProvider>,
+    authority_domain: &crate::memory_authority::DeviceCompatibilityDomain,
+) -> anyhow::Result<Option<i32>> {
+    if authority_provider.is_none() || !session_options.selects_cuda() {
+        return Ok(None);
+    }
+    let Some(session_device_id) = session_options.cuda_device_id() else {
+        anyhow::bail!(
+            "CUDA session options selected a non-host execution provider without a concrete device id"
+        );
+    };
+    let crate::memory_authority::DeviceCompatibilityDomain::Cuda(shared_device_index) =
+        authority_domain
+    else {
+        anyhow::bail!(
+            "a shared CUDA allocator bridge was requested for workflow sessions, but the shared \
+             authority domain is {authority_domain} rather than cuda:{session_device_id}"
+        );
+    };
+    let shared_device_id = i32::try_from(*shared_device_index)
+        .context("shared CUDA authority device id exceeded i32")?;
+    anyhow::ensure!(
+        shared_device_id == session_device_id,
+        "shared CUDA allocator bridge targets device {shared_device_id}, but workflow session \
+         options target CUDA device {session_device_id}"
+    );
+    Ok(Some(session_device_id))
+}
+
+#[cfg(feature = "ort-cuda")]
+fn shared_cuda_allocator_config(
+    session_options: &SessionOptions,
+    authority_provider: Option<&SharedMemoryAuthorityProvider>,
+    authority_domain: &crate::memory_authority::DeviceCompatibilityDomain,
+    resource_governor: &EngineResourceGovernor,
+) -> anyhow::Result<Option<onnx_genai_ort::ManagedCudaAllocatorConfig>> {
+    let Some(session_device_id) =
+        managed_cuda_bridge_device_id(session_options, authority_provider, authority_domain)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(onnx_genai_ort::ManagedCudaAllocatorConfig::new(
+        session_device_id,
+        resource_governor.process_memory_manager(),
+        Arc::new(resource_governor.device_authority()),
+    )?))
+}
+
 impl Engine {
     pub fn from_pipeline_dir(
         pipeline_dir: &Path,
@@ -224,6 +279,20 @@ impl Engine {
         provider: Arc<dyn MemoryAuthorityProvider>,
     ) -> anyhow::Result<PipelineEngine> {
         PipelineEngine::from_dir_with_memory_authority_provider(pipeline_dir, config, provider)
+    }
+
+    pub fn from_pipeline_dir_with_session_options_and_memory_authority_provider(
+        pipeline_dir: &Path,
+        config: EngineConfig,
+        session_options: SessionOptions,
+        provider: Arc<dyn MemoryAuthorityProvider>,
+    ) -> anyhow::Result<PipelineEngine> {
+        PipelineEngine::from_dir_with_session_options_and_memory_authority_provider(
+            pipeline_dir,
+            config,
+            session_options,
+            provider,
+        )
     }
 }
 
@@ -255,6 +324,15 @@ impl PipelineEngine {
             SessionOptions::default(),
             Some(provider),
         )
+    }
+
+    pub fn from_dir_with_session_options_and_memory_authority_provider(
+        pipeline_dir: &Path,
+        config: EngineConfig,
+        session_options: SessionOptions,
+        provider: Arc<dyn MemoryAuthorityProvider>,
+    ) -> anyhow::Result<Self> {
+        Self::build(pipeline_dir, config, session_options, Some(provider))
     }
 
     fn build(
@@ -322,6 +400,14 @@ impl PipelineEngine {
         #[cfg(not(feature = "native-cuda"))]
         let memory_strategy_overrides = crate::engine::MemoryStrategyOverrides::default();
         let managed_vmm = matches!(config.limits.vram_limit, crate::ResourceLimit::Bytes(_));
+        #[cfg(feature = "ort-cuda")]
+        let managed_cuda_device_id = managed_cuda_bridge_device_id(
+            &session_options,
+            authority_provider.as_ref(),
+            &authority_domain,
+        )?;
+        #[cfg(not(feature = "ort-cuda"))]
+        let managed_cuda_device_id: Option<i32> = None;
         let memory_strategy_plan = build_memory_strategy_plan(MemoryStrategyPlanInput {
             config: &config,
             resolved_vram_bytes,
@@ -350,8 +436,7 @@ impl PipelineEngine {
             force_managed_weight_streaming: crate::engine::force_managed_weight_streaming_enabled(),
         });
         log_memory_strategy_plan(&memory_strategy_plan, "workflow");
-        let runtime_manages_initializer_residency = !memory_strategy_plan.advisory_only
-            && memory_strategy_plan.runtime_application().managed_no_spill;
+        let runtime_manages_initializer_residency = managed_cuda_device_id.is_some();
         let source_initializer_reservation = workflow_initializer_reservation_bytes(
             model_weights_bytes,
             0,
@@ -367,14 +452,38 @@ impl PipelineEngine {
             None,
             model_weights_bytes,
             source_initializer_reservation,
-            None,
+            managed_cuda_device_id.and_then(|device| u32::try_from(device).ok()),
             authority_provider.as_ref(),
             &authority_domain,
         )?;
+        if runtime_manages_initializer_residency {
+            let available = onnx_runtime_memory_governor::MemoryGovernor::available(
+                &resource_governor.device_authority(),
+                onnx_runtime_memory_governor::Tier::Device,
+            );
+            anyhow::ensure!(
+                model_weights_bytes <= available,
+                "workflow source initializers require {model_weights_bytes} bytes before session \
+                 construction, but the shared managed CUDA authority has only {available} bytes \
+                 available"
+            );
+        }
         // CUDA Graph capture applies to stable linked execution islands. Enabling
         // it on every source component rejects valid setup/control-flow graphs
         // before the workflow planner can determine capture eligibility.
         let mut component_session_options = session_options.clone();
+        #[cfg(feature = "ort-cuda")]
+        let mut session_options = session_options;
+        #[cfg(feature = "ort-cuda")]
+        if let Some(allocator_config) = shared_cuda_allocator_config(
+            &session_options,
+            authority_provider.as_ref(),
+            &authority_domain,
+            &resource_governor,
+        )? {
+            component_session_options.use_managed_cuda_allocator(allocator_config.clone());
+            session_options.use_managed_cuda_allocator(allocator_config);
+        }
         component_session_options.graph_capture = false;
         let models = PipelineModels::load_with_component_options(
             pipeline_dir,
@@ -411,19 +520,37 @@ impl PipelineEngine {
         let additional_initializer_reservation = maximum_initializer_reservation
             .checked_sub(source_initializer_reservation)
             .context("workflow initializer reservation accounting underflow")?;
-        let island_reservation_admitted = match resource_governor.plan().reserve(
-            Holder::FixedDeviceReservation,
-            additional_initializer_reservation,
-        ) {
-            Ok(_) => true,
-            Err(error) => {
+        let island_reservation_admitted = if runtime_manages_initializer_residency {
+            let available = onnx_runtime_memory_governor::MemoryGovernor::available(
+                &resource_governor.device_authority(),
+                onnx_runtime_memory_governor::Tier::Device,
+            );
+            if maximum_island_initializer_bytes <= available {
+                true
+            } else {
                 tracing::warn!(
-                    additional_initializer_reservation,
-                    %error,
+                    additional_initializer_reservation = maximum_island_initializer_bytes,
+                    available,
                     "workflow execution-island fusion declined because duplicate initializer \
                      residency was not admitted"
                 );
                 false
+            }
+        } else {
+            match resource_governor.plan().reserve(
+                Holder::FixedDeviceReservation,
+                additional_initializer_reservation,
+            ) {
+                Ok(_) => true,
+                Err(error) => {
+                    tracing::warn!(
+                        additional_initializer_reservation,
+                        %error,
+                        "workflow execution-island fusion declined because duplicate initializer \
+                         residency was not admitted"
+                    );
+                    false
+                }
             }
         };
         let execution_islands = if island_reservation_admitted {
@@ -468,6 +595,7 @@ impl PipelineEngine {
             .collect::<HashSet<_>>();
         let device_bridge_components =
             workflow::compile_device_bridge_components(&bridge_graph, &island_components);
+        let ort_environment = models.environment_handle();
         Ok(Self {
             package_root: directory.root.clone(),
             models,
@@ -490,6 +618,7 @@ impl PipelineEngine {
             adapter_cache: RefCell::new(adapters::AdapterCache::default()),
             active_adapter_context: RefCell::new(None),
             preprocessing: directory.preprocessing,
+            _ort_environment: ort_environment,
         })
     }
 
@@ -852,5 +981,523 @@ mod tests {
             workflow_initializer_reservation_bytes(u64::MAX, 1, true).is_err(),
             "managed accounting still validates the topology-derived maximum"
         );
+    }
+
+    #[cfg(feature = "ort-cuda")]
+    mod cuda_managed_bridge {
+        use super::super::PipelineEngine;
+        use crate::{
+            DeviceCompatibilityDomain, DeviceMemoryAuthority, EngineConfig, GeneratePrompt,
+            GenerateRequest, MemoryAuthorityProvider, ProcessMemoryManager, ResourceLimit,
+        };
+        use onnx_genai_ort::{
+            DataType, SessionOptions, Value, available_execution_providers, ep_selection,
+        };
+        use std::fs;
+        use std::path::{Path, PathBuf};
+        use std::sync::{Arc, Mutex, OnceLock};
+        use std::time::{Duration, Instant};
+
+        const BATCH: usize = 4;
+        const VOCAB: usize = 128;
+
+        const DECODER: &str = r#"
+ir_version: 8
+graph {
+  node {
+    input: "scores" output: "logits" op_type: "Softmax"
+    attribute { name: "axis" i: -1 type: INT }
+  }
+  name: "decoder"
+  input { name: "scores" type { tensor_type { elem_type: 1 shape {
+    dim { dim_param: "batch" } dim { dim_param: "vocabulary" }
+  }}}}
+  output { name: "logits" type { tensor_type { elem_type: 1 shape {
+    dim { dim_param: "batch" } dim { dim_param: "vocabulary" }
+  }}}}
+}
+opset_import { domain: "" version: 13 }
+"#;
+
+        const SAMPLER: &str = r#"
+ir_version: 8
+graph {
+  node {
+    input: "logits" output: "token" op_type: "ArgMax"
+    attribute { name: "axis" i: -1 type: INT }
+    attribute { name: "keepdims" i: 0 type: INT }
+  }
+  name: "sampler"
+  input { name: "logits" type { tensor_type { elem_type: 1 shape {
+    dim { dim_param: "batch" } dim { dim_param: "vocabulary" }
+  }}}}
+  output { name: "token" type { tensor_type { elem_type: 7 shape {
+    dim { dim_param: "batch" }
+  }}}}
+}
+opset_import { domain: "" version: 13 }
+"#;
+
+        const TERMINATION: &str = r#"
+ir_version: 8
+graph {
+  node { input: "token" input: "eos" output: "done" op_type: "Equal" }
+  name: "termination"
+  input { name: "token" type { tensor_type { elem_type: 7 shape {
+    dim { dim_param: "batch" }
+  }}}}
+  input { name: "eos" type { tensor_type { elem_type: 7 shape {
+    dim { dim_value: 1 }
+  }}}}
+  output { name: "done" type { tensor_type { elem_type: 9 shape {
+    dim { dim_param: "batch" }
+  }}}}
+}
+opset_import { domain: "" version: 13 }
+"#;
+
+        #[derive(Debug, Clone)]
+        struct FixedAuthorityProvider {
+            manager: ProcessMemoryManager,
+            authority: DeviceMemoryAuthority,
+        }
+
+        impl FixedAuthorityProvider {
+            fn new(device_id: u32) -> Self {
+                let capacity = onnx_genai_ort::cuda_rt::device_memory_info(device_id as i32)
+                    .map(|memory| memory.total_bytes)
+                    .unwrap_or(1 << 33);
+                Self::with_capacity(device_id, capacity as u64)
+            }
+
+            fn with_capacity(device_id: u32, capacity: u64) -> Self {
+                let manager = ProcessMemoryManager::new().expect("process memory manager");
+                Self {
+                    manager,
+                    authority: DeviceMemoryAuthority::new(
+                        DeviceCompatibilityDomain::Cuda(device_id),
+                        capacity,
+                    ),
+                }
+            }
+        }
+
+        impl MemoryAuthorityProvider for FixedAuthorityProvider {
+            fn process_memory_manager(&self) -> ProcessMemoryManager {
+                self.manager.clone()
+            }
+
+            fn validate_limit(
+                &self,
+                domain: &DeviceCompatibilityDomain,
+                _requested: ResourceLimit,
+            ) -> anyhow::Result<()> {
+                anyhow::ensure!(
+                    domain == self.authority.domain(),
+                    "unexpected compatibility domain {domain}"
+                );
+                Ok(())
+            }
+
+            fn authority(
+                &self,
+                domain: &DeviceCompatibilityDomain,
+                _resolved_limit_bytes: u64,
+            ) -> anyhow::Result<DeviceMemoryAuthority> {
+                anyhow::ensure!(
+                    domain == self.authority.domain(),
+                    "unexpected compatibility domain {domain}"
+                );
+                Ok(self.authority.clone())
+            }
+        }
+
+        fn ort_test_lock() -> &'static Mutex<()> {
+            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            LOCK.get_or_init(|| Mutex::new(()))
+        }
+
+        fn cuda_ready() -> bool {
+            available_execution_providers()
+                .ok()
+                .is_some_and(|providers| {
+                    providers
+                        .iter()
+                        .any(|provider| provider.eq_ignore_ascii_case("CUDAExecutionProvider"))
+                })
+                && onnx_genai_ort::cuda_rt::device_memory_info(0).is_ok()
+        }
+
+        fn package_root(name: &str) -> anyhow::Result<PathBuf> {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/test-fixtures/pipeline-managed-cuda-bridge")
+                .join(name);
+            fs::create_dir_all(&root)?;
+            fs::write(root.join("inference_metadata.yaml"), workflow_metadata())?;
+            fs::write(root.join("decoder.onnx.textproto"), DECODER)?;
+            fs::write(root.join("sampler.onnx.textproto"), SAMPLER)?;
+            fs::write(root.join("termination.onnx.textproto"), TERMINATION)?;
+            Ok(root)
+        }
+
+        fn workflow_metadata() -> String {
+            format!(
+                r#"
+pipeline:
+  workflow:
+    manifest:
+      capabilities: [workflow_ssa, typed_emit]
+    inputs:
+      logits:
+        contract: {{ dtype: float32, rank: 2, shape: [{BATCH}, {VOCAB}] }}
+        role: {{ kind: opaque }}
+        source: {{ kind: application, name: logits }}
+        required: true
+      eos:
+        contract: {{ dtype: int64, rank: 1, shape: [1] }}
+        role: {{ kind: opaque }}
+        source: {{ kind: application, name: eos }}
+        required: true
+    outputs:
+      token:
+        contract: {{ dtype: int64, rank: 1, shape: [{BATCH}] }}
+        role: tokens
+        stage: pre_adapter
+      done:
+        contract: {{ dtype: bool, rank: 1, shape: [{BATCH}] }}
+        role: tensor
+        stage: pre_adapter
+    components:
+      decoder:
+        implementation: {{ kind: onnx, artifact: decoder.onnx.textproto }}
+      sampler:
+        implementation: {{ kind: onnx, artifact: sampler.onnx.textproto }}
+      termination:
+        implementation: {{ kind: onnx, artifact: termination.onnx.textproto }}
+    steps:
+      - kind: invoke
+        component: decoder
+        inputs: {{ scores: logits }}
+        outputs: {{ logits: policy_logits }}
+      - kind: invoke
+        component: sampler
+        inputs: {{ logits: policy_logits }}
+        outputs: {{ token: sampled }}
+      - kind: invoke
+        component: termination
+        inputs: {{ token: sampled, eos: eos }}
+        outputs: {{ done: is_done }}
+      - kind: emit
+        value: sampled
+        output: token
+        mode: replace
+      - kind: emit
+        value: is_done
+        output: done
+        mode: replace
+"#
+            )
+        }
+
+        fn logits_bytes() -> Vec<u8> {
+            (0..BATCH * VOCAB)
+                .flat_map(|index| {
+                    let value = ((index % VOCAB) as f32 * 0.0001).sin();
+                    value.to_le_bytes()
+                })
+                .collect()
+        }
+
+        fn workflow_request() -> anyhow::Result<super::super::PipelineGenerateRequest> {
+            let request = GenerateRequest::new(GeneratePrompt::TokenIds(Vec::new()));
+            Ok(super::super::PipelineGenerateRequest::new(request)
+                .with_input(
+                    "logits",
+                    Value::from_raw_bytes(
+                        logits_bytes(),
+                        &[BATCH as i64, VOCAB as i64],
+                        DataType::Float32,
+                    )?,
+                )
+                .with_input("eos", Value::from_slice_i64(&[0], &[1])?))
+        }
+
+        fn wait_for_allocator_idle(
+            engine: &PipelineEngine,
+            expected_live_allocations: usize,
+        ) -> anyhow::Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let snapshot = engine
+                    .resource_governor
+                    .process_memory_manager()
+                    .snapshot()?;
+                let stats = engine
+                    .models
+                    .environment()?
+                    .managed_cuda_allocator_stats(0)
+                    .expect("managed CUDA allocator stats");
+                if snapshot.allocations.len() == expected_live_allocations
+                    && stats.deferred_release_pending == 0
+                {
+                    return Ok(());
+                }
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "managed CUDA allocator never returned to {expected_live_allocations} live \
+                     allocations; snapshot={} stats={stats:?}",
+                    snapshot.allocations.len()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        #[test]
+        fn shared_cuda_allocator_bridge_is_visible_to_component_and_island_sessions() {
+            let _guard = ort_test_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !cuda_ready() {
+                return;
+            }
+
+            let root = package_root("component-and-island").expect("workflow fixture");
+            let provider = Arc::new(FixedAuthorityProvider::new(0));
+            let options = SessionOptions::with_execution_provider(ep_selection("cuda"))
+                .with_intra_op_threads(1);
+            let mut engine =
+                PipelineEngine::from_dir_with_session_options_and_memory_authority_provider(
+                    &root,
+                    EngineConfig::default(),
+                    options,
+                    provider,
+                )
+                .expect("pipeline engine");
+            assert!(
+                !engine.execution_islands.is_empty(),
+                "workflow should lower into an execution island"
+            );
+            let build_stats = engine
+                .models
+                .environment()
+                .expect("pipeline environment")
+                .managed_cuda_allocator_stats(0)
+                .expect("managed CUDA allocator stats");
+            assert!(
+                build_stats.total_allocations > 0 && build_stats.reserve_allocations > 0,
+                "session construction did not allocate through the managed CUDA bridge: \
+                 {build_stats:?}"
+            );
+
+            engine
+                .run_pipeline(workflow_request().expect("workflow request"))
+                .expect("workflow run");
+            let island = engine
+                .execution_island_diagnostics()
+                .into_iter()
+                .next()
+                .expect("execution island diagnostics");
+            assert!(island.runs > 0, "execution island never ran: {island:?}");
+            let after_run = engine
+                .models
+                .environment()
+                .expect("pipeline environment")
+                .managed_cuda_allocator_stats(0)
+                .expect("managed CUDA allocator stats");
+            assert!(
+                after_run.deferred_release_quarantined == 0
+                    && after_run.deferred_release_enqueue_failures == 0,
+                "runtime frees must reclaim after device quiescence without quarantine: \
+                 {after_run:?}"
+            );
+            wait_for_allocator_idle(
+                &engine,
+                engine
+                    .resource_governor
+                    .process_memory_manager()
+                    .snapshot()
+                    .expect("baseline snapshot")
+                    .allocations
+                    .len(),
+            )
+            .expect("idle after run");
+
+            let baseline_live_allocations = engine
+                .resource_governor
+                .process_memory_manager()
+                .snapshot()
+                .expect("baseline snapshot")
+                .allocations
+                .len();
+            let component_allocator = engine
+                .models
+                .session("decoder")
+                .expect("component session")
+                .device_allocator()
+                .expect("component device allocator")
+                .expect("CUDA device allocator");
+            let component_value = Value::empty_in(
+                &[BATCH as i64, VOCAB as i64],
+                DataType::Float32,
+                &component_allocator,
+            )
+            .expect("component-managed device allocation");
+            let island_allocator = engine.execution_islands[0]
+                .session()
+                .device_allocator()
+                .expect("island device allocator")
+                .expect("CUDA island allocator");
+            let island_value = Value::empty_in(&[BATCH as i64], DataType::Int64, &island_allocator)
+                .expect("island-managed device allocation");
+            let live_snapshot = engine
+                .resource_governor
+                .process_memory_manager()
+                .snapshot()
+                .expect("live snapshot");
+            assert!(
+                live_snapshot.allocations.len() >= baseline_live_allocations + 2,
+                "component and island allocations were not both published through the shared \
+                 process memory manager: baseline={baseline_live_allocations} now={} ",
+                live_snapshot.allocations.len()
+            );
+
+            drop(component_value);
+            drop(island_value);
+            wait_for_allocator_idle(&engine, baseline_live_allocations)
+                .expect("component and island frees must settle");
+        }
+
+        #[test]
+        fn shared_cuda_allocator_bridge_survives_graph_capture() {
+            let _guard = ort_test_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !cuda_ready() {
+                return;
+            }
+
+            let root = package_root("graph-capture").expect("workflow fixture");
+            let provider = Arc::new(FixedAuthorityProvider::new(0));
+            let mut options = SessionOptions::with_execution_provider(ep_selection("cuda"))
+                .with_intra_op_threads(1);
+            options.graph_capture = true;
+            let mut engine =
+                PipelineEngine::from_dir_with_session_options_and_memory_authority_provider(
+                    &root,
+                    EngineConfig::default(),
+                    options,
+                    provider,
+                )
+                .expect("pipeline engine");
+
+            engine
+                .run_pipeline(workflow_request().expect("workflow request"))
+                .expect("capture warmup run");
+            engine
+                .run_pipeline(workflow_request().expect("workflow request"))
+                .expect("capture replay run");
+            let island = engine
+                .execution_island_diagnostics()
+                .into_iter()
+                .next()
+                .expect("execution island diagnostics");
+            assert!(
+                island.capture_eligible,
+                "expected a capture-eligible island: {island:?}"
+            );
+            assert!(island.captures >= 1, "island never captured: {island:?}");
+            assert!(island.replays >= 1, "island never replayed: {island:?}");
+            let stats = engine
+                .models
+                .environment()
+                .expect("pipeline environment")
+                .managed_cuda_allocator_stats(0)
+                .expect("managed CUDA allocator stats");
+            assert!(
+                stats.deferred_release_pending == 0
+                    && stats.deferred_release_quarantined == 0
+                    && stats.deferred_release_enqueue_failures == 0,
+                "graph-captured workflow did not settle managed CUDA allocator accounting: \
+                 {stats:?}"
+            );
+        }
+
+        #[test]
+        fn managed_initializer_residency_is_charged_once_near_the_device_limit() {
+            let _guard = ort_test_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !cuda_ready() {
+                return;
+            }
+
+            let root = package_root("near-budget-single-charge").expect("workflow fixture");
+            let options = SessionOptions::with_execution_provider(ep_selection("cuda"))
+                .with_intra_op_threads(1);
+            let calibration_provider = Arc::new(FixedAuthorityProvider::new(0));
+            let calibration =
+                PipelineEngine::from_dir_with_session_options_and_memory_authority_provider(
+                    &root,
+                    EngineConfig::default(),
+                    options.clone(),
+                    calibration_provider,
+                )
+                .expect("calibration pipeline engine");
+            let calibration_snapshot = calibration
+                .resource_governor
+                .process_memory_manager()
+                .snapshot()
+                .expect("calibration PMM snapshot");
+            let actual_initializer_charge = calibration_snapshot.charged_bytes;
+            assert!(actual_initializer_charge > 0);
+            let package_bytes = [
+                "decoder.onnx.textproto",
+                "sampler.onnx.textproto",
+                "termination.onnx.textproto",
+            ]
+            .into_iter()
+            .map(|name| {
+                fs::metadata(root.join(name))
+                    .expect("component metadata")
+                    .len()
+            })
+            .sum::<u64>();
+            drop(calibration);
+
+            let limit = actual_initializer_charge
+                .checked_add(package_bytes / 2)
+                .expect("near-budget limit");
+            let provider = Arc::new(FixedAuthorityProvider::with_capacity(0, limit));
+            let mut config = EngineConfig::default();
+            config.limits.vram_limit = ResourceLimit::Bytes(limit);
+            let engine =
+                PipelineEngine::from_dir_with_session_options_and_memory_authority_provider(
+                    &root, config, options, provider,
+                )
+                .expect("a model that fits once must not fail from a duplicate fixed reservation");
+            let snapshot = engine
+                .resource_governor
+                .process_memory_manager()
+                .snapshot()
+                .expect("near-budget PMM snapshot");
+            assert!(
+                snapshot.charged_bytes <= limit,
+                "managed initializer charges exceeded the shared authority limit: {snapshot:?}"
+            );
+            assert!(
+                engine
+                    .resource_governor
+                    .plan()
+                    .breakdown()
+                    .iter()
+                    .all(|(name, _, bytes)| *name != "fixed device reservation" || *bytes == 0),
+                "managed ORT initializer residency must not keep a second fixed reservation"
+            );
+            assert_eq!(
+                snapshot.authority_snapshots[0].used[0],
+                engine.resource_snapshot().vram.used,
+                "PMM and engine snapshots must report the same canonical device charge"
+            );
+        }
     }
 }

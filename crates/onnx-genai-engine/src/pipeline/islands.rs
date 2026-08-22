@@ -139,6 +139,11 @@ impl ExecutionIsland {
         &self.components
     }
 
+    #[cfg(all(test, feature = "ort-cuda"))]
+    pub(crate) fn session(&self) -> &Session {
+        &self.session
+    }
+
     pub(crate) fn cuda_device_id(&self) -> Option<i32> {
         self.session.cuda_device_id()
     }

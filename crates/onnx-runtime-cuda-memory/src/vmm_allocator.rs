@@ -1206,6 +1206,17 @@ impl CudaVmmAllocator {
         self.backing.physical_pool().map(|pool| pool.authority())
     }
 
+    /// Authority currently charged for this allocator's committed bytes.
+    ///
+    /// When a retained physical-handle pool is active it owns the committed
+    /// bytes; otherwise the arena's own device-tier lease does.
+    pub fn committed_byte_authority(
+        &self,
+    ) -> Option<onnx_runtime_memory_governor::MemoryAuthorityId> {
+        self.physical_pool_authority()
+            .or_else(|| self.lock().lease.authority_id())
+    }
+
     /// Bytes of physical memory mapped right now, and the address space
     /// reserved for them.
     ///

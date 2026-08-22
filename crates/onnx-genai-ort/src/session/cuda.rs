@@ -10,6 +10,7 @@ pub(super) fn append_cuda_execution_provider(
     session_options: *mut onnx_genai_ort_sys::OrtSessionOptions,
     device_id: i32,
     graph_capture: bool,
+    use_ep_level_unified_stream: bool,
     attention_mode: &CudaAttentionMode,
     available: &[String],
 ) -> Result<()> {
@@ -39,7 +40,12 @@ pub(super) fn append_cuda_execution_provider(
     crate::error::check_status(unsafe { create(&mut cuda_options) })?;
     let result = (|| {
         let device_id = device_id.to_string();
-        let provider_options = cuda_provider_options(device_id, graph_capture, attention_mode);
+        let provider_options = cuda_provider_options(
+            device_id,
+            graph_capture,
+            use_ep_level_unified_stream,
+            attention_mode,
+        );
         let option_keys = provider_options
             .iter()
             .map(|(key, _)| {
@@ -103,11 +109,15 @@ pub(super) fn append_cuda_execution_provider(
 pub(super) fn cuda_provider_options(
     device_id: String,
     graph_capture: bool,
+    use_ep_level_unified_stream: bool,
     attention_mode: &CudaAttentionMode,
 ) -> Vec<(String, String)> {
     let mut options = vec![("device_id".to_string(), device_id)];
     if graph_capture {
         options.push(("enable_cuda_graph".to_string(), "1".to_string()));
+    }
+    if use_ep_level_unified_stream {
+        options.push(("use_ep_level_unified_stream".to_string(), "1".to_string()));
     }
     if attention_mode == &CudaAttentionMode::Unfused {
         // ORT AttentionBackend::MATH is bit 16. A positive sdpa_kernel value is
