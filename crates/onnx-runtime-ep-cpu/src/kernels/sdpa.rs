@@ -267,11 +267,62 @@ pub struct QkCapture<'a> {
     pub stage: QkCaptureStage,
 }
 
+/// Below this many row x key x head-dimension multiply-accumulates, waking a
+/// pool costs more than the attention work itself.
+///
+/// Measured, not assumed, on the 16-cell `scripts/ort_ab/gen_mha.py` production
+/// grid at 1/4/8/16 threads against a same-binary A/A null arm. Sorting every
+/// cell by total attention work:
+///
+/// | total MACs | cell | t=16 vs serial |
+/// |---:|---|---:|
+/// | 1.05 M | `llama_decode_kv128` | **+71%** |
+/// | 1.57 M | `bert_base_decode_kv1024` | **+47%** |
+/// | 2.10 M | `llama32x128_kv256` (sweep) | **+37%** |
+/// | 8.39 M | `llama_decode_kv1024` | -42% |
+/// | 8.39 M | `llama_decode_past1023` | -23% |
+/// | 25 M and up | every prefill/encoder cell | -53% to -89% |
+///
+/// The regressions and the wins do not overlap, and the gap between them is
+/// wide, so the constant sits inside it rather than on either edge. What the
+/// grid does *not* give is a sharp crossover: nothing production-shaped lands
+/// between 2.1 M and 8.4 M, and the synthetic cells generated to fill that gap
+/// turned out to be dominated by the BSNH->BNSH transpose rather than by
+/// attention, so they measure the wrong thing and are not used here.
+///
+/// Deliberately ~26x `MIN_PARALLEL_ATTENTION_WORK` in
+/// [`crate::kernels::group_query_attention`], which gates the same class of work
+/// but on a route that reaches the pool differently; the number here is the one
+/// this route's own grid supports, and the two should not be reconciled by
+/// assumption.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+const MIN_PARALLEL_SDPA_WORK: usize = 4 * 1024 * 1024;
+
+/// Smallest multiply-accumulate count worth giving a single task, used as the
+/// grain floor. The runtime treats it as a floor and takes a coarser grain when
+/// there are more rows than lanes, so this only has to exclude splits that could
+/// never pay for their own dispatch.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+const MIN_SDPA_WORK_PER_TASK: usize = 64 * 1024;
+
 #[cfg(all(
     test,
     any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
 ))]
 static SDPA_SIMD_TEST_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Test counter: incremented when [`sdpa_f32_simd`] actually fans its output
+/// rows out, as opposed to running them serially.
+///
+/// Separate from `SDPA_SIMD_TEST_HITS` so a parity test can assert the parallel
+/// path was *exercised*. Without it a routing mistake that quietly reverted to
+/// serial would leave every numeric test passing.
+#[cfg(all(
+    test,
+    any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+))]
+static SDPA_SIMD_TEST_FANOUTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Test counter: incremented when the Accelerate (cblas_sgemm/AMX) SDPA fast
 /// path fires on macOS/iOS.
@@ -1117,44 +1168,208 @@ fn sdpa_f32_simd(
     };
     let combined_scale = post_scale * operand_scale * operand_scale;
 
-    let mut scores = vec![0.0f32; kv_seq];
-    for b in 0..batch {
-        for n in 0..num_heads {
-            let kv_n = n / heads_per_kv;
-            for i in 0..q_seq {
-                let q_base = ((b * num_heads + n) * q_seq + i) * head_size;
-                let q_slice = &q[q_base..q_base + head_size];
+    // `Y` is `[batch, head, q_seq, Dv]`, so the `(b, head, i)` iteration space
+    // flattens to one contiguous output row per index and each row is written by
+    // exactly one task. Nothing is shared but the read-only operands, so the
+    // partition reproduces the serial result bit-for-bit whatever the split.
+    let rows = batch * num_heads * q_seq;
+    let work_per_row = kv_seq.saturating_mul(head_size + v_head_size);
 
-                // scores[j] = combined_scale * dot(Q, K_j) [+softcap] + bias + mask
-                for (j, sc) in scores.iter_mut().enumerate() {
-                    let k_base = ((b * num_kv_heads + kv_n) * kv_seq + j) * head_size;
-                    let mut s = dot_f32(q_slice, &k[k_base..k_base + head_size]) * combined_scale;
-                    if let Some(softcap) = cfg.softcap {
-                        s = softcap * (s / softcap).tanh();
-                    }
-                    s += bias.at(b, n, i, j);
-                    s += mask.at(b, i, j);
-                    if cfg.causal && (j as i64) > cfg.past_seq as i64 + i as i64 {
-                        s = cfg.causal_fill;
-                    }
-                    *sc = s;
-                }
+    // `v_head_size == 0` is a degenerate but reachable shape -- this route has
+    // no non-empty precondition, unlike the MLAS and Accelerate ones -- and it
+    // has to stay the no-op it always was. It cannot go through
+    // `chunk_runs_mut`, which asserts a non-zero chunk.
+    let fan_out = if v_head_size == 0 {
+        None
+    } else {
+        sdpa_rows_per_task(rows, work_per_row)
+    };
 
-                softmax_in_place(&mut scores, SoftmaxExp::F32);
-
-                // context: Y[i] = sum_j(probs[j] * V[j, :]) via NEON AXPY
-                let y_base = ((b * num_heads + n) * q_seq + i) * v_head_size;
-                let y_slice = &mut y[y_base..y_base + v_head_size];
-                y_slice.fill(0.0);
-                for (j, &probability) in scores.iter().enumerate() {
-                    if probability == 0.0 {
-                        continue;
-                    }
-                    let v_base = ((b * num_kv_heads + kv_n) * kv_seq + j) * v_head_size;
-                    axpy_f32(y_slice, probability, &v[v_base..v_base + v_head_size]);
-                }
-            }
+    let Some(min_rows_per_task) = fan_out else {
+        let mut scores = vec![0.0f32; kv_seq];
+        for row in 0..rows {
+            let y_base = row * v_head_size;
+            sdpa_simd_row(
+                row,
+                t,
+                cfg,
+                bias,
+                mask,
+                combined_scale,
+                heads_per_kv,
+                &mut scores,
+                &mut y[y_base..y_base + v_head_size],
+            );
         }
+        return;
+    };
+    // One scratch buffer per worker rather than per row: the score vector is
+    // `kv_seq` floats, and at decode-with-long-past shapes that is a
+    // multi-kilobyte allocation that would otherwise land in the hot loop once
+    // per output row.
+    //
+    // Taken out of the slot and put back rather than borrowed across the body.
+    // A `RefCell` borrow held across `sdpa_simd_row` would panic if this thread
+    // ever ran a second row re-entrantly -- which the decode pool explicitly
+    // permits, since it degrades a nested dispatch to inline execution. Moving
+    // the buffer makes the nested call allocate its own instead of aborting the
+    // forward pass.
+    thread_local! {
+        static ROW_SCORES: std::cell::Cell<Vec<f32>> =
+            const { std::cell::Cell::new(Vec::new()) };
+    }
+    let row_body = |row: usize, y_row: &mut [f32]| {
+        let mut scores = ROW_SCORES.with(std::cell::Cell::take);
+        sdpa_simd_row(
+            row,
+            t,
+            cfg,
+            bias,
+            mask,
+            combined_scale,
+            heads_per_kv,
+            &mut scores,
+            y_row,
+        );
+        ROW_SCORES.with(|slot| slot.set(scores));
+    };
+
+    // Under an active decode scope the forward runs on the engine thread while
+    // the decode pool's workers are resident and spinning; fanning out to any
+    // *other* executor there would contend with them for the same cores. This
+    // is the same routing rule `GroupQueryAttention` follows, and it keys off
+    // which decode scope is active, never off op or model identity.
+    if crate::kernels::matmul_nbits::decode_pool_active() {
+        crate::kernels::matmul_nbits::decode_parallel_output_row_blocks(
+            y,
+            v_head_size,
+            rows,
+            row_body,
+        );
+        #[cfg(test)]
+        SDPA_SIMD_TEST_FANOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    let backend =
+        crate::task_runtime::chunk_runs_mut(y, v_head_size, min_rows_per_task, |first, run| {
+            for (offset, y_row) in run.chunks_mut(v_head_size).enumerate() {
+                row_body(first + offset, y_row);
+            }
+        });
+    #[cfg(test)]
+    if backend != crate::task_runtime::Backend::Serial {
+        SDPA_SIMD_TEST_FANOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(not(test))]
+    let _ = backend;
+}
+
+/// Smallest number of output rows worth handing to another thread, or `None` to
+/// run [`sdpa_f32_simd`] serially.
+///
+/// Pure, and deliberately blind to which executor will serve the fan-out or how
+/// wide it is: grain policy is the part most likely to be wrong, and this way it
+/// is testable without threads. It also means calling it cannot *construct* a
+/// pool -- asking `task_runtime::width()` here would build the native pool even
+/// on the decode route, which does not use it.
+///
+/// So this answers only "is there enough work to be worth splitting, and at what
+/// grain". Whether a split actually happens is the executor's call, and both
+/// executors already refuse the degenerate cases:
+/// [`crate::task_runtime::plan_tasks`] runs serially at width 1 or when the
+/// grain admits fewer than two tasks, and
+/// [`crate::kernels::matmul_nbits::decode_parallel_output_row_blocks`] runs
+/// inline at one worker or one row.
+///
+/// `work_per_row` is `kv_seq * (head_size + v_head_size)` — the per-row
+/// multiply-accumulate count, counting the `Q·Kᵀ` dot over `head_size` and the
+/// `P·V` AXPY over `v_head_size` for each of `kv_seq` keys.
+///
+/// `rows < 2` is not a threshold but an impossibility: a task is a whole number
+/// of rows, so a single row cannot be split however large it is.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+fn sdpa_rows_per_task(rows: usize, work_per_row: usize) -> Option<usize> {
+    if rows < 2 || work_per_row == 0 {
+        return None;
+    }
+    if rows.saturating_mul(work_per_row) < MIN_PARALLEL_SDPA_WORK {
+        return None;
+    }
+    Some(MIN_SDPA_WORK_PER_TASK.div_ceil(work_per_row).max(1))
+}
+
+/// One output row of [`sdpa_f32_simd`]: `Y[b, head, i, :]` for the flattened
+/// row index `row = (b * num_heads + head) * q_seq + i`.
+///
+/// The body is the serial loop's body, unchanged and in the same order, so the
+/// result does not depend on how the rows are partitioned. `scores` is caller-
+/// owned scratch, resized on first use and reused for every later row.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+fn sdpa_simd_row(
+    row: usize,
+    t: &SdpaTensors,
+    cfg: &SdpaConfig,
+    bias: &dyn AttnBias,
+    mask: &dyn KeyMask,
+    combined_scale: f32,
+    heads_per_kv: usize,
+    scores: &mut Vec<f32>,
+    y_row: &mut [f32],
+) {
+    let SdpaTensors {
+        q,
+        k,
+        v,
+        num_heads,
+        num_kv_heads,
+        q_seq,
+        kv_seq,
+        head_size,
+        v_head_size,
+        ..
+    } = *t;
+
+    // `Q` and `Y` share the `[b, head, q_seq, *]` layout, so the flat row index
+    // addresses both directly; only the bias/mask hooks and the KV head need the
+    // decomposed coordinates.
+    let i = row % q_seq;
+    let head = (row / q_seq) % num_heads;
+    let b = row / (q_seq * num_heads);
+    let kv_n = head / heads_per_kv;
+
+    if scores.len() != kv_seq {
+        scores.resize(kv_seq, 0.0);
+    }
+
+    let q_base = row * head_size;
+    let q_slice = &q[q_base..q_base + head_size];
+
+    // scores[j] = combined_scale * dot(Q, K_j) [+softcap] + bias + mask
+    for (j, sc) in scores.iter_mut().enumerate() {
+        let k_base = ((b * num_kv_heads + kv_n) * kv_seq + j) * head_size;
+        let mut s = dot_f32(q_slice, &k[k_base..k_base + head_size]) * combined_scale;
+        if let Some(softcap) = cfg.softcap {
+            s = softcap * (s / softcap).tanh();
+        }
+        s += bias.at(b, head, i, j);
+        s += mask.at(b, i, j);
+        if cfg.causal && (j as i64) > cfg.past_seq as i64 + i as i64 {
+            s = cfg.causal_fill;
+        }
+        *sc = s;
+    }
+
+    softmax_in_place(scores, SoftmaxExp::F32);
+
+    // context: Y[i] = sum_j(probs[j] * V[j, :]) via NEON AXPY
+    y_row.fill(0.0);
+    for (j, &probability) in scores.iter().enumerate() {
+        if probability == 0.0 {
+            continue;
+        }
+        let v_base = ((b * num_kv_heads + kv_n) * kv_seq + j) * v_head_size;
+        axpy_f32(y_row, probability, &v[v_base..v_base + v_head_size]);
     }
 }
 
@@ -3267,5 +3482,349 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Grain policy is pure and thread-free by design, so its edge cases are
+    /// checked here rather than inferred from timings.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn sdpa_grain_policy_refuses_splits_that_cannot_pay_for_themselves() {
+        // One row is not a threshold judgement: a task is a whole number of
+        // rows, so a single row is indivisible however much work it carries.
+        assert_eq!(sdpa_rows_per_task(1, usize::MAX / 2), None);
+        assert_eq!(sdpa_rows_per_task(0, 4096), None);
+        // A degenerate shape (kv_seq == 0) must not divide by zero.
+        assert_eq!(sdpa_rows_per_task(1024, 0), None);
+        // Enough rows, but the total is below the fan-out floor.
+        assert_eq!(sdpa_rows_per_task(8, 64), None);
+        const { assert!(MIN_PARALLEL_SDPA_WORK > 8 * 64) };
+        // The two cells that regressed on the production grid before the floor
+        // was raised: 32 heads x 1 query x 128 keys x 128+128, and 12 heads x
+        // 1 query x 1024 keys x 64+64. Both must now stay serial.
+        assert_eq!(sdpa_rows_per_task(32, 128 * 256), None);
+        assert_eq!(sdpa_rows_per_task(12, 1024 * 128), None);
+        // The smallest cell that won: 32 heads x 1 query x 1024 keys.
+        assert!(sdpa_rows_per_task(32, 1024 * 256).is_some());
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn sdpa_grain_policy_splits_decode_and_prefill_attention_shapes() {
+        // Decode, 32 heads x 1 query against a 2048-deep KV cache at
+        // head_size 128: 32 rows, each 2048 * 256 work. Comfortably parallel.
+        let per_task = sdpa_rows_per_task(32, 2048 * 256).expect("decode shape should fan out");
+        assert_eq!(per_task, 1, "a row this heavy is already a full task");
+        // Prefill, 8 heads x 256 queries against 256 keys at head_size 64:
+        // many light rows, so the grain has to coarsen.
+        let per_task =
+            sdpa_rows_per_task(8 * 256, 256 * 128).expect("prefill shape should fan out");
+        assert!(per_task > 1, "light rows must be batched, got {per_task}");
+        assert!(
+            2048 / per_task >= 2,
+            "grain {per_task} leaves fewer than two tasks"
+        );
+    }
+
+    /// The policy must not build the native pool, or a decode-scope forward --
+    /// which routes to the decode pool instead -- would spin up a second one.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn sdpa_grain_policy_answers_the_same_under_forced_serial() {
+        // `force_serial` makes `task_runtime::width()` report 1. If the policy
+        // consulted it, this would change the answer.
+        let free = sdpa_rows_per_task(32, 2048 * 256);
+        let forced = {
+            let _forced = crate::task_runtime::testing::force_serial();
+            sdpa_rows_per_task(32, 2048 * 256)
+        };
+        assert_eq!(free, forced, "grain policy must not depend on pool width");
+        assert!(free.is_some());
+    }
+
+    /// The fan-out repartitions rows but does not reassociate any arithmetic, so
+    /// it must reproduce the serial result *exactly* -- not within a tolerance.
+    ///
+    /// A tolerance test would pass just as happily if the split silently
+    /// corrupted one row in a way that stayed small, and would also pass if the
+    /// parallel path never ran at all; the counter assertion below closes the
+    /// second hole.
+    ///
+    /// Scope, deliberately stated because it is narrower than it looks: the
+    /// serial control runs the *same* per-row function, so this test falsifies
+    /// partitioning bugs (overlap, gaps, misordered runs, scratch shared across
+    /// tasks) and not row-addressing bugs, which would move both arms together.
+    /// Addressing is covered against an independent oracle by the scalar
+    /// comparison at the end of each case, and by
+    /// `sdpa_dispatch_matches_scalar_oracle_across_shapes`. Both falsifiers were
+    /// checked by hand: disabling the fan-out trips the counter assertion, and
+    /// corrupting the head decomposition trips the scalar comparison.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn parallel_sdpa_is_bit_identical_to_serial_across_shapes() {
+        use std::sync::atomic::Ordering;
+
+        struct Case {
+            name: &'static str,
+            batch: usize,
+            num_heads: usize,
+            num_kv_heads: usize,
+            q_seq: usize,
+            kv_seq: usize,
+            head_size: usize,
+            v_head_size: usize,
+            cfg: SdpaConfig,
+            use_bias: bool,
+            use_mask: bool,
+        }
+
+        let base = SdpaConfig {
+            scale: ScaleMode::PostDot(0.125),
+            softcap: None,
+            causal: false,
+            past_seq: 0,
+            causal_fill: f32::NEG_INFINITY,
+        };
+        let cases = [
+            Case {
+                name: "decode: 32 heads, one query, deep cache",
+                batch: 1,
+                num_heads: 32,
+                num_kv_heads: 32,
+                q_seq: 1,
+                kv_seq: 1024,
+                head_size: 96,
+                v_head_size: 96,
+                cfg: SdpaConfig {
+                    causal: true,
+                    past_seq: 1023,
+                    ..base
+                },
+                use_bias: false,
+                use_mask: false,
+            },
+            Case {
+                name: "gqa decode: 28 heads over 4 kv heads",
+                batch: 1,
+                num_heads: 28,
+                num_kv_heads: 4,
+                q_seq: 1,
+                kv_seq: 1536,
+                head_size: 64,
+                v_head_size: 64,
+                cfg: SdpaConfig {
+                    causal: true,
+                    past_seq: 1535,
+                    ..base
+                },
+                use_bias: false,
+                use_mask: true,
+            },
+            Case {
+                name: "prefill: causal, many light rows",
+                batch: 2,
+                num_heads: 8,
+                num_kv_heads: 8,
+                q_seq: 96,
+                kv_seq: 96,
+                head_size: 64,
+                v_head_size: 64,
+                cfg: SdpaConfig {
+                    causal: true,
+                    past_seq: 0,
+                    ..base
+                },
+                use_bias: true,
+                use_mask: false,
+            },
+            Case {
+                name: "odd heads and tails: 7 heads, prime q_seq/kv_seq, Dv != Dk",
+                batch: 3,
+                num_heads: 7,
+                num_kv_heads: 7,
+                q_seq: 29,
+                kv_seq: 131,
+                head_size: 65,
+                v_head_size: 17,
+                cfg: SdpaConfig {
+                    softcap: Some(30.0),
+                    ..base
+                },
+                use_bias: true,
+                use_mask: true,
+            },
+            Case {
+                name: "split-sqrt scale with bias and mask",
+                batch: 2,
+                num_heads: 12,
+                num_kv_heads: 2,
+                q_seq: 9,
+                kv_seq: 383,
+                head_size: 32,
+                v_head_size: 48,
+                cfg: SdpaConfig {
+                    scale: ScaleMode::SplitSqrt(0.0625),
+                    causal: true,
+                    past_seq: 5,
+                    causal_fill: -1.0e30,
+                    ..base
+                },
+                use_bias: true,
+                use_mask: true,
+            },
+        ];
+
+        let mut fanned_out = 0usize;
+        for case in cases {
+            let q_len = case.batch * case.num_heads * case.q_seq * case.head_size;
+            let k_len = case.batch * case.num_kv_heads * case.kv_seq * case.head_size;
+            let v_len = case.batch * case.num_kv_heads * case.kv_seq * case.v_head_size;
+            let y_len = case.batch * case.num_heads * case.q_seq * case.v_head_size;
+            let q = deterministic_values(q_len, 0x5D00 + q_len as u64, 1.5);
+            let k = deterministic_values(k_len, 0x5E00 + k_len as u64, 1.5);
+            let v = deterministic_values(v_len, 0x5F00 + v_len as u64, 0.75);
+            let tensors = SdpaTensors {
+                q: &q,
+                k: &k,
+                v: &v,
+                batch: case.batch,
+                num_heads: case.num_heads,
+                num_kv_heads: case.num_kv_heads,
+                q_seq: case.q_seq,
+                kv_seq: case.kv_seq,
+                head_size: case.head_size,
+                v_head_size: case.v_head_size,
+            };
+            let bias = PatternBias {
+                q_seq: case.q_seq,
+                kv_seq: case.kv_seq,
+            };
+            let mask = PatternMask {
+                q_seq: case.q_seq,
+                kv_seq: case.kv_seq,
+                fully_masked_query: Some(0),
+            };
+            let bias_ref: &dyn AttnBias = if case.use_bias { &bias } else { &NoBias };
+            let mask_ref: &dyn KeyMask = if case.use_mask { &mask } else { &NoMask };
+
+            let mut serial = vec![f32::NAN; y_len];
+            {
+                let _forced = crate::task_runtime::testing::force_serial();
+                sdpa_f32_simd(&tensors, &case.cfg, bias_ref, mask_ref, &mut serial);
+            }
+
+            let before = SDPA_SIMD_TEST_FANOUTS.load(Ordering::Relaxed);
+            let mut parallel = vec![f32::NAN; y_len];
+            sdpa_f32_simd(&tensors, &case.cfg, bias_ref, mask_ref, &mut parallel);
+            if SDPA_SIMD_TEST_FANOUTS.load(Ordering::Relaxed) != before {
+                fanned_out += 1;
+            }
+
+            for (index, (&got, &want)) in parallel.iter().zip(&serial).enumerate() {
+                assert!(
+                    got.to_bits() == want.to_bits(),
+                    "{}: element {index} differs, parallel {got:?} vs serial {want:?}",
+                    case.name
+                );
+            }
+
+            // Independent oracle, because the two arms above share a row body
+            // and so agree about any addressing mistake. The scalar route
+            // computes the same rows in a different order, so it does not.
+            let mut oracle = vec![f32::NAN; y_len];
+            sdpa_f32_scalar(&tensors, &case.cfg, bias_ref, mask_ref, &mut oracle, None);
+            for (index, (&got, &want)) in parallel.iter().zip(&oracle).enumerate() {
+                assert!(
+                    (got - want).abs() <= 1e-4 * want.abs().max(1.0),
+                    "{}: element {index} disagrees with the scalar oracle, \
+                     got {got:?} want {want:?}",
+                    case.name
+                );
+            }
+        }
+
+        if crate::task_runtime::width() >= 2 {
+            assert_eq!(
+                fanned_out, 5,
+                "only {fanned_out} of 5 shapes fanned out; every case is sized \
+                 above the work floor on purpose, so the parity above would be \
+                 vacuous for the ones that did not"
+            );
+        }
+    }
+
+    /// A zero-width value head is degenerate but reachable: this route has no
+    /// non-empty precondition. It must stay the no-op it was, and in particular
+    /// must not reach `chunk_runs_mut`, which asserts a non-zero chunk.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn zero_width_value_head_is_a_no_op_at_any_size() {
+        // Sized well above the fan-out floor on the Q.K side, so only the
+        // explicit guard keeps it off the parallel route.
+        let (batch, heads, q_seq, kv_seq, dh) = (1usize, 32usize, 1usize, 4096usize, 128usize);
+        let q = deterministic_values(batch * heads * q_seq * dh, 0x7100, 0.7);
+        let k = deterministic_values(batch * heads * kv_seq * dh, 0x7200, 0.7);
+        let tensors = SdpaTensors {
+            q: &q,
+            k: &k,
+            v: &[],
+            batch,
+            num_heads: heads,
+            num_kv_heads: heads,
+            q_seq,
+            kv_seq,
+            head_size: dh,
+            v_head_size: 0,
+        };
+        let cfg = SdpaConfig {
+            scale: ScaleMode::PostDot(0.25),
+            softcap: None,
+            causal: false,
+            past_seq: 0,
+            causal_fill: f32::NEG_INFINITY,
+        };
+        let mut y: Vec<f32> = Vec::new();
+        sdpa_f32_simd(&tensors, &cfg, &NoBias, &NoMask, &mut y);
+        assert!(y.is_empty());
+    }
+
+    /// Below the grain floor the kernel must stay on the calling thread, so a
+    /// tiny attention op does not pay a pool wake.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn tiny_sdpa_shapes_stay_serial() {
+        use std::sync::atomic::Ordering;
+
+        let (batch, heads, q_seq, kv_seq, dh) = (1usize, 2usize, 1usize, 8usize, 16usize);
+        let q = deterministic_values(batch * heads * q_seq * dh, 0x6100, 0.7);
+        let k = deterministic_values(batch * heads * kv_seq * dh, 0x6200, 0.7);
+        let v = deterministic_values(batch * heads * kv_seq * dh, 0x6300, 0.7);
+        let tensors = SdpaTensors {
+            q: &q,
+            k: &k,
+            v: &v,
+            batch,
+            num_heads: heads,
+            num_kv_heads: heads,
+            q_seq,
+            kv_seq,
+            head_size: dh,
+            v_head_size: dh,
+        };
+        let cfg = SdpaConfig {
+            scale: ScaleMode::PostDot(0.25),
+            softcap: None,
+            causal: false,
+            past_seq: 0,
+            causal_fill: f32::NEG_INFINITY,
+        };
+        let mut y = vec![f32::NAN; batch * heads * q_seq * dh];
+        let before = SDPA_SIMD_TEST_FANOUTS.load(Ordering::Relaxed);
+        sdpa_f32_simd(&tensors, &cfg, &NoBias, &NoMask, &mut y);
+        assert_eq!(
+            SDPA_SIMD_TEST_FANOUTS.load(Ordering::Relaxed),
+            before,
+            "a {kv_seq}-key, {heads}-head shape must not wake a pool"
+        );
+        assert!(y.iter().all(|value| value.is_finite()));
     }
 }

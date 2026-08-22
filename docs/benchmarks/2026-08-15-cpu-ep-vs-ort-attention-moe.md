@@ -4788,3 +4788,34 @@ Filed as **#1718**, carrying the flat `native_p50` column, the
 **Rule.** When a native/ORT ratio degrades monotonically with thread count while
 the native absolute time stays flat, stop optimising the kernel. The number is
 reporting the other runtime's scaling, not this one's arithmetic.
+
+### 45.9 Resolution, and one over-claim in 45.8 corrected
+
+#1718 is fixed: `sdpa_f32_simd` now fans out over flattened `(batch, head, query)`
+rows on the task runtime, above a measured 4 Mi-MAC floor. Full results, the
+threshold derivation and the falsifiers are in
+[`2026-08-22-sdpa-fanout.md`](2026-08-22-sdpa-fanout.md). The prefill and encoder
+cells above move -48% to -83% at t >= 4; `llama_prefill_s512_causal` — profiled at
+~73% SDPA on the critical path — goes **233.6 ms -> 30.7 ms (7.6x)** at t=16 with
+process CPU rising 137% -> 956%.
+
+**But 45.8's "it is worth roughly the thread count" is wrong for the decode cells,
+and the correction matters more than the win.** Profiling
+`llama_decode_past1023` at t=16 — the exact cell 45.8 quotes as its
+thread-scaling control — shows it is **51% `__memmove_avx_unaligned_erms`**, under
+`concat_cache` and `load_bnsh`. `sdpa_f32_simd` is ~5.5% of samples, roughly 23%
+of wall. Amdahl therefore bounds *any* SDPA fix on that shape at about **1.3x**,
+not 16x, and the measured result (-14% at t=8, 11 trials) is close to that
+ceiling.
+
+The flat `native_p50` column was real and the code observation was correct. What
+did not follow is the sizing: a flat native column tells you parallelism is
+unclaimed, but not *how much* of the wall clock is available to claim. That
+requires attribution, and on decode-with-past shapes the attribution says the KV
+concat is the larger term. `concat_cache` also still reaches **global Rayon** in
+a pure-native build, which is a separate open lane.
+
+**Amended rule.** A flat native absolute time across thread counts identifies
+unclaimed parallelism, but it does not size the prize. Profile the cell before
+quoting a headroom multiple — otherwise you are asserting that the kernel you
+happened to be reading is the whole critical path.
