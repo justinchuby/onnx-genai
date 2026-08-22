@@ -1340,12 +1340,21 @@ pub fn decode_path_label() -> &'static str {
 /// served it.
 ///
 /// Three separate mechanisms can quietly hand back fewer compute lanes than
-/// were requested -- [`reserve_single_group_headroom`], [`reserve_split_headroom`],
-/// and the single-CPU-cpuset fallback in [`build_from_env`] -- and all three
-/// report only through [`report_spmd_fallback`], which is `tracing::debug!` or
-/// `NXRT_CALIB_DEBUG`-gated. In a default benchmark run they are invisible, so a
+/// were requested: the pre-clamp to `available_parallelism` in
+/// `resolve_persistent_decode_threads_with_override`,
+/// [`reserve_split_headroom`], and the single-CPU-cpuset fallback in
+/// [`build_from_env`]. Only the last reports through [`report_spmd_fallback`],
+/// which is itself `tracing::debug!` or `NXRT_CALIB_DEBUG`-gated; the other two
+/// log nothing at all. In a default benchmark run none of them are visible, so a
 /// `t=N` row in a results table is a *label* rather than a measurement of width
 /// `N`. This is the read that turns it back into a measurement.
+///
+/// [`reserve_single_group_headroom`] is deliberately *not* in that list. It does
+/// reduce the number of spawned threads, but it only runs in the single-group
+/// case, which is exactly the case where `dispatcher_owns_a_shard` is true, so
+/// the lane it takes is added straight back by the dispatcher's own shard. A
+/// 2-lane budget on a 2-CPU cpuset spawns one thread and still reports
+/// `realized = 2`, measured, because two lanes really do compute.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DecodeWidth {
     /// Compute lanes asked for: the explicit `ONNX_GENAI_CPU_DECODE_THREADS`
