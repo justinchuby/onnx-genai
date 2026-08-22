@@ -113,11 +113,24 @@ that constructs and runs a canonical workflow.
   and treat the folded carry as **not** a rollback state cell (recomputed from
   committed tokens on rejection, never restored). Only the per-step forward pass
   is per-backend (`invoke_onnx_component`). The old `SpeculatorConfig` proposer
-  path is deleted once this lands (Rule 3). Proven by the Gemma4 target+assistant
+  path   is deleted once this lands (Rule 3; confirmed non-dependency by onnx-genai
+  `#1716` — examples 22/24 assert only the contract, not which runtime drives
+  them). Proven by the Gemma4 target+assistant
   packages (onnx-genai `#1716`, examples 22 `recurrent` / 24 `folded`) as
   **required ORT/native parity fixtures** asserting the `gemma4_e2b_workflow.rs`
   invariants (shared `kv_ownership`, no KV transitions, `state_pairs: None` for
   the cacheless drafter, read-only borrowed KV with zero writeback).
+
+  Phase-1 preconditions (cross-PR; ratify with the parent + the
+  `speculative/mod.rs` / `#1696` owners before deleting the old path):
+  - The parent ratifies **"replace + delete the old `SpeculatorConfig` proposer
+    path"** as the official direction and assigns single ownership of the
+    interpreter seam (`pipeline/workflow.rs`) + the chained-wiring, so no two PRs
+    edit it.
+  - Pre-existing gates on the old direct-`Engine` speculative path —
+    `gemma4_assistant_full`, `chained_proposer_real` — are **re-pointed** at the
+    interpreter `Chained` construct (or become the ORT/native parity cases above)
+    in the same change, so the deletion drops no coverage.
 
 - **Phase 2 — canonical single-decoder workflow synthesis.** Add a Rust
   synthesizer that turns a plain `model.io`/introspected decoder into a minimal
