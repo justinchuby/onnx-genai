@@ -104,6 +104,15 @@ impl GemmKernel {
         // stripe already was, so `trans_b` now picks a layout rather than a
         // dtype. Both operators, both stored orders and both 16-bit formats
         // reach the same GEMV backend.
+        //
+        // Reaching the same *backend* is not the same as reaching the same
+        // *kernel*, which is what was still divergent: `trans_b` chose between
+        // two kernels differing by up to 2.98x in speed and 9.3x in accuracy,
+        // so equivalent math was still priced -- and rounded -- by how the
+        // exporter happened to store the weight. `half_decode_gemv_dispatch`
+        // closes that: a constant `[K, N]` weight is transposed once into the
+        // prepack cache so both stored orders run the same `[N, K]` kernel,
+        // bit for bit. Its doc comment carries the measurements.
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         if m == 1
             && b.is_contiguous()
@@ -122,11 +131,17 @@ impl GemmKernel {
                 let b_bits = unsafe { std::slice::from_raw_parts(b.data_ptr::<u16>(), k * n) };
                 let mut result = vec![0.0f32; n];
                 count_half_decode_gemv();
-                if trans_b {
-                    half_gemv::gemv_half_nk(format, &a_dense, b_bits, &mut result, k, n);
-                } else {
-                    half_gemv::gemv_half_kn(format, &a_dense, b_bits, &mut result, k, n);
-                }
+                matmul::half_decode_gemv_dispatch(
+                    format,
+                    &self.prepack,
+                    b,
+                    &a_dense,
+                    b_bits,
+                    &mut result,
+                    k,
+                    n,
+                    trans_b,
+                );
                 return Ok(Some(result));
             }
         }
@@ -1323,6 +1338,108 @@ mod half_decode_route_tests {
             .zip(want)
             .map(|(&got, &want)| (f64::from(got) - want).abs() / (1.0 + want.abs()))
             .fold(0.0f64, f64::max)
+    }
+
+    /// #1381, the part that survived: equivalent math must reach the same
+    /// *kernel*, not merely the same module.
+    ///
+    /// Reaching one backend was not enough. `trans_b` still chose between the
+    /// `[K, N]` and `[N, K]` GEMVs, which are not interchangeable: measured on
+    /// AVX2 at `t = 1` the `[K, N]` kernel is 1.56x-2.98x slower (it strides
+    /// `n * 2` bytes between consecutive `p`, so at `n = 6144` every read
+    /// crosses a page and the prefetcher cannot run ahead) and 2.7x-9.3x less
+    /// accurate (one serial accumulator per column against four combined
+    /// pairwise). So the same logical projection was priced -- and rounded --
+    /// by how the exporter happened to store the weight.
+    ///
+    /// With a constant weight transposed once into the prepack cache, all
+    /// three spellings run the `[N, K]` kernel over identical values, so they
+    /// now agree *bit for bit* rather than to a tolerance. That is the
+    /// property worth pinning: a tolerance would pass even if they diverged
+    /// again.
+    #[test]
+    fn every_operator_and_stored_order_decode_bit_identically() {
+        // Thread-local admit, the #1056 isolation idiom: this test asserts the
+        // *admitted* route, so it must not inherit whatever verdict another
+        // test left on the process-global, and must not write that global
+        // itself (which would race every concurrent reader).
+        let _admit = crate::kernels::weight_transpose::CacheEnabledScope::new(true);
+        for &(k, n) in &[(259usize, 131usize), (512, 512), (777, 333)] {
+            let a = operand(k, 0.25);
+            let b_kn = operand(k * n, 1.75);
+            let mut b_nk = vec![0.0f32; k * n];
+            for p in 0..k {
+                for j in 0..n {
+                    b_nk[j * k + p] = b_kn[p * n + j];
+                }
+            }
+
+            matmul::reset_half_decode_transposed_calls();
+            let (gemm_kn, gemm_kn_calls) = decode_gemm(k, n, &a, &b_kn, false);
+            let transposed_after_kn = matmul::half_decode_transposed_calls();
+            let (gemm_nk, gemm_nk_calls) = decode_gemm(k, n, &a, &b_nk, true);
+            let (mm_kn, mm_calls) = decode_matmul(k, n, &a, &b_kn);
+
+            assert_eq!(
+                (gemm_kn_calls, gemm_nk_calls, mm_calls),
+                (1, 1, 1),
+                "{k}x{n}: every spelling must be served by the decode GEMV"
+            );
+            assert_eq!(
+                transposed_after_kn, 1,
+                "{k}x{n}: a constant [K, N] weight must reach the [N, K] kernel \
+                 through the transpose cache, not be read in place"
+            );
+
+            for (index, ((&kn, &nk), &mm)) in gemm_kn
+                .iter()
+                .zip(gemm_nk.iter())
+                .zip(mm_kn.iter())
+                .enumerate()
+            {
+                assert_eq!(
+                    kn.to_bits(),
+                    nk.to_bits(),
+                    "{k}x{n}[{index}]: Gemm transB=0 gave {kn}, transB=1 gave {nk}"
+                );
+                assert_eq!(
+                    kn.to_bits(),
+                    mm.to_bits(),
+                    "{k}x{n}[{index}]: Gemm gave {kn}, MatMul gave {mm}"
+                );
+            }
+        }
+    }
+
+    /// Declining the transpose cache (#1056) must fall back, not fail.
+    ///
+    /// The plan can refuse the footprint on a large model, and then the
+    /// `[K, N]` weight has to be read in place again. That path must still be
+    /// taken, still be correct, and -- unlike the admitted one -- must retain
+    /// nothing.
+    #[test]
+    fn a_declined_transpose_cache_falls_back_to_reading_in_place() {
+        use crate::kernels::weight_transpose::CacheEnabledScope;
+        let (k, n) = (263usize, 137usize);
+        let a = operand(k, 0.5);
+        let b_kn = operand(k * n, 2.25);
+
+        let _decline = CacheEnabledScope::new(false);
+        matmul::reset_half_decode_transposed_calls();
+        let (out, calls) = decode_gemm(k, n, &a, &b_kn, false);
+
+        assert_eq!(calls, 1, "the decode GEMV must still serve the call");
+        assert_eq!(
+            matmul::half_decode_transposed_calls(),
+            0,
+            "a declined cache must not reach the transposed kernel"
+        );
+        let want = reference(k, n, &a, &b_kn);
+        let worst = worst_rel(&out, &want);
+        assert!(
+            worst <= 2e-3,
+            "declined-cache fallback drifted from the f64 reference: {worst:e}"
+        );
     }
 
     /// #1381: `MatMul` and `Gemm` must take the *same* `m == 1` f16 route.
