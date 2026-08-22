@@ -311,33 +311,85 @@ const MIN_SDPA_WORK_PER_TASK: usize = 64 * 1024;
 ))]
 static SDPA_SIMD_TEST_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Test counter: incremented when [`sdpa_f32_simd`] actually fans its output
-/// rows out, as opposed to running them serially.
-///
-/// Separate from `SDPA_SIMD_TEST_HITS` so a parity test can assert the parallel
-/// path was *exercised*. Without it a routing mistake that quietly reverted to
-/// serial would leave every numeric test passing.
+// Test counter: incremented when `sdpa_f32_simd` actually fans its output rows
+// out, as opposed to running them serially.
+//
+// Separate from `SDPA_SIMD_TEST_HITS` so a parity test can assert the parallel
+// path was *exercised*. Without it a routing mistake that quietly reverted to
+// serial would leave every numeric test passing.
+//
+// Thread-local, not a process-wide atomic, because one of the assertions is an
+// equality -- "this shape must *not* have fanned out" -- and a process-wide
+// counter would let a concurrently running test move it. The increments all
+// happen on the thread that called `sdpa_f32_simd`, so a thread-local counts
+// exactly the calls the asserting test made.
 #[cfg(all(
     test,
     any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
 ))]
-static SDPA_SIMD_TEST_FANOUTS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static SDPA_SIMD_TEST_FANOUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
-/// Test counter: incremented only when the fan-out went through the *decode*
-/// pool, as opposed to the task runtime.
-///
-/// The two routes are separate branches and only one of them runs in an
-/// unscoped test, so a single counter cannot tell them apart. Without this the
-/// decode branch -- the one #1718 is actually about -- has no coverage at all,
-/// and a defect confined to it (an argument swap at the dispatch, say) would
-/// leave every other test green.
+/// Fan-outs [`sdpa_f32_simd`] has performed on this thread.
 #[cfg(all(
     test,
     any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
 ))]
-static SDPA_SIMD_TEST_DECODE_FANOUTS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+fn sdpa_simd_test_fanouts() -> usize {
+    SDPA_SIMD_TEST_FANOUTS.with(std::cell::Cell::get)
+}
+
+/// Records that [`sdpa_f32_simd`] fanned out on this thread.
+#[cfg(all(
+    test,
+    any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+))]
+fn note_sdpa_simd_test_fanout() {
+    SDPA_SIMD_TEST_FANOUTS.with(|slot| slot.set(slot.get() + 1));
+}
+
+// Test counter: incremented only when the fan-out went through the *decode*
+// pool, as opposed to the task runtime.
+//
+// The two routes are separate branches and only one of them runs in an unscoped
+// test, so a single counter cannot tell them apart. Without this the decode
+// branch -- the one #1718 is actually about -- has no coverage at all, and a
+// defect confined to it (an argument swap at the dispatch, say) would leave
+// every other test green.
+//
+// Thread-local for the same reason as `SDPA_SIMD_TEST_FANOUTS`. Note the
+// consequence for the caller: `with_decode_pool_scope` runs its closure on a
+// pool worker, so the increment lands on *that* thread's slot, not the test
+// thread's. The asserting test therefore has to sample the counter from inside
+// the scope. That is stricter than a process-wide atomic, not weaker -- it
+// cannot be moved by a concurrently running test.
+#[cfg(all(
+    test,
+    any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+))]
+thread_local! {
+    static SDPA_SIMD_TEST_DECODE_FANOUTS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Decode-route fan-outs [`sdpa_f32_simd`] has performed on this thread.
+#[cfg(all(
+    test,
+    any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+))]
+fn sdpa_simd_test_decode_fanouts() -> usize {
+    SDPA_SIMD_TEST_DECODE_FANOUTS.with(std::cell::Cell::get)
+}
+
+/// Records that [`sdpa_f32_simd`] fanned out through the decode pool.
+#[cfg(all(
+    test,
+    any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+))]
+fn note_sdpa_simd_test_decode_fanout() {
+    SDPA_SIMD_TEST_DECODE_FANOUTS.with(|slot| slot.set(slot.get() + 1));
+}
 
 /// Test counter: incremented when the Accelerate (cblas_sgemm/AMX) SDPA fast
 /// path fires on macOS/iOS.
@@ -1263,8 +1315,8 @@ fn sdpa_f32_simd(
         );
         #[cfg(test)]
         {
-            SDPA_SIMD_TEST_FANOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            SDPA_SIMD_TEST_DECODE_FANOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            note_sdpa_simd_test_fanout();
+            note_sdpa_simd_test_decode_fanout();
         }
         return;
     }
@@ -1276,7 +1328,7 @@ fn sdpa_f32_simd(
         });
     #[cfg(test)]
     if backend != crate::task_runtime::Backend::Serial {
-        SDPA_SIMD_TEST_FANOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        note_sdpa_simd_test_fanout();
     }
     #[cfg(not(test))]
     let _ = backend;
@@ -3579,8 +3631,6 @@ mod tests {
     #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
     #[test]
     fn parallel_sdpa_is_bit_identical_to_serial_across_shapes() {
-        use std::sync::atomic::Ordering;
-
         struct Case {
             name: &'static str,
             batch: usize,
@@ -3730,10 +3780,10 @@ mod tests {
                 sdpa_f32_simd(&tensors, &case.cfg, bias_ref, mask_ref, &mut serial);
             }
 
-            let before = SDPA_SIMD_TEST_FANOUTS.load(Ordering::Relaxed);
+            let before = sdpa_simd_test_fanouts();
             let mut parallel = vec![f32::NAN; y_len];
             sdpa_f32_simd(&tensors, &case.cfg, bias_ref, mask_ref, &mut parallel);
-            if SDPA_SIMD_TEST_FANOUTS.load(Ordering::Relaxed) != before {
+            if sdpa_simd_test_fanouts() != before {
                 fanned_out += 1;
             }
 
@@ -3783,8 +3833,6 @@ mod tests {
     #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
     #[test]
     fn parallel_sdpa_under_an_active_decode_scope_matches_serial() {
-        use std::sync::atomic::Ordering;
-
         // rows = 7 * 37 = 259, v_head_size = 48: distinct, neither a multiple of
         // the other. Work is 259 * 257 * (64 + 48) = 7.45 Mi MACs, above the
         // fan-out floor, so this genuinely dispatches.
@@ -3822,13 +3870,16 @@ mod tests {
             sdpa_f32_simd(&tensors, &cfg, &NoBias, &NoMask, &mut serial);
         }
 
-        let before = SDPA_SIMD_TEST_DECODE_FANOUTS.load(Ordering::Relaxed);
-        let (routed_to_decode, decoded) =
+        // Sampled inside the scope: the closure runs on a decode-pool worker, so
+        // the thread-local increment lands on that worker's slot rather than
+        // this test thread's.
+        let (routed_to_decode, decode_fanouts, decoded) =
             crate::kernels::matmul_nbits::with_decode_pool_scope(true, || {
                 let active = crate::kernels::matmul_nbits::decode_pool_active();
+                let before = sdpa_simd_test_decode_fanouts();
                 let mut y = vec![0.0f32; rows * dv];
                 sdpa_f32_simd(&tensors, &cfg, &NoBias, &NoMask, &mut y);
-                (active, y)
+                (active, sdpa_simd_test_decode_fanouts() - before, y)
             });
 
         assert_eq!(
@@ -3845,8 +3896,7 @@ mod tests {
              decode branch was not exercised on this host"
         );
         assert_eq!(
-            SDPA_SIMD_TEST_DECODE_FANOUTS.load(Ordering::Relaxed),
-            before + 1,
+            decode_fanouts, 1,
             "the decode scope must route through decode_parallel_output_row_blocks"
         );
     }
@@ -3891,8 +3941,6 @@ mod tests {
     #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
     #[test]
     fn tiny_sdpa_shapes_stay_serial() {
-        use std::sync::atomic::Ordering;
-
         let (batch, heads, q_seq, kv_seq, dh) = (1usize, 2usize, 1usize, 8usize, 16usize);
         let q = deterministic_values(batch * heads * q_seq * dh, 0x6100, 0.7);
         let k = deterministic_values(batch * heads * kv_seq * dh, 0x6200, 0.7);
@@ -3917,10 +3965,10 @@ mod tests {
             causal_fill: f32::NEG_INFINITY,
         };
         let mut y = vec![f32::NAN; batch * heads * q_seq * dh];
-        let before = SDPA_SIMD_TEST_FANOUTS.load(Ordering::Relaxed);
+        let before = sdpa_simd_test_fanouts();
         sdpa_f32_simd(&tensors, &cfg, &NoBias, &NoMask, &mut y);
         assert_eq!(
-            SDPA_SIMD_TEST_FANOUTS.load(Ordering::Relaxed),
+            sdpa_simd_test_fanouts(),
             before,
             "a {kv_seq}-key, {heads}-head shape must not wake a pool"
         );
