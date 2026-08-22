@@ -1,0 +1,20 @@
+[package]
+name = "onnx-runtime-memory-testplugin"
+description = "Out-of-tree-style nxmem memory plugin used to exercise the ABI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# `cdylib` is what the host actually dlopens; `rlib` exists only so the host's
+# integration tests can depend on this package and therefore force cargo to
+# build the cdylib before they run.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+onnx-runtime-memory-abi = { workspace = true }
+
+[lints]
+workspace = true

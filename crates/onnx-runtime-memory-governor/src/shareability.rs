@@ -37,7 +37,7 @@
 //! It is the shareability **decision**, not the mapping. It says whether — and
 //! at what cost — a prefix can be shared for a given layout, geometry, prefix
 //! length, and granule. The actual multi-map is
-//! [`DeviceAllocator::commit_shared_prefix`](crate::DeviceAllocator::commit_shared_prefix);
+//! [`SharedMapping::commit_shared_prefix`](crate::SharedMapping::commit_shared_prefix);
 //! a caller uses [`PrefixShareability::shareable`] to decide whether to attempt
 //! it, and [`PrefixShareability::refusal_reason`] to refuse **with a reason**
 //! rather than silently falling back to N private copies — the same "error,

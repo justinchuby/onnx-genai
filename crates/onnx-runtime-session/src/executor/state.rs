@@ -373,8 +373,7 @@ pub(crate) struct Executor {
 }
 
 pub(super) struct PreparedWorkspace {
-    pub(super) buffer: DeviceBuffer,
-    pub(super) _lease: Option<onnx_runtime_memory_governor::MemoryLease>,
+    pub(super) buffer: WorkspaceAllocation,
     pub(super) bytes: usize,
     pub(super) alignment: usize,
 }

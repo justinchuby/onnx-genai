@@ -687,6 +687,8 @@ impl Engine {
                     cuda_offload_policy,
                     #[cfg(feature = "native-cuda")]
                     cuda_memory_governor: std::sync::Arc::new(governor.device_authority()),
+                    #[cfg(feature = "native-cuda")]
+                    process_memory_manager: governor.process_memory_manager(),
                     io: metadata.decoder_io(),
                     metadata_max_len: metadata
                         .model

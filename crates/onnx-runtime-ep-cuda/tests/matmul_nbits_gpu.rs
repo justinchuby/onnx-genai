@@ -543,7 +543,15 @@ fn run_f16_case_with_bits_and_shape(
             device,
         )],
     )?;
-    assert_eq!(kernel.cuda_graph_compatible(), m == 1);
+    // Symmetric int4 M>1 may select the warmed Marlin path, which is capture-safe.
+    // The portable int8/asymmetric prefill paths remain outside the capture contract.
+    if m == 1 {
+        assert!(kernel.cuda_graph_compatible());
+    } else if bits == 8 || zero_points.is_some() || !k.is_multiple_of(8) {
+        // The per-row GEMV loop requires K*2-byte row strides to preserve its
+        // uint4 activation-load alignment; ragged K also remains Marlin-ineligible.
+        assert!(!kernel.cuda_graph_compatible());
+    }
     if m == 1 && (bits == 8 || zero_points.is_some()) {
         let mut eager = vec![0u8; output_len * 2];
         // SAFETY: output allocation contains `output_len` fp16 values.

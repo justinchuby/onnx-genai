@@ -88,7 +88,6 @@ pub use governor::{EngineGovernorError, EngineResourceGovernor, resolve_device_v
 pub(crate) use load::{
     force_managed_weight_streaming_enabled, session_device_domain, validate_shared_authority_limit,
 };
-#[cfg(feature = "native-backend")]
 pub(crate) use memory_plan::Holder;
 pub(crate) use memory_strategy::*;
 pub(crate) use metadata::*;

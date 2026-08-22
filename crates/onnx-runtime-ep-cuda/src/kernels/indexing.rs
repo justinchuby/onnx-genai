@@ -693,7 +693,7 @@ impl Kernel for GatherElementsKernel {
         let axis = axis as i32;
         let elements = output.numel() as u64;
         let index_is_i64 = i32::from(indices.dtype == DataType::Int64);
-        let capture_error = if capturing {
+        let capture_error = if capturing || self.runtime.eager_sync_deferred() {
             self.runtime.capture_error_ptr()
         } else {
             0
@@ -932,7 +932,7 @@ impl Kernel for ScatterNdKernel {
         let tuples = tuples as u64;
         let slice_length = slice_length as u64;
         let reduction = self.reduction as i32;
-        let capture_error = if capturing {
+        let capture_error = if capturing || self.runtime.eager_sync_deferred() {
             self.runtime.capture_error_ptr()
         } else {
             0
@@ -1114,7 +1114,7 @@ impl Kernel for ScatterElementsKernel {
             EpError::KernelFailed("cuda_ep ScatterElements: element count exceeds u64".into())
         })?;
         let reduction = self.reduction as i32;
-        let capture_error = if capturing {
+        let capture_error = if capturing || self.runtime.eager_sync_deferred() {
             self.runtime.capture_error_ptr()
         } else {
             0
