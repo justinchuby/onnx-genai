@@ -1,12 +1,40 @@
 # Workflow-runtime unification: making `pipeline.workflow` the sole runtime
 
-Status: **in progress.** This document is the authoritative plan for collapsing
-the two execution engines (`Engine` text-generation and `PipelineEngine`
-workflow) into **one** canonical `pipeline.workflow` runtime with a single
-state/session model, a single sampling/stopping/decode policy, and ORT/native
-backend executors beneath it. It supersedes the "staged follow-up boundaries"
-framing in [`NATIVE_WORKFLOW_BACKEND.md`](NATIVE_WORKFLOW_BACKEND.md), which
-introduced the backend-neutral component seam this plan builds on.
+Status: **ratified; execution gated on dependencies.** The parent has ratified
+REPLACE + DELETE (no compatibility facade, no permanent delegator) and assigned
+this consolidation — across `speculative/mod.rs`, the direct `Engine`,
+server/CLI/bench/C-API callers, and the two legacy speculative tests — to the
+owner of PR #1723. This document is the authoritative plan for collapsing the
+two execution engines (`Engine` text-generation and `PipelineEngine` workflow)
+into **one** canonical `pipeline.workflow` runtime with a single state/session
+model, a single sampling/stopping/decode policy, and ORT/native backend
+executors beneath it. It supersedes the "staged follow-up boundaries" framing in
+[`NATIVE_WORKFLOW_BACKEND.md`](NATIVE_WORKFLOW_BACKEND.md), which introduced the
+backend-neutral component seam this plan builds on.
+
+**Execution gate (measured, `2026-08-22`).** Phases 1–4 are blocked on two
+external dependencies that are not yet ready, so they cannot be *implemented and
+tested* in isolation without regressing production text generation or building
+on a moving target:
+- **`#1716` is not on `main`.** Its branch (`copilot/gemma4-e2b-metadata`) is
+  ~50k insertions, still evolving (tip added a 26B MoE example), and edits the
+  interpreter seam this PR owns (`pipeline/islands.rs` +246, `pipeline/mod.rs`
+  +138, `pipeline/workflow.rs` +12, `speculative/mod.rs` +94). Starting the
+  interpreter chained/AR work now guarantees a conflict on a moving target. The
+  agreed order is: `#1716` lands on `main` → this PR merges `main` (never
+  rebase) → consolidation proceeds.
+- **No executable chained fixture exists.** Proving ORT/native parity for the
+  chained proposer needs a package that actually uses `proposal_execution`;
+  today none does (the `speculative` fixture uses the old `max_proposal_width`
+  form), and the gemma4-real-packages executable Gemma4 target+assistant package
+  is not built yet. That package (or a tiny authored one on the `#1716` schema)
+  is the parity fixture Phase 1 requires.
+
+The AR/chained interpreter node is a real integration, not a small add:
+`SessionDecodeLoopBackend` (the ORT `DecodeLoopBackend`) is tied to `Engine`
+state (`session`/`kv_cache`/`scheduler`/`session_id`/`state`), so lifting decode
+under the interpreter moves that decode core, which is exactly why it must land
+after `#1716` (to avoid re-doing it against the seam edits above).
 
 Read [`RULES.md`](../../RULES.md). Rule 3 forbids retaining compatibility shims
 for our pre-release APIs; this plan **removes** them rather than keeping two
