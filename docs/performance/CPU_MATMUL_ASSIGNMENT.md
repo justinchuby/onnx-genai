@@ -2518,6 +2518,18 @@ ratios on this host are not reproducible, whichever arm they favour.
   real and is the `worker_wait` yield ramp (a `sched_yield` syscall per
   iteration for the remainder of the blocktime window); it remains open with the
   runtime owner.
+  **Superseded in part (2026-08-22, #1771): the mechanism stands, the width and
+  the magnitude do not.** That `sys` column was taken pre-#1766 on an unbounded
+  process, and the shape it actually had was the *opposite* of what this bullet
+  records: `sys` was **highest at `t=2`** (2.19s) and **decreased** with width.
+  On post-#1766 main the onset is at **`t=16`**, not `t>=4`, and it is an order
+  of magnitude smaller (1.14s). The `yield_now`-per-iteration ramp is still
+  there in the source, and the runtime owner's blocktime `500us -> 0` A/B
+  (`sys` 28.1s -> 5.1s, latency-neutral) is a genuine within-configuration
+  result — but it was measured with the pool oversubscribed against a
+  full-width Rayon pool, which inflates barrier time on its own. Treat the cost
+  as unquantified until the blocktime A/B is re-run on bounded topology. The
+  "~20x jump" figure is mine and should not be re-quoted.
 * The accompanying claim that `ONNX_GENAI_CPU_DECODE_THREADS=2` is a knob that
   "silently does nothing" is **withdrawn (2026-08-22)**. The acc4 regime document
   recorded `=2` as identical to `=1` (23.529 vs 23.527 ms/token) and that
@@ -2533,11 +2545,29 @@ ratios on this host are not reproducible, whichever arm they favour.
   agree to four significant figures, and contention is random. Full curve,
   method and the categorical non-vacuity check:
   [2026-08-22-decode-width-scaling.md](../benchmarks/2026-08-22-decode-width-scaling.md).
+  **Root cause identified (2026-08-22, #1771), and it is mechanical rather than
+  statistical.** Those rows predate **#1766**: the benchmark process never
+  called `CpuExecutionProvider::initialize()`, so the decode budget sized the
+  SPMD pool without *bounding the process*, and the global Rayon pool ran full
+  width at every budget. The `t=1` arm was therefore never 1-wide, which is why
+  the bottom of the sweep read flat. An independent falsifier against
+  `9747b4971` (main minus #1766) reproduces the correction here from the other
+  direction: **1.98x at `t=2` and 187% CPU**, two lanes genuinely computing.
+  This supersedes "contention" as the explanation — contention was a real
+  confound in that window, but it is not what produced the flat line.
 * The general point survives intact and is worth keeping: a knob that silently
   does nothing is worse than a slow one, because every sweep through it prints a
   flat line that reads as "this kernel does not scale". The fix is to verify a
   knob **structurally** (`w` in must give `w` SPMD threads out — categorical, so
   valid even on a loaded host) rather than by comparing timings.
+  **Now enforced (#1747, `b9d9c48`).**
+  `every_benchmarked_decode_width_realizes_the_worker_count_it_requests` sweeps
+  every published width in its own child process and asserts the lanes the pool
+  *built* equal the width requested, so the label can no longer drift from the
+  run. It is mutation-proved against production: reverting #1748's dispatcher
+  lane fails it with `requested width 4 realized 3 compute lanes`. Rows also
+  now print `requested=/realized=/path=` inline (#1764, #1770), so a reader can
+  check a width without re-deriving it.
 * **Benchmarking on this host now requires coordination.** Three agents share
   16 physical cores; two were running heavy jobs on this crate during this
   investigation, one of them the very same benchmark binary. Cross-agent notice
