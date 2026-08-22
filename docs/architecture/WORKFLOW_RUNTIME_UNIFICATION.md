@@ -1,14 +1,16 @@
 # Workflow-runtime unification: making `pipeline.workflow` the sole runtime
 
-Status: **ratified; execution gated on dependencies.** The parent has ratified
-REPLACE + DELETE (no compatibility facade, no permanent delegator) and assigned
-this consolidation — across `speculative/mod.rs`, the direct `Engine`,
-server/CLI/bench/C-API callers, and the two legacy speculative tests — to the
-owner of PR #1723. This document is the authoritative plan for collapsing the
-two execution engines (`Engine` text-generation and `PipelineEngine` workflow)
-into **one** canonical `pipeline.workflow` runtime with a single state/session
-model, a single sampling/stopping/decode policy, and ORT/native backend
-executors beneath it. It supersedes the "staged follow-up boundaries" framing in
+Status: **ratified; execution gated on one remaining dependency (`#1716` on
+`main`).** The parent has ratified REPLACE + DELETE (no compatibility facade, no
+permanent delegator) and assigned this consolidation — across
+`speculative/mod.rs`, the direct `Engine`, server/CLI/bench/C-API callers, and
+the two legacy speculative tests — to the owner of PR #1723. The second gate
+condition (an executable chained fixture) is now **satisfied** — see §Execution
+gate. This document is the authoritative plan for collapsing the two execution
+engines (`Engine` text-generation and `PipelineEngine` workflow) into **one**
+canonical `pipeline.workflow` runtime with a single state/session model, a single
+sampling/stopping/decode policy, and ORT/native backend executors beneath it. It
+supersedes the "staged follow-up boundaries" framing in
 [`NATIVE_WORKFLOW_BACKEND.md`](NATIVE_WORKFLOW_BACKEND.md), which introduced the
 backend-neutral component seam this plan builds on.
 
@@ -16,19 +18,37 @@ backend-neutral component seam this plan builds on.
 external dependencies that are not yet ready, so they cannot be *implemented and
 tested* in isolation without regressing production text generation or building
 on a moving target:
-- **`#1716` is not on `main`.** Its branch (`copilot/gemma4-e2b-metadata`) is
-  ~50k insertions, still evolving (tip added a 26B MoE example), and edits the
-  interpreter seam this PR owns (`pipeline/islands.rs` +246, `pipeline/mod.rs`
-  +138, `pipeline/workflow.rs` +12, `speculative/mod.rs` +94). Starting the
-  interpreter chained/AR work now guarantees a conflict on a moving target. The
-  agreed order is: `#1716` lands on `main` → this PR merges `main` (never
-  rebase) → consolidation proceeds.
-- **No executable chained fixture exists.** Proving ORT/native parity for the
-  chained proposer needs a package that actually uses `proposal_execution`;
-  today none does (the `speculative` fixture uses the old `max_proposal_width`
-  form), and the gemma4-real-packages executable Gemma4 target+assistant package
-  is not built yet. That package (or a tiny authored one on the `#1716` schema)
-  is the parity fixture Phase 1 requires.
+- **The executable chained fixture now exists (`2026-08-22`), but `#1716` is
+  still the gate.** Proving ORT/native parity for the chained proposer needs a
+  package that actually uses `proposal_execution`; the committed `speculative`
+  fixture uses the old `max_proposal_width` form. gemma4-real-packages has now
+  built the tiny executable **`gemma4_chained`** target+assistant fixture on the
+  `#1716` schema (branch `justinchuby/gemma4-chained-fixture` off
+  `copilot/gemma4-e2b-metadata`, commit `c9c62bcd`): committed
+  `inference_metadata.yaml` + `target/` + `assistant/` `*.onnx.textproto` (reused
+  proven `tiny-gemma4-assistant` graphs — hidden 16, 2H 32, vocab 32, kv_heads 2,
+  head_dim 8, 2 layers), greedy/logits-emit/f32/standard ops (ORT ∩ native-CPU
+  safe, op-safety inherited from `gemma4_assistant_full.rs`). Its contract is the
+  agreed chained ABI: assistant = `inputs_embeds[b,q,2H]` + read-only
+  `shared_kv.{full,sliding}_attention.{k,v}` (output-less pure reader) → `logits`
+  + `projected_state` (folded carry); `proposal_execution {chained,
+  folded_carry_output: projected_state}`; `rollback_state` = the 4 target KV
+  cells (folded carry excluded). Static contract review by this PR: **accepted,
+  no regen**. Phase 1 wires it into `native_workflow_parity.rs` as a required
+  `assert_parity_with(root, native_engine|native_cuda_engine, …)` case. **Open
+  contract item** (flagged to gemma4-metadata-audit): the exact meaning of
+  `port_bindings.target_hidden_context` for the folded-carry case — carry_0 is
+  dimensionally the target's `hidden_states.0` (H), not `inputs_embeds` (2H), so
+  the field is either source-naming (should point at the target hidden output) or
+  destination-naming (the fused port); must be pinned identically in the metadata
+  contract and the interpreter before the Phase-1 chained driver is written.
+- **`#1716` is not on `main` — the remaining gate.** Its branch
+  (`copilot/gemma4-e2b-metadata`) is ~50k insertions, still evolving (tip added a
+  26B MoE example), and edits the interpreter seam this PR owns
+  (`pipeline/islands.rs` +246, `pipeline/mod.rs` +138, `pipeline/workflow.rs`
+  +12, `speculative/mod.rs` +94). Starting the interpreter chained/AR work now
+  guarantees a conflict on a moving target. The agreed order is: `#1716` lands on
+  `main` → this PR merges `main` (never rebase) → consolidation proceeds.
 
 The AR/chained interpreter node is a real integration, not a small add:
 `SessionDecodeLoopBackend` (the ORT `DecodeLoopBackend`) is tied to `Engine`
@@ -136,18 +156,27 @@ that constructs and runs a canonical workflow.
   carry)`), which native (the component seam) cannot drive — a fork. Keyed by
   `SpeculativeProposalExecution::Chained` (onnx-genai `#1696`, with
   `folded_carry_output` **or** `recurrent`), the interpreter owns: build the
-  fused `inputs_embeds`; thread `carry_0 = port_bindings.target_hidden_context`,
-  `carry_k = folded_carry_output(k-1)`; drive the chain to `max_proposal_width`;
+  fused `inputs_embeds`; thread `carry_0` from the target hidden context named by
+  `port_bindings.target_hidden_context` (**open contract item, flagged to
+  gemma4-metadata-audit**: for the folded case `carry_0` is dimensionally the
+  target's `hidden_states.0` [H], not `inputs_embeds` [2H], so this field is
+  source-naming vs destination-naming — pin it identically in metadata + the
+  interpreter before writing the driver), `carry_k = folded_carry_output(k-1)`;
+  drive the chain to `max_proposal_width`;
   and treat the folded carry as **not** a rollback state cell (recomputed from
   committed tokens on rejection, never restored). Only the per-step forward pass
   is per-backend (`invoke_onnx_component`). The old `SpeculatorConfig` proposer
   path   is deleted once this lands (Rule 3; confirmed non-dependency by onnx-genai
   `#1716` — examples 22/24 assert only the contract, not which runtime drives
-  them). Proven by the Gemma4 target+assistant
-  packages (onnx-genai `#1716`, examples 22 `recurrent` / 24 `folded`) as
-  **required ORT/native parity fixtures** asserting the `gemma4_e2b_workflow.rs`
-  invariants (shared `kv_ownership`, no KV transitions, `state_pairs: None` for
-  the cacheless drafter, read-only borrowed KV with zero writeback).
+  them). Proven by the executable **`gemma4_chained`** target+assistant fixture
+  (committed by gemma4-real-packages on the `#1716` schema; see §Execution gate)
+  wired into `native_workflow_parity.rs` as a **required ORT/native (and, since
+  its shapes resolve from bound input symbols, native-CUDA device-resident)
+  parity case** — greedy exact-token accept/reject/rollback bit-for-bit — plus
+  the catalogue examples 22 (`recurrent`) / 24 (`folded`) asserting the
+  `gemma4_e2b_workflow.rs` invariants (shared `kv_ownership`, no KV transitions,
+  `state_pairs: None` for the cacheless drafter, read-only borrowed KV with zero
+  writeback).
 
   Phase-1 preconditions (cross-PR; ratify with the parent + the
   `speculative/mod.rs` / `#1696` owners before deleting the old path):
