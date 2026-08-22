@@ -2872,8 +2872,24 @@ fn widened_sgemm_beats_half_gemm(
 /// blocking path for the whole process, so a regression can be bisected in the
 /// field without a rebuild, and so the A/B bench can measure both arms of the
 /// shipped binary. Read once and cached, like `half_prefill_gebp_enabled`.
+///
+/// The env var is read **once** into a `OnceLock`, which is correct for
+/// production — the process is configured at launch and every worker thread
+/// reads the same verdict — but toxic for a parallel test harness. A test that
+/// set the variable at runtime would get one of two wrong outcomes depending on
+/// which test happened to read it first: either the latch is already filled and
+/// the `set_var` does nothing, so both arms of an A/B silently run the *same*
+/// route and it passes while measuring nothing; or this test wins the race and
+/// pins its value process-wide for every later test. Tests must therefore never
+/// touch the variable; they use [`HalfDecodeGemvScope`], a thread-local override
+/// that leaves the latch untouched. See #1736, and #1056 for the same trap in
+/// the weight-transpose cache.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub(crate) fn half_decode_gemv_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = HALF_DECODE_GEMV_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("ONNX_GENAI_CPU_MM_HALF_GEMV")
@@ -2884,6 +2900,55 @@ pub(crate) fn half_decode_gemv_enabled() -> bool {
             })
             .unwrap_or(true)
     })
+}
+
+#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+thread_local! {
+    /// Test-only, per-thread override of the decode-GEMV gate. `None` defers to
+    /// the process-global latch; `Some(v)` forces `v` on **this thread only**,
+    /// so one test's arm cannot leak into another test running concurrently.
+    /// Set exclusively through [`HalfDecodeGemvScope`]. Production never reads
+    /// this — the `#[cfg(test)]` lookup in [`half_decode_gemv_enabled`] compiles
+    /// out entirely.
+    static HALF_DECODE_GEMV_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// RAII, thread-local scoping of the decode-GEMV gate for tests (#1736).
+///
+/// Constructing one forces [`half_decode_gemv_enabled`] to `enabled` on the
+/// current thread; dropping it restores the previous value, including on panic,
+/// so a failing test cannot leave the gate flipped for the tests that follow.
+/// This replaces `set_var`/`remove_var` on `ONNX_GENAI_CPU_MM_HALF_GEMV`, which
+/// could not work against a latched `OnceLock` and which is `unsafe` in edition
+/// 2024 precisely because it races concurrent readers.
+///
+/// Being thread-local is what makes it safe under `cargo test`'s parallel
+/// harness, and it is sound here only because the gate is read on the thread
+/// that calls `execute`. That is not assumed: the route counters are thread-local
+/// too, so if the read ever moved onto a pool worker the override would stop
+/// applying *and* the count would drop to zero, failing the caller's
+/// `gemv_calls == 1` assertion rather than silently reverting to the old
+/// vacuous A/B.
+#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+pub(crate) struct HalfDecodeGemvScope {
+    prev: Option<bool>,
+}
+
+#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+impl HalfDecodeGemvScope {
+    /// Force the decode-GEMV gate to `enabled` on this thread until dropped.
+    pub(crate) fn new(enabled: bool) -> Self {
+        let prev = HALF_DECODE_GEMV_OVERRIDE.with(|c| c.replace(Some(enabled)));
+        Self { prev }
+    }
+}
+
+#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+impl Drop for HalfDecodeGemvScope {
+    fn drop(&mut self) {
+        HALF_DECODE_GEMV_OVERRIDE.with(|c| c.set(self.prev));
+    }
 }
 
 /// The 16-bit storage format both operands share, if they share one.
