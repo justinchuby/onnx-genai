@@ -1079,7 +1079,12 @@ impl PipelineEngine {
                                 .output_names()
                                 .iter()
                                 .cloned()
-                                .zip(session.run(&resolved)?)
+                                .zip(session.run(&resolved).with_context(|| {
+                                    format!(
+                                        "workflow ONNX component '{selected_component}' execution \
+                                         failed"
+                                    )
+                                })?)
                                 .collect()
                         };
                         for (port, tensor) in produced {
@@ -1848,10 +1853,13 @@ impl PipelineEngine {
                     .insert(component.to_string(), Arc::clone(&allocator));
                 allocator
             };
-        let discovered = if selected_outputs
-            .keys()
-            .any(|output| !declaration.ports.outputs.contains_key(output))
-        {
+        let discovered = if selected_outputs.keys().any(|output| {
+            declaration
+                .ports
+                .outputs
+                .get(output)
+                .is_none_or(|contract| resolve_workflow_shape(contract, component_symbols).is_err())
+        }) {
             let mut values = session
                 .output_names()
                 .iter()
@@ -1940,7 +1948,18 @@ impl PipelineEngine {
                         format!("stable component '{component}' output '{output}' has no metadata")
                     })?;
                 let shape = if let Some(contract) = declaration.ports.outputs.get(output) {
-                    resolve_workflow_shape(contract, component_symbols)?
+                    resolve_workflow_shape(contract, component_symbols).or_else(|_| {
+                        discovered
+                            .as_ref()
+                            .and_then(|values| values.get(output))
+                            .map(|value| value.shape().to_vec())
+                            .with_context(|| {
+                                format!(
+                                    "stable component '{component}' output '{output}' shape \
+                                     discovery did not return that output"
+                                )
+                            })
+                    })?
                 } else {
                     discovered
                         .as_ref()
