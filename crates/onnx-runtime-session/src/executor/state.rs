@@ -88,6 +88,23 @@ pub(crate) struct Executor {
     /// Lazy external initializers available only at the nxrt fused-MoE boundary.
     /// Stock EPs ignore this map and keep receiving the resident buffers below.
     pub(super) weight_handles: HashMap<ValueId, WeightHandle>,
+    /// Per-expert region candidates for `com.microsoft::QMoE` expert-bank
+    /// initializers, keyed by the same [`ValueId`] as [`Self::weight_handles`].
+    ///
+    /// This is purely additive bookkeeping for a future pluggable residency
+    /// policy (see issue #82): it records *where each expert's bytes would
+    /// live* inside an already-fully-resident lazy weight, but nothing reads it
+    /// to change binding, allocation, or paging behavior today. A value present
+    /// here is classified [`onnx_runtime_loader::Pageability::Pageable`]; a
+    /// value classified `NonPageable` records its rejection reason for
+    /// diagnostics instead, so no entry silently vanishes — either the
+    /// candidate is a validated partition of the expert bank, or the exact
+    /// reason it isn't is recorded.
+    ///
+    /// Read only under `#[cfg(test)]` via [`Executor::expert_region_candidates`]
+    /// today; production consumers land in a follow-up slice per issue #82.
+    #[allow(dead_code)]
+    pub(super) expert_region_candidates: HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
     pub(super) prefetch_issue_nodes: std::sync::Mutex<HashMap<ValueId, usize>>,
     pub(super) prefetch_lookahead_nodes: usize,
     /// One device buffer per backed value. Static values are allocated once at
