@@ -63,6 +63,7 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::sys::CUdeviceptr;
@@ -183,6 +184,10 @@ struct RepackEntry {
 pub(super) struct RepackCache {
     runtime: Arc<CudaRuntime>,
     map: Mutex<HashMap<(usize, usize, usize, usize), RepackEntry>>,
+    /// Device bytes held by `map`. These are raw `cuMemAlloc`s, invisible to
+    /// the VMM arena, so without a counter this memory cannot be reported at
+    /// all — it shows up only as an unexplained gap against `nvidia-smi`.
+    bytes: AtomicUsize,
 }
 
 impl RepackCache {
@@ -190,7 +195,30 @@ impl RepackCache {
         Self {
             runtime,
             map: Mutex::new(HashMap::new()),
+            bytes: AtomicUsize::new(0),
         }
+    }
+
+    /// Device bytes this cache currently holds.
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    /// Release every repacked weight copy.
+    ///
+    /// The repack exists for the tensor-core GEMM, which only runs at `M > 1`
+    /// (prefill). Single-token decode uses the GEMV path and never reads these
+    /// buffers, so once a session has settled into decode the copies are pure
+    /// device-memory overhead — a full duplicate of the projection weights that
+    /// the VMM arena cannot even see. Dropping them costs a re-repack if a
+    /// later prefill needs them, never a wrong answer.
+    pub(super) fn release_all(&self) {
+        let mut map = self.map.lock().expect("marlin repack cache poisoned");
+        for (_, entry) in map.drain() {
+            // SAFETY: exclusively owned by the cache; freed once here.
+            let _ = unsafe { entry.runtime.free_raw(entry.ptr) };
+        }
+        self.bytes.store(0, Ordering::Relaxed);
     }
 
     /// Ensure the repacked tensor-core weights for `packed` exist on device,
@@ -242,6 +270,7 @@ impl RepackCache {
                 runtime: self.runtime.clone(),
             },
         );
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
         Ok((out, false))
     }
 }
@@ -272,17 +301,41 @@ impl Drop for RepackCache {
 struct ScratchCache {
     map: HashMap<(u32, u32, usize), RepackEntry>,
     order: VecDeque<(u32, u32, usize)>,
+    /// Device bytes currently held by `map`. Tracked because the cap below is
+    /// on bytes, and because this memory is invisible to the VMM arena — it is
+    /// a raw `cuMemAlloc` — so without a counter it cannot be reported at all.
+    bytes: usize,
 }
 
-const SCRATCH_CACHE_CAP: usize = 256;
+/// Upper bound on device memory this cache may hold.
+///
+/// The bound has to be on **bytes**, not on entry count: a cap of "256 entries"
+/// says nothing about memory, because entries range from kilobytes to hundreds
+/// of megabytes. Measured on HY-MT2-1.8B, an entry-capped cache retained a
+/// fixed ~380 MiB of device memory that the VMM arena never saw, which was the
+/// whole of our peak-VRAM deficit against llama.cpp on that model.
+///
+/// These buffers are a *cache*: a miss costs one allocation, never a wrong
+/// answer, so trading a little reuse for a bounded footprint is always safe.
+const SCRATCH_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 static SCRATCH_CACHE: OnceLock<Mutex<ScratchCache>> = OnceLock::new();
+
+/// Device bytes currently retained by the scratch cache.
+///
+/// This memory does not go through the VMM arena, so `vmm_arena` counters
+/// cannot see it. Exposed so callers can account for it rather than discover
+/// it as an unexplained gap between our totals and `nvidia-smi`.
+pub fn scratch_cache_bytes() -> usize {
+    scratch_cache().lock().map(|cache| cache.bytes).unwrap_or(0)
+}
 
 fn scratch_cache() -> &'static Mutex<ScratchCache> {
     SCRATCH_CACHE.get_or_init(|| {
         Mutex::new(ScratchCache {
             map: HashMap::new(),
             order: VecDeque::new(),
+            bytes: 0,
         })
     })
 }
@@ -332,10 +385,16 @@ pub fn ensure_scratch(
         },
     );
     cache.order.push_back(key);
-    while cache.order.len() > SCRATCH_CACHE_CAP {
+    cache.bytes = cache.bytes.saturating_add(bytes);
+    // Evict oldest-first until the retained bytes fit the budget. The entry
+    // just inserted is never evicted: the caller is about to use it, and it is
+    // at the back of `order`. A single buffer larger than the whole budget is
+    // therefore still served — correctness never depends on the cap.
+    while cache.bytes > SCRATCH_CACHE_MAX_BYTES && cache.order.len() > 1 {
         if let Some(evict) = cache.order.pop_front()
             && let Some(entry) = cache.map.remove(&evict)
         {
+            cache.bytes = cache.bytes.saturating_sub(evict.2);
             // SAFETY: exclusively owned by the cache; freed once on eviction.
             let _ = unsafe { entry.runtime.free_raw(entry.ptr) };
         }

@@ -1020,7 +1020,7 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit, nested_control_flow]
+      capabilities: [workflow_ssa, linear_effects, typed_emit, nested_control_flow]
     inputs:
       initial_cache:
         contract: { dtype: float32, rank: 2, shape: [batch, cache] }
@@ -1621,7 +1621,7 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit, nested_control_flow]
+      capabilities: [workflow_ssa, linear_effects, typed_emit, nested_control_flow]
     inputs:
       logits: { contract: { dtype: float32, rank: 2, shape: [batch, vocabulary] },
                 role: { kind: opaque }, source: { kind: application, name: logits }, required: true }
@@ -1805,7 +1805,7 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit, nested_control_flow,
+      capabilities: [workflow_ssa, linear_effects, typed_emit, nested_control_flow,
                      loop_induction_values]
     inputs:
       sample: { contract: { dtype: float32, rank: 2, shape: [batch, width] },
@@ -1925,7 +1925,7 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit, nested_control_flow,
+      capabilities: [workflow_ssa, linear_effects, typed_emit, nested_control_flow,
                      loop_induction_values]
     inputs:
       outer_count: { contract: { dtype: int64, rank: 0, shape: [] },
@@ -2153,7 +2153,7 @@ pipeline:
     manifest:
       adapter_abis: {}
       capabilities:
-        [workflow_ssa, typed_emit, nested_control_flow,
+        [workflow_ssa, linear_effects, typed_emit, nested_control_flow,
          bounded_state_recurrence]
     inputs:
       tentative: { contract: { dtype: int64, rank: 2, shape: [batch, state] },
@@ -2284,7 +2284,7 @@ pipeline:
     manifest:
       adapter_abis: { onnx-genai.grammar-guidance: "1" }
       capabilities:
-        [workflow_ssa, typed_emit, emit_valid_length, emit_row_identity,
+        [workflow_ssa, linear_effects, typed_emit, emit_valid_length, emit_row_identity,
          nested_control_flow, grammar_guidance_adapter, adaptive_proposal_budget,
          advisory_state]
     inputs:
@@ -2711,7 +2711,7 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: { onnx-genai.telemetry: "1" }
-      capabilities: [workflow_ssa, typed_emit, telemetry_adapter]
+      capabilities: [workflow_ssa, linear_effects, typed_emit, telemetry_adapter]
     inputs: {}
     outputs:
       elapsed_ms: { contract: { dtype: float32, rank: 0, shape: [] },
@@ -2779,7 +2779,7 @@ pipeline:
     manifest:
       adapter_abis: {}
       capabilities:
-        [workflow_ssa, typed_emit, streaming_emit,
+        [workflow_ssa, linear_effects, typed_emit, streaming_emit,
          nested_control_flow, session_state_lease]
     inputs:
       initial: { contract: { dtype: int64, rank: 0, shape: [] }, role: { kind: opaque },
@@ -3006,7 +3006,7 @@ pipeline:
     manifest:
       adapter_abis: {}
       capabilities:
-        [workflow_ssa, typed_emit, streaming_emit,
+        [workflow_ssa, linear_effects, typed_emit, streaming_emit,
          nested_control_flow, session_state_lease, advisory_state]
     inputs:
       initial: { contract: { dtype: int64, rank: 0, shape: [] },
@@ -3238,7 +3238,8 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit, streaming_emit, nested_control_flow]
+      capabilities:
+        [workflow_ssa, linear_effects, typed_emit, streaming_emit, nested_control_flow]
     inputs:
       accept:
         contract: { dtype: bool, rank: 0, shape: [] }

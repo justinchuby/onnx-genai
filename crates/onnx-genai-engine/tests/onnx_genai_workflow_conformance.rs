@@ -861,8 +861,12 @@ fn mobius_tts_workflow_executes_real_producer_graphs() -> anyhow::Result<()> {
 
 #[test]
 fn mobius_speculative_workflow_executes_rejection_and_correction() -> anyhow::Result<()> {
-    let mut engine = Engine::from_pipeline_dir(&root("speculative")?, EngineConfig::default())?;
-    let request = PipelineGenerateRequest::new(GenerateRequest {
+    let package = root("speculative")?;
+    let has_asymmetric_value_cache =
+        std::fs::read_to_string(package.join("inference_metadata.yaml"))?
+            .contains("name: verifier.past_key_values.0.value");
+    let mut engine = Engine::from_pipeline_dir(&package, EngineConfig::default())?;
+    let mut request = PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![1, 2, 3, 4]),
         options: options(1),
     })
@@ -882,6 +886,12 @@ fn mobius_speculative_workflow_executes_rejection_and_correction() -> anyhow::Re
     )
     .with_input("telemetry.draft_ms", Value::from_slice_f32(&[1.0], &[1])?)
     .with_input("telemetry.target_ms", Value::from_slice_f32(&[1.0], &[1])?);
+    if has_asymmetric_value_cache {
+        request = request.with_input(
+            "verifier.past_key_values.0.value",
+            Value::from_slice_f32(&[], &[1, 4, 0, 4])?,
+        );
+    }
     let output = engine.run_pipeline_outputs(request)?;
     assert_eq!(output["tokens.row.0"].to_vec_i64()?, [1, 31]);
     Ok(())

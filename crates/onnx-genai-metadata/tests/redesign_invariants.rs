@@ -6,7 +6,8 @@
 //! so the fact under test is the only thing that varies.
 
 use onnx_genai_metadata::{
-    InferenceMetadata, cache_dependencies, semantic_identity_of_str, validate_metadata,
+    InferenceMetadata, WorkflowOutputRole, cache_dependencies, semantic_identity_of_str,
+    validate_metadata,
 };
 
 fn parse(document: &str) -> InferenceMetadata {
@@ -21,10 +22,18 @@ fn errors(document: &str) -> Vec<String> {
 fn image_outputs_require_an_explicit_value_range() {
     let document = include_str!(
         "../../../examples/inference_metadata/catalogue/07-stable-diffusion-text-to-image.yaml"
-    )
-    .replace("\r\n", "\n");
-    let missing_range = document.replacen("        value_range: negative_one_to_one\n", "", 1);
-    let errors = errors(&missing_range);
+    );
+    let mut metadata = parse(document);
+    metadata
+        .pipeline
+        .as_mut()
+        .expect("catalogue entry has a pipeline")
+        .workflow
+        .outputs
+        .get_mut("image")
+        .expect("catalogue entry has an image output")
+        .value_range = None;
+    let errors = validate_metadata(&metadata).expect_err("metadata must be rejected");
     assert!(
         errors
             .iter()
@@ -37,10 +46,18 @@ fn image_outputs_require_an_explicit_value_range() {
 fn image_value_range_is_rejected_on_non_image_outputs() {
     let document = include_str!(
         "../../../examples/inference_metadata/catalogue/07-stable-diffusion-text-to-image.yaml"
-    )
-    .replace("\r\n", "\n");
-    let invalid = document.replacen("        role: image\n", "        role: tensor\n", 1);
-    let errors = errors(&invalid);
+    );
+    let mut metadata = parse(document);
+    metadata
+        .pipeline
+        .as_mut()
+        .expect("catalogue entry has a pipeline")
+        .workflow
+        .outputs
+        .get_mut("image")
+        .expect("catalogue entry has an image output")
+        .role = WorkflowOutputRole::Tensor;
+    let errors = validate_metadata(&metadata).expect_err("metadata must be rejected");
     assert!(
         errors.iter().any(
             |error| error.contains("non-image output 'image' cannot declare image value_range")
@@ -114,7 +131,7 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: { onnx-genai.parameter-overlay: "1" }
-      capabilities: [workflow_ssa, typed_emit, parameter_adapters, heterogeneous_adapter_batching]
+      capabilities: [workflow_ssa, linear_effects, typed_emit, parameter_adapters, heterogeneous_adapter_batching]
     inputs:
       request.adapter_segments:
         contract: { dtype: int64, rank: 2, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
@@ -311,12 +328,17 @@ fn serving_workflow(
     effects: &str,
     speculative: &str,
 ) -> String {
+    let linear_effects = if effects.is_empty() {
+        ""
+    } else {
+        ", linear_effects"
+    };
     format!(
         r#"
 pipeline:
   workflow:
     manifest:
-      capabilities: [workflow_ssa, serving_service_contract]
+      capabilities: [workflow_ssa, serving_service_contract{linear_effects}]
     inputs:
       active:
         contract: {{ dtype: bool, rank: 1, shape: [batch], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
@@ -694,7 +716,7 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: { onnx-genai.grammar-guidance: "1" }
-      capabilities: [workflow_ssa]
+      capabilities: [workflow_ssa, grammar_guidance_adapter]
     inputs: {}
     components:
       grammar:
@@ -1052,7 +1074,8 @@ fn the_speculative_region_covers_every_component_in_the_loop_body() {
     let with_sidecar = workflow
         .replace(
             "capabilities: [workflow_ssa, serving_service_contract]",
-            "capabilities: [workflow_ssa, serving_service_contract, nested_control_flow]",
+            "capabilities: [workflow_ssa, serving_service_contract, linear_effects, \
+             nested_control_flow]",
         )
         .replace(
             r#"      verifier:
@@ -1126,8 +1149,8 @@ fn runtime_owned_state_cannot_be_exported_under_an_alias() {
     let aliased = serving_workflow("permitted", SOUND_CAPABILITIES, "", "")
         .replace(
             "capabilities: [workflow_ssa, serving_service_contract]",
-            "capabilities: [workflow_ssa, serving_service_contract, nested_control_flow, \
-             typed_emit]",
+            "capabilities: [workflow_ssa, serving_service_contract, linear_effects, \
+             nested_control_flow, typed_emit]",
         )
         .replace(
             "      empty_cache:",

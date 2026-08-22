@@ -5,6 +5,7 @@ pipeline:
     manifest:
       capabilities:
       - workflow_ssa
+      - linear_effects
       - typed_emit
       - nested_control_flow
       - loop_induction_values

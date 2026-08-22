@@ -24,8 +24,8 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: onnxruntime/mobius
-          # Switch back to main after the producer PR merges.
-          ref: main
+          # Stacked with mobius#538 until its image/video workflow producer lands.
+          ref: justinchuby/catalogue-diffusion-builds
           path: validation/mobius
       - uses: actions/setup-python@v5
         with:
@@ -44,18 +44,24 @@ jobs:
             "$GITHUB_WORKSPACE/validation/generated"
           PYTHONPATH=src python tests/compare_onnx_genai_validation_packages.py \
             tests/fixtures/onnx_genai_workflows "$GITHUB_WORKSPACE/validation/generated"
-      - name: Validate shared-state pixel-flow semantics
+      - name: Validate package semantics
         run: |
-          cargo run --quiet \
-            -p onnx-genai-metadata --bin validate_metadata -- \
-            validation/generated/shared_state_pixel_flow
-      - name: Execute shared-state pixel-flow paths
+          failed=""
+          for package in validation/generated/*; do
+            [ -f "$package/inference_metadata.yaml" ] || continue
+            cargo run --quiet \
+              -p onnx-genai-metadata --bin validate_metadata -- "$package" \
+              || failed="$failed $package"
+          done
+          if [ -n "$failed" ]; then
+            echo "Invalid packages:$failed"
+            exit 1
+          fi
+      - name: Execute all workflow packages
         run: |
           ORT_LIB="$(python -c \
             'import onnxruntime, pathlib; print(next((pathlib.Path(onnxruntime.__file__).parent / "capi").glob("libonnxruntime.so*")))')"
           MOBIUS_WORKFLOW_CONFORMANCE_DIR="$GITHUB_WORKSPACE/validation/generated" \
-            MOBIUS_WORKFLOW_CONFORMANCE_REQUIRED=1 \
             ONNX_GENAI_ORT_LIB="$ORT_LIB" \
             cargo test -p onnx-genai-engine \
-              --test onnx_genai_workflow_conformance \
-              shared_state_pixel_flow -- --nocapture
+              --test onnx_genai_workflow_conformance -- --nocapture

@@ -4085,27 +4085,18 @@
       ]
     },
     "StatePortAccess": {
-      "description": "State access performed by one component binding.",
-      "oneOf": [
-        {
-          "const": "read_write",
-          "description": "The component consumes the current value and produces its successor.",
-          "type": "string"
-        },
-        {
-          "const": "read_only",
-          "description": "The component consumes a frozen value; any graph output is discarded.",
-          "type": "string"
-        }
-      ]
+      "enum": [
+        "read_write",
+        "read_only"
+      ],
+      "type": "string"
     },
     "StatePortAlias": {
       "additionalProperties": false,
       "properties": {
         "access": {
           "$ref": "#/$defs/StatePortAccess",
-          "default": "read_write",
-          "description": "Whether this component advances the state or only observes a frozen\nvalue produced by another component in the same service group.\n\nA read-only binding still names the graph's present output when the\nartifact exposes one for kernel ABI reasons, but that output is not a\nstate transition and must not be aliased back onto the input."
+          "description": "Whether this component may publish its output back into the state group.\n\nRead-only consumers receive the shared state input but their graph\noutput is not allowed to replace or alias the service-owned buffer."
         },
         "input": {
           "type": "string"

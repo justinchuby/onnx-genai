@@ -1,7 +1,7 @@
 //! Criterion 2 and 8, asserted where they can actually be checked without a
 //! GPU: the built-in eager `cuMemAlloc` allocator is gone from the memory
-//! crate, and the eager call sites that remain elsewhere are the two known
-//! non-allocator ones and no others.
+//! crate, and the only eager call sites that remain elsewhere are the raw
+//! metadata upload seam in `runtime.rs`.
 //!
 //! The GPU tests next door prove the default path *reaches* the arena. They
 //! cannot run here, and they also cannot prove a negative: a second eager site
@@ -16,20 +16,14 @@
 //!
 //! - `runtime.rs` — `CudaRuntime::alloc_raw`/`free_raw`, small synchronous
 //!   metadata uploads for kernel launches.
-//! - `cudnn/mod.rs` — the cuDNN workspace.
 //!
 //! Naming them here means they are disclosed rather than hidden, and it means
 //! removing one is as visible as adding one.
 //!
-//! One scope note so the allowlist does not read broader than it is: it counts
-//! `malloc_sync`/`free_sync` call sites only. `cudnn/mod.rs:621` also reaches
-//! the device eagerly through `.alloc_zeros::<u8>(...)`, which is a third
-//! eager device allocation this scan does not count. It is pre-existing,
-//! untouched by Phase 7, and outside the `DeviceAllocator` seam, so criterion 2
-//! — which is about EP-managed allocation falling back to a built-in eager
-//! allocator — is unaffected by it. What the allowlist pins is the set of
-//! `malloc_sync`/`free_sync` sites, not "every eager device allocation in the
-//! EP".
+//! The companion `alloc_zeros::<u8>(` scan below is the cuDNN-specific guard:
+//! the allowlist still counts only `malloc_sync`/`free_sync`, but a fresh eager
+//! stream allocation for a cuDNN workspace would be just as much a regression
+//! and must therefore stay textually pinned too.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -258,10 +252,10 @@ fn the_removal_stays_explained_in_prose_and_the_code_scan_can_tell_the_differenc
 /// The eager call sites outside the allocator seam are exactly the two known
 /// ones.
 ///
-/// These are not EP-managed allocations through `DeviceAllocator`; they are a
-/// kernel-metadata upload and the cuDNN workspace, and Phase 7 does not claim
-/// to have removed them. Pinning the exact set is what stops the claim from
-/// quietly widening: a third site, or a fourth, goes red here.
+/// These are not EP-managed allocations through `DeviceAllocator`; they are the
+/// raw metadata-upload seam in `runtime.rs`, and Phase 7 does not claim to have
+/// removed them. Pinning the exact set is what stops the claim from quietly
+/// widening: a third site, or a fourth, goes red here.
 ///
 /// The counts are textual occurrences, not seams, and `runtime.rs` is two of
 /// each for one seam. `alloc_raw` calls `malloc_sync`, and on failure drains
@@ -274,12 +268,8 @@ fn the_removal_stays_explained_in_prose_and_the_code_scan_can_tell_the_differenc
 #[test]
 fn the_eager_sites_outside_the_allocator_seam_are_exactly_the_two_disclosed_ones() {
     let ep = crate_src("onnx-runtime-ep-cuda");
-    let expected_allocs: BTreeMap<String, usize> = [
-        (String::from("runtime.rs"), 2usize),
-        (String::from("cudnn/mod.rs"), 1usize),
-    ]
-    .into_iter()
-    .collect();
+    let expected_allocs: BTreeMap<String, usize> =
+        [(String::from("runtime.rs"), 2usize)].into_iter().collect();
     let expected_frees = expected_allocs.clone();
 
     assert_eq!(
@@ -292,5 +282,15 @@ fn the_eager_sites_outside_the_allocator_seam_are_exactly_the_two_disclosed_ones
         count(&ep, EAGER_FREE),
         expected_frees,
         "the set of eager cuMemFree call sites in the CUDA EP changed"
+    );
+}
+
+#[test]
+fn cudnn_has_no_direct_stream_workspace_allocations() {
+    let ep = crate_src("onnx-runtime-ep-cuda");
+    let eager_stream_allocs = count_code(&ep, "alloc_zeros::<u8>(");
+    assert!(
+        eager_stream_allocs.is_empty(),
+        "cuDNN workspaces must come from the prepared provider workspace, not a direct stream allocation: {eager_stream_allocs:?}"
     );
 }

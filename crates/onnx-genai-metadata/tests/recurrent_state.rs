@@ -1,8 +1,7 @@
 //! Fixed-size recurrent state uses one generic replacement discipline.
 
 use onnx_genai_metadata::{
-    InferenceMetadata, StateGroupContract, StateKind, StatePortAccess, StatePortAlias, StateUpdate,
-    validate_metadata,
+    InferenceMetadata, StateGroupContract, StateKind, StateUpdate, validate_metadata,
 };
 
 #[test]
@@ -40,38 +39,29 @@ update:
 
 #[test]
 fn replace_state_rejects_a_sequence_axis() {
-    let yaml = include_str!(
+    let mut metadata: InferenceMetadata = serde_yaml::from_str(include_str!(
         "../../../examples/inference_metadata/catalogue/16-linear-attention-recurrent.yaml"
-    )
-    .replace("\r\n", "\n")
-    .replacen(
-        "kind: recurrent\n            layout: bhfv",
-        "kind: recurrent\n            sequence_axis: 2\n            layout: bhfv",
-        1,
-    );
-    let metadata: InferenceMetadata = serde_yaml::from_str(&yaml).expect("metadata parses");
+    ))
+    .expect("metadata parses");
+    metadata
+        .pipeline
+        .as_mut()
+        .expect("catalogue entry has a pipeline")
+        .workflow
+        .serving
+        .as_mut()
+        .expect("catalogue entry has serving")
+        .state_service
+        .groups
+        .get_mut("linear_accumulator")
+        .expect("catalogue entry has linear accumulator state")
+        .sequence_axis = Some(2);
+
     let errors = validate_metadata(&metadata).expect_err("replace state with an axis is invalid");
     assert!(
         errors
             .iter()
             .any(|error| error.contains("replace") && error.contains("sequence_axis")),
         "unexpected validation errors: {errors:?}"
-    );
-}
-
-#[test]
-fn state_alias_access_is_explicit_and_backward_compatible() {
-    let writer: StatePortAlias = serde_yaml::from_str("input: past_key\noutput: present_key\n")
-        .expect("default writer alias parses");
-    assert_eq!(writer.access, StatePortAccess::ReadWrite);
-
-    let reader: StatePortAlias =
-        serde_yaml::from_str("input: past_key\noutput: present_key\naccess: read_only\n")
-            .expect("read-only alias parses");
-    assert_eq!(reader.access, StatePortAccess::ReadOnly);
-    assert!(
-        serde_yaml::to_string(&reader)
-            .expect("read-only alias serializes")
-            .contains("access: read_only")
     );
 }

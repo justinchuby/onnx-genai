@@ -1251,13 +1251,11 @@ pub struct StateGroupCapabilities {
 pub struct StatePortAlias {
     pub input: String,
     pub output: String,
-    /// Whether this component advances the state or only observes a frozen
-    /// value produced by another component in the same service group.
+    /// Whether this component may publish its output back into the state group.
     ///
-    /// A read-only binding still names the graph's present output when the
-    /// artifact exposes one for kernel ABI reasons, but that output is not a
-    /// state transition and must not be aliased back onto the input.
-    #[serde(default)]
+    /// Read-only consumers receive the shared state input but their graph
+    /// output is not allowed to replace or alias the service-owned buffer.
+    #[serde(default, skip_serializing_if = "StatePortAccess::is_read_write")]
     pub access: StatePortAccess,
     /// Which half of an attention cache this port pair carries.
     ///
@@ -1281,15 +1279,18 @@ pub struct StatePortAlias {
     pub layer: Option<usize>,
 }
 
-/// State access performed by one component binding.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum StatePortAccess {
-    /// The component consumes the current value and produces its successor.
     #[default]
     ReadWrite,
-    /// The component consumes a frozen value; any graph output is discarded.
     ReadOnly,
+}
+
+impl StatePortAccess {
+    pub fn is_read_write(&self) -> bool {
+        matches!(self, Self::ReadWrite)
+    }
 }
 
 /// Which half of a split attention cache a state port pair carries.
