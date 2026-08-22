@@ -35,6 +35,7 @@ non-schema keys.
 | 22 | [Qwen3 chained speculative decode](22-qwen3-chained-speculative-decoding.yaml) | Token-embedding chain with typed hidden/KV recurrence and mapped vocabulary |
 | 23 | [Gemma 4 E2B decoder](23-gemma4-e2b-decoder.yaml) | Dense hybrid full/sliding KV with heterogeneous global/local head widths and shared owners |
 | 24 | [Gemma 4 E2B assistant](24-gemma4-e2b-assistant-speculative.yaml) | Cacheless read-only merged shared-KV drafter with a folded chained carry and graph-internal centroid pruning |
+| 25 | [Gemma 4 26B-A4B MoE decoder](25-gemma4-26b-a4b-moe-decoder.yaml) | Sparse MoE (128 routed + 1 shared) with hybrid attention and heterogeneous global/local KV head count and width |
 
 ## Shared-prefix alternating branches
 
@@ -139,11 +140,12 @@ resolved decode ABI reports `kv_ownership: owned`. It declares:
   owners are the 3 full layers 4/9/14 and 12 sliding layers; `layer` orders and
   pairs the physical owners and does not enumerate every logical layer.
 
-This checkpoint is **dense** (`enable_moe_block: false` / `num_experts: null`),
-so it declares no MoE metadata — none is invented. The schema still expresses a
-sparse FFN through `model.mixture_of_experts` (+ `model.sharding.expert_parallel`)
-for MoE variants; `final_logit_softcapping` and `tie_word_embeddings` are
-graph-internal to the decoder artifact and are not restated as metadata.
+This E2B checkpoint is **dense** (`enable_moe_block: false` / `num_experts: null`),
+so it declares no MoE metadata — none is invented. The sparse mixture-of-experts
+variant is a **different model**, `google/gemma-4-26B-A4B-it` (example 25); MoE is
+attributed there, never to E2B. `final_logit_softcapping` and
+`tie_word_embeddings` are graph-internal to the E2B decoder artifact and are not
+restated as metadata.
 
 The **assistant** (`google/gemma-4-E2B-it-assistant`, example 24) shares one
 workflow with the target and owns nothing. Its full/sliding aliases are
@@ -168,8 +170,9 @@ speculative contract wires the rest generically:
   drafter still emits the full target vocabulary axis, so the relationship is
   `vocabulary: {kind: identical}`. (A drafter exposing a smaller pruned axis would
   use `subset`; one emitting centroid/cluster ids needing a translation table
-  would use `mapped`.) The centroid head is a lossy approximation, so the drafter
-  is not `distribution_preserving` and the caller opts speculation in;
+  would use `mapped`.) With standard speculative rejection sampling the accepted
+  output is the target's, so the drafter is `distribution_preserving: true` even
+  with its lossy pruned head;
 - `rollback_state` lists every rewound target KV cell; the folded carry has no
   state cell and is recomputed from committed tokens, so it is not rewound.
 
@@ -178,6 +181,32 @@ and asserts this ownership, the read-only-versus-read-write split on the shared
 groups, the layer-less merged borrow, the folded chained carry (and that it fails
 closed and stays backward-compatible with the `recurrent` form), the identical
 vocabulary, and the rollback coverage.
+
+## Gemma 4 26B-A4B — the MoE variant (dense E2B is not)
+
+`google/gemma-4-26B-A4B-it` (example 25) is the sparse mixture-of-experts model in
+the Gemma 4 family; the E2B examples above are dense and must not be conflated
+with it. Every fact below is verified from the pinned config (snapshot
+`4d7ae498`) and `modeling_gemma4.py`, not extrapolated from E2B:
+
+- **MoE FFN** — `enable_moe_block: true`, `num_experts: 128`, `top_k_experts: 8`,
+  `moe_intermediate_size: 704`, plus an always-on dense **shared** expert
+  (`intermediate_size: 2112`). The router scores with `softmax`, selects
+  `top_k`, and normalizes the weights. Declared once under
+  `model.mixture_of_experts` (128 routed + 1 shared, 8 per token) with legal
+  expert-parallel facts under `model.sharding.expert_parallel`.
+- **Hybrid attention** — 30 layers, 5:1 local:global (25 sliding + 5 full at
+  layers 5/11/17/23/29), sliding window 1024.
+- **Heterogeneous global/local geometry in both axes** — the global group has
+  `num_global_key_value_heads: 2` at `global_head_dim: 512`; the local group has
+  `num_key_value_heads: 8` at `head_dim: 256`. So the two groups differ in KV head
+  COUNT and head WIDTH, expressed as independent symbolic axes. Grouped-query
+  attention (16 query heads) with `attention_k_eq_v: true`.
+- **No shared/pruned KV layers** — `num_kv_shared_layers: 0`, so every layer owns
+  its KV. Cross-layer KV sharing is an E2B feature, absent here.
+
+The catalogue slice is a reduced illustration (1 full + 1 sliding owner at real
+indices); the real per-layer owner set is stated in the YAML comment.
 
 ## Existing evidence
 

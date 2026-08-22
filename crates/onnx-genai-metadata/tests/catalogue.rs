@@ -19,7 +19,7 @@ fn every_catalogue_example_parses_and_validates() {
 
     assert_eq!(
         examples.len(),
-        24,
+        25,
         "catalogue must cover all requested cases"
     );
     for path in examples {
@@ -119,6 +119,41 @@ fn every_catalogue_example_parses_and_validates() {
                     .proposal_execution,
                 onnx_genai_metadata::SpeculativeProposalExecution::Chained { .. }
             ));
+        }
+        if path
+            .file_name()
+            .is_some_and(|name| name == std::ffi::OsStr::new("25-gemma4-26b-a4b-moe-decoder.yaml"))
+        {
+            // The 26B-A4B variant IS the MoE model — 128 routed + 1 shared
+            // expert, 8 per token (verified from its pinned config).
+            let moe = metadata
+                .model
+                .as_ref()
+                .and_then(|model| model.mixture_of_experts.as_ref())
+                .expect("26B-A4B declares a mixture-of-experts FFN");
+            assert_eq!(moe.routed_expert_count, 128);
+            assert_eq!(moe.experts_per_token, 8);
+            assert_eq!(moe.shared_expert_count, 1);
+            // Heterogeneous global/local geometry in BOTH axes: the global group
+            // has fewer, wider KV heads than the local group.
+            let full_key = workflow.state["full_key"]
+                .contract
+                .shape
+                .as_ref()
+                .expect("full key shape");
+            let sliding_key = workflow.state["sliding_key"]
+                .contract
+                .shape
+                .as_ref()
+                .expect("sliding key shape");
+            assert_ne!(
+                full_key[1], sliding_key[1],
+                "global vs local KV head count differs"
+            );
+            assert_ne!(
+                full_key[3], sliding_key[3],
+                "global vs local head width differs"
+            );
         }
         for (name, component) in &workflow.components {
             if let ComponentImplementation::Onnx { artifact } = &component.implementation {
