@@ -93,7 +93,6 @@ flowchart TD
 | 问题 | 从这里入手 |
 |---|---|
 | 这个项目想成为什么? | [`docs/architecture/DESIGN.md`](../../docs/architecture/DESIGN.md) |
-| 今天哪些能用? | [`docs/status/PROGRESS.md`](../../docs/status/PROGRESS.md) |
 | nxrt 如何拼接在一起? | [`docs/architecture/ORT2.md`](../../docs/architecture/ORT2.md) |
 | 内存实际表现如何? | [`docs/memory/MEMORY_ARCHITECTURE.md`](../../docs/memory/MEMORY_ARCHITECTURE.md) |
 | 提议中的内存契约是什么? | [`docs/memory/MEMORY_MANAGEMENT_MODEL_DESIGN.md`](../../docs/memory/MEMORY_MANAGEMENT_MODEL_DESIGN.md) |
