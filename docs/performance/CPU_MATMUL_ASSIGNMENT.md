@@ -2203,6 +2203,19 @@ kernel cannot agree on a number neither produces.
   instead), this is now correctly an **over**-prediction on decode-only
   workloads — the #1056-mandated safe direction — and prefill still fills it,
   so it is left alone deliberately rather than tightened on a guess.
+* **The same defect existed twice, which changes what the guard has to be.**
+  The transpose-predictor fix and the dense-predictor fix are the identical
+  mistake — gate on `is_default_domain()`, ship the op in `com.microsoft` —
+  written independently in two functions. The registry-derived guard as first
+  built only walked the *transpose* predictor and would not have found the
+  second one; it was found by adversarial review, which is not a control that
+  scales. `no_predictor_zeroes_a_caching_op_because_of_its_shipping_domain`
+  now takes the domain from `OpRegistry::keys()` and asserts **both**
+  predictors are non-zero for every caching op in the domain the registry says
+  it ships in. A test that hardcodes `domain = ""` passes against a predictor
+  that is dead in production; a test that reads the domain from the registry
+  cannot. Both mutations (restoring either blanket bail) now fail two tests
+  each.
 * The `after/MatMul` ratios include two cells at 0.89x and 1.04x-1.09x on the
   smallest shapes, where absolute times are 20-30 microseconds and run-to-run
   noise exceeds the difference. Parity is claimed on the model-shaped rows

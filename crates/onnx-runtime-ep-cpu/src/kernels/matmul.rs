@@ -8296,6 +8296,80 @@ mod weight_cache_accounting {
         );
     }
 
+    /// **The domain-gate property, enumerated from the registry.**
+    ///
+    /// The Opus review of #1702 found the *same* defect a second time, in
+    /// `node_matmul_dense_cache_bytes`: a blanket `!node.is_default_domain()`
+    /// bail silently zeroing every `FusedMatMulBias` node. Two independent
+    /// instances of one mistake is a pattern, not an accident, and the
+    /// transpose-only guard above would not have caught the second one.
+    ///
+    /// So this checks **both** predictors, and it takes the domain from
+    /// `OpRegistry::keys()` rather than from a literal. That is the whole
+    /// point: the registry is the only place that knows an op ships in
+    /// `com.microsoft`, so a predictor that gates on the wrong domain is
+    /// caught by construction instead of by someone remembering. A third
+    /// weight-scaled predictor added later gets covered by adding one line
+    /// here, and until then its absence is at least visible in one place.
+    #[test]
+    fn no_predictor_zeroes_a_caching_op_because_of_its_shipping_domain() {
+        let (k, n) = (12usize, 9usize);
+        let registry = crate::kernels::build_cpu_registry();
+        let mut checked = 0usize;
+
+        for key in registry.keys() {
+            if weight_cache_accounting_classification(&key.op_type)
+                != Some(WeightCacheClass::CachesTransposedWeight)
+            {
+                continue;
+            }
+            // Built with the domain the registry says this op ships in. A
+            // predictor gated on `is_default_domain()` returns 0 here for any
+            // contrib-domain op while still looking correct in a test that
+            // hardcodes `domain = ""`.
+            let graph = half_weight_graph(&key.op_type, &key.domain, k, n);
+            let node = graph.nodes.values().next().expect("single-node graph");
+
+            // `Gemm` is excluded from the dense predictor by design (it has its
+            // own f32 transpose accounting), so only the MatMul family is
+            // checked there; the transpose predictor covers all three.
+            if key.op_type == "MatMul" || key.op_type == "FusedMatMulBias" {
+                assert_ne!(
+                    node_matmul_dense_cache_bytes(node, &graph),
+                    0,
+                    "`node_matmul_dense_cache_bytes` returned 0 for {} in its \
+                     shipping domain {:?}. If that is because of a domain gate, \
+                     it is the #1702 defect again: gate each op to the domain \
+                     it actually ships in, not to one shared \
+                     `is_default_domain()` check.",
+                    key.op_type,
+                    key.domain,
+                );
+            }
+            if cfg!(any(
+                target_arch = "x86",
+                target_arch = "x86_64",
+                target_os = "macos",
+                target_os = "ios"
+            )) {
+                assert_ne!(
+                    node_weight_transpose_cache_bytes(node, &graph),
+                    0,
+                    "`node_weight_transpose_cache_bytes` returned 0 for {} in \
+                     its shipping domain {:?} on a target whose kernels do \
+                     retain the transpose",
+                    key.op_type,
+                    key.domain,
+                );
+            }
+            checked += 1;
+        }
+        assert!(
+            checked >= 3,
+            "expected MatMul, FusedMatMulBias and Gemm; got {checked}"
+        );
+    }
+
     /// Mutation check: the predictor must key on *reaching the shared helper*,
     /// not on an op-name allowlist. Restoring the pre-#1702 behaviour (naming
     /// `MatMul` and excluding `FusedMatMulBias`) must be observable here.
