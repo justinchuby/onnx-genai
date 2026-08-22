@@ -397,7 +397,11 @@ impl PipelineModelDirectory {
             per_component: BTreeMap::new(),
         };
 
-        crate::pipeline_admission::validate_pipeline_admission(&spec, &model_paths)?;
+        crate::pipeline_admission::validate_pipeline_admission(
+            &spec,
+            &model_paths,
+            metadata.speculative.as_ref(),
+        )?;
 
         Ok(Self {
             root: root.to_path_buf(),
