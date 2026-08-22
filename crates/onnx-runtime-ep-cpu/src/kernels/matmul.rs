@@ -8269,12 +8269,9 @@ mod weight_cache_accounting {
             // A binary predicts exactly what its own kernels allocate: the
             // 16-bit decode GEMV exists only on x86, and Apple caches f16 at
             // the same 2 bytes through the Accelerate paths.
-            let expected = if cfg!(any(
-                target_arch = "x86",
-                target_arch = "x86_64",
-                target_os = "macos",
-                target_os = "ios"
-            )) {
+            let expected = if cfg!(any(target_arch = "x86", target_arch = "x86_64"))
+                || (key.op_type != "Gemm" && cfg!(any(target_os = "macos", target_os = "ios")))
+            {
                 (k as u64) * (n as u64) * 2
             } else {
                 0
@@ -8346,12 +8343,9 @@ mod weight_cache_accounting {
                     key.domain,
                 );
             }
-            if cfg!(any(
-                target_arch = "x86",
-                target_arch = "x86_64",
-                target_os = "macos",
-                target_os = "ios"
-            )) {
+            if cfg!(any(target_arch = "x86", target_arch = "x86_64"))
+                || (key.op_type != "Gemm" && cfg!(any(target_os = "macos", target_os = "ios")))
+            {
                 assert_ne!(
                     node_weight_transpose_cache_bytes(node, &graph),
                     0,
