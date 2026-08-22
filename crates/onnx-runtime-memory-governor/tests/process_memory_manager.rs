@@ -14,6 +14,16 @@ use onnx_runtime_memory_governor::{
     ResidualOwnership, Tier,
 };
 
+#[test]
+fn exact_manager_identity_distinguishes_independent_instances() {
+    let first = ProcessMemoryManager::new().expect("first manager");
+    let clone = first.clone();
+    let second = ProcessMemoryManager::new().expect("second manager");
+
+    assert!(first.is_same_instance(&clone));
+    assert!(!first.is_same_instance(&second));
+}
+
 #[derive(Debug, Default)]
 struct Pin;
 

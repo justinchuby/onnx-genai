@@ -1243,6 +1243,25 @@ impl RawSessionOptions {
         env: &Environment,
         options: &SessionOptions,
     ) -> std::result::Result<Self, SessionAttemptError> {
+        #[cfg(feature = "cuda")]
+        if let Some(config) = options.managed_cuda_allocator() {
+            if !options.selects_cuda() {
+                return Err(OrtError::InvalidArgument(
+                    "managed CUDA allocator registration requires a CUDA execution provider".into(),
+                )
+                .into());
+            }
+            if options.cuda_device_id() != Some(config.device_id()) {
+                return Err(OrtError::InvalidArgument(format!(
+                    "managed CUDA allocator is registered for device {}, but these session \
+                     options target CUDA device {:?}",
+                    config.device_id(),
+                    options.cuda_device_id()
+                ))
+                .into());
+            }
+            env.ensure_managed_cuda_allocator(config)?;
+        }
         let api = crate::error::api()?;
         let create = api
             .CreateSessionOptions

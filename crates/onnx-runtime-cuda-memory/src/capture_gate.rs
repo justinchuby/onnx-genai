@@ -31,6 +31,9 @@
 //!   capture region, from `begin` through `end`/`abort`.
 //! * Every code path that can synchronize the device takes
 //!   [`synchronizing_section`] first.
+//! * Callback paths that cannot block, or that may run on the capture thread,
+//!   use [`run_or_defer_synchronizing`] so capture-unsafe work is owned by the
+//!   gate and runs immediately after capture instead.
 //!
 //! Captures exclude synchronizers; synchronizers exclude captures; synchronizers
 //! run concurrently with one another. That is a writer-preferring reader/writer
@@ -62,6 +65,7 @@
 //! graph rather than per token.
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex, OnceLock};
 
 /// Reader/writer counts for the gate.
@@ -75,6 +79,10 @@ struct GateState {
     captures_waiting: u32,
     /// Whether a thread currently holds the capture exclusion.
     capturing: bool,
+    /// Capture-unsafe work submitted while a capture is live. The outermost
+    /// capture guard drains it after ending capture while still excluding the
+    /// next capture.
+    deferred: VecDeque<Box<dyn FnOnce() + Send + 'static>>,
 }
 
 fn gate() -> &'static (Mutex<GateState>, Condvar) {
@@ -178,11 +186,31 @@ impl Drop for CaptureExclusion {
         let (_, condvar) = gate();
         let mut state = lock_state();
         state.capturing = false;
+        let deferred = std::mem::take(&mut state.deferred);
+        if !deferred.is_empty() {
+            state.synchronizers += 1;
+        }
         if self.yielded_own_section {
             state.synchronizers += 1;
         }
         drop(state);
         condvar.notify_all();
+        if !deferred.is_empty() {
+            SHARED_DEPTH.with(|depth| depth.set(depth.get() + 1));
+            for action in deferred {
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)).is_err() {
+                    eprintln!("cuda capture gate: deferred synchronizing action panicked");
+                }
+            }
+            SHARED_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+            let mut state = lock_state();
+            state.synchronizers = state.synchronizers.saturating_sub(1);
+            let drained = state.synchronizers == 0;
+            drop(state);
+            if drained {
+                condvar.notify_all();
+            }
+        }
     }
 }
 
@@ -245,13 +273,59 @@ pub fn synchronizing_section() -> Option<SynchronizingSection> {
     Some(SynchronizingSection { outermost: true })
 }
 
+/// Execute capture-unsafe work now, or defer it until the active capture ends.
+///
+/// Unlike [`synchronizing_section`], this never blocks behind an already-live
+/// capture and never lets the capturing thread use its re-entrancy carve-out to
+/// invoke a capture-unsafe API. The action runs under synchronizer ownership,
+/// either immediately or while the outermost capture guard drains its queue.
+///
+/// Returns `true` when the action was deferred.
+pub fn run_or_defer_synchronizing(action: impl FnOnce() + Send + 'static) -> bool {
+    if CAPTURE_DEPTH.with(Cell::get) > 0 {
+        lock_state().deferred.push_back(Box::new(action));
+        return true;
+    }
+
+    // Re-entry already owns a synchronizer. In particular, deferred actions
+    // run with SHARED_DEPTH set while the capture-drop drain owns one shared
+    // gate entry. Waiting behind a newly queued capture here would make that
+    // capture wait for the very synchronizer this call is refusing to reuse.
+    if SHARED_DEPTH.with(Cell::get) > 0 {
+        action();
+        return false;
+    }
+
+    let (_, condvar) = gate();
+    let mut state = lock_state();
+    while !state.capturing && state.captures_waiting > 0 {
+        state = condvar
+            .wait(state)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+    if state.capturing {
+        state.deferred.push_back(Box::new(action));
+        return true;
+    }
+    state.synchronizers += 1;
+    drop(state);
+
+    SHARED_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    let section = SynchronizingSection { outermost: true };
+    action();
+    drop(section);
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::{Command, Stdio};
     use std::sync::Arc;
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-    use std::time::Duration;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     /// The gate is process-global and these tests deliberately contend on it, so
     /// they must not run concurrently with each other.
@@ -264,6 +338,48 @@ mod tests {
         test_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn wait_for_capture_waiter() {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if lock_state().captures_waiting > 0 {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "capture did not enter the waiting state"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn assert_child_does_not_deadlock(test_filter: &str, marker: &str) {
+        let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+            .arg(test_filter)
+            .arg("--nocapture")
+            .env(marker, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn deadlock regression child");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().expect("poll regression child") {
+                assert!(
+                    status.success(),
+                    "deadlock regression child failed: {status}"
+                );
+                return;
+            }
+            if Instant::now() >= deadline {
+                child.kill().expect("kill deadlocked regression child");
+                let _ = child.wait();
+                panic!("deadlock regression child exceeded {deadline:?}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -324,6 +440,42 @@ mod tests {
             synchronizing_section().is_none(),
             "the capturing thread must bypass the gate rather than queue on it"
         );
+    }
+
+    #[test]
+    fn capture_unsafe_action_from_capture_thread_is_deferred_until_capture_ends() {
+        let _serial = serialized();
+        let ran = Arc::new(AtomicBool::new(false));
+        let capture = CaptureExclusion::acquire();
+        let flag = Arc::clone(&ran);
+        assert!(run_or_defer_synchronizing(move || {
+            flag.store(true, Ordering::SeqCst);
+        }));
+        assert!(!ran.load(Ordering::SeqCst));
+        drop(capture);
+        assert!(ran.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn capture_unsafe_action_from_another_thread_does_not_block_on_capture() {
+        let _serial = serialized();
+        let capture = CaptureExclusion::acquire();
+        let submitted = Arc::new(AtomicBool::new(false));
+        let ran = Arc::new(AtomicBool::new(false));
+        let submitted_flag = Arc::clone(&submitted);
+        let ran_flag = Arc::clone(&ran);
+        let worker = std::thread::spawn(move || {
+            let deferred = run_or_defer_synchronizing(move || {
+                ran_flag.store(true, Ordering::SeqCst);
+            });
+            assert!(deferred);
+            submitted_flag.store(true, Ordering::SeqCst);
+        });
+        worker.join().expect("deferred submitter panicked");
+        assert!(submitted.load(Ordering::SeqCst));
+        assert!(!ran.load(Ordering::SeqCst));
+        drop(capture);
+        assert!(ran.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -399,6 +551,82 @@ mod tests {
         drop(inner);
         drop(outer);
 
+        capturer.join().expect("capture thread panicked");
+    }
+
+    #[test]
+    fn nested_run_or_defer_reuses_a_section_while_capture_waits() {
+        const MARKER: &str = "ONNX_GENAI_CAPTURE_GATE_NESTED_RUN_CHILD";
+        if std::env::var_os(MARKER).is_none() {
+            assert_child_does_not_deadlock(
+                "nested_run_or_defer_reuses_a_section_while_capture_waits",
+                MARKER,
+            );
+            return;
+        }
+
+        let _serial = serialized();
+        let outer = synchronizing_section().expect("not capturing on this thread");
+        let capturer = std::thread::spawn(|| {
+            let _capture = CaptureExclusion::acquire();
+        });
+        wait_for_capture_waiter();
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_in_action = Arc::clone(&ran);
+        assert!(!run_or_defer_synchronizing(move || {
+            ran_in_action.store(true, Ordering::SeqCst);
+        }));
+        assert!(ran.load(Ordering::SeqCst));
+
+        drop(outer);
+        capturer.join().expect("capture thread panicked");
+    }
+
+    #[test]
+    fn recursive_deferred_action_reuses_the_drain_synchronizer() {
+        const MARKER: &str = "ONNX_GENAI_CAPTURE_GATE_RECURSIVE_DRAIN_CHILD";
+        if std::env::var_os(MARKER).is_none() {
+            assert_child_does_not_deadlock(
+                "recursive_deferred_action_reuses_the_drain_synchronizer",
+                MARKER,
+            );
+            return;
+        }
+
+        let _serial = serialized();
+        let (queued_tx, queued_rx) = mpsc::channel();
+        let (drop_tx, drop_rx) = mpsc::channel();
+        let (draining_tx, draining_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+        let (recursive_tx, recursive_rx) = mpsc::channel();
+
+        let drainer = std::thread::spawn(move || {
+            let capture = CaptureExclusion::acquire();
+            assert!(run_or_defer_synchronizing(move || {
+                draining_tx.send(()).expect("announce drain");
+                continue_rx.recv().expect("continue recursive action");
+                assert!(!run_or_defer_synchronizing(move || {
+                    recursive_tx.send(()).expect("recursive action completed");
+                }));
+            }));
+            queued_tx.send(()).expect("announce queued action");
+            drop_rx.recv().expect("start capture drop");
+            drop(capture);
+        });
+
+        queued_rx.recv().expect("deferred action queued");
+        drop_tx.send(()).expect("start draining");
+        draining_rx.recv().expect("deferred drain started");
+        let capturer = std::thread::spawn(|| {
+            let _capture = CaptureExclusion::acquire();
+        });
+        wait_for_capture_waiter();
+        continue_tx.send(()).expect("continue recursive action");
+        recursive_rx
+            .recv()
+            .expect("recursive deferred action did not complete");
+        drainer.join().expect("drainer thread panicked");
         capturer.join().expect("capture thread panicked");
     }
 

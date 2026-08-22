@@ -1661,6 +1661,11 @@ impl MemoryLease {
         self.bytes
     }
 
+    /// Physical-memory authority currently charged for this lease, if known.
+    pub fn authority_id(&self) -> Option<MemoryAuthorityId> {
+        self.accounting.authority_id()
+    }
+
     /// What the bytes are for.
     pub fn role(&self) -> MemoryRole {
         self.role

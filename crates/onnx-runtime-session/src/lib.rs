@@ -1635,6 +1635,12 @@ impl InferenceSession {
         self.exec.device_allocation_counts()
     }
 
+    pub fn raw_device_allocation_site_stats(
+        &self,
+    ) -> Vec<onnx_runtime_ep_api::RawDeviceAllocationSiteStats> {
+        self.exec.raw_device_allocation_site_stats()
+    }
+
     /// Place any long-lived device memory this session's provider holds under
     /// `governor`.
     ///
