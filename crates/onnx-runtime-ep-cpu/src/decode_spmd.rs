@@ -732,6 +732,12 @@ impl SpmdDecodePools {
         shared.wait();
         drop(claim);
         if let Some(payload) = unwind {
+            // A worker panic during the same op stays latched in
+            // `poisoned_worker` and is reported by the next dispatch's
+            // `panic_if_poisoned`, which runs before it publishes anything. The
+            // dispatcher's own payload wins this frame because it is the one
+            // carrying the caller's stack; neither is lost, and `wait` above
+            // already guaranteed no worker is still running.
             std::panic::resume_unwind(payload);
         }
         shared.panic_if_poisoned();
