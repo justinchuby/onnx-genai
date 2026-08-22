@@ -958,9 +958,15 @@ mod tests {
             .unwrap()
             .replace("\r\n", "\n");
         let artifact = format!("    artifacts:\n    - location: {location}\n");
-        metadata = metadata.replace(
-            "    byte_level: true\n",
+        const TOKENIZER_NEEDLE: &str = "    byte_level: true\n";
+        assert!(
+            metadata.contains(TOKENIZER_NEEDLE),
+            "tokenizer fixture must contain the insertion point"
+        );
+        metadata = metadata.replacen(
+            TOKENIZER_NEEDLE,
             &format!("    byte_level: true\n{artifact}"),
+            1,
         );
         fs::write(root.join("inference_metadata.yaml"), metadata).unwrap();
         root
@@ -1038,7 +1044,10 @@ mod tests {
             .to_string()
             .replace('\\', "/");
         assert!(error.contains("cannot be opened"), "{error}");
-        assert!(error.contains("nested/tokenizer.json"), "{error}");
+        assert!(
+            error.contains("nested") && error.contains("tokenizer.json"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::capabilities as capability;
 use crate::schema::{InferenceMetadata, PipelineSpec, WorkflowNode, WorkflowSpec, WorkflowStep};
 
 struct ContractObligation {
@@ -72,12 +73,12 @@ impl Default for RuntimeCapabilities {
     fn default() -> Self {
         Self {
             supported: vec![
-                "kv_cache".to_string(),
-                "grouped_query_attention".to_string(),
-                "multi_head_attention".to_string(),
-                "prefix_cache".to_string(),
-                "continuous_batching".to_string(),
-                "control_flow_loop".to_string(),
+                capability::KV_CACHE.to_string(),
+                capability::GROUPED_QUERY_ATTENTION.to_string(),
+                capability::MULTI_HEAD_ATTENTION.to_string(),
+                capability::PREFIX_CACHE.to_string(),
+                capability::CONTINUOUS_BATCHING.to_string(),
+                capability::CONTROL_FLOW_LOOP.to_string(),
             ],
         }
     }
@@ -85,11 +86,9 @@ impl Default for RuntimeCapabilities {
 
 /// Validate the metadata document and required runtime capabilities.
 ///
-/// Reports structural defects and unsupported capabilities together, which is
-/// what a strict caller wants. A caller that can *proceed* without a capability
-/// — a bare decoder does not need `workflow_ssa` to be honoured — should use
-/// [`validate_structure_and_capabilities`] and decide for itself, rather than
-/// treating a capability it will never exercise as a malformed document.
+/// Reports structural defects and unsupported capabilities together. Canonical
+/// metadata is an execution contract: callers must reject unsupported required
+/// behavior rather than silently selecting a narrower legacy execution path.
 pub fn validate(
     metadata: &InferenceMetadata,
     runtime: &RuntimeCapabilities,
@@ -106,13 +105,9 @@ pub fn validate(
 
 /// Structural defects and unsupported capabilities, kept apart.
 ///
-/// These answer different questions. A structural defect means the document
-/// does not describe a runnable model and no caller can proceed. An unsupported
-/// capability means the package asks for a runtime feature this build lacks,
-/// which only matters if the caller would actually exercise it. Merging them
-/// into one list forces every caller to treat both as fatal, which is why a
-/// bare decoder used to be rejected for declaring workflow capabilities it
-/// never reaches.
+/// These answer different questions while remaining equally fatal at package
+/// admission. Keeping them separate lets loaders report whether the package is
+/// malformed or the runtime lacks behavior the package requires.
 #[derive(Debug, Default, Clone)]
 pub struct CapabilityReport {
     /// The document is malformed or self-inconsistent. Always fatal.
@@ -132,8 +127,10 @@ pub fn validate_structure_and_capabilities(
         .required_capabilities
         .iter()
         .cloned()
-        .chain(derived_capabilities(metadata));
+        .chain(derived_capabilities(metadata))
+        .collect::<BTreeSet<_>>();
     let unsupported_capabilities = required
+        .into_iter()
         .filter(|capability| !runtime.supported.contains(capability))
         .collect();
     CapabilityReport {
@@ -142,28 +139,30 @@ pub fn validate_structure_and_capabilities(
     }
 }
 
-/// Capabilities implied by concrete metadata features.
-pub fn derived_capabilities(metadata: &InferenceMetadata) -> BTreeSet<String> {
+fn metadata_only_required_capabilities(metadata: &InferenceMetadata) -> BTreeSet<String> {
     let mut capabilities = BTreeSet::new();
-    let Some(pipeline) = &metadata.pipeline else {
-        return capabilities;
-    };
-    let workflow = &pipeline.workflow;
-    capabilities.extend(workflow.manifest.capabilities.iter().cloned());
-    capabilities.insert("workflow_ssa".to_string());
-    if workflow.serving.is_some() {
-        capabilities.insert("serving_service_contract".to_string());
-    }
     if metadata.adapters.is_some() {
-        capabilities.insert("parameter_adapters".to_string());
-        capabilities.insert("heterogeneous_adapter_batching".to_string());
+        capabilities.insert(capability::PARAMETER_ADAPTERS.to_string());
+        capabilities.insert(capability::HETEROGENEOUS_ADAPTER_BATCHING.to_string());
+    }
+    capabilities
+}
+
+fn workflow_required_capabilities(
+    workflow: &WorkflowSpec,
+    compiled: Option<&WorkflowNode>,
+) -> BTreeSet<String> {
+    let mut capabilities = BTreeSet::new();
+    capabilities.insert(capability::WORKFLOW_SSA.to_string());
+    if workflow.serving.is_some() {
+        capabilities.insert(capability::SERVING_SERVICE_CONTRACT.to_string());
     }
     if workflow
         .state
         .values()
         .any(|state| state.scope == crate::schema::WorkflowStateScope::Session)
     {
-        capabilities.insert("session_state_lease".to_string());
+        capabilities.insert(capability::SESSION_STATE_LEASE.to_string());
     }
     if workflow.state.values().any(|state| {
         matches!(
@@ -171,35 +170,94 @@ pub fn derived_capabilities(metadata: &InferenceMetadata) -> BTreeSet<String> {
             crate::schema::ShapeRecurrence::Bounded { .. }
         )
     }) {
-        capabilities.insert("bounded_state_recurrence".to_string());
+        capabilities.insert(capability::BOUNDED_STATE_RECURRENCE.to_string());
     }
     if workflow
         .state
         .values()
         .any(|state| state.class == crate::schema::WorkflowStateClass::Advisory)
     {
-        capabilities.insert("advisory_state".to_string());
+        capabilities.insert(capability::ADVISORY_STATE.to_string());
+    }
+    if workflow
+        .inputs
+        .values()
+        .any(|input| input.present_as.is_some())
+    {
+        capabilities.insert(capability::INPUT_PRESENCE.to_string());
+    }
+    if workflow.inputs.values().any(|input| {
+        matches!(
+            &input.role,
+            crate::schema::SemanticInputRole::Runtime {
+                role: crate::schema::RuntimeInputRole::AdapterSegments
+                    | crate::schema::RuntimeInputRole::AdapterCounts
+                    | crate::schema::RuntimeInputRole::AdapterScales
+                    | crate::schema::RuntimeInputRole::AdapterActive,
+                ..
+            }
+        )
+    }) {
+        capabilities.insert(capability::HETEROGENEOUS_ADAPTER_BATCHING.to_string());
+    }
+    if !workflow.effects.is_empty()
+        || workflow
+            .components
+            .values()
+            .any(|component| !component.effects.is_empty())
+    {
+        capabilities.insert(capability::LINEAR_EFFECTS.to_string());
     }
     for component in workflow.components.values() {
-        match component
+        let contract_id = component
             .contract
             .as_ref()
-            .map(|contract| contract.id.as_str())
-        {
-            Some("onnx-genai.adaptive-proposal-budget") => {
-                capabilities.insert("adaptive_proposal_budget".to_string());
+            .map(|contract| contract.id.as_str());
+        let adapter_abi = match &component.implementation {
+            crate::schema::ComponentImplementation::Adapter { abi, .. } => Some(abi.as_str()),
+            _ => None,
+        };
+        for identifier in contract_id.into_iter().chain(adapter_abi) {
+            match identifier {
+                "onnx-genai.adaptive-proposal-budget" => {
+                    capabilities.insert(capability::ADAPTIVE_PROPOSAL_BUDGET.to_string());
+                }
+                "onnx-genai.grammar-guidance" => {
+                    capabilities.insert(capability::GRAMMAR_GUIDANCE_ADAPTER.to_string());
+                }
+                "onnx-genai.telemetry" => {
+                    capabilities.insert(capability::TELEMETRY_ADAPTER.to_string());
+                }
+                "onnx-genai.parameter-overlay" => {
+                    capabilities.insert(capability::PARAMETER_ADAPTERS.to_string());
+                }
+                _ => {}
             }
-            Some("onnx-genai.grammar-guidance") => {
-                capabilities.insert("grammar_guidance_adapter".to_string());
-            }
-            Some("onnx-genai.telemetry") => {
-                capabilities.insert("telemetry_adapter".to_string());
-            }
-            _ => {}
         }
     }
-    if let Ok(compiled) = crate::compile_workflow(workflow) {
-        collect_workflow_capabilities(&compiled.graph, &mut capabilities);
+    if let Some(compiled) = compiled {
+        collect_workflow_capabilities(compiled, &mut capabilities);
+    }
+    capabilities
+}
+
+fn metadata_required_capabilities(metadata: &InferenceMetadata) -> BTreeSet<String> {
+    let mut capabilities = metadata_only_required_capabilities(metadata);
+    if let Some(pipeline) = &metadata.pipeline {
+        let compiled = crate::compile_workflow(&pipeline.workflow).ok();
+        capabilities.extend(workflow_required_capabilities(
+            &pipeline.workflow,
+            compiled.as_ref().map(|compiled| &compiled.graph),
+        ));
+    }
+    capabilities
+}
+
+/// Capabilities implied by concrete metadata features.
+pub fn derived_capabilities(metadata: &InferenceMetadata) -> BTreeSet<String> {
+    let mut capabilities = metadata_required_capabilities(metadata);
+    if let Some(pipeline) = &metadata.pipeline {
+        capabilities.extend(pipeline.workflow.manifest.capabilities.iter().cloned());
     }
     capabilities
 }
@@ -211,22 +269,38 @@ fn collect_workflow_capabilities(node: &WorkflowNode, capabilities: &mut BTreeSe
                 collect_workflow_capabilities(node, capabilities);
             }
         }
-        WorkflowNode::Invoke { .. } => {}
+        WorkflowNode::Invoke { effects, .. } => {
+            if !effects.is_empty() {
+                capabilities.insert(capability::LINEAR_EFFECTS.to_string());
+            }
+        }
         WorkflowNode::Loop {
             setup,
             body,
             iteration,
+            effects,
             ..
         } => {
-            capabilities.insert("nested_control_flow".to_string());
+            capabilities.insert(capability::NESTED_CONTROL_FLOW.to_string());
             if iteration.is_some() {
-                capabilities.insert("loop_induction_values".to_string());
+                capabilities.insert(capability::LOOP_INDUCTION_VALUES.to_string());
+            }
+            if !effects.is_empty() {
+                capabilities.insert(capability::LINEAR_EFFECTS.to_string());
             }
             collect_workflow_capabilities(setup, capabilities);
             collect_workflow_capabilities(body, capabilities);
         }
-        WorkflowNode::Branch { cases, default, .. } => {
-            capabilities.insert("nested_control_flow".to_string());
+        WorkflowNode::Branch {
+            cases,
+            default,
+            effects,
+            ..
+        } => {
+            capabilities.insert(capability::NESTED_CONTROL_FLOW.to_string());
+            if !effects.is_empty() {
+                capabilities.insert(capability::LINEAR_EFFECTS.to_string());
+            }
             for case in cases.values() {
                 collect_workflow_capabilities(case, capabilities);
             }
@@ -237,16 +311,16 @@ fn collect_workflow_capabilities(node: &WorkflowNode, capabilities: &mut BTreeSe
         WorkflowNode::Emit {
             mode, valid_length, ..
         } => {
-            capabilities.insert("typed_emit".to_string());
+            capabilities.insert(capability::TYPED_EMIT.to_string());
             if matches!(mode, crate::schema::WorkflowEmitMode::Event) {
-                capabilities.insert("streaming_emit".to_string());
+                capabilities.insert(capability::STREAMING_EMIT.to_string());
             }
             if valid_length.is_some() {
-                capabilities.insert("emit_valid_length".to_string());
+                capabilities.insert(capability::EMIT_VALID_LENGTH.to_string());
             }
         }
         WorkflowNode::Transfer { .. } => {
-            capabilities.insert("explicit_transfer".to_string());
+            capabilities.insert(capability::EXPLICIT_TRANSFER.to_string());
         }
         WorkflowNode::ExecutionIsland { .. } => {}
     }
@@ -269,6 +343,19 @@ pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>
             metadata.pipeline.as_ref().map(|p| &p.workflow),
             &mut errors,
         );
+        if let Some(workflow) = metadata
+            .pipeline
+            .as_ref()
+            .map(|pipeline| &pipeline.workflow)
+        {
+            for capability in metadata_only_required_capabilities(metadata)
+                .difference(&workflow.manifest.capabilities)
+            {
+                errors.push(format!(
+                    "pipeline.workflow.manifest.capabilities is missing used capability '{capability}'"
+                ));
+            }
+        }
     }
     validate_preprocessing_workflow(metadata, &mut errors);
     validate_generation_contract(metadata, &mut errors);
@@ -2083,40 +2170,7 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
         }
     }
 
-    let mut used = BTreeSet::from(["workflow_ssa".to_string()]);
-    if workflow.serving.is_some() {
-        used.insert("serving_service_contract".to_string());
-    }
-    if workflow
-        .state
-        .values()
-        .any(|state| state.scope == crate::schema::WorkflowStateScope::Session)
-    {
-        used.insert("session_state_lease".to_string());
-    }
-    if workflow.state.values().any(|state| {
-        matches!(
-            state.recurrence,
-            crate::schema::ShapeRecurrence::Bounded { .. }
-        )
-    }) {
-        used.insert("bounded_state_recurrence".to_string());
-    }
-    if workflow
-        .state
-        .values()
-        .any(|state| state.class == crate::schema::WorkflowStateClass::Advisory)
-    {
-        used.insert("advisory_state".to_string());
-    }
-    if workflow
-        .inputs
-        .values()
-        .any(|input| input.present_as.is_some())
-    {
-        used.insert("input_presence".to_string());
-    }
-    collect_workflow_capabilities(&compiled.graph, &mut used);
+    let used = workflow_required_capabilities(workflow, Some(&compiled.graph));
     for capability in used.difference(&workflow.manifest.capabilities) {
         errors.push(format!(
             "pipeline.workflow.manifest.capabilities is missing used capability '{capability}'"

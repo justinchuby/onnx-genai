@@ -8152,3 +8152,40 @@ fn prepare_workspace_resolves_deepseek_additive_mask_query_axis_exactly() {
         .unwrap();
     assert_eq!(resolved, PlannedInputShape::Exact(vec![1, 1, 1, 2048]));
 }
+
+/// Weight-derived caches must be drained before the buffers they are keyed on
+/// are freed (#1726, #1735).
+///
+/// Both caches key entries on a weight's address and hold no claim on the memory
+/// there, so an entry that outlives its buffer can be served to whatever lands on
+/// that address next -- the right route, another model's numbers. Per-owner
+/// eviction closes the within-executor case; this ordering is what closes the
+/// cross-executor one, and it is invisible at runtime: reversing it produces no
+/// error, just a window in which a recycled address inherits stale entries.
+///
+/// Asserted over the source because the failure has no observable signal to
+/// probe for. Reversing the order in `Executor::drop` fails this test.
+#[test]
+fn weight_derived_caches_are_cleared_before_their_buffers_are_freed() {
+    let source = include_str!("mod.rs");
+    let drop_body = source
+        .split_once("impl Drop for Executor {")
+        .expect("Executor has a Drop impl")
+        .1;
+    let free = drop_body
+        .find("self.buffers.drain()")
+        .expect("the drop body frees the executor's buffers");
+    for clear in [
+        "clear_weight_transpose_caches()",
+        "clear_mlas_packed_caches()",
+    ] {
+        let at = drop_body
+            .find(clear)
+            .unwrap_or_else(|| panic!("the drop body must call {clear}"));
+        assert!(
+            at < free,
+            "{clear} runs after the buffers it protects are freed, leaving \
+             entries keyed on addresses the allocator may hand to the next model"
+        );
+    }
+}

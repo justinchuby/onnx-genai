@@ -448,6 +448,10 @@ fn raw_pool_size_class(bytes: usize) -> usize {
     }
 }
 
+/// Source of [`CudaRuntime::runtime_id`]. Monotonic and never reset, so an id
+/// is never handed to a second runtime.
+static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
+
 pub struct CudaRuntime {
     context: Arc<CudaContext>,
     stream: Arc<CudaStream>,
@@ -486,6 +490,29 @@ pub struct CudaRuntime {
     raw_pool_classes: Mutex<HashMap<CUdeviceptr, usize>>,
     raw_pool_retained: AtomicU64,
     raw_pool_hits: AtomicU64,
+    /// Identity for this runtime, unique in this process and never reused.
+    ///
+    /// Not the ordinal: several runtimes may share a device, and the point of
+    /// the id is to tell them apart. Not an address either -- a dropped
+    /// runtime's address can be handed to the next one, which is the very reuse
+    /// this guards against. See [`crate::interleave_cache`].
+    runtime_id: u64,
+    /// Interleaved copies of int4 packed weights, keyed by the source weight's
+    /// device address.
+    ///
+    /// A field rather than a process global because the key *is* an address
+    /// this runtime's allocator minted: once the runtime goes away the address
+    /// means nothing, and serving a later session's weight from an entry keyed
+    /// on it is the #1726 defect. See [`crate::interleave_cache`].
+    interleave: crate::interleave_cache::InterleaveCache,
+    /// Whether device weight offload is on, meaning weight buffers may be paged.
+    ///
+    /// Set once by the provider when it configures residency. A paged weight's
+    /// pages are retired by `weight_paging` without passing through
+    /// `deallocate`, so `interleave` is never told the address died and cannot
+    /// safely key on one. It refuses to cache at all when this is set; see
+    /// [`crate::interleave_cache::InterleaveDevice::interleave_frees_are_observed`].
+    weights_may_be_paged: std::sync::atomic::AtomicBool,
     /// The one cuBLASLt workspace shared by every GEMM on this runtime's
     /// compute stream. Allocated on first use and never freed until the
     /// runtime drops.
@@ -682,6 +709,9 @@ impl CudaRuntime {
             raw_pool_classes: Mutex::new(HashMap::new()),
             raw_pool_retained: AtomicU64::new(0),
             raw_pool_hits: AtomicU64::new(0),
+            runtime_id: NEXT_RUNTIME_ID.fetch_add(1, Ordering::Relaxed),
+            interleave: crate::interleave_cache::InterleaveCache::default(),
+            weights_may_be_paged: std::sync::atomic::AtomicBool::new(false),
             shared_blas_workspace: Mutex::new(None),
             raw_allocation_profile: RawAllocationProfile::new(raw_allocation_profile_enabled()),
             host_to_device_copies: AtomicU64::new(0),
@@ -1403,6 +1433,69 @@ impl CudaRuntime {
             != cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE)
     }
 
+    /// This runtime's process-unique identity. See [`Self::runtime_id`].
+    pub(crate) fn runtime_id(&self) -> u64 {
+        self.runtime_id
+    }
+
+    /// The interleaved copy of the `bytes`-byte int4 packed weight at `packed`,
+    /// built once per weight and released when this runtime drops. Returns
+    /// `(pointer, warm)`; see [`crate::interleave_cache::InterleaveCache::ensure`].
+    pub(crate) fn ensure_interleaved_int4(
+        &self,
+        packed: CUdeviceptr,
+        bytes: usize,
+    ) -> Result<(CUdeviceptr, bool)> {
+        self.interleave.ensure(self, packed, bytes)
+    }
+
+    /// Release every interleaved weight copy this runtime holds.
+    ///
+    /// The backstop, for anything still cached when the runtime itself goes
+    /// away. The load-bearing eviction is [`Self::invalidate_interleaved_for`],
+    /// which runs per buffer as the provider frees it.
+    #[cfg(test)]
+    pub(crate) fn release_interleaved_weights(&self) {
+        self.interleave.release_all(self);
+    }
+
+    /// Drop any interleaved copy derived from the buffer at `base`.
+    ///
+    /// The provider calls this as it frees a device buffer, passing the whole
+    /// allocation — an entry is keyed on a weight's data pointer, which may sit
+    /// at an offset inside the buffer being freed. That address names that
+    /// weight only until this moment; past it the allocator may hand it to the
+    /// next weight of the same size, whose interleave would otherwise be served
+    /// out of this entry (#1726). A provider outlives its executors — sibling
+    /// plans share one, and the control-flow child-executor cache evicts plans
+    /// and frees their initializers back into the same arena — so runtime
+    /// scoping alone leaves that window open and this is what closes it.
+    pub(crate) fn invalidate_interleaved_for(&self, base: CUdeviceptr, len: usize) {
+        self.interleave.invalidate(self, base, len);
+    }
+
+    /// Record that device weight offload is on, so weight buffers may be paged.
+    ///
+    /// One-way: a runtime that has ever paged weights can have had an address
+    /// recycled behind the interleave cache's back, so there is no sound way
+    /// back to caching for the rest of its life.
+    pub(crate) fn set_weights_may_be_paged(&self) {
+        self.weights_may_be_paged
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether weight buffers on this runtime may be paged by the offload path.
+    pub(crate) fn weights_may_be_paged(&self) -> bool {
+        self.weights_may_be_paged
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Interleaved weight copies this runtime currently holds.
+    #[cfg(test)]
+    pub(crate) fn interleaved_weight_count(&self) -> usize {
+        self.interleave.len()
+    }
+
     /// Allocate `bytes` (>= 1) of device memory, returning the raw device
     /// pointer. Binds the context first.
     #[track_caller]
@@ -2015,6 +2108,11 @@ impl Drop for CudaRuntime {
         // released when this body returns, which is *before* the fields drop.
         // See `teardown_section`.
         self.teardown_section = capture_gate::synchronizing_section();
+        // Before the context goes: an interleaved weight copy is keyed by the
+        // source weight's device address, and that address stops meaning
+        // anything once this runtime's allocator is gone. Freeing here is what
+        // bounds an entry's life by the life of the address that names it.
+        self.interleave.release_all(&*self);
         if self.capture_error != 0 {
             // SAFETY: `capture_error` was allocated by this runtime's `alloc_raw`
             // in `with_capture_error_word` and is freed exactly once here.

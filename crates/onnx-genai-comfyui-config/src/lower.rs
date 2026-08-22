@@ -10,6 +10,7 @@
 //! import source, and the emitted metadata is the sole source of execution
 //! truth afterwards.
 
+use onnx_genai_metadata::capabilities as capability;
 use serde_json::{Map, Value, json};
 
 use crate::ComfyUiConfigError;
@@ -50,11 +51,11 @@ impl<'a> Lowering<'a> {
             tail: Vec::new(),
             outputs: Map::new(),
             capabilities: vec![
-                "workflow_ssa",
-                "linear_effects",
-                "nested_control_flow",
-                "loop_induction_values",
-                "typed_emit",
+                capability::WORKFLOW_SSA,
+                capability::LINEAR_EFFECTS,
+                capability::NESTED_CONTROL_FLOW,
+                capability::LOOP_INDUCTION_VALUES,
+                capability::TYPED_EMIT,
             ],
         }
     }
@@ -1052,7 +1053,9 @@ impl<'a> Lowering<'a> {
 
     /// Declare the request-scoped adapter selection inputs a LoRA package needs.
     pub(crate) fn declare_adapter_selection(&mut self, max_adapters: usize) {
-        self.capabilities.push("parameter_adapters");
+        self.capabilities.push(capability::PARAMETER_ADAPTERS);
+        self.capabilities
+            .push(capability::HETEROGENEOUS_ADAPTER_BATCHING);
         let count = i64::try_from(max_adapters).unwrap_or(i64::MAX);
         self.request_input(
             "request.adapter_segments",

@@ -1934,6 +1934,13 @@ pub(crate) mod testutil {
     }
 
     impl Owned {
+        fn evict_stale_half_transpose(bytes: &[u8], shape: &[usize], tag: u16) {
+            let [k, n] = shape else {
+                return;
+            };
+            super::weight_transpose::half_cache_evict(bytes.as_ptr().cast(), *k, *n, tag);
+        }
+
         pub fn f32(shape: &[usize], data: &[f32]) -> Self {
             let strides = compute_contiguous_strides(shape);
             let mut bytes = Vec::with_capacity(data.len() * 4);
@@ -1997,6 +2004,7 @@ pub(crate) mod testutil {
             for &v in data {
                 bytes.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
             }
+            Self::evict_stale_half_transpose(&bytes, shape, 0);
             Self {
                 bytes,
                 shape: shape.to_vec(),
@@ -2013,6 +2021,7 @@ pub(crate) mod testutil {
             for &b in bits {
                 bytes.extend_from_slice(&b.to_le_bytes());
             }
+            Self::evict_stale_half_transpose(&bytes, shape, 0);
             Self {
                 bytes,
                 shape: shape.to_vec(),
@@ -2028,6 +2037,7 @@ pub(crate) mod testutil {
             for &v in data {
                 bytes.extend_from_slice(&half::bf16::from_f32(v).to_le_bytes());
             }
+            Self::evict_stale_half_transpose(&bytes, shape, 1);
             Self {
                 bytes,
                 shape: shape.to_vec(),
@@ -2043,6 +2053,7 @@ pub(crate) mod testutil {
             for &b in bits {
                 bytes.extend_from_slice(&b.to_le_bytes());
             }
+            Self::evict_stale_half_transpose(&bytes, shape, 1);
             Self {
                 bytes,
                 shape: shape.to_vec(),

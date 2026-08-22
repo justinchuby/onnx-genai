@@ -506,7 +506,13 @@ pub(crate) fn evict_f32(key: &WeightTransposeKey) {
 /// can remove is a stale one left by a freed buffer that nobody is using.
 #[cfg(test)]
 pub(crate) fn f16_cache_evict(ptr: *const u16, k: usize, n: usize) {
-    WEIGHT_TRANSPOSE_F16.remove(&WeightTransposeKey::new(ptr, k, n));
+    half_cache_evict(ptr, k, n, 0);
+}
+
+/// Test-only: drop a 16-bit entry keyed on `(ptr, k, n, tag)`.
+#[cfg(test)]
+pub(crate) fn half_cache_evict(ptr: *const u16, k: usize, n: usize, tag: u16) {
+    WEIGHT_TRANSPOSE_F16.remove(&WeightTransposeKey::tagged(ptr, k, n, tag));
 }
 
 /// Entry counts of the global caches as `(f16, f32)`.

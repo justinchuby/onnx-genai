@@ -1807,8 +1807,9 @@ population and the A/A hit **52.7%**. Aggregate throughput is the only valid
 multi-session statistic here, and it moves those rows by ~0.17x. (iii) A cell
 whose min and median disagree in *direction* (t=16: 1.234x vs 0.730x) has not
 been measured; the fix is a longer window (240 tokens -> 1.245x/1.412x), not a
-choice of statistic. Also: `ONNX_GENAI_CPU_DECODE_THREADS=2` is **inert** on this
-harness (identical to `=1`), so any "t=2" row is a duplicate t=1 row.
+choice of statistic. Also: `ONNX_GENAI_CPU_DECODE_THREADS=2` read **identical to
+`=1`** on this harness. That identity was real, but its cause was not the pool —
+see the correction in §27; the knob delivers 1.96x under control.
 
 **Two corrections to this file's host model**, both of which change how earlier
 roofline arguments read: **L3 is 32 MiB per CCX, not 64 MiB shared**, and
@@ -2513,15 +2514,30 @@ ratios on this host are not reproducible, whichever arm they favour.
   same sweep and should not be picked up by the next reader.
 * The dispatch-width question was handed to the runtime owner with CPU-time
   evidence (total CPU-seconds flat across widths, `sys` time rising ~20x from
-  `t<=2` to `t>=4`) rather than tuned around in the kernel. This also supplies a
-  **mechanism for a previously unexplained anomaly**: the acc4 regime document
-  recorded that `ONNX_GENAI_CPU_DECODE_THREADS=2` produces timings identical to
-  `=1` (23.529 vs 23.527 ms/token) and dropped the row rather than explain it.
-  That reproduces here (23.6 vs 23.6 tok/s), and `/usr/bin/time` shows the `=2`
-  run consuming **71% of one core against 98% for `=1`** at the same total user
-  time — the second worker is parked, not computing. A knob that silently does
-  nothing is worse than a slow one, because every sweep through it prints a flat
-  line that reads as "this kernel does not scale".
+  `t<=2` to `t>=4`) rather than tuned around in the kernel. The `sys` rise is
+  real and is the `worker_wait` yield ramp (a `sched_yield` syscall per
+  iteration for the remainder of the blocktime window); it remains open with the
+  runtime owner.
+* The accompanying claim that `ONNX_GENAI_CPU_DECODE_THREADS=2` is a knob that
+  "silently does nothing" is **withdrawn (2026-08-22)**. The acc4 regime document
+  recorded `=2` as identical to `=1` (23.529 vs 23.527 ms/token) and that
+  reproduced here (23.6 vs 23.6 tok/s), but a controlled re-measurement on a
+  quiet host — one process per launch, interleaved arms, per-rep load guard,
+  over-guard cells discarded — gives **20.447 ms/token at `=2` against 40.039 at
+  `=1`, a 1.96x speedup, with a 0.6% A/A null**. Per-thread attribution shows
+  both `=2` workers **99% busy**, not parked. The "71% of one core" figure came
+  from `/usr/bin/time`'s `Percent of CPU`, which is `(user+sys)/wall` and so is
+  wall-derived: under contention it degrades exactly like the wall time it was
+  being used to corroborate, rather than independently confirming it. The
+  strongest clue that this was harness-side was arithmetic — 23.529 vs 23.527
+  agree to four significant figures, and contention is random. Full curve,
+  method and the categorical non-vacuity check:
+  [2026-08-22-decode-width-scaling.md](../benchmarks/2026-08-22-decode-width-scaling.md).
+* The general point survives intact and is worth keeping: a knob that silently
+  does nothing is worse than a slow one, because every sweep through it prints a
+  flat line that reads as "this kernel does not scale". The fix is to verify a
+  knob **structurally** (`w` in must give `w` SPMD threads out — categorical, so
+  valid even on a loaded host) rather than by comparing timings.
 * **Benchmarking on this host now requires coordination.** Three agents share
   16 physical cores; two were running heavy jobs on this crate during this
   investigation, one of them the very same benchmark binary. Cross-agent notice

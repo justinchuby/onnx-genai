@@ -6216,24 +6216,6 @@ fn dequant_f16_gemm_max_scratch_bytes() -> usize {
         .unwrap_or(1 << 30)
 }
 
-/// Opt-in gate for the TRT-LLM-style interleaved + biased int4 decode dequant
-/// (`ONNX_GENAI_INTERLEAVE_DEQUANT`). Default OFF: the lever bakes an offline
-/// nibble-interleave into the packed weights and folds the symmetric `-8` bias
-/// into the LOP3 converter, dropping the per-block zero-point `sub.f16x2` and the
-/// `prmt.b32` activation reorder from the decode inner loop. Byte-identical to the
-/// fp32 multicol path on symmetric weights. Only routes symmetric (no zero-point)
-/// block!=32 int4 nodes that already qualify for the wide-load multicol kernel;
-/// every other node is untouched.
-///
-/// It stays opt-in because the speedup is bought with memory, not for free:
-/// [`ensure_interleaved`] allocates a SECOND copy of every routed weight and keys
-/// the cache off the ORIGINAL packed pointer, which ORT still owns and never
-/// frees. So the routed int4 weights are resident TWICE for the life of the
-/// process — the cache holds 4096 entries while a 52-layer model registers only a
-/// few hundred, so nothing is ever evicted. Measured +8.6% on H200 (211.9 → 230.0
-/// tok/s, glm base); on a 20 GB int4 model that costs ~20 GB extra VRAM, which is
-/// why it must NOT be defaulted on for the memory-tight consumer cards that would
-/// otherwise benefit most from the instruction-count win.
 /// Offer published by `run_bf16` for the duration of the staged fp16 call it
 /// makes on this same thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6287,6 +6269,24 @@ fn take_bf16_direct_out(staging: CUdeviceptr, elements: usize) -> Option<CUdevic
     })
 }
 
+/// Opt-in gate for the TRT-LLM-style interleaved + biased int4 decode dequant
+/// (`ONNX_GENAI_INTERLEAVE_DEQUANT`). Default OFF: the lever bakes an offline
+/// nibble-interleave into the packed weights and folds the symmetric `-8` bias
+/// into the LOP3 converter, dropping the per-block zero-point `sub.f16x2` and the
+/// `prmt.b32` activation reorder from the decode inner loop. Byte-identical to the
+/// fp32 multicol path on symmetric weights. Only routes symmetric (no zero-point)
+/// block!=32 int4 nodes that already qualify for the wide-load multicol kernel;
+/// every other node is untouched.
+///
+/// It stays opt-in because the speedup is bought with memory, not for free:
+/// [`ensure_interleaved`] allocates a SECOND copy of every routed weight and
+/// keys the cache off the ORIGINAL packed pointer, which ORT owns and does not
+/// free while the session runs. So the routed int4 weights are resident TWICE
+/// for the life of the runtime that built them, which is what releases them
+/// (see [`crate::interleave_cache`]). Measured +8.6% on H200 (211.9 → 230.0
+/// tok/s, glm base); on a 20 GB int4 model that costs ~20 GB extra VRAM, which is
+/// why it must NOT be defaulted on for the memory-tight consumer cards that would
+/// otherwise benefit most from the instruction-count win.
 fn interleave_dequant_enabled() -> bool {
     matches!(
         std::env::var("ONNX_GENAI_INTERLEAVE_DEQUANT")
@@ -6311,32 +6311,45 @@ fn use_scales_f16_zp_splitk_pf() -> bool {
     )
 }
 
-/// Module-global cache of offline nibble-interleaved int4 weights, keyed by the
-/// source (packed) device pointer, byte length, and device ordinal. Weights are
-/// immutable initializers, so the device interleave runs once and every later
-/// call — including captured CUDA-graph replays — reuses the cached buffer with
-/// no allocation.
-struct InterleaveEntry {
-    ptr: CUdeviceptr,
-    runtime: Arc<CudaRuntime>,
-}
+/// Runs the device side of the offline nibble-interleave for the cache in
+/// [`crate::interleave_cache`].
+///
+/// The interleave itself lives on [`CudaRuntime`] rather than in a module
+/// global: the cache key is a device address, an address is only a name for a
+/// buffer while the allocator that minted it is alive, and the runtime is the
+/// type that owns that allocator. The rules and their falsifiers are in
+/// [`crate::interleave_cache`]; the device work is here because the interleave
+/// pass is a kernel in this module's NVRTC source.
+impl crate::interleave_cache::InterleaveDevice for CudaRuntime {
+    fn interleave_device_id(&self) -> u64 {
+        self.runtime_id()
+    }
 
-struct InterleaveCache {
-    map: std::collections::HashMap<(usize, usize, u32), InterleaveEntry>,
-    order: std::collections::VecDeque<(usize, usize, u32)>,
-}
+    fn interleave_alloc(&self, bytes: usize) -> Result<CUdeviceptr> {
+        self.alloc_raw(bytes)
+    }
 
-const INTERLEAVE_CACHE_CAP: usize = 4096;
+    unsafe fn interleave_free(&self, ptr: CUdeviceptr) {
+        // SAFETY: forwarded under the caller's obligation that `ptr` came from
+        // `interleave_alloc` above and is freed once.
+        let _ = unsafe { self.free_raw(ptr) };
+    }
 
-static INTERLEAVE_CACHE: std::sync::OnceLock<Mutex<InterleaveCache>> = std::sync::OnceLock::new();
+    fn interleave_build(&self, src: CUdeviceptr, dst: CUdeviceptr, bytes: usize) -> Result<()> {
+        launch_interleave_int4(self, src, dst, bytes)
+    }
 
-fn interleave_cache() -> &'static Mutex<InterleaveCache> {
-    INTERLEAVE_CACHE.get_or_init(|| {
-        Mutex::new(InterleaveCache {
-            map: std::collections::HashMap::new(),
-            order: std::collections::VecDeque::new(),
-        })
-    })
+    fn interleave_is_capturing(&self) -> Result<bool> {
+        self.is_capturing()
+    }
+
+    fn interleave_frees_are_observed(&self) -> bool {
+        !self.weights_may_be_paged()
+    }
+
+    fn interleave_drain_before_free(&self) -> Result<()> {
+        self.drain_for_unmap()
+    }
 }
 
 /// Launch the once-per-weight int4 nibble-interleave pass over `bytes` bytes
@@ -6373,65 +6386,20 @@ fn launch_interleave_int4(
 
 /// Ensure the offline-interleaved copy of the `bytes`-byte packed weight buffer
 /// at `packed` exists on device, running the device interleave once and caching
-/// the result. Returns `(interleaved_ptr, warm)`; `warm == true` means the
-/// buffer was already cached (no allocation / interleave / sync this call, so it
-/// is CUDA-graph capture-safe). A cold miss while capturing is rejected so the
-/// caller falls back to the non-interleaved path rather than allocating inside a
-/// capture.
+/// the result on `runtime`. Returns `(interleaved_ptr, warm)`; `warm == true`
+/// means the buffer was already cached (no allocation / interleave / sync this
+/// call, so it is CUDA-graph capture-safe). A cold miss while capturing is
+/// rejected so the caller falls back to the non-interleaved path rather than
+/// allocating inside a capture.
+///
+/// The entry is keyed by `(packed, bytes)` and lives no longer than `runtime`,
+/// which is what makes a device address a valid identity for it.
 fn ensure_interleaved(
     runtime: &Arc<CudaRuntime>,
     packed: CUdeviceptr,
     bytes: usize,
 ) -> Result<(CUdeviceptr, bool)> {
-    let key = (packed as usize, bytes, runtime.ordinal());
-    {
-        let cache = interleave_cache()
-            .lock()
-            .map_err(|_| error("interleave cache mutex poisoned"))?;
-        if let Some(entry) = cache.map.get(&key) {
-            return Ok((entry.ptr, true));
-        }
-    }
-    if runtime.is_capturing()? {
-        return Err(error(
-            "int4 interleave cannot allocate during CUDA-graph capture; the weight must be \
-             interleaved during warmup before capture",
-        ));
-    }
-    let out = runtime.alloc_raw(bytes)?;
-    if let Err(e) = launch_interleave_int4(runtime, packed, out, bytes) {
-        // SAFETY: `out` was just allocated here and is otherwise unreferenced.
-        let _ = unsafe { runtime.free_raw(out) };
-        return Err(e);
-    }
-    let mut cache = interleave_cache()
-        .lock()
-        .map_err(|_| error("interleave cache mutex poisoned"))?;
-    // Another thread may have inserted the same key while we interleaved.
-    if let Some(entry) = cache.map.get(&key) {
-        let winner = entry.ptr;
-        drop(cache);
-        // SAFETY: `out` is our just-allocated duplicate; free it once.
-        let _ = unsafe { runtime.free_raw(out) };
-        return Ok((winner, true));
-    }
-    cache.map.insert(
-        key,
-        InterleaveEntry {
-            ptr: out,
-            runtime: runtime.clone(),
-        },
-    );
-    cache.order.push_back(key);
-    while cache.order.len() > INTERLEAVE_CACHE_CAP {
-        if let Some(evict) = cache.order.pop_front()
-            && let Some(entry) = cache.map.remove(&evict)
-        {
-            // SAFETY: exclusively owned by the cache; freed once on eviction.
-            let _ = unsafe { entry.runtime.free_raw(entry.ptr) };
-        }
-    }
-    Ok((out, false))
+    runtime.ensure_interleaved_int4(packed, bytes)
 }
 
 fn use_f16_symmetric_splitk(
@@ -7008,6 +6976,23 @@ impl MatMulNBitsKernel {
         marlin_weight_inputs_are_constant(&self.constant_inputs, self.gate_up_swiglu)
     }
 
+    fn release_marlin_repack_for_decode(&self) {
+        // The Marlin repack is a second, tensor-core-layout copy of this op's
+        // weights, allocated raw (invisible to the VMM arena) and only read by
+        // the M > 1 tensor-core GEMM. At decode it is pure device overhead:
+        // measured at ~384 MiB on a 1.8B model whose weights are under 1 GiB.
+        //
+        // The atomic load is the steady-state cost; the drop happens at most
+        // once per prefill→decode transition, and a later prefill simply
+        // repacks. Never release during capture, where freeing device memory
+        // would invalidate the graph.
+        if self.marlin_repack_cache.retained_bytes() > 0
+            && !self.runtime.is_capturing().unwrap_or(true)
+        {
+            self.marlin_repack_cache.release_all();
+        }
+    }
+
     fn run(
         &self,
         inputs: &[TensorView],
@@ -7134,26 +7119,7 @@ impl MatMulNBitsKernel {
         self.last_call_capture_safe
             .store(m == 1 && group_indices.is_none(), Ordering::Relaxed);
         if m == 1 && group_indices.is_none() {
-            // The Marlin repack is a second, tensor-core-layout copy of this
-            // op's weights, allocated raw (invisible to the VMM arena) and
-            // never evicted. It is only read by the `M > 1` tensor-core GEMM,
-            // so once execution reaches single-token decode it is pure device
-            // overhead — measured at ~384 MiB on a 1.8B model whose weights are
-            // under 1 GiB, which was the whole of our peak-VRAM deficit against
-            // llama.cpp.
-            //
-            // Releasing here rather than at a phase boundary keeps the rule
-            // local to the fact that justifies it: this branch is exactly the
-            // condition under which the buffers cannot be read. The atomic load
-            // is the steady-state cost; the drop happens at most once per
-            // prefill→decode transition, and a later prefill simply repacks
-            // again (a cost, never a wrong answer). Never during capture, where
-            // freeing device memory would invalidate the graph.
-            if self.marlin_repack_cache.retained_bytes() > 0
-                && !self.runtime.is_capturing().unwrap_or(true)
-            {
-                self.marlin_repack_cache.release_all();
-            }
+            self.release_marlin_repack_for_decode();
             if self.bits == 4
                 && self.block_size == 128
                 && let Some(zero_points) = zero_points
@@ -12707,15 +12673,17 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 .dtoh(as_bytes_mut(&mut got_f16), output_dev)
                 .unwrap();
             runtime.free_raw(activation_dev).unwrap();
-            // NOTE: `packed_dev` is intentionally NOT freed. The interleave cache
-            // is keyed by (source pointer, byte length, ordinal); freeing the
-            // packed buffer would let CUDA reuse its address for a later,
-            // different-content buffer of the same byte length, producing a stale
-            // cache hit in a subsequent interleave run. Production weights are
-            // immutable initializers that are never freed, so this aliasing
-            // cannot occur there; leaking the small test buffer reproduces that
-            // stable-address invariant. (Real allocations are reclaimed on
-            // process exit.)
+            // NOTE: `packed_dev` is intentionally NOT freed. The interleave
+            // cache is keyed by (source pointer, byte length); freeing the
+            // packed buffer would return its address to `alloc_raw`'s size-class
+            // free list, and the next same-size allocation on this runtime would
+            // get it back with different contents behind the same key. Every
+            // case here shares one runtime, so leaking the small test buffer is
+            // what keeps each weight's address its own. Production weights are
+            // graph initializers, which the executor never frees mid-session --
+            // and the cache now dies with the runtime, so an address cannot
+            // carry an entry into a later session either (#1726 class).
+            // (Real allocations are reclaimed on process exit.)
             runtime.free_raw(scales_dev).unwrap();
             runtime.free_raw(output_dev).unwrap();
         }
@@ -12843,6 +12811,103 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             ran,
             "split-K wide interleaved byte-identity test did not execute any case"
         );
+    }
+
+    /// Two providers on one device must not share interleaved weights.
+    ///
+    /// The cache is keyed by the source weight's device address, and an address
+    /// is only a name for a buffer while the allocator that minted it is alive.
+    /// While this cache was a process global, a weight freed with its session
+    /// left an entry behind that the next session's same-size weight could hit
+    /// at the recycled address -- the right kernel over somebody else's weights.
+    /// The rule is now structural: an entry belongs to one runtime.
+    ///
+    /// The host-side falsifiers for the identity and lifetime rules, driven by a
+    /// deterministic recycling allocator, are in `crate::interleave_cache`; this
+    /// one checks the wiring on a real device.
+    #[test]
+    fn interleaved_weights_are_not_shared_between_runtimes() {
+        const BYTES: usize = 4096;
+        let Some(first) = crate::test_support::maybe_runtime() else {
+            eprintln!("skipping interleave runtime-scoping test: no CUDA device");
+            return;
+        };
+        let Some(second) = crate::test_support::maybe_runtime() else {
+            return;
+        };
+
+        let packed = first.alloc_raw(BYTES).unwrap();
+        let (built, warm) = ensure_interleaved(&first, packed, BYTES).unwrap();
+        assert!(!warm, "the first sight of a weight must build it");
+        assert_eq!(first.interleaved_weight_count(), 1);
+        assert_eq!(
+            second.interleaved_weight_count(),
+            0,
+            "a second runtime must not see the first runtime's entries"
+        );
+
+        // Same address, same length, other runtime: a global cache would serve
+        // the buffer above.
+        let (other, warm) = ensure_interleaved(&second, packed, BYTES).unwrap();
+        assert!(
+            !warm,
+            "a runtime that has never interleaved this weight must build it"
+        );
+        assert_ne!(
+            other, built,
+            "two runtimes were served the same interleaved buffer for one address"
+        );
+
+        // SAFETY: allocated by `first` above and freed once.
+        unsafe { first.free_raw(packed) }.unwrap();
+    }
+
+    /// Tearing a runtime down releases the interleaved copies it built.
+    ///
+    /// The map this replaced held 4096 entries, evicted only under an LRU its
+    /// own documentation says never fills, and had no teardown at all: a full
+    /// duplicate of every routed int4 weight stayed resident for the life of the
+    /// process, across every session that ever loaded one.
+    ///
+    /// Exercises the same `release_all` that `Drop for CudaRuntime` calls, since
+    /// a dropped runtime can no longer be asked what it holds. The assertion is
+    /// that the entry is gone -- the next ask must build again rather than be
+    /// served warm -- and not that the address came back from `alloc_raw`:
+    /// `free_raw` may park a block in its size-class pool or return it to the
+    /// driver depending on the pool budget, and either is correct here.
+    #[test]
+    fn tearing_down_a_runtime_releases_its_interleaved_weights() {
+        const BYTES: usize = 2048;
+        let Some(runtime) = crate::test_support::maybe_runtime() else {
+            eprintln!("skipping interleave teardown test: no CUDA device");
+            return;
+        };
+        let packed = runtime.alloc_raw(BYTES).unwrap();
+        let (_, warm) = ensure_interleaved(&runtime, packed, BYTES).unwrap();
+        assert!(!warm);
+        assert_eq!(runtime.interleaved_weight_count(), 1);
+        assert!(
+            ensure_interleaved(&runtime, packed, BYTES).unwrap().1,
+            "a cached weight must report warm before teardown"
+        );
+
+        runtime.release_interleaved_weights();
+
+        assert_eq!(
+            runtime.interleaved_weight_count(),
+            0,
+            "teardown left interleaved weights behind"
+        );
+        let (_, warm) = ensure_interleaved(&runtime, packed, BYTES).unwrap();
+        assert!(
+            !warm,
+            "teardown dropped the buffer but left the entry, so a later weight \
+             at this address would be served a freed pointer"
+        );
+
+        runtime.release_interleaved_weights();
+        // SAFETY: allocated by this runtime above and freed once.
+        unsafe { runtime.free_raw(packed).unwrap() };
     }
 
     /// The prefetch-pipelined single-warp block-32 scales-fp16 int4 decode GEMV

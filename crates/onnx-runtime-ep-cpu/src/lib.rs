@@ -43,6 +43,8 @@ pub mod optimizer;
 pub mod provider;
 pub mod strided;
 pub mod task_runtime;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod trace;
 pub mod weight_offload;
 

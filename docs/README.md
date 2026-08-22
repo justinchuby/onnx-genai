@@ -84,6 +84,10 @@ Generation-side design: [`SCHEDULING.md`](genai/SCHEDULING.md),
 [`PIPELINE.md`](genai/PIPELINE.md),
 [`MODEL_METADATA.md`](genai/MODEL_METADATA.md),
 [`MODEL_PACKAGE.md`](genai/MODEL_PACKAGE.md),
+[`INFERENCE_METADATA_DECISIONS.md`](genai/INFERENCE_METADATA_DECISIONS.md)
+(normative metadata specification and complete built-in capability catalogue),
+[`WORKFLOW_POLICY_COMPONENTS.md`](WORKFLOW_POLICY_COMPONENTS.md)
+(policy components from first principles and the producer contract),
 [`MOBIUS_WORKFLOW_PRODUCER.md`](genai/MOBIUS_WORKFLOW_PRODUCER.md),
 [`NATIVE_BATCH_DECODE_2B_IMPL_SCOPING.md`](genai/NATIVE_BATCH_DECODE_2B_IMPL_SCOPING.md),
 [`DIFFUSION.md`](genai/DIFFUSION.md),
