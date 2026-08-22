@@ -61,6 +61,35 @@ const PROJECTIONS: &[(usize, usize, &str)] = &[
     (14336, 4096, "down"),
 ];
 
+/// Qwen2.5-7B's decode projections. Not a cosmetic second model: its GQA head
+/// layout makes `qkv` **narrow** (n = 4608 against a k of 3584) and its MLP
+/// **much wider** relative to the hidden size (18944 vs llama's 14336 on a
+/// larger k). Both differences move the `n`-loop trip count, which is exactly
+/// the axis the N-blocked kernel's four-column grouping divides. A conclusion
+/// drawn only from llama shapes has not been tested against a different
+/// n/k ratio at all, and the tail behaviour at `n % 4` is invisible in a set
+/// where every `n` is a multiple of 4.
+const PROJECTIONS_QWEN: &[(usize, usize, &str)] = &[
+    (3584, 4608, "qkv"),
+    (3584, 3584, "o"),
+    (3584, 18944, "gate"),
+    (3584, 18944, "up"),
+    (18944, 3584, "down"),
+];
+
+fn projections() -> &'static [(usize, usize, &'static str)] {
+    match std::env::var("PROBE_MODEL")
+        .unwrap_or_else(|_| "llama".into())
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "qwen" => PROJECTIONS_QWEN,
+        "llama" => PROJECTIONS,
+        other => panic!("PROBE_MODEL must be llama or qwen, got {other:?}"),
+    }
+}
+
 fn packed_bytes(len: usize, seed: u64) -> Vec<u8> {
     let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
     (0..len)
@@ -142,7 +171,7 @@ fn main() {
         .map(|v| v != "0")
         .unwrap_or(true);
 
-    let weights: Vec<Weight> = PROJECTIONS
+    let weights: Vec<Weight> = projections()
         .iter()
         .enumerate()
         .map(|(index, &(k, n, _))| {
@@ -163,7 +192,8 @@ fn main() {
         .collect();
 
     println!(
-        "block_size={block_size} accuracy={accuracy} sessions={sessions} tokens={tokens} layers={layers} spmd={spmd}"
+        "model={} block_size={block_size} accuracy={accuracy} sessions={sessions} tokens={tokens} layers={layers} spmd={spmd}",
+        std::env::var("PROBE_MODEL").unwrap_or_else(|_| "llama".into())
     );
     println!(
         "{:>10} {:>12} {:>12} {:>14}",
