@@ -259,9 +259,26 @@ pub struct SpmdCounters {
     /// consistent: fine for a threshold or a rate, not for an exact assertion
     /// taken immediately after the wake.
     pub spurious_wakes: u64,
-    /// Barriers where the dispatcher exhausted its spin budget waiting for a
-    /// straggler and yielded the core. Only reachable when a worker is
-    /// descheduled, so this is a direct oversubscription signal.
+    /// Barriers where the dispatcher exhausted its spin budget waiting for the
+    /// workers and yielded the core.
+    ///
+    /// **Strongly width- and regime-dependent; not an oversubscription signal.**
+    /// The dispatcher publishes the op, computes its own shard when it has one,
+    /// and only then spins on the completion counters, yielding once after
+    /// `DISPATCHER_SPIN_BEFORE_YIELD` (~10 us). So a yield means the *last*
+    /// worker lagged the dispatcher's own arrival at the barrier by more than
+    /// that -- a statement about spread across workers, not about how long the
+    /// op takes. Measured on an idle, un-oversubscribed host at zero gap:
+    /// 0.004 yields per dispatch at width 4, ~0.9 at width 16, with the
+    /// intervening widths non-monotonic. Read it as a straggler-spread
+    /// indicator, and only ever against a fixed width.
+    ///
+    /// (Two earlier versions of this doc were wrong in opposite directions --
+    /// first "only reachable when a worker is descheduled", then "any op longer
+    /// than the spin budget yields, so it saturates at 1.0/dispatch". Both were
+    /// reasoned from the code; the first was falsified by measuring at width 16
+    /// and the second by measuring at width 4. Neither had been measured across
+    /// the axis that actually moves it.)
     pub dispatcher_yields: u64,
 }
 
@@ -1618,6 +1635,26 @@ pub fn counters() -> Option<SpmdCounters> {
         Some(Some(pools)) => Some(pools.counters()),
         _ => None,
     }
+}
+
+/// The active-spin window a decode worker holds a core before parking, as the
+/// running process resolved it.
+///
+/// `decode_blocktime` latches into a `OnceLock` on the first `worker_wait`, so
+/// a sweep over `ONNX_GENAI_CPU_DECODE_BLOCKTIME_US` has to be *across process
+/// launches*; setting the variable a second time inside one process changes
+/// nothing and the two arms silently measure the same window (#1736's shape). A
+/// harness therefore has to report the window it actually ran with, and it has
+/// to read it from here rather than re-parse the environment itself -- a second
+/// parser is a second implementation that can drift from the one the workers
+/// obey, and would keep printing the requested value after the real policy
+/// changed.
+///
+/// Reading this *does* latch the window if nothing has yet, which is harmless
+/// (the value is a pure function of the environment) but means a harness should
+/// still call it at report time, after the decode it describes.
+pub fn blocktime() -> Duration {
+    decode_blocktime()
 }
 
 /// The width the caller asked for, recorded when the pool is resolved and before
