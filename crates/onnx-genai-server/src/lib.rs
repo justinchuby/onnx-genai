@@ -72,7 +72,10 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/sessions/{id}", delete(routes::delete_session))
         .route("/v1/completions", post(routes::completions))
         .route("/v1/embeddings", post(routes::embeddings))
-        .route("/v1/images/generations", post(routes::openai_images))
+        .route(
+            "/v1/images/generations",
+            post(routes::openai_images).layer(DefaultBodyLimit::max(MEDIA_UPLOAD_BODY_LIMIT)),
+        )
         .route("/sdapi/v1/txt2img", post(routes::a1111_txt2img))
         .route(
             "/sdapi/v1/img2img",

@@ -3,7 +3,7 @@ use onnx_genai::{GenerateOptions, GeneratePrompt, GenerateRequest};
 use onnx_genai_engine::PipelineGenerateRequest;
 use onnx_genai_metadata::{
     ImageOutputValueRange, LiteralValue, PipelineSpec, RuntimeInputRole, ScalarValue,
-    SemanticInputRole, TensorContract, WorkflowOutputRole,
+    SemanticInputRole, TensorContract, WorkflowInputSource, WorkflowOutputRole,
 };
 use onnx_genai_ort::{DataType, Tokenizer, Value};
 
@@ -27,6 +27,7 @@ pub(crate) struct ImagePipelineSpec {
     pub(crate) height: Option<ImageInputBinding>,
     pub(crate) media: Option<ImageInputBinding>,
     pub(crate) denoising_strength: Option<ImageInputBinding>,
+    pub(crate) application_inputs: std::collections::BTreeMap<String, ImageInputBinding>,
     pub(crate) samplers: Vec<String>,
 }
 
@@ -49,6 +50,25 @@ impl ImagePipelineSpec {
             media: binding(spec, RuntimeInputRole::Media)
                 .filter(|binding| binding.contract.dtype == "uint8" && binding.contract.rank == 1),
             denoising_strength: binding(spec, RuntimeInputRole::DenoisingStrength),
+            application_inputs: spec
+                .workflow
+                .inputs
+                .iter()
+                .filter_map(|(_, input)| match (&input.source, &input.role) {
+                    (WorkflowInputSource::Application { name }, SemanticInputRole::Opaque) => {
+                        Some((
+                            name.clone(),
+                            ImageInputBinding {
+                                name: name.clone(),
+                                contract: input.contract.clone(),
+                                default: input.default.clone(),
+                                required: input.required,
+                            },
+                        ))
+                    }
+                    _ => None,
+                })
+                .collect(),
             samplers: declared_samplers(spec),
         })
     }
@@ -205,9 +225,20 @@ impl ImageExecutionRequest {
 
 #[derive(Debug)]
 pub(crate) enum ImageInputValue {
-    I64 { values: Vec<i64>, shape: Vec<i64> },
-    F32 { values: Vec<f32>, shape: Vec<i64> },
+    I64 {
+        values: Vec<i64>,
+        shape: Vec<i64>,
+    },
+    F32 {
+        values: Vec<f32>,
+        shape: Vec<i64>,
+    },
     Bytes(Vec<u8>),
+    Raw {
+        bytes: Vec<u8>,
+        shape: Vec<i64>,
+        dtype: DataType,
+    },
 }
 
 impl ImageInputValue {
@@ -223,6 +254,11 @@ impl ImageInputValue {
                 let length = i64::try_from(bytes.len())?;
                 Value::from_raw_bytes(bytes, &[length], DataType::Uint8).map_err(Into::into)
             }
+            Self::Raw {
+                bytes,
+                shape,
+                dtype,
+            } => Value::from_raw_bytes(bytes, &shape, dtype).map_err(Into::into),
         }
     }
 }
