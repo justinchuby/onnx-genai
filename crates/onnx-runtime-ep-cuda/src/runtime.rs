@@ -505,6 +505,14 @@ pub struct CudaRuntime {
     /// means nothing, and serving a later session's weight from an entry keyed
     /// on it is the #1726 defect. See [`crate::interleave_cache`].
     interleave: crate::interleave_cache::InterleaveCache,
+    /// Whether device weight offload is on, meaning weight buffers may be paged.
+    ///
+    /// Set once by the provider when it configures residency. A paged weight's
+    /// pages are retired by `weight_paging` without passing through
+    /// `deallocate`, so `interleave` is never told the address died and cannot
+    /// safely key on one. It refuses to cache at all when this is set; see
+    /// [`crate::interleave_cache::InterleaveDevice::interleave_frees_are_observed`].
+    weights_may_be_paged: std::sync::atomic::AtomicBool,
     /// The one cuBLASLt workspace shared by every GEMM on this runtime's
     /// compute stream. Allocated on first use and never freed until the
     /// runtime drops.
@@ -703,6 +711,7 @@ impl CudaRuntime {
             raw_pool_hits: AtomicU64::new(0),
             runtime_id: NEXT_RUNTIME_ID.fetch_add(1, Ordering::Relaxed),
             interleave: crate::interleave_cache::InterleaveCache::default(),
+            weights_may_be_paged: std::sync::atomic::AtomicBool::new(false),
             shared_blas_workspace: Mutex::new(None),
             raw_allocation_profile: RawAllocationProfile::new(raw_allocation_profile_enabled()),
             host_to_device_copies: AtomicU64::new(0),
@@ -1440,11 +1449,45 @@ impl CudaRuntime {
         self.interleave.ensure(self, packed, bytes)
     }
 
-    /// Release every interleaved weight copy, as [`Drop`] does. Lets a test
-    /// observe teardown, which a dropped runtime cannot be asked about.
+    /// Release every interleaved weight copy this runtime holds.
+    ///
+    /// The backstop, for anything still cached when the runtime itself goes
+    /// away. The load-bearing eviction is [`Self::invalidate_interleaved_for`],
+    /// which runs per buffer as the provider frees it.
     #[cfg(test)]
     pub(crate) fn release_interleaved_weights(&self) {
         self.interleave.release_all(self);
+    }
+
+    /// Drop any interleaved copy derived from the buffer at `base`.
+    ///
+    /// The provider calls this as it frees a device buffer, passing the whole
+    /// allocation — an entry is keyed on a weight's data pointer, which may sit
+    /// at an offset inside the buffer being freed. That address names that
+    /// weight only until this moment; past it the allocator may hand it to the
+    /// next weight of the same size, whose interleave would otherwise be served
+    /// out of this entry (#1726). A provider outlives its executors — sibling
+    /// plans share one, and the control-flow child-executor cache evicts plans
+    /// and frees their initializers back into the same arena — so runtime
+    /// scoping alone leaves that window open and this is what closes it.
+    pub(crate) fn invalidate_interleaved_for(&self, base: CUdeviceptr, len: usize) {
+        self.interleave.invalidate(self, base, len);
+    }
+
+    /// Record that device weight offload is on, so weight buffers may be paged.
+    ///
+    /// One-way: a runtime that has ever paged weights can have had an address
+    /// recycled behind the interleave cache's back, so there is no sound way
+    /// back to caching for the rest of its life.
+    pub(crate) fn set_weights_may_be_paged(&self) {
+        self.weights_may_be_paged
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether weight buffers on this runtime may be paged by the offload path.
+    pub(crate) fn weights_may_be_paged(&self) -> bool {
+        self.weights_may_be_paged
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Interleaved weight copies this runtime currently holds.
