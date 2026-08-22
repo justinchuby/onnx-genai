@@ -24,7 +24,8 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: onnxruntime/mobius
-          ref: main
+          # Producer support remains on Mobius PR #537 until its owner merges it.
+          ref: justinchuby/minimax-music3
           path: validation/mobius
       - uses: actions/setup-python@v5
         with:

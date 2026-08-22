@@ -708,6 +708,10 @@ fn mobius_speculative_workflow_executes_rejection_and_correction() -> anyhow::Re
         "verifier.past_key_values.0.key",
         Value::from_slice_f32(&[], &[1, 2, 0, 8])?,
     )
+    .with_input(
+        "verifier.past_key_values.0.value",
+        Value::from_slice_f32(&[], &[1, 4, 0, 4])?,
+    )
     .with_input("grammar.initial_state", Value::from_slice_i64(&[0], &[1])?)
     .with_input(
         "grammar.transition_table",
@@ -722,6 +726,31 @@ fn mobius_speculative_workflow_executes_rejection_and_correction() -> anyhow::Re
     .with_input("telemetry.target_ms", Value::from_slice_f32(&[1.0], &[1])?);
     let output = engine.run_pipeline_outputs(request)?;
     assert_eq!(output["tokens.row.0"].to_vec_i64()?, [1, 31]);
+    Ok(())
+}
+
+#[test]
+fn mobius_hierarchical_audio_executes_nested_generation() -> anyhow::Result<()> {
+    let mut engine =
+        Engine::from_pipeline_dir(&root("hierarchical_audio")?, EngineConfig::default())?;
+    let request = PipelineGenerateRequest::new(GenerateRequest {
+        prompt: GeneratePrompt::TokenIds(vec![1, 2, 3]),
+        options: options(2),
+    })
+    .with_input(
+        "request.prompt_tokens",
+        Value::from_slice_i64(&[1, 2, 3, 1, 4, 3], &[2, 3])?,
+    )
+    .with_input(
+        "request.max_frames_with_warmup",
+        Value::from_slice_i64(&[3], &[1])?,
+    )
+    .with_input("request.seed", Value::from_slice_i64(&[7], &[1])?);
+    let output = engine.run_pipeline_outputs(request)?;
+    let audio = &output["audio"];
+    assert_eq!(audio.shape()[..2], [1, 2]);
+    assert!(audio.shape()[2] > 0);
+    assert!(audio.to_vec_f32()?.iter().all(|sample| sample.is_finite()));
     Ok(())
 }
 

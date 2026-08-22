@@ -3145,19 +3145,31 @@ fn validate_workflow_value(
     }
     if let Some(shape) = &contract.shape {
         for (axis, (declared, actual)) in shape.iter().zip(value.shape()).enumerate() {
+            let symbolic_actual = if contract.batch_layout.request_axis() == Some(axis) {
+                let factor = i64::try_from(contract.batch_layout.request_expansion_factor())?;
+                if actual % factor != 0 {
+                    anyhow::bail!(
+                        "workflow value '{name}' axis {axis} is {actual}, which is not divisible \
+                         by its request expansion factor {factor}"
+                    );
+                }
+                actual / factor
+            } else {
+                *actual
+            };
             match declared {
                 TensorDimension::Fixed(expected) if expected != actual => anyhow::bail!(
                     "workflow value '{name}' axis {axis} is {actual}, expected {expected}"
                 ),
                 TensorDimension::Symbol(symbol) if dynamic_symbols.contains(symbol) => {}
                 TensorDimension::Symbol(symbol) => match symbols.get(symbol) {
-                    Some(expected) if expected != actual => anyhow::bail!(
-                        "workflow value '{name}' axis {axis} binds symbol '{symbol}' to {actual}, \
-                         but it was already {expected}"
+                    Some(expected) if *expected != symbolic_actual => anyhow::bail!(
+                        "workflow value '{name}' axis {axis} binds symbol '{symbol}' to \
+                         {symbolic_actual}, but it was already {expected}"
                     ),
                     Some(_) => {}
                     None => {
-                        symbols.insert(symbol.clone(), *actual);
+                        symbols.insert(symbol.clone(), symbolic_actual);
                     }
                 },
                 TensorDimension::Fixed(_) => {}
