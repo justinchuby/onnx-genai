@@ -1017,13 +1017,6 @@ impl PipelineEngine {
                             &selected_inputs,
                             values,
                         )?;
-                        let session =
-                            self.models.session(selected_component).with_context(|| {
-                                format!(
-                                    "workflow ONNX component '{selected_component}' selected for \
-                                 '{component}' was not loaded"
-                                )
-                            })?;
                         // Component dimensions are invocation-local. A decoder, for example, may
                         // bind `sequence` to the prompt length in setup and to one in the loop.
                         // Values crossing the package boundary were already checked there; the
@@ -1058,26 +1051,15 @@ impl PipelineEngine {
                                     })
                             })
                             .collect::<anyhow::Result<Vec<_>>>()?;
-                        let stable_eligible = session.cuda_device_id().is_some()
-                            && self.device_bridge_components.contains(selected_component);
-                        let produced = if stable_eligible {
-                            self.run_stable_component(
-                                workflow,
-                                selected_component,
-                                selected_declaration,
-                                &component_symbols,
-                                session,
-                                &resolved,
-                                &selected_outputs,
-                            )?
-                        } else {
-                            session
-                                .output_names()
-                                .iter()
-                                .cloned()
-                                .zip(session.run(&resolved)?)
-                                .collect()
-                        };
+                        let produced = self.invoke_onnx_component(
+                            workflow,
+                            component,
+                            selected_component,
+                            selected_declaration,
+                            &component_symbols,
+                            &resolved,
+                            &selected_outputs,
+                        )?;
                         for (port, tensor) in produced {
                             let Some(value) = selected_outputs.get(&port) else {
                                 continue;
@@ -1742,6 +1724,89 @@ impl PipelineEngine {
             }
         }
         Ok(())
+    }
+
+    /// Backend-neutral execution seam for a declared ONNX component.
+    ///
+    /// The interpreter is universal over workflows; this is the one place it is
+    /// universal over *backends*. It threads `onnx_genai_ort::Value` either way
+    /// — the ORT branch runs the loaded `Session` (preserving the CUDA-graph /
+    /// `IoBinding` stable-island fast path), and the native branch runs the
+    /// pure-Rust `InferenceSession` through the `Value ⇄ Tensor` bridge. No
+    /// silent fallback: a Native request that reaches here is honored natively
+    /// or fails with an actionable error (Rule 4). See
+    /// `docs/architecture/NATIVE_WORKFLOW_BACKEND.md`.
+    #[allow(clippy::too_many_arguments)]
+    fn invoke_onnx_component(
+        &self,
+        workflow: &WorkflowSpec,
+        component: &str,
+        selected_component: &str,
+        selected_declaration: &onnx_genai_metadata::WorkflowComponent,
+        component_symbols: &HashMap<String, i64>,
+        resolved: &[(&str, &Value)],
+        selected_outputs: &std::collections::BTreeMap<String, String>,
+    ) -> anyhow::Result<Vec<(String, Value)>> {
+        match self.decode_backend {
+            EngineDecodeBackend::Native => {
+                #[cfg(feature = "native-backend")]
+                {
+                    let _ = (workflow, component, selected_declaration, component_symbols);
+                    let set = self.native_components.as_ref().with_context(|| {
+                        format!(
+                            "native workflow backend selected but ONNX component \
+                             '{selected_component}' has no native session"
+                        )
+                    })?;
+                    set.borrow_mut()
+                        .run_component(selected_component, resolved, selected_outputs)
+                }
+                #[cfg(not(feature = "native-backend"))]
+                {
+                    let _ = (
+                        workflow,
+                        component,
+                        selected_component,
+                        selected_declaration,
+                        component_symbols,
+                        resolved,
+                        selected_outputs,
+                    );
+                    unreachable!(
+                        "validate_pipeline_backend_request rejects Native without the \
+                         native-backend feature"
+                    )
+                }
+            }
+            EngineDecodeBackend::Ort | EngineDecodeBackend::Auto => {
+                let session = self.models.session(selected_component).with_context(|| {
+                    format!(
+                        "workflow ONNX component '{selected_component}' selected for '{component}' \
+                         was not loaded"
+                    )
+                })?;
+                let stable_eligible = session.cuda_device_id().is_some()
+                    && self.device_bridge_components.contains(selected_component);
+                if stable_eligible {
+                    self.run_stable_component(
+                        workflow,
+                        selected_component,
+                        selected_declaration,
+                        component_symbols,
+                        session,
+                        resolved,
+                        selected_outputs,
+                    )
+                } else {
+                    Ok(session
+                        .output_names()
+                        .iter()
+                        .cloned()
+                        .zip(session.run(resolved)?)
+                        .collect())
+                }
+            }
+        }
     }
 
     // The stable-binding cache hands out `Arc<Value>` because that is the owner

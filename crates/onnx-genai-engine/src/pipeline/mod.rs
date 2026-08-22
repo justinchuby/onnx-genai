@@ -29,6 +29,8 @@ use std::sync::Arc;
 mod adapters;
 mod arg_reduce;
 mod islands;
+#[cfg(feature = "native-backend")]
+mod native_component;
 mod row_state;
 mod workflow;
 
@@ -167,6 +169,12 @@ pub struct PipelineEngine {
     adapter_cache: RefCell<adapters::AdapterCache>,
     active_adapter_context: RefCell<Option<adapters::AdapterRunContext>>,
     preprocessing: Option<PreprocessingSpec>,
+    /// Native (pure-Rust) component sessions, present only when the engine was
+    /// built for `EngineDecodeBackend::Native`. The universal interpreter drives
+    /// these through the same seam it uses for ORT sessions; see
+    /// `docs/architecture/NATIVE_WORKFLOW_BACKEND.md`.
+    #[cfg(feature = "native-backend")]
+    native_components: Option<RefCell<native_component::NativeComponentSet>>,
 }
 
 impl Drop for PipelineEngine {
@@ -181,15 +189,25 @@ impl Drop for PipelineEngine {
 }
 
 /// Validate an explicit pipeline backend request without touching model files.
+///
+/// The universal workflow interpreter is backend-neutral: it drives every
+/// declared component through a seam that either an ORT `Session` or a native
+/// `InferenceSession` fulfills (see `docs/architecture/NATIVE_WORKFLOW_BACKEND.md`).
+/// `EngineDecodeBackend::Native` is therefore accepted whenever the native
+/// backend is compiled in. A build without the `native-backend` feature has no
+/// native sessions to run, so a native request fails closed here (Rule 4: no
+/// silent ORT fallback) rather than pretending to honor it.
 pub fn validate_pipeline_backend_request(
     requested: EngineDecodeBackend,
 ) -> anyhow::Result<EngineDecodeBackend> {
     let backend = requested_decode_backend(requested)?;
+    #[cfg(not(feature = "native-backend"))]
     if backend == EngineDecodeBackend::Native {
         anyhow::bail!(
-            "pipeline.workflow executes through generic ONNX component invocations; select the \
-             ORT backend and configure its execution provider instead of the legacy native \
-             decoder backend"
+            "pipeline.workflow native execution requires the `native-backend` feature, but this \
+             build was compiled without it. Rebuild with --features native-backend (or \
+             --features native-cuda for the native CUDA EP), or select the ORT backend \
+             (decode_backend = EngineDecodeBackend::Ort / ONNX_GENAI_BACKEND=ort)."
         );
     }
     Ok(backend)
@@ -426,19 +444,24 @@ impl PipelineEngine {
                 false
             }
         };
-        let execution_islands = if island_reservation_admitted {
-            islands::plan_execution_islands(
-                &mut compiled_workflow.graph,
-                &workflow,
-                &models,
-                &aliasable_output_values,
-            )
-            .map_err(|error| {
-                anyhow::anyhow!("Failed to plan workflow execution islands: {error}")
-            })?
-        } else {
-            Vec::new()
-        };
+        let execution_islands =
+            if island_reservation_admitted && decode_backend != EngineDecodeBackend::Native {
+                // Execution islands are the ORT `IoBinding` / CUDA-graph optimization.
+                // The native backend has no equivalent yet (follow-up boundary A), so
+                // under Native we keep the compiled graph's individual component nodes
+                // and drive each through the native seam — correct, just unfused.
+                islands::plan_execution_islands(
+                    &mut compiled_workflow.graph,
+                    &workflow,
+                    &models,
+                    &aliasable_output_values,
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!("Failed to plan workflow execution islands: {error}")
+                })?
+            } else {
+                Vec::new()
+            };
         let live_island_initializer_bytes =
             islands::execution_island_initializer_bytes(&execution_islands)?;
         let live_initializer_reservation = workflow_initializer_reservation_bytes(
@@ -468,6 +491,17 @@ impl PipelineEngine {
             .collect::<HashSet<_>>();
         let device_bridge_components =
             workflow::compile_device_bridge_components(&bridge_graph, &island_components);
+        // Load a native session per component only when the native backend was
+        // requested; the ORT `PipelineModels` above stays authoritative for
+        // graph I/O metadata either way.
+        #[cfg(feature = "native-backend")]
+        let native_components = if decode_backend == EngineDecodeBackend::Native {
+            Some(RefCell::new(native_component::NativeComponentSet::load(
+                &directory.model_paths,
+            )?))
+        } else {
+            None
+        };
         Ok(Self {
             package_root: directory.root.clone(),
             models,
@@ -490,11 +524,23 @@ impl PipelineEngine {
             adapter_cache: RefCell::new(adapters::AdapterCache::default()),
             active_adapter_context: RefCell::new(None),
             preprocessing: directory.preprocessing,
+            #[cfg(feature = "native-backend")]
+            native_components,
         })
     }
 
     pub fn decode_backend(&self) -> EngineDecodeBackend {
         self.decode_backend
+    }
+
+    /// Number of native component invocations performed by this engine so far,
+    /// or `None` when it is not running the native backend. Lets tests prove the
+    /// native sessions — not an ORT fallback — executed a workflow.
+    #[cfg(feature = "native-backend")]
+    pub fn native_component_run_count(&self) -> Option<u64> {
+        self.native_components
+            .as_ref()
+            .map(|set| set.borrow().run_count())
     }
 
     pub fn resource_snapshot(&self) -> onnx_genai_scheduler::GovernorSnapshot {

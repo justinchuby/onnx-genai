@@ -35,7 +35,6 @@ compile_error!(
 pub mod allocator;
 pub mod binding;
 pub mod chat_template;
-pub mod component;
 #[cfg(feature = "cuda")]
 pub mod cuda_rt;
 pub mod decode;
@@ -60,7 +59,6 @@ pub mod value;
 pub use allocator::{Allocator, AllocatorType, MemoryInfo, MemoryType};
 pub use binding::IoBinding;
 pub use chat_template::{ChatMessage, ChatRole, ChatTemplate};
-pub use component::{OrtComponentSession, OrtComponentSessionRef};
 pub use decode::{
     BatchStepLogits, BatchedDecodeSession, BatchedSharedBufferDecodeSession,
     BatchedStaticCacheDecodeSession, DecodeKvMode, DecodeSession, DecodeSessionOptions,
@@ -81,9 +79,6 @@ pub use loader::{
 };
 pub use mtp::{
     MtpDecodeOptions, MtpDecodeSession, MtpDraftKvMode, MtpHeadSignature, MtpStepOutput,
-};
-pub use onnx_genai_metadata::{
-    ComponentDataType, ComponentError, ComponentIo, ComponentSession, ComponentTensor,
 };
 pub use onnx_genai_metadata::{
     ProposalType, SpeculatorConfig, SpeculatorConfigSource, SpeculatorDescriptor,
