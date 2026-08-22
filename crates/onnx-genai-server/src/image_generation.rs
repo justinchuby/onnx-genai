@@ -53,8 +53,8 @@ impl ImagePipelineSpec {
             application_inputs: spec
                 .workflow
                 .inputs
-                .iter()
-                .filter_map(|(_, input)| match (&input.source, &input.role) {
+                .values()
+                .filter_map(|input| match (&input.source, &input.role) {
                     (WorkflowInputSource::Application { name }, SemanticInputRole::Opaque) => {
                         Some((
                             name.clone(),
