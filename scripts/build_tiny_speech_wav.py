@@ -80,6 +80,20 @@ def save_model(model: ir.Model, path: Path) -> None:
 
 def build_vocoder(path: Path) -> None:
     """prompt_tokens[batch, seq] (int64) -> audio[batch, 2, SAMPLES] (float32)."""
+    _build_vocoder(path, dual_output=False)
+
+
+def build_dual_output_vocoder(path: Path) -> None:
+    """prompt_tokens -> audio[batch, 2, SAMPLES] and waveform[batch, 1, SAMPLES].
+
+    The stereo ``audio`` and the mono ``waveform`` (channel 0 alone) are two
+    distinct declared outputs. Fixtures use them to exercise resolution when a
+    workflow declares more than one ``role: audio`` output.
+    """
+    _build_vocoder(path, dual_output=True)
+
+
+def _build_vocoder(path: Path, *, dual_output: bool) -> None:
     prompt_tokens = tensor_value("prompt_tokens", ir.DataType.INT64, ["batch", "sequence"])
 
     ramp = constant(
@@ -134,31 +148,43 @@ def build_vocoder(path: Path) -> None:
     audio.outputs[0].type = ir.TensorType(ir.DataType.FLOAT)
     audio.outputs[0].shape = ir.Shape(["batch", CHANNELS, SAMPLES])
 
+    nodes = [
+        ramp,
+        mean_scale,
+        two_pi,
+        channel_shift,
+        amplitude0,
+        amplitude1,
+        unsqueeze_axes,
+        tokens_f,
+        mean,
+        mean_scaled,
+        mean_col,
+        phase0,
+        angle0,
+        sin0,
+        channel0,
+        phase1,
+        angle1,
+        sin1,
+        channel1,
+        audio,
+    ]
+    outputs = [audio.outputs[0]]
+
+    if dual_output:
+        # Expose channel 0 alone as a second, mono [batch, 1, SAMPLES] output so
+        # a workflow can declare two distinct role: audio outputs.
+        waveform = node("Identity", [channel0.outputs[0]], "waveform")
+        waveform.outputs[0].type = ir.TensorType(ir.DataType.FLOAT)
+        waveform.outputs[0].shape = ir.Shape(["batch", 1, SAMPLES])
+        nodes.append(waveform)
+        outputs.append(waveform.outputs[0])
+
     graph = ir.Graph(
         [prompt_tokens],
-        [audio.outputs[0]],
-        nodes=[
-            ramp,
-            mean_scale,
-            two_pi,
-            channel_shift,
-            amplitude0,
-            amplitude1,
-            unsqueeze_axes,
-            tokens_f,
-            mean,
-            mean_scaled,
-            mean_col,
-            phase0,
-            angle0,
-            sin0,
-            channel0,
-            phase1,
-            angle1,
-            sin1,
-            channel1,
-            audio,
-        ],
+        outputs,
+        nodes=nodes,
         opset_imports={"": 13},
         name="tiny_speech_wav_vocoder",
     )
@@ -338,27 +364,219 @@ package:
 """
 
 
+_MANIFEST_AND_INPUTS = """\
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      adapter_abis:
+        onnx-genai.text-assembly: '1'
+      capabilities:
+      - workflow_ssa
+      - linear_effects
+      - typed_emit
+    inputs:
+      request.prompt_tokens:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - sequence_length
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: prompt_tokens
+        source:
+          kind: request
+        required: true
+"""
+
+_PACKAGE_FOOTER = """\
+package:
+  tokenizer:
+    algorithm: bpe
+    vocab_size: 32000
+    byte_level: true
+    special_tokens:
+      bos:
+        id: 2
+        content: <bos>
+      eos:
+        id: 3
+        content: <eos>
+"""
+
+# Media contract fragments (indented for the `media:` block of an output).
+_COMPAT_STEREO_MEDIA = (
+    "          container: wav\n"
+    "          encoding: pcm_s16_le\n"
+    "          sample_rate_hz: 24000\n"
+    "          source_sample_rate_hz: 24000\n"
+    "          channels: 2\n"
+    "          delivery: buffered\n"
+)
+_COMPAT_MONO_MEDIA = (
+    "          container: wav\n"
+    "          encoding: pcm_s16_le\n"
+    "          sample_rate_hz: 16000\n"
+    "          source_sample_rate_hz: 16000\n"
+    "          channels: 1\n"
+    "          delivery: buffered\n"
+)
+# Incompatible: a raw float32 PCM stream, not a buffered PCM16 WAV.
+_INCOMPAT_STEREO_MEDIA = (
+    "          container: raw\n"
+    "          encoding: pcm_f32_le\n"
+    "          sample_rate_hz: 24000\n"
+    "          channels: 2\n"
+    "          delivery: buffered\n"
+)
+
+_VOCODER_COMPONENT = (
+    "      vocoder:\n"
+    "        implementation:\n"
+    "          kind: onnx\n"
+    "          artifact: vocoder/model.onnx.textproto\n"
+)
+
+
+def _audio_output_block(name: str, channels: int, media: str) -> str:
+    return (
+        f"      {name}:\n"
+        "        contract:\n"
+        "          dtype: float32\n"
+        "          rank: 3\n"
+        "          shape:\n"
+        "          - batch\n"
+        f"          - {channels}\n"
+        "          - samples\n"
+        "          batch_layout:\n"
+        "            kind: request_aligned\n"
+        "            axis: 0\n"
+        "        role: audio\n"
+        "        stage: pre_adapter\n"
+        "        media:\n"
+    ) + media
+
+
+def _adapter_component(name: str) -> str:
+    return (
+        f"      {name}:\n"
+        "        implementation:\n"
+        "          kind: adapter\n"
+        "          abi: onnx-genai.text-assembly\n"
+        "          version: '1'\n"
+        "          artifact: speech_processor.json\n"
+        "        contract:\n"
+        "          id: onnx-genai.text-assembly\n"
+        "          version: '1'\n"
+    )
+
+
+def _invoke_step(*, dual: bool) -> str:
+    outputs = "        audio: speech.audio\n"
+    if dual:
+        outputs += "        waveform: speech.waveform\n"
+    return (
+        "    - kind: invoke\n"
+        "      component: vocoder\n"
+        "      inputs:\n"
+        "        prompt_tokens: request.prompt_tokens\n"
+        "      outputs:\n"
+    ) + outputs
+
+
+def _emit_step(value: str, output: str) -> str:
+    return f"    - kind: emit\n      value: {value}\n      output: {output}\n      mode: replace\n"
+
+
+def _document(outputs_block: str, components_block: str, steps_block: str) -> str:
+    return (
+        _MANIFEST_AND_INPUTS
+        + "    outputs:\n"
+        + outputs_block
+        + "    components:\n"
+        + components_block
+        + "    steps:\n"
+        + steps_block
+        + _PACKAGE_FOOTER
+    )
+
+
+# Two role: audio outputs where the map-first output (`audio`) is an incompatible
+# raw float stream and only the second (`waveform`) is a compatible buffered
+# PCM16 WAV. Resolution must bind and encode exactly `waveform`.
+MIXED_METADATA = _document(
+    _audio_output_block("audio", CHANNELS, _INCOMPAT_STEREO_MEDIA)
+    + _audio_output_block("waveform", 1, _COMPAT_MONO_MEDIA),
+    _VOCODER_COMPONENT + _adapter_component("speech_text_assembly"),
+    _invoke_step(dual=True)
+    + _emit_step("speech.audio", "audio")
+    + _emit_step("speech.waveform", "waveform"),
+)
+
+# Two compatible role: audio outputs. Resolution is ambiguous and must fail
+# closed at load time.
+TWO_AUDIO_METADATA = _document(
+    _audio_output_block("audio", CHANNELS, _COMPAT_STEREO_MEDIA)
+    + _audio_output_block("waveform", 1, _COMPAT_MONO_MEDIA),
+    _VOCODER_COMPONENT + _adapter_component("speech_text_assembly"),
+    _invoke_step(dual=True)
+    + _emit_step("speech.audio", "audio")
+    + _emit_step("speech.waveform", "waveform"),
+)
+
+# One compatible audio output but two text-assembly components. Resolution of the
+# processor is ambiguous and must fail closed at load time.
+TWO_ADAPTERS_METADATA = _document(
+    _audio_output_block("audio", CHANNELS, _COMPAT_STEREO_MEDIA),
+    _VOCODER_COMPONENT
+    + _adapter_component("speech_text_assembly")
+    + _adapter_component("speech_text_assembly_alt"),
+    _invoke_step(dual=False) + _emit_step("speech.audio", "audio"),
+)
+
+
+def _write_package(output: Path, metadata: str, *, dual_output: bool) -> None:
+    if output.exists():
+        shutil.rmtree(output)
+    output.mkdir(parents=True)
+    if dual_output:
+        build_dual_output_vocoder(output / "vocoder" / "model.onnx.textproto")
+    else:
+        build_vocoder(output / "vocoder" / "model.onnx.textproto")
+    (output / "inference_metadata.yaml").write_text(metadata)
+    (output / "speech_processor.json").write_text(
+        json.dumps(SPEECH_PROCESSOR, indent=2) + "\n"
+    )
+    (output / "tokenizer.json").write_text(json.dumps(TOKENIZER, indent=2) + "\n")
+    print(f"wrote fixture to {output}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--output",
         type=Path,
         default=Path("tests/fixtures/onnx_genai_workflows/speech_wav"),
-        help="destination package directory",
+        help="destination package directory for the base fixture",
     )
     args = parser.parse_args()
-    output: Path = args.output
-    if output.exists():
-        shutil.rmtree(output)
-    output.mkdir(parents=True)
+    base: Path = args.output
+    parent = base.parent
 
-    build_vocoder(output / "vocoder" / "model.onnx.textproto")
-    (output / "inference_metadata.yaml").write_text(METADATA)
-    (output / "speech_processor.json").write_text(
-        json.dumps(SPEECH_PROCESSOR, indent=2) + "\n"
+    _write_package(base, METADATA, dual_output=False)
+    # Multi-candidate variants that exercise fail-closed admission/execution
+    # binding. They share the base fixture's generic processor and tokenizer.
+    _write_package(parent / "speech_wav_mixed_audio", MIXED_METADATA, dual_output=True)
+    _write_package(parent / "speech_wav_two_audio", TWO_AUDIO_METADATA, dual_output=True)
+    _write_package(
+        parent / "speech_wav_two_adapters", TWO_ADAPTERS_METADATA, dual_output=False
     )
-    (output / "tokenizer.json").write_text(json.dumps(TOKENIZER, indent=2) + "\n")
-    print(f"wrote tiny speech WAV fixture to {output}")
 
 
 if __name__ == "__main__":

@@ -552,7 +552,7 @@ impl AppState {
             fim_config,
             pipeline: false,
             multimodal: None,
-            speech_prompt: None,
+            speech: None,
             image_pipeline: None,
         })
         .expect("test model handle");
@@ -718,7 +718,7 @@ pub(crate) fn build_handle_with_authorities(
         fim_config,
         pipeline: false,
         multimodal: None,
-        speech_prompt: None,
+        speech: None,
         image_pipeline: None,
     })
 }
@@ -743,12 +743,35 @@ fn build_pipeline_handle(
         authorities,
     )?;
     let multimodal = crate::multimodal::build(&directory, engine.models())?;
-    let speech_prompt =
-        if onnx_genai_engine::pipeline::has_buffered_pcm16_wav_output(&directory.spec.workflow) {
-            crate::speech::load_speech_prompt_processor(model_dir)?
-        } else {
-            None
-        };
+    // Resolve one exact speech capability at load time: bind the single
+    // text-assembly processor to the single compatible buffered PCM16 WAV audio
+    // output that serving will encode. Fail closed on zero, ambiguous, or
+    // mismatched candidates so admission and encoding can never disagree about
+    // which output is served.
+    let speech = match crate::speech::load_speech_prompt_processor(model_dir)? {
+        None => None,
+        Some(processor) => {
+            let candidates = onnx_genai_engine::pipeline::buffered_pcm16_wav_output_names(
+                &directory.spec.workflow,
+            );
+            let audio_output = match candidates.as_slice() {
+                [] => anyhow::bail!(
+                    "model '{model_id}' declares an {} speech adapter but no workflow output declares a compatible buffered PCM16 WAV audio contract",
+                    crate::speech::TEXT_ASSEMBLY_ABI
+                ),
+                [single] => single.clone(),
+                many => anyhow::bail!(
+                    "model '{model_id}' declares {} workflow outputs with a compatible buffered PCM16 WAV audio contract ({}); exactly one is required to bind the speech text-assembly adapter",
+                    many.len(),
+                    many.join(", ")
+                ),
+            };
+            Some(crate::speech::SpeechCapability {
+                processor,
+                audio_output,
+            })
+        }
+    };
     // The declared `generation` block was retired along with the rest of the
     // superseded generation metadata surfaces, so the pipeline path resolves
     // sampling from request options only — same as the non-pipeline path above.
@@ -764,7 +787,7 @@ fn build_pipeline_handle(
         fim_config: None,
         pipeline: true,
         multimodal: Some(multimodal),
-        speech_prompt,
+        speech,
         image_pipeline,
     })
 }

@@ -23,12 +23,13 @@ pub(crate) async fn audio_speech(
         ));
     }
     let handle = resolve_model(&state.registry, &request.model).await?;
-    let processor = handle.speech_prompt.as_ref().ok_or_else(|| {
+    let capability = handle.speech.as_ref().ok_or_else(|| {
         ApiError::bad_request(format!(
             "model '{}' does not declare both a text-assembly adapter and compatible buffered PCM16 WAV output",
             handle.id
         ))
     })?;
+    let processor = &capability.processor;
     if !handle.pipeline {
         return Err(ApiError::bad_request(format!(
             "model '{}' is not an executable workflow package",
@@ -70,7 +71,7 @@ pub(crate) async fn audio_speech(
     };
     let audio = handle
         .engine
-        .synthesize_speech(generation)
+        .synthesize_speech(generation, capability.audio_output.clone())
         .await
         .map_err(map_generate_submit_error)?;
     Ok((

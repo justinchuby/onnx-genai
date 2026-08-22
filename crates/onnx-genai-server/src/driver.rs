@@ -123,6 +123,7 @@ pub(crate) enum DriverCommand {
     },
     SynthesizeSpeech {
         request: Box<GenerateRequest>,
+        audio_output: String,
         reply: oneshot::Sender<anyhow::Result<EncodedAudio>>,
         permit: OwnedSemaphorePermit,
     },
@@ -530,6 +531,7 @@ impl EngineDriver {
     pub(crate) async fn synthesize_speech(
         &self,
         request: GenerateRequest,
+        audio_output: String,
     ) -> Result<EncodedAudio, GenerateSubmitError> {
         let permit = self
             .generation_capacity
@@ -542,6 +544,7 @@ impl EngineDriver {
             .commands
             .send(DriverCommand::SynthesizeSpeech {
                 request: Box::new(request),
+                audio_output,
                 reply,
                 permit,
             })
@@ -765,13 +768,14 @@ fn run_pipeline_driver(
             } => run_pipeline_generation(engine, *request, input, admission, events, permit),
             DriverCommand::SynthesizeSpeech {
                 request,
+                audio_output,
                 reply,
                 permit,
             } => {
                 let _permit = permit;
                 let result = engine
                     .run_pipeline_outputs(PipelineGenerateRequest::new(*request))
-                    .and_then(|outputs| engine.encode_audio_output(&outputs));
+                    .and_then(|outputs| engine.encode_audio_output(&outputs, &audio_output));
                 let _ = reply.send(result);
             }
             DriverCommand::GenerateImage {

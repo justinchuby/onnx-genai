@@ -1,23 +1,50 @@
 use anyhow::{Context, bail};
 use onnx_genai_metadata::{
-    MediaContainer, MediaDelivery, MediaEncoding, OutputStage, WorkflowOutputRole, WorkflowSpec,
+    MediaContainer, MediaDelivery, MediaEncoding, OutputStage, WorkflowOutput, WorkflowOutputRole,
+    WorkflowSpec,
 };
 
 use super::{PipelineEngine, PipelineOutputs};
 
 const RESAMPLE_RADIUS: isize = 16;
 
+/// Whether a single workflow output declares a compatible buffered PCM16 WAV
+/// audio contract: role `audio`, buffered delivery, WAV container, `pcm_s16_le`
+/// encoding, and a positive sample rate and channel count.
+fn is_buffered_pcm16_wav_output(output: &WorkflowOutput) -> bool {
+    output.role == WorkflowOutputRole::Audio
+        && output.media.as_ref().is_some_and(|media| {
+            media.delivery == MediaDelivery::Buffered
+                && media.container == MediaContainer::Wav
+                && media.encoding == MediaEncoding::PcmS16Le
+                && media.sample_rate_hz.is_some_and(|rate| rate > 0)
+                && media.channels.is_some_and(|channels| channels > 0)
+        })
+}
+
+/// Whether the workflow declares *any* compatible buffered PCM16 WAV audio
+/// output. This is a capability probe only; serving admission must instead
+/// resolve the *exact* output with [`buffered_pcm16_wav_output_names`] so the
+/// output that is validated is the same one that is later encoded.
 pub fn has_buffered_pcm16_wav_output(workflow: &WorkflowSpec) -> bool {
-    workflow.outputs.values().any(|output| {
-        output.role == WorkflowOutputRole::Audio
-            && output.media.as_ref().is_some_and(|media| {
-                media.delivery == MediaDelivery::Buffered
-                    && media.container == MediaContainer::Wav
-                    && media.encoding == MediaEncoding::PcmS16Le
-                    && media.sample_rate_hz.is_some_and(|rate| rate > 0)
-                    && media.channels.is_some_and(|channels| channels > 0)
-            })
-    })
+    workflow.outputs.values().any(is_buffered_pcm16_wav_output)
+}
+
+/// Names of every workflow output that declares a compatible buffered PCM16 WAV
+/// audio contract, in deterministic map-key order.
+///
+/// Serving must resolve *exactly one* such output and bind it to the selected
+/// text-assembly contract at load time, rather than admitting on the mere
+/// existence of an audio output and then re-selecting the first output by role
+/// at encode time. Returning every candidate lets the caller fail closed on the
+/// zero and ambiguous cases with a precise error.
+pub fn buffered_pcm16_wav_output_names(workflow: &WorkflowSpec) -> Vec<String> {
+    workflow
+        .outputs
+        .iter()
+        .filter(|(_, output)| is_buffered_pcm16_wav_output(output))
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,17 +56,29 @@ pub struct EncodedAudio {
 }
 
 impl PipelineEngine {
-    pub fn encode_audio_output(&self, outputs: &PipelineOutputs) -> anyhow::Result<EncodedAudio> {
-        let (name, declaration) = self
+    /// Encode the named workflow audio output into a buffered WAV.
+    ///
+    /// The caller passes the exact output name that admission resolved and
+    /// stored, so the output that was validated as compatible at load time is
+    /// the one that is served. This deliberately does not re-select "the first
+    /// output with role: audio", which could differ from the validated output
+    /// when a workflow declares more than one audio output.
+    pub fn encode_audio_output(
+        &self,
+        outputs: &PipelineOutputs,
+        output_name: &str,
+    ) -> anyhow::Result<EncodedAudio> {
+        let declaration = self
             .workflow
             .outputs
-            .iter()
-            .find(|(_, output)| output.role == WorkflowOutputRole::Audio)
-            .context("workflow declares no output with role: audio")?;
-        let media = declaration
-            .media
-            .as_ref()
-            .context("audio output has no media delivery contract")?;
+            .get(output_name)
+            .with_context(|| format!("workflow declares no output named '{output_name}'"))?;
+        if declaration.role != WorkflowOutputRole::Audio {
+            bail!("workflow output '{output_name}' does not have role: audio");
+        }
+        let media = declaration.media.as_ref().with_context(|| {
+            format!("audio output '{output_name}' has no media delivery contract")
+        })?;
         if media.delivery != MediaDelivery::Buffered {
             bail!("audio delivery currently supports buffered outputs only");
         }
@@ -51,8 +90,8 @@ impl PipelineEngine {
             .context("audio output has no sample_rate_hz")?;
         let channels = media.channels.context("audio output has no channels")?;
         let value = self
-            .structured_output_for_role(outputs, WorkflowOutputRole::Audio)
-            .with_context(|| format!("workflow did not emit audio output '{name}'"))?;
+            .structured_output_for_name(outputs, output_name)
+            .with_context(|| format!("workflow did not emit audio output '{output_name}'"))?;
 
         if declaration.stage == OutputStage::PostAdapter {
             let bytes = value.to_raw_bytes()?;
@@ -372,9 +411,81 @@ pipeline:
         .expect("metadata");
         let workflow = &metadata.pipeline.expect("pipeline").workflow;
         assert!(has_buffered_pcm16_wav_output(workflow));
+        assert_eq!(buffered_pcm16_wav_output_names(workflow), ["audio"]);
 
         let mut incompatible = workflow.clone();
         incompatible.outputs.get_mut("audio").expect("audio").media = None;
         assert!(!has_buffered_pcm16_wav_output(&incompatible));
+        assert!(buffered_pcm16_wav_output_names(&incompatible).is_empty());
+    }
+
+    fn workflow_with_two_outputs(
+        first_media: &str,
+        second_media: &str,
+    ) -> onnx_genai_metadata::WorkflowSpec {
+        // `alpha` sorts before `omega`, so any "first output by role" selection
+        // would pick `alpha`. The resolver instead reports every compatible
+        // output by name so the caller can bind exactly one.
+        let metadata: InferenceMetadata = serde_yaml::from_str(&format!(
+            r#"
+schema_version: "1"
+model:
+  kind: pipeline
+  artifacts: []
+pipeline:
+  workflow:
+    manifest:
+      capabilities: []
+    inputs: {{}}
+    outputs:
+      alpha:
+        role: audio
+        stage: pre_adapter
+        contract: {{dtype: float32, rank: 3}}
+        media:
+{first_media}
+      omega:
+        role: audio
+        stage: pre_adapter
+        contract: {{dtype: float32, rank: 3}}
+        media:
+{second_media}
+    components: {{}}
+    state: {{}}
+    steps: []
+"#
+        ))
+        .expect("metadata");
+        metadata.pipeline.expect("pipeline").workflow
+    }
+
+    const COMPATIBLE_MEDIA: &str = "          delivery: buffered\n          container: wav\n          encoding: pcm_s16_le\n          sample_rate_hz: 24000\n          channels: 2";
+    const INCOMPATIBLE_MEDIA: &str = "          delivery: buffered\n          container: raw\n          encoding: pcm_f32_le\n          sample_rate_hz: 24000\n          channels: 2";
+
+    #[test]
+    fn resolver_reports_only_the_compatible_output_when_one_is_incompatible() {
+        // `alpha` (the map-first audio output) is incompatible; only the
+        // compatible `omega` is reported, so admission binds exactly that one.
+        let workflow = workflow_with_two_outputs(INCOMPATIBLE_MEDIA, COMPATIBLE_MEDIA);
+        assert_eq!(buffered_pcm16_wav_output_names(&workflow), ["omega"]);
+        assert!(has_buffered_pcm16_wav_output(&workflow));
+    }
+
+    #[test]
+    fn resolver_reports_every_output_when_multiple_are_compatible() {
+        // Two compatible audio outputs are ambiguous; the resolver reports both
+        // so the caller fails closed instead of silently picking one.
+        let workflow = workflow_with_two_outputs(COMPATIBLE_MEDIA, COMPATIBLE_MEDIA);
+        assert_eq!(
+            buffered_pcm16_wav_output_names(&workflow),
+            ["alpha", "omega"]
+        );
+    }
+
+    #[test]
+    fn resolver_reports_nothing_when_no_output_is_compatible() {
+        let workflow = workflow_with_two_outputs(INCOMPATIBLE_MEDIA, INCOMPATIBLE_MEDIA);
+        assert!(buffered_pcm16_wav_output_names(&workflow).is_empty());
+        assert!(!has_buffered_pcm16_wav_output(&workflow));
     }
 }

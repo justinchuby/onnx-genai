@@ -4,7 +4,19 @@ use anyhow::{Context, bail};
 use regex::Regex;
 use serde::Deserialize;
 
-const TEXT_ASSEMBLY_ABI: &str = "onnx-genai.text-assembly";
+pub(crate) const TEXT_ASSEMBLY_ABI: &str = "onnx-genai.text-assembly";
+
+/// A resolved speech capability: the single text-assembly prompt processor
+/// bound to the single workflow audio output that serving will encode.
+///
+/// The pair is resolved once, at load time, so the output validated as a
+/// compatible buffered PCM16 WAV target is exactly the output later encoded.
+#[derive(Debug, Clone)]
+pub(crate) struct SpeechCapability {
+    pub(crate) processor: Arc<SpeechPromptProcessor>,
+    /// Name of the workflow output that serving encodes for this model.
+    pub(crate) audio_output: String,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -195,31 +207,52 @@ pub(crate) fn load_speech_prompt_processor(
     let Some(components) = components else {
         return Ok(None);
     };
-    for component in components.values() {
+    // Collect every component that implements the text-assembly contract. Zero
+    // means the package is not speech-capable; more than one is ambiguous and
+    // must fail closed rather than silently binding the first match.
+    let mut adapters = Vec::new();
+    for (name, component) in components {
         let id = component
             .get("contract")
             .and_then(|value| value.get("id"))
             .and_then(serde_yaml::Value::as_str);
-        if id != Some(TEXT_ASSEMBLY_ABI) {
-            continue;
+        if id == Some(TEXT_ASSEMBLY_ABI) {
+            let label = name
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| TEXT_ASSEMBLY_ABI.to_string());
+            adapters.push((label, component));
         }
-        let artifact = component
-            .get("implementation")
-            .and_then(|value| value.get("artifact"))
-            .and_then(serde_yaml::Value::as_str)
-            .context("text-assembly adapter must declare an artifact")?;
-        let path = model_dir.join(artifact);
-        let processor = serde_json::from_str::<SpeechPromptProcessor>(
-            &fs::read_to_string(&path)
-                .with_context(|| format!("failed to read {}", path.display()))?,
-        )
-        .with_context(|| format!("failed to parse {}", path.display()))?;
-        if processor.max_input_tokens == 0 || processor.max_output_units == 0 {
-            bail!("text-assembly limits must be greater than zero");
-        }
-        return Ok(Some(Arc::new(processor)));
     }
-    Ok(None)
+    let component = match adapters.as_slice() {
+        [] => return Ok(None),
+        [single] => single.1,
+        many => {
+            let names = many
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "workflow declares {} components implementing the {TEXT_ASSEMBLY_ABI} contract ({names}); exactly one is required for speech synthesis",
+                many.len()
+            );
+        }
+    };
+    let artifact = component
+        .get("implementation")
+        .and_then(|value| value.get("artifact"))
+        .and_then(serde_yaml::Value::as_str)
+        .context("text-assembly adapter must declare an artifact")?;
+    let path = model_dir.join(artifact);
+    let processor = serde_json::from_str::<SpeechPromptProcessor>(
+        &fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?,
+    )
+    .with_context(|| format!("failed to parse {}", path.display()))?;
+    if processor.max_input_tokens == 0 || processor.max_output_units == 0 {
+        bail!("text-assembly limits must be greater than zero");
+    }
+    Ok(Some(Arc::new(processor)))
 }
 
 #[cfg(test)]

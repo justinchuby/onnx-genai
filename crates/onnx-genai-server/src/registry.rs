@@ -56,7 +56,7 @@ pub(crate) struct ModelHandle {
     /// Declared image/audio input contracts, or `None` for a single decoder
     /// graph. Shared with the CLI so both front ends admit the same inputs.
     pub(crate) multimodal: Option<MultimodalSpecs>,
-    pub(crate) speech_prompt: Option<Arc<crate::speech::SpeechPromptProcessor>>,
+    pub(crate) speech: Option<crate::speech::SpeechCapability>,
     pub(crate) image_pipeline: Option<ImagePipelineSpec>,
     /// Whether the package declares a channel whose content the caller must not
     /// be shown, i.e. whether a generated turn carries private reasoning that
@@ -88,7 +88,7 @@ pub(crate) struct ModelHandleParts {
     pub(crate) fim_config: Option<FimConfig>,
     pub(crate) pipeline: bool,
     pub(crate) multimodal: Option<MultimodalSpecs>,
-    pub(crate) speech_prompt: Option<Arc<crate::speech::SpeechPromptProcessor>>,
+    pub(crate) speech: Option<crate::speech::SpeechCapability>,
     pub(crate) image_pipeline: Option<ImagePipelineSpec>,
 }
 
@@ -105,7 +105,7 @@ impl ModelHandle {
             fim_config,
             pipeline,
             multimodal,
-            speech_prompt,
+            speech,
             image_pipeline,
         } = parts;
         let private_channels = declares_private_channels(&model_dir);
@@ -119,7 +119,7 @@ impl ModelHandle {
             fim_config,
             pipeline,
             multimodal,
-            speech_prompt,
+            speech,
             image_pipeline,
             private_channels,
             last_request_at: AtomicU64::new(now_millis()),
@@ -863,7 +863,7 @@ mod tests {
             fim_config: None,
             pipeline: false,
             multimodal: None,
-            speech_prompt: None,
+            speech: None,
             image_pipeline: None,
             private_channels: false,
             last_request_at: AtomicU64::new(last_request_at),
@@ -921,13 +921,13 @@ mod tests {
             fim_config: None,
             pipeline: true,
             multimodal: None,
-            speech_prompt: None,
+            speech: None,
             image_pipeline: None,
         })
         .expect("handle");
 
         assert!(
-            handle.speech_prompt.is_none(),
+            handle.speech.is_none(),
             "registry must require the loader's compatible audio-output decision"
         );
     }

@@ -65,7 +65,7 @@ fn onnx_owned_speech_workflow_encodes_buffered_pcm16_wav() -> anyhow::Result<()>
     assert!(audio.to_vec_f32()?.iter().all(|sample| sample.is_finite()));
 
     // The engine encodes the declared media contract into a canonical WAV.
-    let encoded = engine.encode_audio_output(&outputs)?;
+    let encoded = engine.encode_audio_output(&outputs, "audio")?;
     assert_eq!(encoded.content_type, "audio/wav");
     assert_eq!(encoded.sample_rate_hz, 24000);
     assert_eq!(encoded.channels, 2);
@@ -89,6 +89,13 @@ fn onnx_owned_speech_workflow_encodes_buffered_pcm16_wav() -> anyhow::Result<()>
         data_bytes,
         32 * 2 * 2,
         "resampled stereo 16-bit sample bytes"
+    );
+
+    // Encoding binds to the exact declared output name, not "the first audio
+    // output": an unknown or non-audio name fails closed.
+    assert!(
+        engine.encode_audio_output(&outputs, "waveform").is_err(),
+        "an undeclared output name must not be encoded"
     );
     Ok(())
 }
