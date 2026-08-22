@@ -81,101 +81,13 @@ mod common;
 use std::time::Instant;
 
 use common::Tensor;
-use onnx_runtime_ep_api::{ExecutionProvider, Kernel};
-use onnx_runtime_ep_cpu::{CpuExecutionProvider, with_decode_pool_scope};
-use onnx_runtime_ir::{Attribute, Node, NodeId};
-
-/// One decode step's projections for a llama3-8B-shaped model, as `(k, n)`.
-/// A decode token pays all of these back to back, which is what makes the
-/// per-op fork/join cost a per-token cost rather than a one-off.
-const PROJECTIONS: &[(usize, usize, &str)] = &[
-    (4096, 6144, "qkv"),
-    (4096, 4096, "o"),
-    (4096, 14336, "gate"),
-    (4096, 14336, "up"),
-    (14336, 4096, "down"),
-];
-
-/// Qwen2.5-7B's decode projections. Not a cosmetic second model: its GQA head
-/// layout makes `qkv` **narrow** (n = 4608 against a k of 3584) and its MLP
-/// **much wider** relative to the hidden size (18944 vs llama's 14336 on a
-/// larger k). Both differences move the `n`-loop trip count, which is exactly
-/// the axis the N-blocked kernel's four-column grouping divides. A conclusion
-/// drawn only from llama shapes has not been tested against a different
-/// n/k ratio at all, and the tail behaviour at `n % 4` is invisible in a set
-/// where every `n` is a multiple of 4.
-const PROJECTIONS_QWEN: &[(usize, usize, &str)] = &[
-    (3584, 4608, "qkv"),
-    (3584, 3584, "o"),
-    (3584, 18944, "gate"),
-    (3584, 18944, "up"),
-    (18944, 3584, "down"),
-];
-
-fn projections() -> &'static [(usize, usize, &'static str)] {
-    match std::env::var("PROBE_MODEL")
-        .unwrap_or_else(|_| "llama".into())
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "qwen" => PROJECTIONS_QWEN,
-        "llama" => PROJECTIONS,
-        other => panic!("PROBE_MODEL must be llama or qwen, got {other:?}"),
-    }
-}
-
-fn packed_bytes(len: usize, seed: u64) -> Vec<u8> {
-    let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
-    (0..len)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            (state >> 24) as u8
-        })
-        .collect()
-}
-
-fn floats(len: usize, seed: f32) -> Vec<f32> {
-    (0..len)
-        .map(|i| ((i as f32) * 0.0137 + seed).sin() * 0.5)
-        .collect()
-}
+use common::decode_workload::{Weight, build_kernel, floats, weights};
+use onnx_runtime_ep_api::Kernel;
+use onnx_runtime_ep_cpu::with_decode_pool_scope;
 
 fn median(mut samples: Vec<f64>) -> f64 {
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
     samples[samples.len() / 2]
-}
-
-fn build_kernel(k: usize, n: usize, block_size: usize, accuracy: i64) -> Box<dyn Kernel> {
-    let blocks = k.div_ceil(block_size);
-    let blob = block_size / 2;
-    let shapes = vec![vec![1, k], vec![n, blocks, blob], vec![n, blocks]];
-    let mut node = Node::new(NodeId(0), "MatMulNBits", vec![], vec![]);
-    node.domain = "com.microsoft".into();
-    for (name, value) in [
-        ("K", Attribute::Int(k as i64)),
-        ("N", Attribute::Int(n as i64)),
-        ("bits", Attribute::Int(4)),
-        ("block_size", Attribute::Int(block_size as i64)),
-        ("accuracy_level", Attribute::Int(accuracy)),
-    ] {
-        node.attributes.insert(name.into(), value);
-    }
-    let mut kernel = CpuExecutionProvider::new()
-        .get_kernel(&node, &shapes, 1)
-        .expect("CPU EP must register MatMulNBits");
-    kernel.set_constant_inputs(&[false, true, true]);
-    kernel
-}
-
-/// A weight, shared across sessions the way a served model's weights are.
-struct Weight {
-    b: Tensor,
-    scales: Tensor,
-    k: usize,
-    n: usize,
 }
 
 fn main() {
@@ -213,25 +125,7 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
 
-    let weights: Vec<Weight> = projections()
-        .iter()
-        .enumerate()
-        .map(|(index, &(k, n, _))| {
-            let blocks = k.div_ceil(block_size);
-            let blob = block_size / 2;
-            let packed = packed_bytes(n * blocks * blob, 7 + index as u64);
-            let scales = floats(n * blocks, 0.3)
-                .into_iter()
-                .map(|v| v.abs().max(0.01) * 0.02)
-                .collect::<Vec<_>>();
-            Weight {
-                b: Tensor::u8(&[n, blocks, blob], &packed),
-                scales: Tensor::floats(common::FloatDType::F32, &[n, blocks], &scales),
-                k,
-                n,
-            }
-        })
-        .collect();
+    let weights: Vec<Weight> = weights(block_size);
 
     println!(
         "model={} block_size={block_size} accuracy={accuracy} sessions={sessions} tokens={tokens} layers={layers} spmd={spmd}",
