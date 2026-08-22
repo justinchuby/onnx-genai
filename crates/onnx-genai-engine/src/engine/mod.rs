@@ -82,6 +82,7 @@ mod runtime;
 pub(crate) mod session_state;
 mod speculative_load;
 mod workflow_api;
+pub use workflow_api::WorkflowProvenance;
 
 pub(crate) use decode_backend::*;
 pub(crate) use governor::*;

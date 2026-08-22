@@ -1,0 +1,53 @@
+feat(metadata): compile a bare decoder's model.io into an in-memory canonical workflow
+
+Parent decision A: keep authored bare-decoder metadata unchanged and valid, and
+lower it at load into an internal canonical WorkflowSpec.
+
+`onnx_genai_metadata::canonical` is that compiler. It is a pure function of the
+declared ABI -- same `ModelIoSpec` in, byte-identical document out -- which is
+what makes the lowered form *derived* rather than a second authored answer: it
+cannot drift from `model.io`, because it is recomputed from it on every load.
+Nothing writes it back, so `validate_model_io_against_workflow` never sees a
+pair and no published package needs re-authoring.
+
+It emits canonical YAML and parses it through the ordinary schema path. That is
+deliberate: the lowered form is exactly what an author would have had to write,
+it is diffable, and a field this module gets wrong is a loud error at lowering
+time instead of a subtly malformed spec the interpreter trips over later. It
+caught two on the first run -- a missing `increment` on `growing` recurrence and
+a missing `contract` on the loop induction value.
+
+No schema change. Both canonical components are `binding` components identified
+by contract id -- `onnx-genai.autoregressive-decode` for one decoder forward
+pass, `onnx-genai.token-policy` for next-token selection and stop detection --
+dispatched the way workflow adapters already are. The published JSON schema is
+untouched. KV is declared `management: runtime`, the schema's existing word for
+"the runtime owns these buffers", so the paged / share-buffer / CUDA-graph
+executors keep owning their KV and no per-step host round-trip is introduced.
+
+`/v1/debug/config` gains `workflow_provenance` (authored | lowered | none).
+`pipeline` keeps its meaning -- does the package *serialize* a workflow -- so a
+lowered decoder reports `pipeline: false` with `workflow_provenance: lowered`,
+and no report claims the file contains something it does not.
+
+Tests: 7 unit cases (determinism, schema round-trip, KV becomes runtime-managed
+state, an authored workflow is never lowered beside itself, the package is never
+mutated and stays valid, unpaired KV refused, a missing port named) plus
+`canonical_lowering_corpus` against the real corpus through the engine's own
+loader -- 7 packages covered (phi35-mini int4 shared-buffer, qwen3-0.6b int4,
+qwen2.5-0.5b CUDA, qwen2.5-coder-7b, phi4-mini CUDA, gpt-oss-20b MoE,
+qwen3.5-2b) -- asserting deterministic lowering and that the lowered decoder's
+ports mirror the resolved ABI exactly: no port invented, none dropped.
+
+That corpus test immediately earned its keep. Routing `Engine::from_dir` through
+`load_if_declared` had turned a shape guess into a hard load error for a package
+recognized as multi-component that ships no native metadata. A resolution
+failure now means "not a workflow package" and the decoder loader handles it, as
+it always did.
+
+Greedy goldens over 5 real models (phi35-mini, phi4-mini CUDA, qwen2.5-0.5b
+CUDA, qwen3-0.6b, gpt-oss-20b) are byte-identical before and after. `.goldens/`
+holds the harness and the c58eb5b2 baseline so later work diffs against the
+previous runtime rather than only against itself.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>

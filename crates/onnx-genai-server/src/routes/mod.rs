@@ -148,7 +148,19 @@ pub(crate) struct SessionStatus {
 #[derive(Debug, Serialize)]
 pub(crate) struct DebugConfigResponse {
     model_id: String,
+    /// Whether the package *serializes* `pipeline.workflow`.
+    ///
+    /// Deliberately unchanged in meaning: it answers a question about the file
+    /// on disk. A decoder package whose workflow the runtime compiled in memory
+    /// reports `false` here and says so through `workflow_provenance`, because
+    /// claiming otherwise would assert the package contains something it does
+    /// not.
     pipeline: bool,
+    /// How the runtime obtained the canonical workflow it executes:
+    /// `authored` (serialized in the package), `lowered` (compiled in memory
+    /// from the package's own `model.io`, which remains the sole serialized
+    /// answer), or `none`.
+    workflow_provenance: &'static str,
     max_output_tokens: usize,
     max_sessions: usize,
     max_queue_depth: usize,

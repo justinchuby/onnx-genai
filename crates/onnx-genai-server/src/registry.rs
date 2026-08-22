@@ -847,6 +847,7 @@ mod tests {
             id: id.to_string(),
             engine: EngineDriver {
                 is_workflow: false,
+                workflow_provenance: "none",
                 commands: tx,
                 generation_capacity: Arc::new(Semaphore::new(0)),
                 generation_capacity_size: 0,

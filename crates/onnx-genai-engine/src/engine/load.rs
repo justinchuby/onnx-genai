@@ -13,16 +13,24 @@ impl Engine {
     /// never disagree about — which shape it loaded. This is the one place the
     /// distinction is made; every constructor below routes on it.
     fn declares_workflow(model_dir: &Path) -> anyhow::Result<bool> {
-        Ok(
-            onnx_genai_ort::PipelineModelDirectory::load_if_declared(model_dir)
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "Failed to inspect package '{}': {error}",
-                        model_dir.display()
-                    )
-                })?
-                .is_some(),
-        )
+        // A package that cannot be resolved *as a pipeline* is not one. The
+        // compatibility branch of `load_if_declared` recognizes a multi-component
+        // shape from `genai_config.json` and then requires native metadata to
+        // build it; a hybrid text decoder can pass the first check and fail the
+        // second. Treating that failure as "not a workflow package" keeps such a
+        // package on the decoder loader it has always used, instead of turning a
+        // shape guess into a hard load error.
+        match onnx_genai_ort::PipelineModelDirectory::load_if_declared(model_dir) {
+            Ok(directory) => Ok(directory.is_some()),
+            Err(error) => {
+                tracing::debug!(
+                    model_dir = %model_dir.display(),
+                    %error,
+                    "package is not resolvable as a pipeline; loading it as a decoder"
+                );
+                Ok(false)
+            }
+        }
     }
 
     /// Load a package from a directory.
