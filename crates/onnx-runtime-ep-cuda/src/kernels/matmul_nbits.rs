@@ -7134,6 +7134,26 @@ impl MatMulNBitsKernel {
         self.last_call_capture_safe
             .store(m == 1 && group_indices.is_none(), Ordering::Relaxed);
         if m == 1 && group_indices.is_none() {
+            // The Marlin repack is a second, tensor-core-layout copy of this
+            // op's weights, allocated raw (invisible to the VMM arena) and
+            // never evicted. It is only read by the `M > 1` tensor-core GEMM,
+            // so once execution reaches single-token decode it is pure device
+            // overhead — measured at ~384 MiB on a 1.8B model whose weights are
+            // under 1 GiB, which was the whole of our peak-VRAM deficit against
+            // llama.cpp.
+            //
+            // Releasing here rather than at a phase boundary keeps the rule
+            // local to the fact that justifies it: this branch is exactly the
+            // condition under which the buffers cannot be read. The atomic load
+            // is the steady-state cost; the drop happens at most once per
+            // prefill→decode transition, and a later prefill simply repacks
+            // again (a cost, never a wrong answer). Never during capture, where
+            // freeing device memory would invalidate the graph.
+            if self.marlin_repack_cache.retained_bytes() > 0
+                && !self.runtime.is_capturing().unwrap_or(true)
+            {
+                self.marlin_repack_cache.release_all();
+            }
             if self.bits == 4
                 && self.block_size == 128
                 && let Some(zero_points) = zero_points
