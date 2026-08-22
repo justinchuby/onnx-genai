@@ -15,7 +15,9 @@
 //! a precise "this EP cannot do that" into a false "this document is invalid",
 //! and the difference matters because only one of them tells you to change EP.
 
-use onnx_genai_metadata::{InferenceMetadata, semantic_identity_of_str, validate_metadata};
+use onnx_genai_metadata::{
+    InferenceMetadata, TensorDimension, semantic_identity_of_str, validate_metadata,
+};
 
 fn parse(document: &str) -> InferenceMetadata {
     serde_yaml::from_str(document).expect("metadata parses")
@@ -1098,6 +1100,97 @@ fn two_ports_may_not_claim_the_same_layer() {
         errors.iter().any(|error| error.contains("already claims")),
         "{errors:?}"
     );
+}
+
+fn add_cache_alias(metadata: &mut InferenceMetadata, source: &str, label: &str, layer: usize) {
+    let bindings = metadata
+        .pipeline
+        .as_mut()
+        .unwrap()
+        .workflow
+        .serving
+        .as_mut()
+        .unwrap()
+        .state_service
+        .groups
+        .get_mut("decoder_cache")
+        .unwrap()
+        .ports
+        .get_mut("model")
+        .unwrap();
+    let mut alias = bindings.get(source).unwrap().clone();
+    alias.layer = Some(layer);
+    bindings.insert(label.to_string(), alias);
+}
+
+#[test]
+fn split_attention_cache_rejects_different_key_and_value_counts() {
+    let mut metadata = parse(&MOBIUS_STATIC_CACHE.replace("DTYPE", "float16"));
+    add_cache_alias(&mut metadata, "key_cache", "key_cache_1", 1);
+
+    let errors = validate_metadata(&metadata).expect_err("unpaired key layer must be rejected");
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("key layers are {0, 1}")
+                && error.contains("value layers are {0}")
+                && error.contains("missing value layers are [1]")
+        }),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn split_attention_cache_rejects_mismatched_layer_sets() {
+    let mut metadata = parse(&MOBIUS_STATIC_CACHE.replace("DTYPE", "float16"));
+    add_cache_alias(&mut metadata, "key_cache", "key_cache_1", 1);
+    add_cache_alias(&mut metadata, "value_cache", "value_cache_2", 2);
+
+    let errors = validate_metadata(&metadata).expect_err("mismatched layers must be rejected");
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("key layers are {0, 1}")
+                && error.contains("value layers are {0, 2}")
+                && error.contains("missing value layers are [1]")
+                && error.contains("missing key layers are [2]")
+        }),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn matching_layers_allow_heterogeneous_key_and_value_geometry() {
+    let mut metadata = parse(&MOBIUS_STATIC_CACHE.replace("DTYPE", "float16"));
+    {
+        let workflow = &mut metadata.pipeline.as_mut().unwrap().workflow;
+        let value_shape = vec![
+            TensorDimension::Symbol("batch".to_string()),
+            TensorDimension::Symbol("cache_capacity".to_string()),
+            TensorDimension::Fixed(8),
+        ];
+        let mut value_initializer = workflow.inputs["package.cache"].clone();
+        value_initializer.contract.shape = Some(value_shape.clone());
+        workflow
+            .inputs
+            .insert("package.value_cache".to_string(), value_initializer);
+        workflow
+            .state
+            .get_mut("value_cache")
+            .unwrap()
+            .contract
+            .shape = Some(value_shape.clone());
+        workflow.state.get_mut("value_cache").unwrap().initializer =
+            "package.value_cache".to_string();
+        let ports = &mut workflow.components.get_mut("model").unwrap().ports;
+        ports.inputs.get_mut("value_cache.0").unwrap().shape = Some(value_shape.clone());
+        ports
+            .outputs
+            .get_mut("updated_value_cache.0")
+            .unwrap()
+            .shape = Some(value_shape);
+    }
+
+    validate_metadata(&metadata)
+        .expect("matching key/value layer identity must not require equal cache geometry");
 }
 
 /// The canonical static-cache package validates as a whole package, on disk.

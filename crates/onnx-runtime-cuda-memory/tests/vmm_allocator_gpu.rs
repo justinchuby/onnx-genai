@@ -18,13 +18,36 @@
 //! (#636).
 
 use cudarc::driver::CudaContext;
+use cudarc::driver::sys as cu;
 use onnx_runtime_cuda_memory::vmm_allocator::CudaVmmAllocator;
 use onnx_runtime_memory_governor::{
-    DeviceAllocator, DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole,
-    Tier,
+    AllocationCommitRange, DeviceAllocator, DeviceKey, HolderId, LeaseLedger, LedgerGovernor,
+    MemoryGovernor, MemoryRole, Tier, VirtualBacking,
 };
 
 const HOLDER: HolderId = HolderId::new(21);
+
+fn driver_granularity(device_ordinal: i32) -> usize {
+    let mut prop: cu::CUmemAllocationProp = unsafe { std::mem::zeroed() };
+    prop.type_ = cu::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type_ = cu::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = device_ordinal;
+    let mut granularity = 0usize;
+    let result = unsafe {
+        cu::cuMemGetAllocationGranularity(
+            &mut granularity,
+            &prop,
+            cu::CUmemAllocationGranularity_flags::CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
+        )
+    };
+    assert_eq!(
+        result,
+        cu::CUresult::CUDA_SUCCESS,
+        "cuMemGetAllocationGranularity: {result:?}"
+    );
+    assert_ne!(granularity, 0, "CUDA reported zero VMM granularity");
+    granularity
+}
 
 /// An allocator over `capacity` bytes of address space, and the ledger behind
 /// it, or `None` on a machine with no driver.
@@ -526,6 +549,54 @@ fn committed_ranges_do_not_map_the_whole_virtual_allocation() {
     unsafe { allocator.deallocate(pointer, reserved, 256) };
     assert_eq!(allocator.committed_and_reserved().0, 0);
     assert_eq!(governor.used(Tier::Device), 0);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn disjoint_tiny_ranges_report_and_commit_granule_rounded_bytes() {
+    let (allocator, _governor) = allocator(8 << 20, 8 << 20);
+    let selected: &dyn DeviceAllocator = &allocator;
+    let backing = selected
+        .as_virtual_backing()
+        .expect("VMM capability is discovered from the selected allocator");
+
+    let granularity = driver_granularity(0);
+
+    let allocation_bytes = granularity * 2;
+    let ptr = backing
+        .allocate_committed(allocation_bytes, 256, &[])
+        .expect("reserve without committing");
+    let ranges = [
+        AllocationCommitRange {
+            ptr,
+            allocation_bytes,
+            align: 256,
+            offset: 0,
+            bytes: 64,
+        },
+        AllocationCommitRange {
+            ptr,
+            allocation_bytes,
+            align: 256,
+            offset: granularity + 16,
+            bytes: 32,
+        },
+    ];
+    let mapped = backing
+        .mapped_bytes_for_allocation_ranges(&ranges)
+        .expect("granule-aware estimate");
+    assert_eq!(mapped, (2 * granularity) as u64);
+    assert!(mapped > 96, "raw requested-byte sums would undercharge");
+
+    backing
+        .commit_allocation_ranges(&ranges)
+        .expect("commit both granules");
+    assert_eq!(allocator.committed_and_reserved().0 as u64, mapped);
+    // SAFETY: whole-allocation release remains on the selected allocator.
+    unsafe { selected.deallocate(ptr, allocation_bytes, 256) };
 }
 
 /// Many small allocations share granules rather than each taking one.

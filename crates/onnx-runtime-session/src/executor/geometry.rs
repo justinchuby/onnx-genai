@@ -468,12 +468,7 @@ pub(super) fn describe_non_padded_consumer(node: &Node, input_index: usize) -> O
     if kernel_input_uses_padded_capacity(node, input_index) {
         return None;
     }
-    let name = if node.name.is_empty() {
-        "<unnamed>"
-    } else {
-        node.name.as_str()
-    };
-    Some(format!("{name}({})[input {input_index}]", node.op_type))
+    Some(format!("{}[input {input_index}]", describe_node(node)))
 }
 
 /// The default-domain ops that make up the standard additive causal-attention
@@ -549,7 +544,18 @@ pub(super) fn is_capacity_form_attention_mask_input(node: &Node, input_index: us
 /// mask a capacity-form `Attention` is designed to consume — which is what lets the
 /// decode step keep a fixed-capacity, capture-stable mask binding.
 pub(super) fn mask_binding_feeds_capacity_form_attention(graph: &Graph, mask: ValueId) -> bool {
-    mask_binding_feeds_capacity_form_attention_impl(graph, mask, ShapeConsumptionPolicy::Disqualify)
+    mask_cone_rejection(graph, mask, ShapeConsumptionPolicy::Disqualify).is_none()
+}
+
+/// Why the mask cone failed to classify as padded-capacity-safe, or `None` when
+/// it succeeded. The predicates answer yes/no; bring-up needs the reason, so the
+/// walk records it rather than leaving it to be re-derived from the graph.
+pub(super) fn mask_cone_rejection(
+    graph: &Graph,
+    mask: ValueId,
+    shape_policy: ShapeConsumptionPolicy,
+) -> Option<String> {
+    mask_binding_feeds_capacity_form_attention_impl(graph, mask, shape_policy).err()
 }
 
 /// Whether `mask` feeds *only* the standard additive causal-mask builder cone
@@ -578,12 +584,13 @@ pub(super) fn mask_binding_feeds_capacity_form_attention(graph: &Graph, mask: Va
 /// decode-freeze-safe and keep exposing their logical length every step.
 pub(super) fn mask_binding_feeds_additive_causal_builder(graph: &Graph, mask: ValueId) -> bool {
     mask_binding_feeds_capacity_form_attention_impl(graph, mask, ShapeConsumptionPolicy::Allow)
+        .is_ok()
 }
 
 /// How the mask-cone walk treats a `Shape(mask)` consumer whose output is itself
 /// consumed (i.e. `Shape` is not a dead-end physical-extent read).
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ShapeConsumptionPolicy {
+pub(super) enum ShapeConsumptionPolicy {
     /// Disqualify the binding from *static* padded-capacity freezing: a consumed
     /// `Shape(mask)` leaks the padded width into width-sensitive arithmetic
     /// (the multi-token prefill query-position window), which must see the
@@ -595,11 +602,137 @@ enum ShapeConsumptionPolicy {
     Allow,
 }
 
+/// What a single consumer edge does to the mask's length axis.
+///
+/// Freezing the mask to physical capacity is a **uniform substitution**: replace
+/// the logical length `L` with `max_len` everywhere the mask's length axis
+/// appears. That is sound exactly when no consumer sources that axis from
+/// somewhere other than the mask, and when the padded lanes are neutralised
+/// before reaching anything that is not padding-aware.
+///
+/// Every rule below is one of those two questions. Classifying the edge once,
+/// here, is what keeps the walk from accumulating a separate mechanism per
+/// model — the op allowlist, the `Shape` policy and the `Expand` shape-operand
+/// check are all the *same* question asked about different operands.
+enum ConsumerRole {
+    /// A padding-aware sink: capacity-form `Attention` neutralises the padded
+    /// keys itself, so the substitution terminates safely here.
+    Sink,
+    /// Padding-invariant read that does not propagate: zero padding contributes
+    /// nothing (`ReduceSum`), or the physical extent is read and discarded
+    /// (`Shape` as a dead end).
+    InvariantLeaf,
+    /// The op maps mask lanes to mask lanes without importing the length axis
+    /// from another source, so the substitution stays uniform through it.
+    Propagate,
+    /// The op sources the mask's length axis from somewhere the substitution
+    /// does not reach, so freezing would compare `max_len` against a logical
+    /// length. Carries the explanation.
+    Mixes(String),
+}
+
+fn classify_mask_consumer(
+    graph: &Graph,
+    node: &Node,
+    slot: usize,
+    mask: ValueId,
+    consumers: &std::collections::HashMap<ValueId, Vec<(NodeId, usize)>>,
+    shape_policy: ShapeConsumptionPolicy,
+) -> ConsumerRole {
+    if is_capacity_form_attention_mask_input(node, slot) {
+        return ConsumerRole::Sink;
+    }
+    if kernel_input_uses_padded_capacity(node, slot) {
+        // `ReduceSum` is unconditionally padding-invariant. `Shape` returns the
+        // *physical* width, so it is only a safe leaf while its result is a dead
+        // end; once consumed, the padded `max_len` enters width arithmetic. That
+        // is fatal for multi-token prefill (the query-position window
+        // `Slice(CumSum(mask), Shape-q_seq, Shape)` selects the wrong rows), but
+        // harmless at `q_seq == 1`, where the window saturates to the same
+        // position for any width >= the valid length — hence the policy split.
+        if node.op_type == "Shape" && shape_policy == ShapeConsumptionPolicy::Disqualify {
+            let consumed = node.outputs.iter().any(|out| consumers.contains_key(out));
+            if consumed {
+                return ConsumerRole::Mixes(format!(
+                    "{} output is consumed, so the padded max_len would leak into \
+                     width-sensitive arithmetic (the prefill query-position window)",
+                    describe_node(node)
+                ));
+            }
+        }
+        return ConsumerRole::InvariantLeaf;
+    }
+    // `Expand` sets its output width from the *shape operand*, not from the mask.
+    // The substitution therefore stays uniform only when that operand is itself
+    // mask-derived: freezing the mask makes `Shape(mask)` report `max_len` too,
+    // and the mask is broadcast to exactly its own frozen width. Sourced from
+    // anywhere else, a frozen `max_len`-wide mask could not broadcast at all.
+    if node.is_default_domain() && node.op_type == "Expand" && slot == 0 {
+        return if expand_target_is_mask_derived(graph, node, mask) {
+            ConsumerRole::Propagate
+        } else {
+            ConsumerRole::Mixes(format!(
+                "{}[input {slot}] broadcasts the mask to a target shape not derived from \
+                 Shape(mask), so the frozen width would not match the target",
+                describe_node(node)
+            ))
+        };
+    }
+    if is_additive_mask_builder_op(node) {
+        return ConsumerRole::Propagate;
+    }
+    // Everything else — GLM-5.2's indexer `Add` is the motivating case — combines
+    // the mask elementwise with a value whose extent came from elsewhere.
+    ConsumerRole::Mixes(format!(
+        "{}[input {slot}] is outside the additive causal-mask builder set, so it \
+         sources the mask length axis from another value",
+        describe_node(node)
+    ))
+}
+
+/// Whether `expand`'s shape operand (input 1) is derived from `Shape(mask)`.
+///
+/// Only the mask's own length axis has to come from the mask; the other axes of
+/// the target (batch, query length — typically `Shape(input_ids)`) do not carry
+/// the mask length and are unaffected by the substitution.
+fn expand_target_is_mask_derived(graph: &Graph, expand: &Node, mask: ValueId) -> bool {
+    use std::collections::{HashSet, VecDeque};
+
+    let mut producer: std::collections::HashMap<ValueId, NodeId> = std::collections::HashMap::new();
+    for (node_id, node) in graph.nodes.iter() {
+        for out in &node.outputs {
+            producer.insert(*out, node_id);
+        }
+    }
+    let Some(Some(target)) = expand.inputs.get(1).copied() else {
+        return false;
+    };
+    let mut seen: HashSet<ValueId> = HashSet::new();
+    let mut frontier: VecDeque<ValueId> = VecDeque::new();
+    frontier.push_back(target);
+    while let Some(value) = frontier.pop_front() {
+        if !seen.insert(value) {
+            continue;
+        }
+        let Some(&node_id) = producer.get(&value) else {
+            continue;
+        };
+        let node = graph.node(node_id);
+        if node.op_type == "Shape" && node.inputs.first().copied().flatten() == Some(mask) {
+            return true;
+        }
+        for input in node.inputs.iter().flatten() {
+            frontier.push_back(*input);
+        }
+    }
+    false
+}
+
 fn mask_binding_feeds_capacity_form_attention_impl(
     graph: &Graph,
     mask: ValueId,
     shape_policy: ShapeConsumptionPolicy,
-) -> bool {
+) -> std::result::Result<(), String> {
     use std::collections::{HashMap, HashSet, VecDeque};
 
     // value → consumers as (node id, input slot).
@@ -629,54 +762,39 @@ fn mask_binding_feeds_capacity_form_attention_impl(
         // bindings can in principle also be graph outputs, so the root is not
         // exempt.)
         if graph_outputs.contains(&value) {
-            return false;
+            return Err(format!(
+                "mask-derived value {value:?} escapes as a graph output, so freezing the mask \
+                 to physical width would leak the padded max_len to whatever consumes it"
+            ));
         }
         for &(node_id, slot) in consumers.get(&value).map_or(&[][..], Vec::as_slice) {
             let node = graph.node(node_id);
-            if kernel_input_uses_padded_capacity(node, slot) {
-                // `ReduceSum(mask)` is genuinely padding-invariant (0-padding
-                // sums to nothing, so it yields the *logical* valid length
-                // regardless of physical width) — an unconditional safe leaf.
-                //
-                // `Shape(mask)`, however, returns the *physical* width. It is a
-                // safe leaf only when its result is a dead end: if anything
-                // consumes the `Shape` output the padded `max_len` leaks into
-                // width-sensitive arithmetic. DeepSeek-V2-Lite's HF-style causal
-                // mask builder does exactly this —
-                // `Slice(CumSum(mask), start = Shape(mask) - q_seq, end = Shape(mask))`
-                // selects the query-position window — so freezing the mask to
-                // physical capacity picks positions `[max_len-q_seq .. max_len)`
-                // instead of `[0 .. q_seq)`, producing a non-causal mask and
-                // incoherent decode. Under `Disqualify` this exposes the logical
-                // length (correct multi-token prefill). Under `Allow` the caller
-                // only needs the weaker decode-freeze-safe guarantee (single-token
-                // `q_seq == 1`, where the window saturates to the same position
-                // regardless of width), so a consumed `Shape` does not disqualify.
-                if node.op_type == "Shape" && shape_policy == ShapeConsumptionPolicy::Disqualify {
-                    let shape_output_consumed =
-                        node.outputs.iter().any(|out| consumers.contains_key(out));
-                    if shape_output_consumed {
-                        return false;
-                    }
-                }
-                continue;
+            match classify_mask_consumer(graph, node, slot, mask, &consumers, shape_policy) {
+                ConsumerRole::Sink => reached_attention = true,
+                ConsumerRole::InvariantLeaf => {}
+                ConsumerRole::Propagate => frontier.extend(node.outputs.iter().copied()),
+                ConsumerRole::Mixes(reason) => return Err(reason),
             }
-            if is_capacity_form_attention_mask_input(node, slot) {
-                reached_attention = true;
-                continue;
-            }
-            if is_additive_mask_builder_op(node) {
-                for out in &node.outputs {
-                    frontier.push_back(*out);
-                }
-                continue;
-            }
-            // Any other consumer (e.g. GLM-5.2's indexer `Add`, or a MatMul /
-            // Gather / graph-output sink) observes the mask width: disqualify.
-            return false;
         }
     }
-    reached_attention
+    if reached_attention {
+        Ok(())
+    } else {
+        Err(String::from(
+            "the mask cone never reached a capacity-form Attention mask input",
+        ))
+    }
+}
+
+/// `name(OpType)`, or `<unnamed>(OpType)` — the shared spelling for every node
+/// named in a capture-decline explanation.
+fn describe_node(node: &Node) -> String {
+    let name = if node.name.is_empty() {
+        "<unnamed>"
+    } else {
+        node.name.as_str()
+    };
+    format!("{name}({})", node.op_type)
 }
 
 #[cfg(test)]

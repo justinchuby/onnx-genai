@@ -43,7 +43,7 @@ Results (non-test, non-mock):
 | **`impl ExecutionProvider`?** | Yes — `src/provider.rs:118` |
 | **Trait methods — required** | `name` ✅ (returns `"cpu_ep"`), `device_type` ✅ (Cpu), `device_id` ✅ (CPU:0), `initialize` ✅ (sets Rayon decode budget), `shutdown` ✅, `supports_op` ✅ (registry-keyed, opset-aware, actionable declines), `get_kernel` ✅ (registry lookup → factory.create), `allocate` ✅ (via `DeviceAllocator` seam, power-of-two alignment check), `deallocate` ✅ (cross-device guard, borrowed-buffer no-op), `copy` ✅ (bounds-checked `copy_nonoverlapping`), `copy_async` ✅ (synchronous; returns `Fence::signalled()`), `sync` ✅ (no-op, correct for CPU) |
 | **Trait methods — optional overrides** | `custom_passes` ✅ (`cpu_optimization_passes()`); `with_memory` constructor allows swappable allocator backing |
-| **Methods left to trait default (no-ops)** | `page_lazy_weight`, `prefetch_lazy_weight`, `wait_fence`, `record_compute_fence`, `copy_wait_fence`, `device_argmax_supported` (→`false`), `begin/end/abort_device_graph_capture` (→ err), `replay_device_graph*`, `reset_device_graph`, `check_device_capture_error`, `reserve_workspace`, `as_ort_plugin` (→ `None`), `context_source_keys` |
+| **Methods left to trait default** | `page_lazy_weight`, `prefetch_lazy_weight`, `wait_fence`, `record_compute_fence`, `copy_wait_fence`, `device_argmax_supported` (→`false`), `begin/end/abort_device_graph_capture` (→ err), `replay_device_graph*`, `reset_device_graph`, `check_device_capture_error`, `reserve_workspace`, `as_ort_plugin` (→ `None`), `context_source_keys`; `decommit_allocation_range` now returns actionable unsupported because CPU/eager memory has no `VirtualBacking` |
 | **Any `todo!()`/`unimplemented!`/stubs?** | **None found.** Every method either does real work or is an intentionally correct no-op or default decline. |
 | **Op coverage** | **166 entries** registered in `src/kernels/mod.rs` (verified with `grep -c "reg.register"` → 166). Domains: standard ONNX (`""`, opset-versioned: MatMul, Gemm, Softmax, LayerNorm, GatherND, Reshape, Cast, Conv, …), `com.microsoft` (MatMulNBits, QMoE, GatherBlockQuantized, FusedGemm, MultiHeadAttention, GQA, SkipSimplifiedLayerNorm, CausalConvWithState, RotaryEmbedding, …), `pkg.nxrt` (BlockQuantizedMatMul, BlockQuantizedMoE, IndexShare, VarlenAttention, PackedVarlenAttention, CompressedSparseAttention, …). |
 | **Device / memory model** | Host-only. Buffers are `malloc`/`free` via `onnx_runtime_memory_governor::HostAllocator` (swappable). All pointers are dereferenceable host pointers. No streams, no device context, no fences at runtime. |
@@ -58,7 +58,7 @@ Results (non-test, non-mock):
 |---|---|
 | **Crate / path** | `crates/onnx-runtime-ep-cuda/src/` |
 | **`impl ExecutionProvider`?** | Yes — `src/provider.rs:513` |
-| **Trait methods — required** | `name` ✅ (returns `"cuda_ep"`), `device_type` ✅ (Cuda), `device_id` ✅ (CUDA:ordinal), `initialize` ✅ (binds CUDA context), `shutdown` ✅, `supports_op` ✅ (same registry-keyed pattern as CPU; actionable declines), `get_kernel` ✅ (registry lookup → factory.create), `allocate` ✅ (VMM arena or `cuMemAlloc` path), `deallocate` ✅ (cross-device guard, borrowed no-op), `copy` ✅ (dtod with size check), `copy_async` ✅ (htod/dtod on dedicated transfer stream, returns real `Fence`), `sync` ✅ (`runtime.synchronize()` at `provider.rs:1500`) |
+| **Trait methods — required** | `name` ✅ (returns `"cuda_ep"`), `device_type` ✅ (Cuda), `device_id` ✅ (CUDA:ordinal), `initialize` ✅ (binds CUDA context), `shutdown` ✅, `supports_op` ✅ (same registry-keyed pattern as CPU; actionable declines), `get_kernel` ✅ (registry lookup → factory.create), `allocate` ✅ (the built-in VMM arena, or an injected allocator when one was supplied via `with_memory`; there is no built-in eager `cuMemAlloc` path since #1186 Phase 7), `deallocate` ✅ (cross-device guard, borrowed no-op), `copy` ✅ (dtod with size check), `copy_async` ✅ (htod/dtod on dedicated transfer stream, returns real `Fence`), `sync` ✅ (`runtime.synchronize()` at `provider.rs:1500`) |
 | **Trait methods — real overrides beyond required** | `capabilities` ✅ (advertises nxrt weight-paging when offload enabled), `page_lazy_weight` ✅ (LRU residency cache page-in), `wait_fence` ✅ (compute stream wait), `record_compute_fence` ✅ (WAR fence), `copy_wait_fence` ✅, `copy_from_host/copy_from_host_at/copy_to_host` ✅, `device_argmax_supported` ✅ (→ `true`), `device_argmax` ✅ (CUDA kernel), `begin/end/abort_device_graph_capture` ✅, `replay_device_graph/replay_device_graph_segment` ✅, `reset_device_graph` ✅, `check_device_capture_error` ✅, `allocate_committed`, `commit_allocation_range/ranges`, `decommit_allocation_range`, `allocation_committed_bytes`, `allocate_with_mapped_growth`, `commit_allocation_ranges_with_mapped_growth`, `mapped_bytes_for_allocation*`, `deallocate_with_unmapped`, `reserve_workspace`, `prepare_mapped_growth`, `release_mapped_growth`, `commits_on_demand`, `set_weight_residency_budget`, `adopt_memory_governor`, `custom_passes` |
 | **Stubs / placeholder methods** | `prefetch_lazy_weight` at `provider.rs:564–573`: body is `let _ = (self, key, weight, source); Ok(false)` — acknowledged intentional deferral but **not yet implemented**. Claim-comment says "Phase 2a". |
 | **Any other `todo!()`?** | **None found.** |
@@ -78,6 +78,20 @@ Results (non-test, non-mock):
 | `LegacyOrtEp` (`onnx-runtime-ep-api/src/abi/mod.rs:160`) | **Inbound** adapter: loads an existing ORT plugin `.so` via `CreateEpFactories` and wraps it as a Rust `ExecutionProvider`. Direction is wrong for outbound export. |
 | `PluginExecutionProvider` (`onnx-runtime-session/src/plugin_provider.rs:72`) | **Inbound** bridge: claims subgraphs for a loaded plugin EP and delegates unclaimed ops to an embedded CPU EP. Not an in-repo EP to export. |
 | `onnxruntime-mlx` | Does not exist in this workspace. No reference found. |
+
+### 3.1 Phase-2 decommit contract migration (#1186)
+
+`ExecutionProvider::decommit_allocation_range` intentionally no longer defaults
+to successful `Ok(0)`. Partial decommit has no eager equivalent: providers whose
+selected allocator lacks `VirtualBacking` now return an actionable unsupported
+error rather than reporting success for an accounting-changing operation they
+did not perform.
+
+This is a public trait migration for out-of-tree EPs. An EP that previously
+relied on the inherited no-op must either implement real partial decommit and
+return actual unmapped bytes, or let callers handle the explicit unsupported
+result. Ordinary whole-allocation release is unchanged and remains on
+`ExecutionProvider::deallocate` / the canonical `DeviceAllocator` path.
 
 ---
 

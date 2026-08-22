@@ -440,7 +440,6 @@ fn validate_adapter_artifacts(
     service: &crate::schema::AdapterServiceContract,
     root: &Path,
 ) -> Result<(), crate::MetadataError> {
-    let root = root.canonicalize().map_err(crate::MetadataError::Io)?;
     for (alias, artifact) in &service.artifacts {
         for (index, source) in artifact.weights.iter().enumerate() {
             let mut files = vec![("weights", source.location.as_str())];
@@ -449,7 +448,7 @@ fn validate_adapter_artifacts(
             }
             for (kind, location) in files {
                 resolve_package_artifact(
-                    &root,
+                    root,
                     location,
                     &format!("adapter '{alias}' source {index} {kind}"),
                 )?;

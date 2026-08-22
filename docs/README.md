@@ -9,7 +9,6 @@ give you a stale answer.
 | If you want | Read |
 |---|---|
 | What the project is and how it is put together | [`architecture/DESIGN.md`](architecture/DESIGN.md) |
-| What currently works, with numbers | [`status/PROGRESS.md`](status/PROGRESS.md) |
 | Which CUDA feature to build with, and why there are two | [`build-features.md`](build-features.md) |
 | Why memory is arranged the way it is | [`memory/MEMORY_ARCHITECTURE.md`](memory/MEMORY_ARCHITECTURE.md) |
 | The proposed cross-stack memory contracts | [`memory/MEMORY_MANAGEMENT_MODEL_DESIGN.md`](memory/MEMORY_MANAGEMENT_MODEL_DESIGN.md) |
@@ -123,8 +122,7 @@ Multi-device and collectives: [`DISTRIBUTED_RUNTIME.md`](distributed/DISTRIBUTED
 [`COMMUNICATOR_BUFFER_IMPL.md`](distributed/COMMUNICATOR_BUFFER_IMPL.md).
 
 ### `status/`
-Project state and upstream tracking: [`PROGRESS.md`](status/PROGRESS.md),
-[`DECISIONS_FOR_JUSTIN.md`](status/DECISIONS_FOR_JUSTIN.md),
+Project state and upstream tracking: [`DECISIONS_FOR_JUSTIN.md`](status/DECISIONS_FOR_JUSTIN.md),
 [`UPSTREAM_ORT_ARM_INVENTORY.md`](status/UPSTREAM_ORT_ARM_INVENTORY.md),
 [`UPSTREAM_ORT_MATMULNBITS_INVENTORY.md`](status/UPSTREAM_ORT_MATMULNBITS_INVENTORY.md).
 Dated test-health snapshots (which suites are green/red/ignored on `main`, and

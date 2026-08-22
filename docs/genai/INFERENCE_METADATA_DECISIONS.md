@@ -112,9 +112,10 @@ structurally exposes ([§14](#14-generation)).
 
 ### 3.4 Distribution layer
 
-Signing, provenance, attestation, mirroring, and byte-level integrity. Inference
-metadata contains no artifact hashes: replacing compatible component or
-tokenizer bytes must not require rewriting the semantic contract.
+Distribution manifests own artifact hashes, signatures, provenance,
+attestation, mirroring, and byte-level integrity. Runtime inference metadata
+contains no artifact hashes or fingerprints: replacing compatible component,
+tokenizer, or adapter bytes must not require rewriting the semantic contract.
 
 ---
 

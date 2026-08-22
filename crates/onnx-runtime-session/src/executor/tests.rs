@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use onnx_runtime_ep_api::{
     CaptureSupport, Cost, EpConfig, EpError, ExecutionProviderCapabilities, Fence, Kernel,
@@ -7,6 +7,264 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_memory_governor::MemoryRole;
 
 use super::*;
+
+struct DeferredValidationKernel {
+    fail_next: Arc<AtomicBool>,
+    validation_latch: Arc<AtomicU32>,
+    executions: Arc<AtomicUsize>,
+}
+
+impl Kernel for DeferredValidationKernel {
+    fn execute(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+    ) -> onnx_runtime_ep_api::Result<()> {
+        if inputs.len() != 1
+            || outputs.len() != 1
+            || inputs[0].byte_size() != outputs[0].byte_size()
+        {
+            return Err(EpError::KernelFailed(
+                "deferred validation test kernel received invalid I/O".into(),
+            ));
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                inputs[0].data.0.cast::<u8>(),
+                outputs[0].data.0.cast::<u8>(),
+                inputs[0].byte_size(),
+            );
+        }
+        self.executions.fetch_add(1, Ordering::Relaxed);
+        if self.fail_next.swap(false, Ordering::Relaxed) {
+            self.validation_latch.store(0x40, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+}
+
+struct DeferredValidationEp {
+    cpu: CpuExecutionProvider,
+    fail_next: Arc<AtomicBool>,
+    validation_latch: Arc<AtomicU32>,
+    executions: Arc<AtomicUsize>,
+    synchronized_executions: Arc<AtomicUsize>,
+    resets: Arc<AtomicUsize>,
+    reset_failure_at: Arc<AtomicUsize>,
+}
+
+impl DeferredValidationEp {
+    fn new() -> Self {
+        let mut cpu = CpuExecutionProvider::new();
+        cpu.initialize(&EpConfig::default()).unwrap();
+        Self {
+            cpu,
+            fail_next: Arc::new(AtomicBool::new(true)),
+            validation_latch: Arc::new(AtomicU32::new(0)),
+            executions: Arc::new(AtomicUsize::new(0)),
+            synchronized_executions: Arc::new(AtomicUsize::new(0)),
+            resets: Arc::new(AtomicUsize::new(0)),
+            reset_failure_at: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl ExecutionProvider for DeferredValidationEp {
+    fn name(&self) -> &str {
+        "deferred_validation_test_ep"
+    }
+
+    fn device_type(&self) -> DeviceType {
+        DeviceType::Cpu
+    }
+
+    fn device_id(&self) -> onnx_runtime_ir::DeviceId {
+        onnx_runtime_ir::DeviceId::cpu()
+    }
+
+    fn initialize(&mut self, _config: &EpConfig) -> onnx_runtime_ep_api::Result<()> {
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> onnx_runtime_ep_api::Result<()> {
+        Ok(())
+    }
+
+    fn supports_op(
+        &self,
+        op: &Node,
+        _opset: u64,
+        _shapes: &[Shape],
+        _input_dtypes: &[DataType],
+        _layouts: &[TensorLayout],
+    ) -> KernelMatch {
+        if op.op_type == "DeferredValidation" {
+            KernelMatch::Supported {
+                cost: Cost::ZERO,
+                required_input_layouts: None,
+                output_layouts: vec![TensorLayout::contiguous()],
+            }
+        } else {
+            KernelMatch::unsupported("test EP only supports DeferredValidation")
+        }
+    }
+
+    fn get_kernel(
+        &self,
+        _op: &Node,
+        _shapes: &[Vec<usize>],
+        _opset: u64,
+    ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
+        Ok(Box::new(DeferredValidationKernel {
+            fail_next: Arc::clone(&self.fail_next),
+            validation_latch: Arc::clone(&self.validation_latch),
+            executions: Arc::clone(&self.executions),
+        }))
+    }
+
+    fn allocate(&self, size: usize, alignment: usize) -> onnx_runtime_ep_api::Result<DeviceBuffer> {
+        self.cpu.allocate(size, alignment)
+    }
+
+    fn deallocate(&self, buffer: DeviceBuffer) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.deallocate(buffer)
+    }
+
+    fn copy(
+        &self,
+        src: &DeviceBuffer,
+        dst: &mut DeviceBuffer,
+        size: usize,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.copy(src, dst, size)
+    }
+
+    fn copy_async(
+        &self,
+        src: &DeviceBuffer,
+        dst: &mut DeviceBuffer,
+        size: usize,
+    ) -> onnx_runtime_ep_api::Result<Fence> {
+        self.cpu.copy_async(src, dst, size)
+    }
+
+    fn sync(&self) -> onnx_runtime_ep_api::Result<()> {
+        self.synchronized_executions
+            .store(self.executions.load(Ordering::Relaxed), Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn reset_device_validation_error(&self) -> onnx_runtime_ep_api::Result<()> {
+        let call = self.resets.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.reset_failure_at.load(Ordering::Relaxed) == call {
+            return Err(EpError::KernelFailed(
+                "forced device validation reset failure".into(),
+            ));
+        }
+        self.validation_latch.store(0, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn check_device_capture_error(&self) -> onnx_runtime_ep_api::Result<u32> {
+        if self.synchronized_executions.load(Ordering::Relaxed)
+            != self.executions.load(Ordering::Relaxed)
+        {
+            return Err(EpError::KernelFailed(
+                "device validation latch checked before synchronization".into(),
+            ));
+        }
+        Ok(self.validation_latch.load(Ordering::Relaxed))
+    }
+}
+
+#[test]
+fn deferred_device_validation_is_request_local_and_checked_after_sync() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let input = graph.create_named_value("input", DataType::Float32, static_shape([2]));
+    graph.add_input(input);
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([2]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "DeferredValidation",
+        vec![Some(input)],
+        vec![output],
+    ));
+    graph.add_output(output);
+
+    let ep = Arc::new(DeferredValidationEp::new());
+    let resets = Arc::clone(&ep.resets);
+    let executions = Arc::clone(&ep.executions);
+    let synchronized = Arc::clone(&ep.synchronized_executions);
+    let mut executor = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        ep as Arc<dyn ExecutionProvider>,
+    )
+    .unwrap();
+    let input = Tensor::from_f32(&[2], &[3.0, 7.0]).unwrap();
+
+    let first = executor.run(&[("input", &input)]).unwrap_err();
+    assert!(
+        first
+            .to_string()
+            .contains("device validation failed (flags=0x40)"),
+        "the run that set the deferred latch must fail after synchronization: {first}"
+    );
+
+    let second = executor
+        .run(&[("input", &input)])
+        .expect("the prior run's validation latch must not poison a healthy request");
+    assert_eq!(second[0].to_vec_f32(), vec![3.0, 7.0]);
+    assert_eq!(executions.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        synchronized.load(Ordering::Relaxed),
+        executions.load(Ordering::Relaxed),
+        "validation must be checked only after the request synchronization boundary"
+    );
+    assert_eq!(
+        resets.load(Ordering::Relaxed),
+        4,
+        "each request must reset the latch before execution and after checking it"
+    );
+}
+
+#[test]
+fn device_validation_reset_failure_is_not_ignored_after_a_run() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let input = graph.create_named_value("input", DataType::Float32, static_shape([1]));
+    graph.add_input(input);
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "DeferredValidation",
+        vec![Some(input)],
+        vec![output],
+    ));
+    graph.add_output(output);
+
+    let ep = Arc::new(DeferredValidationEp::new());
+    ep.fail_next.store(false, Ordering::Relaxed);
+    ep.reset_failure_at.store(2, Ordering::Relaxed);
+    let mut executor = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        Arc::clone(&ep) as Arc<dyn ExecutionProvider>,
+    )
+    .unwrap();
+    let input = Tensor::from_f32(&[1], &[5.0]).unwrap();
+
+    let error = executor.run(&[("input", &input)]).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("forced device validation reset failure"),
+        "the post-run latch reset error must propagate: {error}"
+    );
+    assert_eq!(ep.executions.load(Ordering::Relaxed), 1);
+    assert_eq!(ep.resets.load(Ordering::Relaxed), 2);
+}
 
 #[test]
 fn phase_profile_gating_and_accumulation() {
@@ -2258,6 +2516,126 @@ fn deepseek_shape_feeding_slice_window_keeps_logical_width() {
     assert!(
         !mask_binding_feeds_capacity_form_attention(&graph, mask),
         "DeepSeek Shape(mask)→Sub→Slice window arithmetic must keep logical width"
+    );
+}
+
+/// Build `attention_mask → Cast → Unsqueeze → Expand(target) → Unsqueeze →
+/// capacity-form Attention`, the HY-MT1.5 mask builder. `mask_derived_target`
+/// picks whether the `Expand` target shape is built from `Shape(mask)` (the real
+/// model) or from an unrelated value.
+fn expand_mask_builder_graph(mask_derived_target: bool) -> (Graph, ValueId) {
+    use onnx_runtime_ir::static_shape;
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let sh = || static_shape([1]);
+
+    let mask = graph.create_named_value("attention_mask", DataType::Int64, sh());
+    graph.add_input(mask);
+    let q = graph.create_named_value("q", DataType::Float32, sh());
+    let other = graph.create_named_value("input_ids", DataType::Int64, sh());
+    graph.add_input(other);
+
+    let cast = graph.create_named_value("cast", DataType::Float32, sh());
+    graph.insert_node(Node::new(NodeId(0), "Cast", vec![Some(mask)], vec![cast]));
+    let unsq = graph.create_named_value("unsq", DataType::Float32, sh());
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "Unsqueeze",
+        vec![Some(cast)],
+        vec![unsq],
+    ));
+
+    // Target axes: batch/query from `input_ids`, and the mask length axis from
+    // either `Shape(mask)` (self-consistent) or `Shape(input_ids)` (not).
+    let shape_other = graph.create_named_value("shape_other", DataType::Int64, sh());
+    graph.insert_node(Node::new(
+        NodeId(2),
+        "Shape",
+        vec![Some(other)],
+        vec![shape_other],
+    ));
+    let len_axis = if mask_derived_target {
+        let shape_mask = graph.create_named_value("shape_mask", DataType::Int64, sh());
+        graph.insert_node(Node::new(
+            NodeId(3),
+            "Shape",
+            vec![Some(mask)],
+            vec![shape_mask],
+        ));
+        shape_mask
+    } else {
+        let shape_other2 = graph.create_named_value("shape_other2", DataType::Int64, sh());
+        graph.insert_node(Node::new(
+            NodeId(3),
+            "Shape",
+            vec![Some(other)],
+            vec![shape_other2],
+        ));
+        shape_other2
+    };
+    let target = graph.create_named_value("target", DataType::Int64, sh());
+    graph.insert_node(Node::new(
+        NodeId(4),
+        "Concat",
+        vec![Some(shape_other), Some(len_axis)],
+        vec![target],
+    ));
+
+    let expanded = graph.create_named_value("expanded", DataType::Float32, sh());
+    graph.insert_node(Node::new(
+        NodeId(5),
+        "Expand",
+        vec![Some(unsq), Some(target)],
+        vec![expanded],
+    ));
+    let mask_bias = graph.create_named_value("mask_bias", DataType::Float32, sh());
+    graph.insert_node(Node::new(
+        NodeId(6),
+        "Unsqueeze",
+        vec![Some(expanded)],
+        vec![mask_bias],
+    ));
+    let attn = graph.create_named_value("attn", DataType::Float32, sh());
+    graph.insert_node(capacity_form_attention(7, q, mask_bias, attn));
+    graph.add_output(attn);
+    (graph, mask)
+}
+
+/// HY-MT1.5's builder broadcasts the mask with `Expand`, whose target shape
+/// carries the mask length axis from `Shape(mask)` itself. Freezing is then a
+/// uniform substitution — the mask is expanded to exactly its own frozen width —
+/// so the binding is decode-freeze-safe and the decode step may capture.
+///
+/// Static freezing is still refused, because `Shape(mask)` is *consumed*: the
+/// multi-token prefill window needs the logical length. Only the weaker
+/// decode-time predicate holds.
+#[test]
+fn expand_with_mask_derived_target_is_decode_freeze_safe() {
+    let (graph, mask) = expand_mask_builder_graph(true);
+    assert!(
+        mask_binding_feeds_additive_causal_builder(&graph, mask),
+        "an Expand whose target length axis comes from Shape(mask) must be decode-freeze-safe"
+    );
+    assert!(
+        !mask_binding_feeds_capacity_form_attention(&graph, mask),
+        "a consumed Shape(mask) must still refuse *static* freezing"
+    );
+}
+
+/// The same builder, but the `Expand` target sources the length axis from
+/// somewhere the substitution does not reach. A mask frozen to `max_len` could
+/// not broadcast against a target still carrying the logical length, so this
+/// must be refused under both policies.
+#[test]
+fn expand_with_foreign_target_is_rejected() {
+    let (graph, mask) = expand_mask_builder_graph(false);
+    assert!(
+        !mask_binding_feeds_additive_causal_builder(&graph, mask),
+        "an Expand target not derived from Shape(mask) must not be freeze-safe"
+    );
+    assert!(
+        !mask_binding_feeds_capacity_form_attention(&graph, mask),
+        "an Expand target not derived from Shape(mask) must not be statically freezable"
     );
 }
 

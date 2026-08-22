@@ -4,7 +4,7 @@ use onnx_genai_scheduler::ResourceLimit;
 use onnx_runtime_memory_governor::{
     DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MappedAllowance, MappedGrowthGrant,
     MappedGrowthMetrics, MappedHolderRegistration, MemoryAuthorityId, MemoryError, MemoryGovernor,
-    MemoryLease, MemoryRole, ReclaimableMappedHolder, Tier,
+    MemoryLease, MemoryRole, ProcessMemoryManager, ReclaimableMappedHolder, Tier,
 };
 
 /// Physical-device compatibility domain for a shared device memory authority.
@@ -220,6 +220,11 @@ impl MemoryGovernor for DeviceMemoryAuthority {
 /// Standalone callers omit this provider and retain the historical behavior:
 /// every engine constructs a unique device ledger.
 pub trait MemoryAuthorityProvider: Send + Sync {
+    /// One process manager shared by every authority/context this provider
+    /// creates. The manager coordinates identity and transactions; authorities
+    /// remain the budget-policy owners.
+    fn process_memory_manager(&self) -> ProcessMemoryManager;
+
     fn validate_limit(
         &self,
         domain: &DeviceCompatibilityDomain,
