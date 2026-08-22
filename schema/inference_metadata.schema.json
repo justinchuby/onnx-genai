@@ -3810,7 +3810,7 @@
           "description": "Repeated proposer invocations form an autoregressive proposal chain.",
           "properties": {
             "folded_carry_output": {
-              "description": "Proposer OUTPUT port producing the folded carry for the NEXT step\n(carry_k, k>=1). The carry has no dedicated input port: it re-enters\nas the trailing segment of the proposer's fused\n`token_embedding_input` (`concat(embed(last_token), carry)`), so it\nowns no workflow state cell. Three ports pin the fold EXPLICITLY, so\na runtime never infers by convention:\n\n* DESTINATION: `port_bindings.target_hidden_context` names the\n  proposer input port the carry lands in (for a folded carry, the\n  fused `token_embedding_input` itself; its trailing half).\n* carry_0 SOURCE: `folded_carry_seed` names the target output read\n  as the carry on the first step.\n* carry_k SOURCE: this field, the proposer output on every later\n  step.\n\nBecause a folded carry is recomputed from committed tokens on\nrejection rather than restored, it does not appear in\n`rollback_state`. A chained proposer declares at least one of\n`recurrent` or `folded_carry_output`.",
+              "description": "Proposer OUTPUT port producing the folded carry for the NEXT step\n(carry_k, k>=1). The carry has no dedicated input port: it re-enters\nas the trailing segment of the proposer's fused\n`token_embedding_input` (`concat(embed(last_token), carry)`), so it\nowns no workflow state cell. Three ports pin the fold EXPLICITLY, so\na runtime never infers by convention:\n\n* DESTINATION: `port_bindings.target_hidden_context` names the\n  proposer input port the carry lands in. For a folded carry it must\n  equal `token_embedding_input`: the carry occupies the fused input's\n  trailing half, so the destination is that fused input, never a\n  separate port.\n* carry_0 SOURCE: `folded_carry_seed` names the target output read\n  as the carry on the first step.\n* carry_k SOURCE: this field, the proposer output on every later\n  step.\n\nBecause a folded carry is recomputed from committed tokens on\nrejection rather than restored, it does not appear in\n`rollback_state`. A chained proposer declares at least one of\n`recurrent` or `folded_carry_output`.",
               "type": [
                 "string",
                 "null"
@@ -3825,7 +3825,7 @@
                   "type": "null"
                 }
               ],
-              "description": "carry_0 seed: the target component OUTPUT read as the folded carry on\nthe FIRST step, before the proposer has produced a carry. Named\nexplicitly (`component` + `output`) so a runtime reads it rather than\ninferring \"the target hidden output\" by convention. Required whenever\n`folded_carry_output` is present."
+              "description": "carry_0 seed: the target component OUTPUT read as the folded carry on\nthe FIRST step, before the proposer has produced a carry. Named\nexplicitly (`component` + `output`) so a runtime reads it rather than\ninferring \"the target hidden output\" by convention. Its `component`\nmust be the speculative target, since carry_0 is the target's own\nper-token hidden output. Required whenever `folded_carry_output` is\npresent."
             },
             "kind": {
               "const": "chained",
@@ -3853,7 +3853,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Where a runtime obtains `embed(last_token)` for the LEADING half of\nthe fused `token_embedding_input`. A folded-carry proposer graph\nconsumes only the fused input, so it reads no embedding initializer of\nits own and `speculative.shared_weights` stays empty; this names the\nmodel-agnostic embedding table the runtime gathers the leading half\nfrom (never extracted heuristically from a graph). Required whenever\n`folded_carry_output` is present."
+              "description": "Where a runtime obtains `embed(last_token)` for the LEADING half of\nthe fused `token_embedding_input`. A folded-carry proposer graph\nconsumes only the fused input, so it reads no embedding initializer of\nits own and `speculative.shared_weights` stays empty; this names the\nmodel-agnostic embedding table the runtime gathers the leading half\nfrom (never extracted heuristically from a graph). Its `component`\nmust be the speculative target — an ONNX model that owns the named\n`table` initializer — so the table resolves to a real initializer in\nthe target model/artifact. Required whenever `folded_carry_output` is\npresent."
             },
             "token_embedding_input": {
               "description": "Proposer input port receiving the previous selected token embedding.",
@@ -4736,12 +4736,12 @@
       "description": "Explicit, model-agnostic source of the token embedding a chained proposer\nfolds into the leading half of its fused input.\n\nA folded-carry proposer never reads an embedding initializer inside its own\ngraph, so the table cannot be recovered from the proposer graph. This names\nthe component whose embedding the runtime reuses and the initializer that\nholds it, so gathering `embed(last_token)` is a declared contract rather than\na per-model heuristic.",
       "properties": {
         "component": {
-          "description": "The workflow component whose token-embedding table is reused (e.g. the\ntarget, whose vocabulary the proposer shares).",
+          "description": "The workflow component whose token-embedding table is reused. For a\nfolded carry this must be the speculative target, whose vocabulary the\nproposer shares and whose ONNX model owns the `table` initializer.",
           "minLength": 1,
           "type": "string"
         },
         "table": {
-          "description": "The named embedding table (graph initializer) on that component, e.g.\n`model.embed_tokens.weight`. A `[vocab, hidden]` row-major matrix.",
+          "description": "The named embedding table (graph initializer) on that component, e.g.\n`model.embed_tokens.weight`. A `[vocab, hidden]` row-major matrix. It\nmust name a real initializer in the target model/artifact.",
           "minLength": 1,
           "type": "string"
         }

@@ -505,6 +505,109 @@ fn a_token_embedding_must_name_a_real_component() {
     );
 }
 
+/// carry_0 is the target's OWN per-token hidden output, so a `folded_carry_seed`
+/// naming any component other than the speculative target — a *proposer* seed in
+/// particular — is rejected fail-closed, even when it names a real output port.
+#[test]
+fn a_folded_carry_seed_must_come_from_the_target() {
+    // `draft_logits` is a genuine proposer (assistant) output, so the output
+    // port resolves; the seed is rejected only because it is not the target.
+    let mutated = ASSISTANT.replace(
+        "folded_carry_seed: {component: target, output: hidden}",
+        "folded_carry_seed: {component: assistant, output: draft_logits}",
+    );
+    assert_ne!(
+        mutated, ASSISTANT,
+        "the folded_carry_seed line must be present"
+    );
+    let metadata = serde_yaml::from_str::<InferenceMetadata>(&mutated).expect("mutated parses");
+    let errors =
+        validate_metadata(&metadata).expect_err("a proposer-sourced folded carry seed must fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("folded_carry_seed component")
+                && error.contains("must be the speculative target")),
+        "expected a non-target-seed error, got: {errors:?}"
+    );
+}
+
+/// A folded carry re-enters through the fused input's trailing half, so the
+/// DESTINATION `port_bindings.target_hidden_context` must equal the fused
+/// `token_embedding_input`. A different — even valid — proposer input port is
+/// rejected fail-closed, because a folded carry has no separate destination.
+#[test]
+fn a_folded_carry_target_hidden_context_must_equal_token_embedding_input() {
+    // `shared_kv.full_attention.key` is a real assistant input port, but it is
+    // not the fused `inputs_embeds` the carry folds into.
+    let mutated = ASSISTANT.replace(
+        "target_hidden_context: inputs_embeds",
+        "target_hidden_context: shared_kv.full_attention.key",
+    );
+    assert_ne!(
+        mutated, ASSISTANT,
+        "the target_hidden_context line must be present to mutate"
+    );
+    let metadata = serde_yaml::from_str::<InferenceMetadata>(&mutated).expect("mutated parses");
+    let errors = validate_metadata(&metadata)
+        .expect_err("a target_hidden_context that is not the fused input must fail");
+    assert!(
+        errors.iter().any(
+            |error| error.contains("port_bindings.target_hidden_context")
+                && error.contains("must equal the fused token_embedding_input")
+        ),
+        "expected a mismatched-destination error, got: {errors:?}"
+    );
+}
+
+/// The fused input's leading half is `embed(last_token)` gathered from the
+/// TARGET model's embedding, so `token_embedding.table` must resolve to a real
+/// initializer in the named target model/artifact. A table attributed to the
+/// wrong (proposer) model, and an empty table, are both rejected fail-closed.
+#[test]
+fn a_folded_carry_token_embedding_must_resolve_to_a_real_target_initializer() {
+    // Attributing the target's embedding table to the proposer model cannot
+    // resolve to a real initializer in the *target* model/artifact.
+    let wrong_model = ASSISTANT.replace(
+        "token_embedding: {component: target, table: model.embed_tokens.weight}",
+        "token_embedding: {component: assistant, table: model.embed_tokens.weight}",
+    );
+    assert_ne!(
+        wrong_model, ASSISTANT,
+        "the token_embedding line must be present"
+    );
+    let metadata = serde_yaml::from_str::<InferenceMetadata>(&wrong_model).expect("mutated parses");
+    let errors = validate_metadata(&metadata)
+        .expect_err("a token_embedding table on the wrong model must fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("token_embedding component")
+                && error.contains("must be the speculative target")),
+        "expected a wrong-model-table error, got: {errors:?}"
+    );
+
+    // A bogus (empty) table names no initializer at all.
+    let empty_table = ASSISTANT.replace(
+        "token_embedding: {component: target, table: model.embed_tokens.weight}",
+        "token_embedding: {component: target, table: \"\"}",
+    );
+    assert_ne!(
+        empty_table, ASSISTANT,
+        "the token_embedding line must be present"
+    );
+    let metadata = serde_yaml::from_str::<InferenceMetadata>(&empty_table).expect("mutated parses");
+    let errors =
+        validate_metadata(&metadata).expect_err("a token_embedding with an empty table must fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("token_embedding table")
+                && error.contains("real target initializer")),
+        "expected an empty-table error, got: {errors:?}"
+    );
+}
+
 /// A recurrence must resolve to a state-service alias the proposer owns: a
 /// binding whose cell has no `groups.*.ports.<proposer>` alias is rejected, so
 /// a "recurrence" that is never actually carried cannot slip through.

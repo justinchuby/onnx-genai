@@ -2490,6 +2490,16 @@ fn validate_speculative_rollback(metadata: &InferenceMetadata, errors: &mut Vec<
                              not an input port of proposer component '{}'",
                             speculative.proposer
                         ));
+                    } else if context_port != token_embedding_input {
+                        // A folded carry re-enters through the fused input's
+                        // trailing half, so the DESTINATION port is the fused
+                        // `token_embedding_input` itself, never a separate port.
+                        errors.push(format!(
+                            "speculative port_bindings.target_hidden_context '{context_port}' must \
+                             equal the fused token_embedding_input '{token_embedding_input}'; a \
+                             folded carry re-enters through the fused input's trailing half, not a \
+                             separate proposer input port"
+                        ));
                     }
                 }
             }
@@ -2513,6 +2523,17 @@ fn validate_speculative_rollback(metadata: &InferenceMetadata, errors: &mut Vec<
                                 seed.output, seed.component
                             ));
                         }
+                        // carry_0 is the target's OWN per-token hidden output, so
+                        // the seed must name the speculative target — a proposer
+                        // (or any non-target) seed is nonsensical and rejected.
+                        if seed.component != speculative.target {
+                            errors.push(format!(
+                                "speculative folded_carry_seed component '{}' must be the \
+                                 speculative target '{}'; the folded carry's first-step seed is \
+                                 the target's own hidden output",
+                                seed.component, speculative.target
+                            ));
+                        }
                     }
                 },
             }
@@ -2522,15 +2543,49 @@ fn validate_speculative_rollback(metadata: &InferenceMetadata, errors: &mut Vec<
                      token_embedding naming where embed(last_token) is gathered from"
                         .to_string(),
                 ),
-                Some(embedding) => {
-                    if !workflow.components.contains_key(&embedding.component) {
-                        errors.push(format!(
-                            "speculative token_embedding component '{}' is not a declared \
-                             workflow component",
-                            embedding.component
-                        ));
+                Some(embedding) => match workflow.components.get(&embedding.component) {
+                    None => errors.push(format!(
+                        "speculative token_embedding component '{}' is not a declared \
+                         workflow component",
+                        embedding.component
+                    )),
+                    Some(embedding_component) => {
+                        // The fused input's leading half is `embed(last_token)`
+                        // gathered from the TARGET model's shared embedding, so
+                        // the table must resolve to a real initializer in the
+                        // named target model/artifact. Enforce all three facts
+                        // fail-closed: it is the target, the target is an ONNX
+                        // model that owns initializers, and the table is named.
+                        if embedding.component != speculative.target {
+                            errors.push(format!(
+                                "speculative token_embedding component '{}' must be the \
+                                 speculative target '{}'; a folded carry reuses the target \
+                                 model's embedding table",
+                                embedding.component, speculative.target
+                            ));
+                        }
+                        let names_onnx_artifact = matches!(
+                            &embedding_component.implementation,
+                            crate::schema::ComponentImplementation::Onnx { artifact }
+                                if !artifact.trim().is_empty()
+                        );
+                        if !names_onnx_artifact {
+                            errors.push(format!(
+                                "speculative token_embedding names table '{}' on component '{}', \
+                                 which declares no ONNX model artifact for that initializer to \
+                                 resolve against",
+                                embedding.table, embedding.component
+                            ));
+                        }
+                        if embedding.table.trim().is_empty() {
+                            errors.push(
+                                "speculative token_embedding table must name a real target \
+                                 initializer, not an empty string"
+                                    .to_string(),
+                            );
+                        }
                     }
-                }
+                },
             }
         }
         // Every state-service port map the proposer owns, across all groups. A

@@ -433,8 +433,10 @@ pub enum SpeculativeProposalExecution {
         /// a runtime never infers by convention:
         ///
         /// * DESTINATION: `port_bindings.target_hidden_context` names the
-        ///   proposer input port the carry lands in (for a folded carry, the
-        ///   fused `token_embedding_input` itself; its trailing half).
+        ///   proposer input port the carry lands in. For a folded carry it must
+        ///   equal `token_embedding_input`: the carry occupies the fused input's
+        ///   trailing half, so the destination is that fused input, never a
+        ///   separate port.
         /// * carry_0 SOURCE: `folded_carry_seed` names the target output read
         ///   as the carry on the first step.
         /// * carry_k SOURCE: this field, the proposer output on every later
@@ -449,8 +451,10 @@ pub enum SpeculativeProposalExecution {
         /// carry_0 seed: the target component OUTPUT read as the folded carry on
         /// the FIRST step, before the proposer has produced a carry. Named
         /// explicitly (`component` + `output`) so a runtime reads it rather than
-        /// inferring "the target hidden output" by convention. Required whenever
-        /// `folded_carry_output` is present.
+        /// inferring "the target hidden output" by convention. Its `component`
+        /// must be the speculative target, since carry_0 is the target's own
+        /// per-token hidden output. Required whenever `folded_carry_output` is
+        /// present.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         folded_carry_seed: Option<SpeculativeValueRef>,
         /// Where a runtime obtains `embed(last_token)` for the LEADING half of
@@ -458,8 +462,11 @@ pub enum SpeculativeProposalExecution {
         /// consumes only the fused input, so it reads no embedding initializer of
         /// its own and `speculative.shared_weights` stays empty; this names the
         /// model-agnostic embedding table the runtime gathers the leading half
-        /// from (never extracted heuristically from a graph). Required whenever
-        /// `folded_carry_output` is present.
+        /// from (never extracted heuristically from a graph). Its `component`
+        /// must be the speculative target — an ONNX model that owns the named
+        /// `table` initializer — so the table resolves to a real initializer in
+        /// the target model/artifact. Required whenever `folded_carry_output` is
+        /// present.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token_embedding: Option<TokenEmbeddingSource>,
     },
@@ -491,12 +498,14 @@ pub struct SpeculativeValueRef {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TokenEmbeddingSource {
-    /// The workflow component whose token-embedding table is reused (e.g. the
-    /// target, whose vocabulary the proposer shares).
+    /// The workflow component whose token-embedding table is reused. For a
+    /// folded carry this must be the speculative target, whose vocabulary the
+    /// proposer shares and whose ONNX model owns the `table` initializer.
     #[schemars(length(min = 1))]
     pub component: String,
     /// The named embedding table (graph initializer) on that component, e.g.
-    /// `model.embed_tokens.weight`. A `[vocab, hidden]` row-major matrix.
+    /// `model.embed_tokens.weight`. A `[vocab, hidden]` row-major matrix. It
+    /// must name a real initializer in the target model/artifact.
     #[schemars(length(min = 1))]
     pub table: String,
 }
