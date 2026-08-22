@@ -3788,13 +3788,23 @@ impl CudaWeightResidency {
                             "pinned resident key {key} has no stable-slot refill state"
                         ))
                     })?;
-                    if !state.begin_refill() {
+                    // `existing` and `inner.pages[key]` are the refill path's
+                    // two strong references. Any additional reference is a
+                    // consumer handle that may still read this address, so an
+                    // in-place rewrite must be skipped. The residency lock
+                    // keeps eviction and lookup clones out until Pending is
+                    // published; Pending then preserves exclusivity while the
+                    // fill runs without the lock.
+                    if Arc::strong_count(&existing) != 2 {
+                        None
+                    } else if !state.begin_refill() {
                         return Err(WeightHandleError::DeviceBinding(format!(
                             "stable weight slot for key {key} could not claim its refill; \
                              another operation is pending or the slot is poisoned"
                         )));
+                    } else {
+                        Some(state)
                     }
-                    Some(state)
                 } else {
                     None
                 };
@@ -5879,6 +5889,94 @@ mod tests {
             .expect("admit completed-control page");
         residency.lock().mark_pinned(100, granule as u64);
         let completed_ptr = completed_page.ptr;
+
+        // A returned handle is a third strong reference (cache + refill-local
+        // + consumer). A concurrent diagnostic hit must return the existing
+        // page without claiming Pending, copying, or poisoning its slot.
+        let held_fill_called = Arc::new(AtomicBool::new(false));
+        let held_fill_probe = Arc::clone(&held_fill_called);
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let hit = residency
+                        .resident_vmm_with(
+                            100,
+                            DataType::Uint8,
+                            vec![granule],
+                            granule,
+                            WeightEvictionPolicy::Lru,
+                            false,
+                            move |_, _| -> Result<(), WeightHandleError> {
+                                held_fill_probe.store(true, Ordering::Release);
+                                Ok(())
+                            },
+                        )
+                        .map(VmmAdmit::expect_page)
+                        .expect("consumer-owned page must remain a valid hit");
+                    assert_eq!(hit.ptr, completed_ptr);
+                })
+                .join()
+                .expect("consumer-owned refill thread");
+        });
+        assert!(!held_fill_called.load(Ordering::Acquire));
+        assert_eq!(
+            residency
+                .lock()
+                .slots
+                .get(&100)
+                .expect("consumer-owned slot")
+                .state
+                .status(),
+            SlotStatus::Idle
+        );
+        let mut held_bytes = vec![0u8; granule];
+        // SAFETY: `completed_page` is still a live handle for exactly `granule`
+        // bytes, and dtoh synchronizes before returning.
+        unsafe { runtime.dtoh(&mut held_bytes, completed_page.ptr) }
+            .expect("read consumer-owned page");
+        assert_eq!(held_bytes, completed_bytes);
+
+        // Once the consumer drops its handle, only the cache and this lookup's
+        // local clone own the page, so the same diagnostic hit may refill it.
+        drop(completed_page);
+        let refill_bytes = vec![0x32u8; granule];
+        let exclusive_fill_called = Arc::new(AtomicBool::new(false));
+        let exclusive_fill_probe = Arc::clone(&exclusive_fill_called);
+        let refilled_page = residency
+            .resident_vmm_with(
+                100,
+                DataType::Uint8,
+                vec![granule],
+                granule,
+                WeightEvictionPolicy::Lru,
+                false,
+                |runtime, ptr| {
+                    exclusive_fill_probe.store(true, Ordering::Release);
+                    unsafe { runtime.htod(&refill_bytes, ptr) }
+                        .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))
+                },
+            )
+            .map(VmmAdmit::expect_page)
+            .expect("exclusive refill must execute");
+        assert!(exclusive_fill_called.load(Ordering::Acquire));
+        assert_eq!(refilled_page.ptr, completed_ptr);
+        let mut actual_refill_bytes = vec![0u8; granule];
+        // SAFETY: `refilled_page` owns exactly `granule` live device bytes.
+        unsafe { runtime.dtoh(&mut actual_refill_bytes, refilled_page.ptr) }
+            .expect("read exclusively refilled page");
+        assert_eq!(actual_refill_bytes, refill_bytes);
+        assert_eq!(
+            residency
+                .lock()
+                .slots
+                .get(&100)
+                .expect("successfully refilled slot")
+                .state
+                .status(),
+            SlotStatus::Idle
+        );
+        drop(refilled_page);
+
         let completed_error = residency
             .resident_vmm_with(
                 100,
@@ -5905,33 +6003,6 @@ mod tests {
                 .status(),
             SlotStatus::Idle
         );
-        let refill_bytes = vec![0x32u8; granule];
-        let refilled_page = residency
-            .resident_vmm_with(
-                100,
-                DataType::Uint8,
-                vec![granule],
-                granule,
-                WeightEvictionPolicy::Lru,
-                false,
-                |runtime, ptr| {
-                    unsafe { runtime.htod(&refill_bytes, ptr) }
-                        .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))
-                },
-            )
-            .map(VmmAdmit::expect_page)
-            .expect("completed refill fault must leave the page reusable");
-        assert_eq!(refilled_page.ptr, completed_ptr);
-        assert_eq!(
-            residency
-                .lock()
-                .slots
-                .get(&100)
-                .expect("successfully refilled slot")
-                .state
-                .status(),
-            SlotStatus::Idle
-        );
 
         let unresolved_bytes = vec![0x41u8; granule];
         let unresolved_page = residency
@@ -5950,6 +6021,7 @@ mod tests {
             .map(VmmAdmit::expect_page)
             .expect("admit unresolved-control page");
         residency.lock().mark_pinned(101, granule as u64);
+        drop(unresolved_page);
         let source_dropped = Arc::new(AtomicBool::new(false));
         let source_probe = Arc::clone(&source_dropped);
         let charged_before = governor.used(Tier::Device);
@@ -6045,7 +6117,6 @@ mod tests {
         assert_eq!(governor.used(Tier::Device), charged_before);
         assert_eq!(residency.stats().mapped_physical_bytes, mapped_before);
 
-        drop(unresolved_page);
         assert!(!source_dropped.load(Ordering::Acquire));
         let fill_called = Arc::new(AtomicBool::new(false));
         let fill_probe = Arc::clone(&fill_called);
@@ -6124,9 +6195,6 @@ mod tests {
                 .status(),
             SlotStatus::Poisoned
         );
-
-        drop(completed_page);
-        drop(refilled_page);
     }
 
     #[cfg(feature = "gpu-tests")]
