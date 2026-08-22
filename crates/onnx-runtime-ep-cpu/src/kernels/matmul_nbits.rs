@@ -19381,6 +19381,20 @@ mod tests {
     /// Set on the realized-width child; its value is the requested width.
     const SPMD_WIDTH_CHILD_ENV: &str = "ONNX_GENAI_TEST_SPMD_REALIZED_WIDTH_CHILD";
 
+    /// Attempts allowed for the realized-width child before a
+    /// `STATUS_ACCESS_VIOLATION` is treated as a real failure.
+    const SPMD_WIDTH_CHILD_MAX_ATTEMPTS: u32 = 3;
+
+    /// Upper bound on the extra fully-subscribed probe width.
+    ///
+    /// The probe deliberately asks for as many workers as the process has
+    /// allowed CPUs so the dispatcher-headroom branch is reached, but on a
+    /// many-core host that would spin up ~one worker per core just to read a
+    /// count. Cap it: above this many allowed CPUs the probe is skipped rather
+    /// than made cheap-but-meaningless, since a partial request would land back
+    /// in the no-op branch the probe exists to avoid.
+    const SPMD_WIDTH_FULL_SUBSCRIPTION_CAP: usize = 32;
+
     /// What a realized-width child observed about the pool it built.
     #[derive(Debug)]
     struct RealizedWidth {
@@ -19420,7 +19434,8 @@ mod tests {
 
     fn realized_width_report(requested: usize) -> RealizedWidth {
         let width = requested.to_string();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
             .arg("--exact")
             .arg("kernels::matmul_nbits::tests::spmd_realized_width_subprocess")
             .arg("--nocapture")
@@ -19430,17 +19445,48 @@ mod tests {
             .env("RAYON_NUM_THREADS", &width)
             .env(crate::decode_spmd::PERSISTENT_POOL_ENV, "1")
             .env_remove(crate::decode_affinity::DECODE_AFFINITY_ENV)
-            .env_remove(SPMD_PARITY_CHILD_ENV)
-            .output()
-            .expect("run the realized-width child process");
-        assert!(
-            output.status.success(),
-            "realized-width child failed (requested={requested}, status={}):\nstdout:\n{}\nstderr:\n{}",
-            child_status_detail(&output.status),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let stdout = String::from_utf8(output.stdout).expect("child output is UTF-8");
+            .env_remove(SPMD_PARITY_CHILD_ENV);
+
+        // Bounded retry scoped to *exactly* the known environmental crash
+        // signature, for the same reason `run_affinity_defer_child` carries one:
+        // this child builds a pool of spinning workers, and on native Windows
+        // ARM64 that occasionally faults the whole process with
+        // `STATUS_ACCESS_VIOLATION` and empty stderr during pool build/teardown
+        // (see #1745). A real assertion failure prints a Rust panic and so still
+        // fails fast on the first attempt; on Linux this signature never occurs.
+        let mut stdout = String::new();
+        for attempt in 1..=SPMD_WIDTH_CHILD_MAX_ATTEMPTS {
+            let output = command
+                .output()
+                .expect("run the realized-width child process");
+            stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            if is_environmental_access_violation_crash(
+                output.status.success(),
+                output.status.code(),
+                &stdout,
+                &stderr,
+                SPMD_WIDTH_MARKER,
+            ) && attempt < SPMD_WIDTH_CHILD_MAX_ATTEMPTS
+            {
+                eprintln!(
+                    "note: retrying realized-width child (requested={requested}) after \
+                     environmental STATUS_ACCESS_VIOLATION crash, attempt {attempt}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
+
+            assert!(
+                output.status.success(),
+                "realized-width child failed (requested={requested}, status={}):\nstdout:\n{stdout}\n\
+                 stderr:\n{stderr}",
+                child_status_detail(&output.status)
+            );
+            break;
+        }
+
         let report = stdout
             .lines()
             .find_map(|line| {
@@ -19491,7 +19537,23 @@ mod tests {
         // test should be the thing that says so.
         const DISPATCHER_RESERVED_CPUS: usize = 1;
 
-        for requested in BENCHMARKED_DECODE_WIDTHS {
+        // The published widths alone leave a hole: on any host with more
+        // allowed CPUs than the largest of them, every case satisfies
+        // `effective < allowed`, so `reserve_single_group_headroom` is a no-op
+        // and the headroom half of the contract is never exercised -- on
+        // exactly the large hosts most likely to run CI. Add one probe that
+        // asks for the whole allowed cpuset so the reserving branch is reached
+        // on every host, not just small or affinity-restricted ones.
+        let allowed_now = crate::decode_affinity::allowed_cpus().map_or(0, |cpus| cpus.len());
+        let mut widths: Vec<usize> = BENCHMARKED_DECODE_WIDTHS.to_vec();
+        if (2..=SPMD_WIDTH_FULL_SUBSCRIPTION_CAP).contains(&allowed_now)
+            && !widths.contains(&allowed_now)
+        {
+            widths.push(allowed_now);
+        }
+
+        let mut saw_headroom_branch = false;
+        for requested in widths {
             let report = realized_width_report(requested);
             assert_eq!(
                 report.requested, requested,
@@ -19532,6 +19594,7 @@ mod tests {
             let expected = if report.allowed == 0 || effective < report.allowed {
                 effective
             } else {
+                saw_headroom_branch = true;
                 report
                     .allowed
                     .saturating_sub(DISPATCHER_RESERVED_CPUS)
@@ -19543,6 +19606,17 @@ mod tests {
                  {expected} ({report:?}) -- a decode benchmark row labelled t={requested} \
                  would be reporting a width it never ran",
                 report.workers
+            );
+        }
+
+        // Say out loud which hosts check only half the rule, rather than
+        // letting a green run imply the whole contract was covered.
+        if !saw_headroom_branch {
+            assert!(
+                allowed_now == 0 || allowed_now > SPMD_WIDTH_FULL_SUBSCRIPTION_CAP,
+                "the dispatcher-headroom branch was never reached on a host with \
+                 {allowed_now} allowed CPUs, so the full-subscription probe is not doing \
+                 its job and only the no-op half of the contract was checked"
             );
         }
     }
@@ -20189,22 +20263,29 @@ mod tests {
     ///
     /// All four conditions must hold to treat the exit as the environmental flake:
     ///   1. the child exited unsuccessfully (`success` is `false`), AND
-    ///   2. it emitted no success marker (`{AFFINITY_DEFER_MARKER}ok`), AND
+    ///   2. it emitted no `success_marker`, AND
     ///   3. its stderr shows no Rust panic (no `panicked at` / `assertion`
     ///      text) — a genuine assertion failure must fail fast, never retry, AND
     ///   4. the exit code is exactly the Windows `STATUS_ACCESS_VIOLATION`
     ///      NTSTATUS. Matching that specific code keeps the retry Windows-only in
     ///      practice while the code stays portable.
+    ///
+    /// `success_marker` is the stdout token a child prints once it has actually
+    /// completed its work, so a fault raised *after* the result was already
+    /// emitted is correctly classified as non-environmental. Each caller passes
+    /// its own marker, because more than one child-spawning helper needs this
+    /// classification and they do not share a marker.
     fn is_environmental_access_violation_crash(
         success: bool,
         exit_code: Option<i32>,
         stdout: &str,
         stderr: &str,
+        success_marker: &str,
     ) -> bool {
         if success {
             return false;
         }
-        if stdout.contains(&format!("{AFFINITY_DEFER_MARKER}ok")) {
+        if stdout.contains(success_marker) {
             return false;
         }
         if stderr.contains("panicked at") || stderr.contains("assertion") {
@@ -20262,6 +20343,7 @@ mod tests {
                 output.status.code(),
                 &stdout,
                 &stderr,
+                &format!("{AFFINITY_DEFER_MARKER}ok"),
             ) && attempt < AFFINITY_DEFER_CHILD_MAX_ATTEMPTS
             {
                 eprintln!(
@@ -20334,6 +20416,7 @@ mod tests {
             Some(STATUS_ACCESS_VIOLATION),
             "",
             "",
+            &marker_ok,
         ));
 
         // A successful run is never retryable, regardless of exit code.
@@ -20342,6 +20425,7 @@ mod tests {
             Some(STATUS_ACCESS_VIOLATION),
             &marker_ok,
             "",
+            &marker_ok,
         ));
 
         // A real assertion failure (Rust panic in stderr) must fail fast.
@@ -20350,6 +20434,7 @@ mod tests {
             Some(STATUS_ACCESS_VIOLATION),
             "",
             "thread 'main' panicked at src/foo.rs:1:1:\nassertion failed",
+            &marker_ok,
         ));
 
         // Any other non-success exit code is not the known signature.
@@ -20357,10 +20442,11 @@ mod tests {
             false,
             Some(1),
             "",
-            ""
+            "",
+            &marker_ok,
         ));
         assert!(!is_environmental_access_violation_crash(
-            false, None, "", ""
+            false, None, "", "", &marker_ok,
         ));
 
         // Even with the access-violation code, an emitted success marker means the
@@ -20370,6 +20456,27 @@ mod tests {
             Some(STATUS_ACCESS_VIOLATION),
             &marker_ok,
             "",
+            &marker_ok,
+        ));
+
+        // The marker is per-caller: the realized-width child emits a different
+        // token, and classifying it against the affinity marker would call a
+        // completed run environmental. Each caller's own marker must be the one
+        // that suppresses the retry.
+        let width_report = format!("{SPMD_WIDTH_MARKER}requested=2 workers=2");
+        assert!(!is_environmental_access_violation_crash(
+            false,
+            Some(STATUS_ACCESS_VIOLATION),
+            &width_report,
+            "",
+            SPMD_WIDTH_MARKER,
+        ));
+        assert!(is_environmental_access_violation_crash(
+            false,
+            Some(STATUS_ACCESS_VIOLATION),
+            &width_report,
+            "",
+            &marker_ok,
         ));
     }
 
