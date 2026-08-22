@@ -187,6 +187,7 @@ pub struct EngineResourceGovernor {
     /// ledger; a per-caller governor would let each holder believe it had the
     /// whole tier to itself.
     memory: EngineMemoryGovernor,
+    process_memory_manager: onnx_runtime_memory_governor::ProcessMemoryManager,
     /// The fixed device reservation -- weights and runtime overhead -- held as a
     /// lease rather than subtracted before the ledger sees it.
     ///
@@ -254,7 +255,6 @@ impl EngineResourceGovernor {
         )
     }
 
-    #[cfg(feature = "native-backend")]
     // Eight parameters (one over the lint's threshold) because this is
     // `new_with_authority` plus an explicit reservation: #840 added
     // `cuda_device_index` to fix a VRAM-capacity portability bug and pushed it
@@ -414,6 +414,15 @@ impl EngineResourceGovernor {
             snapshot.resolved_limits.host_ram_bytes,
             snapshot.disk_spill.as_ref().map_or(0, |tier| tier.limit),
         );
+        let process_memory_manager = match provider {
+            Some(provider) => provider.process_memory_manager(),
+            None => onnx_runtime_memory_governor::ProcessMemoryManager::new().map_err(|error| {
+                ResourceError::BudgetArithmeticOverflow {
+                    operation: "constructing the local process memory manager",
+                    reason: error.to_string(),
+                }
+            })?,
+        };
         // A reservation that "does not fit under the resolved ceiling" is only a
         // real failure when there *is* a resolved ceiling. When the device
         // capacity is unknown (`vram_bytes == None`) there is nothing to fit
@@ -485,6 +494,7 @@ impl EngineResourceGovernor {
             inner,
             allow_runtime_override,
             memory,
+            process_memory_manager,
             plan: std::sync::Mutex::new(plan),
             #[cfg(feature = "native-backend")]
             weight_offload_host_cache,
@@ -550,6 +560,10 @@ impl EngineResourceGovernor {
 
     pub fn device_authority(&self) -> DeviceMemoryAuthority {
         self.memory.device_authority()
+    }
+
+    pub fn process_memory_manager(&self) -> onnx_runtime_memory_governor::ProcessMemoryManager {
+        self.process_memory_manager.clone()
     }
 
     /// Point-in-time configured, resolved, derived, and live per-tier state.
@@ -1050,6 +1064,7 @@ pub(crate) fn component_governor(
     config: &EngineConfig,
     kv_model: Option<&KvModelInfo>,
     model_weights_bytes: u64,
+    reservation_bytes: u64,
     cuda_device_index: Option<u32>,
     provider: Option<&crate::memory_authority::SharedMemoryAuthorityProvider>,
     domain: &crate::memory_authority::DeviceCompatibilityDomain,
@@ -1058,11 +1073,12 @@ pub(crate) fn component_governor(
         Some(kv_model) => governor_kv_config(Some(kv_model), config)?,
         None => governor_no_paged_kv_config(config)?,
     };
-    EngineResourceGovernor::new_with_authority(
+    EngineResourceGovernor::new_with_authority_and_reservation(
         config.limits.clone(),
         config.allow_runtime_override,
         kv_config,
         model_weights_bytes,
+        reservation_bytes,
         cuda_device_index,
         provider,
         Some(domain),

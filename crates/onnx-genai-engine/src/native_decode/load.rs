@@ -7,6 +7,8 @@ pub(crate) struct NativeDecodeLoadOptions<'a> {
     #[cfg(feature = "native-cuda")]
     pub(crate) cuda_memory_governor:
         Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
+    #[cfg(feature = "native-cuda")]
+    pub(crate) process_memory_manager: onnx_runtime_memory_governor::ProcessMemoryManager,
     pub(crate) io: Option<&'a ModelIoSpec>,
     pub(crate) metadata_max_len: Option<usize>,
     pub(crate) key_sequence_lengths_policy: crate::decode::KeySequenceLengthsPolicy,
@@ -77,6 +79,7 @@ impl NativeDecodeSession {
             io,
             None,
             None,
+            None,
         )
     }
 
@@ -108,10 +111,11 @@ impl NativeDecodeSession {
                 .cuda_offload_policy
                 .unwrap_or_else(onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env);
             let ep = onnx_runtime_ep_cuda::CudaExecutionProvider::
-                initialized_with_offload_policy_and_governor(
+                initialized_with_offload_policy_governor_and_manager(
                     index.unwrap_or(0),
                     policy,
                     options.cuda_memory_governor,
+                    options.process_memory_manager,
                 )
                 .context("initialize native CUDA execution provider")?;
             builder = builder.execution_provider(Arc::new(ep));
@@ -239,7 +243,7 @@ impl NativeDecodeSession {
         device: NativeDecodeDevice,
         options: NativeDecodeCudaOptions,
     ) -> anyhow::Result<Self> {
-        Self::load_with_cuda_options_and_io(path, device, options, None, None, None)
+        Self::load_with_cuda_options_and_io(path, device, options, None, None, None, None)
     }
 
     /// Load a decoder-with-past model, threading the pipeline-declared
@@ -265,6 +269,7 @@ impl NativeDecodeSession {
             io,
             None,
             None,
+            None,
         )
     }
 
@@ -280,7 +285,7 @@ impl NativeDecodeSession {
         options: NativeDecodeCudaOptions,
         io: Option<&ModelIoSpec>,
     ) -> anyhow::Result<Self> {
-        Self::load_with_cuda_options_and_io(path, device, options, io, None, None)
+        Self::load_with_cuda_options_and_io(path, device, options, io, None, None, None)
     }
 
     fn load_with_cuda_options_and_io(
@@ -292,6 +297,10 @@ impl NativeDecodeSession {
             Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
         >,
         #[cfg(not(feature = "native-cuda"))] _cuda_governor: Option<()>,
+        #[cfg(feature = "native-cuda")] cuda_manager: Option<
+            onnx_runtime_memory_governor::ProcessMemoryManager,
+        >,
+        #[cfg(not(feature = "native-cuda"))] _cuda_manager: Option<()>,
         #[cfg(feature = "native-cuda")] cuda_offload_policy: Option<
             onnx_runtime_ep_cuda::DeviceOffloadPolicy,
         >,
@@ -319,14 +328,24 @@ impl NativeDecodeSession {
         let mut builder = InferenceSession::builder().model(path).device(preference);
         #[cfg(feature = "native-cuda")]
         if let (NativeDecodeDevice::Cuda { index }, Some(governor)) = (&device, cuda_governor) {
-            let ep = onnx_runtime_ep_cuda::CudaExecutionProvider::
-                initialized_with_offload_policy_and_governor(
-                    index.unwrap_or(0),
-                    cuda_offload_policy
-                        .unwrap_or_else(onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env),
-                    governor,
-                )
-                .context("initialize governed native CUDA execution provider")?;
+            let policy = cuda_offload_policy
+                .unwrap_or_else(onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env);
+            let ep = match cuda_manager {
+                Some(manager) => onnx_runtime_ep_cuda::CudaExecutionProvider::
+                    initialized_with_offload_policy_governor_and_manager(
+                        index.unwrap_or(0),
+                        policy,
+                        governor,
+                        manager,
+                    ),
+                None => onnx_runtime_ep_cuda::CudaExecutionProvider::
+                    initialized_with_offload_policy_and_governor(
+                        index.unwrap_or(0),
+                        policy,
+                        governor,
+                    ),
+            }
+            .context("initialize governed native CUDA execution provider")?;
             builder = builder.execution_provider(Arc::new(ep));
         }
         if let NativeDecodeDevice::Plugin {

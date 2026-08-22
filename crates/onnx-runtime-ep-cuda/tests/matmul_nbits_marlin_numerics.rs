@@ -109,9 +109,13 @@ fn run_matmul_nbits_f16(ep: &CudaExecutionProvider, p: &Int4Problem) -> Vec<f32>
     graph.add_output(output);
 
     let model = Model::new(&graph);
-    let kernel = ep
+    let mut kernel = ep
         .get_kernel(model.graph.node(node), &[], 1)
         .expect("get_kernel for MatMulNBits int4");
+    // Every operand in this op-semantics harness is a runtime graph input. In
+    // particular B is mutable and must never enter Marlin's pointer-keyed
+    // initializer repack cache.
+    kernel.set_constant_inputs(&[false; 4]);
 
     // Host tensors (raw bytes) for each input in node order.
     let mut inputs: Vec<(DataType, Vec<usize>, Vec<u8>)> = vec![

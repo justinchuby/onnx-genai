@@ -16,8 +16,8 @@
 
 use half::f16;
 use onnx_runtime_ep_api::{
-    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, Result, TensorMut,
-    TensorView,
+    DeviceBuffer, DevicePtr, DevicePtrMut, EpError, ExecutionProvider, KernelMatch, Result,
+    TensorMut, TensorView,
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
@@ -211,7 +211,7 @@ fn standard_attention_and_rope_claim_supported_dtypes_and_require_contiguous_inp
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
-fn standard_attention_claim_requires_homogeneous_floating_input_dtypes() {
+fn standard_attention_claim_allows_independent_mask_dtype_but_requires_homogeneous_qkv() {
     let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
 
     let claim = |input_dtypes: &[DataType]| {
@@ -260,18 +260,22 @@ fn standard_attention_claim_requires_homogeneous_floating_input_dtypes() {
             DataType::Float16,
             DataType::Float32,
         ],
-        [
-            DataType::BFloat16,
-            DataType::Float16,
-            DataType::BFloat16,
-            DataType::BFloat16,
-        ],
     ] {
         assert!(
-            !claim(&input_dtypes).is_supported(),
-            "Attention must reject mixed floating input dtypes: {input_dtypes:?}"
+            claim(&input_dtypes).is_supported(),
+            "Attention must allow an independently typed additive mask: {input_dtypes:?}"
         );
     }
+    let mixed_qkv = [
+        DataType::BFloat16,
+        DataType::Float16,
+        DataType::BFloat16,
+        DataType::BFloat16,
+    ];
+    assert!(
+        !claim(&mixed_qkv).is_supported(),
+        "Attention must reject mixed Q/K/V dtypes: {mixed_qkv:?}"
+    );
 
     for floating_dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
         let homogeneous = [floating_dtype; 4];
@@ -546,11 +550,17 @@ fn run_result_core(
             Ok(bytes)
         })
         .collect::<Result<Vec<_>>>()?;
+    let device_error = ep.runtime().check_capture_error()?;
     for buffer in input_buffers.into_iter().flatten() {
         ep.deallocate(buffer)?;
     }
     for buffer in output_buffers {
         ep.deallocate(buffer)?;
+    }
+    if device_error != 0 {
+        return Err(EpError::KernelFailed(format!(
+            "{op} reported device validation error 0x{device_error:x}"
+        )));
     }
     Ok(result)
 }

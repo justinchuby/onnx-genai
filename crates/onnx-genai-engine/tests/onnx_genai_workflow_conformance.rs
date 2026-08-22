@@ -806,10 +806,6 @@ fn mobius_speculative_workflow_executes_rejection_and_correction() -> anyhow::Re
         "verifier.past_key_values.0.key",
         Value::from_slice_f32(&[], &[1, 2, 0, 8])?,
     )
-    .with_input(
-        "verifier.past_key_values.0.value",
-        Value::from_slice_f32(&[], &[1, 4, 0, 4])?,
-    )
     .with_input("grammar.initial_state", Value::from_slice_i64(&[0], &[1])?)
     .with_input(
         "grammar.transition_table",

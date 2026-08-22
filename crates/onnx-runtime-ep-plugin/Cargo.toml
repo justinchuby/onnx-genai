@@ -26,6 +26,7 @@ libloading = { workspace = true }
 onnx-runtime-ep-cpu = { workspace = true }
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-ir = { workspace = true }
+onnx-runtime-memory-governor = { workspace = true }
 
 [[test]]
 name = "trait_cabi_parity"
