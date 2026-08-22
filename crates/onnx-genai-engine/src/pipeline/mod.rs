@@ -573,6 +573,19 @@ impl PipelineEngine {
             .map(|set| set.borrow().run_count())
     }
 
+    /// `(device_input_bindings, device_outputs)` accumulated by the native
+    /// backend, or `None` when not running the native backend. Non-zero
+    /// `device_input_bindings` proves an intermediate or recurring/state tensor
+    /// entered a component still device-resident (bound zero-copy, no host
+    /// round-trip); both are always zero on the CPU native device. Lets a CUDA
+    /// test prove end-to-end device residency rather than a host round-trip.
+    #[cfg(feature = "native-backend")]
+    pub fn native_device_residency_counts(&self) -> Option<(u64, u64)> {
+        self.native_components
+            .as_ref()
+            .map(|set| set.borrow().device_residency_counts())
+    }
+
     pub fn resource_snapshot(&self) -> onnx_genai_scheduler::GovernorSnapshot {
         self.resource_governor.snapshot()
     }

@@ -142,11 +142,11 @@ with an actionable diagnostic naming the component/adapter/optimization — it d
 
 ## 4. Backend/device residency
 
-| Edge | ORT | Native CPU | Native CUDA (staged, §6) |
+| Edge | ORT | Native CPU | Native CUDA (delivered) |
 |------|-----|-----------|--------------------------|
-| component output → value pool | `Value` (device or host) | `Value::from_raw_bytes` (host; CPU has no device) | device `Value` via `from_external_memory` (zero-copy) |
-| loop-carried / shared state | `Value` alias | `Value` (host) reused, no re-serialization | device `Value` alias, no host round-trip |
-| host-policy boundary | `to_raw_bytes` | `to_raw_bytes` | `copy_from_cuda` |
+| component output → value pool | `Value` (device or host) | `Value::from_raw_bytes` (host; CPU has no device) | device `Value` via `from_external_memory_with_owner` over a device output binding (zero-copy) |
+| loop-carried / shared state | `Value` alias | `Value` (host) reused, no re-serialization | device `Value` alias (`try_alias_clone` shares the owning `Arc`), no host round-trip |
+| host-policy boundary | `to_raw_bytes` | `to_raw_bytes` | `to_host_from_cuda` at the package/API boundary |
 
 The native executor holds its `InferenceSession`s for the life of the engine and
 runs each per iteration, so a recurring component edge reuses one session — the
@@ -185,28 +185,44 @@ invariants are observable through a per-backend run counter.
     ORT would reject at load run natively. `execution_provider_status()` reports
     the real native device. (`native_backend_builds_no_ort_sessions`,
     `ort_backend_builds_ort_sessions`.)
-  * **Rubber-duck fix 2 — explicit device/provider + fail-closed residency.** The
-    native executor no longer calls `InferenceSession::load` (which auto-detects a
-    CPU EP and ignores the requested device). It resolves the device via
-    `resolve_native_decode_device(config.native_device, …)` and builds each
-    session with the explicit EP (`CpuExecutionProvider` / `CudaExecutionProvider`),
-    mirroring `native_decode/load.rs`. The `Value ⇄ Tensor` bridge now gates on
-    residency: a host value/tensor round-trips through bytes (no device round-trip
-    on CPU), and a **device-resident** value/tensor **fails closed** with an
-    actionable diagnostic instead of reading device memory as host bytes
-    (`Tensor::as_bytes` is host-only) or silently host-copying. This is an
-    explicit not-yet-wired boundary, not a permanent CPU-only limit — see
-    boundary A.
-* **Follow-up boundary A — native CUDA device-resident bridge.** The device/EP is
-  now propagated and device tensors fail closed (above); what remains is the
-  zero-copy value bridge: wire `Tensor::device_ptr()` →
-  `Value::from_external_memory` (and `Value` device ptr →
-  `Tensor::from_borrowed_parts_with_guard`) behind `native-cuda`, with
-  ownership/lifetime guards, so device tensors alias zero-copy and native-CUDA
-  workflows run end-to-end. Root-caused: the native runtime **has** these device
-  APIs, so this is a wiring task (plus a CUDA fixture), not a fundamental limit.
-  CUDA execution-island optimizations remain ORT-only until then (fail-closed
-  under Native).
+  * **Rubber-duck fix 2 — explicit device/provider + real device-resident bridge.**
+    The native executor no longer calls `InferenceSession::load` (which
+    auto-detects a CPU EP and ignores the requested device). It resolves the
+    device via `resolve_native_decode_device(config.native_device, …)` and builds
+    each session with the explicit EP (`CpuExecutionProvider` /
+    `CudaExecutionProvider`), mirroring `native_decode/load.rs`. The `Value ⇄
+    Tensor` bridge is residency-aware: on CPU it round-trips through bytes (no
+    device round-trip); on CUDA it keeps tensors **device-resident end-to-end**
+    (boundary A, below). It fails closed only for a genuinely unsupported
+    device/provider (e.g. a plugin EP), never by silently host-copying or reading
+    device memory as host bytes.
+* **Delivered boundary A — native CUDA device-resident bridge.** Implemented
+  behind `native-cuda`. A guard-carrying constructor
+  `Value::from_external_memory_with_owner(ptr, …, owner)` lets a `Value` **own**
+  the native `Tensor`/`DeviceIoBinding` behind the device pointer it wraps: the
+  owner is an `Arc<dyn Any + Send + Sync>` in `TensorBacking::External`, freed by
+  `Value`'s `Drop` *after* the `OrtValue` is released, so there is no leak and no
+  use-after-free, and `try_alias_clone` hands out another `External` sharing the
+  owner so a device value flows through the interpreter's `clone_value` fast path
+  with no host read. In `native_component.rs` the CUDA path binds device-resident
+  inputs zero-copy via `ExternalMemorySpec` + `device_binding_from_external_memory`,
+  binds a device **output** buffer (`allocate_device_output_binding`) for every
+  output whose concrete shape the interpreter already resolved from the bound
+  input symbols (`resolve_component_output_shapes`), runs via
+  `run_with_device_bindings`, and republishes each device output as an owning
+  `Value` — so a recurring/loop-carried/state tensor (KV cache) never round-trips
+  the host. Cross-session stream correctness uses the conservative
+  `Tensor::sync()` / allocator-sync barrier before an output is handed on. Host
+  materialization happens only at genuine host inputs (token ids) and the
+  package/API boundary (`package_outputs`, `Emit`). Proven on H200 by
+  `native_cuda_device_resident_multicomponent`: ORT/native bit-for-bit parity on
+  a two-step static-cache decode **and** non-zero device-residency counters
+  (device input bindings + device outputs) that prove the recurring KV stayed on
+  the device. Dynamic-shape outputs (not resolvable ahead of the run) fall back
+  to host materialization — the correct, safe fallback. Remaining: CUDA
+  execution-island / graph-capture optimizations stay ORT-only (fail-closed under
+  Native); reusing device output buffers across loop steps instead of allocating
+  per step is a perf follow-up, not a correctness gap.
 * **Follow-up boundary B — specialized AR executor.** Recognize the canonical
   single-decoder `Loop` and delegate it to `run_decode_loop` /
   `NativeDecodeSession` as a specialized component executor (device sampling

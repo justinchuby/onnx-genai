@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use onnx_genai_engine::{
     Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GeneratePrompt, GenerateRequest,
-    PipelineGenerateRequest, pipeline::PipelineEngine,
+    NativeDecodeDevice, PipelineGenerateRequest, pipeline::PipelineEngine,
 };
 use onnx_genai_ort::{DataType, Value};
 
@@ -54,10 +54,27 @@ fn ort_engine(root: &Path) -> anyhow::Result<PipelineEngine> {
 }
 
 fn native_engine(root: &Path) -> anyhow::Result<PipelineEngine> {
+    // Pin the CPU native device so the backend-agnostic parity scenarios are
+    // deterministic regardless of build features or a GPU being present — only
+    // the `native-cuda` device-residency test drives the CUDA device.
     Engine::from_pipeline_dir(
         root,
         EngineConfig {
             decode_backend: EngineDecodeBackend::Native,
+            native_device: Some(NativeDecodeDevice::Cpu),
+            ..EngineConfig::default()
+        },
+    )
+}
+
+/// A native engine pinned to CUDA device 0, for the device-residency test.
+#[cfg(feature = "native-cuda")]
+fn native_cuda_engine(root: &Path) -> anyhow::Result<PipelineEngine> {
+    Engine::from_pipeline_dir(
+        root,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            native_device: Some(NativeDecodeDevice::Cuda { index: Some(0) }),
             ..EngineConfig::default()
         },
     )
@@ -109,8 +126,20 @@ fn assert_parity(
     request: impl Fn() -> anyhow::Result<PipelineGenerateRequest>,
     outputs: &[&str],
 ) -> anyhow::Result<PipelineEngine> {
+    assert_parity_with(root, native_engine, request, outputs)
+}
+
+/// Like [`assert_parity`], but the native engine is built by `build_native` so a
+/// test can pin a specific native device (e.g. CUDA for the device-residency
+/// case) while reusing the ORT reference and the output comparison.
+fn assert_parity_with(
+    root: &Path,
+    build_native: impl Fn(&Path) -> anyhow::Result<PipelineEngine>,
+    request: impl Fn() -> anyhow::Result<PipelineGenerateRequest>,
+    outputs: &[&str],
+) -> anyhow::Result<PipelineEngine> {
     let mut ort = ort_engine(root)?;
-    let mut native = native_engine(root)?;
+    let mut native = build_native(root)?;
     let ort_output = ort.run_pipeline(request()?)?;
     let native_output = native.run_pipeline(request()?)?;
     for output in outputs {
@@ -631,44 +660,71 @@ fn ort_backend_builds_ort_sessions() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// On a CUDA box the native backend resolves and reports the CUDA device
-/// (Blocker 2 device/provider propagation — not an auto-detected CPU EP), still
-/// builds zero ORT sessions (Blocker 1), and at a device-resident boundary
-/// either bridges (device bridge wired — boundary A) or **fails closed** with an
-/// actionable native diagnostic — never panics or silently host-copies. If the
-/// CUDA EP cannot load this fixture's ops, session construction fails loudly and
-/// we skip the runtime asserts rather than record a false negative.
+/// On an H200 the native CUDA backend executes a multi-component workflow with
+/// an intermediate and a recurring/state (KV) tensor staying **device-resident
+/// end-to-end** — no host round-trip on the recurring edge. It reports its CUDA
+/// device (Blocker 2 device/provider propagation — not an auto-detected CPU EP),
+/// builds zero ORT sessions (Blocker 1), produces results that match the ORT
+/// reference bit-for-bit, and its device-residency counters prove a recurring
+/// tensor entered a component still on the device (bound zero-copy) and that
+/// components produced device-resident outputs.
+///
+/// If the native CUDA EP cannot load this fixture's ops, that is an op-coverage
+/// gap (not a device-bridge failure), so the test skips loudly rather than
+/// recording a false negative. It never tolerates a *runtime* fail-closed on the
+/// device path — that would mean the bridge did not work.
 #[cfg(feature = "native-cuda")]
 #[test]
-fn native_cuda_device_propagation_and_fail_closed() -> anyhow::Result<()> {
+fn native_cuda_device_resident_multicomponent() -> anyhow::Result<()> {
     let root = fixture("static_cache");
-    let mut engine = match native_engine(&root) {
-        Ok(engine) => engine,
-        Err(error) => {
-            eprintln!(
-                "native-cuda could not load the static_cache fixture (op coverage); skipping \
-                 runtime asserts: {error:#}"
-            );
-            return Ok(());
-        }
-    };
+    if let Err(error) = native_cuda_engine(&root) {
+        eprintln!(
+            "native-cuda could not load the static_cache fixture (op coverage); skipping \
+             device-residency asserts: {error:#}"
+        );
+        return Ok(());
+    }
+
+    // Two decode steps: the decoder is re-invoked with the KV cache it produced
+    // on the previous step. On the device path that KV never leaves the device.
+    // `assert_parity_with` runs the SAME package on ORT and native (pinned to
+    // CUDA here) and asserts every listed output matches, then returns the
+    // native engine.
+    let native = assert_parity_with(
+        &root,
+        native_cuda_engine,
+        || static_cache_request(2),
+        &["cache_lengths", "write_indices", "key_cache", "value_cache"],
+    )?;
+
+    // Device/provider propagation (Blocker 2) + zero ORT sessions (Blocker 1).
     assert!(
-        engine.models().sessions.is_empty(),
+        native.models().sessions.is_empty(),
         "Native must build zero ORT sessions even on CUDA"
     );
-    let status = engine.execution_provider_status();
+    let status = native.execution_provider_status();
     assert!(
         status.starts_with("native-cuda"),
         "Native on a CUDA box must report its CUDA device, got {status}"
     );
-    if let Err(error) = engine.run_pipeline(static_cache_request(2)?) {
-        let message = format!("{error:#}");
-        assert!(
-            message.contains("device-resident") || message.contains("native"),
-            "a device-resident boundary must fail closed with an actionable native diagnostic, \
-             got: {message}"
-        );
-    }
+
+    // End-to-end device residency: a recurring/intermediate tensor entered a
+    // component still on the device (bound zero-copy, no host round-trip), and
+    // components produced device-resident outputs kept on the device for the
+    // next component. This is the proof the parent required — not merely that a
+    // device boundary failed closed.
+    let (device_inputs, device_outputs) = native
+        .native_device_residency_counts()
+        .expect("native backend exposes device-residency counts");
+    assert!(
+        device_inputs > 0,
+        "a recurring/intermediate tensor must enter a component device-resident (bound \
+         zero-copy), proving no host round-trip; got {device_inputs} device input bindings"
+    );
+    assert!(
+        device_outputs > 0,
+        "components must publish device-resident outputs kept on the device; got {device_outputs}"
+    );
     Ok(())
 }
 
