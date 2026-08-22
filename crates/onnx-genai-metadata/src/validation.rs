@@ -85,22 +85,61 @@ impl Default for RuntimeCapabilities {
 }
 
 /// Validate the metadata document and required runtime capabilities.
+///
+/// Reports structural defects and unsupported capabilities together, which is
+/// what a strict caller wants. A caller that can *proceed* without a capability
+/// — a bare decoder does not need `workflow_ssa` to be honoured — should use
+/// [`validate_structure_and_capabilities`] and decide for itself, rather than
+/// treating a capability it will never exercise as a malformed document.
 pub fn validate(
     metadata: &InferenceMetadata,
     runtime: &RuntimeCapabilities,
 ) -> Result<(), Vec<String>> {
-    let mut errors = validate_metadata(metadata).err().unwrap_or_default();
+    let report = validate_structure_and_capabilities(metadata, runtime);
+    let mut errors = report.structural;
+    errors.extend(report.unsupported_capabilities);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Structural defects and unsupported capabilities, kept apart.
+///
+/// These answer different questions. A structural defect means the document
+/// does not describe a runnable model and no caller can proceed. An unsupported
+/// capability means the package asks for a runtime feature this build lacks,
+/// which only matters if the caller would actually exercise it. Merging them
+/// into one list forces every caller to treat both as fatal, which is why a
+/// bare decoder used to be rejected for declaring workflow capabilities it
+/// never reaches.
+#[derive(Debug, Default, Clone)]
+pub struct CapabilityReport {
+    /// The document is malformed or self-inconsistent. Always fatal.
+    pub structural: Vec<String>,
+    /// Capabilities the package declares that this runtime does not implement.
+    pub unsupported_capabilities: Vec<String>,
+}
+
+/// Validate the document, reporting structural defects separately from
+/// capabilities this runtime does not implement.
+pub fn validate_structure_and_capabilities(
+    metadata: &InferenceMetadata,
+    runtime: &RuntimeCapabilities,
+) -> CapabilityReport {
+    let structural = validate_metadata(metadata).err().unwrap_or_default();
     let required = metadata
         .required_capabilities
         .iter()
         .cloned()
         .chain(derived_capabilities(metadata));
-    errors.extend(required.filter(|capability| !runtime.supported.contains(capability)));
-
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
+    let unsupported_capabilities = required
+        .filter(|capability| !runtime.supported.contains(capability))
+        .collect();
+    CapabilityReport {
+        structural,
+        unsupported_capabilities,
     }
 }
 
