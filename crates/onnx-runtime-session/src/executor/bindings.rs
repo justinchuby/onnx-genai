@@ -10,13 +10,21 @@ use super::*;
 /// when used — step-scoped on the per-call prefill/batched route,
 /// session-persistent on the capture-eligible single-token decode route (both
 /// classes, fixed-capacity append and absent present-output staging charge zero);
-/// `com.microsoft::GroupQueryAttention` (#736) reserves one session-persistent
-/// composite covering packed Q/K/V projection staging, route-required BSH↔BNSH
-/// transpose scratch, and its f32 reference score buffer; and the
-/// cuBLASLt GEMM family shares one session-persistent heuristic-sized peak. All
-/// report their exact bytes via [`Kernel::workspace_requirement`].
+/// `Conv` and the cuDNN `ReduceSum`/`ReduceMean` path reserve one
+/// session-persistent cuDNN workspace when the current metadata makes its exact
+/// byte size knowable; `com.microsoft::GroupQueryAttention` (#736) reserves one
+/// session-persistent composite covering packed Q/K/V projection staging,
+/// route-required BSH↔BNSH transpose scratch, and its f32 reference score
+/// buffer; and the cuBLASLt GEMM family shares one session-persistent
+/// heuristic-sized peak. Dynamic-axes reductions still use the same executor
+/// workspace slot, but their first exact size is learned at execution time via
+/// `workspace_requirement_for_execution` after the axes input is warmed.
 pub(super) fn is_planned_workspace_node(node: &onnx_runtime_ir::Node) -> bool {
-    (node.domain.is_empty() && matches!(node.op_type.as_str(), "MatMul" | "Gemm" | "Attention"))
+    (node.domain.is_empty()
+        && matches!(
+            node.op_type.as_str(),
+            "MatMul" | "Gemm" | "Attention" | "Conv" | "ReduceSum" | "ReduceMean"
+        ))
         || (node.domain == onnx_runtime_ir::RUNTIME_DOMAIN
             && matches!(node.op_type.as_str(), "BlockQuantizedMoE" | "IndexShare"))
         || (node.domain == "com.microsoft"
@@ -1314,6 +1322,9 @@ mod planned_workspace_node_tests {
             ("", "MatMul"),
             ("", "Gemm"),
             ("", "Attention"),
+            ("", "Conv"),
+            ("", "ReduceSum"),
+            ("", "ReduceMean"),
             ("com.microsoft", "MatMulNBits"),
             ("com.microsoft", "FusedMatMulBias"),
             ("com.microsoft", "FusedGemm"),

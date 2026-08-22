@@ -1621,7 +1621,7 @@ impl KernelDispatchContext<'_> {
                 .iter()
                 .map(|view| TensorMetadata::new(view.dtype, view.shape, !view.is_absent()))
                 .collect::<Vec<_>>();
-            let requirement = kernel.workspace_requirement(&metadata)?;
+            let requirement = kernel.workspace_requirement_for_execution(views, &metadata)?;
             let prepared = match requirement.lifetime {
                 WorkspaceLifetime::SessionPersistent => &mut *self.persistent_workspace,
                 WorkspaceLifetime::StepScoped => &mut *self.step_workspace,
