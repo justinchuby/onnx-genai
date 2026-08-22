@@ -2662,6 +2662,27 @@ fn workflow_request_value(
                 };
                 Ok(Some(Value::from_slice_i64(&data, &shape)?))
             }
+            GeneratePrompt::TokenRows(rows) => {
+                anyhow::ensure!(
+                    contract.rank == 2,
+                    "multi-row prompt token workflow input must have rank 2"
+                );
+                anyhow::ensure!(!rows.is_empty(), "multi-row prompt must not be empty");
+                let columns = rows[0].len();
+                anyhow::ensure!(
+                    rows.iter().all(|row| row.len() == columns),
+                    "multi-row prompt token rows must have equal lengths"
+                );
+                let data = rows
+                    .iter()
+                    .flatten()
+                    .map(|token| i64::from(*token))
+                    .collect::<Vec<_>>();
+                Ok(Some(Value::from_slice_i64(
+                    &data,
+                    &[rows.len() as i64, columns as i64],
+                )?))
+            }
             GeneratePrompt::Text(_) => anyhow::bail!(
                 "prompt_tokens request binding requires token ids; use a tokenizer adapter for text"
             ),
@@ -4449,7 +4470,7 @@ service_group: decoder_cache
 #[cfg(test)]
 mod workflow_sampling_binding_tests {
     use super::*;
-    use crate::{GenerateOptions, GenerateRequest};
+    use crate::{GenerateOptions, GeneratePrompt, GenerateRequest};
     use onnx_genai_metadata::BatchLayout;
 
     fn request(configure: impl FnOnce(&mut GenerateOptions)) -> GenerateRequest {
@@ -4495,6 +4516,48 @@ mod workflow_sampling_binding_tests {
         assert_eq!(sampling.top_k, 64);
         assert_eq!(sampling.top_p, 0.9);
         assert_eq!(sampling.min_p, 0.05);
+    }
+
+    #[test]
+    fn multi_row_prompt_tokens_bind_as_rank_two() {
+        let mut request = request(|_| {});
+        request.prompt = GeneratePrompt::TokenRows(vec![vec![1, 2, 3], vec![4, 5, 6]]);
+        let contract = TensorContract {
+            dtype: "int64".to_string(),
+            rank: 2,
+            shape: None,
+            optional: false,
+            batch_layout: BatchLayout::default(),
+        };
+
+        let value = workflow_request_value(&RuntimeInputRole::PromptTokens, &request, &contract)
+            .expect("prompt binding")
+            .expect("prompt value");
+        assert_eq!(value.shape(), &[2, 3]);
+        assert_eq!(
+            value.to_vec_i64().expect("prompt rows"),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+    }
+
+    #[test]
+    fn multi_row_prompt_tokens_require_equal_lengths() {
+        let mut request = request(|_| {});
+        request.prompt = GeneratePrompt::TokenRows(vec![vec![1, 2], vec![3]]);
+        let contract = TensorContract {
+            dtype: "int64".to_string(),
+            rank: 2,
+            shape: None,
+            optional: false,
+            batch_layout: BatchLayout::default(),
+        };
+
+        let error =
+            match workflow_request_value(&RuntimeInputRole::PromptTokens, &request, &contract) {
+                Ok(_) => panic!("ragged rows must fail"),
+                Err(error) => error,
+            };
+        assert!(error.to_string().contains("equal lengths"));
     }
 
     #[test]

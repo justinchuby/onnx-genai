@@ -965,6 +965,9 @@ pub enum GeneratePrompt {
     Text(String),
     /// Already-tokenized prompt ids.
     TokenIds(Vec<TokenId>),
+    /// Equal-length token rows for workflows with internal branches such as
+    /// conditional/unconditional guidance. Native text decoders reject this form.
+    TokenRows(Vec<Vec<TokenId>>),
 }
 
 impl From<String> for GeneratePrompt {

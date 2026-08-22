@@ -48,8 +48,11 @@ pub(crate) async fn audio_speech(
             processor.max_input_tokens
         )));
     }
+    let token_rows = processor.token_rows(token_ids).map_err(|error| {
+        ApiError::bad_request(format!("invalid speech guidance rows: {error:#}"))
+    })?;
     let generation = GenerateRequest {
-        prompt: GeneratePrompt::TokenIds(token_ids),
+        prompt: GeneratePrompt::TokenRows(token_rows),
         options: GenerateOptions {
             max_new_tokens: processor.max_output_units,
             max_context: handle.model_max_context,

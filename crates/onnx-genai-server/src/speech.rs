@@ -12,6 +12,16 @@ pub(crate) struct SpeechPromptProcessor {
     pub(crate) max_input_tokens: usize,
     pub(crate) max_output_units: usize,
     segments: Vec<TextSegment>,
+    #[serde(default)]
+    guidance_rows: Option<GuidanceRows>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GuidanceRows {
+    unconditional_token_id: u32,
+    replace_from: usize,
+    preserve_trailing: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -64,6 +74,20 @@ impl SpeechPromptProcessor {
             }
         }
         Ok(prompt)
+    }
+
+    pub(crate) fn token_rows(&self, tokens: Vec<u32>) -> anyhow::Result<Vec<Vec<u32>>> {
+        let Some(guidance) = &self.guidance_rows else {
+            return Ok(vec![tokens]);
+        };
+        anyhow::ensure!(
+            tokens.len() >= guidance.replace_from + guidance.preserve_trailing,
+            "tokenized prompt is too short for the declared guidance-row replacement"
+        );
+        let mut unconditional = tokens.clone();
+        let end = unconditional.len() - guidance.preserve_trailing;
+        unconditional[guidance.replace_from..end].fill(guidance.unconditional_token_id);
+        Ok(vec![tokens, unconditional])
     }
 }
 
@@ -206,6 +230,11 @@ mod tests {
             r#"{
               "max_input_tokens": 5000,
               "max_output_units": 9000,
+              "guidance_rows": {
+                "unconditional_token_id": 151654,
+                "replace_from": 1,
+                "preserve_trailing": 2
+              },
               "segments": [
                 {"literal":"<c>"},
                 {"field":"instructions","transforms":[
@@ -236,6 +265,13 @@ mod tests {
         assert_eq!(
             prompt,
             "<c>Genre\nBPM is 96\nWarm</c><l>[start]\n[verse]\nHello\n[chorus]\nWorld</l>"
+        );
+        let rows = processor
+            .token_rows(vec![10, 11, 12, 13, 14])
+            .expect("guidance rows");
+        assert_eq!(
+            rows,
+            vec![vec![10, 11, 12, 13, 14], vec![10, 151654, 151654, 13, 14]]
         );
     }
 }
