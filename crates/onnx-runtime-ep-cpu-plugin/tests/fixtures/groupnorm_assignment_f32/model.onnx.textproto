@@ -1,4 +1,4 @@
-ir_version: 10
+ir_version: 11
 graph {
   node: [
     { input: ["X", "scale", "bias"] output: ["Z"] op_type: "GroupNormalization"
@@ -32,4 +32,4 @@ graph {
   }
   ]
 }
-opset_import: [{ version: 22 }]
+opset_import: [{ version: 24 }]

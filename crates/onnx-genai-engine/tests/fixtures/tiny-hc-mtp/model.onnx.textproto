@@ -1,4 +1,4 @@
-ir_version: 10
+ir_version: 11
 graph {
   node {
     input: "inputs_embeds"
@@ -147,5 +147,5 @@ graph {
 }
 opset_import {
   domain: ""
-  version: 18
+  version: 24
 }

@@ -19,5 +19,10 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+# Test-only access to the prost `ModelProto`/`decode_model` header decoder for
+# the repo-wide fixture IR/opset guard (already a normal dependency above).
+onnx-runtime-loader = { workspace = true }
+
 [lints]
 workspace = true

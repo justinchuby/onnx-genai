@@ -1,4 +1,4 @@
-ir_version: 8
+ir_version: 11
 graph {
   node: [{
     input: ["X", "skip", "gamma", "", ""]
@@ -70,7 +70,7 @@ graph {
   }]
 }
 opset_import: [{
-  version: 17
+  version: 24
 }, {
   domain: "com.microsoft"
   version: 1
