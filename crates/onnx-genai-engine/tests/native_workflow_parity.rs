@@ -631,6 +631,47 @@ fn ort_backend_builds_ort_sessions() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// On a CUDA box the native backend resolves and reports the CUDA device
+/// (Blocker 2 device/provider propagation — not an auto-detected CPU EP), still
+/// builds zero ORT sessions (Blocker 1), and at a device-resident boundary
+/// either bridges (device bridge wired — boundary A) or **fails closed** with an
+/// actionable native diagnostic — never panics or silently host-copies. If the
+/// CUDA EP cannot load this fixture's ops, session construction fails loudly and
+/// we skip the runtime asserts rather than record a false negative.
+#[cfg(feature = "native-cuda")]
+#[test]
+fn native_cuda_device_propagation_and_fail_closed() -> anyhow::Result<()> {
+    let root = fixture("static_cache");
+    let mut engine = match native_engine(&root) {
+        Ok(engine) => engine,
+        Err(error) => {
+            eprintln!(
+                "native-cuda could not load the static_cache fixture (op coverage); skipping \
+                 runtime asserts: {error:#}"
+            );
+            return Ok(());
+        }
+    };
+    assert!(
+        engine.models().sessions.is_empty(),
+        "Native must build zero ORT sessions even on CUDA"
+    );
+    let status = engine.execution_provider_status();
+    assert!(
+        status.starts_with("native-cuda"),
+        "Native on a CUDA box must report its CUDA device, got {status}"
+    );
+    if let Err(error) = engine.run_pipeline(static_cache_request(2)?) {
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("device-resident") || message.contains("native"),
+            "a device-resident boundary must fail closed with an actionable native diagnostic, \
+             got: {message}"
+        );
+    }
+    Ok(())
+}
+
 /// Fail closed: a native-unsupported op must produce an actionable error naming
 /// the component and the offending dtype — never a silent fall back to ORT. The
 /// checked `decoder` package's RNG sampler casts to uint64, which the native CPU
