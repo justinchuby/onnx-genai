@@ -167,9 +167,15 @@ fn assert_parity_with(
 }
 
 // ── graphs ───────────────────────────────────────────────────────────────────
+//
+// Every model below is IR 11 / default opset 24, the repository floor for new
+// and modified fixtures. The ops used here (`ArgMax` since-13, `Add` since-14,
+// `Less` since-13) had no behavior change after those versions, so raising the
+// import is a version statement rather than a semantic one — the parity these
+// cases assert is unchanged.
 
 const GREEDY: &str = r#"
-ir_version: 8
+ir_version: 11
 graph {
   node { input: "logits" output: "token_ids" op_type: "ArgMax"
     attribute { name: "axis" i: -1 type: 2 }
@@ -184,11 +190,11 @@ graph {
     dim { dim_param: "batch" } dim { dim_param: "vocabulary" } }}}}
   output { name: "token_ids" type { tensor_type { elem_type: 7 shape { dim { dim_param: "batch" } }}}}
 }
-opset_import { domain: "" version: 21 }
+opset_import { domain: "" version: 24 }
 "#;
 
 const ADD_STATE: &str = r#"
-ir_version: 8
+ir_version: 11
 graph {
   node { input: "current" input: "update" output: "next" op_type: "Add" }
   name: "add_state"
@@ -196,11 +202,11 @@ graph {
   input { name: "update" type { tensor_type { elem_type: 7 shape {} }}}
   output { name: "next" type { tensor_type { elem_type: 7 shape {} }}}
 }
-opset_import { domain: "" version: 13 }
+opset_import { domain: "" version: 24 }
 "#;
 
 const LESS: &str = r#"
-ir_version: 8
+ir_version: 11
 graph {
   node { input: "value" input: "limit" output: "continue" op_type: "Less" }
   name: "less"
@@ -208,7 +214,7 @@ graph {
   input { name: "limit" type { tensor_type { elem_type: 7 shape {} }}}
   output { name: "continue" type { tensor_type { elem_type: 9 shape {} }}}
 }
-opset_import { domain: "" version: 13 }
+opset_import { domain: "" version: 24 }
 "#;
 
 // ── metadata ─────────────────────────────────────────────────────────────────

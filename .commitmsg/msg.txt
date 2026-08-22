@@ -1,0 +1,43 @@
+test(fixtures): raise this branch's ONNX fixtures to IR 11 / opset 24 and guard it
+
+Repository requirement: a new or modified test fixture ONNX model must declare
+IR >= 11 and a default-domain opset >= 24.
+
+Audit of everything #1723 adds or copies:
+
+* `gemma4_chained` and `gemma4_chained_mixed` (4 `*.onnx.textproto`) were already
+  IR 11 / opset 24, as are the two generators the graphs came from
+  (`build_tiny_gemma4_assistant.py`, `build_tiny_gemma4_assistant_mixed.py`), so
+  the committed copies and their generators agree -- nothing to regenerate.
+* The three models authored inline in `native_workflow_parity.rs` were IR 8 with
+  opset 21/13/13. Raised to IR 11 / opset 24. `ArgMax` (since-13), `Add`
+  (since-14), and `Less` (since-13) had no behavior change after those versions,
+  so this is a version statement rather than a semantic one -- and the parity the
+  cases assert is unchanged, verified on ORT, native CPU, and H200 native CUDA
+  (`native_workflow_parity` 10/10 and 12/12).
+
+No other ONNX artifact is added by this branch; `input_embedding.f32` and
+`tokenizer.json` are not models.
+
+`fixture_ir_opset_floor` is the local guard. It checks the committed packages and
+the inline models this PR owns, because inline models are exactly where an old
+version creeps back unnoticed -- they are string literals, so no ONNX tool sees
+them until a test runs.
+
+Its scope is deliberately narrow. Widening it to pre-existing fixtures would make
+this branch red for the mainline fixture-upgrade PR's work, which is the fastest
+way to get a guard disabled; the module says so and says what to replace when
+that PR lands. The checks themselves already generalize.
+
+The guard is verified two ways rather than trusted: a self-test pins that the
+parser handles single-line and block `opset_import` forms, treats a missing
+`domain` as the default domain, refuses to let a custom domain satisfy the
+default-domain floor, and reports every import so one stale block cannot hide
+behind a current one; and reintroducing `ir_version: 8` into
+`native_workflow_parity.rs` was confirmed to fail it, naming the offending model.
+
+Verified: `onnx-genai-engine` full suite under `native-backend` -- 70 targets,
+zero failures; H200 `native_workflow_parity` 12/12; `cargo fmt --all --check`;
+`cargo clippy --locked --all-targets -D warnings`.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
