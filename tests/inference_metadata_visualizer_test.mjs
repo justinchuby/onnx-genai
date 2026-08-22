@@ -138,18 +138,22 @@ const decodeMermaidLabel = quoted => {
   return String.fromCodePoint(...codes);
 };
 
-test("mermaidText encodes every character as a numeric entity and round-trips for display", () => {
+test("mermaidText encodes every character as a numeric entity and round-trips exactly", () => {
   const adversarial = [
     'A] --> Evil[pwn]',            // bracket + edge-arrow node injection
     'a{b}c|d',                     // rhombus braces + edge-label pipe
     'q"uote and ; semicolon',      // string break-out + statement separator
     "line1\nline2\ttab",           // newline / tab control characters
+    "\tleading tab and trailing spaces   ", // leading/trailing whitespace
+    "a    b\n\n  c",               // runs of whitespace, blank lines
     '<img src=x onerror=alert(1)>',// HTML event handler
     '<script>globalThis.pwned=1</script>', // script element
     'javascript:alert(1)',         // dangerous URL scheme
     'A & B --- C ==> D',           // ampersand + open/thick links
     'id@{shape: rect}',            // Mermaid @-metadata syntax
-    'héllo · 世界 · 😀 · \u202Ereversed', // Unicode incl. astral + bidi control
+    'héllo · 世界 · 😀🧬 · \u202Ereversed', // Unicode incl. astral pairs + bidi control
+    // A value far longer than any old truncation limit (200 code points) must survive whole.
+    'Z]-->{'.repeat(20) + '😀'.repeat(20) + 'tail; end',
   ];
   for (const payload of adversarial) {
     const label = H.mermaidText(payload);
@@ -157,10 +161,14 @@ test("mermaidText encodes every character as a numeric entity and round-trips fo
     assert.match(label, /^"(?:#\d+;)*"$/, payload);
     assert.doesNotMatch(label.slice(1, -1), /[\[\]{}()|<>&"`]/, payload);
     assert.doesNotMatch(label, /-->|---|==>|javascript:|onerror|<script|<img|alert/i, payload);
-    // Display is preserved: decoding reproduces the whitespace-collapsed text.
-    const expected = payload.replace(/\s+/g, " ").trim();
-    assert.equal(decodeMermaidLabel(label), expected, payload);
+    // The security path is lossless: it never normalizes whitespace and never
+    // truncates, so decoding reproduces the exact original value byte-for-byte.
+    assert.equal(decodeMermaidLabel(label), payload, payload);
   }
+  // Explicitly pin the no-truncation guarantee for a >80 code-point value.
+  const long = "🧬".repeat(130); // 130 astral code points
+  assert.equal([...decodeMermaidLabel(H.mermaidText(long))].length, 130);
+  assert.equal(decodeMermaidLabel(H.mermaidText(long)), long);
   // Empty / nullish labels degrade to a safe placeholder, still fully encoded.
   assert.equal(decodeMermaidLabel(H.mermaidText("")), "unnamed");
   assert.equal(decodeMermaidLabel(H.mermaidText(null)), "unnamed");

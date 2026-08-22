@@ -81,15 +81,20 @@
   // HTML entity (#<codepoint>;) inside a double-quoted label. No raw metadata
   // character ever reaches the Mermaid grammar, so brackets, edge arrows
   // (-->), quotes, braces, pipes, ampersands, semicolons, HTML tags, newlines,
-  // and arbitrary Unicode cannot inject nodes, edges, or markup. Mermaid decodes
-  // the entities back to the original glyphs at render time, so display is exact.
+  // tabs, and arbitrary/astral Unicode cannot inject nodes, edges, or markup.
+  // Mermaid decodes the entities back to the original glyphs at render time.
+  // This is a pure, lossless security transform: it never normalizes whitespace
+  // and never truncates, so the encoded label round-trips the exact value. Any
+  // visual shortening must be a separate UI affordance that keeps the full
+  // value (e.g. a title/details element), never a step baked into this path.
   const BRANCH_KINDS=new Set(["conditional","if","branch","switch","select","case"]);
   const LOOP_KINDS=new Set(["loop","while","for","repeat","foreach","until"]);
   function stepShapeKind(kind){return BRANCH_KINDS.has(kind)?"branch":LOOP_KINDS.has(kind)?"loop":"step"}
-  function mermaidText(value,max=80){
-    const collapsed=String(value??"").replace(/\s+/g," ").trim()||"unnamed";
-    let out="",count=0;
-    for(const ch of collapsed){if(count++>=max)break;out+="#"+ch.codePointAt(0)+";"}
+  function mermaidText(value){
+    const text=String(value??"");
+    if(text==="")return '"#117;#110;#110;#97;#109;#101;#100;"';  // "unnamed" placeholder for empty labels only
+    let out="";
+    for(const ch of text)out+="#"+ch.codePointAt(0)+";";  // one numeric entity per code point, verbatim
     return '"'+out+'"';
   }
   // Structured control-flow graph. Instead of chaining the depth-first step list
