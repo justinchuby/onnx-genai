@@ -146,13 +146,6 @@ struct Bnsh {
     dim: usize,
 }
 
-impl Bnsh {
-    #[inline]
-    fn at(&self, b: usize, h: usize, s: usize, d: usize) -> f32 {
-        self.data[((b * self.heads + h) * self.seq + s) * self.dim + d]
-    }
-}
-
 /// Elements below which the layout transforms stay on one thread: the copies
 /// are pure memory traffic, so the crossover is where a worker's share covers
 /// more than a few pages. Decode steps (`seq == 1`) never reach it.
@@ -333,6 +326,23 @@ fn load_bnsh(
 
 /// Concatenate an optional past cache `[B, N, P, dim]` in front of `cur`
 /// `[B, N, L, dim]` along the sequence axis → `[B, N, P+L, dim]`.
+/// Concatenate a past-KV cache with the current step's keys or values along the
+/// sequence axis.
+///
+/// [`Bnsh`] is contiguous `[b][h][s][d]`, so for a fixed `(b, h)` plane both
+/// sources are *already* laid out exactly as the destination needs them: the
+/// concat is two `copy_from_slice` calls, not `total · dim` element moves.
+///
+/// This previously nested `for d in 0..dim { for j in 0..seq { … } }`, i.e. it
+/// walked a row-major buffer in column-major order. Consecutive stores were
+/// `dim` floats apart — 512 B at Llama's head size, so every store touched a
+/// fresh cache line and the whole tensor was traversed `dim` times. On the
+/// decode shape (1×32 heads, 1024 total, dim 128) that is ~4.2 M near-certain
+/// cache misses per tensor, and it cost ~20 ms of a ~28 ms node: the operator
+/// spent the overwhelming majority of a decode step copying its own cache.
+/// The sibling transforms above document this exact rule; this function was
+/// the one place that broke it, and no benchmark row supplied a past-KV cache,
+/// so nothing measured it until #1685's coverage audit added one.
 fn concat_cache(past: Option<&Bnsh>, cur: &Bnsh, name: &str) -> Result<Bnsh> {
     let Some(past) = past else {
         return Ok(Bnsh {
@@ -353,20 +363,36 @@ fn concat_cache(past: Option<&Bnsh>, cur: &Bnsh, name: &str) -> Result<Bnsh> {
     let (batch, heads, dim) = (cur.batch, cur.heads, cur.dim);
     let total = past.seq + cur.seq;
     let mut data = vec![0.0f32; batch * heads * total * dim];
-    for b in 0..batch {
-        for h in 0..heads {
-            for d in 0..dim {
-                for j in 0..past.seq {
-                    let dst = ((b * heads + h) * total + j) * dim + d;
-                    data[dst] = past.at(b, h, j, d);
-                }
-                for j in 0..cur.seq {
-                    let dst = ((b * heads + h) * total + past.seq + j) * dim + d;
-                    data[dst] = cur.at(b, h, j, d);
-                }
-            }
+    let plane = total * dim;
+    if plane == 0 || batch == 0 || heads == 0 {
+        return Ok(Bnsh {
+            data,
+            batch,
+            heads,
+            seq: total,
+            dim,
+        });
+    }
+
+    let past_plane = past.seq * dim;
+    let cur_plane = cur.seq * dim;
+    let fill = |bh: usize, out: &mut [f32]| {
+        let (head, tail) = out.split_at_mut(past_plane);
+        head.copy_from_slice(&past.data[bh * past_plane..bh * past_plane + past_plane]);
+        tail.copy_from_slice(&cur.data[bh * cur_plane..bh * cur_plane + cur_plane]);
+    };
+
+    if data.len() >= MIN_PARALLEL_TRANSPOSE_ELEMENTS {
+        use rayon::prelude::*;
+        data.par_chunks_mut(plane)
+            .enumerate()
+            .for_each(|(bh, out)| fill(bh, out));
+    } else {
+        for (bh, out) in data.chunks_mut(plane).enumerate() {
+            fill(bh, out);
         }
     }
+
     Ok(Bnsh {
         data,
         batch,
