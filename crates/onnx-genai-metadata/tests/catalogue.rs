@@ -19,7 +19,7 @@ fn every_catalogue_example_parses_and_validates() {
 
     assert_eq!(
         examples.len(),
-        21,
+        24,
         "catalogue must cover all requested cases"
     );
     for path in examples {
@@ -66,6 +66,55 @@ fn every_catalogue_example_parses_and_validates() {
                 full_key[1], sliding_key[1],
                 "different layers must not inherit one package-wide KV head count"
             );
+        }
+        if path
+            .file_name()
+            .is_some_and(|name| name == std::ffi::OsStr::new("23-gemma4-e2b-moe-decoder.yaml"))
+        {
+            let moe = metadata
+                .model
+                .as_ref()
+                .and_then(|model| model.mixture_of_experts.as_ref())
+                .expect("23-gemma4-e2b declares a mixture-of-experts FFN");
+            assert_eq!(moe.experts_per_token, 2);
+            let full_key = workflow.state["full_key_0"]
+                .contract
+                .shape
+                .as_ref()
+                .expect("full key shape");
+            let sliding_key = workflow.state["sliding_key_0"]
+                .contract
+                .shape
+                .as_ref()
+                .expect("sliding key shape");
+            assert_ne!(
+                full_key[3], sliding_key[3],
+                "global and local layers must keep independent head widths"
+            );
+        }
+        if path.file_name().is_some_and(|name| {
+            name == std::ffi::OsStr::new("24-gemma4-e2b-assistant-speculative.yaml")
+        }) {
+            // The assistant reads the target's attention groups read-only and
+            // never advances them; its resolved decode ABI therefore owns no KV.
+            let assistant = onnx_genai_metadata::decoder_abi(workflow, "assistant")
+                .expect("assistant ABI resolves");
+            assert_eq!(
+                assistant.kv_ownership,
+                Some(onnx_genai_metadata::KvOwnership::Shared)
+            );
+            assert!(
+                assistant.kv_inputs.is_none(),
+                "read-only shares are not KV transitions"
+            );
+            assert!(matches!(
+                metadata
+                    .speculative
+                    .as_ref()
+                    .expect("speculative")
+                    .proposal_execution,
+                onnx_genai_metadata::SpeculativeProposalExecution::Chained { .. }
+            ));
         }
         for (name, component) in &workflow.components {
             if let ComponentImplementation::Onnx { artifact } = &component.implementation {

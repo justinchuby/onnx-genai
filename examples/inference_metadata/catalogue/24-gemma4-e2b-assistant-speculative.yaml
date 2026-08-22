@@ -1,0 +1,299 @@
+# Gemma 4 E2B assistant. Real-package shape for the pruned, shared-KV drafter
+# `google/gemma-4-E2B-it-assistant` paired with its `google/gemma-4-E2B-it`
+# target in one speculative workflow.
+#
+# The schema carries no model name; artifact paths and this comment identify the
+# concrete pair. Every fact below is generic and graph-visible:
+#
+#   * Cacheless assistant: the drafter owns NO attention KV. It reads the
+#     target-owned `full_attention` and `sliding_attention` groups through
+#     `access: read_only` aliases, so it observes the committed prefix without
+#     advancing or aliasing it. The read-only present outputs it still exposes
+#     (a fused-attention kernel emits them) are discarded, never a transition.
+#   * Heterogeneous, subset KV: the target owns two global layers (0, 1) and one
+#     local layer (0) with independent head counts and head widths; the drafter
+#     reads only global layer 0 and local layer 0, mapping its two attention
+#     layers onto a smaller set of physical target owners.
+#   * Concatenated target handoff: the drafter's `inputs_embeds` is
+#     `concat(target_input_embedding(last_token), target_hidden)`; the target
+#     input-embedding table is borrowed through `speculative.shared_weights`
+#     (ordered embeddings) and the hidden half is declared through
+#     `speculative.port_bindings.target_hidden_context`.
+#   * Chained recurrence, no draft cache: the ONLY loop-carried cell the drafter
+#     owns is `projected_state` (a `recurrent` / `replace` group). Each drafter
+#     invocation emits one draft distribution plus the next `projected_state`;
+#     the runtime re-invokes it up to `max_proposal_width`.
+#   * Sparse / pruned LM head: the drafter's vocabulary is a prefix-ordered
+#     subset of the target's (`vocabulary: {kind: subset}`), so its logits axis
+#     is smaller than the target's. A pruned drafter is not distribution
+#     preserving, so the caller must opt speculation in.
+#   * Atomic rollback: a rejected proposal rewinds every target KV cell and the
+#     drafter's `projected_state`, each covered to `max_proposal_width`.
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      capabilities: [workflow_ssa, typed_emit, serving_service_contract]
+    inputs:
+      request.active:
+        contract: {dtype: bool, rank: 1, shape: [batch], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: opaque}
+        source: {kind: application, name: active}
+        required: true
+      request.done:
+        contract: {dtype: bool, rank: 1, shape: [batch], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: opaque}
+        source: {kind: application, name: done}
+        required: true
+      request.accepted_len:
+        contract: {dtype: int64, rank: 1, shape: [batch], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: opaque}
+        source: {kind: application, name: accepted_len}
+        required: true
+      request.input_ids:
+        contract: {dtype: int64, rank: 2, shape: [batch, sequence], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: runtime, version: '1.0', role: prompt_tokens}
+        source: {kind: request}
+        required: true
+      request.inputs_embeds:
+        contract: {dtype: float16, rank: 3, shape: [batch, sequence, fused_hidden], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: opaque}
+        source: {kind: application, name: inputs_embeds}
+        required: true
+      request.projected_state:
+        contract: {dtype: float16, rank: 3, shape: [batch, sequence, hidden], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: opaque}
+        source: {kind: application, name: projected_state}
+        required: true
+      request.full_key_0:
+        contract: {dtype: float16, rank: 4, shape: [batch, full_key_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: opaque}
+        source: {kind: application, name: full_key_0}
+        required: true
+      request.full_value_0:
+        contract: {dtype: float16, rank: 4, shape: [batch, full_value_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: opaque}
+        source: {kind: application, name: full_value_0}
+        required: true
+      request.full_key_1:
+        contract: {dtype: float16, rank: 4, shape: [batch, full_key_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: opaque}
+        source: {kind: application, name: full_key_1}
+        required: true
+      request.full_value_1:
+        contract: {dtype: float16, rank: 4, shape: [batch, full_value_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: opaque}
+        source: {kind: application, name: full_value_1}
+        required: true
+      request.sliding_key_0:
+        contract: {dtype: float16, rank: 4, shape: [batch, sliding_key_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: opaque}
+        source: {kind: application, name: sliding_key_0}
+        required: true
+      request.sliding_value_0:
+        contract: {dtype: float16, rank: 4, shape: [batch, sliding_value_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: opaque}
+        source: {kind: application, name: sliding_value_0}
+        required: true
+    outputs:
+      logits:
+        contract: {dtype: float16, rank: 3, shape: [batch, sequence, vocab], batch_layout: {kind: request_aligned, axis: 0}}
+        role: tensor
+        stage: pre_adapter
+    components:
+      assistant:
+        implementation: {kind: onnx, artifact: gemma4_e2b_assistant/model.onnx.textproto}
+        ports:
+          inputs:
+            inputs_embeds: {dtype: float16, rank: 3, shape: [batch, sequence, fused_hidden], batch_layout: {kind: request_aligned, axis: 0}}
+            projected_state: {dtype: float16, rank: 3, shape: [batch, sequence, hidden], batch_layout: {kind: request_aligned, axis: 0}}
+            full_key_0: {dtype: float16, rank: 4, shape: [batch, full_key_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            full_value_0: {dtype: float16, rank: 4, shape: [batch, full_value_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            sliding_key_0: {dtype: float16, rank: 4, shape: [batch, sliding_key_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            sliding_value_0: {dtype: float16, rank: 4, shape: [batch, sliding_value_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+          outputs:
+            draft_logits: {dtype: float16, rank: 3, shape: [batch, sequence, draft_vocab], batch_layout: {kind: request_aligned, axis: 0}}
+            next_projected_state: {dtype: float16, rank: 3, shape: [batch, sequence, hidden], batch_layout: {kind: request_aligned, axis: 0}}
+            present_full_key_0: {dtype: float16, rank: 4, shape: [batch, full_key_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            present_full_value_0: {dtype: float16, rank: 4, shape: [batch, full_value_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            present_sliding_key_0: {dtype: float16, rank: 4, shape: [batch, sliding_key_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            present_sliding_value_0: {dtype: float16, rank: 4, shape: [batch, sliding_value_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+      target:
+        implementation: {kind: onnx, artifact: gemma4_e2b/decoder.onnx.textproto}
+        ports:
+          inputs:
+            input_ids: {dtype: int64, rank: 2, shape: [batch, sequence], batch_layout: {kind: request_aligned, axis: 0}}
+            full_key_0: {dtype: float16, rank: 4, shape: [batch, full_key_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            full_value_0: {dtype: float16, rank: 4, shape: [batch, full_value_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            full_key_1: {dtype: float16, rank: 4, shape: [batch, full_key_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            full_value_1: {dtype: float16, rank: 4, shape: [batch, full_value_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            sliding_key_0: {dtype: float16, rank: 4, shape: [batch, sliding_key_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            sliding_value_0: {dtype: float16, rank: 4, shape: [batch, sliding_value_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+          outputs:
+            logits: {dtype: float16, rank: 3, shape: [batch, sequence, vocab], batch_layout: {kind: request_aligned, axis: 0}}
+            hidden: {dtype: float16, rank: 3, shape: [batch, sequence, hidden], batch_layout: {kind: request_aligned, axis: 0}}
+            next_full_key_0: {dtype: float16, rank: 4, shape: [batch, full_key_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            next_full_value_0: {dtype: float16, rank: 4, shape: [batch, full_value_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            next_full_key_1: {dtype: float16, rank: 4, shape: [batch, full_key_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            next_full_value_1: {dtype: float16, rank: 4, shape: [batch, full_value_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            next_sliding_key_0: {dtype: float16, rank: 4, shape: [batch, sliding_key_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            next_sliding_value_0: {dtype: float16, rank: 4, shape: [batch, sliding_value_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+          roles: {input_ids: token_ids, logits: logits}
+    state:
+      full_key_0:
+        contract: {dtype: float16, rank: 4, shape: [batch, full_key_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        scope: invocation
+        initializer: request.full_key_0
+        recurrence: {kind: invariant}
+        management: runtime
+        release_boundary: invocation
+        service_group: full_attention
+      full_value_0:
+        contract: {dtype: float16, rank: 4, shape: [batch, full_value_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        scope: invocation
+        initializer: request.full_value_0
+        recurrence: {kind: invariant}
+        management: runtime
+        release_boundary: invocation
+        service_group: full_attention
+      full_key_1:
+        contract: {dtype: float16, rank: 4, shape: [batch, full_key_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        scope: invocation
+        initializer: request.full_key_1
+        recurrence: {kind: invariant}
+        management: runtime
+        release_boundary: invocation
+        service_group: full_attention
+      full_value_1:
+        contract: {dtype: float16, rank: 4, shape: [batch, full_value_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        scope: invocation
+        initializer: request.full_value_1
+        recurrence: {kind: invariant}
+        management: runtime
+        release_boundary: invocation
+        service_group: full_attention
+      sliding_key_0:
+        contract: {dtype: float16, rank: 4, shape: [batch, sliding_key_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        scope: invocation
+        initializer: request.sliding_key_0
+        recurrence: {kind: invariant}
+        management: runtime
+        release_boundary: invocation
+        service_group: sliding_attention
+      sliding_value_0:
+        contract: {dtype: float16, rank: 4, shape: [batch, sliding_value_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        scope: invocation
+        initializer: request.sliding_value_0
+        recurrence: {kind: invariant}
+        management: runtime
+        release_boundary: invocation
+        service_group: sliding_attention
+      projected_state:
+        contract: {dtype: float16, rank: 3, shape: [batch, sequence, hidden], batch_layout: {kind: request_aligned, axis: 0}}
+        scope: invocation
+        initializer: request.projected_state
+        recurrence: {kind: invariant}
+        management: runtime
+        release_boundary: invocation
+        service_group: assistant_state
+    steps:
+    - kind: invoke
+      component: assistant
+      inputs:
+        inputs_embeds: request.inputs_embeds
+        projected_state: request.projected_state
+        full_key_0: request.full_key_0
+        full_value_0: request.full_value_0
+        sliding_key_0: request.sliding_key_0
+        sliding_value_0: request.sliding_value_0
+      outputs:
+        draft_logits: draft.logits
+        next_projected_state: draft.projected_state
+        present_full_key_0: draft.present_full_key_0
+        present_full_value_0: draft.present_full_value_0
+        present_sliding_key_0: draft.present_sliding_key_0
+        present_sliding_value_0: draft.present_sliding_value_0
+    - kind: invoke
+      component: target
+      inputs:
+        input_ids: request.input_ids
+        full_key_0: request.full_key_0
+        full_value_0: request.full_value_0
+        full_key_1: request.full_key_1
+        full_value_1: request.full_value_1
+        sliding_key_0: request.sliding_key_0
+        sliding_value_0: request.sliding_value_0
+      outputs:
+        logits: target.logits
+        hidden: target.hidden
+        next_full_key_0: target.full_key_0
+        next_full_value_0: target.full_value_0
+        next_full_key_1: target.full_key_1
+        next_full_value_1: target.full_value_1
+        next_sliding_key_0: target.sliding_key_0
+        next_sliding_value_0: target.sliding_value_0
+    - kind: emit
+      value: target.logits
+      output: logits
+      mode: replace
+    serving:
+      active: request.active
+      done: request.done
+      accepted_len: request.accepted_len
+      state_service:
+        groups:
+          full_attention:
+            kind: full_attention
+            sequence_axis: 2
+            layout: bnsh
+            update: {kind: append}
+            reuse: {prefix_reusable: true, evictable_prefix: false}
+            capabilities: {rollback_positions: 4, snapshot: true, fork: true}
+            ports:
+              target:
+                full_key_0: {input: full_key_0, output: next_full_key_0, role: key, layer: 0}
+                full_value_0: {input: full_value_0, output: next_full_value_0, role: value, layer: 0}
+                full_key_1: {input: full_key_1, output: next_full_key_1, role: key, layer: 1}
+                full_value_1: {input: full_value_1, output: next_full_value_1, role: value, layer: 1}
+              assistant:
+                full_key_0: {input: full_key_0, output: present_full_key_0, access: read_only, role: key, layer: 0}
+                full_value_0: {input: full_value_0, output: present_full_value_0, access: read_only, role: value, layer: 0}
+          sliding_attention:
+            kind: sliding_attention
+            sequence_axis: 2
+            layout: bnsh
+            update: {kind: append}
+            reuse: {prefix_reusable: true, evictable_prefix: true}
+            capabilities: {rollback_positions: 4, snapshot: true, fork: true}
+            ports:
+              target:
+                sliding_key_0: {input: sliding_key_0, output: next_sliding_key_0, role: key, layer: 0}
+                sliding_value_0: {input: sliding_value_0, output: next_sliding_value_0, role: value, layer: 0}
+              assistant:
+                sliding_key_0: {input: sliding_key_0, output: present_sliding_key_0, access: read_only, role: key, layer: 0}
+                sliding_value_0: {input: sliding_value_0, output: present_sliding_value_0, access: read_only, role: value, layer: 0}
+          assistant_state:
+            kind: recurrent
+            layout: bsh
+            update: {kind: replace}
+            capabilities: {rollback_positions: 4, snapshot: true, fork: true}
+            ports:
+              assistant:
+                projected_state: {input: projected_state, output: next_projected_state}
+speculative:
+  proposer: assistant
+  target: target
+  proposal_execution:
+    kind: chained
+    token_embedding_input: inputs_embeds
+    logits_output: draft_logits
+    recurrent:
+    - {state: projected_state, input: projected_state, output: next_projected_state}
+  port_bindings:
+    target_hidden_context: inputs_embeds
+  shared_state: [full_attention, sliding_attention]
+  shared_weights: [target_embedding.f32]
+  vocabulary: {kind: subset, proposer_vocab_size: 24}
+  max_proposal_width: 4
+  distribution_preserving: false
+  rollback_state: [full_key_0, full_value_0, full_key_1, full_value_1, sliding_key_0, sliding_value_0, projected_state]
