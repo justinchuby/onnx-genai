@@ -511,6 +511,14 @@ speculative:
         "      - kind: invoke\n        component: proposer",
         "      - kind: invoke\n        component: proposer\n        inputs: { inputs_embeds: empty_cache, past_state: empty_cache }\n        outputs: { draft_logits: draft.logits, next_state: draft.next_state }",
         1,
+    )
+    // The proposer's recurrence advances `cache`, so the decoder_cache group
+    // must expose a read_write proposer alias for it: the verifier alias alone
+    // does not carry the proposer's loop, and a chained recurrence must resolve
+    // through serving.state_service.groups.*.ports.proposer.
+    .replace(
+        "              verifier:\n                cache: { input: past_key_values, output: present_key_values }",
+        "              verifier:\n                cache: { input: past_key_values, output: present_key_values }\n              proposer:\n                cache: { input: past_state, output: next_state }",
     );
     validate_metadata(&parse(&metadata)).expect("typed chained proposer must validate");
 
