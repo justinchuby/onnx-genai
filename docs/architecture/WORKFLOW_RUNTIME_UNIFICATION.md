@@ -1,9 +1,12 @@
 # Workflow-runtime unification: making `pipeline.workflow` the sole runtime
 
-Status: **Phase 0, Phase 1, and the runtime-type collapse have landed. One
-public runtime type remains and no caller dispatches on package shape. Making
-the interpreter execute *plain-decoder* text generation is blocked on a
-ratified-rule decision the parent owns — see §7.** The parent ratified REPLACE + DELETE (no
+Status: **Phase 0, Phase 1, the runtime-type collapse, and the canonical
+lowering have landed.** One public runtime type remains, no caller dispatches on
+package shape, and a bare decoder now *has* a canonical `WorkflowSpec` — compiled
+in memory from its own `model.io`, which stays the sole serialized answer. The
+remaining step is having the interpreter **execute** that lowered workflow for
+plain decoders and deleting the decode-core orchestration; §7 records the
+parent's decision (option A) and what is still to build. The parent ratified REPLACE + DELETE (no
 compatibility facade, no permanent delegator) and assigned this consolidation to
 the owner of PR #1723. Its two gate conditions are both satisfied: `#1716` is on
 `main` (`7b79b3f5`), merged here (never rebased), and the hermetic executable
@@ -319,56 +322,72 @@ Shared infrastructure both engines already use — `engine/load.rs`,
 `placement.rs`, `session_state.rs` — is **kept**; it is not duplicated
 orchestration.
 
-## 7. Blocker: a bare decoder cannot hold a workflow under the current rule
+## 7. Canonical lowering (parent decision A) — landed, and what remains
 
-The remaining step — the interpreter executing plain-decoder text generation, so
-`pipeline.workflow` is the sole runtime for *every* package — needs a bare
-decoder package to have a `WorkflowSpec`. Three facts in this repo make that a
-decision rather than an implementation:
+The parent chose **A: in-memory-only canonical lowering.** Authored bare-decoder
+metadata is unchanged and still valid; `model.io` remains the sole serialized
+source; the runtime compiles it into an internal canonical `WorkflowSpec` at
+load. No schema relaxation, no package re-authoring.
 
-1. **`validate_metadata` rejects `model.io` beside `pipeline.workflow`**
-   (`crates/onnx-genai-metadata/src/validation.rs`,
-   `validate_model_io_against_workflow`). The rule is deliberate and documented:
-   "a second serialized expression of the same facts is not redundancy but a
-   fork". Every bare-decoder package declares `model.io`. Giving one a workflow
-   therefore makes it *invalid by our own ratified rule*.
-2. **`PipelineModelDirectory::load` requires `metadata.pipeline`**
-   (`crates/onnx-genai-ort/src/loader.rs`) — it errors with "metadata has no
-   pipeline section". The workflow runtime's component store cannot be built for
-   a package that has none.
-3. **`InferenceMetadata::decoder_io_is_legacy()` is observable.** It reports
-   "this ABI came from the deprecated block" by asking whether a workflow
-   resolved. Synthesizing one flips that answer for every existing package, and
-   the server surfaces the related fact on `/v1/debug/config`.
+### Landed
 
-The parent must pick one:
+`onnx_genai_metadata::canonical` is the compiler.
 
-- **(A) In-memory canonical workflow only.** The synthesized `WorkflowSpec`
-  never enters `InferenceMetadata.pipeline`, so validation never sees the pair
-  and `decoder_io_is_legacy()` keeps its current answer. "Sole runtime" then
-  holds at *execution* while the metadata surface still calls a bare decoder
-  non-workflow. Implementable without a schema change: the decode node can be a
-  `ComponentImplementation::Binding` component carrying a
-  `contract.id: onnx-genai.autoregressive-decode`, which the interpreter
-  dispatches the way it already dispatches adapters by `(abi, version)` — no new
-  enum variant, no JSON-schema change. Needs a component-less `PipelineModels`
-  constructor in `onnx-genai-ort`.
-- **(B) Relax the rule for synthesized workflows.** Permit `model.io` beside a
-  workflow when the workflow is synthesized, which requires a serialized fact
-  distinguishing synthesized from authored — a schema addition, and a weakening
-  of the "one writable answer" invariant §7.1 exists to protect.
-- **(C) Re-author every package.** Require `pipeline.workflow` in every package
-  and drop `model.io`. Clean, and breaks every published bare-decoder package
-  until it is re-exported.
+* **Deterministic and derived.** A pure function of the declared ABI — same
+  `ModelIoSpec` in, byte-identical document out. That is what makes the lowered
+  form derived rather than a second authored answer: it cannot drift from
+  `model.io`, because it is recomputed from it on every load. Nothing writes it
+  back, so `validate_model_io_against_workflow` never sees a pair.
+* **No schema change.** Both canonical components are `binding` components
+  identified by contract id — `onnx-genai.autoregressive-decode` (one decoder
+  forward pass) and `onnx-genai.token-policy` (next-token selection and stop
+  detection) — dispatched the way workflow adapters already are. The published
+  JSON schema is untouched.
+* **KV stays with its executor.** The lowered state cells are declared
+  `management: runtime`, the schema's existing word for "the runtime owns these
+  buffers", so the paged / share-buffer / CUDA-graph executors keep owning their
+  KV. The interpreter owns the *loop*, not the KV bytes — which is what keeps
+  device residency intact.
+* **Honest provenance.** `Engine::workflow_provenance()` and
+  `/v1/debug/config.workflow_provenance` report `authored` | `lowered` | `none`.
+  `pipeline` keeps its old meaning (does the package *serialize* a workflow), so
+  a lowered decoder reports `pipeline: false, workflow_provenance: "lowered"` and
+  no report claims the file contains something it does not.
+* **Proven.** 7 unit cases plus `canonical_lowering_corpus` over the real corpus
+  (7 packages: phi35-mini int4 shared-buffer, qwen3-0.6b int4, qwen2.5-0.5b CUDA,
+  qwen2.5-coder-7b, phi4-mini CUDA, gpt-oss-20b MoE, qwen3.5-2b), asserting
+  deterministic lowering and exact ABI mirroring. Greedy goldens over 5 real
+  models are byte-identical before and after. See
+  [`.goldens/REAL_MODEL_EVIDENCE.md`](../../.goldens/REAL_MODEL_EVIDENCE.md).
 
-**Second, independent gate on any of the three: verification.** Rewiring
-`Engine::generate` for bare decoders moves the production text-generation path.
-Its coverage is largely real-model (`*_divergence`, `*_decode_lock`,
-`phi35_*`, `qwen*`, `deepseek*`), which skip without downloaded weights, so the
-change cannot be proven green in a weightless environment. Landing it needs a
-run with the model corpus available — otherwise Rule 8 is satisfied on paper by
-tests that did not execute.
+### Remaining, by symbol
 
-Everything short of that gate is done: one runtime type, one constructor, one
-generation entry point, one session API, and no caller-side dispatch (§6 items
-for the server, CLI, C ABI, and benchmarks are complete and tested).
+Lowering produces the canonical workflow; the interpreter does not yet *run* it
+for a plain decoder. `Engine::generate_with_callbacks` still routes a
+non-workflow package to the decode core. To finish:
+
+1. **`PipelineModels` for a component-less package** (`onnx-genai-ort/loader.rs`)
+   — the lowered workflow declares two `binding` components and zero ONNX
+   artifacts, so the component store must be constructible without a `pipeline`
+   metadata section. Needs a constructor; no schema change.
+2. **Ownership inversion** — the interpreter must reach the decode executor.
+   `Engine` currently owns `WorkflowRuntime`; either flatten the two field sets
+   into the one struct (field names collide only on `decode_backend`,
+   `memory_strategy_plan`, and the governor, all already reconciled) or thread
+   the executor through `run_workflow_node`.
+3. **The two contract executors** (`pipeline/workflow.rs`) — dispatch
+   `onnx-genai.autoregressive-decode` to the resolved decode session and
+   `onnx-genai.token-policy` to `processors.rs::select_next_token*` /
+   `finish_reason_after_token`, so sampling and stopping have exactly one
+   implementation shared with authored workflows.
+4. **Route and delete** — point `Engine::generate*` at `run_workflow` for lowered
+   packages, then delete `decode_loop.rs::run_decode_loop` as a *loop* (its
+   policy helpers stay, now called from the node) and the generate-time
+   declaration switch.
+5. **Re-prove** — the goldens in `.goldens/` are the parity gate: the same 5 real
+   models must still produce byte-identical greedy streams, plus the H200 CUDA
+   suites.
+
+Step 3 is where the design earns or loses: if the decode executor ends up owning
+the token loop rather than one forward pass, the result is the opaque node the
+parent explicitly ruled out.
