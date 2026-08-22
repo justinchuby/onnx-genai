@@ -19478,6 +19478,16 @@ mod tests {
     /// `ONNX_GENAI_CPU_DECODE_THREADS`, not the width the pool actually built.
     const BENCHMARKED_DECODE_WIDTHS: [usize; 5] = [1, 2, 4, 8, 16];
 
+    /// Upper bound on the extra fully-subscribed probe width.
+    ///
+    /// The probe asks for as many lanes as the process has allowed CPUs so the
+    /// dispatcher-reservation path is reached, but on a many-core host that
+    /// would spin up ~one worker per core just to read a count. Above this many
+    /// allowed CPUs, skip it rather than make it cheap-but-meaningless: a
+    /// partial request lands back in the no-op branch the probe exists to
+    /// avoid, which would be coverage in name only.
+    const SPMD_WIDTH_FULL_SUBSCRIPTION_CAP: usize = 32;
+
     /// Marker prefix for the realized-width child's single report line.
     const SPMD_WIDTH_MARKER: &str = "SPMD_REALIZED_WIDTH:";
 
@@ -19487,16 +19497,6 @@ mod tests {
     /// Attempts allowed for the realized-width child before a
     /// `STATUS_ACCESS_VIOLATION` is treated as a real failure.
     const SPMD_WIDTH_CHILD_MAX_ATTEMPTS: u32 = 3;
-
-    /// Upper bound on the extra fully-subscribed probe width.
-    ///
-    /// The probe deliberately asks for as many workers as the process has
-    /// allowed CPUs so the dispatcher-headroom branch is reached, but on a
-    /// many-core host that would spin up ~one worker per core just to read a
-    /// count. Cap it: above this many allowed CPUs the probe is skipped rather
-    /// than made cheap-but-meaningless, since a partial request would land back
-    /// in the no-op branch the probe exists to avoid.
-    const SPMD_WIDTH_FULL_SUBSCRIPTION_CAP: usize = 32;
 
     /// What a realized-width child observed about the pool it built.
     #[derive(Debug)]
@@ -19622,31 +19622,35 @@ mod tests {
     ///
     /// The width a benchmark asks for is not the width it gets. An explicit
     /// request is clamped to the host's logical CPUs by
-    /// `resolve_persistent_decode_threads_with_override`, and then
-    /// `reserve_single_group_headroom` frees a CPU for the inline dispatcher
-    /// whenever the request would occupy the whole allowed cpuset -- so
-    /// `ONNX_GENAI_CPU_DECODE_THREADS=2` on a 2-CPU cpuset builds *one* worker.
-    /// Each of those reductions is deliberate and documented, but none of them
-    /// is visible to a harness that reports the number it requested.
+    /// `resolve_persistent_decode_threads_with_override`, and
+    /// `reserve_single_group_headroom` then frees a CPU for the inline
+    /// dispatcher whenever the request would occupy the whole allowed cpuset.
+    /// Neither reduction is visible to a harness that reports the number it
+    /// requested, and #1746 is what that costs: for a while every explicit
+    /// budget silently bought `N-1` compute lanes, and at `N=2` the single
+    /// remaining lane tripped the serial short-circuit and made the knob
+    /// indistinguishable from `=1`. Nothing failed; the numbers were just
+    /// answering a different question than their labels claimed.
     ///
     /// So assert the contract end to end, at the widths we actually publish,
-    /// against facts the child observed about itself rather than against a
-    /// recomputation of the code under test.
+    /// against facts a child process observed about itself rather than against
+    /// a recomputation of the code under test.
+    ///
+    /// The assertion is exact at every width, including full subscription:
+    /// since #1748 the dispatcher owns the shard the reservation frees, so
+    /// `total_workers` counts compute lanes and equals the request. Verified
+    /// here under `taskset` at 1, 2, 4, 8 and 32 CPUs -- the fully-subscribed
+    /// case is the *common* one in production, because
+    /// `bound_process_to_decode_budget` confines the process to exactly the
+    /// budgeted CPUs at EP init.
     #[test]
     fn every_benchmarked_decode_width_realizes_the_worker_count_it_requests() {
-        // `DISPATCHER_RESERVED_CPUS` is private to `decode_spmd`, so the one
-        // CPU it holds back is restated here. That duplication is the point:
-        // if the reservation changes, a width label changes with it, and this
-        // test should be the thing that says so.
-        const DISPATCHER_RESERVED_CPUS: usize = 1;
-
-        // The published widths alone leave a hole: on any host with more
-        // allowed CPUs than the largest of them, every case satisfies
-        // `effective < allowed`, so `reserve_single_group_headroom` is a no-op
-        // and the headroom half of the contract is never exercised -- on
-        // exactly the large hosts most likely to run CI. Add one probe that
-        // asks for the whole allowed cpuset so the reserving branch is reached
-        // on every host, not just small or affinity-restricted ones.
+        // The published widths alone leave the interesting hole unprobed: on a
+        // host with more allowed CPUs than the largest of them, every case
+        // satisfies `effective < allowed`, so the dispatcher reservation is a
+        // no-op and full subscription -- the shape #1746 broke, and the shape
+        // production actually runs after `bound_process_to_decode_budget` --
+        // is never reached. Add one probe that asks for the whole cpuset.
         let allowed_now = crate::decode_affinity::allowed_cpus().map_or(0, |cpus| cpus.len());
         let mut widths: Vec<usize> = BENCHMARKED_DECODE_WIDTHS.to_vec();
         if (2..=SPMD_WIDTH_FULL_SUBSCRIPTION_CAP).contains(&allowed_now)
@@ -19655,7 +19659,6 @@ mod tests {
             widths.push(allowed_now);
         }
 
-        let mut saw_headroom_branch = false;
         for requested in widths {
             let report = realized_width_report(requested);
             assert_eq!(
@@ -19694,32 +19697,12 @@ mod tests {
                 continue;
             }
 
-            let expected = if report.allowed == 0 || effective < report.allowed {
-                effective
-            } else {
-                saw_headroom_branch = true;
-                report
-                    .allowed
-                    .saturating_sub(DISPATCHER_RESERVED_CPUS)
-                    .max(1)
-            };
             assert_eq!(
-                report.workers, expected,
-                "requested width {requested} realized {} workers, not the contractual \
-                 {expected} ({report:?}) -- a decode benchmark row labelled t={requested} \
+                report.workers, effective,
+                "requested width {requested} realized {} compute lanes, not the {effective} \
+                 it asked for ({report:?}) -- a decode benchmark row labelled t={requested} \
                  would be reporting a width it never ran",
                 report.workers
-            );
-        }
-
-        // Say out loud which hosts check only half the rule, rather than
-        // letting a green run imply the whole contract was covered.
-        if !saw_headroom_branch {
-            assert!(
-                allowed_now == 0 || allowed_now > SPMD_WIDTH_FULL_SUBSCRIPTION_CAP,
-                "the dispatcher-headroom branch was never reached on a host with \
-                 {allowed_now} allowed CPUs, so the full-subscription probe is not doing \
-                 its job and only the no-op half of the contract was checked"
             );
         }
     }
