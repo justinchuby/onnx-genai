@@ -24,8 +24,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: onnxruntime/mobius
-          # Stacked with mobius#538 until its image/video workflow producer lands.
-          ref: justinchuby/catalogue-diffusion-builds
+          ref: main
           path: validation/mobius
       - uses: actions/setup-python@v5
         with:
