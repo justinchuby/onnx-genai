@@ -81,7 +81,7 @@ performance cliff that only trained weights would trigger.
 | `gen_gqa.py` | `com.microsoft::GroupQueryAttention`, one node, fully static shapes |
 | `gen_grid.py` | the GQA decode/prefill grid across four model geometries |
 | `gen_l3sweep.py` | GQA decode graphs whose per-head attended-KV working set lands on 1/2/4/8/16/32 MiB, for cache-topology sweeps |
-| `gen_mha.py` | `com.microsoft::MultiHeadAttention` (the operator the vectorised `sdpa_f32` path serves) |
+| `gen_mha.py` | `com.microsoft::MultiHeadAttention` (the operator the vectorised `sdpa_f32` path serves), 16 cells: 7 bidirectional encoder/prefill shapes, 3 causal (`unidirectional=1`) decoder prefills, 5 decode shapes (`q_seq = 1`, KV 128/1024/4096, batched), and one 8-token chunk |
 | `gen_moe.py` | `com.microsoft::MoE` / `QMoE`, top-k routing, grouped experts |
 | `gen_transforms.py` | the transforms that *surround* attention: `Softmax`, `RotaryEmbedding`, KV-cache `Concat`, BSNH↔BNSH `Transpose` |
 | `gen_f16_gemv.py` | decode-shaped (`M = 1`) f16 `MatMul` or `Gemm` (`--op`), sweeping the weight working set from L2-resident to past LLC |
