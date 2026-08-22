@@ -126,6 +126,15 @@ enum TensorBacking {
     /// consult this rather than trying and faulting.
     External {
         host_accessible: bool,
+        /// Optional shared owner kept alive for as long as this `Value` **or any
+        /// alias derived from it**: dropping the last sharer drops this after the
+        /// `OrtValue` is released, so an external allocation this `Value` wraps
+        /// (e.g. a native `Tensor`'s device memory) is freed only once ORT and
+        /// every alias are done with it. `Arc` (not `Box`) so a device value can
+        /// be alias-cloned in O(1) — [`Value::try_alias_clone`] hands out another
+        /// `External` sharing this owner instead of a host byte copy. `None` when
+        /// the caller owns the memory elsewhere (a pure borrow).
+        owner: Option<Arc<dyn core::any::Any + Send + Sync>>,
     },
     None,
 }
@@ -367,8 +376,49 @@ impl Value {
             ptr,
             shape: shape.to_vec(),
             dtype,
-            backing: TensorBacking::External { host_accessible },
+            backing: TensorBacking::External {
+                host_accessible,
+                owner: None,
+            },
         })
+    }
+
+    /// Wrap external memory whose backing allocation this `Value` should keep
+    /// alive.
+    ///
+    /// Identical to [`Value::from_external_memory`], but the returned `Value`
+    /// takes ownership of `owner` and drops it only after the underlying
+    /// `OrtValue` is released (see the [`Drop`] impl). Use this when the buffer
+    /// behind `data` is owned by a Rust object — for example a native runtime
+    /// `Tensor` holding device memory — so that ORT keeps the allocation valid
+    /// for exactly as long as the `Value` (and any alias derived from it) can
+    /// still reach it, with no early free and no leak.
+    ///
+    /// # Safety
+    ///
+    /// The same requirements as [`Value::from_external_memory`] apply to `data`,
+    /// `bytes`, `shape`, `dtype`, and `memory_info`. The one obligation this
+    /// method discharges for you is lifetime: `owner` must be the object that
+    /// actually keeps `data` allocated, so keeping it alive keeps `data` valid.
+    pub unsafe fn from_external_memory_with_owner(
+        data: *mut std::ffi::c_void,
+        bytes: usize,
+        shape: &[i64],
+        dtype: DataType,
+        memory_info: &MemoryInfo,
+        owner: Box<dyn core::any::Any + Send + Sync>,
+    ) -> Result<Self> {
+        // SAFETY: forwarded verbatim to `from_external_memory`; the caller
+        // upholds its contract, and `owner` only extends how long `data` lives.
+        let mut value =
+            unsafe { Self::from_external_memory(data, bytes, shape, dtype, memory_info)? };
+        match &mut value.backing {
+            TensorBacking::External { owner: slot, .. } => *slot = Some(Arc::from(owner)),
+            // `from_external_memory` always yields `External`; anything else is
+            // an internal contract break, not a caller error.
+            _ => unreachable!("from_external_memory produced a non-external backing"),
+        }
+        Ok(value)
     }
 
     /// Whether this value's bytes can be read or written through a host
@@ -380,7 +430,8 @@ impl Value {
         !matches!(
             self.backing,
             TensorBacking::External {
-                host_accessible: false
+                host_accessible: false,
+                ..
             }
         )
     }
@@ -1349,8 +1400,53 @@ impl Value {
             TensorBacking::Alias(owner) => {
                 Some(Value::alias_with_shape(Arc::clone(owner), &self.shape))
             }
+            // An external allocation this value *owns* (e.g. a native `Tensor`'s
+            // device memory) can be aliased in O(1): re-wrap the same allocation
+            // as another external value sharing the owner `Arc`, so both keep it
+            // alive with no byte copy. This is what lets a device-resident value
+            // flow through the interpreter's `clone_value` fast path instead of
+            // failing a host read. A pure borrow (`owner: None`) has no lifetime
+            // guarantee to share, so it is not alias-cloneable.
+            TensorBacking::External {
+                host_accessible,
+                owner: Some(owner),
+            } => Some(self.alias_external_with_owner(*host_accessible, Arc::clone(owner))),
             _ => None,
         }
+    }
+
+    /// Re-wrap this value's external allocation as another `External` value that
+    /// shares `owner`, keeping the same shape/dtype/memory. O(1), no byte copy.
+    fn alias_external_with_owner(
+        &self,
+        host_accessible: bool,
+        owner: Arc<dyn core::any::Any + Send + Sync>,
+    ) -> Result<Value> {
+        let memory_info = tensor_memory_info(self.ptr.as_ptr())?;
+        let numel = self.numel();
+        // A zero-element alias dereferences no data pointer; hand ORT an aligned
+        // address it will never read rather than the owner's (possibly null) one.
+        let data = if numel == 0 {
+            dangling_aligned(self.dtype)
+        } else {
+            tensor_data_ptr(self.ptr.as_ptr())?
+        };
+        let ptr = create_tensor_with_data_at(
+            memory_info,
+            data,
+            numel * self.dtype.size_of(),
+            &self.shape,
+            self.dtype,
+        )?;
+        Ok(Self {
+            ptr,
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+            backing: TensorBacking::External {
+                host_accessible,
+                owner: Some(owner),
+            },
+        })
     }
 
     pub(crate) unsafe fn from_raw(ptr: *mut onnx_genai_ort_sys::OrtValue) -> Result<Self> {
@@ -1373,7 +1469,9 @@ impl Drop for Value {
             TensorBacking::I64(data) => data.len(),
             TensorBacking::Bytes(data) => data.len(),
             TensorBacking::Alias(owner) => owner.numel(),
-            // Borrowed memory: nothing here keeps it alive, by construction.
+            // Borrowed memory. Any `_owner` here is a struct field, so drop glue
+            // frees it *after* this body releases the `OrtValue` below — ORT is
+            // always done with the allocation before the owner frees it.
             TensorBacking::External { .. } => 0,
             TensorBacking::None => 0,
         };

@@ -229,6 +229,11 @@ fn tensor_to_f32(tensor: &Tensor) -> anyhow::Result<Vec<f32>> {
     }
 }
 
+/// Materialize `values` as a native tensor of `dtype`.
+///
+/// Only the dtype-parity tests below need this now that the shared-KV proposer's
+/// embedding input is gone; the encoder it wraps is still the production path.
+#[cfg(test)]
 pub(crate) fn tensor_from_f32_as(
     dtype: DataType,
     shape: &[usize],
@@ -240,9 +245,7 @@ pub(crate) fn tensor_from_f32_as(
             let bytes = f32_slice_to_dtype_bytes(dtype, values)?;
             Ok(Tensor::from_raw(dtype, shape.to_vec(), &bytes)?)
         }
-        other => bail!(
-            "native embeddings input must be Float32, Float16, or BFloat16, got {other:?}; fix io.inputs_embeds_input or export a floating tensor"
-        ),
+        other => bail!("native tensor must be Float32, Float16, or BFloat16, got {other:?}"),
     }
 }
 
@@ -250,7 +253,7 @@ pub(crate) fn tensor_from_f32_as(
 /// `half` crate for the 16-bit narrowing so the result is bit-identical to the
 /// ORT KV-inject path (`onnx_genai_ort::Value::from_f32_slice_as`,
 /// `crates/onnx-genai-ort/src/value.rs`). Sharing this one encoder keeps the
-/// native embedding-input path (`tensor_from_f32_as`) and the device paged
+/// native embedding-input encoders and the device paged
 /// present-KV seed (`DecodeCudaState::seed_prefix`, GAP-3 Inc-D.1) byte-for-byte
 /// aligned with ORT — the whole basis of the paged-KV byte-equality oracle.
 pub(crate) fn f32_slice_to_dtype_bytes(dtype: DataType, values: &[f32]) -> anyhow::Result<Vec<u8>> {

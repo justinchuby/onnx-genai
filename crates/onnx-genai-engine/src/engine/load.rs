@@ -259,8 +259,6 @@ impl Engine {
         )?;
         let eagle3 =
             load_eagle3_model(&speculative_mode, &session, &environment, &session_options)?;
-        let shared_kv_proposer =
-            load_shared_kv_proposer(&speculative_mode, &session, &environment, &session_options)?;
 
         let connector = {
             let _span = onnx_genai_ort::prof_span!("engine.connector_bridge");
@@ -299,13 +297,11 @@ impl Engine {
             #[cfg(feature = "native-backend")]
             native_max_sessions: config.native_max_sessions,
             #[cfg(feature = "native-backend")]
-            native_shared_kv_proposer: None,
             #[cfg(feature = "native-backend")]
             native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
             draft,
             mtp,
             eagle3,
-            shared_kv_proposer,
             tokenizer,
             fim_config,
             num_speculative_tokens: config.num_speculative_tokens.max(1),
@@ -933,11 +929,8 @@ impl Engine {
         if let Some(trace) = trace {
             native_session.set_trace_context(trace);
         }
-        let native_shared_kv_proposer = None;
-        // Shared-KV drafting is no longer resolved from the package, so this
-        // path never offers a shared-KV proposer. MTP remains the one native
-        // proposer kind, and the effective mode is decided below once the MTP
-        // loader has reported.
+        // MTP is the one native proposer kind; the effective mode is decided
+        // below once the MTP loader has reported.
         let shared_kv_mode = SpeculativeMode::None;
         let environment = {
             let _span = onnx_genai_ort::prof_span!("engine.ort_environment");
@@ -994,12 +987,10 @@ impl Engine {
             native_access_counter: 0,
             native_default_session: None,
             native_max_sessions: config.native_max_sessions,
-            native_shared_kv_proposer,
             native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
             draft: None,
             mtp,
             eagle3: None,
-            shared_kv_proposer: None,
             tokenizer,
             fim_config,
             num_speculative_tokens: config.num_speculative_tokens.max(1),
@@ -2505,99 +2496,6 @@ fn load_eagle3_model(
         None
     };
     Ok(eagle3)
-}
-
-fn load_shared_kv_proposer(
-    speculative_mode: &SpeculativeMode,
-    session: &Session,
-    environment: &Environment,
-    session_options: &SessionOptions,
-) -> anyhow::Result<Option<SharedKvProposerModel>> {
-    let shared_kv_proposer = if let SpeculativeMode::SharedKv(assistant_config) = speculative_mode {
-        crate::config::validate_shared_kv_proposer_config(assistant_config)?;
-        let hidden_output = session
-            .outputs()
-            .iter()
-            .find(|output| output.name == assistant_config.target_hidden_output)
-            .with_context(|| {
-                format!(
-                    "shared-KV proposer target model must expose hidden-state output '{}'",
-                    assistant_config.target_hidden_output
-                )
-            })?;
-        if hidden_output.dtype != DataType::Float32 {
-            anyhow::bail!(
-                "shared-KV proposer target hidden-state output '{}' must be Float32, got {:?}",
-                hidden_output.name,
-                hidden_output.dtype
-            );
-        }
-        if hidden_output.shape.last().copied().filter(|dim| *dim > 0)
-            != Some(assistant_config.backbone_hidden_size as i64)
-        {
-            anyhow::bail!(
-                "shared-KV proposer target hidden-state output '{}' shape {:?} does not end in configured backbone hidden size {}",
-                hidden_output.name,
-                hidden_output.shape,
-                assistant_config.backbone_hidden_size
-            );
-        }
-        let assistant_session = Session::new(
-            environment,
-            &assistant_config.assistant_model,
-            session_options.clone(),
-        )
-        .map_err(|error| anyhow::anyhow!("Failed to load shared-KV proposer model: {error}"))?;
-        let signature = SharedKvProposerSession::detect(&assistant_session)
-            .map_err(|error| {
-                anyhow::anyhow!("Failed to inspect shared-KV proposer model: {error}")
-            })?
-            .context("configured shared-KV proposer model does not expose proposer I/O")?;
-        if signature.backbone_hidden_size != assistant_config.backbone_hidden_size {
-            anyhow::bail!(
-                "shared-KV proposer hidden size {} does not match configured backbone hidden size {}",
-                signature.backbone_hidden_size,
-                assistant_config.backbone_hidden_size
-            );
-        }
-        if signature.vocab_size != assistant_config.vocab_size {
-            anyhow::bail!(
-                "shared-KV proposer vocabulary {} does not match configured vocab size {}",
-                signature.vocab_size,
-                assistant_config.vocab_size
-            );
-        }
-        for group in &assistant_config.shared_kv {
-            if !signature
-                .shared_kv
-                .iter()
-                .any(|spec| spec.name == group.name)
-            {
-                anyhow::bail!(
-                    "shared-KV proposer model does not expose shared_kv group '{}'",
-                    group.name
-                );
-            }
-        }
-        let embedding = read_f32_weights(&assistant_config.input_embedding_weights)?;
-        let embedder = LinearEmbedder::new(
-            embedding,
-            assistant_config.vocab_size,
-            assistant_config.backbone_hidden_size,
-        )
-        .map_err(|error| {
-            anyhow::anyhow!("Invalid shared-KV proposer input embedding weights: {error}")
-        })?;
-        Some(SharedKvProposerModel {
-            config: assistant_config.clone(),
-            session: Box::new(assistant_session),
-            embedder,
-            num_speculative_tokens: assistant_config.num_speculative_tokens,
-        })
-    } else {
-        None
-    };
-    Ok(shared_kv_proposer)
 }
 
 #[cfg(test)]

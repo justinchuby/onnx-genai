@@ -67,7 +67,6 @@ pub struct Engine {
     pub(crate) native_max_sessions: usize,
     /// Native shared-KV proposer loaded from the same metadata contract.
     #[cfg(feature = "native-backend")]
-    pub(crate) native_shared_kv_proposer: Option<NativeSharedKvProposerModel>,
     /// Native recurrent/past snapshots keyed by semantic token prefixes.
     #[cfg(feature = "native-backend")]
     pub(crate) native_recurrent_prefix_stats: RecurrentPrefixCacheStats,
@@ -78,7 +77,6 @@ pub struct Engine {
     /// Optional EAGLE-3 head and target-side embedding.
     pub(crate) eagle3: Option<Eagle3Model>,
     /// Optional shared-KV draft proposer.
-    pub(crate) shared_kv_proposer: Option<SharedKvProposerModel>,
     /// Tokenizer loaded from the model directory.
     pub(crate) tokenizer: Tokenizer,
     /// Auto-detected fill-in-the-middle token configuration.
@@ -149,21 +147,4 @@ pub(crate) struct Eagle3Model {
     pub(crate) hidden_outputs: Vec<String>,
     pub(crate) kv_mode: onnx_genai_ort::Eagle3DraftKvMode,
     pub(crate) num_speculative_tokens: usize,
-}
-
-pub(crate) struct SharedKvProposerModel {
-    pub(crate) config: SharedKvProposerConfig,
-    pub(crate) session: Box<Session>,
-    /// Target input-token embedding table, used to build the token-embedding
-    /// half of each draft step's `inputs_embeds`.
-    pub(crate) embedder: LinearEmbedder,
-    pub(crate) num_speculative_tokens: usize,
-}
-
-#[cfg(feature = "native-backend")]
-pub(crate) struct NativeSharedKvProposerModel {
-    pub(crate) session: crate::native_decode::NativeProposerSession,
-    pub(crate) embedder: LinearEmbedder,
-    pub(crate) groups: Vec<onnx_genai_metadata::SharedKvGroup>,
-    pub(crate) hidden_size: usize,
 }

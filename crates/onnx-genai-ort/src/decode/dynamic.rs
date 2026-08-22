@@ -1683,6 +1683,21 @@ impl DecodeSession<'_> {
     }
 }
 
+/// Whether per-step input-shape diagnostics are enabled
+/// (`ONNX_GENAI_ORT_DEBUG_SHAPES`).
+///
+/// Cached on first use: this is consulted once per decode step, and a raw
+/// `env::var_os` there would put an environment lookup in the hot path.
+///
+/// The shapes it prints — the attention-mask length against the past KV extent
+/// actually bound — are what identified the share-buffer/standard-`Attention`
+/// mismatch this module now guards against, so the hook is kept rather than
+/// deleted with the investigation.
+fn debug_shapes_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("ONNX_GENAI_ORT_DEBUG_SHAPES").is_some())
+}
+
 #[cfg(test)]
 mod captured_step_retry_tests {
     use super::*;
@@ -1827,19 +1842,4 @@ mod captured_step_retry_tests {
         );
         assert!(propagated.is_err());
     }
-}
-
-/// Whether per-step input-shape diagnostics are enabled
-/// (`ONNX_GENAI_ORT_DEBUG_SHAPES`).
-///
-/// Cached on first use: this is consulted once per decode step, and a raw
-/// `env::var_os` there would put an environment lookup in the hot path.
-///
-/// The shapes it prints — the attention-mask length against the past KV extent
-/// actually bound — are what identified the share-buffer/standard-`Attention`
-/// mismatch this module now guards against, so the hook is kept rather than
-/// deleted with the investigation.
-fn debug_shapes_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("ONNX_GENAI_ORT_DEBUG_SHAPES").is_some())
 }

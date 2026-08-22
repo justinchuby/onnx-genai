@@ -35,7 +35,6 @@ compile_error!(
 pub mod allocator;
 pub mod binding;
 pub mod chat_template;
-pub mod component;
 #[cfg(feature = "cuda")]
 pub mod cuda_rt;
 pub mod decode;
@@ -55,14 +54,12 @@ mod pipeline_admission;
 pub mod profile;
 pub mod runtime_capability;
 pub mod session;
-pub mod shared_kv_proposer;
 pub mod tokenizer;
 pub mod value;
 
 pub use allocator::{Allocator, AllocatorType, MemoryInfo, MemoryType};
 pub use binding::IoBinding;
 pub use chat_template::{ChatMessage, ChatRole, ChatTemplate};
-pub use component::{OrtComponentSession, OrtComponentSessionRef};
 pub use decode::{
     BatchStepLogits, BatchedDecodeSession, BatchedSharedBufferDecodeSession,
     BatchedStaticCacheDecodeSession, DecodeKvMode, DecodeSession, DecodeSessionOptions,
@@ -87,9 +84,6 @@ pub use mtp::{
     MtpDecodeOptions, MtpDecodeSession, MtpDraftKvMode, MtpHeadSignature, MtpStepOutput,
 };
 pub use onnx_genai_metadata::{
-    ComponentDataType, ComponentError, ComponentIo, ComponentSession, ComponentTensor,
-};
-pub use onnx_genai_metadata::{
     ProposalType, SpeculatorConfig, SpeculatorConfigSource, SpeculatorDescriptor,
     SpeculatorProposerKind, SpeculatorProposerStatus, SpeculatorVerifier, detect_speculator,
 };
@@ -100,10 +94,6 @@ pub use session::{
     HardwareKind, ResolvedEp, RunPhaseError, Session, SessionOptions, SkippedExecutionProvider,
     TensorInfo, USE_ENV_ALLOCATORS, available_execution_providers, capability, ep_selection,
     resolve_execution_provider, selectable_execution_providers,
-};
-pub use shared_kv_proposer::{
-    SharedKvInput, SharedKvProposerSession, SharedKvProposerSignature, SharedKvProposerStepOutput,
-    SharedKvSpec,
 };
 pub use tokenizer::Tokenizer;
 pub use value::{DataType, Value};

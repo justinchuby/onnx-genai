@@ -513,17 +513,20 @@ impl PipelineEngine {
             return clone_value(value);
         }
         let device_id = value.device_id()?;
-        let island = self
+        if let Some(island) = self
             .execution_islands
             .iter()
             .find(|island| island.cuda_device_id() == Some(device_id))
-            .with_context(|| {
-                format!(
-                    "workflow has a value on CUDA device {device_id} but no execution island for \
-                     that device"
-                )
-            })?;
-        island.materialize_host(value)
+        {
+            return island.materialize_host(value);
+        }
+        // Native backend: no execution islands exist, but a native component may
+        // still hand back a device-resident value. Materialize it to host with a
+        // standalone device→host copy (the interpreter's host-policy boundaries
+        // — branch predicates, adapters, emit — need host bytes).
+        value
+            .to_host_from_cuda(device_id)
+            .with_context(|| format!("failed to materialize CUDA device {device_id} value to host"))
     }
 
     fn materialize_workflow_value(
@@ -538,17 +541,18 @@ impl PipelineEngine {
             return Ok(());
         }
         let device_id = value.device_id()?;
-        let island = self
+        let host = if let Some(island) = self
             .execution_islands
             .iter()
             .find(|island| island.cuda_device_id() == Some(device_id))
-            .with_context(|| {
-                format!(
-                    "workflow has a value on CUDA device {device_id} but no execution island for \
-                     that device"
-                )
-            })?;
-        let host = island.materialize_host(value)?;
+        {
+            island.materialize_host(value)?
+        } else {
+            // Native backend: no islands; standalone device→host copy.
+            value.to_host_from_cuda(device_id).with_context(|| {
+                format!("failed to materialize CUDA device {device_id} value '{name}' to host")
+            })?
+        };
         values.insert(name.to_string(), host);
         Ok(())
     }
@@ -630,6 +634,46 @@ impl PipelineEngine {
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineOutputs> {
         WorkflowExecutionPlan::new(self, request)?.execute_outputs()
+    }
+
+    pub(crate) fn run_workflow_retained(
+        &self,
+        request: PipelineGenerateRequest,
+    ) -> anyhow::Result<PipelineTensors> {
+        let mut plan = WorkflowExecutionPlan::new(self, request)?;
+        let (mut values, _) = plan.execute_retained()?;
+        // `execute_retained` parks the pass's inputs back on the plan for replay.
+        // A retained run has no replay — the caller wanted the whole value map —
+        // so fold them back in; a proposal chain binds the proposer's borrowed
+        // shared KV and masks straight from these request values.
+        for (name, value) in std::mem::take(&mut plan.values) {
+            values.entry(name).or_insert(value);
+        }
+        // Declared package outputs read the same here as they do from
+        // `run_pipeline`: host-resident. Internal SSA values are deliberately
+        // left where the backend produced them, so a native-CUDA proposal chain
+        // keeps its carry and borrowed KV device-resident instead of paying a
+        // host round-trip to be observed.
+        for output in self.workflow.outputs.keys() {
+            let row_prefix = format!("{output}.row.");
+            let event_prefix = format!("{output}.");
+            let names = values
+                .keys()
+                .filter(|name| {
+                    *name == output
+                        || name.starts_with(&row_prefix)
+                        || (name.starts_with(&event_prefix)
+                            && name[event_prefix.len()..]
+                                .chars()
+                                .all(|character| character.is_ascii_digit()))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for name in names {
+                self.materialize_workflow_value(&mut values, &name)?;
+            }
+        }
+        Ok(values)
     }
 }
 
@@ -774,6 +818,20 @@ impl<'a> WorkflowExecutionPlan<'a> {
     }
 
     pub fn execute_outputs(&mut self) -> anyhow::Result<PipelineOutputs> {
+        let (values, row_outputs) = self.execute_retained()?;
+        self.engine.package_outputs(values, row_outputs)
+    }
+
+    /// Execute the workflow and keep every SSA value the pass produced.
+    ///
+    /// [`Self::execute_outputs`] narrows this to the package's declared outputs.
+    /// Interpreter-level constructs that consume a completed pass — the chained
+    /// speculative driver reading its `folded_carry_seed` and the proposer's
+    /// borrowed shared-KV bindings, above all — need the values the workflow
+    /// bound internally, not just what it published.
+    pub fn execute_retained(
+        &mut self,
+    ) -> anyhow::Result<(PipelineTensors, BTreeMap<String, Vec<String>>)> {
         let started = std::time::Instant::now();
         let mut telemetry = WorkflowRunTelemetry {
             started: Some(started),
@@ -933,9 +991,8 @@ impl<'a> WorkflowExecutionPlan<'a> {
         counters.last_emitted_elements = telemetry.emitted_elements;
         drop(counters);
         let inputs = self.take_inputs(&mut values);
-        let outputs = engine.package_outputs(values, telemetry.row_outputs);
         self.values = inputs;
-        outputs
+        Ok((values, telemetry.row_outputs))
     }
 
     fn retain_inputs(&mut self, values: &mut PipelineTensors) {
@@ -1017,13 +1074,6 @@ impl PipelineEngine {
                             &selected_inputs,
                             values,
                         )?;
-                        let session =
-                            self.models.session(selected_component).with_context(|| {
-                                format!(
-                                    "workflow ONNX component '{selected_component}' selected for \
-                                 '{component}' was not loaded"
-                                )
-                            })?;
                         // Component dimensions are invocation-local. A decoder, for example, may
                         // bind `sequence` to the prompt length in setup and to one in the loop.
                         // Values crossing the package boundary were already checked there; the
@@ -1058,26 +1108,26 @@ impl PipelineEngine {
                                     })
                             })
                             .collect::<anyhow::Result<Vec<_>>>()?;
-                        let stable_eligible = session.cuda_device_id().is_some()
-                            && self.device_bridge_components.contains(selected_component);
-                        let produced = if stable_eligible {
-                            self.run_stable_component(
-                                workflow,
-                                selected_component,
-                                selected_declaration,
-                                &component_symbols,
-                                session,
-                                &resolved,
-                                &selected_outputs,
-                            )?
-                        } else {
-                            session
-                                .output_names()
-                                .iter()
-                                .cloned()
-                                .zip(session.run(&resolved)?)
-                                .collect()
-                        };
+                        // Concrete output shapes known from the bound input
+                        // symbols, so the native CUDA seam can keep resolvable
+                        // outputs (a recurring/state tensor in particular)
+                        // device-resident. The ORT path ignores this.
+                        let component_output_shapes = resolve_component_output_shapes(
+                            selected_declaration,
+                            &selected_outputs,
+                            &component_symbols,
+                            &component_dynamic_symbols,
+                        );
+                        let produced = self.invoke_onnx_component(
+                            workflow,
+                            component,
+                            selected_component,
+                            selected_declaration,
+                            &component_symbols,
+                            &resolved,
+                            &selected_outputs,
+                            &component_output_shapes,
+                        )?;
                         for (port, tensor) in produced {
                             let Some(value) = selected_outputs.get(&port) else {
                                 continue;
@@ -1742,6 +1792,177 @@ impl PipelineEngine {
             }
         }
         Ok(())
+    }
+
+    /// Invoke one declared ONNX component with caller-supplied port values.
+    ///
+    /// This is the same execution seam a `WorkflowNode::Invoke` uses — port
+    /// contract validation, symbol binding, resolvable output shapes, and
+    /// [`Self::invoke_onnx_component`] — exposed for interpreter constructs
+    /// that drive a component outside the SSA step list, such as the chained
+    /// speculative proposal loop (`pipeline::speculative`). Keeping them on one
+    /// seam is what makes those constructs backend-neutral: ORT and native both
+    /// run through the identical path, with no second "invoke a component"
+    /// implementation to keep in sync.
+    pub(crate) fn invoke_component_values(
+        &self,
+        component: &str,
+        inputs: &[(&str, &Value)],
+        outputs: &std::collections::BTreeMap<String, String>,
+    ) -> anyhow::Result<Vec<(String, Value)>> {
+        let workflow = &self.workflow;
+        let declaration = workflow
+            .components
+            .get(component)
+            .with_context(|| format!("workflow component '{component}' is undeclared"))?;
+        anyhow::ensure!(
+            matches!(
+                declaration.implementation,
+                ComponentImplementation::Onnx { .. }
+            ),
+            "workflow component '{component}' is not an ONNX component"
+        );
+        let mut component_symbols = HashMap::new();
+        let component_dynamic_symbols = std::collections::HashSet::new();
+        for (port, value) in inputs {
+            if let Some(contract) = declaration.ports.inputs.get(*port) {
+                validate_workflow_value(
+                    port,
+                    value,
+                    contract,
+                    &mut component_symbols,
+                    &component_dynamic_symbols,
+                )?;
+            }
+        }
+        let output_shapes = resolve_component_output_shapes(
+            declaration,
+            outputs,
+            &component_symbols,
+            &component_dynamic_symbols,
+        );
+        let produced = self.invoke_onnx_component(
+            workflow,
+            component,
+            component,
+            declaration,
+            &component_symbols,
+            inputs,
+            outputs,
+            &output_shapes,
+        )?;
+        for (port, tensor) in &produced {
+            if let Some(contract) = declaration.ports.outputs.get(port) {
+                validate_workflow_value(
+                    port,
+                    tensor,
+                    contract,
+                    &mut component_symbols,
+                    &component_dynamic_symbols,
+                )?;
+            }
+        }
+        Ok(produced)
+    }
+
+    /// Copy a possibly device-resident value into host memory.
+    ///
+    /// Interpreter constructs that must read tensor bytes (a proposal loop's
+    /// argmax, a folded carry it re-packs into the next fused input) go through
+    /// here so a native-CUDA run stays correct without the caller knowing where
+    /// the value lives.
+    pub(crate) fn host_copy_of(&self, value: &Value) -> anyhow::Result<Value> {
+        self.materialize_workflow_value_copy(value)
+    }
+
+    /// Backend-neutral execution seam for a declared ONNX component.
+    ///
+    /// The interpreter is universal over workflows; this is the one place it is
+    /// universal over *backends*. It threads `onnx_genai_ort::Value` either way
+    /// — the ORT branch runs the loaded `Session` (preserving the CUDA-graph /
+    /// `IoBinding` stable-island fast path), and the native branch runs the
+    /// pure-Rust `InferenceSession` through the `Value ⇄ Tensor` bridge. No
+    /// silent fallback: a Native request that reaches here is honored natively
+    /// or fails with an actionable error (Rule 4). See
+    /// `docs/architecture/NATIVE_WORKFLOW_BACKEND.md`.
+    #[allow(clippy::too_many_arguments)]
+    fn invoke_onnx_component(
+        &self,
+        workflow: &WorkflowSpec,
+        component: &str,
+        selected_component: &str,
+        selected_declaration: &onnx_genai_metadata::WorkflowComponent,
+        component_symbols: &HashMap<String, i64>,
+        resolved: &[(&str, &Value)],
+        selected_outputs: &std::collections::BTreeMap<String, String>,
+        output_shapes: &std::collections::BTreeMap<String, Vec<usize>>,
+    ) -> anyhow::Result<Vec<(String, Value)>> {
+        match self.decode_backend {
+            EngineDecodeBackend::Native => {
+                #[cfg(feature = "native-backend")]
+                {
+                    let _ = (workflow, component, selected_declaration, component_symbols);
+                    let set = self.native_components.as_ref().with_context(|| {
+                        format!(
+                            "native workflow backend selected but ONNX component \
+                             '{selected_component}' has no native session"
+                        )
+                    })?;
+                    set.borrow_mut().run_component(
+                        selected_component,
+                        resolved,
+                        selected_outputs,
+                        output_shapes,
+                    )
+                }
+                #[cfg(not(feature = "native-backend"))]
+                {
+                    let _ = (
+                        workflow,
+                        component,
+                        selected_component,
+                        selected_declaration,
+                        component_symbols,
+                        resolved,
+                        selected_outputs,
+                        output_shapes,
+                    );
+                    unreachable!(
+                        "validate_pipeline_backend_request rejects Native without the \
+                         native-backend feature"
+                    )
+                }
+            }
+            EngineDecodeBackend::Ort | EngineDecodeBackend::Auto => {
+                let _ = output_shapes;
+                let session = self.models.session(selected_component).with_context(|| {
+                    format!(
+                        "workflow ONNX component '{selected_component}' selected for '{component}' \
+                         was not loaded"
+                    )
+                })?;
+                let stable_eligible = session.cuda_device_id().is_some()
+                    && self.device_bridge_components.contains(selected_component);
+                if stable_eligible {
+                    self.run_stable_component(
+                        workflow,
+                        selected_component,
+                        selected_declaration,
+                        component_symbols,
+                        session,
+                        resolved,
+                        selected_outputs,
+                    )
+                } else {
+                    Ok(session
+                        .output_names()
+                        .iter()
+                        .cloned()
+                        .zip(session.run(resolved)?)
+                        .collect())
+                }
+            }
+        }
     }
 
     // The stable-binding cache hands out `Arc<Value>` because that is the owner
@@ -3075,6 +3296,56 @@ fn literal_shape(contract: &TensorContract) -> anyhow::Result<Vec<i64>> {
 
 fn shape_numel(shape: &[i64]) -> usize {
     shape.iter().map(|dimension| *dimension as usize).product()
+}
+
+/// Resolve each declared output port's contract shape to concrete dimensions
+/// using the invocation's already-bound component symbols.
+///
+/// Returns only ports whose every dimension is known now (a fixed dim, or a
+/// symbol the inputs already bound) — a genuinely dynamic output dimension is
+/// omitted, so the native CUDA seam can pre-allocate a device output buffer for
+/// the resolvable ones (keeping a recurring/state tensor device-resident) and
+/// fall back to host materialization for the rest. Backend-agnostic: the ORT
+/// path ignores it.
+fn resolve_component_output_shapes(
+    declaration: &onnx_genai_metadata::WorkflowComponent,
+    selected_outputs: &std::collections::BTreeMap<String, String>,
+    symbols: &HashMap<String, i64>,
+    dynamic_symbols: &std::collections::HashSet<String>,
+) -> std::collections::BTreeMap<String, Vec<usize>> {
+    let mut resolved = std::collections::BTreeMap::new();
+    for port in selected_outputs.keys() {
+        let Some(contract) = declaration.ports.outputs.get(port) else {
+            continue;
+        };
+        let Some(shape) = &contract.shape else {
+            continue;
+        };
+        let mut dims = Vec::with_capacity(shape.len());
+        let mut fully_known = true;
+        for dim in shape {
+            match dim {
+                TensorDimension::Fixed(value) if *value >= 0 => dims.push(*value as usize),
+                TensorDimension::Symbol(symbol) if !dynamic_symbols.contains(symbol) => {
+                    match symbols.get(symbol) {
+                        Some(value) if *value >= 0 => dims.push(*value as usize),
+                        _ => {
+                            fully_known = false;
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    fully_known = false;
+                    break;
+                }
+            }
+        }
+        if fully_known {
+            resolved.insert(port.clone(), dims);
+        }
+    }
+    resolved
 }
 
 fn validate_workflow_value(

@@ -349,9 +349,7 @@ impl Engine {
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         self.last_speculative_stats = SpeculativeStats::default();
-        if request.options.speculative_mode.is_none()
-            && (self.native_shared_kv_proposer.is_some() || self.mtp.is_some())
-        {
+        if request.options.speculative_mode.is_none() && self.mtp.is_some() {
             request.options.speculative_mode = Some(self.speculative_mode.clone());
         }
         reject_native_request_speculation(&request.options)?;
@@ -409,19 +407,6 @@ impl Engine {
                             native_session,
                             ngram,
                             max_tokens,
-                            plan.width,
-                        )?
-                    }
-                    NativeSpeculationKind::SharedKv => {
-                        let proposer = self.native_shared_kv_proposer.as_mut().context(
-                            "native shared-KV speculation requested without a loaded proposer session",
-                        )?;
-                        crate::native_speculative::NativeSpeculativeDriver::new_shared_kv(
-                            native_session,
-                            &mut proposer.session,
-                            &proposer.embedder,
-                            &proposer.groups,
-                            proposer.hidden_size,
                             plan.width,
                         )?
                     }
@@ -829,8 +814,7 @@ impl Engine {
             // before touching the native backend.
             let native_spec_requested = request.options.speculative_mode.is_some()
                 || request.options.num_speculative_tokens.is_some()
-                || self.mtp.is_some()
-                || self.native_shared_kv_proposer.is_some();
+                || self.mtp.is_some();
             if request.options.cold_start || native_spec_requested {
                 let result = self.generate_native_cold_with_callback(
                     request,
@@ -1348,7 +1332,7 @@ impl Engine {
         let fixed_state_budget_bytes = self.governor.snapshot().resolved_limits.host_ram_bytes;
         if matches!(
             &self.speculative_mode,
-            SpeculativeMode::Mtp(_) | SpeculativeMode::Eagle3(_) | SpeculativeMode::SharedKv(_)
+            SpeculativeMode::Mtp(_) | SpeculativeMode::Eagle3(_)
         ) {
             DecodeState::new_with_io_positions_and_state_budget(
                 session,
@@ -2097,39 +2081,6 @@ impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
 
 #[cfg(feature = "native-backend")]
 impl Engine {
-    /// Deprecated native-only shim. Use [`Engine::create_session`] for both ORT
-    /// and native backends.
-    pub fn create_native_session(&mut self) -> anyhow::Result<SessionId> {
-        if self.decode_backend != EngineDecodeBackend::Native {
-            anyhow::bail!("create_native_session requires the native decode backend");
-        }
-        self.create_session()
-    }
-
-    /// Deprecated native-only shim. Use [`Engine::close_session`].
-    pub fn close_native_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
-        self.close_session(session_id)
-    }
-
-    /// Deprecated native-only shim. Use [`Engine::generate_in_session`].
-    pub fn generate_native_in_session(
-        &mut self,
-        session_id: SessionId,
-        request: GenerateRequest,
-    ) -> anyhow::Result<GenerateResult> {
-        self.generate_in_session(session_id, request)
-    }
-
-    /// Deprecated native-only shim. Use [`Engine::generate_in_session_with_callback`].
-    pub fn generate_native_in_session_with_callback(
-        &mut self,
-        session_id: SessionId,
-        request: GenerateRequest,
-        callback: Option<&mut GenerateTokenCallback<'_>>,
-    ) -> anyhow::Result<GenerateResult> {
-        self.generate_native_in_session_with_callbacks(session_id, request, None, callback)
-    }
-
     fn generate_native_in_session_with_callbacks(
         &mut self,
         session_id: SessionId,
@@ -2350,15 +2301,6 @@ impl Engine {
         self.scheduler.complete(session_id);
         result
     }
-
-    /// Deprecated native-only shim. Use [`Engine::rewind_session_by`].
-    pub fn rewind_native_session(
-        &mut self,
-        session_id: SessionId,
-        token_count: RewindTokenCount,
-    ) -> anyhow::Result<SessionPosition> {
-        self.rewind_session_by(session_id, token_count)
-    }
 }
 
 #[cfg(test)]
@@ -2408,20 +2350,19 @@ mod tests {
         );
 
         options.num_speculative_tokens = None;
-        options.speculative_mode = Some(SpeculativeMode::SharedKv(
-            crate::config::SharedKvProposerConfig {
-                assistant_model: PathBuf::from("assistant.onnx"),
-                target_hidden_output: "hidden".to_string(),
-                input_embedding_weights: PathBuf::from("embedding.bin"),
-                backbone_hidden_size: 1,
-                vocab_size: 1,
-                num_speculative_tokens: 3,
-                shared_kv: Vec::new(),
-            },
-        ));
-        let shared_kv = native_speculation_plan(&options, &chain).unwrap();
-        assert_eq!(shared_kv.width, 4);
-        assert_eq!(native_workspace_query_rows(1, Some(&shared_kv), 8, None), 4);
+        options.speculative_mode = Some(SpeculativeMode::Mtp(crate::config::MtpConfig {
+            head_model: PathBuf::from("mtp.onnx"),
+            target_hidden_output: "hidden".to_string(),
+            embedding_weights: PathBuf::from("embedding.bin"),
+            lm_head_weights: PathBuf::from("lm_head.bin"),
+            vocab_size: 1,
+            hidden_size: 1,
+            kv_mode: onnx_genai_ort::MtpDraftKvMode::GrowCache,
+            num_speculative_tokens: 3,
+        }));
+        let mtp = native_speculation_plan(&options, &chain).unwrap();
+        assert_eq!(mtp.width, 4);
+        assert_eq!(native_workspace_query_rows(1, Some(&mtp), 8, None), 4);
 
         assert_eq!(native_workspace_query_rows(3, None, 8, None), 3);
     }
@@ -2469,12 +2410,10 @@ mod tests {
             native_access_counter: 0,
             native_default_session: None,
             native_max_sessions: 8,
-            native_shared_kv_proposer: None,
             native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
             draft: None,
             mtp: None,
             eagle3: None,
-            shared_kv_proposer: None,
             tokenizer,
             fim_config: None,
             num_speculative_tokens: 1,
@@ -2550,12 +2489,10 @@ mod tests {
             native_access_counter: 0,
             native_default_session: None,
             native_max_sessions: 8,
-            native_shared_kv_proposer: None,
             native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
             draft: None,
             mtp: None,
             eagle3: None,
-            shared_kv_proposer: None,
             tokenizer,
             fim_config: None,
             num_speculative_tokens: 1,

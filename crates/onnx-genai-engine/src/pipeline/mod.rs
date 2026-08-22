@@ -29,7 +29,10 @@ use std::sync::Arc;
 mod adapters;
 mod arg_reduce;
 mod islands;
+#[cfg(feature = "native-backend")]
+mod native_component;
 mod row_state;
+pub mod speculative;
 mod workflow;
 
 pub use adapters::{AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection};
@@ -167,6 +170,17 @@ pub struct PipelineEngine {
     adapter_cache: RefCell<adapters::AdapterCache>,
     active_adapter_context: RefCell<Option<adapters::AdapterRunContext>>,
     preprocessing: Option<PreprocessingSpec>,
+    /// The package's speculative compatibility contract, when it declares one.
+    /// The chained proposal driver in [`speculative`] reads every field it needs
+    /// from here, so proposal execution is metadata-driven rather than keyed on
+    /// a model name.
+    speculative: Option<onnx_genai_metadata::SpeculativeContract>,
+    /// Native (pure-Rust) component sessions, present only when the engine was
+    /// built for `EngineDecodeBackend::Native`. The universal interpreter drives
+    /// these through the same seam it uses for ORT sessions; see
+    /// `docs/architecture/NATIVE_WORKFLOW_BACKEND.md`.
+    #[cfg(feature = "native-backend")]
+    native_components: Option<RefCell<native_component::NativeComponentSet>>,
     /// Kept last so the ORT environment, its registered allocator bridge, and
     /// their plugin/provider teardown outlive every component and execution-island
     /// session that may still call back into them.
@@ -185,15 +199,25 @@ impl Drop for PipelineEngine {
 }
 
 /// Validate an explicit pipeline backend request without touching model files.
+///
+/// The universal workflow interpreter is backend-neutral: it drives every
+/// declared component through a seam that either an ORT `Session` or a native
+/// `InferenceSession` fulfills (see `docs/architecture/NATIVE_WORKFLOW_BACKEND.md`).
+/// `EngineDecodeBackend::Native` is therefore accepted whenever the native
+/// backend is compiled in. A build without the `native-backend` feature has no
+/// native sessions to run, so a native request fails closed here (Rule 4: no
+/// silent ORT fallback) rather than pretending to honor it.
 pub fn validate_pipeline_backend_request(
     requested: EngineDecodeBackend,
 ) -> anyhow::Result<EngineDecodeBackend> {
     let backend = requested_decode_backend(requested)?;
+    #[cfg(not(feature = "native-backend"))]
     if backend == EngineDecodeBackend::Native {
         anyhow::bail!(
-            "pipeline.workflow executes through generic ONNX component invocations; select the \
-             ORT backend and configure its execution provider instead of the legacy native \
-             decoder backend"
+            "pipeline.workflow native execution requires the `native-backend` feature, but this \
+             build was compiled without it. Rebuild with --features native-backend (or \
+             --features native-cuda for the native CUDA EP), or select the ORT backend \
+             (decode_backend = EngineDecodeBackend::Ort / ONNX_GENAI_BACKEND=ort)."
         );
     }
     Ok(backend)
@@ -485,13 +509,42 @@ impl PipelineEngine {
             session_options.use_managed_cuda_allocator(allocator_config);
         }
         component_session_options.graph_capture = false;
-        let models = PipelineModels::load_with_component_options(
-            pipeline_dir,
-            component_session_options,
-            session_options,
-        )
+        // Under Native, every component executes on a native `InferenceSession`
+        // (see `native_component`), so building an ORT `Session` for each one is
+        // redundant, pulls in the ORT runtime unnecessarily, double-loads
+        // weights, and misreports the execution provider — and a native-only
+        // operator would make ORT reject the graph at load. Build ORT sessions
+        // only for the ORT backend; under Native, load backend-neutral graph I/O
+        // only (`PipelineModels::graph_io_metadata`) so the package's I/O
+        // contract stays available without an ORT session.
+        #[cfg(feature = "native-backend")]
+        let native_device = if decode_backend == EngineDecodeBackend::Native {
+            Some(crate::engine::resolve_native_decode_device(
+                config.native_device.clone(),
+                &session_options,
+            )?)
+        } else {
+            None
+        };
+        let models = if decode_backend == EngineDecodeBackend::Native {
+            PipelineModels::load_with_ort_session_filter(
+                pipeline_dir,
+                component_session_options,
+                |_| false,
+            )
+        } else {
+            PipelineModels::load_with_component_options(
+                pipeline_dir,
+                component_session_options,
+                session_options,
+            )
+        }
         .map_err(|error| anyhow::anyhow!("Failed to load workflow components: {error}"))?;
 
+        let speculative = directory
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.speculative.clone());
         let workflow = directory.spec.workflow;
         let mut compiled_workflow = onnx_genai_metadata::compile_workflow(&workflow)
             .map_err(|error| anyhow::anyhow!("Failed to lower workflow metadata: {error}"))?;
@@ -507,10 +560,16 @@ impl PipelineEngine {
         // session creation. This is a topology-derived maximum: a component
         // invoked in two different islands contributes twice, while a candidate
         // the linker rejects contributes nothing.
+        // Values a speculative proposal driver consumes after a pass are real
+        // consumers island fusion cannot see; keep them live in both the
+        // reservation dry-run and the plan so the two agree.
+        let speculative_live_values =
+            speculative::externally_used_values(speculative.as_ref(), &workflow);
         let maximum_island_initializer_bytes = islands::maximum_execution_island_initializer_bytes(
             &compiled_workflow.graph,
             &workflow,
             &models,
+            &speculative_live_values,
         )?;
         let maximum_initializer_reservation = workflow_initializer_reservation_bytes(
             model_weights_bytes,
@@ -553,19 +612,25 @@ impl PipelineEngine {
                 }
             }
         };
-        let execution_islands = if island_reservation_admitted {
-            islands::plan_execution_islands(
-                &mut compiled_workflow.graph,
-                &workflow,
-                &models,
-                &aliasable_output_values,
-            )
-            .map_err(|error| {
-                anyhow::anyhow!("Failed to plan workflow execution islands: {error}")
-            })?
-        } else {
-            Vec::new()
-        };
+        let execution_islands =
+            if island_reservation_admitted && decode_backend != EngineDecodeBackend::Native {
+                // Execution islands are the ORT `IoBinding` / CUDA-graph optimization.
+                // The native backend has no equivalent yet (follow-up boundary A), so
+                // under Native we keep the compiled graph's individual component nodes
+                // and drive each through the native seam — correct, just unfused.
+                islands::plan_execution_islands(
+                    &mut compiled_workflow.graph,
+                    &workflow,
+                    &models,
+                    &aliasable_output_values,
+                    &speculative_live_values,
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!("Failed to plan workflow execution islands: {error}")
+                })?
+            } else {
+                Vec::new()
+            };
         let live_island_initializer_bytes =
             islands::execution_island_initializer_bytes(&execution_islands)?;
         let live_initializer_reservation = workflow_initializer_reservation_bytes(
@@ -595,6 +660,22 @@ impl PipelineEngine {
             .collect::<HashSet<_>>();
         let device_bridge_components =
             workflow::compile_device_bridge_components(&bridge_graph, &island_components);
+        // Load a native session per component only when the native backend was
+        // requested, bound to the resolved native device/EP. The ORT
+        // `PipelineModels` above holds only backend-neutral graph I/O in that
+        // case (no ORT sessions were built).
+        #[cfg(feature = "native-backend")]
+        let native_components = if decode_backend == EngineDecodeBackend::Native {
+            let device = native_device
+                .as_ref()
+                .expect("native device is resolved when the decode backend is Native");
+            Some(RefCell::new(native_component::NativeComponentSet::load(
+                &directory.model_paths,
+                device,
+            )?))
+        } else {
+            None
+        };
         let ort_environment = models.environment_handle();
         Ok(Self {
             package_root: directory.root.clone(),
@@ -618,12 +699,38 @@ impl PipelineEngine {
             adapter_cache: RefCell::new(adapters::AdapterCache::default()),
             active_adapter_context: RefCell::new(None),
             preprocessing: directory.preprocessing,
+            speculative,
+            #[cfg(feature = "native-backend")]
+            native_components,
             _ort_environment: ort_environment,
         })
     }
 
     pub fn decode_backend(&self) -> EngineDecodeBackend {
         self.decode_backend
+    }
+
+    /// Number of native component invocations performed by this engine so far,
+    /// or `None` when it is not running the native backend. Lets tests prove the
+    /// native sessions — not an ORT fallback — executed a workflow.
+    #[cfg(feature = "native-backend")]
+    pub fn native_component_run_count(&self) -> Option<u64> {
+        self.native_components
+            .as_ref()
+            .map(|set| set.borrow().run_count())
+    }
+
+    /// `(device_input_bindings, device_outputs)` accumulated by the native
+    /// backend, or `None` when not running the native backend. Non-zero
+    /// `device_input_bindings` proves an intermediate or recurring/state tensor
+    /// entered a component still device-resident (bound zero-copy, no host
+    /// round-trip); both are always zero on the CPU native device. Lets a CUDA
+    /// test prove end-to-end device residency rather than a host round-trip.
+    #[cfg(feature = "native-backend")]
+    pub fn native_device_residency_counts(&self) -> Option<(u64, u64)> {
+        self.native_components
+            .as_ref()
+            .map(|set| set.borrow().device_residency_counts())
     }
 
     pub fn resource_snapshot(&self) -> onnx_genai_scheduler::GovernorSnapshot {
@@ -653,6 +760,13 @@ impl PipelineEngine {
 
     /// Execution-provider placement reported by the loaded component sessions.
     pub fn execution_provider_status(&self) -> String {
+        // Under the native backend no ORT sessions exist; report the native
+        // device the components actually run on instead of an empty/"native"
+        // placeholder derived from an absent ORT session set.
+        #[cfg(feature = "native-backend")]
+        if let Some(native) = self.native_components.as_ref() {
+            return native.borrow().device_label().to_string();
+        }
         let mut summaries = self
             .models
             .sessions
@@ -689,6 +803,22 @@ impl PipelineEngine {
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
         self.run_workflow(request)
+    }
+
+    /// Run the workflow and keep every value the pass bound, not only the
+    /// package's declared outputs.
+    ///
+    /// This is the seam interpreter-level constructs consume: a chained
+    /// speculative proposal reads its `folded_carry_seed` from the target output
+    /// the pass produced and binds the proposer's borrowed read-only KV from the
+    /// same values the workflow itself bound, so the proposal chain sees exactly
+    /// the tensors the package declared rather than a caller's reconstruction of
+    /// them.
+    pub fn run_pipeline_retained(
+        &mut self,
+        request: PipelineGenerateRequest,
+    ) -> anyhow::Result<PipelineTensors> {
+        self.run_workflow_retained(request)
     }
 
     /// Drop every reusable execution result this pipeline is holding, so the

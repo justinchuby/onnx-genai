@@ -364,49 +364,6 @@ pub struct Eagle3Config {
     pub num_speculative_tokens: usize,
 }
 
-/// Files and target-model outputs required for shared-KV draft speculation
-/// (originally introduced for Gemma4 `*-assistant` draft models).
-///
-/// The proposer is a shared-KV draft: it owns no KV cache and instead reads
-/// slices of the target model's paged KV cache. It carries its own internal
-/// `lm_head`, but it does *not* own an input embedding table: each step builds
-/// `inputs_embeds = concat(target_input_embedding(last_token), hidden)`, so the
-/// engine supplies the target's raw input-token embedding via
-/// [`SharedKvProposerConfig::input_embedding_weights`]. The first step seeds
-/// `hidden` from the target's last hidden state and `last_token` from the last
-/// context token; every later step threads the proposer's own `projected_state`
-/// and the previously drafted token.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SharedKvProposerConfig {
-    /// ONNX model containing the shared-KV proposer graph.
-    pub assistant_model: PathBuf,
-    /// Target decoder output containing `[batch, sequence, hidden]` states,
-    /// used to seed the first assistant step. Must be Float32.
-    pub target_hidden_output: String,
-    /// Raw little-endian f32 target input-token embedding weights in
-    /// `[vocab_size, backbone_hidden_size]` order, used to build the token-
-    /// embedding half of each step's `inputs_embeds`.
-    pub input_embedding_weights: PathBuf,
-    /// Target backbone hidden size `H`.
-    pub backbone_hidden_size: usize,
-    /// Vocabulary size of the assistant's own `logits` output.
-    pub vocab_size: usize,
-    /// Number of speculative tokens produced after the guaranteed target token.
-    pub num_speculative_tokens: usize,
-    /// Shared-KV binding groups mapping assistant `shared_kv.<name>` inputs to
-    /// target KV layer indices.
-    pub shared_kv: Vec<SharedKvBinding>,
-}
-
-/// One shared-KV binding for [`SharedKvProposerConfig`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SharedKvBinding {
-    /// Assistant input group name, e.g. `sliding_attention` / `full_attention`.
-    pub name: String,
-    /// Target KV layer indices whose cache feeds this shared-KV slice.
-    pub target_layers: Vec<usize>,
-}
-
 /// Built-in speculative candidate source.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum SpeculativeMode {
@@ -426,8 +383,6 @@ pub enum SpeculativeMode {
     Mtp(MtpConfig),
     /// Propose autoregressively from fused low/middle/high target hidden states.
     Eagle3(Eagle3Config),
-    /// Propose with a shared-KV draft proposer that reads target KV slices.
-    SharedKv(SharedKvProposerConfig),
 }
 
 /// Identifier for a persistent generation session.
@@ -1564,9 +1519,6 @@ impl GenerateOptions {
         if let Some(SpeculativeMode::Eagle3(config)) = &self.speculative_mode {
             validate_eagle3_config(config)?;
         }
-        if let Some(SpeculativeMode::SharedKv(config)) = &self.speculative_mode {
-            validate_shared_kv_proposer_config(config)?;
-        }
         Ok(())
     }
 }
@@ -1644,37 +1596,6 @@ pub(crate) fn validate_eagle3_config(config: &Eagle3Config) -> anyhow::Result<()
     }
     if config.num_speculative_tokens == 0 {
         anyhow::bail!("EAGLE-3 num_speculative_tokens must be greater than zero");
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_shared_kv_proposer_config(
-    config: &SharedKvProposerConfig,
-) -> anyhow::Result<()> {
-    if config.target_hidden_output.is_empty() {
-        anyhow::bail!("shared-KV proposer target_hidden_output must not be empty");
-    }
-    if config.backbone_hidden_size == 0 || config.vocab_size == 0 {
-        anyhow::bail!(
-            "shared-KV proposer backbone_hidden_size and vocab_size must be greater than zero"
-        );
-    }
-    if config.num_speculative_tokens == 0 {
-        anyhow::bail!("shared-KV proposer num_speculative_tokens must be greater than zero");
-    }
-    if config.shared_kv.is_empty() {
-        anyhow::bail!("shared-KV proposer requires at least one shared_kv binding group");
-    }
-    for group in &config.shared_kv {
-        if group.name.is_empty() {
-            anyhow::bail!("shared-KV proposer shared_kv group name must not be empty");
-        }
-        if group.target_layers.is_empty() {
-            anyhow::bail!(
-                "shared-KV proposer shared_kv group '{}' must list at least one target layer",
-                group.name
-            );
-        }
     }
     Ok(())
 }

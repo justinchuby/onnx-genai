@@ -37,6 +37,14 @@ name = "deepseek_v2_tiny_qmoe_native_e2e"
 required-features = ["native-backend"]
 
 [[test]]
+name = "native_workflow_smoke"
+required-features = ["native-backend"]
+
+[[test]]
+name = "native_workflow_parity"
+required-features = ["native-backend"]
+
+[[test]]
 name = "native_cuda_captured_step_inputs_parity"
 required-features = ["native-cuda"]
 
