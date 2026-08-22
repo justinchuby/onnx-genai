@@ -155,6 +155,13 @@ invariants are observable through a per-backend run counter.
 
 ## 5. Staged deletion plan
 
+> **Update:** the direct-`Engine` collapse (boundary C) is now the committed
+> direction, tracked authoritatively in
+> [`WORKFLOW_RUNTIME_UNIFICATION.md`](WORKFLOW_RUNTIME_UNIFICATION.md). Its
+> Phase 0 (deleting the deprecated `*_native_*` session compatibility shims and
+> migrating the one caller to the unified `create_session`/`generate_in_session`
+> API) has landed; boundaries A/B/D below remain as written.
+
 * **This increment**
   * Add `WorkflowComponentBackend` seam + `invoke_onnx_component`; route the
     interpreter's ONNX-component case through it (ORT path unchanged — proven by

@@ -1106,8 +1106,7 @@ required_capabilities: [kv_cache, grouped_query_attention, some_future_feature]
     )
     .expect("parse metadata");
 
-    let report =
-        validate_structure_and_capabilities(&metadata, &RuntimeCapabilities::default());
+    let report = validate_structure_and_capabilities(&metadata, &RuntimeCapabilities::default());
 
     assert!(
         report.structural.is_empty(),

@@ -2097,39 +2097,6 @@ impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
 
 #[cfg(feature = "native-backend")]
 impl Engine {
-    /// Deprecated native-only shim. Use [`Engine::create_session`] for both ORT
-    /// and native backends.
-    pub fn create_native_session(&mut self) -> anyhow::Result<SessionId> {
-        if self.decode_backend != EngineDecodeBackend::Native {
-            anyhow::bail!("create_native_session requires the native decode backend");
-        }
-        self.create_session()
-    }
-
-    /// Deprecated native-only shim. Use [`Engine::close_session`].
-    pub fn close_native_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
-        self.close_session(session_id)
-    }
-
-    /// Deprecated native-only shim. Use [`Engine::generate_in_session`].
-    pub fn generate_native_in_session(
-        &mut self,
-        session_id: SessionId,
-        request: GenerateRequest,
-    ) -> anyhow::Result<GenerateResult> {
-        self.generate_in_session(session_id, request)
-    }
-
-    /// Deprecated native-only shim. Use [`Engine::generate_in_session_with_callback`].
-    pub fn generate_native_in_session_with_callback(
-        &mut self,
-        session_id: SessionId,
-        request: GenerateRequest,
-        callback: Option<&mut GenerateTokenCallback<'_>>,
-    ) -> anyhow::Result<GenerateResult> {
-        self.generate_native_in_session_with_callbacks(session_id, request, None, callback)
-    }
-
     fn generate_native_in_session_with_callbacks(
         &mut self,
         session_id: SessionId,
@@ -2349,15 +2316,6 @@ impl Engine {
         })();
         self.scheduler.complete(session_id);
         result
-    }
-
-    /// Deprecated native-only shim. Use [`Engine::rewind_session_by`].
-    pub fn rewind_native_session(
-        &mut self,
-        session_id: SessionId,
-        token_count: RewindTokenCount,
-    ) -> anyhow::Result<SessionPosition> {
-        self.rewind_session_by(session_id, token_count)
     }
 }
 
