@@ -1,7 +1,9 @@
 # Workflow-runtime unification: making `pipeline.workflow` the sole runtime
 
-Status: **Phase 0 and Phase 1 have landed; Phase 1b and Phases 2-4 are
-the remaining work, itemized by symbol in §3 and §6.** The parent ratified REPLACE + DELETE (no
+Status: **Phase 0, Phase 1, and the runtime-type collapse have landed. One
+public runtime type remains and no caller dispatches on package shape. Making
+the interpreter execute *plain-decoder* text generation is blocked on a
+ratified-rule decision the parent owns — see §7.** The parent ratified REPLACE + DELETE (no
 compatibility facade, no permanent delegator) and assigned this consolidation to
 the owner of PR #1723. Its two gate conditions are both satisfied: `#1716` is on
 `main` (`7b79b3f5`), merged here (never rebased), and the hermetic executable
@@ -282,21 +284,22 @@ touch, so the next change starts from a list rather than a survey.
   less capable. Phase 1b's AR node is what lets the synthesized workflow reuse
   the Rust sampler instead of needing an ONNX one.
 
-**Phase 3 — migrate callers.**
-- `crates/onnx-genai-server/src/routes/completions.rs`: the
-  `if handle.pipeline { … } else { … }` dispatch at lines 9, 342, 444, 615
-  collapses into one path.
-- `crates/onnx-genai-cli/src/interactive.rs` (`PipelineEngine::from_dir_with_session_options`)
-  and `src/transcribe.rs` already use `PipelineEngine`; the plain-decoder CLI
-  path is what moves.
-- `crates/onnx-genai-bench/src/bin/profile_native.rs`: the `--pipeline` flag
-  stops being a mode (note its current
-  "`--speculative` is not supported on the `--pipeline` path" bail — Phase 1
-  removes the reason for it).
-- `crates/onnx-genai-capi` and `crates/onnx-genai-python`: neither references
-  `PipelineEngine` today; both route through `Engine`, so they follow whatever
-  `Engine::from_pretrained` becomes in Phase 2 rather than needing their own
-  migration.
+**Phase 3 — migrate callers — DONE.**
+- One public runtime type. `PipelineEngine` is deleted; the workflow interpreter
+  is `pub(crate) pipeline::WorkflowRuntime`, held by `Engine`.
+- `Engine::from_dir` resolves the package shape itself, so no caller runs
+  `PipelineModelDirectory::load_if_declared` and picks a constructor.
+- `crates/onnx-genai-server/src/driver.rs`: `EngineBackend::{Single,Pipeline}` is
+  one owned runtime; `run_engine_driver` asks `engine.is_workflow()`.
+  `EngineDriver::warmup` no longer takes a caller-supplied `pipeline: bool`.
+- `crates/onnx-genai-server/src/routes/completions.rs`: the four
+  `if handle.pipeline` branches are one `submit_generation` call. `sessions.rs`
+  and `admin.rs` ask the runtime. `ModelHandle::pipeline` is deleted.
+- CLI (`interactive.rs`, `transcribe.rs`), `run_comfyui`, `profile_native`, the
+  workflow example, and 40+ tests name one type.
+- The C ABI and Python bindings never referenced `PipelineEngine`; they route
+  through `Engine` and inherit the collapse with no migration of their own.
+- Pinned by `crates/onnx-genai-engine/tests/one_runtime_e2e.rs` (5 cases).
 
 **Phase 4 — collapse `Engine`.**
 - `crates/onnx-genai-engine/src/engine/runtime.rs`: the parallel generate /
@@ -315,3 +318,57 @@ Shared infrastructure both engines already use — `engine/load.rs`,
 `governor.rs`, `memory_strategy.rs`, `memory_plan.rs`, `metadata.rs`,
 `placement.rs`, `session_state.rs` — is **kept**; it is not duplicated
 orchestration.
+
+## 7. Blocker: a bare decoder cannot hold a workflow under the current rule
+
+The remaining step — the interpreter executing plain-decoder text generation, so
+`pipeline.workflow` is the sole runtime for *every* package — needs a bare
+decoder package to have a `WorkflowSpec`. Three facts in this repo make that a
+decision rather than an implementation:
+
+1. **`validate_metadata` rejects `model.io` beside `pipeline.workflow`**
+   (`crates/onnx-genai-metadata/src/validation.rs`,
+   `validate_model_io_against_workflow`). The rule is deliberate and documented:
+   "a second serialized expression of the same facts is not redundancy but a
+   fork". Every bare-decoder package declares `model.io`. Giving one a workflow
+   therefore makes it *invalid by our own ratified rule*.
+2. **`PipelineModelDirectory::load` requires `metadata.pipeline`**
+   (`crates/onnx-genai-ort/src/loader.rs`) — it errors with "metadata has no
+   pipeline section". The workflow runtime's component store cannot be built for
+   a package that has none.
+3. **`InferenceMetadata::decoder_io_is_legacy()` is observable.** It reports
+   "this ABI came from the deprecated block" by asking whether a workflow
+   resolved. Synthesizing one flips that answer for every existing package, and
+   the server surfaces the related fact on `/v1/debug/config`.
+
+The parent must pick one:
+
+- **(A) In-memory canonical workflow only.** The synthesized `WorkflowSpec`
+  never enters `InferenceMetadata.pipeline`, so validation never sees the pair
+  and `decoder_io_is_legacy()` keeps its current answer. "Sole runtime" then
+  holds at *execution* while the metadata surface still calls a bare decoder
+  non-workflow. Implementable without a schema change: the decode node can be a
+  `ComponentImplementation::Binding` component carrying a
+  `contract.id: onnx-genai.autoregressive-decode`, which the interpreter
+  dispatches the way it already dispatches adapters by `(abi, version)` — no new
+  enum variant, no JSON-schema change. Needs a component-less `PipelineModels`
+  constructor in `onnx-genai-ort`.
+- **(B) Relax the rule for synthesized workflows.** Permit `model.io` beside a
+  workflow when the workflow is synthesized, which requires a serialized fact
+  distinguishing synthesized from authored — a schema addition, and a weakening
+  of the "one writable answer" invariant §7.1 exists to protect.
+- **(C) Re-author every package.** Require `pipeline.workflow` in every package
+  and drop `model.io`. Clean, and breaks every published bare-decoder package
+  until it is re-exported.
+
+**Second, independent gate on any of the three: verification.** Rewiring
+`Engine::generate` for bare decoders moves the production text-generation path.
+Its coverage is largely real-model (`*_divergence`, `*_decode_lock`,
+`phi35_*`, `qwen*`, `deepseek*`), which skip without downloaded weights, so the
+change cannot be proven green in a weightless environment. Landing it needs a
+run with the model corpus available — otherwise Rule 8 is satisfied on paper by
+tests that did not execute.
+
+Everything short of that gate is done: one runtime type, one constructor, one
+generation entry point, one session API, and no caller-side dispatch (§6 items
+for the server, CLI, C ABI, and benchmarks are complete and tested).
