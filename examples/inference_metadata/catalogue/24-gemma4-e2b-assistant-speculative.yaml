@@ -27,8 +27,10 @@
 #     `inputs_embeds = concat(target_input_embedding(last_token), carry)`. The
 #     drafter emits `projected_state` as an output ONLY and takes no separate
 #     carry input: the carry re-enters as the trailing half of `inputs_embeds`.
-#     Its first-step value is the target hidden named by
-#     `speculative.port_bindings.target_hidden_context`, and each step replaces it
+#     Its first-step value (carry_0) is the target's own per-token hidden output;
+#     `speculative.port_bindings.target_hidden_context` names the drafter INPUT
+#     PORT it re-enters through (the fused `inputs_embeds`), a destination port,
+#     not the source. Each step replaces it
 #     with the drafter's output — declared as
 #     `proposal_execution.folded_carry_output`. The tied target input embedding is
 #     graph-internal to the target model, so no external `shared_weights` file is
@@ -151,7 +153,7 @@ pipeline:
             next_full_value_1: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
             next_sliding_key_0: {dtype: float16, rank: 4, shape: [batch, sliding_kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
             next_sliding_value_0: {dtype: float16, rank: 4, shape: [batch, sliding_kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
-          roles: {input_ids: token_ids, logits: logits}
+          roles: {input_ids: token_ids, logits: logits, hidden: hidden_states}
     state:
       full_key_0:
         contract: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
@@ -281,12 +283,21 @@ speculative:
     logits_output: draft_logits
     # The drafter emits `next_projected_state` but takes no separate carry input:
     # it re-enters as the trailing half of the fused `inputs_embeds`
-    # (`inputs_embeds = concat(target_embedding(token), carry)`). The first-step
-    # carry is the target hidden named by `port_bindings.target_hidden_context`;
-    # it has no workflow state cell and is recomputed on rejection, so it is not
-    # in `rollback_state`.
+    # (`inputs_embeds = concat(target_embedding(token), carry)`). carry_0 is the
+    # target's own per-token hidden output; `port_bindings.target_hidden_context`
+    # names the DESTINATION drafter input port it re-enters through (here the
+    # fused `inputs_embeds`), not the source value. The carry has no workflow
+    # state cell and is recomputed on rejection, so it is not in `rollback_state`.
     folded_carry_output: next_projected_state
+    # carry_0 SOURCE: the target output read as the fold's first-step seed
+    # (role-tagged hidden_states above), named explicitly so it is not inferred.
+    folded_carry_seed: {component: target, output: hidden}
+    # embed(last_token) for the fused input's LEADING half: the drafter graph
+    # reads only inputs_embeds, so name the target embedding table explicitly.
+    token_embedding: {component: target, table: model.embed_tokens.weight}
   port_bindings:
+    # Destination proposer input port carry_0 (and every later carry) re-enters
+    # through; for a folded carry this is the fused token_embedding_input itself.
     target_hidden_context: inputs_embeds
   shared_state: [full_attention, sliding_attention]
   vocabulary: {kind: identical}

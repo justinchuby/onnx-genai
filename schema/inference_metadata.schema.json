@@ -3810,11 +3810,22 @@
           "description": "Repeated proposer invocations form an autoregressive proposal chain.",
           "properties": {
             "folded_carry_output": {
-              "description": "A loop-carried activation the proposer emits but re-consumes WITHOUT\na separate input port: it re-enters as the trailing segment of\n`token_embedding_input`. The proposer's fused input is\n`concat(token_embedding, carry)`, so the carry has no port and no\nworkflow state cell of its own. Its first-step value is the target\ncontext named by `port_bindings.target_hidden_context`; each step\nreplaces it with this output. Because a folded carry is recomputed\nfrom committed tokens on rejection rather than restored, it does not\nappear in `rollback_state`. A chained proposer declares at least one\nof `recurrent` or `folded_carry_output`.",
+              "description": "Proposer OUTPUT port producing the folded carry for the NEXT step\n(carry_k, k>=1). The carry has no dedicated input port: it re-enters\nas the trailing segment of the proposer's fused\n`token_embedding_input` (`concat(embed(last_token), carry)`), so it\nowns no workflow state cell. Three ports pin the fold EXPLICITLY, so\na runtime never infers by convention:\n  * DESTINATION: `port_bindings.target_hidden_context` names the\n    proposer input port the carry lands in (for a folded carry, the\n    fused `token_embedding_input` itself; its trailing half).\n  * carry_0 SOURCE: `folded_carry_seed` names the target output read\n    as the carry on the first step.\n  * carry_k SOURCE: this field, the proposer output on every later\n    step.\nBecause a folded carry is recomputed from committed tokens on\nrejection rather than restored, it does not appear in\n`rollback_state`. A chained proposer declares at least one of\n`recurrent` or `folded_carry_output`.",
               "type": [
                 "string",
                 "null"
               ]
+            },
+            "folded_carry_seed": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SpeculativeValueRef"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "carry_0 seed: the target component OUTPUT read as the folded carry on\nthe FIRST step, before the proposer has produced a carry. Named\nexplicitly (`component` + `output`) so a runtime reads it rather than\ninferring \"the target hidden output\" by convention. Required whenever\n`folded_carry_output` is present."
             },
             "kind": {
               "const": "chained",
@@ -3832,6 +3843,17 @@
                 "$ref": "#/$defs/SpeculativeRecurrenceBinding"
               },
               "type": "array"
+            },
+            "token_embedding": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TokenEmbeddingSource"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Where a runtime obtains `embed(last_token)` for the LEADING half of\nthe fused `token_embedding_input`. A folded-carry proposer graph\nconsumes only the fused input, so it reads no embedding initializer of\nits own and `speculative.shared_weights` stays empty; this names the\nmodel-agnostic embedding table the runtime gathers the leading half\nfrom (never extracted heuristically from a graph). Required whenever\n`folded_carry_output` is present."
             },
             "token_embedding_input": {
               "description": "Proposer input port receiving the previous selected token embedding.",
@@ -3871,6 +3893,27 @@
       "required": [
         "state",
         "input",
+        "output"
+      ],
+      "type": "object"
+    },
+    "SpeculativeValueRef": {
+      "additionalProperties": false,
+      "description": "An explicit reference to a value a workflow component produces.\n\nBoth halves are named so a speculative runtime resolves the value from the\ndeclared graph I/O, never by string convention or shape guessing.",
+      "properties": {
+        "component": {
+          "description": "The workflow component that produces the value.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "output": {
+          "description": "The declared output port of that component carrying the value.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "component",
         "output"
       ],
       "type": "object"
@@ -4687,6 +4730,27 @@
         }
       ],
       "type": "string"
+    },
+    "TokenEmbeddingSource": {
+      "additionalProperties": false,
+      "description": "Explicit, model-agnostic source of the token embedding a chained proposer\nfolds into the leading half of its fused input.\n\nA folded-carry proposer never reads an embedding initializer inside its own\ngraph, so the table cannot be recovered from the proposer graph. This names\nthe component whose embedding the runtime reuses and the initializer that\nholds it, so gathering `embed(last_token)` is a declared contract rather than\na per-model heuristic.",
+      "properties": {
+        "component": {
+          "description": "The workflow component whose token-embedding table is reused (e.g. the\ntarget, whose vocabulary the proposer shares).",
+          "minLength": 1,
+          "type": "string"
+        },
+        "table": {
+          "description": "The named embedding table (graph initializer) on that component, e.g.\n`model.embed_tokens.weight`. A `[vocab, hidden]` row-major matrix.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "component",
+        "table"
+      ],
+      "type": "object"
     },
     "TokenizerArtifact": {
       "additionalProperties": false,
