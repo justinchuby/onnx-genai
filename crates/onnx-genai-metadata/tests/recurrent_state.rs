@@ -42,6 +42,7 @@ fn replace_state_rejects_a_sequence_axis() {
     let yaml = include_str!(
         "../../../examples/inference_metadata/catalogue/16-linear-attention-recurrent.yaml"
     )
+    .replace("\r\n", "\n")
     .replacen(
         "kind: recurrent\n            layout: bhfv",
         "kind: recurrent\n            sequence_axis: 2\n            layout: bhfv",
