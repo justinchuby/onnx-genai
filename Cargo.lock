@@ -2578,6 +2578,7 @@ dependencies = [
  "libloading 0.8.9",
  "onnx-runtime-memory-abi",
  "onnx-runtime-memory-api",
+ "onnx-runtime-memory-governor",
  "onnx-runtime-memory-testplugin",
  "thiserror 2.0.19",
 ]
