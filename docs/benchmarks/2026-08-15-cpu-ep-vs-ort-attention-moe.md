@@ -4930,7 +4930,7 @@ asks for 32, and the runtime faithfully honours it.
 So the residual is not a runtime defect to fix. It is a request that cannot pay
 for itself, which the runtime accepted silently.
 
-### 46.6 What phase 20 changes
+### 46.6 What this phase changes
 
 Two things, both small.
 

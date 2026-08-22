@@ -4241,29 +4241,6 @@ fn resolve_rayon_global_threads(
 /// most once and only its first attempt logs.
 static PROCESS_BUDGET_BOUND: OnceLock<()> = OnceLock::new();
 
-/// Confine the whole process to the explicit decode budget so a user who caps
-/// cores (via `--cpu-cores N`, `ONNX_GENAI_CPU_DECODE_THREADS=N`, or
-/// [`set_decode_thread_budget`]) disturbs at most `N` CPUs -- covering prefill
-/// and every MLAS GEMM, not just the steady-decode SPMD pool.
-///
-/// Two mechanisms, applied once, early (at CPU EP initialization, before any
-/// GEMM builds the lazily-initialized global Rayon pool):
-///
-/// 1. **Rayon global-pool size.** The pool is built with `N` threads instead of
-///    `available_parallelism()`, so `mlas-sys`'s `rayon_max_threads` reports `N`
-///    and MLAS partitions each GEMM into `N` tiles. The pool is fixed for the
-///    process lifetime and `build_global` fails if it already exists, so this
-///    must run before the first Rayon use; if the pool was already built we log
-///    once and leave it (a no-op with warning).
-/// 2. **(Linux) process CPU affinity.** The calling (main) thread is confined to
-///    `N` CPUs packed on a single NUMA node where possible; threads spawned
-///    afterwards (the Rayon pool, the SPMD decode pool) inherit the mask, so the
-///    process stays on `N` CPUs without an external `taskset`. This composes
-///    with the existing decode-affinity control: if the user set an explicit
-///    `ONNX_GENAI_CPU_DECODE_AFFINITY`, their choice wins and the auto-mask
-///    stands down. Non-Linux hosts skip affinity (the Rayon-count bound still
-///    applies).
-///
 /// Whether an explicit decode budget asks for more workers than the host has
 /// physical cores, returning that core count when it does.
 ///
@@ -4297,9 +4274,9 @@ fn budget_beyond_physical_cores(threads: usize, physical: Option<usize>) -> Opti
 /// No wall-clock gain at all, 8% more CPU per inference, and 2.4x the one-off
 /// construction cost -- which is futex and yield-spin churn while ~2x the
 /// threads come up, and which grows faster than linearly in the worker count.
-/// Larger prefill shapes measured the same way or worse. The runtime honours the
-/// request either way; this only makes a request that cannot pay for itself
-/// visible instead of silent.
+/// Larger prefill shapes in the same diagnostic harness measured the same way
+/// or worse. The runtime honours the request either way; this only makes a
+/// request that cannot pay for itself visible instead of silent.
 fn report_budget_beyond_physical_cores(threads: usize) {
     let Some(cores) =
         budget_beyond_physical_cores(threads, crate::core_topology::allowed_physical_cores())
@@ -4315,6 +4292,29 @@ fn report_budget_beyond_physical_cores(threads: usize) {
     );
 }
 
+/// Confine the whole process to the explicit decode budget so a user who caps
+/// cores (via `--cpu-cores N`, `ONNX_GENAI_CPU_DECODE_THREADS=N`, or
+/// [`set_decode_thread_budget`]) disturbs at most `N` CPUs -- covering prefill
+/// and every MLAS GEMM, not just the steady-decode SPMD pool.
+///
+/// Two mechanisms, applied once, early (at CPU EP initialization, before any
+/// GEMM builds the lazily-initialized global Rayon pool):
+///
+/// 1. **Rayon global-pool size.** The pool is built with `N` threads instead of
+///    `available_parallelism()`, so `mlas-sys`'s `rayon_max_threads` reports `N`
+///    and MLAS partitions each GEMM into `N` tiles. The pool is fixed for the
+///    process lifetime and `build_global` fails if it already exists, so this
+///    must run before the first Rayon use; if the pool was already built we log
+///    once and leave it (a no-op with warning).
+/// 2. **(Linux) process CPU affinity.** The calling (main) thread is confined to
+///    `N` CPUs packed on a single NUMA node where possible; threads spawned
+///    afterwards (the Rayon pool, the SPMD decode pool) inherit the mask, so the
+///    process stays on `N` CPUs without an external `taskset`. This composes
+///    with the existing decode-affinity control: if the user set an explicit
+///    `ONNX_GENAI_CPU_DECODE_AFFINITY`, their choice wins and the auto-mask
+///    stands down. Non-Linux hosts skip affinity (the Rayon-count bound still
+///    applies).
+///
 /// A no-op when no explicit budget is set, so the default sizing is unchanged.
 pub fn bound_process_to_decode_budget() {
     if PROCESS_BUDGET_BOUND.set(()).is_err() {
