@@ -6,7 +6,7 @@
 //! Rust `propose()` bound to ORT `Session`s, which made it a second execution
 //! engine that the backend-neutral component seam could not drive. It lives here
 //! now: every proposer step runs through
-//! [`PipelineEngine::invoke_component_values`], so ORT and native execute the
+//! [`WorkflowRuntime::invoke_component_values`], so ORT and native execute the
 //! identical chain.
 //!
 //! Everything the loop needs is read from the package's
@@ -36,7 +36,7 @@ use onnx_genai_metadata::{
 };
 use onnx_genai_ort::{DataType, Value};
 
-use super::{PipelineEngine, PipelineTensors};
+use super::{PipelineTensors, WorkflowRuntime};
 
 /// One materialized chained proposal.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,7 +105,7 @@ struct ChainedPlan<'a> {
     proposer_outputs: BTreeMap<String, String>,
 }
 
-impl PipelineEngine {
+impl WorkflowRuntime {
     /// The package's speculative compatibility contract, when it declares one.
     pub fn speculative_contract(&self) -> Option<&SpeculativeContract> {
         self.speculative.as_ref()
@@ -115,7 +115,7 @@ impl PipelineEngine {
     /// component seam.
     ///
     /// `run` holds the SSA values of the completed verification pass — the same
-    /// map [`PipelineEngine::run_workflow`] produces. Every proposer port is
+    /// map [`WorkflowRuntime::run_workflow`] produces. Every proposer port is
     /// bound from the workflow's own invocation of that component, so the
     /// borrowed read-only shared KV, position ids, and masks are exactly the
     /// tensors the package declared; only `token_embedding_input` is overridden,

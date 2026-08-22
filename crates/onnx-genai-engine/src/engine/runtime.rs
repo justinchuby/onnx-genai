@@ -319,7 +319,10 @@ impl Engine {
     }
 
     fn default_eos_token_ids(&self) -> Vec<TokenId> {
-        self.tokenizer.eos_token_ids()
+        self.tokenizer
+            .as_ref()
+            .map(Tokenizer::eos_token_ids)
+            .unwrap_or_default()
     }
 
     fn apply_eos_defaults(&self, options: &mut GenerateOptions) {
@@ -337,7 +340,23 @@ impl Engine {
 
     /// Effective context limit for a request, combining model metadata,
     /// per-request override, and decode-path capacity.
+    /// The package's tokenizer, or an error naming why text decode is
+    /// unavailable.
+    ///
+    /// A workflow package may ship no tokenizer at all (an image-generation
+    /// pipeline, for instance). Making that an explicit error here keeps the
+    /// absence a diagnosable load-time fact rather than a panic deep in the
+    /// decode loop.
+    pub(crate) fn require_tokenizer(&self) -> anyhow::Result<&Tokenizer> {
+        self.tokenizer
+            .as_ref()
+            .context("this package declares no tokenizer, so it cannot tokenize or decode text")
+    }
+
     pub fn effective_max_context(&self, options: &GenerateOptions) -> Option<usize> {
+        if let Some(workflow) = self.workflow.as_deref() {
+            return workflow.effective_max_context(options);
+        }
         self.max_context_for_request(options)
     }
 
@@ -361,7 +380,7 @@ impl Engine {
             anyhow::bail!("prompt must contain at least one token");
         }
         options.max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(&self.tokenizer), false)?;
+        let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
         let speculation_plan = native_speculation_plan(&options, &chain);
         let scheduler_session_id = self.next_native_session_id();
         let scheduled = self.admit_generate_request_with_scheduler(
@@ -394,6 +413,11 @@ impl Engine {
         // Speculation ON (implemented greedy prompt-lookup) → the native
         // speculative driver. Every other request stays on the untouched plain
         // M=1 fast path below, preserving the 762 tok/s non-regression guarantee.
+        // Borrowed before the mutable native-session borrows below.
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .context("this package declares no tokenizer, so it cannot decode text")?;
         let result = if let Some(plan) = speculation_plan {
             let mut stats = SpeculativeStats::default();
             let result = (|| {
@@ -451,7 +475,7 @@ impl Engine {
                     &prompt_tokens,
                     &options,
                     &chain,
-                    &self.tokenizer,
+                    tokenizer,
                     &mut stats,
                     callback,
                 )
@@ -467,7 +491,7 @@ impl Engine {
                 &prompt_tokens,
                 &options,
                 &chain,
-                &self.tokenizer,
+                tokenizer,
                 callback,
             )
         };
@@ -646,17 +670,20 @@ impl Engine {
 
     /// Access the engine-owned Resource Governor handle.
     pub fn governor(&self) -> &EngineResourceGovernor {
-        &self.governor
+        self.governor
+            .as_ref()
+            .or_else(|| self.workflow.as_deref().map(|workflow| workflow.governor()))
+            .expect("every runtime owns exactly one resource governor")
     }
 
     /// Convenience snapshot of configured and live resource state.
     pub fn resource_snapshot(&self) -> GovernorSnapshot {
-        self.governor.snapshot()
+        self.governor().snapshot()
     }
 
     /// Bytes by which the device memory ledger exceeds its live ceiling.
     pub fn device_oversubscribed_bytes(&self) -> u64 {
-        self.governor.device_oversubscribed_bytes()
+        self.governor().device_oversubscribed_bytes()
     }
 
     /// Static weight placement computed from `device_policy` at model load.
@@ -680,7 +707,7 @@ impl Engine {
         &self,
         limit: ResourceLimit,
     ) -> Result<GovernorReconfigureOutcome, EngineGovernorError> {
-        self.governor.set_vram_limit(limit)
+        self.governor().set_vram_limit(limit)
     }
 
     /// Cumulative KV page activity: allocations, frees, and evictions.
@@ -806,6 +833,13 @@ impl Engine {
         admission_callback: Option<&mut dyn FnMut()>,
         token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        // One entry point. A package that declares `pipeline.workflow` is driven
+        // by the interpreter over its declared `tokens` output; a package that
+        // declares a bare decoder is driven by the decode core below. The caller
+        // does not choose, and no longer holds a different type for each.
+        if self.workflow.is_some() {
+            return self.workflow_generate(request, admission_callback, token_callback);
+        }
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
             // Speculation still runs cold: the native speculative paths own
@@ -976,8 +1010,11 @@ impl Engine {
         }
 
         let max_context = self.max_context_for_request(&options);
-        let chain =
-            build_processor_chain(&options, Some(&self.tokenizer), custom_sampler.is_some())?;
+        let chain = build_processor_chain(
+            &options,
+            Some(self.require_tokenizer()?),
+            custom_sampler.is_some(),
+        )?;
 
         let scheduled = self.admit_generate_request_with_scheduler(
             session_id,
@@ -1020,6 +1057,13 @@ impl Engine {
                 });
             }
 
+            // Borrow the tokenizer before the disjoint mutable borrows below:
+            // the decode backend takes `&mut self.kv_cache` / `&mut
+            // self.scheduler`, so a later `&self` accessor call would overlap.
+            let tokenizer = self
+                .tokenizer
+                .as_ref()
+                .context("this package declares no tokenizer, so it cannot decode text")?;
             let mut backend = SessionDecodeLoopBackend {
                 session: self
                     .session
@@ -1036,7 +1080,7 @@ impl Engine {
                 &mut loop_state,
                 &options,
                 &chain,
-                &self.tokenizer,
+                tokenizer,
                 max_context,
                 callback.as_deref_mut(),
             )
@@ -1329,7 +1373,7 @@ impl Engine {
             .context("ORT decoder session is unavailable")?;
         // Bind ports from explicit metadata or unambiguous tensor shapes.
         let io = self.metadata.decoder_io();
-        let fixed_state_budget_bytes = self.governor.snapshot().resolved_limits.host_ram_bytes;
+        let fixed_state_budget_bytes = self.governor().snapshot().resolved_limits.host_ram_bytes;
         if matches!(
             &self.speculative_mode,
             SpeculativeMode::Mtp(_) | SpeculativeMode::Eagle3(_)
@@ -1392,6 +1436,9 @@ impl Engine {
     /// it from requested settings, so explicit CPU fallbacks and skipped
     /// providers are visible to status/profile output.
     pub fn execution_provider_status(&self) -> String {
+        if let Some(workflow) = self.workflow.as_deref() {
+            return workflow.execution_provider_status();
+        }
         self.session.as_deref().map_or_else(
             || "native".to_string(),
             |session| session.execution_provider_status().summary(),
@@ -1462,7 +1509,11 @@ impl Engine {
             "<|endoftext|>",
             "<|file_sep|>",
         ] {
-            if let Some(token_id) = self.tokenizer.token_id(token) {
+            if let Some(token_id) = self
+                .tokenizer
+                .as_ref()
+                .and_then(|tokenizer| tokenizer.token_id(token))
+            {
                 push_unique_stop_sequence(
                     &mut options.stop_sequences,
                     StopSequence::Tokens(vec![token_id]),
@@ -1506,7 +1557,10 @@ impl Engine {
     /// `max_length`, or to feed [`Engine::embed`] and the generation APIs). It
     /// uses the same tokenizer path as the engine's internal prompt handling.
     pub fn tokenize(&self, text: &str) -> anyhow::Result<Vec<TokenId>> {
-        self.tokenizer.encode(text).map_err(|e| {
+        if let Some(workflow) = self.workflow.as_deref() {
+            return workflow.tokenize(text);
+        }
+        self.require_tokenizer()?.encode(text).map_err(|e| {
             anyhow::anyhow!(
                 "failed to tokenize input text with the model's tokenizer: {e}; \
                  verify the model directory contains a valid tokenizer.json"
@@ -1518,7 +1572,7 @@ impl Engine {
         match prompt {
             GeneratePrompt::TokenIds(tokens) => Ok(tokens.clone()),
             GeneratePrompt::Text(text) => self
-                .tokenizer
+                .require_tokenizer()?
                 .encode(text)
                 .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}")),
         }
@@ -1732,7 +1786,7 @@ impl Engine {
         }
 
         let max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(&self.tokenizer), false)?;
+        let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
         let mut state = self
             .sessions
             .remove(&request.session_id)
@@ -1778,6 +1832,11 @@ impl Engine {
             custom_sampler: None,
         };
         let step_result = {
+            // Borrowed before the disjoint mutable borrows the backend takes.
+            let tokenizer = self
+                .tokenizer
+                .as_ref()
+                .context("this package declares no tokenizer, so it cannot decode text")?;
             let mut backend = SessionDecodeLoopBackend {
                 session: self
                     .session
@@ -1794,7 +1853,7 @@ impl Engine {
                 &mut loop_state,
                 &active.options,
                 &active.chain,
-                &self.tokenizer,
+                tokenizer,
                 active.max_context,
                 None,
             )?
@@ -1991,7 +2050,7 @@ impl Engine {
     ) -> anyhow::Result<GenerateResult> {
         Ok(GenerateResult {
             text: self
-                .tokenizer
+                .require_tokenizer()?
                 .decode(generated_tokens)
                 .map_err(|e| anyhow::anyhow!("Failed to detokenize generated tokens: {e}"))?,
             token_ids: generated_tokens.to_vec(),
@@ -2098,7 +2157,7 @@ impl Engine {
             anyhow::bail!("prompt must contain at least one token");
         }
         options.max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(&self.tokenizer), false)?;
+        let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
         if native_speculation_plan(&options, &chain).is_some() {
             anyhow::bail!(
                 "native session generation does not support speculative decoding; use stateless generate() for native prompt-lookup/shared-KV speculation"
@@ -2202,9 +2261,20 @@ impl Engine {
                 };
                 match snapshot {
                     Ok(snapshot) => {
+                        // Borrow the governor field directly, not through
+                        // `governor()`: the closure below runs while
+                        // `self.prefix_cache` is mutably borrowed, and a
+                        // whole-`self` accessor borrow would conflict. The native
+                        // decode path only exists for a decoder package, which
+                        // always owns its governor.
+                        let governor_memory = self
+                            .governor
+                            .as_ref()
+                            .context("the native decode path requires a decoder-owned governor")?
+                            .memory();
                         let reserve_snapshot = || {
                             onnx_runtime_memory_governor::MemoryGovernor::reserve(
-                                self.governor.memory(),
+                                governor_memory,
                                 onnx_runtime_memory_governor::Tier::Host,
                                 snapshot.bytes(),
                                 Holder::RecurrentPrefixSnapshot.role(),
@@ -2258,6 +2328,11 @@ impl Engine {
             }
 
             let mut result = {
+                // Borrowed before the mutable native-session borrow below.
+                let tokenizer = self
+                    .tokenizer
+                    .as_ref()
+                    .context("this package declares no tokenizer, so it cannot decode text")?;
                 let native = self
                     .native_session
                     .as_mut()
@@ -2279,7 +2354,7 @@ impl Engine {
                     resume_from,
                     &options,
                     &chain,
-                    &self.tokenizer,
+                    tokenizer,
                     callback,
                 )?
             };
@@ -2386,6 +2461,7 @@ mod tests {
             0,
         )?;
         let mut engine = Engine {
+            workflow: None,
             decode_backend: EngineDecodeBackend::Native,
             metadata: InferenceMetadata::default(),
             metadata_hints: MetadataHints::default(),
@@ -2398,7 +2474,7 @@ mod tests {
                 scheduler_config,
                 onnx_genai_scheduler::ByteBudget::new(10),
             ),
-            governor,
+            governor: Some(governor),
             sessions: HashMap::new(),
             session: None,
             native_session: None,
@@ -2414,7 +2490,7 @@ mod tests {
             draft: None,
             mtp: None,
             eagle3: None,
-            tokenizer,
+            tokenizer: Some(tokenizer),
             fim_config: None,
             num_speculative_tokens: 1,
             speculative_mode: SpeculativeMode::None,
@@ -2465,6 +2541,7 @@ mod tests {
         // model. This is the honesty guarantee -- capability is not read off the
         // decode_path alone.
         let mut engine = Engine {
+            workflow: None,
             decode_backend: EngineDecodeBackend::Native,
             metadata: InferenceMetadata::default(),
             metadata_hints: MetadataHints::default(),
@@ -2477,7 +2554,7 @@ mod tests {
                 onnx_genai_scheduler::SchedulerConfig::default(),
                 onnx_genai_scheduler::ByteBudget::new(10),
             ),
-            governor,
+            governor: Some(governor),
             sessions: HashMap::new(),
             session: None,
             native_session: None,
@@ -2493,7 +2570,7 @@ mod tests {
             draft: None,
             mtp: None,
             eagle3: None,
-            tokenizer,
+            tokenizer: Some(tokenizer),
             fim_config: None,
             num_speculative_tokens: 1,
             speculative_mode: SpeculativeMode::None,

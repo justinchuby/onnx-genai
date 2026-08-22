@@ -2,10 +2,9 @@
 
 use crate::decode::clone_value;
 use crate::engine::{
-    Engine, EngineConfig, EngineResourceGovernor, Holder, MemoryStrategyPlanInput,
-    analyze_model_memory, build_memory_strategy_plan, combine_graph_memory, component_governor,
-    log_memory_strategy_plan, requested_decode_backend, resolve_memory_strategy_hot_tier_bytes,
-    resolve_vram_limit_bytes,
+    EngineConfig, EngineResourceGovernor, Holder, MemoryStrategyPlanInput, analyze_model_memory,
+    build_memory_strategy_plan, combine_graph_memory, component_governor, log_memory_strategy_plan,
+    requested_decode_backend, resolve_memory_strategy_hot_tier_bytes, resolve_vram_limit_bytes,
 };
 use crate::memory_authority::{MemoryAuthorityProvider, SharedMemoryAuthorityProvider};
 use crate::{
@@ -145,7 +144,7 @@ impl From<GenerateRequest> for PipelineGenerateRequest {
 }
 
 /// Engine for packages expressed exclusively with `pipeline.workflow`.
-pub struct PipelineEngine {
+pub(crate) struct WorkflowRuntime {
     package_root: std::path::PathBuf,
     models: PipelineModels,
     resource_governor: EngineResourceGovernor,
@@ -187,7 +186,7 @@ pub struct PipelineEngine {
     _ort_environment: Option<Arc<onnx_genai_ort::Environment>>,
 }
 
-impl Drop for PipelineEngine {
+impl Drop for WorkflowRuntime {
     fn drop(&mut self) {
         for island in &mut self.execution_islands {
             island.clear_bindings();
@@ -289,42 +288,7 @@ fn shared_cuda_allocator_config(
     )?))
 }
 
-impl Engine {
-    pub fn from_pipeline_dir(
-        pipeline_dir: &Path,
-        config: EngineConfig,
-    ) -> anyhow::Result<PipelineEngine> {
-        PipelineEngine::from_dir_with_config(pipeline_dir, config)
-    }
-
-    pub fn from_pipeline_dir_with_memory_authority_provider(
-        pipeline_dir: &Path,
-        config: EngineConfig,
-        provider: Arc<dyn MemoryAuthorityProvider>,
-    ) -> anyhow::Result<PipelineEngine> {
-        PipelineEngine::from_dir_with_memory_authority_provider(pipeline_dir, config, provider)
-    }
-
-    pub fn from_pipeline_dir_with_session_options_and_memory_authority_provider(
-        pipeline_dir: &Path,
-        config: EngineConfig,
-        session_options: SessionOptions,
-        provider: Arc<dyn MemoryAuthorityProvider>,
-    ) -> anyhow::Result<PipelineEngine> {
-        PipelineEngine::from_dir_with_session_options_and_memory_authority_provider(
-            pipeline_dir,
-            config,
-            session_options,
-            provider,
-        )
-    }
-}
-
-impl PipelineEngine {
-    pub fn from_dir(pipeline_dir: &Path) -> anyhow::Result<Self> {
-        Self::from_dir_with_config(pipeline_dir, EngineConfig::default())
-    }
-
+impl WorkflowRuntime {
     pub fn from_dir_with_config(pipeline_dir: &Path, config: EngineConfig) -> anyhow::Result<Self> {
         Self::build(pipeline_dir, config, SessionOptions::default(), None)
     }
@@ -733,8 +697,8 @@ impl PipelineEngine {
             .map(|set| set.borrow().device_residency_counts())
     }
 
-    pub fn resource_snapshot(&self) -> onnx_genai_scheduler::GovernorSnapshot {
-        self.resource_governor.snapshot()
+    pub(crate) fn governor(&self) -> &EngineResourceGovernor {
+        &self.resource_governor
     }
 
     pub fn memory_strategy_plan(&self) -> &MemoryStrategyPlan {
@@ -786,18 +750,6 @@ impl PipelineEngine {
         self.adapter_cache.borrow().diagnostic()
     }
 
-    pub fn device_authority(&self) -> crate::memory_authority::DeviceMemoryAuthority {
-        self.resource_governor.device_authority()
-    }
-
-    pub fn set_vram_limit(
-        &self,
-        limit: onnx_genai_scheduler::ResourceLimit,
-    ) -> Result<onnx_genai_scheduler::GovernorReconfigureOutcome, crate::engine::EngineGovernorError>
-    {
-        self.resource_governor.set_vram_limit(limit)
-    }
-
     pub fn run_pipeline(
         &mut self,
         request: PipelineGenerateRequest,
@@ -821,24 +773,6 @@ impl PipelineEngine {
         self.run_workflow_retained(request)
     }
 
-    /// Drop every reusable execution result this pipeline is holding, so the
-    /// next generation recomputes its workflow from scratch. Returns how many
-    /// memoized entries were dropped.
-    ///
-    /// The workflow engine reuses work through two caches: memoized component
-    /// outputs (deterministic components replayed across requests) and
-    /// session-scoped workflow state. Benchmarks need to drop both. A harness
-    /// that replays one prompt — which is what warmup runs do — otherwise
-    /// answers each measured generation almost entirely out of retained state,
-    /// and reports a "prefill" that does not vary with prompt length (#1529).
-    pub fn clear_prefix_cache(&mut self) -> usize {
-        let dropped =
-            self.component_outputs.get_mut().len() + self.workflow_session_state.get_mut().len();
-        self.component_outputs.get_mut().clear();
-        self.workflow_session_state.get_mut().clear();
-        dropped
-    }
-
     /// Encode text with the same tokenizer this pipeline uses for prompts.
     ///
     /// The public seam benchmarks need to report how many prompt tokens a
@@ -852,14 +786,6 @@ impl PipelineEngine {
                  verify the model directory contains a valid tokenizer.json"
             )
         })
-    }
-
-    /// Decode token ids back to text with this pipeline's tokenizer, the
-    /// inverse seam of [`PipelineEngine::tokenize`].
-    pub fn detokenize(&self, tokens: &[TokenId]) -> anyhow::Result<String> {
-        self.tokenizer()?
-            .decode(tokens)
-            .map_err(|e| anyhow::anyhow!("failed to detokenize token ids: {e}"))
     }
 
     fn tokenizer(&self) -> anyhow::Result<&Tokenizer> {
@@ -1003,11 +929,6 @@ impl PipelineEngine {
         Ok(())
     }
 
-    /// Convenience text API lowered through the generic tokens package output.
-    pub fn generate(&mut self, request: GenerateRequest) -> anyhow::Result<GenerateResult> {
-        self.generate_with_callbacks(request.into(), None, None)
-    }
-
     pub fn generate_with_pipeline_request(
         &mut self,
         request: PipelineGenerateRequest,
@@ -1115,7 +1036,7 @@ mod tests {
 
     #[cfg(feature = "ort-cuda")]
     mod cuda_managed_bridge {
-        use super::super::PipelineEngine;
+        use super::super::WorkflowRuntime;
         use crate::{
             DeviceCompatibilityDomain, DeviceMemoryAuthority, EngineConfig, GeneratePrompt,
             GenerateRequest, MemoryAuthorityProvider, ProcessMemoryManager, ResourceLimit,
@@ -1353,7 +1274,7 @@ pipeline:
         }
 
         fn wait_for_allocator_idle(
-            engine: &PipelineEngine,
+            engine: &WorkflowRuntime,
             expected_live_allocations: usize,
         ) -> anyhow::Result<()> {
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -1396,7 +1317,7 @@ pipeline:
             let options = SessionOptions::with_execution_provider(ep_selection("cuda"))
                 .with_intra_op_threads(1);
             let mut engine =
-                PipelineEngine::from_dir_with_session_options_and_memory_authority_provider(
+                WorkflowRuntime::from_dir_with_session_options_and_memory_authority_provider(
                     &root,
                     EngineConfig::default(),
                     options,
@@ -1512,7 +1433,7 @@ pipeline:
                 .with_intra_op_threads(1);
             options.graph_capture = true;
             let mut engine =
-                PipelineEngine::from_dir_with_session_options_and_memory_authority_provider(
+                WorkflowRuntime::from_dir_with_session_options_and_memory_authority_provider(
                     &root,
                     EngineConfig::default(),
                     options,
@@ -1566,7 +1487,7 @@ pipeline:
                 .with_intra_op_threads(1);
             let calibration_provider = Arc::new(FixedAuthorityProvider::new(0));
             let calibration =
-                PipelineEngine::from_dir_with_session_options_and_memory_authority_provider(
+                WorkflowRuntime::from_dir_with_session_options_and_memory_authority_provider(
                     &root,
                     EngineConfig::default(),
                     options.clone(),
@@ -1601,7 +1522,7 @@ pipeline:
             let mut config = EngineConfig::default();
             config.limits.vram_limit = ResourceLimit::Bytes(limit);
             let engine =
-                PipelineEngine::from_dir_with_session_options_and_memory_authority_provider(
+                WorkflowRuntime::from_dir_with_session_options_and_memory_authority_provider(
                     &root, config, options, provider,
                 )
                 .expect("a model that fits once must not fail from a duplicate fixed reservation");

@@ -1206,7 +1206,7 @@ pipeline:
         ],
     )?;
     let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
-    let run = |engine: &mut onnx_genai_engine::PipelineEngine, min_p: f32| {
+    let run = |engine: &mut onnx_genai_engine::Engine, min_p: f32| {
         let mut generate = GenerateRequest::new(GeneratePrompt::TokenIds(vec![]));
         generate.options.min_p = min_p;
         engine.run_pipeline(
@@ -3209,14 +3209,14 @@ pipeline:
     assert_eq!(first["latent"].to_vec_i64()?, [5]);
     assert_eq!(first["advisory_count"].to_vec_i64()?, [2]);
     assert_eq!(first["actions"].as_raw_bytes()?, [0]);
-    let checkpoint = engine.checkpoint_session("world-checkpoint")?;
+    let checkpoint = engine.checkpoint_workflow_session("world-checkpoint")?;
 
     let advanced = engine.run_pipeline(request(1, 2))?;
     assert_eq!(advanced["latent"].to_vec_i64()?, [9]);
     assert_eq!(advanced["advisory_count"].to_vec_i64()?, [3]);
     assert_eq!(advanced["actions"].as_raw_bytes()?, [0]);
 
-    engine.restore_session_checkpoint("world-checkpoint", &checkpoint)?;
+    engine.restore_workflow_session_checkpoint("world-checkpoint", &checkpoint)?;
     let replayed = engine.run_pipeline(request(1, 2))?;
     assert_eq!(replayed["latent"].to_vec_i64()?, [9]);
     assert_eq!(

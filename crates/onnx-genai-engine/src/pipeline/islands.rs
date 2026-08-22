@@ -17,7 +17,7 @@ use onnx_runtime_loader::proto::onnx::{
 };
 use prost::Message;
 
-use super::{PipelineEngine, PipelineTensors};
+use super::{PipelineTensors, WorkflowRuntime};
 use crate::decode::clone_value;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -753,7 +753,7 @@ impl Drop for ExecutionIsland {
     }
 }
 
-impl PipelineEngine {
+impl WorkflowRuntime {
     pub fn execution_island_diagnostics(&self) -> Vec<ExecutionIslandDiagnostic> {
         self.execution_islands
             .iter()

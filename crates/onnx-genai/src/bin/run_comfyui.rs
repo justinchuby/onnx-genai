@@ -170,7 +170,7 @@ fn run() -> anyhow::Result<()> {
 /// The role is read from the emitted metadata rather than from an output name,
 /// so nothing here depends on how the converter spelled it.
 fn image_output<'a>(
-    engine: &onnx_genai::engine::pipeline::PipelineEngine,
+    engine: &onnx_genai::Engine,
     outputs: &'a PipelineOutputs,
 ) -> anyhow::Result<&'a Value> {
     engine

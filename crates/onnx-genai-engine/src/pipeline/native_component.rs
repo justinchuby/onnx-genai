@@ -201,7 +201,7 @@ struct NativeComponent {
 
 /// Every declared ONNX component of a workflow package, loaded as a native
 /// [`InferenceSession`] bound to the engine's resolved native device/EP. Held
-/// for the life of the [`PipelineEngine`], so a component invoked once per loop
+/// for the life of the [`WorkflowRuntime`], so a component invoked once per loop
 /// iteration reuses one session.
 pub(crate) struct NativeComponentSet {
     components: HashMap<String, NativeComponent>,

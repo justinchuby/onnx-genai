@@ -2067,7 +2067,7 @@ impl Engine {
                     .chain(draft_tokens[..idx].iter().copied())
                     .collect(),
                 generated_text: self
-                    .tokenizer
+                    .require_tokenizer()?
                     .decode(
                         &generated_tokens
                             .iter()
@@ -2164,7 +2164,7 @@ impl Engine {
                     .chain(draft_tokens.iter().copied())
                     .collect(),
                 generated_text: self
-                    .tokenizer
+                    .require_tokenizer()?
                     .decode(
                         &generated_tokens
                             .iter()
@@ -2259,7 +2259,7 @@ impl Engine {
                 token_id,
                 options,
                 chain,
-                &self.tokenizer,
+                self.require_tokenizer()?,
                 callback.as_deref_mut(),
             )?;
             *generated_tokens = commit_state.generated_tokens;

@@ -17,8 +17,7 @@
 //! the runtime rejects the writes the declaration makes illegal.
 
 use onnx_genai_engine::{
-    Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest,
-    PipelineGenerateRequest, pipeline::PipelineEngine,
+    Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest, PipelineGenerateRequest,
 };
 use onnx_genai_ort::{DataType, Value};
 use std::path::PathBuf;
@@ -31,7 +30,7 @@ fn package() -> PathBuf {
         .join("../../tests/fixtures/onnx_genai_workflows/static_cache")
 }
 
-fn engine() -> anyhow::Result<PipelineEngine> {
+fn engine() -> anyhow::Result<Engine> {
     Engine::from_pipeline_dir(&package(), EngineConfig::default())
 }
 

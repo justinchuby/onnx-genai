@@ -13,7 +13,6 @@
 
 use std::path::Path;
 
-use onnx_genai_engine::pipeline::PipelineEngine;
 use onnx_genai_engine::{Engine, EngineConfig};
 
 #[path = "common/chained.rs"]
@@ -23,7 +22,7 @@ use chained::{
     ChainedFixture, HIDDEN, PROMPT_TOKENS, fixture_root, greedy_reference, target_greedy_map,
 };
 
-fn engine(root: &Path) -> anyhow::Result<PipelineEngine> {
+fn engine(root: &Path) -> anyhow::Result<Engine> {
     Engine::from_pipeline_dir(root, EngineConfig::default())
 }
 

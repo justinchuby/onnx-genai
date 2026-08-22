@@ -774,12 +774,12 @@ impl Engine {
             request.options.validate()?;
             let mut options = request.options;
             if options.eos_token_id.is_none() {
-                options.eos_token_id = self.tokenizer.eos_token_id();
+                options.eos_token_id = self.require_tokenizer()?.eos_token_id();
             }
             let prompt_tokens = match request.prompt {
                 GeneratePrompt::TokenIds(tokens) => tokens,
                 GeneratePrompt::Text(text) => self
-                    .tokenizer
+                    .require_tokenizer()?
                     .encode(&text)
                     .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}"))?,
             };
@@ -787,11 +787,11 @@ impl Engine {
                 anyhow::bail!("prompt must contain at least one token");
             }
             let max_context = self.batched_max_context_for_request(&options);
-            let chain = build_processor_chain(&options, Some(&self.tokenizer), false)?;
+            let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
             if reached_context_limit(prompt_tokens.len(), max_context) {
                 ensure_constrained_finish(&options, "", FinishReason::Length)?;
                 results[result_index] = Some(finish_result(
-                    &self.tokenizer,
+                    self.require_tokenizer()?,
                     &[],
                     FinishReason::Length,
                     0,
@@ -860,7 +860,7 @@ impl Engine {
                     token_id,
                     &row.options,
                     &row.chain,
-                    &self.tokenizer,
+                    self.require_tokenizer()?,
                     None,
                 )?;
 
@@ -887,7 +887,7 @@ impl Engine {
 
                 if let Some(reason) = finish_reason {
                     results[row.result_index] = Some(finish_result(
-                        &self.tokenizer,
+                        self.require_tokenizer()?,
                         &row.state.generated_tokens,
                         reason,
                         row.state.prefix_cache_hit_len,
@@ -1032,7 +1032,9 @@ impl Engine {
                 .model
                 .as_ref()
                 .and_then(|model| model.max_sequence_length);
-            let tokenizer = &self.tokenizer;
+            let tokenizer = self.tokenizer.as_ref().context(
+                "continuous batching requires a tokenizer, which this package does not declare",
+            )?;
             let session = self.native_session.as_mut().context(
                 "continuous batching on the native backend requires an engine-owned native \
                  decode session; none is loaded",
@@ -1126,7 +1128,14 @@ impl Engine {
             .model
             .as_ref()
             .and_then(|model| model.max_sequence_length);
-        ContinuousBatchManager::new(decode, &self.tokenizer, metadata_max_context, max_batch)
+        ContinuousBatchManager::new(
+            decode,
+            self.tokenizer.as_ref().context(
+                "continuous batching requires a tokenizer, which this package does not declare",
+            )?,
+            metadata_max_context,
+            max_batch,
+        )
     }
 
     /// Run requests to completion through a dynamic continuous batch.
@@ -1201,7 +1210,7 @@ impl Engine {
             let prompt_tokens = match &request.prompt {
                 GeneratePrompt::TokenIds(tokens) => tokens.clone(),
                 GeneratePrompt::Text(text) => self
-                    .tokenizer
+                    .require_tokenizer()?
                     .encode(text)
                     .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}"))?,
             };

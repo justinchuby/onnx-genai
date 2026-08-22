@@ -550,7 +550,6 @@ impl AppState {
             model_max_context,
             generation_defaults: None,
             fim_config,
-            pipeline: false,
             multimodal: None,
             image_pipeline: None,
         });
@@ -714,7 +713,6 @@ pub(crate) fn build_handle_with_authorities(
         model_max_context,
         generation_defaults,
         fim_config,
-        pipeline: false,
         multimodal: None,
         image_pipeline: None,
     }))
@@ -739,7 +737,7 @@ fn build_pipeline_handle(
         config.engine_config.clone(),
         authorities,
     )?;
-    let multimodal = crate::multimodal::build(&directory, engine.models())?;
+    let multimodal = crate::multimodal::build(&directory, engine.models()?)?;
     // The declared `generation` block was retired along with the rest of the
     // superseded generation metadata surfaces, so the pipeline path resolves
     // sampling from request options only — same as the non-pipeline path above.
@@ -753,7 +751,6 @@ fn build_pipeline_handle(
         model_max_context,
         generation_defaults,
         fim_config: None,
-        pipeline: true,
         multimodal: Some(multimodal),
         image_pipeline,
     }))

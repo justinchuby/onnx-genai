@@ -95,7 +95,7 @@ pub(crate) async fn debug_config(
         .ok_or_else(|| ApiError::internal("no model loaded"))?;
     Ok(Json(DebugConfigResponse {
         model_id: handle.id.clone(),
-        pipeline: handle.pipeline,
+        pipeline: handle.engine.is_workflow(),
         max_output_tokens: state.config.max_output_tokens,
         max_sessions: state.config.max_sessions,
         max_queue_depth: state.config.max_queue_depth,

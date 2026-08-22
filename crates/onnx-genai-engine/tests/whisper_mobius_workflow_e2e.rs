@@ -22,7 +22,7 @@
 
 use std::path::PathBuf;
 
-use onnx_genai_engine::pipeline::{PipelineEngine, PipelineGenerateRequest, WorkflowOutputRole};
+use onnx_genai_engine::pipeline::{PipelineGenerateRequest, WorkflowOutputRole};
 use onnx_genai_engine::{Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest};
 use onnx_genai_ort::{DataType, Value};
 use onnx_genai_preprocess::audio::{LogMelExtractor, WHISPER_SAMPLE_RATE, decode_wav_pcm16};
@@ -225,7 +225,7 @@ fn transcribe_request(
 }
 
 fn rows_of(
-    engine: &PipelineEngine,
+    engine: &Engine,
     outputs: &onnx_genai_engine::pipeline::PipelineOutputs,
 ) -> anyhow::Result<Vec<Vec<i64>>> {
     engine

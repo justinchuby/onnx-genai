@@ -8,7 +8,7 @@ pub(crate) async fn create_session(
         .resolve("")
         .map_err(map_registry_error)?
         .ok_or_else(|| ApiError::internal("no model loaded"))?;
-    if handle.pipeline {
+    if handle.engine.is_workflow() {
         return Err(ApiError::bad_request(
             "sessions are not supported by pipeline models",
         ));

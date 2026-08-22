@@ -7,8 +7,7 @@
 
 use onnx_genai_engine::{
     AdapterActivation, AdapterSelection, Engine, EngineConfig, GenerateOptions, GeneratePrompt,
-    GenerateRequest, PipelineGenerateRequest,
-    pipeline::{PipelineEngine, WorkflowOutputRole},
+    GenerateRequest, PipelineGenerateRequest, pipeline::WorkflowOutputRole,
 };
 use onnx_genai_ort::{DataType, Value};
 use std::path::PathBuf;
@@ -185,7 +184,7 @@ fn mobius_parameter_adapters_preserve_order_rows_and_compaction() -> anyhow::Res
     Ok(())
 }
 
-fn assert_batched_policy_super_island(engine: &PipelineEngine) {
+fn assert_batched_policy_super_island(engine: &Engine) {
     let diagnostics = engine.execution_island_diagnostics();
     let island = diagnostics
         .iter()

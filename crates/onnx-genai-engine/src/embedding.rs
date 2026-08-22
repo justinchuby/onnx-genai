@@ -383,7 +383,7 @@ mod tests {
         let ids = engine.tokenize("hello world")?;
         assert!(!ids.is_empty(), "tokenizer produced no ids");
         // The public seam must agree with the tokenizer path the engine owns.
-        let expected = engine.tokenizer.encode("hello world")?;
+        let expected = engine.require_tokenizer()?.encode("hello world")?;
         assert_eq!(ids, expected);
         Ok(())
     }

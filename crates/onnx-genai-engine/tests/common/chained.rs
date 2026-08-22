@@ -8,14 +8,14 @@
 //! to undo.
 //!
 //! Nothing here is specific to the interpreter's *backend*: `ChainedFixture`
-//! takes whichever `PipelineEngine` the caller built, so the ORT-only cases and
+//! takes whichever `Engine` the caller built, so the ORT-only cases and
 //! the ORT ⇄ native parity case drive the identical code.
 
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 
-use onnx_genai_engine::pipeline::PipelineEngine;
+use onnx_genai_engine::Engine;
 use onnx_genai_engine::pipeline::speculative::{ChainedProposal, ChainedProposalOptions};
 use onnx_genai_engine::{
     GenerateOptions, GeneratePrompt, GenerateRequest, PipelineGenerateRequest, PipelineTensors,
@@ -198,25 +198,22 @@ fn boolean(values: &[bool]) -> anyhow::Result<Value> {
     )?)
 }
 
-/// Drives the fixture through one `PipelineEngine`, whichever backend built it.
+/// Drives the fixture through one `Engine`, whichever backend built it.
 pub struct ChainedFixture {
-    engine: PipelineEngine,
+    engine: Engine,
     geometry: ChainedGeometry,
 }
 
 impl ChainedFixture {
-    pub fn new(engine: PipelineEngine) -> anyhow::Result<Self> {
+    pub fn new(engine: Engine) -> anyhow::Result<Self> {
         Self::with_geometry(engine, HOMOGENEOUS)
     }
 
-    pub fn with_geometry(
-        engine: PipelineEngine,
-        geometry: ChainedGeometry,
-    ) -> anyhow::Result<Self> {
+    pub fn with_geometry(engine: Engine, geometry: ChainedGeometry) -> anyhow::Result<Self> {
         Ok(Self { engine, geometry })
     }
 
-    pub fn engine(&self) -> &PipelineEngine {
+    pub fn engine(&self) -> &Engine {
         &self.engine
     }
 

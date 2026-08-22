@@ -94,8 +94,8 @@
 use std::path::{Path, PathBuf};
 
 use onnx_genai_engine::{
-    EngineConfig, EngineDecodeBackend, GenerateOptions, GeneratePrompt, GenerateRequest,
-    GenerateResult, NativeDecodeDevice, PipelineEngine, PipelineGenerateRequest,
+    Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GeneratePrompt, GenerateRequest,
+    GenerateResult, NativeDecodeDevice, PipelineGenerateRequest,
 };
 use onnx_genai_ort::Tokenizer;
 
@@ -179,17 +179,17 @@ fn engine(
     dir: &Path,
     backend: EngineDecodeBackend,
     device: NativeDecodeDevice,
-) -> anyhow::Result<PipelineEngine> {
+) -> anyhow::Result<Engine> {
     let config = EngineConfig {
         decode_backend: backend,
         native_device: Some(device),
         ..EngineConfig::default()
     };
-    PipelineEngine::from_dir_with_config(dir, config)
+    Engine::from_dir_with_config(dir, config)
 }
 
 /// Autoregressive greedy stream (temperature 0) of `max_new_tokens` tokens.
-fn greedy_stream(engine: &mut PipelineEngine, max_new_tokens: usize) -> anyhow::Result<Vec<u32>> {
+fn greedy_stream(engine: &mut Engine, max_new_tokens: usize) -> anyhow::Result<Vec<u32>> {
     let mut request = GenerateRequest::new(GeneratePrompt::Text(PROMPT.to_string()));
     request.options = GenerateOptions {
         max_new_tokens,
@@ -205,7 +205,7 @@ fn greedy_stream(engine: &mut PipelineEngine, max_new_tokens: usize) -> anyhow::
 /// Teacher-force `context` for a single greedy step, returning the top-K
 /// log-softmax at the predicted position.
 fn teacher_forced_step(
-    engine: &mut PipelineEngine,
+    engine: &mut Engine,
     context: &[u32],
     k: usize,
 ) -> anyhow::Result<GenerateResult> {

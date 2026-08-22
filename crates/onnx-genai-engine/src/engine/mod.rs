@@ -81,6 +81,7 @@ mod placement;
 mod runtime;
 pub(crate) mod session_state;
 mod speculative_load;
+mod workflow_api;
 
 pub(crate) use decode_backend::*;
 pub(crate) use governor::*;
@@ -192,6 +193,7 @@ mod tests {
         )?;
 
         Ok(Engine {
+            workflow: None,
             decode_backend: EngineDecodeBackend::Ort,
             metadata: InferenceMetadata::default(),
             metadata_hints: MetadataHints::default(),
@@ -201,7 +203,7 @@ mod tests {
             kv_model: None,
             decode_path: ModelDecodePath::Generic,
             scheduler: Scheduler::new(onnx_genai_scheduler::SchedulerConfig::default()),
-            governor,
+            governor: Some(governor),
             sessions,
             session: None,
             #[cfg(feature = "native-backend")]
@@ -227,7 +229,7 @@ mod tests {
             draft: None,
             mtp: None,
             eagle3: None,
-            tokenizer,
+            tokenizer: Some(tokenizer),
             fim_config: None,
             num_speculative_tokens: 1,
             speculative_mode: SpeculativeMode::None,

@@ -248,7 +248,7 @@ pub(crate) struct WorkflowPerformanceCounters {
 /// resolution, component override validation, and the input value slots. Each
 /// execution retains those inputs while discarding transient SSA and emit values.
 pub struct WorkflowExecutionPlan<'a> {
-    engine: &'a PipelineEngine,
+    engine: &'a WorkflowRuntime,
     values: PipelineTensors,
     input_names: Vec<String>,
     input_aliases: HashMap<String, String>,
@@ -283,7 +283,7 @@ impl WorkflowRunTelemetry {
 }
 
 type WorkflowAdapterExecutor = fn(
-    &PipelineEngine,
+    &WorkflowRuntime,
     &str,
     &std::collections::BTreeMap<String, String>,
     &std::collections::BTreeMap<String, String>,
@@ -301,23 +301,23 @@ fn workflow_adapter_registry()
         HashMap::from([
             (
                 ("onnx-genai.image-preprocess", "1"),
-                PipelineEngine::run_image_preprocess_adapter as WorkflowAdapterExecutor,
+                WorkflowRuntime::run_image_preprocess_adapter as WorkflowAdapterExecutor,
             ),
             (
                 ("onnx-genai.audio-preprocess", "1"),
-                PipelineEngine::run_audio_preprocess_adapter as WorkflowAdapterExecutor,
+                WorkflowRuntime::run_audio_preprocess_adapter as WorkflowAdapterExecutor,
             ),
             (
                 ("onnx-genai.grammar-guidance", "1"),
-                PipelineEngine::run_grammar_guidance_adapter as WorkflowAdapterExecutor,
+                WorkflowRuntime::run_grammar_guidance_adapter as WorkflowAdapterExecutor,
             ),
             (
                 ("onnx-genai.telemetry", "1"),
-                PipelineEngine::run_telemetry_adapter as WorkflowAdapterExecutor,
+                WorkflowRuntime::run_telemetry_adapter as WorkflowAdapterExecutor,
             ),
             (
                 ("onnx-genai.parameter-overlay", "1"),
-                PipelineEngine::run_parameter_overlay_adapter as WorkflowAdapterExecutor,
+                WorkflowRuntime::run_parameter_overlay_adapter as WorkflowAdapterExecutor,
             ),
         ])
     });
@@ -507,7 +507,7 @@ fn session_state_value_name(cell: &str) -> String {
     format!("__session_state.{cell}")
 }
 
-impl PipelineEngine {
+impl WorkflowRuntime {
     fn materialize_workflow_value_copy(&self, value: &Value) -> anyhow::Result<Value> {
         if value.is_host_resident()? {
             return clone_value(value);
@@ -679,7 +679,7 @@ impl PipelineEngine {
 
 impl<'a> WorkflowExecutionPlan<'a> {
     pub(crate) fn new(
-        engine: &'a PipelineEngine,
+        engine: &'a WorkflowRuntime,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<Self> {
         let PipelineGenerateRequest {
@@ -1007,7 +1007,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
     }
 }
 
-impl PipelineEngine {
+impl WorkflowRuntime {
     // Recursive execution threads the explicit interpreter stores and telemetry.
     #[allow(clippy::too_many_arguments)]
     fn run_workflow_node(

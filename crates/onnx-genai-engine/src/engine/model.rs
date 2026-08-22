@@ -7,8 +7,19 @@ use super::*;
 /// that must borrow the session field disjointly from other mutable fields.
 pub(crate) const MISSING_ORT_SESSION: &str = "ORT backend must own a decoder session";
 
-/// The generation engine.
+/// The one generation runtime.
+///
+/// There is exactly one runtime type. A package that declares
+/// `pipeline.workflow` is executed by the workflow interpreter held in
+/// [`Self::workflow`]; a package that declares a bare decoder is executed by the
+/// decode core in the fields below. Both live on this type on purpose: callers
+/// (server, CLI, C ABI, benchmarks) hold one handle and never branch on which
+/// kind of package they loaded, which is what the old
+/// `Engine` / `PipelineEngine` split forced them to do.
 pub struct Engine {
+    /// Workflow interpreter state, present when the package declares
+    /// `pipeline.workflow`.
+    pub(crate) workflow: Option<Box<crate::pipeline::WorkflowRuntime>>,
     /// Resolved decoder execution backend.
     pub(crate) decode_backend: EngineDecodeBackend,
     /// Model inference metadata.
@@ -28,7 +39,12 @@ pub struct Engine {
     /// Batch scheduler.
     pub(crate) scheduler: Scheduler,
     /// Per-device resource ceilings and shared scheduler byte budget.
-    pub(crate) governor: EngineResourceGovernor,
+    ///
+    /// Absent for a workflow package, whose governor is owned by the interpreter
+    /// state in [`Self::workflow`]. Exactly one governor exists per runtime
+    /// either way — a second would double-count every reservation — which is why
+    /// this is an `Option` rather than a fresh inert instance.
+    pub(crate) governor: Option<EngineResourceGovernor>,
     /// Persistent multi-turn session state, keyed by session id.
     pub(crate) sessions: HashMap<SessionId, EngineSession>,
     /// ORT session for decoder execution.
@@ -78,7 +94,12 @@ pub struct Engine {
     pub(crate) eagle3: Option<Eagle3Model>,
     /// Optional shared-KV draft proposer.
     /// Tokenizer loaded from the model directory.
-    pub(crate) tokenizer: Tokenizer,
+    ///
+    /// Absent for a workflow package that ships none (an image-generation
+    /// pipeline, for instance): such a package never reaches the token decode
+    /// path, and inventing an empty tokenizer would make that a runtime
+    /// surprise instead of a load-time fact.
+    pub(crate) tokenizer: Option<Tokenizer>,
     /// Auto-detected fill-in-the-middle token configuration.
     pub(crate) fim_config: Option<FimConfig>,
     /// Default speculative draft width K.
@@ -99,6 +120,76 @@ pub struct Engine {
     /// Tests that exercise pre-session validation may set this to `None` so they
     /// stay model-free and do not touch the local ORT library.
     pub(crate) _environment: Option<Environment>,
+}
+
+impl Engine {
+    /// Build the one runtime around an already-constructed workflow interpreter.
+    ///
+    /// The decode-core fields below it are inert for a workflow package: it owns
+    /// no paged KV, no decoder session, and no scheduler of its own — its
+    /// components own their caches and the interpreter drives them. They are
+    /// real (not `Option`) values so the decode core needs no null checks on a
+    /// path it never runs; the governor, memory plan, and backend are read back
+    /// from the workflow so a caller sees one authoritative answer.
+    pub(crate) fn from_workflow(
+        workflow: crate::pipeline::WorkflowRuntime,
+    ) -> anyhow::Result<Self> {
+        let decode_backend = workflow.decode_backend();
+        let memory_strategy_plan = workflow.memory_strategy_plan().clone();
+        let metadata = workflow
+            .models()
+            .directory
+            .metadata
+            .clone()
+            .unwrap_or_default();
+        // The package's tokenizer stays owned by `PipelineModels`; text
+        // tokenization for a workflow package is served from there rather than
+        // duplicated into the decode core.
+        Ok(Engine {
+            workflow: Some(Box::new(workflow)),
+            decode_backend,
+            metadata,
+            metadata_hints: MetadataHints::default(),
+            kv_cache: PagedKvCache::new(1, 1),
+            prefix_cache: PrefixCache::new(),
+            token_prefix_cache: Vec::new(),
+            kv_model: None,
+            decode_path: ModelDecodePath::Generic,
+            scheduler: Scheduler::new(onnx_genai_scheduler::SchedulerConfig::default()),
+            governor: None,
+            sessions: HashMap::new(),
+            session: None,
+            #[cfg(feature = "native-backend")]
+            native_session: None,
+            #[cfg(feature = "native-backend")]
+            weight_placement: None,
+            memory_strategy_plan,
+            #[cfg(feature = "native-backend")]
+            native_sessions: HashMap::new(),
+            #[cfg(feature = "native-backend")]
+            native_active_session: None,
+            #[cfg(feature = "native-backend")]
+            native_session_counter: 0,
+            #[cfg(feature = "native-backend")]
+            native_access_counter: 0,
+            #[cfg(feature = "native-backend")]
+            native_default_session: None,
+            #[cfg(feature = "native-backend")]
+            native_max_sessions: 0,
+            #[cfg(feature = "native-backend")]
+            native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
+            draft: None,
+            mtp: None,
+            eagle3: None,
+            tokenizer: None,
+            fim_config: None,
+            num_speculative_tokens: 1,
+            speculative_mode: SpeculativeMode::None,
+            last_speculative_stats: SpeculativeStats::default(),
+            connector: ConnectorBridge::null(),
+            _environment: None,
+        })
+    }
 }
 
 #[cfg(feature = "native-backend")]

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use onnx_genai_engine::{
     Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GeneratePrompt, GenerateRequest,
-    NativeDecodeDevice, PipelineGenerateRequest, pipeline::PipelineEngine,
+    NativeDecodeDevice, PipelineGenerateRequest,
 };
 use onnx_genai_ort::{DataType, Value};
 
@@ -46,7 +46,7 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn ort_engine(root: &Path) -> anyhow::Result<PipelineEngine> {
+fn ort_engine(root: &Path) -> anyhow::Result<Engine> {
     Engine::from_pipeline_dir(
         root,
         EngineConfig {
@@ -56,7 +56,7 @@ fn ort_engine(root: &Path) -> anyhow::Result<PipelineEngine> {
     )
 }
 
-fn native_engine(root: &Path) -> anyhow::Result<PipelineEngine> {
+fn native_engine(root: &Path) -> anyhow::Result<Engine> {
     // Pin the CPU native device so the backend-agnostic parity scenarios are
     // deterministic regardless of build features or a GPU being present — only
     // the `native-cuda` device-residency test drives the CUDA device.
@@ -72,7 +72,7 @@ fn native_engine(root: &Path) -> anyhow::Result<PipelineEngine> {
 
 /// A native engine pinned to CUDA device 0, for the device-residency test.
 #[cfg(feature = "native-cuda")]
-fn native_cuda_engine(root: &Path) -> anyhow::Result<PipelineEngine> {
+fn native_cuda_engine(root: &Path) -> anyhow::Result<Engine> {
     Engine::from_pipeline_dir(
         root,
         EngineConfig {
@@ -128,7 +128,7 @@ fn assert_parity(
     root: &Path,
     request: impl Fn() -> anyhow::Result<PipelineGenerateRequest>,
     outputs: &[&str],
-) -> anyhow::Result<PipelineEngine> {
+) -> anyhow::Result<Engine> {
     assert_parity_with(root, native_engine, request, outputs)
 }
 
@@ -137,10 +137,10 @@ fn assert_parity(
 /// case) while reusing the ORT reference and the output comparison.
 fn assert_parity_with(
     root: &Path,
-    build_native: impl Fn(&Path) -> anyhow::Result<PipelineEngine>,
+    build_native: impl Fn(&Path) -> anyhow::Result<Engine>,
     request: impl Fn() -> anyhow::Result<PipelineGenerateRequest>,
     outputs: &[&str],
-) -> anyhow::Result<PipelineEngine> {
+) -> anyhow::Result<Engine> {
     let mut ort = ort_engine(root)?;
     let mut native = build_native(root)?;
     let ort_output = ort.run_pipeline(request()?)?;
@@ -631,12 +631,12 @@ fn native_backend_builds_no_ort_sessions() -> anyhow::Result<()> {
     let root = fixture("static_cache");
     let mut engine = native_engine(&root)?;
     assert!(
-        engine.models().sessions.is_empty(),
+        engine.models()?.sessions.is_empty(),
         "Native must build zero ORT component sessions, found {}",
-        engine.models().sessions.len()
+        engine.models()?.sessions.len()
     );
     assert!(
-        !engine.models().graph_io_metadata.is_empty(),
+        !engine.models()?.graph_io_metadata.is_empty(),
         "Native must still expose backend-neutral graph I/O metadata for the components"
     );
     let output = engine.run_pipeline(static_cache_request(2)?)?;
@@ -656,7 +656,7 @@ fn ort_backend_builds_ort_sessions() -> anyhow::Result<()> {
     let root = fixture("static_cache");
     let engine = ort_engine(&root)?;
     assert!(
-        !engine.models().sessions.is_empty(),
+        !engine.models()?.sessions.is_empty(),
         "ORT must build component sessions"
     );
     assert_ne!(
@@ -807,7 +807,7 @@ fn chained_speculative_proposal_parity_native_cuda() -> anyhow::Result<()> {
 }
 
 fn assert_chained_parity(
-    build_native: impl Fn(&Path) -> anyhow::Result<PipelineEngine>,
+    build_native: impl Fn(&Path) -> anyhow::Result<Engine>,
 ) -> anyhow::Result<()> {
     let root = chained::fixture_root();
     let mut ort = chained::ChainedFixture::new(ort_engine(&root)?)?;

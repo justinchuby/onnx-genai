@@ -7,17 +7,48 @@ use crate::memory_authority::{
 };
 
 impl Engine {
-    /// Load a model from a directory.
+    /// Whether `model_dir` declares a `pipeline.workflow` package.
+    ///
+    /// Resolved from the package itself so a caller never has to know — and can
+    /// never disagree about — which shape it loaded. This is the one place the
+    /// distinction is made; every constructor below routes on it.
+    fn declares_workflow(model_dir: &Path) -> anyhow::Result<bool> {
+        Ok(
+            onnx_genai_ort::PipelineModelDirectory::load_if_declared(model_dir)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "Failed to inspect package '{}': {error}",
+                        model_dir.display()
+                    )
+                })?
+                .is_some(),
+        )
+    }
+
+    /// Load a package from a directory.
+    ///
+    /// One entry point for both package shapes: a package that declares
+    /// `pipeline.workflow` is loaded as workflow interpreter state, a package
+    /// that declares a bare decoder as decode-core state. The caller gets the
+    /// same type either way.
     pub fn from_dir(model_dir: &Path, config: EngineConfig) -> anyhow::Result<Self> {
+        if Self::declares_workflow(model_dir)? {
+            return Self::from_pipeline_dir(model_dir, config);
+        }
         Self::from_dir_impl(model_dir, config, SessionOptions::default(), false, None)
     }
 
-    /// Load a model using a caller-owned device authority provider.
+    /// Load a package using a caller-owned device authority provider.
     pub fn from_dir_with_memory_authority_provider(
         model_dir: &Path,
         config: EngineConfig,
         provider: Arc<dyn MemoryAuthorityProvider>,
     ) -> anyhow::Result<Self> {
+        if Self::declares_workflow(model_dir)? {
+            return Self::from_pipeline_dir_with_memory_authority_provider(
+                model_dir, config, provider,
+            );
+        }
         Self::from_dir_impl(
             model_dir,
             config,
@@ -27,12 +58,20 @@ impl Engine {
         )
     }
 
-    /// Load a model from a directory with explicit ORT session options.
+    /// Load a package from a directory with explicit ORT session options.
     pub fn from_dir_with_session_options(
         model_dir: &Path,
         config: EngineConfig,
         session_options: SessionOptions,
     ) -> anyhow::Result<Self> {
+        if Self::declares_workflow(model_dir)? {
+            return crate::pipeline::WorkflowRuntime::from_dir_with_session_options(
+                model_dir,
+                config,
+                session_options,
+            )
+            .and_then(Self::from_workflow);
+        }
         Self::from_dir_impl(model_dir, config, session_options, true, None)
     }
 
@@ -266,6 +305,7 @@ impl Engine {
         };
 
         Ok(Self {
+            workflow: None,
             decode_backend,
             metadata,
             metadata_hints,
@@ -275,7 +315,7 @@ impl Engine {
             kv_model,
             decode_path,
             scheduler,
-            governor,
+            governor: Some(governor),
             sessions: HashMap::new(),
             _environment: Some(environment),
             session: Some(Box::new(session)),
@@ -302,7 +342,7 @@ impl Engine {
             draft,
             mtp,
             eagle3,
-            tokenizer,
+            tokenizer: Some(tokenizer),
             fim_config,
             num_speculative_tokens: config.num_speculative_tokens.max(1),
             speculative_mode,
@@ -966,6 +1006,7 @@ impl Engine {
             Scheduler::with_byte_budget(scheduler_config, governor.byte_budget_after_native_load());
 
         Ok(Self {
+            workflow: None,
             decode_backend: EngineDecodeBackend::Native,
             metadata,
             metadata_hints,
@@ -975,7 +1016,7 @@ impl Engine {
             kv_model,
             decode_path: ModelDecodePath::Generic,
             scheduler,
-            governor,
+            governor: Some(governor),
             sessions: HashMap::new(),
             session: None,
             native_session: Some(native_session),
@@ -991,7 +1032,7 @@ impl Engine {
             draft: None,
             mtp,
             eagle3: None,
-            tokenizer,
+            tokenizer: Some(tokenizer),
             fim_config,
             num_speculative_tokens: config.num_speculative_tokens.max(1),
             speculative_mode,

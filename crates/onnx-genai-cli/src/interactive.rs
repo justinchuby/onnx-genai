@@ -7,9 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context as _;
 use nu_ansi_term::{Color as AnsiColor, Style as AnsiStyle};
-use onnx_genai::engine::{
-    EngineDecodeBackend, PipelineEngine, PipelineGenerateRequest, is_missing_required_input,
-};
+use onnx_genai::engine::{EngineDecodeBackend, PipelineGenerateRequest, is_missing_required_input};
 use onnx_genai::metadata::GenerationDefaults;
 use onnx_genai::ort::profile::TraceVerbosity;
 use onnx_genai::ort::{ChatMessage, ChatRole, SessionOptions, Tokenizer, ep_selection};
@@ -364,7 +362,7 @@ pub(super) enum Backend {
 
 /// A loaded pipeline package plus the contracts needed to feed it.
 pub(super) struct PipelineBackend {
-    engine: PipelineEngine,
+    engine: Engine,
     tokenizer: Tokenizer,
     multimodal: MultimodalSpecs,
     generation_defaults: Option<GenerationDefaults>,
@@ -575,11 +573,8 @@ impl Backend {
                         setup.tokenizer_path.display()
                     )
                 })?;
-                let engine = PipelineEngine::from_dir_with_session_options(
-                    model_dir,
-                    config,
-                    session_options,
-                )?;
+                let engine =
+                    Engine::from_dir_with_session_options(model_dir, config, session_options)?;
                 Ok(Self::Pipeline(Box::new(PipelineBackend {
                     engine,
                     tokenizer,
@@ -821,7 +816,7 @@ impl Backend {
                     build_pipeline_request(&pipeline.tokenizer, &pipeline.multimodal, turn)?;
                 pipeline
                     .engine
-                    .generate_with_callback(request, Some(callback))
+                    .generate_pipeline_with_callback(request, Some(callback))
                     .map_err(|error| match required {
                         // A multimodal package can require its non-text input;
                         // say so rather than leaving a bare "missing input".

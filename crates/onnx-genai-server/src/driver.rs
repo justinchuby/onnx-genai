@@ -11,7 +11,7 @@ use onnx_genai::{
 use onnx_genai_engine::{
     BatchingCapability, ContinuousBatchAdmission, ContinuousBatchEvent, ContinuousBatchHandle,
     ContinuousBatchManager, DeviceMemoryAuthority, EmbeddingOptions, EngineGovernorError,
-    FimConfig, GovernorSnapshot, KvNotApplicable, KvTelemetry, MemoryStrategyPlan, PipelineEngine,
+    FimConfig, GovernorSnapshot, KvNotApplicable, KvTelemetry, MemoryStrategyPlan,
     PipelineGenerateRequest, ResourceLimit, SchedulerAdmissionError,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -42,6 +42,8 @@ pub(crate) struct EngineDriver {
     /// sees `batch_supported=false` / effective max batch = 1 directly instead of
     /// inferring it from a debug-level "using per-request engine path" log line.
     pub(crate) batching: Arc<BatchingReport>,
+    /// Resolved from the loaded runtime, not from a caller-supplied flag.
+    pub(crate) is_workflow: bool,
 }
 
 /// Server-facing summary of an engine's batching capability, combining the
@@ -216,12 +218,13 @@ impl DriverFailure {
     }
 }
 
-enum EngineBackend {
-    Single(Box<Engine>),
-    Pipeline(Box<PipelineEngine>),
-}
-
-struct EngineOwner(EngineBackend);
+/// The driver owns exactly one runtime.
+///
+/// There used to be two variants here because there were two runtime types and
+/// the server had to know which one it held. There is one type now, so the
+/// owner is one box and the *runtime* resolves how to execute a request from the
+/// package's own declaration.
+struct EngineOwner(Box<Engine>);
 
 #[derive(Debug)]
 pub(crate) enum GenerateSubmitError {
@@ -286,11 +289,9 @@ impl EngineDriver {
             kv_telemetry.set_not_applicable(KvNotApplicable::CacheCannotPage);
         }
         let memory_strategy_plan = Arc::new(engine.memory_strategy_plan().clone());
-        let owner = EngineOwner(EngineBackend::Single(Box::new(engine)));
-        let resource_snapshot = Arc::new(Mutex::new(Some(match &owner.0 {
-            EngineBackend::Single(engine) => engine.resource_snapshot(),
-            EngineBackend::Pipeline(_) => unreachable!("single-engine owner just constructed"),
-        })));
+        let owner = EngineOwner(Box::new(engine));
+        let is_workflow = owner.0.is_workflow();
+        let resource_snapshot = Arc::new(Mutex::new(Some(owner.0.resource_snapshot())));
         let driver_snapshot = Arc::clone(&resource_snapshot);
         thread::Builder::new()
             .name("onnx-genai-batch-driver".to_string())
@@ -314,20 +315,19 @@ impl EngineDriver {
             memory_strategy_plan,
             device_authority,
             batching,
+            is_workflow,
         }
     }
 
-    pub(crate) fn start_pipeline(engine: PipelineEngine, max_queue_depth: usize) -> Self {
+    pub(crate) fn start_pipeline(engine: Engine, max_queue_depth: usize) -> Self {
         let (commands, rx) = mpsc::channel(max_queue_depth);
         let generation_capacity = Arc::new(Semaphore::new(max_queue_depth));
         let driver_capacity = generation_capacity.clone();
-        let device_authority = Some(engine.device_authority());
+        let device_authority = Some(engine.governor().device_authority());
         let memory_strategy_plan = Arc::new(engine.memory_strategy_plan().clone());
-        let owner = EngineOwner(EngineBackend::Pipeline(Box::new(engine)));
-        let resource_snapshot = Arc::new(Mutex::new(Some(match &owner.0 {
-            EngineBackend::Pipeline(engine) => engine.resource_snapshot(),
-            EngineBackend::Single(_) => unreachable!("pipeline owner just constructed"),
-        })));
+        let owner = EngineOwner(Box::new(engine));
+        let is_workflow = owner.0.is_workflow();
+        let resource_snapshot = Arc::new(Mutex::new(Some(owner.0.resource_snapshot())));
         let driver_snapshot = Arc::clone(&resource_snapshot);
         // A pipeline engine owns its components' caches rather than one page
         // table, so there is nothing here to mirror. Reported as an explicit
@@ -357,6 +357,7 @@ impl EngineDriver {
             memory_strategy_plan,
             device_authority,
             batching: Arc::new(BatchingReport::pipeline()),
+            is_workflow,
         }
     }
 
@@ -411,6 +412,33 @@ impl EngineDriver {
             .map_err(|_| anyhow::anyhow!("engine driver stopped"))?
     }
 
+    /// Submit one generation, whatever the package shape.
+    ///
+    /// The runtime resolves how to execute it, so a route no longer chooses
+    /// between a text command and a pipeline command: it passes the session it
+    /// has (ignored by a workflow package, which owns no engine sessions) and
+    /// the multimodal attachments it has (ignored by a decoder package, which
+    /// takes its prompt from the request).
+    pub(crate) async fn submit_generation(
+        &self,
+        session_id: Option<SessionId>,
+        request: GenerateRequest,
+        input: Option<MultimodalInput>,
+    ) -> Result<DriverGeneration, GenerateSubmitError> {
+        if self.is_workflow {
+            return self.generate_pipeline(request, input).await;
+        }
+        self.generate(session_id, request).await
+    }
+
+    /// Whether the runtime behind this driver executes a workflow package.
+    ///
+    /// Read from the engine at startup, never supplied by a caller, so a route
+    /// and the driver can never disagree about which package was loaded.
+    pub(crate) fn is_workflow(&self) -> bool {
+        self.is_workflow
+    }
+
     pub(crate) async fn generate(
         &self,
         session_id: Option<SessionId>,
@@ -447,7 +475,7 @@ impl EngineDriver {
 
     /// Run a small generation while blocking the calling thread. Used only by
     /// startup and the administrative warmup path, never request generation.
-    pub(crate) fn warmup(&self, request: GenerateRequest, pipeline: bool) -> anyhow::Result<()> {
+    pub(crate) fn warmup(&self, request: GenerateRequest) -> anyhow::Result<()> {
         let permit = self
             .generation_capacity
             .clone()
@@ -455,7 +483,7 @@ impl EngineDriver {
             .map_err(|_| anyhow::anyhow!("generation capacity exceeded"))?;
         let (events, mut receiver) = mpsc::channel(DRIVER_OUTPUT_BUFFER);
         let (admission, _admission_rx) = oneshot::channel();
-        let command = if pipeline {
+        let command = if self.is_workflow {
             DriverCommand::GeneratePipeline {
                 request: Box::new(request),
                 input: None,
@@ -684,13 +712,15 @@ fn run_engine_driver(
     generation_capacity: Arc<Semaphore>,
     resource_snapshot: Arc<Mutex<Option<GovernorSnapshot>>>,
 ) {
-    let mut engine = match owner.0 {
-        EngineBackend::Single(engine) => *engine,
-        EngineBackend::Pipeline(mut pipeline) => {
-            run_pipeline_driver(&mut pipeline, rx, &resource_snapshot);
-            return;
-        }
-    };
+    let mut engine = *owner.0;
+    // A workflow package serves one request at a time: its components own
+    // separate caches rather than one batched forward pass. Asking the runtime
+    // rather than a caller-supplied flag is what lets both package shapes share
+    // this one driver.
+    if engine.is_workflow() {
+        run_pipeline_driver(&mut engine, rx, &resource_snapshot);
+        return;
+    }
     let continuous_batch_supported = engine.continuous_batch_manager(max_batch).is_ok();
     if continuous_batch_supported {
         tracing::info!(max_batch, "continuous batch driver enabled");
@@ -713,7 +743,7 @@ fn run_engine_driver(
 }
 
 fn run_pipeline_driver(
-    engine: &mut PipelineEngine,
+    engine: &mut Engine,
     mut rx: mpsc::Receiver<DriverCommand>,
     resource_snapshot: &Mutex<Option<GovernorSnapshot>>,
 ) {
@@ -1617,7 +1647,7 @@ impl std::fmt::Display for DriverDeliveryError {
 impl std::error::Error for DriverDeliveryError {}
 
 fn run_pipeline_generation(
-    engine: &mut PipelineEngine,
+    engine: &mut Engine,
     request: GenerateRequest,
     input: Option<MultimodalInput>,
     admission: oneshot::Sender<Result<(), DriverFailure>>,
@@ -1649,7 +1679,11 @@ fn run_pipeline_generation(
                 let _ = sender.send(Ok(()));
             }
         };
-        engine.generate_with_callbacks(pipeline_request, Some(&mut admitted), Some(&mut callback))
+        engine.generate_pipeline_with_callbacks(
+            pipeline_request,
+            Some(&mut admitted),
+            Some(&mut callback),
+        )
     };
     match result {
         Ok(result) => {
@@ -1929,6 +1963,7 @@ mod admission_tests {
             .try_send(DriverCommand::ResourceSnapshot(reply))
             .expect("fill command queue");
         let driver = EngineDriver {
+            is_workflow: false,
             commands,
             generation_capacity: Arc::new(Semaphore::new(1)),
             generation_capacity_size: 1,

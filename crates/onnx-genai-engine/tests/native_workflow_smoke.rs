@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use onnx_genai_engine::{
     Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GeneratePrompt, GenerateRequest,
-    NativeDecodeDevice, PipelineGenerateRequest, pipeline::PipelineEngine,
+    NativeDecodeDevice, PipelineGenerateRequest,
 };
 use onnx_genai_ort::{DataType, Value};
 
@@ -36,7 +36,7 @@ fn options(max_new_tokens: usize) -> GenerateOptions {
 
 #[test]
 fn native_runs_diffusion_loop_package() -> anyhow::Result<()> {
-    let mut engine: PipelineEngine = Engine::from_pipeline_dir(&root("diffusion"), native())?;
+    let mut engine: Engine = Engine::from_pipeline_dir(&root("diffusion"), native())?;
     let noise: Vec<f32> = (0..4 * 4 * 4)
         .map(|index| (index as f32 - 32.0) / 16.0)
         .collect();
@@ -56,7 +56,7 @@ fn native_runs_diffusion_loop_package() -> anyhow::Result<()> {
 
 #[test]
 fn native_runs_static_cache_ar_package() -> anyhow::Result<()> {
-    let mut engine: PipelineEngine = Engine::from_pipeline_dir(&root("static_cache"), native())?;
+    let mut engine: Engine = Engine::from_pipeline_dir(&root("static_cache"), native())?;
     let request = PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![]),
         options: options(2),
