@@ -1452,6 +1452,11 @@ impl RegisteredMemoryContext {
         &self.record.label
     }
 
+    /// The device this context was registered for.
+    pub fn device(&self) -> DeviceKey {
+        self.record.registered.device()
+    }
+
     /// A pin source that keeps this context from completing teardown.
     ///
     /// Handed to mechanisms that queue deferred releases — notably plugin
