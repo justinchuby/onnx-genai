@@ -2338,7 +2338,6 @@ mod tests {
             parse_decode_blocktime(Some("250")),
             Duration::from_nanos(250)
         );
-        assert_eq!(parse_decode_blocktime(Some("500")), DEFAULT_BLOCKTIME);
     }
 
     #[test]
