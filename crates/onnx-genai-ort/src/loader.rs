@@ -949,11 +949,19 @@ mod tests {
             .join(name);
         let _ = fs::remove_dir_all(&root);
         copy_directory(&source, &root);
-        let mut metadata = fs::read_to_string(source.join("inference_metadata.yaml")).unwrap();
+        let mut metadata = fs::read_to_string(source.join("inference_metadata.yaml"))
+            .unwrap()
+            .replace("\r\n", "\n");
         let artifact = format!("    artifacts:\n    - location: {location}\n");
-        metadata = metadata.replace(
-            "    byte_level: true\n",
+        const TOKENIZER_NEEDLE: &str = "    byte_level: true\n";
+        assert!(
+            metadata.contains(TOKENIZER_NEEDLE),
+            "tokenizer fixture must contain the insertion point"
+        );
+        metadata = metadata.replacen(
+            TOKENIZER_NEEDLE,
             &format!("    byte_level: true\n{artifact}"),
+            1,
         );
         fs::write(root.join("inference_metadata.yaml"), metadata).unwrap();
         root

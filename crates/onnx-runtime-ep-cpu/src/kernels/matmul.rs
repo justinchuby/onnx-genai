@@ -5852,6 +5852,9 @@ mod tests {
         reset_half_decode_gemv_calls();
         let a = Owned::f16(&[1, k], &a_data);
         let b = Owned::f16(&[k, n], &b_data);
+        // The process-global transpose cache may retain an entry for a freed
+        // allocation whose address was recycled for this test's weight.
+        weight_transpose::f16_cache_evict(b.bytes.as_ptr().cast(), k, n);
         let mut out = Owned::zeros_f32(&[1, n]);
         let mut kernel = MatMulKernel::default();
         kernel.set_constant_inputs(&[false, true]);
