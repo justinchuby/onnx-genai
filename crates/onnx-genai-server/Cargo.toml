@@ -86,11 +86,11 @@ getrandom = "0.3"
 base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
+image = { workspace = true, features = ["png"] }
 
 [dev-dependencies]
 onnx-runtime-virtual-memory = { workspace = true }
 tower = { workspace = true }
-image = { workspace = true, features = ["png"] }
 tempfile = "3"
 
 [dev-dependencies.cudarc]
