@@ -1168,6 +1168,93 @@ async fn speech_endpoint_synthesizes_buffered_pcm16_wav() {
     assert_eq!(&wav[36..40], b"data");
 }
 
+/// The optional `max_output_units` budget is honoured against the package's
+/// declared ceiling. The value is read from the canonical text-assembly
+/// contract (`speech_processor.json`), not from any model-family default, so an
+/// explicit in-range budget still renders a valid buffered WAV.
+#[tokio::test]
+async fn speech_endpoint_honors_explicit_max_output_units() {
+    let response = app(speech_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/speech")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "speech-wav",
+                        "input": "hello world",
+                        "instructions": "the quick brown fox",
+                        "response_format": "wav",
+                        "stream": false,
+                        "max_output_units": 3
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("audio/wav")
+    );
+    let wav = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&wav[0..4], b"RIFF");
+    assert_eq!(&wav[8..12], b"WAVE");
+}
+
+/// The raw speech route fails closed when `max_output_units` falls outside the
+/// canonical `[1, max_output_units]` budget declared by the package. Both the
+/// zero and over-ceiling cases are rejected before any execution, and the error
+/// names the declared ceiling generically (no model-specific constant).
+#[tokio::test]
+async fn speech_endpoint_rejects_out_of_range_max_output_units() {
+    for units in [0_usize, 9999_usize] {
+        let response = app(speech_state())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/audio/speech")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "speech-wav",
+                            "input": "hello world",
+                            "response_format": "wav",
+                            "stream": false,
+                            "max_output_units": units
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "max_output_units={units} must be rejected"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("max_output_units must be between 1 and"),
+            "message: {}",
+            body["error"]["message"]
+        );
+    }
+}
+
 #[tokio::test]
 #[ignore = "synthetic Whisper-contract smoke test; run explicitly for audio server validation"]
 async fn audio_endpoints_route_through_tiny_whisper_pipeline() {
