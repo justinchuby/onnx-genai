@@ -21,7 +21,8 @@ fn errors(document: &str) -> Vec<String> {
 fn image_outputs_require_an_explicit_value_range() {
     let document = include_str!(
         "../../../examples/inference_metadata/catalogue/07-stable-diffusion-text-to-image.yaml"
-    );
+    )
+    .replace("\r\n", "\n");
     let missing_range = document.replacen("        value_range: negative_one_to_one\n", "", 1);
     let errors = errors(&missing_range);
     assert!(
@@ -36,7 +37,8 @@ fn image_outputs_require_an_explicit_value_range() {
 fn image_value_range_is_rejected_on_non_image_outputs() {
     let document = include_str!(
         "../../../examples/inference_metadata/catalogue/07-stable-diffusion-text-to-image.yaml"
-    );
+    )
+    .replace("\r\n", "\n");
     let invalid = document.replacen("        role: image\n", "        role: tensor\n", 1);
     let errors = errors(&invalid);
     assert!(

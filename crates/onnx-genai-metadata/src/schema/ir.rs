@@ -1266,7 +1266,7 @@ pub struct StatePortAlias {
     /// A read-only binding still names the graph's present output when the
     /// artifact exposes one for kernel ABI reasons, but that output is not a
     /// state transition and must not be aliased back onto the input.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "StatePortAccess::is_read_write")]
     pub access: StatePortAccess,
     /// Which half of an attention cache this port pair carries.
     ///
@@ -1299,6 +1299,12 @@ pub enum StatePortAccess {
     ReadWrite,
     /// The component consumes a frozen value; any graph output is discarded.
     ReadOnly,
+}
+
+impl StatePortAccess {
+    pub fn is_read_write(&self) -> bool {
+        matches!(self, Self::ReadWrite)
+    }
 }
 
 /// Which half of a split attention cache a state port pair carries.

@@ -4198,7 +4198,6 @@
       "properties": {
         "access": {
           "$ref": "#/$defs/StatePortAccess",
-          "default": "read_write",
           "description": "Whether this component advances the state or only observes a frozen\nvalue produced by another component in the same service group.\n\nA read-only binding still names the graph's present output when the\nartifact exposes one for kernel ABI reasons, but that output is not a\nstate transition and must not be aliased back onto the input."
         },
         "input": {
