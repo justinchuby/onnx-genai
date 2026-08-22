@@ -74,7 +74,24 @@ on a moving target:
   Generalizes to real models (names the target's in-model embedding table, no
   per-model gate); for this tiny fixture the drafter ignores the embed half, so it
   is exercised structurally but doesn't perturb the greedy tokens.
-- **`#1716` is not on `main` — the remaining gate.** Its branch
+
+  **Scale validation (real Gemma4-E2B packages, `2026-08-22`).** The identical
+  contract shape is now on the published real models — the same field-reading
+  Phase-1 driver serves both, confirming the "no model-name gate" invariant
+  empirically. The parent kept the schema strict (`folded_carry_seed` must name a
+  *real* target output — no request-input escape hatch); mobius gemma4 now honors
+  `output_layer_indices` and emits the post-final-norm hidden (== HF
+  `hidden_states[-1]`) as `hidden_states.{idx}` (mobius PR #546 @ `710d4927`,
+  backward-compatible). Real E2B `proposal_execution` carries
+  `folded_carry_seed: {component: target, output: hidden_states.34}` and
+  `token_embedding: {component: target, table: model.embed_tokens.weight}`
+  (`[262144,1536]` fp16) — real ports, no placeholders. Packages (do-not-merge,
+  user-published): target `onnx-genai-example-gemma4-e2b @ 19583bf0`, assistant
+  `…-assistant @ 4b6f1533`, speculative `…-speculative @ 3e5d3b6a`; all pass
+  `#1716` `validate_metadata` + jsonschema, L4 hidden ONNX-vs-HF cos 0.999999.
+  These are the coordinates for an optional real-model scale-validation case
+  *after* the tiny-fixture parity case lands; the tiny `gemma4_chained @
+  8a66e2c8` stays the required, hermetic Phase-1 parity fixture.
   (`copilot/gemma4-e2b-metadata`) is ~50k insertions, still evolving (tip added a
   26B MoE example), and edits the interpreter seam this PR owns
   (`pipeline/islands.rs` +246, `pipeline/mod.rs` +138, `pipeline/workflow.rs`
