@@ -262,19 +262,23 @@ pub struct SpmdCounters {
     /// Barriers where the dispatcher exhausted its spin budget waiting for the
     /// workers and yielded the core.
     ///
-    /// **Saturating, and not an oversubscription signal on its own.** The
-    /// dispatcher spins [`DISPATCHER_SPIN_BEFORE_YIELD`] iterations (~10 us)
-    /// before yielding once, so *any* op whose shard takes longer than that
-    /// yields -- which is every real decode projection. Measured on an idle,
-    /// un-oversubscribed host at width 16, this reads 1.0 yields per dispatch,
-    /// i.e. fully saturated. It discriminates only for ops short enough to
-    /// complete inside the spin budget; above that, read `parks` and the
-    /// straggler shape in wall time instead.
+    /// **Strongly width- and regime-dependent; not an oversubscription signal.**
+    /// The dispatcher publishes the op, computes its own shard when it has one,
+    /// and only then spins on the completion counters, yielding once after
+    /// `DISPATCHER_SPIN_BEFORE_YIELD` (~10 us). So a yield means the *last*
+    /// worker lagged the dispatcher's own arrival at the barrier by more than
+    /// that -- a statement about spread across workers, not about how long the
+    /// op takes. Measured on an idle, un-oversubscribed host at zero gap:
+    /// 0.004 yields per dispatch at width 4, ~0.9 at width 16, with the
+    /// intervening widths non-monotonic. Read it as a straggler-spread
+    /// indicator, and only ever against a fixed width.
     ///
-    /// (The first version of this doc claimed the opposite -- that a yield is
-    /// "only reachable when a worker is descheduled". That was reasoned from
-    /// the code and never measured, and the first run of the gap harness
-    /// falsified it immediately.)
+    /// (Two earlier versions of this doc were wrong in opposite directions --
+    /// first "only reachable when a worker is descheduled", then "any op longer
+    /// than the spin budget yields, so it saturates at 1.0/dispatch". Both were
+    /// reasoned from the code; the first was falsified by measuring at width 16
+    /// and the second by measuring at width 4. Neither had been measured across
+    /// the axis that actually moves it.)
     pub dispatcher_yields: u64,
 }
 
@@ -1636,7 +1640,7 @@ pub fn counters() -> Option<SpmdCounters> {
 /// The active-spin window a decode worker holds a core before parking, as the
 /// running process resolved it.
 ///
-/// [`decode_blocktime`] latches into a `OnceLock` on the first `worker_wait`, so
+/// `decode_blocktime` latches into a `OnceLock` on the first `worker_wait`, so
 /// a sweep over `ONNX_GENAI_CPU_DECODE_BLOCKTIME_US` has to be *across process
 /// launches*; setting the variable a second time inside one process changes
 /// nothing and the two arms silently measure the same window (#1736's shape). A
