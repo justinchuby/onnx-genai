@@ -16,8 +16,12 @@
 
 mod common;
 
+use std::sync::Arc;
+
 use half::f16;
-use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    DevicePtr, DevicePtrMut, ExecutionProvider, TensorMetadata, TensorMut, TensorView,
+};
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ir::{
@@ -196,10 +200,11 @@ fn run_model(
         &y_strides,
         dev,
     );
-    ep.get_kernel(node, &[x_shape.clone(), w.dims.clone(), b.dims.clone()], 17)
-        .unwrap()
-        .execute(&inputs, &mut [output])
+    let kernel = ep
+        .get_kernel(node, &[x_shape.clone(), w.dims.clone(), b.dims.clone()], 17)
         .unwrap();
+    let mut workspace = None;
+    common::execute_kernel(ep, kernel.as_ref(), &inputs, &mut [output], &mut workspace).unwrap();
 
     let mut bytes = vec![0; y_shape.iter().product::<usize>() * dtype.byte_size()];
     unsafe {
@@ -207,6 +212,9 @@ fn run_model(
             .dtoh(&mut bytes, cuptr(y_buf.as_ptr()))
             .unwrap()
     };
+    if let Some(workspace) = workspace {
+        ep.deallocate_workspace(workspace).unwrap();
+    }
     ep.deallocate(x_buf).unwrap();
     ep.deallocate(w_buf).unwrap();
     ep.deallocate(b_buf).unwrap();
@@ -506,4 +514,239 @@ fn cuda_conv1d_matches_cpu_for_standard_grouped_and_causal_geometry() {
             },
         );
     }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn cudnn_conv_prepared_workspace_reuses_the_injected_allocator_and_captures() {
+    let injected = Arc::new(common::ExternalEagerAllocator::new(
+        common::require_context("cuDNN Conv prepared-workspace allocator substitution"),
+    ));
+    let ep =
+        common::require_cuda()
+            .with_memory(
+                Arc::clone(&injected) as Arc<dyn onnx_runtime_memory_governor::DeviceAllocator>
+            )
+            .expect("the injected allocator must be accepted for the visible CUDA device");
+    let runtime = ep.runtime();
+    let dtype = DataType::Float32;
+    let candidates = [
+        (
+            vec![1usize, 16, 32, 32],
+            vec![32usize, 16, 3, 3],
+            vec![1usize, 32, 32, 32],
+            [1, 1],
+            [1, 1, 1, 1],
+        ),
+        (
+            vec![1usize, 32, 64, 64],
+            vec![64usize, 32, 5, 5],
+            vec![1usize, 64, 64, 64],
+            [1, 1],
+            [2, 2, 2, 2],
+        ),
+        (
+            vec![1usize, 32, 128, 128],
+            vec![64usize, 32, 7, 7],
+            vec![1usize, 64, 128, 128],
+            [1, 1],
+            [3, 3, 3, 3],
+        ),
+    ];
+
+    for (x_shape, w_shape, y_shape, strides, pads) in candidates {
+        let x_values = (0..x_shape.iter().product::<usize>())
+            .map(|index| (index as f32 * 0.01).sin() + (index % 7) as f32 * 0.05)
+            .collect::<Vec<_>>();
+        let w_values = (0..w_shape.iter().product::<usize>())
+            .map(|index| ((index % 17) as f32 - 8.0) * 0.02)
+            .collect::<Vec<_>>();
+        let bias_values = (0..w_shape[0])
+            .map(|index| index as f32 * 0.01 - 0.2)
+            .collect::<Vec<_>>();
+        let (graph, node_id) = build_conv_model(
+            &x_shape,
+            &w_shape,
+            &y_shape,
+            &w_values,
+            &bias_values,
+            dtype,
+            strides,
+            pads,
+            [1, 1],
+            1,
+        );
+        let model = Model::new(&graph);
+        let kernel = ep
+            .get_kernel(
+                model.graph.node(node_id),
+                &[x_shape.clone(), w_shape.clone(), vec![w_shape[0]]],
+                17,
+            )
+            .unwrap();
+        let b_shape = [w_shape[0]];
+        let metadata = [
+            TensorMetadata::new(dtype, &x_shape, true),
+            TensorMetadata::new(dtype, &w_shape, true),
+            TensorMetadata::new(dtype, &b_shape, true),
+        ];
+        let requirement = kernel
+            .workspace_requirement(&metadata)
+            .expect("workspace requirement");
+        if requirement.bytes == 0 {
+            continue;
+        }
+
+        let x = ep
+            .allocate(x_values.len() * dtype.byte_size(), 256)
+            .expect("allocate X");
+        let w = ep
+            .allocate(w_values.len() * dtype.byte_size(), 256)
+            .expect("allocate W");
+        let b = ep
+            .allocate(bias_values.len() * dtype.byte_size(), 256)
+            .expect("allocate B");
+        let mut eager = ep
+            .allocate(y_shape.iter().product::<usize>() * dtype.byte_size(), 256)
+            .expect("allocate eager Y");
+        let mut captured = ep
+            .allocate(y_shape.iter().product::<usize>() * dtype.byte_size(), 256)
+            .expect("allocate captured Y");
+        unsafe {
+            runtime
+                .htod(&tensor_bytes(dtype, &x_values), cuptr(x.as_ptr()))
+                .unwrap();
+            runtime
+                .htod(&tensor_bytes(dtype, &w_values), cuptr(w.as_ptr()))
+                .unwrap();
+            runtime
+                .htod(&tensor_bytes(dtype, &bias_values), cuptr(b.as_ptr()))
+                .unwrap();
+        }
+
+        let x_strides = compute_contiguous_strides(&x_shape);
+        let w_strides = compute_contiguous_strides(&w_shape);
+        let b_strides = compute_contiguous_strides(&b_shape);
+        let y_strides = compute_contiguous_strides(&y_shape);
+        let device = ep.device_id();
+        let inputs = [
+            TensorView::new(DevicePtr(x.as_ptr()), dtype, &x_shape, &x_strides, device),
+            TensorView::new(DevicePtr(w.as_ptr()), dtype, &w_shape, &w_strides, device),
+            TensorView::new(DevicePtr(b.as_ptr()), dtype, &b_shape, &b_strides, device),
+        ];
+        let calls_after_buffers = injected.cumemalloc_calls();
+        let mut workspace = None;
+        {
+            let output = TensorMut::new(
+                DevicePtrMut(eager.as_mut_ptr()),
+                dtype,
+                &y_shape,
+                &y_strides,
+                device,
+            );
+            common::execute_kernel(&ep, kernel.as_ref(), &inputs, &mut [output], &mut workspace)
+                .expect("first eager cuDNN Conv execute");
+        }
+        assert!(
+            workspace.is_some(),
+            "positive workspace requirement must allocate"
+        );
+        let calls_after_first = injected.cumemalloc_calls();
+        assert_eq!(
+            calls_after_first,
+            calls_after_buffers + 1,
+            "the first conv execute must allocate exactly one prepared workspace through the injected allocator"
+        );
+        {
+            let output = TensorMut::new(
+                DevicePtrMut(captured.as_mut_ptr()),
+                dtype,
+                &y_shape,
+                &y_strides,
+                device,
+            );
+            common::execute_kernel(&ep, kernel.as_ref(), &inputs, &mut [output], &mut workspace)
+                .expect("second eager cuDNN Conv execute");
+        }
+        let calls_after_second = injected.cumemalloc_calls();
+        assert_eq!(
+            calls_after_second, calls_after_first,
+            "repeated conv executes must reuse the prepared workspace"
+        );
+        let mut eager_bytes = vec![0u8; y_shape.iter().product::<usize>() * dtype.byte_size()];
+        let mut repeat_bytes = vec![0u8; eager_bytes.len()];
+        unsafe {
+            runtime
+                .dtoh(&mut eager_bytes, cuptr(eager.as_ptr()))
+                .unwrap();
+            runtime
+                .dtoh(&mut repeat_bytes, cuptr(captured.as_ptr()))
+                .unwrap();
+        }
+        assert_eq!(
+            repeat_bytes, eager_bytes,
+            "reusing the prepared workspace changed the convolution output"
+        );
+        assert!(
+            kernel.cuda_graph_compatible(),
+            "a warmed cuDNN Conv with prepared workspace must be capture-supported"
+        );
+
+        let kernels: [&dyn onnx_runtime_ep_api::Kernel; 1] = [kernel.as_ref()];
+        runtime
+            .begin_graph_capture(&kernels)
+            .expect("begin Conv CUDA graph capture");
+        {
+            let output = TensorMut::new(
+                DevicePtrMut(captured.as_mut_ptr()),
+                dtype,
+                &y_shape,
+                &y_strides,
+                device,
+            );
+            common::execute_kernel(&ep, kernel.as_ref(), &inputs, &mut [output], &mut workspace)
+                .expect("record Conv with prepared workspace");
+        }
+        runtime
+            .end_graph_capture()
+            .expect("end Conv CUDA graph capture");
+        runtime.replay_graph().expect("replay captured Conv");
+        let calls_after_capture = injected.cumemalloc_calls();
+        assert_eq!(
+            calls_after_capture, calls_after_second,
+            "recording or replaying the Conv graph must not allocate a new workspace"
+        );
+        let mut captured_bytes = vec![0u8; eager_bytes.len()];
+        unsafe {
+            runtime
+                .dtoh(&mut captured_bytes, cuptr(captured.as_ptr()))
+                .unwrap();
+        }
+        assert_eq!(
+            captured_bytes, eager_bytes,
+            "captured Conv output diverged from eager output"
+        );
+        assert!(runtime.reset_graph().unwrap(), "reset captured Conv graph");
+
+        if let Some(workspace) = workspace.take() {
+            ep.deallocate_workspace(workspace).unwrap();
+        }
+        for buffer in [captured, eager, b, w, x] {
+            ep.deallocate(buffer).unwrap();
+        }
+        common::drain_releases(&ep, "Conv prepared workspace teardown");
+        assert_eq!(
+            injected.frees(),
+            injected.cumemalloc_calls(),
+            "the injected allocator must observe every Conv buffer/workspace free"
+        );
+        return;
+    }
+
+    panic!(
+        "no cuDNN Conv candidate selected a positive prepared workspace; update the test geometries"
+    );
 }

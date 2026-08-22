@@ -367,10 +367,7 @@ impl Engine {
         // decoders (no recurrent state pairs) yield no derived spec and keep their
         // existing load path unchanged. See #384 and the qwen3.5-27B enablement.
         maybe_fill_hybrid_io_from_graph(&mut metadata, &model_directory.model_path);
-        let runtime_caps = onnx_genai_metadata::RuntimeCapabilities::default();
-        if let Err(errors) = onnx_genai_metadata::validate(&metadata, &runtime_caps) {
-            anyhow::bail!("Invalid inference metadata: {errors:?}");
-        }
+        admit_inference_metadata(&metadata)?;
         // Native MTP self-speculation seeds its draft head from a target hidden
         // output. The native decode session only records that hidden state when
         // the decode ABI names it, but the seed is declared by the MTP sidecar
@@ -1151,16 +1148,30 @@ fn load_inference_metadata(model_directory: &ModelDirectory) -> anyhow::Result<I
     Ok(default_inference_metadata())
 }
 
+fn admit_inference_metadata(metadata: &InferenceMetadata) -> anyhow::Result<()> {
+    let runtime_caps = onnx_genai_metadata::RuntimeCapabilities::default();
+    let report = onnx_genai_metadata::validate_structure_and_capabilities(metadata, &runtime_caps);
+    if !report.structural.is_empty() {
+        anyhow::bail!("Invalid inference metadata: {:?}", report.structural);
+    }
+    if !report.unsupported_capabilities.is_empty() {
+        anyhow::bail!(
+            "Unsupported inference metadata capabilities: {}",
+            report.unsupported_capabilities.join(", ")
+        );
+    }
+    Ok(())
+}
+
 fn resolve_metadata_and_decode_path(
     metadata: InferenceMetadata,
     shared_kv: crate::decode::SharedKvOffer,
     capture_requested: bool,
 ) -> anyhow::Result<MetadataResolution> {
-    // Validate capabilities
-    let runtime_caps = onnx_genai_metadata::RuntimeCapabilities::default();
-    if let Err(errors) = onnx_genai_metadata::validate(&metadata, &runtime_caps) {
-        anyhow::bail!("Invalid inference metadata: {errors:?}");
-    }
+    // Canonical metadata is the sole execution contract. A bare decoder may
+    // not bypass workflow, serving, adapter, or policy requirements it cannot
+    // execute; admission must fail before decode-path selection.
+    admit_inference_metadata(&metadata)?;
 
     let sliding_window = crate::decode::sliding_window_from_metadata(&metadata)?;
     let sink_tokens = crate::decode::sink_tokens_from_metadata(&metadata);
@@ -2530,6 +2541,57 @@ fn load_shared_kv_proposer(
         None
     };
     Ok(shared_kv_proposer)
+}
+
+#[cfg(test)]
+mod metadata_admission_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_declared_capability_rejects_before_decode_selection() {
+        let metadata: InferenceMetadata =
+            serde_yaml::from_str("schema_version: v1\nrequired_capabilities: [vendor.future]\n")
+                .expect("metadata parses");
+
+        let error = admit_inference_metadata(&metadata)
+            .expect_err("unsupported capability must fail closed")
+            .to_string();
+        assert!(
+            error.contains("Unsupported inference metadata capabilities")
+                && error.contains("vendor.future"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn unsupported_derived_workflow_capability_cannot_fall_back_to_bare_decoder() {
+        let metadata: InferenceMetadata = serde_yaml::from_str(
+            r#"
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      capabilities: [workflow_ssa]
+    components:
+      decoder:
+        implementation: { kind: binding }
+        ports: {}
+    steps:
+      - kind: invoke
+        component: decoder
+"#,
+        )
+        .expect("metadata parses");
+
+        let error = admit_inference_metadata(&metadata)
+            .expect_err("workflow package must not fall back to bare decode")
+            .to_string();
+        assert!(
+            error.contains("Unsupported inference metadata capabilities")
+                && error.contains("workflow_ssa"),
+            "{error}"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "native-backend"))]

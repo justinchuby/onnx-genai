@@ -201,6 +201,13 @@ pub fn set_weight_transpose_cache_enabled(enabled: bool) {
 ///   Apple arm is likewise `cfg`-gated: a binary predicts exactly what its own
 ///   kernels will allocate.
 ///
+/// * **x86 — `MatMul` / `FusedMatMulBias` / `Gemm transB=0` with a constant
+///   16-bit `B`**: the decode GEMV transposes the weight once to `[N, K]` and
+///   caches it at its stored width, `N * K * 2`. All three route through the
+///   single `try_half_decode_gemv` helper, so all three are counted by the
+///   same arm — see the note there on why keying on the shared helper rather
+///   than on an op-name list is what stops this going stale.
+///
 /// The shape-keyed kernel cache instantiates a node once per activation shape
 /// (prefill `m > 1`, decode `m == 1`), but every instance keys the *global*
 /// cache on `(weight address, K, N)`, so the second instantiation hits the
@@ -232,7 +239,15 @@ fn constant_b_numel(node: &Node, graph: &Graph) -> Option<(u64, DataType)> {
 /// Per-node contribution to [`weight_transpose_cache_predicted_bytes`]. Mirrors
 /// exactly the kernel call sites documented there.
 fn node_weight_transpose_cache_bytes(node: &Node, graph: &Graph) -> u64 {
-    if !node.is_default_domain() {
+    // Domain gate. `Gemm`/`MatMul` are default-domain ops; `FusedMatMulBias` is
+    // emitted by the optimizer's `MatMul + Add` fusion into the *contrib*
+    // domain (`optimizer.rs`, `MICROSOFT_DOMAIN`) and its kernel is registered
+    // there (`kernels/mod.rs`). A blanket `!node.is_default_domain()` bail
+    // therefore silently zeroed every fused projection -- the node this
+    // predictor most needs to account for after #1702 was the one node it
+    // could never see. Each op below states the domain it actually ships in.
+    let contrib = node.domain == "com.microsoft";
+    if !node.is_default_domain() && !contrib {
         return 0;
     }
     // All platforms: `Gemm` with `transB != 0` transposes a constant `B[N,K]`
@@ -243,7 +258,7 @@ fn node_weight_transpose_cache_bytes(node: &Node, graph: &Graph) -> u64 {
     let x86_half_decode = cfg!(any(target_arch = "x86", target_arch = "x86_64"));
     let half = |dtype: DataType| matches!(dtype, DataType::Float16 | DataType::BFloat16);
 
-    if node.op_type == "Gemm" {
+    if node.op_type == "Gemm" && node.is_default_domain() {
         let trans_b = node.attr("transB").and_then(Attribute::as_int).unwrap_or(0) != 0;
         let Some((numel, dtype)) = constant_b_numel(node, graph) else {
             return 0;
@@ -262,7 +277,10 @@ fn node_weight_transpose_cache_bytes(node: &Node, graph: &Graph) -> u64 {
         }
         return 0;
     }
-    if node.op_type == "MatMul" || node.op_type == "FusedMatMulBias" {
+    // `MatMul` ships in the default domain, `FusedMatMulBias` in contrib.
+    if (node.op_type == "MatMul" && node.is_default_domain())
+        || (node.op_type == "FusedMatMulBias" && contrib)
+    {
         let Some((numel, dtype)) = constant_b_numel(node, graph) else {
             return 0;
         };
@@ -272,10 +290,16 @@ fn node_weight_transpose_cache_bytes(node: &Node, graph: &Graph) -> u64 {
             let elem = if dtype == DataType::Float16 { 2 } else { 4 };
             return numel.saturating_mul(elem);
         }
-        // x86 elsewhere: only `MatMul` reaches the decode GEMV --
-        // `FusedMatMulBias` has no 16-bit GEMV on this target and retains
-        // nothing, so counting it would over-budget every fused projection.
-        if x86_half_decode && node.op_type == "MatMul" && half(dtype) {
+        // x86 elsewhere: `MatMul` and, since #1702, `FusedMatMulBias` both
+        // reach the decode GEMV through the same `try_half_decode_gemv`
+        // helper, so both retain the same `2 * numel` transpose. This arm
+        // deliberately does *not* name one op and exclude the other: the
+        // predictor's previous `node.op_type == "MatMul"` restriction was
+        // correct only for as long as the two operators had different
+        // routes, and it went silently stale the moment they were unified.
+        // Keying on "does this node reach the shared helper" instead of on a
+        // hardcoded op name is what keeps it from going stale again.
+        if x86_half_decode && half(dtype) {
             return numel.saturating_mul(2);
         }
         return 0;
@@ -285,11 +309,16 @@ fn node_weight_transpose_cache_bytes(node: &Node, graph: &Graph) -> u64 {
 
 /// Evict all entries from the global weight-transpose caches.
 ///
-/// **Must** be called when an Executor drops: the caches are keyed by
-/// (address, K, N), which makes a stale entry impossible for a *different*
-/// tensor, but a later model whose mmap places a **same-shaped** weight at a
-/// recycled address would still match. Clearing on Executor drop closes that
-/// remaining lifetime window and bounds cache growth across model lifetimes.
+/// **Must** be called when an Executor drops. The caches are keyed by
+/// (address, K, N), and an address only names a tensor while that tensor is
+/// *live*: once freed, a same-shaped weight landing on the recycled address
+/// matches the key and is served the previous weight's rows (#1726). Clearing
+/// on Executor drop bounds cache growth across model lifetimes and closes that
+/// window for the prewarmed entries, which have no other owner; entries a
+/// [`MatMulPrepack`] installed are evicted when it drops.
+///
+/// Note this runs *before* `Executor::drop` frees the weight buffers, which is
+/// what makes the teardown ordering safe rather than merely lucky.
 pub fn clear_weight_transpose_caches() {
     weight_transpose::clear_all();
 }
@@ -509,8 +538,17 @@ fn node_matmul_dense_cache_bytes(node: &Node, graph: &Graph) -> u64 {
     // is accounted separately. FusedMatMulBias is included because the optimiser
     // may already have fused a `MatMul + Add` before this predictor runs, and it
     // holds the identical `dense` cache.
-    if !node.is_default_domain() || (node.op_type != "MatMul" && node.op_type != "FusedMatMulBias")
-    {
+    //
+    // `MatMul` ships in the default domain; `FusedMatMulBias` ships in the
+    // optimizer's contrib domain (`com.microsoft`). A blanket
+    // `!node.is_default_domain()` bail would silently zero every
+    // `FusedMatMulBias` node here exactly as it once did in
+    // `node_weight_transpose_cache_bytes` (#1702) — the very defect that
+    // predictor's fix removed. Each op is gated to the domain it actually
+    // ships in instead of one shared domain check.
+    let is_matmul = node.op_type == "MatMul" && node.is_default_domain();
+    let is_fused_bias = node.op_type == "FusedMatMulBias" && node.domain == "com.microsoft";
+    if !is_matmul && !is_fused_bias {
         return 0;
     }
     let mut total = 0_u64;
@@ -639,12 +677,12 @@ pub(crate) struct MatMulPrepack {
         not(any(target_os = "macos", target_os = "ios")),
         allow(dead_code, reason = "consumed only by the Apple Accelerate paths")
     )]
-    transposed_b: OnceLock<(WeightTransposeKey, Arc<Vec<f32>>)>,
+    transposed_b: OnceLock<(WeightTransposeKey, bool, Arc<Vec<f32>>)>,
     /// Lazily-computed f16 transpose of the B weight matrix, with the key it
     /// was computed for. Stores the raw u16 bit patterns of half::f16 in N×K
     /// layout, read directly from the mmap'd model file without widening to
     /// f32. Only populated when B is a constant Float16 input.
-    transposed_b_f16: OnceLock<(WeightTransposeKey, Arc<Vec<u16>>)>,
+    transposed_b_f16: OnceLock<(WeightTransposeKey, bool, Arc<Vec<u16>>)>,
     /// Lazily-computed contiguous f16 copy of B for non-contiguous weight
     /// matrices (e.g. lm_head vocab projection stored column-major in the ONNX
     /// model). Stores raw u16 bit patterns in row-major K×N layout. Only
@@ -655,6 +693,45 @@ pub(crate) struct MatMulPrepack {
         allow(dead_code, reason = "consumed only by the Apple Accelerate paths")
     )]
     contiguous_b_f16: OnceLock<Arc<Vec<u16>>>,
+}
+
+/// Entries this prepack *installed* in the process-global transpose caches must
+/// not outlive it (#1726).
+///
+/// Those caches are keyed on `(address, k, n, tag)` and hold no claim on the
+/// buffer at that address. A `1024 x 1024` f16 weight is 2 MiB, which glibc
+/// serves by `mmap` at first; freeing one raises the dynamic mmap threshold, so
+/// the *next* same-size weight is cut from the brk heap and readily lands on a
+/// just-freed address. The lookup then hits, the route counter reads exactly
+/// what it should, and the kernel multiplies another weight's rows -- values
+/// that are not a function of the inputs, which is how #1726 presented.
+///
+/// Ownership is the installing call, not merely reaching the entry: a prepack
+/// that shared one someone else put there records `false` and evicts nothing.
+/// That distinction is load-bearing. The model-load prewarms
+/// ([`precompute_f16_weight_transpose`]) install under the same key a consuming
+/// kernel later computes, so an unconditional eviction here would let the first
+/// transient consumer to drop pull the prewarmed transpose out from under a
+/// live one -- silently undoing the TTFT work the prewarm exists to do, and
+/// undercounting `weight_transpose_cache_bytes` while the bytes are still
+/// resident behind a sibling's `Arc`.
+///
+/// What this closes is the *transient* weight: a prepack whose source is freed
+/// while the process lives on. It is not what protects a session teardown --
+/// there `Executor::drop` clears the caches before it frees the weight buffers,
+/// and the prepacks (a struct field) drop afterwards onto an already-empty map.
+/// A prepack holds an `Arc` of the transpose and a bare address, never the
+/// source itself, so nothing here keeps a weight alive; the guarantee is only
+/// that the entry does not outlive the prepack that put it there.
+impl Drop for MatMulPrepack {
+    fn drop(&mut self) {
+        if let Some((key, true, _)) = self.transposed_b.get() {
+            weight_transpose::evict_f32(key);
+        }
+        if let Some((key, true, _)) = self.transposed_b_f16.get() {
+            weight_transpose::evict_half(key);
+        }
+    }
 }
 
 impl Default for MatMulPrepack {
@@ -775,16 +852,31 @@ impl MatMulPrepack {
         if key.numel() != Some(b.len()) {
             return None;
         }
-        let (cached_key, bt) = self.transposed_b.get_or_init(|| {
-            let bt = weight_transpose::cached_transpose_f32(b, k, n)
+        let (cached_key, _, bt) = self.transposed_b.get_or_init(|| {
+            let (bt, installed) = weight_transpose::cached_transpose_f32_reporting(b, k, n)
                 .expect("length was validated against [k, n] above");
-            (key, bt)
+            (key, installed, bt)
         });
         (*cached_key == key).then(|| bt.as_slice())
     }
 
     /// Returns a cached f16 transpose of B[K,N] → B_T[N,K] row-major.
     ///
+    /// Weight-scaled bytes this prepack is currently holding in its 16-bit
+    /// transpose memo — the *actual* side of the `predicted == actual`
+    /// reconciliation that `node_weight_transpose_cache_bytes` is the
+    /// predicted side of (#1056 ratio-1.00, #1702).
+    ///
+    /// Reads this instance rather than the process-global total, so a test can
+    /// attribute the bytes to the execution it just performed even under the
+    /// parallel harness.
+    #[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+    pub(crate) fn retained_transpose_bytes(&self) -> u64 {
+        self.transposed_b_f16
+            .get()
+            .map_or(0, |(_, _, bt)| bt.len() * std::mem::size_of::<u16>()) as u64
+    }
+
     /// Like [`transposed_b`](Self::transposed_b) but preserves the original f16
     /// storage format (as raw u16 bit patterns), reading directly from the
     /// mmap'd model buffer. Uses a process-global cache so the transpose
@@ -853,10 +945,10 @@ impl MatMulPrepack {
             HalfFormat::Bf16 => 1,
         };
         let key = WeightTransposeKey::tagged(src.as_ptr(), k, n, tag);
-        let (cached_key, bt) = self.transposed_b_f16.get_or_init(|| {
-            let bt = weight_transpose::cached_transpose_half(src, k, n, tag)
+        let (cached_key, _, bt) = self.transposed_b_f16.get_or_init(|| {
+            let (bt, installed) = weight_transpose::cached_transpose_half_reporting(src, k, n, tag)
                 .expect("length was validated against [k, n] above");
-            (key, bt)
+            (key, installed, bt)
         });
         (*cached_key == key).then(|| bt.as_slice())
     }
@@ -2403,40 +2495,8 @@ impl MatMulKernel {
         // `try_matmul_half`, because the batch guard below keeps it off this
         // GEMV and its only other destination is the row-blocked GEMM.
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        if geom.m == 1
-            && numel(&geom.batch_shape) <= 1
-            && geom.b_promoted_rank == 2
-            && inputs[1].is_contiguous()
-            && inputs[1].numel() == geom.k.saturating_mul(geom.n)
-            && let Some(format) = half_storage_format(inputs[0].dtype, inputs[1].dtype)
-            && half_gemv::simd_available(format)
-            && half_decode_gemv_enabled()
-        {
-            inputs[1].validate()?;
-            let a_dense = self.prepack.dense(0, &inputs[0])?;
-            if a_dense.len() == geom.k {
-                // SAFETY: `inputs[1]` was just validated as a contiguous
-                // Float16/BFloat16 view whose element count equals `k * n`.
-                // Both are transparent over `u16`, so reading their storage as
-                // raw bit patterns is sound, and the view outlives this call.
-                let b_bits = unsafe {
-                    std::slice::from_raw_parts(inputs[1].data_ptr::<u16>(), geom.k * geom.n)
-                };
-                let mut result = vec![0.0f32; geom.n];
-                count_half_decode_gemv();
-                half_decode_gemv_dispatch(
-                    format,
-                    &self.prepack,
-                    &inputs[1],
-                    &a_dense,
-                    b_bits,
-                    &mut result,
-                    geom.k,
-                    geom.n,
-                    false,
-                );
-                return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
-            }
+        if let Some(result) = try_half_decode_gemv(&self.prepack, &inputs[0], &inputs[1], &geom)? {
+            return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
         }
 
         // f16 prefill through MLAS SGEMM on a once-widened, once-packed B.
@@ -3276,6 +3336,77 @@ pub(crate) fn half_decode_gemv_dispatch(
     half_gemv::gemv_half_kn(format, a, b_bits, out, k, n);
 }
 
+/// The x86 16-bit decode GEMV arm, shared by every operator whose math is
+/// `A @ B` with a 2-D 16-bit `B` at `m == 1`.
+///
+/// Returns `Some(result)` (length `n`) when the route applies, `None` when any
+/// guard declines and the caller must continue down its own chain.
+///
+/// **This exists because a copy of these guards is how #1381 stayed open.**
+/// `MatMul` reached this route and `FusedMatMulBias` — the fusion the
+/// optimizer produces for the `MatMul + Add(bias)` that almost every
+/// `nn.Linear` becomes — did not, so the *better-optimized* form of a
+/// projection was the slower one, by 1.55x-3.02x depending on shape and dtype.
+/// The divergence was invisible because the two kernels agreed on values and
+/// only disagreed on which kernel produced them. Extracting the arm makes
+/// "same math, same route" a property of there being one arm, rather than of
+/// two sites being edited together.
+///
+/// Every guard here is load-bearing and is asserted by
+/// `half_decode_route_tests`:
+/// - `m == 1`: above it, panel reuse repays `try_matmul_half`'s packing.
+/// - unbatched, 2-D promoted `B`: a batched `m == 1` belongs on the GEBP.
+/// - contiguous `B` with exactly `k * n` elements: the raw-bits read below.
+/// - a 16-bit storage format both operands share, with SIMD for it.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub(crate) fn try_half_decode_gemv(
+    prepack: &MatMulPrepack,
+    a: &TensorView,
+    b: &TensorView,
+    geom: &MatMulGeometry,
+) -> Result<Option<Vec<f32>>> {
+    let (k, n) = (geom.k, geom.n);
+    if geom.m != 1
+        || numel(&geom.batch_shape) > 1
+        || geom.b_promoted_rank != 2
+        || !b.is_contiguous()
+        || b.numel() != k.saturating_mul(n)
+        || !half_decode_gemv_enabled()
+    {
+        return Ok(None);
+    }
+    let Some(format) = half_storage_format(a.dtype, b.dtype) else {
+        return Ok(None);
+    };
+    if !half_gemv::simd_available(format) {
+        return Ok(None);
+    }
+    b.validate()?;
+    let a_dense = prepack.dense(0, a)?;
+    if a_dense.len() != k {
+        return Ok(None);
+    }
+    // SAFETY: `b` was just validated as a contiguous Float16/BFloat16 view
+    // whose element count equals `k * n`. Both are transparent over `u16`, so
+    // reading their storage as raw bit patterns is sound, and the view
+    // outlives this call.
+    let b_bits = unsafe { std::slice::from_raw_parts(b.data_ptr::<u16>(), k * n) };
+    let mut result = vec![0.0f32; n];
+    count_half_decode_gemv();
+    half_decode_gemv_dispatch(
+        format,
+        prepack,
+        b,
+        &a_dense,
+        b_bits,
+        &mut result,
+        k,
+        n,
+        false,
+    );
+    Ok(Some(result))
+}
+
 /// Compute `A @ B` (numpy semantics: batched, broadcast leading dims, 1-D
 /// operand promotion) into a dense row-major `Vec<f32>`.
 ///
@@ -3372,7 +3503,7 @@ fn matmul_dense_impl_with_geom(
 /// Precomputed MatMul dimensions: 1-D promotion, inner-dim agreement, batch
 /// broadcast, and per-tile element counts. Computed once so both the owned and
 /// direct-output paths share exactly one geometry derivation.
-struct MatMulGeometry {
+pub(crate) struct MatMulGeometry {
     m: usize,
     k: usize,
     n: usize,
@@ -3393,7 +3524,7 @@ struct MatMulGeometry {
 
 /// Derive [`MatMulGeometry`] from the two operand views (numpy matmul
 /// semantics: 1-D promotion, inner-dim check, broadcast leading dims).
-fn matmul_geometry(a: &TensorView, b: &TensorView) -> Result<MatMulGeometry> {
+pub(crate) fn matmul_geometry(a: &TensorView, b: &TensorView) -> Result<MatMulGeometry> {
     // Promote 1-D operands per numpy matmul: a [K] -> [1,K] (drop row after),
     // b [K] -> [K,1] (drop col after).
     let a_raw = a.shape;
@@ -3685,6 +3816,57 @@ mod tests {
             matmul_dense_cache_predicted_bytes(&dense_matmul_graph(k, n, DataType::Float16, false)),
             0,
             "a non-constant operand is never memoised as a weight"
+        );
+    }
+
+    /// Mutation guard: `FusedMatMulBias` ships in the optimizer's
+    /// `com.microsoft` domain, never the default domain. A predictor gated on
+    /// `node.is_default_domain()` alone silently zeros every fused node here —
+    /// the exact defect #1702 fixed in `node_weight_transpose_cache_bytes` but
+    /// which this predictor still carried until this test caught it. `MatMul`
+    /// (default domain) and `FusedMatMulBias` (`com.microsoft`) with identical
+    /// geometry must be budgeted identically.
+    #[test]
+    fn fused_matmul_bias_dense_cache_is_budgeted_in_its_shipping_domain() {
+        use onnx_runtime_ir::{NodeId, TensorData, WeightRef, static_shape};
+        let (k, n) = (10usize, 7usize);
+
+        let matmul_bytes =
+            matmul_dense_cache_predicted_bytes(&dense_matmul_graph(k, n, DataType::Float16, true));
+        assert_ne!(matmul_bytes, 0, "sanity: MatMul itself must be budgeted");
+
+        let mut graph = Graph::new();
+        let a = graph.create_named_value("A", DataType::Float32, static_shape([1, k]));
+        let b = graph.create_named_value("B", DataType::Float16, static_shape([k, n]));
+        let bias = graph.create_named_value("C", DataType::Float32, static_shape([n]));
+        let y = graph.create_named_value("Y", DataType::Float32, static_shape([1, n]));
+        graph.add_input(a);
+        graph.add_input(b);
+        graph.add_input(bias);
+        let mut node = Node::new(
+            NodeId(0),
+            "FusedMatMulBias",
+            vec![Some(a), Some(b), Some(bias)],
+            vec![y],
+        );
+        node.domain = "com.microsoft".to_string();
+        graph.insert_node(node);
+        graph.add_output(y);
+        graph.set_initializer(
+            b,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float16,
+                vec![k, n],
+                vec![0u8; k * n * 2],
+            )),
+        );
+
+        let fused_bytes = matmul_dense_cache_predicted_bytes(&graph);
+        assert_eq!(
+            fused_bytes, matmul_bytes,
+            "FusedMatMulBias must be budgeted exactly like MatMul in its \
+             shipping (`com.microsoft`) domain -- a 0 here means the domain \
+             gate silently excludes every fused node again"
         );
     }
 
@@ -5211,7 +5393,7 @@ mod tests {
         // comparison below is a real guard: it proves the first call populated
         // the cache and the second reused it (rather than repopulating).
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        let ptr_before = kernel.prepack.transposed_b_f16.get().unwrap().1.as_ptr();
+        let ptr_before = kernel.prepack.transposed_b_f16.get().unwrap().2.as_ptr();
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         let ptr_before = kernel.prepack.dense[1].filled().unwrap().as_ptr();
 
@@ -5225,7 +5407,7 @@ mod tests {
         // The pointer must be unchanged — the OnceLock was already populated.
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         assert_eq!(
-            kernel.prepack.transposed_b_f16.get().unwrap().1.as_ptr(),
+            kernel.prepack.transposed_b_f16.get().unwrap().2.as_ptr(),
             ptr_before,
             "transposed_b_f16 cache was reallocated on the second execute"
         );
@@ -5798,7 +5980,7 @@ mod tests {
             // replaces an older "must not transpose at all" -- the concern it
             // encoded (a silent, weight-scaled resident buffer) is preserved,
             // and now checked against the number the plan budgets.
-            if let Some((_, bt)) = kernel.prepack.transposed_b_f16.get() {
+            if let Some((_, _, bt)) = kernel.prepack.transposed_b_f16.get() {
                 assert_eq!(
                     bt.len(),
                     k * n,
@@ -5874,6 +6056,115 @@ mod tests {
                 "column {index}: {g} != {w}"
             );
         }
+    }
+
+    /// A weight freed at one address must not lend its transpose to the next
+    /// weight that lands there (#1726).
+    ///
+    /// The global f16 transpose cache is keyed on `(address, k, n, tag)` and
+    /// nothing checks that the buffer still holds what was transposed, so a
+    /// recycled allocation of the same shape and dtype is served the *previous*
+    /// weight's rows. The route counter still reads 1, because the right route
+    /// did run -- it just read another weight's bytes. That is #1726's exact
+    /// signature: right route, values that are not a function of the inputs.
+    ///
+    /// Reusing one owning buffer makes the address collision deterministic on
+    /// every allocator and platform. The first kernel must evict the transpose
+    /// it installed when it drops; after the bytes are replaced in place, a
+    /// second kernel at the same address must transpose the new weight.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn a_recycled_weight_address_must_not_serve_the_previous_weights_transpose() {
+        if !crate::backend::has_simd_x86() {
+            return;
+        }
+        let (k, n) = (1024usize, 1024usize);
+        let a_data: Vec<f32> = (0..k).map(|i| ((i % 17) as f32 - 8.0) / 16.0).collect();
+        // Distinct weights. The second is deliberately *not* on the 1/16 grid,
+        // so a stale read is arithmetically unmistakable rather than a rounding
+        // argument: every honest dot product here is a multiple of 1/256.
+        let first_data: Vec<f32> = (0..k * n).map(|i| ((i % 19) as f32 - 9.0) / 16.0).collect();
+        let second_data: Vec<f32> = (0..k * n)
+            .map(|i| ((i % 23) as f32 - 11.0) / 32.0 + 0.001_953_125)
+            .collect();
+        let want_first = naive_matmul(&a_data, &first_data, 1, k, n);
+        let want_second = naive_matmul(&a_data, &second_data, 1, k, n);
+
+        let mut weight = Owned::f16(&[k, n], &first_data);
+        let decode = |weight: &Owned| -> Vec<f32> {
+            let a = Owned::f16(&[1, k], &a_data);
+            let mut out = Owned::zeros_f32(&[1, n]);
+            let mut kernel = MatMulKernel::default();
+            kernel.set_constant_inputs(&[false, true]);
+            kernel
+                .execute(&[a.view(), weight.view()], &mut [out.view_mut()])
+                .unwrap();
+            out.to_f32()
+        };
+
+        for (index, (got, want)) in decode(&weight).iter().zip(&want_first).enumerate() {
+            assert!(
+                (got - want).abs() <= 2e-2 * (1.0 + want.abs()),
+                "first weight column {index}: {got} != {want}"
+            );
+        }
+
+        let address = weight.bytes.as_ptr();
+        for (bytes, value) in weight.bytes.chunks_exact_mut(2).zip(&second_data) {
+            bytes.copy_from_slice(&half::f16::from_f32(*value).to_le_bytes());
+        }
+        assert_eq!(weight.bytes.as_ptr(), address);
+
+        for (index, (got, want)) in decode(&weight).iter().zip(&want_second).enumerate() {
+            assert!(
+                (got - want).abs() <= 2e-2 * (1.0 + want.abs()),
+                "second weight column {index}: {got} != {want} -- a transpose cached for \
+                     the previous weight at this address was served to this one"
+            );
+        }
+    }
+
+    /// A prewarmed transpose must survive the drop of a kernel that merely
+    /// *used* it (#1726 follow-up).
+    ///
+    /// The eviction that closes #1726 belongs to the call that installed the
+    /// entry, not to everyone who reaches it. `precompute_f32_weight_transpose`
+    /// installs at model load under exactly the key a consuming kernel later
+    /// computes, and discards its `Arc` on purpose so the global cache is what
+    /// retains the work. If a transient consumer evicted on drop, the first
+    /// kernel-cache shape eviction would throw away the prewarm -- the TTFT
+    /// spike it exists to prevent -- and would undercount
+    /// `weight_transpose_cache_bytes` while a sibling `Arc` still holds the
+    /// bytes resident.
+    #[test]
+    fn a_prewarmed_transpose_outlives_a_kernel_that_only_shared_it() {
+        let (k, n) = (48usize, 64usize);
+        let b_data: Vec<f32> = (0..k * n).map(|i| (i % 13) as f32 - 6.0).collect();
+        let ptr = b_data.as_ptr();
+        // Start from a known state: a since-freed weight of these dims may have
+        // left a stale entry at this recycled address.
+        weight_transpose::f32_cache_evict(ptr, k, n);
+
+        weight_transpose::cached_transpose_f32(&b_data, k, n).expect("prewarm installs");
+        assert!(
+            weight_transpose::f32_cache_contains(ptr, k, n),
+            "precondition: the prewarm must be resident before the consumer runs"
+        );
+
+        {
+            let mut prepack = MatMulPrepack::default();
+            prepack.set_constant_inputs(&[false, true]);
+            assert!(
+                prepack.transposed_b(&b_data, k, n).is_some(),
+                "the consumer must reach the prewarmed entry"
+            );
+        }
+
+        assert!(
+            weight_transpose::f32_cache_contains(ptr, k, n),
+            "a kernel that only shared the prewarmed transpose evicted it on drop"
+        );
+        weight_transpose::f32_cache_evict(ptr, k, n);
     }
 
     #[test]
@@ -6063,7 +6354,7 @@ mod tests {
                 .prepack
                 .transposed_b_f16
                 .get()
-                .map_or(0, |(_, bt)| bt.len() * 2) as u64;
+                .map_or(0, |(_, _, bt)| bt.len() * 2) as u64;
             let (node, graph) = half_matmul_node(HalfFormat::F16, k, n);
             let predicted = node_weight_transpose_cache_bytes(&node, &graph);
             assert!(
@@ -7700,5 +7991,592 @@ mod tests {
                 }
             });
         }
+    }
+}
+
+/// #1702: keeps the weight-cache *accounting* honest, as distinct from the
+/// weight-cache *governance* `.github/workflows/weight-cache-guard.yml`
+/// already enforces.
+///
+/// # The escape this closes
+///
+/// The governance guard greps new `OnceLock<..Cache..>` declarations and makes
+/// the author declare a [`GovernedWeightCache`] verdict. It is a good guard for
+/// "somebody added a new cache". It says nothing about the *other* half, which
+/// is how #1702 escaped: the cache already existed and was already governed,
+/// and a new **route** (`FusedMatMulBias` reaching the shared decode GEMV) was
+/// pointed at it. `node_weight_transpose_cache_bytes` named `MatMul` explicitly
+/// and returned 0 for `FusedMatMulBias` — a comment that was true when written
+/// and false the moment the two operators were unified. Nothing failed. The
+/// memory plan would simply have under-budgeted every fused projection.
+///
+/// A per-route hand-written reconciliation test (`gemm.rs`'s
+/// `predicted_transpose_bytes_equal_actual_after_gemm_execution`) cannot close
+/// this either, because the omission and the missing test are the *same*
+/// omission: whoever forgets the predictor forgets its test.
+///
+/// # The property
+///
+/// The only structure that cannot be silently omitted is one derived from the
+/// **real registry**. [`weight_cache_accounting_classification`] must answer
+/// for every `(op_type, domain)` in `build_cpu_registry`, and the test below
+/// walks `OpRegistry::keys()` to check that. Registering a kernel without
+/// classifying it fails the test with the file and line to edit — the author is
+/// *forced* to state whether their op retains weight-scaled bytes, at the
+/// moment they add it, rather than being trusted to remember.
+#[cfg(test)]
+mod weight_cache_accounting {
+    use super::*;
+    use onnx_runtime_ir::{NodeId, TensorData, WeightRef, static_shape};
+
+    /// Whether an operator can retain weight-scaled bytes in a process-global
+    /// cache, and hence whether it owes
+    /// [`node_weight_transpose_cache_bytes`] a prediction.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum WeightCacheClass {
+        /// Reaches a weight-transpose cache for some input configuration. The
+        /// reconciliation test below builds a graph for it and asserts
+        /// `predicted == actual`.
+        CachesTransposedWeight,
+        /// Retains no weight-scaled process-global bytes. The `&'static str`
+        /// is the reason, and exists to make a wrong classification obvious in
+        /// review rather than being a bare `false`.
+        NoWeightCache(&'static str),
+    }
+
+    /// The classification every registered CPU op must have.
+    ///
+    /// Deliberately a total function over op name rather than a `HashMap`
+    /// literal: the `match` has no fallback arm that could absorb a new op, and
+    /// the caller turns `None` into a failure naming the op. Adding a kernel
+    /// therefore has exactly one way to proceed — decide, here, what it
+    /// retains.
+    fn weight_cache_accounting_classification(op_type: &str) -> Option<WeightCacheClass> {
+        use WeightCacheClass::{CachesTransposedWeight, NoWeightCache};
+        Some(match op_type {
+            // --- the MatMul family: all three share `try_half_decode_gemv` ---
+            "MatMul" | "FusedMatMulBias" | "Gemm" => CachesTransposedWeight,
+
+            // Fused MatMul+Bias+Relu. Routes through the shared MatMul GEMM,
+            // but its own kernel has no 16-bit decode GEMV arm, so it never
+            // reaches `cached_transpose_*`. If one is ever added, this arm must
+            // move up one line and the predictor must gain it -- the test
+            // below fails loudly in exactly that case, because the
+            // classification and the predictor are cross-checked.
+            "FusedGemm" => NoWeightCache("no 16-bit decode GEMV arm; f32 dense path only"),
+
+            // Registered only under the `mlas` feature. NCHWc convolution
+            // reorders weights into its own blocked layout inside the MLAS
+            // path, which is never linked into the default artifact and never
+            // touches the weight-transpose caches. Listed explicitly rather
+            // than skipped, because `--features mlas` is exactly the
+            // configuration where an unclassified op would otherwise slip
+            // through: this arm is why the guard walks the registry the test
+            // binary actually built.
+            "NchwcConv"
+            | "NchwcAveragePool"
+            | "NchwcGlobalAveragePool"
+            | "NchwcMaxPool"
+            | "NchwcReorderToBlocked"
+            | "NchwcReorderToNchw" => {
+                NoWeightCache("mlas-only NCHWc blocked layout, not the transpose cache")
+            }
+
+            // Quantized/packed matmuls own their own prepack caches, which are
+            // governed and accounted separately (`matmul_nbits`'s borrowed
+            // packed cache, #1619/#1628). They never call the f32/f16
+            // weight-transpose caches this predictor covers.
+            "MatMulNBits"
+            | "MatMulInteger"
+            | "QLinearMatMul"
+            | "DynamicQuantizeMatMul"
+            | "MatMulIntegerToFloat"
+            | "BlockQuantizedMatMul"
+            | "BlockQuantizedMoE"
+            | "GatherBlockQuantized" => {
+                NoWeightCache("owns a separately governed packed-weight cache")
+            }
+
+            // Attention/MoE fusions call the shared GEMM on *activations*
+            // (Q·K^T, ·V), whose operands are not graph-constant, so no
+            // constant weight ever reaches a transpose cache.
+            "FusedAttention"
+            | "MultiHeadAttention"
+            | "GroupQueryAttention"
+            | "Attention"
+            | "SparseAttention"
+            | "MoE"
+            | "QMoE"
+            | "PackedMultiHeadAttention"
+            | "PackedVarlenAttention"
+            | "VarlenAttention"
+            | "LinearAttention"
+            | "CompressedSparseAttention"
+            | "SparseKvGather" => {
+                NoWeightCache("GEMM operands are activations, never constant weights")
+            }
+
+            // Everything else: elementwise, shape, reduction, normalization,
+            // sampling and control ops. None hold weight-scaled process-global
+            // state. Grouped rather than enumerated because the grouping *is*
+            // the claim, and the test asserts the claim by executing the
+            // predictor against them.
+            other => NoWeightCache(match other {
+                _ if is_known_non_caching_op(other) => "no weight-scaled process-global cache",
+                _ => return None,
+            }),
+        })
+    }
+
+    /// The bulk of the registry: ops with no weight-scaled cache. Kept as an
+    /// explicit list, not a wildcard, so a *new* op falls through to `None` and
+    /// fails the test instead of being absorbed.
+    fn is_known_non_caching_op(op_type: &str) -> bool {
+        const NON_CACHING: &[&str] = &[
+            "Abs",
+            "Acos",
+            "Acosh",
+            "Add",
+            "AffineGrid",
+            "And",
+            "ArgMax",
+            "ArgMin",
+            "Asin",
+            "Asinh",
+            "Atan",
+            "Atanh",
+            "AveragePool",
+            "BatchNormalization",
+            "BiasGelu",
+            "BiasSplitGelu",
+            "BitShift",
+            "BitwiseAnd",
+            "BlackmanWindow",
+            "BitwiseNot",
+            "BitwiseOr",
+            "BitwiseXor",
+            "Cast",
+            "CastLike",
+            "CausalConvWithState",
+            "Ceil",
+            "Celu",
+            "CenterCropPad",
+            "Clip",
+            "Col2Im",
+            "Compress",
+            "Concat",
+            "Constant",
+            "ConstantOfShape",
+            "Conv",
+            "ConvInteger",
+            "ConvTranspose",
+            "Cos",
+            "Cosh",
+            "CumProd",
+            "CumSum",
+            "DFT",
+            "DepthToSpace",
+            "DequantizeLinear",
+            "Div",
+            "Dropout",
+            "DynamicQuantizeLinear",
+            "Einsum",
+            "Elu",
+            "Equal",
+            "Erf",
+            "Exp",
+            "Expand",
+            "EyeLike",
+            "FastGelu",
+            "Flatten",
+            "Floor",
+            "Gather",
+            "GatherElements",
+            "GatherND",
+            "Gelu",
+            "GlobalAveragePool",
+            "GlobalLpPool",
+            "GlobalMaxPool",
+            "Greater",
+            "GreaterOrEqual",
+            "GridSample",
+            "GroupNorm",
+            "GroupNormalization",
+            "HammingWindow",
+            "HannWindow",
+            "HardSigmoid",
+            "HardSwish",
+            "Hardmax",
+            "Identity",
+            "If",
+            "IndexShare",
+            "InstanceNormalization",
+            "IsInf",
+            "IsNaN",
+            "LayerNormalization",
+            "LeakyRelu",
+            "Less",
+            "LessOrEqual",
+            "Log",
+            "LogSoftmax",
+            "Loop",
+            "LpNormalization",
+            "LpPool",
+            "MatMulBnb4",
+            "Max",
+            "MaxPool",
+            "Mean",
+            "MelWeightMatrix",
+            "Min",
+            "Mish",
+            "Mod",
+            "Mul",
+            "Neg",
+            "NegativeLogLikelihoodLoss",
+            "NhwcConv",
+            "NonMaxSuppression",
+            "NonZero",
+            "Not",
+            "OneHot",
+            "Or",
+            "PRelu",
+            "Pad",
+            "Pow",
+            "QLinearAdd",
+            "QLinearAveragePool",
+            "QLinearConcat",
+            "QLinearConv",
+            "QLinearGlobalAveragePool",
+            "QLinearLeakyRelu",
+            "QLinearMul",
+            "QLinearSigmoid",
+            "QLinearSoftmax",
+            "QuantizeLinear",
+            "QuickGelu",
+            "RMSNormalization",
+            "RandomNormal",
+            "RandomNormalLike",
+            "RandomUniform",
+            "RandomUniformLike",
+            "Range",
+            "Reciprocal",
+            "ReduceL1",
+            "ReduceL2",
+            "ReduceLogSum",
+            "ReduceLogSumExp",
+            "ReduceMax",
+            "ReduceMean",
+            "ReduceMin",
+            "ReduceProd",
+            "ReduceSum",
+            "ReduceSumSquare",
+            "Relu",
+            "Reshape",
+            "Resize",
+            "RotaryEmbedding",
+            "Round",
+            "STFT",
+            "ScatterElements",
+            "ScatterND",
+            "Selu",
+            "Shape",
+            "Shrink",
+            "Sigmoid",
+            "Sign",
+            "Silu",
+            "SimplifiedLayerNormalization",
+            "Sin",
+            "Sinh",
+            "Size",
+            "Skip",
+            "SkipLayerNormalization",
+            "SkipSimplifiedLayerNormalization",
+            "Slice",
+            "Softmax",
+            "SoftmaxCrossEntropyLoss",
+            "Softplus",
+            "Softsign",
+            "SpaceToDepth",
+            "Split",
+            "Sqrt",
+            "Squeeze",
+            "Sub",
+            "Sum",
+            "Swish",
+            "Tan",
+            "Tanh",
+            "ThresholdedRelu",
+            "Tile",
+            "TopK",
+            "Transpose",
+            "Trilu",
+            "Unique",
+            "Unsqueeze",
+            "Upsample",
+            "Where",
+            "Xor",
+        ];
+        NON_CACHING.contains(&op_type)
+    }
+
+    /// **The anti-omission property.** Walks the *real* registry, so an op
+    /// cannot be added without a deliberate accounting decision.
+    #[test]
+    fn every_registered_cpu_op_is_classified_for_weight_cache_accounting() {
+        let registry = crate::kernels::build_cpu_registry();
+        let mut unclassified: Vec<String> = registry
+            .keys()
+            .map(|key| key.op_type.clone())
+            .filter(|op| weight_cache_accounting_classification(op).is_none())
+            .collect();
+        unclassified.sort();
+        unclassified.dedup();
+        assert!(
+            unclassified.is_empty(),
+            "these CPU kernels are registered but have no weight-cache accounting \
+             classification: {unclassified:?}\n\
+             \n\
+             Add each to `weight_cache_accounting_classification` in \
+             `crates/onnx-runtime-ep-cpu/src/kernels/matmul.rs`. If the kernel can \
+             route a *constant* weight through `weight_transpose::cached_transpose_*` \
+             (directly or via `try_half_decode_gemv`), classify it \
+             `CachesTransposedWeight` AND give it an arm in \
+             `node_weight_transpose_cache_bytes`, or the memory plan will \
+             under-budget it (#1702). Otherwise classify it `NoWeightCache` with \
+             the reason it retains nothing."
+        );
+    }
+
+    /// Minimal single-node graph with a constant 16-bit `[k, n]` `B`, for the
+    /// ops whose second input is a weight.
+    fn half_weight_graph(op_type: &str, domain: &str, k: usize, n: usize) -> Graph {
+        let mut graph = Graph::new();
+        let a = graph.create_named_value("A", DataType::Float16, static_shape([1, k]));
+        let b = graph.create_named_value("B", DataType::Float16, static_shape([k, n]));
+        let y = graph.create_named_value("Y", DataType::Float16, static_shape([1, n]));
+        graph.add_input(a);
+        graph.add_input(b);
+        let mut inputs = vec![Some(a), Some(b)];
+        if op_type == "FusedMatMulBias" {
+            let bias = graph.create_named_value("C", DataType::Float16, static_shape([n]));
+            graph.add_input(bias);
+            inputs.push(Some(bias));
+            graph.set_initializer(
+                bias,
+                WeightRef::Inline(TensorData::from_raw(
+                    DataType::Float16,
+                    vec![n],
+                    vec![0u8; n * 2],
+                )),
+            );
+        }
+        let mut node = Node::new(NodeId(0), op_type, inputs, vec![y]);
+        node.domain = domain.to_string();
+        graph.insert_node(node);
+        graph.add_output(y);
+        graph.set_initializer(
+            b,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float16,
+                vec![k, n],
+                vec![0u8; k * n * 2],
+            )),
+        );
+        graph
+    }
+
+    /// **The reconciliation property.** For every op classified as caching, a
+    /// real execution's retained bytes must equal the prediction — the #1056
+    /// ratio-1.00 criterion, now enforced per *route* rather than per
+    /// hand-written test.
+    ///
+    /// Runs on every target. The 16-bit decode GEMV is `cfg`-gated to x86, so
+    /// the *correct* prediction on aarch64 is 0 -- which is a property worth
+    /// asserting rather than a reason to compile the test out. Gating it to
+    /// x86 would also leave `half_weight_graph` dead on the aarch64 lane,
+    /// which builds tests with `-D warnings`; a guard that breaks the
+    /// cross-compile it is meant to protect is not a guard.
+    #[test]
+    fn predicted_transpose_bytes_equal_actual_for_every_caching_op() {
+        // Reads only the pure `node_weight_transpose_cache_bytes` predictor, so
+        // unlike `gemm.rs`'s reconciliation it touches no process-global cache
+        // and needs no `TRANSPOSE_TEST_LOCK` / `CacheEnabledScope` (#1056).
+        // Distinctive geometry so a stray same-shaped entry cannot alias it,
+        // and an odd `k` so a tail-handling bug cannot hide.
+        let (k, n) = (83usize, 41usize);
+        let registry = crate::kernels::build_cpu_registry();
+
+        let mut checked = 0usize;
+        for key in registry.keys() {
+            if weight_cache_accounting_classification(&key.op_type)
+                != Some(WeightCacheClass::CachesTransposedWeight)
+            {
+                continue;
+            }
+            // `Gemm` reaches the cache through its own `transB` arm, which
+            // `gemm.rs` reconciles at f32 width; this graph builder feeds the
+            // 16-bit `transB = 0` route the MatMul family shares.
+            let graph = half_weight_graph(&key.op_type, &key.domain, k, n);
+            let node = graph.nodes.values().next().expect("single-node graph");
+            let predicted = node_weight_transpose_cache_bytes(node, &graph);
+            // A binary predicts exactly what its own kernels allocate. The
+            // shared 16-bit decode GEMV exists only on x86. Apple's Accelerate
+            // paths retain the same f16 transpose for MatMul and
+            // FusedMatMulBias, but Gemm does not enter those paths.
+            let x86 = cfg!(any(target_arch = "x86", target_arch = "x86_64"));
+            let apple_matmul =
+                cfg!(any(target_os = "macos", target_os = "ios")) && key.op_type != "Gemm";
+            let expected = if x86 || apple_matmul {
+                (k as u64) * (n as u64) * 2
+            } else {
+                0
+            };
+            assert_eq!(
+                predicted, expected,
+                "{} must predict exactly the transpose bytes this target's \
+                 kernels retain; a 0 where the GEMV exists is the #1702 \
+                 under-budget bug, and a non-zero where it does not exist \
+                 over-budgets every projection",
+                key.op_type
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 3,
+            "expected at least MatMul, FusedMatMulBias and Gemm to be reconciled, \
+             got {checked} -- did the classification silently narrow?"
+        );
+    }
+
+    /// **The domain-gate property, enumerated from the registry.**
+    ///
+    /// The Opus review of #1702 found the *same* defect a second time, in
+    /// `node_matmul_dense_cache_bytes`: a blanket `!node.is_default_domain()`
+    /// bail silently zeroing every `FusedMatMulBias` node. Two independent
+    /// instances of one mistake is a pattern, not an accident, and the
+    /// transpose-only guard above would not have caught the second one.
+    ///
+    /// So this checks **both** predictors, and it takes the domain from
+    /// `OpRegistry::keys()` rather than from a literal. That is the whole
+    /// point: the registry is the only place that knows an op ships in
+    /// `com.microsoft`, so a predictor that gates on the wrong domain is
+    /// caught by construction instead of by someone remembering. A third
+    /// weight-scaled predictor added later gets covered by adding one line
+    /// here, and until then its absence is at least visible in one place.
+    #[test]
+    fn no_predictor_zeroes_a_caching_op_because_of_its_shipping_domain() {
+        let (k, n) = (12usize, 9usize);
+        let registry = crate::kernels::build_cpu_registry();
+        let mut checked = 0usize;
+
+        for key in registry.keys() {
+            if weight_cache_accounting_classification(&key.op_type)
+                != Some(WeightCacheClass::CachesTransposedWeight)
+            {
+                continue;
+            }
+            // Built with the domain the registry says this op ships in. A
+            // predictor gated on `is_default_domain()` returns 0 here for any
+            // contrib-domain op while still looking correct in a test that
+            // hardcodes `domain = ""`.
+            let graph = half_weight_graph(&key.op_type, &key.domain, k, n);
+            let node = graph.nodes.values().next().expect("single-node graph");
+
+            // `Gemm` is excluded from the dense predictor by design (it has its
+            // own f32 transpose accounting), so only the MatMul family is
+            // checked there; the transpose predictor covers all three.
+            if key.op_type == "MatMul" || key.op_type == "FusedMatMulBias" {
+                assert_ne!(
+                    node_matmul_dense_cache_bytes(node, &graph),
+                    0,
+                    "`node_matmul_dense_cache_bytes` returned 0 for {} in its \
+                     shipping domain {:?}. If that is because of a domain gate, \
+                     it is the #1702 defect again: gate each op to the domain \
+                     it actually ships in, not to one shared \
+                     `is_default_domain()` check.",
+                    key.op_type,
+                    key.domain,
+                );
+            }
+            let x86 = cfg!(any(target_arch = "x86", target_arch = "x86_64"));
+            let apple_matmul =
+                cfg!(any(target_os = "macos", target_os = "ios")) && key.op_type != "Gemm";
+            if x86 || apple_matmul {
+                assert_ne!(
+                    node_weight_transpose_cache_bytes(node, &graph),
+                    0,
+                    "`node_weight_transpose_cache_bytes` returned 0 for {} in \
+                     its shipping domain {:?} on a target whose kernels do \
+                     retain the transpose",
+                    key.op_type,
+                    key.domain,
+                );
+            }
+            checked += 1;
+        }
+        assert!(
+            checked >= 3,
+            "expected MatMul, FusedMatMulBias and Gemm; got {checked}"
+        );
+    }
+
+    /// Mutation check: the predictor must key on *reaching the shared helper*,
+    /// not on an op-name allowlist. Restoring the pre-#1702 behaviour (naming
+    /// `MatMul` and excluding `FusedMatMulBias`) must be observable here.
+    #[test]
+    fn fused_matmul_bias_is_budgeted_exactly_like_matmul() {
+        let (k, n) = (83usize, 41usize);
+        let bytes = |op: &str, domain: &str| {
+            let graph = half_weight_graph(op, domain, k, n);
+            let node = graph.nodes.values().next().unwrap();
+            node_weight_transpose_cache_bytes(node, &graph)
+        };
+        // Arch-independent: whatever `MatMul` is budgeted on this target,
+        // `FusedMatMulBias` must be budgeted the same, because since #1702 they
+        // are the same code path. That equality is the invariant, so the test
+        // does not need to know which target it is on.
+        let matmul = bytes("MatMul", "");
+        // The *shipping* domain: the optimizer emits the fusion into contrib,
+        // and the predictor's blanket non-default-domain bail used to zero it
+        // there even once the op name was accepted. Passing "" here would make
+        // this test pass against a predictor that is dead in production.
+        let fused = bytes("FusedMatMulBias", "com.microsoft");
+        assert_eq!(
+            fused, matmul,
+            "since #1702 `FusedMatMulBias` routes through the *same* \
+             `try_half_decode_gemv` as `MatMul`, so it retains the same bytes \
+             and must be budgeted identically. A 0 here means the predictor \
+             went back to an op-name allowlist and the plan under-budgets \
+             every fused projection."
+        );
+    }
+
+    /// A non-constant `B` is not cacheable, so neither op may budget for it.
+    /// Guards the opposite error: over-budgeting on the strength of op name
+    /// alone.
+    #[test]
+    fn no_op_budgets_a_non_constant_weight() {
+        let mut graph = Graph::new();
+        let a = graph.create_named_value("A", DataType::Float16, static_shape([1, 8]));
+        let b = graph.create_named_value("B", DataType::Float16, static_shape([8, 4]));
+        let y = graph.create_named_value("Y", DataType::Float16, static_shape([1, 4]));
+        graph.add_input(a);
+        graph.add_input(b);
+        let mut node = Node::new(
+            NodeId(0),
+            "FusedMatMulBias",
+            vec![Some(a), Some(b)],
+            vec![y],
+        );
+        node.domain = "com.microsoft".to_string();
+        graph.insert_node(node);
+        graph.add_output(y);
+        // No `set_initializer`: `B` stays an activation.
+        let node = graph.nodes.values().next().unwrap();
+        assert_eq!(
+            node_weight_transpose_cache_bytes(node, &graph),
+            0,
+            "an activation `B` is never cached, so it must never be budgeted"
+        );
     }
 }

@@ -648,12 +648,11 @@ fn lora_routes_through_canonical_adapter_selection() {
     ] {
         assert!(workflow["inputs"][name].is_object(), "missing {name}");
     }
-    assert!(
-        workflow["manifest"]["capabilities"]
-            .as_array()
-            .expect("capabilities")
-            .contains(&json!("parameter_adapters"))
-    );
+    let capabilities = workflow["manifest"]["capabilities"]
+        .as_array()
+        .expect("capabilities");
+    assert!(capabilities.contains(&json!("parameter_adapters")));
+    assert!(capabilities.contains(&json!("heterogeneous_adapter_batching")));
     assert_eq!(
         document["adapters"]["selection"]["segments"],
         json!("request.adapter_segments")

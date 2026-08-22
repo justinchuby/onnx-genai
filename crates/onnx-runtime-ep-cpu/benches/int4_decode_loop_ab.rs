@@ -41,6 +41,41 @@
 //! three interleaved repetitions). The default width already resolves to 16 on
 //! a 32-vCPU host, for both the persistent and the flat pool.
 
+//! # What `tokens_s_total` means (#1712)
+//!
+//! Stated explicitly because it was previously **not the same quantity** as the
+//! ORT baseline it was being divided by, and the mismatch was large enough to
+//! invent a result. The definition here, and in
+//! `ort_matmulnbits_baseline.py`, is now identical in all four respects:
+//!
+//! | | definition |
+//! |---|---|
+//! | numerator | `sessions * tokens` -- every measured token from every session |
+//! | denominator | wall-clock seconds from the **barrier release** to the last session's join |
+//! | warmup | 3 steps per session, completed *before* the barrier, never inside the clock |
+//! | over repetitions | **median**, never min or max |
+//!
+//! Each of those four was previously wrong on at least one side:
+//!
+//! * The native denominator used to include thread spawn and the three warmup
+//!   steps. At `tokens = 24` that charged 27 steps of work against 24 counted
+//!   tokens -- a flat ~11% penalty the ORT arm never paid.
+//! * There was no barrier, so sessions started staggered and `wall` absorbed
+//!   the ramp. ORT has used a `threading.Barrier` throughout.
+//! * ORT reported `min` (single-session) or `max` (concurrent) over
+//!   repetitions -- the luckiest run -- against a single native shot.
+//! * Worst: ORT used **two different statistics either side of `sessions = 1`**.
+//!   At `sessions = 1` it reported `1000 / median_ms_per_token`, which excludes
+//!   every straggler; at `sessions >= 2` it reported wall-clock aggregate,
+//!   which includes them. A baseline that switches from a best-case to a
+//!   realistic statistic at `sessions = 2` will always make its opponent look
+//!   worst at `sessions = 1`, which is exactly the shape the "the gap is
+//!   concurrency-dependent" reading was built on.
+//!
+//! `spread_%` is `(max - min) / median` across repetitions and is printed so a
+//! cell whose noise exceeds its effect cannot be quoted without that being
+//! visible in the same row.
+
 mod common;
 
 use std::time::Instant;
@@ -60,6 +95,35 @@ const PROJECTIONS: &[(usize, usize, &str)] = &[
     (4096, 14336, "up"),
     (14336, 4096, "down"),
 ];
+
+/// Qwen2.5-7B's decode projections. Not a cosmetic second model: its GQA head
+/// layout makes `qkv` **narrow** (n = 4608 against a k of 3584) and its MLP
+/// **much wider** relative to the hidden size (18944 vs llama's 14336 on a
+/// larger k). Both differences move the `n`-loop trip count, which is exactly
+/// the axis the N-blocked kernel's four-column grouping divides. A conclusion
+/// drawn only from llama shapes has not been tested against a different
+/// n/k ratio at all, and the tail behaviour at `n % 4` is invisible in a set
+/// where every `n` is a multiple of 4.
+const PROJECTIONS_QWEN: &[(usize, usize, &str)] = &[
+    (3584, 4608, "qkv"),
+    (3584, 3584, "o"),
+    (3584, 18944, "gate"),
+    (3584, 18944, "up"),
+    (18944, 3584, "down"),
+];
+
+fn projections() -> &'static [(usize, usize, &'static str)] {
+    match std::env::var("PROBE_MODEL")
+        .unwrap_or_else(|_| "llama".into())
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "qwen" => PROJECTIONS_QWEN,
+        "llama" => PROJECTIONS,
+        other => panic!("PROBE_MODEL must be llama or qwen, got {other:?}"),
+    }
+}
 
 fn packed_bytes(len: usize, seed: u64) -> Vec<u8> {
     let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
@@ -141,8 +205,12 @@ fn main() {
     let spmd: bool = std::env::var("PROBE_SPMD")
         .map(|v| v != "0")
         .unwrap_or(true);
+    let reps: usize = std::env::var("PROBE_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
 
-    let weights: Vec<Weight> = PROJECTIONS
+    let weights: Vec<Weight> = projections()
         .iter()
         .enumerate()
         .map(|(index, &(k, n, _))| {
@@ -163,16 +231,17 @@ fn main() {
         .collect();
 
     println!(
-        "block_size={block_size} accuracy={accuracy} sessions={sessions} tokens={tokens} layers={layers} spmd={spmd}"
+        "model={} block_size={block_size} accuracy={accuracy} sessions={sessions} tokens={tokens} layers={layers} spmd={spmd}",
+        std::env::var("PROBE_MODEL").unwrap_or_else(|_| "llama".into())
     );
     println!(
-        "{:>10} {:>12} {:>12} {:>14}",
-        "phase", "ms_token", "ms_token_p90", "tokens_s_total"
+        "{:>10} {:>12} {:>12} {:>14} {:>9}",
+        "phase", "ms_token", "ms_token_p90", "tokens_s_total", "spread_%"
     );
 
     // Each session owns its kernels and its activations, and shares the
     // weights, which is how a served model is actually laid out.
-    let run_session = |warm: bool| -> Vec<f64> {
+    let run_session = |warm: bool, barrier: &std::sync::Barrier| -> Vec<f64> {
         let mut kernels: Vec<Box<dyn Kernel>> = Vec::new();
         let mut activations: Vec<Tensor> = Vec::new();
         let mut outputs: Vec<Tensor> = Vec::new();
@@ -221,6 +290,13 @@ fn main() {
         // the GEBP arm forks the 32-wide global pool, inside it the decode pool
         // is already resident and the fan-out it partitions is that one.
         let mut samples = Vec::with_capacity(tokens);
+        // The barrier is released only after every session has finished its
+        // warmup, so `wall` on the driving thread covers the measured tokens
+        // and nothing else. Without it, `wall` also contained thread spawn and
+        // three warmup steps -- with `tokens = 24` that is 27 steps of work
+        // charged against 24 counted tokens, a flat ~11% penalty that the ORT
+        // arm never paid because its warmup runs before its clock starts.
+        barrier.wait();
         for _ in 0..tokens {
             let (acts, ws) = (&activations, &weights);
             let moved = state;
@@ -235,15 +311,23 @@ fn main() {
         samples
     };
 
-    for (phase, warm) in [("cold", false), ("steady", true)] {
-        let started = Instant::now();
-        let per_session: Vec<Vec<f64>> = std::thread::scope(|scope| {
+    // One repetition of one phase. Returns `(median_ms_token, p90, tokens_s_total)`.
+    let measure = |warm: bool| -> (f64, f64, f64) {
+        let barrier = std::sync::Barrier::new(sessions + 1);
+        let (per_session, wall) = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..sessions)
-                .map(|_| scope.spawn(|| run_session(warm)))
+                .map(|_| {
+                    let barrier = &barrier;
+                    scope.spawn(move || run_session(warm, barrier))
+                })
                 .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
+            // Releases every session at once, then starts the clock. All
+            // warmup and allocation is already behind us at this point.
+            barrier.wait();
+            let start = Instant::now();
+            let out: Vec<Vec<f64>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            (out, start.elapsed().as_secs_f64())
         });
-        let wall = started.elapsed().as_secs_f64();
 
         let mut all: Vec<f64> = per_session.into_iter().flatten().collect();
         let ms = median(all.clone());
@@ -252,7 +336,31 @@ fn main() {
         // Aggregate throughput is the number the pool question is really about:
         // a wider fork can cut one session's latency and still lose once
         // sessions have to share the machine.
-        let total = (sessions * tokens) as f64 / wall;
-        println!("{phase:>10} {ms:>12.3} {p90:>12.3} {total:>14.1}");
+        (ms, p90, (sessions * tokens) as f64 / wall)
+    };
+
+    for (phase, warm) in [("cold", false), ("steady", true)] {
+        // `cold` is inherently single-shot: repeating it would measure a warm
+        // run. Only `steady` is repeated.
+        let n = if warm { reps } else { 1 };
+        let mut rows: Vec<(f64, f64, f64)> = Vec::with_capacity(n);
+        for _ in 0..n {
+            rows.push(measure(warm));
+        }
+        let ms = median(rows.iter().map(|r| r.0).collect());
+        let p90 = median(rows.iter().map(|r| r.1).collect());
+        // MEDIAN over repetitions, deliberately not min/max. Reporting the
+        // best repetition makes every arm look like its luckiest run and makes
+        // the spread invisible, which is how a 2x measurement artifact can
+        // survive review (see the ratio-definition note in the module docs).
+        let mut tps: Vec<f64> = rows.iter().map(|r| r.2).collect();
+        let total = median(tps.clone());
+        tps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let spread = if total > 0.0 {
+            (tps[tps.len() - 1] - tps[0]) / total * 100.0
+        } else {
+            0.0
+        };
+        println!("{phase:>10} {ms:>12.3} {p90:>12.3} {total:>14.1} {spread:>9.1}");
     }
 }

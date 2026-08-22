@@ -1807,8 +1807,9 @@ population and the A/A hit **52.7%**. Aggregate throughput is the only valid
 multi-session statistic here, and it moves those rows by ~0.17x. (iii) A cell
 whose min and median disagree in *direction* (t=16: 1.234x vs 0.730x) has not
 been measured; the fix is a longer window (240 tokens -> 1.245x/1.412x), not a
-choice of statistic. Also: `ONNX_GENAI_CPU_DECODE_THREADS=2` is **inert** on this
-harness (identical to `=1`), so any "t=2" row is a duplicate t=1 row.
+choice of statistic. Also: `ONNX_GENAI_CPU_DECODE_THREADS=2` read **identical to
+`=1`** on this harness. That identity was real, but its cause was not the pool —
+see the correction in §27; the knob delivers 1.96x under control.
 
 **Two corrections to this file's host model**, both of which change how earlier
 roofline arguments read: **L3 is 32 MiB per CCX, not 64 MiB shared**, and
@@ -2094,3 +2095,451 @@ here. Merged as `2e1cfb67c`.
 
 Full record:
 [`docs/benchmarks/2026-08-21-half-decode-layout-divergence.md`](../benchmarks/2026-08-21-half-decode-layout-divergence.md).
+
+## 26. `FusedMatMulBias` had no 16-bit decode GEMV — the fused form of a projection was the slow one (#1702)
+
+The optimizer fuses `MatMul + Add(bias)` into `FusedMatMulBias`. On x86 that
+fusion was a **pessimisation for every 16-bit weight**: `MatMul` had a 16-bit
+decode GEMV and `FusedMatMulBias` did not, so the fused node widened the whole
+constant weight to a resident `4 * K * N` f32 copy and ran an f32 GEMV over it.
+Applying the optimizer made the model slower, which is the exact inversion its
+cost model is supposed to prevent.
+
+Measured on the quiesced host (16 physical cores, `steady_ms`, three reps,
+interleaved before/after/`MatMul` in one binary):
+
+| shape | dtype | FMB before | FMB after | gain | `MatMul` | after/`MatMul` |
+|---|---|---|---|---|---|---|
+| mlp 4096x14336 | f16 | 2.687 | 1.730 | **1.55x** | 1.759 | 0.98x |
+| mlp 4096x14336 | bf16 | 2.845 | 1.723 | **1.65x** | 1.709 | 1.01x |
+| lm_head 4096x128256 | f16 | 8.595 | 6.862 | **1.25x** | 6.789 | 1.01x |
+| lm_head 4096x128256 | bf16 | 8.698 | 6.885 | **1.26x** | 6.784 | 1.01x |
+| qkv 4096x4096 | f16 | 1.407 | 0.175 | **8.04x** | 0.171 | 1.02x |
+| qkv 4096x4096 | bf16 | 1.427 | 0.152 | **9.39x** | 0.171 | 0.89x |
+| attn_out 4096x4096 | f16 | 0.289 | 0.026 | **11.12x** | 0.025 | 1.04x |
+| **f32 mlp (null control)** | f32 | 6.551 | 6.538 | **1.00x** | 6.656 | 0.98x |
+| **f32 lm_head (null control)** | f32 | 14.896 | 14.840 | **1.00x** | 14.795 | 1.00x |
+
+The `after/MatMul` column is the point: **0.98x–1.04x on every model-shaped
+row**. The fix is not a new kernel, it is deleting a divergence — `MatMul`'s
+decode arm was extracted into `try_half_decode_gemv` and both operators now
+call it, so the fused form is exactly as fast as the unfused one and the
+bias is a post-reduction epilogue that never touches summation order.
+
+The f32 rows are a **null control that was built into the workload rather than
+added afterwards**: `FusedMatMulBias`'s f32 path was already *faster* than
+`MatMul`'s, and it is unchanged at 1.00x. That rules out "the fused operator's
+plumbing is slow" as an explanation and localises the entire penalty to the
+missing 16-bit route.
+
+### The headline in #1702 was understated, and the reason is worth recording
+
+#1702 reported 1.55x. That is the mlp row and it is correct, but the range is
+1.25x–11.12x and the *first* measurement of the small shapes said 1.17x. The
+difference was **host load**: the first pass ran while the acc0 matrix was
+still executing at load average 20.94. Every number in it was void. This is the
+third time in this assignment that a contended host has produced a plausible,
+publishable, wrong number, so the rule is now explicit — `uptime` before every
+benchmark, and never run two of them at once. The cheap diagnostic that
+survives contention is the **cold/steady shape**, not the steady number:
+`MatMul` cold 4.673 / steady 0.602 (it builds a transpose) versus pre-fix FMB
+cold 1.832 / steady 1.691 (it never does), which identified the missing route
+correctly even while the timings were garbage.
+
+### A second defect, found by the guard rather than by review
+
+Routing `FusedMatMulBias` through the shared helper makes it retain the same
+`2 * K * N` transpose `MatMul` retains, so `node_weight_transpose_cache_bytes`
+owed it a prediction. It had an explicit arm saying the opposite —
+"`FusedMatMulBias` has no 16-bit GEMV on this target and retains nothing, so
+counting it would over-budget every fused projection" — a comment that was true
+when written and false the moment the operators were unified.
+
+Fixing the op name was **not sufficient, and believing it was would have shipped
+a dead predictor.** `node_weight_transpose_cache_bytes` opens with a blanket
+`if !node.is_default_domain() { return 0 }`, and the optimizer emits
+`FusedMatMulBias` into `com.microsoft`. The one node the predictor most needed
+to see was the one node it structurally could not. The unit test that caught
+this passed when written with `domain = ""` and failed the instant it used the
+domain the operator actually ships in; tests for domain-scoped code must use the
+shipping domain or they validate a code path that never executes.
+
+### The guard: classification derived from the registry, not from memory
+
+Both defects are the same shape — *an existing, governed cache gains a new
+route, and the accounting is not updated*. `weight-cache-guard.yml` cannot see
+it: that guard greps for new `OnceLock<..Cache..>` declarations, and no new
+cache was declared. A hand-written per-route reconciliation test cannot see it
+either, because the missing predictor arm and the missing test are the same
+omission — whoever forgets one forgets the other.
+
+The guard that does work derives its obligation from the **real registry**:
+`every_registered_cpu_op_is_classified_for_weight_cache_accounting` walks
+`OpRegistry::keys()` and fails until every registered op has been classified
+`CachesTransposedWeight` or `NoWeightCache(reason)`. Registering a kernel
+without deciding what it retains is now a test failure naming the op and the
+function to edit. It found 27 unclassified ops on first run.
+
+Three mutations confirm it is not decorative: excluding `FusedMatMulBias` from
+the shared arm, restoring the pre-#1702 op-name allowlist, and restoring the
+blanket non-default-domain bail each fail at least two of the four tests.
+Live reconciliation (`retained_transpose_bytes_are_bytes_the_plan_predicted`)
+closes the loop from the executing kernel's side, so the predictor and the
+kernel cannot agree on a number neither produces.
+
+### Honest limits (updated after Opus review)
+
+* `node_matmul_dense_cache_bytes` had a second, independent instance of the
+  same domain-gate defect #1702 fixed in `node_weight_transpose_cache_bytes`:
+  its blanket `!node.is_default_domain()` bail silently zeroed every
+  `FusedMatMulBias` node (which always ships in `com.microsoft`), so it was an
+  **under**-prediction, not the over-prediction this section originally
+  claimed. Fixed by gating each op to the domain it actually ships in
+  (`node.op_type == "MatMul" && node.is_default_domain()` /
+  `node.op_type == "FusedMatMulBias" && node.domain == "com.microsoft"`), with
+  `fused_matmul_bias_dense_cache_is_budgeted_in_its_shipping_domain` guarding
+  the regression. With that fixed, the predictor now counts `FusedMatMulBias`
+  at `4 * numel * MATMUL_DENSE_DECODE_INSTANTIATIONS` as documented; since the
+  decode path no longer fills that cache (it takes `try_half_decode_gemv`
+  instead), this is now correctly an **over**-prediction on decode-only
+  workloads — the #1056-mandated safe direction — and prefill still fills it,
+  so it is left alone deliberately rather than tightened on a guess.
+* **The same defect existed twice, which changes what the guard has to be.**
+  The transpose-predictor fix and the dense-predictor fix are the identical
+  mistake — gate on `is_default_domain()`, ship the op in `com.microsoft` —
+  written independently in two functions. The registry-derived guard as first
+  built only walked the *transpose* predictor and would not have found the
+  second one; it was found by adversarial review, which is not a control that
+  scales. `no_predictor_zeroes_a_caching_op_because_of_its_shipping_domain`
+  now takes the domain from `OpRegistry::keys()` and asserts **both**
+  predictors are non-zero for every caching op in the domain the registry says
+  it ships in. A test that hardcodes `domain = ""` passes against a predictor
+  that is dead in production; a test that reads the domain from the registry
+  cannot. Both mutations (restoring either blanket bail) now fail two tests
+  each.
+* The `after/MatMul` ratios include two cells at 0.89x and 1.04x-1.09x on the
+  smallest shapes, where absolute times are 20-30 microseconds and run-to-run
+  noise exceeds the difference. Parity is claimed on the model-shaped rows
+  (0.98x-1.01x), not on those.
+
+Full record:
+[`docs/benchmarks/2026-08-22-fused-matmul-bias-half-gemv.md`](../benchmarks/2026-08-22-fused-matmul-bias-half-gemv.md).
+
+## 27. The acc0 single-session "gap" was measured with two different rulers (**retraction**, #1712)
+
+The 24-cell acc0 matrix posted to #1679/#1676 divided a native number by an ORT
+number that **was not the same statistic**, and the disagreement between the two
+definitions was concentrated at exactly `sessions = 1` — the configuration the
+whole "single-session gap" conclusion rests on.
+
+### The four biases
+
+| | native (before) | ORT (before) |
+|---|---|---|
+| denominator | wall included thread spawn + 3 warmup steps | warmup ran before `t0` |
+| session start | no barrier; staggered spawn absorbed into `wall` | `threading.Barrier` |
+| over repetitions | single shot | `min` (s=1) / `max` (s≥2) — the luckiest run |
+| **statistic** | wall-clock aggregate at every `s` | **`1000/median_ms` at s=1, wall-clock aggregate at s≥2** |
+
+The last row is the one that manufactures a result. The baseline switched from a
+best-case statistic (a median per-token time, which excludes every straggler) to
+a realistic one (wall-clock aggregate, which includes them) **at `sessions = 2`**.
+A baseline that does that is guaranteed to look strongest at `sessions = 1`, and
+"strongest at `sessions = 1`" is precisely the shape that was reported as *"the
+gap is concurrency-dependent; we lose at one session and win at two and four."*
+
+That reading is withdrawn. It is an artifact of the instrument.
+
+The native side was independently penalised: at `tokens = 24`, charging three
+warmup steps to the clock means 27 steps of work counted against 24 tokens, a
+flat ~11% handicap the ORT arm never paid at any session count.
+
+### What the headline actually was
+
+`qwen t=16 s=1 acc=0` was published as **0.436x**. Under a single definition the
+same cell reads **0.70x**, and six independent runs per arm show the ratio cannot
+honestly be quoted more precisely than a **range of 0.48x–0.86x**, because the
+ORT arm lands in two clusters 1.79x apart:
+
+```
+native  190.9 195.6 197.8 200.3 201.5 220.6   unimodal, ±8%
+ORT     218.3 229.8 246.2 396.9 414.9 427.7   two clusters, 1.79x apart
+```
+
+**The 0.436x figure was never a measurable quantity.** It is `max`-over-reps of
+ORT's fast cluster divided by a single-shot native run carrying an 11% warmup
+handicap.
+
+### Why the second conclusion is *also* being withheld
+
+The obvious next claim — "ORT is bimodal here, so the anomaly is in the baseline"
+— is not supported either, and it is worth recording why, because it was nearly
+published. The three slow ORT runs reported intra-run spreads of 67.9%, 4.7% and
+12.0%; the three fast ones reported 1.4%, 1.1% and 0.7%. **Elevated intra-run
+spread confined to the slow cluster is the signature of external contention, not
+of an internal bimodality** — a genuinely bimodal implementation would be stable
+in both of its modes. The parsimonious explanation is that the slow cluster is
+other load on the host, which was later confirmed to be present.
+
+So this cell has **no published ratio** until both arms are re-run interleaved on
+a quiet host.
+
+### The measurement environment was the dominant error term
+
+Mid-investigation the host was found to be running, concurrently: another agent's
+full `cargo test`/`llvm-cov` on this same crate (~2470% CPU), **another agent's
+run of this same `int4_decode_loop_ab` benchmark** (~1275% CPU), and a stray
+`while :; do :; done` spinner. Peak load average 31.25 on a 16-physical-core box.
+
+The same cell — qwen, block 32, acc 0, s=1, 16 decode threads, pinned to even
+CPUs — measured **197.2 tok/s** in one window and **22.8 tok/s** in another. An
+8.6x swing, from the environment alone.
+
+The trap worth naming: **several of those contaminated runs reported an intra-run
+`spread_%` under 6%.** A tight spread means the contention was *steady* during
+the run, not that the host was idle. Intra-run spread is not a contention
+detector, and treating it as one is how a 8.6x environmental artifact acquires a
+credible-looking error bar. `acc0_gap_matrix.py` therefore refuses to start a
+cell while any other process is above 150% CPU, and marks the cell `UNTRUSTED`
+rather than silently proceeding if it cannot wait one out.
+
+### What survives contention, and a claim withdrawn on review
+
+Absolute throughput on this host is not stable, so the instinct was to fall back
+on a **ratio between the two arms measured back-to-back in the same window** on
+the grounds that both arms eat the same contention. Interleaved native / ORT /
+native, native A/A partner at **1.018**:
+
+| arm | tok/s | achieved GB/s on the same 145.7 MB/token footprint |
+|---|---|---|
+| native acc0 | 196.0 | 28.5 |
+| ORT | 279.5 | 40.7 |
+
+That was originally written up as a "decisive observation" that ORT reaches a
+bandwidth we do not, and that this direction was stable even if the multiplier
+was not. **Opus review rejected that, correctly, and it is withdrawn.** The
+refutation is in this document's own bistability data below:
+
+* Pair 8 has native at **264.9** against ORT at **255.0** — native out-bandwidths
+  ORT in the same shared window. So the direction is not universal.
+* Native's own fast placement, **335.6 tok/s = 48.9 GB/s**, is *higher* than the
+  40.7 GB/s ORT figure quoted above as decisive.
+
+The A/A of 1.018 does not rescue it. That partner controls native-vs-native
+placement stability across two native launches; it says nothing about which L3
+placement the separately-launched **ORT** process drew. Quoting native at 28.5
+GB/s against ORT at 40.7 GB/s compares native's slow placement with ORT's fast
+one, and then calls the difference stable. That is precisely the objection used
+two subsections above to withhold the "ORT is intrinsically bimodal" and "~14% of
+FMA peak" claims — a placement-depressed number is a **lower bound**, and I
+applied that standard to two claims and then failed to apply it to a third.
+
+**What the evidence actually supports**, stated at the strength it can carry:
+
+* In some shared windows ORT out-bandwidths native; in at least one, native
+  out-bandwidths ORT. Both arms are placement-bistable per process launch.
+* **We are not memory-bound, and this conclusion is now *stronger*, not weaker.**
+  Native's own fast mode demonstrates the memory system supplies at least 48.9
+  GB/s to *our* kernel. So our common-case 28.5 GB/s is not a hardware ceiling —
+  it is something we are leaving on the table. That is a better-founded statement
+  than the retracted one, and it does not depend on the ORT arm at all.
+
+### The MLP-starvation hypothesis is provisionally falsified
+
+The leading explanation for a single-session deficit was memory-level-parallelism
+starvation: one session cannot keep enough cache misses outstanding, while two or
+four supply independent streams that do. That predicts aggregate bandwidth rising
+with session count.
+
+Measured across `s = 1, 2, 4, 8` it does not rise — it stays flat at ~22–28 GB/s
+aggregate. Marked **provisional** because the sweep was taken in a contended
+window, but the shape is a within-sweep comparison and the prediction is
+directional, so a real MLP effect should still have been visible.
+
+If it holds, it has a second consequence worth stating plainly: **the `s=2`/`s=4`
+"wins" were never us scaling.** Our absolute throughput is flat in session count,
+so those cells were the baseline degrading, not the kernel improving — and no
+kernel change should be justified by them.
+
+### The mechanism: the acc0 kernel is per-*block* bound, not per-*nibble* bound
+
+This is the one result of this segment that is both quantitative and robust. It
+is a **within-sweep comparison of a single arm**, all four points taken
+back-to-back in one quiet window, so it does not depend on the ORT baseline or
+on absolute throughput being stable.
+
+Sweeping `block_size` varies how often the per-block epilogue runs while leaving
+the number of nibbles to unpack essentially unchanged. qwen, `t=16`, `s=1`,
+`accuracy_level = 0`:
+
+| block | tok/s | spread | bytes/token | achieved GB/s |
+|---|---|---|---|---|
+| 16 | 93.3 | 8.7% | 174.8 MB | 16.3 |
+| 32 | 195.2 | 7.0% | 145.7 MB | **28.4** |
+| 64 | 428.9 | 16.3% | 131.1 MB | **56.2** |
+| 128 | 352.8 | 57.6% | 123.8 MB | (spread too high to quote) |
+
+Single launch per row, so the *magnitudes* below are superseded by the paired
+measurement that follows; the table is kept because the monotone direction and
+the block-16 scalar cliff are both real.
+
+That single-shot sweep suggested ~2x per doubling. **It overstated the effect**,
+because block 64 happened to draw a fast placement (see the bistability section);
+this is precisely the trap this section is otherwise about. Re-measured properly
+as six interleaved, independently launched pairs:
+
+| pair | block 32 | block 64 | ratio |
+|---|---|---|---|
+| 1 | 190.7 | 307.0 | 1.61x |
+| 2 | 195.5 | 283.3 | 1.45x |
+| 3 | 204.0 | 281.9 | 1.38x |
+| 4 | 203.9 | 298.0 | 1.46x |
+| 5 | 192.5 | 278.0 | 1.44x |
+| 6 | 199.2 | 303.4 | 1.52x |
+| **median** | **197.4** | **290.7** | **1.47x** |
+
+**1.47x, six pairs out of six, with no overlap between the two distributions.**
+That is the load-bearing number; the 2.20x from the single sweep is withdrawn.
+
+Doubling the block size moves 1.11x less traffic and does 1.47x more work, and
+the nibble count is identical in both rows. A per-nibble cost cannot produce
+that. **The dominant cost is per-block work.**
+
+Worth noting the model this *fails* to match, since it bounds how well the
+mechanism is understood: counting instructions in the loop below predicts only
+~1.14x for 32→64 (block 64 amortises one epilogue over two chunks instead of
+one). The measured 1.47x is larger, so per-block cost is not just the visible
+instruction count — the branchy `BorrowedScales::get` discriminant test, the
+bounds-checked indexing, and the dependency chain through `blk[c]` into `acc[c]`
+are all per-block too. The *direction* is established; the full decomposition is
+not, and should not be claimed until a prototype confirms it.
+
+Block 16 is a separate effect and is not evidence for anything here: the
+dispatch gate at `matmul_nbits.rs:1568` requires `block_size.is_multiple_of(32)`,
+so block 16 **never enters `borrowed_int4_nblock4_avx2` at all** and is routed to
+`borrowed_affine_int4_matmul` instead. It is slow because it is not taking this
+kernel, not because of anything inside it. (An earlier draft of this section
+blamed `chunks = block_size / 32` evaluating to zero; that line is unreachable
+for block 16 and the attribution was wrong, though the exclusion is right.)
+
+The code says the same thing. In `borrowed_int4_nblock4_avx2` the inner chunk
+loop runs `block_size / 32` times, so **at block 32 it runs exactly once**, and
+each block then pays a full epilogue:
+
+```rust
+for c in 0..group {
+    let scale = scales.get(scale_bases[c] + block);
+    let zero_point = layout.zero_point(zp_rows[c], block) as f32;
+    acc[c] = _mm256_fmadd_ps(blk[c], _mm256_set1_ps(scale), acc[c]);
+    correction[c] += scale * zero_point * activation_sums[block];
+}
+```
+
+At block 32 that epilogue — a bounds-checked scale fetch, a branchy
+`zero_point` lookup, a broadcast, an FMA, and three scalar float ops — runs
+**once per four FMAs of useful work**, per column. At block 64 it amortises over
+eight, at block 128 over sixteen. That is exactly the observed curve.
+
+Two further notes:
+
+* The benchmark passes **no zero-point tensor**, so `zp_rows[c]` is `None` and
+  `layout.zero_point` returns a constant. It is still being called per block per
+  column, inside the hot loop. That is pure overhead on the default production
+  path, with no numerical consequence to hoisting it.
+* `correction[c] += scale * zero_point * activation_sums[block]` is a scalar
+  chain across blocks. With `zp` constant it is `zp * dot(scales, activation_sums)`
+  — a reduction that could be computed 8-wide in a separate pass. That one is
+  **not** numerically free: f32 addition is not associative, so it must be
+  weighed against the acc0 exactness contract rather than assumed.
+
+This is §22's finding ("per-block bookkeeping was 1.68x of the int4 acc4 decode
+kernel — at block 32, at low thread counts") reappearing in the **acc0** kernel,
+where it was never fixed. It supersedes the unpack/convert hypothesis stated
+earlier in this section, which this sweep **falsifies**: if the nibble unpack
+dominated, block size would barely move the number.
+
+### The host is bistable, and a cpuset mask is not enough
+
+Eight interleaved ORT/native pairs on a quiet host:
+
+```
+ORT     338.6  421.8  442.0  428.6  440.1  223.0  293.5  255.0
+native  198.3  196.0  240.9  335.6  200.3  197.8  197.6  264.9
+```
+
+Both arms are bistable, and the tell is that the runs reporting *low* intra-run
+spread cluster at each arm's fast mode (ORT 442.0/428.6/440.1 at 0.4%/3.5%/3.0%;
+native 198.3/200.3/197.8/197.6 at 16%/0.2%/2.4%/4.0%). A run is either placed
+well and then internally stable, or placed badly and then also noisy.
+
+This is thread-to-L3-domain placement at process start. `taskset -c 0,2,...,30`
+constrains the pool to 16 distinct physical cores spanning **both** 32 MiB L3
+instances, but it does not determine which thread lands in which domain, and the
+weight set (145.7 MB) is far larger than either. So the earlier attribution of
+the slow cluster to "external contention" was itself incomplete: contention was
+real and was the dominant error term, but a second bistability survives on an
+idle host.
+
+**Consequence for all future numbers in this document: a cpuset mask is not
+sufficient pinning.** Per-thread placement has to be fixed, or every cell has to
+be reported as a distribution over independent process launches. Single-run
+ratios on this host are not reproducible, whichever arm they favour.
+
+### Disposition
+
+* Harness unified and the definition written into the module docs as a table, so
+  the two arms cannot silently drift apart again.
+* Both arms print `spread_%`; the driver blocks on a quiet host and labels
+  untrusted cells.
+* The 24-cell matrix, the 0.436x headline, and the "concurrency-dependent gap"
+  reading are **withdrawn**. A quiet-host re-measurement under the unified
+  definition puts `qwen t=16 s=1` at **0.625x** (A/A 1.042), but see the
+  bistability section: even that is one draw from a distribution, and the
+  matching `llama t=16 s=1` cell is **rejected by its own A/A of 0.796**, whose
+  20% self-noise is comparable to the 24% effect it was supposed to support.
+* We win `s=2`/`s=4` decisively (qwen 1.86x/2.18x, llama 2.27x/2.40x, effects far
+  larger than their A/A noise) — but our *absolute* throughput falls with session
+  count (qwen 272.7 → 192.2 → 152.9). Those cells are the baseline collapsing
+  (436.2 → 103.1 → 70.0), not us scaling, and must not be cited as kernel wins.
+* **Next mechanism, now identified rather than guessed: amortise the per-block
+  epilogue in `borrowed_int4_nblock4_avx2`.** The block sweep shows the kernel
+  reaches the machine's bandwidth ceiling at block 64 and half of it at the
+  production block 32, and the code shows why — at block 32 the chunk loop runs
+  once, so every four FMAs pay a scale fetch, a branchy `zero_point` lookup, a
+  broadcast, an FMA and three scalar ops. Hoisting the `zp_rows[c] == None` case
+  out of the block loop is numerically free and is the first thing to do;
+  vectorising the `correction` reduction is not free and must be weighed against
+  the acc0 exactness contract.
+* The earlier unpack/convert hypothesis in this section is **falsified** by that
+  same sweep and should not be picked up by the next reader.
+* The dispatch-width question was handed to the runtime owner with CPU-time
+  evidence (total CPU-seconds flat across widths, `sys` time rising ~20x from
+  `t<=2` to `t>=4`) rather than tuned around in the kernel. The `sys` rise is
+  real and is the `worker_wait` yield ramp (a `sched_yield` syscall per
+  iteration for the remainder of the blocktime window); it remains open with the
+  runtime owner.
+* The accompanying claim that `ONNX_GENAI_CPU_DECODE_THREADS=2` is a knob that
+  "silently does nothing" is **withdrawn (2026-08-22)**. The acc4 regime document
+  recorded `=2` as identical to `=1` (23.529 vs 23.527 ms/token) and that
+  reproduced here (23.6 vs 23.6 tok/s), but a controlled re-measurement on a
+  quiet host — one process per launch, interleaved arms, per-rep load guard,
+  over-guard cells discarded — gives **20.447 ms/token at `=2` against 40.039 at
+  `=1`, a 1.96x speedup, with a 0.6% A/A null**. Per-thread attribution shows
+  both `=2` workers **99% busy**, not parked. The "71% of one core" figure came
+  from `/usr/bin/time`'s `Percent of CPU`, which is `(user+sys)/wall` and so is
+  wall-derived: under contention it degrades exactly like the wall time it was
+  being used to corroborate, rather than independently confirming it. The
+  strongest clue that this was harness-side was arithmetic — 23.529 vs 23.527
+  agree to four significant figures, and contention is random. Full curve,
+  method and the categorical non-vacuity check:
+  [2026-08-22-decode-width-scaling.md](../benchmarks/2026-08-22-decode-width-scaling.md).
+* The general point survives intact and is worth keeping: a knob that silently
+  does nothing is worse than a slow one, because every sweep through it prints a
+  flat line that reads as "this kernel does not scale". The fix is to verify a
+  knob **structurally** (`w` in must give `w` SPMD threads out — categorical, so
+  valid even on a loaded host) rather than by comparing timings.
+* **Benchmarking on this host now requires coordination.** Three agents share
+  16 physical cores; two were running heavy jobs on this crate during this
+  investigation, one of them the very same benchmark binary. Cross-agent notice
+  before a long run is not politeness, it is a correctness requirement for
+  anyone publishing a ratio.

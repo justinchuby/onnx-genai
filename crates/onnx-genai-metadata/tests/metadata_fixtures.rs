@@ -106,6 +106,69 @@ fn adapter_service_contract_is_valid_and_derives_capabilities() {
     assert!(capabilities.contains("heterogeneous_adapter_batching"));
 }
 
+fn assert_capability_omission_is_rejected(document: &str, capability: &str) {
+    let mut metadata: InferenceMetadata =
+        serde_yaml::from_str(document).expect("capability fixture parses");
+    validate_metadata(&metadata).expect("capability fixture validates");
+    metadata
+        .pipeline
+        .as_mut()
+        .expect("pipeline")
+        .workflow
+        .manifest
+        .capabilities
+        .remove(capability);
+
+    let errors = validate_metadata(&metadata).expect_err("used capability omission must fail");
+    assert!(
+        errors.iter().any(|error| {
+            error
+                == &format!(
+                    "pipeline.workflow.manifest.capabilities is missing used capability \
+                     '{capability}'"
+                )
+        }),
+        "{capability}: {errors:?}"
+    );
+}
+
+#[test]
+fn structurally_derived_capability_omissions_fail_closed() {
+    for capability in ["parameter_adapters", "heterogeneous_adapter_batching"] {
+        assert_capability_omission_is_rejected(ADAPTER_WORKFLOW, capability);
+    }
+
+    let speculative = include_str!(
+        "../../../tests/fixtures/onnx_genai_workflows/speculative/inference_metadata.yaml"
+    );
+    for capability in ["grammar_guidance_adapter", "adaptive_proposal_budget"] {
+        assert_capability_omission_is_rejected(speculative, capability);
+    }
+
+    let linear_effects =
+        include_str!("../../../examples/inference_metadata/catalogue/02-cosmos3-edge-rollout.yaml");
+    assert_capability_omission_is_rejected(linear_effects, "linear_effects");
+
+    assert_capability_omission_is_rejected(
+        r#"
+pipeline:
+  workflow:
+    manifest:
+      adapter_abis: { onnx-genai.telemetry: "1" }
+      capabilities: [workflow_ssa, telemetry_adapter]
+    inputs: {}
+    components:
+      telemetry:
+        implementation: { kind: adapter, abi: onnx-genai.telemetry, version: "1" }
+        ports: {}
+    steps:
+      - kind: invoke
+        component: telemetry
+"#,
+        "telemetry_adapter",
+    );
+}
+
 #[test]
 fn workflow_custom_op_admission_fields_are_rejected() {
     let manifest_field = ADAPTER_WORKFLOW.replace(
@@ -1084,4 +1147,43 @@ pipeline:
             .any(|error| error.contains("unsupported action")),
         "{errors:?}"
     );
+}
+
+/// A package may declare workflow capabilities a given runtime does not
+/// implement. Those are a capability-negotiation question, not a malformed
+/// document, and must be reported apart from structural defects so a caller
+/// that never exercises them can still load the model.
+///
+/// Regression guard for the bare decoder that was rejected with
+/// `Invalid inference metadata: ["bounded_state_recurrence", "emit_valid_length",
+/// "linear_effects", ...]` — eight capability names presented as validation
+/// errors on a model that decoded correctly once they were dropped.
+#[test]
+fn unsupported_capabilities_are_reported_apart_from_structural_defects() {
+    use onnx_genai_metadata::{RuntimeCapabilities, validate_structure_and_capabilities};
+
+    let metadata: InferenceMetadata = serde_yaml::from_str(
+        r#"
+required_capabilities: [kv_cache, grouped_query_attention, some_future_feature]
+"#,
+    )
+    .expect("parse metadata");
+
+    let report = validate_structure_and_capabilities(&metadata, &RuntimeCapabilities::default());
+
+    assert!(
+        report.structural.is_empty(),
+        "a well-formed document must report no structural defects, got {:?}",
+        report.structural
+    );
+    assert_eq!(
+        report.unsupported_capabilities,
+        vec!["some_future_feature".to_string()],
+        "only the capability this runtime lacks should be listed; kv_cache and \
+         grouped_query_attention are supported"
+    );
+
+    // The strict entry point still folds both together, so callers that want
+    // all-or-nothing keep their behaviour.
+    assert!(onnx_genai_metadata::validate(&metadata, &RuntimeCapabilities::default()).is_err());
 }

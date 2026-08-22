@@ -249,6 +249,322 @@ fn softmax_stays_normalized_on_extreme_rows() {
     }
 }
 
+// ─── Scaled dot-product attention ───────────────────────────────────────────
+
+/// The SDPA shapes this suite holds the two routes to.
+///
+/// The grid is chosen for *routes*, not for coverage percentage:
+///
+/// * `issue_1685` is the exact shape whose output grew an eight-row hole in
+///   #1685 — 12 tiles of `128x64`, enough `(b, head)` tiles to fan out and
+///   enough rows for MLAS to partition the `probs.V` GEMM across its pool.
+/// * `decode_*` is `q_seq == 1`, the shape a generation step actually runs and
+///   the one the standing MHA benchmark grid never contained.
+/// * `gqa_*` has `kv_heads < heads`, so the KV-head folding in both routes is
+///   exercised rather than assumed.
+/// * `ragged` has no dimension that is a multiple of any tile width.
+struct SdpaShape {
+    label: &'static str,
+    batch: usize,
+    heads: usize,
+    kv_heads: usize,
+    q_seq: usize,
+    kv_seq: usize,
+    head_size: usize,
+    v_head_size: usize,
+}
+
+/// Shorthand so the grid below stays a readable table.
+#[allow(clippy::too_many_arguments)] // one positional per shape dimension; a builder would obscure the grid
+const fn shape(
+    label: &'static str,
+    batch: usize,
+    heads: usize,
+    kv_heads: usize,
+    q_seq: usize,
+    kv_seq: usize,
+    head_size: usize,
+    v_head_size: usize,
+) -> SdpaShape {
+    SdpaShape {
+        label,
+        batch,
+        heads,
+        kv_heads,
+        q_seq,
+        kv_seq,
+        head_size,
+        v_head_size,
+    }
+}
+
+const SDPA_SHAPES: &[SdpaShape] = &[
+    shape("issue_1685", 1, 12, 4, 128, 128, 64, 64),
+    shape("decode_llama_kv1024", 1, 32, 8, 1, 1024, 128, 128),
+    shape("decode_short", 2, 8, 8, 1, 129, 80, 80),
+    shape("prefill_bert", 1, 12, 12, 128, 128, 64, 64),
+    shape("gqa_prefill", 1, 16, 4, 64, 192, 128, 128),
+    shape("cross_attention", 1, 8, 8, 48, 300, 64, 64),
+    shape("ragged", 3, 6, 3, 7, 71, 33, 17),
+    shape("wide_v", 1, 4, 2, 5, 37, 64, 96),
+];
+
+fn sdpa_case(shape: &SdpaShape, causal: bool) -> backend_ab::SdpaCase {
+    backend_ab::SdpaCase {
+        batch: shape.batch,
+        num_heads: shape.heads,
+        num_kv_heads: shape.kv_heads,
+        q_seq: shape.q_seq,
+        kv_seq: shape.kv_seq,
+        head_size: shape.head_size,
+        v_head_size: shape.v_head_size,
+        causal,
+    }
+}
+
+/// Softmax attention is a convex combination of the `V` rows, so every output
+/// element must lie inside that head's per-column range of `V`. This is an
+/// oracle neither route can satisfy by accident, and it holds in a default
+/// build where there is no MLAS to compare against — so this suite still has
+/// an independent check when the reference is absent.
+fn assert_context_is_a_convex_combination(
+    label: &str,
+    case: &backend_ab::SdpaCase,
+    v: &[f32],
+    y: &[f32],
+) {
+    let heads_per_kv = case.num_heads / case.num_kv_heads;
+    for b in 0..case.batch {
+        for head in 0..case.num_heads {
+            let kv_head = head / heads_per_kv;
+            let v_off = ((b * case.num_kv_heads + kv_head) * case.kv_seq) * case.v_head_size;
+            for d in 0..case.v_head_size {
+                let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+                for j in 0..case.kv_seq {
+                    let value = v[v_off + j * case.v_head_size + d];
+                    lo = lo.min(value);
+                    hi = hi.max(value);
+                }
+                let y_off = ((b * case.num_heads + head) * case.q_seq) * case.v_head_size;
+                for i in 0..case.q_seq {
+                    let got = y[y_off + i * case.v_head_size + d];
+                    // Slack for fp32 rounding of the weighted sum.
+                    let slack = 1e-4 + (hi - lo).abs() * 1e-4;
+                    assert!(
+                        got >= lo - slack && got <= hi + slack,
+                        "{label}: context[b{b} h{head} i{i} d{d}] = {got} escapes the V range \
+                         [{lo}, {hi}] — attention output must be a convex combination of V"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// **Fail loud on lost work.** Both SDPA routes write the whole context tensor
+/// with `beta = 0`, so an element the kernel never touched is a defect, not a
+/// number.
+///
+/// This is the guard #1685 asked for. That defect surfaced as an eight-row
+/// contiguous run of exact `0.0` inside one `(batch, head)` tile, produced by a
+/// GEMM partition that never ran. It was only visible because a *different*
+/// test happened to compare two runs; against a zero-filled output buffer a
+/// dropped write is indistinguishable from a legitimate zero, and against a
+/// single run it is invisible entirely. Poisoning the buffer with `NaN` makes
+/// lost work unambiguous and independent of the values involved.
+#[test]
+fn sdpa_routes_write_every_output_element() {
+    assert!(
+        !SDPA_SHAPES.is_empty(),
+        "empty shape grid would pass vacuously"
+    );
+    let mut compared_mlas = 0usize;
+    for shape in SDPA_SHAPES {
+        for causal in [false, true] {
+            let case = sdpa_case(shape, causal);
+            let q = values(case.q_len(), 0x5DAA_0001);
+            let k = values(case.k_len(), 0x5DAA_0002);
+            let v = values(case.v_len(), 0x5DAA_0003);
+
+            let mut native = vec![f32::NAN; case.y_len()];
+            backend_ab::sdpa_native(&case, &q, &k, &v, &mut native);
+            assert_no_unwritten(
+                &format!("{} causal={causal} native", shape.label),
+                &case,
+                &native,
+            );
+            assert_context_is_a_convex_combination(
+                &format!("{} causal={causal} native", shape.label),
+                &case,
+                &v,
+                &native,
+            );
+
+            let mut mlas = vec![f32::NAN; case.y_len()];
+            if backend_ab::sdpa_mlas(&case, &q, &k, &v, &mut mlas) {
+                compared_mlas += 1;
+                assert_no_unwritten(
+                    &format!("{} causal={causal} mlas", shape.label),
+                    &case,
+                    &mlas,
+                );
+                assert_context_is_a_convex_combination(
+                    &format!("{} causal={causal} mlas", shape.label),
+                    &case,
+                    &v,
+                    &mlas,
+                );
+            }
+        }
+    }
+    assert_eq!(
+        compared_mlas > 0,
+        backend_ab::mlas_available(),
+        "the MLAS SDPA route must run exactly when the reference is linked"
+    );
+}
+
+/// Report an unwritten region the way the defect actually presents: the count,
+/// the first index, and the `(head, row)` it decodes to — because "8 rows of
+/// one head's tile" is the fingerprint of a dropped GEMM partition, and a bare
+/// index is not.
+fn assert_no_unwritten(label: &str, case: &backend_ab::SdpaCase, y: &[f32]) {
+    let unwritten: Vec<usize> = y
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| value.is_nan())
+        .map(|(index, _)| index)
+        .collect();
+    if unwritten.is_empty() {
+        return;
+    }
+    let tile = case.q_seq * case.v_head_size;
+    let first = unwritten[0];
+    panic!(
+        "{label}: {} of {} output elements were never written (first index {first} = \
+         batch-head tile {}, row {}, column {}). A `beta = 0` GEMM must overwrite all of C; \
+         a contiguous run of whole rows is a dropped work partition, not a numerical error.",
+        unwritten.len(),
+        y.len(),
+        first / tile,
+        (first % tile) / case.v_head_size,
+        first % case.v_head_size,
+    );
+}
+
+/// The native route and the MLAS reference must agree on the attention core.
+///
+/// This is [`KernelFamily::AttentionTranspose`]'s missing A/B. Its plan entry
+/// claims `Partial("everything except the two inner GEMMs is native")`, and
+/// until now nothing in this suite held that claim to a comparison — the one
+/// family with a known reference-route defect was the one family with no
+/// same-binary A/B.
+///
+/// The two routes reassociate both matmuls differently (a GEMM against a
+/// hand-rolled dot/axpy loop), so the tolerance is accumulation slack over
+/// `kv_seq` terms, not zero.
+#[test]
+#[cfg(feature = "mlas")]
+fn sdpa_native_and_mlas_agree() {
+    for shape in SDPA_SHAPES {
+        for causal in [false, true] {
+            let case = sdpa_case(shape, causal);
+            let q = values(case.q_len(), 0x5DAA_0011);
+            let k = values(case.k_len(), 0x5DAA_0012);
+            let v = values(case.v_len(), 0x5DAA_0013);
+
+            let mut native = vec![f32::NAN; case.y_len()];
+            backend_ab::sdpa_native(&case, &q, &k, &v, &mut native);
+            let mut mlas = vec![f32::NAN; case.y_len()];
+            assert!(backend_ab::sdpa_mlas(&case, &q, &k, &v, &mut mlas));
+
+            // Both outputs are convex combinations of V, so magnitudes are
+            // O(1); the error budget is the softmax-weighted sum over kv_seq.
+            assert_close(
+                &format!("sdpa {} causal={causal}", shape.label),
+                &mlas,
+                &native,
+                case.kv_seq,
+                64.0,
+            );
+        }
+    }
+}
+
+/// #1685's real trigger was **concurrency**, not shape: several threads driving
+/// SDPA at once, each fanning its `(batch, head)` tiles across a pool while the
+/// inner GEMMs dispatch onto the shared MLAS pool underneath.
+///
+/// The pool bug that produced it (a worker from a finished dispatch still
+/// inside `run_job` when the next dispatch republished the loop counters —
+/// see `crates/mlas-sys/tests/concurrent_dispatch.rs`) only appears when
+/// dispatches overlap. A single-threaded shape sweep cannot reach it, which is
+/// why the original report reproduced at ~3% per process and not at all in a
+/// tight in-process loop.
+#[test]
+fn concurrent_sdpa_sessions_lose_no_work() {
+    let case = backend_ab::SdpaCase {
+        batch: 1,
+        num_heads: 12,
+        num_kv_heads: 4,
+        q_seq: 128,
+        kv_seq: 128,
+        head_size: 64,
+        v_head_size: 64,
+        causal: true,
+    };
+    let q = values(case.q_len(), 0x5DAA_0021);
+    let k = values(case.k_len(), 0x5DAA_0022);
+    let v = values(case.v_len(), 0x5DAA_0023);
+
+    let sessions = 4usize;
+    let rounds = 24usize;
+    let run = move || {
+        std::thread::scope(|scope| {
+            for session in 0..sessions {
+                let (case, q, k, v) = (case, &q, &k, &v);
+                scope.spawn(move || {
+                    for round in 0..rounds {
+                        let label = format!("session {session} round {round}");
+                        let mut native = vec![f32::NAN; case.y_len()];
+                        backend_ab::sdpa_native(&case, q, k, v, &mut native);
+                        assert_no_unwritten(&format!("{label} native"), &case, &native);
+
+                        let mut mlas = vec![f32::NAN; case.y_len()];
+                        if backend_ab::sdpa_mlas(&case, q, k, v, &mut mlas) {
+                            assert_no_unwritten(&format!("{label} mlas"), &case, &mlas);
+                        }
+                    }
+                });
+            }
+        });
+    };
+
+    // Run on a watchdog thread. The failure this guards has two forms: lost
+    // work, which the NaN scan above catches, and a pool that never returns at
+    // all, which would otherwise hang the suite until CI's own timeout killed
+    // it with no diagnosis attached.
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("sdpa-concurrency-watchdog".into())
+        .spawn(move || {
+            let verdict = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+            let _ = done.send(verdict.is_ok());
+        })
+        .expect("watchdog thread must start");
+
+    match finished.recv_timeout(std::time::Duration::from_secs(120)) {
+        Ok(true) => {}
+        // The inner panic has already printed its own message and location.
+        Ok(false) => panic!("a concurrent SDPA session failed; see the panic above"),
+        Err(_) => panic!(
+            "concurrent SDPA sessions never finished: the shared pool stopped making \
+             progress, which is what happens when a straggler from a retired epoch \
+             decrements the next job's completion counter past zero (#1685)"
+        ),
+    }
+}
+
 /// `Erf` and exact `Gelu` keep an MLAS route because it measured faster. The
 /// tolerance is the documented polynomial slack between the two, not zero: MLAS
 /// dispatches by ISA and our AVX2 path mirrors only one of its kernels.

@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use onnx_genai_metadata::{InferenceMetadata, PipelineSpec, PreprocessingSpec, load_metadata};
 use onnx_model_package::{ModelPackage, SelectionRequest, is_model_package_directory};
@@ -413,11 +413,11 @@ impl PipelineModelDirectory {
 }
 
 /// The one ORT environment a pipeline's sessions share, created on first use.
-fn lazy_environment(cell: &OnceLock<Environment>) -> Result<&Environment> {
+fn lazy_environment(cell: &OnceLock<Arc<Environment>>) -> Result<&Arc<Environment>> {
     if let Some(environment) = cell.get() {
         return Ok(environment);
     }
-    let created = Environment::new("onnx-genai-pipeline")?;
+    let created = Arc::new(Environment::new("onnx-genai-pipeline")?);
     Ok(cell.get_or_init(|| created))
 }
 
@@ -436,7 +436,7 @@ pub struct PipelineModels {
     /// Created on first use so a package inspected without ORT sessions never
     /// initializes the ORT runtime, while generated execution islands can still
     /// obtain the one environment their sessions share.
-    environment: OnceLock<Environment>,
+    environment: OnceLock<Arc<Environment>>,
 }
 
 impl PipelineModels {
@@ -494,7 +494,7 @@ impl PipelineModels {
                 sessions.insert(
                     name.clone(),
                     Session::new(
-                        lazy_environment(&environment)?,
+                        lazy_environment(&environment)?.as_ref(),
                         path,
                         component_options.clone(),
                     )?,
@@ -562,7 +562,12 @@ impl PipelineModels {
     /// ORT session, so the environment stays uncreated until an execution island
     /// actually needs one.
     pub fn environment(&self) -> Result<&Environment> {
-        lazy_environment(&self.environment)
+        lazy_environment(&self.environment).map(Arc::as_ref)
+    }
+
+    #[doc(hidden)]
+    pub fn environment_handle(&self) -> Option<Arc<Environment>> {
+        self.environment.get().cloned()
     }
 
     /// Session options used to load package components.
@@ -949,11 +954,19 @@ mod tests {
             .join(name);
         let _ = fs::remove_dir_all(&root);
         copy_directory(&source, &root);
-        let mut metadata = fs::read_to_string(source.join("inference_metadata.yaml")).unwrap();
+        let mut metadata = fs::read_to_string(source.join("inference_metadata.yaml"))
+            .unwrap()
+            .replace("\r\n", "\n");
         let artifact = format!("    artifacts:\n    - location: {location}\n");
-        metadata = metadata.replace(
-            "    byte_level: true\n",
+        const TOKENIZER_NEEDLE: &str = "    byte_level: true\n";
+        assert!(
+            metadata.contains(TOKENIZER_NEEDLE),
+            "tokenizer fixture must contain the insertion point"
+        );
+        metadata = metadata.replacen(
+            TOKENIZER_NEEDLE,
             &format!("    byte_level: true\n{artifact}"),
+            1,
         );
         fs::write(root.join("inference_metadata.yaml"), metadata).unwrap();
         root
@@ -1028,7 +1041,10 @@ mod tests {
 
         let error = PipelineModelDirectory::load(&root).unwrap_err().to_string();
         assert!(error.contains("cannot be opened"), "{error}");
-        assert!(error.contains("nested/tokenizer.json"), "{error}");
+        assert!(
+            error.contains("nested") && error.contains("tokenizer.json"),
+            "{error}"
+        );
     }
 
     #[test]

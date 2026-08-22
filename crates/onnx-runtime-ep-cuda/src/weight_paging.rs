@@ -16,6 +16,7 @@
 //! into the executor's live MoE dispatch so the fused kernel consumes the device
 //! page, and async prefetch overlap (issues #82/#87).
 
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -35,7 +36,7 @@ use crate::deferred_release::{
     CudaDeferredReleaseQueue, DeferredActionOutcome, DeferredReleaseAction, RetainedOwnership,
 };
 use crate::pinned_pool::PinnedStagingPool;
-use crate::runtime::{CopyCompleted, CudaRuntime, PinnedStaging, raw_ptr};
+use crate::runtime::{CopyCompleted, CudaRuntime, FailedHtodCompletion, PinnedStaging, raw_ptr};
 
 /// Alignment for stable-VA weight slots (issue #716). The VMM arena rounds
 /// commits to the 2 MiB device granule (#776) regardless, so this only governs
@@ -175,6 +176,13 @@ fn eviction_made_committed_progress(
     after_owned < before_owned
         || after_required_owned < before_required_owned
         || after_required_mapped < before_required_mapped
+}
+
+fn vmm_committed_authority_matches(
+    allocator: &crate::vmm_allocator::CudaVmmAllocator,
+    governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
+) -> bool {
+    allocator.committed_byte_authority() == Some(governor.authority_id())
 }
 
 /// Snapshot of the process-global weight-offload counters.
@@ -1073,16 +1081,14 @@ fn pin_checksum_keys() -> Option<&'static HashSet<u64>> {
         .as_ref()
 }
 
-/// Parsed force-re-fill cadence, cached once per process. `None`/`Some(0)` on the
-/// shipped path means never re-fill.
+/// Parsed force-re-fill cadence. `None`/`Some(0)` on the shipped path means
+/// never re-fill. This is read only for an opt-in pinned page, and remains
+/// dynamic so fault-injection tests and diagnostic runs can scope the knob.
 fn pin_refill_every() -> Option<u64> {
-    static CACHE: OnceLock<Option<u64>> = OnceLock::new();
-    *CACHE.get_or_init(|| {
-        std::env::var(WEIGHT_PIN_REFILL_EVERY_ENV)
-            .ok()
-            .and_then(|raw| raw.trim().parse::<u64>().ok())
-            .filter(|n| *n > 0)
-    })
+    std::env::var(WEIGHT_PIN_REFILL_EVERY_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
 }
 
 /// #945 control — isolate the *reused-slot bypass* hazard. When enabled, a key
@@ -1375,18 +1381,20 @@ enum WeightAllocation {
         /// one. The slot is marked pending while its deferred decommit is in
         /// flight and is only reusable again once that decommit terminally
         /// completes; a decommit that quarantines poisons the slot instead.
-        slot_state: Option<Arc<SlotReleaseState>>,
+        slot_state: Option<Arc<SlotOperationState>>,
     },
 }
 
-/// Whether a stable weight slot may be mapped again.
+/// Whether a stable weight slot may be accessed or mapped again.
 ///
 /// A slot's virtual address is baked into captured graphs, so remapping it
 /// while its previous physical decommit is still in flight would let a page-in
-/// race a release over one address. The slot therefore carries explicit state:
-/// page-in fails closed unless the slot is idle.
+/// race a release over one address. A pinned-page diagnostic refill also writes
+/// that same address after dropping the residency lock. The slot therefore
+/// carries explicit state: lookups, refills, and page-ins fail closed unless the
+/// slot is idle.
 #[derive(Debug, Default)]
-pub(crate) struct SlotReleaseState {
+pub(crate) struct SlotOperationState {
     state: std::sync::atomic::AtomicU8,
 }
 
@@ -1402,7 +1410,7 @@ pub enum SlotStatus {
     Poisoned,
 }
 
-impl SlotReleaseState {
+impl SlotOperationState {
     const IDLE: u8 = 0;
     const PENDING: u8 = 1;
     const POISONED: u8 = 2;
@@ -1415,9 +1423,10 @@ impl SlotReleaseState {
         }
     }
 
-    /// Claim the slot for a deferred release. Returns `false` when a release is
-    /// already in flight or the slot is poisoned.
-    fn begin_release(&self) -> bool {
+    /// Claim the slot for an operation that must finish outside the residency
+    /// lock. Returns `false` when another operation is pending or the slot is
+    /// poisoned.
+    fn begin_pending(&self) -> bool {
         self.state
             .compare_exchange(
                 Self::IDLE,
@@ -1428,8 +1437,18 @@ impl SlotReleaseState {
             .is_ok()
     }
 
-    /// The deferred release completed; the address may be mapped again.
-    fn finish_release(&self) {
+    /// Claim the slot for a deferred release.
+    fn begin_release(&self) -> bool {
+        self.begin_pending()
+    }
+
+    /// Claim the slot before a pinned refill drops the residency lock.
+    fn begin_refill(&self) -> bool {
+        self.begin_pending()
+    }
+
+    /// A pending operation completed with valid slot contents.
+    fn finish_pending(&self) {
         let _ = self.state.compare_exchange(
             Self::PENDING,
             Self::IDLE,
@@ -1438,7 +1457,19 @@ impl SlotReleaseState {
         );
     }
 
-    /// The release did not complete. The slot is never reusable.
+    /// The deferred release completed; the address may be mapped again.
+    fn finish_release(&self) {
+        self.finish_pending();
+    }
+
+    /// A refill completed successfully, was not submitted, or terminally
+    /// completed before reporting an error. In all three cases no copy can
+    /// still mutate the address and its contents remain valid.
+    fn finish_refill(&self) {
+        self.finish_pending();
+    }
+
+    /// A pending operation did not complete. The slot is never reusable.
     fn poison(&self) {
         self.state.store(Self::POISONED, Ordering::Release);
     }
@@ -1455,7 +1486,7 @@ struct StableWeightSlot {
     len: usize,
     /// Shared with every page that occupies this slot, so a page-in can see
     /// that the previous page's decommit has not finished.
-    state: Arc<SlotReleaseState>,
+    state: Arc<SlotOperationState>,
 }
 
 /// A weight page's device memory, released after both stream tails.
@@ -1485,7 +1516,7 @@ enum WeightReleaseAction {
         allowance: onnx_runtime_memory_governor::MappedAllowance,
         ptr: CUdeviceptr,
         len: usize,
-        slot_state: Option<Arc<SlotReleaseState>>,
+        slot_state: Option<Arc<SlotOperationState>>,
     },
     /// A duplicate or already-poisoned stable-slot release. Nothing may touch
     /// the address again, so retain the exact allocator/allowance/slot state.
@@ -1494,7 +1525,7 @@ enum WeightReleaseAction {
         allowance: onnx_runtime_memory_governor::MappedAllowance,
         ptr: CUdeviceptr,
         len: usize,
-        slot_state: Option<Arc<SlotReleaseState>>,
+        slot_state: Option<Arc<SlotOperationState>>,
     },
 }
 
@@ -2110,10 +2141,25 @@ impl CudaWeightPage {
             shape,
         };
         let staged = &staging.as_slice()[..len];
-        let (copy_ms, completed) =
-            unsafe { runtime.htod_async_elapsed_ms(staged, ptr) }.map_err(|error| {
-                WeightHandleError::DeviceBinding(format!("measured H2D copy: {error}"))
-            })?;
+        let (copy_ms, completed) = match unsafe { runtime.htod_async_elapsed_ms(staged, ptr) } {
+            Ok(result) => result,
+            Err(error) => {
+                let (detail, completion) = error.into_parts();
+                let error =
+                    WeightHandleError::DeviceBinding(format!("measured H2D copy: {detail}"));
+                match completion {
+                    FailedHtodCompletion::NotSubmitted => return Err(error),
+                    FailedHtodCompletion::Completed(_) => return Err(error),
+                    FailedHtodCompletion::MayBeInFlight => {
+                        quarantine_in_flight_fill(Box::new((page, staging)));
+                        return Err(WeightHandleError::DeviceBinding(format!(
+                            "{error}; destination and staging source were quarantined because \
+                             copy-stream completion could not be established"
+                        )));
+                    }
+                }
+            }
+        };
         GLOBAL_HTOD_NS.fetch_add((copy_ms * 1_000_000.0) as u64, Ordering::Relaxed);
         GLOBAL_HTOD_BYTES.fetch_add(len as u64, Ordering::Relaxed);
         Ok((page, 0, staging, completed))
@@ -2221,6 +2267,13 @@ pub struct CudaWeightPager<'a, S: MmapRegionSource + ?Sized> {
 
 impl<'a, S: MmapRegionSource + ?Sized> CudaWeightPager<'a, S> {
     pub fn new(runtime: Arc<CudaRuntime>, source: &'a S) -> Self {
+        // Marking here rather than at the call sites is what makes it
+        // unmissable: a pager cannot exist on a runtime without that runtime
+        // knowing its weights may be paged. The pages this builds are retired
+        // through `free_raw`/`deallocate_span` rather than the provider's
+        // `deallocate`, so the interleave cache is never told an address died
+        // and must refuse to key on one. See [`crate::interleave_cache`].
+        runtime.set_weights_may_be_paged();
         Self {
             runtime,
             queue: None,
@@ -2429,6 +2482,90 @@ enum SpanAdmit {
     /// streamed) this span, so the caller must bind it zero-copy instead. No
     /// eviction, reservation-map, or fill happened — the reserved VA is clean.
     DeferToZeroCopy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FreshSpanCleanup {
+    /// Admission failed before consuming the fresh reservation.
+    CallerOwns,
+    /// Rollback released or quarantined the reservation exactly once.
+    Consumed,
+}
+
+#[derive(Debug)]
+struct SpanAdmitError {
+    error: WeightHandleError,
+    fresh_span: FreshSpanCleanup,
+}
+
+impl From<WeightHandleError> for SpanAdmitError {
+    fn from(error: WeightHandleError) -> Self {
+        Self {
+            error,
+            fresh_span: FreshSpanCleanup::CallerOwns,
+        }
+    }
+}
+
+struct VmmFillFailure {
+    error: WeightHandleError,
+    in_flight_source: Option<Box<dyn Any + Send>>,
+}
+
+impl VmmFillFailure {
+    fn completed(error: WeightHandleError) -> Self {
+        Self {
+            error,
+            in_flight_source: None,
+        }
+    }
+
+    fn may_be_in_flight(error: WeightHandleError, source: Box<dyn Any + Send>) -> Self {
+        Self {
+            error,
+            in_flight_source: Some(source),
+        }
+    }
+}
+
+trait IntoVmmFillResult {
+    fn into_vmm_fill_result(self) -> Result<(), VmmFillFailure>;
+}
+
+impl IntoVmmFillResult for Result<(), WeightHandleError> {
+    fn into_vmm_fill_result(self) -> Result<(), VmmFillFailure> {
+        self.map_err(VmmFillFailure::completed)
+    }
+}
+
+impl IntoVmmFillResult for Result<(), VmmFillFailure> {
+    fn into_vmm_fill_result(self) -> Result<(), VmmFillFailure> {
+        self
+    }
+}
+
+fn in_flight_fill_quarantine() -> &'static Mutex<Vec<Box<dyn Any + Send>>> {
+    // A failed stream synchronization provides no terminal boundary at which
+    // either endpoint can be destroyed. Keep both for process lifetime: this
+    // deliberately outlives CUDA context teardown and therefore never runs a
+    // staging-buffer or VMM-allocation destructor against a lost context.
+    static QUARANTINE: OnceLock<Mutex<Vec<Box<dyn Any + Send>>>> = OnceLock::new();
+    QUARANTINE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn quarantine_in_flight_fill(ownership: Box<dyn Any + Send>) {
+    in_flight_fill_quarantine()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(ownership);
+}
+
+#[cfg(test)]
+fn in_flight_fill_quarantine_count() -> usize {
+    in_flight_fill_quarantine()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .len()
 }
 
 /// Outcome of a VMM live page-in attempt (`resident_vmm_with`) under the
@@ -2817,6 +2954,10 @@ impl CudaWeightResidency {
     /// out, and neither side can see the other's.
     pub fn new(runtime: Arc<CudaRuntime>, budget_bytes: u64) -> Self {
         replace_global_budget(0, budget_bytes);
+        // See `CudaWeightPager::new`: a runtime that can page weights must say
+        // so before anything can page one, so the interleave cache stops
+        // keying on addresses this will recycle.
+        runtime.set_weights_may_be_paged();
         Self {
             runtime: Arc::clone(&runtime),
             queue: None,
@@ -3049,6 +3190,13 @@ impl CudaWeightResidency {
         }
         let (allowance, lease) = {
             let mut inner = self.lock();
+            // Context loss is terminal for every baked address. In particular,
+            // a refill that was pending when teardown was confirmed must not
+            // later restore the slot to idle and expose a pointer into the dead
+            // context; finish_refill's compare-exchange preserves this poison.
+            for slot in inner.slots.values() {
+                slot.state.poison();
+            }
             let allowance = inner.mapped_allowance.take();
             let lease = inner.lease.take();
             inner.policy.budget = 0;
@@ -3102,7 +3250,7 @@ impl CudaWeightResidency {
         self
     }
 
-    /// Use the production VMM arena and its existing physical-memory authority
+    /// Use the production VMM arena and its existing committed-byte authority
     /// for weight pages. The configured cache budget remains an observability
     /// value; admission is governed by incremental authority-owned bytes, not
     /// by a second private lease.
@@ -3118,11 +3266,13 @@ impl CudaWeightResidency {
                     .into(),
             ));
         }
-        if allocator.physical_pool_authority() != Some(governor.authority_id()) {
-            return Err(WeightHandleError::DeviceBinding(
-                "VMM weight residency and its governor must share one physical-memory authority"
-                    .into(),
-            ));
+        if !vmm_committed_authority_matches(allocator.as_ref(), governor.as_ref()) {
+            return Err(WeightHandleError::DeviceBinding(format!(
+                "VMM weight residency and its governor must share one committed-byte \
+                     authority (allocator: {:?}, governor: {:?})",
+                allocator.committed_byte_authority(),
+                governor.authority_id()
+            )));
         }
         let _ = self.physical.set(PhysicalAdmission {
             allocator,
@@ -3143,11 +3293,13 @@ impl CudaWeightResidency {
                     .into(),
             ));
         }
-        if allocator.physical_pool_authority() != Some(governor.authority_id()) {
-            return Err(WeightHandleError::DeviceBinding(
-                "VMM weight residency and its governor must share one physical-memory authority"
-                    .into(),
-            ));
+        if !vmm_committed_authority_matches(allocator.as_ref(), governor.as_ref()) {
+            return Err(WeightHandleError::DeviceBinding(format!(
+                "VMM weight residency and its governor must share one committed-byte \
+                     authority (allocator: {:?}, governor: {:?})",
+                allocator.committed_byte_authority(),
+                governor.authority_id()
+            )));
         }
         self.physical
             .set(PhysicalAdmission {
@@ -3273,10 +3425,30 @@ impl CudaWeightResidency {
                 // structurally gated on the copy having completed.
                 move |runtime, ptr| {
                     let staged = &staging.as_slice()[..len];
-                    let (copy_ms, completed) =
-                        unsafe { runtime.htod_async_elapsed_ms(staged, ptr) }.map_err(|error| {
-                            WeightHandleError::DeviceBinding(format!("measured H2D copy: {error}"))
-                        })?;
+                    let (copy_ms, completed) = match unsafe {
+                        runtime.htod_async_elapsed_ms(staged, ptr)
+                    } {
+                        Ok(result) => result,
+                        Err(error) => {
+                            let (detail, completion) = error.into_parts();
+                            let error = WeightHandleError::DeviceBinding(format!(
+                                "measured H2D copy: {detail}"
+                            ));
+                            return match completion {
+                                FailedHtodCompletion::NotSubmitted => {
+                                    Err(VmmFillFailure::completed(error))
+                                }
+                                FailedHtodCompletion::Completed(completed) => {
+                                    staging.retire(completed);
+                                    Err(VmmFillFailure::completed(error))
+                                }
+                                FailedHtodCompletion::MayBeInFlight => {
+                                    let source = staging.into_inner();
+                                    Err(VmmFillFailure::may_be_in_flight(error, Box::new(source)))
+                                }
+                            };
+                        }
+                    };
                     GLOBAL_HTOD_NS.fetch_add((copy_ms * 1_000_000.0) as u64, Ordering::Relaxed);
                     GLOBAL_HTOD_BYTES.fetch_add(len as u64, Ordering::Relaxed);
                     staging.retire(completed);
@@ -3565,7 +3737,7 @@ impl CudaWeightResidency {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn resident_vmm_with<F>(
+    fn resident_vmm_with<F, R>(
         &self,
         key: u64,
         dtype: DataType,
@@ -3576,7 +3748,8 @@ impl CudaWeightResidency {
         fill: F,
     ) -> Result<VmmAdmit, WeightHandleError>
     where
-        F: FnOnce(&CudaRuntime, CUdeviceptr) -> Result<(), WeightHandleError>,
+        F: FnOnce(&CudaRuntime, CUdeviceptr) -> R,
+        R: IntoVmmFillResult,
     {
         let physical = self
             .physical
@@ -3584,6 +3757,24 @@ impl CudaWeightResidency {
             .expect("VMM residency helper requires physical admission");
         let mut inner = self.lock();
         if let Some(existing) = inner.pages.get(&key).cloned() {
+            let slot_state = inner.slots.get(&key).map(|slot| Arc::clone(&slot.state));
+            if let Some(state) = slot_state.as_ref() {
+                match state.status() {
+                    SlotStatus::Idle => {}
+                    SlotStatus::Pending => {
+                        return Err(WeightHandleError::DeviceBinding(format!(
+                            "stable weight slot for key {key} has a refill or release pending; \
+                             retry after that operation terminally completes"
+                        )));
+                    }
+                    SlotStatus::Poisoned => {
+                        return Err(WeightHandleError::DeviceBinding(format!(
+                            "stable weight slot for key {key} is poisoned; its device pointer \
+                             must never be returned or written again"
+                        )));
+                    }
+                }
+            }
             inner.record_hit(key);
             // #945 retained-page-staleness probes. Reached only when a probe env
             // is set; the shipped path takes the early return above unchanged.
@@ -3602,24 +3793,70 @@ impl CudaWeightResidency {
                 } else {
                     None
                 };
+                let refill_claim = if refill_every.is_some_and(|every| step % every == 0) {
+                    let state = slot_state.ok_or_else(|| {
+                        WeightHandleError::DeviceBinding(format!(
+                            "pinned resident key {key} has no stable-slot refill state"
+                        ))
+                    })?;
+                    // `existing` and `inner.pages[key]` are the refill path's
+                    // two strong references. Any additional reference is a
+                    // consumer handle that may still read this address, so an
+                    // in-place rewrite must be skipped. The residency lock
+                    // keeps eviction and lookup clones out until Pending is
+                    // published; Pending then preserves exclusivity while the
+                    // fill runs without the lock.
+                    if Arc::strong_count(&existing) != 2 {
+                        None
+                    } else if !state.begin_refill() {
+                        return Err(WeightHandleError::DeviceBinding(format!(
+                            "stable weight slot for key {key} could not claim its refill; \
+                             another operation is pending or the slot is poisoned"
+                        )));
+                    } else {
+                        Some(state)
+                    }
+                } else {
+                    None
+                };
                 drop(inner);
                 if let Some(baseline) = baseline {
-                    let current = self.hash_page_granules(existing.ptr, existing.len)?;
+                    let current = match self.hash_page_granules(existing.ptr, existing.len) {
+                        Ok(current) => current,
+                        Err(error) => {
+                            if let Some(state) = refill_claim.as_ref() {
+                                state.finish_refill();
+                            }
+                            return Err(error);
+                        }
+                    };
                     report_pin_granule_diff(key, step, &baseline, &current);
                 }
-                if let Some(every) = refill_every
-                    && step % every == 0
-                {
+                if let Some(state) = refill_claim {
                     // Re-run the admission fill against the *same* device VA,
                     // re-copying the original host source. If corruption
                     // vanishes under this, the retained device copy had gone
                     // stale (host bytes are unchanged) — the decisive control.
-                    self.runtime.drain_for_unmap().map_err(|error| {
-                        WeightHandleError::DeviceBinding(format!(
+                    if let Err(error) = self.runtime.drain_for_unmap() {
+                        state.finish_refill();
+                        return Err(WeightHandleError::DeviceBinding(format!(
                             "pin-refill compute drain: {error}"
-                        ))
-                    })?;
-                    fill(&self.runtime, existing.ptr)?;
+                        )));
+                    }
+                    match fill(&self.runtime, existing.ptr).into_vmm_fill_result() {
+                        Ok(()) => state.finish_refill(),
+                        Err(failure) => {
+                            return Err(
+                                self.handle_pinned_refill_failure(key, existing, state, failure)
+                            );
+                        }
+                    }
+                    if state.status() != SlotStatus::Idle {
+                        return Err(WeightHandleError::DeviceBinding(format!(
+                            "stable weight slot for key {key} became poisoned during refill; \
+                             refusing to return its device pointer"
+                        )));
+                    }
                     eprintln!(
                         "weight_pin_refill[#945]: key={key} step={step} re-filled \
                          pinned page from host source"
@@ -3744,14 +3981,14 @@ impl CudaWeightResidency {
                 }
                 return Ok(VmmAdmit::DeferToZeroCopy);
             }
-            Err(error) => {
+            Err(failure) => {
                 // A reused slot's VA is persistent (its physical is already
                 // decommitted); a fresh throwaway reservation must be released
                 // so a failed page-in never leaks address space.
-                if reused_slot.is_none() {
+                if reused_slot.is_none() && failure.fresh_span == FreshSpanCleanup::CallerOwns {
                     let _ = physical.allocator.deallocate_span(ptr);
                 }
-                return Err(error);
+                return Err(failure.error);
             }
         };
 
@@ -3794,7 +4031,7 @@ impl CudaWeightResidency {
         let slot_state = match reused_slot.as_ref() {
             Some(slot) => Some(Arc::clone(&slot.state)),
             None if stable_slot => {
-                let state = Arc::new(SlotReleaseState::default());
+                let state = Arc::new(SlotOperationState::default());
                 inner.slots.insert(
                     key,
                     StableWeightSlot {
@@ -3846,6 +4083,42 @@ impl CudaWeightResidency {
         Ok(VmmAdmit::Page(page))
     }
 
+    fn handle_pinned_refill_failure(
+        &self,
+        key: u64,
+        existing: Arc<CudaWeightPage>,
+        state: Arc<SlotOperationState>,
+        failure: VmmFillFailure,
+    ) -> WeightHandleError {
+        let VmmFillFailure {
+            error,
+            in_flight_source,
+        } = failure;
+        let Some(source) = in_flight_source else {
+            // NotSubmitted leaves the old destination untouched. Completed
+            // carries a completion witness proving the submitted copy ended
+            // normally, so the new destination contents are valid and the
+            // pooled staging source was already retired by the fill closure.
+            state.finish_refill();
+            return error;
+        };
+
+        let mut inner = self.lock();
+        // Poison while holding residency before removing the page. A concurrent
+        // lookup can observe Pending before this lock is acquired, or Poisoned
+        // after it, but can never observe an idle resident pointer.
+        state.poison();
+        // Stop every later lookup before retaining the page. Its mapped charge
+        // deliberately remains live because completion is unresolved.
+        inner.remove_page(key);
+        drop(inner);
+        quarantine_in_flight_fill(Box::new((existing, source)));
+        WeightHandleError::DeviceBinding(format!(
+            "{error}; pinned-page refill completion could not be established; the destination \
+             mapping and staging source remain charged and quarantined"
+        ))
+    }
+
     /// Commit `len` physical bytes under the reserved VA `ptr`, evicting other
     /// resident pages as `eviction` permits, then run `fill` to copy the weight
     /// bytes into the freshly mapped granules. Returns
@@ -3868,7 +4141,7 @@ impl CudaWeightResidency {
     /// declines capture whenever a step reports a bypass or eviction (issue
     /// #716), keeping the invariant enforceable rather than advisory.
     #[allow(clippy::too_many_arguments)]
-    fn admit_committed_span<F>(
+    fn admit_committed_span<F, R>(
         &self,
         inner: &mut ResidencyInner,
         physical: &PhysicalAdmission,
@@ -3880,9 +4153,10 @@ impl CudaWeightResidency {
         has_stable_slot: bool,
         hybrid_zero_copy: bool,
         fill: F,
-    ) -> Result<SpanAdmit, WeightHandleError>
+    ) -> Result<SpanAdmit, SpanAdmitError>
     where
-        F: FnOnce(&CudaRuntime, CUdeviceptr) -> Result<(), WeightHandleError>,
+        F: FnOnce(&CudaRuntime, CUdeviceptr) -> R,
+        R: IntoVmmFillResult,
     {
         let mut fill = Some(fill);
         let max_evictions = inner.pages.len();
@@ -3956,21 +4230,49 @@ impl CudaWeightResidency {
                         // not a pure aliasing/logic bug. Default OFF /
                         // byte-identical.
                         if sync_before_fill_enabled() {
-                            self.runtime.drain_for_unmap().map_err(|error| {
-                                WeightHandleError::DeviceBinding(format!(
-                                    "sync-before-fill compute drain: {error}"
-                                ))
-                            })?;
-                            self.runtime.copy_stream().synchronize().map_err(|error| {
-                                WeightHandleError::DeviceBinding(format!(
-                                    "sync-before-fill copy drain: {error}"
-                                ))
-                            })?;
+                            if let Err(error) = self.runtime.drain_for_unmap() {
+                                return Err(self.rollback_failed_vmm_fill(
+                                    physical,
+                                    allowance,
+                                    ptr,
+                                    len,
+                                    has_stable_slot,
+                                    inner.slots.get(&key).map(|slot| Arc::clone(&slot.state)),
+                                    VmmFillFailure::completed(WeightHandleError::DeviceBinding(
+                                        format!("sync-before-fill compute drain: {error}"),
+                                    )),
+                                ));
+                            }
+                            if let Err(error) = self.runtime.copy_stream().synchronize() {
+                                return Err(self.rollback_failed_vmm_fill(
+                                    physical,
+                                    allowance,
+                                    ptr,
+                                    len,
+                                    has_stable_slot,
+                                    inner.slots.get(&key).map(|slot| Arc::clone(&slot.state)),
+                                    VmmFillFailure::completed(WeightHandleError::DeviceBinding(
+                                        format!("sync-before-fill copy drain: {error}"),
+                                    )),
+                                ));
+                            }
                         }
-                        fill.take().expect("VMM page fill runs once")(
+                        if let Err(failure) = fill.take().expect("VMM page fill runs once")(
                             &self.runtime,
                             ptr.as_ptr() as CUdeviceptr,
-                        )?;
+                        )
+                        .into_vmm_fill_result()
+                        {
+                            return Err(self.rollback_failed_vmm_fill(
+                                physical,
+                                allowance,
+                                ptr,
+                                len,
+                                has_stable_slot,
+                                inner.slots.get(&key).map(|slot| Arc::clone(&slot.state)),
+                                failure,
+                            ));
+                        }
                         // The span is filled and (if not a bypass) about to join
                         // the resident set. Pin it now so no later admission can
                         // ever select it as an eviction victim — the whole point
@@ -3988,7 +4290,7 @@ impl CudaWeightResidency {
                             |current| Some(current.saturating_sub(required_mapped)),
                         );
                         if evictions >= max_evictions {
-                            return Err(WeightHandleError::DeviceBinding(error.to_string()));
+                            return Err(WeightHandleError::DeviceBinding(error.to_string()).into());
                         }
                     }
                 }
@@ -4036,7 +4338,8 @@ impl CudaWeightResidency {
                      {zone_available} bytes of weight-zone headroom and {required_owned} \
                      incremental committed bytes with {global_available} bytes of physical \
                      headroom after {evictions} eviction(s)"
-                )));
+                ))
+                .into());
             }
             let before_owned = physical
                 .allocator
@@ -4067,7 +4370,8 @@ impl CudaWeightResidency {
                      {zone_available} bytes of weight-zone headroom and {required_owned} \
                      incremental committed bytes with {global_available} bytes of physical \
                      headroom, and no page is evictable"
-                )));
+                ))
+                .into());
             };
             let Some(queue) = self.queue.as_ref().cloned() else {
                 return Err(WeightHandleError::DeviceBinding(
@@ -4075,7 +4379,8 @@ impl CudaWeightResidency {
                      installed; refusing rather than leaking the page or freeing it before \
                      in-flight CUDA work completes"
                         .into(),
-                ));
+                )
+                .into());
             };
             // Eviction used to drain both streams here, so that the evicted
             // page's VMM unmap could not race a kernel or a transfer still
@@ -4092,7 +4397,8 @@ impl CudaWeightResidency {
                     "weight eviction did not settle its deferred release within \
                      {DEFERRED_RELEASE_WAIT_TIMEOUT:?}; admission cannot claim the mapped or \
                      physical headroom yet"
-                )));
+                ))
+                .into());
             }
             add_duration(&GLOBAL_ADMIT_SYNC_NS, evict_start.elapsed());
             evictions += 1;
@@ -4121,6 +4427,129 @@ impl CudaWeightResidency {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn rollback_failed_vmm_fill(
+        &self,
+        physical: &PhysicalAdmission,
+        allowance: &onnx_runtime_memory_governor::MappedAllowance,
+        ptr: NonNull<u8>,
+        len: usize,
+        has_stable_slot: bool,
+        slot_state: Option<Arc<SlotOperationState>>,
+        failure: VmmFillFailure,
+    ) -> SpanAdmitError {
+        if let Some(source) = failure.in_flight_source {
+            if let Some(state) = slot_state.as_ref() {
+                state.poison();
+            }
+            quarantine_in_flight_fill(Box::new((
+                Arc::clone(&physical.allocator),
+                allowance.clone(),
+                ptr.as_ptr() as usize,
+                len,
+                slot_state,
+                source,
+            )));
+            return SpanAdmitError {
+                error: WeightHandleError::DeviceBinding(format!(
+                    "{}; VMM fill rollback: copy-stream completion could not be established; \
+                     the destination mapping and staging source remain charged and quarantined",
+                    failure.error
+                )),
+                fresh_span: FreshSpanCleanup::Consumed,
+            };
+        }
+        let cleanup = if has_stable_slot {
+            match physical
+                .allocator
+                .decommit_allocation_range_outcome(ptr, len, 0, len)
+            {
+                Ok(crate::vmm_allocator::DecommitOutcome::Complete { accounting }) => {
+                    WeightReleaseAction::refund(allowance, accounting.unmapped_bytes);
+                    if accounting.quarantined_owned_bytes == 0 {
+                        format!("rolled back {} mapped byte(s)", accounting.unmapped_bytes)
+                    } else {
+                        format!(
+                            "unmapped {} byte(s), but quarantined {} byte(s) of residual physical \
+                             ownership",
+                            accounting.unmapped_bytes, accounting.quarantined_owned_bytes
+                        )
+                    }
+                }
+                Ok(crate::vmm_allocator::DecommitOutcome::RolledBack { reason }) => {
+                    if let Some(state) = slot_state.as_ref() {
+                        state.poison();
+                    }
+                    format!(
+                        "cleanup rolled back to the partially filled mapping ({reason}); the \
+                         stable slot was poisoned and remains charged"
+                    )
+                }
+                Ok(crate::vmm_allocator::DecommitOutcome::Quarantined {
+                    accounting,
+                    residual,
+                    reason,
+                }) => {
+                    WeightReleaseAction::refund(allowance, accounting.unmapped_bytes);
+                    if let Some(state) = slot_state.as_ref() {
+                        state.poison();
+                    }
+                    format!(
+                        "cleanup quarantined the stable slot ({reason}); refunded {} unmapped \
+                         byte(s) and retained {} byte(s) at {:#x}",
+                        accounting.unmapped_bytes, residual.retained_bytes, residual.address
+                    )
+                }
+                Err(cleanup_error) => {
+                    if let Some(state) = slot_state.as_ref() {
+                        state.poison();
+                    }
+                    format!(
+                        "cleanup was refused ({cleanup_error}); the stable slot was poisoned and \
+                         remains charged"
+                    )
+                }
+            }
+        } else {
+            match physical.allocator.deallocate_span_outcome(ptr) {
+                onnx_runtime_memory_governor::AllocationReleaseOutcome::Complete { accounting } => {
+                    WeightReleaseAction::refund(allowance, accounting.unmapped_bytes);
+                    format!(
+                        "released the fresh span and refunded {} mapped byte(s)",
+                        accounting.unmapped_bytes
+                    )
+                }
+                onnx_runtime_memory_governor::AllocationReleaseOutcome::Quarantined {
+                    accounting,
+                    residual,
+                } => {
+                    WeightReleaseAction::refund(allowance, accounting.unmapped_bytes);
+                    format!(
+                        "quarantined the fresh span; refunded {} unmapped byte(s) and retained {} \
+                         byte(s) at {:#x}: {}",
+                        accounting.unmapped_bytes,
+                        residual.retained_bytes,
+                        residual.address,
+                        residual.reason
+                    )
+                }
+                onnx_runtime_memory_governor::AllocationReleaseOutcome::Failed { failure } => {
+                    format!(
+                        "cleanup failed before a release outcome was established ({failure}); the \
+                         allocator retains the span and its charge"
+                    )
+                }
+            }
+        };
+        SpanAdmitError {
+            error: WeightHandleError::DeviceBinding(format!(
+                "{}; VMM fill rollback: {cleanup}",
+                failure.error
+            )),
+            fresh_span: FreshSpanCleanup::Consumed,
+        }
+    }
+
     fn eviction_for(&self, boundary: LazyWeightBoundary) -> WeightEvictionPolicy {
         eviction_for_boundary(self.scan_resistant_dense, boundary)
     }
@@ -4129,6 +4558,17 @@ impl CudaWeightResidency {
     fn get_hit(&self, key: u64) -> Option<Arc<CudaWeightPage>> {
         let mut inner = self.lock();
         if let Some(page) = inner.pages.get(&key).cloned() {
+            // A pinned refill writes this resident page after releasing `inner`.
+            // Decline every fast-path lookup until the refill has terminally
+            // completed; resident_vmm_with will return a retryable pending error
+            // or a terminal poisoned error without exposing the pointer.
+            if inner
+                .slots
+                .get(&key)
+                .is_some_and(|slot| slot.state.status() != SlotStatus::Idle)
+            {
+                return None;
+            }
             let is_pinned = inner.pinned.contains(&key);
             // #945 experiment 1: when forcing a periodic re-fill of a pinned key,
             // decline the fast-path hit here so the caller falls through to the
@@ -4503,6 +4943,7 @@ impl ResidencyInner {
         self.policy
             .next_evictable_index(eviction, &mut |key| {
                 !self.pinned.contains(&key)
+                    && self.slot_is_idle(key)
                     && self
                         .pages
                         .get(&key)
@@ -4524,6 +4965,7 @@ impl ResidencyInner {
         let mut best: Option<(u64, u64)> = None;
         for (&key, &bytes) in &self.policy.bytes_by_key {
             let evictable = !self.pinned.contains(&key)
+                && self.slot_is_idle(key)
                 && self
                     .pages
                     .get(&key)
@@ -4550,6 +4992,7 @@ impl ResidencyInner {
     ) -> Option<u64> {
         let is_evictable = |key: u64| -> bool {
             !self.pinned.contains(&key)
+                && self.slot_is_idle(key)
                 && self
                     .pages
                     .get(&key)
@@ -4613,10 +5056,14 @@ impl ResidencyInner {
     fn evict_to_fit(&mut self, incoming: u64, eviction: WeightEvictionPolicy) {
         let evicted = {
             let pages = &self.pages;
+            let slots = &self.slots;
             self.policy.evict_to_fit(incoming, eviction, |key| {
-                pages
+                slots
                     .get(&key)
-                    .is_some_and(|page| Arc::strong_count(page) == 1)
+                    .is_none_or(|slot| slot.state.status() == SlotStatus::Idle)
+                    && pages
+                        .get(&key)
+                        .is_some_and(|page| Arc::strong_count(page) == 1)
             })
         };
         for key in evicted {
@@ -4632,11 +5079,34 @@ impl ResidencyInner {
             }
         }
     }
+
+    fn slot_is_idle(&self, key: u64) -> bool {
+        self.slots
+            .get(&key)
+            .is_none_or(|slot| slot.state.status() == SlotStatus::Idle)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::EnvVarGuard;
+
+    #[test]
+    fn slot_operation_state_never_reopens_after_poison() {
+        let state = SlotOperationState::default();
+        assert!(state.begin_refill());
+        assert_eq!(state.status(), SlotStatus::Pending);
+        assert!(!state.begin_release());
+        state.poison();
+        state.finish_refill();
+        assert_eq!(state.status(), SlotStatus::Poisoned);
+
+        let completed = SlotOperationState::default();
+        assert!(completed.begin_refill());
+        completed.finish_refill();
+        assert_eq!(completed.status(), SlotStatus::Idle);
+    }
 
     /// `reset_global_offload_stats` clears the window counters and leaves every
     /// live gauge alone -- including the process-lifetime peak, which it must
@@ -5023,17 +5493,801 @@ mod tests {
         ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
     )]
     #[test]
+    fn failed_vmm_weight_fills_refund_fresh_and_reused_slot_charges() {
+        use onnx_runtime_memory_governor::{
+            DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole,
+        };
+
+        let mut env = EnvVarGuard::acquire();
+        env.unset(crate::vmm_allocator::CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV);
+        let Ok(runtime) = CudaRuntime::new(0).map(Arc::new) else {
+            eprintln!("SKIPPED (CUDA runtime dependencies unavailable): VMM fill rollback test");
+            return;
+        };
+        let granule = 2usize << 20;
+        let governor = Arc::new(LedgerGovernor::new(LeaseLedger::new(
+            (granule * 2) as u64,
+            0,
+            0,
+        )));
+        let allocator = Arc::new(
+            crate::vmm_allocator::CudaVmmAllocator::new(
+                runtime.cuda_context(),
+                DeviceKey::device(0),
+                0,
+                64 << 20,
+                governor.as_ref(),
+                HolderId::new(738),
+                MemoryRole::Weights,
+            )
+            .expect("no-pool VMM allocator"),
+        );
+        let authority: Arc<dyn MemoryGovernor + Send + Sync> = governor.clone();
+        let release_queue = CudaDeferredReleaseQueue::new(
+            Box::new(crate::deferred_release::CudaStreamFences::new(Arc::clone(
+                &runtime,
+            ))),
+            crate::deferred_release::DEFAULT_DEFERRED_RELEASE_CAPACITY,
+        );
+        let residency = CudaWeightResidency::new(Arc::clone(&runtime), granule as u64)
+            .with_deferred_release_queue(Arc::clone(&release_queue))
+            .with_vmm_admission(Arc::clone(&allocator), authority)
+            .expect("install VMM admission");
+        residency
+            .adopt_governed_budget(governor.as_ref(), Tier::Device, HolderId::new(738))
+            .expect("reserve mapped allowance");
+
+        let global_before = GLOBAL_WEIGHT_MAPPED_BYTES.load(Ordering::Relaxed);
+        let fresh_error = residency
+            .resident_vmm_with(
+                1,
+                DataType::Uint8,
+                vec![granule],
+                granule,
+                WeightEvictionPolicy::Lru,
+                false,
+                |_, _| {
+                    Err(WeightHandleError::DeviceBinding(
+                        "injected H2D fill failure".into(),
+                    ))
+                },
+            )
+            .expect_err("fresh fill failure");
+        assert!(fresh_error.to_string().contains("released the fresh span"));
+        assert_eq!(residency.stats().mapped_physical_bytes, 0);
+        assert_eq!(governor.used(Tier::Device), 0);
+        assert_eq!(
+            GLOBAL_WEIGHT_MAPPED_BYTES.load(Ordering::Relaxed),
+            global_before
+        );
+
+        // A fresh-fill rollback owns the reservation cleanup. If the caller
+        // releases it a second time, the arena free list can contain the same
+        // address twice and hand two concurrent allocations one VA.
+        let allocations: Vec<usize> = (0..2)
+            .map(|_| {
+                let allocator = Arc::clone(&allocator);
+                std::thread::spawn(move || {
+                    allocator
+                        .allocate_committed(granule, WEIGHT_SLOT_ALIGN, &[])
+                        .expect("post-rollback allocation")
+                        .as_ptr() as usize
+                })
+            })
+            .map(|thread| thread.join().expect("allocation thread panicked"))
+            .collect();
+        assert_ne!(
+            allocations[0], allocations[1],
+            "fresh rollback double-released one VA into the arena free list"
+        );
+        for address in allocations {
+            let ptr = NonNull::new(address as *mut u8).expect("non-null allocation");
+            let outcome = allocator.deallocate_span_outcome(ptr);
+            assert!(
+                matches!(
+                    outcome,
+                    onnx_runtime_memory_governor::AllocationReleaseOutcome::Complete { .. }
+                ),
+                "post-rollback probe span must release exactly once: {outcome:?}"
+            );
+        }
+
+        let first_bytes = vec![0x31u8; granule];
+        let first = residency
+            .resident_vmm_with(
+                1,
+                DataType::Uint8,
+                vec![granule],
+                granule,
+                WeightEvictionPolicy::Lru,
+                false,
+                move |runtime, ptr| {
+                    unsafe { runtime.htod(&first_bytes, ptr) }
+                        .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))
+                },
+            )
+            .map(VmmAdmit::expect_page)
+            .expect("first stable slot");
+        drop(first);
+        let second_bytes = vec![0x42u8; granule];
+        let second = residency
+            .resident_vmm_with(
+                2,
+                DataType::Uint8,
+                vec![granule],
+                granule,
+                WeightEvictionPolicy::Lru,
+                false,
+                move |runtime, ptr| {
+                    unsafe { runtime.htod(&second_bytes, ptr) }
+                        .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))
+                },
+            )
+            .map(VmmAdmit::expect_page)
+            .expect("evict first slot");
+        assert!(
+            release_queue.wait_until_idle(DEFERRED_RELEASE_WAIT_TIMEOUT),
+            "first stable-slot decommit"
+        );
+        drop(second);
+        residency.lock().remove_page_after_stream_sync(2);
+        assert!(
+            release_queue.wait_until_idle(DEFERRED_RELEASE_WAIT_TIMEOUT),
+            "second stable-slot decommit"
+        );
+        let mapped_baseline = residency.stats().mapped_physical_bytes;
+        let charged_baseline = governor.used(Tier::Device);
+        let global_baseline = GLOBAL_WEIGHT_MAPPED_BYTES.load(Ordering::Relaxed);
+
+        let reused_error = residency
+            .resident_vmm_with(
+                1,
+                DataType::Uint8,
+                vec![granule],
+                granule,
+                WeightEvictionPolicy::Lru,
+                false,
+                |_, _| {
+                    Err(WeightHandleError::DeviceBinding(
+                        "injected synchronization failure".into(),
+                    ))
+                },
+            )
+            .expect_err("reused-slot fill failure");
+        assert!(reused_error.to_string().contains("rolled back"));
+        assert_eq!(residency.stats().mapped_physical_bytes, mapped_baseline);
+        assert_eq!(governor.used(Tier::Device), charged_baseline);
+        assert_eq!(
+            GLOBAL_WEIGHT_MAPPED_BYTES.load(Ordering::Relaxed),
+            global_baseline
+        );
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn possible_in_flight_vmm_fills_quarantine_fresh_and_reused_destinations() {
+        use onnx_runtime_memory_governor::{
+            DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole,
+        };
+
+        #[derive(Debug)]
+        struct DropProbe(Arc<AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let mut env = EnvVarGuard::acquire();
+        env.unset(crate::vmm_allocator::CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV);
+        let Ok(runtime) = CudaRuntime::new(0).map(Arc::new) else {
+            eprintln!("SKIPPED (CUDA runtime dependencies unavailable): in-flight fill test");
+            return;
+        };
+        let granule = 2usize << 20;
+        let governor = Arc::new(LedgerGovernor::new(LeaseLedger::new(
+            (granule * 2) as u64,
+            0,
+            0,
+        )));
+        let allocator = Arc::new(
+            crate::vmm_allocator::CudaVmmAllocator::new(
+                runtime.cuda_context(),
+                DeviceKey::device(0),
+                0,
+                64 << 20,
+                governor.as_ref(),
+                HolderId::new(740),
+                MemoryRole::Weights,
+            )
+            .expect("no-pool VMM allocator"),
+        );
+        let authority: Arc<dyn MemoryGovernor + Send + Sync> = governor.clone();
+        let release_queue = CudaDeferredReleaseQueue::new(
+            Box::new(crate::deferred_release::CudaStreamFences::new(Arc::clone(
+                &runtime,
+            ))),
+            crate::deferred_release::DEFAULT_DEFERRED_RELEASE_CAPACITY,
+        );
+        let residency = CudaWeightResidency::new(Arc::clone(&runtime), (granule * 2) as u64)
+            .with_deferred_release_queue(Arc::clone(&release_queue))
+            .with_vmm_admission(Arc::clone(&allocator), authority)
+            .expect("install VMM admission");
+        residency
+            .adopt_governed_budget(governor.as_ref(), Tier::Device, HolderId::new(740))
+            .expect("reserve mapped allowance");
+
+        let quarantine_before = in_flight_fill_quarantine_count();
+        let global_before = GLOBAL_WEIGHT_MAPPED_BYTES.load(Ordering::Relaxed);
+        let fresh_dropped = Arc::new(AtomicBool::new(false));
+        let fresh_probe = Arc::clone(&fresh_dropped);
+        let fresh_error = residency
+            .resident_vmm_with(
+                90,
+                DataType::Uint8,
+                vec![granule],
+                granule,
+                WeightEvictionPolicy::Lru,
+                false,
+                move |_, _| -> Result<(), VmmFillFailure> {
+                    Err(VmmFillFailure::may_be_in_flight(
+                        WeightHandleError::DeviceBinding(
+                            "injected end-event record and copy-stream sync failure".into(),
+                        ),
+                        Box::new(DropProbe(fresh_probe)),
+                    ))
+                },
+            )
+            .expect_err("fresh destination must be quarantined");
+        assert!(
+            fresh_error
+                .to_string()
+                .contains("remain charged and quarantined")
+        );
+        assert!(!fresh_dropped.load(Ordering::Acquire));
+        assert_eq!(governor.used(Tier::Device), granule as u64);
+        assert_eq!(residency.stats().mapped_physical_bytes, granule as u64);
+
+        let bytes = vec![0x51u8; granule];
+        let page = residency
+            .resident_vmm_with(
+                91,
+                DataType::Uint8,
+                vec![granule],
+                granule,
+                WeightEvictionPolicy::Lru,
+                false,
+                move |runtime, ptr| {
+                    unsafe { runtime.htod(&bytes, ptr) }
+                        .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))
+                },
+            )
+            .map(VmmAdmit::expect_page)
+            .expect("create stable slot for reuse");
+        drop(page);
+        residency.lock().remove_page_after_stream_sync(91);
+        assert!(
+            release_queue.wait_until_idle(DEFERRED_RELEASE_WAIT_TIMEOUT),
+            "stable slot must become reusable"
+        );
+
+        let reused_dropped = Arc::new(AtomicBool::new(false));
+        let reused_probe = Arc::clone(&reused_dropped);
+        let reused_error = residency
+            .resident_vmm_with(
+                91,
+                DataType::Uint8,
+                vec![granule],
+                granule,
+                WeightEvictionPolicy::Lru,
+                false,
+                move |_, _| -> Result<(), VmmFillFailure> {
+                    Err(VmmFillFailure::may_be_in_flight(
+                        WeightHandleError::DeviceBinding(
+                            "injected reused-slot event and synchronization failure".into(),
+                        ),
+                        Box::new(DropProbe(reused_probe)),
+                    ))
+                },
+            )
+            .expect_err("reused destination must be quarantined");
+        assert!(
+            reused_error
+                .to_string()
+                .contains("remain charged and quarantined")
+        );
+        assert!(!reused_dropped.load(Ordering::Acquire));
+        assert_eq!(governor.used(Tier::Device), (granule * 2) as u64);
+        assert_eq!(
+            residency.stats().mapped_physical_bytes,
+            (granule * 2) as u64
+        );
+        assert_eq!(
+            residency
+                .lock()
+                .slots
+                .get(&91)
+                .expect("reused slot")
+                .state
+                .status(),
+            SlotStatus::Poisoned
+        );
+        assert_eq!(in_flight_fill_quarantine_count(), quarantine_before + 2);
+        assert_eq!(
+            GLOBAL_WEIGHT_MAPPED_BYTES.load(Ordering::Relaxed),
+            global_before + (granule * 2) as u64
+        );
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn concurrent_pinned_refill_state_machine_quarantines_only_unresolved_copies() {
+        use onnx_runtime_memory_governor::{
+            DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole,
+        };
+
+        #[derive(Debug)]
+        struct DropProbe(Arc<AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let mut env = EnvVarGuard::acquire();
+        env.unset(crate::vmm_allocator::CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV)
+            .set(WEIGHT_PIN_REFILL_EVERY_ENV, "1");
+        let Ok(runtime) = CudaRuntime::new(0).map(Arc::new) else {
+            eprintln!("SKIPPED (CUDA runtime dependencies unavailable): pinned refill fault test");
+            return;
+        };
+        let granule = 2usize << 20;
+        let governor = Arc::new(LedgerGovernor::new(LeaseLedger::new(
+            (granule * 2) as u64,
+            0,
+            0,
+        )));
+        let allocator = Arc::new(
+            crate::vmm_allocator::CudaVmmAllocator::new(
+                runtime.cuda_context(),
+                DeviceKey::device(0),
+                0,
+                64 << 20,
+                governor.as_ref(),
+                HolderId::new(741),
+                MemoryRole::Weights,
+            )
+            .expect("no-pool VMM allocator"),
+        );
+        let authority: Arc<dyn MemoryGovernor + Send + Sync> = governor.clone();
+        let release_queue = CudaDeferredReleaseQueue::new(
+            Box::new(crate::deferred_release::CudaStreamFences::new(Arc::clone(
+                &runtime,
+            ))),
+            crate::deferred_release::DEFAULT_DEFERRED_RELEASE_CAPACITY,
+        );
+        let residency = CudaWeightResidency::new(Arc::clone(&runtime), (granule * 2) as u64)
+            .with_deferred_release_queue(Arc::clone(&release_queue))
+            .with_vmm_admission(Arc::clone(&allocator), authority)
+            .expect("install VMM admission");
+        residency
+            .adopt_governed_budget(governor.as_ref(), Tier::Device, HolderId::new(741))
+            .expect("reserve mapped allowance");
+
+        let completed_bytes = vec![0x31u8; granule];
+        let completed_page = residency
+            .resident_vmm_with(
+                100,
+                DataType::Uint8,
+                vec![granule],
+                granule,
+                WeightEvictionPolicy::Lru,
+                false,
+                |runtime, ptr| {
+                    unsafe { runtime.htod(&completed_bytes, ptr) }
+                        .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))
+                },
+            )
+            .map(VmmAdmit::expect_page)
+            .expect("admit completed-control page");
+        residency.lock().mark_pinned(100, granule as u64);
+        let completed_ptr = completed_page.ptr;
+
+        // A returned handle is a third strong reference (cache + refill-local
+        // + consumer). A concurrent diagnostic hit must return the existing
+        // page without claiming Pending, copying, or poisoning its slot.
+        let held_fill_called = Arc::new(AtomicBool::new(false));
+        let held_fill_probe = Arc::clone(&held_fill_called);
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let hit = residency
+                        .resident_vmm_with(
+                            100,
+                            DataType::Uint8,
+                            vec![granule],
+                            granule,
+                            WeightEvictionPolicy::Lru,
+                            false,
+                            move |_, _| -> Result<(), WeightHandleError> {
+                                held_fill_probe.store(true, Ordering::Release);
+                                Ok(())
+                            },
+                        )
+                        .map(VmmAdmit::expect_page)
+                        .expect("consumer-owned page must remain a valid hit");
+                    assert_eq!(hit.ptr, completed_ptr);
+                })
+                .join()
+                .expect("consumer-owned refill thread");
+        });
+        assert!(!held_fill_called.load(Ordering::Acquire));
+        assert_eq!(
+            residency
+                .lock()
+                .slots
+                .get(&100)
+                .expect("consumer-owned slot")
+                .state
+                .status(),
+            SlotStatus::Idle
+        );
+        let mut held_bytes = vec![0u8; granule];
+        // SAFETY: `completed_page` is still a live handle for exactly `granule`
+        // bytes, and dtoh synchronizes before returning.
+        unsafe { runtime.dtoh(&mut held_bytes, completed_page.ptr) }
+            .expect("read consumer-owned page");
+        assert_eq!(held_bytes, completed_bytes);
+
+        // Once the consumer drops its handle, only the cache and this lookup's
+        // local clone own the page, so the same diagnostic hit may refill it.
+        drop(completed_page);
+        let refill_bytes = vec![0x32u8; granule];
+        let exclusive_fill_called = Arc::new(AtomicBool::new(false));
+        let exclusive_fill_probe = Arc::clone(&exclusive_fill_called);
+        let refilled_page = residency
+            .resident_vmm_with(
+                100,
+                DataType::Uint8,
+                vec![granule],
+                granule,
+                WeightEvictionPolicy::Lru,
+                false,
+                |runtime, ptr| {
+                    exclusive_fill_probe.store(true, Ordering::Release);
+                    unsafe { runtime.htod(&refill_bytes, ptr) }
+                        .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))
+                },
+            )
+            .map(VmmAdmit::expect_page)
+            .expect("exclusive refill must execute");
+        assert!(exclusive_fill_called.load(Ordering::Acquire));
+        assert_eq!(refilled_page.ptr, completed_ptr);
+        let mut actual_refill_bytes = vec![0u8; granule];
+        // SAFETY: `refilled_page` owns exactly `granule` live device bytes.
+        unsafe { runtime.dtoh(&mut actual_refill_bytes, refilled_page.ptr) }
+            .expect("read exclusively refilled page");
+        assert_eq!(actual_refill_bytes, refill_bytes);
+        assert_eq!(
+            residency
+                .lock()
+                .slots
+                .get(&100)
+                .expect("successfully refilled slot")
+                .state
+                .status(),
+            SlotStatus::Idle
+        );
+        drop(refilled_page);
+
+        let completed_error = residency
+            .resident_vmm_with(
+                100,
+                DataType::Uint8,
+                vec![granule],
+                granule,
+                WeightEvictionPolicy::Lru,
+                false,
+                |_, _| {
+                    Err(VmmFillFailure::completed(WeightHandleError::DeviceBinding(
+                        "injected completed refill measurement failure".into(),
+                    )))
+                },
+            )
+            .expect_err("completed refill fault must be reported");
+        assert!(completed_error.to_string().contains("injected completed"));
+        assert_eq!(
+            residency
+                .lock()
+                .slots
+                .get(&100)
+                .expect("completed-control slot")
+                .state
+                .status(),
+            SlotStatus::Idle
+        );
+
+        let unresolved_bytes = vec![0x41u8; granule];
+        let unresolved_page = residency
+            .resident_vmm_with(
+                101,
+                DataType::Uint8,
+                vec![granule],
+                granule,
+                WeightEvictionPolicy::Lru,
+                false,
+                |runtime, ptr| {
+                    unsafe { runtime.htod(&unresolved_bytes, ptr) }
+                        .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))
+                },
+            )
+            .map(VmmAdmit::expect_page)
+            .expect("admit unresolved-control page");
+        residency.lock().mark_pinned(101, granule as u64);
+        drop(unresolved_page);
+        let source_dropped = Arc::new(AtomicBool::new(false));
+        let source_probe = Arc::clone(&source_dropped);
+        let charged_before = governor.used(Tier::Device);
+        let mapped_before = residency.stats().mapped_physical_bytes;
+        let active_refills = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active_refills = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let second_fill_called = Arc::new(AtomicBool::new(false));
+        let (first_entered_tx, first_entered_rx) = std::sync::mpsc::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let (unresolved_error, concurrent_error) = std::thread::scope(|scope| {
+            let active_refills = Arc::clone(&active_refills);
+            let max_active_refills = Arc::clone(&max_active_refills);
+            let first = scope.spawn(|| {
+                residency
+                    .resident_vmm_with(
+                        101,
+                        DataType::Uint8,
+                        vec![granule],
+                        granule,
+                        WeightEvictionPolicy::Lru,
+                        false,
+                        move |runtime, ptr| -> Result<(), VmmFillFailure> {
+                            let active = active_refills.fetch_add(1, Ordering::AcqRel) + 1;
+                            max_active_refills.fetch_max(active, Ordering::AcqRel);
+                            first_entered_tx.send(()).expect("signal first refill");
+                            release_first_rx.recv().expect("release first refill");
+                            unsafe { runtime.htod(&unresolved_bytes, ptr) }.map_err(|error| {
+                                VmmFillFailure::completed(WeightHandleError::DeviceBinding(
+                                    error.to_string(),
+                                ))
+                            })?;
+                            active_refills.fetch_sub(1, Ordering::AcqRel);
+                            Err(VmmFillFailure::may_be_in_flight(
+                                WeightHandleError::DeviceBinding(
+                                    "injected pinned refill synchronization failure".into(),
+                                ),
+                                Box::new(DropProbe(source_probe)),
+                            ))
+                        },
+                    )
+                    .expect_err("unresolved refill must quarantine the resident page")
+            });
+
+            first_entered_rx.recv().expect("first refill entered");
+            assert_eq!(
+                residency
+                    .lock()
+                    .slots
+                    .get(&101)
+                    .expect("pending refill slot")
+                    .state
+                    .status(),
+                SlotStatus::Pending
+            );
+            let second_fill_probe = Arc::clone(&second_fill_called);
+            let concurrent_error = residency
+                .resident_vmm_with(
+                    101,
+                    DataType::Uint8,
+                    vec![granule],
+                    granule,
+                    WeightEvictionPolicy::Lru,
+                    false,
+                    move |_, _| -> Result<(), WeightHandleError> {
+                        second_fill_probe.store(true, Ordering::Release);
+                        Ok(())
+                    },
+                )
+                .expect_err("concurrent lookup must not return or rewrite a pending slot");
+            release_first_tx.send(()).expect("release first refill");
+            (first.join().expect("first refill thread"), concurrent_error)
+        });
+        assert!(concurrent_error.to_string().contains("pending"));
+        assert!(!second_fill_called.load(Ordering::Acquire));
+        assert_eq!(max_active_refills.load(Ordering::Acquire), 1);
+        assert!(
+            unresolved_error
+                .to_string()
+                .contains("destination mapping and staging source remain charged and quarantined")
+        );
+        assert!(!source_dropped.load(Ordering::Acquire));
+        assert!(!residency.lock().pages.contains_key(&101));
+        assert_eq!(
+            residency
+                .lock()
+                .slots
+                .get(&101)
+                .expect("unresolved slot")
+                .state
+                .status(),
+            SlotStatus::Poisoned
+        );
+        assert_eq!(governor.used(Tier::Device), charged_before);
+        assert_eq!(residency.stats().mapped_physical_bytes, mapped_before);
+
+        assert!(!source_dropped.load(Ordering::Acquire));
+        let fill_called = Arc::new(AtomicBool::new(false));
+        let fill_probe = Arc::clone(&fill_called);
+        let poisoned_error = residency
+            .resident_vmm_with(
+                101,
+                DataType::Uint8,
+                vec![granule],
+                granule,
+                WeightEvictionPolicy::Lru,
+                false,
+                move |_, _| -> Result<(), WeightHandleError> {
+                    fill_probe.store(true, Ordering::Release);
+                    Ok(())
+                },
+            )
+            .expect_err("quarantined destination must never be refilled");
+        assert!(poisoned_error.to_string().contains("poisoned"));
+        assert!(!fill_called.load(Ordering::Acquire));
+
+        let (teardown_entered_tx, teardown_entered_rx) = std::sync::mpsc::channel();
+        let (finish_teardown_tx, finish_teardown_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let refill = scope.spawn(|| {
+                residency
+                    .resident_vmm_with(
+                        100,
+                        DataType::Uint8,
+                        vec![granule],
+                        granule,
+                        WeightEvictionPolicy::Lru,
+                        false,
+                        move |_, _| -> Result<(), WeightHandleError> {
+                            teardown_entered_tx
+                                .send(())
+                                .expect("signal teardown refill");
+                            finish_teardown_rx.recv().expect("finish teardown refill");
+                            Ok(())
+                        },
+                    )
+                    .expect_err("teardown poison must prevent the pending refill pointer return")
+            });
+            teardown_entered_rx.recv().expect("teardown refill entered");
+            assert_eq!(
+                residency
+                    .lock()
+                    .slots
+                    .get(&100)
+                    .expect("teardown pending slot")
+                    .state
+                    .status(),
+                SlotStatus::Pending
+            );
+            residency.confirm_context_terminated();
+            finish_teardown_tx.send(()).expect("finish teardown refill");
+            let error = refill.join().expect("teardown refill thread");
+            assert!(error.to_string().contains("poisoned"));
+        });
+        assert_eq!(
+            residency
+                .lock()
+                .slots
+                .get(&100)
+                .expect("teardown poisoned slot")
+                .state
+                .status(),
+            SlotStatus::Poisoned
+        );
+        assert_eq!(
+            residency
+                .lock()
+                .slots
+                .get(&101)
+                .expect("unresolved poisoned slot")
+                .state
+                .status(),
+            SlotStatus::Poisoned
+        );
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    #[test]
+    fn failed_vmm_fill_keeps_cleanup_residuals_charged_and_quarantined() {
+        use onnx_runtime_cuda_memory::release::{DriverFaultPlan, DriverOperation};
+        use onnx_runtime_memory_governor::{
+            DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole,
+        };
+
+        let mut env = EnvVarGuard::acquire();
+        env.unset(crate::vmm_allocator::CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV);
+        let Ok(runtime) = CudaRuntime::new(0).map(Arc::new) else {
+            eprintln!("SKIPPED (CUDA runtime dependencies unavailable): VMM cleanup fault test");
+            return;
+        };
+        let granule = 2usize << 20;
+        let governor = Arc::new(LedgerGovernor::new(LeaseLedger::new(granule as u64, 0, 0)));
+        let mut allocator = crate::vmm_allocator::CudaVmmAllocator::new(
+            runtime.cuda_context(),
+            DeviceKey::device(0),
+            0,
+            64 << 20,
+            governor.as_ref(),
+            HolderId::new(739),
+            MemoryRole::Weights,
+        )
+        .expect("no-pool VMM allocator");
+        allocator.install_driver_faults(Arc::new(
+            DriverFaultPlan::new().fail_nth(DriverOperation::Unmap, 1),
+        ));
+        let allocator = Arc::new(allocator);
+        let authority: Arc<dyn MemoryGovernor + Send + Sync> = governor.clone();
+        let residency = CudaWeightResidency::new(Arc::clone(&runtime), granule as u64)
+            .with_vmm_admission(Arc::clone(&allocator), authority)
+            .expect("install VMM admission");
+        residency
+            .adopt_governed_budget(governor.as_ref(), Tier::Device, HolderId::new(739))
+            .expect("reserve mapped allowance");
+
+        let global_before = GLOBAL_WEIGHT_MAPPED_BYTES.load(Ordering::Relaxed);
+        let error = residency
+            .resident_vmm_with(
+                1,
+                DataType::Uint8,
+                vec![granule],
+                granule,
+                WeightEvictionPolicy::Lru,
+                false,
+                |_, _| {
+                    Err(WeightHandleError::DeviceBinding(
+                        "injected fill failure before cleanup fault".into(),
+                    ))
+                },
+            )
+            .expect_err("fill and cleanup failure");
+        assert!(error.to_string().contains("quarantined"));
+        assert_eq!(residency.stats().mapped_physical_bytes, granule as u64);
+        assert_eq!(governor.used(Tier::Device), granule as u64);
+        assert_eq!(allocator.quarantined_owned_bytes(), granule as u64);
+        assert_eq!(
+            GLOBAL_WEIGHT_MAPPED_BYTES.load(Ordering::Relaxed),
+            global_before + granule as u64,
+            "a still-mapped quarantined residual must remain in the global mapped gauge"
+        );
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
     fn vmm_weight_admission_reuses_owned_granules_without_runtime_alloc_free() {
         use onnx_runtime_memory_governor::{
             DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole,
         };
 
-        unsafe {
-            std::env::set_var(
-                crate::vmm_allocator::CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV,
-                (64usize << 20).to_string(),
-            );
-        }
+        let mut env = EnvVarGuard::acquire();
+        env.set(
+            crate::vmm_allocator::CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV,
+            &(64usize << 20).to_string(),
+        );
         let Ok(runtime) = CudaRuntime::new(0).map(Arc::new) else {
             eprintln!(
                 "SKIPPED (CUDA runtime dependencies unavailable): VMM weight admission GPU test"
@@ -5106,7 +6360,9 @@ mod tests {
                 granule,
                 WeightEvictionPolicy::StableResident,
                 false,
-                |_, _| panic!("zone refusal must happen before copy"),
+                |_, _| -> Result<(), WeightHandleError> {
+                    panic!("zone refusal must happen before copy")
+                },
             )
             .expect_err("global room cannot bypass a full mapped weight allowance");
         assert!(zone_error.to_string().contains("weight-zone headroom"));
@@ -5170,7 +6426,9 @@ mod tests {
                 granule,
                 WeightEvictionPolicy::Lru,
                 false,
-                |_, _| panic!("global refusal must happen before copy"),
+                |_, _| -> Result<(), WeightHandleError> {
+                    panic!("global refusal must happen before copy")
+                },
             )
             .expect_err("zone room cannot bypass missing global physical headroom");
         assert!(global_error.to_string().contains("physical headroom"));
@@ -5207,12 +6465,11 @@ mod tests {
             DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryRole,
         };
 
-        unsafe {
-            std::env::set_var(
-                crate::vmm_allocator::CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV,
-                (64usize << 20).to_string(),
-            );
-        }
+        let mut env = EnvVarGuard::acquire();
+        env.set(
+            crate::vmm_allocator::CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV,
+            &(64usize << 20).to_string(),
+        );
         let Ok(runtime) = CudaRuntime::new(0).map(Arc::new) else {
             eprintln!("SKIPPED (CUDA runtime dependencies unavailable): stable-VA repage GPU test");
             return;
