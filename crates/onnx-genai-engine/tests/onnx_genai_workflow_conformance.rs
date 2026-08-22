@@ -522,6 +522,15 @@ fn shared_state_pixel_flow_request(
     Ok(request)
 }
 
+fn shared_state_pixel_flow_geometry_override_request() -> anyhow::Result<PipelineGenerateRequest> {
+    Ok(
+        shared_state_pixel_flow_request(5, false, None, 7)?.with_input(
+            "request.latent",
+            Value::from_slice_f32(&vec![0.0; 3 * 64 * 96], &[1, 3, 64, 96])?,
+        ),
+    )
+}
+
 #[test]
 fn mobius_shared_state_pixel_flow_executes_text_and_generation_paths() -> anyhow::Result<()> {
     let Some(package) = optional_producer_package("shared_state_pixel_flow")? else {
@@ -550,6 +559,27 @@ fn mobius_shared_state_pixel_flow_executes_text_and_generation_paths() -> anyhow
         repeated["image"].to_vec_f32()?,
         generated["image"].to_vec_f32()?
     );
+
+    // The positive and negative prefixes have lengths 5 and 2, while the
+    // supplied 64x96 latent deliberately disagrees with the 32x32 request.
+    // The fixture's denoiser makes both temporal positions and actual latent
+    // geometry observable in the final pixels.
+    let overridden =
+        engine.run_pipeline_outputs(shared_state_pixel_flow_geometry_override_request()?)?;
+    assert_eq!(overridden["image"].shape(), [1, 3, 64, 96]);
+    let resolved_scale = (6.0_f32 / 64.0).sqrt();
+    let first_x0 = 0.02 * (resolved_scale + 17.0);
+    let expected = 0.02 * (0.5 * first_x0 + 0.5 + resolved_scale + 17.0);
+    let shared_positions =
+        0.02 * (0.5 * 0.02 * (resolved_scale + 14.0) + 0.5 + resolved_scale + 14.0);
+    let request_scale = 0.125_f32;
+    let request_geometry =
+        0.02 * (0.5 * 0.02 * (request_scale + 17.0) + 0.5 + request_scale + 17.0);
+    for value in overridden["image"].to_vec_f32()? {
+        assert!((value - expected).abs() < 1e-5, "{value} != {expected}");
+        assert!((value - shared_positions).abs() > 1e-3);
+        assert!((value - request_geometry).abs() > 1e-3);
+    }
     Ok(())
 }
 
