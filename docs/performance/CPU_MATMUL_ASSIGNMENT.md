@@ -1895,3 +1895,175 @@ progress on acc0.
 
 Full record:
 [`docs/benchmarks/2026-08-21-int4-acc4-execution-regime.md`](../benchmarks/2026-08-21-int4-acc4-execution-regime.md).
+
+### 23. The register-blocked int4 decode kernel shipped default-off and stayed dormant for its whole life (**fixed**)
+
+`accuracy_level = 0` is the production default, and route counters instrumented
+from operator entry through the kernel said it never reached the N-blocked
+kernel: `entry_bits4=95 percolumn=95 nblock=0 block_simd=129,499,136`.
+#1104 built that kernel, measured 1.46x on a 14B model, proved it
+byte-identical, and then shipped it behind a **default-off** env toggle "until
+the win is measured, exactly like the toggles that preceded it". The
+measurement never happened. Nothing asserted which route production took, so a
+finished, proven kernel sat unreachable in the tree while the default path took
+the per-column loop.
+
+The repair is one line of default (`unwrap_or(false)` -> `unwrap_or(true)`) plus
+`acc0_decode_reaches_the_nblocked_kernel_by_default`, which makes the default
+route a **checked property** rather than a comment. Merged as `99f105d52`.
+
+**The first attribution I produced was wrong, and the instrument is what was
+wrong.** The route probe's `fetch_add` fired 129 million times in the per-column
+arm and zero in the N-blocked arm, so the counter inflated the baseline it was
+supposed to measure by ~3x and produced a self-consistent 3.14x/4.80x. Rebuilt
+without the probe in the timed path:
+
+| route | t=1 | t=4 | vs per-column |
+|---|---|---|---|
+| per-column (previous default) | 56.528 | 28.518 | 1.00x |
+| N-blocked, group of 1 | 55.156 | 27.861 | 1.02x |
+| N-blocked, group of 2 | 47.679 | 23.885 | 1.19x |
+| N-blocked, group of 4 | 38.114 | 19.238 | **1.48x** |
+
+**The group-of-1 row rules out the explanation the structure suggests.**
+Restructuring the reduction — keeping the scale in a vector accumulator and
+reducing once per column instead of once per 32-weight block — is worth
+**1.02x, i.e. nothing measurable**, even though the per-column path's hreduce
+(`extractf128`/`movehl`/`shuffle`, each dependent on the last) sits on the
+critical path every four FMAs. The block loop has enough independent work for
+the out-of-order engine to hide it. The entire win is the **four-column
+activation reuse**: 1.45x from group 1 to group 4, which also matches #1104's
+independently measured 1.46x.
+
+**The numerics move the wrong way and are shipped anyway, disclosed.** The
+N-blocked kernel's separated correction is up to **3.70x worse** relatively
+against f64 (2.422e-5 vs 6.739e-6). It stays within the pinned envelope, the
+envelope guard was sized to the *measurement* (8x) rather than to hope, and the
+tradeoff is stated rather than buried — a 1.48x decode win for a 3.7x relative
+error increase inside an envelope is a defensible trade only if both numbers
+are on the table.
+
+Two lessons this file has now recorded twice each: an instrument in the timed
+path is a measurement error, not overhead (cf. §18); and "default off until
+measured" is a decision that expires silently unless a test asserts the default.
+
+### 24. The t=8 "wash" is worker-to-CPU placement, not the kernel (**negative result; runtime-owned**)
+
+The premise handed to me was that #1628's int4 acc4 win vanishes at t=8 while
+holding at t=1/4/16, and that the kernel should be looked at. **It does not
+reproduce.** Measured against explicit pool widths rather than a thread-count
+label, the win is flat through width 8 and collapses *after* it:
+
+| pool width | 1 | 4 | 8 | 12 | 16 |
+|---|---|---|---|---|---|
+| speedup | 1.66x | 1.65x | 1.66x | 1.238x | 0.993x |
+
+So there is no t=8 anomaly to tune for. There is a **width-12-and-above**
+collapse, and it is not the kernel.
+
+Two hypotheses were tried and discarded before the right one. Memory bandwidth:
+the host sustains 83 GB/s and the decode loop draws 41 GB/s, so it is not
+bandwidth-bound. Task grain: the shard count and barrier time move as expected.
+
+**Root cause: `decode_spmd.rs::node_shards` pins worker *i* to
+`allowed_cpus()[i]` in logical order.** On this host SMT siblings are adjacent
+(CPUs 0 and 1 are the two threads of core 0), so 16 workers land on CPUs 0-15,
+which is **8 physical cores**, and half of them contend for a sibling's
+execution units. Verified by reading `/proc/<pid>/task/*/stat`, and confirmed
+decisively by comparison: default placement 0.982x versus one-worker-per-
+physical-core 1.225x on the same binary and the same shapes.
+
+**No kernel change was made**, which is the point. Filed as **#1680** with the
+measurement and the placement evidence, for the runtime owner. Every timing in
+§23 and §25 is `taskset`-pinned to even CPUs as a consequence — an unpinned
+multi-thread number on this host is measuring the scheduler, not the kernel.
+
+### 25. `f16`/`bf16` decode diverged by *layout*, and the slow side was also the less accurate one (**fixed**)
+
+#1381's dispatch comment claimed the divergence was closed: "both operators,
+both stored orders and both 16-bit formats reach the same GEMV backend". Same
+**backend**, not same **kernel**. Enumerated with route counters:
+
+| operator | stored order | kernel taken |
+|---|---|---|
+| `Gemm` transB=1 | `[N,K]` | `gemv_half_nk` |
+| `Gemm` transB=0 | `[K,N]` | `gemv_half_kn` |
+| `MatMul` | `[K,N]` | `gemv_half_kn` |
+| `FusedMatMulBias` | `[K,N]` | **no 16-bit GEMV at all** |
+
+The fourth row was found empirically, not inferred — `count_half_decode_gemv()`
+lives in `MatMulKernel::execute_with_backend` and `fused_matmul_bias.rs` calls
+the free `matmul_dense_prepacked_into`, so a probe read `matmul_gemv=1
+fused_gemv=0`. It matters because the optimizer fuses `MatMul + Add(bias)`. The
+MatMul-side transposed row had **no test**: `decode_matmul` only ever built B as
+`[k,n]` — the fourth unmeasured-region-behind-a-gate this file records (cf. §11,
+§12, §14, §19).
+
+**`[K,N]` crosses a page every `p`.** The stride between consecutive `p` is
+`n*2` bytes — 12 KB at n=6144 — and the L2 prefetcher does not cross page
+boundaries. Direct kernel A/B on identical bytes: `gemv_half_kn` is
+**1.56-2.98x** slower.
+
+**The zero-memory alternative was tried first and is a negative result.**
+`_mm_prefetch` at distance 12 into the strided inner loop made `kn` *worse*
+(5580 vs 5022 us on qkv). The stride penalty is not prefetch-recoverable, which
+is what justifies paying `2*K*N` bytes for a transpose.
+
+**Accuracy moves the same way, so there is no trade to weigh.** `kn` carries one
+serial accumulator per column across the whole contraction; `nk` carries four
+combined pairwise. Against an f64 oracle, `nk` is **2.7-9.3x** more accurate.
+The first version of that test used `*0.125` operands — exactly representable,
+every partial sum exact — and reported zero error and 100% bit-identity. It
+could not detect the effect it existed to measure. Hostile data shows ~3%
+bit-identity. That is the same failure mode as the instrument in §23: **check
+that the measurement can see the effect at all.**
+
+Production-path A/B, two builds, `taskset`-pinned, `steady_ms`:
+
+| dtype | shape | before | after | speedup |
+|---|---|---|---|---|
+| **f32 (null control)** | attn_out 1024x768 | 0.068 | 0.067 | 1.01x |
+| **f32 (null control)** | mlp 4096x11008 | 6.605 | 6.628 | 1.00x |
+| f16 | attn_out 1024x768 | 0.063 | 0.028 | **2.25x** |
+| f16 | square 2048x2048 | 0.314 | 0.058 | **5.41x** |
+| f16 | mlp 4096x11008 | 2.867 | 1.791 | **1.60x** |
+| f16 | lm_head 896x151936 | 8.553 | 7.089 | **1.21x** |
+| bf16 | attn_out 1024x768 | 0.077 | 0.026 | **2.96x** |
+| bf16 | mlp 4096x11008 | 2.782 | 1.719 | **1.62x** |
+| bf16 | lm_head 896x151936 | 8.635 | 7.064 | **1.22x** |
+
+**The best row is not the interesting one.** `square` at 5.4x is a shape nobody
+runs; the model-shaped rows are 1.2-1.6x, and `lm_head` — which gains least at
+1.21x — is also the row that pays most, **272 MB** resident for one weight.
+
+**The memory-plan coupling is the part that could have gone badly.**
+`node_weight_transpose_cache_bytes` is what `engine/load.rs` budgets against
+under #1056, and it was `cfg(macos/ios)` for `MatMul`. On x86 this transpose
+would have been **completely invisible to the plan**, which would have
+under-budgeted by gigabytes. Any change that makes a kernel retain a
+weight-scaled buffer must update that predictor. `FusedMatMulBias` is
+deliberately excluded — it has no x86 16-bit GEMV, so budgeting it would
+over-reserve every fused projection.
+
+**Two guard tests encoded the opposite decision** ("a transposed variant would
+cost a permanent 2*K*N bytes"). They were not deleted: they now assert the
+stronger invariant they were reaching for — no **unbudgeted** copy, and never an
+f32 widening, checked against the predictor itself.
+
+**Admission is no longer numerically neutral on this path.** Declining the cache
+changes *which kernel* runs and therefore output bits. Three contract comments
+still claimed neutrality and were corrected; an Opus review caught that the
+commit message disclosed it but the comments a maintainer actually reads did
+not.
+
+**A real bug, introduced and fixed here.** The f16 transpose cache stores raw
+`u16` keyed `(addr, k, n)` with **no dtype** — safe only while one dtype used
+it. Routing bf16 through it let a bf16 weight hit an f16 entry left at a
+recycled address: `-0.000021640852 != -0.8984375`, reproducible **only in
+company**. Guarding the view dtype is not enough; the *key* needs the
+discriminator.
+
+**Still divergent, deliberately:** `FusedMatMulBias` takes no 16-bit GEMV on
+x86 — 2845 us on qkv against MatMul's 1830 us after this change. It is a
+separate mechanism with its own memory-plan consequence and is not folded in
+here. Merged as `2e1cfb67c`.
