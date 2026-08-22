@@ -28,7 +28,7 @@ fn optional_producer_package(name: &str) -> anyhow::Result<Option<PathBuf>> {
     if path.is_dir() {
         return Ok(Some(path));
     }
-    if std::env::var_os("MOBIUS_WORKFLOW_CONFORMANCE_DIR").is_some() {
+    if std::env::var_os("MOBIUS_WORKFLOW_CONFORMANCE_REQUIRED").is_some() {
         anyhow::bail!(
             "required Mobius workflow package does not exist: {}",
             path.display()
