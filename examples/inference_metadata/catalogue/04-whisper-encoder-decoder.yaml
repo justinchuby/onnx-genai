@@ -1,0 +1,145 @@
+# Whisper encoder-decoder ASR with graph-visible cross-attention input.
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      capabilities:
+      - workflow_ssa
+      - typed_emit
+    inputs:
+      request.input_features:
+        contract:
+          dtype: float32
+          rank: 3
+          shape:
+          - batch
+          - 80
+          - frames
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: media
+        source:
+          kind: request
+        required: true
+      request.decoder_input_ids:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - text_sequence
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: prompt_tokens
+        source:
+          kind: request
+        required: true
+    outputs:
+      logits:
+        contract:
+          dtype: float16
+          rank: 3
+          shape:
+          - batch
+          - sequence
+          - vocab
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
+    components:
+      encoder:
+        implementation:
+          kind: onnx
+          artifact: whisper/encoder.onnx.textproto
+        ports:
+          inputs:
+            input_features:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - 80
+              - frames
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            encoder_hidden_states:
+              dtype: float16
+              rank: 3
+              shape:
+              - batch
+              - audio_sequence
+              - hidden
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      decoder:
+        implementation:
+          kind: onnx
+          artifact: whisper/decoder.onnx.textproto
+        ports:
+          inputs:
+            input_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - text_sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            encoder_hidden_states:
+              dtype: float16
+              rank: 3
+              shape:
+              - batch
+              - audio_sequence
+              - hidden
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            logits:
+              dtype: float16
+              rank: 3
+              shape:
+              - batch
+              - sequence
+              - vocab
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          roles:
+            input_ids: token_ids
+            encoder_hidden_states: encoder_hidden_states
+            logits: logits
+    state: {}
+    steps:
+    - kind: invoke
+      component: encoder
+      inputs:
+        input_features: request.input_features
+      outputs:
+        encoder_hidden_states: audio.encoded
+    - kind: invoke
+      component: decoder
+      inputs:
+        input_ids: request.decoder_input_ids
+        encoder_hidden_states: audio.encoded
+      outputs:
+        logits: decoder.logits
+    - kind: emit
+      value: decoder.logits
+      output: logits
+      mode: replace

@@ -39,3 +39,9 @@ Established same-weights glm/qwen native-vs-ORT ground truth, then gated the #97
 
 Scribe recorded Sebastian's qwen3.5 hybrid ladder closure: `lm_head` kernel NO-GO, op-soup DECLINED, and `CudaDropIdentityCast` GO via PR #1459 (`792958ecf`), byte-identical with +3.0% short-context throughput. The cleanup generalizes beyond qwen3.5 as identity-cast elimination for CUDA bridge graphs. Deckard/Wallace completed the 0.8B export + fair A/B rows, so the family trio is complete.
 
+## 2026-08-20T05:50Z — Qwen3.8-27B int4 decode benchmark dispatched
+
+Dispatched to benchmark Qwen3.8-27B int4 batch=1 decode on native CUDA EP versus ORT against the 150–250 tok/s H200 target. Report pending. Starting assumptions: conversion is coherent, MatMulNBits N=48 is currently worked around with dense `in_proj_a/b` nodes, and the VMM 64GB arena issue is already resolved on `origin/main`.
+## 2026-08-20T05:50:19+00:00 — Phase-4 q38 integration validation closed
+
+Scribe recorded Sebastian's Phase-4 benchmark/revalidation: initial q38 baseline was **52.6 tok/s** and #1557 alone lifted current-main to **54.56 tok/s**, correcting the earlier host-argmax thesis. Integrated #1561+#1562 then measured q38 **54.56→61.32 tok/s (+12.4%)** and mary **58.81→60.59 tok/s (+3.0%)**. mary was byte-identical; q38 differences were intrinsic razor-thin argmax tie flips from split-K GEMV accumulation, not a regression. Standing next lever is int4 M=1 GEMV toward bandwidth-bound execution; q38 remains ~**2.45×** short of 150 tok/s and still lacks a deterministic golden oracle.

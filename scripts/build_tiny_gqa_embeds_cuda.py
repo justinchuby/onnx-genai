@@ -243,6 +243,9 @@ pipeline:
       to: decoder.inputs_embeds
       dtype: fp32
       device_transfer: false
+  phases:
+    embedding:
+      run_on: every_step
   strategy:
     kind: composite
     stages:
@@ -250,25 +253,11 @@ pipeline:
         strategy:
           kind: single_pass
           model: vision_encoder
-        run_on: prompt_only
-      - name: fuse_embeddings
-        strategy:
-          kind: single_pass
-          model: embedding
-        run_on: every_step
       - name: decode
         strategy:
           kind: autoregressive
           decoder: decoder
           max_tokens: 4
-        run_on: every_step
-  phases:
-    vision_encoder:
-      run_on: prompt_only
-    embedding:
-      run_on: every_step
-    decoder:
-      run_on: every_step
 """
 
 

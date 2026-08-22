@@ -112,6 +112,39 @@ pub struct ImageExpansionSummary {
     pub tensor_length: usize,
 }
 
+impl ImageExpansionSummary {
+    /// Prompt tokens this image occupies once its placeholder run is expanded.
+    ///
+    /// A patchified export merges `spatial_merge_size` patches per spatial axis
+    /// into one image token, so the run length follows the packed patch grid and
+    /// is a property of this image, not of the package. A tiled export has no
+    /// patch grid: its run length is `tokens_per_tile * tile_count`, and
+    /// `tokens_per_tile` is a package fact that preprocessing alone cannot
+    /// recover, so this returns `None` and the caller must consult the package's
+    /// declared token-expansion config instead.
+    pub fn image_token_count(&self) -> anyhow::Result<Option<usize>> {
+        let Some([temporal, height, width]) = self.patch_grid else {
+            return Ok(None);
+        };
+        let merge = self.spatial_merge_size.max(1);
+        if !height.is_multiple_of(merge) || !width.is_multiple_of(merge) {
+            anyhow::bail!(
+                "image {} has a {height}x{width} patch grid that is not divisible by \
+                 spatial_merge_size {merge}, so its patches cannot be merged into whole \
+                 image tokens",
+                self.image_index
+            );
+        }
+        // (t, h/merge, w/merge): each merge_size x merge_size patch group
+        // collapses to exactly one image token in the prompt.
+        temporal
+            .checked_mul(height / merge)
+            .and_then(|rows| rows.checked_mul(width / merge))
+            .map(Some)
+            .context("image token count overflowed")
+    }
+}
+
 /// Named typed tensors plus image-order-preserving expansion metadata.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImageTensorBundle {
@@ -587,12 +620,20 @@ fn pack_image(image: &PreparedImage, patchify: &PatchifySpec) -> anyhow::Result<
                 height
             );
         }
-        for group_y in 0..patches_h / patchify.merge_size {
-            for group_x in 0..patches_w / patchify.merge_size {
-                for local_y in 0..patchify.merge_size {
-                    for local_x in 0..patchify.merge_size {
-                        let patch_y = group_y * patchify.merge_size + local_y;
-                        let patch_x = group_x * patchify.merge_size + local_x;
+        // `merge_size` decides how many patches become one image token; it does
+        // not have to decide the order they are written in. `PatchOrder::Raster`
+        // walks plain row-major order for exports that group patches inside the
+        // graph instead.
+        let group = match patchify.patch_order {
+            super::program::PatchOrder::MergeGroups => patchify.merge_size,
+            super::program::PatchOrder::Raster => 1,
+        };
+        for group_y in 0..patches_h / group {
+            for group_x in 0..patches_w / group {
+                for local_y in 0..group {
+                    for local_x in 0..group {
+                        let patch_y = group_y * group + local_y;
+                        let patch_x = group_x * group + local_x;
                         match patchify.channel_order {
                             PatchChannelOrder::ChannelsFirst => {
                                 let mut emit_channel = |channel: usize| {
@@ -1300,6 +1341,7 @@ mod tests {
             merge_size: 1,
             channel_order,
             temporal_order: PatchTemporalOrder::ChannelMajor,
+            patch_order: crate::image::program::PatchOrder::MergeGroups,
             coordinate_order: CoordinateOrder::Yx,
         };
 

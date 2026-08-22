@@ -724,6 +724,64 @@ approach is committed to. Recording them as open questions is deliberate: the
 alternative — asserting a root cause and building on it — is the failure mode
 this document has already had to retract twice.
 
+### Shipped: CUDA's only built-in mechanism is VMM (#1186 Phase 7)
+
+Everything above is design. This subsection is the exception: it describes what
+the CUDA execution provider does **today**, because the capability boundary it
+draws is the concrete instance of the negotiation problem this section is about.
+
+The CUDA EP used to carry two built-in device memory mechanisms — an eager
+`cuMemAlloc` allocator and the VMM arena — with the arena selected by an opt-in
+environment flag and the eager allocator serving as the fallback when the arena
+could not be built. That is the shape this document argues against in
+"An unreported capability degrades to its most conservative reading": a missing
+capability quietly selected a *different* mechanism whose bytes were not charged
+the same way, and the operator's evidence that it had happened was a log line.
+
+As shipped:
+
+- **The VMM arena is the sole built-in mechanism.** It is constructed
+  unconditionally, with no environment opt-in. The eager allocator
+  (`CudaDeviceAllocator`) and its selection flag (`ONNX_GENAI_CUDA_VMM`) are
+  deleted, not deprecated.
+- **Unsupported means fail, not degrade.** The capability is exercised at
+  provider construction by `cuMemAddressReserve`, which reserves the arena's
+  address range and whose failure `CudaVirtualBacking::reserve` propagates with
+  no fallback. That single call is the init-time detector: a device or driver
+  build without VMM support refuses it, and construction fails fatally. The
+  driver's reported allocation granularity is *not* a second detector —
+  `allocation_granularity` substitutes a 2 MiB default when the driver refuses
+  the query or reports zero, so the `granularity == 0` guard in the arena
+  builder is unreachable from the CUDA provider. Failure returns an error
+  naming the device ordinal, the driver's own message, the specific driver
+  entry points that constitute the support boundary, any requested managed
+  limit, and `with_memory` as the supported way to supply a different
+  mechanism. There is no second built-in mechanism for it to fall back to.
+- **Removing the built-in implementation did not remove the capability.**
+  `DeviceAllocator` is unchanged, and CPU, injected and integration-boundary
+  mechanisms continue to use it. A caller who needs eager `cuMemAlloc` — or any
+  other mechanism — implements the trait and injects it through
+  `CudaExecutionProvider::with_memory`.
+- **Injection is authoritative, and never ignored.** A successful
+  `with_memory` retires the built-in arena and the injected mechanism serves
+  everything afterwards. It is refused, before the offered allocator is used at
+  all, in exactly two cases: the allocator serves a different device, or the
+  mechanism it would replace still has memory outstanding. Both return `Err`;
+  a call never succeeds and is then disregarded.
+
+#### Shipped constraints of the built-in arena
+
+These are boundaries of the implementation rather than tuning knobs, and they
+are the first things worth knowing when diagnosing it.
+
+| Constraint | As shipped | Consequence |
+|---|---|---|
+| Virtual reservation | 64 GiB on the standalone/plugin path | Address space only; it does not reserve device memory. An arena cannot grow past it. |
+| Physical granularity | 2 MiB, as reported by the driver | Every commit rounds up to it, so the committed/useful ratio is worst for many small spans. This is not a capability probe: if the driver refuses the query or reports zero, 2 MiB is substituted, so an unsupported device is detected by `cuMemAddressReserve` and not here. |
+| Retained physical-handle pool | On at 256 MiB by default on the standalone/plugin path and on the governed path with dynamic lending; on the governed non-lending path, only when `ONNX_GENAI_CUDA_PHYSICAL_HANDLE_POOL_BYTES` is a positive byte count | The variable *overrides* the default rather than enabling a pool, so on the two default-on paths device memory is retained whether or not it is set. The pool is owned by the governor's authority; adopting a governor whose authority does not match the pool's is an error. Zero or unparseable means "fall back to the path default", never "a pool of zero". |
+| Teardown synchronization | In-flight stream work is awaited before physical handles are released | Provider drop can block. Releasing under in-flight work is what this ordering exists to prevent. |
+| Device loss | Driver errors propagate | No retry and no silent discard; a lost device surfaces as a failure rather than as memory that appears to have been freed. |
+
 ## Do we still need PagedAttention?
 
 **VMM lets us keep non-paged attention kernels while committing physical memory

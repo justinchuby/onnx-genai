@@ -68,14 +68,15 @@ fn argmax(row: &[f32]) -> TokenId {
 fn load(model_dir: &std::path::Path, graph_capture: bool, kv_max: usize) -> NativeDecodeSession {
     // glm-4-9b declares its I/O in inference_metadata.yaml but leaves
     // `token_input` unset, and its two rank-2 int64 inputs (input_ids,
-    // attention_mask) are ambiguous under shape-only autoderive. Load the real
-    // metadata I/O and disambiguate explicitly, exactly as the pipeline would.
+    // attention_mask) are ambiguous under shape-only autoderive. Resolve the
+    // real decode ABI -- workflow ports first, legacy block only for packages
+    // that have no workflow -- and disambiguate explicitly, as the pipeline would.
     let meta = onnx_genai_metadata::load_metadata(&model_dir.join("inference_metadata.yaml"))
         .expect("load inference_metadata.yaml");
     let mut io = meta
-        .model
-        .and_then(|m| m.io)
-        .expect("inference_metadata.yaml declares model.io");
+        .decoder_io()
+        .cloned()
+        .expect("inference_metadata.yaml declares a decode ABI");
     io.sequence_source = Some(SequenceInputKind::TokenIds);
     if io.token_input.is_none() {
         io.token_input = Some("input_ids".into());
@@ -96,7 +97,7 @@ fn load(model_dir: &std::path::Path, graph_capture: bool, kv_max: usize) -> Nati
     .expect("load decoder")
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 #[ignore = "Lever-B phase0 GPU probe; run deliberately with --ignored on a verified-idle H200"]
 fn leverb_phase0_capture_probe() -> anyhow::Result<()> {

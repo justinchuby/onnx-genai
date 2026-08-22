@@ -28,11 +28,10 @@ A Rust inference runtime for generative AI models, built on ONNX Runtime.
 - **Pipelines and models:** metadata-declared multi-model pipelines, a tested
   tiny vision-language pipeline fixture, and real Qwen2.5-0.5B-Instruct and
   TinyStories generation built through Mobius.
-- **Execution providers:** select CPU, WebGPU, CUDA, CoreML, or configured ORT
-  plugin EPs with `ONNX_GENAI_EP` — a comma-separated priority list is
-  supported so several providers (including multiple plugins) can be composed;
-  unavailable requested providers fail clearly unless `ONNX_GENAI_EP_FALLBACK=1`
-  explicitly opts into a visible CPU retry.
+- **Execution providers:** select CPU, WebGPU, CUDA, CoreML, or any ORT plugin
+  EP with `ONNX_GENAI_EP` — a comma-separated priority list is supported so
+  several providers (including multiple plugins) can be composed; unavailable
+  providers warn and fall back to CPU.
 - **Extensibility:** public `Sampler`, `SpeculativeProposer`, logit processor
   registry, and KV/pipeline APIs, plus an internal `DecodeBackend` seam shared
   by dynamic and static-cache decoding.
@@ -87,10 +86,10 @@ cargo build --release -p onnx-genai-cli
 
 ./target/release/onnx-genai generate \
   models/qwen2.5-0.5b \
-  "Write a short Rust hello-world program." \
   --max-new-tokens 64 \
   --temperature 0 \
-  --stream
+  --stream \
+  --prompt "Write a short Rust hello-world program."
 ```
 
 When `--max-new-tokens` is omitted, `generate` and `run` use whatever budget
@@ -187,11 +186,13 @@ inference metadata (`preprocessing.image` + `pipeline.vision` for images, an
 modalities on any package that declares one:
 
 ```bash
-./target/release/onnx-genai generate models/tiny-vlm "What is in this image?" \
-  --image ./cat.png
+./target/release/onnx-genai generate models/tiny-vlm \
+  --image ./cat.png \
+  --prompt "What is in this image?"
 
-./target/release/onnx-genai generate models/whisper-tiny "" \
-  --audio ./speech.wav
+./target/release/onnx-genai generate models/whisper-tiny \
+  --audio ./speech.wav \
+  --prompt ""
 ```
 
 Audio is transcription: the model's own decoder prompt replaces the typed text,
@@ -202,17 +203,17 @@ You do not have to know a model's image placeholder token. Pass the images and
 write the prompt normally — one placeholder per image is prepended for you:
 
 ```bash
-onnx-genai generate models/my-vlm "What changed between these two photos?" \
-  --image left.png --image right.png
+onnx-genai generate models/my-vlm \
+  --image left.png --image right.png \
+  --prompt "What changed between these two photos?"
 ```
 
 To control where each image sits in the sentence, write the placeholders
 yourself and they are honored verbatim:
 
 ```bash
-onnx-genai generate models/my-vlm \
-  "The first <image> is a cat and the second <image> is a dog. Compare them." \
-  --image cat.png --image dog.png
+onnx-genai generate models/my-vlm --image cat.png --image dog.png \
+  --prompt "The first <image> is a cat and the second <image> is a dog. Compare them."
 ```
 
 A *partial* set is rejected rather than topped up: once you start positioning
@@ -257,7 +258,7 @@ ONNX fixtures in `tests/fixtures/`; see
 `--profile` reports where the time went. It works on every subcommand:
 
 ```bash
-onnx-genai --profile generate models/qwen2.5-0.5b "..." --max-new-tokens 40
+onnx-genai --profile generate models/qwen2.5-0.5b --prompt "..." --max-new-tokens 40
 ```
 
 ```text
@@ -367,10 +368,10 @@ absent line means "not accounted here", never "nothing was used".
 
 ```bash
 # Machine-readable, for diffing runs or plotting in CI (`-` writes to stdout)
-onnx-genai --profile-json bench.json generate models/qwen2.5-0.5b "..."
+onnx-genai --profile-json bench.json generate models/qwen2.5-0.5b --prompt "..."
 
 # Chrome Trace Event timeline, viewable at https://ui.perfetto.dev
-onnx-genai --profile-trace trace.json generate models/qwen2.5-0.5b "..."
+onnx-genai --profile-trace trace.json generate models/qwen2.5-0.5b --prompt "..."
 ```
 
 ### Generate images
@@ -380,7 +381,7 @@ onnx-genai --profile-trace trace.json generate models/qwen2.5-0.5b "..."
 
 ```bash
 ./target/release/onnx-genai generate models/stable-diffusion-1.5 \
-  "an astronaut riding a horse" \
+  --prompt "an astronaut riding a horse" \
   --negative-prompt "blurry, low quality" \
   --steps 25 --guidance-scale 7.5 --seed 0 \
   --width 512 --height 512 \
@@ -391,6 +392,27 @@ Steps, guidance scale, and the sampler default to the values the package
 declares. For packages whose pipeline stops at the latent instead of declaring
 a final VAE phase, add `--vae-decoder <latent-to-image.onnx>` (and
 `--vae-scaling-factor`).
+
+### Import a ComfyUI workflow
+
+A ComfyUI *"Save (API Format)"* export can be lowered into the same canonical
+`pipeline.workflow` metadata a natively exported diffusion package carries (see
+[docs/genai/COMFYUI_IMPORT.md](docs/genai/COMFYUI_IMPORT.md)):
+
+```bash
+# Convert only.
+cargo run -p onnx-genai-comfyui-config --bin comfyui_to_metadata -- \
+  --out models/sd15/inference_metadata.yaml workflow.json
+
+# Convert, then execute on the generic workflow engine.
+cargo run -p onnx-genai --bin run_comfyui -- \
+  --package models/sd15 --output out.ppm workflow.json
+```
+
+Import is one-way and fail-closed, exactly like `genai_config.json`: once the
+metadata exists it is the only source of execution truth, and any node that
+would change the produced image but has no canonical representation is an error
+naming the node and the remedy rather than a silent drop.
 
 ### Reasoning models
 
@@ -454,21 +476,6 @@ a clean transcript. Tune segmentation with `--segment-seconds`,
 Whole-file transcription is also available over HTTP as
 `POST /v1/audio/transcriptions`.
 
-### Generate speech
-
-`generate --output-audio` synthesizes through a text-to-speech package — an
-autoregressive decoder that emits audio codes followed by a `run_on: final_only`
-vocoder stage:
-
-```bash
-./target/release/onnx-genai generate models/my-tts "Hello from onnx-genai." \
-  --output-audio speech.wav
-```
-
-The output sample rate is declared by the package as `pipeline.audio.sample_rate`
-rather than assumed; a package that omits it is rejected with an error rather
-than played back at a guessed pitch (pass `--sample-rate` to supply one).
-
 The native CPU decode path also enables a steady-state **decode-plan memo** by
 default: it caches the per-step shape/buffer plan and replays it token-to-token
 (token-exact by construction, with an in-flight verify net and a graceful fall
@@ -491,6 +498,50 @@ Available routes are `GET /health`, `GET /v1/models`,
 `POST /v1/images/generations`, `POST /v1/sessions`, and
 `DELETE /v1/sessions/{id}`. Pass a session id as `X-Session-Id` on chat
 requests to reuse persistent context.
+
+#### Image generation
+
+Image generation runs the loaded package's `pipeline.workflow`; it does not
+select a hard-coded diffusion implementation by model name. The workflow must
+declare an `image` output role plus semantic inputs such as `prompt_tokens`,
+`seed`, `max_iterations`, and (when supported) `negative_prompt_tokens`,
+`guidance_scale`, `width`, `height`, `media`, and `denoising_strength`.
+Every image output must also declare its architecture-neutral `value_range`
+(`zero_to_one`, `negative_one_to_one`, or `zero_to_255`); the server validates
+that contract and never guesses normalization from generated pixel content.
+Values within a small scale-relative floating-point tolerance of the declared
+endpoints are clamped as numerical noise; material range violations fail.
+Packages whose text/image preprocessing is not yet implemented in the server
+can explicitly bridge metadata inputs with an `application_inputs` object on
+either image API. Each entry names a workflow input whose source is
+`{kind: application}`, and supplies `dtype`, `shape`, and base64-encoded raw
+tensor bytes as `data_b64`. The server validates the name, dtype, rank, decoded
+byte count, and all required application inputs against metadata before
+execution. This is an explicit preprocessed-input contract: prompts and source
+images are not silently converted into opaque tensors.
+
+```bash
+curl http://127.0.0.1:8080/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"my-diffusion-package","prompt":"a lighthouse","response_format":"b64_json"}'
+
+curl http://127.0.0.1:8080/sdapi/v1/txt2img \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"a lighthouse","negative_prompt":"","seed":42,"steps":20,"cfg_scale":7.5}'
+```
+
+AUTOMATIC1111 compatibility includes `POST /sdapi/v1/txt2img`,
+`POST /sdapi/v1/img2img`, and discovery at `/sdapi/v1/sd-models`,
+`/sdapi/v1/samplers`, and `/sdapi/v1/options`. Images are returned as base64
+PNG. `img2img` accepts semantic image/media plus denoising-strength roles, or
+explicit metadata-declared `application_inputs` when preprocessing was done by
+the caller. Image API JSON bodies are limited to 25 MiB so base64-encoded
+1024px-class source images and typed tensors fit while oversized uploads
+receive HTTP 413. URL responses, server-side image saving, scripts,
+extensions, ControlNet fields, and parameters the package cannot bind are
+rejected explicitly rather than ignored. OpenAI `output_format: png` and opaque
+backgrounds are supported; JPEG/WebP, transparency, and moderation requests are
+rejected because this server does not currently provide those capabilities.
 
 #### Multimodal chat
 
@@ -519,29 +570,6 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 A model that declares no image or audio contract rejects the part with a 400
 naming what it does accept, and unknown part types are named in the error along
 with the supported set.
-
-#### Image generation
-
-`POST /v1/images/generations` renders through a diffusion package's own declared
-denoise loop. Only `b64_json` is returned — the server stores nothing, so it has
-no URL to hand back. `negative_prompt`, `steps`, `guidance_scale`, and `seed`
-are onnx-genai extensions; omitted sampling values fall back to the package's
-declared `num_steps` / `guidance_scale`.
-
-```bash
-curl http://127.0.0.1:8080/v1/images/generations \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "stable-diffusion-1.5",
-    "prompt": "an astronaut riding a horse",
-    "negative_prompt": "blurry, low quality",
-    "size": "512x512",
-    "n": 1,
-    "steps": 25,
-    "guidance_scale": 7.5,
-    "seed": 0
-  }'
-```
 
 #### Speech synthesis
 

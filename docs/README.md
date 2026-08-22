@@ -9,7 +9,7 @@ give you a stale answer.
 | If you want | Read |
 |---|---|
 | What the project is and how it is put together | [`architecture/DESIGN.md`](architecture/DESIGN.md) |
-| What currently works, with numbers | [`status/PROGRESS.md`](status/PROGRESS.md) |
+| Which CUDA feature to build with, and why there are two | [`build-features.md`](build-features.md) |
 | Why memory is arranged the way it is | [`memory/MEMORY_ARCHITECTURE.md`](memory/MEMORY_ARCHITECTURE.md) |
 | The proposed cross-stack memory contracts | [`memory/MEMORY_MANAGEMENT_MODEL_DESIGN.md`](memory/MEMORY_MANAGEMENT_MODEL_DESIGN.md) |
 
@@ -84,8 +84,10 @@ Generation-side design: [`SCHEDULING.md`](genai/SCHEDULING.md),
 [`PIPELINE.md`](genai/PIPELINE.md),
 [`MODEL_METADATA.md`](genai/MODEL_METADATA.md),
 [`MODEL_PACKAGE.md`](genai/MODEL_PACKAGE.md),
+[`MOBIUS_WORKFLOW_PRODUCER.md`](genai/MOBIUS_WORKFLOW_PRODUCER.md),
 [`NATIVE_BATCH_DECODE_2B_IMPL_SCOPING.md`](genai/NATIVE_BATCH_DECODE_2B_IMPL_SCOPING.md),
-[`DIFFUSION.md`](genai/DIFFUSION.md).
+[`DIFFUSION.md`](genai/DIFFUSION.md),
+[`COMFYUI_IMPORT.md`](genai/COMFYUI_IMPORT.md).
 
 ### `quantization/`
 Quantized formats and MoE: [`SUB4BIT_QUANT.md`](quantization/SUB4BIT_QUANT.md),
@@ -120,8 +122,7 @@ Multi-device and collectives: [`DISTRIBUTED_RUNTIME.md`](distributed/DISTRIBUTED
 [`COMMUNICATOR_BUFFER_IMPL.md`](distributed/COMMUNICATOR_BUFFER_IMPL.md).
 
 ### `status/`
-Project state and upstream tracking: [`PROGRESS.md`](status/PROGRESS.md),
-[`DECISIONS_FOR_JUSTIN.md`](status/DECISIONS_FOR_JUSTIN.md),
+Project state and upstream tracking: [`DECISIONS_FOR_JUSTIN.md`](status/DECISIONS_FOR_JUSTIN.md),
 [`UPSTREAM_ORT_ARM_INVENTORY.md`](status/UPSTREAM_ORT_ARM_INVENTORY.md),
 [`UPSTREAM_ORT_MATMULNBITS_INVENTORY.md`](status/UPSTREAM_ORT_MATMULNBITS_INVENTORY.md).
 Dated test-health snapshots (which suites are green/red/ignored on `main`, and
@@ -129,8 +130,9 @@ why): [`2026-08-19-test-health-baseline.md`](status/2026-08-19-test-health-basel
 — **check the date; a baseline decays.**
 
 ### `benchmarks/`, `portability/`, `research/`
-Pre-existing directories, unchanged: dated benchmark runs, portability notes,
-and research write-ups.
+Dated benchmark runs, including
+[`2026-08-21-mobius-workflow-conformance.md`](benchmarks/2026-08-21-mobius-workflow-conformance.md),
+plus portability notes and research write-ups.
 
 ## Two standing rules
 
@@ -144,4 +146,9 @@ and research write-ups.
    it from verification.
 
 See [`.github/skills/measurement-discipline/SKILL.md`](../.github/skills/measurement-discipline/SKILL.md)
-for the failure modes behind these rules.
+for the failure modes behind these rules, and
+[`.github/skills/cuda-perf-measurement/SKILL.md`](../.github/skills/cuda-perf-measurement/SKILL.md)
+for which instrument to reach for on the CUDA backend — including the three
+device-specific traps (nsys hiding CUDA-graph internals, load cost read as
+per-token cost, wall clock that cannot resolve 10%) that have each produced a
+confidently backwards answer here.

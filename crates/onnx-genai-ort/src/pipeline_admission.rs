@@ -1,9 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use onnx_genai_metadata::{
-    PipelineSpec, PipelineStrategy, PipelineStrategyKind, PreprocessingSpec, TensorDimension,
-};
+use onnx_genai_metadata::{PipelineSpec, TensorDimension};
 use onnx_runtime_loader::proto::onnx::{ValueInfoProto, tensor_shape_proto, type_proto};
 use onnx_std::ir::{DataType, Dim};
 
@@ -36,15 +34,366 @@ struct ComponentSignature {
 
 pub(crate) fn validate_pipeline_admission(
     spec: &PipelineSpec,
-    preprocessing: Option<&PreprocessingSpec>,
     model_paths: &BTreeMap<String, PathBuf>,
 ) -> Result<()> {
     let signatures = inspect_component_signatures(model_paths)?;
-    validate_edges(spec, &signatures)?;
-    validate_optional_inputs(spec, &signatures)?;
+    validate_workflow_signatures(&spec.workflow, &signatures)
+}
 
-    let preprocessed_inputs = validate_image_program(spec, preprocessing, &signatures)?;
-    validate_input_closure(spec, &signatures, &preprocessed_inputs)
+fn validate_workflow_signatures(
+    workflow: &onnx_genai_metadata::WorkflowSpec,
+    signatures: &BTreeMap<String, ComponentSignature>,
+) -> Result<()> {
+    for (component, declaration) in &workflow.components {
+        let onnx_genai_metadata::ComponentImplementation::Onnx { .. } = &declaration.implementation
+        else {
+            continue;
+        };
+        let signature = signatures.get(component).ok_or_else(|| {
+            OrtError::InvalidArgument(format!(
+                "workflow ONNX component '{component}' has no inspected model"
+            ))
+        })?;
+        for (direction, declared, actual) in [
+            ("input", &declaration.ports.inputs, &signature.inputs),
+            ("output", &declaration.ports.outputs, &signature.outputs),
+        ] {
+            for (port, contract) in declared {
+                let signature = actual.get(port).ok_or_else(|| {
+                    OrtError::InvalidArgument(format!(
+                        "workflow component '{component}' declares {direction} port '{port}', \
+                         but the ONNX graph does not expose it"
+                    ))
+                })?;
+                let dtype = parse_dtype(&contract.dtype).ok_or_else(|| {
+                    OrtError::InvalidArgument(format!(
+                        "workflow component '{component}' {direction} '{port}' has unsupported \
+                         dtype '{}'",
+                        contract.dtype
+                    ))
+                })?;
+                if dtype != signature.dtype {
+                    return Err(OrtError::InvalidArgument(format!(
+                        "workflow component '{component}' {direction} '{port}' declares dtype {}, \
+                         but the ONNX graph exposes {}",
+                        contract.dtype,
+                        dtype_name(signature.dtype)
+                    )));
+                }
+                if contract.rank != signature.rank() {
+                    return Err(OrtError::InvalidArgument(format!(
+                        "workflow component '{component}' {direction} '{port}' declares rank {}, \
+                         but the ONNX graph exposes rank {}",
+                        contract.rank,
+                        signature.rank()
+                    )));
+                }
+                if let Some(shape) = &contract.shape {
+                    for (axis, (declared, actual)) in shape.iter().zip(&signature.shape).enumerate()
+                    {
+                        if let (TensorDimension::Fixed(declared), PortDimension::Static(actual)) =
+                            (declared, actual)
+                            && usize::try_from(*declared).ok() != Some(*actual)
+                        {
+                            return Err(OrtError::InvalidArgument(format!(
+                                "workflow component '{component}' {direction} '{port}' axis \
+                                 {axis} declares {declared}, but the ONNX graph exposes {actual}"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    validate_component_replacement_signatures(workflow, signatures)?;
+    validate_workflow_invocations(&workflow.steps, workflow, signatures)?;
+    Ok(())
+}
+
+fn validate_component_replacement_signatures(
+    workflow: &onnx_genai_metadata::WorkflowSpec,
+    signatures: &BTreeMap<String, ComponentSignature>,
+) -> Result<()> {
+    for (target_name, target) in &workflow.components {
+        if !target.application_overridable {
+            continue;
+        }
+        let target_contract = target.contract.as_ref().ok_or_else(|| {
+            OrtError::InvalidArgument(format!(
+                "overridable component '{target_name}' has no versioned contract"
+            ))
+        })?;
+        let target_signature = signatures.get(target_name).ok_or_else(|| {
+            OrtError::InvalidArgument(format!(
+                "overridable component '{target_name}' has no inspected ONNX model"
+            ))
+        })?;
+        for (replacement_name, replacement) in &workflow.components {
+            if replacement_name == target_name {
+                continue;
+            }
+            let Some(replacement_contract) = &replacement.contract else {
+                continue;
+            };
+            if replacement_contract.id != target_contract.id
+                || replacement_contract.version != target_contract.version
+            {
+                continue;
+            }
+            let Some(replacement_signature) = signatures.get(replacement_name) else {
+                continue;
+            };
+            for (role, target_port) in &target_contract.bindings {
+                let replacement_port = replacement_contract.bindings.get(role).ok_or_else(|| {
+                    OrtError::InvalidArgument(format!(
+                        "replacement component '{replacement_name}' lacks semantic port '{role}' \
+                         required by '{target_name}'"
+                    ))
+                })?;
+                let (target_direction, target_port_signature) =
+                    semantic_port_signature(target_name, role, target_port, target_signature)?;
+                let (replacement_direction, replacement_port_signature) = semantic_port_signature(
+                    replacement_name,
+                    role,
+                    replacement_port,
+                    replacement_signature,
+                )?;
+                if target_direction != replacement_direction
+                    || !port_signatures_compatible(
+                        target_port_signature,
+                        replacement_port_signature,
+                    )
+                {
+                    return Err(OrtError::InvalidArgument(format!(
+                        "replacement component '{replacement_name}' semantic port '{role}' is \
+                         incompatible with '{target_name}'"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn port_signatures_compatible(left: &PortSignature, right: &PortSignature) -> bool {
+    left.dtype == right.dtype
+        && left.rank() == right.rank()
+        && left
+            .shape
+            .iter()
+            .zip(&right.shape)
+            .all(|(left, right)| match (left, right) {
+                (PortDimension::Static(left), PortDimension::Static(right)) => left == right,
+                _ => true,
+            })
+}
+
+fn semantic_port_signature<'a>(
+    component: &str,
+    role: &str,
+    port: &str,
+    signature: &'a ComponentSignature,
+) -> Result<(&'static str, &'a PortSignature)> {
+    match (signature.inputs.get(port), signature.outputs.get(port)) {
+        (Some(signature), None) => Ok(("input", signature)),
+        (None, Some(signature)) => Ok(("output", signature)),
+        _ => Err(OrtError::InvalidArgument(format!(
+            "component '{component}' semantic port '{role}' binds '{port}', which is not exactly \
+             one ONNX input or output"
+        ))),
+    }
+}
+
+fn validate_workflow_invocations(
+    steps: &[onnx_genai_metadata::WorkflowStep],
+    workflow: &onnx_genai_metadata::WorkflowSpec,
+    signatures: &BTreeMap<String, ComponentSignature>,
+) -> Result<()> {
+    for step in steps {
+        match step {
+            onnx_genai_metadata::WorkflowStep::Sequence { steps } => {
+                validate_workflow_invocations(steps, workflow, signatures)?;
+            }
+            onnx_genai_metadata::WorkflowStep::Invoke {
+                component,
+                inputs,
+                outputs,
+            } => {
+                let declaration = workflow.components.get(component).ok_or_else(|| {
+                    OrtError::InvalidArgument(format!(
+                        "workflow invokes unknown component '{component}'"
+                    ))
+                })?;
+                if declaration.application_overridable {
+                    let contract = declaration.contract.as_ref().ok_or_else(|| {
+                        OrtError::InvalidArgument(format!(
+                            "overridable component '{component}' has no versioned contract"
+                        ))
+                    })?;
+                    for port in inputs.keys().chain(outputs.keys()) {
+                        if !contract.bindings.values().any(|binding| binding == port) {
+                            return Err(OrtError::InvalidArgument(format!(
+                                "overridable component '{component}' invocation port '{port}' is \
+                                 not covered by its semantic contract ABI"
+                            )));
+                        }
+                    }
+                    for (replacement_name, replacement) in &workflow.components {
+                        if replacement_name == component {
+                            continue;
+                        }
+                        let Some(replacement_contract) = &replacement.contract else {
+                            continue;
+                        };
+                        if replacement_contract.id != contract.id
+                            || replacement_contract.version != contract.version
+                        {
+                            continue;
+                        }
+                        let Some(replacement_signature) = signatures.get(replacement_name) else {
+                            continue;
+                        };
+                        let remapped_inputs = remap_invocation_ports(
+                            component,
+                            contract,
+                            replacement_name,
+                            replacement_contract,
+                            inputs,
+                        )?;
+                        let remapped_outputs = remap_invocation_ports(
+                            component,
+                            contract,
+                            replacement_name,
+                            replacement_contract,
+                            outputs,
+                        )?;
+                        validate_invocation_ports(
+                            replacement_name,
+                            "input",
+                            &remapped_inputs,
+                            &replacement_signature.inputs,
+                            Some(&replacement_signature.defaulted_inputs),
+                            true,
+                        )?;
+                        validate_invocation_ports(
+                            replacement_name,
+                            "output",
+                            &remapped_outputs,
+                            &replacement_signature.outputs,
+                            None,
+                            false,
+                        )?;
+                    }
+                }
+                if matches!(
+                    declaration.implementation,
+                    onnx_genai_metadata::ComponentImplementation::Onnx { .. }
+                ) {
+                    let signature = signatures.get(component).ok_or_else(|| {
+                        OrtError::InvalidArgument(format!(
+                            "workflow ONNX component '{component}' has no inspected model"
+                        ))
+                    })?;
+                    validate_invocation_ports(
+                        component,
+                        "input",
+                        inputs,
+                        &signature.inputs,
+                        Some(&signature.defaulted_inputs),
+                        true,
+                    )?;
+                    validate_invocation_ports(
+                        component,
+                        "output",
+                        outputs,
+                        &signature.outputs,
+                        None,
+                        false,
+                    )?;
+                }
+            }
+            onnx_genai_metadata::WorkflowStep::Loop { setup, steps, .. } => {
+                validate_workflow_invocations(setup, workflow, signatures)?;
+                validate_workflow_invocations(steps, workflow, signatures)?;
+            }
+            onnx_genai_metadata::WorkflowStep::Branch { cases, default, .. } => {
+                for case in cases.values() {
+                    validate_workflow_invocations(
+                        std::slice::from_ref(case),
+                        workflow,
+                        signatures,
+                    )?;
+                }
+                if let Some(default) = default {
+                    validate_workflow_invocations(
+                        std::slice::from_ref(default.as_ref()),
+                        workflow,
+                        signatures,
+                    )?;
+                }
+            }
+            onnx_genai_metadata::WorkflowStep::Emit { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn remap_invocation_ports(
+    target_name: &str,
+    target_contract: &onnx_genai_metadata::ComponentContract,
+    replacement_name: &str,
+    replacement_contract: &onnx_genai_metadata::ComponentContract,
+    ports: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>> {
+    ports
+        .iter()
+        .map(|(port, value)| {
+            let role = target_contract
+                .bindings
+                .iter()
+                .find_map(|(role, bound)| (bound == port).then_some(role))
+                .ok_or_else(|| {
+                    OrtError::InvalidArgument(format!(
+                        "overridable component '{target_name}' invocation port '{port}' is not \
+                         covered by its semantic contract ABI"
+                    ))
+                })?;
+            let replacement_port = replacement_contract.bindings.get(role).ok_or_else(|| {
+                OrtError::InvalidArgument(format!(
+                    "replacement component '{replacement_name}' lacks semantic port '{role}' \
+                     required by '{target_name}'"
+                ))
+            })?;
+            Ok((replacement_port.clone(), value.clone()))
+        })
+        .collect()
+}
+
+fn validate_invocation_ports(
+    component: &str,
+    direction: &str,
+    bindings: &BTreeMap<String, String>,
+    actual: &BTreeMap<String, PortSignature>,
+    optional: Option<&BTreeSet<String>>,
+    require_all: bool,
+) -> Result<()> {
+    for port in bindings.keys() {
+        if !actual.contains_key(port) {
+            return Err(OrtError::InvalidArgument(format!(
+                "workflow invocation of '{component}' binds unknown {direction} port '{port}'"
+            )));
+        }
+    }
+    if require_all {
+        for port in actual.keys() {
+            if !bindings.contains_key(port) && !optional.is_some_and(|ports| ports.contains(port)) {
+                return Err(OrtError::InvalidArgument(format!(
+                    "workflow invocation of '{component}' is missing {direction} port '{port}'"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn inspect_component_signatures(
@@ -217,622 +566,6 @@ fn raw_input_signature(
         })
         .unwrap_or_default();
     Ok(PortSignature { dtype, shape })
-}
-
-fn validate_optional_inputs(
-    spec: &PipelineSpec,
-    signatures: &BTreeMap<String, ComponentSignature>,
-) -> Result<()> {
-    for (component, model) in &spec.models {
-        let Some(io) = model.io.as_ref() else {
-            continue;
-        };
-        let signature = signatures
-            .get(component)
-            .expect("inspected declared component");
-        for (port, optional) in &io.optional_inputs {
-            let endpoint = format!("{component}.{port}");
-            let input = signature.inputs.get(port).ok_or_else(|| {
-                admission_error(
-                    &endpoint,
-                    format!(
-                        "optional input '{endpoint}' is not an ONNX graph input of component '{component}'"
-                    ),
-                    "regenerate the native sidecar so optional_inputs names a retained ONNX GraphProto input"
-                        .to_string(),
-                )
-            })?;
-            if optional.absent.shape.len() != input.rank() {
-                return Err(admission_error(
-                    &endpoint,
-                    format!(
-                        "optional zero fallback rank {} does not match ONNX graph input rank {}",
-                        optional.absent.shape.len(),
-                        input.rank()
-                    ),
-                    format!(
-                        "regenerate the native sidecar so optional_inputs.{port}.absent.shape has {} dimensions",
-                        input.rank()
-                    ),
-                ));
-            }
-            for (index, (fallback, required)) in
-                optional.absent.shape.iter().zip(&input.shape).enumerate()
-            {
-                if let (TensorDimension::Fixed(actual), PortDimension::Static(expected)) =
-                    (fallback, required)
-                    && usize::try_from(*actual).ok() != Some(*expected)
-                {
-                    return Err(admission_error(
-                        &endpoint,
-                        format!(
-                            "optional zero fallback dimension {index} is {actual}, but the ONNX graph input requires static dimension {expected}"
-                        ),
-                        format!(
-                            "regenerate the native sidecar so optional_inputs.{port}.absent.shape matches the retained ONNX graph input"
-                        ),
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_edges(
-    spec: &PipelineSpec,
-    signatures: &BTreeMap<String, ComponentSignature>,
-) -> Result<()> {
-    let synthetic_outputs = synthetic_outputs(&spec.strategy);
-    let transformed_loop_components = transformed_loop_components(&spec.strategy);
-    for edge in &spec.dataflow {
-        let (source_component, source_port) = parse_endpoint(&edge.from)?;
-        let (destination_component, destination_port) = parse_endpoint(&edge.to)?;
-        let source = signatures
-            .get(source_component)
-            .and_then(|signature| signature.outputs.get(source_port))
-            .or_else(|| synthetic_outputs.get(&(source_component, source_port)))
-            .ok_or_else(|| {
-                admission_error(
-                    &edge.from,
-                    format!(
-                        "dataflow source '{}' is not an ONNX graph output",
-                        edge.from
-                    ),
-                    format!(
-                        "regenerate the native sidecar so {} names a real producer output",
-                        edge.from
-                    ),
-                )
-            })?;
-        let destination = signatures
-            .get(destination_component)
-            .and_then(|signature| signature.inputs.get(destination_port))
-            .ok_or_else(|| {
-                admission_error(
-                    &edge.to,
-                    format!(
-                        "dataflow destination '{}' is not an ONNX graph input",
-                        edge.to
-                    ),
-                    format!(
-                        "regenerate the native sidecar so {} names a real consumer input",
-                        edge.to
-                    ),
-                )
-            })?;
-
-        if source_component == destination_component
-            && transformed_loop_components.contains(source_component)
-        {
-            continue;
-        }
-
-        if source.dtype != destination.dtype {
-            return Err(admission_error(
-                &edge.to,
-                format!(
-                    "dataflow edge '{} -> {}' has incompatible dtypes: producer is {}, consumer is {}{}",
-                    edge.from,
-                    edge.to,
-                    dtype_name(source.dtype),
-                    dtype_name(destination.dtype),
-                    edge.dtype
-                        .as_deref()
-                        .map(|dtype| format!(", metadata declares '{dtype}'"))
-                        .unwrap_or_default()
-                ),
-                format!(
-                    "regenerate the native sidecar or graphs so {} and {} use the same dtype",
-                    edge.from, edge.to
-                ),
-            ));
-        }
-
-        if source.rank() != destination.rank() {
-            return Err(admission_error(
-                &edge.to,
-                format!(
-                    "dataflow edge '{} -> {}' has incompatible ranks: producer rank {}, consumer rank {}",
-                    edge.from,
-                    edge.to,
-                    source.rank(),
-                    destination.rank()
-                ),
-                format!(
-                    "regenerate the native sidecar or add an explicit transform so {} matches {}",
-                    edge.from, edge.to
-                ),
-            ));
-        }
-        if let Some(declared) = edge.dtype.as_deref() {
-            let declared_dtype = parse_dtype(declared).ok_or_else(|| {
-                admission_error(
-                    &edge.to,
-                    format!(
-                        "dataflow edge '{} -> {}' declares unsupported dtype '{declared}'",
-                        edge.from, edge.to
-                    ),
-                    "regenerate the native sidecar with the producer's canonical tensor dtype"
-                        .to_string(),
-                )
-            })?;
-            if declared_dtype != source.dtype {
-                return Err(admission_error(
-                    &edge.to,
-                    format!(
-                        "dataflow edge '{} -> {}' declares dtype '{declared}', but both graphs use {}",
-                        edge.from,
-                        edge.to,
-                        dtype_name(source.dtype)
-                    ),
-                    "regenerate the native sidecar so the edge dtype matches both graph ports"
-                        .to_string(),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn transformed_loop_components(strategy: &PipelineStrategy) -> BTreeSet<&str> {
-    let mut components = BTreeSet::new();
-    collect_transformed_loop_components(strategy, &mut components);
-    components
-}
-
-fn collect_transformed_loop_components<'a>(
-    strategy: &'a PipelineStrategy,
-    components: &mut BTreeSet<&'a str>,
-) {
-    match strategy.kind {
-        PipelineStrategyKind::Iterative => {
-            if strategy.scheduler_config.is_some()
-                && let Some(denoiser) = strategy.denoiser.as_deref()
-            {
-                components.insert(denoiser);
-            }
-        }
-        PipelineStrategyKind::Composite => {
-            for stage in &strategy.stages {
-                collect_transformed_loop_components(&stage.strategy, components);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn validate_image_program(
-    spec: &PipelineSpec,
-    preprocessing: Option<&PreprocessingSpec>,
-    signatures: &BTreeMap<String, ComponentSignature>,
-) -> Result<BTreeSet<String>> {
-    let image_program = preprocessing.and_then(|preprocessing| preprocessing.image.as_ref());
-    let mut bound = BTreeSet::new();
-
-    if let Some(program) = image_program {
-        for output in &program.outputs {
-            let endpoint = resolve_input_endpoint(&output.name, signatures)?;
-            let Some((endpoint, input)) = endpoint else {
-                if output.optional.unwrap_or(false) {
-                    continue;
-                }
-                return Err(admission_error(
-                    &output.name,
-                    format!(
-                        "required preprocessing.image output '{}' does not resolve to an ONNX component input",
-                        output.name
-                    ),
-                    format!(
-                        "regenerate the native sidecar so preprocessing output '{}' names an exact component.port",
-                        output.name
-                    ),
-                ));
-            };
-            let declared_dtype = parse_dtype(&output.dtype).ok_or_else(|| {
-                admission_error(
-                    &endpoint,
-                    format!(
-                        "preprocessing.image output '{}' declares unsupported dtype '{}'",
-                        output.name, output.dtype
-                    ),
-                    "regenerate the native sidecar with a supported tensor dtype".to_string(),
-                )
-            })?;
-            if declared_dtype != input.dtype {
-                return Err(admission_error(
-                    &endpoint,
-                    format!(
-                        "preprocessing.image output '{}' declares {}, but {} expects {}",
-                        output.name,
-                        dtype_name(declared_dtype),
-                        endpoint,
-                        dtype_name(input.dtype)
-                    ),
-                    format!(
-                        "regenerate the native sidecar so preprocessing output '{}' matches {}",
-                        output.name, endpoint
-                    ),
-                ));
-            }
-            if !bound.insert(endpoint.clone()) {
-                return Err(admission_error(
-                    &endpoint,
-                    "multiple preprocessing.image outputs bind the same ONNX input".to_string(),
-                    "regenerate the native sidecar so every preprocessing output binds a unique component.port"
-                        .to_string(),
-                ));
-            }
-        }
-    }
-
-    if image_program.is_some()
-        && !decoder_components(&spec.strategy).is_empty()
-        && spec.vision.is_none()
-        && let Some(endpoint) = bound.first()
-    {
-        return Err(admission_error(
-            endpoint,
-            "the image preprocessing endpoint is incomplete: preprocessing.image is declared for an autoregressive pipeline, but pipeline.vision has no prompt expansion program"
-                .to_string(),
-            "regenerate the native sidecar with a pipeline.vision expansion contract that matches the preprocessing program"
-                .to_string(),
-        ));
-    }
-
-    if spec.vision.is_some() {
-        for (component, model) in &spec.models {
-            if model.role != "vision_encoder" {
-                continue;
-            }
-            let signature = signatures
-                .get(component)
-                .expect("inspected declared component");
-            for port in signature.inputs.keys() {
-                let endpoint = format!("{component}.{port}");
-                let has_edge = spec.dataflow.iter().any(|edge| edge.to == endpoint);
-                if !has_edge && !bound.contains(&endpoint) {
-                    return Err(admission_error(
-                        &endpoint,
-                        "the declared image modality endpoint cannot be constructed: pipeline.vision is present, but preprocessing.image does not bind this required ONNX input"
-                            .to_string(),
-                        format!(
-                            "regenerate the native sidecar with preprocessing.image output '{endpoint}' and a matching vision expansion program"
-                        ),
-                    ));
-                }
-            }
-        }
-    }
-
-    Ok(bound)
-}
-
-fn validate_input_closure(
-    spec: &PipelineSpec,
-    signatures: &BTreeMap<String, ComponentSignature>,
-    preprocessed_inputs: &BTreeSet<String>,
-) -> Result<()> {
-    let decoders = decoder_components(&spec.strategy);
-    let generated = generated_inputs(spec, &decoders);
-
-    for (component, signature) in signatures {
-        let component_presence = spec
-            .phases
-            .get(component)
-            .and_then(|phase| phase.when_present.as_deref());
-        let optional_inputs = spec
-            .models
-            .get(component)
-            .and_then(|model| model.io.as_ref())
-            .map(|io| &io.optional_inputs);
-        let explicit_decoder_contract = decoders.contains(component)
-            && spec
-                .models
-                .get(component)
-                .is_some_and(|model| model.io.is_some());
-        for port in signature.inputs.keys() {
-            let endpoint = format!("{component}.{port}");
-            let incoming_edges = spec
-                .dataflow
-                .iter()
-                .filter(|edge| edge.to == endpoint)
-                .count();
-            let defaulted = signature.defaulted_inputs.contains(port);
-            let generated_or_stateful = generated.contains(&endpoint);
-            let preprocessed = preprocessed_inputs.contains(&endpoint);
-            let optional = optional_inputs.and_then(|inputs| inputs.get(port));
-            // Requests may bind any component.port. Without an explicit decoder I/O contract,
-            // absence of another source is not proof that the port is unbound, so fail open.
-            // A declared optional input is also an explicit request-time source contract.
-            let external = (!explicit_decoder_contract || optional.is_some())
-                && incoming_edges == 0
-                && !defaulted
-                && !generated_or_stateful
-                && !preprocessed;
-            let binding_count = incoming_edges
-                + usize::from(defaulted)
-                + usize::from(generated_or_stateful)
-                + usize::from(preprocessed)
-                + usize::from(external);
-
-            if binding_count == 0 {
-                return Err(admission_error(
-                    &endpoint,
-                    "required ONNX graph input is unbound: no external, generated, stateful, default, preprocessing, or dataflow source is declared for this port"
-                        .to_string(),
-                    format!(
-                        "regenerate the native sidecar so {endpoint} is fed by exactly one declared source"
-                    ),
-                ));
-            }
-            if binding_count > 1 {
-                return Err(admission_error(
-                    &endpoint,
-                    "required ONNX graph input has multiple binding sources, so execution would be ambiguous"
-                        .to_string(),
-                    format!(
-                        "regenerate the native sidecar so {endpoint} is fed by exactly one external, generated, stateful, default, or dataflow source"
-                    ),
-                ));
-            }
-
-            for edge in spec.dataflow.iter().filter(|edge| edge.to == endpoint) {
-                let (producer, _) = parse_endpoint(&edge.from)?;
-                let producer_presence = spec
-                    .phases
-                    .get(producer)
-                    .and_then(|phase| phase.when_present.as_deref());
-                let absent_branch_closed = producer_presence.is_none_or(|presence| {
-                    component_presence == Some(presence)
-                        || optional.is_some_and(|optional| optional.presence == presence)
-                });
-                if !absent_branch_closed {
-                    let presence = producer_presence.expect("checked gated producer");
-                    return Err(admission_error(
-                        &endpoint,
-                        format!(
-                            "dataflow source '{}' is unavailable when presence key '{presence}' is absent, but required destination '{endpoint}' has no matching fallback or component gate",
-                            edge.from
-                        ),
-                        format!(
-                            "declare optional_inputs.{port} with presence '{presence}', gate component '{component}' with the same key, or provide an always-available source"
-                        ),
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn generated_inputs(spec: &PipelineSpec, decoders: &BTreeSet<String>) -> BTreeSet<String> {
-    let mut generated = BTreeSet::new();
-
-    for (component, model) in &spec.models {
-        if let Some(io) = model.io.as_ref() {
-            for port in [
-                io.token_input.as_deref(),
-                decoders
-                    .contains(component)
-                    .then_some(io.attention_mask_input.as_deref())
-                    .flatten(),
-                decoders
-                    .contains(component)
-                    .then_some(io.position_ids_input.as_deref())
-                    .flatten(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                generated.insert(format!("{component}.{port}"));
-            }
-            for port in io.kv_inputs.iter().flatten() {
-                generated.insert(format!("{component}.{port}"));
-            }
-            for port in io.cross_kv_inputs.iter().flatten() {
-                generated.insert(format!("{component}.{port}"));
-            }
-            for pair in io.state_pairs.iter().flatten() {
-                generated.insert(format!("{component}.{}", pair.input));
-            }
-        }
-    }
-
-    if let Some(position) = spec.positions.as_ref() {
-        for decoder in decoders {
-            generated.insert(format!("{decoder}.{}", position.input));
-        }
-    }
-    collect_strategy_generated_inputs(&spec.strategy, &mut generated);
-    generated
-}
-
-fn collect_strategy_generated_inputs(
-    strategy: &PipelineStrategy,
-    generated: &mut BTreeSet<String>,
-) {
-    match strategy.kind {
-        PipelineStrategyKind::Iterative => {
-            if let (Some(denoiser), Some(timestep)) = (
-                strategy.denoiser.as_deref(),
-                strategy.timestep_input.as_deref(),
-            ) {
-                generated.insert(format!("{denoiser}.{timestep}"));
-            }
-        }
-        PipelineStrategyKind::NestedAutoregressive => {
-            if let Some(pre_embedder) = strategy.pre_embedder.as_ref() {
-                generated.insert(format!(
-                    "{}.{}",
-                    pre_embedder.component, pre_embedder.frame_codes_input
-                ));
-                if let Some(text_embed) = pre_embedder.text_embed_input.as_deref() {
-                    generated.insert(format!("{}.{}", pre_embedder.component, text_embed));
-                }
-            }
-            if let Some(prefill) = strategy.prefill_embedder.as_ref() {
-                generated.insert(format!("{}.{}", prefill.component, prefill.prompt_input));
-            }
-        }
-        PipelineStrategyKind::Composite => {
-            for stage in &strategy.stages {
-                collect_strategy_generated_inputs(&stage.strategy, generated);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn synthetic_outputs(strategy: &PipelineStrategy) -> BTreeMap<(&str, &str), PortSignature> {
-    let mut outputs = BTreeMap::new();
-    collect_synthetic_outputs(strategy, &mut outputs);
-    outputs
-}
-
-fn collect_synthetic_outputs<'a>(
-    strategy: &'a PipelineStrategy,
-    outputs: &mut BTreeMap<(&'a str, &'a str), PortSignature>,
-) {
-    match strategy.kind {
-        PipelineStrategyKind::Autoregressive => {
-            if let Some(decoder) = strategy.decoder.as_deref() {
-                outputs.insert(
-                    (decoder, "output_ids"),
-                    PortSignature {
-                        dtype: DataType::Int64,
-                        shape: vec![PortDimension::Static(1), PortDimension::Dynamic],
-                    },
-                );
-            }
-        }
-        PipelineStrategyKind::NestedAutoregressive => {
-            if let Some(outer) = strategy.outer.as_deref() {
-                outputs.insert(
-                    (outer, "output_codes"),
-                    PortSignature {
-                        dtype: DataType::Int64,
-                        shape: vec![
-                            PortDimension::Static(1),
-                            PortDimension::Dynamic,
-                            PortDimension::Dynamic,
-                        ],
-                    },
-                );
-            }
-        }
-        PipelineStrategyKind::Composite => {
-            for stage in &strategy.stages {
-                collect_synthetic_outputs(&stage.strategy, outputs);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn decoder_components(strategy: &PipelineStrategy) -> BTreeSet<String> {
-    let mut decoders = BTreeSet::new();
-    collect_decoder_components(strategy, &mut decoders);
-    decoders
-}
-
-fn collect_decoder_components(strategy: &PipelineStrategy, decoders: &mut BTreeSet<String>) {
-    match strategy.kind {
-        PipelineStrategyKind::Autoregressive => {
-            if let Some(decoder) = strategy.decoder.as_ref() {
-                decoders.insert(decoder.clone());
-            }
-        }
-        PipelineStrategyKind::NestedAutoregressive => {
-            if let Some(outer) = strategy.outer.as_ref() {
-                decoders.insert(outer.clone());
-            }
-            if let Some(inner) = strategy.inner.as_ref() {
-                decoders.insert(inner.clone());
-            }
-        }
-        PipelineStrategyKind::Composite => {
-            for stage in &strategy.stages {
-                collect_decoder_components(&stage.strategy, decoders);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn resolve_input_endpoint<'a>(
-    endpoint: &str,
-    signatures: &'a BTreeMap<String, ComponentSignature>,
-) -> Result<Option<(String, &'a PortSignature)>> {
-    if let Some((component, port)) = parse_endpoint_unchecked(endpoint) {
-        return Ok(signatures
-            .get(component)
-            .and_then(|signature| signature.inputs.get(port))
-            .map(|input| (endpoint.to_string(), input)));
-    }
-
-    let matches = signatures
-        .iter()
-        .filter_map(|(component, signature)| {
-            signature
-                .inputs
-                .get(endpoint)
-                .map(|input| (format!("{component}.{endpoint}"), input))
-        })
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [] => Ok(None),
-        [(endpoint, input)] => Ok(Some((endpoint.clone(), *input))),
-        _ => Err(admission_error(
-            endpoint,
-            format!(
-                "preprocessing endpoint '{endpoint}' is ambiguous across {} ONNX inputs",
-                matches.len()
-            ),
-            "regenerate the native sidecar with an exact component.port preprocessing output"
-                .to_string(),
-        )),
-    }
-}
-
-fn parse_endpoint(endpoint: &str) -> Result<(&str, &str)> {
-    parse_endpoint_unchecked(endpoint).ok_or_else(|| {
-        OrtError::InvalidArgument(format!(
-            "package admission rejected endpoint '{endpoint}': expected component.port. \
-             Regenerate the native sidecar with exact component.port dataflow endpoints"
-        ))
-    })
-}
-
-fn parse_endpoint_unchecked(endpoint: &str) -> Option<(&str, &str)> {
-    let (component, port) = endpoint.split_once('.')?;
-    (!component.is_empty() && !port.is_empty()).then_some((component, port))
-}
-
-fn admission_error(endpoint: &str, why: String, fix: String) -> OrtError {
-    OrtError::InvalidArgument(format!(
-        "package admission rejected {endpoint}: {why}. How to fix: {fix}"
-    ))
 }
 
 fn component_inspection_error(component: &str, path: &Path, cause: String) -> OrtError {

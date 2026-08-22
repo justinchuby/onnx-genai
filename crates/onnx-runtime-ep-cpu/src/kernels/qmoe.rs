@@ -2069,7 +2069,7 @@ mod tests {
         let fc2_packed_shape = [EXPERTS, HIDDEN, PACKED];
         let fc2_scale_shape = [EXPERTS, HIDDEN, BLOCKS];
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/qmoe_weight_offload/model.onnx");
+            .join("tests/fixtures/qmoe_weight_offload/model.onnx.textproto");
         let (graph, fixture_store) =
             load_model_with_weights(&fixture).expect("load ONNX IR QMoE fixture");
         let node = graph

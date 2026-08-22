@@ -15,11 +15,29 @@ use cudarc::cudnn::{
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{CudaStream, DevicePtr, DevicePtrMut, DeviceSlice, SyncOnDrop};
 use half::{bf16, f16};
-use onnx_runtime_ep_api::{EpError, Result};
+use onnx_runtime_ep_api::{
+    EpError, Result, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+};
 use onnx_runtime_ir::DataType;
+use onnx_runtime_memory_governor::MemoryRole;
 
 use crate::dynamic_library::{CudaLibrary, is_available};
 use crate::error::{cudnn_err, cudnn_unavailable, driver_err};
+
+pub const WORKSPACE_ALIGNMENT: usize = 256;
+
+pub const fn governed_workspace_requirement(bytes: usize) -> WorkspaceRequirement {
+    if bytes == 0 {
+        WorkspaceRequirement::NONE
+    } else {
+        WorkspaceRequirement {
+            bytes: bytes as u64,
+            alignment: WORKSPACE_ALIGNMENT,
+            lifetime: WorkspaceLifetime::SessionPersistent,
+            role: MemoryRole::Workspace { step_scoped: false },
+        }
+    }
+}
 
 /// cuDNN element types supported by the CUDA EP's library-backed kernels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -241,6 +259,28 @@ fn i32_value(name: &str, value: usize) -> Result<i32> {
     })
 }
 
+fn governed_workspace_ptr(
+    workspace: Option<WorkspaceView>,
+    required: usize,
+    op: &str,
+) -> Result<CUdeviceptr> {
+    if required == 0 {
+        return Ok(0);
+    }
+    let workspace = workspace.ok_or_else(|| {
+        EpError::KernelFailed(format!(
+            "cuda_ep {op}: prepared cuDNN workspace requires {required} bytes, but none was supplied"
+        ))
+    })?;
+    if workspace.bytes() < required {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep {op}: prepared cuDNN workspace requires {required} bytes, supplied {}",
+            workspace.bytes()
+        )));
+    }
+    Ok(workspace.ptr().0 as CUdeviceptr)
+}
+
 /// An owned cudarc tensor descriptor for one of the supported ONNX dtypes.
 ///
 /// Its lifetime prevents native resources from escaping
@@ -294,7 +334,7 @@ pub struct CudnnHandle<'handle> {
     handle: &'handle Arc<Cudnn>,
     stream: &'handle Arc<CudaStream>,
     /// Raw cuDNN handle, stream-bound, used only by the f32-compute-type reduce
-    /// path (see [`CudnnHandle::reduce_cached`]). It aliases the same CUDA
+    /// path (see [`CudnnHandle::reduce_with_workspace`]). It aliases the same CUDA
     /// stream as `handle` and is serialized by the backend's handle mutex.
     reduce_handle: sys::cudnnHandle_t,
 }
@@ -385,43 +425,21 @@ impl CudnnHandle<'_> {
         .map_err(|e| cudnn_err("cudnnSoftmaxForward", e))
     }
 
-    /// CUDA-graph-capture-eligible cuDNN reduce that reuses cached descriptors
-    /// and a cached device workspace across calls with the same signature.
+    /// Query the exact cuDNN reduce workspace bytes for one signature, caching
+    /// only host descriptors and the queried size.
     ///
-    /// A per-call `cudnnGetReductionWorkspaceSize` + `alloc_zeros` (device
-    /// `cuMemAlloc`) plus the reduce kernel's trailing `synchronize()` are what
-    /// make the plain [`CudnnHandle::reduce`] path non-capturable — a device
-    /// allocation and a host sync are both illegal inside a CUDA graph capture,
-    /// so the segmenter shreds the graph at every float reduce (the dense
-    /// MoE per-expert mask reduce fires this thousands of times per decode
-    /// step). This entry point hoists all of that out of the hot path: the
-    /// first call for a signature (or after a shape change) allocates the
-    /// descriptors and workspace and caches them on `cache`; every subsequent
-    /// call with the same `(op, input, output)` signature reuses them and only
-    /// enqueues `cudnnReduceTensor`, so the reduce records cleanly into a
-    /// captured segment.
-    ///
-    /// This drives the raw cuDNN FFI with an **f32 compute type and f32
-    /// alpha/beta** for both f32 and f16 I/O. For f16 that is the ONNX
-    /// accumulate-in-f32 semantics (`cudnnReduceTensor` rejects a half
-    /// `reduceTensorCompType` — `CUDNN_STATUS_NOT_SUPPORTED` — and requires
-    /// `CUDNN_DATA_FLOAT` accumulation for half I/O, which is exactly ONNX's
-    /// accumulate-in-f32-then-cast-back rule); for f32 it is byte-identical to
-    /// the type-coupled safe reduce (f32 comp type, `alpha = 1`, `beta = 0`,
-    /// same descriptors). bf16 is rejected here — cuDNN cannot reduce it — and
-    /// is routed to the NVRTC kernel by the caller.
-    ///
-    /// The caller must **not** synchronize after this returns while a capture is
-    /// recording; in eager mode it keeps its usual trailing sync.
-    pub fn reduce_cached(
+    /// The executor owns the actual device workspace through the provider's
+    /// governed allocator. This cache exists only to avoid re-querying the
+    /// cuDNN signature during capture, where a shape or axes change must be
+    /// rejected rather than silently re-planning.
+    pub fn reduce_workspace_bytes(
         &self,
         cache: &mut CudnnReduceCache,
         input_spec: &TensorDescriptorSpec,
         output_spec: &TensorDescriptorSpec,
         op: CudnnReduceOp,
-        buffers: CudnnBufferPair,
         capturing: bool,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         if input_spec.dtype() != output_spec.dtype() {
             return Err(EpError::KernelFailed(
                 "cuda_ep: cuDNN reduction input/output descriptor dtypes differ".into(),
@@ -448,8 +466,48 @@ impl CudnnHandle<'_> {
                         .into(),
                 ));
             }
-            self.repopulate_reduce_cache(cache, input_spec, output_spec, op, key)?;
+            self.prepare_reduce_cache(cache, input_spec, output_spec, op, key)?;
         }
+
+        Ok(cache.workspace_bytes)
+    }
+
+    /// CUDA-graph-capture-eligible cuDNN reduce that reuses cached descriptors
+    /// and an executor-prepared device workspace across calls with the same
+    /// signature.
+    ///
+    /// A per-call `cudnnGetReductionWorkspaceSize` plus a device allocation and
+    /// the reduce kernel's trailing `synchronize()` are what made the old path
+    /// non-capturable. The queried workspace size now flows through
+    /// `Kernel::workspace_requirement*` to the executor's prepared persistent
+    /// workspace, so this hot path only verifies the warmed signature and
+    /// enqueues `cudnnReduceTensor`.
+    ///
+    /// This drives the raw cuDNN FFI with an **f32 compute type and f32
+    /// alpha/beta** for both f32 and f16 I/O. For f16 that is the ONNX
+    /// accumulate-in-f32 semantics (`cudnnReduceTensor` rejects a half
+    /// `reduceTensorCompType` — `CUDNN_STATUS_NOT_SUPPORTED` — and requires
+    /// `CUDNN_DATA_FLOAT` accumulation for half I/O, which is exactly ONNX's
+    /// accumulate-in-f32-then-cast-back rule); for f32 it is byte-identical to
+    /// the type-coupled safe reduce (f32 comp type, `alpha = 1`, `beta = 0`,
+    /// same descriptors). bf16 is rejected here — cuDNN cannot reduce it — and
+    /// is routed to the NVRTC kernel by the caller.
+    ///
+    /// The caller must **not** synchronize after this returns while a capture is
+    /// recording; in eager mode it keeps its usual trailing sync.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reduce_with_workspace(
+        &self,
+        cache: &mut CudnnReduceCache,
+        input_spec: &TensorDescriptorSpec,
+        output_spec: &TensorDescriptorSpec,
+        op: CudnnReduceOp,
+        buffers: CudnnBufferPair,
+        workspace: Option<WorkspaceView>,
+        capturing: bool,
+    ) -> Result<()> {
+        let workspace_bytes =
+            self.reduce_workspace_bytes(cache, input_spec, output_spec, op, capturing)?;
 
         let reduce = cache
             .reduce_desc
@@ -463,18 +521,22 @@ impl CudnnHandle<'_> {
 
         let alpha = 1.0f32;
         let beta = 0.0f32;
+        let workspace = governed_workspace_ptr(workspace, workspace_bytes, "Reduce")?;
         // SAFETY: the cached tensor descriptors describe the f16/f32 device
         // buffers, the cached reduction descriptor uses an f32 comp type (so
-        // alpha/beta are f32), and the cached workspace is at least the queried
-        // size for this signature with indices disabled.
+        // alpha/beta are f32), and the executor-prepared workspace is at least
+        // the queried size for this signature with indices disabled.
         unsafe {
+            // cuDNN allocates and synchronizes internally; gate the whole
+            // invocation. See `onnx_runtime_cuda_memory::capture_gate`.
+            let _section = onnx_runtime_cuda_memory::capture_gate::synchronizing_section();
             result::reduce_tensor(
                 self.reduce_handle,
                 reduce.0,
                 std::ptr::null_mut(),
                 0,
-                cache.workspace as *mut std::ffi::c_void,
-                cache.workspace_bytes,
+                workspace as *mut std::ffi::c_void,
+                workspace_bytes,
                 (&alpha as *const f32).cast::<std::ffi::c_void>(),
                 a_desc.0,
                 buffers.input as *const std::ffi::c_void,
@@ -486,10 +548,10 @@ impl CudnnHandle<'_> {
         .map_err(|e| cudnn_err("cudnnReduceTensor", e))
     }
 
-    /// (Re)build the cached descriptors and device workspace for a new reduce
-    /// signature. Only ever called in eager mode (a signature change during
-    /// capture is rejected by [`CudnnHandle::reduce_cached`]).
-    fn repopulate_reduce_cache(
+    /// (Re)build the cached descriptors and queried workspace bytes for a new
+    /// reduce signature. Only ever called in eager mode (a signature change
+    /// during capture is rejected by [`CudnnHandle::reduce_with_workspace`]).
+    fn prepare_reduce_cache(
         &self,
         cache: &mut CudnnReduceCache,
         input_spec: &TensorDescriptorSpec,
@@ -508,52 +570,169 @@ impl CudnnHandle<'_> {
         }
         .map_err(|e| cudnn_err("cudnnGetReductionWorkspaceSize", e))?;
 
-        // Retire the previous workspace only after every prior launch using it
-        // has completed. This runs in eager mode, so the sync is legal.
-        if cache.workspace != 0 {
-            self.stream.synchronize().map_err(|e| {
-                driver_err("synchronizing before freeing cuDNN reduce workspace", e)
-            })?;
-            // SAFETY: the cache exclusively owns this pointer and the sync above
-            // drained every launch that referenced it.
-            unsafe { free_reduce_workspace(cache.workspace) }?;
-            cache.workspace = 0;
-            cache.workspace_bytes = 0;
-        }
-
-        // SAFETY: a fresh device allocation the cache owns and frees exactly once.
-        let workspace = unsafe {
-            cudarc::driver::result::malloc_sync(workspace_bytes.max(1))
-                .map_err(|e| driver_err("allocating cuDNN reduce workspace", e))?
-        };
-
         cache.input_desc = Some(a_desc);
         cache.output_desc = Some(c_desc);
         cache.reduce_desc = Some(reduce);
-        cache.workspace = workspace;
         cache.workspace_bytes = workspace_bytes;
         cache.key = Some(key);
         Ok(())
     }
 
-    /// Select a cuDNN forward algorithm, allocate its workspace, and execute a
-    /// 2-D NCHW convolution with an optional fused channel bias.
-    pub fn conv2d(&self, spec: &CudnnConvSpec, buffers: CudnnConvBuffers) -> Result<()> {
-        match spec.dtype {
-            CudnnTensorType::F32 => self.conv2d_t::<f32>(spec, buffers, (1.0f32, 0.0f32)),
-            CudnnTensorType::F16 => {
-                self.conv2d_t::<f16>(spec, buffers, (f16::from_f32(1.0), f16::from_f32(0.0)))
+    /// Query the exact cuDNN convolution workspace bytes for one signature,
+    /// caching only the selected forward algorithm and queried size.
+    pub fn conv_workspace_bytes(
+        &self,
+        cache: &mut CudnnConvPlanCache,
+        spec: &CudnnConvSpec,
+        has_bias: bool,
+        capturing: bool,
+    ) -> Result<usize> {
+        let key = CudnnConvKey {
+            spec: spec.clone(),
+            has_bias,
+        };
+        if cache.key.as_ref() != Some(&key) {
+            if capturing {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep: cuDNN convolution signature changed during CUDA graph capture; \
+                     warm the fixed shape before capture"
+                        .into(),
+                ));
             }
-            CudnnTensorType::Bf16 => {
-                self.conv2d_t::<bf16>(spec, buffers, (bf16::from_f32(1.0), bf16::from_f32(0.0)))
-            }
+            self.prepare_conv_cache(cache, spec, has_bias, key)?;
         }
+        Ok(cache.workspace_bytes)
+    }
+
+    /// Execute a 2-D NCHW convolution with an optional fused channel bias,
+    /// consuming an executor-prepared workspace selected through
+    /// [`CudnnHandle::conv_workspace_bytes`].
+    pub fn conv2d(
+        &self,
+        cache: &mut CudnnConvPlanCache,
+        spec: &CudnnConvSpec,
+        buffers: CudnnConvBuffers,
+        workspace: Option<WorkspaceView>,
+        capturing: bool,
+    ) -> Result<()> {
+        let workspace_bytes =
+            self.conv_workspace_bytes(cache, spec, buffers.bias.is_some(), capturing)?;
+        let algo = cache.algo.ok_or_else(|| {
+            EpError::KernelFailed("cuda_ep: missing cuDNN convolution plan".into())
+        })?;
+        match spec.dtype {
+            CudnnTensorType::F32 => {
+                self.conv2d_t::<f32>(spec, buffers, workspace, workspace_bytes, algo, (1.0, 0.0))
+            }
+            CudnnTensorType::F16 => self.conv2d_t::<f16>(
+                spec,
+                buffers,
+                workspace,
+                workspace_bytes,
+                algo,
+                (f16::from_f32(1.0), f16::from_f32(0.0)),
+            ),
+            CudnnTensorType::Bf16 => self.conv2d_t::<bf16>(
+                spec,
+                buffers,
+                workspace,
+                workspace_bytes,
+                algo,
+                (bf16::from_f32(1.0), bf16::from_f32(0.0)),
+            ),
+        }
+    }
+
+    fn prepare_conv_cache(
+        &self,
+        cache: &mut CudnnConvPlanCache,
+        spec: &CudnnConvSpec,
+        has_bias: bool,
+        key: CudnnConvKey,
+    ) -> Result<()> {
+        let (algo, workspace_bytes) = match spec.dtype {
+            CudnnTensorType::F32 => self.conv_plan_t::<f32>(spec, has_bias)?,
+            CudnnTensorType::F16 => self.conv_plan_t::<f16>(spec, has_bias)?,
+            CudnnTensorType::Bf16 => self.conv_plan_t::<bf16>(spec, has_bias)?,
+        };
+        cache.key = Some(key);
+        cache.algo = Some(algo);
+        cache.workspace_bytes = workspace_bytes;
+        Ok(())
+    }
+
+    fn conv_plan_t<T: CudnnDataType + Copy>(
+        &self,
+        spec: &CudnnConvSpec,
+        has_bias: bool,
+    ) -> Result<(sys::cudnnConvolutionFwdAlgo_t, usize)> {
+        let x_desc = self
+            .handle
+            .create_4d_tensor_ex::<T>(spec.input_dims, spec.input_strides)
+            .map_err(|e| cudnn_err("creating convolution input descriptor", e))?;
+        let w_desc = self
+            .handle
+            .create_4d_filter::<T>(
+                sys::cudnnTensorFormat_t::CUDNN_TENSOR_NCHW,
+                spec.filter_dims,
+            )
+            .map_err(|e| cudnn_err("creating convolution filter descriptor", e))?;
+        let y_desc = self
+            .handle
+            .create_4d_tensor_ex::<T>(spec.output_dims, spec.output_strides)
+            .map_err(|e| cudnn_err("creating convolution output descriptor", e))?;
+        let mut conv_desc = self
+            .handle
+            .create_conv2d::<f32>(
+                spec.pads,
+                spec.strides,
+                spec.dilations,
+                sys::cudnnConvolutionMode_t::CUDNN_CROSS_CORRELATION,
+            )
+            .map_err(|e| cudnn_err("creating convolution descriptor", e))?;
+        conv_desc
+            .set_group_count(spec.groups)
+            .map_err(|e| cudnn_err("cudnnSetConvolutionGroupCount", e))?;
+        conv_desc
+            .set_math_type(match spec.dtype {
+                CudnnTensorType::F32 => sys::cudnnMathType_t::CUDNN_DEFAULT_MATH,
+                CudnnTensorType::F16 | CudnnTensorType::Bf16 => {
+                    sys::cudnnMathType_t::CUDNN_TENSOR_OP_MATH
+                }
+            })
+            .map_err(|e| cudnn_err("cudnnSetConvolutionMathType", e))?;
+        let op = ConvForward {
+            conv: &conv_desc,
+            x: &x_desc,
+            w: &w_desc,
+            y: &y_desc,
+        };
+        let algo = if has_bias {
+            sys::cudnnConvolutionFwdAlgo_t::CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM
+        } else {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op.pick_algorithm()))
+                .map_err(|_| {
+                    EpError::KernelFailed(
+                        "cuda_ep Conv: cuDNN forward algorithm selection failed or returned no \
+                         usable algorithm"
+                            .into(),
+                    )
+                })?
+                .map_err(|e| cudnn_err("cudnnGetConvolutionForwardAlgorithm_v7", e))?
+        };
+        let workspace_bytes = op
+            .get_workspace_size(algo)
+            .map_err(|e| cudnn_err("cudnnGetConvolutionForwardWorkspaceSize", e))?;
+        Ok((algo, workspace_bytes))
     }
 
     fn conv2d_t<T: CudnnDataType + Copy>(
         &self,
         spec: &CudnnConvSpec,
         buffers: CudnnConvBuffers,
+        workspace: Option<WorkspaceView>,
+        workspace_bytes: usize,
+        algo: sys::cudnnConvolutionFwdAlgo_t,
         scaling: (T, T),
     ) -> Result<()> {
         let x_desc = self
@@ -600,26 +779,9 @@ impl CudnnHandle<'_> {
             w: &w_desc,
             y: &y_desc,
         };
-        let algo = if buffers.bias.is_some() {
-            sys::cudnnConvolutionFwdAlgo_t::CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM
-        } else {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op.pick_algorithm()))
-                .map_err(|_| {
-                    EpError::KernelFailed(
-                        "cuda_ep Conv: cuDNN forward algorithm selection failed or returned no \
-                         usable algorithm"
-                            .into(),
-                    )
-                })?
-                .map_err(|e| cudnn_err("cudnnGetConvolutionForwardAlgorithm_v7", e))?
-        };
-        let workspace_bytes = op
-            .get_workspace_size(algo)
-            .map_err(|e| cudnn_err("cudnnGetConvolutionForwardWorkspaceSize", e))?;
-        let mut workspace = self
-            .stream
-            .alloc_zeros::<u8>(workspace_bytes.max(1))
-            .map_err(|e| driver_err("allocating cuDNN convolution workspace", e))?;
+        let workspace_ptr = governed_workspace_ptr(workspace, workspace_bytes, "Conv")?;
+        let mut workspace = (workspace_bytes != 0)
+            .then(|| RawDevice::<u8>::new(workspace_ptr, workspace_bytes, self.stream.clone()));
         let input = RawDevice::<T>::new(buffers.input, buffers.input_numel, self.stream.clone());
         let filter = RawDevice::<T>::new(buffers.filter, buffers.filter_numel, self.stream.clone());
         let mut output =
@@ -657,7 +819,7 @@ impl CudnnHandle<'_> {
             unsafe {
                 fused.launch(
                     algo,
-                    Some(&mut workspace),
+                    workspace.as_mut(),
                     scaling,
                     &input,
                     &filter,
@@ -673,7 +835,7 @@ impl CudnnHandle<'_> {
             unsafe {
                 op.launch(
                     algo,
-                    Some(&mut workspace),
+                    workspace.as_mut(),
                     scaling,
                     &input,
                     &filter,
@@ -891,16 +1053,23 @@ impl Drop for RawReductionDescriptor {
     }
 }
 
-/// Free a cuDNN reduce workspace previously allocated by [`CudnnReduceCache`].
-///
-/// # Safety
-/// `ptr` must be a live device allocation from `cudarc::driver::result::malloc_sync`
-/// (as produced by [`CudnnHandle::repopulate_reduce_cache`]) that has not been
-/// freed, and no in-flight launch may still reference it.
-unsafe fn free_reduce_workspace(ptr: CUdeviceptr) -> Result<()> {
-    // SAFETY: the caller upholds the single-free / no-live-use contract.
-    unsafe { cudarc::driver::result::free_sync(ptr) }
-        .map_err(|e| driver_err("freeing cuDNN reduce workspace", e))
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CudnnConvKey {
+    spec: CudnnConvSpec,
+    has_bias: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct CudnnConvPlanCache {
+    key: Option<CudnnConvKey>,
+    algo: Option<sys::cudnnConvolutionFwdAlgo_t>,
+    workspace_bytes: usize,
+}
+
+impl CudnnConvPlanCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 /// Signature identifying a cached cuDNN reduce: the op plus the input and output
@@ -913,54 +1082,40 @@ struct CudnnReduceKey {
     output: TensorDescriptorSpec,
 }
 
-/// Per-reduce-kernel cache of cuDNN descriptors and a device workspace, reused
-/// across calls with a stable signature so a fixed-shape decode reduce needs no
-/// per-call device allocation or workspace-size query. This is what lets the
-/// float reduce record into a captured CUDA graph (see
-/// [`CudnnHandle::reduce_cached`]). One instance is owned per `ReduceKernel` and
-/// serialized behind that kernel's mutex.
+/// Per-reduce-kernel cache of cuDNN descriptors and the exact workspace bytes
+/// for the warmed signature. The executor owns the actual device workspace.
+/// One instance is owned per `ReduceKernel` and serialized behind that kernel's
+/// mutex.
 #[derive(Debug)]
 pub struct CudnnReduceCache {
-    stream: Arc<CudaStream>,
     key: Option<CudnnReduceKey>,
     input_desc: Option<RawTensorDescriptor>,
     output_desc: Option<RawTensorDescriptor>,
     reduce_desc: Option<RawReductionDescriptor>,
-    workspace: CUdeviceptr,
     workspace_bytes: usize,
 }
 
-// SAFETY: cuDNN descriptors and the raw workspace pointer are not safe for
-// concurrent use, but every access is serialized behind the owning kernel's
-// mutex and runs on the thread bound to the owning CUDA context (bound by
-// `with_handle` for launches and by `Drop` before freeing).
+// SAFETY: cuDNN descriptors are not safe for concurrent use, but every access
+// is serialized behind the owning kernel's mutex and runs on the thread bound
+// to the owning CUDA context.
 unsafe impl Send for CudnnReduceCache {}
 
 impl CudnnReduceCache {
-    /// Create an empty cache bound to the EP's compute stream.
-    pub fn new(stream: Arc<CudaStream>) -> Self {
+    /// Create an empty cache.
+    pub fn new() -> Self {
         Self {
-            stream,
             key: None,
             input_desc: None,
             output_desc: None,
             reduce_desc: None,
-            workspace: 0,
             workspace_bytes: 0,
         }
     }
 }
 
-impl Drop for CudnnReduceCache {
-    fn drop(&mut self) {
-        if self.workspace != 0 {
-            let _ = self.stream.context().bind_to_thread();
-            let _ = self.stream.synchronize();
-            // SAFETY: the cache exclusively owns this pointer; the sync above
-            // drained every launch that referenced it, and it is freed once.
-            let _ = unsafe { free_reduce_workspace(self.workspace) };
-            self.workspace = 0;
-        }
+impl Default for CudnnReduceCache {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -23,6 +23,7 @@ members = [
     "crates/onnx-runtime-memory",
     "crates/onnx-runtime-virtual-memory",
     "crates/onnx-runtime-cuda-memory",
+    "crates/onnx-runtime-memory-api",
     "crates/onnx-runtime-memory-governor",
     "crates/onnx-runtime-cpuinfo",
     "crates/onnx-runtime-loader",
@@ -72,6 +73,11 @@ members = [
     "crates/onnx-runtime-ep-nxrt-host",
     "crates/onnx-runtime-ep-nxrt-testplugin",
 
+    # ── Dynamic memory-plugin ABI (nxmem — issue #1186 phase 6) ──
+    "crates/onnx-runtime-memory-abi",
+    "crates/onnx-runtime-memory-host",
+    "crates/onnx-runtime-memory-testplugin",
+
     # ── Vendored ONNX Runtime MLAS bindings ──
     # Registered as a member so `cargo build -p mlas-sys` resolves. Nothing
     # reaches it by default: only `--features onnx-runtime-ep-cpu/mlas` pulls it
@@ -87,6 +93,7 @@ default-members = [
     "crates/onnx-genai-preprocess",
     "crates/onnx-genai-metadata",
     "crates/onnx-genai-genai-config",
+    "crates/onnx-genai-comfyui-config",
     "crates/onnx-genai-runtime-config",
     "crates/onnx-genai-kv",
     "crates/onnx-genai-scheduler",
@@ -101,7 +108,10 @@ default-members = [
     "crates/onnx-runtime-memory",
     "crates/onnx-runtime-virtual-memory",
     "crates/onnx-runtime-cuda-memory",
+    "crates/onnx-runtime-memory-api",
     "crates/onnx-runtime-memory-governor",
+    "crates/onnx-runtime-memory-abi",
+    "crates/onnx-runtime-memory-host",
     "crates/onnx-runtime-cpuinfo",
     "crates/onnx-runtime-loader",
     "crates/onnx-model-package",
@@ -164,6 +174,22 @@ unsafe_op_in_unsafe_fn = "warn"
 [workspace.lints.clippy]
 # Widely-satisfied hygiene lints only.
 uninlined_format_args = "warn"
+# rustc/clippy 1.98.0 (2026-08-18) added `chunks_exact_to_as_chunks`, a warn-by-default
+# lint that fires at 201 call sites across 12 crates here and so turns every
+# `-D warnings` gate red the moment a runner picks up the new stable. This repo pins no
+# toolchain, so that is not opt-in.
+#
+# It is also not uniformly auto-fixable: where the chunk size is an associated const of
+# a type parameter (`onnx-runtime-ir::read_vec_le` uses `T::BYTE_SIZE`), the suggested
+# `as_chunks::<T::BYTE_SIZE>()` fails to compile — "generic parameters may not be used
+# in const operations". Verified directly against rustc 1.98.0.
+#
+# Allowed centrally so a toolchain bump cannot gate unrelated work. Migrating the sites
+# that do benefit (`as_chunks` yields `&[T; N]`, dropping fallible `try_into` and helping
+# codegen) is worth doing per-crate by each owner, not as one 201-site emergency rewrite:
+# tracked in #1606, which also owns deleting this line. #1605 covers pinning the toolchain
+# so the next new stable lint is not an outage.
+chunks_exact_to_as_chunks = "allow"
 
 [workspace.dependencies]
 # Internal crates
@@ -185,6 +211,7 @@ onnx-runtime-ir = { path = "crates/onnx-runtime-ir", version = "=0.1.0-dev.5" }
 onnx-runtime-memory = { path = "crates/onnx-runtime-memory", version = "=0.1.0-dev.5" }
 onnx-runtime-virtual-memory = { path = "crates/onnx-runtime-virtual-memory", version = "=0.1.0-dev.5" }
 onnx-runtime-cuda-memory = { path = "crates/onnx-runtime-cuda-memory", version = "=0.1.0-dev.5" }
+onnx-runtime-memory-api = { path = "crates/onnx-runtime-memory-api", version = "=0.1.0-dev.5" }
 onnx-runtime-memory-governor = { path = "crates/onnx-runtime-memory-governor", version = "=0.1.0-dev.5" }
 onnx-runtime-cpuinfo = { path = "crates/onnx-runtime-cpuinfo", version = "=0.1.0-dev.5" }
 onnx-runtime-loader = { path = "crates/onnx-runtime-loader", version = "=0.1.0-dev.5" }
@@ -216,6 +243,11 @@ onnx-runtime-ep-nxrt-abi = { path = "crates/onnx-runtime-ep-nxrt-abi", version =
 onnx-runtime-ep-nxrt-host = { path = "crates/onnx-runtime-ep-nxrt-host", version = "=0.1.0-dev.5" }
 onnx-runtime-ep-nxrt-testplugin = { path = "crates/onnx-runtime-ep-nxrt-testplugin", version = "=0.1.0-dev.5" }
 
+# Dynamic memory-plugin ABI (nxmem)
+onnx-runtime-memory-abi = { path = "crates/onnx-runtime-memory-abi", version = "=0.1.0-dev.5" }
+onnx-runtime-memory-host = { path = "crates/onnx-runtime-memory-host", version = "=0.1.0-dev.5" }
+onnx-runtime-memory-testplugin = { path = "crates/onnx-runtime-memory-testplugin" }
+
 # Test-only helper crate (publish = false, no version pin needed).
 onnx-runtime-ort-testkit = { path = "crates/onnx-runtime-ort-testkit" }
 
@@ -232,6 +264,7 @@ async-trait = "0.1"
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
 serde_yaml = "0.9"
 schemars = "1.2"
 tracing = "0.1"

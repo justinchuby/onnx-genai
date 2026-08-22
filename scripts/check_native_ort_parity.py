@@ -4,7 +4,7 @@
 Build first:
   source .cudaenv.sh
   cargo build --release -p onnx-genai-bench \
-    --features bench-native,cuda --bin profile_native
+    --features native-cuda --bin profile_native
 
 Then run:
   python3 scripts/check_native_ort_parity.py

@@ -258,7 +258,12 @@ impl Kernel for TransposeKernel {
         true
     }
 
-    fn view_outputs(&self, inputs: &[TensorView], num_outputs: usize) -> Option<Vec<ViewOutput>> {
+    fn view_outputs(
+        &self,
+        inputs: &[TensorView],
+        _output_shapes: &[Vec<usize>],
+        num_outputs: usize,
+    ) -> Option<Vec<ViewOutput>> {
         if num_outputs != 1 || inputs.len() != 1 || inputs[0].dtype.byte_size() == 0 {
             return None;
         }
@@ -649,7 +654,7 @@ mod tests {
         let view = TransposeKernel {
             perm: Some(vec![1, 0]),
         }
-        .view_outputs(&[a.view()], 1)
+        .view_outputs(&[a.view()], &[vec![2, 3]], 1)
         .unwrap()
         .pop()
         .unwrap();

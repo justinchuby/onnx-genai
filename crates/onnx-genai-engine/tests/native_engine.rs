@@ -7,7 +7,7 @@ use onnx_genai_engine::{
 };
 use onnx_genai_ort::{SessionOptions, ep_selection};
 use std::path::Path;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
@@ -141,7 +141,7 @@ fn native_sub4_cpu_generates_from_multi_token_prompt() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "native-cuda"))]
 #[test]
 fn native_backend_rejects_cuda_without_cuda_feature() {
     let fixture =
@@ -157,15 +157,22 @@ fn native_backend_rejects_cuda_without_cuda_feature() {
     .err()
     .expect("native CUDA must require the CUDA feature");
     let message = format!("{error:#}");
+    // Assert the facts a reader needs, not the sentence: the message must name
+    // the feature that actually gates this path and give a command that works.
+    // The previous assertion pinned a literal sentence naming a `'cuda'` feature
+    // that no longer exists, so it kept passing after the rename while the
+    // message it guarded had become unactionable.
     assert!(
-        message.contains(
-            "requires building onnx-genai-engine with both the 'native-backend' and 'cuda' features"
-        ),
-        "{message}"
+        message.contains("native-cuda"),
+        "message must name the real gating feature: {message}"
+    );
+    assert!(
+        message.contains("--features native-cuda"),
+        "message must give a usable rebuild command: {message}"
     );
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn native_cuda_engine(model_dir: &Path) -> anyhow::Result<Engine> {
     Engine::from_dir(
         model_dir,
@@ -177,7 +184,7 @@ fn native_cuda_engine(model_dir: &Path) -> anyhow::Result<Engine> {
     )
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn greedy_request(prompt: GeneratePrompt, max_new_tokens: usize) -> GenerateRequest {
     let mut request = GenerateRequest::new(prompt);
     request.options.max_new_tokens = max_new_tokens;
@@ -187,7 +194,7 @@ fn greedy_request(prompt: GeneratePrompt, max_new_tokens: usize) -> GenerateRequ
     request
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 fn native_sub4_cuda_fallback_generates_coherent_decode() -> anyhow::Result<()> {
     if let Err(error) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) {
@@ -218,7 +225,7 @@ fn native_sub4_cuda_fallback_generates_coherent_decode() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 fn engine_native_cuda_matches_cpu_tokens() -> anyhow::Result<()> {
     if let Err(error) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) {
@@ -263,7 +270,7 @@ fn engine_native_cuda_matches_cpu_tokens() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 fn qwen15b_native_decode_locks_accurate_near_tie_token() -> anyhow::Result<()> {
     let Some(model_dir) = std::env::var_os("ONNX_GENAI_QWEN15B_CUDA_DIR").map(PathBuf::from) else {
@@ -301,7 +308,7 @@ fn qwen15b_native_decode_locks_accurate_near_tie_token() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 fn engine_native_scalar_gqa_runs_without_metadata_permission() -> anyhow::Result<()> {
     if let Err(error) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) {

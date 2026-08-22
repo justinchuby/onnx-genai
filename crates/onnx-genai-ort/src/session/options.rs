@@ -2,6 +2,8 @@ use std::ffi::CStr;
 
 use onnx_genai_runtime_config::{EpSelection, runtime_config};
 
+#[cfg(feature = "cuda")]
+use crate::managed_cuda_allocator::ManagedCudaAllocatorConfig;
 use crate::{OrtError, Result};
 
 use super::CudaAttentionMode;
@@ -59,6 +61,10 @@ pub struct SessionOptions {
     /// Explicit opt-in to retry a failed non-CPU session on CPU. Off by default
     /// so a requested EP cannot silently change semantics.
     pub allow_cpu_fallback: bool,
+    /// Optional environment-registered CUDA allocator bridge backed by a shared
+    /// process memory manager and authority.
+    #[cfg(feature = "cuda")]
+    pub(crate) managed_cuda_allocator: Option<ManagedCudaAllocatorConfig>,
 }
 
 /// ORT session config key that makes a session allocate through allocators
@@ -82,6 +88,20 @@ impl SessionOptions {
             self.session_config_entries
                 .push((USE_ENV_ALLOCATORS.to_string(), "1".to_string()));
         }
+        self
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn use_managed_cuda_allocator(&mut self, config: ManagedCudaAllocatorConfig) -> &mut Self {
+        self.use_env_allocators();
+        self.managed_cuda_allocator = Some(config);
+        self
+    }
+
+    #[cfg(feature = "cuda")]
+    #[must_use]
+    pub fn with_managed_cuda_allocator(mut self, config: ManagedCudaAllocatorConfig) -> Self {
+        self.use_managed_cuda_allocator(config);
         self
     }
 }
@@ -151,6 +171,8 @@ impl SessionOptions {
             session_config_entries: runtime_config().session_config_entries.clone(),
             auto_selected: false,
             allow_cpu_fallback: runtime_config().ep_fallback,
+            #[cfg(feature = "cuda")]
+            managed_cuda_allocator: None,
         }
     }
 
@@ -193,6 +215,10 @@ impl SessionOptions {
             .collect();
         options.webgpu_disable_validation = false;
         options.graph_capture = false;
+        #[cfg(feature = "cuda")]
+        if !options.selects_cuda() {
+            options.managed_cuda_allocator = None;
+        }
         options.apply_provider_defaults();
         options
     }
@@ -240,6 +266,29 @@ impl SessionOptions {
         self.execution_providers
             .iter()
             .any(|ep| ep.caps.is_nvidia() && ep.caps.is_gpu())
+    }
+
+    pub fn cuda_device_id(&self) -> Option<i32> {
+        self.execution_providers.iter().find_map(|ep| {
+            (ep.caps.is_nvidia() && ep.caps.is_gpu())
+                .then(|| ep.caps.device_id())
+                .flatten()
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn managed_cuda_allocator(&self) -> Option<&ManagedCudaAllocatorConfig> {
+        self.managed_cuda_allocator.as_ref()
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn forces_cuda_unified_stream(&self) -> bool {
+        self.managed_cuda_allocator.is_some()
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    pub(crate) fn forces_cuda_unified_stream(&self) -> bool {
+        false
     }
 
     /// Apply provider performance defaults. WebGPU validation is disabled (pure

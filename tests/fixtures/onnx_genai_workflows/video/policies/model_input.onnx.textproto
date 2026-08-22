@@ -1,0 +1,152 @@
+ir_version: 11
+producer_name: "mobius"
+graph {
+  node {
+    input: "sample"
+    output: "model_input"
+    name: "Identity_node_0"
+    op_type: "Identity"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "schedule"
+    input: "step"
+    output: "v_Gather_1"
+    name: "Gather_node_1"
+    op_type: "Gather"
+    attribute {
+      name: "axis"
+      i: 0
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  name: "identity_model_input"
+  input {
+    name: "sample"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "frames"
+          }
+          dim {
+            dim_param: "channels"
+          }
+          dim {
+            dim_param: "height"
+          }
+          dim {
+            dim_param: "width"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "step"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "schedule"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "schedule_length"
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "model_input"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "frames"
+          }
+          dim {
+            dim_param: "channels"
+          }
+          dim {
+            dim_param: "height"
+          }
+          dim {
+            dim_param: "width"
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Gather_1"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  metadata_props {
+    key: "mobius.generation.policy_contract"
+    value: "{}"
+  }
+  metadata_props {
+    key: "mobius.generation.policy_contract_id"
+    value: "mobius.policy.auxiliary@1"
+  }
+  metadata_props {
+    key: "mobius.generation.policy_effects"
+    value: "[]"
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}

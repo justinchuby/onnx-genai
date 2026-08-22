@@ -590,6 +590,31 @@ fn load_textproto_fixture_matches_binary_io() {
     }
 }
 
+#[test]
+fn load_textproto_fixture_resolves_external_weights() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../onnx-runtime-ep-cpu/tests/fixtures/qmoe_weight_offload");
+    let path = root.join("model.onnx.textproto");
+    let (graph, store) = onnx_runtime_loader::load_model_with_weights(&path)
+        .unwrap_or_else(|e| panic!("failed to load external-data textproto fixture: {e}"));
+
+    let external = graph
+        .initializers
+        .values()
+        .filter(|weight| matches!(weight, onnx_runtime_ir::WeightRef::External { .. }))
+        .collect::<Vec<_>>();
+    assert!(
+        !external.is_empty(),
+        "fixture must preserve external weights"
+    );
+    for weight in external {
+        assert!(
+            store.bytes(weight).is_some(),
+            "external textproto weight bytes must resolve beside the graph"
+        );
+    }
+}
+
 // ── load_*_with_weights: bytes survive after load, work for inline + external ──
 /// Build a tiny model with inline weights and verify that the Arc<WeightStore>
 /// keeps the bytes accessible after `load_model_bytes_with_weights` returns.

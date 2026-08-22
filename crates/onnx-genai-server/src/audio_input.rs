@@ -1,7 +1,7 @@
 use anyhow::Context;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use onnx_genai_preprocess::audio::{
-    LogMelExtractor, WHISPER_N_FRAMES, WHISPER_SAMPLE_RATE, decode_wav_pcm16,
+    LogMelExtractor, WHISPER_N_FRAMES, WHISPER_SAMPLE_RATE, decode_wav_pcm16, encode_wav_pcm16,
 };
 
 use crate::types::InputAudio;
@@ -12,6 +12,11 @@ pub struct AudioInputSpec {
     pub n_mels: usize,
     pub n_frames: usize,
     pub max_tokens: Option<usize>,
+    /// Whether the endpoint takes the encoded container rather than features.
+    ///
+    /// A package that declares `preprocessing.audio` owns feature extraction
+    /// itself, so the server must hand it the bytes and stay out of the way.
+    pub encoded: bool,
 }
 
 impl AudioInputSpec {
@@ -46,7 +51,28 @@ impl AudioInputSpec {
             n_mels,
             n_frames,
             max_tokens,
+            encoded: false,
         })
+    }
+
+    /// Builds a spec for an endpoint that consumes the encoded audio container.
+    ///
+    /// The declared preprocessing program is what turns those bytes into the
+    /// encoder's feature tensor, so the mel geometry here is only used to bound
+    /// the transcribable window reported to callers.
+    pub fn from_encoded_input(
+        endpoint: String,
+        n_mels: usize,
+        n_frames: usize,
+        max_tokens: Option<usize>,
+    ) -> Self {
+        Self {
+            endpoint,
+            n_mels,
+            n_frames,
+            max_tokens,
+            encoded: true,
+        }
     }
 }
 
@@ -119,4 +145,12 @@ fn resize_feature_frames(
             .copy_from_slice(&source[source_start..source_start + copy_frames]);
     }
     output
+}
+
+/// Re-encodes `[-1, 1]` mono samples into a PCM16 WAV container.
+///
+/// A package whose preprocessing program starts at `decode` accepts a container,
+/// not bare samples, so a stream segment has to be wrapped before it is bound.
+pub fn encode_samples_wav(samples: &[f32], sample_rate: u32) -> anyhow::Result<Vec<u8>> {
+    Ok(encode_wav_pcm16(samples, sample_rate, 1)?)
 }

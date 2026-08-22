@@ -41,7 +41,7 @@
 //! CUDA_VISIBLE_DEVICES=0 cargo test -p onnx-genai-engine --features native-backend,cuda \
 //!   --test deepseek_r1_1_5b_benchprompt_divergence -- --ignored --nocapture
 //! ```
-#![cfg(all(feature = "native-backend", feature = "cuda"))]
+#![cfg(feature = "native-cuda")]
 
 #[path = "common/oracle_lock.rs"]
 mod oracle_lock;

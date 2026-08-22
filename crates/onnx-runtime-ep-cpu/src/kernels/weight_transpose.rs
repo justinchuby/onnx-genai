@@ -140,15 +140,34 @@ pub struct WeightTransposeKey {
     addr: usize,
     k: usize,
     n: usize,
+    /// Distinguishes interpretations that share an element *width*.
+    ///
+    /// The f16 cache stores raw `u16` bit patterns, and `f16` and `bf16` are
+    /// both 16 bits -- so without this the two would collide on `(addr, k, n)`
+    /// alone. They do collide in practice: a freed `f16` weight's address is
+    /// readily recycled for a `bf16` one of the same shape, and the hit would
+    /// then reinterpret every weight rather than miss. The address alone was
+    /// only ever sufficient while exactly one dtype used each map.
+    tag: u16,
 }
 
 impl WeightTransposeKey {
     /// Build the key for the transpose of a `[k, n]` matrix based at `ptr`.
+    ///
+    /// Uses tag 0, which is correct for any cache whose element type has a
+    /// single interpretation (the f32 map, and the f16 map's `f16` entries).
     pub fn new<T>(ptr: *const T, k: usize, n: usize) -> Self {
+        Self::tagged(ptr, k, n, 0)
+    }
+
+    /// [`new`](Self::new) for a map whose element type is shared by more than
+    /// one dtype; `tag` names which one.
+    pub fn tagged<T>(ptr: *const T, k: usize, n: usize, tag: u16) -> Self {
         Self {
             addr: ptr as usize,
             k,
             n,
+            tag,
         }
     }
 
@@ -187,9 +206,10 @@ impl<T: Copy + Default + Send + Sync> TransposeCache<T> {
             .cloned()
     }
 
-    /// Drop a single entry by key. Test-only; used to clear a stale entry left
-    /// at a since-recycled address so a peek has a deterministic starting point.
-    #[cfg(test)]
+    /// Drop a single entry by key.
+    ///
+    /// Called when the owner of an entry goes away, so that the entry cannot
+    /// outlive the buffer whose address keys it (#1726).
     pub fn remove(&self, key: &WeightTransposeKey) {
         self.entries
             .lock()
@@ -244,27 +264,65 @@ impl<T: Copy + Default + Send + Sync> TransposeCache<T> {
     /// inserted: they cost nothing to produce and would otherwise let a caller
     /// with a degenerate shape grow the map.
     pub fn get_or_insert_transpose(&self, src: &[T], k: usize, n: usize) -> Option<Arc<Vec<T>>> {
-        let key = WeightTransposeKey::new(src.as_ptr(), k, n);
+        self.get_or_insert_transpose_tagged(src, k, n, 0)
+    }
+
+    /// [`get_or_insert_transpose`](Self::get_or_insert_transpose) for a map
+    /// shared by several dtypes of the same width.
+    pub fn get_or_insert_transpose_tagged(
+        &self,
+        src: &[T],
+        k: usize,
+        n: usize,
+        tag: u16,
+    ) -> Option<Arc<Vec<T>>> {
+        self.get_or_insert_transpose_reporting(src, k, n, tag)
+            .map(|(transposed, _)| transposed)
+    }
+
+    /// [`get_or_insert_transpose_tagged`](Self::get_or_insert_transpose_tagged),
+    /// additionally reporting whether *this* call installed the entry.
+    ///
+    /// The flag is what makes eviction ownership well-defined (#1726). A caller
+    /// that merely shared an entry someone else installed must never evict it:
+    /// the installer may be the model-load prewarm, whose entry is meant to
+    /// outlive every transient consumer. `false` is returned for a hit, for the
+    /// racer that lost the insert, and for a degenerate empty matrix (never
+    /// inserted, so there is nothing to own).
+    pub fn get_or_insert_transpose_reporting(
+        &self,
+        src: &[T],
+        k: usize,
+        n: usize,
+        tag: u16,
+    ) -> Option<(Arc<Vec<T>>, bool)> {
+        let key = WeightTransposeKey::tagged(src.as_ptr(), k, n, tag);
         if key.numel() != Some(src.len()) {
             return None;
         }
         if src.is_empty() {
-            return Some(Arc::new(Vec::new()));
+            return Some((Arc::new(Vec::new()), false));
         }
         if let Some(hit) = self.get(&key) {
-            return Some(hit);
+            return Some((hit, false));
         }
         let transposed = Arc::new(transpose_row_major(src, k, n));
         // A concurrent racer may have inserted an identical entry meanwhile.
-        // Keep whichever landed first so every reader shares one allocation.
-        Some(
-            self.entries
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .entry(key)
-                .or_insert(transposed)
-                .clone(),
-        )
+        // Keep whichever landed first so every reader shares one allocation --
+        // and let only that winner claim ownership of the eviction.
+        match self
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key)
+        {
+            std::collections::hash_map::Entry::Occupied(occupied) => {
+                Some((occupied.get().clone(), false))
+            }
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                Some((vacant.insert(transposed).clone(), true))
+            }
+        }
     }
 }
 
@@ -385,10 +443,70 @@ pub(crate) fn f32_cache_evict(ptr: *const f32, k: usize, n: usize) {
 /// When the cache is declined ([`cache_enabled`] is `false`) the transpose is
 /// computed per call and not retained (#1056).
 pub fn cached_transpose_f16(src: &[u16], k: usize, n: usize) -> Option<Arc<Vec<u16>>> {
+    cached_transpose_half(src, k, n, 0)
+}
+
+/// [`cached_transpose_f16`] for either 16-bit format; `tag` separates the two
+/// interpretations sharing this `u16` map (0 = `f16`, 1 = `bf16`).
+pub fn cached_transpose_half(src: &[u16], k: usize, n: usize, tag: u16) -> Option<Arc<Vec<u16>>> {
+    cached_transpose_half_reporting(src, k, n, tag).map(|(transposed, _)| transposed)
+}
+
+/// [`cached_transpose_half`] reporting whether this call installed the entry,
+/// i.e. whether the caller owns its eviction (#1726).
+///
+/// A declined cache retains nothing, so its `false` is truthful: there is no
+/// global entry to evict.
+pub(crate) fn cached_transpose_half_reporting(
+    src: &[u16],
+    k: usize,
+    n: usize,
+    tag: u16,
+) -> Option<(Arc<Vec<u16>>, bool)> {
     if !cache_enabled() {
-        return transpose_uncached(src, k, n);
+        return transpose_uncached(src, k, n).map(|transposed| (transposed, false));
     }
-    WEIGHT_TRANSPOSE_F16.get_or_insert_transpose(src, k, n)
+    WEIGHT_TRANSPOSE_F16.get_or_insert_transpose_reporting(src, k, n, tag)
+}
+
+/// [`cached_transpose_half_reporting`] for the f32 map.
+pub(crate) fn cached_transpose_f32_reporting(
+    src: &[f32],
+    k: usize,
+    n: usize,
+) -> Option<(Arc<Vec<f32>>, bool)> {
+    if !cache_enabled() {
+        return transpose_uncached(src, k, n).map(|transposed| (transposed, false));
+    }
+    WEIGHT_TRANSPOSE_F32.get_or_insert_transpose_reporting(src, k, n, 0)
+}
+
+/// Drop the f16 entry `key` names, if it is still present.
+///
+/// The caller is the owner that installed it: entries are keyed on the source
+/// buffer's *address*, and nothing in the key proves that the bytes there are
+/// still the ones that were transposed. An entry that outlives its source is a
+/// loaded gun -- the next allocation of the same shape and dtype to land on
+/// that address is served the previous weight's rows, with the right route and
+/// silently foreign numbers (#1726). Evicting at the owner's drop keeps every
+/// entry's lifetime inside its source's.
+pub(crate) fn evict_half(key: &WeightTransposeKey) {
+    WEIGHT_TRANSPOSE_F16.remove(key);
+}
+
+/// [`evict_half`] for the f32 map.
+pub(crate) fn evict_f32(key: &WeightTransposeKey) {
+    WEIGHT_TRANSPOSE_F32.remove(key);
+}
+
+/// Test-only: drop any f16 entry keyed on `(ptr, k, n)`.
+///
+/// The f16 counterpart of [`f32_cache_evict`], and safe for the same reason: a
+/// *live* concurrent allocation can never share `ptr`, so the only entry this
+/// can remove is a stale one left by a freed buffer that nobody is using.
+#[cfg(test)]
+pub(crate) fn f16_cache_evict(ptr: *const u16, k: usize, n: usize) {
+    WEIGHT_TRANSPOSE_F16.remove(&WeightTransposeKey::new(ptr, k, n));
 }
 
 /// Entry counts of the global caches as `(f16, f32)`.
@@ -890,15 +1008,36 @@ mod tests {
     }
 
     /// The process-global entry points reach their own dtype's cache and honour
-    /// the same total key. Assertions are monotone (`>=` against a baseline)
-    /// because other tests in this binary share the global caches.
+    /// the same total key.
+    ///
+    /// Both halves of this test have to survive sharing the global caches with
+    /// every other test in the binary, and they need *different* defences:
+    ///
+    /// * The size assertions are monotone (`>=` against a baseline) because
+    ///   other tests insert concurrently.
+    /// * The **value** assertions need more than that. The cache keys on
+    ///   `(address, K, N)`, and these buffers are short-lived locals, so the
+    ///   allocator can hand us an address a freed buffer of the same shape used
+    ///   earlier — at which point `cached_transpose_f32` answers from a stale
+    ///   entry describing someone else's data and never looks at ours. That is
+    ///   not hypothetical: it turned this test red on `Rust coverage (Windows
+    ///   x86_64)`, returning a uniform `[1.0; 12]` left-hand side. So evict our
+    ///   three keys first, exactly as the `gemm.rs` cache tests do.
+    ///
+    /// Eviction happens *before* the baseline is sampled: evicting after would
+    /// remove up to two entries the baseline had already counted and turn the
+    /// `>= f32_before + 2` assertion into a false failure.
     #[test]
     fn global_caches_are_per_dtype_and_keyed_by_shape() {
-        let (f16_before, f32_before) = cache_sizes();
-
         let mut f32_buf = vec![0.0f32; 12];
         fill(&mut f32_buf, 1.0);
         let f16_buf: Vec<u16> = (0..12u16).map(|i| 0x3C00 + i).collect();
+
+        f32_cache_evict(f32_buf.as_ptr(), 3, 4);
+        f32_cache_evict(f32_buf.as_ptr(), 4, 3);
+        f16_cache_evict(f16_buf.as_ptr(), 3, 4);
+
+        let (f16_before, f32_before) = cache_sizes();
 
         let a = cached_transpose_f32(&f32_buf, 3, 4).expect("f32 [3,4]");
         let b = cached_transpose_f32(&f32_buf, 4, 3).expect("f32 [4,3]");
@@ -919,5 +1058,43 @@ mod tests {
             "both f32 shapes must be cached"
         );
         assert!(f16_after > f16_before, "the f16 entry must be cached");
+    }
+
+    /// `f16` and `bf16` share the `u16` cache, so the key must separate them.
+    ///
+    /// Found the hard way: routing `bf16` decode through this cache made a
+    /// `bf16` weight hit an `f16` entry left by a freed buffer at the same
+    /// address, and every weight was silently reinterpreted -- the failure
+    /// surfaced as `-0.0000216 != -0.8984375`, and only in company, because it
+    /// needs the allocator to recycle the address. Asserting on the *key*
+    /// instead of hoping for that reuse makes the guard deterministic.
+    #[test]
+    fn the_two_16_bit_formats_do_not_share_a_cache_entry() {
+        let k = 4usize;
+        let n = 3usize;
+        // Same bits, two interpretations: as f16 these are ~1.0, as bf16 they
+        // are ~2.0, so a crossed hit is unmistakable in the values too.
+        let src: Vec<u16> = (0..k * n).map(|i| 0x3C00 + i as u16).collect();
+
+        let as_f16 = cached_transpose_half(&src, k, n, 0).expect("f16 transpose");
+        let as_bf16 = cached_transpose_half(&src, k, n, 1).expect("bf16 transpose");
+
+        assert_eq!(
+            WeightTransposeKey::tagged(src.as_ptr(), k, n, 0).tag,
+            0,
+            "the f16 tag must be the untagged default so existing entries keep their key"
+        );
+        assert_ne!(
+            WeightTransposeKey::tagged(src.as_ptr(), k, n, 0),
+            WeightTransposeKey::tagged(src.as_ptr(), k, n, 1),
+            "one address and shape must not key both formats"
+        );
+        // Both are the same permutation of the same bits -- the point is that
+        // each format got its *own* entry, not that the contents differ.
+        assert_eq!(as_f16.as_slice(), as_bf16.as_slice());
+        assert!(
+            !Arc::ptr_eq(&as_f16, &as_bf16),
+            "a bf16 lookup must not be served the f16 allocation"
+        );
     }
 }

@@ -43,6 +43,38 @@ impl DecodeBackend for NativeDecodeSession {
 }
 
 impl NativeDecodeSession {
+    /// Greedy sibling of [`Self::decode_with_step_inputs`] for a decoder whose
+    /// graph declares per-step ports (an embedding input, and any other declared
+    /// `Routed` port) that [`DecodeBackend::decode_argmax`] cannot carry.
+    ///
+    /// Returns `Ok(None)` whenever the step is not the captured single-token
+    /// shape the device-argmax epilogue applies to — a multi-token prefill, a
+    /// decoder whose step inputs are not capture-eligible, a non-CUDA session.
+    /// The caller then falls back to logits, so this is a fast path and never a
+    /// behaviour switch.
+    pub(crate) fn decode_argmax_with_step_inputs(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+        step_inputs: &[(String, Tensor)],
+    ) -> anyhow::Result<Option<TokenId>> {
+        if token_ids.len() != 1 || !self.captured_step_input_greedy_supported() {
+            return Ok(None);
+        }
+        if past_len != self.current_len {
+            bail!(
+                "native decode past length mismatch: caller supplied {past_len}, adapter holds {}",
+                self.current_len
+            );
+        }
+        let total_len = past_len
+            .checked_add(1)
+            .context("native decode context length overflow")?;
+        self.maybe_enable_decode_inline(token_ids);
+        self.decode_cuda_captured_step_inputs_greedy(token_ids, past_len, total_len, step_inputs)
+            .map(Some)
+    }
+
     /// One prefill or decode forward over `token_ids`, with no chunking.
     fn decode_argmax_forward(
         &mut self,
@@ -52,6 +84,26 @@ impl NativeDecodeSession {
         self.maybe_enable_decode_inline(token_ids);
         if self.cuda.is_some() {
             if token_ids.len() == 1 {
+                // A decoder that declares per-step `inputs_embeds`/routed ports
+                // cannot take the token-id-only greedy step below: that step
+                // writes only the token id, so those persistent bindings would
+                // replay whatever bytes they last held. Offer the captured
+                // step-input epilogue first; it returns `None` whenever the step
+                // is not that shape, and otherwise fails naming the port that
+                // was not supplied instead of decoding without it.
+                if let Some(token) =
+                    self.decode_argmax_with_step_inputs(token_ids, past_len, &[])?
+                {
+                    return Ok(Some(token));
+                }
+                if self.has_eager_step_inputs() {
+                    bail!(
+                        "native CUDA decoder declares per-step inputs_embeds/routed ports, which \
+                         the greedy argmax fast path cannot supply; drive this decoder through \
+                         the workflow bindings that route those ports, or read logits and sample \
+                         on the host"
+                    );
+                }
                 return self.decode_cuda_greedy(token_ids[0], past_len).map(Some);
             }
             let token = self
@@ -105,14 +157,39 @@ impl NativeDecodeSession {
         if let Some(state) = &mut self.cuda {
             // Option (b) default: invalidate the captured decode graph before the
             // KV roll-back (the eager verify path captures nothing, and the plain
-            // M=1 path re-warms cleanly). Option (c) (dormant until WP4) retains
-            // the single fixed-topology M=maxK graph and rewinds contents only —
-            // `state.rewind` mutates just the mask tail + KV logical length, the
-            // same data-driven mutation the captured graph already tolerates.
-            if !state.retain_graph_on_rewind {
+            // M=1 path re-warms cleanly). Two dormant seams (both OFF by default)
+            // would retain the graph across a contents-only rewind instead — the
+            // rewind only zeros the mask tail + truncates the KV logical length,
+            // leaving every binding's physical_shape/device_ptr fixed, so the
+            // captured M=1 graph's replay signature stays valid: `retain_graph_on_rewind`
+            // (option (c) padded verify capture) and `retain_decode_graph_across_spec`
+            // (spec-decode retention). Retention on rewind alone is capture-safe,
+            // but NOT sufficient for a speedup: the eager M>1 verify forward tears
+            // the graph down every step regardless, and retaining across BOTH
+            // sites is capture-unsafe until the verify workspace is pinned (see
+            // the verify site + decision note). A full reset to `target_len == 0`
+            // (between generations) always invalidates so a stale graph never
+            // leaks into the next generation.
+            let retain = state.retain_graph_on_rewind
+                || (state.retain_decode_graph_across_spec && target_len != 0);
+            if !retain {
                 state.invalidate_graph(&mut self.session)?;
             }
             state.rewind(target_len)?;
+            if target_len == 0 {
+                // Generation-reset boundary: `rewind(0)` just re-zeroed the
+                // recurrent/conv rolling caches, so a verify graph captured in the
+                // previous generation would replay against reset state (and, on a
+                // reused session across prompts, potentially stale bindings). Reset
+                // the verify-dedicated sibling's captured graph and re-arm its
+                // phase so the next generation re-warms + recaptures cleanly. This
+                // is the ONLY place the verify sibling is reset — within a
+                // generation it survives the per-step Primary teardowns because it
+                // binds only fixed-capacity, non-moving external buffers plus its
+                // own private interior arena (see `invalidate_graph`).
+                self.session.reset_verify_sibling_device_graph()?;
+                state.reset_verify_graph_phase();
+            }
             self.current_len = target_len;
             return Ok(());
         }
@@ -142,8 +219,11 @@ impl NativeDecodeSession {
             .collect();
         for (name, tensor) in &mut self.past {
             // Recurrent states are destructive rolling caches with no per-step
-            // history to slice; leave them intact (greedy decode never rewinds,
-            // and speculative rewind of a recurrent state is unsupported).
+            // history to slice; leave them intact here. Greedy decode never
+            // rewinds, and a speculative rewind commits them out-of-band via
+            // `snapshot_recurrent_state` + `commit_recurrent_state_to_accepted`
+            // (snapshot the pre-draft state, then re-advance by the accepted
+            // tokens) rather than prefix-slicing them.
             if recurrent_names.contains(name) {
                 continue;
             }

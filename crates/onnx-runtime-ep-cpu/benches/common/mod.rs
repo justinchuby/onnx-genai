@@ -23,6 +23,15 @@ impl FloatDType {
         }
     }
 
+    /// Bytes per element, so a bandwidth-bound bench can report the traffic
+    /// its route actually issues rather than a flop count.
+    pub fn size_of(self) -> usize {
+        match self {
+            Self::F32 => 4,
+            Self::F16 | Self::Bf16 => 2,
+        }
+    }
+
     fn data_type(self) -> DataType {
         match self {
             Self::F32 => DataType::Float32,

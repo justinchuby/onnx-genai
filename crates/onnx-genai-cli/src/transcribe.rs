@@ -568,7 +568,9 @@ impl<R: BufRead> PcmStreamReader<R> {
             .chunks_exact(frame_bytes)
             .map(|frame| {
                 let sum: f32 = frame
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|pair| f32::from(i16::from_le_bytes([pair[0], pair[1]])))
                     .sum();
                 sum / f32::from(self.channels) / 32768.0

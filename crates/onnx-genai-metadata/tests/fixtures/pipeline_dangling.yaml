@@ -1,7 +1,7 @@
 pipeline:
   models:
     decoder:
-      filename: decoder.onnx
+      filename: decoder.onnx.textproto
       type: decoder
   dataflow:
     - from: encoder.hidden

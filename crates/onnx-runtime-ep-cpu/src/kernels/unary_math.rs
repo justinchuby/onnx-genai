@@ -271,8 +271,10 @@ mod tests {
         assert_eq!(
             i32_output
                 .bytes
-                .chunks_exact(4)
-                .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| i32::from_le_bytes(*bytes))
                 .collect::<Vec<_>>(),
             vec![i32::MIN, 7, -3]
         );
@@ -283,8 +285,10 @@ mod tests {
         assert_eq!(
             i64_output
                 .bytes
-                .chunks_exact(8)
-                .map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|bytes| i64::from_le_bytes(*bytes))
                 .collect::<Vec<_>>(),
             vec![i64::MIN, 7, -3]
         );

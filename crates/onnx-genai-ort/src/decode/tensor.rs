@@ -138,8 +138,12 @@ pub(super) fn zeroed_value(shape: &[i64], dtype: DataType) -> Result<Value> {
         DataType::Float32 => Value::from_vec_f32(vec![0.0; numel], shape),
         DataType::Float16 => Value::from_vec_f16_bits(vec![0; numel], shape),
         DataType::BFloat16 => Value::from_vec_bf16_bits(vec![0; numel], shape),
-        dtype => Err(OrtError::InvalidArgument(format!(
-            "cannot allocate static-cache tensor with dtype {dtype:?}"
-        ))),
+        // Every other dtype gets zeroed bytes. Zero is representable in every
+        // ONNX tensor element type, including FP8, so allocating an empty cache
+        // needs no per-dtype host representation. Whether a kernel can then
+        // compute on those bytes is an execution-provider question, answered
+        // when the session binds them; refusing to allocate here would report a
+        // missing kernel as a missing allocator.
+        dtype => Value::from_raw_bytes(vec![0u8; numel * dtype.size_of()], shape, dtype),
     }
 }

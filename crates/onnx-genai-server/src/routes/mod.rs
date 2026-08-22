@@ -11,9 +11,6 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response, Sse, sse::Event},
 };
-use base64::Engine as _;
-use onnx_genai::text_to_audio::TextToAudioRequest;
-use onnx_genai::text_to_image::TextToImageRequest;
 use onnx_genai::{
     FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult, SessionId,
     StopSequence,
@@ -48,15 +45,14 @@ use crate::{
         ChatLogprobs, ChatMessage, ChatMessageContent, ChatMessageToolCall,
         ChatMessageToolCallFunction, ChatTokenLogprob, ChatTool, ChatTopLogprob, CompletionChoice,
         CompletionLogprobs, CompletionRequest, CompletionResponse, EmbeddingData, EmbeddingInput,
-        EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, ImageData,
-        ImageGenerationRequest, ImageGenerationResponse, ImageResponseFormat, InputAudio,
-        ReasoningEffort, ResponseFormat, SpeechRequest, SpeechResponseFormat, StopInput,
-        ToolChoice, ToolChoiceMode, Usage,
+        EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, InputAudio,
+        ReasoningEffort, ResponseFormat, StopInput, ToolChoice, ToolChoiceMode, Usage,
     },
 };
 
 mod admin;
 mod completions;
+mod images;
 mod multimodal;
 mod sessions;
 
@@ -67,6 +63,8 @@ pub(crate) use admin::{
     admin_warmup_model, debug_config, debug_kv, debug_profile, debug_sessions, debug_trace,
     debug_trace_perfetto, health, models, resources, status,
 };
+#[cfg(test)]
+pub(crate) use completions::prepare_completion;
 pub use completions::{
     ParsedAssistantOutput, build_generate_request, build_prompt, parse_assistant_output,
     parse_tool_calls,
@@ -74,9 +72,10 @@ pub use completions::{
 pub(crate) use completions::{
     chat_completions, collect_generation_result, completions, embeddings,
 };
-#[cfg(test)]
-pub(crate) use completions::{image_placeholder_text, prepare_completion};
-pub(crate) use multimodal::{audio_speech, audio_transcriptions, image_generations};
+pub(crate) use images::{
+    a1111_img2img, a1111_models, a1111_options, a1111_samplers, a1111_txt2img, openai_images,
+};
+pub(crate) use multimodal::audio_transcriptions;
 pub(crate) use sessions::{create_session, delete_session};
 
 const SESSION_ID_HEADER: &str = "x-session-id";
@@ -454,6 +453,15 @@ impl ApiError {
             retry_after_secs: Some(OVERLOAD_RETRY_AFTER_SECS),
         }
     }
+
+    fn payload_too_large(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: message.into(),
+            kind: "invalid_request_error",
+            retry_after_secs: None,
+        }
+    }
 }
 
 fn generation_failure(error: DriverFailure) -> ApiError {
@@ -490,6 +498,9 @@ where
     async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
         match Json::<T>::from_request(request, state).await {
             Ok(Json(value)) => Ok(Self(value)),
+            Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+                Err(ApiError::payload_too_large(rejection.body_text()))
+            }
             Err(rejection) => Err(ApiError::bad_request(describe_json_rejection(&rejection))),
         }
     }
@@ -663,6 +674,7 @@ mod overload_tests {
             available: 0,
             role: onnx_runtime_memory_governor::MemoryRole::KvCache,
             detail: "mapped holder could not reach its tentative reclaim target".into(),
+            source: None,
         }
         .into();
         let response = generation_failure(DriverFailure::from_engine_error(&error)).into_response();

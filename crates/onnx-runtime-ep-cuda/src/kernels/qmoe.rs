@@ -36,6 +36,11 @@ const GATE_UP_ACTIVATE_BF16_OCC_ENTRY: &str = "qmoe_gate_up_activate_bf16_occ";
 const COMBINE_F32_ENTRY: &str = "qmoe_combine_f32";
 const COMBINE_F16_ENTRY: &str = "qmoe_combine_f16";
 const COMBINE_BF16_ENTRY: &str = "qmoe_combine_bf16";
+// Element-wise widen of the T-typed float routing/scale/bias inputs to f32 so
+// the f32 routing and dequant kernels can be reused unchanged for fp16/bf16
+// graphs. See `FloatDtype::widen_entry`.
+const WIDEN_F16_ENTRY: &str = "qmoe_widen_f16_f32";
+const WIDEN_BF16_ENTRY: &str = "qmoe_widen_bf16_f32";
 const LINEAR_ONE_TASK_PER_BLOCK_MAX_ROUTES: usize = 16;
 
 const CUDA_SRC: &str = r#"
@@ -78,6 +83,35 @@ __device__ __forceinline__ int total_order_key(float value)
 // memory instead of re-issuing latency-bound global loads. At decode (rows=1)
 // this replaces a single active thread with the whole block, which was the
 // dominant decode cost.
+#if QMOE_HAS_HALF
+// Widen a contiguous fp16/bf16 buffer to f32 (grid-strided). Conversion is
+// exact: every fp16/bf16 value is representable in f32, so the reused f32
+// routing/dequant kernels see byte-for-byte the authored values.
+extern "C" __global__ void qmoe_widen_f16_f32(
+    const __half* src,
+    float* dst,
+    const unsigned long long count)
+{
+    for (unsigned long long i =
+             blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+         i < count; i += (unsigned long long)blockDim.x * gridDim.x) {
+        dst[i] = __half2float(src[i]);
+    }
+}
+
+extern "C" __global__ void qmoe_widen_bf16_f32(
+    const __nv_bfloat16* src,
+    float* dst,
+    const unsigned long long count)
+{
+    for (unsigned long long i =
+             blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+         i < count; i += (unsigned long long)blockDim.x * gridDim.x) {
+        dst[i] = __bfloat162float(src[i]);
+    }
+}
+#endif
+
 extern "C" __global__ void qmoe_route(
     const float* router_probs,
     const float* router_weights,
@@ -1272,6 +1306,12 @@ struct QuantizedExperts<'a> {
     scales: &'a TensorView<'a>,
     zero_points: Option<&'a TensorView<'a>>,
     bias: Option<&'a TensorView<'a>>,
+    /// f32 device buffer holding widened scales when the graph is fp16/bf16;
+    /// `None` for f32 (use `scales` directly). The dequant kernels always read
+    /// f32 scales, so fp16/bf16 scales are widened once per execute.
+    scales_override: Option<CUdeviceptr>,
+    /// f32 device buffer holding widened biases when the graph is fp16/bf16.
+    bias_override: Option<CUdeviceptr>,
     out_features: usize,
     in_features: usize,
     packed_in: usize,
@@ -1307,7 +1347,7 @@ impl<'a> QuantizedExperts<'a> {
             packed.dtype,
             DataType::Uint8,
         )?;
-        require_dtype(&format!("{name}_scales"), scales.dtype, DataType::Float32)?;
+        float_widen_entry(&format!("{name}_scales"), scales.dtype)?;
         let pack_size = 8 / bits;
         if !in_features.is_multiple_of(pack_size) {
             return Err(error(format!(
@@ -1349,11 +1389,7 @@ impl<'a> QuantizedExperts<'a> {
             )?;
         }
         if let Some(bias) = bias {
-            require_dtype(
-                &format!("{name}_experts_bias"),
-                bias.dtype,
-                DataType::Float32,
-            )?;
+            float_widen_entry(&format!("{name}_experts_bias"), bias.dtype)?;
             require_shape(
                 &format!("{name}_experts_bias"),
                 bias.shape,
@@ -1380,12 +1416,30 @@ impl<'a> QuantizedExperts<'a> {
             scales,
             zero_points,
             bias,
+            scales_override: None,
+            bias_override: None,
             out_features,
             in_features,
             packed_in,
             blocks,
             zero_point_bytes,
         })
+    }
+
+    /// Device pointer to f32 scales: the widened buffer for fp16/bf16 graphs,
+    /// or the original f32 initializer.
+    fn scales_ptr(&self) -> CUdeviceptr {
+        self.scales_override
+            .unwrap_or_else(|| tensor_ptr(self.scales))
+    }
+
+    /// Device pointer to f32 biases (widened for fp16/bf16), or 0 when absent.
+    fn bias_ptr(&self) -> CUdeviceptr {
+        match (self.bias_override, self.bias) {
+            (Some(ptr), _) => ptr,
+            (None, Some(bias)) => tensor_ptr(bias),
+            (None, None) => 0,
+        }
     }
 }
 
@@ -1430,7 +1484,7 @@ impl Kernel for QMoEKernel {
                 outputs[0].dtype, inputs[0].dtype
             )));
         }
-        require_dtype("router_probs", inputs[1].dtype, DataType::Float32)?;
+        float_widen_entry("router_probs", inputs[1].dtype)?;
         if dtype.needs_half_headers() {
             self.runtime.require_nvrtc_half_headers("QMoE")?;
         }
@@ -1482,7 +1536,7 @@ impl Kernel for QMoEKernel {
         }
         let fc1_size = self.attributes.fc1_size(inter)?;
 
-        let fc1 = QuantizedExperts::validate(
+        let mut fc1 = QuantizedExperts::validate(
             "fc1",
             &inputs[2],
             &inputs[3],
@@ -1494,7 +1548,7 @@ impl Kernel for QMoEKernel {
             self.bits,
             self.block_size,
         )?;
-        let fc2 = QuantizedExperts::validate(
+        let mut fc2 = QuantizedExperts::validate(
             "fc2",
             &inputs[5],
             &inputs[6],
@@ -1509,7 +1563,7 @@ impl Kernel for QMoEKernel {
 
         let has_fc3 = optional_input(inputs, 8).is_some();
         let uses_separate_gate = self.attributes.uses_separate_gate(has_fc3);
-        let fc3 = if uses_separate_gate {
+        let mut fc3 = if uses_separate_gate {
             Some(QuantizedExperts::validate(
                 "fc3",
                 optional_input(inputs, 8)
@@ -1541,7 +1595,7 @@ impl Kernel for QMoEKernel {
         };
 
         if let Some(router_weights) = optional_input(inputs, 14) {
-            require_dtype("router_weights", router_weights.dtype, DataType::Float32)?;
+            float_widen_entry("router_weights", router_weights.dtype)?;
             require_shape("router_weights", router_weights.shape, &[rows, experts])?;
         }
         for (name, tensor) in [("input", &inputs[0]), ("router_probs", &inputs[1])] {
@@ -1656,9 +1710,114 @@ impl Kernel for QMoEKernel {
             )
             .transpose()?;
 
+        // ORT binds input, router_probs, scales, biases and the optional
+        // aggregation weights to one type parameter T, so a valid fp16/bf16
+        // graph carries fp16/bf16 versions of these operands. The routing and
+        // dequant kernels read them as f32, so widen any non-f32 operand to f32
+        // scratch once per execute — an exact, lossless upcast — and reuse the
+        // identical f32 kernels. Each operand is classified independently: an
+        // f32 operand keeps its original pointer (so pure-f32 graphs and the
+        // pre-existing "fp16 activations + f32 scales" graphs are byte-for-byte
+        // unchanged), while an fp16/bf16 operand is upcast.
+        let router_elems = checked_product(&[rows, experts], "router element count")?;
+        let router_probs_ptr = match float_widen_entry("router_probs", inputs[1].dtype)? {
+            None => tensor_ptr(&inputs[1]),
+            Some(entry) => self.widen_to_f32(
+                &mut scratch,
+                11,
+                capturing,
+                entry,
+                tensor_ptr(&inputs[1]),
+                router_elems,
+            )?,
+        };
+        let router_weights_ptr = match optional_input(inputs, 14) {
+            None => 0,
+            Some(rw) => match float_widen_entry("router_weights", rw.dtype)? {
+                None => tensor_ptr(rw),
+                Some(entry) => self.widen_to_f32(
+                    &mut scratch,
+                    12,
+                    capturing,
+                    entry,
+                    tensor_ptr(rw),
+                    router_elems,
+                )?,
+            },
+        };
+        if let Some(entry) = float_widen_entry("fc1_scales", fc1.scales.dtype)? {
+            fc1.scales_override = Some(self.widen_to_f32(
+                &mut scratch,
+                13,
+                capturing,
+                entry,
+                tensor_ptr(fc1.scales),
+                checked_product(fc1.scales.shape, "fc1 scales element count")?,
+            )?);
+        }
+        if let Some(entry) = float_widen_entry("fc2_scales", fc2.scales.dtype)? {
+            fc2.scales_override = Some(self.widen_to_f32(
+                &mut scratch,
+                14,
+                capturing,
+                entry,
+                tensor_ptr(fc2.scales),
+                checked_product(fc2.scales.shape, "fc2 scales element count")?,
+            )?);
+        }
+        if let Some(fc3) = fc3.as_mut()
+            && let Some(entry) = float_widen_entry("fc3_scales", fc3.scales.dtype)?
+        {
+            fc3.scales_override = Some(self.widen_to_f32(
+                &mut scratch,
+                15,
+                capturing,
+                entry,
+                tensor_ptr(fc3.scales),
+                checked_product(fc3.scales.shape, "fc3 scales element count")?,
+            )?);
+        }
+        if let Some(bias) = fc1.bias
+            && let Some(entry) = float_widen_entry("fc1_experts_bias", bias.dtype)?
+        {
+            fc1.bias_override = Some(self.widen_to_f32(
+                &mut scratch,
+                16,
+                capturing,
+                entry,
+                tensor_ptr(bias),
+                checked_product(bias.shape, "fc1 bias element count")?,
+            )?);
+        }
+        if let Some(bias) = fc2.bias
+            && let Some(entry) = float_widen_entry("fc2_experts_bias", bias.dtype)?
+        {
+            fc2.bias_override = Some(self.widen_to_f32(
+                &mut scratch,
+                17,
+                capturing,
+                entry,
+                tensor_ptr(bias),
+                checked_product(bias.shape, "fc2 bias element count")?,
+            )?);
+        }
+        if let Some(fc3) = fc3.as_mut()
+            && let Some(bias) = fc3.bias
+            && let Some(entry) = float_widen_entry("fc3_experts_bias", bias.dtype)?
+        {
+            fc3.bias_override = Some(self.widen_to_f32(
+                &mut scratch,
+                18,
+                capturing,
+                entry,
+                tensor_ptr(bias),
+                checked_product(bias.shape, "fc3 bias element count")?,
+            )?);
+        }
+
         self.launch_route(
-            &inputs[1],
-            optional_input(inputs, 14),
+            router_probs_ptr,
+            router_weights_ptr,
             route_indices,
             route_weights,
             rows,
@@ -1669,7 +1828,13 @@ impl Kernel for QMoEKernel {
         // diffed to distinguish a benign borderline-argmax reassociation from a
         // real router top-k divergence. Safe only outside graph capture.
         if !capturing && std::env::var_os("ONNX_GENAI_QMOE_ROUTE_DUMP").is_some() {
-            self.dump_route_selection(&inputs[1], route_indices, rows, experts, self.attributes.k)?;
+            self.dump_route_selection(
+                router_probs_ptr,
+                route_indices,
+                rows,
+                experts,
+                self.attributes.k,
+            )?;
         }
         if let Some(grouping) = grouping {
             let fc1_output = fc1_output.expect("grouped QMoE keeps FC1 scratch");
@@ -1821,7 +1986,7 @@ impl QMoEKernel {
     /// any token divergence is purely downstream (GEMV/argmax), not routing.
     fn dump_route_selection(
         &self,
-        router_probs: &TensorView,
+        router_probs: CUdeviceptr,
         route_indices: CUdeviceptr,
         rows: usize,
         experts: usize,
@@ -1847,7 +2012,7 @@ impl QMoEKernel {
                     rows * experts * std::mem::size_of::<f32>(),
                 )
             };
-            unsafe { self.runtime.dtoh(bytes, tensor_ptr(router_probs))? };
+            unsafe { self.runtime.dtoh(bytes, router_probs)? };
         }
         for row in 0..rows {
             let call = CALL.fetch_add(1, Ordering::Relaxed);
@@ -1878,18 +2043,48 @@ impl QMoEKernel {
         Ok(())
     }
 
+    /// Widen a contiguous fp16/bf16 device buffer (`entry` selects the kernel)
+    /// into f32 scratch slot `index`, returning the f32 pointer. Conversion is
+    /// exact, so the reused f32 routing/dequant kernels are numerically
+    /// unaffected. Only invoked for fp16/bf16 graphs; f32 never widens.
+    #[allow(clippy::too_many_arguments)]
+    fn widen_to_f32(
+        &self,
+        scratch: &mut ScratchPool,
+        index: usize,
+        capturing: bool,
+        entry: &str,
+        src: CUdeviceptr,
+        elements: usize,
+    ) -> Result<CUdeviceptr> {
+        let bytes = checked_bytes(elements, std::mem::size_of::<f32>(), "widened f32 scratch")?;
+        let dst = scratch.ensure(&self.runtime, index, bytes, capturing)?;
+        // The widen kernels use __half/__nv_bfloat16, so ensure NVRTC compiles
+        // the module with the fp16/bf16 headers available before it is resolved.
+        self.runtime.require_nvrtc_half_headers("QMoE widen")?;
+        let function = self.runtime.nvrtc_function(MODULE, CUDA_SRC, entry)?;
+        let count = as_u64("widen element count", elements)?;
+        let config = self.pointwise_launch_config(count)?;
+        let mut builder = self.runtime.stream().launch_builder(&function);
+        builder.arg(&src).arg(&dst).arg(&count);
+        // SAFETY: `src` holds `elements` fp16/bf16 values and `dst` was sized for
+        // the same count of f32; the ABI matches `qmoe_widen_*_f32`.
+        unsafe { builder.launch(config) }
+            .map(|_| ())
+            .map_err(|err| driver_err("widen QMoE fp16 routing/scale input", err))?;
+        Ok(dst)
+    }
+
     fn launch_route(
         &self,
-        router_probs: &TensorView,
-        router_weights: Option<&TensorView>,
+        router_probs: CUdeviceptr,
+        router_weights: CUdeviceptr,
         route_indices: CUdeviceptr,
         route_weights: CUdeviceptr,
         rows: usize,
         experts: usize,
     ) -> Result<()> {
         let function = self.runtime.nvrtc_function(MODULE, CUDA_SRC, ROUTE_ENTRY)?;
-        let router_probs = tensor_ptr(router_probs);
-        let router_weights = router_weights.map(tensor_ptr).unwrap_or(0);
         let rows = as_u64("row count", rows)?;
         let experts = as_i32("expert count", experts)?;
         let top_k = as_i32("top-k", self.attributes.k)?;
@@ -2080,9 +2275,9 @@ impl QMoEKernel {
                 .ok_or_else(|| error("grouped GEMM shared-memory stride overflow"))?,
         )?;
         let packed = tensor_ptr(weights.packed);
-        let scales = tensor_ptr(weights.scales);
+        let scales = weights.scales_ptr();
         let zero_points = weights.zero_points.map(tensor_ptr).unwrap_or(0);
-        let bias = weights.bias.map(tensor_ptr).unwrap_or(0);
+        let bias = weights.bias_ptr();
         let routes = as_u64("route count", routes)?;
         let tasks = as_u64("grouped linear task count", tasks)?;
         let gemm_min_tokens = as_u64(
@@ -2149,9 +2344,9 @@ impl QMoEKernel {
             .nvrtc_function(module, source, dtype.linear_entry())?;
         let packed = tensor_ptr(weights.packed);
         let expert_counts = expert_counts.unwrap_or(0);
-        let scales = tensor_ptr(weights.scales);
+        let scales = weights.scales_ptr();
         let zero_points = weights.zero_points.map(tensor_ptr).unwrap_or(0);
-        let bias = weights.bias.map(tensor_ptr).unwrap_or(0);
+        let bias = weights.bias_ptr();
         let tasks = checked_product(&[routes, weights.out_features], "linear output task count")?;
         let grid_x = self.linear_reduction_grid(tasks, routes)?;
         let config = self.runtime.reduction_launch_config(
@@ -2255,17 +2450,15 @@ impl QMoEKernel {
             std::mem::size_of::<f32>() as u32,
         )?;
         let fc1_packed = tensor_ptr(fc1.packed);
-        let fc1_scales = tensor_ptr(fc1.scales);
+        let fc1_scales = fc1.scales_ptr();
         let fc1_zero_points = fc1.zero_points.map(tensor_ptr).unwrap_or(0);
-        let fc1_bias = fc1.bias.map(tensor_ptr).unwrap_or(0);
+        let fc1_bias = fc1.bias_ptr();
         let fc3_packed = fc3.map(|weights| tensor_ptr(weights.packed)).unwrap_or(0);
-        let fc3_scales = fc3.map(|weights| tensor_ptr(weights.scales)).unwrap_or(0);
+        let fc3_scales = fc3.map(|weights| weights.scales_ptr()).unwrap_or(0);
         let fc3_zero_points = fc3
             .and_then(|weights| weights.zero_points.map(tensor_ptr))
             .unwrap_or(0);
-        let fc3_bias = fc3
-            .and_then(|weights| weights.bias.map(tensor_ptr))
-            .unwrap_or(0);
+        let fc3_bias = fc3.map(|weights| weights.bias_ptr()).unwrap_or(0);
         let routes = as_u64("route count", routes)?;
         let top_k = as_i32("top-k", self.attributes.k)?;
         let inter = as_i32("intermediate feature count", inter)?;
@@ -2499,7 +2692,29 @@ impl QMoEKernel {
     }
 }
 
-const SCRATCH_SLOTS: usize = 11;
+const SCRATCH_SLOTS: usize = 19;
+
+/// Classifies a QMoE T-typed float operand (router_probs, scales, biases,
+/// aggregation weights) and returns the widen kernel that upcasts it to f32, or
+/// `None` when it is already f32 (used directly to keep the f32 path
+/// bit-identical). Errors for any non-float dtype.
+///
+/// ORT's `com.microsoft::QMoE` binds these operands to a single type parameter
+/// `T` = {float, float16, bfloat16}, so a valid fp16 graph carries fp16 scales
+/// and router probs. Because the native backend is the sole validator (it skips
+/// ORT's `Session::new` type check), we accept the stricter superset where each
+/// float operand is independently f32 or a half type: an all-fp16 graph runs,
+/// and a mixed graph (fp16 activations, f32 scales) keeps working unchanged.
+fn float_widen_entry(name: &str, dtype: DataType) -> Result<Option<&'static str>> {
+    match dtype {
+        DataType::Float32 => Ok(None),
+        DataType::Float16 => Ok(Some(WIDEN_F16_ENTRY)),
+        DataType::BFloat16 => Ok(Some(WIDEN_BF16_ENTRY)),
+        other => Err(error(format!(
+            "{name} requires Float32, Float16, or BFloat16, got {other:?}"
+        ))),
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct ScratchSlot {

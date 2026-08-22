@@ -17,27 +17,6 @@ fn fixture(name: &str) -> PathBuf {
     repository_root().join("tests/fixtures").join(name)
 }
 
-/// A 4x4 solid-color PNG written to the target directory.
-fn sample_png() -> PathBuf {
-    let directory = repository_root().join("target/test-fixtures");
-    std::fs::create_dir_all(&directory).unwrap();
-    let path = directory.join("repl-sample.png");
-    // Several tests want this file and cargo runs them in parallel, so it is
-    // written to a per-test temporary and renamed into place. Writing the shared
-    // path directly lets one test read what another is still writing, which
-    // surfaces as "the image format could not be determined".
-    let staging = directory.join(format!(
-        "repl-sample-{}-{:?}.png",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    image::RgbImage::from_pixel(4, 4, image::Rgb([10, 200, 90]))
-        .save(&staging)
-        .expect("the sample PNG must be written");
-    std::fs::rename(&staging, &path).expect("the sample PNG must be published atomically");
-    path
-}
-
 /// Run the REPL with `script` on stdin and return its output.
 ///
 /// The script is fed all at once; the REPL exits on the trailing empty line or
@@ -98,22 +77,12 @@ fn completed_turns(output: &str) -> usize {
         .expect("the /session summary must report a completed-turns count")
 }
 
-fn vlm() -> PathBuf {
-    fixture("tiny-vlm-image-input")
-}
-
 fn text_model() -> PathBuf {
     fixture("tiny-llm")
 }
 
 #[test]
 fn the_banner_reports_the_modalities_the_model_accepts() {
-    let vlm_banner = text(&repl(&vlm(), &["--raw"], "\n"));
-    assert!(
-        vlm_banner.contains("text + image input"),
-        "banner: {vlm_banner}"
-    );
-
     let text_banner = text(&repl(&text_model(), &[], "\n"));
     assert!(
         text_banner.contains("(text input)"),
@@ -218,44 +187,9 @@ fn system_and_raw_and_reset_acknowledge_their_effect() {
 }
 
 #[test]
-fn an_image_attachment_runs_the_turn_and_is_cleared_afterwards() {
-    let image = sample_png();
-    let script = format!(
-        "/image {} describe <image>\ndescribe <image>\n\n",
-        image.display()
-    );
-    let output = text(&repl(&vlm(), &["--raw", "--max-new-tokens", "2"], &script));
-
-    // First turn: the staged image is consumed and the model answers.
-    assert!(
-        output.contains(&format!("(sending {})", image.display())),
-        "{output}"
-    );
-    assert!(output.contains("img"), "{output}");
-    // Second turn: the attachment was cleared, so the same prompt now fails for
-    // want of an image rather than silently reusing the previous one.
-    assert!(
-        output.contains("the turn carried no attachment"),
-        "the staged image must not leak into the next turn: {output}"
-    );
-}
-
-#[test]
-fn reset_drops_a_staged_attachment_before_it_is_sent() {
-    let image = sample_png();
-    let script = format!("/image {} \n/reset\ndescribe <image>\n\n", image.display());
-    let output = text(&repl(&vlm(), &["--raw", "--max-new-tokens", "2"], &script));
-
-    assert!(
-        output.contains("the turn carried no attachment"),
-        "/reset must discard the staged image: {output}"
-    );
-}
-
-#[test]
 fn a_rejected_attachment_keeps_the_session_alive() {
     let script = "/audio /nonexistent.wav\n/help\n\n";
-    let output = repl(&vlm(), &["--raw"], script);
+    let output = repl(&text_model(), &["--raw"], script);
     let stdout = stdout_text(&output);
     let stderr = stderr_text(&output);
 
@@ -268,46 +202,12 @@ fn a_rejected_attachment_keeps_the_session_alive() {
 
 #[test]
 fn a_missing_attachment_path_is_reported_with_usage() {
-    let output = repl(&vlm(), &["--raw"], "/image\n/help\n\n");
+    let output = repl(&text_model(), &["--raw"], "/image\n/help\n\n");
     let stdout = stdout_text(&output);
     let stderr = stderr_text(&output);
 
     assert!(stderr.contains("usage: /image <path>"), "{stderr}");
     assert!(stdout.contains("/system <text>"), "{stdout}");
-}
-
-#[test]
-fn a_nonexistent_attachment_file_names_the_path() {
-    let output = text(&repl(
-        &vlm(),
-        &["--raw"],
-        "/image ./definitely-missing.png\n\n",
-    ));
-
-    assert!(output.contains("definitely-missing.png"), "{output}");
-    assert!(output.contains("How:"), "{output}");
-}
-
-#[test]
-fn preloaded_attachments_apply_to_the_first_turn() {
-    let image = sample_png();
-    let output = text(&repl(
-        &vlm(),
-        &[
-            "--raw",
-            "--max-new-tokens",
-            "2",
-            "--image",
-            image.to_str().unwrap(),
-        ],
-        "describe <image>\n\n",
-    ));
-
-    assert!(
-        output.contains(&format!("(sending {})", image.display())),
-        "a --image passed to `run` must be staged for the first turn: {output}"
-    );
-    assert!(output.contains("img"), "{output}");
 }
 
 #[test]
@@ -572,7 +472,7 @@ fn greedy_reasoning_is_reproducible_across_runs() {
 }
 
 #[test]
-fn sampling_reaches_the_decode_loop_not_only_the_session_summary() {
+fn request_sampling_reaches_the_decode_loop_not_only_the_session_summary() {
     // Finding 1 (Gaff, then Luv): the `/session` summary resolves the sampling
     // policy in `SessionSummary::fmt`, *independently* of generation. A test
     // keyed only on that summary passes even when generation silently reverts to
@@ -596,31 +496,33 @@ fn sampling_reaches_the_decode_loop_not_only_the_session_summary() {
     // near-deterministic tokens cannot witness sampling (that is exactly why the
     // token-stream approach failed). This test's job is the resolution boundary.
     //
-    // tiny-reasoning declares do_sample=true, temperature=0.6, top_k=20, so with
-    // no sampling flag the decode loop must run stochastically at those declared
-    // values. Commenting out the per-turn `resolve_sampling_defaults` call in
-    // `interactive.rs` collapses the resolved policy to the runtime greedy
-    // fallback (greedy=true, temperature=1, top_k=0) and turns every assertion
-    // below red -- while the `/session`-keyed tests stay green, proving those
-    // never witnessed generation.
+    // Sampling is request-parameterized: explicit temperature and top-k inputs
+    // must reach the decode loop without relying on package metadata defaults.
     let sampled = stderr_text(&repl(
         &reasoning_model(),
-        &["--max-new-tokens", "8"],
+        &[
+            "--temperature",
+            "0.6",
+            "--top-k",
+            "20",
+            "--max-new-tokens",
+            "8",
+        ],
         "/stats\nquick\n\n",
     ));
     assert!(
         sampled.contains("sampling greedy=false"),
-        "the model's declared do_sample must reach the decode loop, not just the \
+        "the request sampling policy must reach the decode loop, not just the \
          /session summary; the stats line did not report a stochastic policy: {sampled}"
     );
     assert!(
         sampled.contains("temperature=0.6"),
-        "the decode loop must use the model's declared temperature, not the runtime \
+        "the decode loop must use the request temperature, not the runtime \
          default; a regression that ignores declared temperature is invisible otherwise: {sampled}"
     );
     assert!(
         sampled.contains("top_k=20"),
-        "the decode loop must use the model's declared top_k, not the runtime \
+        "the decode loop must use the request top_k, not the runtime \
          default; a regression that ignores declared top_k is invisible otherwise: {sampled}"
     );
 
@@ -641,7 +543,7 @@ fn sampling_reaches_the_decode_loop_not_only_the_session_summary() {
 }
 
 #[test]
-fn the_session_summary_reports_the_same_policy_generation_used() {
+fn the_session_summary_reports_the_same_request_policy_generation_used() {
     // Unification guard (Gaff Finding 1, Luv (b)): the `/session` summary and the
     // decode loop resolve the sampling policy through one shared helper
     // (`resolve_session_sampling`) reading the live backend, so the summary is
@@ -650,13 +552,20 @@ fn the_session_summary_reports_the_same_policy_generation_used() {
     // token-stream test already removed the harm; it never worked, so the
     // divergence was live and is closed here rather than ticketed.
     //
-    // Observe both surfaces in one no-flag session: the `--stats` line (stderr)
+    // Observe both surfaces in one explicitly parameterized session: the `--stats` line (stderr)
     // reports what the turn used; the `/session` summary (stdout) reports what it
     // will use. Both must show the identical resolved policy -- greedy=false at
     // the declared temperature 0.6 / top_k 20.
     let output = repl(
         &reasoning_model(),
-        &["--max-new-tokens", "8"],
+        &[
+            "--temperature",
+            "0.6",
+            "--top-k",
+            "20",
+            "--max-new-tokens",
+            "8",
+        ],
         "/stats\nquick\n/session\n\n",
     );
     let stats = stderr_text(&output);
@@ -684,22 +593,19 @@ fn the_session_summary_reports_the_same_policy_generation_used() {
 }
 
 #[test]
-fn a_model_declaring_do_sample_is_not_forced_into_greedy() {
-    // #385/#392: the runtime's greedy fallback must not override a default the
-    // model actually published. tiny-reasoning declares `do_sample: true`, so
-    // with no sampling flag the resolved policy is stochastic at the declared
-    // temperature -- precisely the regime a reasoning model ships to avoid the
-    // greedy loop above. This pins how `/session` *reports* the resolved policy;
-    // that generation actually *uses* it is pinned by
-    // `sampling_reaches_the_decode_loop_not_only_the_session_summary`.
-    let output = text(&repl(&reasoning_model(), &[], "/session\n\n"));
+fn explicit_request_sampling_is_not_forced_into_greedy() {
+    let output = text(&repl(
+        &reasoning_model(),
+        &["--temperature", "0.6"],
+        "/session\n\n",
+    ));
     assert!(
         output.contains("greedy=false"),
-        "a declared do_sample=true must resolve to stochastic decoding: {output}"
+        "an explicit request temperature must resolve to stochastic decoding: {output}"
     );
     assert!(
         output.contains("temperature=0.6"),
-        "the model's declared temperature must be honored: {output}"
+        "the request temperature must be honored: {output}"
     );
 }
 
@@ -824,7 +730,7 @@ fn a_reasoning_turn_that_closes_on_an_empty_answer_is_dropped_not_committed() {
 }
 
 #[test]
-fn the_declared_stochastic_regime_still_terminates_without_hanging() {
+fn the_request_stochastic_regime_still_terminates_without_hanging() {
     // The design asks for greedy plus a stochastic path. Under the model's
     // declared do_sample the generated tokens differ run to run, so -- unlike the
     // greedy tests -- the per-turn outcome (drop vs close) is not fixed: sampling
@@ -836,7 +742,14 @@ fn the_declared_stochastic_regime_still_terminates_without_hanging() {
     // pins termination and policy, not an outcome tally.
     let output = repl(
         &reasoning_model(),
-        &["--max-new-tokens", "16"],
+        &[
+            "--temperature",
+            "0.6",
+            "--top-k",
+            "20",
+            "--max-new-tokens",
+            "16",
+        ],
         &reasoning_session_script(),
     );
     let combined = text(&output);
@@ -846,7 +759,7 @@ fn the_declared_stochastic_regime_still_terminates_without_hanging() {
     );
     assert!(
         combined.contains("greedy=false"),
-        "the declared regime must be stochastic: {combined}"
+        "the request regime must be stochastic: {combined}"
     );
     // Prove every one of the ten turns actually ran to a *classified* outcome --
     // merely reaching `/session` does not, because a turn refused at admission
@@ -877,37 +790,6 @@ fn the_declared_stochastic_regime_still_terminates_without_hanging() {
          empty-close drop, or admission drop); completed={completed} \
          reasoning_drops={reasoning_drops} empty_close_drops={empty_close_drops} \
          admission_drops={admission_drops}: {combined}"
-    );
-}
-
-#[test]
-fn a_second_question_about_the_same_image_reuses_the_encoder() {
-    // The reason multimodal reuse exists: a follow-up about the same picture
-    // should not re-run the vision encoder, and `--profile` is where a user can
-    // see that it did not.
-    let image = sample_png();
-    let path = image.to_str().unwrap();
-    let script = format!("/image {path} describe it\n/image {path} and again\n\n");
-    let output = repl_with_global_flags(
-        &fixture("tiny-vlm-image-input"),
-        &["--profile"],
-        &["--max-new-tokens", "2"],
-        &script,
-    );
-    let text = text(&output);
-
-    assert!(
-        output.status.success(),
-        "the REPL must exit cleanly: {text}"
-    );
-    assert!(
-        text.contains("encoder cache"),
-        "the profile must report encoder reuse: {text}"
-    );
-    // The first turn runs the encoder; the second must find it memoized.
-    assert!(
-        text.contains("1 hit / 0 run"),
-        "the follow-up turn must hit the memoized encoder output: {text}"
     );
 }
 

@@ -1,13 +1,13 @@
 use super::kv_commit::KvCommitLayout;
 use super::*;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 use onnx_genai_metadata::LoopStatePair;
 use onnx_genai_metadata::{KvOwnership, ModelIoSpec, SequenceInputKind};
 use onnx_runtime_ir::{Attribute, Graph, Node, NodeId, Shape, SymbolId, TensorData};
 use prost::Message;
 use std::collections::BTreeMap;
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn qwen_cuda_smoke_model_dir() -> Option<std::path::PathBuf> {
     let model_dir = std::env::var_os("ONNX_GENAI_QWEN_CUDA_SMOKE_MODEL")
         .map(std::path::PathBuf::from)
@@ -21,13 +21,13 @@ fn qwen_cuda_smoke_model_dir() -> Option<std::path::PathBuf> {
     Some(model_dir)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 struct EnvVarGuard {
     key: &'static str,
     previous: Option<std::ffi::OsString>,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 impl EnvVarGuard {
     fn set(key: &'static str, value: &str) -> Self {
         let previous = std::env::var_os(key);
@@ -40,7 +40,7 @@ impl EnvVarGuard {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
         // SAFETY: paired with `EnvVarGuard::set`; this test-only guard restores
@@ -337,7 +337,7 @@ fn cuda_kv_capacity_error_explains_source_and_device_memory() {
     assert!(message.contains("ONNX_GENAI_CUDA_KV_MAX_LEN"), "{message}");
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 fn non_power_of_two_kv_growth_routes_overlapping_copies_through_scratch() {
     let inner = 32usize;
@@ -803,6 +803,644 @@ fn tiny_hybrid_decoder() -> InferenceSession {
     InferenceSession::from_graph(graph).expect("build tiny hybrid decoder")
 }
 
+/// A hybrid decoder whose recurrent/conv states *mutate* every step, so a
+/// speculative commit oracle can distinguish "advanced by j tokens" from
+/// "advanced by k tokens".
+///
+/// Both loop-carried states accumulate the sum of the token ids fed to a
+/// forward: `present = past_state + reduce_sum(input_ids)` (broadcast over the
+/// state's feature axes at batch 1). This is a deterministic function of the
+/// tokens processed, exactly the property the recurrent-state commit relies on:
+/// re-running only the accepted tokens from a snapshot reproduces the accepted
+/// state byte-for-byte. Layer 1 is dense GQA KV (prefix-sliced on rewind), so
+/// the model exercises the mixed recurrent + attention rewind seam.
+fn mutating_hybrid_decoder() -> InferenceSession {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 13);
+    let batch = graph.intern_symbol("batch");
+    let sequence = graph.intern_symbol("sequence");
+    let total = graph.intern_symbol("total");
+    let past = graph.intern_symbol("past");
+    let shape = |dims: &[Dim]| -> Shape { dims.to_vec() };
+
+    let input_ids = graph.create_named_value(
+        "input_ids",
+        DataType::Int64,
+        shape(&[batch.into(), sequence.into()]),
+    );
+    let attention_mask = graph.create_named_value(
+        "attention_mask",
+        DataType::Int64,
+        shape(&[batch.into(), total.into()]),
+    );
+    let position_ids = graph.create_named_value(
+        "position_ids",
+        DataType::Int64,
+        shape(&[batch.into(), sequence.into()]),
+    );
+    let conv_state = graph.create_named_value(
+        "past_key_values.0.conv_state",
+        DataType::Float32,
+        shape(&[batch.into(), 4.into(), 3.into()]),
+    );
+    let recurrent_state = graph.create_named_value(
+        "past_key_values.0.recurrent_state",
+        DataType::Float32,
+        shape(&[batch.into(), 2.into(), 4.into(), 4.into()]),
+    );
+    let past_key = graph.create_named_value(
+        "past_key_values.1.key",
+        DataType::Float32,
+        shape(&[batch.into(), 1.into(), past.into(), 1.into()]),
+    );
+    let past_value = graph.create_named_value(
+        "past_key_values.1.value",
+        DataType::Float32,
+        shape(&[batch.into(), 1.into(), past.into(), 1.into()]),
+    );
+    for input in [
+        input_ids,
+        attention_mask,
+        position_ids,
+        conv_state,
+        recurrent_state,
+        past_key,
+        past_value,
+    ] {
+        graph.add_input(input);
+    }
+
+    let cast = graph.create_value(DataType::Float32, shape(&[batch.into(), sequence.into()]));
+    insert_op(
+        &mut graph,
+        "Cast",
+        vec![input_ids],
+        cast,
+        &[("to", Attribute::Int(1))],
+    );
+    // token_sum: [1, 1] scalar-per-batch accumulator broadcast into each state.
+    let token_sum = graph.create_value(DataType::Float32, shape(&[batch.into(), 1.into()]));
+    insert_op(
+        &mut graph,
+        "ReduceSum",
+        vec![cast],
+        token_sum,
+        &[
+            ("axes", Attribute::Ints(vec![1])),
+            ("keepdims", Attribute::Int(1)),
+        ],
+    );
+    let current_kv = graph.create_value(
+        DataType::Float32,
+        shape(&[batch.into(), 1.into(), sequence.into(), 1.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Unsqueeze",
+        vec![cast],
+        current_kv,
+        &[("axes", Attribute::Ints(vec![1, 3]))],
+    );
+    let logits = graph.create_named_value(
+        "logits",
+        DataType::Float32,
+        shape(&[batch.into(), sequence.into(), 1.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Unsqueeze",
+        vec![cast],
+        logits,
+        &[("axes", Attribute::Ints(vec![2]))],
+    );
+
+    // Recurrent states are replaced wholesale each step by accumulating the
+    // per-forward token sum (broadcast over the feature axes at batch 1).
+    let present_conv = graph.create_named_value(
+        "present.0.conv_state",
+        DataType::Float32,
+        shape(&[batch.into(), 4.into(), 3.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Add",
+        vec![conv_state, token_sum],
+        present_conv,
+        &[],
+    );
+    let present_recurrent = graph.create_named_value(
+        "present.0.recurrent_state",
+        DataType::Float32,
+        shape(&[batch.into(), 2.into(), 4.into(), 4.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Add",
+        vec![recurrent_state, token_sum],
+        present_recurrent,
+        &[],
+    );
+    let present_key = graph.create_named_value(
+        "present.1.key",
+        DataType::Float32,
+        shape(&[batch.into(), 1.into(), total.into(), 1.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Concat",
+        vec![past_key, current_kv],
+        present_key,
+        &[("axis", Attribute::Int(2))],
+    );
+    let present_value = graph.create_named_value(
+        "present.1.value",
+        DataType::Float32,
+        shape(&[batch.into(), 1.into(), total.into(), 1.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Concat",
+        vec![past_value, current_kv],
+        present_value,
+        &[("axis", Attribute::Int(2))],
+    );
+    for output in [
+        logits,
+        present_conv,
+        present_recurrent,
+        present_key,
+        present_value,
+    ] {
+        graph.add_output(output);
+    }
+    InferenceSession::from_graph(graph).expect("build mutating hybrid decoder")
+}
+
+/// Sorted `(name, bytes)` of every recurrent/conv state a session carries, for
+/// byte-identity comparison in the commit oracle.
+fn recurrent_state_bytes(session: &NativeDecodeSession) -> Vec<(String, Vec<u8>)> {
+    let mut names: Vec<String> = session.recurrent_past_names().into_iter().collect();
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| {
+            let bytes = session
+                .past
+                .get(&name)
+                .expect("recurrent state materialized")
+                .as_bytes()
+                .to_vec();
+            (name, bytes)
+        })
+        .collect()
+}
+
+#[test]
+fn native_recurrent_commit_matches_accepted_prefix_replay() {
+    // The correctness oracle for speculative recurrent-state commit (vLLM's
+    // no-rollback rule): after snapshotting the pre-draft recurrent/conv state,
+    // running k drafts, and committing to `j` accepted tokens, the recurrent
+    // state must be byte-identical to feeding ONLY those j accepted tokens from
+    // the snapshot. Attention KV keeps its ordinary prefix-slice rewind. No real
+    // MTP artifact is needed — the synthetic decoder makes the recurrent update a
+    // deterministic function of the tokens processed.
+    let base_tokens = [5u32, 7, 9];
+    let draft_tokens = [2u32, 4, 6]; // k = 3 speculative drafts
+    let k = draft_tokens.len();
+
+    for &j in &[0usize, 1, k] {
+        // Oracle: from the same base, advance by exactly the j accepted tokens.
+        let mut oracle = NativeDecodeSession::from_session(mutating_hybrid_decoder())
+            .expect("oracle hybrid decoder loads");
+        oracle
+            .decode_argmax(&base_tokens, 0)
+            .expect("oracle prefill");
+        let base_len = oracle.current_len();
+        if j > 0 {
+            oracle
+                .decode_argmax(&draft_tokens[..j], base_len)
+                .expect("oracle accepted-prefix advance");
+        }
+        let oracle_state = recurrent_state_bytes(&oracle);
+
+        // Speculative path: snapshot, run all k drafts through verify, commit(j).
+        let mut spec = NativeDecodeSession::from_session(mutating_hybrid_decoder())
+            .expect("spec hybrid decoder loads");
+        spec.decode_argmax(&base_tokens, 0).expect("spec prefill");
+        assert_eq!(spec.current_len(), base_len, "same base length");
+        let snapshot = spec
+            .snapshot_recurrent_state()
+            .expect("snapshot pre-draft recurrent state");
+        assert_eq!(snapshot.committed_len(), base_len);
+        spec.decode_argmax(&draft_tokens, base_len)
+            .expect("spec verify window advances all k drafts");
+        // Sanity: after k drafts the state is NOT the accepted-prefix state for
+        // j < k, so the commit has real work to do.
+        if j < k {
+            assert_ne!(
+                recurrent_state_bytes(&spec),
+                oracle_state,
+                "verify window state must differ from the j-accepted state (j={j})"
+            );
+        }
+        spec.commit_recurrent_state_to_accepted(&snapshot, base_len, &draft_tokens[..j])
+            .expect("commit recurrent state to accepted prefix");
+
+        assert_eq!(
+            spec.current_len(),
+            base_len + j,
+            "committed logical length equals base + accepted (j={j})"
+        );
+        assert_eq!(
+            recurrent_state_bytes(&spec),
+            oracle_state,
+            "committed recurrent state must be byte-identical to a j-token replay (j={j})"
+        );
+    }
+}
+
+#[test]
+fn native_recurrent_snapshot_requires_recurrent_state() {
+    // The primitive is inert on a pure-dense decoder: no recurrent state means
+    // no snapshot, so greedy/dense speculative paths never engage it.
+    let mut dense = NativeDecodeSession::from_session_with_cuda_kv_max_len_and_io(
+        tiny_decoder(true),
+        None,
+        Some(&tiny_decoder_io()),
+    )
+    .expect("dense decoder loads");
+    assert!(!dense.has_recurrent_state());
+    assert!(
+        dense.snapshot_recurrent_state().is_err(),
+        "a pure-dense decoder must refuse a recurrent-state snapshot"
+    );
+}
+
+#[test]
+fn native_verify_then_recurrent_commit_matches_accepted_prefix_replay() {
+    // The exact sequence the native speculative driver now performs on a hybrid
+    // recurrent target: snapshot the pre-draft recurrent/conv state, run the
+    // K-token verify window through `decode_verify` (the driver's real call,
+    // which destructively advances the rolling state by K), then commit to the
+    // `j` accepted tokens. The committed recurrent state must be byte-identical
+    // to a fresh session that decoded only base ++ draft[..j]. Crucially, the
+    // pre-#1598 behaviour (a plain `rewind` to base+j after the verify window)
+    // leaves the recurrent state stranded at the K-token value and DIVERGES —
+    // the negative control below proves the commit is load-bearing, not cosmetic.
+    let base_tokens = [5u32, 7, 9];
+    let draft_tokens = [2u32, 4, 6]; // k = 3 speculative drafts
+    let k = draft_tokens.len();
+
+    for &j in &[0usize, 1, k] {
+        // Oracle: a fresh session advanced by exactly the j accepted tokens.
+        let mut oracle = NativeDecodeSession::from_session(mutating_hybrid_decoder())
+            .expect("oracle hybrid decoder loads");
+        oracle
+            .decode_argmax(&base_tokens, 0)
+            .expect("oracle prefill");
+        let base_len = oracle.current_len();
+        if j > 0 {
+            oracle
+                .decode_argmax(&draft_tokens[..j], base_len)
+                .expect("oracle accepted-prefix advance");
+        }
+        let oracle_state = recurrent_state_bytes(&oracle);
+
+        // Driver path: prefill base, snapshot, verify K via `decode_verify`,
+        // then commit to the accepted prefix.
+        let mut spec = NativeDecodeSession::from_session(mutating_hybrid_decoder())
+            .expect("spec hybrid decoder loads");
+        spec.decode_argmax(&base_tokens, 0).expect("spec prefill");
+        assert_eq!(spec.current_len(), base_len, "same base length");
+        let snapshot = spec
+            .snapshot_recurrent_state()
+            .expect("snapshot pre-draft recurrent state");
+        spec.decode_verify(&draft_tokens, base_len)
+            .expect("verify window advances all k drafts eagerly");
+        assert_eq!(
+            spec.current_len(),
+            base_len + k,
+            "verify advances current_len to base + k"
+        );
+
+        // Negative control: a plain rewind (the pre-#1598 accept path) would
+        // leave the destructive recurrent state at its post-verify (k-token)
+        // value, diverging from the j-accepted oracle whenever j < k.
+        if j < k {
+            let mut stale = NativeDecodeSession::from_session(mutating_hybrid_decoder())
+                .expect("stale hybrid decoder loads");
+            stale.decode_argmax(&base_tokens, 0).expect("stale prefill");
+            stale
+                .decode_verify(&draft_tokens, base_len)
+                .expect("stale verify");
+            stale.rewind(base_len + j).expect("stale plain rewind");
+            assert_ne!(
+                recurrent_state_bytes(&stale),
+                oracle_state,
+                "plain rewind must strand the recurrent state (j={j}); commit is load-bearing"
+            );
+        }
+
+        spec.commit_recurrent_state_to_accepted(&snapshot, base_len, &draft_tokens[..j])
+            .expect("commit recurrent state to accepted prefix");
+        assert_eq!(
+            spec.current_len(),
+            base_len + j,
+            "committed logical length equals base + accepted (j={j})"
+        );
+        assert_eq!(
+            recurrent_state_bytes(&spec),
+            oracle_state,
+            "verify+commit recurrent state must byte-match a base++accepted replay (j={j})"
+        );
+    }
+}
+
+/// A hybrid recurrent decoder whose `logits` DEPEND on the incoming (past)
+/// recurrent state: `logits[b,s,0] = input_ids[b,s] + reduce_sum(conv_state)`.
+///
+/// `mutating_hybrid_decoder` proves the *state* is committed correctly, but its
+/// logits are state-independent, so it cannot observe the failure mode that once
+/// misled a diagnosis: an eager multi-token verify forward run from a STALE
+/// (non-restored) recurrent state emits *different* logits than an m=1 greedy
+/// step from the correct committed state. This fixture makes that dependence
+/// observable so the regression below can assert the driver's snapshot→verify→
+/// restore contract is load-bearing for the emitted logits, not only the state.
+fn state_coupled_hybrid_decoder() -> InferenceSession {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 13);
+    let batch = graph.intern_symbol("batch");
+    let sequence = graph.intern_symbol("sequence");
+    let total = graph.intern_symbol("total");
+    let past = graph.intern_symbol("past");
+    let shape = |dims: &[Dim]| -> Shape { dims.to_vec() };
+
+    let input_ids = graph.create_named_value(
+        "input_ids",
+        DataType::Int64,
+        shape(&[batch.into(), sequence.into()]),
+    );
+    let attention_mask = graph.create_named_value(
+        "attention_mask",
+        DataType::Int64,
+        shape(&[batch.into(), total.into()]),
+    );
+    let position_ids = graph.create_named_value(
+        "position_ids",
+        DataType::Int64,
+        shape(&[batch.into(), sequence.into()]),
+    );
+    let conv_state = graph.create_named_value(
+        "past_key_values.0.conv_state",
+        DataType::Float32,
+        shape(&[batch.into(), 4.into(), 3.into()]),
+    );
+    let recurrent_state = graph.create_named_value(
+        "past_key_values.0.recurrent_state",
+        DataType::Float32,
+        shape(&[batch.into(), 2.into(), 4.into(), 4.into()]),
+    );
+    let past_key = graph.create_named_value(
+        "past_key_values.1.key",
+        DataType::Float32,
+        shape(&[batch.into(), 1.into(), past.into(), 1.into()]),
+    );
+    let past_value = graph.create_named_value(
+        "past_key_values.1.value",
+        DataType::Float32,
+        shape(&[batch.into(), 1.into(), past.into(), 1.into()]),
+    );
+    for input in [
+        input_ids,
+        attention_mask,
+        position_ids,
+        conv_state,
+        recurrent_state,
+        past_key,
+        past_value,
+    ] {
+        graph.add_input(input);
+    }
+
+    let cast = graph.create_value(DataType::Float32, shape(&[batch.into(), sequence.into()]));
+    insert_op(
+        &mut graph,
+        "Cast",
+        vec![input_ids],
+        cast,
+        &[("to", Attribute::Int(1))],
+    );
+    // Per-forward token-sum accumulator, broadcast into each recurrent state.
+    let token_sum = graph.create_value(DataType::Float32, shape(&[batch.into(), 1.into()]));
+    insert_op(
+        &mut graph,
+        "ReduceSum",
+        vec![cast],
+        token_sum,
+        &[
+            ("axes", Attribute::Ints(vec![1])),
+            ("keepdims", Attribute::Int(1)),
+        ],
+    );
+    // logits_base[b,s,0] = input_ids[b,s].
+    let logits_base = graph.create_value(
+        DataType::Float32,
+        shape(&[batch.into(), sequence.into(), 1.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Unsqueeze",
+        vec![cast],
+        logits_base,
+        &[("axes", Attribute::Ints(vec![2]))],
+    );
+    // state_scalar[b,1,1] = reduce_sum over the PAST conv_state feature axes.
+    let state_scalar = graph.create_value(
+        DataType::Float32,
+        shape(&[batch.into(), 1.into(), 1.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "ReduceSum",
+        vec![conv_state],
+        state_scalar,
+        &[
+            ("axes", Attribute::Ints(vec![1, 2])),
+            ("keepdims", Attribute::Int(1)),
+        ],
+    );
+    // logits[b,s,0] = input_ids[b,s] + reduce_sum(conv_state): a step-invariant
+    // read of the loop-carried recurrent state, so a stale state is observable.
+    let logits = graph.create_named_value(
+        "logits",
+        DataType::Float32,
+        shape(&[batch.into(), sequence.into(), 1.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Add",
+        vec![logits_base, state_scalar],
+        logits,
+        &[],
+    );
+
+    let current_kv = graph.create_value(
+        DataType::Float32,
+        shape(&[batch.into(), 1.into(), sequence.into(), 1.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Unsqueeze",
+        vec![cast],
+        current_kv,
+        &[("axes", Attribute::Ints(vec![1, 3]))],
+    );
+    // Recurrent states advance by accumulating the per-forward token sum.
+    let present_conv = graph.create_named_value(
+        "present.0.conv_state",
+        DataType::Float32,
+        shape(&[batch.into(), 4.into(), 3.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Add",
+        vec![conv_state, token_sum],
+        present_conv,
+        &[],
+    );
+    let present_recurrent = graph.create_named_value(
+        "present.0.recurrent_state",
+        DataType::Float32,
+        shape(&[batch.into(), 2.into(), 4.into(), 4.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Add",
+        vec![recurrent_state, token_sum],
+        present_recurrent,
+        &[],
+    );
+    let present_key = graph.create_named_value(
+        "present.1.key",
+        DataType::Float32,
+        shape(&[batch.into(), 1.into(), total.into(), 1.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Concat",
+        vec![past_key, current_kv],
+        present_key,
+        &[("axis", Attribute::Int(2))],
+    );
+    let present_value = graph.create_named_value(
+        "present.1.value",
+        DataType::Float32,
+        shape(&[batch.into(), 1.into(), total.into(), 1.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Concat",
+        vec![past_value, current_kv],
+        present_value,
+        &[("axis", Attribute::Int(2))],
+    );
+    for output in [
+        logits,
+        present_conv,
+        present_recurrent,
+        present_key,
+        present_value,
+    ] {
+        graph.add_output(output);
+    }
+    InferenceSession::from_graph(graph).expect("build state-coupled hybrid decoder")
+}
+
+#[test]
+fn native_verify_logits_require_restored_recurrent_state() {
+    // Regression oracle for the speculative driver's snapshot→verify→restore
+    // contract on a hybrid recurrent target, at the emitted-logits level.
+    //
+    // The driver snapshots the pre-draft recurrent/conv state, runs the eager
+    // verify window from the CURRENT committed state, and — on the accept path —
+    // restores that snapshot before re-advancing by the accepted tokens. This
+    // test proves the restore is load-bearing for the verify *logits*: an eager
+    // verify run from the correctly-committed state is bit-identical to an m=1
+    // greedy step, while the SAME verify run from a stale (non-restored)
+    // recurrent state diverges. (An earlier diagnosis mistook the stale-state
+    // artifact of a verify probe that skipped this restore for a non-existent
+    // "main-exec recurrent continuity" bug; this fixes the probe's oracle and
+    // pins the true contract.)
+    let base_tokens = [5u32, 7, 9];
+    for k in [1usize, 3] {
+        let drafts: Vec<u32> = (0..k).map(|i| 2 * (i as u32 + 1)).collect();
+
+        // Reference: the m=1 greedy logit row at `base_len` from the committed
+        // state S_base (the row a plain greedy step would emit).
+        let mut reference = NativeDecodeSession::from_session(state_coupled_hybrid_decoder())
+            .expect("reference hybrid decoder loads");
+        reference
+            .decode_argmax(&base_tokens, 0)
+            .expect("reference prefill");
+        let base_len = reference.current_len();
+        let m1 = reference
+            .decode(&[drafts[0]], base_len)
+            .expect("reference m=1 greedy step");
+        let m1_row0 = m1[0][0];
+
+        let mut spec = NativeDecodeSession::from_session(state_coupled_hybrid_decoder())
+            .expect("spec hybrid decoder loads");
+        spec.decode_argmax(&base_tokens, 0).expect("spec prefill");
+        assert_eq!(spec.current_len(), base_len);
+        let snapshot = spec
+            .snapshot_recurrent_state()
+            .expect("snapshot pre-draft recurrent state");
+
+        // (1) Verify from the CURRENT committed state (== S_base) matches greedy.
+        let good = spec
+            .decode_verify(&drafts, base_len)
+            .expect("verify from committed state");
+        assert_eq!(
+            good[0][0].to_bits(),
+            m1_row0.to_bits(),
+            "verify row 0 from the committed recurrent state must bit-match the m=1 greedy \
+             logit (k={k})"
+        );
+
+        // (2) Negative control: a plain KV rewind leaves the destructive
+        // recurrent state stranded at its post-verify value; verifying again
+        // WITHOUT restoring the snapshot must DIVERGE from greedy — this is the
+        // stale-state artifact that invalidates any verify oracle skipping the
+        // restore.
+        spec.rewind(base_len)
+            .expect("kv rewind, recurrent left stale");
+        let stale = spec
+            .decode_verify(&drafts, base_len)
+            .expect("verify from stale recurrent state");
+        assert_ne!(
+            stale[0][0].to_bits(),
+            m1_row0.to_bits(),
+            "verify row 0 from a STALE recurrent state must diverge from greedy — the restore \
+             is load-bearing (k={k})"
+        );
+
+        // (3) Restoring the snapshot before the verify reinstates bit-identity,
+        // exactly as the driver's commit path does.
+        spec.rewind(base_len).expect("kv rewind before restore");
+        spec.restore_recurrent_state(&snapshot)
+            .expect("restore recurrent state to S_base");
+        let restored = spec
+            .decode_verify(&drafts, base_len)
+            .expect("verify from restored recurrent state");
+        assert_eq!(
+            restored[0][0].to_bits(),
+            m1_row0.to_bits(),
+            "verify row 0 after restoring the committed recurrent state must bit-match the m=1 \
+             greedy logit (k={k})"
+        );
+    }
+}
+
 #[test]
 fn native_decoder_auto_derives_hybrid_state_io() {
     // A hybrid decoder with NO declared `io:` must load via the graph-derived
@@ -867,10 +1505,7 @@ fn native_decoder_auto_derive_skips_dense_ambiguous_decoder() {
         Ok(_) => panic!("dense ambiguous decoder must still require explicit token_input"),
         Err(error) => error,
     };
-    assert!(
-        error.to_string().contains("model.io.token_input"),
-        "{error:#}"
-    );
+    assert!(error.to_string().contains("token_input"), "{error:#}");
 }
 
 fn target_io(sequence_source: SequenceInputKind) -> ModelIoSpec {
@@ -891,10 +1526,10 @@ fn target_io(sequence_source: SequenceInputKind) -> ModelIoSpec {
         audio_features_input: None,
         cross_kv_inputs: None,
         cross_kv_outputs: None,
-        kv_update: None,
         state_pairs: None,
         optional_inputs: BTreeMap::new(),
         static_cache: None,
+        aliasing: None,
     }
 }
 
@@ -918,10 +1553,10 @@ fn tiny_decoder_io() -> ModelIoSpec {
         audio_features_input: None,
         cross_kv_inputs: None,
         cross_kv_outputs: None,
-        kv_update: None,
         state_pairs: None,
         optional_inputs: BTreeMap::new(),
         static_cache: None,
+        aliasing: None,
     }
 }
 
@@ -931,10 +1566,7 @@ fn native_decoder_requires_explicit_ambiguous_io() {
         Ok(_) => panic!("ambiguous decoder roles must require metadata"),
         Err(error) => error,
     };
-    assert!(
-        error.to_string().contains("model.io.token_input"),
-        "{error:#}"
-    );
+    assert!(error.to_string().contains("token_input"), "{error:#}");
 }
 
 fn tiny_embedding_target(with_routed_input: bool) -> InferenceSession {
@@ -1065,10 +1697,10 @@ fn proposer_io(sequence_source: SequenceInputKind, kv_ownership: KvOwnership) ->
         audio_features_input: None,
         cross_kv_inputs: None,
         cross_kv_outputs: None,
-        kv_update: None,
         state_pairs: None,
         optional_inputs: std::collections::BTreeMap::new(),
         static_cache: None,
+        aliasing: None,
     }
 }
 
@@ -1216,7 +1848,7 @@ fn tiny_shared_kv_embed_proposer(width: usize) -> InferenceSession {
     session_from_graph(graph)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[derive(Clone, Copy)]
 enum AuxOutput {
     /// Static `[1, 1]` auxiliary output produced by `Cast(input_ids)`. The
@@ -1235,7 +1867,7 @@ enum AuxOutput {
     SymbolicTotalSeq,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn capture_safe_cuda_decoder(
     graph_capture: bool,
     max_len: usize,
@@ -1243,7 +1875,7 @@ fn capture_safe_cuda_decoder(
     build_cuda_decoder(graph_capture, max_len, AuxOutput::StaticUnit)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn build_cuda_decoder(
     graph_capture: bool,
     max_len: usize,
@@ -1252,7 +1884,7 @@ fn build_cuda_decoder(
     build_cuda_decoder_with_fixed_state(graph_capture, Some(max_len), aux, false)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn build_cuda_decoder_with_fixed_state(
     graph_capture: bool,
     kv_max_len: Option<usize>,
@@ -1417,11 +2049,11 @@ fn build_cuda_decoder_with_fixed_state(
 /// until growth fails" sentinel. This is the shape a model with no declared
 /// `max_sequence_length` produces on the non-VMM native-CUDA decode path. We go
 /// through the `fixed_state` builder purely because it declares the graph
-/// `model.io` ports explicitly via `tiny_decoder_io()`; the default (non-VMM)
+/// decode ABI ports explicitly via `tiny_decoder_io()`; the default (non-VMM)
 /// KV path is unaffected by the extra recurrent state pair, so
 /// `kv_commits_on_demand` stays false and this reproduces the metadata-less
 /// non-VMM construction exactly.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn build_cuda_decoder_unbounded() -> anyhow::Result<NativeDecodeSession> {
     build_cuda_decoder_with_fixed_state(false, None, AuxOutput::StaticUnit, true)
 }
@@ -1436,7 +2068,7 @@ fn build_cuda_decoder_unbounded() -> anyhow::Result<NativeDecodeSession> {
 /// `full_mask_bytes` only inside the `kv_commits_on_demand` (VMM) branch that
 /// consumes it. This test drives the real construction and goes RED (with that
 /// exact overflow error) if the computation is hoisted back out of the branch.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 fn native_cuda_decoder_constructs_with_unbounded_metadata_less_capacity() -> anyhow::Result<()> {
     if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
@@ -1490,7 +2122,7 @@ fn native_cuda_decoder_constructs_with_unbounded_metadata_less_capacity() -> any
 /// `kv_commits_on_demand()` assertion guarantees the test really is on the VMM
 /// path — without it a silent fall back to the eager path would make the test
 /// prove nothing.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 fn native_cuda_vmm_decoder_constructs_with_unbounded_metadata_less_capacity() -> anyhow::Result<()>
 {
@@ -1542,7 +2174,7 @@ fn native_cuda_vmm_decoder_constructs_with_unbounded_metadata_less_capacity() ->
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn binding_addresses(session: &NativeDecodeSession) -> Vec<usize> {
     session
         .cuda
@@ -1562,7 +2194,7 @@ fn binding_addresses(session: &NativeDecodeSession) -> Vec<usize> {
 /// changes the emitted logits on the next generation — the exact signature of
 /// the session-reuse corruption bug. Used by the regression test that a reused
 /// `NativeDecodeSession` re-zeros recurrent state on `reset()`.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn build_cuda_recurrent_logits_decoder(max_len: usize) -> anyhow::Result<NativeDecodeSession> {
     use prost::Message;
 
@@ -1711,7 +2343,7 @@ fn build_cuda_recurrent_logits_decoder(max_len: usize) -> anyhow::Result<NativeD
 /// degenerate output on hybrid LinearAttention models). This test is
 /// non-vacuous: the logits are a direct function of the incoming recurrent
 /// state, so a stale state changes the asserted values.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 fn native_cuda_reused_session_rezeros_recurrent_state() -> anyhow::Result<()> {
     if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
@@ -1753,7 +2385,7 @@ fn native_cuda_reused_session_rezeros_recurrent_state() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn input_update_stats(session: &NativeDecodeSession) -> [DeviceBindingTransferStats; 3] {
     let state = session.cuda.as_ref().expect("CUDA state");
     [
@@ -1763,7 +2395,7 @@ fn input_update_stats(session: &NativeDecodeSession) -> [DeviceBindingTransferSt
     ]
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn assert_single_value_uploads(
     before: [DeviceBindingTransferStats; 3],
     after: [DeviceBindingTransferStats; 3],
@@ -1777,7 +2409,7 @@ fn assert_single_value_uploads(
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn assert_decode_bindings(
     session: &mut NativeDecodeSession,
     addresses: &[usize],
@@ -1816,7 +2448,7 @@ fn assert_decode_bindings(
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 fn run_capture_safe_decode(
     session: &mut NativeDecodeSession,
     tokens: &[TokenId],
@@ -2451,7 +3083,7 @@ fn unresolved_symbolic_axis_flags_only_non_unit_symbols() {
     );
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 fn native_cuda_binds_rank3_fixed_state_without_changing_growing_kv() -> anyhow::Result<()> {
     if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
@@ -2487,7 +3119,7 @@ fn native_cuda_binds_rank3_fixed_state_without_changing_growing_kv() -> anyhow::
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 #[ignore = "fixture defect, not a product bug (#1284): the synthetic decoder routes growable KV \
 through Cast, not a capacity-form attention op, so `binding_consumers_use_physical_capacity` \
@@ -2576,7 +3208,7 @@ fn native_cuda_capture_replay_is_bit_exact_and_refreshes_decode_inputs() -> anyh
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 #[ignore = "fixture defect, not a product bug (#1284): the synthetic decoder routes growable KV \
 through Cast, not a capacity-form attention op, so `binding_consumers_use_physical_capacity` \
@@ -2638,7 +3270,7 @@ fn native_cuda_symbolic_batch_aux_captures_bit_exact() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 fn native_cuda_symbolic_total_seq_aux_declines_capture_but_decodes_eagerly() -> anyhow::Result<()> {
     // F2 negative case (the F1 path): an auxiliary output whose symbolic dim
@@ -2722,7 +3354,7 @@ fn native_decode_accepts_last_token_only_logits_and_advances_kv() {
     assert_eq!(session.current_len(), 4);
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 fn native_cuda_qwen_decode_matches_cpu_tokens() -> anyhow::Result<()> {
     if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
@@ -2859,7 +3491,7 @@ fn native_cuda_qwen_decode_matches_cpu_tokens() -> anyhow::Result<()> {
 /// range or dropping `committed_ranges` in the plumbing makes the load-time KV
 /// commitment equal the full-context reservation and this test fails; sabotaging
 /// `commits_on_demand()` makes growth replace the bindings and this test fails.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 fn native_cuda_vmm_kv_grows_in_place_and_commits_more_granules() -> anyhow::Result<()> {
     if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
@@ -2950,7 +3582,7 @@ fn native_cuda_vmm_kv_grows_in_place_and_commits_more_granules() -> anyhow::Resu
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 fn native_cuda_verify_rewind_no_kv_corruption() -> anyhow::Result<()> {
     // WP1 exit criterion on real device KV: decode K draft tokens through the
@@ -3375,7 +4007,7 @@ fn decode_inline_never_routes_when_disabled_or_unbuilt() {
 /// `kv_layout` descriptor, with an environment override for residency
 /// diagnostics. Absent metadata means head-major — exactly the historical
 /// behavior — so no currently-loadable model changes its committed geometry.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 #[test]
 fn cuda_kv_layout_resolves_from_metadata_with_env_override() {
     use super::cuda::resolve_cuda_kv_layout;
@@ -3665,7 +4297,9 @@ fn growing_the_cpu_kv_cache_relocates_every_head() {
 
     let raw = grown.read_bytes().expect("read grown cache");
     let values: Vec<f32> = raw
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     assert_eq!(values.len(), heads * grown_capacity * head_dim);
@@ -3759,7 +4393,9 @@ fn assert_kv_prefix_intact(
     let capacity = binding.physical_shape()[2];
     let raw = binding.read_bytes().expect("read cache");
     let values: Vec<f32> = raw
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     for block in 0..heads {

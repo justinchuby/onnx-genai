@@ -1,14 +1,10 @@
 use std::{
     collections::{HashMap, VecDeque},
-    path::PathBuf,
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
 
-use anyhow::Context;
-use onnx_genai::text_to_audio::{SynthesizedAudio, TextToAudioRequest};
-use onnx_genai::text_to_image::{RenderedImage, TextToImageRequest};
 use onnx_genai::{
     Engine, GenerateOptions, GenerateRequest, GenerateResult, GenerateToken, SessionId, TokenId,
 };
@@ -18,9 +14,9 @@ use onnx_genai_engine::{
     FimConfig, GovernorSnapshot, KvNotApplicable, KvTelemetry, MemoryStrategyPlan, PipelineEngine,
     PipelineGenerateRequest, ResourceLimit, SchedulerAdmissionError,
 };
-use onnx_genai_ort::Tokenizer;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
+use crate::image_generation::{ImageExecutionRequest, ProducedImage};
 use crate::metrics::GenerationMetrics;
 use crate::multimodal::MultimodalInput;
 
@@ -124,6 +120,12 @@ pub(crate) enum DriverCommand {
         events: mpsc::Sender<DriverEvent>,
         permit: OwnedSemaphorePermit,
     },
+    GenerateImage {
+        request: Box<ImageExecutionRequest>,
+        reply: oneshot::Sender<anyhow::Result<ProducedImage>>,
+        permit: OwnedSemaphorePermit,
+        track_metrics: bool,
+    },
     GenerateFim {
         prefix: String,
         suffix: String,
@@ -137,16 +139,6 @@ pub(crate) enum DriverCommand {
         input_ids: Vec<TokenId>,
         options: EmbeddingOptions,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<f32>>>,
-    },
-    RenderImages {
-        pipeline_dir: PathBuf,
-        request: Box<TextToImageRequest>,
-        reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<RenderedImage>>>,
-    },
-    SynthesizeSpeech {
-        tokenizer: Arc<Tokenizer>,
-        request: Box<TextToAudioRequest>,
-        reply: tokio::sync::oneshot::Sender<anyhow::Result<SynthesizedAudio>>,
     },
     #[cfg(test)]
     ResourceSnapshot(tokio::sync::oneshot::Sender<anyhow::Result<GovernorSnapshot>>),
@@ -210,7 +202,11 @@ impl DriverFailure {
             )
         });
         Self {
-            message: error.to_string(),
+            // Anyhow's Display shows only the outermost context, which for a
+            // decode failure is the generic "forward pass failed" wrapper. The
+            // alternate form keeps the whole chain, and this message is the
+            // only thing the client ever sees.
+            message: format!("{error:#}"),
             kind: if memory_overload {
                 DriverFailureKind::MemoryOverload
             } else {
@@ -517,70 +513,62 @@ impl EngineDriver {
             crate::metrics::generation_queue_cancelled();
             return Err(GenerateSubmitError::DriverStopped);
         }
+
         Ok(DriverGeneration {
             admission: admission_rx,
             events: rx,
         })
     }
 
-    /// Render images on the engine thread that owns the pipeline.
-    ///
-    /// Diffusion is a single long synchronous call rather than a token stream,
-    /// so this is a plain request/response command instead of an event channel.
-    pub(crate) async fn render_images(
+    pub(crate) async fn generate_image(
         &self,
-        pipeline_dir: PathBuf,
-        request: TextToImageRequest,
-    ) -> Result<anyhow::Result<Vec<RenderedImage>>, GenerateSubmitError> {
-        let _permit = self
+        request: ImageExecutionRequest,
+    ) -> Result<anyhow::Result<ProducedImage>, GenerateSubmitError> {
+        let permit = self
             .generation_capacity
             .clone()
             .try_acquire_owned()
             .map_err(|_| GenerateSubmitError::Overloaded)?;
-        let (reply, rx) = tokio::sync::oneshot::channel();
+        let (reply, receiver) = oneshot::channel();
+        crate::metrics::generation_queued();
         if self
             .commands
-            .send(DriverCommand::RenderImages {
-                pipeline_dir,
+            .send(DriverCommand::GenerateImage {
                 request: Box::new(request),
                 reply,
+                permit,
+                track_metrics: true,
             })
             .await
             .is_err()
         {
+            crate::metrics::generation_queue_cancelled();
             return Err(GenerateSubmitError::DriverStopped);
         }
-        rx.await.map_err(|_| GenerateSubmitError::DriverStopped)
+        receiver
+            .await
+            .map_err(|_| GenerateSubmitError::DriverStopped)
     }
 
-    /// Synthesize speech on the engine thread that owns the pipeline.
-    ///
-    /// Like image rendering, this is one long synchronous call rather than a
-    /// token stream, so it is a plain request/response command.
-    pub(crate) async fn synthesize_speech(
-        &self,
-        tokenizer: Arc<Tokenizer>,
-        request: TextToAudioRequest,
-    ) -> Result<anyhow::Result<SynthesizedAudio>, GenerateSubmitError> {
-        let _permit = self
+    pub(crate) fn warmup_image(&self, request: ImageExecutionRequest) -> anyhow::Result<()> {
+        let permit = self
             .generation_capacity
             .clone()
             .try_acquire_owned()
-            .map_err(|_| GenerateSubmitError::Overloaded)?;
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        if self
-            .commands
-            .send(DriverCommand::SynthesizeSpeech {
-                tokenizer,
+            .map_err(|_| anyhow::anyhow!("generation capacity exceeded"))?;
+        let (reply, receiver) = oneshot::channel();
+        self.commands
+            .blocking_send(DriverCommand::GenerateImage {
                 request: Box::new(request),
                 reply,
+                permit,
+                track_metrics: false,
             })
-            .await
-            .is_err()
-        {
-            return Err(GenerateSubmitError::DriverStopped);
-        }
-        rx.await.map_err(|_| GenerateSubmitError::DriverStopped)
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
+        receiver
+            .blocking_recv()
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))??;
+        Ok(())
     }
 
     pub(crate) async fn generate_fim(
@@ -738,25 +726,31 @@ fn run_pipeline_driver(
                 events,
                 permit,
             } => run_pipeline_generation(engine, *request, input, admission, events, permit),
-            DriverCommand::RenderImages {
-                pipeline_dir,
+            DriverCommand::GenerateImage {
                 request,
                 reply,
+                permit: _permit,
+                track_metrics,
             } => {
-                let _ = reply.send(onnx_genai::text_to_image::render(
-                    &pipeline_dir,
-                    engine,
-                    &request,
-                ));
-            }
-            DriverCommand::SynthesizeSpeech {
-                tokenizer,
-                request,
-                reply,
-            } => {
-                let _ = reply.send(onnx_genai::text_to_audio::synthesize(
-                    engine, &tokenizer, &request,
-                ));
+                let _metrics = track_metrics.then(GenerationMetrics::start);
+                let result = (|| {
+                    let outputs = engine.run_pipeline_outputs(request.into_pipeline()?)?;
+                    let image = engine
+                        .structured_output_for_role(
+                            &outputs,
+                            onnx_genai_engine::pipeline::WorkflowOutputRole::Image,
+                        )
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "workflow completed without emitting its declared image output"
+                            )
+                        })?;
+                    Ok(ProducedImage {
+                        values: image.to_vec_f32_lossy()?,
+                        shape: image.shape().to_vec(),
+                    })
+                })();
+                let _ = reply.send(result);
             }
             DriverCommand::CreateSession(response) => {
                 let _ = response.send(Err(anyhow::anyhow!(
@@ -1037,6 +1031,7 @@ fn run_static_batch_until_idle(
     };
     let mut routes: HashMap<usize, DriverRoute> = HashMap::new();
     let mut abandoned = HashMap::new();
+    let mut reported_occupancy = onnx_genai_engine::BatchOccupancy::default();
     for pending in initial {
         submit_to_continuous_manager(
             &mut manager,
@@ -1123,7 +1118,7 @@ fn run_static_batch_until_idle(
         route_continuous_admissions(manager.poll_admissions(), &mut routes);
         if let Err(err) = manager.step() {
             let mut failure = DriverFailure::from_engine_error(&err);
-            failure.message = format!("continuous batch generation failed: {err}");
+            failure.message = format!("continuous batch generation failed: {err:#}");
             for (_, mut route) in routes.drain() {
                 if let Some(sender) = route.admission.take() {
                     let _ = sender.send(Err(failure.clone()));
@@ -1133,14 +1128,41 @@ fn run_static_batch_until_idle(
                     kind: failure.kind,
                 }));
             }
+            reported_occupancy = publish_batch_occupancy(manager.occupancy(), reported_occupancy);
             break;
         }
         route_continuous_admissions(manager.poll_admissions(), &mut routes);
         route_continuous_events(manager.poll(), &mut routes, &mut abandoned);
+        reported_occupancy = publish_batch_occupancy(manager.occupancy(), reported_occupancy);
         if manager.is_idle() {
             break;
         }
     }
+    tracing::info!(
+        steps = reported_occupancy.steps,
+        rows_advanced = reported_occupancy.rows_advanced,
+        peak_rows = reported_occupancy.max_rows_in_step,
+        max_batch = reported_occupancy.max_batch,
+        mean_rows_per_step = reported_occupancy.mean_rows_per_step(),
+        "continuous batch group drained"
+    );
+}
+
+/// Publish the forwards issued since the last report to the process metrics.
+///
+/// The manager reports cumulative occupancy for its own lifetime, but the
+/// registry accumulates across batch groups, so only the delta is added.
+fn publish_batch_occupancy(
+    current: onnx_genai_engine::BatchOccupancy,
+    reported: onnx_genai_engine::BatchOccupancy,
+) -> onnx_genai_engine::BatchOccupancy {
+    crate::metrics::batch_forwards_observed(
+        current.steps.saturating_sub(reported.steps),
+        current.rows_advanced.saturating_sub(reported.rows_advanced),
+        current.max_rows_in_step,
+        current.max_batch,
+    );
+    current
 }
 
 /// What the admission loop should do this iteration.
@@ -1207,9 +1229,8 @@ fn deferred_permit_holder_count(deferred: &VecDeque<DriverCommand>) -> usize {
                 command,
                 DriverCommand::Generate { .. }
                     | DriverCommand::GeneratePipeline { .. }
+                    | DriverCommand::GenerateImage { .. }
                     | DriverCommand::GenerateFim { .. }
-                    | DriverCommand::RenderImages { .. }
-                    | DriverCommand::SynthesizeSpeech { .. }
             )
         })
         .count()
@@ -1346,12 +1367,16 @@ fn route_continuous_events(
     for event in events {
         match event {
             ContinuousBatchEvent::Token { handle, token } => {
-                // A slow or disconnected consumer loses its route immediately. The
-                // driver never waits for output capacity; it keeps stepping every
-                // other row while the manager retires the abandoned row.
+                // A *disconnected* consumer loses its route immediately: the driver
+                // keeps stepping every other row while the manager retires the
+                // abandoned one. A consumer that is merely behind gets backpressure
+                // instead — dropping its route would discard the tokens it has not
+                // read yet along with the terminal event, turning a live request
+                // into a truncated stream once the bounded channel filled up.
                 let delivery_failed = if let Some(route) = routes.get_mut(&handle.id) {
                     route.metrics.token();
-                    route.events.try_send(DriverEvent::Token(token)).is_err()
+                    deliver_driver_event(&route.events, DriverEvent::Token(token), DELIVERY_GRACE)
+                        .is_err()
                 } else {
                     false
                 };
@@ -1364,7 +1389,14 @@ fn route_continuous_events(
                     route
                         .metrics
                         .result(result.token_ids.len(), result.prefix_cache_hit_len);
-                    let _ = route.events.try_send(DriverEvent::Finished(result));
+                    // The terminal event must reach the consumer even when the
+                    // channel is momentarily full; losing it closes the stream and
+                    // the caller reports "generation stream ended before result".
+                    let _ = deliver_driver_event(
+                        &route.events,
+                        DriverEvent::Finished(result),
+                        DELIVERY_GRACE,
+                    );
                 } else if let Some(mut route) = abandoned.remove(&handle.id) {
                     route
                         .metrics
@@ -1424,26 +1456,18 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             let _ = admission.send(Err(failure.clone()));
             let _ = events.try_send(DriverEvent::Error(failure));
         }
+        DriverCommand::GenerateImage { reply, .. } => {
+            crate::metrics::generation_queue_cancelled();
+            let _ = reply.send(Err(anyhow::anyhow!(
+                "image generation requires a metadata-declared pipeline model"
+            )));
+        }
         DriverCommand::Embed {
             input_ids,
             options,
             reply,
         } => {
             let _ = reply.send(engine.embed_with_options(&input_ids, options));
-        }
-        DriverCommand::RenderImages { reply, .. } => {
-            let _ = reply.send(Err(anyhow::anyhow!(
-                "What: image generation was routed to a single-model engine. \
-                 Why: only a declared diffusion pipeline can run a denoise loop. \
-                 How: request a model whose package declares `strategy.denoiser`."
-            )));
-        }
-        DriverCommand::SynthesizeSpeech { reply, .. } => {
-            let _ = reply.send(Err(anyhow::anyhow!(
-                "What: speech synthesis was routed to a single-model engine. \
-                 Why: only a declared pipeline can run a post-decode vocoder stage. \
-                 How: request a model whose package declares a `run_on: final_only` waveform stage."
-            )));
         }
         #[cfg(test)]
         DriverCommand::ResourceSnapshot(reply) => {
@@ -1457,6 +1481,140 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
         }
     }
 }
+
+/// How long a consumer may hold up the driver before it counts as stalled.
+///
+/// The driver serves every generation — batched rows and solo requests alike —
+/// from one thread, so a consumer that stops reading holds up everyone behind
+/// it. Two bounds pin this value. It must be far longer than the microseconds
+/// an awake receiver needs to drain a `DRIVER_OUTPUT_BUFFER`-sized burst, so a
+/// consumer that is merely *behind* is never mistaken for a dead one. And it
+/// must stay well inside the time a caller is willing to wait for an unrelated
+/// request, because abandoning a consumer that has genuinely stopped reading is
+/// what preserves the guarantee that no single route can wedge the driver.
+const DELIVERY_GRACE: Duration = Duration::from_secs(1);
+
+/// How often to retry a full channel while waiting out the grace period.
+const DELIVERY_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Deliver a driver event, waiting briefly for capacity instead of dropping the
+/// route the moment its channel is full.
+///
+/// `try_send` alone cannot tell "the consumer went away" from "the consumer is
+/// briefly behind", and the bounded channel holds only `DRIVER_OUTPUT_BUFFER`
+/// events. Treating a full buffer as a disconnect aborted every generation
+/// longer than the buffer — "stream receiver closed: no available capacity" —
+/// while the client was still connected and reading, and then dropped the
+/// terminal event into that same full buffer, so the caller was told
+/// "generation stream ended before result" instead of what actually went wrong.
+///
+/// Driver generation runs on a dedicated OS thread, never on the async runtime,
+/// so waiting here parks that one thread rather than stalling the reactor. The
+/// wait is bounded by `grace` so a consumer that has genuinely stopped reading
+/// still loses its route and cannot wedge other rows.
+fn deliver_driver_event(
+    events: &mpsc::Sender<DriverEvent>,
+    event: DriverEvent,
+    grace: Duration,
+) -> Result<(), DriverDeliveryError> {
+    let mut pending = match events.try_send(event) {
+        Ok(()) => return Ok(()),
+        Err(mpsc::error::TrySendError::Full(event)) => event,
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            return Err(DriverDeliveryError::Disconnected);
+        }
+    };
+    let deadline = Instant::now() + grace;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(DriverDeliveryError::Stalled);
+        }
+        thread::sleep(DELIVERY_RETRY_INTERVAL);
+        pending = match events.try_send(pending) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::error::TrySendError::Full(event)) => event,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(DriverDeliveryError::Disconnected);
+            }
+        };
+    }
+}
+
+/// Deliver one event to a single request's own output channel.
+///
+/// The solo paths own their channel outright and have nothing to report a
+/// typed stall to, so they take the default grace and surface either failure as
+/// an ordinary error that ends the generation.
+fn deliver_event(events: &mpsc::Sender<DriverEvent>, event: DriverEvent) -> anyhow::Result<()> {
+    deliver_driver_event(events, event, DELIVERY_GRACE).map_err(anyhow::Error::new)
+}
+
+#[cfg(test)]
+mod image_metrics_tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::state::AppState;
+
+    #[tokio::test]
+    async fn failed_image_execution_restores_pending_metric() {
+        let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/comfyui_workflows/txt2img_sd15");
+        let state = AppState::load(&model_dir, Some("image-metrics-error".to_string())).unwrap();
+        let handle = state
+            .registry
+            .resolve("image-metrics-error")
+            .unwrap()
+            .unwrap();
+        let baseline = crate::metrics::snapshot().pending_requests;
+
+        // Omitting the required application-owned negative-prompt input makes
+        // the workflow fail after the image command starts.
+        let result = handle
+            .engine
+            .generate_image(ImageExecutionRequest {
+                request: GenerateRequest {
+                    prompt: onnx_genai::GeneratePrompt::TokenIds(vec![2, 3]),
+                    options: GenerateOptions {
+                        max_new_tokens: 1,
+                        seed: Some(1),
+                        ..GenerateOptions::default()
+                    },
+                },
+                inputs: Vec::new(),
+            })
+            .await
+            .expect("image command submitted");
+
+        assert!(
+            result.is_err(),
+            "malformed image workflow request must fail"
+        );
+        assert_eq!(crate::metrics::snapshot().pending_requests, baseline);
+    }
+}
+
+/// Why a driver event could not be handed to its consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriverDeliveryError {
+    /// The receiver was dropped.
+    Disconnected,
+    /// The receiver is still alive but stopped draining within the grace period.
+    Stalled,
+}
+
+impl std::fmt::Display for DriverDeliveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disconnected => formatter.write_str("stream receiver closed"),
+            Self::Stalled => {
+                formatter.write_str("stream consumer stalled: output buffer stayed full")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DriverDeliveryError {}
 
 fn run_pipeline_generation(
     engine: &mut PipelineEngine,
@@ -1483,9 +1641,7 @@ fn run_pipeline_generation(
     let mut admission = Some(admission);
     let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
         metrics.token();
-        events
-            .try_send(DriverEvent::Token(token))
-            .context("stream receiver closed")
+        deliver_event(&events, DriverEvent::Token(token))
     };
     let result = {
         let mut admitted = || {
@@ -1498,14 +1654,14 @@ fn run_pipeline_generation(
     match result {
         Ok(result) => {
             metrics.result(result.token_ids.len(), result.prefix_cache_hit_len);
-            let _ = events.try_send(DriverEvent::Finished(result));
+            let _ = deliver_event(&events, DriverEvent::Finished(result));
         }
         Err(err) => {
             let failure = DriverFailure::from_engine_error(&err);
             if let Some(sender) = admission.take() {
                 let _ = sender.send(Err(failure.clone()));
             }
-            let _ = events.try_send(DriverEvent::Error(failure));
+            let _ = deliver_event(&events, DriverEvent::Error(failure));
         }
     }
 }
@@ -1522,9 +1678,7 @@ fn run_fallback_generation(
     let mut admission = Some(admission);
     let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
         metrics.token();
-        events
-            .try_send(DriverEvent::Token(token))
-            .context("stream receiver closed")
+        deliver_event(&events, DriverEvent::Token(token))
     };
     let result = {
         let mut admitted = || {
@@ -1547,14 +1701,14 @@ fn run_fallback_generation(
     match result {
         Ok(result) => {
             metrics.result(result.token_ids.len(), result.prefix_cache_hit_len);
-            let _ = events.try_send(DriverEvent::Finished(result));
+            let _ = deliver_event(&events, DriverEvent::Finished(result));
         }
         Err(err) => {
             let failure = DriverFailure::from_engine_error(&err);
             if let Some(sender) = admission.take() {
                 let _ = sender.send(Err(failure.clone()));
             }
-            let _ = events.try_send(DriverEvent::Error(failure));
+            let _ = deliver_event(&events, DriverEvent::Error(failure));
         }
     }
 }
@@ -1592,14 +1746,14 @@ fn run_fim_generation(
     match result {
         Ok(result) => {
             metrics.result(result.token_ids.len(), result.prefix_cache_hit_len);
-            let _ = events.try_send(DriverEvent::Finished(result));
+            let _ = deliver_event(&events, DriverEvent::Finished(result));
         }
         Err(err) => {
             let failure = DriverFailure::from_engine_error(&err);
             if let Some(sender) = admission.take() {
                 let _ = sender.send(Err(failure.clone()));
             }
-            let _ = events.try_send(DriverEvent::Error(failure));
+            let _ = deliver_event(&events, DriverEvent::Error(failure));
         }
     }
 }
@@ -1717,7 +1871,22 @@ mod admission_tests {
                 requested: 4096,
                 available: 0,
                 role: onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
-                detail: "physical handle pool lease refused".into(),
+                detail: "cuMemMap could not grow the physical handle pool".into(),
+                // Shaped the way the allocator actually reports this: the
+                // governor's refusal is carried whole, so classification must
+                // not depend on the wording of `detail`.
+                source: Some(Box::new(
+                    onnx_runtime_memory_governor::MemoryError::TierExhausted {
+                        tier: "device",
+                        requested: 4096,
+                        used: 0,
+                        limit: 0,
+                        available: 0,
+                        role: onnx_runtime_memory_governor::MemoryRole::Workspace {
+                            step_scoped: false,
+                        },
+                    },
+                )),
             }
             .into();
         assert_eq!(
@@ -1855,64 +2024,242 @@ mod admission_tests {
             "a non-empty deferred queue is not a solo request"
         );
     }
+}
 
-    /// Every command that takes a `generation_capacity` permit must be counted.
-    ///
-    /// `in_flight` is derived from that semaphore, and this count is subtracted
-    /// from it to estimate arrivals. Missing a permit-holding variant here
-    /// understates the deferred total, inflates the estimate, and forces a lone
-    /// request onto the slow path -- which is exactly what happened when only
-    /// the three text-generation commands were counted.
+#[cfg(test)]
+mod driver_delivery_tests {
+    use super::*;
+    use onnx_genai_engine::FinishReason;
+
+    fn token(id: u32) -> GenerateToken {
+        GenerateToken {
+            token_id: id,
+            text: format!("t{id}"),
+            finish_reason: None,
+        }
+    }
+
+    fn result(tokens: usize) -> GenerateResult {
+        GenerateResult {
+            text: "done".to_string(),
+            token_ids: (0..tokens as u32).collect(),
+            finish_reason: FinishReason::EosToken,
+            prefix_cache_hit_len: 0,
+            logprobs: None,
+            budget_cap: None,
+        }
+    }
+
+    /// The defect: a generation longer than the output buffer aborted, and the
+    /// terminal event was then dropped into the same full buffer, so the client
+    /// was told the stream ended rather than what happened. A single request
+    /// owns its channel, so the driver must wait for capacity instead.
     #[test]
-    fn image_commands_are_counted_as_permit_holders() {
-        let (image_reply, _image_rx) = tokio::sync::oneshot::channel();
-        let mut deferred: VecDeque<DriverCommand> = VecDeque::new();
-        deferred.push_back(DriverCommand::RenderImages {
-            pipeline_dir: PathBuf::new(),
-            request: Box::new(TextToImageRequest::default()),
-            reply: image_reply,
+    fn a_generation_longer_than_the_output_buffer_still_delivers_every_event() {
+        let (events, mut rx) = mpsc::channel(DRIVER_OUTPUT_BUFFER);
+        let produced = DRIVER_OUTPUT_BUFFER * 3;
+        let sender = thread::spawn(move || {
+            for _ in 0..produced {
+                deliver_event(&events, DriverEvent::Token(token(0)))
+                    .expect("a live receiver must accept every token");
+            }
+            deliver_event(&events, DriverEvent::Finished(result(0)))
+                .expect("the terminal event must not be dropped for a full buffer");
         });
 
-        assert_eq!(
-            deferred_permit_holder_count(&deferred),
-            1,
-            "RenderImages holds a generation_capacity permit and must be \
-             subtracted from the in-flight estimate"
+        let mut tokens = 0;
+        let mut finished = false;
+        while let Some(event) = rx.blocking_recv() {
+            match event {
+                DriverEvent::Token(_) => tokens += 1,
+                DriverEvent::Finished(_) => {
+                    finished = true;
+                    break;
+                }
+                DriverEvent::Error(error) => panic!("unexpected failure: {}", error.message),
+            }
+        }
+        sender.join().expect("sender thread panicked");
+        assert_eq!(tokens, produced);
+        assert!(finished, "the result must reach the caller");
+    }
+
+    /// A receiver that is genuinely gone must still be reported, so a
+    /// disconnected client stops the generation instead of blocking it forever.
+    #[test]
+    fn a_dropped_receiver_is_reported_as_a_closed_stream() {
+        let (events, rx) = mpsc::channel::<DriverEvent>(DRIVER_OUTPUT_BUFFER);
+        drop(rx);
+        let error = deliver_event(&events, DriverEvent::Token(token(0)))
+            .expect_err("a dropped receiver cannot accept events");
+        assert!(error.to_string().contains("stream receiver closed"));
+    }
+
+    /// Waiting for capacity must stay bounded. These paths run on the driver's
+    /// one dedicated thread, so a consumer that holds its receiver but never
+    /// reads it has to be abandoned, or every later request waits behind it.
+    /// It is reported as stalled, not as closed, because those differ.
+    #[test]
+    fn a_receiver_that_never_reads_is_abandoned_within_the_budget() {
+        let (events, _held) = mpsc::channel::<DriverEvent>(1);
+        deliver_event(&events, DriverEvent::Token(token(0))).expect("the first event fits");
+
+        let started = Instant::now();
+        let error = deliver_event(&events, DriverEvent::Token(token(0)))
+            .expect_err("a receiver that never reads cannot be waited on forever");
+        let waited = started.elapsed();
+
+        assert!(error.to_string().contains("stream consumer stalled"));
+        assert!(waited >= DELIVERY_GRACE, "gave up too early: {waited:?}");
+        assert!(
+            waited < DELIVERY_GRACE * 3,
+            "held the driver far past the budget: {waited:?}"
         );
     }
 
-    /// A deferred permit holder must not be mistaken for an incoming sibling.
-    ///
-    /// This is the end-to-end shape of the bug: one image request queued behind
-    /// a lone generation used to make `expected_this_batch` exceed `collected`,
-    /// which held the generation to the hard deadline and then ran it through
-    /// the continuous-batch path by itself.
-    #[test]
-    fn a_deferred_image_request_does_not_force_a_lone_generation_onto_the_slow_path() {
-        let (image_reply, _image_rx) = tokio::sync::oneshot::channel();
-        let mut deferred: VecDeque<DriverCommand> = VecDeque::new();
-        deferred.push_back(DriverCommand::RenderImages {
-            pipeline_dir: PathBuf::new(),
-            request: Box::new(TextToImageRequest::default()),
-            reply: image_reply,
+    fn route(capacity: usize) -> (DriverRoute, mpsc::Receiver<DriverEvent>) {
+        let (events, events_rx) = mpsc::channel(capacity);
+        let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        (
+            DriverRoute {
+                admission: None,
+                events,
+                _permit: permit,
+                metrics: GenerationMetrics::start(),
+            },
+            events_rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn full_channel_applies_backpressure_instead_of_failing() {
+        // Regression: a generation longer than the bounded channel used to abort
+        // with "stream receiver closed: no available capacity" even though the
+        // consumer was alive and reading.
+        let (events, mut events_rx) = mpsc::channel(2);
+        let producer = tokio::task::spawn_blocking(move || {
+            for id in 0..8 {
+                deliver_driver_event(&events, DriverEvent::Token(token(id)), DELIVERY_GRACE)
+                    .expect("live consumer must not be treated as disconnected");
+            }
         });
 
-        // Two permits are held: our lone generation, and the queued image.
-        let in_flight = 2usize;
-        let max_batch = 4usize;
-        let expected_this_batch = in_flight
-            .saturating_sub(deferred_permit_holder_count(&deferred))
-            .min(max_batch);
+        let mut seen = Vec::new();
+        while let Some(DriverEvent::Token(token)) = events_rx.recv().await {
+            seen.push(token.token_id);
+        }
+        producer.await.unwrap();
+        assert_eq!(seen, (0..8).collect::<Vec<_>>(), "no token may be dropped");
+    }
 
-        assert_eq!(
-            expected_this_batch, 1,
-            "the queued image is accounted for, not counted as an arrival"
+    #[tokio::test]
+    async fn dropped_consumer_reports_disconnect() {
+        let (events, events_rx) = mpsc::channel(1);
+        drop(events_rx);
+        let failed = tokio::task::spawn_blocking(move || {
+            deliver_driver_event(&events, DriverEvent::Token(token(0)), DELIVERY_GRACE).is_err()
+        })
+        .await
+        .unwrap();
+        assert!(
+            failed,
+            "a closed channel must surface as a delivery failure"
         );
-        assert_ne!(
-            admission_step(1, expected_this_batch, 0, deferred.is_empty(), false),
-            AdmissionStep::WaitForSibling,
-            "a lone generation must not wait for a sibling that is really a \
-             queued image request"
+    }
+
+    #[tokio::test]
+    async fn slow_batch_consumer_keeps_route_and_receives_terminal_event() {
+        let handle = ContinuousBatchHandle { id: 7 };
+        let (driver_route, mut events_rx) = route(2);
+        let mut routes = HashMap::from([(handle.id, driver_route)]);
+        let mut abandoned = HashMap::new();
+
+        let mut events: Vec<_> = (0..6)
+            .map(|id| ContinuousBatchEvent::Token {
+                handle,
+                token: token(id),
+            })
+            .collect();
+        events.push(ContinuousBatchEvent::Finished {
+            handle,
+            result: result(6),
+        });
+
+        let routing = tokio::task::spawn_blocking(move || {
+            route_continuous_events(events, &mut routes, &mut abandoned);
+            (routes.len(), abandoned.len())
+        });
+
+        let mut tokens = Vec::new();
+        let mut finished = false;
+        while let Some(event) = events_rx.recv().await {
+            match event {
+                DriverEvent::Token(token) => tokens.push(token.token_id),
+                DriverEvent::Finished(_) => finished = true,
+                DriverEvent::Error(error) => panic!("unexpected failure: {error:?}"),
+            }
+        }
+
+        let (live, abandoned) = routing.await.unwrap();
+        assert_eq!(tokens, (0..6).collect::<Vec<_>>());
+        assert!(finished, "the terminal event must survive a full channel");
+        assert_eq!(abandoned, 0, "a reading consumer must not be abandoned");
+        assert_eq!(live, 0, "the finished route is retired, not abandoned");
+    }
+
+    #[tokio::test]
+    async fn stalled_consumer_is_abandoned_after_the_grace_period() {
+        // A consumer that stops draining entirely must lose its route so it
+        // cannot hold up the rows batched alongside it.
+        let handle = ContinuousBatchHandle { id: 11 };
+        let (driver_route, _held_rx) = route(1);
+        let mut routes = HashMap::from([(handle.id, driver_route)]);
+        let mut abandoned = HashMap::new();
+
+        let elapsed = tokio::task::spawn_blocking(move || {
+            let started = Instant::now();
+            route_continuous_events(
+                (0..4)
+                    .map(|id| ContinuousBatchEvent::Token {
+                        handle,
+                        token: token(id),
+                    })
+                    .collect(),
+                &mut routes,
+                &mut abandoned,
+            );
+            (started.elapsed(), routes.len(), abandoned.len())
+        })
+        .await
+        .unwrap();
+
+        let (duration, live, abandoned) = elapsed;
+        assert_eq!(live, 0, "a stalled route is dropped");
+        assert_eq!(abandoned, 1);
+        assert!(
+            duration < DELIVERY_GRACE * 3,
+            "the driver must not wait out the grace period once per token, took {duration:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn disconnected_batch_consumer_is_abandoned() {
+        let handle = ContinuousBatchHandle { id: 3 };
+        let (driver_route, events_rx) = route(4);
+        drop(events_rx);
+        let mut routes = HashMap::from([(handle.id, driver_route)]);
+        let mut abandoned = HashMap::new();
+
+        route_continuous_events(
+            vec![ContinuousBatchEvent::Token {
+                handle,
+                token: token(0),
+            }],
+            &mut routes,
+            &mut abandoned,
+        );
+
+        assert!(routes.is_empty(), "a dead consumer loses its route");
+        assert_eq!(abandoned.len(), 1);
     }
 }

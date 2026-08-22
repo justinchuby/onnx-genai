@@ -157,7 +157,7 @@ pub(crate) fn reject_native_request_speculation(options: &GenerateOptions) -> an
     let unsupported = match options.speculative_mode.as_ref() {
         None | Some(SpeculativeMode::None) | Some(SpeculativeMode::PromptLookup { .. }) => None,
         Some(SpeculativeMode::DraftModel) => Some("draft-model"),
-        Some(SpeculativeMode::Mtp(_)) => Some("MTP"),
+        Some(SpeculativeMode::Mtp(_)) => None,
         Some(SpeculativeMode::Eagle3(_)) => Some("EAGLE-3"),
         Some(SpeculativeMode::SharedKv(_)) => None,
     };
@@ -171,7 +171,11 @@ pub(crate) fn reject_native_request_speculation(options: &GenerateOptions) -> an
     if options.num_speculative_tokens.is_some()
         && !matches!(
             options.speculative_mode.as_ref(),
-            Some(SpeculativeMode::PromptLookup { .. } | SpeculativeMode::SharedKv(_))
+            Some(
+                SpeculativeMode::PromptLookup { .. }
+                    | SpeculativeMode::SharedKv(_)
+                    | SpeculativeMode::Mtp(_)
+            )
         )
     {
         anyhow::bail!(
@@ -193,6 +197,7 @@ pub(crate) struct NativeSpeculationPlan {
 pub(crate) enum NativeSpeculationKind {
     PromptLookup { ngram: usize, max_tokens: usize },
     SharedKv,
+    Mtp,
 }
 
 /// Decide whether a native request should run through the speculative driver.
@@ -219,16 +224,23 @@ pub(crate) fn native_speculation_plan(
             NativeSpeculationKind::SharedKv,
             config.num_speculative_tokens.saturating_add(1),
         ),
+        SpeculativeMode::Mtp(config) => (
+            NativeSpeculationKind::Mtp,
+            config.num_speculative_tokens.saturating_add(1),
+        ),
         _ => return None,
     };
-    let greedy = options.greedy || options.temperature == 0.0;
+    let greedy = options.selects_greedily();
     if !greedy || !chain.is_empty() || options.top_logprobs.is_some() {
         return None;
     }
     let width = options
         .num_speculative_tokens
         .map(|value| {
-            value.saturating_add(usize::from(matches!(kind, NativeSpeculationKind::SharedKv)))
+            value.saturating_add(usize::from(matches!(
+                kind,
+                NativeSpeculationKind::SharedKv | NativeSpeculationKind::Mtp
+            )))
         })
         .unwrap_or(default_width)
         .max(1);

@@ -15,7 +15,9 @@ pub(crate) fn resolve_native_decode_device(
     use crate::native_decode::NativeDecodeDevice;
 
     if let Some(device) = configured {
-        return validate_native_decode_device(device);
+        let device = validate_native_decode_device(device)?;
+        log_resolved_native_decode_device(&device, "requested explicitly", true);
+        return Ok(device);
     }
 
     match session_options
@@ -23,7 +25,31 @@ pub(crate) fn resolve_native_decode_device(
         .iter()
         .find(|provider| !provider.caps.is_host())
     {
-        None => Ok(NativeDecodeDevice::Cpu),
+        None => {
+            // The model declares no accelerator, which is the common case: most
+            // exports declare none at all. Reading that as "the user wants the
+            // CPU" is what made `--backend native` run on the CPU on a GPU box
+            // (#1064, #1551). A declaration that isn't there is an absence of
+            // information, not a preference, so probe for a usable device
+            // instead. `--device cpu` remains the way to ask for the CPU.
+            #[cfg(feature = "native-cuda")]
+            if onnx_runtime_ep_cuda::CudaExecutionProvider::is_available(0) {
+                let device = NativeDecodeDevice::Cuda { index: Some(0) };
+                log_resolved_native_decode_device(
+                    &device,
+                    "auto-detected: the model declares no execution provider and CUDA:0 is usable",
+                    false,
+                );
+                return validate_native_decode_device(device);
+            }
+            let device = NativeDecodeDevice::Cpu;
+            log_resolved_native_decode_device(
+                &device,
+                "the model declares no execution provider and no accelerator was detected",
+                false,
+            );
+            Ok(device)
+        }
         Some(provider) if provider.native_plugin_bridge().is_some() => {
             let bridge = provider.native_plugin_bridge().expect("checked above");
             if bridge.lib.as_os_str().is_empty() || !bridge.lib.is_file() {
@@ -33,11 +59,17 @@ pub(crate) fn resolve_native_decode_device(
                     bridge.lib.display()
                 );
             }
-            validate_native_decode_device(NativeDecodeDevice::Plugin {
+            let device = validate_native_decode_device(NativeDecodeDevice::Plugin {
                 library: bridge.lib,
                 registration_name: Some(bridge.registration_name),
                 provider_name: bridge.provider_name,
-            })
+            })?;
+            log_resolved_native_decode_device(
+                &device,
+                "declared by the model as a plugin provider",
+                false,
+            );
+            Ok(device)
         }
         Some(provider) if provider.caps.is_gpu() && provider.caps.is_nvidia() => {
             let device_id = provider.caps.device_id().unwrap_or(0);
@@ -46,7 +78,10 @@ pub(crate) fn resolve_native_decode_device(
                     "native decoder backend CUDA device id must be non-negative, got {device_id}"
                 )
             })?;
-            validate_native_decode_device(NativeDecodeDevice::Cuda { index: Some(index) })
+            let device =
+                validate_native_decode_device(NativeDecodeDevice::Cuda { index: Some(index) })?;
+            log_resolved_native_decode_device(&device, "declared by the model", false);
+            Ok(device)
         }
         Some(provider) => {
             anyhow::bail!(
@@ -54,6 +89,41 @@ pub(crate) fn resolve_native_decode_device(
                 provider.caps.name
             )
         }
+    }
+}
+
+/// Say which device a native decode session resolved to, and why.
+///
+/// Unconditional and at INFO because the failure this guards against is silent:
+/// a run that was asked for the native backend but quietly landed on the CPU
+/// looks exactly like one that landed on the GPU (#1064, #1551). The engine
+/// already logs a device further in, but only from a path pipeline models do
+/// not take, so it never appeared for them.
+#[cfg(feature = "native-backend")]
+fn log_resolved_native_decode_device(
+    device: &crate::native_decode::NativeDecodeDevice,
+    reason: &str,
+    requested: bool,
+) {
+    let on_cpu = matches!(device, crate::native_decode::NativeDecodeDevice::Cpu);
+    // Warn only for a CPU nobody asked for: that is the case that is otherwise
+    // indistinguishable from success. A caller who passed `--device cpu` got
+    // what they asked for and does not need to be told off for it.
+    if on_cpu && !requested {
+        tracing::warn!(
+            backend = "native",
+            device = ?device,
+            reason,
+            "the native decoder resolved to the CPU and will be far slower than an \
+             accelerator; pass an explicit device to override"
+        );
+    } else {
+        tracing::info!(
+            backend = "native",
+            device = ?device,
+            reason,
+            "resolved native decode device"
+        );
     }
 }
 
@@ -73,14 +143,17 @@ pub(crate) fn validate_native_decode_device(
             Ok(device)
         }
         crate::native_decode::NativeDecodeDevice::Cuda { .. } => {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "native-cuda")]
             {
                 Ok(device)
             }
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "native-cuda"))]
             {
                 anyhow::bail!(
-                    "native decoder backend CUDA device requires building onnx-genai-engine with both the 'native-backend' and 'cuda' features"
+                    "native decoder backend CUDA device requires the 'native-cuda' feature, which \
+                     this build of onnx-genai-engine does not have (it already implies \
+                     'native-backend'); rebuild with `--features native-cuda`, or select a CPU or \
+                     plugin decode device"
                 )
             }
         }
@@ -114,6 +187,7 @@ pub struct EngineResourceGovernor {
     /// ledger; a per-caller governor would let each holder believe it had the
     /// whole tier to itself.
     memory: EngineMemoryGovernor,
+    process_memory_manager: onnx_runtime_memory_governor::ProcessMemoryManager,
     /// The fixed device reservation -- weights and runtime overhead -- held as a
     /// lease rather than subtracted before the ledger sees it.
     ///
@@ -181,7 +255,6 @@ impl EngineResourceGovernor {
         )
     }
 
-    #[cfg(feature = "native-backend")]
     // Eight parameters (one over the lint's threshold) because this is
     // `new_with_authority` plus an explicit reservation: #840 added
     // `cuda_device_index` to fix a VRAM-capacity portability bug and pushed it
@@ -208,27 +281,6 @@ impl EngineResourceGovernor {
             (model_weights_bytes, reservation_bytes),
             provider,
             domain,
-        )
-    }
-
-    pub(crate) fn new_for_shared_pipeline_kv(
-        limits: ResourceLimits,
-        allow_runtime_override: bool,
-        kv_config: ModelKvConfig,
-        existing_device_usage_bytes: u64,
-        cuda_device_index: Option<u32>,
-        provider: Option<&SharedMemoryAuthorityProvider>,
-        domain: &DeviceCompatibilityDomain,
-    ) -> Result<Self, ResourceError> {
-        let capacities = capacity_providers_for_device(&limits, cuda_device_index);
-        Self::new_with_capacities_and_authority(
-            limits,
-            allow_runtime_override,
-            capacities,
-            kv_config,
-            (existing_device_usage_bytes, 0),
-            provider,
-            Some(domain),
         )
     }
 
@@ -362,6 +414,15 @@ impl EngineResourceGovernor {
             snapshot.resolved_limits.host_ram_bytes,
             snapshot.disk_spill.as_ref().map_or(0, |tier| tier.limit),
         );
+        let process_memory_manager = match provider {
+            Some(provider) => provider.process_memory_manager(),
+            None => onnx_runtime_memory_governor::ProcessMemoryManager::new().map_err(|error| {
+                ResourceError::BudgetArithmeticOverflow {
+                    operation: "constructing the local process memory manager",
+                    reason: error.to_string(),
+                }
+            })?,
+        };
         // A reservation that "does not fit under the resolved ceiling" is only a
         // real failure when there *is* a resolved ceiling. When the device
         // capacity is unknown (`vram_bytes == None`) there is nothing to fit
@@ -433,6 +494,7 @@ impl EngineResourceGovernor {
             inner,
             allow_runtime_override,
             memory,
+            process_memory_manager,
             plan: std::sync::Mutex::new(plan),
             #[cfg(feature = "native-backend")]
             weight_offload_host_cache,
@@ -498,6 +560,10 @@ impl EngineResourceGovernor {
 
     pub fn device_authority(&self) -> DeviceMemoryAuthority {
         self.memory.device_authority()
+    }
+
+    pub fn process_memory_manager(&self) -> onnx_runtime_memory_governor::ProcessMemoryManager {
+        self.process_memory_manager.clone()
     }
 
     /// Point-in-time configured, resolved, derived, and live per-tier state.
@@ -698,7 +764,7 @@ pub(crate) fn fallback_capacity_providers(limits: &ResourceLimits) -> CapacityPr
 /// query is unavailable (no driver, query failure, or a nonsense zero total)
 /// so the caller reports the device tier as *unknown* rather than fabricating a
 /// capacity.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 pub(crate) fn real_cuda_vram_capacity(device_index: u32) -> Option<(u64, u64)> {
     let device_id = i32::try_from(device_index).ok()?;
     match onnx_genai_ort::cuda_rt::device_memory_info(device_id) {
@@ -817,13 +883,13 @@ pub(crate) fn clamp_ceiling_to_usable_vram(
 /// is *measured* or *unknown*, so every consumer — the decode governor and the
 /// server's device-limit resolution alike — shares one honest answer (#947).
 pub(crate) fn device_vram_capacity(cuda_device_index: Option<u32>) -> Arc<dyn CapacityProvider> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "native-cuda")]
     if let Some(index) = cuda_device_index
         && let Some((total, free)) = real_cuda_vram_capacity(index)
     {
         return Arc::new(FixedCapacity::new(total, free));
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "native-cuda"))]
     let _ = cuda_device_index;
     Arc::new(onnx_genai_scheduler::UnknownCapacity)
 }
@@ -998,6 +1064,7 @@ pub(crate) fn component_governor(
     config: &EngineConfig,
     kv_model: Option<&KvModelInfo>,
     model_weights_bytes: u64,
+    reservation_bytes: u64,
     cuda_device_index: Option<u32>,
     provider: Option<&crate::memory_authority::SharedMemoryAuthorityProvider>,
     domain: &crate::memory_authority::DeviceCompatibilityDomain,
@@ -1006,11 +1073,12 @@ pub(crate) fn component_governor(
         Some(kv_model) => governor_kv_config(Some(kv_model), config)?,
         None => governor_no_paged_kv_config(config)?,
     };
-    EngineResourceGovernor::new_with_authority(
+    EngineResourceGovernor::new_with_authority_and_reservation(
         config.limits.clone(),
         config.allow_runtime_override,
         kv_config,
         model_weights_bytes,
+        reservation_bytes,
         cuda_device_index,
         provider,
         Some(domain),
@@ -1021,6 +1089,67 @@ pub(crate) fn component_governor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An explicit `--device` is authoritative in both directions. The CPU case
+    /// is the one that matters: after #1551 made an undeclared device probe for
+    /// an accelerator, asking for the CPU on a GPU machine must still get the
+    /// CPU, or the flag would be unable to express what it exists to express.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn an_explicitly_requested_device_is_never_second_guessed() {
+        use crate::native_decode::NativeDecodeDevice;
+
+        let options = SessionOptions::default();
+
+        assert_eq!(
+            resolve_native_decode_device(Some(NativeDecodeDevice::Cpu), &options).unwrap(),
+            NativeDecodeDevice::Cpu,
+            "an explicit CPU request must survive accelerator detection"
+        );
+        #[cfg(feature = "native-cuda")]
+        assert_eq!(
+            resolve_native_decode_device(
+                Some(NativeDecodeDevice::Cuda { index: Some(2) }),
+                &options
+            )
+            .unwrap(),
+            NativeDecodeDevice::Cuda { index: Some(2) },
+            "an explicit CUDA index must be passed through unchanged"
+        );
+    }
+
+    /// A model that declares no execution provider used to resolve to the CPU,
+    /// so `--backend native` on a GPU machine silently decoded on the CPU
+    /// (#1064) -- and, because nothing said so, CLI-driven A/B and correctness
+    /// checks silently compared two runs that exercised neither the accelerator
+    /// nor the lever under test (#1551).
+    ///
+    /// An absent declaration is missing information, not a request for the CPU,
+    /// so it now probes instead. The assertion is written against the probe
+    /// rather than against a fixed device so that it is meaningful on both a GPU
+    /// box and a CPU-only one.
+    #[cfg(all(feature = "native-backend", feature = "native-cuda"))]
+    #[test]
+    fn an_undeclared_device_probes_for_an_accelerator_instead_of_assuming_the_cpu() {
+        use crate::native_decode::NativeDecodeDevice;
+
+        let resolved = resolve_native_decode_device(None, &SessionOptions::default()).unwrap();
+
+        if onnx_runtime_ep_cuda::CudaExecutionProvider::is_available(0) {
+            assert_eq!(
+                resolved,
+                NativeDecodeDevice::Cuda { index: Some(0) },
+                "a usable CUDA device must be preferred over the CPU when the model \
+                 declares nothing"
+            );
+        } else {
+            assert_eq!(
+                resolved,
+                NativeDecodeDevice::Cpu,
+                "with no usable accelerator the CPU remains the answer"
+            );
+        }
+    }
 
     #[test]
     fn fraction_over_unmeasured_vram_is_unknown_not_a_number() {
@@ -1195,7 +1324,7 @@ mod tests {
     // with a visible device, a `Fraction(0.90)` must resolve against the true
     // device total, not a provisional cap — otherwise any model larger than
     // ~7.2 GiB fails to load resident even on a 143 GiB H200.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "native-cuda")]
     #[test]
     fn real_cuda_capacity_lifts_fraction_above_provisional_cap() {
         // Historic 8 GiB provisional cap this test guards against regressing to.

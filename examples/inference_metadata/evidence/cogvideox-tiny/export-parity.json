@@ -1,0 +1,23 @@
+{
+  "denoiser_step_0": {
+    "shape_match": true,
+    "max_abs": 3.0018389225006104e-05,
+    "mean_abs": 1.0670628398656845e-05,
+    "max_rel": 0.024334201765812708,
+    "correlation": 0.999999999774145
+  },
+  "denoiser_step_1": {
+    "shape_match": true,
+    "max_abs": 3.7789344787597656e-05,
+    "mean_abs": 1.0974612087011337e-05,
+    "max_rel": 0.0013608040156887534,
+    "correlation": 0.9999999996912506
+  },
+  "denoiser_step_2": {
+    "shape_match": true,
+    "max_abs": 3.540515899658203e-05,
+    "mean_abs": 9.435205720365048e-06,
+    "max_rel": 0.002581235232844694,
+    "correlation": 0.9999999997668594
+  }
+}

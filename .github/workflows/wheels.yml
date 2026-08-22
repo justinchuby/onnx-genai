@@ -122,7 +122,7 @@ jobs:
     env:
       CIBW_ARCHS: ${{ matrix.archs }}
       # Pass the optional Cargo feature through cibuildwheel's PEP 517 frontend.
-      CIBW_CONFIG_SETTINGS: "build-args='--features cuda'"
+      CIBW_CONFIG_SETTINGS: "build-args='--features ort-cuda'"
 
     steps:
       - uses: actions/checkout@v5

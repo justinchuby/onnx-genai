@@ -3,7 +3,8 @@
 
 The rule
 --------
-Every ``static ...TEST_HITS: AtomicUsize`` counter in the CPU EP kernel code
+Every ``static ...TEST_HITS`` / ``...TEST_CALLS`` / ``...TEST_DISPATCHES``
+``AtomicUsize`` counter in the CPU EP kernel code
 must be read (via ``.load(...)``) inside a ``#[test]`` function in the same
 file. A counter with no test proves nothing — the dispatch path it instruments
 is *claimed* to be covered but actually never exercised in CI.
@@ -70,9 +71,35 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 KERNELS = REPO / "crates" / "onnx-runtime-ep-cpu" / "src" / "kernels"
 
+# The suffixes that name a dispatch-reachability counter.
+#
+# `TEST_HITS` was the original convention. `TEST_CALLS` and `TEST_DISPATCHES`
+# grew up alongside it in `matmul_nbits.rs` and were invisible to this lint
+# until they were added here: at the time of writing that was nine counters
+# plus `SPMD_TEST_DISPATCHES`, against twenty-five linted `TEST_HITS`. A
+# counter this lint does not know about is exactly the thing the lint exists to
+# prevent -- it *looks* like proof a branch is covered while enforcing nothing.
+#
+# Names are matched, not semantics, so a fourth suffix would be silently
+# unenforced all over again. `UNKNOWN_SUFFIX_RE` below closes that loop: any
+# `static ..._TEST_<something>: AtomicUsize` whose suffix is not listed here is
+# reported, so adding a counter under a new name fails this lint rather than
+# quietly opting out of it.
+COUNTER_SUFFIXES = ("TEST_HITS", "TEST_CALLS", "TEST_DISPATCHES")
+_SUFFIX_ALT = "|".join(COUNTER_SUFFIXES)
+
 # Matches: static SOMETHING_TEST_HITS: ... AtomicUsize/AtomicU64 ...
 COUNTER_DECL_RE = re.compile(
-    r"^(?:pub(?:\([^)]*\))?\s+)?static\s+(\w+TEST_HITS)\s*:\s*"
+    rf"^(?:pub(?:\([^)]*\))?\s+)?static\s+(\w+(?:{_SUFFIX_ALT}))\s*:\s*"
+    r"(?:std::sync::atomic::)?Atomic(?:Usize|U64)",
+    re.MULTILINE,
+)
+
+# A `static` whose name looks like a counter but whose suffix is not one this
+# lint knows. Locks and thread-locals (`TEST_LOCK`, `TEST_LOCAL`) are not
+# counters and are excluded by requiring an atomic type.
+UNKNOWN_SUFFIX_RE = re.compile(
+    r"^(?:pub(?:\([^)]*\))?\s+)?static\s+(\w+_TEST_\w+)\s*:\s*"
     r"(?:std::sync::atomic::)?Atomic(?:Usize|U64)",
     re.MULTILINE,
 )
@@ -122,7 +149,8 @@ def check_file(path: Path) -> list[str]:
 
     # Find all counter declarations
     counters = COUNTER_DECL_RE.findall(text)
-    if not counters:
+    unknown = [n for n in UNKNOWN_SUFFIX_RE.findall(text) if not n.endswith(COUNTER_SUFFIXES)]
+    if not counters and not unknown:
         return []
 
     rel = path.relative_to(REPO)
@@ -172,8 +200,30 @@ def check_file(path: Path) -> list[str]:
                 f"    before for exclusion)."
             )
 
+    # A counter whose suffix this lint does not recognise is worse than no
+    # counter: it reads as coverage and enforces nothing.
+    for name in unknown:
+        decl_line = next(
+            (
+                i + 1
+                for i, line in enumerate(lines)
+                if re.search(rf"^(?:pub(?:\([^)]*\))?\s+)?static\s+{re.escape(name)}\b", line)
+            ),
+            0,
+        )
+        problems.append(
+            f"  {rel}:{decl_line}: `{name}` uses a counter suffix this lint does not know\n"
+            f"\n"
+            f"    It looks like a dispatch-reachability counter, so a reader will\n"
+            f"    take it as proof the branch is covered -- but the lint matches\n"
+            f"    names, so nothing requires a test to read it.\n"
+            f"\n"
+            f"    Fix: rename it to end in one of {', '.join(COUNTER_SUFFIXES)},\n"
+            f"    or add its suffix to COUNTER_SUFFIXES in this script."
+        )
+
     # Also check: are there fetch_add calls to names that aren't declared?
-    fetch_re = re.compile(r"\b(\w+TEST_HITS)\.fetch_add\s*\(")
+    fetch_re = re.compile(rf"\b(\w+(?:{_SUFFIX_ALT}))\.fetch_add\s*\(")
     all_fetch_names = set(fetch_re.findall(text))
     counter_set = set(counters)
     orphan_fetches = all_fetch_names - counter_set

@@ -275,32 +275,6 @@ fn native_workspace_query_rows(
     prompt_rows.max(verify_rows)
 }
 
-fn metadata_eos_token_ids(metadata: &InferenceMetadata) -> Vec<TokenId> {
-    metadata
-        .tokens
-        .as_ref()
-        .and_then(|tokens| tokens.eos_token_id.as_ref())
-        .into_iter()
-        .flatten()
-        .filter_map(|&id| TokenId::try_from(id).ok())
-        .collect()
-}
-
-#[cfg(test)]
-mod eos_tests {
-    use super::*;
-
-    #[test]
-    fn metadata_eos_token_ids_preserves_multiple_valid_ids() {
-        let metadata: InferenceMetadata = serde_json::from_value(serde_json::json!({
-            "tokens": { "eos_token_id": [151645, -1, 4294967296_u64, 151643] }
-        }))
-        .unwrap();
-
-        assert_eq!(metadata_eos_token_ids(&metadata), vec![151645, 151643]);
-    }
-}
-
 impl Engine {
     fn admit_generate_request_with_scheduler(
         &mut self,
@@ -345,13 +319,7 @@ impl Engine {
     }
 
     fn default_eos_token_ids(&self) -> Vec<TokenId> {
-        let mut ids = metadata_eos_token_ids(&self.metadata);
-        for id in self.tokenizer.eos_token_ids() {
-            if !ids.contains(&id) {
-                ids.push(id);
-            }
-        }
-        ids
+        self.tokenizer.eos_token_ids()
     }
 
     fn apply_eos_defaults(&self, options: &mut GenerateOptions) {
@@ -381,7 +349,9 @@ impl Engine {
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         self.last_speculative_stats = SpeculativeStats::default();
-        if request.options.speculative_mode.is_none() && self.native_shared_kv_proposer.is_some() {
+        if request.options.speculative_mode.is_none()
+            && (self.native_shared_kv_proposer.is_some() || self.mtp.is_some())
+        {
             request.options.speculative_mode = Some(self.speculative_mode.clone());
         }
         reject_native_request_speculation(&request.options)?;
@@ -393,7 +363,7 @@ impl Engine {
             anyhow::bail!("prompt must contain at least one token");
         }
         options.max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
+        let chain = build_processor_chain(&options, Some(&self.tokenizer), false)?;
         let speculation_plan = native_speculation_plan(&options, &chain);
         let scheduler_session_id = self.next_native_session_id();
         let scheduled = self.admit_generate_request_with_scheduler(
@@ -452,6 +422,42 @@ impl Engine {
                             &proposer.embedder,
                             &proposer.groups,
                             proposer.hidden_size,
+                            plan.width,
+                        )?
+                    }
+                    NativeSpeculationKind::Mtp => {
+                        let mtp = self.mtp.as_ref().context(
+                            "native MTP speculation requested without a loaded MTP head",
+                        )?;
+                        // Reuse the generic MtpProposer (guaranteed target token +
+                        // K speculative drafts from the ORT MTP head) through the
+                        // native driver; the head runs on the ORT CUDA EP while the
+                        // hybrid GDN target runs natively. The recurrent-state
+                        // commit-by-accepted primitive (#1633) advances the target's
+                        // GDN/conv state on accept.
+                        let proposer = MtpProposer::new_owned(
+                            std::sync::Arc::clone(&mtp.session),
+                            onnx_genai_ort::MtpDecodeOptions {
+                                kv_mode: mtp.kv_mode,
+                                batch_size: 1,
+                                hc_mult: mtp.runtime_config.hc_mult,
+                                hidden_state_rank4: mtp.runtime_config.target_hidden_layout
+                                    == MtpHiddenLayout::Bshc,
+                                hidden_output: mtp.runtime_config.mtp_hidden_output.clone(),
+                                state_output: mtp.runtime_config.mtp_state_output.clone(),
+                            },
+                            mtp.embedder.clone(),
+                            mtp.lm_head.clone(),
+                            mtp.runtime_config.cache_scope,
+                        )?;
+                        let hidden_size = mtp
+                            .runtime_config
+                            .hc_mult
+                            .saturating_mul(mtp.config.hidden_size);
+                        crate::native_speculative::NativeSpeculativeDriver::new_mtp(
+                            native_session,
+                            proposer,
+                            hidden_size,
                             plan.width,
                         )?
                     }
@@ -822,7 +828,9 @@ impl Engine {
             // cold and session-reusing paths still admit through the scheduler
             // before touching the native backend.
             let native_spec_requested = request.options.speculative_mode.is_some()
-                || request.options.num_speculative_tokens.is_some();
+                || request.options.num_speculative_tokens.is_some()
+                || self.mtp.is_some()
+                || self.native_shared_kv_proposer.is_some();
             if request.options.cold_start || native_spec_requested {
                 let result = self.generate_native_cold_with_callback(
                     request,
@@ -984,7 +992,8 @@ impl Engine {
         }
 
         let max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
+        let chain =
+            build_processor_chain(&options, Some(&self.tokenizer), custom_sampler.is_some())?;
 
         let scheduled = self.admit_generate_request_with_scheduler(
             session_id,
@@ -1335,11 +1344,7 @@ impl Engine {
             .as_deref()
             .context("ORT decoder session is unavailable")?;
         // Bind ports from explicit metadata or unambiguous tensor shapes.
-        let io = self
-            .metadata
-            .model
-            .as_ref()
-            .and_then(|model| model.io.as_ref());
+        let io = self.metadata.decoder_io();
         let fixed_state_budget_bytes = self.governor.snapshot().resolved_limits.host_ram_bytes;
         if matches!(
             &self.speculative_mode,
@@ -1437,7 +1442,7 @@ impl Engine {
     /// anything (`reserved_bytes > 0, commits == 0`), which is the bug #659 hid
     /// behind a log line for an entire release.
     pub fn vmm_arena_stats(&self) -> Option<crate::VmmArenaStats> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         {
             let stats = onnx_runtime_ep_cuda::vmm_allocator::global_vmm_stats();
             Some(crate::VmmArenaStats {
@@ -1452,7 +1457,7 @@ impl Engine {
                 unaccounted_committed_bytes: stats.unaccounted_committed_bytes,
             })
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "native-cuda"))]
         {
             None
         }
@@ -1506,7 +1511,7 @@ impl Engine {
                 max_len,
                 ..
             } => max_len,
-            ModelDecodePath::PastPresent { .. } | ModelDecodePath::Legacy => None,
+            ModelDecodePath::PastPresent { .. } | ModelDecodePath::Generic => None,
         }
     }
 
@@ -1743,7 +1748,7 @@ impl Engine {
         }
 
         let max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
+        let chain = build_processor_chain(&options, Some(&self.tokenizer), false)?;
         let mut state = self
             .sessions
             .remove(&request.session_id)
@@ -1871,11 +1876,7 @@ impl Engine {
         let Some(session) = self.session.as_deref() else {
             return false;
         };
-        let io = self
-            .metadata
-            .model
-            .as_ref()
-            .and_then(|model| model.io.as_ref());
+        let io = self.metadata.decoder_io();
         ort_session_has_recurrent_state(session, io)
     }
 
@@ -2146,7 +2147,7 @@ impl Engine {
             anyhow::bail!("prompt must contain at least one token");
         }
         options.max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
+        let chain = build_processor_chain(&options, Some(&self.tokenizer), false)?;
         if native_speculation_plan(&options, &chain).is_some() {
             anyhow::bail!(
                 "native session generation does not support speculative decoding; use stateless generate() for native prompt-lookup/shared-KV speculation"
@@ -2451,7 +2452,7 @@ mod tests {
             prefix_cache: PrefixCache::new(),
             token_prefix_cache: Vec::new(),
             kv_model: None,
-            decode_path: ModelDecodePath::Legacy,
+            decode_path: ModelDecodePath::Generic,
             scheduler: Scheduler::with_byte_budget(
                 scheduler_config,
                 onnx_genai_scheduler::ByteBudget::new(10),

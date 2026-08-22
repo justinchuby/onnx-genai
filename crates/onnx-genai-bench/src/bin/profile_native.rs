@@ -10,11 +10,12 @@ use onnx_genai_engine::logits::{
     MinPProcessor, RepetitionPenaltyProcessor, TemperatureProcessor, TopKProcessor, TopPProcessor,
 };
 use onnx_genai_engine::{
-    DecodePrecision, Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GenerateRequest,
-    NativeDecodeDevice, NativeDecodeSession, PipelineEngine, PipelineGenerateRequest,
-    ProcessorChain, SpeculativeMode, SpeculativeStats, parse_resource_limit,
+    DecodePrecision, Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GeneratePrompt,
+    GenerateRequest, NativeDecodeDevice, NativeDecodeSession, PipelineEngine,
+    PipelineGenerateRequest, ProcessorChain, SpeculativeMode, SpeculativeStats,
+    parse_resource_limit,
 };
-use onnx_genai_ort::{Tokenizer, available_execution_providers, profile};
+use onnx_genai_ort::{DataType, Tokenizer, Value, available_execution_providers, profile};
 use onnx_runtime_session::InferenceSession;
 
 /// Honor `ONNX_GENAI_VRAM_LIMIT` in the profiler, mirroring the server CLI.
@@ -137,6 +138,39 @@ struct Args {
     decode_precision: DecodePrecisionArg,
     #[arg(long, default_value = "Hello")]
     prompt: String,
+    /// Read the prompt text from this file instead of `--prompt`.
+    ///
+    /// Prefill timing is dominated by fixed per-generation overhead at short
+    /// prompt lengths, so a slope measured across two short prompts is mostly
+    /// noise. `testdata/long-prompt.txt` ships ~21.7k tokens of deterministic,
+    /// non-repetitive prose for exactly this: take prefill at two lengths well
+    /// apart and the fixed overhead cancels out of the difference.
+    #[arg(long)]
+    prompt_file: Option<PathBuf>,
+    /// Truncate the prompt to exactly this many tokens, using the model's own
+    /// tokenizer. Lets a prefill sweep name lengths directly instead of
+    /// pre-tokenizing prompt files out-of-band and hoping the harness and the
+    /// engine agree on the tokenizer.
+    #[arg(long)]
+    prompt_tokens: Option<usize>,
+    /// Measure real prompt-processing throughput at several prompt lengths,
+    /// e.g. `--prefill-sweep 1024,4096,8192`.
+    ///
+    /// Each length is served from a *disjoint* window of the prompt, so no two
+    /// points share a prefix and none of them can be answered out of the prefix
+    /// cache. Reports each point plus the least-squares slope, whose reciprocal
+    /// is the marginal prompt-processing rate with fixed per-generation
+    /// overhead (model-load, embedding upload) divided out.
+    #[arg(long, value_delimiter = ',')]
+    prefill_sweep: Option<Vec<usize>>,
+    /// Clear the prefix cache before every measured generation.
+    ///
+    /// Warmup runs replay the same prompt, so by default a measured `--steady`
+    /// run reads its whole prompt back out of the prefix cache and its
+    /// "prefill" reflects one token of work, not prompt processing. Set this to
+    /// measure prefill; leave it off to measure warm-cache serving.
+    #[arg(long)]
+    no_prefix_cache: bool,
     /// When set, capture an `onnx-runtime-tracer` timeline of a single traced
     /// generation and write it as Chrome JSON to this path. Surfaces the per-op
     /// executor spans with `kernel_variant` / `capture_status` fields. Tracing
@@ -151,12 +185,15 @@ struct Args {
     dump_logprobs: Option<PathBuf>,
     #[arg(long, default_value_t = 40)]
     logprobs_k: usize,
-    /// Override the text prompt with an explicit JSON array of token ids (e.g.
-    /// "[9707, 12824, 13]"). Enables exact teacher-forced logit comparison
-    /// against ORT without tokenizer round-trip drift. Only honored with
-    /// --dump-logprobs.
-    #[arg(long)]
+    /// Path to a JSON file holding an explicit array of prompt token ids (file
+    /// contents e.g. `[9707, 12824, 13]`), overriding the text prompt. Applies
+    /// to the engine (`--steady`), native, pipeline, and log-probability runs so
+    /// paired benchmarks avoid tokenizer round-trip drift.
+    #[arg(long, value_name = "JSON_FILE")]
     prompt_ids: Option<PathBuf>,
+    /// Encoded image supplied as the optional `request.image` workflow input.
+    #[arg(long)]
+    image: Option<PathBuf>,
     /// HF-style repetition penalty applied host-side to the output logits before
     /// token selection (divides positive / multiplies negative logits of tokens
     /// already in the prompt+generated stream). Default 1.0 is OFF and keeps the
@@ -306,8 +343,9 @@ struct Args {
     /// with the host argmax (logits D2H + host reduction) vs the on-GPU argmax
     /// (`decode_greedy_batch`, no logits D2H), reporting tok/s for both and the
     /// token divergence between them. Pure base-decode measurement — no
-    /// speculative / draft machinery. Selects the primary reported path via the
-    /// `ONNX_GENAI_ONGPU_ARGMAX` env flag (default OFF = host argmax).
+    /// speculative / draft machinery. Both arms are always measured and their
+    /// token streams cross-checked for byte-identity; the on-GPU path is what
+    /// the engine ships, so it is the one the net ratio is reported against.
     #[arg(long, default_value_t = false)]
     ongpu_argmax_bench: bool,
 }
@@ -407,8 +445,43 @@ fn generate(
     Ok(result.token_ids)
 }
 
+/// Prompt ids parsed from `--prompt-ids`, published once by [`init_prompt_ids`]
+/// before any request is built.
+static PROMPT_IDS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+
+/// Parse `--prompt-ids` up front so every request path — including the engine
+/// `--steady` path — sees the same explicit token ids. Without this the engine
+/// path silently fell back to `--prompt` text, so a paired benchmark could
+/// report numbers for a prompt the caller never asked for.
+fn init_prompt_ids(args: &Args) -> Result<()> {
+    let Some(ids_path) = args.prompt_ids.as_ref() else {
+        return Ok(());
+    };
+    let raw = std::fs::read_to_string(ids_path)
+        .with_context(|| format!("read prompt ids from {}", ids_path.display()))?;
+    let ids = serde_json::from_str::<Vec<u32>>(raw.trim())
+        .with_context(|| format!("parse prompt ids JSON from {}", ids_path.display()))?;
+    if ids.is_empty() {
+        bail!("prompt ids from {} are empty", ids_path.display());
+    }
+    let _ = PROMPT_IDS.set(ids);
+    Ok(())
+}
+
 fn request(args: &Args, tokens: usize) -> GenerateRequest {
-    let mut request = GenerateRequest::new(args.prompt.clone());
+    if let Some(ids) = PROMPT_IDS.get() {
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(ids.clone()));
+        request.options.max_new_tokens = tokens;
+        request.options.stop_on_eos = false;
+        apply_sampling_options(&mut request.options, args);
+        apply_speculative_options(&mut request.options, args);
+        return request;
+    }
+    request_with_prompt(args, tokens, &args.prompt)
+}
+
+fn request_with_prompt(args: &Args, tokens: usize, prompt: &str) -> GenerateRequest {
+    let mut request = GenerateRequest::new(prompt.to_string());
     request.options.max_new_tokens = tokens;
     request.options.stop_on_eos = false;
     apply_sampling_options(&mut request.options, args);
@@ -441,8 +514,24 @@ fn describe_speculative(args: &Args) -> String {
     }
 }
 
-fn pipeline_request(args: &Args, tokens: usize) -> PipelineGenerateRequest {
-    PipelineGenerateRequest::new(request(args, tokens))
+fn pipeline_request(
+    args: &Args,
+    tokens: usize,
+    prompt_tokens: &[u32],
+) -> Result<PipelineGenerateRequest> {
+    let mut request = request(args, tokens);
+    request.prompt = GeneratePrompt::TokenIds(prompt_tokens.to_vec());
+    let mut pipeline_request = PipelineGenerateRequest::new(request);
+    if let Some(image_path) = args.image.as_ref() {
+        let image = std::fs::read(image_path)
+            .with_context(|| format!("read workflow image {}", image_path.display()))?;
+        let encoded_bytes = i64::try_from(image.len()).context("workflow image is too large")?;
+        pipeline_request = pipeline_request.with_input(
+            "request.image",
+            Value::from_raw_bytes(image, &[encoded_bytes], DataType::Uint8)?,
+        );
+    }
+    Ok(pipeline_request)
 }
 
 fn describe_sampling(args: &Args) -> String {
@@ -566,6 +655,13 @@ fn print_cuda_observability(
             stats.graph.fallbacks,
             stats.graph.invalidations
         );
+        println!(
+            "cuda_graph_verify: captures={} replays={} fallbacks={} invalidations={}",
+            stats.graph.verify_captures,
+            stats.graph.verify_replays,
+            stats.graph.verify_fallbacks,
+            stats.graph.verify_invalidations
+        );
         if let Some(before) = before {
             println!(
                 "cuda_graph_measured: captures={} replays={} fallbacks={} invalidations={}",
@@ -576,6 +672,37 @@ fn print_cuda_observability(
                     .graph
                     .invalidations
                     .saturating_sub(before.graph.invalidations)
+            );
+            println!(
+                "cuda_graph_verify_measured: captures={} replays={} fallbacks={} invalidations={}",
+                stats
+                    .graph
+                    .verify_captures
+                    .saturating_sub(before.graph.verify_captures),
+                stats
+                    .graph
+                    .verify_replays
+                    .saturating_sub(before.graph.verify_replays),
+                stats
+                    .graph
+                    .verify_fallbacks
+                    .saturating_sub(before.graph.verify_fallbacks),
+                stats
+                    .graph
+                    .verify_invalidations
+                    .saturating_sub(before.graph.verify_invalidations)
+            );
+        }
+        print_raw_allocation_profile(
+            "cuda_raw_alloc_total",
+            &stats.graph.raw_allocation_sites,
+            None,
+        );
+        if let Some(before) = before {
+            print_raw_allocation_profile(
+                "cuda_raw_alloc_measured",
+                &stats.graph.raw_allocation_sites,
+                Some(&before.graph.raw_allocation_sites),
             );
         }
         if let Some(reason) = &stats.graph.decline_reason {
@@ -593,6 +720,85 @@ fn print_cuda_observability(
                 stats.graph.device_token_loop_k, stats.graph.device_token_loop_steps
             );
         }
+    }
+}
+
+fn print_raw_allocation_profile(
+    label: &str,
+    sites: &[onnx_runtime_ep_cuda::CudaRawAllocationSiteStats],
+    before: Option<&[onnx_runtime_ep_cuda::CudaRawAllocationSiteStats]>,
+) {
+    let mut deltas = sites
+        .iter()
+        .filter_map(|site| {
+            let prior = before.and_then(|before| {
+                before
+                    .iter()
+                    .find(|prior| prior.file == site.file && prior.line == site.line)
+            });
+            let delta = onnx_runtime_ep_cuda::CudaRawAllocationSiteStats {
+                file: site.file,
+                line: site.line,
+                requests: site
+                    .requests
+                    .saturating_sub(prior.map_or(0, |prior| prior.requests)),
+                requested_bytes: site
+                    .requested_bytes
+                    .saturating_sub(prior.map_or(0, |prior| prior.requested_bytes)),
+                driver_allocations: site
+                    .driver_allocations
+                    .saturating_sub(prior.map_or(0, |prior| prior.driver_allocations)),
+                driver_bytes: site
+                    .driver_bytes
+                    .saturating_sub(prior.map_or(0, |prior| prior.driver_bytes)),
+                pool_hits: site
+                    .pool_hits
+                    .saturating_sub(prior.map_or(0, |prior| prior.pool_hits)),
+                pool_hit_bytes: site
+                    .pool_hit_bytes
+                    .saturating_sub(prior.map_or(0, |prior| prior.pool_hit_bytes)),
+            };
+            (delta.requests > 0).then_some(delta)
+        })
+        .collect::<Vec<_>>();
+    if deltas.is_empty() {
+        return;
+    }
+    deltas.sort_unstable_by(|left, right| {
+        right
+            .driver_bytes
+            .cmp(&left.driver_bytes)
+            .then_with(|| right.pool_hit_bytes.cmp(&left.pool_hit_bytes))
+            .then_with(|| left.file.cmp(right.file))
+            .then_with(|| left.line.cmp(&right.line))
+    });
+    let requests = deltas.iter().map(|site| site.requests).sum::<u64>();
+    let requested_bytes = deltas.iter().map(|site| site.requested_bytes).sum::<u64>();
+    let driver_allocations = deltas
+        .iter()
+        .map(|site| site.driver_allocations)
+        .sum::<u64>();
+    let driver_bytes = deltas.iter().map(|site| site.driver_bytes).sum::<u64>();
+    let pool_hits = deltas.iter().map(|site| site.pool_hits).sum::<u64>();
+    let pool_hit_bytes = deltas.iter().map(|site| site.pool_hit_bytes).sum::<u64>();
+    println!(
+        "{label}: requests={requests} requested_bytes={requested_bytes} \
+         driver_allocations={driver_allocations} driver_bytes={driver_bytes} \
+         pool_hits={pool_hits} pool_hit_bytes={pool_hit_bytes}"
+    );
+    for site in deltas {
+        println!(
+            "{label}_site: {}:{} requests={} requested_bytes={} driver_allocations={} \
+             driver_bytes={} pool_hits={} pool_hit_bytes={}",
+            site.file,
+            site.line,
+            site.requests,
+            site.requested_bytes,
+            site.driver_allocations,
+            site.driver_bytes,
+            site.pool_hits,
+            site.pool_hit_bytes
+        );
     }
 }
 
@@ -1789,18 +1995,6 @@ fn host_argmax(logits: &[f32]) -> u32 {
     best_index as u32
 }
 
-/// Opt-in on-GPU-argmax base-decode flag (`ONNX_GENAI_ONGPU_ARGMAX`). Default
-/// OFF. When ON, the base-decode greedy A/B benchmark reports the on-GPU-argmax
-/// (`decode_greedy_batch`) path as its primary throughput number; when OFF it
-/// reports the host-argmax path. Both paths are always measured and their token
-/// streams cross-checked for byte-identity regardless of the flag.
-fn ongpu_argmax_enabled() -> bool {
-    matches!(
-        std::env::var("ONNX_GENAI_ONGPU_ARGMAX").ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE") | Some("on") | Some("ON")
-    )
-}
-
 /// Lowest-index-on-ties argmax: strict `>` from `-inf` keeps the FIRST maximum,
 /// matching the ONNX/ORT canonical greedy tie-break (`ArgMax` with
 /// `select_last_index=false`), the host sampler `sample_greedy` ("ties keep the
@@ -1960,11 +2154,9 @@ fn run_ongpu_argmax_bench(args: &Args, model_dir: &Path, device: NativeDecodeDev
     let eos: Vec<u32> = vec![151645, 151643];
     let max_new = args.tokens;
     let skip = args.decode_skip.max(1);
-    let primary_ongpu = ongpu_argmax_enabled();
-
     println!(
         "profile_native: ongpu-argmax-bench model={} layers={} prompt_tokens={} tokens={} \
-         warmups={} runs={} decode_skip={} ONNX_GENAI_ONGPU_ARGMAX={} (primary_path={})",
+         warmups={} runs={} decode_skip={}",
         model_dir.display(),
         session.kv_layer_count(),
         prompt_tokens.len(),
@@ -1972,8 +2164,6 @@ fn run_ongpu_argmax_bench(args: &Args, model_dir: &Path, device: NativeDecodeDev
         args.warmups,
         args.runs,
         skip,
-        if primary_ongpu { "1" } else { "0" },
-        if primary_ongpu { "ongpu" } else { "host" },
     );
 
     // Warmup both paths to arm CUDA-graph capture before timing.
@@ -2841,6 +3031,13 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     }
     if args.speculative != SpeculativeArg::None {
         print_speculative_observability(&engine.last_speculative_stats());
+    } else {
+        let stats = engine.last_speculative_stats();
+        if stats.verification_steps > 0 || stats.proposed_tokens > 0 {
+            print_speculative_observability(&stats);
+        } else {
+            println!("speculative_stats: none (no speculative decode engaged)");
+        }
     }
     print_cuda_observability(&engine, cuda_before.as_ref());
     print_weight_offload_observability(generated as u64);
@@ -2849,6 +3046,103 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
         println!("{}", profile::report(generated as u64));
     }
     onnx_runtime_session::print_exec_phase_profile();
+    Ok(())
+}
+
+/// Time one generation's first token and report what it actually processed.
+fn time_first_token(
+    args: &Args,
+    engine: &mut PipelineEngine,
+    prompt_tokens: &[u32],
+) -> Result<(f64, usize)> {
+    let start = Instant::now();
+    let mut first: Option<std::time::Duration> = None;
+    let mut callback = |_| {
+        if first.is_none() {
+            first = Some(start.elapsed());
+        }
+        Ok(())
+    };
+    let result = engine
+        .generate_with_callback(
+            pipeline_request(args, 1, prompt_tokens)?,
+            Some(&mut callback),
+        )
+        .context("prefill sweep generation")?;
+    let elapsed = first.context("generation emitted no tokens")?;
+    Ok((elapsed.as_secs_f64() * 1_000.0, result.prefix_cache_hit_len))
+}
+
+/// Measure prompt-processing throughput across prompt lengths.
+///
+/// The prefix cache is cleared before every point. Without that, each point is
+/// a prefix of the next and the sweep answers almost every generation out of
+/// cache, reporting a prefill that does not vary with prompt length at all.
+fn run_prefill_sweep(
+    args: &Args,
+    engine: &mut PipelineEngine,
+    ids: &[u32],
+    lengths: &[usize],
+) -> Result<()> {
+    if lengths.is_empty() {
+        bail!("--prefill-sweep needs at least one length");
+    }
+    const WARMUP_TOKENS: usize = 64;
+    let longest = lengths.iter().copied().max().unwrap_or(0);
+    if ids.len() < longest {
+        bail!(
+            "--prefill-sweep needs {longest} prompt tokens but the prompt has {}; use \
+             --prompt-file testdata/long-prompt.txt (~21.7k tokens)",
+            ids.len()
+        );
+    }
+
+    // One throwaway generation absorbs process startup so the first measured
+    // point does not carry it.
+    time_first_token(args, engine, &ids[..WARMUP_TOKENS.min(ids.len())])
+        .context("prefill sweep warmup")?;
+
+    let mut points: Vec<(f64, f64)> = Vec::with_capacity(lengths.len());
+    for &len in lengths {
+        // Prompts are submitted as token ids, so the measured window is exactly
+        // `len` tokens; there is no detokenize/re-encode round trip to distort
+        // the count the engine really sees.
+        let window = &ids[..len];
+        engine.clear_prefix_cache();
+        let (ms, hit) = time_first_token(args, engine, window)?;
+        if hit > 0 {
+            bail!(
+                "prefill sweep measured a {hit}-token prefix cache hit after clearing the \
+                 cache; the measurement would not reflect prompt processing"
+            );
+        }
+        let processed = window.len().saturating_sub(hit);
+        println!(
+            "prefill_sweep: prompt_tokens={} prefix_cache_hit={hit} prefill={ms:.3} ms \
+             throughput={:.1} tok/s",
+            window.len(),
+            processed as f64 * 1_000.0 / ms
+        );
+        points.push((window.len() as f64, ms));
+    }
+
+    if points.len() >= 2 {
+        let n = points.len() as f64;
+        let mean_x = points.iter().map(|p| p.0).sum::<f64>() / n;
+        let mean_y = points.iter().map(|p| p.1).sum::<f64>() / n;
+        let cov: f64 = points
+            .iter()
+            .map(|(x, y)| (x - mean_x) * (y - mean_y))
+            .sum();
+        let var: f64 = points.iter().map(|(x, _)| (x - mean_x).powi(2)).sum();
+        let slope = cov / var;
+        let intercept = mean_y - slope * mean_x;
+        println!(
+            "prefill_sweep: slope={slope:.4} ms/token => {:.1} tok/s marginal, \
+             fixed_overhead={intercept:.1} ms",
+            1_000.0 / slope
+        );
+    }
     Ok(())
 }
 
@@ -2902,10 +3196,49 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
     apply_vram_limit_env(&mut config)?;
     let mut engine = PipelineEngine::from_dir_with_config(model_dir, config)
         .with_context(|| format!("load pipeline engine {}", model_dir.display()))?;
+    let tokenizer =
+        Tokenizer::from_file(tokenizer_file(model_dir)).context("load pipeline tokenizer.json")?;
+    // Resolve the prompt against the package's own tokenizer, then report the
+    // length. Prefill numbers are meaningless without the token count they were
+    // measured over, and a harness-side tokenizer is not guaranteed to be the
+    // one this pipeline routes prompts through.
+    let mut prompt_tokens = if let Some(ids_path) = args.prompt_ids.as_ref() {
+        let raw = std::fs::read_to_string(ids_path)
+            .with_context(|| format!("read prompt ids from {}", ids_path.display()))?;
+        serde_json::from_str::<Vec<u32>>(raw.trim())
+            .with_context(|| format!("parse prompt ids JSON from {}", ids_path.display()))?
+    } else {
+        tokenizer
+            .encode(&args.prompt)
+            .context("tokenize pipeline prompt")?
+    };
+    if prompt_tokens.is_empty() {
+        bail!("pipeline prompt tokenized to an empty sequence");
+    }
+    if let Some(want) = args.prompt_tokens {
+        if prompt_tokens.len() < want {
+            bail!(
+                "--prompt-tokens {want} exceeds the {} tokens available in the prompt; \
+                 supply a longer --prompt-file (testdata/long-prompt.txt has ~21.7k)",
+                prompt_tokens.len()
+            );
+        }
+        prompt_tokens.truncate(want);
+    }
+    println!("profile_native: prompt_tokens={}", prompt_tokens.len());
+
+    if let Some(lengths) = args.prefill_sweep.clone() {
+        return run_prefill_sweep(args, &mut engine, &prompt_tokens, &lengths);
+    }
+
     for _ in 0..args.warmups {
         std::hint::black_box(
             engine
-                .generate_with_pipeline_request(pipeline_request(args, args.tokens))
+                .generate_with_pipeline_request(pipeline_request(
+                    args,
+                    args.tokens,
+                    &prompt_tokens,
+                )?)
                 .context("pipeline warmup generation")?,
         );
     }
@@ -2917,6 +3250,9 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
         let mut reference_tokens = None;
         let mut reference_text = None;
         for run in 1..=args.runs {
+            if args.no_prefix_cache {
+                engine.clear_prefix_cache();
+            }
             let start = Instant::now();
             let mut token_times = Vec::with_capacity(args.tokens);
             let mut callback = |_| {
@@ -2924,8 +3260,12 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
                 Ok(())
             };
             let result = engine
-                .generate_with_callback(pipeline_request(args, args.tokens), Some(&mut callback))
+                .generate_with_callback(
+                    pipeline_request(args, args.tokens, &prompt_tokens)?,
+                    Some(&mut callback),
+                )
                 .context("steady pipeline measured generation")?;
+            let cache_hit = result.prefix_cache_hit_len;
             if token_times.len() <= args.decode_skip {
                 bail!(
                     "pipeline generation emitted {} tokens, not enough for --decode-skip {}",
@@ -2933,6 +3273,7 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
                     args.decode_skip
                 );
             }
+            let generated_tokens = result.token_ids.len();
             if let Some(reference) = &reference_tokens {
                 if reference != &result.token_ids {
                     bail!("pipeline greedy decode was not deterministic across measured runs");
@@ -2942,14 +3283,48 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
                 reference_text = Some(result.text);
             }
 
-            let prefill_ms = token_times[0].as_secs_f64() * 1_000.0;
-            let decode_tokens = token_times.len() - args.decode_skip;
-            let decode_wall =
-                token_times[token_times.len() - 1] - token_times[args.decode_skip - 1];
-            let ms_per_token = decode_wall.as_secs_f64() * 1_000.0 / decode_tokens as f64;
-            let tok_per_s = decode_tokens as f64 / decode_wall.as_secs_f64();
+            let diagnostic = engine.workflow_performance_diagnostic();
+            if diagnostic.last_emit_timestamps_ns.len() != generated_tokens {
+                bail!(
+                    "workflow emitted {} timing events for {} generated tokens",
+                    diagnostic.last_emit_timestamps_ns.len(),
+                    generated_tokens
+                );
+            }
+            let prefill_ms = diagnostic.last_emit_timestamps_ns[0] as f64 / 1_000_000.0;
+            let decode_tokens = diagnostic.last_emit_timestamps_ns.len() - args.decode_skip;
+            let decode_ns = diagnostic.last_emit_timestamps_ns
+                [diagnostic.last_emit_timestamps_ns.len() - 1]
+                - diagnostic.last_emit_timestamps_ns[args.decode_skip - 1];
+            let decode_wall = Duration::from_nanos(u64::try_from(decode_ns)?);
+            let ms_per_token = decode_ns as f64 / 1_000_000.0 / decode_tokens as f64;
+            let tok_per_s = decode_tokens as f64 * 1_000_000_000.0 / decode_ns as f64;
+            // A measured prefill that reused workflow state did not process
+            // those tokens, so reporting it as prompt-processing throughput
+            // overstates prefill by however much it reused. This is easy to hit
+            // by accident: --warmups replays the *same* prompt, so the measured
+            // run reads back a fully cached prefix and reports a prefill that is
+            // independent of prompt length (#1529).
+            let prompt_token_count = prompt_tokens.len();
+            let prefill_new_tokens = prompt_token_count.saturating_sub(cache_hit);
+            let prefill_note = if cache_hit > 0 {
+                format!(
+                    " prefix_cache_hit={cache_hit}/{prompt_token_count} \
+                     WARNING: only {prefill_new_tokens} tokens were actually processed; \
+                     this is NOT prompt-processing throughput (re-run with --warmups 0 \
+                     or a distinct prompt per run)"
+                )
+            } else if prefill_new_tokens > 0 {
+                format!(
+                    " prefill_throughput={:.1} tok/s ({prefill_new_tokens} tokens)",
+                    prefill_new_tokens as f64 * 1_000.0 / prefill_ms
+                )
+            } else {
+                String::new()
+            };
             println!(
-                "steady_run {run}: prefill={prefill_ms:.3} ms decode_tokens={decode_tokens} \
+                "steady_run {run}: prefill={prefill_ms:.3} ms{prefill_note} \
+                 decode_tokens={decode_tokens} \
                  decode_wall={:.3} ms decode={ms_per_token:.3} ms/token \
                  throughput={tok_per_s:.2} tok/s",
                 decode_wall.as_secs_f64() * 1_000.0
@@ -2968,6 +3343,43 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
             args.warmups,
             args.decode_skip
         );
+        let diagnostic = engine.workflow_performance_diagnostic();
+        for (stage, elapsed_ns) in &diagnostic.last_stage_elapsed_ns {
+            let runs = diagnostic.last_stage_runs.get(stage).copied().unwrap_or(0);
+            println!(
+                "workflow_stage {stage}: runs={runs} elapsed={:.3}ms avg={:.3}ms",
+                *elapsed_ns as f64 / 1_000_000.0,
+                if runs == 0 {
+                    0.0
+                } else {
+                    *elapsed_ns as f64 / runs as f64 / 1_000_000.0
+                }
+            );
+        }
+        for island in diagnostic.islands {
+            println!(
+                "workflow_island {}: components={:?} runs={} session_runs={} eager={} stable={} \
+                 captures={} replays={} syncs={} h2d={}/{}B d2h={}/{}B d2d={}/{}B \
+                 elapsed={:.3}ms fallback={:?}",
+                island.id,
+                island.components,
+                island.runs,
+                island.session_runs,
+                island.eager_runs,
+                island.stable_binding_runs,
+                island.captures,
+                island.replays,
+                island.device_synchronizations,
+                island.host_to_device_copies,
+                island.host_to_device_bytes,
+                island.device_to_host_copies,
+                island.device_to_host_bytes,
+                island.device_to_device_copies,
+                island.device_to_device_bytes,
+                island.total_run_ns as f64 / 1_000_000.0,
+                island.fallback_reason
+            );
+        }
         if let Some(tokens) = reference_tokens {
             println!("generated_token_ids: {tokens:?}");
         }
@@ -2984,7 +3396,7 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
     for _ in 0..args.runs {
         let start = Instant::now();
         let result = engine
-            .generate_with_pipeline_request(pipeline_request(args, args.tokens))
+            .generate_with_pipeline_request(pipeline_request(args, args.tokens, &prompt_tokens)?)
             .context("pipeline measured generation")?;
         elapsed += start.elapsed();
         generated += result.token_ids.len();
@@ -3022,8 +3434,13 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    if let Some(path) = args.prompt_file.clone() {
+        args.prompt = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read --prompt-file {}", path.display()))?;
+    }
     validate_backend(&args)?;
+    init_prompt_ids(&args)?;
     eprintln!(
         "profile_native: WEIGHT_OFFLOAD_BYTE_AWARE={:?} WEIGHT_OFFLOAD_EVICT_ORDER={:?} \
          MANAGED_WEIGHT_STREAMING={:?} CUDA_GRAPH={:?}",
@@ -3081,7 +3498,14 @@ fn main() -> Result<()> {
     };
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .context("load tokenizer.json beside native decoder")?;
-    let prompt_tokens = tokenizer.encode(&args.prompt).context("tokenize prompt")?;
+    let prompt_tokens = if let Some(ids_path) = args.prompt_ids.as_ref() {
+        let raw = std::fs::read_to_string(ids_path)
+            .with_context(|| format!("read prompt ids from {}", ids_path.display()))?;
+        serde_json::from_str::<Vec<u32>>(raw.trim())
+            .with_context(|| format!("parse prompt ids JSON from {}", ids_path.display()))?
+    } else {
+        tokenizer.encode(&args.prompt).context("tokenize prompt")?
+    };
     if prompt_tokens.is_empty() {
         bail!("prompt tokenized to an empty sequence");
     }
@@ -3192,19 +3616,10 @@ fn main() -> Result<()> {
         );
     }
     if let Some(dump_path) = args.dump_logprobs.as_ref() {
-        let dump_prompt_tokens = if let Some(ids_path) = args.prompt_ids.as_ref() {
-            let raw = std::fs::read_to_string(ids_path)
-                .with_context(|| format!("read prompt ids from {}", ids_path.display()))?;
-            let ids: Vec<u32> = serde_json::from_str(raw.trim())
-                .with_context(|| format!("parse prompt ids JSON from {}", ids_path.display()))?;
-            if ids.is_empty() {
-                bail!("--prompt-ids must contain at least one token id");
-            }
-            println!("dump_prompt_ids: {ids:?}");
-            ids
-        } else {
-            prompt_tokens.clone()
-        };
+        let dump_prompt_tokens = prompt_tokens.clone();
+        if args.prompt_ids.is_some() {
+            println!("dump_prompt_ids: {dump_prompt_tokens:?}");
+        }
         let options = GenerateOptions {
             max_new_tokens: 1,
             temperature: 0.0,

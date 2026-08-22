@@ -305,6 +305,11 @@ impl TokenEmbedder for MtpEmbedder {
 pub(crate) enum MtpLmHead {
     Linear(LinearLmHead),
     TargetInitializer(TargetInitializerLmHead),
+    /// int4 `MatMulNBits` shared LM-head projected on the GPU (or CPU) via a
+    /// standalone single-node session that reuses the target's quantised
+    /// initializers zero-copy. Selected when the target LM-head is quantised.
+    #[cfg(feature = "native-backend")]
+    Quantized(QuantizedDraftLmHead),
 }
 
 impl LmHead for MtpLmHead {
@@ -312,6 +317,8 @@ impl LmHead for MtpLmHead {
         match self {
             Self::Linear(lm_head) => lm_head.vocab_size(),
             Self::TargetInitializer(lm_head) => lm_head.vocab_size(),
+            #[cfg(feature = "native-backend")]
+            Self::Quantized(lm_head) => lm_head.vocab_size(),
         }
     }
 
@@ -319,8 +326,39 @@ impl LmHead for MtpLmHead {
         match self {
             Self::Linear(lm_head) => lm_head.logits(hidden, out),
             Self::TargetInitializer(lm_head) => lm_head.logits(hidden, out),
+            #[cfg(feature = "native-backend")]
+            Self::Quantized(lm_head) => lm_head.logits(hidden, out),
         }
     }
+}
+
+/// Device on which the int4 draft LM-head `MatMulNBits` projection runs.
+///
+/// The projection is a standalone single-node session built from the target's
+/// own quantised LM-head initializers. It runs *outside* the captured native
+/// decode step (during proposal), so it never affects CUDA-graph capture of the
+/// target decode step.
+#[derive(Debug, Clone, Copy)]
+// An ORT-only build still threads `Option<DraftProjectionDevice>` through the
+// adapter loader, but only the native path ever constructs one; outside that
+// feature, constructions are limited to tests.
+#[cfg_attr(not(feature = "native-backend"), allow(dead_code))]
+pub(crate) enum DraftProjectionDevice {
+    /// Project on the CPU int4 `MatMulNBits` kernel (used by unit tests and the
+    /// native CPU backend).
+    Cpu,
+    /// Project on the native CUDA int4 `MatMulNBits` kernel at the given ordinal.
+    Cuda {
+        #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+        index: u32,
+    },
+}
+
+fn is_dense_float_dtype(dtype: IrDataType) -> bool {
+    matches!(
+        dtype,
+        IrDataType::Float32 | IrDataType::Float16 | IrDataType::BFloat16
+    )
 }
 
 pub(crate) fn load_target_initializer_adapters(
@@ -328,6 +366,7 @@ pub(crate) fn load_target_initializer_adapters(
     embedding_name: &str,
     lm_head_name: &str,
     hidden_size: usize,
+    projection: Option<DraftProjectionDevice>,
 ) -> anyhow::Result<(MtpEmbedder, MtpLmHead, usize)> {
     let (graph, store) =
         onnx_runtime_loader::load_model_with_weights(model_path).with_context(|| {
@@ -354,7 +393,54 @@ pub(crate) fn load_target_initializer_adapters(
         );
     }
     let vocab_size = embedding_dims[0];
+    let embedder = TargetInitializerEmbedder {
+        matrix: TargetInitializerMatrix::new(
+            Arc::clone(&store),
+            embedding_weight,
+            vocab_size,
+            hidden_size,
+        )?,
+    };
     let lm_head_dims = lm_head_weight.dims();
+    // The MTP draft head reuses the target's shared LM-head to project its hidden
+    // state into draft logits. A *dense* [vocab, hidden] / [hidden, vocab] weight
+    // (f32/f16/bf16) is projected host-side by `TargetInitializerLmHead`. An int4
+    // MatMulNBits-quantised lm_head is stored as a 3-D packed uint8 blob with
+    // companion scales / zero_points: dequantising the full matrix is multi-GB
+    // and a host-side draft GEMV per step is not throughput-viable, so it is
+    // projected on the GPU (or CPU) via a standalone single-node MatMulNBits
+    // session that reuses the target's own quantised initializers zero-copy —
+    // running *outside* the captured decode step, so capture-safety is preserved.
+    if lm_head_dims.len() != 2 || !is_dense_float_dtype(lm_head_weight.dtype()) {
+        #[cfg(feature = "native-backend")]
+        if let Some(projection) = projection {
+            let (lm_head, head_vocab) = build_quantized_draft_lm_head(
+                &graph,
+                Arc::clone(&store),
+                lm_head_name,
+                hidden_size,
+                projection,
+            )?;
+            if head_vocab != vocab_size {
+                anyhow::bail!(
+                    "target quantised LM-head vocabulary {head_vocab} does not match embedding vocabulary {vocab_size}"
+                );
+            }
+            return Ok((
+                MtpEmbedder::TargetInitializer(embedder),
+                MtpLmHead::Quantized(lm_head),
+                vocab_size,
+            ));
+        }
+        anyhow::bail!(
+            "target LM-head initializer '{lm_head_name}' has shape {lm_head_dims:?} dtype {:?}, \
+             which is not a dense f32/f16/bf16 [vocab, hidden] matrix. A quantised (e.g. int4 \
+             MatMulNBits) shared LM-head requires a GPU/CPU projection device (only the native \
+             backend supplies one); it cannot be dequantised host-side.",
+            lm_head_weight.dtype()
+        );
+    }
+    let _ = projection;
     let (layout, rows, cols) = if lm_head_dims == [hidden_size, vocab_size] {
         (
             LmHeadInitializerLayout::HiddenVocab,
@@ -372,14 +458,6 @@ pub(crate) fn load_target_initializer_adapters(
             "target LM-head initializer '{lm_head_name}' shape {lm_head_dims:?} must be [{hidden_size}, {vocab_size}] or [{vocab_size}, {hidden_size}]"
         );
     };
-    let embedder = TargetInitializerEmbedder {
-        matrix: TargetInitializerMatrix::new(
-            Arc::clone(&store),
-            embedding_weight,
-            vocab_size,
-            hidden_size,
-        )?,
-    };
     let lm_head = TargetInitializerLmHead {
         matrix: TargetInitializerMatrix::new(store, lm_head_weight, rows, cols)?,
         layout,
@@ -390,6 +468,304 @@ pub(crate) fn load_target_initializer_adapters(
         MtpEmbedder::TargetInitializer(embedder),
         MtpLmHead::TargetInitializer(lm_head),
         vocab_size,
+    ))
+}
+
+/// A shared int4 `MatMulNBits` LM-head projected on-device (or on the CPU int4
+/// kernel) for MTP draft-token generation.
+///
+/// The projection is a standalone single-node `InferenceSession` built from the
+/// target model's *own* quantised LM-head initializers (weight / scales /
+/// zero_points), reused zero-copy through the same [`WeightStore`] mmap — no
+/// re-export, no host-side dequantisation. `logits` feeds one hidden vector per
+/// draft step and reads back the full vocabulary logits. This runs during
+/// proposal, *outside* the captured native decode step, so it never perturbs
+/// CUDA-graph capture of the target step (fallbacks stay at zero). Draft-token
+/// exactness is not required for correctness — drafts are verified against the
+/// target, so an imperfect projection only lowers the acceptance rate.
+#[cfg(feature = "native-backend")]
+pub(crate) struct QuantizedDraftLmHead {
+    session: Arc<std::sync::Mutex<onnx_runtime_session::InferenceSession>>,
+    input_name: String,
+    hidden: usize,
+    vocab: usize,
+}
+
+#[cfg(feature = "native-backend")]
+impl std::fmt::Debug for QuantizedDraftLmHead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuantizedDraftLmHead")
+            .field("hidden", &self.hidden)
+            .field("vocab", &self.vocab)
+            .finish()
+    }
+}
+
+#[cfg(feature = "native-backend")]
+impl Clone for QuantizedDraftLmHead {
+    fn clone(&self) -> Self {
+        Self {
+            session: Arc::clone(&self.session),
+            input_name: self.input_name.clone(),
+            hidden: self.hidden,
+            vocab: self.vocab,
+        }
+    }
+}
+
+#[cfg(feature = "native-backend")]
+impl LmHead for QuantizedDraftLmHead {
+    fn vocab_size(&self) -> usize {
+        self.vocab
+    }
+
+    fn logits(&self, hidden: &[f32], out: &mut [f32]) -> anyhow::Result<()> {
+        if hidden.len() != self.hidden {
+            anyhow::bail!(
+                "quantised lm-head input length {} != hidden {}",
+                hidden.len(),
+                self.hidden
+            );
+        }
+        if out.len() != self.vocab {
+            anyhow::bail!(
+                "quantised lm-head output length {} != vocab {}",
+                out.len(),
+                self.vocab
+            );
+        }
+        let input = onnx_runtime_session::Tensor::from_f32(&[1, self.hidden], hidden)
+            .context("build draft lm-head projection input")?;
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|_| anyhow::anyhow!("draft lm-head projection session lock poisoned"))?;
+        let outputs = session
+            .run(&[(self.input_name.as_str(), &input)])
+            .context("run draft lm-head projection")?;
+        let logits = outputs
+            .into_iter()
+            .next()
+            .context("draft lm-head projection produced no output")?;
+        match logits.dtype {
+            IrDataType::Float32 => {
+                let values = logits.to_vec_f32();
+                if values.len() != self.vocab {
+                    anyhow::bail!(
+                        "draft lm-head projection returned {} logits, expected {}",
+                        values.len(),
+                        self.vocab
+                    );
+                }
+                out.copy_from_slice(&values);
+            }
+            other => anyhow::bail!("draft lm-head projection returned unsupported dtype {other:?}"),
+        }
+        Ok(())
+    }
+}
+
+/// Build a [`QuantizedDraftLmHead`] from a loaded target `graph` by locating the
+/// `MatMulNBits` node that consumes `lm_head_name` and cloning it into a
+/// standalone single-node projection session on `projection`.
+///
+/// All shape/quantisation parameters (`K`, `N`, `bits`, `block_size`, the
+/// scales / zero_points inputs) are derived from the discovered node — nothing
+/// is hardcoded. The three quantised initializers are reused zero-copy from the
+/// same [`WeightStore`], which is handed to the projection session so its mmap
+/// stays alive.
+#[cfg(feature = "native-backend")]
+fn build_quantized_draft_lm_head(
+    graph: &onnx_runtime_ir::Graph,
+    store: Arc<WeightStore>,
+    lm_head_name: &str,
+    hidden_size: usize,
+    projection: DraftProjectionDevice,
+) -> anyhow::Result<(QuantizedDraftLmHead, usize)> {
+    use onnx_runtime_ir::{Attribute, Node, NodeId, static_shape};
+
+    // The native loader lowers int4 `MatMulNBits` into an explicit dequant +
+    // dense `MatMul` subgraph (BitShift / BitwiseAnd / Cast / Sub / Mul), so the
+    // loaded IR contains no `MatMulNBits` node to clone. The three quantised
+    // initializers (weight / scales / zero_points) do persist, however, so we
+    // reconstruct a clean single-node `MatMulNBits` projection from them and let
+    // the projection session's EP re-run the quantised GEMV. `weight`/`scales`
+    // are required; `zero_points` is optional (symmetric quantisation).
+    let find_initializer = |name: &str| -> Option<WeightRef> {
+        graph.initializers.iter().find_map(|(&vid, weight)| {
+            (graph.value(vid).name.as_deref() == Some(name)).then(|| weight.clone())
+        })
+    };
+    let weight_ref = find_initializer(lm_head_name)
+        .with_context(|| format!("shared LM-head initializer '{lm_head_name}' was not found"))?;
+    // Companion scales / zero_points follow the `MatMulNBits` export convention:
+    // the same prefix as the packed weight with a `.scales` / `.zero_points`
+    // suffix (e.g. `lm_head.weight` -> `lm_head.scales`).
+    let prefix = lm_head_name
+        .rsplit_once('.')
+        .map(|(head, _)| head)
+        .unwrap_or(lm_head_name);
+    let scales_name = format!("{prefix}.scales");
+    let zero_points_name = format!("{prefix}.zero_points");
+    let scales_ref = find_initializer(&scales_name).with_context(|| {
+        format!(
+            "quantised LM-head '{lm_head_name}' companion scales initializer '{scales_name}' \
+             was not found"
+        )
+    })?;
+    let zero_points_ref = find_initializer(&zero_points_name);
+
+    // Derive all quantisation geometry from the initializer shapes and the
+    // configured hidden size — nothing is hardcoded. The packed weight is
+    // [N, k_blocks, blob] uint8; K = hidden_size; block_size = K / k_blocks;
+    // bits = blob_bytes * 8 / block_size (int4 packs two weights per byte).
+    let weight_dims = weight_ref.dims();
+    if weight_dims.len() != 3 {
+        anyhow::bail!(
+            "quantised LM-head weight '{lm_head_name}' must be a 3-D packed [N, k_blocks, blob] \
+             tensor, got shape {weight_dims:?}"
+        );
+    }
+    let n = weight_dims[0];
+    let k_blocks = weight_dims[1];
+    let blob = weight_dims[2];
+    let k = hidden_size;
+    if k_blocks == 0 || !k.is_multiple_of(k_blocks) {
+        anyhow::bail!(
+            "quantised LM-head weight '{lm_head_name}' k_blocks {k_blocks} does not divide hidden \
+             size {k}"
+        );
+    }
+    let block_size = (k / k_blocks) as i64;
+    if block_size == 0 || (blob * 8) % (block_size as usize) != 0 {
+        anyhow::bail!(
+            "quantised LM-head weight '{lm_head_name}' blob {blob} incompatible with block_size \
+             {block_size}"
+        );
+    }
+    let bits = (blob * 8 / block_size as usize) as i64;
+    let scales_dims = scales_ref.dims().to_vec();
+    if scales_dims != [n, k_blocks] {
+        anyhow::bail!(
+            "quantised LM-head scales '{scales_name}' shape {scales_dims:?} does not match \
+             weight-derived [N={n}, k_blocks={k_blocks}]"
+        );
+    }
+    // The MatMulNBits CUDA kernel requires Float32 scales; the exported artifact
+    // stores them as BFloat16 (or Float16). Convert once, at build time, into an
+    // inline Float32 initializer so the reconstructed projection node satisfies
+    // the kernel's dtype contract. Float32 scales are passed through untouched.
+    let scales_ref = match scales_ref.dtype() {
+        IrDataType::Float32 => scales_ref,
+        dtype @ (IrDataType::BFloat16 | IrDataType::Float16) => {
+            let raw = store.bytes(&scales_ref).with_context(|| {
+                format!("resolve bytes for quantised LM-head scales '{scales_name}'")
+            })?;
+            if raw.len() % 2 != 0 {
+                anyhow::bail!(
+                    "quantised LM-head scales '{scales_name}' byte length {} is not 2-byte aligned",
+                    raw.len()
+                );
+            }
+            let mut f32_bytes = Vec::with_capacity(raw.len() * 2);
+            for chunk in raw.chunks_exact(2) {
+                let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                let value = match dtype {
+                    IrDataType::BFloat16 => half::bf16::from_bits(bits).to_f32(),
+                    _ => half::f16::from_bits(bits).to_f32(),
+                };
+                f32_bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+                IrDataType::Float32,
+                scales_dims.to_vec(),
+                f32_bytes,
+            ))
+        }
+        other => anyhow::bail!(
+            "quantised LM-head scales '{scales_name}' has unsupported dtype {other:?}; \
+             expected Float32, BFloat16, or Float16"
+        ),
+    };
+    let mut projection_graph = onnx_runtime_ir::Graph::default();
+    projection_graph
+        .opset_imports
+        .insert("com.microsoft".to_string(), 1);
+    let hidden_value = projection_graph.create_named_value(
+        "draft_hidden",
+        IrDataType::Float32,
+        static_shape([1, k]),
+    );
+    projection_graph.add_input(hidden_value);
+    let add_initializer = |graph: &mut onnx_runtime_ir::Graph, name: &str, weight: &WeightRef| {
+        let value = graph.create_named_value(
+            name,
+            weight.dtype(),
+            static_shape(weight.dims().iter().copied()),
+        );
+        graph.set_initializer(value, weight.clone());
+        value
+    };
+    let weight_value = add_initializer(&mut projection_graph, "draft_lm_head.weight", &weight_ref);
+    let scales_value = add_initializer(&mut projection_graph, "draft_lm_head.scales", &scales_ref);
+    let mut inputs = vec![Some(hidden_value), Some(weight_value), Some(scales_value)];
+    if let Some(zero_points_ref) = &zero_points_ref {
+        let zero_points_value = add_initializer(
+            &mut projection_graph,
+            "draft_lm_head.zero_points",
+            zero_points_ref,
+        );
+        inputs.push(Some(zero_points_value));
+    }
+    let logits_value = projection_graph.create_named_value(
+        "draft_logits",
+        IrDataType::Float32,
+        static_shape([1, n]),
+    );
+    let mut projection_node = Node::new(NodeId(0), "MatMulNBits", inputs, vec![logits_value]);
+    projection_node.domain = "com.microsoft".to_string();
+    projection_node
+        .attributes
+        .insert("K".to_string(), Attribute::Int(k as i64));
+    projection_node
+        .attributes
+        .insert("N".to_string(), Attribute::Int(n as i64));
+    projection_node
+        .attributes
+        .insert("bits".to_string(), Attribute::Int(bits));
+    projection_node
+        .attributes
+        .insert("block_size".to_string(), Attribute::Int(block_size));
+    projection_graph.insert_node(projection_node);
+    projection_graph.add_output(logits_value);
+
+    let provider: Arc<dyn onnx_runtime_ep_api::ExecutionProvider> = match projection {
+        DraftProjectionDevice::Cpu => Arc::new(onnx_runtime_ep_cpu::CpuExecutionProvider::new()),
+        #[cfg(feature = "native-cuda")]
+        DraftProjectionDevice::Cuda { index } => Arc::new(
+            onnx_runtime_ep_cuda::CudaExecutionProvider::initialized(index)
+                .context("initialize CUDA EP for int4 draft LM-head projection")?,
+        ),
+        #[cfg(not(feature = "native-cuda"))]
+        DraftProjectionDevice::Cuda { .. } => anyhow::bail!(
+            "int4 draft LM-head projection on CUDA requires the `native-cuda` feature"
+        ),
+    };
+    let session = onnx_runtime_session::InferenceSession::from_graph_with_provider(
+        projection_graph,
+        store,
+        Path::new("."),
+        provider,
+    )
+    .context("build int4 draft LM-head projection session")?;
+    Ok((
+        QuantizedDraftLmHead {
+            session: Arc::new(std::sync::Mutex::new(session)),
+            input_name: "draft_hidden".to_string(),
+            hidden: hidden_size,
+            vocab: n,
+        },
+        n,
     ))
 }
 
@@ -1149,7 +1525,37 @@ impl Engine {
             .unwrap_or_else(|| self.speculative_mode.clone())
     }
 
+    /// Whether the package permits the runtime to turn speculation on by itself.
+    ///
+    /// Speculation replaces one implementation of a contract with an equivalent
+    /// one, so the package's declared equivalence class decides whether the swap
+    /// is silently allowed. Only a `bitwise` or `distribution_preserving`
+    /// contract may be substituted without the caller asking: a merely
+    /// `semantic` equivalence is free to change the output distribution, which
+    /// is exactly what a caller who did not ask for speculation did not agree to.
+    ///
+    /// A component that declares nothing is treated as `semantic` — the schema
+    /// default — so silence never buys an automatic optimization. Note that an
+    /// absent contract must be *counted* as semantic rather than skipped:
+    /// filtering undeclared components out would make `all` vacuously true for a
+    /// package whose components declare no contracts at all.
+    pub(crate) fn permits_automatic_speculation(&self) -> bool {
+        let Some(pipeline) = &self.metadata.pipeline else {
+            return false;
+        };
+        components_permit_automatic_speculation(&pipeline.workflow.components)
+    }
+
     pub(crate) fn should_use_speculative(&self, options: &GenerateOptions) -> bool {
+        // Naming a mode — on the request or in the engine configuration — is an
+        // explicit opt-in. Anything else is the runtime substituting a different
+        // implementation of the same contract on its own, which only a
+        // bitwise or distribution-preserving equivalence class permits.
+        let opted_in = options.speculative_mode.is_some()
+            || !matches!(self.speculative_mode, SpeculativeMode::None);
+        if !opted_in && !self.permits_automatic_speculation() {
+            return false;
+        }
         let mode_available = match self.speculative_mode(options) {
             SpeculativeMode::None => false,
             SpeculativeMode::DraftModel => self.draft.is_some(),
@@ -1170,7 +1576,7 @@ impl Engine {
             // Grammar processors carry per-request parser state; draft/verify
             // would need separate parser branches for speculative candidates.
             && options.constraint.is_none()
-            && (options.greedy || options.temperature == 0.0)
+            && options.selects_greedily()
             && self.kv_model.is_some()
     }
 
@@ -1270,6 +1676,16 @@ impl Engine {
                 },
             )?;
 
+            // Snapshot the pre-draft recurrent/conv state of a hybrid native
+            // target BEFORE the verify window destructively advances it, so the
+            // accept path can commit it to exactly the accepted prefix. Inert for
+            // every non-native / pure-dense target (returns `None`).
+            #[cfg(feature = "native-backend")]
+            let recurrent_snapshot = match state.decode_state.native_recurrent_runner_mut() {
+                Some(native) => Some(native.snapshot_recurrent_state()?),
+                None => None,
+            };
+
             let verified_logits =
                 self.run_target_verification(session_id, state, &draft_tokens, base_len)?;
 
@@ -1289,6 +1705,22 @@ impl Engine {
                 step,
             )?;
             let accepted = accepted_prefix.accepted;
+
+            // Commit the hybrid native target's recurrent/conv state to the
+            // accepted prefix. Attention KV keeps the ordinary prefix-slice rewind
+            // in `assemble_commit_tokens`; this only rebuilds the destructive
+            // rolling caches (snapshot + accepted-token re-advance), then squares
+            // the paged length bookkeeping so that rewind becomes a no-op.
+            #[cfg(feature = "native-backend")]
+            if let Some(snapshot) = recurrent_snapshot.as_ref() {
+                self.commit_native_recurrent_target(
+                    session_id,
+                    state,
+                    base_len,
+                    &draft_tokens[..accepted],
+                    snapshot,
+                )?;
+            }
 
             // Rewind the target KV to the accepted prefix and pick any correction
             // or bonus token. The rewind happens inside assemble_commit_tokens
@@ -1685,6 +2117,45 @@ impl Engine {
         Ok(verified_logits)
     }
 
+    /// Commit a hybrid native target's recurrent/conv state to the accepted
+    /// prefix after a verify window advanced it over every draft token.
+    ///
+    /// Gated-DeltaNet SSM + conv1d state is a destructive rolling cache with no
+    /// per-step history to prefix-slice, so — following vLLM — the committed
+    /// state is rebuilt from the pre-draft `snapshot`: attention KV is
+    /// prefix-sliced back to `base_len` and the recurrent/conv bindings are
+    /// restored, then exactly `accepted_tokens` are re-run so the state equals
+    /// feeding only the accepted continuation from the snapshot. The re-run also
+    /// leaves the native attention KV at `base_len + accepted`, so this squares
+    /// the paged length bookkeeping the runner mirrors, letting the ordinary
+    /// rewind in [`Self::assemble_commit_tokens`] become a no-op.
+    #[cfg(feature = "native-backend")]
+    fn commit_native_recurrent_target(
+        &mut self,
+        session_id: SessionId,
+        state: &mut EngineSession,
+        base_len: usize,
+        accepted_tokens: &[TokenId],
+        snapshot: &crate::native_decode::RecurrentStateSnapshot,
+    ) -> anyhow::Result<()> {
+        {
+            let native = state
+                .decode_state
+                .native_recurrent_runner_mut()
+                .context("native recurrent target is no longer available for commit")?;
+            native.commit_recurrent_state_to_accepted(snapshot, base_len, accepted_tokens)?;
+        }
+        let committed = base_len + accepted_tokens.len();
+        self.kv_cache
+            .rewind_to(session_id, committed)
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to rewind KV sequence {session_id} to {committed}: {e}")
+            })?;
+        state.kv_token_count = committed;
+        state.tokens.truncate(committed);
+        Ok(())
+    }
+
     /// Select the target token for each proposed position and count the longest
     /// accepted prefix, recording the correction token at the first mismatch.
     #[allow(clippy::too_many_arguments)]
@@ -2016,12 +2487,145 @@ pub(crate) fn shared_kv_slices_from_materialized(
     Ok(slices)
 }
 
+/// Whether every component may be silently swapped for an equivalent one.
+///
+/// An absent contract counts as `EquivalenceClass::Semantic` — the schema
+/// default — rather than being skipped. Filtering undeclared components out
+/// would make the `all` vacuously true for a package whose components declare no
+/// contracts at all, which is precisely the package that promised nothing.
+fn components_permit_automatic_speculation(
+    components: &std::collections::BTreeMap<String, onnx_genai_metadata::WorkflowComponent>,
+) -> bool {
+    if components.is_empty() {
+        return false;
+    }
+    components.values().all(|component| {
+        component
+            .contract
+            .as_ref()
+            .map(|contract| contract.equivalence)
+            .unwrap_or_default()
+            .permits_automatic_speculation()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use onnx_genai_ort::{Environment, SessionOptions};
     use std::path::Path;
     use std::sync::{Mutex, OnceLock};
+
+    /// The int4 draft LM-head projection primitive must reproduce a `MatMulNBits`
+    /// GEMV from the target's own quantised initializers, argmax-correctly, on
+    /// the CPU int4 kernel — the GPU path shares this exact builder. A one-hot
+    /// hidden vector isolates a single weight column: setting one column's lead
+    /// nibble to the maximum code (15, i.e. +7 after the symmetric zero-point)
+    /// while every other column stays at the zero code (8) makes that column the
+    /// unique argmax, independent of the exact scale, proving the projection
+    /// routes hidden→logits through the real quantised kernel rather than a stub.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn quantized_draft_lm_head_projects_int4_argmax() -> anyhow::Result<()> {
+        use onnx_runtime_ir::{
+            Attribute, DataType, Graph, Node, NodeId, TensorData, WeightRef, static_shape,
+        };
+
+        // K=32 (one block), N=4 columns, symmetric int4 (no zero_points input).
+        let k = 32usize;
+        let n = 4usize;
+        let block_size = 32i64;
+        let k_blocks = 1usize;
+        let blob = 16usize; // block_size / 2, two int4 weights per byte.
+        let target_col = 2usize;
+
+        // Every packed byte is 0x88 → both nibbles are code 8 (zero after the
+        // symmetric zero-point). For the target column, the first weight (k=0,
+        // the low nibble of byte 0) is code 15 (+7).
+        let mut weight = vec![0x88u8; n * k_blocks * blob];
+        weight[target_col * k_blocks * blob] = 0x8F;
+        let scales = vec![1.0f32; n * k_blocks];
+
+        let mut graph = Graph::default();
+        graph.opset_imports.insert("com.microsoft".to_string(), 1);
+        let activation = graph.create_named_value("A", DataType::Float32, static_shape([1, k]));
+        let weight_value = graph.create_named_value(
+            "lm_head.weight",
+            DataType::Uint8,
+            static_shape([n, k_blocks, blob]),
+        );
+        graph.set_initializer(
+            weight_value,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Uint8,
+                vec![n, k_blocks, blob],
+                weight,
+            )),
+        );
+        let scales_value = graph.create_named_value(
+            "lm_head.scales",
+            DataType::Float32,
+            static_shape([n, k_blocks]),
+        );
+        graph.set_initializer(
+            scales_value,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![n, k_blocks],
+                scales.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            )),
+        );
+        let logits_value =
+            graph.create_named_value("logits", DataType::Float32, static_shape([1, n]));
+        let mut node = Node::new(
+            NodeId(0),
+            "MatMulNBits",
+            vec![Some(activation), Some(weight_value), Some(scales_value)],
+            vec![logits_value],
+        );
+        node.domain = "com.microsoft".to_string();
+        node.attributes
+            .insert("K".to_string(), Attribute::Int(k as i64));
+        node.attributes
+            .insert("N".to_string(), Attribute::Int(n as i64));
+        node.attributes
+            .insert("bits".to_string(), Attribute::Int(4));
+        node.attributes
+            .insert("block_size".to_string(), Attribute::Int(block_size));
+        graph.insert_node(node);
+
+        let (lm_head, vocab) = build_quantized_draft_lm_head(
+            &graph,
+            Arc::new(WeightStore::new()),
+            "lm_head.weight",
+            k,
+            DraftProjectionDevice::Cpu,
+        )?;
+        assert_eq!(vocab, n);
+        assert_eq!(lm_head.vocab_size(), n);
+
+        // One-hot hidden at k=0 selects each column's lead weight.
+        let mut hidden = vec![0.0f32; k];
+        hidden[0] = 1.0;
+        let mut logits = vec![0.0f32; n];
+        lm_head.logits(&hidden, &mut logits)?;
+
+        let best = argmax(&logits).expect("argmax over non-empty logits");
+        assert_eq!(
+            best, target_col,
+            "int4 draft projection argmax {best} != expected column {target_col}; logits {logits:?}"
+        );
+        for (col, &value) in logits.iter().enumerate() {
+            if col != target_col {
+                assert!(
+                    logits[target_col] > value,
+                    "target column logit {} not strictly greatest vs col {col} = {value}",
+                    logits[target_col]
+                );
+            }
+        }
+        Ok(())
+    }
 
     /// The shared-KV slicer must read each group's `num_kv_heads`/`head_dim`
     /// from the specific target layer it references, not a single global value.
@@ -2443,6 +3047,7 @@ mod tests {
             "transformer.wte.weight",
             "lm_head.weight_t",
             16,
+            None,
         )?;
         assert_eq!(vocab_size, 32);
 
@@ -2450,8 +3055,10 @@ mod tests {
         embedder.embed(7, &mut embedded)?;
         let raw_embedding = std::fs::read(fixture.join("embedding.f32"))?;
         let expected_embedding = raw_embedding
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four bytes")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
             .collect::<Vec<_>>();
         assert_eq!(embedded, expected_embedding[7 * 16..8 * 16]);
 
@@ -2461,8 +3068,10 @@ mod tests {
         let raw_lm_head = std::fs::read(fixture.join("lm_head.f32"))?;
         let linear_lm_head = LinearLmHead::new(
             raw_lm_head
-                .chunks_exact(4)
-                .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four bytes")))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| f32::from_le_bytes(*bytes))
                 .collect(),
             16,
             32,
@@ -2601,5 +3210,70 @@ mod tests {
             SpeculativeMode::None => "none",
         };
         assert_eq!(selected, "eagle3");
+    }
+}
+
+#[cfg(test)]
+mod equivalence_gate_tests {
+    use super::components_permit_automatic_speculation;
+    use onnx_genai_metadata::WorkflowComponent;
+    use std::collections::BTreeMap;
+
+    fn component(equivalence: Option<&str>) -> WorkflowComponent {
+        let contract = equivalence
+            .map(|class| {
+                format!(
+                    "\ncontract:\n  id: onnx-genai.decoder\n  version: \"1\"\n  \
+                     equivalence: {class}\n"
+                )
+            })
+            .unwrap_or_default();
+        serde_yaml::from_str(&format!(
+            "implementation: {{ kind: onnx, artifact: decoder.onnx }}\nports: {{}}{contract}"
+        ))
+        .expect("component parses")
+    }
+
+    fn gate(components: &[(&str, Option<&str>)]) -> bool {
+        let map = components
+            .iter()
+            .map(|(name, class)| ((*name).to_string(), component(*class)))
+            .collect::<BTreeMap<_, _>>();
+        components_permit_automatic_speculation(&map)
+    }
+
+    /// Silence must never buy an automatic optimization. A package whose
+    /// components declare no contract at all promised nothing, so it must be
+    /// read as `semantic` — not skipped, which would make `all` vacuously true.
+    #[test]
+    fn a_package_that_declares_no_contracts_permits_nothing() {
+        assert!(!gate(&[("decoder", None)]));
+        assert!(!gate(&[("decoder", None), ("draft", None)]));
+        assert!(!gate(&[]), "an empty package promised nothing either");
+    }
+
+    /// One undeclared component is enough to withhold consent, even when every
+    /// component that did declare one is distribution-preserving.
+    #[test]
+    fn one_undeclared_component_withholds_consent() {
+        assert!(gate(&[("decoder", Some("distribution_preserving"))]));
+        assert!(!gate(&[
+            ("decoder", Some("distribution_preserving")),
+            ("draft", None),
+        ]));
+    }
+
+    /// Only bitwise and distribution-preserving equivalence permit a silent
+    /// swap; merely semantic equivalence is free to change the output
+    /// distribution, which an unasking caller did not agree to.
+    #[test]
+    fn only_distribution_preserving_classes_permit_a_silent_swap() {
+        assert!(gate(&[("decoder", Some("bitwise"))]));
+        assert!(gate(&[("decoder", Some("distribution_preserving"))]));
+        assert!(!gate(&[("decoder", Some("semantic"))]));
+        assert!(!gate(&[
+            ("decoder", Some("bitwise")),
+            ("draft", Some("semantic")),
+        ]));
     }
 }

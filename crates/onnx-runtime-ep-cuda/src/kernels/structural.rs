@@ -305,7 +305,7 @@ impl Kernel for GatherNdKernel {
         let element_bytes = element_bytes as i32;
         let index_is_i64 = i32::from(indices.dtype == DataType::Int64);
         let elements_u64 = elements as u64;
-        let capture_error = if capturing {
+        let capture_error = if capturing || self.runtime.eager_sync_deferred() {
             self.runtime.capture_error_ptr()
         } else {
             0

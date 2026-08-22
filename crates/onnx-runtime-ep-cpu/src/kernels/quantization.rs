@@ -270,16 +270,22 @@ fn read_floats(op: &str, view: &TensorView) -> Result<Vec<f32>> {
     let bytes = to_dense_bytes(view)?;
     Ok(match view.dtype {
         DataType::Float32 => bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect(),
         DataType::Float16 => bytes
-            .chunks_exact(2)
-            .map(|b| half::f16::from_le_bytes(b.try_into().unwrap()).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| half::f16::from_le_bytes(*b).to_f32())
             .collect(),
         DataType::BFloat16 => bytes
-            .chunks_exact(2)
-            .map(|b| half::bf16::from_le_bytes(b.try_into().unwrap()).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| half::bf16::from_le_bytes(*b).to_f32())
             .collect(),
         other => {
             return Err(EpError::KernelFailed(format!(
@@ -322,8 +328,10 @@ fn read_integers(op: &str, view: &TensorView) -> Result<Vec<i64>> {
         DataType::Int8 => bytes.iter().map(|&b| b as i8 as i64).collect(),
         DataType::Uint8 => bytes.into_iter().map(i64::from).collect(),
         DataType::Int32 => bytes
-            .chunks_exact(4)
-            .map(|b| i32::from_le_bytes(b.try_into().unwrap()) as i64)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| i32::from_le_bytes(*b) as i64)
             .collect(),
         other => {
             return Err(EpError::KernelFailed(format!(

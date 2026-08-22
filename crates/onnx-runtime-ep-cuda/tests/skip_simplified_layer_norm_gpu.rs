@@ -605,8 +605,8 @@ fn skip_simplified_layer_norm_fixed_decode_capture_replays_bit_identically() {
     );
     kernel.execute(&prefill_views, &mut [output]).unwrap();
     assert!(
-        !kernel.cuda_graph_compatible(),
-        "multi-group prefill must not be capture eligible"
+        kernel.cuda_graph_compatible(),
+        "a warmed fixed-shape multi-group call must be capture eligible"
     );
     drop(prefill_views);
     for buffer in prefill_buffers {

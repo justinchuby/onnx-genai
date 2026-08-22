@@ -1,0 +1,557 @@
+ir_version: 11
+producer_name: "mobius"
+graph {
+  node {
+    input: "latent"
+    output: "v_Shape_0"
+    name: "Shape_node_0"
+    op_type: "Shape"
+    attribute {
+      name: "end"
+      i: 1
+      type: INT
+    }
+    attribute {
+      name: "start"
+      i: 0
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "latent"
+    output: "v_Shape_1"
+    name: "Shape_node_1"
+    op_type: "Shape"
+    attribute {
+      name: "end"
+      i: 4
+      type: INT
+    }
+    attribute {
+      name: "start"
+      i: 3
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "latent"
+    output: "v_Shape_2"
+    name: "Shape_node_2"
+    op_type: "Shape"
+    attribute {
+      name: "end"
+      i: 5
+      type: INT
+    }
+    attribute {
+      name: "start"
+      i: 4
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    output: "v_Constant_3"
+    name: "Constant_node_3"
+    op_type: "Constant"
+    attribute {
+      name: "value_ints"
+      ints: 4
+      ints: 0
+      type: INTS
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "v_Shape_0"
+    input: "v_Constant_3"
+    input: "v_Shape_1"
+    input: "v_Shape_2"
+    output: "v_Concat_4"
+    name: "Concat_node_4"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: 0
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "v_Concat_4"
+    output: "conv_cache.conv_in"
+    name: "ConstantOfShape_node_5"
+    op_type: "ConstantOfShape"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        data_type: 1
+        raw_data: "\000\000\000\000"
+      }
+      type: TENSOR
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    output: "v_Constant_6"
+    name: "Constant_node_6"
+    op_type: "Constant"
+    attribute {
+      name: "value_ints"
+      ints: 2
+      type: INTS
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "v_Shape_1"
+    input: "v_Constant_6"
+    output: "v_Mul_7"
+    name: "Mul_node_7"
+    op_type: "Mul"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    output: "v_Constant_8"
+    name: "Constant_node_8"
+    op_type: "Constant"
+    attribute {
+      name: "value_ints"
+      ints: 2
+      type: INTS
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "v_Shape_2"
+    input: "v_Constant_8"
+    output: "v_Mul_9"
+    name: "Mul_node_9"
+    op_type: "Mul"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    output: "v_Constant_10"
+    name: "Constant_node_10"
+    op_type: "Constant"
+    attribute {
+      name: "value_ints"
+      ints: 3
+      ints: 0
+      type: INTS
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "v_Shape_0"
+    input: "v_Constant_10"
+    input: "v_Mul_7"
+    input: "v_Mul_9"
+    output: "v_Concat_11"
+    name: "Concat_node_11"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: 0
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "v_Concat_11"
+    output: "conv_cache.conv_out"
+    name: "ConstantOfShape_node_12"
+    op_type: "ConstantOfShape"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        data_type: 1
+        raw_data: "\000\000\000\000"
+      }
+      type: TENSOR
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  name: "video_conv_cache_initializer"
+  input {
+    name: "latent"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "channels"
+          }
+          dim {
+            dim_param: "latent_frames"
+          }
+          dim {
+            dim_param: "height"
+          }
+          dim {
+            dim_param: "width"
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "conv_cache.conv_in"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_value: 0
+          }
+          dim {
+            dim_param: "height"
+          }
+          dim {
+            dim_param: "width"
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "conv_cache.conv_out"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 3
+          }
+          dim {
+            dim_value: 0
+          }
+          dim {
+            dim_param: "2*height"
+          }
+          dim {
+            dim_param: "2*width"
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Shape_0"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Shape_1"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Shape_2"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Constant_3"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 2
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Concat_4"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 5
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Constant_6"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Mul_7"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Constant_8"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Mul_9"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Constant_10"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 2
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Concat_11"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 5
+          }
+        }
+      }
+    }
+  }
+  metadata_props {
+    key: "mobius.generation.policy_contract"
+    value: "{}"
+  }
+  metadata_props {
+    key: "mobius.generation.policy_contract_id"
+    value: "mobius.policy.auxiliary@1"
+  }
+  metadata_props {
+    key: "mobius.generation.policy_effects"
+    value: "[]"
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}

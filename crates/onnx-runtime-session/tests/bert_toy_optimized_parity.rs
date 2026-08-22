@@ -46,8 +46,10 @@ fn read_bin(name: &str) -> Vec<u8> {
 fn i64_input(name: &str) -> Tensor {
     let bytes = read_bin(name);
     let data: Vec<i64> = bytes
-        .chunks_exact(8)
-        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| i64::from_le_bytes(*c))
         .collect();
     assert_eq!(data.len(), 8, "{name} expected 8 int64 values");
     Tensor::from_i64(&[1, 8], &data).unwrap()
@@ -55,8 +57,10 @@ fn i64_input(name: &str) -> Tensor {
 
 fn f32_reference(name: &str) -> Vec<f32> {
     read_bin(name)
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 

@@ -37,7 +37,8 @@
 //! canonical `HostGovernor` lives — already depends on `onnx-genai-kv`. The KV
 //! store therefore cannot lease from `HostGovernor` without a dependency cycle,
 //! so the vocabulary has to sit below both. It is also what a third party would
-//! implement against, which is why it depends on nothing but `thiserror`.
+//! implement against, which is why it depends only on the primitive
+//! `onnx-runtime-memory-api` crate.
 //!
 //! Two divergences from the canonical design, stated rather than hidden:
 //!
@@ -72,19 +73,45 @@
 
 pub mod allocator;
 pub mod large_alloc_cache;
+pub mod manager;
 pub mod shareability;
+pub mod shared_prefix;
 
 pub use allocator::{
-    AllocationCommitRange, DeviceAllocator, DeviceKey, HostAllocator, MappedAllocation,
-    SharedDevicePrefix, SharedPrefixCommitInfo,
+    AllocationCommitRange, AllocationGeneration, AllocationIdentity, AllocationReleaseOutcome,
+    AllocationReleaseState, AuthorityIdentity, BindingError, BindingGeneration, BindingId,
+    BindingIdentity, BindingRegistry, BindingResource, BoundAllocation, BoundMemoryView,
+    BoundSharedMapping, BoundSharedPrefix, BoundVirtualBacking, DeferredEnqueueError,
+    DeferredEnqueueRejection, DeferredReleaseDisposition, DeferredReleaseQueue, DeviceAllocator,
+    DeviceKey, ExplicitReleaseError, HostAllocator, MappedAllocation, MechanismCoherence,
+    MechanismIdentity, MechanismLifecycle, MechanismSnapshot, MemoryBinding, OwnedView,
+    OwningAllocation, OwningReleaseError, PreparedAllocationRelease, ProviderContextIdentity,
+    QuarantineReason, QuarantinedAllocation, RegisteredAuthority, RegisteredMechanism,
+    RegisteredProviderContext, ReleaseAccounting, ReleaseFailure, ResidualOwnership,
+    SharedDevicePrefix, SharedMapping, SharedPrefixCommitInfo, ValidatedMemoryView, VirtualBacking,
 };
 pub use large_alloc_cache::{
     DEFAULT_CACHE_BUDGET_BYTES, FALLBACK_FLOOR_BYTES, LargeAllocCache, LargeAllocCacheStats,
     MAX_CACHED_BYTES, calibrate_floor_bytes, calibrated_floor_bytes, default_budget_bytes,
 };
+pub use manager::{
+    AllocationChargeMode, AllocationPublication, AllocationRequest, AllocationSettlementStatus,
+    AllocationSettlementToken, AllocationSettlementWait, AllocationStepError,
+    AllocationTransactionError, AuthorityMemorySnapshot, DeviceLossListener, ManagedAllocation,
+    ManagedAllocationSnapshot, ManagedAllocationState, ManagedPreparedRelease, ManagedReleaseError,
+    MemoryContextOperation, MemoryContextScope, ProcessAuthorityId, ProcessMemoryLimits,
+    ProcessMemoryManager, ProcessMemorySnapshot, RegisteredMemoryAuthority,
+    RegisteredMemoryContext, RegisteredMemoryHolder, RegisteredMemoryMechanism,
+    ScopedAllocationContext, ScopedMemoryBinding, ScopedVirtualBacking, SharedPhysicalIdentity,
+    WeakProcessMemoryManager,
+};
+pub use onnx_runtime_memory_api::{MemoryError, MemoryRole, Tier};
 pub use shareability::{
     KvFragmentation, ModelKvGeometry, PrefixShareability, evaluate_geometry_shareability,
     evaluate_prefix_shareability,
+};
+pub use shared_prefix::{
+    SharedPrefixCommitTarget, SharedPrefixPairCommitError, commit_shared_prefix_pair,
 };
 
 use std::collections::{BTreeMap, VecDeque};
@@ -137,72 +164,6 @@ impl std::fmt::Display for MemoryAuthorityId {
     }
 }
 
-/// Where the bytes physically live.
-///
-/// Ordered from fastest to slowest, which is also the demotion order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Tier {
-    /// Accelerator memory (VRAM).
-    Device,
-    /// Host RAM.
-    Host,
-    /// Spill file on disk.
-    Disk,
-}
-
-impl Tier {
-    /// Every tier, fastest first.
-    pub const ALL: [Tier; 3] = [Tier::Device, Tier::Host, Tier::Disk];
-
-    /// Stable index for array-backed per-tier state.
-    const fn index(self) -> usize {
-        match self {
-            Tier::Device => 0,
-            Tier::Host => 1,
-            Tier::Disk => 2,
-        }
-    }
-
-    /// Human-facing name used in error messages.
-    pub const fn name(self) -> &'static str {
-        match self {
-            Tier::Device => "device",
-            Tier::Host => "host",
-            Tier::Disk => "disk",
-        }
-    }
-}
-
-/// What a reservation is *for*.
-///
-/// The governor reads this; it never infers purpose from allocation size or
-/// timing, because that is guessing. Roles are what make an eviction order
-/// expressible rather than hardcoded.
-///
-/// Deliberately carries no sequence or session identity. Under G3 the governor
-/// asks a *holder* to release bytes and the holder chooses which of its own
-/// sequences to give up, so the governor never has to reason about sequences —
-/// and this crate never has to depend on the KV layer to name one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MemoryRole {
-    /// Long-lived per-sequence KV. Migratable, and the usual eviction target
-    /// after weights.
-    KvCache,
-    /// Scratch space for computation.
-    Workspace {
-        /// Released wholesale at the end of the step that took it. Step-scoped
-        /// workspace is never migrated, because nothing would be gained before
-        /// it is freed anyway.
-        step_scoped: bool,
-    },
-    /// Model parameters. Immutable and shareable, so the cheapest thing to
-    /// demote first: it can always be re-read from the package on disk.
-    Weights,
-    /// Intermediate activations for one graph execution. The hottest and
-    /// shortest-lived class.
-    Activation,
-}
-
 /// Identifies a component that holds leases, so the governor can ask it to
 /// release under pressure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -224,73 +185,6 @@ impl std::fmt::Display for HolderId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "holder {}", self.0)
     }
-}
-
-/// Why a reservation could not be granted.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum MemoryError {
-    /// The tier does not have room, and no holder released enough.
-    #[error(
-        "cannot reserve {requested} bytes of {tier} memory for {role:?}: {used} of {limit} bytes \
-         are already leased, leaving {available}; free memory by closing sessions, lower the \
-         demand, or raise the {tier} limit"
-    )]
-    TierExhausted {
-        /// Which tier ran out.
-        tier: &'static str,
-        /// What the caller asked for.
-        requested: u64,
-        /// Bytes leased before this request.
-        used: u64,
-        /// The tier ceiling.
-        limit: u64,
-        /// `limit - used`.
-        available: u64,
-        /// The role that was refused.
-        role: MemoryRole,
-    },
-    /// The request itself is not representable.
-    #[error("cannot reserve {requested} bytes of {tier} memory: {reason}")]
-    InvalidRequest {
-        /// Which tier was addressed.
-        tier: &'static str,
-        /// What the caller asked for.
-        requested: u64,
-        /// What is wrong with it.
-        reason: &'static str,
-    },
-    /// The request was well formed and within budget, but the allocator behind
-    /// the tier refused it for a reason of its own.
-    ///
-    /// Distinct from [`MemoryError::TierExhausted`], which means *we* declined,
-    /// and from [`MemoryError::InvalidRequest`], which means the caller asked
-    /// for something impossible. This one carries the backing allocator's own
-    /// account of the failure, which is usually the only thing that identifies
-    /// it: a driver that is out of memory and a driver that has no context both
-    /// fail an allocation, and calling them both "out of memory" sends the next
-    /// person to read the log in the wrong direction.
-    #[error("cannot allocate {requested} bytes of {tier} memory: {reason}")]
-    AllocationFailed {
-        /// Which tier was addressed.
-        tier: &'static str,
-        /// What the caller asked for.
-        requested: u64,
-        /// What the backing allocator said.
-        reason: String,
-    },
-    /// A well-formed capacity transfer or backing claim could not make enough
-    /// governed bytes available.
-    #[error(
-        "cannot make {requested} bytes of {tier} capacity available for {role:?}: only \
-         {available} bytes became available; {detail}"
-    )]
-    CapacityUnavailable {
-        tier: &'static str,
-        requested: u64,
-        available: u64,
-        role: MemoryRole,
-        detail: String,
-    },
 }
 
 /// Per-tier accounting shared by a governor and every lease it has granted.
@@ -831,6 +725,29 @@ impl MappedAllowance {
         returned
     }
 
+    /// Discharge this attribution after external proof that its provider
+    /// context no longer exists.
+    ///
+    /// Every clone shares this state, so later page/action drops observe a zero
+    /// limit and cannot release the same allowance twice.
+    pub fn confirm_context_terminated(&self) {
+        let released = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let released = state.limit;
+            state.limit = 0;
+            state.mapped = 0;
+            state.growth_reserved = 0;
+            released
+        };
+        if released != 0 {
+            self.inner.accounting.release(self.inner.tier, released);
+        }
+    }
+
     pub fn holder(&self) -> HolderId {
         self.inner.holder
     }
@@ -934,6 +851,42 @@ impl MappedAllowance {
                 reason: "mapped growth commit overflows mapped attribution",
             })?;
         Ok(())
+    }
+
+    /// Record retained mappings after a partial allocator failure.
+    ///
+    /// Unlike ordinary commit, counter overflow fails *conservatively*: mapped
+    /// attribution is pinned at `u64::MAX` after consuming the reservation so a
+    /// later admission cannot treat retained physical ownership as free.
+    fn map_reserved_retained(&self, bytes: u64) -> Result<(), MemoryError> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if bytes > state.growth_reserved {
+            return Err(MemoryError::InvalidRequest {
+                tier: self.inner.tier.name(),
+                requested: bytes,
+                reason: "retained mapped growth exceeds its live reservation",
+            });
+        }
+        state.growth_reserved -= bytes;
+        match state.mapped.checked_add(bytes) {
+            Some(next) => {
+                state.mapped = next;
+                Ok(())
+            }
+            None => {
+                state.mapped = u64::MAX;
+                Err(MemoryError::InvalidRequest {
+                    tier: self.inner.tier.name(),
+                    requested: bytes,
+                    reason: "retained mapped growth overflows mapped attribution; admission is \
+                             pinned closed",
+                })
+            }
+        }
     }
 }
 
@@ -1267,6 +1220,9 @@ impl MappedGrowthAuthority {
                     available: report.reclaimed_bytes,
                     role: requester.role(),
                     detail: "mapped holder could not reach its tentative reclaim target".into(),
+                    // This layer reached the conclusion itself; no lower
+                    // refusal to report.
+                    source: None,
                 });
             }
             grant.transferred_bytes = grant.transferred_bytes.saturating_add(transfer);
@@ -1485,6 +1441,30 @@ impl MappedGrowthGrant {
         Ok(())
     }
 
+    /// Settle a partially failed allocator transaction that retained mappings.
+    ///
+    /// The residual is committed to mapped attribution, unused capacity is
+    /// returned, and the operation guard is always released. This is the
+    /// fail-closed counterpart to [`commit_bytes`](Self::commit_bytes): retained
+    /// physical ownership must never be rolled back as if nothing happened.
+    pub fn settle_retained_bytes(mut self, retained_mapped_bytes: u64) -> Result<(), MemoryError> {
+        self.reduce_to_actual(retained_mapped_bytes)?;
+        let result = self.requester.map_reserved_retained(retained_mapped_bytes);
+        self.physical_capacity.release_remaining();
+        self.authority
+            .counters
+            .bytes_transferred
+            .fetch_add(self.transferred_bytes, Ordering::Relaxed);
+        if result.is_err() {
+            self.authority
+                .counters
+                .failures
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.finish();
+        result
+    }
+
     fn reduce_to_actual(&mut self, actual: u64) -> Result<(), MemoryError> {
         if actual > self.requested_bytes {
             return Err(MemoryError::InvalidRequest {
@@ -1679,6 +1659,11 @@ impl MemoryLease {
     /// How many bytes this lease currently covers.
     pub fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// Physical-memory authority currently charged for this lease, if known.
+    pub fn authority_id(&self) -> Option<MemoryAuthorityId> {
+        self.accounting.authority_id()
     }
 
     /// What the bytes are for.
@@ -2101,6 +2086,62 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
 
+    /// `CapacityUnavailable` exists to report someone else's refusal, so the
+    /// refusal has to survive being reported: admission callers tell "we
+    /// declined, ask for less" from "the driver failed, give up" by matching
+    /// the variant, and they cannot match a string.
+    ///
+    /// This pins a specific trap. `#[source]` on a `Box<ConcreteError>` yields
+    /// a chain node whose concrete type is the *box*, so `downcast_ref` for the
+    /// error itself silently misses -- the message still reads correctly, which
+    /// is what makes it easy to reintroduce while "simplifying" the field back
+    /// to `Option<Box<MemoryError>>`.
+    #[test]
+    fn capacity_unavailable_keeps_the_refusal_underneath_it_downcastable() {
+        let error = MemoryError::CapacityUnavailable {
+            tier: Tier::Device.name(),
+            requested: 2 << 20,
+            available: 0,
+            role: MemoryRole::Workspace { step_scoped: false },
+            detail: "cuMemMap could not grow the physical handle pool".into(),
+            source: Some(Box::new(MemoryError::TierExhausted {
+                tier: Tier::Device.name(),
+                requested: 2 << 20,
+                used: 22531,
+                limit: 22531,
+                available: 0,
+                role: MemoryRole::Workspace { step_scoped: false },
+            })),
+        };
+
+        let cause = std::error::Error::source(&error).expect("the refusal must be reachable");
+        assert!(
+            matches!(
+                cause.downcast_ref::<MemoryError>(),
+                Some(MemoryError::TierExhausted {
+                    role: MemoryRole::Workspace { step_scoped: false },
+                    ..
+                })
+            ),
+            "the cause must arrive as a MemoryError, not as a box around one: {cause}"
+        );
+    }
+
+    /// A layer that reached its own conclusion has nothing to report
+    /// underneath, and must not invent one.
+    #[test]
+    fn capacity_unavailable_reports_no_cause_when_it_decided_alone() {
+        let error = MemoryError::CapacityUnavailable {
+            tier: Tier::Device.name(),
+            requested: 4096,
+            available: 0,
+            role: MemoryRole::KvCache,
+            detail: "mapped holder could not reach its tentative reclaim target".into(),
+            source: None,
+        };
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
     struct TestMappedHolder {
         allowance: MappedAllowance,
         mapped: AtomicU64,
@@ -2358,6 +2399,49 @@ mod tests {
         ));
         assert_eq!(requester.limit(), 20);
         assert_eq!(requester.mapped_bytes(), 20);
+    }
+
+    #[test]
+    fn retained_mapped_growth_releases_operation_guard_and_keeps_residual_attributed() {
+        let governor = LedgerGovernor::new(LeaseLedger::new(64, 0, 0));
+        let requester = mapped_allowance(
+            &governor,
+            0,
+            MemoryRole::Workspace { step_scoped: false },
+            2,
+        );
+        governor
+            .prepare_mapped_growth(&requester, 20)
+            .unwrap()
+            .settle_retained_bytes(12)
+            .unwrap();
+        assert_eq!(requester.mapped_bytes(), 12);
+        assert_eq!(requester.limit(), 12);
+
+        // A forgotten operation guard would block this second transaction
+        // forever. Completing it proves retained settlement released the gate.
+        governor
+            .prepare_mapped_growth(&requester, 8)
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert_eq!(requester.mapped_bytes(), 20);
+    }
+
+    #[test]
+    fn confirmed_context_discharges_all_mapped_allowance_clones_exactly_once() {
+        let governor = LedgerGovernor::new(LeaseLedger::new(100, 0, 0));
+        let first = mapped_allowance(&governor, 100, MemoryRole::Weights, 1);
+        let clone = first.clone();
+        clone.confirm_context_terminated();
+        let second = mapped_allowance(&governor, 100, MemoryRole::Weights, 2);
+        drop(first);
+        drop(clone);
+        let error = governor
+            .reserve_mapped_allowance(Tier::Device, 1, MemoryRole::Weights, HolderId::new(3))
+            .unwrap_err();
+        assert!(matches!(error, MemoryError::TierExhausted { .. }));
+        drop(second);
     }
 
     #[test]

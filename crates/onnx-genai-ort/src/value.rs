@@ -392,13 +392,12 @@ impl Value {
     /// device tensor that address is not dereferenceable from the CPU, so the
     /// alternative to this check is a wild read or store rather than a fault.
     fn ensure_host_accessible(&self, operation: &str) -> Result<()> {
-        if self.is_host_accessible() {
+        if self.is_host_accessible() && self.is_host_resident()? {
             return Ok(());
         }
         Err(OrtError::InvalidArgument(format!(
             "{operation} needs to reach this tensor's bytes through a host pointer, but it \
-             wraps external memory that was declared as living on a device; copy it to the \
-             host first, or use the device-side helpers"
+             lives on a device; copy it to the host first, or use the device-side helpers"
         )))
     }
 
@@ -539,6 +538,9 @@ impl Value {
         let get_device_type = api
             .MemoryInfoGetDeviceType
             .ok_or(OrtError::ApiUnavailable("MemoryInfoGetDeviceType"))?;
+        let get_name = api
+            .MemoryInfoGetName
+            .ok_or(OrtError::ApiUnavailable("MemoryInfoGetName"))?;
         let mut memory_info = std::ptr::null();
         // SAFETY: `self.ptr` is a valid tensor OrtValue. ORT owns the returned
         // OrtMemoryInfo for the lifetime of the value, so it must not be freed.
@@ -552,7 +554,44 @@ impl Value {
         // SAFETY: `memory_info` is the non-null table ORT just returned, and
         // `device_type` is a valid out-parameter for the duration of the call.
         unsafe { get_device_type(memory_info, &mut device_type) };
-        Ok(device_type == onnx_genai_ort_sys::OrtMemoryInfoDeviceType_CPU)
+        if device_type != onnx_genai_ort_sys::OrtMemoryInfoDeviceType_CPU {
+            return Ok(false);
+        }
+        let mut name = std::ptr::null();
+        // SAFETY: `memory_info` is valid and `name` is a live out-parameter.
+        crate::error::check_status(unsafe { get_name(memory_info, &mut name) })?;
+        if name.is_null() {
+            return Err(OrtError::NullPointer);
+        }
+        // `CreateMemoryInfo`, used by the built-in CUDA allocator, does not
+        // encode an OrtDevice type and ORT reports CPU here despite returning
+        // a device pointer. The allocator name remains authoritative.
+        let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy();
+        Ok(!matches!(name.as_ref(), "Cuda" | "DML" | "WebGPU_Buffer"))
+    }
+
+    /// Return the allocator device ID recorded on this tensor.
+    pub fn device_id(&self) -> Result<i32> {
+        let api = crate::error::api()?;
+        let get_memory_info = api
+            .GetTensorMemoryInfo
+            .ok_or(OrtError::ApiUnavailable("GetTensorMemoryInfo"))?;
+        let get_device_id = api
+            .MemoryInfoGetId
+            .ok_or(OrtError::ApiUnavailable("MemoryInfoGetId"))?;
+        let mut memory_info = std::ptr::null();
+        // SAFETY: `self.ptr` is a valid tensor OrtValue. ORT owns the returned
+        // OrtMemoryInfo for the lifetime of the value.
+        crate::error::check_status(unsafe {
+            get_memory_info(self.ptr.as_ptr(), &mut memory_info)
+        })?;
+        if memory_info.is_null() {
+            return Err(OrtError::NullPointer);
+        }
+        let mut device_id = 0;
+        // SAFETY: `memory_info` is valid and `device_id` is a live out-parameter.
+        crate::error::check_status(unsafe { get_device_id(memory_info, &mut device_id) })?;
+        Ok(device_id)
     }
 
     /// Borrow the tensor's raw little-endian element bytes.
@@ -761,6 +800,132 @@ impl Value {
     /// decode-session diagnostics that need to verify buffer reuse.
     pub fn data_ptr_addr(&self) -> Result<usize> {
         Ok(tensor_data_ptr(self.ptr.as_ptr())? as usize)
+    }
+
+    /// Copy a host tensor into this existing host tensor without changing its
+    /// OrtValue or buffer address. Stable workflow-island bindings use this to
+    /// refresh request/loop inputs while preserving CUDA Graph replay addresses.
+    pub fn copy_from_host(&self, source: &Value) -> Result<()> {
+        self.ensure_host_accessible("copy_from_host destination")?;
+        source.ensure_host_accessible("copy_from_host source")?;
+        if self.dtype != source.dtype || self.shape != source.shape {
+            return Err(OrtError::InvalidArgument(format!(
+                "copy_from_host requires identical tensors, destination {:?} {:?}, source {:?} {:?}",
+                self.dtype, self.shape, source.dtype, source.shape
+            )));
+        }
+        let bytes = self
+            .numel()
+            .checked_mul(self.dtype.size_of())
+            .ok_or_else(|| {
+                OrtError::InvalidArgument("copy_from_host tensor byte size overflows".into())
+            })?;
+        let destination = tensor_data_ptr(self.ptr.as_ptr())?;
+        let source = tensor_data_ptr(source.ptr.as_ptr())?;
+        // SAFETY: shape/dtype equality guarantees both tensor buffers contain
+        // at least `bytes` bytes and do not overlap (distinct OrtValues).
+        unsafe { std::ptr::copy_nonoverlapping(source, destination, bytes) };
+        Ok(())
+    }
+
+    /// Copy an identically typed/shaped tensor between host and CUDA memory.
+    ///
+    /// CPU-to-CPU copies use ordinary host memory. Any copy involving device
+    /// memory uses the selected CUDA device explicitly so callers can refresh
+    /// stable graph-capture buffers without replacing their addresses.
+    pub fn copy_from_cuda(&self, source: &Value, device_id: i32) -> Result<()> {
+        if self.shape != source.shape || self.dtype != source.dtype {
+            return Err(OrtError::InvalidArgument(format!(
+                "CUDA tensor copy requires identical tensors, destination {:?} {:?}, source {:?} {:?}",
+                self.dtype, self.shape, source.dtype, source.shape
+            )));
+        }
+
+        let destination_host = self.is_host_resident()?;
+        let source_host = source.is_host_resident()?;
+        if destination_host && source_host {
+            return self.copy_from_host(source);
+        }
+        #[cfg(feature = "cuda")]
+        {
+            let bytes = self
+                .numel()
+                .checked_mul(self.dtype.size_of())
+                .ok_or_else(|| {
+                    OrtError::InvalidArgument("CUDA tensor copy byte size overflows".into())
+                })?;
+            let destination = self.data_ptr_addr()?;
+            let source_ptr = source.data_ptr_addr()?;
+            let _guard = crate::cuda_rt::DeviceGuard::set(device_id)?;
+            match (destination_host, source_host) {
+                (false, true) => {
+                    crate::cuda_rt::memcpy_host_to_device(destination, source.as_raw_bytes()?)?
+                }
+                (true, false) => {
+                    // SAFETY: destination is a host tensor with exactly `bytes`
+                    // writable bytes and remains alive for the copy.
+                    let destination_bytes =
+                        unsafe { std::slice::from_raw_parts_mut(destination as *mut u8, bytes) };
+                    crate::cuda_rt::memcpy_device_to_host(destination_bytes, source_ptr)?
+                }
+                (false, false) => {
+                    crate::cuda_rt::memcpy_device_to_device(destination, source_ptr, bytes)?
+                }
+                (true, true) => unreachable!(),
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = device_id;
+            Err(OrtError::InvalidArgument(
+                "tensor copy involves CUDA memory but this build has no CUDA support".into(),
+            ))
+        }
+    }
+
+    /// Enqueue a same-device CUDA copy without synchronizing the device.
+    pub fn copy_from_cuda_async(&self, source: &Value, device_id: i32) -> Result<()> {
+        if self.shape != source.shape || self.dtype != source.dtype {
+            return Err(OrtError::InvalidArgument(format!(
+                "asynchronous CUDA tensor copy requires identical tensors, destination {:?} {:?}, source {:?} {:?}",
+                self.dtype, self.shape, source.dtype, source.shape
+            )));
+        }
+        if self.is_host_resident()? || source.is_host_resident()? {
+            return Err(OrtError::InvalidArgument(
+                "asynchronous CUDA tensor copy requires device-resident tensors".into(),
+            ));
+        }
+        #[cfg(feature = "cuda")]
+        {
+            let bytes = self
+                .numel()
+                .checked_mul(self.dtype.size_of())
+                .ok_or_else(|| {
+                    OrtError::InvalidArgument("CUDA tensor copy byte size overflows".into())
+                })?;
+            let _guard = crate::cuda_rt::DeviceGuard::set(device_id)?;
+            crate::cuda_rt::memcpy_device_to_device_async(
+                self.data_ptr_addr()?,
+                source.data_ptr_addr()?,
+                bytes,
+            )
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = device_id;
+            Err(OrtError::InvalidArgument(
+                "asynchronous CUDA copy requires the cuda feature".into(),
+            ))
+        }
+    }
+
+    /// Copy this tensor into a newly allocated CPU tensor.
+    pub fn to_host_from_cuda(&self, device_id: i32) -> Result<Self> {
+        let host = Self::empty(&self.shape, self.dtype)?;
+        host.copy_from_cuda(self, device_id)?;
+        Ok(host)
     }
 
     /// Overwrite the leading `data.len()` Int64 elements of this tensor in
@@ -1114,7 +1279,7 @@ impl Value {
         Ok(())
     }
 
-    /// Create a no-copy CPU tensor alias over the prefix of an existing tensor.
+    /// Create a no-copy tensor alias over the prefix of an existing tensor.
     ///
     /// The returned OrtValue has its own shape but points at the same underlying
     /// tensor data as `owner`. `owner` is kept alive by the alias backing.
@@ -1134,8 +1299,20 @@ impl Value {
                 owner.numel()
             )));
         }
-        let data = tensor_data_ptr(owner.ptr.as_ptr())?;
-        let ptr = create_tensor_with_data(
+        let memory_info = tensor_memory_info(owner.ptr.as_ptr())?;
+        // A zero-element alias borrows no bytes, and ORT is entitled to report a
+        // null data pointer for a tensor that owns none. Such an alias is still
+        // a real tensor -- a workflow's growing state starts empty and an
+        // island's outputs are aliased before anything has been appended -- so
+        // give ORT an aligned address it will never dereference instead of
+        // asking the owner for one.
+        let data = if alias_numel == 0 {
+            dangling_aligned(owner.dtype)
+        } else {
+            tensor_data_ptr(owner.ptr.as_ptr())?
+        };
+        let ptr = create_tensor_with_data_at(
+            memory_info,
             data,
             alias_numel * owner.dtype.size_of(),
             shape,
@@ -1147,6 +1324,17 @@ impl Value {
             dtype: owner.dtype,
             backing: TensorBacking::Alias(owner),
         })
+    }
+
+    /// Convert an owned tensor into a no-copy alias with the requested shape.
+    #[allow(clippy::arc_with_non_send_sync)]
+    pub fn into_alias_with_shape(owner: Value, shape: &[i64]) -> Result<Self> {
+        Self::alias_with_shape(Arc::new(owner), shape)
+    }
+
+    /// Create a no-copy tensor view while retaining a shared allocation owner.
+    pub fn alias_from_shared_owner(owner: Arc<Value>, shape: &[i64]) -> Result<Self> {
+        Self::alias_with_shape(owner, shape)
     }
 
     /// If this value is a no-copy alias over a shared owner, produce another
@@ -1243,6 +1431,16 @@ fn create_tensor_with_data_in(
     dtype: DataType,
     memory_info: &MemoryInfo,
 ) -> Result<NonNull<onnx_genai_ort_sys::OrtValue>> {
+    create_tensor_with_data_at(memory_info.as_ptr(), data, bytes, shape, dtype)
+}
+
+fn create_tensor_with_data_at(
+    memory_info: *const onnx_genai_ort_sys::OrtMemoryInfo,
+    data: *mut std::ffi::c_void,
+    bytes: usize,
+    shape: &[i64],
+    dtype: DataType,
+) -> Result<NonNull<onnx_genai_ort_sys::OrtValue>> {
     let mut ptr = std::ptr::null_mut();
     let api = crate::error::api()?;
     let create = api
@@ -1253,7 +1451,7 @@ fn create_tensor_with_data_in(
     // the caller's contract for the external one. `shape` is valid for the call.
     crate::error::check_status(unsafe {
         create(
-            memory_info.as_ptr(),
+            memory_info,
             data,
             bytes,
             shape.as_ptr(),
@@ -1263,6 +1461,23 @@ fn create_tensor_with_data_in(
         )
     })?;
     NonNull::new(ptr).ok_or(OrtError::NullPointer)
+}
+
+fn tensor_memory_info(
+    value: *const onnx_genai_ort_sys::OrtValue,
+) -> Result<*const onnx_genai_ort_sys::OrtMemoryInfo> {
+    let api = crate::error::api()?;
+    let get_memory_info = api
+        .GetTensorMemoryInfo
+        .ok_or(OrtError::ApiUnavailable("GetTensorMemoryInfo"))?;
+    let mut memory_info = std::ptr::null();
+    // SAFETY: `value` is a valid tensor OrtValue and ORT owns the returned
+    // memory-info object for the tensor's lifetime.
+    crate::error::check_status(unsafe { get_memory_info(value, &mut memory_info) })?;
+    if memory_info.is_null() {
+        return Err(OrtError::NullPointer);
+    }
+    Ok(memory_info)
 }
 
 fn tensor_shape_and_type(
@@ -1475,6 +1690,15 @@ fn argmax_bf16_bits(bits: &[u16]) -> usize {
     argmax_half_bits(halves)
 }
 
+/// A non-null, correctly aligned address for a tensor that owns no bytes.
+///
+/// ORT requires a non-null data pointer even when the tensor has zero elements,
+/// and every reader casts that pointer to the element type, so it has to carry
+/// the element alignment even though nothing may dereference it.
+fn dangling_aligned(dtype: DataType) -> *mut std::ffi::c_void {
+    std::ptr::without_provenance_mut::<u8>(dtype.size_of().max(1)).cast()
+}
+
 fn tensor_data_ptr(value: *mut onnx_genai_ort_sys::OrtValue) -> Result<*mut std::ffi::c_void> {
     let api = crate::error::api()?;
     let get_data = api
@@ -1495,9 +1719,23 @@ mod host_residency_tests {
     use super::*;
 
     #[test]
+    fn an_empty_tensor_can_be_aliased_and_read_back() {
+        // Workflow state that grows along an axis starts at length zero, and the
+        // engine aliases every island output before running it. Both have to
+        // work for a tensor that owns no bytes.
+        let owner = Value::empty(&[1, 4, 0, 2, 2], DataType::Float32).expect("empty tensor");
+        let alias = Value::into_alias_with_shape(owner, &[1, 4, 0, 2, 2]).expect("alias");
+        assert_eq!(alias.shape(), [1, 4, 0, 2, 2]);
+        assert_eq!(alias.numel(), 0);
+        assert!(alias.to_vec_f32().expect("read back").is_empty());
+        assert!(alias.as_raw_bytes().expect("borrow bytes").is_empty());
+    }
+
+    #[test]
     fn a_host_tensor_reports_host_residency_and_lends_its_bytes() {
         let value = Value::from_slice_f32(&[1.0, 2.0], &[2]).expect("build a host tensor");
         assert!(value.is_host_resident().expect("memory info is available"));
+        assert_eq!(value.device_id().expect("device ID is available"), 0);
         assert_eq!(
             value.as_raw_bytes().expect("host bytes are borrowable"),
             &[1.0f32, 2.0]
@@ -1815,7 +2053,7 @@ mod cuda_device_write_tests {
 
     const TINY_LLM: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../tests/fixtures/tiny-llm/model.onnx"
+        "/../../tests/fixtures/tiny-llm-sharedbuffer/model.onnx.textproto"
     );
 
     /// Build a CUDA session and return its device KV allocator together with the
@@ -1912,6 +2150,45 @@ mod cuda_device_write_tests {
         assert_eq!(&read_back[prefix.len()..], &[-1_i64, -1]);
 
         release_cuda_resources_in_order(tensor, allocator, session, env);
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA GPU + CUDA-enabled ONNX Runtime"]
+    fn cuda_alias_preserves_device_residency_without_copying() {
+        let Some((env, session, allocator, device_id)) = cuda_device_allocator() else {
+            return;
+        };
+        let owner = Value::empty_in(&[4], DataType::Int64, &allocator).expect("device allocation");
+        assert!(!owner.is_host_resident().expect("device residency"));
+        let host = Value::from_slice_i64(&[9, 8, 7, 6], &[4]).expect("host tensor");
+        let error = owner
+            .copy_from_host(&host)
+            .expect_err("CUDA allocation must not be host-accessible");
+        assert!(
+            error.to_string().contains("lives on a device"),
+            "unexpected error: {error}"
+        );
+        let bytes = [1_i64, 2, 3, 4]
+            .into_iter()
+            .flat_map(i64::to_ne_bytes)
+            .collect::<Vec<_>>();
+        crate::cuda_rt::memcpy_host_to_device(owner.data_ptr_addr().unwrap(), &bytes)
+            .expect("host-to-device copy");
+        let owner_ptr = owner.data_ptr_addr().unwrap();
+        let alias = Value::into_alias_with_shape(owner, &[2]).expect("device alias");
+        let alias_clone = alias
+            .try_alias_clone()
+            .expect("alias backing")
+            .expect("alias clone");
+        assert_eq!(alias.device_id().expect("alias device"), device_id);
+        assert_eq!(alias.data_ptr_addr().unwrap(), owner_ptr);
+        assert_eq!(alias_clone.data_ptr_addr().unwrap(), owner_ptr);
+        assert_eq!(read_device_i64(&alias, 2), vec![1, 2]);
+        drop(alias_clone);
+        drop(alias);
+        drop(allocator);
+        drop(session);
+        drop(env);
     }
 
     #[test]

@@ -19,7 +19,27 @@ pub fn compute_contiguous_strides(shape: &[usize]) -> Vec<i64> {
 
 /// Whether `strides` describe a row-major contiguous layout for `shape`.
 pub fn is_contiguous(shape: &[usize], strides: &[i64]) -> bool {
-    strides == compute_contiguous_strides(shape).as_slice()
+    if shape.len() != strides.len() {
+        return false;
+    }
+    // Accumulate the row-major stride walking backwards rather than
+    // materialising the whole vector to compare against it. Same reason as
+    // `is_dense`: this runs on the kernel fast-path checks, once per operand,
+    // and allocating to answer a question about a handful of integers is the
+    // dominant cost of asking it.
+    //
+    // Short-circuiting on the first mismatch also means this cannot overflow
+    // where the allocating version could, since that one built every stride
+    // before comparing any of them. Strictly more defensive, and unreachable
+    // either way for shapes whose element count fits in memory.
+    let mut expected: i64 = 1;
+    for i in (0..shape.len()).rev() {
+        if strides[i] != expected {
+            return false;
+        }
+        expected *= shape[i] as i64;
+    }
+    true
 }
 
 /// Whether a tensor with `shape` and `strides` is **dense**: it occupies a
@@ -41,25 +61,93 @@ pub fn is_dense(shape: &[usize], strides: &[i64]) -> bool {
     if shape.len() != strides.len() {
         return false;
     }
-    // Collect (abs_stride, dim_size) for non-trivial dimensions.
-    let mut pairs: Vec<(i64, usize)> = shape
-        .iter()
-        .zip(strides)
-        .filter(|&(&d, _)| d > 1)
-        .map(|(&d, &s)| (s.unsigned_abs() as i64, d))
-        .collect();
+    // `is_dense` runs once per operand per node on the dispatch path. Collecting
+    // into a `Vec` to inspect a handful of numbers put a heap allocation there:
+    // perf sampling of a 100-node elementwise chain attributed 5.25% of this
+    // EP's dispatch time to this function and the `Vec` it built, against 3%
+    // for the arithmetic the whole graph exists to do.
+    //
+    // Rank <= 8 covers every tensor ONNX produces in practice, so those pairs
+    // live on the stack. Higher ranks keep the heap path rather than impose a
+    // limit the type system does not have. Both paths hand the same slice to
+    // the same routine, so there is one implementation of the predicate.
+    // Row-major contiguous with every extent non-empty is the overwhelmingly
+    // common case on the dispatch path: every tensor ORT hands this EP is
+    // contiguous, and the strides the plugin builds for it are built *as*
+    // contiguous by `contiguous_strides`. The fact is therefore proven twice
+    // per operand -- once by construction, and once here by re-deriving it
+    // through a filter, a copy and a sort.
+    //
+    // Proving it the cheap way first is exact rather than heuristic: under
+    // these conditions the tensor occupies `[0, numel)` with no holes, which is
+    // the definition below. A `false` decides nothing and falls through to the
+    // general path, so this can only ever save work, never change an answer.
+    //
+    // The zero-extent test is load-bearing and not defensive. `[2, 0]` with
+    // strides `[0, 1]` satisfies the contiguity recurrence -- the accumulator
+    // is multiplied by 0 and every later stride matches 0 -- while the general
+    // path calls it *not* dense, because dimension 2 has stride 0 and no size-1
+    // exemption. `is_contiguous` alone is therefore the wrong predicate to
+    // shortcut with, which the differential test against the reference
+    // implementation caught immediately.
+    let mut expected: i64 = 1;
+    let mut fast = true;
+    for i in (0..shape.len()).rev() {
+        if shape[i] == 0 || strides[i] != expected {
+            fast = false;
+            break;
+        }
+        expected *= shape[i] as i64;
+    }
+    if fast {
+        return true;
+    }
+    const INLINE_RANK: usize = 8;
+    let nontrivial = |(&d, &s): (&usize, &i64)| (s.unsigned_abs() as i64, d);
+    if shape.len() <= INLINE_RANK {
+        let mut pairs = [(0i64, 0usize); INLINE_RANK];
+        let mut len = 0;
+        for pair in shape
+            .iter()
+            .zip(strides)
+            .filter(|&(&d, _)| d > 1)
+            .map(nontrivial)
+        {
+            pairs[len] = pair;
+            len += 1;
+        }
+        dense_extents(&mut pairs[..len])
+    } else {
+        let mut pairs: Vec<(i64, usize)> = shape
+            .iter()
+            .zip(strides)
+            .filter(|&(&d, _)| d > 1)
+            .map(nontrivial)
+            .collect();
+        dense_extents(&mut pairs)
+    }
+}
+
+/// The density predicate over the non-trivial `(abs_stride, size)` extents.
+///
+/// Sorts `pairs` in place by ascending stride, so the caller owns the storage
+/// and `is_dense` can keep it on the stack for ordinary ranks.
+fn dense_extents(pairs: &mut [(i64, usize)]) -> bool {
     if pairs.is_empty() {
         return true; // scalar or all-ones shape
     }
     // Sort by stride ascending.
     pairs.sort_unstable_by_key(|&(s, _)| s);
-    // The smallest stride must be 1 (element-adjacent).
+    // The smallest stride must be 1 (element-adjacent). The loop below would
+    // reject this case too, on its first iteration, since `expected_stride`
+    // starts at 1 -- mutation testing confirms removing this branch changes no
+    // result. It is kept as the statement of intent the loop obscures.
     if pairs[0].0 != 1 {
         return false;
     }
     // Each subsequent stride must equal the product of all preceding sizes.
     let mut expected_stride: i64 = 1;
-    for &(stride, size) in &pairs {
+    for &(stride, size) in &*pairs {
         if stride != expected_stride {
             return false;
         }
@@ -194,6 +282,264 @@ impl TensorLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pre-optimisation `is_contiguous`, verbatim, as a differential
+    /// oracle -- it materialised the full stride vector and compared slices.
+    fn is_contiguous_reference(shape: &[usize], strides: &[i64]) -> bool {
+        strides == compute_contiguous_strides(shape).as_slice()
+    }
+
+    /// The allocation-free walk must agree with the materialise-and-compare
+    /// version on every input. Falsifier — accumulate the product in the wrong
+    /// direction, drop the length check, or use `shape[i + 1]` instead of
+    /// `shape[i]` when advancing, and this disagrees.
+    #[test]
+    fn contiguous_walk_agrees_with_the_materialising_implementation() {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = |bound: u64| -> u64 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % bound
+        };
+
+        let mut agreed_true = 0usize;
+        for rank in 0..=6usize {
+            for _ in 0..500 {
+                let shape: Vec<usize> = (0..rank).map(|_| next(4) as usize).collect();
+                let strides: Vec<i64> = match next(3) {
+                    // Exactly contiguous, so the accepting arm is exercised.
+                    0 => compute_contiguous_strides(&shape),
+                    // Contiguous with one axis disturbed, the near-miss case.
+                    1 => {
+                        let mut s = compute_contiguous_strides(&shape);
+                        if !s.is_empty() {
+                            let i = next(s.len() as u64) as usize;
+                            s[i] += next(3) as i64 - 1;
+                        }
+                        s
+                    }
+                    _ => (0..rank).map(|_| next(9) as i64 - 4).collect(),
+                };
+                let got = is_contiguous(&shape, &strides);
+                if got && !shape.is_empty() {
+                    agreed_true += 1;
+                }
+                assert_eq!(
+                    got,
+                    is_contiguous_reference(&shape, &strides),
+                    "disagreement for shape {shape:?} strides {strides:?}"
+                );
+
+                // Ragged lengths must be rejected identically.
+                let mut long = strides.clone();
+                long.push(1);
+                assert_eq!(
+                    is_contiguous(&shape, &long),
+                    is_contiguous_reference(&shape, &long),
+                    "disagreement for shape {shape:?} strides {long:?}"
+                );
+            }
+        }
+        assert!(
+            agreed_true > 100,
+            "the corpus never reached the accepting arm on a non-empty shape \
+             (only {agreed_true} cases), so it proved nothing"
+        );
+    }
+
+    /// The pre-optimisation `is_dense`, verbatim, as a differential oracle.
+    ///
+    /// Kept deliberately naive and heap-based: its whole value is that it was
+    /// not written by the same edit as the version under test, so a mistake in
+    /// the inline-storage path cannot hide behind a matching mistake here.
+    fn is_dense_reference(shape: &[usize], strides: &[i64]) -> bool {
+        if shape.len() != strides.len() {
+            return false;
+        }
+        let mut pairs: Vec<(i64, usize)> = shape
+            .iter()
+            .zip(strides)
+            .filter(|&(&d, _)| d > 1)
+            .map(|(&d, &s)| (s.unsigned_abs() as i64, d))
+            .collect();
+        if pairs.is_empty() {
+            return true;
+        }
+        pairs.sort_unstable_by_key(|&(s, _)| s);
+        if pairs[0].0 != 1 {
+            return false;
+        }
+        let mut expected_stride: i64 = 1;
+        for &(stride, size) in &pairs {
+            if stride != expected_stride {
+                return false;
+            }
+            expected_stride *= size as i64;
+        }
+        true
+    }
+
+    /// Every rank the inline path serves, plus the ranks that spill to the
+    /// heap, must agree with the original implementation on every case --
+    /// dense, non-dense, permuted, zero-sized, negative-strided and
+    /// mismatched-length. Falsifier — change `INLINE_RANK`, drop the `d > 1`
+    /// filter, or forget to truncate the inline array to `len`, and the two
+    /// implementations disagree here.
+    /// The contiguity shortcut in [`is_dense`] must reject zero extents.
+    ///
+    /// `[2, 0]` with strides `[0, 1]` satisfies the row-major contiguity
+    /// recurrence -- the accumulator hits 0 at the empty axis and every stride
+    /// below it matches 0 -- but it is **not** dense: dimension 2 has stride 0.
+    /// Shortcutting on `is_contiguous` alone returns `true` here and disagrees
+    /// with the reference. Found by the differential test, pinned here so the
+    /// specific case survives any future rewrite of the generator.
+    #[test]
+    fn the_contiguity_shortcut_rejects_zero_extents() {
+        assert!(is_contiguous(&[2, 0], &[0, 1]), "premise of this test");
+        assert!(!is_dense(&[2, 0], &[0, 1]));
+        assert_eq!(
+            is_dense(&[2, 0], &[0, 1]),
+            is_dense_reference(&[2, 0], &[0, 1])
+        );
+
+        // An empty tensor whose layout *is* dense still answers true, via the
+        // empty-extents exit rather than the shortcut.
+        assert!(is_dense(&[0], &[1]));
+        assert!(is_dense(&[0, 3], &[3, 1]));
+    }
+
+    /// The shortcut must not fire for a layout that is dense but not row-major
+    /// -- those still have to reach the sort. A negative stride is dense by the
+    /// absolute-stride rule and is exactly such a case.
+    #[test]
+    fn the_contiguity_shortcut_does_not_shadow_the_general_path() {
+        // Column-major: dense, not contiguous.
+        assert!(!is_contiguous(&[4, 3], &[1, 4]));
+        assert!(is_dense(&[4, 3], &[1, 4]));
+        // Negative innermost stride: dense under the absolute-stride rule.
+        assert!(is_dense(&[2, 3], &[3, -1]));
+        assert_eq!(
+            is_dense(&[2, 3], &[3, -1]),
+            is_dense_reference(&[2, 3], &[3, -1])
+        );
+        // Rank above INLINE_RANK still agrees.
+        let shape = [2usize, 1, 2, 1, 2, 1, 2, 1, 2, 2];
+        let strides = compute_contiguous_strides(&shape);
+        assert!(is_dense(&shape, &strides));
+        assert_eq!(
+            is_dense(&shape, &strides),
+            is_dense_reference(&shape, &strides)
+        );
+    }
+
+    #[test]
+    fn inline_storage_agrees_with_the_original_implementation() {
+        // Deterministic pseudo-random cases: a fixed LCG so a failure is
+        // reproducible from the printed inputs alone.
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = |bound: u64| -> u64 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % bound
+        };
+
+        let mut checked_dense = 0usize;
+        // Ranks 0..=10 straddle INLINE_RANK (8) in both directions.
+        for rank in 0..=10usize {
+            for _ in 0..400 {
+                let shape: Vec<usize> = (0..rank).map(|_| next(4) as usize).collect();
+                // Mix genuinely contiguous layouts (so the dense arm is
+                // actually exercised, not just the early rejections) with
+                // arbitrary ones.
+                let strides: Vec<i64> = if next(2) == 0 {
+                    compute_contiguous_strides(&shape)
+                } else {
+                    (0..rank)
+                        .map(|_| next(9) as i64 - 4) // includes 0 and negatives
+                        .collect()
+                };
+                let got = is_dense(&shape, &strides);
+                // Count only cases that actually reached the sort-and-product
+                // logic. A shape that is empty or all-ones returns `true` from
+                // the empty-extents early exit without exercising anything, so
+                // counting those would let this guard be satisfied by rank 0
+                // alone and assert nothing about the arm it names.
+                if got && shape.iter().any(|&d| d > 1) {
+                    checked_dense += 1;
+                }
+                assert_eq!(
+                    got,
+                    is_dense_reference(&shape, &strides),
+                    "disagreement for shape {shape:?} strides {strides:?}"
+                );
+
+                // Dropping a stride makes this a length mismatch for every
+                // rank but 0, where both sides see two empty slices.
+                let mut short = strides.clone();
+                short.pop();
+                assert_eq!(
+                    is_dense(&shape, &short),
+                    is_dense_reference(&shape, &short),
+                    "disagreement for shape {shape:?} strides {short:?}"
+                );
+            }
+        }
+        assert!(
+            checked_dense > 100,
+            "the corpus degenerated into rejections and trivial shapes; it proved \
+             nothing about the sort-and-product arm (only {checked_dense} dense \
+             cases with a dimension above 1)"
+        );
+    }
+
+    /// A rank of exactly `INLINE_RANK` with every dimension non-trivial is the
+    /// one input that fills the stack array completely, so `pairs[..len]` and
+    /// the whole array coincide and the truncation is a no-op. Pin it
+    /// deterministically rather than relying on the random corpus to land on
+    /// it, and cover dense-but-not-row-major while here.
+    #[test]
+    fn a_completely_full_inline_array_is_handled() {
+        let shape = [2usize; 8];
+        assert_eq!(shape.len(), 8, "this test must fill the inline array");
+
+        let strides = compute_contiguous_strides(&shape);
+        assert!(is_dense(&shape, &strides));
+        assert!(is_dense_reference(&shape, &strides));
+
+        // Dense without being row-major contiguous: reverse the axis order.
+        let mut permuted: Vec<i64> = strides.clone();
+        permuted.reverse();
+        assert!(!is_contiguous(&shape, &permuted));
+        assert_eq!(
+            is_dense(&shape, &permuted),
+            is_dense_reference(&shape, &permuted)
+        );
+        assert!(is_dense(&shape, &permuted));
+
+        // One stride off by one is a hole, and must be rejected.
+        let mut holed = strides.clone();
+        holed[0] += 1;
+        assert!(!is_dense(&shape, &holed));
+        assert!(!is_dense_reference(&shape, &holed));
+    }
+
+    /// The heap fallback must still be reachable and correct: a rank above
+    /// `INLINE_RANK` cannot fit the stack array.
+    #[test]
+    fn ranks_above_the_inline_bound_use_the_heap_path_correctly() {
+        let shape = [2usize, 2, 2, 2, 2, 2, 2, 2, 2];
+        let strides = compute_contiguous_strides(&shape);
+        assert!(shape.len() > 8, "this test must exercise the fallback");
+        assert!(is_dense(&shape, &strides));
+        assert!(is_dense_reference(&shape, &strides));
+
+        let mut broken = strides.clone();
+        broken[0] += 1;
+        assert!(!is_dense(&shape, &broken));
+        assert!(!is_dense_reference(&shape, &broken));
+    }
 
     #[test]
     fn contiguous_strides_row_major() {

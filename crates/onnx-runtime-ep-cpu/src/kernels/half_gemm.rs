@@ -261,6 +261,21 @@ unsafe fn widen_bf16_neon(source: &[u16], destination: &mut [f32]) {
     widen_scalar::<Bf16>(&source[index..], &mut destination[index..]);
 }
 
+/// Widen a contiguous run of 16-bit floats into `f32`, using whichever vector
+/// conversion the host supports.
+///
+/// Exposed so sibling kernels that pack their own panels (the x86 fused
+/// widen-pack prefill GEBP) convert exactly as this module does, keeping the
+/// two paths numerically identical.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub(crate) fn widen_contiguous(format: HalfFormat, source: &[u16], destination: &mut [f32]) {
+    let path = selected_execution_path();
+    match format {
+        HalfFormat::F16 => F16::pack_contiguous(source, destination, path),
+        HalfFormat::Bf16 => Bf16::pack_contiguous(source, destination, path),
+    }
+}
+
 /// Compute `c[m,n] = a[m,k] @ b[k,n]` with `f32` accumulation.
 ///
 /// `a` and `b` contain raw `f16` or `bf16` bit patterns selected by `format`.
@@ -591,6 +606,28 @@ fn pack_b<T: HalfElement>(
 ) {
     packed.clear();
     packed.resize(panel_depth * panel_columns, 0.0);
+
+    // A transposed `B` (`transB = 1`, `MatrixLayout::transposed`) stores each
+    // logical *column* contiguously, so the generic element-at-a-time branch
+    // below would walk it with stride `column_stride` -- a fresh cache line and
+    // a scalar widen for every one of the `panel_depth * panel_columns`
+    // entries. Reading along the stored direction instead makes the loads
+    // contiguous and hands them to the same SIMD widener the row-major path
+    // uses. See `pack_b_transposed`.
+    if layout.column_stride != 1 && layout.row_stride == 1 {
+        pack_b_transposed::<T>(
+            source,
+            layout.column_stride,
+            depth_start,
+            panel_depth,
+            column_start,
+            panel_columns,
+            packed,
+            path,
+        );
+        return;
+    }
+
     for depth in 0..panel_depth {
         let destination = &mut packed[depth * panel_columns..(depth + 1) * panel_columns];
         if layout.column_stride == 1 {
@@ -605,6 +642,96 @@ fn pack_b<T: HalfElement>(
                 let source_index = (depth_start + depth) * layout.row_stride
                     + (column_start + column) * layout.column_stride;
                 *output = T::to_f32(source[source_index]);
+            }
+        }
+    }
+}
+
+/// Number of `B` columns transposed together in `pack_b_transposed`.
+///
+/// The packed panel is indexed `[depth][column]`, so filling it from a
+/// column-major source is a transpose, and a transpose can be blocked to trade
+/// scattered stores for contiguous ones: with `GROUP` columns in flight each
+/// depth writes `GROUP` adjacent `f32` instead of one, so a 64-byte line is
+/// filled by `16 / GROUP` stores rather than 16.
+///
+/// That pushes *upward*, but the scratch pushes back. `GROUP` columns of a
+/// `KC`-deep panel are live at once, costing `GROUP * KC * 4` bytes, and it
+/// shares L1d with the `KC * NC * 4` = 32 KiB packed panel being written --
+/// which on this host is the whole 32 KiB L1d by itself. So every extra KiB of
+/// scratch evicts panel lines, and the optimum is not the largest group.
+///
+/// Measured on the reference host (AMD EPYC 9V74, AVX2+F16C, no AVX-512),
+/// `f16gemm_nt_qwen3_8b_m128`, native-only, `p50` ms, two independent runs
+/// (9 runs/3 warmups, then 15/5):
+///
+/// | GROUP | scratch |           t=1 |         t=8 |        t=16 |
+/// |-------|---------|---------------|-------------|-------------|
+/// |     1 |  0.5 KiB| 141.5 / 144.4 | 46.1 / 48.5 | 39.8 / 40.8 |
+/// |     4 |  2 KiB  | 124.6 / 121.8 | 35.6 / 36.7 | 30.5 / 30.6 |
+/// |     8 |  4 KiB  | 126.3 / 123.2 | 38.4 / 38.7 | 32.0 / 33.3 |
+/// |    16 |  8 KiB  | 125.9 / 121.7 | 36.9 / 38.3 | 33.6 / 33.0 |
+///
+/// 4 wins `t=8` and `t=16` in both runs and is within 2.9 ms of the best at
+/// `t=1`, so it is the choice. The interesting row is `GROUP = 1`: contiguous
+/// loads but still scattered stores, and it already captures roughly
+/// three-quarters of the total win. The loads were the dominant cost; blocking
+/// the stores is a real but secondary ~10-20% on top.
+const TRANSPOSED_PACK_GROUP: usize = 4;
+
+/// Pack a `panel_depth x panel_columns` tile of a **column-major** `B` into the
+/// row-major `[depth][column]` panel the micro-kernel expects.
+///
+/// This is the `transB = 1` layout: `source[(column) * column_stride + depth]`.
+/// Walking `column` in the inner loop (what the generic path does) strides by
+/// `column_stride`; walking `depth` in the inner loop is contiguous, so each
+/// column's slice can go through `T::pack_contiguous` and get the same F16C /
+/// NEON widening the row-major path gets. Columns are processed
+/// `TRANSPOSED_PACK_GROUP` at a time so the transposing stores are contiguous
+/// too.
+///
+/// This also switches transposed `B` from the scalar `to_f32` onto the same
+/// widening the row-major path already used, so the two paths now agree
+/// bit-for-bit. Both widenings are exact for every finite value, subnormal and
+/// infinity, so only NaN encodings can differ, and only for `bf16`: sweeping
+/// all 65536 patterns, `f16` scalar and F16C agree everywhere, while scalar
+/// `bf16::to_f32` quiets the 126 signalling NaNs (`0x7f81 -> 0x7fc1_0000`)
+/// where the `<< 16` widening preserves the signalling bit. The result is NaN
+/// either way; the change makes transposed `B` match row-major `B`.
+#[allow(clippy::too_many_arguments)]
+fn pack_b_transposed<T: HalfElement>(
+    source: &[u16],
+    column_stride: usize,
+    depth_start: usize,
+    panel_depth: usize,
+    column_start: usize,
+    panel_columns: usize,
+    packed: &mut [f32],
+    path: ExecutionPath,
+) {
+    debug_assert_eq!(packed.len(), panel_depth * panel_columns);
+    debug_assert!(panel_depth <= KC);
+
+    // Sized by the `panel_depth <= KC` invariant above: the only caller passes
+    // `KC.min(k - depth_start)`. The zeroing is dead -- every lane written to
+    // `widened` is fully overwritten by `pack_contiguous` before it is read --
+    // but it is 2 KiB of stack per call and avoiding it would mean
+    // `MaybeUninit`, which is not worth the `unsafe` here.
+    let mut widened = [0.0f32; TRANSPOSED_PACK_GROUP * KC];
+    for group_start in (0..panel_columns).step_by(TRANSPOSED_PACK_GROUP) {
+        let group = TRANSPOSED_PACK_GROUP.min(panel_columns - group_start);
+        for lane in 0..group {
+            let source_start = (column_start + group_start + lane) * column_stride + depth_start;
+            T::pack_contiguous(
+                &source[source_start..source_start + panel_depth],
+                &mut widened[lane * panel_depth..(lane + 1) * panel_depth],
+                path,
+            );
+        }
+        for depth in 0..panel_depth {
+            let row = &mut packed[depth * panel_columns + group_start..][..group];
+            for (lane, output) in row.iter_mut().enumerate() {
+                *output = widened[lane * panel_depth + depth];
             }
         }
     }
@@ -1214,6 +1341,146 @@ mod tests {
             );
             assert_eq!(actual, expected);
         }
+    }
+
+    /// A `transB = 1` GEMM must return **bit-identical** results to the same
+    /// product spelled with `B` physically transposed into row-major storage.
+    ///
+    /// Both spellings reach the same micro-kernel over the same packed panel
+    /// and differ only in which `pack_b` route fills it. Widening `f16`/`bf16`
+    /// to `f32` is exact and elementwise, so the order the panel is filled in
+    /// cannot change a single bit of it -- which makes bit-identity, not a
+    /// tolerance, the right assertion, and pins the fast transposed path
+    /// against the generic strided one it replaced.
+    ///
+    /// Shapes straddle every blocking constant the packer uses:
+    /// `TRANSPOSED_PACK_GROUP` (4), `NR` (8), `NC` (64) and `KC` (128), so the
+    /// grouped loop is exercised with short trailing groups and short trailing
+    /// depth panels rather than only on exact multiples.
+    #[test]
+    fn transposed_b_is_bit_identical_to_pre_transposed_row_major() {
+        const SHAPES: &[(usize, usize, usize)] = &[
+            (1, 1, 1),
+            (2, 3, 2),
+            (4, 8, 8),
+            (5, 130, 9),
+            (8, 128, 64),
+            (7, 129, 65),
+            (4, 260, 71),
+            (16, 63, 200),
+            (33, 191, 137),
+            (3, 7, 5),
+        ];
+
+        let mut paths = detected_simd_paths();
+        paths.push(ExecutionPath::Scalar);
+
+        for &path in &paths {
+            for format in [HalfFormat::F16, HalfFormat::Bf16] {
+                for &(m, k, n) in SHAPES {
+                    // `stored` is `[n, k]`: B as `transB = 1` stores it.
+                    let stored: Vec<u16> = (0..n * k)
+                        .map(|index| {
+                            half_bits(format, ((index as f32 * 0.037 + 0.11).sin()) * 0.375)
+                        })
+                        .collect();
+                    // The same matrix physically transposed to `[k, n]`.
+                    let mut row_major = vec![0u16; k * n];
+                    for column in 0..n {
+                        for depth in 0..k {
+                            row_major[depth * n + column] = stored[column * k + depth];
+                        }
+                    }
+                    let a: Vec<u16> = (0..m * k)
+                        .map(|index| {
+                            half_bits(format, ((index as f32 * 0.061 - 0.23).cos()) * 0.375)
+                        })
+                        .collect();
+
+                    let mut transposed_result = vec![0.0; m * n];
+                    let mut row_major_result = vec![0.0; m * n];
+                    gemm_with_path(
+                        format,
+                        &a,
+                        MatrixLayout::row_major(k),
+                        &stored,
+                        MatrixLayout::transposed(k),
+                        &mut transposed_result,
+                        m,
+                        k,
+                        n,
+                        path,
+                    );
+                    gemm_with_path(
+                        format,
+                        &a,
+                        MatrixLayout::row_major(k),
+                        &row_major,
+                        MatrixLayout::row_major(n),
+                        &mut row_major_result,
+                        m,
+                        k,
+                        n,
+                        path,
+                    );
+
+                    assert_eq!(
+                        transposed_result
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .collect::<Vec<_>>(),
+                        row_major_result
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .collect::<Vec<_>>(),
+                        "{format:?} {path:?} {m}x{k}x{n}: transposed B differs from \
+                         pre-transposed row-major B"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The generic strided `pack_b` branch must still be reachable, so the
+    /// transposed fast path cannot silently become the only column-strided
+    /// route and leave genuinely 2-D-strided layouts untested.
+    ///
+    /// `MatrixLayout { row_stride: 2, column_stride: 5 }` has neither stride
+    /// equal to 1, which is the condition the fast path declines.
+    #[test]
+    fn a_layout_strided_in_both_directions_still_packs_correctly() {
+        let (m, k, n) = (3, 4, 2);
+        let (row_stride, column_stride) = (2usize, 5usize);
+        let logical_b: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.25 - 1.0).collect();
+        let mut stored = vec![0u16; (k - 1) * row_stride + (n - 1) * column_stride + 1];
+        for depth in 0..k {
+            for column in 0..n {
+                stored[depth * row_stride + column * column_stride] =
+                    half::f16::from_f32(logical_b[depth * n + column]).to_bits();
+            }
+        }
+        let logical_a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.5 - 2.0).collect();
+        let a: Vec<u16> = logical_a
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_bits())
+            .collect();
+
+        let mut actual = vec![0.0; m * n];
+        gemm(
+            HalfFormat::F16,
+            &a,
+            MatrixLayout::row_major(k),
+            &stored,
+            MatrixLayout {
+                row_stride,
+                column_stride,
+            },
+            &mut actual,
+            m,
+            k,
+            n,
+        );
+        assert_eq!(actual, reference(&logical_a, &logical_b, m, k, n));
     }
 }
 

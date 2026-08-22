@@ -22,7 +22,7 @@
 //!   --features native-backend,cuda --test decode_workspace_bucket_growth \
 //!   -- --ignored --test-threads=1 --nocapture
 //! ```
-#![cfg(all(feature = "native-backend", feature = "cuda"))]
+#![cfg(feature = "native-cuda")]
 
 use onnx_genai_engine::{
     Engine, EngineConfig, EngineDecodeBackend, GeneratePrompt, GenerateRequest, NativeDecodeDevice,

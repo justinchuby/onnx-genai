@@ -101,7 +101,7 @@ GQA, 48 skip-RMSNorm, and no uncovered graph op. A native CUDA smoke passed:
 
 ```bash
 ONNX_GENAI_CUDA_KV_MAX_LEN=64 ONNX_GENAI_CUDA_GRAPH=0 \
-cargo run -q -p onnx-genai-bench --features bench-native,cuda \
+cargo run -q -p onnx-genai-bench --features native-cuda \
   --bin profile_native -- \
   --model /home/justinchu/glm-e2e-artifacts/deepseek-coder-1.3b-int4-cuda \
   --ep cuda --tokens 4 --warmups 0 --runs 1 --prompt 'def fibonacci(n):'
@@ -217,7 +217,7 @@ Native CUDA on GPU 4, with graph capture enabled:
 
 ```bash
 CUDA_VISIBLE_DEVICES=4 cargo run -q -p onnx-genai-bench \
-  --features bench-native,cuda --bin profile_native -- \
+  --features native-cuda --bin profile_native -- \
   --model /home/justinchu/glm-e2e-artifacts/deepseek-r1-distill-qwen-1.5b-int4-cuda \
   --ep cuda --steady --warmups 1 --runs 1 --tokens 32 \
   --prompt 'Solve: what is 17*23? Think step by step.'

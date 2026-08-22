@@ -3,59 +3,15 @@
 //! Pure code motion from `decode.rs`.
 
 use super::metadata::{
-    KeySequenceLengthsPolicy, decode_kv_mode_from_shared_buffer_len, effective_sliding_window,
-    graph_enforces_sliding_window, is_group_query_attention, is_share_buffer_kv_dtype,
-    key_sequence_lengths_policy, shared_kv_buffer_len_from_metadata, sliding_window_from_metadata,
+    KeySequenceLengthsPolicy, graph_accepts_padded_past, graph_uses_explicit_kv_length_attention,
+    key_sequence_lengths_policy, sliding_window_from_metadata,
 };
 use super::step::{build_position_step, decode_step_layout};
 use super::values::{slice_value_axis, zero_state_value};
-use onnx_genai_genai_config::GenAiConfig;
 use onnx_genai_metadata::{
-    AttentionConfig, InferenceMetadata, KvCacheSpec, ModelCapabilities, RuntimeConfigurable,
-    RuntimeKvConfig,
+    AttentionConfig, InferenceMetadata, ModelCapabilities, RuntimeConfigurable,
 };
-use onnx_genai_ort::{DataType, DecodeKvMode, TensorInfo, Value};
-
-#[test]
-fn is_group_query_attention_recognizes_variants() {
-    for attention_type in [
-        "grouped_query",
-        "group_query",
-        "grouped_query_attention",
-        "group_query_attention",
-        "gqa",
-        "Grouped-Query",
-        "GROUPED QUERY",
-        "group-query-attention",
-        "Group Query Attention",
-        "GQA",
-    ] {
-        assert!(
-            is_group_query_attention(attention_type),
-            "{attention_type:?} should be recognized as GQA"
-        );
-    }
-
-    for attention_type in ["multi_head_attention", "mha", ""] {
-        assert!(
-            !is_group_query_attention(attention_type),
-            "{attention_type:?} should not be recognized as GQA"
-        );
-    }
-}
-
-#[test]
-fn recognizes_share_buffer_kv_dtype_variants() {
-    assert!(is_share_buffer_kv_dtype("float16"));
-    assert!(is_share_buffer_kv_dtype("FP16"));
-    assert!(is_share_buffer_kv_dtype("half"));
-    assert!(is_share_buffer_kv_dtype("float32"));
-    assert!(is_share_buffer_kv_dtype("FP32"));
-    assert!(is_share_buffer_kv_dtype("float"));
-    assert!(is_share_buffer_kv_dtype("bfloat16"));
-    assert!(is_share_buffer_kv_dtype("BF16"));
-    assert!(!is_share_buffer_kv_dtype("int8"));
-}
+use onnx_genai_ort::{DataType, TensorInfo, Value};
 
 #[test]
 fn metadata_free_multiaxis_positions_are_rejected() {
@@ -126,21 +82,7 @@ fn fixed_state_zero_initialization_resolves_symbolic_batch_axis() {
 }
 
 fn empty_metadata() -> InferenceMetadata {
-    InferenceMetadata {
-        required_capabilities: vec![],
-        schema_version: None,
-        model: None,
-        kv_cache: None,
-        quantization: None,
-        preprocessing: None,
-        pipeline: None,
-        strategy: None,
-        speculative: None,
-        structured_output: None,
-        hardware_requirements: None,
-        generation: None,
-        tokens: None,
-    }
+    InferenceMetadata::default()
 }
 
 fn gqa_attention() -> AttentionConfig {
@@ -163,46 +105,13 @@ fn model_capabilities(
 ) -> ModelCapabilities {
     ModelCapabilities {
         vocab_size: None,
-        io: None,
         attention: Some(attention),
         max_sequence_length,
-        speculative: None,
         runtime_configurable,
+        sharding: None,
         mixture_of_experts: None,
+        ..Default::default()
     }
-}
-
-#[test]
-fn shared_kv_from_gqa_fp16_native_dtype() {
-    let metadata = InferenceMetadata {
-        model: Some(model_capabilities(gqa_attention(), Some(4096), None)),
-        kv_cache: Some(KvCacheSpec {
-            native_dtype: Some("float16".to_string()),
-            quantization_tolerance: None,
-            sensitive_layers: None,
-            operations: None,
-        }),
-        ..empty_metadata()
-    };
-    assert_eq!(shared_kv_buffer_len_from_metadata(&metadata), Some(4096));
-}
-
-#[test]
-fn declared_shared_buffer_is_attention_type_agnostic() {
-    let metadata: InferenceMetadata = serde_yaml::from_str(
-        r#"
-model:
-  max_sequence_length: 1024
-  attention:
-    type: multi_head_attention
-  io:
-    kv_update: shared_buffer
-kv_cache:
-  native_dtype: float32
-"#,
-    )
-    .expect("valid declarative shared-buffer metadata");
-    assert_eq!(shared_kv_buffer_len_from_metadata(&metadata), Some(1024));
 }
 
 #[test]
@@ -226,185 +135,11 @@ fn key_sequence_lengths_policy_is_generic_and_strict_by_default() {
 }
 
 #[test]
-fn genai_share_buffer_metadata_resolves_shared_mode_for_mlx_without_ep_gate() {
-    let config: GenAiConfig = serde_json::from_str(
-        r#"{
-                "model": {
-                    "context_length": 4096,
-                    "decoder": {
-                        "head_size": 64,
-                        "num_attention_heads": 14,
-                        "num_key_value_heads": 2,
-                        "num_hidden_layers": 24
-                    }
-                },
-                "search": { "past_present_share_buffer": true }
-            }"#,
-    )
-    .expect("valid share-buffer genai_config");
-    let metadata = config
-        .to_inference_metadata(Some("float16"))
-        .expect("share-buffer metadata");
-
-    // The metadata contract is provider-independent: given a capable session
-    // (CPU/CUDA/WebGPU, or an opted-in Metal), this share-buffer metadata
-    // resolves to the SharedBuffer mode.
-    assert_eq!(
-        decode_kv_mode_from_shared_buffer_len(shared_kv_buffer_len_from_metadata(&metadata), true,),
-        DecodeKvMode::SharedBuffer
-    );
-}
-
-#[test]
-fn decode_kv_mode_gates_shared_buffer_on_present_binding_capability() {
-    // Share-buffer requested by metadata (Some(max_len)).
-    let requested = Some(4096usize);
-    // Metadata does NOT request share-buffer.
-    let not_requested: Option<usize> = None;
-
-    // Capable session (CPU/CUDA/WebGPU, or opted-in Metal) ⇒ SharedBuffer.
-    assert_eq!(
-        decode_kv_mode_from_shared_buffer_len(requested, true),
-        DecodeKvMode::SharedBuffer
-    );
-
-    // Metal-without-opt-in (capability FALSE) ⇒ ZeroCopyRebind, even though
-    // the metadata requested the shared buffer. This preserves today's Metal
-    // behavior and keeps `is_metal()` out of decode logic.
-    assert_eq!(
-        decode_kv_mode_from_shared_buffer_len(requested, false),
-        DecodeKvMode::ZeroCopyRebind
-    );
-
-    // No share-buffer request ⇒ ZeroCopyRebind regardless of capability.
-    assert_eq!(
-        decode_kv_mode_from_shared_buffer_len(not_requested, true),
-        DecodeKvMode::ZeroCopyRebind
-    );
-    assert_eq!(
-        decode_kv_mode_from_shared_buffer_len(not_requested, false),
-        DecodeKvMode::ZeroCopyRebind
-    );
-}
-
-#[test]
-fn shared_kv_from_gqa_fp16_runtime_configurable_dtype() {
-    let metadata = InferenceMetadata {
-        model: Some(model_capabilities(
-            gqa_attention(),
-            Some(2048),
-            Some(RuntimeConfigurable {
-                kv_cache: Some(RuntimeKvConfig {
-                    dtype: vec!["float32".to_string(), "float16".to_string()],
-                }),
-                prefix_cache: None,
-                continuous_batching: None,
-                chunked_prefill: None,
-            }),
-        )),
-        kv_cache: None,
-        ..empty_metadata()
-    };
-    assert_eq!(shared_kv_buffer_len_from_metadata(&metadata), Some(2048));
-}
-
-#[test]
-fn no_shared_kv_when_not_gqa() {
-    let metadata = InferenceMetadata {
-        model: Some(model_capabilities(
-            AttentionConfig {
-                attention_type: "multi_head_attention".to_string(),
-                ..gqa_attention()
-            },
-            Some(4096),
-            None,
-        )),
-        kv_cache: Some(KvCacheSpec {
-            native_dtype: Some("float16".to_string()),
-            quantization_tolerance: None,
-            sensitive_layers: None,
-            operations: None,
-        }),
-        ..empty_metadata()
-    };
-    assert_eq!(shared_kv_buffer_len_from_metadata(&metadata), None);
-}
-
-#[test]
-fn shared_kv_from_gqa_fp32_native_dtype() {
-    // The CPU recipe declares fp32 GQA KV; it must take the shared-buffer
-    // path (O(1)/token) rather than the growing ZeroCopyRebind path.
-    let metadata = InferenceMetadata {
-        model: Some(model_capabilities(gqa_attention(), Some(4096), None)),
-        kv_cache: Some(KvCacheSpec {
-            native_dtype: Some("float32".to_string()),
-            quantization_tolerance: None,
-            sensitive_layers: None,
-            operations: None,
-        }),
-        ..empty_metadata()
-    };
-    assert_eq!(shared_kv_buffer_len_from_metadata(&metadata), Some(4096));
-}
-
-#[test]
-fn shared_kv_from_gqa_bf16_native_dtype() {
-    let metadata = InferenceMetadata {
-        model: Some(model_capabilities(gqa_attention(), Some(4096), None)),
-        kv_cache: Some(KvCacheSpec {
-            native_dtype: Some("bfloat16".to_string()),
-            quantization_tolerance: None,
-            sensitive_layers: None,
-            operations: None,
-        }),
-        ..empty_metadata()
-    };
-    assert_eq!(shared_kv_buffer_len_from_metadata(&metadata), Some(4096));
-}
-
-#[test]
-fn no_shared_kv_when_unsupported_kv_dtype() {
-    let metadata = InferenceMetadata {
-        model: Some(model_capabilities(gqa_attention(), Some(4096), None)),
-        kv_cache: Some(KvCacheSpec {
-            native_dtype: Some("int8".to_string()),
-            quantization_tolerance: None,
-            sensitive_layers: None,
-            operations: None,
-        }),
-        ..empty_metadata()
-    };
-    assert_eq!(shared_kv_buffer_len_from_metadata(&metadata), None);
-}
-
-#[test]
-fn no_shared_kv_when_max_sequence_length_absent() {
-    let metadata = InferenceMetadata {
-        model: Some(model_capabilities(gqa_attention(), None, None)),
-        kv_cache: Some(KvCacheSpec {
-            native_dtype: Some("float16".to_string()),
-            quantization_tolerance: None,
-            sensitive_layers: None,
-            operations: None,
-        }),
-        ..empty_metadata()
-    };
-    assert_eq!(shared_kv_buffer_len_from_metadata(&metadata), None);
-}
-
-#[test]
-fn no_shared_kv_when_metadata_empty() {
-    assert_eq!(shared_kv_buffer_len_from_metadata(&empty_metadata()), None);
-}
-
-#[test]
 fn sliding_window_metadata_is_consumed_and_validated() {
     let mut attention = gqa_attention();
     attention.sliding_window = Some(4096);
-    let metadata = InferenceMetadata {
-        model: Some(model_capabilities(attention, Some(131_072), None)),
-        ..empty_metadata()
-    };
+    let mut metadata = empty_metadata();
+    metadata.model = Some(model_capabilities(attention, Some(131_072), None));
     assert_eq!(sliding_window_from_metadata(&metadata).unwrap(), Some(4096));
 
     let mut invalid = metadata.clone();
@@ -419,94 +154,6 @@ fn sliding_window_metadata_is_consumed_and_validated() {
     assert!(sliding_window_from_metadata(&invalid).is_err());
     assert_eq!(
         sliding_window_from_metadata(&empty_metadata()).unwrap(),
-        None
-    );
-}
-
-/// Build a single-node decoder graph with one `GroupQueryAttention` op. When
-/// `local_window_size` is `Some(w)`, the op carries that attribute (a real,
-/// graph-enforced sliding window); when `None`, the op has no window attribute
-/// (global attention), mirroring a vestigial metadata-only window.
-fn gqa_graph(local_window_size: Option<i64>) -> onnx_runtime_ir::Graph {
-    use onnx_runtime_ir::{Attribute, Graph, Node};
-    let mut graph = Graph::default();
-    graph.nodes.insert_with(|id| {
-        let mut node = Node::new(id, "GroupQueryAttention", vec![], vec![]);
-        node.domain = "com.microsoft".to_string();
-        node.attributes
-            .insert("num_heads".to_string(), Attribute::Int(32));
-        node.attributes
-            .insert("kv_num_heads".to_string(), Attribute::Int(2));
-        node.attributes
-            .insert("do_rotary".to_string(), Attribute::Int(1));
-        if let Some(window) = local_window_size {
-            node.attributes
-                .insert("local_window_size".to_string(), Attribute::Int(window));
-        }
-        node
-    });
-    graph
-}
-
-#[test]
-fn graph_enforces_sliding_window_detects_gqa_local_window() {
-    // Real SWA export (Gemma/Mistral-style): GQA op carries local_window_size > 0.
-    assert!(graph_enforces_sliding_window(&gqa_graph(Some(4096))));
-}
-
-#[test]
-fn graph_without_local_window_is_global_attention() {
-    // Muse-Glimmer-style: GQA ops carry NO local_window_size => global attention.
-    assert!(!graph_enforces_sliding_window(&gqa_graph(None)));
-    // ORT's disabled sentinel (-1) and 0 both mean "no window".
-    assert!(!graph_enforces_sliding_window(&gqa_graph(Some(-1))));
-    assert!(!graph_enforces_sliding_window(&gqa_graph(Some(0))));
-}
-
-#[test]
-fn graph_enforces_sliding_window_recurses_into_subgraphs() {
-    use onnx_runtime_ir::{Attribute, Graph, Node};
-    let mut outer = Graph::default();
-    outer.nodes.insert_with(|id| {
-        let mut node = Node::new(id, "If", vec![], vec![]);
-        node.attributes.insert(
-            "then_branch".to_string(),
-            Attribute::Graph(Box::new(gqa_graph(Some(2048)))),
-        );
-        node
-    });
-    assert!(graph_enforces_sliding_window(&outer));
-}
-
-#[test]
-fn effective_sliding_window_drops_vestigial_metadata_window() {
-    // A window declared in inference_metadata.yaml but NOT enforced by the graph
-    // (Muse-Glimmer): treated as global attention so it routes to shared-buffer.
-    let global_graph = gqa_graph(None);
-    assert_eq!(
-        effective_sliding_window(Some(2048), Some(&global_graph)),
-        None
-    );
-}
-
-#[test]
-fn effective_sliding_window_preserves_real_swa_window() {
-    // A window the graph actually enforces (real SWA) stays active => windowed path.
-    let windowed_graph = gqa_graph(Some(4096));
-    assert_eq!(
-        effective_sliding_window(Some(4096), Some(&windowed_graph)),
-        Some(4096)
-    );
-}
-
-#[test]
-fn effective_sliding_window_is_conservative_without_graph() {
-    // If the graph cannot be inspected, keep the declared window so real SWA
-    // models are never regressed onto a global-attention path.
-    assert_eq!(effective_sliding_window(Some(4096), None), Some(4096));
-    // No declared window is always None regardless of graph.
-    assert_eq!(
-        effective_sliding_window(None, Some(&gqa_graph(Some(4096)))),
         None
     );
 }
@@ -535,5 +182,135 @@ fn kv_axis_slicing_keeps_requested_suffix_in_order() {
     assert_eq!(
         suffix.to_vec_f32().unwrap(),
         vec![20.0, 21.0, 30.0, 31.0, 40.0, 41.0]
+    );
+}
+
+/// Build a single-node decoder graph with one `GroupQueryAttention` op. When
+/// `local_window_size` is `Some(w)`, the op carries that attribute; when `None`,
+/// the op has no window attribute (global attention).
+fn gqa_graph(local_window_size: Option<i64>) -> onnx_runtime_ir::Graph {
+    use onnx_runtime_ir::{Attribute, Graph, Node};
+    let mut graph = Graph::default();
+    graph.nodes.insert_with(|id| {
+        let mut node = Node::new(id, "GroupQueryAttention", vec![], vec![]);
+        node.domain = "com.microsoft".to_string();
+        node.attributes
+            .insert("num_heads".to_string(), Attribute::Int(32));
+        node.attributes
+            .insert("kv_num_heads".to_string(), Attribute::Int(2));
+        node.attributes
+            .insert("do_rotary".to_string(), Attribute::Int(1));
+        if let Some(window) = local_window_size {
+            node.attributes
+                .insert("local_window_size".to_string(), Attribute::Int(window));
+        }
+        node
+    });
+    graph
+}
+
+/// A decoder graph whose attention is the **standard opset** `Attention`
+/// (domain `""`), the operator that derives `total_sequence_length` from the
+/// past KV tensor and cross-checks it against the attention mask.
+fn standard_attention_graph(domain: &str) -> onnx_runtime_ir::Graph {
+    use onnx_runtime_ir::{Attribute, Graph, Node};
+    let mut graph = Graph::default();
+    graph.nodes.insert_with(|id| {
+        let mut node = Node::new(id, "Attention", vec![], vec![]);
+        node.domain = domain.to_string();
+        node.attributes
+            .insert("is_causal".to_string(), Attribute::Int(1));
+        node.attributes
+            .insert("kv_num_heads".to_string(), Attribute::Int(8));
+        node.attributes
+            .insert("q_num_heads".to_string(), Attribute::Int(16));
+        node
+    });
+    graph
+}
+
+#[test]
+fn standard_attention_graph_rejects_a_capacity_padded_past() {
+    // The share-buffer path binds `past_key_values.*` at the runtime-owned
+    // capacity, not at the valid length. The standard opset `Attention` has no
+    // valid-length input, so ORT computes total_sequence_length from that padded
+    // extent and rejects the run when it disagrees with the mask:
+    //   "inconsistent total_sequence_length (between attn_mask and past_key ...)"
+    // Both spellings of the default domain must be caught.
+    assert!(!graph_accepts_padded_past(&standard_attention_graph("")));
+    assert!(!graph_accepts_padded_past(&standard_attention_graph(
+        "ai.onnx"
+    )));
+}
+
+#[test]
+fn group_query_attention_graph_accepts_a_capacity_padded_past() {
+    // GQA takes an explicit valid length (`seqlens_k`) and writes the new step in
+    // place at that offset, so a fixed-capacity past is exactly its contract.
+    // This is the case the share-buffer path was designed for and must keep.
+    assert!(graph_accepts_padded_past(&gqa_graph(None)));
+    assert!(graph_accepts_padded_past(&gqa_graph(Some(4096))));
+}
+
+#[test]
+fn a_single_standard_attention_node_disqualifies_a_mixed_graph() {
+    // One cross-checking op is enough to break the whole decode step, so the
+    // predicate must be "all ops accept" rather than "any op accepts".
+    use onnx_runtime_ir::{Attribute, Node};
+    let mut graph = gqa_graph(None);
+    graph.nodes.insert_with(|id| {
+        let mut node = Node::new(id, "Attention", vec![], vec![]);
+        node.domain = String::new();
+        node.attributes
+            .insert("is_causal".to_string(), Attribute::Int(1));
+        node
+    });
+    assert!(!graph_accepts_padded_past(&graph));
+}
+
+#[test]
+fn gqa_graph_is_positive_evidence_for_the_shared_kv_buffer() {
+    // A `genai_config.json` exported for CPU carries
+    // `search.past_present_share_buffer: false`, which is correct for CPU and is
+    // not a fact about the model. Positive graph evidence — an attention op that
+    // takes an explicit valid KV length — is what actually qualifies the shared
+    // buffer, so a GQA graph must count even when nothing advertised it.
+    assert!(graph_uses_explicit_kv_length_attention(&gqa_graph(None)));
+    assert!(graph_uses_explicit_kv_length_attention(&gqa_graph(Some(
+        4096
+    ))));
+}
+
+#[test]
+fn standard_attention_graph_is_not_evidence_for_the_shared_kv_buffer() {
+    // The standard opset `Attention` derives the KV extent from the past tensor
+    // itself, so a capacity-padded past is exactly what it cannot take.
+    assert!(!graph_uses_explicit_kv_length_attention(
+        &standard_attention_graph("")
+    ));
+    assert!(!graph_uses_explicit_kv_length_attention(
+        &standard_attention_graph("ai.onnx")
+    ));
+}
+
+#[test]
+fn the_share_buffer_predicates_are_not_inverses_of_each_other() {
+    // Deliberately asymmetric: the veto is permissive so an unrecognised op
+    // cannot silently break a model, while enabling needs positive evidence so
+    // an unrecognised op cannot silently switch the shared buffer on. A graph of
+    // ops we do not classify must therefore be allowed by one and rejected by
+    // the other.
+    use onnx_runtime_ir::{Graph, Node};
+    let mut graph = Graph::default();
+    graph
+        .nodes
+        .insert_with(|id| Node::new(id, "MatMul", vec![], vec![]));
+    assert!(
+        graph_accepts_padded_past(&graph),
+        "an unrecognised op must not trip the veto"
+    );
+    assert!(
+        !graph_uses_explicit_kv_length_attention(&graph),
+        "an unrecognised op must not count as positive evidence"
     );
 }

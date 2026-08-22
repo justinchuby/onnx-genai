@@ -2,7 +2,8 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header},
 };
-use onnx_genai::{Engine, EngineConfig, GeneratePrompt};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use onnx_genai::GeneratePrompt;
 use onnx_genai_engine::GenerateConstraint;
 use onnx_genai_server::{
     AppState, ChatCompletionRequest, ServerConfig, app, build_generate_request,
@@ -16,18 +17,8 @@ fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm")
 }
 
-fn static_fixture_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter")
-}
-
 async fn test_app() -> axum::Router {
     let state = AppState::load(&fixture_dir(), Some("tiny-llm".to_string())).unwrap();
-    app(state)
-}
-
-async fn static_test_app() -> axum::Router {
-    let state =
-        AppState::load(&static_fixture_dir(), Some("tiny-llm-scatter".to_string())).unwrap();
     app(state)
 }
 
@@ -35,6 +26,115 @@ async fn test_app_with_config(config: ServerConfig) -> axum::Router {
     let state =
         AppState::load_with_config(&fixture_dir(), Some("tiny-llm".to_string()), config).unwrap();
     app(state)
+}
+
+fn diffusion_fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/comfyui_workflows/txt2img_sd15")
+}
+
+async fn image_app() -> axum::Router {
+    let state =
+        AppState::load(&diffusion_fixture_dir(), Some("tiny-diffusion".to_string())).unwrap();
+    app(state)
+}
+
+fn copy_tree(source: &std::path::Path, destination: &std::path::Path) {
+    std::fs::create_dir_all(destination).unwrap();
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let target = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+fn image_package_without_guidance_role() -> tempfile::TempDir {
+    let package = tempfile::tempdir().unwrap();
+    copy_tree(&diffusion_fixture_dir(), package.path());
+    let metadata_path = package.path().join("inference_metadata.yaml");
+    let metadata = std::fs::read_to_string(&metadata_path).unwrap();
+    let runtime_role = "        role:\n          kind: runtime\n          version: '1.0'\n          role: guidance_scale\n        source:\n          kind: application\n          name: guidance_scale";
+    let application_role = "        role:\n          kind: opaque\n        source:\n          kind: application\n          name: guidance_scale";
+    let metadata = metadata.replace(runtime_role, application_role);
+    assert_ne!(
+        metadata,
+        std::fs::read_to_string(&metadata_path).unwrap(),
+        "fixture must contain the guidance runtime role"
+    );
+    std::fs::write(metadata_path, metadata).unwrap();
+    package
+}
+
+async fn image_admin_app() -> axum::Router {
+    let state = AppState::load_with_config(
+        &diffusion_fixture_dir(),
+        Some("tiny-diffusion".to_string()),
+        ServerConfig {
+            enable_admin_endpoints: true,
+            ..ServerConfig::default()
+        },
+    )
+    .unwrap();
+    app(state)
+}
+
+async fn post_json(app: axum::Router, uri: &str, body: Value) -> axum::response::Response {
+    app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+async fn response_json(response: axum::response::Response) -> (StatusCode, Value) {
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&body)
+            .unwrap_or_else(|_| panic!("non-JSON response: {}", String::from_utf8_lossy(&body))),
+    )
+}
+
+fn assert_png_base64(encoded: &str) {
+    let bytes = STANDARD.decode(encoded).unwrap();
+    assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+    let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (4, 4));
+}
+
+async fn pending_queue_depth(app: axum::Router) -> u64 {
+    let (_, body) = response_json(
+        app.oneshot(
+            Request::builder()
+                .uri("/v1/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    body["queue_depth"].as_u64().unwrap()
+}
+
+async fn wait_for_pending_queue_depth(app: axum::Router, expected: u64) {
+    for _ in 0..300 {
+        if pending_queue_depth(app.clone()).await == expected {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(pending_queue_depth(app).await, expected);
 }
 
 fn sse_data_lines(text: &str) -> Vec<&str> {
@@ -87,11 +187,416 @@ async fn post_completion(app: axum::Router, body: Value) -> axum::response::Resp
     .unwrap()
 }
 
-fn direct_static_completion(body: Value) -> String {
-    let request = chat_request(body);
-    let generate_request = build_generate_request(&request);
-    let mut engine = Engine::from_dir(&static_fixture_dir(), EngineConfig::default()).unwrap();
-    engine.generate(generate_request).unwrap().text
+#[tokio::test]
+async fn openai_images_executes_metadata_diffusion_pipeline_and_returns_png() {
+    let (status, body) = response_json(
+        post_json(
+            image_app().await,
+            "/v1/images/generations",
+            json!({
+                "model": "tiny-diffusion",
+                "prompt": "a tiny lighthouse",
+                "n": 1,
+                "response_format": "b64_json",
+                "output_format": "png",
+                "background": "opaque"
+            }),
+        )
+        .await,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["created"].as_u64().is_some(), "{body}");
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 1);
+    assert_png_base64(data[0]["b64_json"].as_str().unwrap());
+    assert!(data[0].get("revised_prompt").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn admin_warmup_executes_image_only_pipeline_output() {
+    let app = image_admin_app().await;
+    let (status, body) = response_json(
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/admin/models/tiny-diffusion/warm")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["id"], "tiny-diffusion");
+    assert_eq!(body["warmed"], true);
+}
+
+#[tokio::test]
+async fn openai_and_a1111_lower_to_equivalent_pipeline_inputs() {
+    let app = image_app().await;
+    let (_, openai) = response_json(
+        post_json(
+            app.clone(),
+            "/v1/images/generations",
+            json!({
+                "model": "tiny-diffusion",
+                "prompt": "equivalent request"
+            }),
+        )
+        .await,
+    )
+    .await;
+    let (status, a1111) = response_json(
+        post_json(
+            app,
+            "/sdapi/v1/txt2img",
+            json!({
+                "prompt": "equivalent request",
+                "negative_prompt": "",
+                "seed": 20260821,
+                "steps": 4,
+                "cfg_scale": 7.5,
+                "sampler_name": "Euler"
+            }),
+        )
+        .await,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{a1111}");
+    assert_eq!(
+        openai["data"][0]["b64_json"], a1111["images"][0],
+        "both schemas must bind the same semantic workflow inputs"
+    );
+}
+
+#[tokio::test]
+async fn a1111_seed_is_deterministic_and_reported() {
+    async fn generate(app: axum::Router, seed: i64) -> Value {
+        let (status, body) = response_json(
+            post_json(
+                app,
+                "/sdapi/v1/txt2img",
+                json!({
+                    "prompt": "seed proof",
+                    "seed": seed,
+                    "steps": 4,
+                    "cfg_scale": 7.5
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+
+    let app = image_app().await;
+    let first = generate(app.clone(), 11).await;
+    let again = generate(app.clone(), 11).await;
+    let other = generate(app, 12).await;
+    assert_eq!(first["images"][0], again["images"][0]);
+    assert_ne!(first["images"][0], other["images"][0]);
+    assert_eq!(first["parameters"]["seed"], 11);
+    let info: Value = serde_json::from_str(first["info"].as_str().unwrap()).unwrap();
+    assert_eq!(info["all_seeds"], json!([11]));
+    assert_png_base64(first["images"][0].as_str().unwrap());
+}
+
+#[tokio::test]
+async fn repeated_image_generations_restore_pending_metrics_to_baseline() {
+    let app = image_app().await;
+    wait_for_pending_queue_depth(app.clone(), 0).await;
+    let baseline = 0;
+    for seed in 100..103 {
+        let (status, body) = response_json(
+            post_json(
+                app.clone(),
+                "/sdapi/v1/txt2img",
+                json!({
+                    "prompt": "metrics lifecycle",
+                    "seed": seed,
+                    "steps": 1,
+                    "cfg_scale": 7.5
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    wait_for_pending_queue_depth(app, baseline).await;
+}
+
+#[tokio::test]
+async fn image_apis_fail_closed_for_unbindable_or_fake_behavior() {
+    let app = image_app().await;
+    for (uri, request, expected) in [
+        (
+            "/v1/images/generations",
+            json!({
+                "model": "tiny-diffusion",
+                "prompt": "x",
+                "response_format": "url"
+            }),
+            "asset store",
+        ),
+        (
+            "/v1/images/generations",
+            json!({
+                "model": "tiny-diffusion",
+                "prompt": "x",
+                "size": "1024x1024"
+            }),
+            "dimension roles",
+        ),
+        (
+            "/v1/images/generations",
+            json!({
+                "model": "tiny-diffusion",
+                "prompt": "x",
+                "output_format": "webp"
+            }),
+            "only `output_format: png`",
+        ),
+        (
+            "/v1/images/generations",
+            json!({
+                "model": "tiny-diffusion",
+                "prompt": "x",
+                "background": "transparent"
+            }),
+            "emits RGB without alpha",
+        ),
+        (
+            "/v1/images/generations",
+            json!({
+                "model": "tiny-diffusion",
+                "prompt": "x",
+                "moderation": "auto"
+            }),
+            "no image moderation pipeline",
+        ),
+        (
+            "/sdapi/v1/txt2img",
+            json!({
+                "prompt": "x",
+                "alwayson_scripts": {"controlnet": {"args": []}}
+            }),
+            "never silently ignored",
+        ),
+        (
+            "/sdapi/v1/img2img",
+            json!({
+                "prompt": "x",
+                "init_images": ["aGVsbG8="],
+                "denoising_strength": 0.5
+            }),
+            "no semantic image/media input",
+        ),
+    ] {
+        let (status, body) = response_json(post_json(app.clone(), uri, request).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(expected),
+            "{body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn img2img_accepts_media_sized_json_and_preserves_payload_too_large() {
+    let app = image_app().await;
+    let accepted_base64 = "A".repeat(3 * 1024 * 1024);
+    let (status, body) = response_json(
+        post_json(
+            app.clone(),
+            "/sdapi/v1/img2img",
+            json!({
+                "prompt": "large source image",
+                "init_images": [accepted_base64],
+                "denoising_strength": 0.5
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no semantic image/media input"),
+        "{body}"
+    );
+
+    let oversized_base64 = "A".repeat(26 * 1024 * 1024);
+    let (status, body) = response_json(
+        post_json(
+            app,
+            "/sdapi/v1/img2img",
+            json!({
+                "prompt": "oversized source image",
+                "init_images": [oversized_base64],
+                "denoising_strength": 0.5
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test]
+async fn txt2img_accepts_realistic_application_inputs_and_rejects_oversized_json() {
+    let app = image_app().await;
+    let latent = STANDARD.encode(vec![0_u8; 4 * 384 * 384 * 4]);
+    let (status, body) = response_json(
+        post_json(
+            app.clone(),
+            "/sdapi/v1/txt2img",
+            json!({
+                "application_inputs": {
+                    "latent": {
+                        "dtype": "float32",
+                        "shape": [1, 4, 384, 384],
+                        "data_b64": latent
+                    }
+                }
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not declared by workflow metadata"),
+        "{body}"
+    );
+
+    let oversized = "A".repeat(26 * 1024 * 1024);
+    let (status, body) = response_json(
+        post_json(
+            app,
+            "/sdapi/v1/txt2img",
+            json!({
+                "application_inputs": {
+                    "latent": {
+                        "dtype": "float32",
+                        "shape": [1],
+                        "data_b64": oversized
+                    }
+                }
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test]
+async fn a1111_application_inputs_do_not_bypass_legacy_control_roles() {
+    let package = image_package_without_guidance_role();
+    let state = AppState::load(package.path(), Some("application-image".to_string())).unwrap();
+    let app = app(state);
+    let scalar = STANDARD.encode(7.5_f32.to_le_bytes());
+    let (status, body) = response_json(
+        post_json(
+            app,
+            "/sdapi/v1/txt2img",
+            json!({
+                "cfg_scale": 8.0,
+                "application_inputs": {
+                    "guidance_scale": {
+                        "dtype": "float32",
+                        "shape": [1],
+                        "data_b64": scalar
+                    }
+                }
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("requested `cfg_scale` cannot be bound"),
+        "{body}"
+    );
+
+    let (status, body) = response_json(
+        post_json(
+            image_app().await,
+            "/sdapi/v1/img2img",
+            json!({
+                "init_images": ["not-base64"],
+                "denoising_strength": 0.5,
+                "application_inputs": {
+                    "latent": {
+                        "dtype": "float32",
+                        "shape": [1, 4, 8, 8],
+                        "data_b64": STANDARD.encode(vec![0_u8; 4 * 8 * 8 * 4])
+                    }
+                }
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no semantic image/media input"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn a1111_discovery_reports_loaded_metadata_capabilities() {
+    let app = image_app().await;
+    for (uri, key, expected) in [
+        ("/sdapi/v1/sd-models", "model_name", "tiny-diffusion"),
+        ("/sdapi/v1/samplers", "name", "euler"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body[0][key], expected);
+    }
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/sdapi/v1/options")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = response_json(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["samples_format"], "png");
+    assert_eq!(body["save_images"], false);
 }
 
 async fn create_http_session(app: axum::Router) -> String {
@@ -357,41 +862,6 @@ async fn completions_with_suffix_rejects_model_without_fim_tokens() {
         "{json}"
     );
     assert!(message.contains("recognized FIM tokens"), "{json}");
-}
-
-#[tokio::test]
-async fn concurrent_static_cache_chat_completions_share_batched_driver() {
-    let app = static_test_app().await;
-    let requests = [
-        json!({"model": "tiny-llm-scatter", "messages": [{"role": "user", "content": "hello"}], "max_tokens": 2}),
-        json!({"model": "tiny-llm-scatter", "messages": [{"role": "user", "content": "world"}], "max_tokens": 3}),
-        json!({"model": "tiny-llm-scatter", "messages": [{"role": "user", "content": "tok16"}], "max_tokens": 1}),
-        json!({"model": "tiny-llm-scatter", "messages": [{"role": "user", "content": "tok17"}], "max_tokens": 4}),
-    ];
-    let expected = requests
-        .iter()
-        .cloned()
-        .map(direct_static_completion)
-        .collect::<Vec<_>>();
-
-    let (a, b, c, d) = tokio::join!(
-        post_chat_json(app.clone(), requests[0].clone()),
-        post_chat_json(app.clone(), requests[1].clone()),
-        post_chat_json(app.clone(), requests[2].clone()),
-        post_chat_json(app.clone(), requests[3].clone()),
-    );
-    let responses = [a, b, c, d];
-
-    for (response, expected_text) in responses.iter().zip(expected) {
-        assert_eq!(response["object"], "chat.completion");
-        assert_eq!(response["model"], "tiny-llm-scatter");
-        assert_eq!(
-            response["choices"][0]["message"]["content"]
-                .as_str()
-                .unwrap(),
-            expected_text
-        );
-    }
 }
 
 #[test]

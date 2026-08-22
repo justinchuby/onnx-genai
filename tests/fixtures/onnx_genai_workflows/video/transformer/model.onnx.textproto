@@ -1,0 +1,1026 @@
+ir_version: 11
+graph {
+  node {
+    input: "sample"
+    output: "v_Shape_0"
+    name: "Shape_node_0"
+    op_type: "Shape"
+    attribute {
+      name: "end"
+      i: 1
+      type: INT
+    }
+    attribute {
+      name: "start"
+      i: 0
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    output: "v_Constant_1"
+    name: "Constant_node_1"
+    op_type: "Constant"
+    attribute {
+      name: "value_ints"
+      ints: 1
+      ints: 1
+      ints: 1
+      ints: 1
+      type: INTS
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "v_Shape_0"
+    input: "v_Constant_1"
+    output: "v_Concat_2"
+    name: "Concat_node_2"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: 0
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "timestep"
+    output: "v_Cast_3"
+    name: "Cast_node_3"
+    op_type: "Cast"
+    attribute {
+      name: "to"
+      i: 1
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    output: "v_Constant_4"
+    name: "Constant_node_4"
+    op_type: "Constant"
+    attribute {
+      name: "value_float"
+      f: 1000.0
+      type: FLOAT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "v_Cast_3"
+    input: "v_Constant_4"
+    output: "v_Div_5"
+    name: "Div_node_5"
+    op_type: "Div"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "v_Div_5"
+    input: "v_Concat_2"
+    output: "v_Reshape_6"
+    name: "Reshape_node_6"
+    op_type: "Reshape"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "encoder_hidden_states"
+    input: "const_1d_0"
+    output: "v_ReduceMean_7"
+    name: "ReduceMean_node_7"
+    op_type: "ReduceMean"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "v_ReduceMean_7"
+    input: "v_Concat_2"
+    output: "v_Reshape_8"
+    name: "Reshape_node_8"
+    op_type: "Reshape"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    output: "v_Constant_9"
+    name: "Constant_node_9"
+    op_type: "Constant"
+    attribute {
+      name: "value_ints"
+      ints: 0
+      type: INTS
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "v_Constant_9"
+    output: "v_Squeeze_10"
+    name: "Squeeze_node_10"
+    op_type: "Squeeze"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "sample"
+    output: "v_Shape_11"
+    name: "Shape_node_11"
+    op_type: "Shape"
+    attribute {
+      name: "end"
+      i: 2
+      type: INT
+    }
+    attribute {
+      name: "start"
+      i: 1
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "v_Shape_11"
+    output: "v_Squeeze_12"
+    name: "Squeeze_node_12"
+    op_type: "Squeeze"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    output: "v_Constant_13"
+    name: "Constant_node_13"
+    op_type: "Constant"
+    attribute {
+      name: "value_ints"
+      ints: 1
+      type: INTS
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "v_Constant_13"
+    output: "v_Squeeze_14"
+    name: "Squeeze_node_14"
+    op_type: "Squeeze"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "v_Squeeze_10"
+    input: "v_Squeeze_12"
+    input: "v_Squeeze_14"
+    output: "v_Range_15"
+    name: "Range_node_15"
+    op_type: "Range"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "v_Range_15"
+    output: "v_Cast_16"
+    name: "Cast_node_16"
+    op_type: "Cast"
+    attribute {
+      name: "to"
+      i: 1
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    output: "v_Constant_17"
+    name: "Constant_node_17"
+    op_type: "Constant"
+    attribute {
+      name: "value_ints"
+      ints: 1
+      ints: -1
+      ints: 1
+      ints: 1
+      ints: 1
+      type: INTS
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "v_Cast_16"
+    input: "v_Constant_17"
+    output: "v_Reshape_18"
+    name: "Reshape_node_18"
+    op_type: "Reshape"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    output: "v_Constant_19"
+    name: "Constant_node_19"
+    op_type: "Constant"
+    attribute {
+      name: "value_float"
+      f: 100.0
+      type: FLOAT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "v_Reshape_18"
+    input: "v_Constant_19"
+    output: "v_Div_20"
+    name: "Div_node_20"
+    op_type: "Div"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    output: "v_Constant_21"
+    name: "Constant_node_21"
+    op_type: "Constant"
+    attribute {
+      name: "value_float"
+      f: 0.5
+      type: FLOAT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "sample"
+    input: "v_Constant_21"
+    output: "v_Mul_22"
+    name: "Mul_node_22"
+    op_type: "Mul"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "v_Reshape_6"
+    input: "v_Reshape_8"
+    output: "v_Add_23"
+    name: "Add_node_23"
+    op_type: "Add"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "v_Add_23"
+    input: "v_Div_20"
+    output: "v_Add_24"
+    name: "Add_node_24"
+    op_type: "Add"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "v_Mul_22"
+    input: "v_Add_24"
+    output: "noise_pred"
+    name: "Add_node_25"
+    op_type: "Add"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  name: "transformer"
+  initializer {
+    dims: 2
+    data_type: 7
+    name: "const_1d_0"
+    raw_data: "\001\000\000\000\000\000\000\000\002\000\000\000\000\000\000\000"
+  }
+  input {
+    name: "sample"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "component.transformer.batch"
+          }
+          dim {
+            dim_param: "component.transformer.num_frames"
+          }
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_param: "component.transformer.height"
+          }
+          dim {
+            dim_param: "component.transformer.width"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "timestep"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "component.transformer.batch"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "encoder_hidden_states"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "component.transformer.batch"
+          }
+          dim {
+            dim_param: "component.transformer.prompt_sequence"
+          }
+          dim {
+            dim_value: 32
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "noise_pred"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "component.transformer.batch"
+          }
+          dim {
+            dim_param: "component.transformer.num_frames"
+          }
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_param: "component.transformer.height"
+          }
+          dim {
+            dim_param: "component.transformer.width"
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "const_1d_0"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 2
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Shape_0"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Constant_1"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Concat_2"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 5
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Cast_3"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Constant_4"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Div_5"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Reshape_6"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+          }
+          dim {
+          }
+          dim {
+          }
+          dim {
+          }
+          dim {
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_ReduceMean_7"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Reshape_8"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+          }
+          dim {
+          }
+          dim {
+          }
+          dim {
+          }
+          dim {
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Constant_9"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Squeeze_10"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Shape_11"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Squeeze_12"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Constant_13"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Squeeze_14"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Range_15"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Cast_16"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Constant_17"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 5
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Reshape_18"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Constant_19"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Div_20"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Constant_21"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Mul_22"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+          }
+          dim {
+          }
+          dim {
+            dim_value: 4
+          }
+          dim {
+          }
+          dim {
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Add_23"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+          }
+          dim {
+          }
+          dim {
+          }
+          dim {
+          }
+          dim {
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Add_24"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+          }
+          dim {
+          }
+          dim {
+          }
+          dim {
+          }
+          dim {
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}

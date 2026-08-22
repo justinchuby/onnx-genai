@@ -480,6 +480,7 @@ impl Executor {
             graph,
             weights,
             ep,
+            graph_slot: DeviceGraphSlot::Primary,
             weight_handles,
             prefetch_issue_nodes: std::sync::Mutex::new(HashMap::new()),
             prefetch_lookahead_nodes: dense_weight_prefetch_lookahead_nodes(),
@@ -496,15 +497,8 @@ impl Executor {
             subgraph_execs: HashMap::new(),
             control_flow_stats: ControlFlowStats::default(),
             if_last_predicate: HashMap::new(),
-            device_graph_signature: None,
-            capture_schedule: None,
-            capture_segmentation: Vec::new(),
+            slot_capture: std::array::from_fn(|_| SlotCaptureState::default()),
             control_flow_output_values,
-            capture_cf_shapes: HashMap::new(),
-            capture_warm_signature: None,
-            capture_warm_shapes: HashMap::new(),
-            capture_warm_seeded: HashMap::new(),
-            capture_quarantine_ops: HashSet::new(),
             capture_growing_symbols,
             capacity_pinned_kv_symbols: HashSet::new(),
             last_capture_failed_node: None,
@@ -514,6 +508,7 @@ impl Executor {
             activation_memory_plan: None,
             shared_buffers: HashMap::new(),
             parked_input_buffers: Vec::new(),
+            capture_deferred_frees: Vec::new(),
             sequences: HashMap::new(),
             seq_elem_values: HashMap::new(),
             execution_provider_fallback_report,
@@ -535,12 +530,14 @@ impl Executor {
             decode_view_plan_sig_mismatch_streak: 0,
             decode_view_plan_disabled: false,
             compute_in_place_enabled: compute_in_place_env_enabled(),
+            release_dead_values_enabled: false,
             compute_in_place_alias_count: 0,
             scan_inline_single_trip_enabled: scan_inline_single_trip_env_enabled(),
             scan_inline_single_trip_count: 0,
             kernel_bindings: vec![None; plan_len],
             persistent_workspace: None,
             step_workspace: None,
+            pin_step_workspace: false,
             inherited_workspace: None,
             workspace_preparation_required: false,
         };
@@ -717,6 +714,48 @@ impl Executor {
 
         let sibling = Self::build(graph, Arc::clone(&self.weights), Arc::clone(&self.ep))?;
         Ok(Some(sibling))
+    }
+
+    /// Build a verify-dedicated sibling executor for native MTP self-speculative
+    /// decode. Structurally identical to the main executor (same graph), but with
+    /// its **own** interior device-buffer arena (`buffers`/`buffer_shapes`) so the
+    /// fixed M=k+1 verify forward's JIT-sized interior scratch is never resized by
+    /// the interleaved M=1 base decode running on the main executor — the exact
+    /// clobber that made the shared-arena verify capture decline (interior
+    /// `Slice` sized `[1,1]` by the M=1 decode vs the `[1,2]` the M=2 verify
+    /// needs). Shares ONLY the immutable `Arc<WeightStore>` and
+    /// `Arc<dyn ExecutionProvider>` with the main executor, so a verify step
+    /// routed here binds the identical persistent **external** state buffers (KV
+    /// cache, recurrent/conv state, embeds) supplied through the caller's
+    /// `bindings`, while its **interior** scratch stays private and fixed at the
+    /// M=k+1 shape across every replay. Drives the [`DeviceGraphSlot::Verify`]
+    /// slot so its captured M=k+1 graph is independent of the main executor's
+    /// `Primary` M=1 decode graph (both coexist on the shared EP and each replays
+    /// by shape key). No graph transform is applied: unlike the decode-inline
+    /// sibling this is a plain structural clone, so it is available for **any**
+    /// model with recurrent state (including artifacts whose recurrent `Scan` is
+    /// not single-trip-inlineable).
+    pub(crate) fn build_verify_sibling(&self) -> Result<Self> {
+        let mut graph = self.graph.clone();
+        // Re-resolve interior shapes on the cloned (post-placement) graph before
+        // build, mirroring `build_decode_inline_sibling`'s permissive re-inference.
+        let registry = InferenceRegistry::default_registry();
+        let opset_imports = graph.opset_imports.clone();
+        registry.infer_graph(&mut graph, &opset_imports, MergePolicy::Permissive)?;
+        let mut sibling = Self::build(graph, Arc::clone(&self.weights), Arc::clone(&self.ep))?;
+        sibling.graph_slot = DeviceGraphSlot::Verify;
+        // Pin the sibling's StepScoped workspace. The sibling ONLY ever runs the
+        // fixed M=k+1 verify shape, so its workspace is reserved once at that peak
+        // and never needs to grow or shrink. Its captured verify graph bakes the
+        // workspace device pointer, so it must NOT be freed between replays:
+        // without the pin, `release_step_workspace` returns the workspace to the
+        // shared EP arena after each step, the interleaved M=1 decode on the main
+        // executor reserves that same freed slot, and the next verify replay reads
+        // reallocated memory (a nondeterministic illegal access, #1647's stale-ptr
+        // hazard). Pinning keeps the sibling's scratch pointer stable for every
+        // replay.
+        sibling.pin_step_workspace = true;
+        Ok(sibling)
     }
 
     /// Place the graph on execution providers: reject incompatible graphs, run
@@ -1058,6 +1097,7 @@ impl Executor {
                 input_dtypes,
                 output_dtypes,
                 inplace_dead_inputs: Vec::new(),
+                dead_after: Vec::new(),
                 lazy_weight_inputs,
             });
         }
@@ -1091,6 +1131,27 @@ impl Executor {
                     })
                 })
                 .collect();
+            // Values this node consumes for the last time. Weights are excluded
+            // here rather than at runtime because an initializer's buffer is
+            // built once and reused by every later run -- releasing it after its
+            // final *use in this run* would leave the next run with no weights.
+            // Graph inputs are excluded for the same reason at a different
+            // lifetime: their storage belongs to the caller's binding.
+            let mut seen = std::collections::HashSet::new();
+            let dead_after: Vec<ValueId> = node
+                .inputs
+                .iter()
+                .flatten()
+                .copied()
+                .filter(|vid| {
+                    last_use.get(vid) == Some(&pi)
+                        && !graph_outputs.contains(vid)
+                        && !graph.initializers.contains_key(vid)
+                        && !graph.inputs.contains(vid)
+                        && seen.insert(*vid)
+                })
+                .collect();
+            node.dead_after = dead_after;
         }
         if let Some(span) = plan_span.as_mut() {
             span.set_args(
@@ -1742,6 +1803,10 @@ impl Executor {
                 !self.binding_consumers_use_padded_capacity(vid)
             }
         });
+        let decode_freeze_safe_mask = self
+            .input_index
+            .get(&input_name)
+            .is_some_and(|&vid| self.binding_mask_is_decode_freeze_safe(vid));
         DeviceIoBinding::allocate(
             self.ep.clone(),
             DeviceBindingSpec {
@@ -1752,6 +1817,7 @@ impl Executor {
                 physical_shape,
                 logical_shape,
                 expose_logical_input_shape,
+                decode_freeze_safe_mask,
                 allocation_bytes: None,
                 committed_ranges: None,
             },
@@ -1776,6 +1842,10 @@ impl Executor {
                 !self.binding_consumers_use_padded_capacity(vid)
             }
         });
+        let decode_freeze_safe_mask = self
+            .input_index
+            .get(&input_name)
+            .is_some_and(|&vid| self.binding_mask_is_decode_freeze_safe(vid));
         DeviceIoBinding::allocate(
             self.ep.clone(),
             DeviceBindingSpec {
@@ -1786,6 +1856,7 @@ impl Executor {
                 physical_shape,
                 logical_shape,
                 expose_logical_input_shape,
+                decode_freeze_safe_mask,
                 allocation_bytes: Some(allocation_bytes),
                 committed_ranges: Some(committed_ranges),
             },
@@ -1828,6 +1899,10 @@ impl Executor {
                 !self.binding_consumers_use_padded_capacity(vid)
             }
         });
+        let decode_freeze_safe_mask = self
+            .input_index
+            .get(&input_name)
+            .is_some_and(|&vid| self.binding_mask_is_decode_freeze_safe(vid));
         // SAFETY: delegated to this function's contract.
         unsafe {
             DeviceIoBinding::from_external_memory(
@@ -1840,6 +1915,7 @@ impl Executor {
                     physical_shape,
                     logical_shape,
                     expose_logical_input_shape,
+                    decode_freeze_safe_mask,
                     allocation_bytes: None,
                     committed_ranges: None,
                 },
@@ -1866,6 +1942,7 @@ impl Executor {
                 physical_shape,
                 logical_shape,
                 expose_logical_input_shape: false,
+                decode_freeze_safe_mask: false,
                 allocation_bytes: None,
                 committed_ranges: None,
             },
@@ -1888,7 +1965,70 @@ impl Executor {
         found
     }
 
+    /// Name the direct consumers of `input` that are **not** padded-capacity-safe
+    /// — the ones that force the binding to expose its logical valid length and
+    /// therefore forfeit CUDA-graph capture. The predicate itself only answers
+    /// yes/no, so bring-up on a new architecture otherwise has to re-derive the
+    /// offender from the graph by hand; report it instead of inferring it.
+    pub(super) fn padded_capacity_offenders(&self, input: ValueId) -> Vec<String> {
+        let mut offenders = Vec::new();
+        for plan in &self.plan {
+            for (slot, value) in plan.inputs.iter().enumerate() {
+                if *value != Some(input) {
+                    continue;
+                }
+                let node = self.graph.node(plan.node_id);
+                if let Some(described) = describe_non_padded_consumer(node, slot) {
+                    offenders.push(described);
+                }
+            }
+        }
+        offenders
+    }
+
     pub(super) fn binding_consumers_use_padded_capacity(&self, input: ValueId) -> bool {
+        let padded = self.binding_consumers_use_padded_capacity_inner(input);
+        if !padded {
+            self.report_padded_capacity_decline(input);
+        }
+        padded
+    }
+
+    /// Emit the attribution for a padded-capacity decline. Gated behind
+    /// `ONNX_GENAI_CUDA_DEBUG_MASK_CAPACITY` so the default path stays silent,
+    /// matching the RMSNorm-fold attribution added in #1671.
+    fn report_padded_capacity_decline(&self, input: ValueId) {
+        let offenders = self.padded_capacity_offenders(input);
+        if offenders.is_empty() {
+            return;
+        }
+        if std::env::var("ONNX_GENAI_CUDA_DEBUG_MASK_CAPACITY").is_ok_and(|v| v != "0") {
+            eprintln!(
+                "mask_capacity_decline: non-capacity-aware consumer(s) {}",
+                offenders.join(", ")
+            );
+            // The direct-consumer list only explains the fast path. When the
+            // topology-gated fallbacks also declined, name the reason each gave.
+            // `Disqualify` drives static freezing; `Allow` is the weaker
+            // decode-freeze-safe classification that actually decides whether a
+            // single-token decode step may still capture, so report both.
+            if let Some(reason) =
+                mask_cone_rejection(&self.graph, input, ShapeConsumptionPolicy::Disqualify)
+            {
+                eprintln!("mask_capacity_decline: static freeze rejected: {reason}");
+            }
+            match mask_cone_rejection(&self.graph, input, ShapeConsumptionPolicy::Allow) {
+                Some(reason) => {
+                    eprintln!("mask_capacity_decline: decode-freeze-safe rejected: {reason}")
+                }
+                None => eprintln!(
+                    "mask_capacity_decline: decode-freeze-safe HOLDS (capture may still proceed)"
+                ),
+            }
+        }
+    }
+
+    fn binding_consumers_use_padded_capacity_inner(&self, input: ValueId) -> bool {
         let mut found = false;
         let mut all_direct_padded = true;
         for plan in &self.plan {
@@ -1918,6 +2058,20 @@ impl Executor {
         mask_binding_feeds_capacity_form_attention(&self.graph, input)
     }
 
+    /// Whether the mask binding `input` is *decode-freeze-safe*: it feeds only the
+    /// additive causal-mask builder cone terminating at capacity-form `Attention`,
+    /// so a single-token decode step (`q_seq == 1`) can freeze the mask to
+    /// physical capacity even when [`Self::binding_consumers_use_padded_capacity`]
+    /// declines to freeze it *statically* (because `Shape(mask)` leaks the padded
+    /// width into the multi-token prefill query-position window). The decode
+    /// window saturates at `q_seq == 1`, so a frozen decode mask is byte-identical
+    /// and keeps `logical == physical`, restoring CUDA-graph capture eligibility
+    /// for these models (e.g. DeepSeek-V2-Lite). GLM-5.2's indexer `Add` cone is
+    /// still excluded, so it is not decode-freeze-safe.
+    pub(super) fn binding_mask_is_decode_freeze_safe(&self, input: ValueId) -> bool {
+        mask_binding_feeds_additive_causal_builder(&self.graph, input)
+    }
+
     /// The compiled graph, retained for the §55.4 EPContext dump path: the
     /// exporter needs the (post-optimize) graph to serialise a `*_ctx.onnx`
     /// context-cache model with compiled partitions spliced out.
@@ -1940,6 +2094,16 @@ impl Executor {
             child.set_trace_context(trace.clone());
         }
         self.trace = trace;
+    }
+
+    /// Enable/disable dead-value buffer release, propagating to control-flow
+    /// child executors so a Scan/Loop body frees its intermediates too -- the
+    /// vision encoder's per-image Scan bodies are a large part of its live set.
+    pub(crate) fn set_release_dead_values(&mut self, enabled: bool) {
+        for child in self.subgraph_execs.values_mut() {
+            child.set_release_dead_values(enabled);
+        }
+        self.release_dead_values_enabled = enabled;
     }
 
     /// Live weight bytes backing the graph, needed alongside [`Self::graph`] so

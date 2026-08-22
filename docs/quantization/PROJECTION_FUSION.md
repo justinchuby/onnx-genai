@@ -38,7 +38,7 @@ Inspection of `/home/justinchu/qwen2.5-0.5b-int4-onnx/model.onnx` on 2026-07-16 
 - one already-fused QKV projection per layer, named like `/model/layers.0/attn/qkv_proj/MatMul_Q4`, with `K=896`, `N=1152`, `block_size=32`, and `accuracy_level=4`;
 - separate gate and up projections per layer, each with `K=896`, `N=4864`; and
 - no `Split` node in the artifact.
-The packed-QKV fact is consistent with the project progress record, which says native genai-builder compatibility includes packed-QKV GQA exports ([PROGRESS.md, lines 294-303](../status/PROGRESS.md#L294-L303)). The CPU GQA kernel also explicitly supports both unpacked Q/K/V and packed QKV ([group_query_attention.rs, lines 1-6](../../crates/onnx-runtime-ep-cpu/src/kernels/group_query_attention.rs#L1-L6)).
+The CPU GQA kernel explicitly supports both unpacked Q/K/V and packed QKV ([group_query_attention.rs, lines 1-6](../../crates/onnx-runtime-ep-cpu/src/kernels/group_query_attention.rs#L1-L6)).
 
 Therefore:
 - **gate/up fusion is directly applicable to the measured artifact;**

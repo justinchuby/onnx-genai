@@ -29,6 +29,7 @@ pub(crate) struct NativeProposerSession {
     has_plugin_fused: bool,
 }
 
+#[allow(dead_code)]
 impl NativeProposerSession {
     pub(crate) fn load(
         path: impl AsRef<Path>,

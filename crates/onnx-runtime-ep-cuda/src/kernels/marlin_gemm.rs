@@ -63,6 +63,7 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::sys::CUdeviceptr;
@@ -165,96 +166,126 @@ pub fn marlin_splitk_enabled() -> bool {
     )
 }
 
-/// Global cache of repacked weights, keyed by the source (packed) device pointer
-/// plus dims and device ordinal. Weights are immutable initializers, so the
-/// device repack runs **once** per weight and every later call — including
-/// captured CUDA-graph replays — reuses the cached buffer with no allocation.
-/// Kept module-global (rather than a per-kernel field) so wiring touches only
-/// the `matmul_nbits.rs` dispatch seam. A bounded FIFO frees the oldest entry via
-/// its owning runtime when the cap is exceeded.
+/// Kernel-owned cache of repacked immutable weights.
+///
+/// The source device address is only meaningful while the owning
+/// `MatMulNBitsKernel` is alive: CUDA may reuse it for different constant
+/// contents after that kernel/session is released. Keeping the cache on the
+/// kernel therefore makes `(address, dimensions)` a valid identity without a
+/// device-to-host content hash. Repeated calls on the same kernel still reuse
+/// the repack, including captured CUDA-graph replays.
+#[derive(Debug)]
 struct RepackEntry {
     ptr: CUdeviceptr,
     runtime: Arc<CudaRuntime>,
 }
 
-struct RepackCache {
-    map: HashMap<(usize, u32, usize, usize, usize), RepackEntry>,
-    order: VecDeque<(usize, u32, usize, usize, usize)>,
+#[derive(Debug)]
+pub(super) struct RepackCache {
+    runtime: Arc<CudaRuntime>,
+    map: Mutex<HashMap<(usize, usize, usize, usize), RepackEntry>>,
+    /// Device bytes held by `map`. These are raw `cuMemAlloc`s, invisible to
+    /// the VMM arena, so without a counter this memory cannot be reported at
+    /// all — it shows up only as an unexplained gap against `nvidia-smi`.
+    bytes: AtomicUsize,
 }
 
-const REPACK_CACHE_CAP: usize = 4096;
-
-static REPACK_CACHE: OnceLock<Mutex<RepackCache>> = OnceLock::new();
-
-fn repack_cache() -> &'static Mutex<RepackCache> {
-    REPACK_CACHE.get_or_init(|| {
-        Mutex::new(RepackCache {
-            map: HashMap::new(),
-            order: VecDeque::new(),
-        })
-    })
-}
-
-/// Ensure the repacked tensor-core weights for `packed` exist on device, running
-/// the device repack once and caching the result. Returns `(repacked_ptr,
-/// warm)`, where `warm == true` means the buffer was already cached (this call
-/// performed no allocation / repack / sync and is therefore CUDA-graph
-/// capture-safe). A cold miss while the stream is capturing is rejected so the
-/// caller can fall back rather than allocate inside a capture.
-pub fn ensure_repacked(
-    runtime: &Arc<CudaRuntime>,
-    packed: CUdeviceptr,
-    n: usize,
-    k: usize,
-    group_size: usize,
-) -> Result<(CUdeviceptr, bool)> {
-    let key = (packed as usize, runtime.ordinal(), n, k, group_size);
-    {
-        let cache = repack_cache().lock().expect("marlin repack cache poisoned");
-        if let Some(entry) = cache.map.get(&key) {
-            return Ok((entry.ptr, true));
+impl RepackCache {
+    pub(super) fn new(runtime: Arc<CudaRuntime>) -> Self {
+        Self {
+            runtime,
+            map: Mutex::new(HashMap::new()),
+            bytes: AtomicUsize::new(0),
         }
     }
-    if runtime.is_capturing()? {
-        return Err(EpError::KernelFailed(
-            "cuda_ep: Marlin weight repack cannot allocate during CUDA-graph capture; \
-             the weight must be repacked during warmup before capture"
-                .into(),
-        ));
+
+    /// Device bytes this cache currently holds.
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.bytes.load(Ordering::Relaxed)
     }
-    let bytes = repacked_bytes(n, k);
-    let out = runtime.alloc_raw(bytes)?;
-    if let Err(e) = launch_marlin_repack(runtime, packed, out, n, k, group_size) {
-        // SAFETY: `out` was just allocated here and is otherwise unreferenced.
-        let _ = unsafe { runtime.free_raw(out) };
-        return Err(e);
+
+    /// Release every repacked weight copy.
+    ///
+    /// The repack exists for the tensor-core GEMM, which only runs at `M > 1`
+    /// (prefill). Single-token decode uses the GEMV path and never reads these
+    /// buffers, so once a session has settled into decode the copies are pure
+    /// device-memory overhead — a full duplicate of the projection weights that
+    /// the VMM arena cannot even see. Dropping them costs a re-repack if a
+    /// later prefill needs them, never a wrong answer.
+    pub(super) fn release_all(&self) {
+        let mut map = self.map.lock().expect("marlin repack cache poisoned");
+        for (_, entry) in map.drain() {
+            // SAFETY: exclusively owned by the cache; freed once here.
+            let _ = unsafe { entry.runtime.free_raw(entry.ptr) };
+        }
+        self.bytes.store(0, Ordering::Relaxed);
     }
-    let mut cache = repack_cache().lock().expect("marlin repack cache poisoned");
-    // Another thread may have inserted the same key while we repacked; keep one.
-    if let Some(entry) = cache.map.get(&key) {
-        let winner = entry.ptr;
-        drop(cache);
-        // SAFETY: `out` is our just-allocated duplicate; free it once.
-        let _ = unsafe { runtime.free_raw(out) };
-        return Ok((winner, true));
-    }
-    cache.map.insert(
-        key,
-        RepackEntry {
-            ptr: out,
-            runtime: runtime.clone(),
-        },
-    );
-    cache.order.push_back(key);
-    while cache.order.len() > REPACK_CACHE_CAP {
-        if let Some(evict) = cache.order.pop_front()
-            && let Some(entry) = cache.map.remove(&evict)
+
+    /// Ensure the repacked tensor-core weights for `packed` exist on device,
+    /// running the device repack once for this kernel owner. Returns
+    /// `(repacked_ptr, warm)`, where `warm == true` means the buffer was already
+    /// cached and this call performed no allocation/repack/sync. A cold miss
+    /// while the stream is capturing is rejected.
+    pub(super) fn ensure_repacked(
+        &self,
+        packed: CUdeviceptr,
+        n: usize,
+        k: usize,
+        group_size: usize,
+    ) -> Result<(CUdeviceptr, bool)> {
+        let key = (packed as usize, n, k, group_size);
         {
-            // SAFETY: exclusively owned by the cache; freed once on eviction.
+            let cache = self.map.lock().expect("marlin repack cache poisoned");
+            if let Some(entry) = cache.get(&key) {
+                return Ok((entry.ptr, true));
+            }
+        }
+        if self.runtime.is_capturing()? {
+            return Err(EpError::KernelFailed(
+                "cuda_ep: Marlin weight repack cannot allocate during CUDA-graph capture; \
+                 the weight must be repacked during warmup before capture"
+                    .into(),
+            ));
+        }
+        let bytes = repacked_bytes(n, k);
+        let out = self.runtime.alloc_raw(bytes)?;
+        if let Err(e) = launch_marlin_repack(&self.runtime, packed, out, n, k, group_size) {
+            // SAFETY: `out` was just allocated here and is otherwise unreferenced.
+            let _ = unsafe { self.runtime.free_raw(out) };
+            return Err(e);
+        }
+        let mut cache = self.map.lock().expect("marlin repack cache poisoned");
+        // Another thread may have inserted the same key while we repacked; keep one.
+        if let Some(entry) = cache.get(&key) {
+            let winner = entry.ptr;
+            drop(cache);
+            // SAFETY: `out` is our just-allocated duplicate; free it once.
+            let _ = unsafe { self.runtime.free_raw(out) };
+            return Ok((winner, true));
+        }
+        cache.insert(
+            key,
+            RepackEntry {
+                ptr: out,
+                runtime: self.runtime.clone(),
+            },
+        );
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        Ok((out, false))
+    }
+}
+
+impl Drop for RepackCache {
+    fn drop(&mut self) {
+        let cache = self
+            .map
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner());
+        for (_, entry) in cache.drain() {
+            // SAFETY: each repack is exclusively owned by this kernel cache.
             let _ = unsafe { entry.runtime.free_raw(entry.ptr) };
         }
     }
-    Ok((out, false))
 }
 
 /// Module-global pool of reusable device scratch buffers for the Marlin fused
@@ -270,17 +301,41 @@ pub fn ensure_repacked(
 struct ScratchCache {
     map: HashMap<(u32, u32, usize), RepackEntry>,
     order: VecDeque<(u32, u32, usize)>,
+    /// Device bytes currently held by `map`. Tracked because the cap below is
+    /// on bytes, and because this memory is invisible to the VMM arena — it is
+    /// a raw `cuMemAlloc` — so without a counter it cannot be reported at all.
+    bytes: usize,
 }
 
-const SCRATCH_CACHE_CAP: usize = 256;
+/// Upper bound on device memory this cache may hold.
+///
+/// The bound has to be on **bytes**, not on entry count: a cap of "256 entries"
+/// says nothing about memory, because entries range from kilobytes to hundreds
+/// of megabytes. Measured on HY-MT2-1.8B, an entry-capped cache retained a
+/// fixed ~380 MiB of device memory that the VMM arena never saw, which was the
+/// whole of our peak-VRAM deficit against llama.cpp on that model.
+///
+/// These buffers are a *cache*: a miss costs one allocation, never a wrong
+/// answer, so trading a little reuse for a bounded footprint is always safe.
+const SCRATCH_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 static SCRATCH_CACHE: OnceLock<Mutex<ScratchCache>> = OnceLock::new();
+
+/// Device bytes currently retained by the scratch cache.
+///
+/// This memory does not go through the VMM arena, so `vmm_arena` counters
+/// cannot see it. Exposed so callers can account for it rather than discover
+/// it as an unexplained gap between our totals and `nvidia-smi`.
+pub fn scratch_cache_bytes() -> usize {
+    scratch_cache().lock().map(|cache| cache.bytes).unwrap_or(0)
+}
 
 fn scratch_cache() -> &'static Mutex<ScratchCache> {
     SCRATCH_CACHE.get_or_init(|| {
         Mutex::new(ScratchCache {
             map: HashMap::new(),
             order: VecDeque::new(),
+            bytes: 0,
         })
     })
 }
@@ -330,10 +385,16 @@ pub fn ensure_scratch(
         },
     );
     cache.order.push_back(key);
-    while cache.order.len() > SCRATCH_CACHE_CAP {
+    cache.bytes = cache.bytes.saturating_add(bytes);
+    // Evict oldest-first until the retained bytes fit the budget. The entry
+    // just inserted is never evicted: the caller is about to use it, and it is
+    // at the back of `order`. A single buffer larger than the whole budget is
+    // therefore still served — correctness never depends on the cap.
+    while cache.bytes > SCRATCH_CACHE_MAX_BYTES && cache.order.len() > 1 {
         if let Some(evict) = cache.order.pop_front()
             && let Some(entry) = cache.map.remove(&evict)
         {
+            cache.bytes = cache.bytes.saturating_sub(evict.2);
             // SAFETY: exclusively owned by the cache; freed once on eviction.
             let _ = unsafe { entry.runtime.free_raw(entry.ptr) };
         }
@@ -1128,13 +1189,7 @@ mod tests {
     use crate::runtime::CudaRuntime;
 
     fn runtime() -> Option<Arc<CudaRuntime>> {
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let rt = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
-            .ok()
-            .flatten();
-        std::panic::set_hook(previous);
-        rt
+        crate::test_support::maybe_runtime()
     }
 
     fn as_bytes<T: Copy>(values: &[T]) -> &[u8] {
@@ -1698,6 +1753,82 @@ mod tests {
                 got, host,
                 "device repack != host repack for n={n} group={group}"
             );
+        }
+    }
+
+    /// Reusing the exact same source address for a later constant owner must
+    /// repack the later contents instead of returning the first owner's buffer.
+    ///
+    /// The test deliberately overwrites one live allocation between cache
+    /// owners, making address reuse deterministic rather than depending on
+    /// `cuMemAlloc` choosing a recently freed address. A process-global
+    /// `(address, dimensions)` cache returns `expected_a` for the second owner.
+    #[test]
+    #[ignore = "requires a live CUDA device"]
+    fn repack_cache_address_reuse_is_scoped_to_kernel_owner() {
+        let Some(rt) = runtime() else {
+            eprintln!("skipping: CUDA runtime unavailable");
+            return;
+        };
+        let n = 8usize;
+        let k = 128usize;
+        let group = 128usize;
+        let packed_a = vec![0x21u8; n * k / 2];
+        let packed_b = vec![0xe4u8; n * k / 2];
+        let expected_a = repack_int4_weights(&packed_a, n, k, group);
+        let expected_b = repack_int4_weights(&packed_b, n, k, group);
+        assert_ne!(expected_a, expected_b);
+
+        let source = rt.alloc_raw(packed_a.len()).unwrap();
+        // SAFETY: `source` was allocated for the complete packed tensor.
+        unsafe {
+            rt.htod(&packed_a, source).unwrap();
+        }
+        {
+            let owner_a = RepackCache::new(rt.clone());
+            let (repacked_a, warm) = owner_a.ensure_repacked(source, n, k, group).unwrap();
+            assert!(!warm, "the first call for an owner must repack");
+            rt.synchronize().unwrap();
+            let mut got_a = vec![0u8; expected_a.len()];
+            // SAFETY: `repacked_a` holds exactly `expected_a.len()` bytes.
+            unsafe {
+                rt.dtoh(&mut got_a, repacked_a).unwrap();
+            }
+            assert_eq!(got_a, expected_a);
+
+            let (same_repack, warm) = owner_a.ensure_repacked(source, n, k, group).unwrap();
+            assert!(warm, "the immutable weight must reuse its owner's repack");
+            assert_eq!(same_repack, repacked_a);
+        }
+
+        // Deterministically present different constant contents at the same
+        // device address under a new kernel/cache owner.
+        // SAFETY: `source` remains live and has the same packed-tensor capacity.
+        unsafe {
+            rt.htod(&packed_b, source).unwrap();
+        }
+        {
+            let owner_b = RepackCache::new(rt.clone());
+            let (repacked_b, warm) = owner_b.ensure_repacked(source, n, k, group).unwrap();
+            assert!(
+                !warm,
+                "a new owner at a reused address must not hit an old repack"
+            );
+            rt.synchronize().unwrap();
+            let mut got_b = vec![0u8; expected_b.len()];
+            // SAFETY: `repacked_b` holds exactly `expected_b.len()` bytes.
+            unsafe {
+                rt.dtoh(&mut got_b, repacked_b).unwrap();
+            }
+            assert_eq!(
+                got_b, expected_b,
+                "reused source address returned stale repacked contents"
+            );
+        }
+
+        // SAFETY: the source allocation remains exclusively owned by this test.
+        unsafe {
+            rt.free_raw(source).unwrap();
         }
     }
 }

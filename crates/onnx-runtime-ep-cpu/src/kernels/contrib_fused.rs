@@ -56,14 +56,23 @@ fn require_skip_layer_norm_dtype(inputs: &[TensorView], outputs: &[TensorMut]) -
         if output.is_absent() {
             continue;
         }
-        let expected = if matches!(index, 1 | 2) {
-            DataType::Float32
-        } else {
-            dtype
-        };
-        if output.dtype != expected {
+        if matches!(index, 1 | 2) {
+            // `mean`/`inv_std_var` are training-only stats that inference
+            // graphs leave dangling. ORT's schema types them `float`, but
+            // exporters routinely emit them in the activation dtype instead
+            // (the bf16 skip-RMSNorm path documents the same allowance), and
+            // the write below narrows to whichever was declared.
+            if output.dtype != DataType::Float32 && output.dtype != dtype {
+                return Err(EpError::KernelFailed(format!(
+                    "SkipLayerNormalization: output {index} must have dtype Float32 or {dtype:?}, got {:?}",
+                    output.dtype
+                )));
+            }
+            continue;
+        }
+        if output.dtype != dtype {
             return Err(EpError::KernelFailed(format!(
-                "SkipLayerNormalization: output {index} must have dtype {expected:?}, got {:?}",
+                "SkipLayerNormalization: output {index} must have dtype {dtype:?}, got {:?}",
                 output.dtype
             )));
         }
@@ -515,7 +524,7 @@ mod tests {
         let mut want = Vec::new();
         let mut means = Vec::new();
         let mut invs = Vec::new();
-        for row in sum.chunks_exact(4) {
+        for row in sum.as_chunks::<4>().0 {
             let m = row.iter().sum::<f32>() / 4.;
             let inv = 1. / (row.iter().map(|v| (v - m).powi(2)).sum::<f32>() / 4. + 1e-5).sqrt();
             means.push(m);
@@ -603,7 +612,7 @@ mod tests {
         .unwrap();
         let scale_data = [1., 2., 0.5, 1.5];
         let mut want = Vec::new();
-        for row in [1., 2., 3., 4., -2., 0., 2., 4.].chunks_exact(4) {
+        for row in [1., 2., 3., 4., -2., 0., 2., 4.].as_chunks::<4>().0 {
             let inv = 1. / (row.iter().map(|v| v * v).sum::<f32>() / 4. + 1e-5).sqrt();
             want.extend((0..4).map(|i| row[i] * inv * scale_data[i]));
         }
@@ -803,12 +812,82 @@ mod tests {
         let gamma_data = [1., 2., 0.5, 1.5];
         let beta_data = [0., 1., -1., 0.5];
         let mut want = Vec::new();
-        for row in sum.chunks_exact(4) {
+        for row in sum.as_chunks::<4>().0 {
             let m = row.iter().sum::<f32>() / 4.;
             let inv = 1. / (row.iter().map(|v| (v - m).powi(2)).sum::<f32>() / 4. + 1e-5).sqrt();
             want.extend((0..4).map(|i| (row[i] - m) * inv * gamma_data[i] + beta_data[i]));
         }
         assert_close(&y.to_f32(), &want);
+    }
+
+    /// A bf16 graph may declare the dangling `mean`/`inv_std_var` stats in the
+    /// activation dtype rather than the schema's float. The Muse Glimmer vision
+    /// tower does exactly this, so the kernel must accept it and narrow the
+    /// stat writes instead of rejecting the node.
+    #[test]
+    fn skip_layer_norm_accepts_bf16_stat_outputs() {
+        let x = Owned::bf16(&[2, 4], &[1., 2., 3., 4., 2., 3., 4., 5.]);
+        let skip = Owned::bf16(&[2, 4], &[0.5, -1., 1., 0., 1., 0., -1., 2.]);
+        let gamma = Owned::bf16(&[4], &[1., 2., 0.5, 1.5]);
+        let mut y = Owned::zeros(DataType::BFloat16, &[2, 4]);
+        let mut mean = Owned::zeros(DataType::BFloat16, &[2, 1]);
+        let mut inv_std = Owned::zeros(DataType::BFloat16, &[2, 1]);
+        SkipLayerNormKernel { epsilon: 1e-5 }
+            .execute(
+                &[x.view(), skip.view(), gamma.view()],
+                &mut [y.view_mut(), mean.view_mut(), inv_std.view_mut()],
+            )
+            .unwrap();
+        // sum = X + skip; row means are 2.625 and 4.0.
+        let means = mean.to_bf16_as_f32();
+        assert!((means[0] - 2.625).abs() < 0.05, "got {means:?}");
+        assert!((means[1] - 4.0).abs() < 0.05, "got {means:?}");
+        assert!(
+            inv_std
+                .to_bf16_as_f32()
+                .iter()
+                .all(|v| v.is_finite() && *v > 0.)
+        );
+    }
+
+    /// The same node with schema-conformant float stats stays accepted.
+    #[test]
+    fn skip_layer_norm_accepts_f32_stat_outputs_in_a_bf16_graph() {
+        let x = Owned::bf16(&[2, 4], &[1., 2., 3., 4., 2., 3., 4., 5.]);
+        let skip = Owned::bf16(&[2, 4], &[0.5, -1., 1., 0., 1., 0., -1., 2.]);
+        let gamma = Owned::bf16(&[4], &[1., 2., 0.5, 1.5]);
+        let mut y = Owned::zeros(DataType::BFloat16, &[2, 4]);
+        let mut mean = Owned::zeros_f32(&[2, 1]);
+        let mut inv_std = Owned::zeros_f32(&[2, 1]);
+        SkipLayerNormKernel { epsilon: 1e-5 }
+            .execute(
+                &[x.view(), skip.view(), gamma.view()],
+                &mut [y.view_mut(), mean.view_mut(), inv_std.view_mut()],
+            )
+            .unwrap();
+        let means = mean.to_f32();
+        assert!((means[0] - 2.625).abs() < 0.05, "got {means:?}");
+        assert!((means[1] - 4.0).abs() < 0.05, "got {means:?}");
+    }
+
+    /// A stat output in an unrelated dtype is still a hard error.
+    #[test]
+    fn skip_layer_norm_rejects_unrelated_stat_dtype() {
+        let x = Owned::bf16(&[2, 4], &[1., 2., 3., 4., 2., 3., 4., 5.]);
+        let skip = Owned::bf16(&[2, 4], &[0.5, -1., 1., 0., 1., 0., -1., 2.]);
+        let gamma = Owned::bf16(&[4], &[1., 2., 0.5, 1.5]);
+        let mut y = Owned::zeros(DataType::BFloat16, &[2, 4]);
+        let mut mean = Owned::zeros(DataType::Float16, &[2, 1]);
+        let error = SkipLayerNormKernel { epsilon: 1e-5 }
+            .execute(
+                &[x.view(), skip.view(), gamma.view()],
+                &mut [y.view_mut(), mean.view_mut()],
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Float32 or BFloat16"),
+            "unexpected error: {error}"
+        );
     }
 
     /// A 4-output SkipLayerNorm node writes `output`, `mean`, `inv_std_var`, and
@@ -848,7 +927,7 @@ mod tests {
         let mut want = Vec::new();
         let mut means = Vec::new();
         let mut invs = Vec::new();
-        for row in sum.chunks_exact(4) {
+        for row in sum.as_chunks::<4>().0 {
             let m = row.iter().sum::<f32>() / 4.;
             let inv = 1. / (row.iter().map(|v| (v - m).powi(2)).sum::<f32>() / 4. + 1e-5).sqrt();
             means.push(m);
@@ -885,7 +964,7 @@ mod tests {
         let sum = [1.75f32, 1., 3.5, 5., 3.25, 3., 2.5, 8.];
         let gamma_data = [1., 2., 0.5, 1.5];
         let mut want = Vec::new();
-        for row in sum.chunks_exact(4) {
+        for row in sum.as_chunks::<4>().0 {
             let m = row.iter().sum::<f32>() / 4.;
             let inv = 1. / (row.iter().map(|v| (v - m).powi(2)).sum::<f32>() / 4. + 1e-5).sqrt();
             want.extend((0..4).map(|i| (row[i] - m) * inv * gamma_data[i]));
@@ -919,7 +998,7 @@ mod tests {
         let gamma_data = [1., 2., 0.5, 1.5];
         let beta_data = [0., 1., -1., 0.5];
         let mut want = Vec::new();
-        for row in sum.chunks_exact(4) {
+        for row in sum.as_chunks::<4>().0 {
             let m = row.iter().sum::<f32>() / 4.;
             let inv = 1. / (row.iter().map(|v| (v - m).powi(2)).sum::<f32>() / 4. + 1e-5).sqrt();
             want.extend((0..4).map(|i| (row[i] - m) * inv * gamma_data[i] + beta_data[i]));
@@ -951,7 +1030,7 @@ mod tests {
         let scale_data = [1., 2., 0.5, 1.5];
         let mut want = Vec::new();
         let mut want_inv = Vec::new();
-        for group in x_data.chunks_exact(4) {
+        for group in x_data.as_chunks::<4>().0 {
             let inv = 1. / (group.iter().map(|v| v * v).sum::<f32>() / 4. + eps).sqrt();
             want_inv.push(inv);
             want.extend((0..4).map(|i| group[i] * inv * scale_data[i]));
