@@ -1028,7 +1028,10 @@ mod tests {
     fn pipeline_rejects_missing_declared_tokenizer_file() {
         let root = staged_pipeline("missing-file", "nested/tokenizer.json");
 
-        let error = PipelineModelDirectory::load(&root).unwrap_err().to_string();
+        let error = PipelineModelDirectory::load(&root)
+            .unwrap_err()
+            .to_string()
+            .replace('\\', "/");
         assert!(error.contains("cannot be opened"), "{error}");
         assert!(error.contains("nested/tokenizer.json"), "{error}");
     }
