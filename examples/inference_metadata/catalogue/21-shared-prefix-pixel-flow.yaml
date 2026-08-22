@@ -63,6 +63,7 @@ pipeline:
       - loop_induction_values
       - serving_service_contract
       - input_presence
+      - linear_effects
     inputs:
       request.prompt_tokens:
         contract:
