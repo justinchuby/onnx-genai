@@ -392,6 +392,50 @@ pub fn sdpa_f32(
     sdpa_f32_scalar(t, cfg, bias, mask, y, qk);
 }
 
+/// The route a **production** (default, MLAS-free) build takes for this shape,
+/// selected explicitly rather than through [`sdpa_f32`]'s `cfg` ladder.
+///
+/// [`sdpa_f32`] short-circuits to [`sdpa_f32_fast`] whenever the crate is built
+/// `--features mlas`, so under that feature it cannot be used as the native
+/// half of an A/B: both halves would be MLAS. This entry point names the native
+/// route directly, so [`crate::backend_ab`] can hold the shipped route and the
+/// reference route side by side in one binary.
+pub fn sdpa_f32_native(
+    t: &SdpaTensors,
+    cfg: &SdpaConfig,
+    bias: &dyn AttnBias,
+    mask: &dyn KeyMask,
+    y: &mut [f32],
+) {
+    #[cfg(target_arch = "aarch64")]
+    sdpa_f32_simd(t, cfg, bias, mask, y);
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if crate::backend::has_simd_x86() {
+            sdpa_f32_simd(t, cfg, bias, mask, y);
+            return;
+        }
+        sdpa_f32_scalar(t, cfg, bias, mask, y, None);
+    }
+}
+
+/// The vendored-MLAS reference route for this shape, selected explicitly.
+///
+/// Only exists `--features mlas`; see [`crate::backend_ab`] for why both halves
+/// have to be reachable from one binary.
+#[cfg(feature = "mlas")]
+pub fn sdpa_f32_mlas(
+    t: &SdpaTensors,
+    cfg: &SdpaConfig,
+    bias: &dyn AttnBias,
+    mask: &dyn KeyMask,
+    y: &mut [f32],
+) {
+    sdpa_f32_fast(t, cfg, bias, mask, y);
+}
+
 /// Run one decode query row against the caller-selected KV window `[lo, hi)`.
 ///
 /// The caller retains ownership of GQA-specific causal/sliding-window policy
@@ -3127,8 +3171,15 @@ mod tests {
                     past_seq: kv_seq.saturating_sub(q_seq),
                     causal_fill: f32::MIN,
                 };
-                let mut fast = vec![0.0f32; batch * heads * q_seq * dv];
-                let mut general = vec![0.0f32; batch * heads * q_seq * dv];
+                // Prefilled with NaN rather than zero. A dropped write is then
+                // unambiguous: it survives as a NaN, and NaN != NaN makes the
+                // comparison below fail loudly at the offending element. With
+                // zero prefill an unwritten element is indistinguishable from a
+                // legitimate `0.0`, and a hole that lands in the same place in
+                // both runs cancels out and passes silently — which is how
+                // #1685 stayed invisible here while it was live.
+                let mut fast = vec![f32::NAN; batch * heads * q_seq * dv];
+                let mut general = vec![f32::NAN; batch * heads * q_seq * dv];
                 sdpa_f32(&tensors, &cfg, &NoBias, &NoMask, &mut fast, None);
                 sdpa_f32(
                     &tensors,
@@ -3138,6 +3189,22 @@ mod tests {
                     &mut general,
                     None,
                 );
+                for (route, out) in [("identity-specialized", &fast), ("general", &general)] {
+                    if let Some(idx) = out.iter().position(|x| x.is_nan()) {
+                        let unwritten = out.iter().filter(|x| x.is_nan()).count();
+                        let tile = idx / (q_seq * dv);
+                        let row = (idx % (q_seq * dv)) / dv;
+                        panic!(
+                            "shape {si} causal={causal}: the {route} route left {unwritten} of \
+                             {} output elements unwritten; first at index {idx} = \
+                             (tile {tile}, row {row}, column {}). Contiguous runs of \
+                             `v_head_size` starting on a row boundary mean a dropped GEMM row \
+                             partition (see #1685).",
+                            out.len(),
+                            idx % dv,
+                        );
+                    }
+                }
                 assert_eq!(
                     fast, general,
                     "shape {si} causal={causal}: identity specialization diverged"
