@@ -19,7 +19,7 @@ use onnx_runtime_memory_abi::{
     NxmemNegotiateResponse, NxmemQueryUnloadReadinessFn, NxmemUnloadReport, NxmemVersionRange,
     validate_negotiation,
 };
-use onnx_runtime_memory_api::DeviceKey;
+use onnx_runtime_memory_api::{DeviceKey, ProviderContextPinSource};
 
 use crate::allocator::{HostReclaim, PluginAllocator, open_allocator};
 use crate::error::PluginError;
@@ -233,7 +233,28 @@ impl PluginFactory {
         required_capability_flags: u64,
         reclaim: Option<Arc<dyn HostReclaim>>,
     ) -> Result<PluginAllocator, PluginError> {
-        open_allocator(self, required_capability_flags, reclaim)
+        open_allocator(self, required_capability_flags, reclaim, None)
+    }
+
+    /// Open an allocator bound to a provider/context.
+    ///
+    /// The binding exists for one reason: a deferred release retires against
+    /// the provider that owns the underlying device resources, so that
+    /// provider must not finish teardown while a queued free still names it.
+    /// While any release queued through this allocator is outstanding, the
+    /// context holds one pin and teardown blocks; once a context stops
+    /// accepting work, further deferred releases are refused rather than
+    /// queued unpinned.
+    ///
+    /// Use [`open`](Self::open) for the standalone case where no provider
+    /// stands behind the mechanism.
+    pub fn open_with_provider_context(
+        &self,
+        required_capability_flags: u64,
+        reclaim: Option<Arc<dyn HostReclaim>>,
+        context: Arc<dyn ProviderContextPinSource>,
+    ) -> Result<PluginAllocator, PluginError> {
+        open_allocator(self, required_capability_flags, reclaim, Some(context))
     }
 
     pub(crate) fn vtable(&self) -> &NxmemAllocatorFactoryVtable {
