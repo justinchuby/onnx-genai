@@ -117,3 +117,73 @@ Neither applies to the runs above, but both are real and worth a guard:
    the `total_workers <= 1` serial short-circuit above: all work runs on the
    dispatcher while a pinned worker sits parked, with no diagnostic. Benchmarking
    inside a small container hits this.
+
+## Addendum (#1746): the container case is not container-only
+
+**Date:** 2026-08-22. Added by Sebastian after this document merged.
+
+Vacuity case 2 above — `THREADS=N` on an exactly-N-CPU cpuset, via
+`reserve_single_group_headroom(N, N) == N-1` — is described here as something
+*"benchmarking inside a small container hits"*. It is not confined to
+containers. **The shipping EP builds that cpuset itself**, so the condition
+fires on every explicit budget in production.
+
+`provider.rs:340` — `EpFactory::initialize()`, the earliest per-session hook —
+calls `bound_process_to_decode_budget()`, which confines the process to exactly
+`N` CPUs so that "a user who caps cores disturbs at most N CPUs". The pool is
+then built lazily at first decode, reads `allowed_cpus()`, finds exactly `N`,
+and reserves one for the dispatcher.
+
+Measured through the production sequence, under the *same* outer
+`taskset -c 0,2,...,30` this document's runs used:
+
+```
+onnx-genai: CPU decode budget 2 confined the process to 2 CPUs [0, 2]
+PROD budget=2 allowed_before=Some(16) allowed_after=Some(2) spmd_threads=1
+PROD budget=4 allowed_before=Some(16) allowed_after=Some(4) spmd_threads=3
+PROD budget=8 allowed_before=Some(16) allowed_after=Some(8) spmd_threads=7
+```
+
+`allowed_before=16 -> allowed_after=N` is the mechanism. At `N=2` the single
+remaining worker trips the `total_workers <= 1` serial short-circuit this
+document already identifies as special-casing `t=1` — so in production `=2` and
+`=1` really are the same code path.
+
+### This does not retract anything above
+
+The measurements in this document are correct **for the harness they were taken
+on**, and the 1.96x stands. `crates/onnx-runtime-ep-cpu/benches/int4_decode_loop_ab.rs`
+never calls `EpFactory::initialize()`; it constructs `CpuExecutionProvider` and
+enters the decode scope through `with_decode_pool_scope` directly. So
+`bound_process_to_decode_budget()` never runs there, the process keeps the 16
+CPUs the outer `taskset` gave it, `reserve_single_group_headroom(2, 16) = 2`,
+and the bench genuinely gets two busy workers. The per-thread attribution table
+is sound.
+
+That is also why the non-vacuity check passed: `w` in gave `w` out because the
+reservation never fired in that binary.
+
+**The finding is the divergence, not an error in either measurement.** The
+decode bench does not reproduce the production thread topology, so a width sweep
+run through it is structurally unable to observe this class of defect. Any
+thread-scaling curve taken from `int4_decode_loop_ab` describes the harness.
+
+### One correction to the table
+
+The `t=16` row is a **15-worker** measurement. Under
+`taskset -c 0,2,...,30` the bench has 16 allowed CPUs, so
+`reserve_single_group_headroom(16, 16) = 15` fires even without the production
+confinement. The `1/2/4/8` non-vacuity checks could not have caught this,
+because the reservation only triggers at exactly full subscription. The knee
+into `t=16` is therefore measured at 15 lanes, not 16 — which slightly
+*understates* the plateau rather than overstating it, so the conclusion drawn
+from it is unaffected.
+
+### Fix
+
+#1746 gives the reserved CPU a compute lane instead of only a spinning
+dispatcher: `N-1` pinned worker threads (so the 20-60x starvation cliff that
+motivated the reservation stays fixed) plus the dispatcher computing the
+remaining shard = `N` lanes on `N` CPUs. Verified `N` in -> `N` lanes for
+`N = 2/4/8/16` through the production sequence, with a subprocess regression
+test per budget.
