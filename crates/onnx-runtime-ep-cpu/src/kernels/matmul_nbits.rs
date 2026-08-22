@@ -9910,7 +9910,33 @@ const MIN_OUTPUTS_PER_TASK: usize = 16;
 const MANY_THREAD_CUTOFF: usize = 48;
 
 pub(crate) fn output_chunk_len(n: usize, k: usize) -> usize {
-    let threads = effective_fan_out_width();
+    output_chunk_len_for(effective_fan_out_width(), n, k)
+}
+
+/// [`output_chunk_len`] for an executor whose width is known independently of
+/// the ambient Rayon pool.
+///
+/// The Rayon fan-outs partition the pool they are already installed on, so
+/// reading the width back out of Rayon is exactly right for them. The persistent
+/// SPMD pool is *not* a Rayon pool: it owns its own workers and dispatches
+/// through a broadcast barrier, so `rayon::current_num_threads()` describes an
+/// unrelated executor. Letting it choose the SPMD grain has two costs, both
+/// measured on a 32-vCPU/16-core EPYC 9V74:
+///
+/// 1. **A silent cliff.** `RAYON_NUM_THREADS=1` made `output_chunk_len` return
+///    the whole output, so [`crate::decode_spmd::SpmdDecodePools::dispatch_output_rows`]
+///    took its serial short-circuit and ran every projection on the dispatcher
+///    thread while 15 SPMD workers sat spinning: 2.82 ms/token to 39.97 ms/token
+///    (14.2x) on the `qwen` int4 decode loop, with the pool fully built.
+/// 2. **A pool nobody asked for.** `rayon::current_num_threads()` *builds* the
+///    global pool, so a decode that never touches Rayon still paid for
+///    `available_parallelism()` worth of threads: 49 process threads for a
+///    16-core budget (15 SPMD workers plus 32 global Rayon workers plus main).
+///
+/// Sizing the SPMD grain from `total_workers` fixes both: the partition matches
+/// the executor that will actually run it, and the decode path stops
+/// constructing a Rayon pool it never dispatches to.
+pub(crate) fn output_chunk_len_for(threads: usize, n: usize, k: usize) -> usize {
     let total_work = n.saturating_mul(k);
     // Small projections amortize Rayon well on one socket, but dispatching each
     // one across a larger pool costs more than its GEMV on the dual-socket host.
@@ -20683,6 +20709,70 @@ mod tests {
             "with the hint equal to the ambient width the grain must be unchanged"
         );
         assert_eq!(deferred_decode_width(), None);
+    }
+
+    /// The SPMD decode pool is not a Rayon pool, so its fan-out grain must come
+    /// from its own worker count.
+    ///
+    /// `output_chunk_len` reads `rayon::current_num_threads()`, which describes
+    /// an executor the SPMD pool never dispatches to. When the ambient pool is
+    /// narrower than the SPMD pool the shared rule collapses to "run it all
+    /// serially", and `dispatch_output_rows` then hands the whole projection to
+    /// the dispatcher thread while every SPMD worker sits spinning --
+    /// `RAYON_NUM_THREADS=1` cost 14.2x on the `qwen` int4 decode loop.
+    /// `output_chunk_len_for` takes the width as an argument so the partition
+    /// matches the executor that will actually run it.
+    #[test]
+    fn the_spmd_grain_is_independent_of_the_ambient_rayon_width() {
+        let (n, k) = (4096usize, 1024usize);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("one-thread pool");
+
+        let (ambient, explicit) = pool.install(|| {
+            (
+                output_chunk_len(n, k),
+                output_chunk_len_for(rayon::current_num_threads().max(16), n, k),
+            )
+        });
+
+        assert_eq!(
+            ambient, n,
+            "a one-wide ambient pool must not split the output -- this is the \
+             value the SPMD pool used to read"
+        );
+        assert!(
+            explicit < n,
+            "a 16-wide SPMD pool must still split the output when the ambient \
+             Rayon pool is one thread (got {explicit} for n = {n})"
+        );
+    }
+
+    /// The width argument, not the ambient pool, is what moves the grain.
+    #[test]
+    fn output_chunk_len_for_matches_the_ambient_rule_at_the_ambient_width() {
+        let (n, k) = (6144usize, 4096usize);
+        assert_eq!(
+            output_chunk_len(n, k),
+            output_chunk_len_for(effective_fan_out_width(), n, k),
+            "the ambient wrapper must be exactly the width-taking rule applied \
+             to the ambient width"
+        );
+        assert_eq!(
+            output_chunk_len_for(1, n, k),
+            n,
+            "one worker cannot split the output"
+        );
+        assert_eq!(
+            output_chunk_len_for(0, n, k),
+            n,
+            "a zero width must degrade to serial, not divide by zero"
+        );
+        assert!(
+            output_chunk_len_for(16, n, k) <= output_chunk_len_for(2, n, k),
+            "more workers must not produce a coarser partition"
+        );
     }
 
     /// The fallback half: work that genuinely routes to Rayon must still run,
