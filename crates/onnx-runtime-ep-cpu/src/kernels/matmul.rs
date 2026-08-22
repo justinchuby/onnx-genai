@@ -309,11 +309,16 @@ fn node_weight_transpose_cache_bytes(node: &Node, graph: &Graph) -> u64 {
 
 /// Evict all entries from the global weight-transpose caches.
 ///
-/// **Must** be called when an Executor drops: the caches are keyed by
-/// (address, K, N), which makes a stale entry impossible for a *different*
-/// tensor, but a later model whose mmap places a **same-shaped** weight at a
-/// recycled address would still match. Clearing on Executor drop closes that
-/// remaining lifetime window and bounds cache growth across model lifetimes.
+/// **Must** be called when an Executor drops. The caches are keyed by
+/// (address, K, N), and an address only names a tensor while that tensor is
+/// *live*: once freed, a same-shaped weight landing on the recycled address
+/// matches the key and is served the previous weight's rows (#1726). Clearing
+/// on Executor drop bounds cache growth across model lifetimes and closes that
+/// window for the prewarmed entries, which have no other owner; entries a
+/// [`MatMulPrepack`] installed are evicted when it drops.
+///
+/// Note this runs *before* `Executor::drop` frees the weight buffers, which is
+/// what makes the teardown ordering safe rather than merely lucky.
 pub fn clear_weight_transpose_caches() {
     weight_transpose::clear_all();
 }
@@ -672,12 +677,12 @@ pub(crate) struct MatMulPrepack {
         not(any(target_os = "macos", target_os = "ios")),
         allow(dead_code, reason = "consumed only by the Apple Accelerate paths")
     )]
-    transposed_b: OnceLock<(WeightTransposeKey, Arc<Vec<f32>>)>,
+    transposed_b: OnceLock<(WeightTransposeKey, bool, Arc<Vec<f32>>)>,
     /// Lazily-computed f16 transpose of the B weight matrix, with the key it
     /// was computed for. Stores the raw u16 bit patterns of half::f16 in N×K
     /// layout, read directly from the mmap'd model file without widening to
     /// f32. Only populated when B is a constant Float16 input.
-    transposed_b_f16: OnceLock<(WeightTransposeKey, Arc<Vec<u16>>)>,
+    transposed_b_f16: OnceLock<(WeightTransposeKey, bool, Arc<Vec<u16>>)>,
     /// Lazily-computed contiguous f16 copy of B for non-contiguous weight
     /// matrices (e.g. lm_head vocab projection stored column-major in the ONNX
     /// model). Stores raw u16 bit patterns in row-major K×N layout. Only
@@ -688,6 +693,45 @@ pub(crate) struct MatMulPrepack {
         allow(dead_code, reason = "consumed only by the Apple Accelerate paths")
     )]
     contiguous_b_f16: OnceLock<Arc<Vec<u16>>>,
+}
+
+/// Entries this prepack *installed* in the process-global transpose caches must
+/// not outlive it (#1726).
+///
+/// Those caches are keyed on `(address, k, n, tag)` and hold no claim on the
+/// buffer at that address. A `1024 x 1024` f16 weight is 2 MiB, which glibc
+/// serves by `mmap` at first; freeing one raises the dynamic mmap threshold, so
+/// the *next* same-size weight is cut from the brk heap and readily lands on a
+/// just-freed address. The lookup then hits, the route counter reads exactly
+/// what it should, and the kernel multiplies another weight's rows -- values
+/// that are not a function of the inputs, which is how #1726 presented.
+///
+/// Ownership is the installing call, not merely reaching the entry: a prepack
+/// that shared one someone else put there records `false` and evicts nothing.
+/// That distinction is load-bearing. The model-load prewarms
+/// ([`precompute_f16_weight_transpose`]) install under the same key a consuming
+/// kernel later computes, so an unconditional eviction here would let the first
+/// transient consumer to drop pull the prewarmed transpose out from under a
+/// live one -- silently undoing the TTFT work the prewarm exists to do, and
+/// undercounting `weight_transpose_cache_bytes` while the bytes are still
+/// resident behind a sibling's `Arc`.
+///
+/// What this closes is the *transient* weight: a prepack whose source is freed
+/// while the process lives on. It is not what protects a session teardown --
+/// there `Executor::drop` clears the caches before it frees the weight buffers,
+/// and the prepacks (a struct field) drop afterwards onto an already-empty map.
+/// A prepack holds an `Arc` of the transpose and a bare address, never the
+/// source itself, so nothing here keeps a weight alive; the guarantee is only
+/// that the entry does not outlive the prepack that put it there.
+impl Drop for MatMulPrepack {
+    fn drop(&mut self) {
+        if let Some((key, true, _)) = self.transposed_b.get() {
+            weight_transpose::evict_f32(key);
+        }
+        if let Some((key, true, _)) = self.transposed_b_f16.get() {
+            weight_transpose::evict_half(key);
+        }
+    }
 }
 
 impl Default for MatMulPrepack {
@@ -808,10 +852,10 @@ impl MatMulPrepack {
         if key.numel() != Some(b.len()) {
             return None;
         }
-        let (cached_key, bt) = self.transposed_b.get_or_init(|| {
-            let bt = weight_transpose::cached_transpose_f32(b, k, n)
+        let (cached_key, _, bt) = self.transposed_b.get_or_init(|| {
+            let (bt, installed) = weight_transpose::cached_transpose_f32_reporting(b, k, n)
                 .expect("length was validated against [k, n] above");
-            (key, bt)
+            (key, installed, bt)
         });
         (*cached_key == key).then(|| bt.as_slice())
     }
@@ -830,7 +874,7 @@ impl MatMulPrepack {
     pub(crate) fn retained_transpose_bytes(&self) -> u64 {
         self.transposed_b_f16
             .get()
-            .map_or(0, |(_, bt)| bt.len() * std::mem::size_of::<u16>()) as u64
+            .map_or(0, |(_, _, bt)| bt.len() * std::mem::size_of::<u16>()) as u64
     }
 
     /// Like [`transposed_b`](Self::transposed_b) but preserves the original f16
@@ -901,10 +945,10 @@ impl MatMulPrepack {
             HalfFormat::Bf16 => 1,
         };
         let key = WeightTransposeKey::tagged(src.as_ptr(), k, n, tag);
-        let (cached_key, bt) = self.transposed_b_f16.get_or_init(|| {
-            let bt = weight_transpose::cached_transpose_half(src, k, n, tag)
+        let (cached_key, _, bt) = self.transposed_b_f16.get_or_init(|| {
+            let (bt, installed) = weight_transpose::cached_transpose_half_reporting(src, k, n, tag)
                 .expect("length was validated against [k, n] above");
-            (key, bt)
+            (key, installed, bt)
         });
         (*cached_key == key).then(|| bt.as_slice())
     }
@@ -5936,7 +5980,7 @@ mod tests {
             // replaces an older "must not transpose at all" -- the concern it
             // encoded (a silent, weight-scaled resident buffer) is preserved,
             // and now checked against the number the plan budgets.
-            if let Some((_, bt)) = kernel.prepack.transposed_b_f16.get() {
+            if let Some((_, _, bt)) = kernel.prepack.transposed_b_f16.get() {
                 assert_eq!(
                     bt.len(),
                     k * n,
@@ -6012,6 +6056,140 @@ mod tests {
                 "column {index}: {g} != {w}"
             );
         }
+    }
+
+    /// A weight freed at one address must not lend its transpose to the next
+    /// weight that lands there (#1726).
+    ///
+    /// The global f16 transpose cache is keyed on `(address, k, n, tag)` and
+    /// nothing checks that the buffer still holds what was transposed, so a
+    /// recycled allocation of the same shape and dtype is served the *previous*
+    /// weight's rows. The route counter still reads 1, because the right route
+    /// did run -- it just read another weight's bytes. That is #1726's exact
+    /// signature: right route, values that are not a function of the inputs.
+    ///
+    /// The rounds matter. A `1024 x 1024` f16 weight is 2 MiB, which glibc
+    /// serves by `mmap` at first; freeing it raises the dynamic mmap threshold
+    /// so later same-size requests come from the brk heap, where the address is
+    /// promptly reused. The first rounds therefore establish the recycling that
+    /// the later rounds detect, which is why one allocate/free pair is not
+    /// enough to see this.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn a_recycled_weight_address_must_not_serve_the_previous_weights_transpose() {
+        if !crate::backend::has_simd_x86() {
+            return;
+        }
+        let (k, n) = (1024usize, 1024usize);
+        let a_data: Vec<f32> = (0..k).map(|i| ((i % 17) as f32 - 8.0) / 16.0).collect();
+        // Distinct weights. The second is deliberately *not* on the 1/16 grid,
+        // so a stale read is arithmetically unmistakable rather than a rounding
+        // argument: every honest dot product here is a multiple of 1/256.
+        let first_data: Vec<f32> = (0..k * n).map(|i| ((i % 19) as f32 - 9.0) / 16.0).collect();
+        let second_data: Vec<f32> = (0..k * n)
+            .map(|i| ((i % 23) as f32 - 11.0) / 32.0 + 0.001_953_125)
+            .collect();
+        let want_first = naive_matmul(&a_data, &first_data, 1, k, n);
+        let want_second = naive_matmul(&a_data, &second_data, 1, k, n);
+
+        let decode = |b_data: &[f32]| -> (Vec<f32>, usize) {
+            let a = Owned::f16(&[1, k], &a_data);
+            let b = Owned::f16(&[k, n], b_data);
+            let addr = b.view().data_ptr::<u16>() as usize;
+            let mut out = Owned::zeros_f32(&[1, n]);
+            let mut kernel = MatMulKernel::default();
+            kernel.set_constant_inputs(&[false, true]);
+            kernel
+                .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+                .unwrap();
+            (out.to_f32(), addr)
+        };
+
+        let mut seen: Vec<(usize, bool)> = Vec::new();
+        let mut recycled_across_weights = false;
+        for round in 0..8 {
+            let (first_half, want) = if round % 2 == 0 {
+                (true, &want_first)
+            } else {
+                (false, &want_second)
+            };
+            let data: &[f32] = if first_half {
+                &first_data
+            } else {
+                &second_data
+            };
+            let (got, addr) = decode(data);
+            // Only a *cross-weight* reuse recreates the hazard: the same weight
+            // landing on its own former address would be served a transpose of
+            // identical bytes and prove nothing.
+            let recycled = seen
+                .iter()
+                .any(|&(seen_addr, seen_first)| seen_addr == addr && seen_first != first_half);
+            recycled_across_weights |= recycled;
+            seen.push((addr, first_half));
+            for (index, (g, w)) in got.iter().zip(want).enumerate() {
+                assert!(
+                    (g - w).abs() <= 2e-2 * (1.0 + w.abs()),
+                    "round {round} column {index}: {g} != {w} (address {addr:#x} \
+                     recycled={recycled}) -- a transpose cached for a previous \
+                     weight at this address was served to this one"
+                );
+            }
+        }
+        // Without this the test could pass by never recreating the hazard --
+        // a silent regression into proving nothing. Reuse by the *same* weight
+        // does not count, so this cannot be satisfied vacuously by an allocator
+        // that happens to hand back one buffer's own address.
+        assert!(
+            recycled_across_weights,
+            "no address was reused across weights in {} rounds, so this run did \
+             not exercise the recycling hazard it exists to catch; addresses: {:#x?}",
+            seen.len(),
+            seen
+        );
+    }
+
+    /// A prewarmed transpose must survive the drop of a kernel that merely
+    /// *used* it (#1726 follow-up).
+    ///
+    /// The eviction that closes #1726 belongs to the call that installed the
+    /// entry, not to everyone who reaches it. `precompute_f32_weight_transpose`
+    /// installs at model load under exactly the key a consuming kernel later
+    /// computes, and discards its `Arc` on purpose so the global cache is what
+    /// retains the work. If a transient consumer evicted on drop, the first
+    /// kernel-cache shape eviction would throw away the prewarm -- the TTFT
+    /// spike it exists to prevent -- and would undercount
+    /// `weight_transpose_cache_bytes` while a sibling `Arc` still holds the
+    /// bytes resident.
+    #[test]
+    fn a_prewarmed_transpose_outlives_a_kernel_that_only_shared_it() {
+        let (k, n) = (48usize, 64usize);
+        let b_data: Vec<f32> = (0..k * n).map(|i| (i % 13) as f32 - 6.0).collect();
+        let ptr = b_data.as_ptr();
+        // Start from a known state: a since-freed weight of these dims may have
+        // left a stale entry at this recycled address.
+        weight_transpose::f32_cache_evict(ptr, k, n);
+
+        weight_transpose::cached_transpose_f32(&b_data, k, n).expect("prewarm installs");
+        assert!(
+            weight_transpose::f32_cache_contains(ptr, k, n),
+            "precondition: the prewarm must be resident before the consumer runs"
+        );
+
+        {
+            let mut prepack = MatMulPrepack::default();
+            prepack.set_constant_inputs(&[false, true]);
+            assert!(
+                prepack.transposed_b(&b_data, k, n).is_some(),
+                "the consumer must reach the prewarmed entry"
+            );
+        }
+
+        assert!(
+            weight_transpose::f32_cache_contains(ptr, k, n),
+            "a kernel that only shared the prewarmed transpose evicted it on drop"
+        );
+        weight_transpose::f32_cache_evict(ptr, k, n);
     }
 
     #[test]
@@ -6201,7 +6379,7 @@ mod tests {
                 .prepack
                 .transposed_b_f16
                 .get()
-                .map_or(0, |(_, bt)| bt.len() * 2) as u64;
+                .map_or(0, |(_, _, bt)| bt.len() * 2) as u64;
             let (node, graph) = half_matmul_node(HalfFormat::F16, k, n);
             let predicted = node_weight_transpose_cache_bytes(&node, &graph);
             assert!(
