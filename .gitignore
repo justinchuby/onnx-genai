@@ -88,6 +88,9 @@ bench-bins/
 .rg_*
 .rv_*
 .roy_*
+# Summary transcript from roy_validate.sh. The per-gate logs match `.rv_*`,
+# but the summary did not, so it was easy to commit by accident with `add -A`.
+roy_validate.log
 
 # Deckard local bench env + scratch (not for PR)
 .deckard_env.sh
