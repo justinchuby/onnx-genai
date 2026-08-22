@@ -2302,42 +2302,46 @@ credible-looking error bar. `acc0_gap_matrix.py` therefore refuses to start a
 cell while any other process is above 150% CPU, and marks the cell `UNTRUSTED`
 rather than silently proceeding if it cannot wait one out.
 
-### What survives contention: the within-window bandwidth comparison
+### What survives contention, and a claim withdrawn on review
 
-Absolute throughput on this host is currently worthless, so every claim below is
-a **ratio between the two arms measured back-to-back in the same window**, which
-is the one form that survives — both arms eat the same contention.
-
-Interleaved native / ORT / native on `qwen t=16 s=1 acc=0`, with the native A/A
-partner confirming the native arm's own noise floor at **1.018**:
+Absolute throughput on this host is not stable, so the instinct was to fall back
+on a **ratio between the two arms measured back-to-back in the same window** on
+the grounds that both arms eat the same contention. Interleaved native / ORT /
+native, native A/A partner at **1.018**:
 
 | arm | tok/s | achieved GB/s on the same 145.7 MB/token footprint |
 |---|---|---|
-| native acc0 | 196.0 | **28.5** |
-| ORT | 279.5 | **40.7** |
+| native acc0 | 196.0 | 28.5 |
+| ORT | 279.5 | 40.7 |
 
-**ORT sustains 1.43x our bandwidth on the identical weight footprint, in the
-identical environment.** That is the decisive observation, and it is why the
-GB/s columns exist: ORT *demonstrates* that more bandwidth was available on this
-machine at that moment. We are therefore not limited by the memory system, and
-"the host is busy" cannot explain the difference — it was busy for both arms.
+That was originally written up as a "decisive observation" that ORT reaches a
+bandwidth we do not, and that this direction was stable even if the multiplier
+was not. **Opus review rejected that, correctly, and it is withdrawn.** The
+refutation is in this document's own bistability data below:
 
-A later quiet-host run of the same cell gives 272.7 vs 436.2 tok/s (28.5 → 39.7
-and 40.7 → 63.5 GB/s), i.e. **1.60x**. Both figures are draws from the bistable
-distribution characterised below; the qualitative point — ORT reaching a
-bandwidth we do not, under whatever conditions both arms share — is what is
-stable across them, not the specific multiplier.
+* Pair 8 has native at **264.9** against ORT at **255.0** — native out-bandwidths
+  ORT in the same shared window. So the direction is not universal.
+* Native's own fast placement, **335.6 tok/s = 48.9 GB/s**, is *higher* than the
+  40.7 GB/s ORT figure quoted above as decisive.
 
-The complementary absolute framing (a single pinned core sustaining ~3.4 GB/s
-against a 31–36 GB/s per-CCX ceiling, ≈2.3 MACs/cycle against AVX2+FMA's 16, so
-~14% of arithmetic peak) points the same way — at the nibble unpack and int→f32
-conversion feeding each FMA rather than at traffic — but it is **not being
-claimed as a number yet**. Contention depresses it, so it is only a lower bound,
-and a lower bound cannot by itself establish distance from a ceiling. It needs a
-quiet host. Note also that CPU-time-per-token, the obvious contention-immune
-substitute, is *not* immune here: a busy SMT sibling steals execution-unit
-throughput while the thread keeps accruing CPU time, so it inflates rather than
-cancels.
+The A/A of 1.018 does not rescue it. That partner controls native-vs-native
+placement stability across two native launches; it says nothing about which L3
+placement the separately-launched **ORT** process drew. Quoting native at 28.5
+GB/s against ORT at 40.7 GB/s compares native's slow placement with ORT's fast
+one, and then calls the difference stable. That is precisely the objection used
+two subsections above to withhold the "ORT is intrinsically bimodal" and "~14% of
+FMA peak" claims — a placement-depressed number is a **lower bound**, and I
+applied that standard to two claims and then failed to apply it to a third.
+
+**What the evidence actually supports**, stated at the strength it can carry:
+
+* In some shared windows ORT out-bandwidths native; in at least one, native
+  out-bandwidths ORT. Both arms are placement-bistable per process launch.
+* **We are not memory-bound, and this conclusion is now *stronger*, not weaker.**
+  Native's own fast mode demonstrates the memory system supplies at least 48.9
+  GB/s to *our* kernel. So our common-case 28.5 GB/s is not a hardware ceiling —
+  it is something we are leaving on the table. That is a better-founded statement
+  than the retracted one, and it does not depend on the ORT arm at all.
 
 ### The MLP-starvation hypothesis is provisionally falsified
 
@@ -2409,10 +2413,13 @@ bounds-checked indexing, and the dependency chain through `blk[c]` into `acc[c]`
 are all per-block too. The *direction* is established; the full decomposition is
 not, and should not be claimed until a prototype confirms it.
 
-Block 16 is a separate effect and is not evidence for anything here: `chunks =
-block_size / 32` is **zero** at block 16, and `!block_size.is_multiple_of(32)`
-sends it to the scalar fallback entirely. It is slow because it is not
-vectorised at all.
+Block 16 is a separate effect and is not evidence for anything here: the
+dispatch gate at `matmul_nbits.rs:1568` requires `block_size.is_multiple_of(32)`,
+so block 16 **never enters `borrowed_int4_nblock4_avx2` at all** and is routed to
+`borrowed_affine_int4_matmul` instead. It is slow because it is not taking this
+kernel, not because of anything inside it. (An earlier draft of this section
+blamed `chunks = block_size / 32` evaluating to zero; that line is unreachable
+for block 16 and the attribution was wrong, though the exclusion is right.)
 
 The code says the same thing. In `borrowed_int4_nblock4_avx2` the inner chunk
 loop runs `block_size / 32` times, so **at block 32 it runs exactly once**, and
@@ -2506,7 +2513,15 @@ ratios on this host are not reproducible, whichever arm they favour.
   same sweep and should not be picked up by the next reader.
 * The dispatch-width question was handed to the runtime owner with CPU-time
   evidence (total CPU-seconds flat across widths, `sys` time rising ~20x from
-  `t<=2` to `t>=4`) rather than tuned around in the kernel.
+  `t<=2` to `t>=4`) rather than tuned around in the kernel. This also supplies a
+  **mechanism for a previously unexplained anomaly**: the acc4 regime document
+  recorded that `ONNX_GENAI_CPU_DECODE_THREADS=2` produces timings identical to
+  `=1` (23.529 vs 23.527 ms/token) and dropped the row rather than explain it.
+  That reproduces here (23.6 vs 23.6 tok/s), and `/usr/bin/time` shows the `=2`
+  run consuming **71% of one core against 98% for `=1`** at the same total user
+  time — the second worker is parked, not computing. A knob that silently does
+  nothing is worse than a slow one, because every sweep through it prints a flat
+  line that reads as "this kernel does not scale".
 * **Benchmarking on this host now requires coordination.** Three agents share
   16 physical cores; two were running heavy jobs on this crate during this
   investigation, one of them the very same benchmark binary. Cross-agent notice
