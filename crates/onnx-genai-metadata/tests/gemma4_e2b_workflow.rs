@@ -357,13 +357,10 @@ fn a_folded_carry_output_must_be_a_proposer_output() {
 /// `port_bindings.target_hidden_context`, or the carry has no seed.
 #[test]
 fn a_folded_carry_requires_a_target_hidden_context_binding() {
-    let mutated = ASSISTANT.replace(
-        "  port_bindings:\n    target_hidden_context: inputs_embeds\n",
-        "",
-    );
+    let mutated = ASSISTANT.replace("    target_hidden_context: inputs_embeds\n", "");
     assert_ne!(
         mutated, ASSISTANT,
-        "the port_bindings block must be present to remove"
+        "the target_hidden_context line must be present to remove"
     );
     let metadata = serde_yaml::from_str::<InferenceMetadata>(&mutated).expect("mutated parses");
     let errors = validate_metadata(&metadata)
