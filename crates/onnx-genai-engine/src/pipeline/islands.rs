@@ -139,7 +139,7 @@ impl ExecutionIsland {
         &self.components
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "ort-cuda"))]
     pub(crate) fn session(&self) -> &Session {
         &self.session
     }
