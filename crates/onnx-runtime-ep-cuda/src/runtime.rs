@@ -354,6 +354,17 @@ pub struct CudaRuntime {
     raw_pool_classes: Mutex<HashMap<CUdeviceptr, usize>>,
     raw_pool_retained: AtomicU64,
     raw_pool_hits: AtomicU64,
+    /// The one cuBLASLt workspace shared by every GEMM on this runtime's
+    /// compute stream. Allocated on first use and never freed until the
+    /// runtime drops.
+    ///
+    /// cuBLASLt scratch does not carry state between calls, and work on a
+    /// single stream is serial, so one buffer per stream is exactly as correct
+    /// as one per call — while a per-call allocation costs
+    /// [`WORKSPACE_BYTES`] for every attention op in flight. Measured on a
+    /// 32-layer 1.8B model, the per-call path put hundreds of MiB of raw
+    /// device memory behind a prefill that needed 32 MiB.
+    shared_blas_workspace: Mutex<Option<CUdeviceptr>>,
     host_to_device_copies: AtomicU64,
     device_to_host_copies: AtomicU64,
     async_host_to_device_copies: AtomicU64,
@@ -538,6 +549,7 @@ impl CudaRuntime {
             raw_pool_classes: Mutex::new(HashMap::new()),
             raw_pool_retained: AtomicU64::new(0),
             raw_pool_hits: AtomicU64::new(0),
+            shared_blas_workspace: Mutex::new(None),
             host_to_device_copies: AtomicU64::new(0),
             device_to_host_copies: AtomicU64::new(0),
             async_host_to_device_copies: AtomicU64::new(0),
@@ -1294,6 +1306,28 @@ impl CudaRuntime {
     /// Device bytes currently held in the `alloc_raw` pool.
     pub fn raw_pool_retained_bytes(&self) -> u64 {
         self.raw_pool_retained.load(Ordering::Relaxed)
+    }
+
+    /// The cuBLASLt workspace shared by every GEMM on this runtime's stream.
+    ///
+    /// Allocated on first use and retained for the runtime's lifetime, so a
+    /// warm call makes no allocation and stays CUDA-graph capture-safe. Callers
+    /// must not free the returned pointer.
+    ///
+    /// Sharing is sound because cuBLASLt scratch carries nothing between calls
+    /// and work on one stream is serial: two GEMMs on this runtime cannot be
+    /// mid-flight at once, so they cannot observe each other's scratch.
+    pub fn shared_blas_workspace(&self, bytes: usize) -> Result<CUdeviceptr> {
+        let mut slot = self
+            .shared_blas_workspace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(ptr) = *slot {
+            return Ok(ptr);
+        }
+        let ptr = self.alloc_raw(bytes)?;
+        *slot = Some(ptr);
+        Ok(ptr)
     }
 
     fn take_pooled(&self, class: usize) -> Option<CUdeviceptr> {
