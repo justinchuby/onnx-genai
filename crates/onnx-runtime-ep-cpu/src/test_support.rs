@@ -191,6 +191,29 @@ mod tests {
         unsafe { std::env::remove_var(PRESENT) };
     }
 
+    /// `unset` is the entry point for tests that assert a variable's *default*
+    /// (absent) behaviour. Covered here rather than only from the
+    /// `x86_64`-gated callers, so the helper is exercised -- and is not dead
+    /// code -- on every architecture the crate is checked for.
+    #[test]
+    fn unset_hides_a_present_variable_and_puts_it_back() {
+        let _lock = local_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: this module's tests are serialised by `local_env_lock`.
+        unsafe { std::env::set_var(PRESENT, "visible") };
+        {
+            let _env = EnvVarGuard::unset(PRESENT);
+            assert!(
+                std::env::var_os(PRESENT).is_none(),
+                "the variable must be absent for the guard's lifetime"
+            );
+        }
+        assert_eq!(std::env::var(PRESENT).as_deref(), Ok("visible"));
+        // SAFETY: see above.
+        unsafe { std::env::remove_var(PRESENT) };
+    }
+
     /// The whole point of the type: the restore must survive an unwind. Without
     /// `Drop` this leaks the override into every later test in the binary.
     #[test]
