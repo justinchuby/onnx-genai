@@ -165,7 +165,7 @@ mod mm_profile {
 
 /// Overrides the bounded M=1 decode pool size; set to `0` to use the global
 /// Rayon pool as an escape hatch.
-const DECODE_THREADS_ENV: &str = "ONNX_GENAI_CPU_DECODE_THREADS";
+pub(crate) const DECODE_THREADS_ENV: &str = "ONNX_GENAI_CPU_DECODE_THREADS";
 
 /// `mlas-sys` reads the same knob to size its standalone pool. Fail the build
 /// rather than let the two names drift apart silently.
