@@ -69,7 +69,12 @@ impl<'a> GroupPorts<'a> {
         self.aliases
             .iter()
             .filter(|(_, _, alias)| alias.access == crate::schema::StatePortAccess::ReadWrite)
-            .map(|(_, _, alias)| (alias.input.as_str(), alias.output.as_str()))
+            .filter_map(|(_, _, alias)| {
+                // A read-write transition always names an output (validation
+                // enforces it); the filter_map keeps this total without an
+                // unwrap.
+                Some((alias.input.as_str(), alias.output.as_deref()?))
+            })
     }
 
     fn with_role(&self, wanted: StatePortRole) -> Vec<&'a crate::schema::StatePortAlias> {
@@ -348,7 +353,13 @@ fn derive_static_cache(
         kv_sequence_length_input,
         key_cache_inputs: keys.iter().map(|alias| alias.input.clone()).collect(),
         value_cache_inputs: values.iter().map(|alias| alias.input.clone()).collect(),
-        key_cache_outputs: keys.iter().map(|alias| alias.output.clone()).collect(),
-        value_cache_outputs: values.iter().map(|alias| alias.output.clone()).collect(),
+        key_cache_outputs: keys
+            .iter()
+            .filter_map(|alias| alias.output.clone())
+            .collect(),
+        value_cache_outputs: values
+            .iter()
+            .filter_map(|alias| alias.output.clone())
+            .collect(),
     })
 }

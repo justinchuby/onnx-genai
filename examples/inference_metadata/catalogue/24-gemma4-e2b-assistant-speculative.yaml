@@ -8,8 +8,10 @@
 #   * Cacheless assistant: the drafter owns NO attention KV. It reads the
 #     target-owned `full_attention` and `sliding_attention` groups through
 #     `access: read_only` aliases, so it observes the committed prefix without
-#     advancing or aliasing it. The read-only present outputs it still exposes
-#     (a fused-attention kernel emits them) are discarded, never a transition.
+#     advancing or aliasing it. This drafter is a pure reader — its graph emits
+#     no present KV at all — so its read-only aliases omit `output` entirely.
+#     (A reader whose kernel does emit a discarded present may still name it; the
+#     value is never a state transition either way.)
 #   * Heterogeneous, subset KV: the target owns two global layers (0, 1) and one
 #     local layer (0) with independent head counts and head widths; the drafter
 #     reads only global layer 0 and local layer 0, mapping its two attention
@@ -120,10 +122,6 @@ pipeline:
           outputs:
             draft_logits: {dtype: float16, rank: 3, shape: [batch, sequence, draft_vocab], batch_layout: {kind: request_aligned, axis: 0}}
             next_projected_state: {dtype: float16, rank: 3, shape: [batch, sequence, hidden], batch_layout: {kind: request_aligned, axis: 0}}
-            present_full_key_0: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
-            present_full_value_0: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
-            present_sliding_key_0: {dtype: float16, rank: 4, shape: [batch, sliding_kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
-            present_sliding_value_0: {dtype: float16, rank: 4, shape: [batch, sliding_kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
       target:
         implementation: {kind: onnx, artifact: gemma4_e2b/decoder.onnx.textproto}
         ports:
@@ -215,10 +213,6 @@ pipeline:
       outputs:
         draft_logits: draft.logits
         next_projected_state: draft.projected_state
-        present_full_key_0: draft.present_full_key_0
-        present_full_value_0: draft.present_full_value_0
-        present_sliding_key_0: draft.present_sliding_key_0
-        present_sliding_value_0: draft.present_sliding_value_0
     - kind: invoke
       component: target
       inputs:
@@ -262,8 +256,8 @@ pipeline:
                 full_key_1: {input: full_key_1, output: next_full_key_1, role: key, layer: 1}
                 full_value_1: {input: full_value_1, output: next_full_value_1, role: value, layer: 1}
               assistant:
-                full_key_0: {input: full_key_0, output: present_full_key_0, access: read_only, role: key, layer: 0}
-                full_value_0: {input: full_value_0, output: present_full_value_0, access: read_only, role: value, layer: 0}
+                full_key_0: {input: full_key_0, access: read_only, role: key, layer: 0}
+                full_value_0: {input: full_value_0, access: read_only, role: value, layer: 0}
           sliding_attention:
             kind: sliding_attention
             sequence_axis: 2
@@ -276,8 +270,8 @@ pipeline:
                 sliding_key_0: {input: sliding_key_0, output: next_sliding_key_0, role: key, layer: 0}
                 sliding_value_0: {input: sliding_value_0, output: next_sliding_value_0, role: value, layer: 0}
               assistant:
-                sliding_key_0: {input: sliding_key_0, output: present_sliding_key_0, access: read_only, role: key, layer: 0}
-                sliding_value_0: {input: sliding_value_0, output: present_sliding_value_0, access: read_only, role: value, layer: 0}
+                sliding_key_0: {input: sliding_key_0, access: read_only, role: key, layer: 0}
+                sliding_value_0: {input: sliding_value_0, access: read_only, role: value, layer: 0}
           assistant_state:
             kind: recurrent
             layout: bsh

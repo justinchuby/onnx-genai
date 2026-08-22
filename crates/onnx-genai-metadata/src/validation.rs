@@ -1869,12 +1869,31 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                             alias.input
                         ));
                     }
-                    if !inferred_ports && !component.ports.outputs.contains_key(&alias.output) {
-                        errors.push(format!(
-                            "state service group '{group_name}' component '{component_name}' \
-                             output alias '{}' is not a declared port",
-                            alias.output
-                        ));
+                    match &alias.output {
+                        Some(output) => {
+                            if !inferred_ports && !component.ports.outputs.contains_key(output) {
+                                errors.push(format!(
+                                    "state service group '{group_name}' component \
+                                     '{component_name}' output alias '{output}' is not a declared \
+                                     port"
+                                ));
+                            }
+                        }
+                        None => {
+                            // Only a read-only borrow may omit its output: a
+                            // pure reader consumes a frozen buffer and advances
+                            // nothing, so it exposes no present port. A
+                            // read-write transition with no output could never
+                            // be written back.
+                            if alias.access != crate::schema::StatePortAccess::ReadOnly {
+                                errors.push(format!(
+                                    "state service group '{group_name}' component \
+                                     '{component_name}' read-write alias for input '{}' declares \
+                                     no output; only a read_only borrow may omit one",
+                                    alias.input
+                                ));
+                            }
+                        }
                     }
                 }
             }

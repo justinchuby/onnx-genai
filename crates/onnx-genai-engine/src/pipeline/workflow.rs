@@ -1782,7 +1782,7 @@ impl PipelineEngine {
                     .filter_map(|group| group.ports.get(component))
                     .flat_map(|aliases| aliases.values())
                     .filter(|alias| alias.access == onnx_genai_metadata::StatePortAccess::ReadWrite)
-                    .map(|alias| (alias.output.clone(), alias.input.clone()))
+                    .filter_map(|alias| Some((alias.output.clone()?, alias.input.clone())))
                     .collect::<HashMap<_, _>>()
             })
             .unwrap_or_default();

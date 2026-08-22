@@ -264,3 +264,28 @@ fn both_packages_lower_to_an_executable_plan() {
         );
     }
 }
+
+/// The read-only relaxation is narrow: a read-WRITE alias that names no output
+/// port is still rejected, because a transition with no output cannot be
+/// written back.
+#[test]
+fn a_read_write_alias_still_requires_an_output() {
+    // Flip one of the assistant's read-only borrows into a (default) read-write
+    // alias while leaving it without an output port.
+    let mutated = ASSISTANT.replace(
+        "full_key_0: {input: full_key_0, access: read_only, role: key, layer: 0}",
+        "full_key_0: {input: full_key_0, role: key, layer: 0}",
+    );
+    assert_ne!(
+        mutated, ASSISTANT,
+        "the read-only alias line must be present to mutate"
+    );
+    let metadata = serde_yaml::from_str::<InferenceMetadata>(&mutated).expect("mutated parses");
+    let errors = validate_metadata(&metadata).expect_err("a read-write alias with no output fails");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("declares no output")),
+        "expected a missing-output error, got: {errors:?}"
+    );
+}

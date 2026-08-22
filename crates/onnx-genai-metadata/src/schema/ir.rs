@@ -1250,7 +1250,16 @@ pub struct StateGroupCapabilities {
 #[serde(deny_unknown_fields)]
 pub struct StatePortAlias {
     pub input: String,
-    pub output: String,
+    /// Graph output port carrying this pair's next-step value.
+    ///
+    /// Required for a read-write transition. A `read_only` binding MAY omit it:
+    /// a pure borrowed-state reader — e.g. a shared-KV drafter that consumes
+    /// another decoder's cache and advances nothing — exposes no present output
+    /// at all, so there is nothing to name. A read-only reader whose artifact
+    /// still emits a discarded present output for kernel-ABI reasons may name it
+    /// here, but that value is never a state transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
     /// Whether this component advances the state or only observes a frozen
     /// value produced by another component in the same service group.
     ///

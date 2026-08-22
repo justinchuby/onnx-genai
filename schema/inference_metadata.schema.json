@@ -4207,7 +4207,11 @@
           ]
         },
         "output": {
-          "type": "string"
+          "description": "Graph output port carrying this pair's next-step value.\n\nRequired for a read-write transition. A `read_only` binding MAY omit it:\na pure borrowed-state reader — e.g. a shared-KV drafter that consumes\nanother decoder's cache and advances nothing — exposes no present output\nat all, so there is nothing to name. A read-only reader whose artifact\nstill emits a discarded present output for kernel-ABI reasons may name it\nhere, but that value is never a state transition.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "role": {
           "anyOf": [
@@ -4222,8 +4226,7 @@
         }
       },
       "required": [
-        "input",
-        "output"
+        "input"
       ],
       "type": "object"
     },
