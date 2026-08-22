@@ -10940,7 +10940,7 @@ mod tests {
                 )
                 .unwrap();
             let cached = kernel.weight_nk.get().is_some();
-            (y.bytes, cached)
+            (std::mem::take(&mut y.bytes), cached)
         };
 
         let (bytes_enabled, cached_enabled) = run(true);

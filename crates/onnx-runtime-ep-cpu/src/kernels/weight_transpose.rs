@@ -250,6 +250,17 @@ impl<T: Copy + Default + Send + Sync> TransposeCache<T> {
             .clear();
     }
 
+    /// Drop every entry whose key names `addr`, whatever its shape or tag.
+    ///
+    /// See [`evict_address`] for why an entry must not outlive the buffer its
+    /// key points at.
+    pub fn evict_address(&self, addr: usize) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|key, _| key.addr != addr);
+    }
+
     /// Return the `[n, k]` row-major transpose of the `[k, n]` row-major matrix
     /// `src`, computing and caching it on a miss.
     ///
@@ -459,6 +470,20 @@ pub fn cache_bytes() -> usize {
 pub fn clear_all() {
     WEIGHT_TRANSPOSE_F16.clear();
     WEIGHT_TRANSPOSE_F32.clear();
+}
+
+/// Evict every entry keyed on `addr`, across both global caches and every
+/// shape and tag recorded for it.
+///
+/// The key is `(addr, k, n, tag)` and carries no link to the buffer's
+/// lifetime, so an entry outliving its weight is a correctness hazard rather
+/// than merely stale memory: once the allocator recycles the block for another
+/// same-shaped weight the key *matches*, the lookup hits, and the kernel
+/// multiplies by the wrong matrix with no error and no diagnostic (#1731).
+/// Call this at the moment the buffer at `addr` dies.
+pub fn evict_address(addr: usize) {
+    WEIGHT_TRANSPOSE_F16.evict_address(addr);
+    WEIGHT_TRANSPOSE_F32.evict_address(addr);
 }
 
 #[cfg(test)]

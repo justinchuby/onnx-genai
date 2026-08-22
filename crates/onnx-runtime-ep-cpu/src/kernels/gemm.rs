@@ -1496,6 +1496,38 @@ mod half_decode_route_tests {
         }
     }
 
+    /// Falsifier for #1731: a recycled weight address must not serve another
+    /// weight's transpose.
+    ///
+    /// `WeightTransposeKey` is `(addr, k, n, tag)`. Nothing in that key is tied
+    /// to the *contents* or the *lifetime* of the buffer it names, so once the
+    /// first weight below is dropped and the allocator hands the same block to
+    /// the second, the lookup hits and the GEMV multiplies by the wrong matrix.
+    #[test]
+    fn a_recycled_weight_address_must_not_serve_another_weights_transpose() {
+        if !half_gemv::simd_available(HalfFormat::F16) {
+            return;
+        }
+        let (k, n) = (4096usize, 4096usize);
+        let a = operand(k, 0.25);
+
+        // Two *different* weights of identical shape and dtype.
+        let first = operand(k * n, -0.5);
+        let second = operand(k * n, 0.125);
+
+        // Populate the global cache for `first`, then let its buffer go.
+        let (_, _) = decode_gemm(k, n, &a, &first, false);
+
+        // `second` is very likely to land on the recycled block.
+        let (got, _) = decode_gemm(k, n, &a, &second, false);
+
+        let worst = worst_rel(&got, &reference(k, n, &a, &second));
+        assert!(
+            worst <= 2e-3,
+            "a recycled address served the previous weight's transpose: {worst:e}"
+        );
+    }
+
     /// A transposed weight is `[N, K]` and keeps its own GEMV at every size.
     ///
     /// Worth pinning separately because the `[N, K]` arm is the layout every

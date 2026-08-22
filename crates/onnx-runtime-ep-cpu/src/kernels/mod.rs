@@ -1933,6 +1933,29 @@ pub(crate) mod testutil {
         pub dtype: DataType,
     }
 
+    /// Dropping this buffer's weight-transpose entries is the test-side
+    /// counterpart of the Executor-drop eviction in `onnx-runtime-session`
+    /// (#1731).
+    ///
+    /// The transpose caches are keyed on `(weight address, K, N, tag)`, which
+    /// carries no link to the buffer's lifetime. Production closes that window
+    /// by evicting when an Executor drops; a test binary has no Executor, frees
+    /// these buffers constantly, and readily hands the same block to the next
+    /// same-shaped weight. The key then *matches*, the lookup hits, and the
+    /// kernel silently multiplies by a previous test's matrix -- a
+    /// deterministic wrong answer that surfaced as a ~50% flake in
+    /// `gemm_and_matmul_take_the_same_decode_route` and
+    /// `f16_decode_at_the_retired_weight_gate_keeps_the_gemv`.
+    ///
+    /// Eviction is scoped to *this* buffer's address so a live weight's entry
+    /// is never discarded -- the cache-accounting tests assert that an executed
+    /// kernel's transpose is still resident.
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            crate::kernels::weight_transpose::evict_address(self.bytes.as_ptr() as usize);
+        }
+    }
+
     impl Owned {
         pub fn f32(shape: &[usize], data: &[f32]) -> Self {
             let strides = compute_contiguous_strides(shape);

@@ -829,7 +829,7 @@ mod contiguous_fast_path_tests {
         CastKernel { to: Some(to) }
             .execute(&[input.view()], &mut [output.view_mut()])
             .unwrap();
-        output.bytes
+        std::mem::take(&mut output.bytes)
     }
 
     const TARGETS: [DataType; 12] = [

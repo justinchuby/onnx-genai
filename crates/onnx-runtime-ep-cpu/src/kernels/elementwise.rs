@@ -1824,7 +1824,7 @@ mod dense_broadcast_equivalence_tests {
         BinaryKernel { op, flops: None }
             .execute(&[l.view(), r.view()], &mut [out.view_mut()])
             .unwrap();
-        out.bytes
+        std::mem::take(&mut out.bytes)
     }
 
     /// Adversarial values: signed zeros, infinities, a NaN, subnormals and
