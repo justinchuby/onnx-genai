@@ -431,13 +431,15 @@ pub enum SpeculativeProposalExecution {
         /// `token_embedding_input` (`concat(embed(last_token), carry)`), so it
         /// owns no workflow state cell. Three ports pin the fold EXPLICITLY, so
         /// a runtime never infers by convention:
-        ///   * DESTINATION: `port_bindings.target_hidden_context` names the
-        ///     proposer input port the carry lands in (for a folded carry, the
-        ///     fused `token_embedding_input` itself; its trailing half).
-        ///   * carry_0 SOURCE: `folded_carry_seed` names the target output read
-        ///     as the carry on the first step.
-        ///   * carry_k SOURCE: this field, the proposer output on every later
-        ///     step.
+        ///
+        /// * DESTINATION: `port_bindings.target_hidden_context` names the
+        ///   proposer input port the carry lands in (for a folded carry, the
+        ///   fused `token_embedding_input` itself; its trailing half).
+        /// * carry_0 SOURCE: `folded_carry_seed` names the target output read
+        ///   as the carry on the first step.
+        /// * carry_k SOURCE: this field, the proposer output on every later
+        ///   step.
+        ///
         /// Because a folded carry is recomputed from committed tokens on
         /// rejection rather than restored, it does not appear in
         /// `rollback_state`. A chained proposer declares at least one of
