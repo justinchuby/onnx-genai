@@ -234,8 +234,8 @@ fn assistant_speculative_contract_is_chained_pruned_and_rewindable() {
         other => panic!("expected an identical vocabulary, got {other:?}"),
     }
     assert!(
-        !speculative.distribution_preserving,
-        "a lossy centroid drafter is opt-in"
+        speculative.distribution_preserving,
+        "standard rejection sampling preserves the distribution despite the pruned head"
     );
 
     // Every rewound cell is bound to a group covered to the proposal width.
