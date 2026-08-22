@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use onnx_genai_engine::{
     Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GeneratePrompt, GenerateRequest,
-    PipelineGenerateRequest, pipeline::PipelineEngine,
+    NativeDecodeDevice, PipelineGenerateRequest, pipeline::PipelineEngine,
 };
 use onnx_genai_ort::{DataType, Value};
 
@@ -19,6 +19,9 @@ fn root(name: &str) -> PathBuf {
 fn native() -> EngineConfig {
     EngineConfig {
         decode_backend: EngineDecodeBackend::Native,
+        // Pin CPU so the smoke run is deterministic regardless of build features
+        // or a GPU being present; device-residency is covered in the parity file.
+        native_device: Some(NativeDecodeDevice::Cpu),
         ..EngineConfig::default()
     }
 }
