@@ -31,6 +31,24 @@ non-schema keys.
 | 18 | [Static cache](18-static-cache-indexed-scatter.yaml) | Fixed capacity, logical lengths, indexed scatter |
 | 19 | [Operator ABI comparison](19-operator-abi-comparison.yaml) | Graph-visible operator/port distinctions |
 | 20 | [Qwen3.5 hybrid speculative decode](20-qwen3_5-hybrid-speculative-decoding.yaml) | Full-attention KV plus linear/conv replacement state with atomic rollback |
+| 21 | [Shared-prefix pixel flow](21-shared-prefix-pixel-flow.yaml) | Alternating CFG branches read frozen prefix state across a flow-matching loop |
+
+## Shared-prefix alternating branches
+
+The shared-prefix example is architecture-neutral. An understanding component
+advances conditional and unconditional state groups once. Generation components
+then bind those groups with `access: read_only`, so alternating CFG branches can
+reuse the frozen prefixes without pretending that discarded graph outputs are
+state transitions. The same pattern applies to unified any-to-any architectures
+whose later stages consume, but must not advance, state produced by an earlier
+stage. Conditional and unconditional prefixes may have different sequence
+lengths. The workflow derives resolution-aware initial noise from semantic
+seed/width/height inputs, while retaining an optional caller-supplied latent
+for controlled parity runs, and clamps the final image to its declared range.
+
+A 49 GB mixed-precision production package exercised this exact metadata
+pattern on H200 for text prefill, 512x512 text-to-image, and reference-image
+editing: <https://huggingface.co/justinchuby/sensenova-u1.5-8b-mot-onnx-canonical>.
 
 ## Qwen3.5 hybrid state and speculative decoding
 

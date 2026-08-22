@@ -68,12 +68,14 @@ impl<'a> GroupPorts<'a> {
     fn pairs(&self) -> impl Iterator<Item = (&'a str, &'a str)> + '_ {
         self.aliases
             .iter()
+            .filter(|(_, _, alias)| alias.access == crate::schema::StatePortAccess::ReadWrite)
             .map(|(_, _, alias)| (alias.input.as_str(), alias.output.as_str()))
     }
 
     fn with_role(&self, wanted: StatePortRole) -> Vec<&'a crate::schema::StatePortAlias> {
         self.aliases
             .iter()
+            .filter(|(_, _, alias)| alias.access == crate::schema::StatePortAccess::ReadWrite)
             .filter(|(_, role, _)| *role == Some(wanted))
             .map(|(_, _, alias)| *alias)
             .collect()
