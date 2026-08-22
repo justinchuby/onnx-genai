@@ -14,24 +14,24 @@ fn request(prompt: &str) -> GenerateRequest {
 }
 
 fn engine(target: &Path, package: &Path, speculative: bool) -> anyhow::Result<Engine> {
-    let speculative_mode = speculative
-        .then(|| {
-            SpeculativeMode::Eagle3(Eagle3Config {
-                head_model: package.join("proposer/model.onnx"),
-                target_hidden_outputs: vec![
-                    "hidden_states.2".into(),
-                    "hidden_states.14".into(),
-                    "hidden_states.25".into(),
-                ],
-                embedding_weights: package.join("target_embedding.f32"),
-                token_map: Some(package.join("draft_to_target.i64")),
-                vocab_size: 151_936,
-                hidden_size: 1024,
-                kv_mode: Eagle3DraftKvMode::GrowCache,
-                num_speculative_tokens: 6,
-            })
+    let speculative_mode = if speculative {
+        SpeculativeMode::Eagle3(Eagle3Config {
+            head_model: package.join("proposer/model.onnx"),
+            target_hidden_outputs: vec![
+                "hidden_states.2".into(),
+                "hidden_states.14".into(),
+                "hidden_states.25".into(),
+            ],
+            embedding_weights: package.join("target_embedding.f32"),
+            token_map: Some(package.join("draft_to_target.i64")),
+            vocab_size: 151_936,
+            hidden_size: 1024,
+            kv_mode: Eagle3DraftKvMode::GrowCache,
+            num_speculative_tokens: 6,
         })
-        .unwrap_or(SpeculativeMode::None);
+    } else {
+        SpeculativeMode::None
+    };
     Engine::from_dir(
         target,
         EngineConfig {
