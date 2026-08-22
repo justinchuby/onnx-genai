@@ -1251,6 +1251,12 @@ pub struct StateGroupCapabilities {
 pub struct StatePortAlias {
     pub input: String,
     pub output: String,
+    /// Whether this component may publish its output back into the state group.
+    ///
+    /// Read-only consumers receive the shared state input but their graph
+    /// output is not allowed to replace or alias the service-owned buffer.
+    #[serde(default, skip_serializing_if = "StatePortAccess::is_read_write")]
+    pub access: StatePortAccess,
     /// Which half of an attention cache this port pair carries.
     ///
     /// A graph that splits keys and values into separate buffers exposes two
@@ -1271,6 +1277,20 @@ pub struct StatePortAlias {
     /// otherwise silently transpose two layers' caches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layer: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StatePortAccess {
+    #[default]
+    ReadWrite,
+    ReadOnly,
+}
+
+impl StatePortAccess {
+    pub fn is_read_write(&self) -> bool {
+        matches!(self, Self::ReadWrite)
+    }
 }
 
 /// Which half of a split attention cache a state port pair carries.
