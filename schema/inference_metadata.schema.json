@@ -2436,6 +2436,74 @@
       ],
       "type": "object"
     },
+    "MediaContainer": {
+      "enum": [
+        "raw",
+        "wav"
+      ],
+      "type": "string"
+    },
+    "MediaDelivery": {
+      "enum": [
+        "buffered",
+        "streaming"
+      ],
+      "type": "string"
+    },
+    "MediaEncoding": {
+      "enum": [
+        "pcm_s16_le",
+        "pcm_f32_le"
+      ],
+      "type": "string"
+    },
+    "MediaOutputContract": {
+      "additionalProperties": false,
+      "properties": {
+        "channels": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "container": {
+          "$ref": "#/$defs/MediaContainer"
+        },
+        "delivery": {
+          "$ref": "#/$defs/MediaDelivery",
+          "default": "buffered"
+        },
+        "encoding": {
+          "$ref": "#/$defs/MediaEncoding"
+        },
+        "sample_rate_hz": {
+          "description": "Sample rate of the encoded response.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "source_sample_rate_hz": {
+          "description": "Sample rate of a pre-adapter waveform. When it differs from\n`sample_rate_hz`, the API boundary resamples before encoding.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "container",
+        "encoding"
+      ],
+      "type": "object"
+    },
     "MixtureOfExpertsSpec": {
       "description": "Explicit sparse mixture-of-experts structure and graph representation.",
       "properties": {
@@ -4913,6 +4981,17 @@
       "properties": {
         "contract": {
           "$ref": "#/$defs/TensorContract"
+        },
+        "media": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MediaOutputContract"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Concrete media delivery contract for a post-processing output.\n\nTensor shape alone cannot distinguish PCM samples from encoded WAV bytes,\nnor can it carry the sample rate and channel count required by an audio\nserving API. This remains architecture-neutral and intentionally contains\nno model-family identifiers or artifact fingerprints."
         },
         "role": {
           "$ref": "#/$defs/WorkflowOutputRole"
