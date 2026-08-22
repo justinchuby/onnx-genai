@@ -56,7 +56,9 @@ fn image_package_without_guidance_role() -> tempfile::TempDir {
     let package = tempfile::tempdir().unwrap();
     copy_tree(&diffusion_fixture_dir(), package.path());
     let metadata_path = package.path().join("inference_metadata.yaml");
-    let metadata = std::fs::read_to_string(&metadata_path).unwrap();
+    let metadata = std::fs::read_to_string(&metadata_path)
+        .unwrap()
+        .replace("\r\n", "\n");
     let runtime_role = "        role:\n          kind: runtime\n          version: '1.0'\n          role: guidance_scale\n        source:\n          kind: application\n          name: guidance_scale";
     let application_role = "        role:\n          kind: opaque\n        source:\n          kind: application\n          name: guidance_scale";
     let metadata = metadata.replace(runtime_role, application_role);
