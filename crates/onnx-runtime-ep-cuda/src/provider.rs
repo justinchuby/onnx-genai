@@ -400,6 +400,17 @@ fn auto_dynamic_lending_for(
     governor_present && policy.managed_no_spill && lending_enabled
 }
 
+fn validate_offload_policy(policy: &DeviceOffloadPolicy) -> Result<()> {
+    if policy.byte_aware_residency {
+        return Err(EpError::KernelFailed(
+            "cuda_ep: byte-aware weight residency is disabled because real-GPU validation found \
+             token-identity corruption; the byte-aware policy must remain disabled"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Refuse an allocator that does not serve `expected_index`.
 ///
 /// Split out of [`CudaExecutionProvider::with_memory`] so the decision can be
@@ -818,6 +829,7 @@ impl CudaExecutionProvider {
         governor: Option<Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>>,
         manager: Option<ProcessMemoryManager>,
     ) -> Result<Self> {
+        validate_offload_policy(&offload_policy)?;
         let runtime = Arc::new(CudaRuntime::new(ordinal)?);
         let csa_metrics = Arc::new(CsaMetrics::default());
         let registry = build_cuda_registry_with_metrics(runtime.clone(), csa_metrics.clone());
@@ -3467,6 +3479,17 @@ mod tests {
     use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, Tier};
 
     use crate::test_support::EnvVarGuard;
+
+    #[test]
+    fn known_unsafe_byte_aware_residency_is_rejected_before_cuda_initialization() {
+        let error = validate_offload_policy(&DeviceOffloadPolicy {
+            byte_aware_residency: true,
+            ..DeviceOffloadPolicy::default()
+        })
+        .expect_err("known-corrupting residency policy must fail closed");
+
+        assert!(error.to_string().contains("token-identity corruption"));
+    }
 
     struct HostMmap {
         mapping_id: usize,

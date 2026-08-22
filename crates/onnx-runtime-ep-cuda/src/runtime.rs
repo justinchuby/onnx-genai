@@ -2521,7 +2521,7 @@ extern "C" __global__ void add_seven(float* out, unsigned long long n) {
             let host_bytes =
                 unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr().cast::<u8>(), bytes) };
             unsafe { runtime.dtoh(host_bytes, out) }.unwrap();
-            unsafe { runtime.free_raw(out) };
+            let _ = unsafe { runtime.free_raw(out) };
             host
         };
 

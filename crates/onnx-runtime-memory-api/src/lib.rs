@@ -18,6 +18,7 @@
 pub mod allocator;
 pub mod binding;
 pub mod capability;
+pub mod context_pin;
 pub mod deferred;
 
 pub use allocator::{
@@ -33,6 +34,7 @@ pub use binding::{
     RegisteredMechanism, RegisteredProviderContext, ValidatedMemoryView,
 };
 pub use capability::{SharedMapping, VirtualBacking};
+pub use context_pin::{ProviderContextPin, ProviderContextPinError, ProviderContextPinSource};
 pub use deferred::{
     AllocationReleaseOutcome, AllocationReleaseState, DeferredEnqueueError,
     DeferredEnqueueRejection, DeferredReleaseDisposition, DeferredReleaseQueue,

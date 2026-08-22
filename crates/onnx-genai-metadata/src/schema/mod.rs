@@ -466,7 +466,7 @@ mod schema_vocabulary {
 
 mod schema_helpers {
     use schemars::Schema;
-    use serde_json::{Value, json};
+    use serde_json::json;
 
     pub(super) fn inference_metadata_constraints(schema: &mut Schema) {
         schema
@@ -485,44 +485,6 @@ mod schema_helpers {
                     }
                 }
             }));
-    }
-
-    pub(super) fn speculator_config_aliases(schema: &mut Schema) {
-        add_alias(
-            schema,
-            "proposal_type",
-            "method",
-            "Deprecated alias for `proposal_type`.",
-        );
-        add_alias(
-            schema,
-            "num_speculative_tokens",
-            "tokens_per_step",
-            "Deprecated alias for `num_speculative_tokens`.",
-        );
-
-        if let Some(required) = schema
-            .ensure_object()
-            .get_mut("required")
-            .and_then(Value::as_array_mut)
-        {
-            required.retain(|name| name != "proposal_type");
-        }
-
-        schema.ensure_object().insert(
-            "oneOf".into(),
-            json!([
-                {
-                    "required": ["proposal_type"],
-                    "not": {"required": ["method"]}
-                },
-                {
-                    "required": ["method"],
-                    "not": {"required": ["proposal_type"]}
-                }
-            ]),
-        );
-        forbid_both(schema, "num_speculative_tokens", "tokens_per_step");
     }
 
     pub(super) fn loop_state_pair(schema: &mut Schema) {
@@ -667,44 +629,6 @@ mod schema_helpers {
                 }
             ]),
         );
-    }
-
-    fn add_alias(schema: &mut Schema, canonical: &str, alias: &str, description: &str) {
-        let object = schema.ensure_object();
-        let Some(canonical_schema) = object
-            .get("properties")
-            .and_then(Value::as_object)
-            .and_then(|properties| properties.get(canonical))
-            .cloned()
-        else {
-            return;
-        };
-
-        if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
-            properties.insert(
-                alias.to_owned(),
-                json!({
-                    "allOf": [canonical_schema],
-                    "deprecated": true,
-                    "description": description
-                }),
-            );
-        }
-    }
-
-    fn forbid_both(schema: &mut Schema, first: &str, second: &str) {
-        let constraint = json!({
-            "not": {
-                "required": [first, second]
-            }
-        });
-        let object = schema.ensure_object();
-        object
-            .entry("allOf")
-            .or_insert_with(|| json!([]))
-            .as_array_mut()
-            .expect("allOf inserted as an array")
-            .push(constraint);
     }
 }
 
