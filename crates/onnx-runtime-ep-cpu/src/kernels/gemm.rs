@@ -1149,7 +1149,6 @@ mod tests {
             y.to_f32()
         };
 
-        let before = matmul::weight_transpose_cache_bytes();
         let _prefill = run(4);
         let _decode = run(1);
         let after = matmul::weight_transpose_cache_bytes();
@@ -1175,8 +1174,13 @@ mod tests {
              shared copy"
         );
         // And that copy is genuinely part of the global total the plan budgets.
+        // Only a lower bound is checkable here: the total is process-global, and
+        // under the parallel harness a concurrent test can both grow it (caching
+        // its own weight) and shrink it (evicting entries when its buffers die,
+        // see `Owned::drop`). A delta against a "before" reading is therefore not
+        // reliable -- this weight's own bytes are asserted exactly, just above.
         assert!(
-            after >= before + predicted as usize,
+            after >= predicted as usize,
             "the cached transpose must be reflected in the global byte total"
         );
     }
