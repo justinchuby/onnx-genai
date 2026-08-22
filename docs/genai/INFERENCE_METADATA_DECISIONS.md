@@ -112,9 +112,10 @@ structurally exposes ([§14](#14-generation)).
 
 ### 3.4 Distribution layer
 
-Signing, provenance, attestation, and mirroring. Format-specific checksums
-(for example `adapters[*].sha256`) remain where an existing loader ABI needs
-them; there is no global metadata digest requirement.
+Distribution manifests own artifact hashes, signatures, provenance,
+attestation, mirroring, and byte-level integrity. Runtime inference metadata
+contains no artifact hashes or fingerprints: replacing compatible component,
+tokenizer, or adapter bytes must not require rewriting the semantic contract.
 
 ---
 
@@ -480,8 +481,8 @@ scheduler identity, has no meaning outside the invocation that produced it, and
 
 - the **target manifest**: which parameters are adaptable, with their shapes and
   composition order — architecture-neutral and authoritative;
-- **artifact bindings**: sources (PEFT + safetensors, ORT `.onnx_adapter`),
-  their exact `sha256`, and the ABI they satisfy;
+- **artifact bindings**: sources (PEFT + safetensors, ORT `.onnx_adapter`) and
+  the ABI they satisfy;
 - the **request-selection contract**: the typed, request-aligned inputs through
   which a caller selects adapters.
 
@@ -1147,7 +1148,6 @@ package:
     byte_level: true
     artifacts:
       - location: tokenizer.json
-        sha256: "…"          # exact bytes, so the vocabulary is unambiguous
     special_tokens:
       bos: { id: 1, content: "<s>" }
       eos: { id: 2, content: "</s>" }
@@ -1157,11 +1157,11 @@ package:
       component: grammar
 ```
 
-The tokenizer artifact's exact bytes matter: a grammar compiled against a
-different vocabulary produces a different token mask. The constraint-language
-dialect and version matter for the same reason — a caller-supplied grammar is
-only meaningful against a named dialect, and the component that interprets it is
-named so the dependency is derivable ([§11](#11-cache-correctness-dependencies)).
+The tokenizer's declared vocabulary facts and artifact location are part of the
+semantic contract, while byte-level integrity belongs to distribution. The
+constraint-language dialect and version matter because a caller-supplied grammar
+is only meaningful against a named dialect, and the component that interprets it
+is named so the dependency is derivable ([§11](#11-cache-correctness-dependencies)).
 
 ---
 
@@ -1376,7 +1376,7 @@ a suggestion; the ban on a second serialized ABI was briefly in that state and
    identity change costs one recompile while a spurious match serves a stale
    plan against changed semantics.
 9. **Generation override support is structural and fail-loud.**
-10. **Constraint dialect and exact tokenizer bytes are represented.**
+10. **Constraint dialect and replaceable tokenizer artifacts are represented.**
 11. **One-file profile evolution works.** Required profiles fail a reader that
     does not understand them; ignorable profiles are skipped.
 12. **Session scope is normative.**
