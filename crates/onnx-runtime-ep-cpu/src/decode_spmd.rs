@@ -1336,6 +1336,88 @@ pub fn decode_path_label() -> &'static str {
     DECODE_PATH_LABEL.get().copied().unwrap_or("unresolved")
 }
 
+/// The width a decode request asked for, what it actually got, and which path
+/// served it.
+///
+/// Three separate mechanisms can quietly hand back fewer compute lanes than
+/// were requested -- [`reserve_single_group_headroom`], [`reserve_split_headroom`],
+/// and the single-CPU-cpuset fallback in [`build_from_env`] -- and all three
+/// report only through [`report_spmd_fallback`], which is `tracing::debug!` or
+/// `NXRT_CALIB_DEBUG`-gated. In a default benchmark run they are invisible, so a
+/// `t=N` row in a results table is a *label* rather than a measurement of width
+/// `N`. This is the read that turns it back into a measurement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DecodeWidth {
+    /// Compute lanes asked for: the explicit `ONNX_GENAI_CPU_DECODE_THREADS`
+    /// budget, or the default physical-core budget when unset. `None` means
+    /// either the width was never resolved (no decode has run yet) or the
+    /// caller opted out with `=0`, which is what `path` disambiguates.
+    pub requested: Option<usize>,
+    /// Compute lanes actually available. `None` until a decode path is chosen.
+    ///
+    /// On the persistent pool this is exact and includes the dispatcher's own
+    /// shard. On the flat path there is no fixed layout to report, so it is the
+    /// width of the Rayon pool **the calling thread is on** -- meaningful inside
+    /// `with_decode_pool_scope`, and the global width outside it. Same
+    /// convention as [`crate::kernels::matmul_nbits::active_decode_worker_count`].
+    pub realized: Option<usize>,
+    /// The selected path, as [`decode_path_label`] reports it.
+    pub path: &'static str,
+}
+
+impl DecodeWidth {
+    /// Whether the realized width matches what was asked for.
+    ///
+    /// `false` whenever a request was silently reduced, and also whenever the
+    /// width has not been resolved yet -- a harness that asserts on this cannot
+    /// accidentally pass by querying too early.
+    pub fn is_as_requested(&self) -> bool {
+        match (self.requested, self.realized) {
+            (Some(requested), Some(realized)) => requested == realized,
+            _ => false,
+        }
+    }
+}
+
+/// Report the requested vs realized decode width and the path that served it.
+///
+/// Deliberately **does not** build the pool: it reads the already-initialized
+/// statics, so calling it cannot change which path a process takes or when it is
+/// chosen. A harness should run at least one decode step first and then assert;
+/// before that the fields read `None` / `"unresolved"` and
+/// [`DecodeWidth::is_as_requested`] is `false`.
+pub fn decode_width() -> DecodeWidth {
+    let requested = REQUESTED_WIDTH.get().copied().flatten();
+    let realized = match POOLS.get() {
+        Some(Some(pools)) => Some(pools.total_workers()),
+        // The pool was resolved and declined: decode is on the flat path, whose
+        // width is whatever Rayon pool the caller is standing in.
+        Some(None) => Some(rayon::current_num_threads()),
+        None => None,
+    };
+    DecodeWidth {
+        requested,
+        realized,
+        path: decode_path_label(),
+    }
+}
+
+/// The width the caller explicitly asked for, recorded before any of the
+/// reductions that can shrink it.
+///
+/// Deliberately the *unclamped* request from
+/// [`crate::kernels::matmul_nbits::decode_thread_budget`] rather than the
+/// resolved width `build_from_env` receives: the resolver already clamps to
+/// `available_parallelism`, so recording its output would make a request of 8
+/// inside a 2-CPU cpuset report as "8 requested, 2 realized"... no, worse, as
+/// "2 requested, 2 realized" -- satisfied. That is precisely the silent
+/// mislabelling this type exists to expose, so the comparison has to be against
+/// what the user actually typed.
+///
+/// `None` when nobody asked for a specific width (default policy) or when the
+/// caller opted out with `=0`.
+static REQUESTED_WIDTH: OnceLock<Option<usize>> = OnceLock::new();
+
 /// The lazily built persistent SPMD layout, or `None` when the mode is opted out
 /// or the safe auto-enable gate declines. Built once and reused for the whole
 /// process.
@@ -1492,7 +1574,24 @@ pub fn build_from_env(threads: Option<usize>) -> Option<SpmdDecodePools> {
     // calibrator can time the live decode step on it. `Off` (`=0`) and `THREADS=0`
     // leave decode on the flat Rayon path. See `PERSISTENT_POOL_ENV`.
     let mode = persistence_mode();
+    // Recorded before any of the reductions below can shrink it, and before the
+    // early returns that drop decode to the flat path, so `decode_width` can
+    // always answer "what was asked for" even when the answer to "what did you
+    // get" is "something else entirely".
+    //
+    // `decode_thread_budget()` and not `threads`: the caller's `threads` has
+    // already been clamped to the cpuset by
+    // `resolve_persistent_decode_threads_with_override`, so using it would
+    // compare the reduced width against itself and report every reduction as
+    // satisfied.
+    REQUESTED_WIDTH
+        .get_or_init(|| crate::kernels::matmul_nbits::decode_thread_budget().or(threads));
     if !pool_mode_builds(mode) {
+        // An explicit `=0` opt-out is a decision, not an unresolved state: decode
+        // is definitively on the flat path. Without this the label reads
+        // "unresolved" forever and a harness cannot tell an opt-out apart from a
+        // process that has not decoded yet.
+        DECODE_PATH_LABEL.get_or_init(|| "flat");
         return None;
     }
     // Adaptive defers to an explicit decode-affinity request: if the user set
@@ -1502,6 +1601,10 @@ pub fn build_from_env(threads: Option<usize>) -> Option<SpmdDecodePools> {
     // `numa_pools`, everything else via the flat path + `plan_decode_affinity`).
     // `On` still builds the pool and keeps its documented precedence.
     if matches!(mode, PersistenceMode::Adaptive) && explicit_decode_affinity_set() {
+        // Also a decision: the user's affinity request drives decode via
+        // `numa_pools` or the flat path, so record that rather than leaving the
+        // label unresolved.
+        DECODE_PATH_LABEL.get_or_init(|| "flat");
         return None;
     }
     let Some(total) = threads else {
@@ -1512,6 +1615,7 @@ pub fn build_from_env(threads: Option<usize>) -> Option<SpmdDecodePools> {
         return None;
     };
     if total == 0 {
+        DECODE_PATH_LABEL.get_or_init(|| "flat");
         return None;
     }
     // Cpuset-aware dispatcher headroom: when the requested spinning-worker count
@@ -2486,6 +2590,79 @@ mod tests {
     /// The dispatcher shard is only claimed on the single-group layout, and only
     /// when the headroom reservation actually took a worker away. A budget with
     /// spare CPUs must be unchanged, or it would over-subscribe the request.
+    /// `decode_width` must never force the pool to build. Reading it is what a
+    /// harness does *before* deciding whether the run is trustworthy, so if the
+    /// read itself resolved the path it would both change process behaviour and
+    /// destroy the "not resolved yet" signal that keeps an early assertion from
+    /// passing vacuously.
+    #[test]
+    fn reading_the_decode_width_does_not_resolve_the_decode_path() {
+        let before = POOLS.get().is_some();
+        let width = decode_width();
+        assert_eq!(
+            POOLS.get().is_some(),
+            before,
+            "decode_width must not build the pool as a side effect"
+        );
+        if !before {
+            assert_eq!(width.realized, None);
+            assert!(
+                !width.is_as_requested(),
+                "an unresolved width must not report as satisfied, or a harness \
+                 that asserts too early passes for the wrong reason"
+            );
+        }
+    }
+
+    /// The whole point of the read: a request that was silently reduced must not
+    /// report as satisfied. Covers the reduction Roy's `t=N` rows could not see.
+    #[test]
+    fn a_reduced_width_does_not_report_as_requested() {
+        let reduced = DecodeWidth {
+            requested: Some(16),
+            realized: Some(15),
+            path: "spmd-pool",
+        };
+        assert!(
+            !reduced.is_as_requested(),
+            "16 requested and 15 realized is exactly the case a t=16 row would \
+             otherwise label as a width-16 measurement"
+        );
+
+        let honored = DecodeWidth {
+            requested: Some(16),
+            realized: Some(16),
+            path: "spmd-pool",
+        };
+        assert!(honored.is_as_requested());
+
+        // Dropping to the flat path is the other silent reduction: the width
+        // may even look larger, but it is not the pool that was asked for.
+        let flat = DecodeWidth {
+            requested: Some(2),
+            realized: Some(32),
+            path: "flat",
+        };
+        assert!(!flat.is_as_requested());
+    }
+
+    /// An unresolved width must stay unsatisfied no matter which half is
+    /// missing, so a harness cannot pass by asserting before it has decoded.
+    #[test]
+    fn a_half_known_width_is_never_satisfied() {
+        for (requested, realized) in [(Some(4), None), (None, Some(4)), (None, None)] {
+            let width = DecodeWidth {
+                requested,
+                realized,
+                path: "unresolved",
+            };
+            assert!(
+                !width.is_as_requested(),
+                "requested={requested:?} realized={realized:?} must not report satisfied"
+            );
+        }
+    }
+
     #[test]
     fn the_dispatcher_only_claims_a_shard_when_headroom_was_reserved() {
         let group = |workers| {
@@ -2529,7 +2706,9 @@ mod tests {
     }
 
     const BUDGET_LANE_CHILD_ENV: &str = "ONNX_GENAI_TEST_BUDGET_LANE_CHILD";
+    const BUDGET_LANE_CONFINE_ENV: &str = "ONNX_GENAI_TEST_BUDGET_LANE_CONFINE";
     const BUDGET_LANE_MARKER: &str = "BUDGET_LANE_RESULT=";
+    const BUDGET_LANE_SKIP_MARKER: &str = "BUDGET_LANE_SKIP=";
 
     /// End-to-end guard for #1746, across the process boundary the defect lived
     /// in.
@@ -2565,48 +2744,25 @@ mod tests {
         }
 
         for budget in budgets {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .arg("--exact")
-                .arg("decode_spmd::tests::budget_lane_child")
-                .arg("--nocapture")
-                .arg("--test-threads=1")
-                .arg("--ignored")
-                .env(BUDGET_LANE_CHILD_ENV, budget.to_string())
-                .env(
-                    crate::kernels::matmul_nbits::DECODE_THREADS_ENV,
-                    budget.to_string(),
-                )
-                .env(PERSISTENT_POOL_ENV, "1")
-                .env_remove(crate::decode_affinity::DECODE_AFFINITY_ENV)
-                .output()
-                .expect("run decode-budget lane child");
-            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-            assert!(
-                output.status.success(),
-                "budget {budget} child failed ({}):\nstdout:\n{stdout}\nstderr:\n{}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            );
-            let encoded = stdout
-                .lines()
-                .find_map(|line| {
-                    line.split_once(BUDGET_LANE_MARKER)
-                        .map(|(_, rest)| rest.trim())
-                })
-                .unwrap_or_else(|| panic!("budget {budget} child emitted no result:\n{stdout}"));
-            let mut fields = encoded.split(',').map(|f| f.parse::<usize>().unwrap());
-            let (allowed, nodes, threads, lanes) = (
-                fields.next().unwrap(),
-                fields.next().unwrap(),
-                fields.next().unwrap(),
-                fields.next().unwrap(),
-            );
+            let lane = run_budget_lane_child(budget, None).expect("the unconfined arm never skips");
+            let (allowed, nodes, threads, lanes) =
+                (lane.allowed, lane.nodes, lane.threads, lane.lanes);
+            let (requested, realized, path) = (lane.requested, lane.realized, lane.path.as_str());
             if nodes != 1 {
                 // A budget that straddles NUMA nodes takes the split path, which
                 // keeps the previous per-node reservation. Not this test's case.
                 eprintln!("budget {budget}: skipped, {nodes}-node split layout");
                 continue;
             }
+            // The introspection must agree with the pool it describes, on the
+            // real production path. A `t=N` row is only a width-N measurement if
+            // this holds, which is the whole reason the read exists.
+            assert_eq!(
+                (requested, realized, path),
+                (Some(budget), Some(budget), "spmd-pool"),
+                "budget {budget}: decode_width must report the realized width and \
+                 path, got requested={requested:?} realized={realized:?} path={path}"
+            );
             assert_eq!(
                 lanes, budget,
                 "ONNX_GENAI_CPU_DECODE_THREADS={budget} must buy {budget} compute lanes, \
@@ -2629,6 +2785,147 @@ mod tests {
         }
     }
 
+    /// One decoded `BUDGET_LANE_MARKER` line from a lane child.
+    struct BudgetLane {
+        allowed: usize,
+        nodes: usize,
+        threads: usize,
+        lanes: usize,
+        requested: Option<usize>,
+        realized: Option<usize>,
+        path: String,
+    }
+
+    /// Spawns the lane child at `budget`, optionally pre-confining it to
+    /// `confine` CPUs, and decodes its one result line.
+    fn run_budget_lane_child(budget: usize, confine: Option<usize>) -> Option<BudgetLane> {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.arg("--exact")
+            .arg("decode_spmd::tests::budget_lane_child")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .arg("--ignored")
+            .env(BUDGET_LANE_CHILD_ENV, budget.to_string())
+            .env(
+                crate::kernels::matmul_nbits::DECODE_THREADS_ENV,
+                budget.to_string(),
+            )
+            .env(PERSISTENT_POOL_ENV, "1")
+            .env_remove(crate::decode_affinity::DECODE_AFFINITY_ENV);
+        if let Some(confine) = confine {
+            cmd.env(BUDGET_LANE_CONFINE_ENV, confine.to_string());
+        } else {
+            cmd.env_remove(BUDGET_LANE_CONFINE_ENV);
+        }
+        let output = cmd.output().expect("run decode-budget lane child");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "budget {budget} child failed ({}):\nstdout:\n{stdout}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if let Some(reason) = stdout.lines().find_map(|line| {
+            line.split_once(BUDGET_LANE_SKIP_MARKER)
+                .map(|(_, r)| r.trim())
+        }) {
+            eprintln!("budget {budget}: child skipped: {reason}");
+            return None;
+        }
+        let encoded = stdout
+            .lines()
+            .find_map(|line| {
+                line.split_once(BUDGET_LANE_MARKER)
+                    .map(|(_, rest)| rest.trim())
+            })
+            .unwrap_or_else(|| panic!("budget {budget} child emitted no result:\n{stdout}"));
+        let fields: Vec<&str> = encoded.split(',').collect();
+        assert_eq!(fields.len(), 7, "malformed lane result {encoded:?}");
+        let num = |i: usize| fields[i].parse::<usize>().unwrap();
+        // The child encodes an absent width as 0, which is never a valid width.
+        let opt = |i: usize| Some(num(i)).filter(|&n| n != 0);
+        Some(BudgetLane {
+            allowed: num(0),
+            nodes: num(1),
+            threads: num(2),
+            lanes: num(3),
+            requested: opt(4),
+            realized: opt(5),
+            path: fields[6].trim().to_owned(),
+        })
+    }
+
+    /// The counterpart to [`an_explicit_budget_buys_its_full_width_end_to_end`]:
+    /// when the host *cannot* honour the request, the read must say so.
+    ///
+    /// This is the case that makes the introspection worth having. A published
+    /// `t=N` row is a label, not a measurement, and the ways a request gets
+    /// silently reduced -- `reserve_single_group_headroom`,
+    /// `reserve_split_headroom`, and the single-CPU cpuset branch that drops
+    /// decode to the flat path -- all report only through `report_spmd_fallback`,
+    /// which is `tracing::debug!`/`NXRT_CALIB_DEBUG`-gated and therefore invisible
+    /// in a default benchmark run.
+    ///
+    /// Requesting 8 lanes inside a 2-CPU cpuset is that situation made
+    /// deterministic. The exact realized width is a policy detail this test
+    /// deliberately does not pin; what it pins is that the read never claims the
+    /// request was honoured when it was not.
+    #[test]
+    fn a_budget_the_host_cannot_honour_never_reports_as_requested() {
+        let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+        const CONFINE: usize = 2;
+        const REQUEST: usize = 8;
+        if available < REQUEST {
+            eprintln!("skipped: needs >= {REQUEST} CPUs, host reports {available}");
+            return;
+        }
+        let Some(lane) = run_budget_lane_child(REQUEST, Some(CONFINE)) else {
+            return; // No process-wide affinity mask on this host.
+        };
+        assert!(
+            lane.allowed <= CONFINE,
+            "the confinement must land, got {} allowed CPUs",
+            lane.allowed
+        );
+        assert_eq!(
+            lane.requested,
+            Some(REQUEST),
+            "the requested width must survive the reduction -- without it there is \
+             nothing to compare the realized width against"
+        );
+        assert!(
+            lane.realized.is_none_or(|r| r < REQUEST),
+            "a {CONFINE}-CPU cpuset cannot deliver {REQUEST} lanes, but the read \
+             reported {:?}",
+            lane.realized
+        );
+        // The whole contract in one line: this must be false whenever the label
+        // and the reality disagree.
+        let width = DecodeWidth {
+            requested: lane.requested,
+            realized: lane.realized,
+            path: "",
+        };
+        assert!(
+            !width.is_as_requested(),
+            "requested={:?} realized={:?} must not report as requested",
+            lane.requested,
+            lane.realized
+        );
+        // And the pool, if one was built, must agree with what the read said.
+        if lane.path == "spmd-pool" {
+            assert_eq!(
+                lane.realized,
+                Some(lane.lanes),
+                "the read must report the pool's own lane count"
+            );
+        }
+        eprintln!(
+            "requested={REQUEST} in a {CONFINE}-CPU cpuset -> allowed={} realized={:?} path={}",
+            lane.allowed, lane.realized, lane.path
+        );
+    }
+
     /// The child arm of [`an_explicit_budget_buys_its_full_width_end_to_end`].
     /// `#[ignore]`d so only the parent's explicit `--ignored --exact` run
     /// executes it; it confines the process's CPU affinity and must not run in
@@ -2640,18 +2937,57 @@ mod tests {
             return;
         };
         let budget: usize = budget.to_string_lossy().parse().expect("budget");
+        // Optional pre-confinement, used by the reduced-width arm to make the
+        // host unable to honour the request. Applied before
+        // `bound_process_to_decode_budget` so the budget logic sees the smaller
+        // cpuset, exactly as an external `taskset` or container limit would
+        // present it.
+        if let Some(confined) = std::env::var_os(BUDGET_LANE_CONFINE_ENV) {
+            let confined: usize = confined.to_string_lossy().parse().expect("confine");
+            let cpus: Vec<usize> = (0..confined).collect();
+            if let Err(err) = crate::decode_affinity::set_current_thread_affinity(&cpus) {
+                // Only Linux implements a process-wide mask, so on other hosts
+                // there is no way to manufacture the reduction. Report a skip
+                // rather than failing: the arm is about the read's behaviour
+                // under reduction, not about affinity support.
+                println!("{BUDGET_LANE_SKIP_MARKER}{err}");
+                return;
+            }
+        }
+        // `pools()` reads the budget from the environment, so confirm the env the
+        // parent set agrees with the budget it asked for. Checked against the
+        // *unclamped* accessor, since under confinement the resolved width is
+        // deliberately smaller than the request.
+        assert_eq!(
+            crate::kernels::matmul_nbits::decode_thread_budget(),
+            Some(budget),
+            "the child's environment must carry the budget the parent requested"
+        );
         // Exactly the production sequence: EP `initialize()` bounds the process,
         // then the pool is built lazily at first decode.
         crate::kernels::matmul_nbits::bound_process_to_decode_budget();
         let allowed = crate::decode_affinity::allowed_cpus().map_or(0, |c| c.len());
-        let pool = build_from_env(Some(budget)).expect("budget >= 2 must build a pool");
+        // Deliberately the global `pools()` entry rather than `build_from_env`
+        // directly: that is what a real decode reaches, and it is the only way
+        // `decode_width` sees a resolved path -- so this arm checks the
+        // introspection a harness will assert on, not a parallel construction of
+        // it that could agree while production disagrees.
+        let pool = pools();
+        let (nodes, threads, lanes) = pool.map_or((0, 0, 0), |p| {
+            (
+                p.node_count(),
+                p.node_thread_counts.iter().sum::<usize>(),
+                p.total_workers(),
+            )
+        });
+        let width = decode_width();
         println!(
-            "{BUDGET_LANE_MARKER}{allowed},{},{},{}",
-            pool.node_count(),
-            pool.node_thread_counts.iter().sum::<usize>(),
-            pool.total_workers()
+            "{BUDGET_LANE_MARKER}{allowed},{nodes},{threads},{lanes},{},{},{}",
+            width.requested.unwrap_or(0),
+            width.realized.unwrap_or(0),
+            width.path,
         );
-        pool.shutdown();
+        shutdown_pools();
     }
 
     #[test]
