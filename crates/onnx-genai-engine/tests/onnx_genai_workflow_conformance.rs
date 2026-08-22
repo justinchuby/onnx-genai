@@ -23,6 +23,24 @@ fn root(name: &str) -> anyhow::Result<PathBuf> {
     Ok(root.join(name))
 }
 
+fn optional_producer_package(name: &str) -> anyhow::Result<Option<PathBuf>> {
+    let path = root(name)?;
+    if path.is_dir() {
+        return Ok(Some(path));
+    }
+    if std::env::var_os("MOBIUS_WORKFLOW_CONFORMANCE_DIR").is_some() {
+        anyhow::bail!(
+            "required Mobius workflow package does not exist: {}",
+            path.display()
+        );
+    }
+    eprintln!(
+        "skipping producer-only workflow package absent from the standalone checkout: {}",
+        path.display()
+    );
+    Ok(None)
+}
+
 fn options(max_new_tokens: usize) -> GenerateOptions {
     let mut options = GenerateOptions::default();
     options.max_new_tokens = max_new_tokens;
@@ -506,8 +524,10 @@ fn shared_state_pixel_flow_request(
 
 #[test]
 fn mobius_shared_state_pixel_flow_executes_text_and_generation_paths() -> anyhow::Result<()> {
-    let mut engine =
-        Engine::from_pipeline_dir(&root("shared_state_pixel_flow")?, EngineConfig::default())?;
+    let Some(package) = optional_producer_package("shared_state_pixel_flow")? else {
+        return Ok(());
+    };
+    let mut engine = Engine::from_pipeline_dir(&package, EngineConfig::default())?;
 
     let text = engine.run_pipeline_outputs(shared_state_pixel_flow_request(2, true, None, 7)?)?;
     assert_eq!(text["logits"].shape(), [1, 2, 64]);
@@ -535,8 +555,10 @@ fn mobius_shared_state_pixel_flow_executes_text_and_generation_paths() -> anyhow
 
 #[test]
 fn mobius_shared_state_pixel_flow_executes_reference_image_edit() -> anyhow::Result<()> {
-    let mut engine =
-        Engine::from_pipeline_dir(&root("shared_state_pixel_flow")?, EngineConfig::default())?;
+    let Some(package) = optional_producer_package("shared_state_pixel_flow")? else {
+        return Ok(());
+    };
+    let mut engine = Engine::from_pipeline_dir(&package, EngineConfig::default())?;
     let png = vec![
         137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 2,
         0, 0, 0, 144, 119, 83, 222, 0, 0, 0, 12, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 0, 0,
