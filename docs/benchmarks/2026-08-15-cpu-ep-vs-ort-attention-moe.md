@@ -4747,6 +4747,8 @@ decode cells that already win (`bert_base_decode_kv1024` 0.55x,
 
 This is a separate workstream from #1685 and is filed as such rather than folded
 into a coverage PR; it also touches pool ownership, which is Sebastian's lane.
+Filed as **#1718**, carrying the flat `native_p50` column, the
+`llama_decode_past1023` thread-scaling control above, and the code observation.
 
 **Rule.** When a native/ORT ratio degrades monotonically with thread count while
 the native absolute time stays flat, stop optimising the kernel. The number is
