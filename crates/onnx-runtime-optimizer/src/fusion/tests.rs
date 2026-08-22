@@ -525,46 +525,86 @@ fn find_match_reports_correct_shape() {
     assert_eq!(p.pattern_name(), "MatMul+Bias");
 }
 
-#[test]
-fn declines_layernorm_when_axes_is_input() {
-    // Opset-18 style: `ReduceMean` takes `axes` as an INPUT, not an
-    // attribute. The axis can't be pinned to a single concrete value from an
-    // attribute, so the fusion must DECLINE and leave all 9 ops intact
-    // (never silently assume axis = -1).
-    let mut g = layernorm_graph();
-    let mean = g
+/// Rewrite the `ReduceMean` that produces `out_name` from the attribute form to
+/// the opset-24 axes-as-input form, backed by a fresh int64 initializer.
+fn convert_reduce_to_axes_input(g: &mut Graph, out_name: &str, init_name: &str, axes: &[i64]) {
+    let out = g
         .values
         .iter()
-        .find(|(_, v)| v.name.as_deref() == Some("mean"))
+        .find(|(_, v)| v.name.as_deref() == Some(out_name))
         .map(|(id, _)| id)
         .unwrap();
-    let rm1 = g.value(mean).producer.unwrap();
-    // Drop the `axes` attribute and feed axes in as an initializer INPUT.
-    g.node_mut(rm1).attributes.remove("axes");
-    let axes_in = g.create_named_value("axes_in", DataType::Int64, static_shape([1]));
+    let rm = g.value(out).producer.unwrap();
+    g.node_mut(rm).attributes.remove("axes");
+    let axes_in = g.create_named_value(init_name, DataType::Int64, static_shape([axes.len()]));
+    let data: Vec<u8> = axes.iter().flat_map(|a| a.to_le_bytes()).collect();
     g.set_initializer(
         axes_in,
         WeightRef::Inline(TensorData::from_raw(
             DataType::Int64,
-            vec![1],
-            (-1i64).to_le_bytes().to_vec(),
+            vec![axes.len()],
+            data,
         )),
     );
-    let input_index = g.node(rm1).inputs.len();
-    g.node_mut(rm1).inputs.push(None);
-    g.replace_input(rm1, input_index, Some(axes_in));
+    let input_index = g.node(rm).inputs.len();
+    g.node_mut(rm).inputs.push(None);
+    g.replace_input(rm, input_index, Some(axes_in));
+}
+
+#[test]
+fn fuses_layernorm_when_axes_is_input() {
+    // Opset-24 style: BOTH `ReduceMean` nodes take `axes` as an INPUT. The fusion
+    // resolves the single concrete axis from each int64 initializer, requires the
+    // mean and variance reductions to agree, and fuses to one
+    // `LayerNormalization` (axis = -1). (Migrating fixtures to opset 24 relies on
+    // this.)
+    let mut g = layernorm_graph();
+    convert_reduce_to_axes_input(&mut g, "mean", "mean_axes", &[-1]);
+    convert_reduce_to_axes_input(&mut g, "var", "var_axes", &[-1]);
     assert!(g.validate().is_ok());
 
     assert_eq!(g.num_nodes(), 9);
     OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
+    let layernorms: Vec<_> = g
+        .nodes
+        .values()
+        .filter(|n| n.op_type == "LayerNormalization")
+        .collect();
     assert_eq!(
-        g.num_nodes(),
-        9,
-        "axes-as-input LayerNorm must NOT fuse — all original ops kept"
+        layernorms.len(),
+        1,
+        "axes-as-input LayerNorm must fuse to one LayerNormalization"
     );
+    assert_eq!(
+        layernorms[0].attr("axis").and_then(Attribute::as_int),
+        Some(-1),
+        "axis must be resolved from the int64 axes input"
+    );
+    assert_eq!(
+        g.nodes
+            .values()
+            .filter(|n| n.op_type == "ReduceMean")
+            .count(),
+        0,
+        "both ReduceMean ops must fuse away"
+    );
+    assert!(g.validate().is_ok());
+}
+
+#[test]
+fn declines_layernorm_when_reduce_axes_disagree() {
+    // Mean reduces axis -1 but variance reduces axis -2: not a LayerNorm, so the
+    // fusion must decline and keep both ReduceMean ops.
+    let mut g = layernorm_graph();
+    convert_reduce_to_axes_input(&mut g, "mean", "mean_axes", &[-1]);
+    convert_reduce_to_axes_input(&mut g, "var", "var_axes", &[-2]);
+    assert!(g.validate().is_ok());
+
+    assert_eq!(g.num_nodes(), 9);
+    OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
     assert!(
         g.nodes.values().all(|n| n.op_type != "LayerNormalization"),
-        "no fused LayerNormalization must be emitted"
+        "mismatched mean/variance reduce axes must not fuse"
     );
     assert_eq!(
         g.nodes
@@ -574,7 +614,95 @@ fn declines_layernorm_when_axes_is_input() {
         2,
         "both ReduceMean ops remain"
     );
+}
+
+#[test]
+fn declines_layernorm_when_reduce_keepdims_zero() {
+    // keepdims = 0 collapses the reduced dim, breaking the LayerNorm broadcast,
+    // so the fusion must decline even though the rest of the pattern matches.
+    let mut g = layernorm_graph();
+    let mean = g
+        .values
+        .iter()
+        .find(|(_, v)| v.name.as_deref() == Some("mean"))
+        .map(|(id, _)| id)
+        .unwrap();
+    let rm1 = g.value(mean).producer.unwrap();
+    g.node_mut(rm1)
+        .attributes
+        .insert("keepdims".into(), Attribute::Int(0));
+
+    assert_eq!(g.num_nodes(), 9);
+    OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
+    assert!(
+        g.nodes.values().all(|n| n.op_type != "LayerNormalization"),
+        "keepdims = 0 on a reduce must not fuse"
+    );
+}
+
+/// Rewrite the `ReduceMean` producing `out_name` to take `axes` from a
+/// `Constant` node (rather than an initializer), mirroring a graph where
+/// `ConstantFolding` has not yet run.
+fn convert_reduce_to_axes_constant(g: &mut Graph, out_name: &str, const_name: &str, axes: &[i64]) {
+    let out = g
+        .values
+        .iter()
+        .find(|(_, v)| v.name.as_deref() == Some(out_name))
+        .map(|(id, _)| id)
+        .unwrap();
+    let rm = g.value(out).producer.unwrap();
+    g.node_mut(rm).attributes.remove("axes");
+    let axes_val = g.create_named_value(const_name, DataType::Int64, static_shape([axes.len()]));
+    let data: Vec<u8> = axes.iter().flat_map(|a| a.to_le_bytes()).collect();
+    let mut constant = Node::new(NodeId(0), "Constant", vec![], vec![axes_val]);
+    constant.attributes.insert(
+        "value".into(),
+        Attribute::Tensor(TensorData::from_raw(
+            DataType::Int64,
+            vec![axes.len()],
+            data,
+        )),
+    );
+    g.insert_node(constant);
+    let input_index = g.node(rm).inputs.len();
+    g.node_mut(rm).inputs.push(None);
+    g.replace_input(rm, input_index, Some(axes_val));
+}
+
+#[test]
+fn fuses_layernorm_when_axes_is_unfolded_constant_node() {
+    // The fusion pass may run before `ConstantFolding` materializes a `Constant`
+    // axes node as an initializer. `read_i64_vector` resolves the axes directly
+    // from the `Constant` producer, so `OpFusion` alone still fuses.
+    let mut g = layernorm_graph();
+    convert_reduce_to_axes_constant(&mut g, "mean", "mean_axes_const", &[-1]);
+    convert_reduce_to_axes_constant(&mut g, "var", "var_axes_const", &[-1]);
     assert!(g.validate().is_ok());
+
+    OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
+    let layernorms: Vec<_> = g
+        .nodes
+        .values()
+        .filter(|n| n.op_type == "LayerNormalization")
+        .collect();
+    assert_eq!(
+        layernorms.len(),
+        1,
+        "Constant-node axes must fuse without prior constant folding"
+    );
+    assert_eq!(
+        layernorms[0].attr("axis").and_then(Attribute::as_int),
+        Some(-1),
+        "axis must be resolved from the Constant axes node"
+    );
+    assert_eq!(
+        g.nodes
+            .values()
+            .filter(|n| n.op_type == "ReduceMean")
+            .count(),
+        0,
+        "both ReduceMean ops must fuse away"
+    );
 }
 
 #[test]

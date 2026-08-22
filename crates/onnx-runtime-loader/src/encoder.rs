@@ -63,8 +63,9 @@ use crate::proto::onnx::{
 use crate::weights::WeightStore;
 
 /// Default ONNX `ir_version` stamped when [`ModelMetadata`] does not override it
-/// (IR version 10, the version paired with opset 21).
-pub const DEFAULT_IR_VERSION: i64 = 10;
+/// (IR version 11, matching the maintained-fixture floor enforced by
+/// `onnx-std`'s `fixture_ir_opset_guard` and paired with default opset 24).
+pub const DEFAULT_IR_VERSION: i64 = 11;
 
 /// Model-level metadata that the IR [`Graph`] does not itself carry.
 ///

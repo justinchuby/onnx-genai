@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Generate deterministic ORT reference fixtures for the bert_toy conformance test.
 
-Loads ``model.onnx`` via onnxruntime's CPUExecutionProvider, feeds a set of
-hardcoded (deterministic) inputs, runs inference, and writes both the inputs
-and the reference outputs to committed fixture files:
+Loads ``model.onnx.textproto`` (the committed git-friendly ONNX TextFormat model)
+via onnxruntime's CPUExecutionProvider, feeds a set of hardcoded (deterministic)
+inputs, runs inference, and writes both the inputs and the reference outputs to
+committed fixture files:
 
   * ``<name>.bin``  -- raw little-endian element bytes for each input/output.
   * ``manifest.json`` -- names, shapes, dtypes, and the literal input values.
@@ -24,10 +25,12 @@ import json
 import pathlib
 
 import numpy as np
+import onnx
 import onnxruntime as ort
+from google.protobuf import text_format
 
 HERE = pathlib.Path(__file__).resolve().parent
-MODEL = HERE / "model.onnx"
+MODEL = HERE / "model.onnx.textproto"
 
 BATCH = 1
 SEQ = 8
@@ -60,13 +63,19 @@ def write_array(name: str, arr: np.ndarray) -> dict:
 
 
 def main() -> None:
-    sess = ort.InferenceSession(str(MODEL), providers=["CPUExecutionProvider"])
+    # ORT's on-disk loader can't parse TextFormat, so parse the committed
+    # textproto and hand ORT the serialized binary ModelProto bytes.
+    model = onnx.ModelProto()
+    text_format.Parse(MODEL.read_text(), model)
+    sess = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
 
     output_names = [o.name for o in sess.get_outputs()]
     outputs = sess.run(output_names, {k: v for k, v in INPUTS.items()})
 
     manifest = {
-        "model": "model.onnx",
+        "model": "model.onnx.textproto",
         "provider": "CPUExecutionProvider",
         "onnxruntime_version": ort.__version__,
         "batch": BATCH,

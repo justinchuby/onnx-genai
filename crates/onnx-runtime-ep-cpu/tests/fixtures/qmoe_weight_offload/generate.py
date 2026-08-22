@@ -83,10 +83,10 @@ def main() -> None:
         [y],
         nodes=[node],
         initializers=[fc1_packed, fc1_scales, fc2_packed, fc2_scales],
-        opset_imports={"": 17, "com.microsoft": 1},
+        opset_imports={"": 24, "com.microsoft": 1},
         name="qmoe_weight_offload",
     )
-    proto = ir.to_proto(ir.Model(graph, ir_version=10))
+    proto = ir.to_proto(ir.Model(graph, ir_version=11))
 
     payloads = {
         "fc1_packed": fc1_packed_data.tobytes(),
