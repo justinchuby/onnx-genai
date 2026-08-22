@@ -4699,6 +4699,41 @@ there. `MultiHeadAttention` executes natively at 99.97% of node time, one call,
 no ORT fallback. 432/432 trials parity `PASS` (the 24 failures were the
 undefined cell, now removed).
 
+**Measurement conditions -- what the absolute milliseconds are and are not.**
+This grid was taken on a shared 16-physical/32-logical host on which other
+agents run benchmarks and full test suites. Roy has since measured the *same*
+cell at 197.2 and 22.8 tok/s in two windows -- an 8.6x swing from contention
+alone -- with intra-run spreads as tight as 6% in the corrupted samples. A
+tight spread only says contention was *steady* during the run; it does not say
+the host was quiet. I did not record host occupancy for this window, so I
+cannot certify it was.
+
+What survives that, and why:
+
+- **Ratios.** The arms are interleaved, so a steady occupancy tax inflates both
+  and cancels in `native/ort`. This covers the parity grid and the
+  `concat_cache` before/after figures in 45.6.
+- **The scaling shape in 45.8.** ORT improved 3.05 -> 1.06 ms across
+  `t = 1 -> 16` *in the same interleaved window* in which the native arm stayed
+  flat. Contention cannot starve one interleaved arm while the other scales
+  2.9x, so ORT is a positive control for core availability -- the same role the
+  842-symbol MLAS build plays for the symbol probe above. The finding also has
+  a timing-free leg: `sdpa_f32_simd` contains no fan-out at all.
+
+What does not survive: the **absolute** millisecond columns below. A steady
+occupancy tax is invisible in the spread *and* invisible in the ratio, and it
+is real. Treat them as shape, not as throughput numbers, and do not quote them
+as a baseline without re-measuring on a recorded quiet window. In particular
+the mild regression at `t = 16` (9.2 -> 14.4 ms) is small enough to be a
+contention artifact; nothing in 45.8 depends on it.
+
+**Rule.** A benchmark on a shared host must record host occupancy alongside the
+numbers, gating on the instantaneous runnable count
+(`cut -d' ' -f4 /proc/loadavg | cut -d/ -f1`) rather than the 1-minute load
+average, which is an EMA and misleads in both directions -- it stays high for a
+minute after a heavy run ends and reads low while a burst is still in flight.
+An unrecorded window cannot be defended later; it can only be re-run.
+
 `native/ort`, p50, lower is better; `(…)` is the same-invocation A/A null
 control arm:
 
