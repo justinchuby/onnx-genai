@@ -130,6 +130,9 @@ fn oracle_row(activations: &[f32], weight: &Weight<'_>, row: usize, col: usize) 
 }
 
 fn main() {
+    // Match the decode thread topology a served session runs in (#1749).
+    common::init_decode_topology();
+
     let block_size = 32usize;
     let shapes: Vec<(usize, usize)> = match std::env::var("PROBE_SHAPE").as_deref() {
         Ok("big") => vec![(4096, 11008)],

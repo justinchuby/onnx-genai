@@ -131,14 +131,36 @@ impl MoeAttributes {
                 "swiglu_fusion is only valid when activation_type='swiglu'",
             ));
         }
+        let activation_alpha = float_attr(node, "activation_alpha", 1.0)?;
+        let activation_beta = float_attr(node, "activation_beta", 0.0)?;
+        let swiglu_limit = float_attr(node, "swiglu_limit", f32::INFINITY)?;
+        // These three feed directly into the clipped-SwiGLU formula
+        // (`min/max/clamp` then a sigmoid and a multiply). A NaN silently
+        // poisons every routed token's output instead of failing at the one
+        // point - node creation - where the offending attribute name is
+        // still available to report.
+        for (name, value) in [
+            ("activation_alpha", activation_alpha),
+            ("activation_beta", activation_beta),
+            ("swiglu_limit", swiglu_limit),
+        ] {
+            if value.is_nan() {
+                return Err(error(format!("attribute {name} must not be NaN")));
+            }
+        }
+        if swiglu_limit <= 0.0 {
+            return Err(error(format!(
+                "swiglu_limit must be positive, got {swiglu_limit}"
+            )));
+        }
         Ok(Self {
             k: k as usize,
             activation,
             normalize_routing_weights: normalize,
             swiglu_fusion: swiglu_fusion as usize,
-            activation_alpha: float_attr(node, "activation_alpha", 1.0)?,
-            activation_beta: float_attr(node, "activation_beta", 0.0)?,
-            swiglu_limit: float_attr(node, "swiglu_limit", f32::INFINITY)?,
+            activation_alpha,
+            activation_beta,
+            swiglu_limit,
         })
     }
 

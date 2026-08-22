@@ -179,6 +179,9 @@ struct Weight {
 }
 
 fn main() {
+    // Match the decode thread topology a served session runs in (#1749).
+    common::init_decode_topology();
+
     let block_size: usize = std::env::var("PROBE_BLOCK")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -363,4 +366,8 @@ fn main() {
         };
         println!("{phase:>10} {ms:>12.3} {p90:>12.3} {total:>14.1} {spread:>9.1}");
     }
+
+    // After the phases, never before: the pool is built at first decode, so this
+    // is the earliest point the realized width exists to be read.
+    common::report_decode_width();
 }

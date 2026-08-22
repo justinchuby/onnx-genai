@@ -144,6 +144,9 @@ fn max_relative_deviation(got: &[f32], want: &[f32]) -> f32 {
 }
 
 fn main() {
+    // Match the decode thread topology a served session runs in (#1749).
+    common::init_decode_topology();
+
     // Shapes a decode step actually issues: a 7B-class MLP projection, a
     // vocabulary head (the widest weight in the graph), and a square control.
     let shapes: Vec<(&str, usize, usize)> = match std::env::var("PROBE_SHAPE").as_deref() {

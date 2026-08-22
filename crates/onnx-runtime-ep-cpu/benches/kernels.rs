@@ -19,6 +19,10 @@ fn thread_pool(threads: usize) -> ThreadPool {
 }
 
 fn bench_add(c: &mut Criterion) {
+    // Match the decode thread topology a served session runs in (#1749).
+    // Idempotent, and called from every group member rather than just the
+    // first so coverage does not silently ride on `criterion_group!` order.
+    common::init_decode_topology();
     let mut group = c.benchmark_group("add");
     for (size, shape) in [
         ("small", vec![1_024]),
@@ -53,6 +57,10 @@ fn bench_add(c: &mut Criterion) {
 }
 
 fn bench_reduce_mean(c: &mut Criterion) {
+    // Match the decode thread topology a served session runs in (#1749).
+    // Idempotent, and called from every group member rather than just the
+    // first so coverage does not silently ride on `criterion_group!` order.
+    common::init_decode_topology();
     let mut group = c.benchmark_group("reduce_mean");
     for (size, shape) in [
         ("small", vec![32, 128]),
@@ -90,6 +98,10 @@ fn bench_reduce_mean(c: &mut Criterion) {
 }
 
 fn bench_gather(c: &mut Criterion) {
+    // Match the decode thread topology a served session runs in (#1749).
+    // Idempotent, and called from every group member rather than just the
+    // first so coverage does not silently ride on `criterion_group!` order.
+    common::init_decode_topology();
     let mut group = c.benchmark_group("gather");
     for (size, rows, columns, index_count) in [
         ("small", 4_096, 128, 32),
@@ -156,6 +168,10 @@ fn with_gemm_backend<T>(backend: &str, f: impl FnOnce() -> T) -> T {
 }
 
 fn bench_matmul(c: &mut Criterion) {
+    // Match the decode thread topology a served session runs in (#1749).
+    // Idempotent, and called from every group member rather than just the
+    // first so coverage does not silently ride on `criterion_group!` order.
+    common::init_decode_topology();
     let mut group = c.benchmark_group("matmul");
     let backends = &[
         "generic",
@@ -267,6 +283,10 @@ fn dequantize_mxfp4_kn(n: usize, k: usize, packed: &[u8]) -> Vec<f32> {
 }
 
 fn bench_block_quantized_matmul_cache(c: &mut Criterion) {
+    // Match the decode thread topology a served session runs in (#1749).
+    // Idempotent, and called from every group member rather than just the
+    // first so coverage does not silently ride on `criterion_group!` order.
+    common::init_decode_topology();
     let mut group = c.benchmark_group("block_quantized_matmul_cached_dense");
     group.sample_size(15);
     let (m, k, n) = (1usize, 1_024usize, 1_024usize);
@@ -368,6 +388,10 @@ fn block_quantized_moe_kernel(top_k: usize) -> Box<dyn Kernel> {
 }
 
 fn bench_block_quantized_moe_cache(c: &mut Criterion) {
+    // Match the decode thread topology a served session runs in (#1749).
+    // Idempotent, and called from every group member rather than just the
+    // first so coverage does not silently ride on `criterion_group!` order.
+    common::init_decode_topology();
     let mut group = c.benchmark_group("block_quantized_moe_cached_dense");
     group.sample_size(15);
     let (rows, hidden, inter, experts, top_k) = (1usize, 256usize, 256usize, 4usize, 1usize);
