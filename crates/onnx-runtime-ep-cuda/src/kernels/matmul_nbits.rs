@@ -35,6 +35,12 @@ const GEMV_INT4_F32_BLOCK128_ENTRY: &str = "matmul_nbits_gemv_int4_f32_block128"
 /// `column * k_blocks` scale/zero-point base recomputation all drop out.
 const GEMV_INT8_F32_BLOCK128_ENTRY: &str = "matmul_nbits_gemv_int8_f32_block128";
 const QUANTIZE_ACCURACY4_ENTRY: &str = "matmul_nbits_quantize_accuracy4_block32";
+/// Half-activation W4A8 entries: an int8 activation quantizer and the matching
+/// `__dp4a` GEMV for fp16 models. The fp32 `accuracy4` entries above cannot
+/// serve an fp16 model, which is why `accuracy_level=4` was previously a no-op
+/// on every fp16 package (#1758).
+const QUANTIZE_ACCURACY4_F16_ENTRY: &str = "matmul_nbits_quantize_accuracy4_block32_f16";
+const GEMV_ACCURACY4_F16_ENTRY: &str = "matmul_nbits_gemv_accuracy4_block32_f16";
 const GEMV_ACCURACY4_ENTRY: &str = "matmul_nbits_gemv_accuracy4_block32";
 const GEMV_ACCURACY4_STAGE64_ENTRY: &str = "matmul_nbits_gemv_accuracy4_block32_stage64";
 // General-block-size fp32-activation accuracy_level=4 decode entries. These give
@@ -527,6 +533,9 @@ extern "C" __global__ void matmul_nbits_dequant_f16(
 "#;
 
 const GEMV_SRC: &str = r#"
+// Needed by the `*_f16` W4A8 entries below: their dot product is integer, but
+// the activation they read and the scales/bias/output they write are fp16.
+#include <cuda_fp16.h>
 __device__ __forceinline__ float warp_sum(float value)
 {
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -748,6 +757,47 @@ extern "C" __global__ void matmul_nbits_gemv_int4_f32_block128(
 // and the CPU native path. A single per-row scale is dominated by activation
 // outliers and rounds small in-block magnitudes to zero, flipping argmaxes on
 // outlier-heavy models (e.g. Phi-3.5); per-block scales track fp32 faithfully.
+// Half-activation counterpart of `matmul_nbits_quantize_accuracy4_block32`.
+//
+// The int8-activation ("W4A8") decode GEMV below is dtype-agnostic once the
+// activation is quantized — only this first step reads the model's activation
+// dtype. Splitting the quantizer rather than templating the GEMV keeps one
+// dot-product kernel for both fp32 and fp16 models, so the accumulation order
+// (and therefore the numerics) cannot drift between them.
+extern "C" __global__ void matmul_nbits_quantize_accuracy4_block32_f16(
+    const __half* activation,
+    signed char* quantized_activation,
+    float* activation_scale_out,
+    const int k,
+    const int padded_k)
+{
+    (void)padded_k;
+    const int block = (int)blockIdx.x;
+    const int lane = (int)threadIdx.x;
+    const int depth = block * 32 + lane;
+    const float value = (depth < k) ? __half2float(activation[depth]) : 0.0f;
+
+    float max_abs = fabsf(value);
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        max_abs = fmaxf(max_abs,
+            __shfl_down_sync(0xffffffffu, max_abs, offset));
+    }
+    max_abs = __shfl_sync(0xffffffffu, max_abs, 0);
+
+    const float activation_scale = max_abs == 0.0f ? 0.0f : max_abs / 127.0f;
+    const float inverse_scale =
+        activation_scale == 0.0f ? 0.0f : 1.0f / activation_scale;
+    if (lane == 0) {
+        activation_scale_out[block] = activation_scale;
+    }
+    int quantized = 0;
+    if (depth < k && activation_scale != 0.0f) {
+        quantized = (int)roundf(fminf(127.0f, fmaxf(-127.0f,
+            value * inverse_scale)));
+    }
+    quantized_activation[depth] = (signed char)quantized;
+}
+
 extern "C" __global__ void matmul_nbits_quantize_accuracy4_block32(
     const float* activation,
     signed char* quantized_activation,
@@ -867,6 +917,115 @@ extern "C" __global__ void matmul_nbits_gemv_accuracy4_block32(
     value = warp_sum(value);
     if (lane == 0 && column < n) {
         output[column] = bias ? __fadd_rn(value, bias[column]) : value;
+    }
+}
+
+// Half-activation counterpart of `matmul_nbits_gemv_accuracy4_block32`.
+//
+// The dot product is identical, instruction for instruction: the same uint4
+// weight load, the same `unpack_int4x4` + `dot_int8x4` sequence, the same
+// per-block fp32 scale fold and the same `warp_sum` association. Only the
+// epilogue dtypes differ — scales, bias and output are fp16 here. Keeping the
+// inner loop byte-identical is deliberate: it means an fp16 model and an fp32
+// model that quantize to the same int8 activations produce the same int32
+// dot products, so a divergence between them can only come from the epilogue.
+//
+// This is the W4A8 shape llama.cpp's `mul_mat_vec_q` uses (int8 activation,
+// 4-bit weights unpacked with shift+and, `__dp4a` accumulation, scale applied
+// once per block in fp32). It is available to fp16 models only through this
+// kernel; the fp32-only variants above cannot serve them.
+extern "C" __global__ void matmul_nbits_gemv_accuracy4_block32_f16(
+    const signed char* quantized_activation,
+    const float* activation_scale_ptr,
+    const unsigned char* packed,
+    const void* scales_raw,
+    const unsigned char* zero_points,
+    const __half* bias,
+    __half* output,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int scales_fp16,
+    const int bias_post_round,
+    const int zp_row_bytes)
+{
+    (void)k;
+    extern __shared__ signed char activation_tile[];
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int column = (int)blockIdx.x * 8 + warp;
+
+    float value = 0.0f;
+    for (int tile_block = 0; tile_block < k_blocks; tile_block += 32) {
+        const int tile_blocks = min(32, k_blocks - tile_block);
+        const int tile_depths = tile_blocks * 32;
+        for (int depth = tid; depth < tile_depths; depth += (int)blockDim.x) {
+            activation_tile[depth] =
+                quantized_activation[tile_block * 32 + depth];
+        }
+        __syncthreads();
+
+        const int block = tile_block + lane;
+        if (column < n && block < k_blocks) {
+            const long packed_start = ((long)column * k_blocks + block) * 16;
+            const uint4 packed_weights =
+                *reinterpret_cast<const uint4*>(packed + packed_start);
+            const unsigned int words[4] = {
+                packed_weights.x, packed_weights.y, packed_weights.z, packed_weights.w
+            };
+            const signed char* activation_block = activation_tile + lane * 32;
+            int dot = 0;
+            int activation_sum = 0;
+#pragma unroll
+            for (int word = 0; word < 4; ++word) {
+                const int activation0 =
+                    *reinterpret_cast<const int*>(activation_block + word * 8);
+                const int activation1 =
+                    *reinterpret_cast<const int*>(activation_block + word * 8 + 4);
+                dot = dot_int8x4(activation0, unpack_int4x4(words[word], 0), dot);
+                dot = dot_int8x4(activation1, unpack_int4x4(words[word], 16), dot);
+                activation_sum = dot_int8x4(activation0, 0x01010101, activation_sum);
+                activation_sum = dot_int8x4(activation1, 0x01010101, activation_sum);
+            }
+            // `unpack_int4x4` already applies the implied zero point 8, so the
+            // accumulator holds sum(qa * (qw - 8)). An explicit zero point only
+            // needs the residual removed: sum(qa * (qw - zp)) ==
+            // sum(qa * (qw - 8)) - (zp - 8) * sum(qa). Symmetric int4 keeps
+            // zp == 8, making this an exact no-op.
+            if (zero_points) {
+                const unsigned char zp =
+                    zero_points[(long)column * zp_row_bytes + (block >> 1)];
+                const int zero_point = (block & 1) ? (zp >> 4) : (zp & 15);
+                dot -= (zero_point - 8) * activation_sum;
+            }
+            const long scale_index = (long)column * k_blocks + block;
+            const float weight_scale = scales_fp16
+                ? __half2float(
+                    reinterpret_cast<const __half*>(scales_raw)[scale_index])
+                : reinterpret_cast<const float*>(scales_raw)[scale_index];
+            const float block_scale =
+                __fmul_rn(activation_scale_ptr[block], weight_scale);
+            value = __fadd_rn(value, __fmul_rn((float)dot, block_scale));
+        }
+        __syncthreads();
+    }
+
+    value = warp_sum(value);
+    if (lane == 0 && column < n) {
+        // Bias folding is inlined rather than shared with the fp16 GEMV module:
+        // this kernel lives in the module that owns `unpack_int4x4` /
+        // `dot_int8x4`, and a kernel cannot reference a helper defined in a
+        // different NVRTC translation unit.
+        const __half rounded = __float2half(value);
+        if (!bias) {
+            output[column] = rounded;
+        } else if (bias_post_round) {
+            output[column] = __float2half(
+                __half2float(rounded) + __half2float(bias[column]));
+        } else {
+            output[column] = __float2half(value + __half2float(bias[column]));
+        }
     }
 }
 
@@ -8213,6 +8372,36 @@ impl MatMulNBitsKernel {
                 zp_row_bytes,
             );
         }
+        // fp16-activation W4A8: `accuracy_level=4` asks to trade activation
+        // precision for decode speed, but every accuracy4 entry was fp32-only,
+        // so on an fp16 model the request was silently ignored. Route it to the
+        // dp4a GEMV. Symmetric and asymmetric int4 are both served: the packed
+        // zero point is removed once per block from the integer accumulator.
+        if self.bits == 4
+            && self.accuracy_level == 4
+            && self.block_size == 32
+            && self.k.is_multiple_of(32)
+            && self.accuracy4_workspace.is_some()
+        {
+            onnx_runtime_ep_api::record_kernel_variant!(
+                "gemv_accuracy4_f16_dp4a",
+                "M==1 decode: fp16 activation, bits=4, accuracy_level==4, block_size==32, \
+                 zero_points={} → int8-quantized activation + __dp4a GEMV (W4A8; lossy vs \
+                 the fp16 path by the caller's accuracy_level request)",
+                zero_points.is_some()
+            );
+            return self.launch_accuracy4_gemv_f16(
+                a_row,
+                packed,
+                scales,
+                scales_fp16,
+                zero_points,
+                bias,
+                y_row,
+                k_blocks,
+                zp_row_bytes,
+            );
+        }
         self.launch_f16_gemv(
             a_row,
             packed,
@@ -10670,6 +10859,116 @@ impl MatMulNBitsKernel {
         }
         .map(|_| ())
         .map_err(|err| driver_err("launch MatMulNBits accuracy_level=4 GEMV", err))
+    }
+
+    /// fp16-activation `accuracy_level=4` (W4A8) decode GEMV.
+    ///
+    /// Same two-stage shape as [`Self::launch_accuracy4_gemv`] — quantize the
+    /// activation row to int8 once per K-block, then reduce with `__dp4a` — but
+    /// reading `__half` activations and writing a `__half` result. The fp32
+    /// entries could not serve an fp16 model, which is why `accuracy_level=4`
+    /// was previously an exact no-op on fp16 weights-only-quantized models.
+    ///
+    /// Precision: int8 activation quantization is lossy relative to fp16, so
+    /// this is deliberately *not* bit-identical to the fp16 `__hfma2` path. It
+    /// is gated on the caller opting in via `accuracy_level=4`, which is the
+    /// contract's existing "trade activation precision for speed" request.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_accuracy4_gemv_f16(
+        &self,
+        activation: &TensorView,
+        packed: &TensorView,
+        scales: &TensorView,
+        scales_fp16: bool,
+        zero_points: Option<&TensorView>,
+        bias: Option<&TensorView>,
+        output: &mut TensorMut,
+        k_blocks: usize,
+        zp_row_bytes: usize,
+    ) -> Result<()> {
+        self.runtime
+            .require_nvrtc_half_headers("MatMulNBits accuracy_level=4 fp16 GEMV")?;
+        let workspace = self
+            .accuracy4_workspace
+            .as_ref()
+            .ok_or_else(|| error("accuracy_level=4 GEMV workspace is unavailable"))?
+            .lock()
+            .map_err(|_| error("accuracy_level=4 GEMV workspace lock poisoned"))?;
+        let quantize_function =
+            self.runtime
+                .nvrtc_function(GEMV_MODULE, GEMV_SRC, QUANTIZE_ACCURACY4_F16_ENTRY)?;
+        let gemv_function =
+            self.runtime
+                .nvrtc_function(GEMV_MODULE, GEMV_SRC, GEMV_ACCURACY4_F16_ENTRY)?;
+
+        let activation_ptr = cuptr(activation.data_ptr::<u8>() as *const c_void);
+        let packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
+        let scales_ptr = cuptr(scales.data_ptr::<u8>() as *const c_void);
+        let bias_ptr = bias
+            .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
+        let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
+        let k = as_i32("K", self.k)?;
+        let n = as_i32("N", self.n)?;
+        let k_blocks_i32 = as_i32("K block count", k_blocks)?;
+        let padded_k = as_i32("padded K", workspace.padded_k)?;
+        let scales_fp16_flag: i32 = i32::from(scales_fp16);
+        let bias_post_round: i32 = i32::from(self.fold_bias_post_round);
+        let zp_row_bytes_i32 = as_i32("zero-point row bytes", zp_row_bytes)?;
+        let zero_points_ptr = zero_points
+            .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
+
+        let mut quantize_builder = self.runtime.stream().launch_builder(&quantize_function);
+        quantize_builder
+            .arg(&activation_ptr)
+            .arg(&workspace.quantized_activation)
+            .arg(&workspace.activation_scale)
+            .arg(&k)
+            .arg(&padded_k);
+        // SAFETY: the persistent workspace covers padded_k int8 values plus one
+        // f32 scale per block-32, and the scalar ABI matches the fp16
+        // quantization entry point. One warp (CUDA block) quantizes one K-block.
+        unsafe {
+            quantize_builder.launch(LaunchConfig {
+                grid_dim: ((workspace.padded_k / 32) as u32, 1, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|err| driver_err("launch MatMulNBits accuracy_level=4 fp16 quantization", err))?;
+
+        let mut gemv_builder = self.runtime.stream().launch_builder(&gemv_function);
+        gemv_builder
+            .arg(&workspace.quantized_activation)
+            .arg(&workspace.activation_scale)
+            .arg(&packed_ptr)
+            .arg(&scales_ptr)
+            .arg(&zero_points_ptr)
+            .arg(&bias_ptr)
+            .arg(&output_ptr)
+            .arg(&k)
+            .arg(&n)
+            .arg(&k_blocks_i32)
+            .arg(&scales_fp16_flag)
+            .arg(&bias_post_round)
+            .arg(&zp_row_bytes_i32);
+        // SAFETY: this path is restricted to symmetric block-32 M=1 int4 inputs;
+        // the persistent quantized activation is initialized by the preceding
+        // stream launch, and the scalar ABI matches the fp16 GEMV entry point.
+        unsafe {
+            gemv_builder.launch(LaunchConfig {
+                grid_dim: (
+                    self.n.div_ceil(GEMV_ACCURACY4_COLUMNS_PER_BLOCK) as u32,
+                    1,
+                    1,
+                ),
+                block_dim: (GEMV_ACCURACY4_THREADS, 1, 1),
+                shared_mem_bytes: GEMV_ACCURACY4_SHARED_BYTES,
+            })
+        }
+        .map(|_| ())
+        .map_err(|err| driver_err("launch MatMulNBits accuracy_level=4 fp16 GEMV", err))
     }
 
     /// General-block-size fp32-activation accuracy_level=4 decode GEMV. Quantizes
