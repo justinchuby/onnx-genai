@@ -1659,6 +1659,15 @@
       ],
       "type": "string"
     },
+    "ImageOutputValueRange": {
+      "description": "Numeric interpretation of pixels emitted by an image workflow output.\n\nThis is an output contract, not a model-family hint: consumers must never\ninfer normalization from observed pixel values.",
+      "enum": [
+        "zero_to_one",
+        "negative_one_to_one",
+        "zero_to_255"
+      ],
+      "type": "string"
+    },
     "ImagePreprocessingProgram": {
       "description": "Generic image preprocessing program: an ordered transform pipeline plus the\nnamed workflow SSA tensor outputs it emits.\n\nThe program is expressed entirely as parameterized, architecture-neutral\ndata. Transform operations are generic (decode, resize, rescale, normalize,\ntile, patchify, pad). In workflow metadata, outputs are materialized by a\nmanifest-pinned preprocessing adapter invocation and bind processor-local\nvalues to typed SSA names. A package may name an output `pixel_position_ids`,\n`image_grid_thw`, or anything else without introducing runtime model-family\ndispatch.",
       "properties": {
@@ -3278,10 +3287,16 @@
           "enum": [
             "prompt_text",
             "prompt_tokens",
+            "negative_prompt_text",
+            "negative_prompt_tokens",
             "media",
             "max_iterations",
             "max_output_tokens",
             "seed",
+            "guidance_scale",
+            "width",
+            "height",
+            "denoising_strength",
             "sampling_temperature",
             "sampling_top_k",
             "sampling_top_p",
@@ -4891,6 +4906,16 @@
         },
         "stage": {
           "$ref": "#/$defs/OutputStage"
+        },
+        "value_range": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImageOutputValueRange"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [

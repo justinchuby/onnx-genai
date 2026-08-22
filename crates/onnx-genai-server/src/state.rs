@@ -552,6 +552,7 @@ impl AppState {
             fim_config,
             pipeline: false,
             multimodal: None,
+            image_pipeline: None,
         });
         let registry = ModelRegistry::from_handle(Arc::new(handle), config.clone());
         Self {
@@ -715,6 +716,7 @@ pub(crate) fn build_handle_with_authorities(
         fim_config,
         pipeline: false,
         multimodal: None,
+        image_pipeline: None,
     }))
 }
 
@@ -727,6 +729,7 @@ fn build_pipeline_handle(
     directory: PipelineModelDirectory,
     authorities: Arc<ServerMemoryAuthorities>,
 ) -> anyhow::Result<ModelHandle> {
+    let image_pipeline = crate::image_generation::ImagePipelineSpec::from_pipeline(&directory.spec);
     let tokenizer_path = crate::multimodal::tokenizer_path(model_dir, &directory)?;
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Failed to load pipeline tokenizer: {e}"))?;
@@ -752,6 +755,7 @@ fn build_pipeline_handle(
         fim_config: None,
         pipeline: true,
         multimodal: Some(multimodal),
+        image_pipeline,
     }))
 }
 
