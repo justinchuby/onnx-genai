@@ -1098,6 +1098,23 @@ impl MoeAttributes {
                 "swiglu_fusion is only valid when activation_type='swiglu'",
             ));
         }
+        let activation_alpha = float_attr(node, "activation_alpha", 1.0)?;
+        let activation_beta = float_attr(node, "activation_beta", 0.0)?;
+        let swiglu_limit = float_attr(node, "swiglu_limit", f32::INFINITY)?;
+        for (name, value) in [
+            ("activation_alpha", activation_alpha),
+            ("activation_beta", activation_beta),
+            ("swiglu_limit", swiglu_limit),
+        ] {
+            if value.is_nan() {
+                return Err(error(format!("attribute {name} must not be NaN")));
+            }
+        }
+        if swiglu_limit <= 0.0 {
+            return Err(error(format!(
+                "swiglu_limit must be positive, got {swiglu_limit}"
+            )));
+        }
         Ok(Self {
             k: usize::try_from(k).map_err(|_| error("k exceeds usize limits"))?,
             prefill_min_tokens: usize::try_from(prefill_min_tokens)
@@ -1105,9 +1122,9 @@ impl MoeAttributes {
             activation,
             normalize_routing_weights,
             swiglu_fusion: swiglu_fusion as usize,
-            activation_alpha: float_attr(node, "activation_alpha", 1.0)?,
-            activation_beta: float_attr(node, "activation_beta", 0.0)?,
-            swiglu_limit: float_attr(node, "swiglu_limit", f32::INFINITY)?,
+            activation_alpha,
+            activation_beta,
+            swiglu_limit,
         })
     }
 
