@@ -81,7 +81,7 @@ adapters:
 pipeline:
   workflow:
     manifest:
-      capabilities: [workflow_ssa, parameter_adapters]
+      capabilities: [workflow_ssa, parameter_adapters, heterogeneous_adapter_batching]
     inputs:
       request.lora_segments:
         contract: { dtype: int64, rank: 2, shape: [batch, 2],
