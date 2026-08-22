@@ -26,8 +26,9 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: onnxruntime/mobius
-          # Producer support remains on Mobius PR #537 until its owner merges it.
-          ref: justinchuby/minimax-music3
+          # Exact producer revision from Mobius PR #537. Keep CI reproducible
+          # until that commit is reachable from the upstream default branch.
+          ref: 3b73190bc352bf0794c6badfe2383c559506ca77
           path: validation/mobius
       - uses: actions/setup-python@v5
         with:

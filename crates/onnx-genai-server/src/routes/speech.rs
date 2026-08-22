@@ -23,18 +23,18 @@ pub(crate) async fn audio_speech(
         ));
     }
     let handle = resolve_model(&state.registry, &request.model).await?;
+    let processor = handle.speech_prompt.as_ref().ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "model '{}' does not declare both a text-assembly adapter and compatible buffered PCM16 WAV output",
+            handle.id
+        ))
+    })?;
     if !handle.pipeline {
         return Err(ApiError::bad_request(format!(
             "model '{}' is not an executable workflow package",
             handle.id
         )));
     }
-    let processor = handle.speech_prompt.as_ref().ok_or_else(|| {
-        ApiError::bad_request(format!(
-            "model '{}' does not declare a text-assembly speech adapter",
-            handle.id
-        ))
-    })?;
     let prompt = processor
         .assemble(&request.input, &request.instructions)
         .map_err(|error| ApiError::bad_request(format!("invalid speech input: {error:#}")))?;

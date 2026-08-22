@@ -1,11 +1,24 @@
 use anyhow::{Context, bail};
 use onnx_genai_metadata::{
-    MediaContainer, MediaDelivery, MediaEncoding, OutputStage, WorkflowOutputRole,
+    MediaContainer, MediaDelivery, MediaEncoding, OutputStage, WorkflowOutputRole, WorkflowSpec,
 };
 
 use super::{PipelineEngine, PipelineOutputs};
 
 const RESAMPLE_RADIUS: isize = 16;
+
+pub fn has_buffered_pcm16_wav_output(workflow: &WorkflowSpec) -> bool {
+    workflow.outputs.values().any(|output| {
+        output.role == WorkflowOutputRole::Audio
+            && output.media.as_ref().is_some_and(|media| {
+                media.delivery == MediaDelivery::Buffered
+                    && media.container == MediaContainer::Wav
+                    && media.encoding == MediaEncoding::PcmS16Le
+                    && media.sample_rate_hz.is_some_and(|rate| rate > 0)
+                    && media.channels.is_some_and(|channels| channels > 0)
+            })
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedAudio {
@@ -209,11 +222,39 @@ pub fn encode_pcm16_wav(
 }
 
 fn validate_wav_header(bytes: &[u8], sample_rate: u32, channels: u16) -> anyhow::Result<()> {
-    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+    if bytes.len() < 44
+        || &bytes[0..4] != b"RIFF"
+        || &bytes[8..12] != b"WAVE"
+        || &bytes[12..16] != b"fmt "
+        || &bytes[36..40] != b"data"
+    {
         bail!("post-adapter audio output is not a valid WAV byte stream");
     }
+    let riff_size = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    let fmt_size = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let audio_format = u16::from_le_bytes([bytes[20], bytes[21]]);
     let actual_channels = u16::from_le_bytes([bytes[22], bytes[23]]);
     let actual_rate = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
+    let byte_rate = u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
+    let block_align = u16::from_le_bytes([bytes[32], bytes[33]]);
+    let bits_per_sample = u16::from_le_bytes([bytes[34], bytes[35]]);
+    let data_size = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]);
+    let expected_block_align = channels
+        .checked_mul(2)
+        .context("declared WAV channel count overflows block alignment")?;
+    let expected_byte_rate = sample_rate
+        .checked_mul(u32::from(expected_block_align))
+        .context("declared WAV byte rate overflows")?;
+    if fmt_size != 16
+        || audio_format != 1
+        || bits_per_sample != 16
+        || block_align != expected_block_align
+        || byte_rate != expected_byte_rate
+        || usize::try_from(riff_size).ok() != bytes.len().checked_sub(8)
+        || usize::try_from(data_size).ok() != bytes.len().checked_sub(44)
+    {
+        bail!("post-adapter WAV must contain canonical PCM16 fmt and data chunks");
+    }
     if actual_channels != channels || actual_rate != sample_rate {
         bail!(
             "WAV header declares {actual_channels} channels at {actual_rate} Hz; metadata declares {channels} channels at {sample_rate} Hz"
@@ -225,6 +266,7 @@ fn validate_wav_header(bytes: &[u8], sample_rate: u32, channels: u16) -> anyhow:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use onnx_genai_metadata::InferenceMetadata;
 
     fn sine(rate: u32, frequency: f64, seconds: f64) -> Vec<f32> {
         (0..(rate as f64 * seconds) as usize)
@@ -282,5 +324,57 @@ mod tests {
                 255, 127, 0, 64, // L1=1, R1=0.5
             ]
         );
+    }
+
+    #[test]
+    fn wav_validation_rejects_non_pcm16_and_inconsistent_data_lengths() {
+        let wav = encode_pcm16_wav(&[0.0, 0.0], 2, 32_000).expect("WAV");
+        validate_wav_header(&wav, 32_000, 2).expect("canonical WAV validates");
+
+        let mut float_wav = wav.clone();
+        float_wav[20..22].copy_from_slice(&3u16.to_le_bytes());
+        assert!(validate_wav_header(&float_wav, 32_000, 2).is_err());
+
+        let mut truncated = wav;
+        truncated.pop();
+        assert!(validate_wav_header(&truncated, 32_000, 2).is_err());
+    }
+
+    #[test]
+    fn speech_delivery_capability_requires_buffered_pcm16_wav_audio() {
+        let metadata: InferenceMetadata = serde_yaml::from_str(
+            r#"
+schema_version: "1"
+model:
+  kind: pipeline
+  artifacts: []
+pipeline:
+  workflow:
+    manifest:
+      capabilities: []
+    inputs: {}
+    outputs:
+      audio:
+        role: audio
+        stage: post_adapter
+        contract: {dtype: uint8, rank: 1}
+        media:
+          delivery: buffered
+          container: wav
+          encoding: pcm_s16_le
+          sample_rate_hz: 32000
+          channels: 2
+    components: {}
+    state: {}
+    steps: []
+"#,
+        )
+        .expect("metadata");
+        let workflow = &metadata.pipeline.expect("pipeline").workflow;
+        assert!(has_buffered_pcm16_wav_output(workflow));
+
+        let mut incompatible = workflow.clone();
+        incompatible.outputs.get_mut("audio").expect("audio").media = None;
+        assert!(!has_buffered_pcm16_wav_output(&incompatible));
     }
 }

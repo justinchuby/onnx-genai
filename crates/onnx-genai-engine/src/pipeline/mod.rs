@@ -44,6 +44,10 @@ pub use workflow::{
     is_missing_required_input,
 };
 
+pub fn has_buffered_pcm16_wav_output(workflow: &WorkflowSpec) -> bool {
+    audio::has_buffered_pcm16_wav_output(workflow)
+}
+
 pub type PipelineTensors = HashMap<String, Value>;
 
 /// Structured workflow outputs with request-aligned rows.

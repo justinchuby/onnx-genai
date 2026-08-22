@@ -1442,6 +1442,12 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
         contract: &crate::schema::TensorContract,
         errors: &mut Vec<String>,
     ) {
+        if let crate::schema::BatchLayout::RequestExpanded { factor: 0, .. } = contract.batch_layout
+        {
+            errors.push(format!(
+                "{path} declares request_expanded.factor 0; the expansion factor must be at least 1"
+            ));
+        }
         if contract
             .shape
             .as_ref()

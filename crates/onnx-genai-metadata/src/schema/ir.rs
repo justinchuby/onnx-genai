@@ -44,6 +44,8 @@ pub enum BatchLayout {
     /// example conditional/unconditional classifier-free-guidance rows).
     RequestExpanded {
         axis: usize,
+        /// Number of contiguous physical rows owned by each logical request.
+        /// Validation requires this to be at least one.
         factor: usize,
     },
     TokenPacked {

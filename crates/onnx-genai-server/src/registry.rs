@@ -88,6 +88,7 @@ pub(crate) struct ModelHandleParts {
     pub(crate) fim_config: Option<FimConfig>,
     pub(crate) pipeline: bool,
     pub(crate) multimodal: Option<MultimodalSpecs>,
+    pub(crate) speech_prompt: Option<Arc<crate::speech::SpeechPromptProcessor>>,
     pub(crate) image_pipeline: Option<ImagePipelineSpec>,
 }
 
@@ -104,10 +105,10 @@ impl ModelHandle {
             fim_config,
             pipeline,
             multimodal,
+            speech_prompt,
             image_pipeline,
         } = parts;
         let private_channels = declares_private_channels(&model_dir);
-        let speech_prompt = crate::speech::load_speech_prompt_processor(&model_dir)?;
         Ok(Self {
             id,
             engine,

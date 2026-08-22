@@ -1076,6 +1076,37 @@ async fn speech_endpoint_accepts_only_wav_delivery() {
 }
 
 #[tokio::test]
+async fn non_speech_registry_entry_does_not_expose_speech_route() {
+    let response = app(tiny_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/speech")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "model": "tiny-llm",
+                        "input": "lyrics",
+                        "instructions": "music",
+                        "response_format": "wav",
+                        "stream": false
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).expect("UTF-8");
+    assert!(
+        body.contains("compatible buffered PCM16 WAV output"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
 #[ignore = "synthetic Whisper-contract smoke test; run explicitly for audio server validation"]
 async fn audio_endpoints_route_through_tiny_whisper_pipeline() {
     let model_dir =

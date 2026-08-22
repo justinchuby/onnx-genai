@@ -552,6 +552,7 @@ impl AppState {
             fim_config,
             pipeline: false,
             multimodal: None,
+            speech_prompt: None,
             image_pipeline: None,
         })
         .expect("test model handle");
@@ -717,6 +718,7 @@ pub(crate) fn build_handle_with_authorities(
         fim_config,
         pipeline: false,
         multimodal: None,
+        speech_prompt: None,
         image_pipeline: None,
     })
 }
@@ -741,6 +743,12 @@ fn build_pipeline_handle(
         authorities,
     )?;
     let multimodal = crate::multimodal::build(&directory, engine.models())?;
+    let speech_prompt =
+        if onnx_genai_engine::pipeline::has_buffered_pcm16_wav_output(&directory.spec.workflow) {
+            crate::speech::load_speech_prompt_processor(model_dir)?
+        } else {
+            None
+        };
     // The declared `generation` block was retired along with the rest of the
     // superseded generation metadata surfaces, so the pipeline path resolves
     // sampling from request options only — same as the non-pipeline path above.
@@ -756,6 +764,7 @@ fn build_pipeline_handle(
         fim_config: None,
         pipeline: true,
         multimodal: Some(multimodal),
+        speech_prompt,
         image_pipeline,
     })
 }

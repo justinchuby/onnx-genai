@@ -259,3 +259,23 @@ fn fixed_guidance_rows_have_an_explicit_request_expansion_layout() {
     assert_eq!(layout.request_axis(), Some(0));
     assert_eq!(layout.request_expansion_factor(), 2);
 }
+
+#[test]
+fn zero_request_expansion_is_rejected_before_runtime_admission() {
+    let mut metadata: InferenceMetadata =
+        serde_yaml::from_str(AUDIO_WORKFLOW).expect("audio workflow parses");
+    let workflow = &mut metadata.pipeline.as_mut().expect("pipeline").workflow;
+    workflow
+        .outputs
+        .get_mut("audio")
+        .expect("audio output")
+        .contract
+        .batch_layout = onnx_genai_metadata::BatchLayout::RequestExpanded { axis: 0, factor: 0 };
+    let errors = validate_metadata(&metadata).expect_err("factor zero must be rejected");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("request_expanded.factor 0")),
+        "{errors:#?}"
+    );
+}

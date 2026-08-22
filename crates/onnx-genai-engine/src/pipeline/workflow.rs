@@ -3147,6 +3147,10 @@ fn validate_workflow_value(
         for (axis, (declared, actual)) in shape.iter().zip(value.shape()).enumerate() {
             let symbolic_actual = if contract.batch_layout.request_axis() == Some(axis) {
                 let factor = i64::try_from(contract.batch_layout.request_expansion_factor())?;
+                anyhow::ensure!(
+                    factor > 0,
+                    "workflow value '{name}' has a zero request expansion factor"
+                );
                 if actual % factor != 0 {
                     anyhow::bail!(
                         "workflow value '{name}' axis {axis} is {actual}, which is not divisible \
@@ -3815,6 +3819,10 @@ fn merge_inactive_rows(
             .context("mixed active row carry batch axis exceeds tensor rank")?,
     )?;
     let expansion = state.contract.batch_layout.request_expansion_factor();
+    anyhow::ensure!(
+        expansion > 0,
+        "mixed active row carry has a zero request expansion factor"
+    );
     anyhow::ensure!(
         active.len().saturating_mul(expansion) == rows,
         "loop active mask has {} requests with expansion {expansion} for state batch {rows}",
