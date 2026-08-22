@@ -2881,12 +2881,16 @@ fn widened_sgemm_beats_half_gemm(
 /// the `set_var` does nothing, so both arms of an A/B silently run the *same*
 /// route and it passes while measuring nothing; or this test wins the race and
 /// pins its value process-wide for every later test. Tests must therefore never
-/// touch the variable; they use [`HalfDecodeGemvScope`], a thread-local override
+/// touch the variable; they use `HalfDecodeGemvScope`, a thread-local override
 /// that leaves the latch untouched. See #1736, and #1056 for the same trap in
 /// the weight-transpose cache.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub(crate) fn half_decode_gemv_enabled() -> bool {
-    #[cfg(test)]
+    // Gated identically to the thread-local below rather than on bare `test`:
+    // the two are equivalent only because this function is already x86-only, and
+    // adding a non-x86 arm should not silently reference a symbol that does not
+    // exist there.
+    #[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
     if let Some(forced) = HALF_DECODE_GEMV_OVERRIDE.with(std::cell::Cell::get) {
         return forced;
     }
