@@ -29,15 +29,29 @@ Applying that rule to `qwen t=16 s=1 acc=0`, the cell previously published as
 0.436x, six independent runs per arm:
 
     native  190.9 195.6 197.8 200.3 201.5 220.6   unimodal, +-8%
-    ORT     218.3 229.8 246.2 396.9 414.9 427.7   BIMODAL, two clean clusters
+    ORT     218.3 229.8 246.2 396.9 414.9 427.7   two clusters, 1.79x apart
 
-So the anomaly is in the *baseline*, not in our kernel, and it is a genuine
-bimodality rather than one bad sample -- individual ORT runs inside each mode
-are internally stable (intra-run spread as low as 0.7%). The honest reading of
-this cell is a ratio range of 0.48x (against ORT's fast mode) to 0.86x (against
-its slow mode). It must not be quoted as a single number, and the old 0.436x
-came from taking `max` over repetitions of the *fast* mode while the native arm
-ran single-shot with warmup inside its own clock.
+What that does and does not establish
+-------------------------------------
+It establishes that **0.436x was not a measurable quantity**: it came from
+taking `max` over repetitions of ORT's fast cluster while the native arm ran
+single-shot with its own warmup inside its clock. Under one definition the
+same cell reads 0.70x, and the ratio cannot be quoted more precisely than the
+range 0.48x-0.86x.
+
+It does **not** yet establish that ORT is intrinsically bimodal here, and the
+temptation to claim that should be resisted. The three slow ORT runs reported
+intra-run spreads of 67.9%, 4.7% and 12.0% against 1.4%, 1.1% and 0.7% for the
+three fast ones, and the host was later found to have two other agents running
+heavy jobs on it. Elevated intra-run spread in exactly the slow cluster is the
+signature of external contention, not of an internal bimodality -- a genuinely
+bimodal implementation would be internally stable in *both* modes. So the
+parsimonious reading is that the slow cluster is contention, which makes this
+a measurement-environment finding rather than a fact about ORT.
+
+Separating the two requires re-running both arms interleaved on a quiet host,
+which is what `wait_quiet` and `competing_load` below exist to guarantee. Until
+that has been done this cell has no published ratio.
 """
 import argparse
 import json

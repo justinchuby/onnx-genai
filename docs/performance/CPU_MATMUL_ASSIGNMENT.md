@@ -2223,3 +2223,153 @@ kernel cannot agree on a number neither produces.
 
 Full record:
 [`docs/benchmarks/2026-08-22-fused-matmul-bias-half-gemv.md`](../benchmarks/2026-08-22-fused-matmul-bias-half-gemv.md).
+
+## 27. The acc0 single-session "gap" was measured with two different rulers (**retraction**, #1712)
+
+The 24-cell acc0 matrix posted to #1679/#1676 divided a native number by an ORT
+number that **was not the same statistic**, and the disagreement between the two
+definitions was concentrated at exactly `sessions = 1` — the configuration the
+whole "single-session gap" conclusion rests on.
+
+### The four biases
+
+| | native (before) | ORT (before) |
+|---|---|---|
+| denominator | wall included thread spawn + 3 warmup steps | warmup ran before `t0` |
+| session start | no barrier; staggered spawn absorbed into `wall` | `threading.Barrier` |
+| over repetitions | single shot | `min` (s=1) / `max` (s≥2) — the luckiest run |
+| **statistic** | wall-clock aggregate at every `s` | **`1000/median_ms` at s=1, wall-clock aggregate at s≥2** |
+
+The last row is the one that manufactures a result. The baseline switched from a
+best-case statistic (a median per-token time, which excludes every straggler) to
+a realistic one (wall-clock aggregate, which includes them) **at `sessions = 2`**.
+A baseline that does that is guaranteed to look strongest at `sessions = 1`, and
+"strongest at `sessions = 1`" is precisely the shape that was reported as *"the
+gap is concurrency-dependent; we lose at one session and win at two and four."*
+
+That reading is withdrawn. It is an artifact of the instrument.
+
+The native side was independently penalised: at `tokens = 24`, charging three
+warmup steps to the clock means 27 steps of work counted against 24 tokens, a
+flat ~11% handicap the ORT arm never paid at any session count.
+
+### What the headline actually was
+
+`qwen t=16 s=1 acc=0` was published as **0.436x**. Under a single definition the
+same cell reads **0.70x**, and six independent runs per arm show the ratio cannot
+honestly be quoted more precisely than a **range of 0.48x–0.86x**, because the
+ORT arm lands in two clusters 1.79x apart:
+
+```
+native  190.9 195.6 197.8 200.3 201.5 220.6   unimodal, ±8%
+ORT     218.3 229.8 246.2 396.9 414.9 427.7   two clusters, 1.79x apart
+```
+
+**The 0.436x figure was never a measurable quantity.** It is `max`-over-reps of
+ORT's fast cluster divided by a single-shot native run carrying an 11% warmup
+handicap.
+
+### Why the second conclusion is *also* being withheld
+
+The obvious next claim — "ORT is bimodal here, so the anomaly is in the baseline"
+— is not supported either, and it is worth recording why, because it was nearly
+published. The three slow ORT runs reported intra-run spreads of 67.9%, 4.7% and
+12.0%; the three fast ones reported 1.4%, 1.1% and 0.7%. **Elevated intra-run
+spread confined to the slow cluster is the signature of external contention, not
+of an internal bimodality** — a genuinely bimodal implementation would be stable
+in both of its modes. The parsimonious explanation is that the slow cluster is
+other load on the host, which was later confirmed to be present.
+
+So this cell has **no published ratio** until both arms are re-run interleaved on
+a quiet host.
+
+### The measurement environment was the dominant error term
+
+Mid-investigation the host was found to be running, concurrently: another agent's
+full `cargo test`/`llvm-cov` on this same crate (~2470% CPU), **another agent's
+run of this same `int4_decode_loop_ab` benchmark** (~1275% CPU), and a stray
+`while :; do :; done` spinner. Peak load average 31.25 on a 16-physical-core box.
+
+The same cell — qwen, block 32, acc 0, s=1, 16 decode threads, pinned to even
+CPUs — measured **197.2 tok/s** in one window and **22.8 tok/s** in another. An
+8.6x swing, from the environment alone.
+
+The trap worth naming: **several of those contaminated runs reported an intra-run
+`spread_%` under 6%.** A tight spread means the contention was *steady* during
+the run, not that the host was idle. Intra-run spread is not a contention
+detector, and treating it as one is how a 8.6x environmental artifact acquires a
+credible-looking error bar. `acc0_gap_matrix.py` therefore refuses to start a
+cell while any other process is above 150% CPU, and marks the cell `UNTRUSTED`
+rather than silently proceeding if it cannot wait one out.
+
+### What survives contention: the within-window bandwidth comparison
+
+Absolute throughput on this host is currently worthless, so every claim below is
+a **ratio between the two arms measured back-to-back in the same window**, which
+is the one form that survives — both arms eat the same contention.
+
+Interleaved native / ORT / native on `qwen t=16 s=1 acc=0`, with the native A/A
+partner confirming the native arm's own noise floor at **1.018**:
+
+| arm | tok/s | achieved GB/s on the same 145.7 MB/token footprint |
+|---|---|---|
+| native acc0 | 196.0 | **28.5** |
+| ORT | 279.5 | **40.7** |
+
+**ORT sustains 1.43x our bandwidth on the identical weight footprint, in the
+identical environment.** That is the decisive observation, and it is why the
+GB/s columns exist: ORT *demonstrates* that more bandwidth was available on this
+machine at that moment. We are therefore not limited by the memory system, and
+"the host is busy" cannot explain the difference — it was busy for both arms.
+
+The complementary absolute framing (a single pinned core sustaining ~3.4 GB/s
+against a 31–36 GB/s per-CCX ceiling, ≈2.3 MACs/cycle against AVX2+FMA's 16, so
+~14% of arithmetic peak) points the same way — at the nibble unpack and int→f32
+conversion feeding each FMA rather than at traffic — but it is **not being
+claimed as a number yet**. Contention depresses it, so it is only a lower bound,
+and a lower bound cannot by itself establish distance from a ceiling. It needs a
+quiet host. Note also that CPU-time-per-token, the obvious contention-immune
+substitute, is *not* immune here: a busy SMT sibling steals execution-unit
+throughput while the thread keeps accruing CPU time, so it inflates rather than
+cancels.
+
+### The MLP-starvation hypothesis is provisionally falsified
+
+The leading explanation for a single-session deficit was memory-level-parallelism
+starvation: one session cannot keep enough cache misses outstanding, while two or
+four supply independent streams that do. That predicts aggregate bandwidth rising
+with session count.
+
+Measured across `s = 1, 2, 4, 8` it does not rise — it stays flat at ~22–28 GB/s
+aggregate. Marked **provisional** because the sweep was taken in a contended
+window, but the shape is a within-sweep comparison and the prediction is
+directional, so a real MLP effect should still have been visible.
+
+If it holds, it has a second consequence worth stating plainly: **the `s=2`/`s=4`
+"wins" were never us scaling.** Our absolute throughput is flat in session count,
+so those cells were the baseline degrading, not the kernel improving — and no
+kernel change should be justified by them.
+
+### Disposition
+
+* Harness unified and the definition written into the module docs as a table, so
+  the two arms cannot silently drift apart again.
+* Both arms print `spread_%`; the driver blocks on a quiet host and labels
+  untrusted cells.
+* The 24-cell matrix, the 0.436x headline, and the "concurrency-dependent gap"
+  reading are **withdrawn pending re-measurement on an uncontended host**.
+* The one surviving quantitative claim is the within-window one: **ORT sustains
+  1.43x our achieved bandwidth on the same footprint in the same conditions**,
+  so the deficit is real, is not the memory system, and is not the host.
+* Next mechanism to attack is the **unpack/convert issue cost inside
+  `borrowed_int4_nblock4_avx2`**, which is kernel-owned. It is the hypothesis
+  most consistent with the evidence, and it is *not yet proven* — proving it
+  needs a quiet host and a mechanism-isolating ablation, not another matrix.
+* The dispatch-width question was handed to the runtime owner with CPU-time
+  evidence (total CPU-seconds flat across widths, `sys` time rising ~20x from
+  `t<=2` to `t>=4`) rather than tuned around in the kernel.
+* **Benchmarking on this host now requires coordination.** Three agents share
+  16 physical cores; two were running heavy jobs on this crate during this
+  investigation, one of them the very same benchmark binary. Cross-agent notice
+  before a long run is not politeness, it is a correctness requirement for
+  anyone publishing a ratio.
