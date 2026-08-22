@@ -40,6 +40,14 @@ pub enum BatchLayout {
     RequestAligned {
         axis: usize,
     },
+    /// Each request owns a fixed-size contiguous group on ``axis`` (for
+    /// example conditional/unconditional classifier-free-guidance rows).
+    RequestExpanded {
+        axis: usize,
+        /// Number of contiguous physical rows owned by each logical request.
+        /// Validation requires this to be at least one.
+        factor: usize,
+    },
     TokenPacked {
         /// Request-aligned value holding the exclusive prefix offset of each request's items.
         offsets: String,
@@ -59,8 +67,16 @@ impl BatchLayout {
     /// Axis permuted when the runtime compacts the batch, if any.
     pub fn request_axis(&self) -> Option<usize> {
         match self {
-            Self::RequestAligned { axis } => Some(*axis),
+            Self::RequestAligned { axis } | Self::RequestExpanded { axis, .. } => Some(*axis),
             Self::Shared | Self::TokenPacked { .. } | Self::RuntimeSequenceState => None,
+        }
+    }
+
+    /// Number of contiguous tensor rows owned by each request.
+    pub fn request_expansion_factor(&self) -> usize {
+        match self {
+            Self::RequestExpanded { factor, .. } => *factor,
+            _ => 1,
         }
     }
 
@@ -585,6 +601,14 @@ pub struct WorkflowOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_range: Option<ImageOutputValueRange>,
     pub stage: OutputStage,
+    /// Concrete media delivery contract for a post-processing output.
+    ///
+    /// Tensor shape alone cannot distinguish PCM samples from encoded WAV bytes,
+    /// nor can it carry the sample rate and channel count required by an audio
+    /// serving API. This remains architecture-neutral and intentionally contains
+    /// no model-family identifiers or artifact fingerprints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<MediaOutputContract>,
 }
 
 /// Numeric interpretation of pixels emitted by an image workflow output.
@@ -612,6 +636,46 @@ pub enum WorkflowOutputRole {
     Audio,
     Tensor,
     Event,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MediaOutputContract {
+    pub container: MediaContainer,
+    pub encoding: MediaEncoding,
+    /// Sample rate of the encoded response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_rate_hz: Option<u32>,
+    /// Sample rate of a pre-adapter waveform. When it differs from
+    /// `sample_rate_hz`, the API boundary resamples before encoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_sample_rate_hz: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channels: Option<u16>,
+    #[serde(default)]
+    pub delivery: MediaDelivery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaContainer {
+    Raw,
+    Wav,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaEncoding {
+    PcmS16Le,
+    PcmF32Le,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaDelivery {
+    #[default]
+    Buffered,
+    Streaming,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]

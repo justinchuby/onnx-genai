@@ -1012,6 +1012,423 @@ async fn transcription_multipart_against_non_audio_model_returns_400() {
 }
 
 #[tokio::test]
+async fn speech_endpoint_rejects_streaming_before_execution() {
+    let response = app(tiny_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/speech")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "input": "lyrics",
+                        "instructions": "music description",
+                        "response_format": "wav",
+                        "stream": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("stream=true")
+    );
+}
+
+#[tokio::test]
+async fn speech_endpoint_accepts_only_wav_delivery() {
+    let response = app(tiny_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/speech")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "input": "lyrics",
+                        "response_format": "mp3"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("response_format=wav")
+    );
+}
+
+#[tokio::test]
+async fn non_speech_registry_entry_does_not_expose_speech_route() {
+    let response = app(tiny_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/speech")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "model": "tiny-llm",
+                        "input": "lyrics",
+                        "instructions": "music",
+                        "response_format": "wav",
+                        "stream": false
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).expect("UTF-8");
+    assert!(
+        body.contains("compatible buffered PCM16 WAV output"),
+        "{body}"
+    );
+}
+
+fn speech_state() -> AppState {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/onnx_genai_workflows/speech_wav");
+    AppState::load(&model_dir, Some("speech-wav".to_string())).expect("load speech fixture")
+}
+
+/// Raw `/v1/audio/speech` conformance against an ONNX-owned, self-contained
+/// workflow package: a text prompt assembled by a generic text-assembly adapter
+/// is synthesized into a buffered PCM16 WAV that honours the package's declared
+/// `media` contract (audio/wav, two channels, 24 kHz, 16-bit). The runtime only
+/// consumes canonical metadata fields, so this holds for any package that
+/// declares the same contract.
+#[tokio::test]
+async fn speech_endpoint_synthesizes_buffered_pcm16_wav() {
+    let response = app(speech_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/speech")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "speech-wav",
+                        "input": "hello world",
+                        "instructions": "the quick brown fox",
+                        "response_format": "wav",
+                        "stream": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("audio/wav")
+    );
+
+    let wav = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(wav.len() > 44, "WAV must carry a header plus PCM samples");
+    assert_eq!(&wav[0..4], b"RIFF");
+    assert_eq!(&wav[8..12], b"WAVE");
+    assert_eq!(&wav[12..16], b"fmt ");
+    // Audio format tag 1 == PCM.
+    assert_eq!(u16::from_le_bytes([wav[20], wav[21]]), 1);
+    // Channel count and sample rate come from the declared media contract.
+    assert_eq!(u16::from_le_bytes([wav[22], wav[23]]), 2);
+    assert_eq!(
+        u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]),
+        24000
+    );
+    // pcm_s16_le is 16-bit.
+    assert_eq!(u16::from_le_bytes([wav[34], wav[35]]), 16);
+    assert_eq!(&wav[36..40], b"data");
+}
+
+/// The optional `max_output_units` budget is honoured against the package's
+/// declared ceiling. The value is read from the canonical text-assembly
+/// contract (`speech_processor.json`), not from any model-family default, so an
+/// explicit in-range budget still renders a valid buffered WAV.
+#[tokio::test]
+async fn speech_endpoint_honors_explicit_max_output_units() {
+    let response = app(speech_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/speech")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "speech-wav",
+                        "input": "hello world",
+                        "instructions": "the quick brown fox",
+                        "response_format": "wav",
+                        "stream": false,
+                        "max_output_units": 3
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("audio/wav")
+    );
+    let wav = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&wav[0..4], b"RIFF");
+    assert_eq!(&wav[8..12], b"WAVE");
+}
+
+/// The raw speech route fails closed when `max_output_units` falls outside the
+/// canonical `[1, max_output_units]` budget declared by the package. Both the
+/// zero and over-ceiling cases are rejected before any execution, and the error
+/// names the declared ceiling generically (no model-specific constant).
+#[tokio::test]
+async fn speech_endpoint_rejects_out_of_range_max_output_units() {
+    for units in [0_usize, 9999_usize] {
+        let response = app(speech_state())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/audio/speech")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "speech-wav",
+                            "input": "hello world",
+                            "response_format": "wav",
+                            "stream": false,
+                            "max_output_units": units
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "max_output_units={units} must be rejected"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("max_output_units must be between 1 and"),
+            "message: {}",
+            body["error"]["message"]
+        );
+    }
+}
+
+/// The declared ceiling itself is exactly the inclusive upper bound: a request
+/// for the full budget (64) renders a valid WAV, while the first value beyond it
+/// (65) fails closed with an error that names the declared ceiling verbatim.
+#[tokio::test]
+async fn speech_endpoint_enforces_declared_max_output_units_ceiling() {
+    // The package declares `max_output_units: 64`; 64 is admitted.
+    let response = app(speech_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/speech")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "speech-wav",
+                        "input": "hello world",
+                        "response_format": "wav",
+                        "stream": false,
+                        "max_output_units": 64
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the declared ceiling of 64 must be admitted"
+    );
+    let wav = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&wav[0..4], b"RIFF");
+    assert_eq!(&wav[8..12], b"WAVE");
+
+    // 65 is the first value beyond the ceiling and must be rejected.
+    let response = app(speech_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/speech")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "speech-wav",
+                        "input": "hello world",
+                        "response_format": "wav",
+                        "stream": false,
+                        "max_output_units": 65
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("64"),
+        "error must name the declared ceiling of 64: {message}"
+    );
+}
+
+fn speech_state_from(fixture: &str, id: &str) -> AppState {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/onnx_genai_workflows")
+        .join(fixture);
+    AppState::load(&model_dir, Some(id.to_string())).expect("load speech fixture")
+}
+
+fn try_load_speech_fixture(fixture: &str, id: &str) -> anyhow::Result<AppState> {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/onnx_genai_workflows")
+        .join(fixture);
+    AppState::load(&model_dir, Some(id.to_string()))
+}
+
+/// Admission and execution must bind the *exact* compatible output resolved at
+/// load time, not merely "any" role: audio output. The mixed fixture declares
+/// two role: audio outputs where the map-first key (`audio`) is an incompatible
+/// raw float stream and only the second (`waveform`) is a compatible buffered
+/// PCM16 WAV (mono, 16 kHz, 64 samples => 128 bytes of PCM). A correct binding
+/// encodes `waveform`; the old "first role: audio" behaviour would have selected
+/// the incompatible `audio` output instead.
+#[tokio::test]
+async fn speech_endpoint_encodes_resolved_output_not_map_first_role_audio() {
+    let response = app(speech_state_from("speech_wav_mixed_audio", "speech-mixed"))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/speech")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "speech-mixed",
+                        "input": "hello world",
+                        "instructions": "the quick brown fox",
+                        "response_format": "wav",
+                        "stream": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("audio/wav")
+    );
+    let wav = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&wav[0..4], b"RIFF");
+    assert_eq!(&wav[8..12], b"WAVE");
+    assert_eq!(&wav[12..16], b"fmt ");
+    // The resolved `waveform` output is mono at 16 kHz; the incompatible,
+    // map-first `audio` output would have been stereo at 24 kHz.
+    assert_eq!(
+        u16::from_le_bytes([wav[22], wav[23]]),
+        1,
+        "must encode the resolved mono waveform output, not the stereo audio output"
+    );
+    assert_eq!(
+        u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]),
+        16000,
+        "must encode the resolved output's 16 kHz sample rate"
+    );
+    assert_eq!(&wav[36..40], b"data");
+    // 64 samples * 1 channel * 2 bytes (pcm_s16_le) == 128 bytes of PCM data.
+    assert_eq!(
+        u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]),
+        128,
+        "must carry exactly the resolved mono output's PCM payload"
+    );
+}
+
+/// Fail closed when more than one workflow output declares a compatible buffered
+/// PCM16 WAV audio contract: the load cannot decide which output the speech
+/// adapter binds to, so it rejects with a clear error naming both candidates.
+#[test]
+fn speech_load_rejects_ambiguous_audio_outputs() {
+    let error = match try_load_speech_fixture("speech_wav_two_audio", "speech-two-audio") {
+        Ok(_) => panic!("ambiguous compatible audio outputs must be rejected at load"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(
+        error.contains("exactly one is required to bind the speech text-assembly adapter"),
+        "error must explain the ambiguity: {error}"
+    );
+}
+
+/// Fail closed when more than one component implements the text-assembly
+/// contract: the speech processor cannot be resolved unambiguously, so the load
+/// rejects with a clear error.
+#[test]
+fn speech_load_rejects_multiple_text_assembly_adapters() {
+    let error = match try_load_speech_fixture("speech_wav_two_adapters", "speech-two-adapters") {
+        Ok(_) => panic!("multiple text-assembly adapters must be rejected at load"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(
+        error.contains("exactly one is required for speech synthesis"),
+        "error must explain the adapter ambiguity: {error}"
+    );
+}
+
+#[tokio::test]
 #[ignore = "synthetic Whisper-contract smoke test; run explicitly for audio server validation"]
 async fn audio_endpoints_route_through_tiny_whisper_pipeline() {
     let model_dir =

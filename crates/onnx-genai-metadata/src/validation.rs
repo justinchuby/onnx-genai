@@ -1529,6 +1529,12 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
         contract: &crate::schema::TensorContract,
         errors: &mut Vec<String>,
     ) {
+        if let crate::schema::BatchLayout::RequestExpanded { factor: 0, .. } = contract.batch_layout
+        {
+            errors.push(format!(
+                "{path} declares request_expanded.factor 0; the expansion factor must be at least 1"
+            ));
+        }
         if contract
             .shape
             .as_ref()
@@ -1655,6 +1661,58 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
             &output.contract,
             errors,
         );
+        if let Some(media) = &output.media {
+            if output.role != crate::schema::WorkflowOutputRole::Audio {
+                errors.push(format!(
+                    "workflow output '{name}' declares a media contract but its role is not audio"
+                ));
+            }
+            if media.sample_rate_hz == Some(0) {
+                errors.push(format!(
+                    "workflow output '{name}' media.sample_rate_hz must be greater than zero"
+                ));
+            }
+            if media.source_sample_rate_hz == Some(0) {
+                errors.push(format!(
+                    "workflow output '{name}' media.source_sample_rate_hz must be greater than zero"
+                ));
+            }
+            if media.channels == Some(0) {
+                errors.push(format!(
+                    "workflow output '{name}' media.channels must be greater than zero"
+                ));
+            }
+            if media.sample_rate_hz.is_none() {
+                errors.push(format!(
+                    "workflow output '{name}' audio media contract must declare sample_rate_hz"
+                ));
+            }
+            if media.channels.is_none() {
+                errors.push(format!(
+                    "workflow output '{name}' audio media contract must declare channels"
+                ));
+            }
+            if media.container == crate::schema::MediaContainer::Wav {
+                match output.stage {
+                    crate::schema::OutputStage::PostAdapter if output.contract.dtype != "uint8" => {
+                        errors.push(format!(
+                            "workflow output '{name}' is a post-adapter WAV but its contract dtype is not uint8"
+                        ));
+                    }
+                    crate::schema::OutputStage::PreAdapter
+                        if !matches!(
+                            output.contract.dtype.as_str(),
+                            "float32" | "fp32" | "float16" | "fp16" | "bfloat16" | "bf16"
+                        ) =>
+                    {
+                        errors.push(format!(
+                            "workflow output '{name}' is a pre-adapter WAV source but its contract dtype is not floating point"
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
         match (&output.role, output.value_range) {
             (crate::schema::WorkflowOutputRole::Image, None) => errors.push(format!(
                 "workflow image output '{name}' must declare value_range"
