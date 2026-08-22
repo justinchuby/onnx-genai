@@ -706,7 +706,7 @@ fn native_cuda_device_resident_multicomponent() -> anyhow::Result<()> {
 
     // Device/provider propagation (Blocker 2) + zero ORT sessions (Blocker 1).
     assert!(
-        native.models().sessions.is_empty(),
+        native.models()?.sessions.is_empty(),
         "Native must build zero ORT sessions even on CUDA"
     );
     let status = native.execution_provider_status();
