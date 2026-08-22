@@ -13330,12 +13330,20 @@ mod tests {
         // Each round allocates the weight afresh so the allocator can hand back
         // a retired round's address, then drops it -- exactly the lifetime the
         // store must not outlive.
-        let decode = |which: usize| -> (Vec<f32>, usize, bool) {
+        let decode = |which: usize| -> (Vec<f32>, [usize; 3], bool) {
             let (packed, scales, zps) = &quantized[which];
             let b = Owned::u8(&[n, blocks, blob], packed);
             let scales_t = Owned::f32(&[n, blocks], scales);
             let zero_points = Owned::u8(&[n, zp_blob], zps);
-            let addr = b.view().data_ptr::<u8>() as usize;
+            // The whole key, not just the weight: a stale hit needs all three
+            // operand addresses to collide, so tracking only the weight's would
+            // let the run report "recycled" while the key never matched -- the
+            // test would then pass without exercising anything.
+            let addr = [
+                b.view().data_ptr::<u8>() as usize,
+                scales_t.view().data_ptr::<u8>() as usize,
+                zero_points.view().data_ptr::<u8>() as usize,
+            ];
             let mut result = vec![0.0f32; m * n];
             let kernel = accuracy4_kernel(k, n, block_size);
             let ran = kernel
@@ -13371,10 +13379,20 @@ mod tests {
              would be undetectable"
         );
 
-        let mut seen: Vec<(usize, usize)> = Vec::new();
+        let mut seen: Vec<([usize; 3], usize)> = Vec::new();
         let mut recycled_across_weights = false;
         for round in 0..8 {
             let which = round % 2;
+            // Allocator-independent, and the assertion that actually carries this
+            // test: the previous round's kernel has retired, so whatever it
+            // installed must be gone. Address recycling below is a second,
+            // stronger-but-hostier arm; this one holds on every allocator.
+            assert_eq!(
+                mlas_store_len(),
+                (0, 0),
+                "round {round}: the retired kernel left its pack in the store, \
+                 where a later weight at its address can inherit it"
+            );
             let (got, addr, routed) = decode(which);
             assert!(
                 routed,
@@ -13391,9 +13409,9 @@ mod tests {
             seen.push((addr, which));
             assert_eq!(
                 got, truth[which],
-                "round {round} (weight {which}, address {addr:#x}, \
+                "round {round} (weight {which}, key addresses {addr:#x?}, \
                  recycled={recycled}): a pack cached for a previous weight at \
-                 this address was served to this one"
+                 these addresses was served to this one"
             );
         }
         // SAFETY: still holding the backend env lock; restore prior value.
@@ -13403,13 +13421,23 @@ mod tests {
                 None => std::env::remove_var("NXRT_CPU_GEMM_BACKEND"),
             }
         }
-        assert!(
-            recycled_across_weights,
-            "no address was reused across weights in {} rounds, so this run did \
-             not exercise the recycling hazard it exists to catch; addresses: {:#x?}",
-            seen.len(),
-            seen
-        );
+        // Not an assertion. Address recycling is the allocator's choice, not the
+        // code's: glibc's brk heap reuses these sizes readily, but an allocator
+        // that serves each request fresh (ASan, valgrind, some musl and macOS
+        // configurations) would fail a *correct* implementation here. The
+        // per-round store-drain assertion above covers the mechanism without
+        // depending on it. Reported loudly so a run that skipped this arm is
+        // never mistaken for one that exercised it.
+        if !recycled_across_weights {
+            eprintln!(
+                "NOTE: no full key was reused across weights in {} rounds, so \
+                 this allocator did not exercise the recycling arm; the \
+                 per-round eviction assertion still covered the mechanism. \
+                 Key addresses: {:#x?}",
+                seen.len(),
+                seen
+            );
+        }
     }
 
     /// A pack must survive the drop of a kernel that merely *shared* it (#1735).
