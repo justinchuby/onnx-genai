@@ -81,6 +81,13 @@ fn plugin_discovery_lock() -> &'static Mutex<()> {
 pub struct Environment {
     ptr: NonNull<onnx_genai_ort_sys::OrtEnv>,
     _name: String,
+    #[cfg(feature = "cuda")]
+    managed_cuda_allocators: Mutex<
+        std::collections::HashMap<
+            i32,
+            crate::managed_cuda_allocator::ManagedCudaEnvironmentRegistration,
+        >,
+    >,
 }
 
 impl Environment {
@@ -113,11 +120,48 @@ impl Environment {
         Ok(Self {
             ptr,
             _name: name.to_string(),
+            #[cfg(feature = "cuda")]
+            managed_cuda_allocators: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
     pub(crate) fn as_ptr(&self) -> *const onnx_genai_ort_sys::OrtEnv {
         self.ptr.as_ptr()
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn ensure_managed_cuda_allocator(
+        &self,
+        config: &crate::managed_cuda_allocator::ManagedCudaAllocatorConfig,
+    ) -> Result<()> {
+        let mut allocators = self.managed_cuda_allocators.lock().map_err(|_| {
+            OrtError::InvalidArgument("managed CUDA allocator lock was poisoned".into())
+        })?;
+        if let Some(existing) = allocators.get(&config.device_id()) {
+            if existing.matches(config) {
+                return Ok(());
+            }
+            return Err(OrtError::InvalidArgument(format!(
+                "a different managed CUDA allocator is already registered for device {}",
+                config.device_id()
+            )));
+        }
+        let registration =
+            crate::managed_cuda_allocator::register_managed_cuda_allocator(self, config)?;
+        allocators.insert(config.device_id(), registration);
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn managed_cuda_allocator_stats(
+        &self,
+        device_id: i32,
+    ) -> Option<crate::managed_cuda_allocator::ManagedCudaAllocatorStats> {
+        self.managed_cuda_allocators
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&device_id)
+            .map(|registration| registration.stats())
     }
 
     /// Register an ORT execution-provider plugin shared library.
@@ -269,6 +313,11 @@ impl Drop for Environment {
         let mut lifecycle = environment_lifecycle()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        #[cfg(feature = "cuda")]
+        self.managed_cuda_allocators
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         if let Ok(api) = crate::error::api()
             && let Some(release) = api.ReleaseEnv
         {
