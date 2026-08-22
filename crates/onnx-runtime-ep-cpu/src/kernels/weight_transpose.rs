@@ -206,9 +206,10 @@ impl<T: Copy + Default + Send + Sync> TransposeCache<T> {
             .cloned()
     }
 
-    /// Drop a single entry by key. Test-only; used to clear a stale entry left
-    /// at a since-recycled address so a peek has a deterministic starting point.
-    #[cfg(test)]
+    /// Drop a single entry by key.
+    ///
+    /// Called when the owner of an entry goes away, so that the entry cannot
+    /// outlive the buffer whose address keys it (#1726).
     pub fn remove(&self, key: &WeightTransposeKey) {
         self.entries
             .lock()
@@ -426,6 +427,24 @@ pub fn cached_transpose_half(src: &[u16], k: usize, n: usize, tag: u16) -> Optio
         return transpose_uncached(src, k, n);
     }
     WEIGHT_TRANSPOSE_F16.get_or_insert_transpose_tagged(src, k, n, tag)
+}
+
+/// Drop the f16 entry `key` names, if it is still present.
+///
+/// The caller is the owner that installed it: entries are keyed on the source
+/// buffer's *address*, and nothing in the key proves that the bytes there are
+/// still the ones that were transposed. An entry that outlives its source is a
+/// loaded gun -- the next allocation of the same shape and dtype to land on
+/// that address is served the previous weight's rows, with the right route and
+/// silently foreign numbers (#1726). Evicting at the owner's drop keeps every
+/// entry's lifetime inside its source's.
+pub(crate) fn evict_half(key: &WeightTransposeKey) {
+    WEIGHT_TRANSPOSE_F16.remove(key);
+}
+
+/// [`evict_half`] for the f32 map.
+pub(crate) fn evict_f32(key: &WeightTransposeKey) {
+    WEIGHT_TRANSPOSE_F32.remove(key);
 }
 
 /// Test-only: drop any f16 entry keyed on `(ptr, k, n)`.

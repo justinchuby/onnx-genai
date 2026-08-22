@@ -690,6 +690,33 @@ pub(crate) struct MatMulPrepack {
     contiguous_b_f16: OnceLock<Arc<Vec<u16>>>,
 }
 
+/// Entries this prepack installed in the process-global transpose caches must
+/// not outlive it (#1726).
+///
+/// Those caches are keyed on `(address, k, n, tag)` and hold no claim on the
+/// buffer at that address. A `1024 x 1024` f16 weight is 2 MiB, which glibc
+/// serves by `mmap` at first; freeing one raises the dynamic mmap threshold, so
+/// the *next* same-size weight is cut from the brk heap and readily lands on a
+/// just-freed address. The lookup then hits, the route counter reads exactly
+/// what it should, and the kernel multiplies another weight's rows -- values
+/// that are not a function of the inputs, which is how #1726 presented.
+///
+/// A prepack holds the operand view it transposed, so evicting here bounds the
+/// entry's lifetime by the source's. Entries installed by the model-load
+/// prewarms are deliberately left alone: they key on model-owned weight memory
+/// that outlives every prepack, and `clear_weight_transpose_caches` already
+/// drops them at the Executor boundary.
+impl Drop for MatMulPrepack {
+    fn drop(&mut self) {
+        if let Some((key, _)) = self.transposed_b.get() {
+            weight_transpose::evict_f32(key);
+        }
+        if let Some((key, _)) = self.transposed_b_f16.get() {
+            weight_transpose::evict_half(key);
+        }
+    }
+}
+
 impl Default for MatMulPrepack {
     /// Build a prepack whose `dense` slots carry the current admission verdict
     /// (#1056). Manual rather than derived because [`GovernedWeightCache`] has no
@@ -6012,6 +6039,90 @@ mod tests {
                 "column {index}: {g} != {w}"
             );
         }
+    }
+
+    /// A weight freed at one address must not lend its transpose to the next
+    /// weight that lands there (#1726).
+    ///
+    /// The global f16 transpose cache is keyed on `(address, k, n, tag)` and
+    /// nothing checks that the buffer still holds what was transposed, so a
+    /// recycled allocation of the same shape and dtype is served the *previous*
+    /// weight's rows. The route counter still reads 1, because the right route
+    /// did run -- it just read another weight's bytes. That is #1726's exact
+    /// signature: right route, values that are not a function of the inputs.
+    ///
+    /// The rounds matter. A `1024 x 1024` f16 weight is 2 MiB, which glibc
+    /// serves by `mmap` at first; freeing it raises the dynamic mmap threshold
+    /// so later same-size requests come from the brk heap, where the address is
+    /// promptly reused. The first rounds therefore establish the recycling that
+    /// the later rounds detect, which is why one allocate/free pair is not
+    /// enough to see this.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn a_recycled_weight_address_must_not_serve_the_previous_weights_transpose() {
+        if !crate::backend::has_simd_x86() {
+            return;
+        }
+        let (k, n) = (1024usize, 1024usize);
+        let a_data: Vec<f32> = (0..k).map(|i| ((i % 17) as f32 - 8.0) / 16.0).collect();
+        // Distinct weights. The second is deliberately *not* on the 1/16 grid,
+        // so a stale read is arithmetically unmistakable rather than a rounding
+        // argument: every honest dot product here is a multiple of 1/256.
+        let first_data: Vec<f32> = (0..k * n).map(|i| ((i % 19) as f32 - 9.0) / 16.0).collect();
+        let second_data: Vec<f32> = (0..k * n)
+            .map(|i| ((i % 23) as f32 - 11.0) / 32.0 + 0.001_953_125)
+            .collect();
+        let want_first = naive_matmul(&a_data, &first_data, 1, k, n);
+        let want_second = naive_matmul(&a_data, &second_data, 1, k, n);
+
+        let decode = |b_data: &[f32]| -> (Vec<f32>, usize) {
+            let a = Owned::f16(&[1, k], &a_data);
+            let b = Owned::f16(&[k, n], b_data);
+            let addr = b.view().data_ptr::<u16>() as usize;
+            let mut out = Owned::zeros_f32(&[1, n]);
+            let mut kernel = MatMulKernel::default();
+            kernel.set_constant_inputs(&[false, true]);
+            kernel
+                .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+                .unwrap();
+            (out.to_f32(), addr)
+        };
+
+        let mut seen: Vec<usize> = Vec::new();
+        let mut recycled_at_least_once = false;
+        for round in 0..8 {
+            let (first_half, want) = if round % 2 == 0 {
+                (true, &want_first)
+            } else {
+                (false, &want_second)
+            };
+            let data: &[f32] = if first_half {
+                &first_data
+            } else {
+                &second_data
+            };
+            let (got, addr) = decode(data);
+            let recycled = seen.contains(&addr);
+            recycled_at_least_once |= recycled;
+            seen.push(addr);
+            for (index, (g, w)) in got.iter().zip(want).enumerate() {
+                assert!(
+                    (g - w).abs() <= 2e-2 * (1.0 + w.abs()),
+                    "round {round} column {index}: {g} != {w} (address {addr:#x} \
+                     recycled={recycled}) -- a transpose cached for a previous \
+                     weight at this address was served to this one"
+                );
+            }
+        }
+        // Without this the test could pass by never recreating the hazard --
+        // a silent regression into proving nothing.
+        assert!(
+            recycled_at_least_once,
+            "no address was reused across {} rounds, so this run did not \
+             exercise the recycling hazard it exists to catch; addresses: {:#x?}",
+            seen.len(),
+            seen
+        );
     }
 
     #[test]
