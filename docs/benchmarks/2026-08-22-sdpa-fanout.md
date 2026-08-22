@@ -117,6 +117,22 @@ The flat t=1→t=16 scaling reported in #1718 was real, but on decode-with-past 
 
 **Follow-up, out of scope here:** `concat_cache` still reaches **global Rayon** in a pure-native build. That is a separate lane and is not claimed or fixed by this work.
 
+## 6b. The per-thread scratch, and its per-process ceiling
+
+The softmax scratch is one `Vec<f32>` per *thread*, reused across rows, because the score vector is `kv_seq` floats and a decode-with-long-past shape would otherwise allocate multiple kilobytes once per output row.
+
+Being thread-local, **a single constant is not the process's exposure** — it is retained once per worker that ever runs this kernel, for the life of the process. The natural size, `kv_seq`, is unbounded, so a 128k-context request would permanently pin ~512 KiB per worker (8 MiB across 16) after one long prompt.
+
+`MAX_RETAINED_ROW_SCORES = 8192` floats caps it, and the ceiling is stated as the product:
+
+| | per thread | 16-core budget | 64-thread budget |
+|---|---|---|---|
+| retained scratch | 8192 × 4 B = **32 KiB** | **512 KiB** | **2 MiB** |
+
+Above the cap the buffer is dropped rather than retained, so those shapes allocate once per row again. That is cheap by construction: a row at `kv_seq > 8192` already costs at least `8192 × (head_size + v_head_size)` MACs, so one allocation is a rounding error. Retention only ever mattered for the many-short-rows case — prefill — and prefill `kv_seq` is under the cap on every production shape in §4.
+
+The test drives the buffer from **four threads**, because a single-instantiation test cannot observe the ×N multiplier at all: it asserts both that each thread retains its own buffer under the cap (so the multiplier is real) and that every thread retains zero above it (so the ceiling holds).
+
 ## 7. Falsifiers
 
 Every claim below was verified by deliberately breaking the code and confirming the suite goes red.
@@ -128,6 +144,7 @@ Every claim below was verified by deliberately breaking the code and confirming 
 | F3 | task run offset ignored | bit-identity vs `force_serial()` |
 | F4 | `v_head_size == 0` guard removed | zero-width no-op test (panics in `chunk_runs_mut`) |
 | F5 | `v_head_size` and `rows` swapped at the decode dispatch | decode-scope parity test |
+| F6 | scratch retention cap removed | 4-thread retained-bytes bound test |
 
 **F5 was added after review, and the gap it closes was real.** The first version of this
 suite had *no* test that entered a decode scope, so the decode branch of the router —
@@ -143,7 +160,7 @@ caught. None of F1–F4 catch it.
 ## 8. Validation
 
 - `cargo test --locked` over the `offline-linux` package set — **4595 passed, 0 failed**
-- `cargo test -p onnx-runtime-ep-cpu --lib` — 1602 passed, 0 failed
+- `cargo test -p onnx-runtime-ep-cpu --lib` — 1603 passed, 0 failed
 - `cargo fmt --all -- --check`
 - `cargo clippy --locked --all-targets` over the offline-linux set, `-D warnings`
 - `cargo clippy --all-targets --target aarch64-unknown-linux-gnu -p onnx-runtime-ep-cpu -- -D warnings`
