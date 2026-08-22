@@ -101,6 +101,24 @@ that constructs and runs a canonical workflow.
   `DecodeLoopBackend` (ORT) / native. Proven by parity: the `decoder` fixture
   output via the AR node equals the direct `Engine` output.
 
+  This phase also **lifts the chained speculative proposer into the
+  interpreter** so it stops being an ORT-only path. Today the folded/threaded
+  draft loop lives in a direct-`Engine` Rust `propose()`
+  (`speculative/mod.rs:1273-1356`: `inputs_embeds = concat(embedding(last_token),
+  carry)`), which native (the component seam) cannot drive — a fork. Keyed by
+  `SpeculativeProposalExecution::Chained` (onnx-genai `#1696`, with
+  `folded_carry_output` **or** `recurrent`), the interpreter owns: build the
+  fused `inputs_embeds`; thread `carry_0 = port_bindings.target_hidden_context`,
+  `carry_k = folded_carry_output(k-1)`; drive the chain to `max_proposal_width`;
+  and treat the folded carry as **not** a rollback state cell (recomputed from
+  committed tokens on rejection, never restored). Only the per-step forward pass
+  is per-backend (`invoke_onnx_component`). The old `SpeculatorConfig` proposer
+  path is deleted once this lands (Rule 3). Proven by the Gemma4 target+assistant
+  packages (onnx-genai `#1716`, examples 22 `recurrent` / 24 `folded`) as
+  **required ORT/native parity fixtures** asserting the `gemma4_e2b_workflow.rs`
+  invariants (shared `kv_ownership`, no KV transitions, `state_pairs: None` for
+  the cacheless drafter, read-only borrowed KV with zero writeback).
+
 - **Phase 2 — canonical single-decoder workflow synthesis.** Add a Rust
   synthesizer that turns a plain `model.io`/introspected decoder into a minimal
   canonical `WorkflowSpec` (a `Loop` over the decode node with token/length/KV
