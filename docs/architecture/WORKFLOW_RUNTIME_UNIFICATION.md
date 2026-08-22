@@ -35,13 +35,39 @@ on a moving target:
   folded_carry_output: projected_state}`; `rollback_state` = the 4 target KV
   cells (folded carry excluded). Static contract review by this PR: **accepted,
   no regen**. Phase 1 wires it into `native_workflow_parity.rs` as a required
-  `assert_parity_with(root, native_engine|native_cuda_engine, …)` case. **Open
-  contract item** (flagged to gemma4-metadata-audit): the exact meaning of
-  `port_bindings.target_hidden_context` for the folded-carry case — carry_0 is
-  dimensionally the target's `hidden_states.0` (H), not `inputs_embeds` (2H), so
-  the field is either source-naming (should point at the target hidden output) or
-  destination-naming (the fused port); must be pinned identically in the metadata
-  contract and the interpreter before the Phase-1 chained driver is written.
+  `assert_parity_with(root, native_engine|native_cuda_engine, …)` case.
+
+  **Ground-truth semantics confirmed** (gemma4-real-packages, from the graph
+  slice values + embedding-file size): `carry_0 = target.hidden_states.0` (H=16);
+  each proposer step `inputs_embeds[b,q,2H] = concat(embed(last_token)[0:16],
+  carry[16:32])` — embed is the **leading** H, carry the **trailing** H (pinned
+  by the assistant graph's `Slice starts=[16] ends=[32] axis=2`);
+  `input_embedding.f32` is `[vocab=32, hidden=16]`, the row-gather table.
+  `steps` = the single-pass body; the `speculative:` block is the loop driver;
+  the Phase-1 chained construct **overrides** `inputs_embeds` each proposer step
+  (`request.inputs_embeds` is only the single-pass binding). **Coverage boundary
+  to respect:** this tiny drafter reads *only* the carry half — `embed[0:16]` is
+  present to satisfy the 2H ABI but is **unused** by the graph, so the fixture's
+  greedy tokens depend on the carry chain (`hidden_states.0 → projected_state →
+  …`) and the read-only borrowed KV, **not** on embedding-gather correctness.
+  That cleanly isolates folded-carry threading + borrowed-KV + accept/reject/
+  rollback (exactly what this parity case must prove), but means embed-gather
+  correctness is **not** validated here — Phase 1 covers that separately (a
+  real-model chained fixture or a dedicated embed-gather unit check), so the
+  parity suite never implies embed-building is proven when it isn't.
+
+  **Open contract items (both gemma4-metadata-audit's fields, ruling pending):**
+  (1) the **direction** of `port_bindings.target_hidden_context` — this PR and
+  gemma4-real-packages both read it as destination-naming (the fused
+  `inputs_embeds` port) with `carry_0` sourced from `target.hidden_states.0` by
+  the folded-carry convention, but the field owner must ratify so metadata and
+  interpreter agree verbatim. (2) **Where the interpreter sources the embedding
+  table for real models** — the fixture omits `speculative.shared_weights`
+  (strict form: the drafter graph does not read an embedding initializer), so for
+  real models the chained construct must build `embed(token)` from the target's
+  in-model embedding (or a named field), which the field owner should pin (no
+  model-name gate). Moot for this fixture (embed unused), but required before the
+  real-model emitter PR.
 - **`#1716` is not on `main` — the remaining gate.** Its branch
   (`copilot/gemma4-e2b-metadata`) is ~50k insertions, still evolving (tip added a
   26B MoE example), and edits the interpreter seam this PR owns
@@ -156,12 +182,11 @@ that constructs and runs a canonical workflow.
   carry)`), which native (the component seam) cannot drive — a fork. Keyed by
   `SpeculativeProposalExecution::Chained` (onnx-genai `#1696`, with
   `folded_carry_output` **or** `recurrent`), the interpreter owns: build the
-  fused `inputs_embeds`; thread `carry_0` from the target hidden context named by
-  `port_bindings.target_hidden_context` (**open contract item, flagged to
-  gemma4-metadata-audit**: for the folded case `carry_0` is dimensionally the
-  target's `hidden_states.0` [H], not `inputs_embeds` [2H], so this field is
-  source-naming vs destination-naming — pin it identically in metadata + the
-  interpreter before writing the driver), `carry_k = folded_carry_output(k-1)`;
+  fused `inputs_embeds` = `concat(embed(last_token)[leading H], carry[trailing
+  H])`; thread `carry_0 = target.hidden_states.0` (confirmed from the fixture
+  graph; named via `port_bindings.target_hidden_context` — **field direction
+  pending gemma4-metadata-audit's ratification**, read as destination-naming),
+  `carry_k = folded_carry_output(k-1)`;
   drive the chain to `max_proposal_width`;
   and treat the folded carry as **not** a rollback state cell (recomputed from
   committed tokens on rejection, never restored). Only the per-step forward pass
