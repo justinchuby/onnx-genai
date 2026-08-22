@@ -11,6 +11,8 @@ const TEXT_ASSEMBLY_ABI: &str = "onnx-genai.text-assembly";
 pub(crate) struct SpeechPromptProcessor {
     pub(crate) max_input_tokens: usize,
     pub(crate) max_output_units: usize,
+    #[serde(default)]
+    pub(crate) state_advance_units: usize,
     segments: Vec<TextSegment>,
     #[serde(default)]
     guidance_rows: Option<GuidanceRows>,
@@ -230,6 +232,7 @@ mod tests {
             r#"{
               "max_input_tokens": 5000,
               "max_output_units": 9000,
+              "state_advance_units": 1,
               "guidance_rows": {
                 "unconditional_token_id": 151654,
                 "replace_from": 1,
@@ -273,5 +276,6 @@ mod tests {
             rows,
             vec![vec![10, 11, 12, 13, 14], vec![10, 151654, 151654, 13, 14]]
         );
+        assert_eq!(processor.state_advance_units, 1);
     }
 }

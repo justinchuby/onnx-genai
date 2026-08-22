@@ -54,7 +54,9 @@ pub(crate) async fn audio_speech(
     let generation = GenerateRequest {
         prompt: GeneratePrompt::TokenRows(token_rows),
         options: GenerateOptions {
-            max_new_tokens: processor.max_output_units,
+            max_new_tokens: processor
+                .max_output_units
+                .saturating_add(processor.state_advance_units),
             max_context: handle.model_max_context,
             ..GenerateOptions::default()
         },
