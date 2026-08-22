@@ -1081,16 +1081,14 @@ fn pin_checksum_keys() -> Option<&'static HashSet<u64>> {
         .as_ref()
 }
 
-/// Parsed force-re-fill cadence, cached once per process. `None`/`Some(0)` on the
-/// shipped path means never re-fill.
+/// Parsed force-re-fill cadence. `None`/`Some(0)` on the shipped path means
+/// never re-fill. This is read only for an opt-in pinned page, and remains
+/// dynamic so fault-injection tests and diagnostic runs can scope the knob.
 fn pin_refill_every() -> Option<u64> {
-    static CACHE: OnceLock<Option<u64>> = OnceLock::new();
-    *CACHE.get_or_init(|| {
-        std::env::var(WEIGHT_PIN_REFILL_EVERY_ENV)
-            .ok()
-            .and_then(|raw| raw.trim().parse::<u64>().ok())
-            .filter(|n| *n > 0)
-    })
+    std::env::var(WEIGHT_PIN_REFILL_EVERY_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
 }
 
 /// #945 control — isolate the *reused-slot bypass* hazard. When enabled, a key
@@ -3751,9 +3749,9 @@ impl CudaWeightResidency {
                             "pin-refill compute drain: {error}"
                         ))
                     })?;
-                    fill(&self.runtime, existing.ptr)
-                        .into_vmm_fill_result()
-                        .map_err(|failure| failure.error)?;
+                    if let Err(failure) = fill(&self.runtime, existing.ptr).into_vmm_fill_result() {
+                        return Err(self.handle_pinned_refill_failure(key, existing, failure));
+                    }
                     eprintln!(
                         "weight_pin_refill[#945]: key={key} step={step} re-filled \
                          pinned page from host source"
@@ -3978,6 +3976,38 @@ impl CudaWeightResidency {
             self.lock().pin_granule_hashes.insert(key, hashes);
         }
         Ok(VmmAdmit::Page(page))
+    }
+
+    fn handle_pinned_refill_failure(
+        &self,
+        key: u64,
+        existing: Arc<CudaWeightPage>,
+        failure: VmmFillFailure,
+    ) -> WeightHandleError {
+        let VmmFillFailure {
+            error,
+            in_flight_source,
+        } = failure;
+        let Some(source) = in_flight_source else {
+            // NotSubmitted leaves the old destination untouched. Completed
+            // carries a completion witness, so both endpoints are safe and the
+            // pooled staging source was already retired by the fill closure.
+            return error;
+        };
+
+        let mut inner = self.lock();
+        if let Some(slot) = inner.slots.get(&key) {
+            slot.state.poison();
+        }
+        // Stop every later lookup before retaining the page. Its mapped charge
+        // deliberately remains live because completion is unresolved.
+        inner.remove_page(key);
+        drop(inner);
+        quarantine_in_flight_fill(Box::new((existing, source)));
+        WeightHandleError::DeviceBinding(format!(
+            "{error}; pinned-page refill completion could not be established; the destination \
+             mapping and staging source remain charged and quarantined"
+        ))
     }
 
     /// Commit `len` physical bytes under the reserved VA `ptr`, evicting other
@@ -5641,6 +5671,216 @@ mod tests {
         assert_eq!(
             GLOBAL_WEIGHT_MAPPED_BYTES.load(Ordering::Relaxed),
             global_before + (granule * 2) as u64
+        );
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn pinned_refill_failure_quarantines_only_unresolved_copies() {
+        use onnx_runtime_memory_governor::{
+            DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole,
+        };
+
+        #[derive(Debug)]
+        struct DropProbe(Arc<AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let mut env = EnvVarGuard::acquire();
+        env.unset(crate::vmm_allocator::CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV)
+            .set(WEIGHT_PIN_REFILL_EVERY_ENV, "1");
+        let Ok(runtime) = CudaRuntime::new(0).map(Arc::new) else {
+            eprintln!("SKIPPED (CUDA runtime dependencies unavailable): pinned refill fault test");
+            return;
+        };
+        let granule = 2usize << 20;
+        let governor = Arc::new(LedgerGovernor::new(LeaseLedger::new(
+            (granule * 2) as u64,
+            0,
+            0,
+        )));
+        let allocator = Arc::new(
+            crate::vmm_allocator::CudaVmmAllocator::new(
+                runtime.cuda_context(),
+                DeviceKey::device(0),
+                0,
+                64 << 20,
+                governor.as_ref(),
+                HolderId::new(741),
+                MemoryRole::Weights,
+            )
+            .expect("no-pool VMM allocator"),
+        );
+        let authority: Arc<dyn MemoryGovernor + Send + Sync> = governor.clone();
+        let release_queue = CudaDeferredReleaseQueue::new(
+            Box::new(crate::deferred_release::CudaStreamFences::new(Arc::clone(
+                &runtime,
+            ))),
+            crate::deferred_release::DEFAULT_DEFERRED_RELEASE_CAPACITY,
+        );
+        let residency = CudaWeightResidency::new(Arc::clone(&runtime), (granule * 2) as u64)
+            .with_deferred_release_queue(Arc::clone(&release_queue))
+            .with_vmm_admission(Arc::clone(&allocator), authority)
+            .expect("install VMM admission");
+        residency
+            .adopt_governed_budget(governor.as_ref(), Tier::Device, HolderId::new(741))
+            .expect("reserve mapped allowance");
+
+        let completed_bytes = vec![0x31u8; granule];
+        let completed_page = residency
+            .resident_vmm_with(
+                100,
+                DataType::Uint8,
+                vec![granule],
+                granule,
+                WeightEvictionPolicy::Lru,
+                false,
+                |runtime, ptr| {
+                    unsafe { runtime.htod(&completed_bytes, ptr) }
+                        .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))
+                },
+            )
+            .map(VmmAdmit::expect_page)
+            .expect("admit completed-control page");
+        residency.lock().mark_pinned(100, granule as u64);
+        let completed_ptr = completed_page.ptr;
+        let completed_error = residency
+            .resident_vmm_with(
+                100,
+                DataType::Uint8,
+                vec![granule],
+                granule,
+                WeightEvictionPolicy::Lru,
+                false,
+                |_, _| {
+                    Err(VmmFillFailure::completed(WeightHandleError::DeviceBinding(
+                        "injected completed refill measurement failure".into(),
+                    )))
+                },
+            )
+            .expect_err("completed refill fault must be reported");
+        assert!(completed_error.to_string().contains("injected completed"));
+        assert_eq!(
+            residency
+                .lock()
+                .slots
+                .get(&100)
+                .expect("completed-control slot")
+                .state
+                .status(),
+            SlotStatus::Idle
+        );
+        let refill_bytes = vec![0x32u8; granule];
+        let refilled_page = residency
+            .resident_vmm_with(
+                100,
+                DataType::Uint8,
+                vec![granule],
+                granule,
+                WeightEvictionPolicy::Lru,
+                false,
+                |runtime, ptr| {
+                    unsafe { runtime.htod(&refill_bytes, ptr) }
+                        .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))
+                },
+            )
+            .map(VmmAdmit::expect_page)
+            .expect("completed refill fault must leave the page reusable");
+        assert_eq!(refilled_page.ptr, completed_ptr);
+
+        let unresolved_bytes = vec![0x41u8; granule];
+        let unresolved_page = residency
+            .resident_vmm_with(
+                101,
+                DataType::Uint8,
+                vec![granule],
+                granule,
+                WeightEvictionPolicy::Lru,
+                false,
+                |runtime, ptr| {
+                    unsafe { runtime.htod(&unresolved_bytes, ptr) }
+                        .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))
+                },
+            )
+            .map(VmmAdmit::expect_page)
+            .expect("admit unresolved-control page");
+        residency.lock().mark_pinned(101, granule as u64);
+        let source_dropped = Arc::new(AtomicBool::new(false));
+        let source_probe = Arc::clone(&source_dropped);
+        let charged_before = governor.used(Tier::Device);
+        let mapped_before = residency.stats().mapped_physical_bytes;
+        let unresolved_error = residency
+            .resident_vmm_with(
+                101,
+                DataType::Uint8,
+                vec![granule],
+                granule,
+                WeightEvictionPolicy::Lru,
+                false,
+                move |_, _| -> Result<(), VmmFillFailure> {
+                    Err(VmmFillFailure::may_be_in_flight(
+                        WeightHandleError::DeviceBinding(
+                            "injected pinned refill synchronization failure".into(),
+                        ),
+                        Box::new(DropProbe(source_probe)),
+                    ))
+                },
+            )
+            .expect_err("unresolved refill must quarantine the resident page");
+        assert!(
+            unresolved_error
+                .to_string()
+                .contains("destination mapping and staging source remain charged and quarantined")
+        );
+        assert!(!source_dropped.load(Ordering::Acquire));
+        assert!(!residency.lock().pages.contains_key(&101));
+        assert_eq!(
+            residency
+                .lock()
+                .slots
+                .get(&101)
+                .expect("unresolved slot")
+                .state
+                .status(),
+            SlotStatus::Poisoned
+        );
+        assert_eq!(governor.used(Tier::Device), charged_before);
+        assert_eq!(residency.stats().mapped_physical_bytes, mapped_before);
+
+        drop(unresolved_page);
+        assert!(!source_dropped.load(Ordering::Acquire));
+        let fill_called = Arc::new(AtomicBool::new(false));
+        let fill_probe = Arc::clone(&fill_called);
+        let poisoned_error = residency
+            .resident_vmm_with(
+                101,
+                DataType::Uint8,
+                vec![granule],
+                granule,
+                WeightEvictionPolicy::Lru,
+                false,
+                move |_, _| -> Result<(), WeightHandleError> {
+                    fill_probe.store(true, Ordering::Release);
+                    Ok(())
+                },
+            )
+            .expect_err("quarantined destination must never be refilled");
+        assert!(poisoned_error.to_string().contains("poisoned"));
+        assert!(!fill_called.load(Ordering::Acquire));
+
+        drop(completed_page);
+        drop(refilled_page);
+        residency.lock().remove_page_after_stream_sync(100);
+        assert!(
+            release_queue.wait_until_idle(DEFERRED_RELEASE_WAIT_TIMEOUT),
+            "completed-control page release"
         );
     }
 
