@@ -131,7 +131,7 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: { onnx-genai.parameter-overlay: "1" }
-      capabilities: [workflow_ssa, typed_emit, parameter_adapters, heterogeneous_adapter_batching]
+      capabilities: [workflow_ssa, linear_effects, typed_emit, parameter_adapters, heterogeneous_adapter_batching]
     inputs:
       request.adapter_segments:
         contract: { dtype: int64, rank: 2, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
@@ -328,12 +328,17 @@ fn serving_workflow(
     effects: &str,
     speculative: &str,
 ) -> String {
+    let linear_effects = if effects.is_empty() {
+        ""
+    } else {
+        ", linear_effects"
+    };
     format!(
         r#"
 pipeline:
   workflow:
     manifest:
-      capabilities: [workflow_ssa, serving_service_contract]
+      capabilities: [workflow_ssa, serving_service_contract{linear_effects}]
     inputs:
       active:
         contract: {{ dtype: bool, rank: 1, shape: [batch], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
@@ -711,7 +716,7 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: { onnx-genai.grammar-guidance: "1" }
-      capabilities: [workflow_ssa]
+      capabilities: [workflow_ssa, grammar_guidance_adapter]
     inputs: {}
     components:
       grammar:
@@ -1069,7 +1074,8 @@ fn the_speculative_region_covers_every_component_in_the_loop_body() {
     let with_sidecar = workflow
         .replace(
             "capabilities: [workflow_ssa, serving_service_contract]",
-            "capabilities: [workflow_ssa, serving_service_contract, nested_control_flow]",
+            "capabilities: [workflow_ssa, serving_service_contract, linear_effects, \
+             nested_control_flow]",
         )
         .replace(
             r#"      verifier:
@@ -1143,8 +1149,8 @@ fn runtime_owned_state_cannot_be_exported_under_an_alias() {
     let aliased = serving_workflow("permitted", SOUND_CAPABILITIES, "", "")
         .replace(
             "capabilities: [workflow_ssa, serving_service_contract]",
-            "capabilities: [workflow_ssa, serving_service_contract, nested_control_flow, \
-             typed_emit]",
+            "capabilities: [workflow_ssa, serving_service_contract, linear_effects, \
+             nested_control_flow, typed_emit]",
         )
         .replace(
             "      empty_cache:",
