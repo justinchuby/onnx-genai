@@ -297,8 +297,8 @@ mod tests {
 mod route_tests {
     use super::*;
     use crate::kernels::matmul::{
-        half_decode_gemv_calls, half_decode_transposed_calls, reset_half_decode_gemv_calls,
-        reset_half_decode_transposed_calls,
+        HalfDecodeGemvScope, half_decode_gemv_calls, half_decode_transposed_calls,
+        reset_half_decode_gemv_calls, reset_half_decode_transposed_calls,
     };
     use crate::kernels::testutil::Owned;
     use crate::kernels::weight_transpose::CacheEnabledScope;
@@ -371,29 +371,40 @@ mod route_tests {
 
         for (shape, values) in cases {
             let bias = Owned::f16(&shape, &values);
-            let run = |gemv: bool| -> Vec<f32> {
+            let run = |gemv: bool| -> (Vec<f32>, u64) {
                 // Declining the transpose cache does not disable the GEMV, so
-                // the control here is the env gate the kernel reads.
-                let restore = std::env::var("ONNX_GENAI_CPU_MM_HALF_GEMV").ok();
-                if gemv {
-                    unsafe { std::env::remove_var("ONNX_GENAI_CPU_MM_HALF_GEMV") };
-                } else {
-                    unsafe { std::env::set_var("ONNX_GENAI_CPU_MM_HALF_GEMV", "0") };
-                }
+                // the control here is the gate the kernel reads. Scope it
+                // thread-locally rather than through
+                // `ONNX_GENAI_CPU_MM_HALF_GEMV`: that variable latches in a
+                // `OnceLock`, so setting it at runtime either does nothing (and
+                // both arms silently run the same route) or pins the value for
+                // every later test in the process. See #1736.
+                let _gate = HalfDecodeGemvScope::new(gemv);
+                reset_half_decode_gemv_calls();
                 let mut y = Owned::zeros_f32(&[1, n]);
                 let mut kernel = FusedMatMulBiasKernel::default();
                 kernel.set_constant_inputs(&[false, true, true]);
                 kernel
                     .execute(&[a.view(), b.view(), bias.view()], &mut [y.view_mut()])
                     .unwrap();
-                match restore {
-                    Some(v) => unsafe { std::env::set_var("ONNX_GENAI_CPU_MM_HALF_GEMV", v) },
-                    None => unsafe { std::env::remove_var("ONNX_GENAI_CPU_MM_HALF_GEMV") },
-                }
-                y.to_f32()
+                (y.to_f32(), half_decode_gemv_calls())
             };
-            let with_gemv = run(true);
-            let without = run(false);
+            let (with_gemv, gemv_calls) = run(true);
+            let (without, fallback_calls) = run(false);
+
+            // Without this the comparison can pass while both arms take the
+            // same route, which is the failure mode #1736 describes: a test
+            // that cannot fail still reads as coverage.
+            assert_eq!(
+                gemv_calls, 1,
+                "bias shape {shape:?}: the GEMV arm must actually reach the \
+                 16-bit GEMV, or this A/B is comparing a route against itself"
+            );
+            assert_eq!(
+                fallback_calls, 0,
+                "bias shape {shape:?}: the control arm must not reach the \
+                 16-bit GEMV, or the gate is not gating"
+            );
             for (index, (got, want)) in with_gemv.iter().zip(&without).enumerate() {
                 assert!(
                     (got - want).abs() <= 1e-3 * (1.0 + want.abs()),
