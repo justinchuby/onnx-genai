@@ -6,7 +6,7 @@ use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
 use crate::logits::{ProcessorChain, TokenId};
 use crate::sampling::sample_greedy;
 use anyhow::{Context, bail};
-use onnx_genai_metadata::{KvOwnership, ModelIoSpec, SequenceInputKind, SharedKvGroup};
+use onnx_genai_metadata::{KvOwnership, ModelIoSpec, SequenceInputKind};
 use onnx_genai_ort::Tokenizer;
 use onnx_runtime_ir::{DataType, DeviceType, Dim, SymbolId};
 use onnx_runtime_session::{
@@ -27,7 +27,6 @@ mod io;
 mod kv_commit;
 mod load;
 mod paged_gqa;
-mod proposer;
 mod tensor;
 #[cfg(feature = "native-cuda")]
 pub(crate) use tensor::recurrent_state_bytes_from_graph;
@@ -54,7 +53,6 @@ pub use paged_gqa::{
     GQA_PRESENT_ALLOCATIONS, PagedGqaConfig, flat_gqa_decode_step, gqa_present_allocations,
     paged_gqa_decode_step,
 };
-pub(crate) use proposer::NativeProposerSession;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use tensor::*;
 
@@ -824,62 +822,6 @@ impl NativeDecodeSession {
     /// Last target hidden-state row produced by the most recent forward.
     pub(crate) fn last_hidden(&self) -> Option<&[f32]> {
         self.last_hidden.as_deref()
-    }
-
-    /// Materialize metadata-declared shared-KV references from the target's
-    /// current host cache. Native CUDA keeps KV device-resident and is not yet
-    /// exposed through this CPU tensor contract.
-    pub(crate) fn shared_kv_inputs(
-        &self,
-        groups: &[SharedKvGroup],
-    ) -> anyhow::Result<Vec<(String, Tensor)>> {
-        if self.cuda.is_some() {
-            bail!(
-                "native shared-KV proposer execution currently requires a CPU target session; CUDA target KV references need device-binding alias support"
-            );
-        }
-        let mut inputs = Vec::with_capacity(groups.len() * 2);
-        for group in groups {
-            let key_target = group.target_key_input.as_deref().with_context(|| {
-                format!(
-                    "shared_kv group '{}' is missing target_key_input; declare the exact target decoder KV input name",
-                    group.name
-                )
-            })?;
-            let value_target = group.target_value_input.as_deref().with_context(|| {
-                format!(
-                    "shared_kv group '{}' is missing target_value_input; declare the exact target decoder KV input name",
-                    group.name
-                )
-            })?;
-            let key_input = group.key_input.as_deref().with_context(|| {
-                format!(
-                    "shared_kv group '{}' is missing key_input; declare the exact proposer input name",
-                    group.name
-                )
-            })?;
-            let value_input = group.value_input.as_deref().with_context(|| {
-                format!(
-                    "shared_kv group '{}' is missing value_input; declare the exact proposer input name",
-                    group.name
-                )
-            })?;
-            let key = self.past.get(key_target).with_context(|| {
-                format!(
-                    "target shared-KV key '{}' for group '{}' is unavailable; run the target decoder before invoking the proposer and ensure io.kv_inputs names this cache",
-                    key_target, group.name
-                )
-            })?;
-            let value = self.past.get(value_target).with_context(|| {
-                format!(
-                    "target shared-KV value '{}' for group '{}' is unavailable; run the target decoder before invoking the proposer and ensure io.kv_inputs names this cache",
-                    value_target, group.name
-                )
-            })?;
-            inputs.push((key_input.to_owned(), key.clone()));
-            inputs.push((value_input.to_owned(), value.clone()));
-        }
-        Ok(inputs)
     }
 
     pub fn cuda_kv_debug_stats(&self) -> Option<CudaKvDebugStats> {

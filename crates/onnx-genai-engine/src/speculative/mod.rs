@@ -32,7 +32,6 @@ use anyhow::Context;
 use onnx_genai_kv::KvCacheOps;
 use onnx_genai_ort::{
     Eagle3DecodeOptions, Eagle3DecodeSession, MtpDecodeOptions, MtpDecodeSession, Session,
-    SharedKvInput,
 };
 use onnx_runtime_ir::{DataType as IrDataType, WeightRef};
 use onnx_runtime_loader::WeightStore;
@@ -887,8 +886,6 @@ pub struct SpeculativeProposerContext<'a> {
     pub target_hidden_layers: Option<&'a [Vec<f32>]>,
     /// Target model's unprocessed greedy next token.
     pub guaranteed_token: Option<TokenId>,
-    /// Target KV slices bound to a shared-KV proposer's `shared_kv.*` inputs.
-    pub shared_kv_slices: Option<&'a [SharedKvInput]>,
 }
 
 /// Aggregate diagnostics for one speculative generation.
@@ -1442,7 +1439,6 @@ struct CandidateProposalInputs<'a> {
     step: usize,
     base_len: usize,
     prediction: &'a TargetPrediction,
-    shared_kv_slices: Option<&'a [SharedKvInput]>,
     generated_tokens: &'a [TokenId],
     generated_text: &'a str,
     options: &'a GenerateOptions,
@@ -1588,8 +1584,6 @@ impl Engine {
 
             let prediction = self.load_target_prediction(session_id, state, &speculative_mode)?;
 
-            let shared_kv_slices: Option<Vec<SharedKvInput>> = None;
-
             let draft_tokens = self.propose_candidates(
                 &speculative_mode,
                 state,
@@ -1600,7 +1594,6 @@ impl Engine {
                     step,
                     base_len,
                     prediction: &prediction,
-                    shared_kv_slices: shared_kv_slices.as_deref(),
                     generated_tokens,
                     generated_text,
                     options,
@@ -1886,7 +1879,6 @@ impl Engine {
             target_hidden: inputs.prediction.target_hidden.as_deref(),
             target_hidden_layers: inputs.prediction.target_hidden_layers.as_deref(),
             guaranteed_token: inputs.prediction.guaranteed_token,
-            shared_kv_slices: inputs.shared_kv_slices,
         };
         let draft_tokens = match speculative_mode {
             SpeculativeMode::None => Vec::new(),
@@ -2515,7 +2507,6 @@ mod tests {
             target_hidden: None,
             target_hidden_layers: None,
             guaranteed_token: None,
-            shared_kv_slices: None,
         })?;
         proposer.accept(&SpeculativeAcceptContext {
             accepted_prefix_len: 1,
@@ -2546,7 +2537,6 @@ mod tests {
             target_hidden: None,
             target_hidden_layers: None,
             guaranteed_token: None,
-            shared_kv_slices: None,
         })?;
 
         assert_eq!(proposal.tokens, vec![9, 4, 7]);
@@ -2577,7 +2567,6 @@ mod tests {
             target_hidden: None,
             target_hidden_layers: None,
             guaranteed_token: None,
-            shared_kv_slices: None,
         };
         let mut proposer = NgramProposer::new(2, 4)?;
 
@@ -2604,7 +2593,6 @@ mod tests {
             target_hidden: None,
             target_hidden_layers: None,
             guaranteed_token: None,
-            shared_kv_slices: None,
         })?;
         assert_eq!(proposal.tokens, vec![3, 4]);
 
@@ -2620,7 +2608,6 @@ mod tests {
             target_hidden: None,
             target_hidden_layers: None,
             guaranteed_token: None,
-            shared_kv_slices: None,
         })?;
         assert_eq!(proposal.tokens, vec![3]);
         Ok(())
@@ -2695,7 +2682,6 @@ mod tests {
             target_hidden: Some(&hidden),
             target_hidden_layers: None,
             guaranteed_token: Some(guaranteed),
-            shared_kv_slices: None,
         })?;
 
         assert_eq!(proposer.name(), "mtp");
@@ -2787,7 +2773,6 @@ mod tests {
             target_hidden: Some(&target_hc),
             target_hidden_layers: None,
             guaranteed_token: Some(0),
-            shared_kv_slices: None,
         })?;
 
         assert_eq!(proposal.tokens, vec![0, 0, 0]);
@@ -2873,7 +2858,6 @@ mod tests {
             target_hidden: Some(&layers[2]),
             target_hidden_layers: Some(&layers),
             guaranteed_token: Some(7),
-            shared_kv_slices: None,
         })?;
 
         assert_eq!(proposer.name(), "eagle3");
@@ -2911,7 +2895,6 @@ mod tests {
             target_hidden: Some(&layers[2]),
             target_hidden_layers: Some(&layers),
             guaranteed_token: Some(7),
-            shared_kv_slices: None,
         };
         let weights = lcg_weights(0x5555_6666, VOCAB * HIDDEN);
         let mut plain = Eagle3Proposer::new(
@@ -2996,7 +2979,6 @@ mod tests {
             target_hidden: Some(&layers[2]),
             target_hidden_layers: Some(&layers),
             guaranteed_token: Some(9),
-            shared_kv_slices: None,
         };
         let mut proposer = Eagle3Proposer::new(&head, Eagle3DecodeOptions::default(), embedder)?;
 

@@ -54,7 +54,6 @@ mod pipeline_admission;
 pub mod profile;
 pub mod runtime_capability;
 pub mod session;
-pub mod shared_kv_proposer;
 pub mod tokenizer;
 pub mod value;
 
@@ -95,10 +94,6 @@ pub use session::{
     HardwareKind, ResolvedEp, RunPhaseError, Session, SessionOptions, SkippedExecutionProvider,
     TensorInfo, USE_ENV_ALLOCATORS, available_execution_providers, capability, ep_selection,
     resolve_execution_provider, selectable_execution_providers,
-};
-pub use shared_kv_proposer::{
-    SharedKvInput, SharedKvProposerSession, SharedKvProposerSignature, SharedKvProposerStepOutput,
-    SharedKvSpec,
 };
 pub use tokenizer::Tokenizer;
 pub use value::{DataType, Value};

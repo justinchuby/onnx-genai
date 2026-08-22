@@ -111,10 +111,10 @@ pub use decoder_abi::{decoder_abi, sole_decoder_component};
 pub use identity::{IDENTITY_SCHEME, semantic_identity, semantic_identity_of_str};
 pub use lowering::{CompiledWorkflow, compile_workflow};
 pub use parser::{
-    MtpProposerSpec, SharedKvProposerSpec, SpeculatorConfigSource, SpeculatorDescriptor,
-    SpeculatorProposerKind, SpeculatorProposerStatus, detect_speculator, find_metadata_path,
-    load_metadata, load_metadata_from_dir, load_metadata_package, load_metadata_with_identity,
-    load_pipeline_spec, resolve_package_artifact,
+    MtpProposerSpec, SpeculatorConfigSource, SpeculatorDescriptor, SpeculatorProposerKind,
+    SpeculatorProposerStatus, detect_speculator, find_metadata_path, load_metadata,
+    load_metadata_from_dir, load_metadata_package, load_metadata_with_identity, load_pipeline_spec,
+    resolve_package_artifact,
 };
 pub use schema::*;
 pub use validation::{
