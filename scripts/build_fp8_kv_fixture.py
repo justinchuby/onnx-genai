@@ -32,7 +32,7 @@ def cache(name: str) -> onnx.ValueInfoProto:
 
 
 def write(model: onnx.ModelProto, stem: str) -> None:
-    model.ir_version = 10
+    model.ir_version = 11
     onnx.checker.check_model(model)
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / f"{stem}.onnx.textproto").write_text(str(model))
@@ -45,7 +45,7 @@ def identity_graph() -> onnx.ModelProto:
         [cache("key_cache")],
         [cache("updated_key_cache")],
     )
-    return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
+    return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 24)])
 
 
 def scatter_graph() -> onnx.ModelProto:
@@ -74,7 +74,7 @@ def scatter_graph() -> onnx.ModelProto:
         ],
         [cache("updated_key_cache")],
     )
-    return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
+    return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 24)])
 
 
 if __name__ == "__main__":

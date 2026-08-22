@@ -1,4 +1,4 @@
-ir_version: 10
+ir_version: 11
 graph {
   node {
     input: "cache"
@@ -87,5 +87,5 @@ graph {
 }
 opset_import {
   domain: ""
-  version: 16
+  version: 24
 }

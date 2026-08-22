@@ -1,8 +1,8 @@
-ir_version: 8
+ir_version: 11
 graph {
   name: "identity"
 }
 opset_import {
   domain: ""
-  version: 13
+  version: 24
 }

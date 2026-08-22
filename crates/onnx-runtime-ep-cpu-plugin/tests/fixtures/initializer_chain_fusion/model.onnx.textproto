@@ -1,4 +1,4 @@
-ir_version: 10
+ir_version: 11
 graph {
   node: [
     { input: ["X", "W"] output: ["M"] op_type: "MatMul" },
@@ -19,4 +19,4 @@ graph {
     type { tensor_type { elem_type: 1 shape { dim: [{ dim_value: 2 }, { dim_value: 3 }] } } }
   }]
 }
-opset_import: [{ version: 13 }]
+opset_import: [{ version: 24 }]
