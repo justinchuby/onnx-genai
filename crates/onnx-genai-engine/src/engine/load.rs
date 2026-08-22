@@ -1172,8 +1172,7 @@ fn resolve_metadata_and_decode_path(
     // to load over them rejects packages that would run correctly. Report them
     // and continue.
     let runtime_caps = onnx_genai_metadata::RuntimeCapabilities::default();
-    let report =
-        onnx_genai_metadata::validate_structure_and_capabilities(&metadata, &runtime_caps);
+    let report = onnx_genai_metadata::validate_structure_and_capabilities(&metadata, &runtime_caps);
     if !report.structural.is_empty() {
         anyhow::bail!("Invalid inference metadata: {:?}", report.structural);
     }
