@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod decode_workload;
+
 use half::{bf16, f16};
 use onnx_runtime_ep_api::{
     DevicePtr, DevicePtrMut, ExecutionProvider, Kernel, TensorMut, TensorView,
@@ -133,6 +135,18 @@ impl Tensor {
             Storage::U8(values) => values.as_mut_ptr().cast(),
             Storage::I64(values) => values.as_mut_ptr().cast(),
             Storage::I32(values) => values.as_mut_ptr().cast(),
+        }
+    }
+
+    /// The f32 payload, for benches that need to compare results across cells.
+    ///
+    /// Panics on any other storage: a hash that silently skipped a non-f32
+    /// tensor would compare equal for every input, which is the vacuous-control
+    /// shape this is here to avoid.
+    pub fn f32s(&self) -> &[f32] {
+        match &self.storage {
+            Storage::F32(values) => values,
+            _ => panic!("f32s() on a non-f32 tensor"),
         }
     }
 
