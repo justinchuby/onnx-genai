@@ -30,14 +30,99 @@ struct ComponentSignature {
     inputs: BTreeMap<String, PortSignature>,
     outputs: BTreeMap<String, PortSignature>,
     defaulted_inputs: BTreeSet<String>,
+    /// Names of every initializer (graph weight) the loaded ONNX model owns.
+    ///
+    /// Populated from the loader's decoded model inventory, so external-data
+    /// initializers resolved from sidecar files are included. This is what a
+    /// folded-carry `token_embedding.table` must resolve against.
+    initializers: BTreeSet<String>,
 }
 
 pub(crate) fn validate_pipeline_admission(
     spec: &PipelineSpec,
     model_paths: &BTreeMap<String, PathBuf>,
+    speculative: Option<&onnx_genai_metadata::SpeculativeContract>,
 ) -> Result<()> {
     let signatures = inspect_component_signatures(model_paths)?;
-    validate_workflow_signatures(&spec.workflow, &signatures)
+    validate_workflow_signatures(&spec.workflow, &signatures)?;
+    if let Some(speculative) = speculative {
+        validate_speculative_token_embedding(speculative, &signatures)?;
+    }
+    Ok(())
+}
+
+/// Resolve a folded-carry `token_embedding.table` against the target model's
+/// real initializer inventory, fail-closed.
+///
+/// The metadata validator already checks the *structural* contract: the
+/// embedding component must be the speculative target, that target must be an
+/// ONNX component, and the table string must be non-empty. It cannot, however,
+/// see inside the ONNX artifact, so a producer can still name a table that does
+/// not exist. A folded-carry proposer gathers `embed(last_token)` from this
+/// exact initializer and reads no embedding weight inside its own graph, so a
+/// dangling table would silently break generation. Admission has already loaded
+/// every ONNX component, so here the declared table is required to match a real
+/// initializer the target model owns. The error names the component and table.
+fn validate_speculative_token_embedding(
+    speculative: &onnx_genai_metadata::SpeculativeContract,
+    signatures: &BTreeMap<String, ComponentSignature>,
+) -> Result<()> {
+    // Only a chained proposer with a folded carry names an embedding table; a
+    // block proposer or a chained proposer without a folded carry does not.
+    let onnx_genai_metadata::SpeculativeProposalExecution::Chained {
+        token_embedding: Some(embedding),
+        ..
+    } = &speculative.proposal_execution
+    else {
+        return Ok(());
+    };
+    let signature = signatures.get(&embedding.component).ok_or_else(|| {
+        OrtError::InvalidArgument(format!(
+            "package admission rejected speculative token_embedding: component \
+             '{component}' has no inspected ONNX model, so its embedding table \
+             '{table}' cannot be resolved. How to fix: declare \
+             token_embedding.component as the speculative target ONNX component \
+             that owns the '{table}' initializer",
+            component = embedding.component,
+            table = embedding.table,
+        ))
+    })?;
+    if !signature.initializers.contains(&embedding.table) {
+        return Err(OrtError::InvalidArgument(format!(
+            "package admission rejected speculative token_embedding: table \
+             '{table}' is not an initializer of target component '{component}'. A \
+             folded-carry proposer gathers embed(last_token) from this exact \
+             initializer, so it must resolve to a real weight in the target \
+             model/artifact. How to fix: set token_embedding.table to an \
+             initializer name declared by component '{component}' (declared \
+             initializers: {available})",
+            table = embedding.table,
+            component = embedding.component,
+            available = summarize_initializers(&signature.initializers),
+        )));
+    }
+    Ok(())
+}
+
+/// Render an initializer inventory for an error message: sorted, capped, and
+/// annotated with the total so a large target model does not dump thousands of
+/// names while still pointing a producer at the real weights.
+fn summarize_initializers(initializers: &BTreeSet<String>) -> String {
+    const MAX_LISTED: usize = 8;
+    if initializers.is_empty() {
+        return "none".to_string();
+    }
+    let listed = initializers
+        .iter()
+        .take(MAX_LISTED)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if initializers.len() > MAX_LISTED {
+        format!("{listed}, ... ({total} total)", total = initializers.len())
+    } else {
+        listed
+    }
 }
 
 fn validate_workflow_signatures(
@@ -480,6 +565,13 @@ fn inspect_component_signature(component: &str, path: &Path) -> Result<Component
         .iter()
         .map(|initializer| initializer.name.as_str())
         .collect::<BTreeSet<_>>();
+    // Retain the target's initializer inventory so a folded-carry
+    // `token_embedding.table` can be resolved against the exact set of weights
+    // the model owns, rather than trusting the declared string.
+    signature.initializers = initializer_names
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
 
     for input in &source_graph.input {
         let name = input.name.clone();
@@ -638,5 +730,117 @@ fn dtype_name(dtype: DataType) -> &'static str {
         DataType::Float8E8M0 => "float8_e8m0",
         DataType::Uint2 => "uint2",
         DataType::Int2 => "int2",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Path to the real speculative verifier ONNX fixture, whose graph owns the
+    /// inline initializers `const_1d_0` and `const_1d_1`.
+    fn verifier_model_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../tests/fixtures/onnx_genai_workflows/speculative/verifier/model.onnx.textproto",
+        )
+    }
+
+    /// Inspect the real verifier fixture into a signature map keyed `verifier`,
+    /// exactly as pipeline admission does at load time.
+    fn verifier_signatures() -> BTreeMap<String, ComponentSignature> {
+        let mut model_paths = BTreeMap::new();
+        model_paths.insert("verifier".to_string(), verifier_model_path());
+        inspect_component_signatures(&model_paths).expect("verifier fixture should inspect")
+    }
+
+    /// Build a chained-proposer speculative contract whose folded-carry
+    /// `token_embedding` names the verifier component and the given table.
+    fn chained_speculative_with_table(table: &str) -> onnx_genai_metadata::SpeculativeContract {
+        let yaml = [
+            "proposer: proposer".to_string(),
+            "target: verifier".to_string(),
+            "proposal_execution:".to_string(),
+            "  kind: chained".to_string(),
+            "  token_embedding_input: inputs_embeds".to_string(),
+            "  logits_output: draft_logits".to_string(),
+            "  token_embedding:".to_string(),
+            "    component: verifier".to_string(),
+            format!("    table: {table}"),
+            "vocabulary:".to_string(),
+            "  kind: identical".to_string(),
+            "max_proposal_width: 4".to_string(),
+        ]
+        .join("\n");
+        serde_yaml::from_str(&yaml).expect("speculative contract YAML should parse")
+    }
+
+    #[test]
+    fn token_embedding_table_resolving_to_a_real_initializer_is_admitted() {
+        let signatures = verifier_signatures();
+        // The inventory was really read from the ONNX artifact, not assumed.
+        let inventory = &signatures
+            .get("verifier")
+            .expect("verifier signature")
+            .initializers;
+        assert!(inventory.contains("const_1d_0"));
+        assert!(inventory.contains("const_1d_1"));
+
+        let speculative = chained_speculative_with_table("const_1d_0");
+        validate_speculative_token_embedding(&speculative, &signatures)
+            .expect("a table matching a real initializer must be admitted");
+    }
+
+    #[test]
+    fn a_nonexistent_token_embedding_table_is_rejected_at_admission() {
+        let signatures = verifier_signatures();
+        // Non-empty and structurally valid, but absent from the target model.
+        let speculative = chained_speculative_with_table("model.embed_tokens.weight");
+        let err = validate_speculative_token_embedding(&speculative, &signatures)
+            .expect_err("a dangling embedding table must be rejected fail-closed");
+        let message = err.to_string();
+        assert!(
+            message.contains("model.embed_tokens.weight"),
+            "error must name the offending table: {message}"
+        );
+        assert!(
+            message.contains("verifier"),
+            "error must name the target component: {message}"
+        );
+    }
+
+    #[test]
+    fn a_token_embedding_component_without_an_inspected_model_is_rejected() {
+        let signatures = verifier_signatures();
+        let mut speculative = chained_speculative_with_table("const_1d_0");
+        // Point the embedding at a component that was never inspected/loaded.
+        if let onnx_genai_metadata::SpeculativeProposalExecution::Chained {
+            token_embedding: Some(embedding),
+            ..
+        } = &mut speculative.proposal_execution
+        {
+            embedding.component = "ghost".to_string();
+        }
+        let err = validate_speculative_token_embedding(&speculative, &signatures)
+            .expect_err("an embedding component with no inspected model must be rejected");
+        assert!(err.to_string().contains("ghost"));
+    }
+
+    #[test]
+    fn a_block_proposer_without_a_folded_carry_is_ignored() {
+        let signatures = verifier_signatures();
+        let yaml = [
+            "proposer: proposer",
+            "target: verifier",
+            "proposal_execution:",
+            "  kind: block",
+            "vocabulary:",
+            "  kind: identical",
+            "max_proposal_width: 4",
+        ]
+        .join("\n");
+        let speculative: onnx_genai_metadata::SpeculativeContract =
+            serde_yaml::from_str(&yaml).expect("block speculative contract should parse");
+        validate_speculative_token_embedding(&speculative, &signatures)
+            .expect("a proposer without a folded-carry token_embedding needs no inventory check");
     }
 }

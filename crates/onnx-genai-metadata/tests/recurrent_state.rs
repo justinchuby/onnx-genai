@@ -1,7 +1,8 @@
 //! Fixed-size recurrent state uses one generic replacement discipline.
 
 use onnx_genai_metadata::{
-    InferenceMetadata, StateGroupContract, StateKind, StateUpdate, validate_metadata,
+    InferenceMetadata, StateGroupContract, StateKind, StatePortAccess, StatePortAlias, StateUpdate,
+    validate_metadata,
 };
 
 #[test]
@@ -64,4 +65,44 @@ fn replace_state_rejects_a_sequence_axis() {
             .any(|error| error.contains("replace") && error.contains("sequence_axis")),
         "unexpected validation errors: {errors:?}"
     );
+}
+
+#[test]
+fn state_alias_access_is_explicit_and_backward_compatible() {
+    let writer: StatePortAlias = serde_yaml::from_str("input: past_key\noutput: present_key\n")
+        .expect("default writer alias parses");
+    assert_eq!(writer.access, StatePortAccess::ReadWrite);
+
+    let reader: StatePortAlias =
+        serde_yaml::from_str("input: past_key\noutput: present_key\naccess: read_only\n")
+            .expect("read-only alias parses");
+    assert_eq!(reader.access, StatePortAccess::ReadOnly);
+    assert!(
+        serde_yaml::to_string(&reader)
+            .expect("read-only alias serializes")
+            .contains("access: read_only")
+    );
+}
+
+#[test]
+fn read_only_borrow_may_omit_its_output() {
+    // A pure borrowed-state reader (e.g. a shared-KV drafter that consumes
+    // another decoder's cache and advances nothing) exposes no present output,
+    // so a read-only alias may omit `output` entirely.
+    let reader: StatePortAlias =
+        serde_yaml::from_str("input: shared_kv.full_attention.key\naccess: read_only\nrole: key\n")
+            .expect("read-only alias without an output parses");
+    assert_eq!(reader.access, StatePortAccess::ReadOnly);
+    assert!(reader.output.is_none());
+    assert!(
+        !serde_yaml::to_string(&reader)
+            .expect("alias serializes")
+            .contains("output"),
+        "an absent output is not serialized"
+    );
+
+    // A read-write transition still round-trips its output.
+    let writer: StatePortAlias =
+        serde_yaml::from_str("input: past_key\noutput: present_key\n").expect("writer parses");
+    assert_eq!(writer.output.as_deref(), Some("present_key"));
 }

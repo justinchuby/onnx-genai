@@ -1,0 +1,142 @@
+ir_version: 11
+graph {
+  node {
+    input: "input_ids"
+    output: "bs_shape"
+    name: "Shape_bs"
+    op_type: "Shape"
+  }
+  node {
+    output: "vocab_dim"
+    name: "Const_vocab"
+    op_type: "Constant"
+    attribute {
+      name: "value_ints"
+      ints: 16
+      type: INTS
+    }
+  }
+  node {
+    input: "bs_shape"
+    input: "vocab_dim"
+    output: "logits_shape"
+    name: "Concat_logits"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "logits_shape"
+    output: "logits"
+    name: "ConstantOfShape_logits"
+    op_type: "ConstantOfShape"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        data_type: 1
+        raw_data: "\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    output: "hidden_dim"
+    name: "Const_hidden"
+    op_type: "Constant"
+    attribute {
+      name: "value_ints"
+      ints: 8
+      type: INTS
+    }
+  }
+  node {
+    input: "bs_shape"
+    input: "hidden_dim"
+    output: "state_shape"
+    name: "Concat_state"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "state_shape"
+    output: "orphan_state"
+    name: "ConstantOfShape_state"
+    op_type: "ConstantOfShape"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        data_type: 1
+        raw_data: "\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  name: "tiny_orphan_output_decoder"
+  input {
+    name: "input_ids"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence"
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "logits"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "orphan_state"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence"
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}

@@ -32,6 +32,10 @@ non-schema keys.
 | 19 | [Operator ABI comparison](19-operator-abi-comparison.yaml) | Graph-visible operator/port distinctions |
 | 20 | [Qwen3.5 hybrid speculative decode](20-qwen3_5-hybrid-speculative-decoding.yaml) | Full-attention KV plus linear/conv replacement state with atomic rollback |
 | 21 | [Shared-prefix pixel flow](21-shared-prefix-pixel-flow.yaml) | Alternating CFG branches read frozen prefix state across a flow-matching loop |
+| 22 | [Qwen3 chained speculative decode](22-qwen3-chained-speculative-decoding.yaml) | Token-embedding chain with typed hidden/KV recurrence and mapped vocabulary |
+| 23 | [Gemma 4 E2B decoder](23-gemma4-e2b-decoder.yaml) | Dense hybrid full/sliding KV with heterogeneous global/local head widths and shared owners |
+| 24 | [Gemma 4 E2B assistant](24-gemma4-e2b-assistant-speculative.yaml) | Cacheless read-only merged shared-KV drafter with a folded chained carry and graph-internal centroid pruning |
+| 25 | [Gemma 4 26B-A4B MoE decoder](25-gemma4-26b-a4b-moe-decoder.yaml) | Sparse MoE (128 routed + 1 shared) with hybrid attention and heterogeneous global/local KV head count and width |
 
 ## Shared-prefix alternating branches
 
@@ -108,6 +112,101 @@ actual graph port independently, so layers may have different KV head counts
 and a layer may even expose different K and V head counts. Split groups only
 when update discipline, layout, dtype, sequence axis, lifetime, or rollback
 semantics differ—not merely because two aliases have different shapes.
+
+## Gemma 4 E2B target and pruned shared-KV assistant
+
+The Gemma 4 E2B pair (examples 23 and 24) exercises a hybrid-attention target and
+its cacheless drafter with one generic vocabulary — no model name appears in the
+schema. **Both examples are reduced illustrations**: the real target has 35
+decoder layers with 15 physical KV owners (3 full-attention at layers 4/9/14,
+head_dim 512; 12 sliding-attention, head_dim 256) and 20 shared layers that own
+no cache, and the real drafter has 4 layers (3 sliding + 1 full). The YAML slices
+below carry a reduced owner set (2 full + 1 sliding owner at illustrative
+indices) so the catalogue stays readable; those owner counts and indices are
+illustrative, not the model's real graph facts. The borrowed-KV and speculative
+CONTRACT is shown exactly as the real graph exposes it.
+
+The **target** (`google/gemma-4-E2B-it`, example 23) is a plain decoder whose
+resolved decode ABI reports `kv_ownership: owned`. It declares:
+
+- separate `full_attention` (global, `evictable_prefix: false`) and
+  `sliding_attention` (local window 512, `evictable_prefix: true`) groups;
+- heterogeneous global/local geometry: the real heterogeneity is head WIDTH — the
+  global `full_head_dim` (512) is twice the local `sliding_head_dim` (256). It is
+  grouped-query attention with one KV head (`num_key_value_heads: 1`), so key and
+  value share one head-count symbol per group. (A model whose K and V head counts
+  differ is equally expressible — see example 1 — this checkpoint's do not.)
+- fewer physical KV owners than logical layers (`num_kv_shared_layers`): the real
+  owners are the 3 full layers 4/9/14 and 12 sliding layers; `layer` orders and
+  pairs the physical owners and does not enumerate every logical layer.
+
+This E2B checkpoint is **dense** (`enable_moe_block: false` / `num_experts: null`),
+so it declares no MoE metadata — none is invented. The sparse mixture-of-experts
+variant is a **different model**, `google/gemma-4-26B-A4B-it` (example 25); MoE is
+attributed there, never to E2B. `final_logit_softcapping` and
+`tie_word_embeddings` are graph-internal to the E2B decoder artifact and are not
+restated as metadata.
+
+The **assistant** (`google/gemma-4-E2B-it-assistant`, example 24) shares one
+workflow with the target and owns nothing. Its full/sliding aliases are
+`access: read_only` and its carry is folded into the fused input, so its resolved
+ABI is `kv_ownership: shared` with no KV transitions and no state pairs. The
+speculative contract wires the rest generically:
+
+- single merged borrow: the drafter takes one `shared_kv.full_attention.{key,
+  value}` and one `shared_kv.sliding_attention.{key,value}` input — a merged view
+  of each group that maps to no specific owner — so each read-only alias names one
+  representative owner cell as its anchor and carries NO `layer`;
+- `proposal_execution: {kind: chained, token_embedding_input, logits_output,
+  folded_carry_output}` — the drafter emits `projected_state` as an output that
+  re-enters as the trailing half of the fused `inputs_embeds =
+  concat(target_input_embedding(token), carry)`; the first-step carry is
+  `port_bindings.target_hidden_context`. The tied target embedding is
+  graph-internal, so no external `shared_weights` file is referenced;
+- `shared_state: [full_attention, sliding_attention]` names the frozen groups the
+  drafter reads;
+- the sparse, ordered-embedding LM head routes through centroids
+  (`num_centroids`, `centroid_intermediate_top_k`) inside the graph, but the
+  drafter still emits the full target vocabulary axis, so the relationship is
+  `vocabulary: {kind: identical}`. (A drafter exposing a smaller pruned axis would
+  use `subset`; one emitting centroid/cluster ids needing a translation table
+  would use `mapped`.) With standard speculative rejection sampling the accepted
+  output is the target's, so the drafter is `distribution_preserving: true` even
+  with its lossy pruned head;
+- `rollback_state` lists every rewound target KV cell; the folded carry has no
+  state cell and is recomputed from committed tokens, so it is not rewound.
+
+`crates/onnx-genai-metadata/tests/gemma4_e2b_workflow.rs` resolves both examples
+and asserts this ownership, the read-only-versus-read-write split on the shared
+groups, the layer-less merged borrow, the folded chained carry (and that it fails
+closed and stays backward-compatible with the `recurrent` form), the identical
+vocabulary, and the rollback coverage.
+
+## Gemma 4 26B-A4B — the MoE variant (dense E2B is not)
+
+`google/gemma-4-26B-A4B-it` (example 25) is the sparse mixture-of-experts model in
+the Gemma 4 family; the E2B examples above are dense and must not be conflated
+with it. Every fact below is verified from the pinned config (snapshot
+`4d7ae498`) and `modeling_gemma4.py`, not extrapolated from E2B:
+
+- **MoE FFN** — `enable_moe_block: true`, `num_experts: 128`, `top_k_experts: 8`,
+  `moe_intermediate_size: 704`, plus an always-on dense **shared** expert
+  (`intermediate_size: 2112`). The router scores with `softmax`, selects
+  `top_k`, and normalizes the weights. Declared once under
+  `model.mixture_of_experts` (128 routed + 1 shared, 8 per token) with legal
+  expert-parallel facts under `model.sharding.expert_parallel`.
+- **Hybrid attention** — 30 layers, 5:1 local:global (25 sliding + 5 full at
+  layers 5/11/17/23/29), sliding window 1024.
+- **Heterogeneous global/local geometry in both axes** — the global group has
+  `num_global_key_value_heads: 2` at `global_head_dim: 512`; the local group has
+  `num_key_value_heads: 8` at `head_dim: 256`. So the two groups differ in KV head
+  COUNT and head WIDTH, expressed as independent symbolic axes. Grouped-query
+  attention (16 query heads) with `attention_k_eq_v: true`.
+- **No shared/pruned KV layers** — `num_kv_shared_layers: 0`, so every layer owns
+  its KV. Cross-layer KV sharing is an E2B feature, absent here.
+
+The catalogue slice is a reduced illustration (1 full + 1 sliding owner at real
+indices); the real per-layer owner set is stated in the YAML comment.
 
 ## Existing evidence
 

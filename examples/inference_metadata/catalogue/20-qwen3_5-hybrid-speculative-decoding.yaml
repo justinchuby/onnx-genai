@@ -1,6 +1,10 @@
 # Qwen3.5 hybrid decoder with full-attention KV, linear-attention recurrence,
-# and causal-convolution history. The independent proposer is recomputed from
-# committed tokens, so only target-owned state is persistent and rolled back.
+# and causal-convolution history. Verification takes one atomic snapshot of all
+# three target-owned state groups before running the candidate block. Acceptance
+# commits the common prefix to every group; rejection restores KV length, the
+# linear accumulator, and causal-convolution history to the same accepted
+# position. No group may commit or roll back independently. The independent
+# proposer is recomputed from committed tokens and owns no persistent state.
 schema_version: v1
 pipeline:
   workflow:

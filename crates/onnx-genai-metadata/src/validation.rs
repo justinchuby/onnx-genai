@@ -1995,12 +1995,31 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                             alias.input
                         ));
                     }
-                    if !inferred_ports && !component.ports.outputs.contains_key(&alias.output) {
-                        errors.push(format!(
-                            "state service group '{group_name}' component '{component_name}' \
-                             output alias '{}' is not a declared port",
-                            alias.output
-                        ));
+                    match &alias.output {
+                        Some(output) => {
+                            if !inferred_ports && !component.ports.outputs.contains_key(output) {
+                                errors.push(format!(
+                                    "state service group '{group_name}' component \
+                                     '{component_name}' output alias '{output}' is not a declared \
+                                     port"
+                                ));
+                            }
+                        }
+                        None => {
+                            // Only a read-only borrow may omit its output: a
+                            // pure reader consumes a frozen buffer and advances
+                            // nothing, so it exposes no present port. A
+                            // read-write transition with no output could never
+                            // be written back.
+                            if alias.access != crate::schema::StatePortAccess::ReadOnly {
+                                errors.push(format!(
+                                    "state service group '{group_name}' component \
+                                     '{component_name}' read-write alias for input '{}' declares \
+                                     no output; only a read_only borrow may omit one",
+                                    alias.input
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -2408,6 +2427,256 @@ fn validate_speculative_rollback(metadata: &InferenceMetadata, errors: &mut Vec<
             errors.push(format!(
                 "speculative.{role} '{component}' is not a declared workflow component"
             ));
+        }
+    }
+    if let crate::schema::SpeculativeProposalExecution::Chained {
+        token_embedding_input,
+        logits_output,
+        recurrent,
+        folded_carry_output,
+        folded_carry_seed,
+        token_embedding,
+    } = &speculative.proposal_execution
+        && let Some(proposer) = workflow.components.get(&speculative.proposer)
+    {
+        if !proposer.ports.inputs.contains_key(token_embedding_input) {
+            errors.push(format!(
+                "speculative chained proposer input '{token_embedding_input}' is not an input \
+                 port of component '{}'",
+                speculative.proposer
+            ));
+        }
+        if !proposer.ports.outputs.contains_key(logits_output) {
+            errors.push(format!(
+                "speculative chained proposer logits '{logits_output}' is not an output port of \
+                 component '{}'",
+                speculative.proposer
+            ));
+        }
+        if recurrent.is_empty() && folded_carry_output.is_none() {
+            errors.push(
+                "speculative chained proposal must declare at least one recurrent binding or a \
+                 folded_carry_output"
+                    .to_string(),
+            );
+        }
+        if let Some(folded) = folded_carry_output
+            && !proposer.ports.outputs.contains_key(folded)
+        {
+            errors.push(format!(
+                "speculative chained folded_carry_output '{folded}' is not an output port of \
+                 component '{}'",
+                speculative.proposer
+            ));
+        }
+        // A folded carry is pinned by three explicit ports so a runtime never
+        // infers by convention: the DESTINATION it lands in
+        // (`port_bindings.target_hidden_context`, a proposer input port), the
+        // carry_0 SOURCE (`folded_carry_seed`, a target output), and the
+        // embedding table for the fused input's leading half (`token_embedding`).
+        // Each is required when a folded carry is declared.
+        if folded_carry_output.is_some() {
+            match speculative.port_bindings.get("target_hidden_context") {
+                None => errors.push(
+                    "speculative chained proposal declares a folded_carry_output but no \
+                     port_bindings.target_hidden_context naming the destination proposer input \
+                     port the carry lands in"
+                        .to_string(),
+                ),
+                Some(context_port) => {
+                    if !proposer.ports.inputs.contains_key(context_port) {
+                        errors.push(format!(
+                            "speculative port_bindings.target_hidden_context '{context_port}' is \
+                             not an input port of proposer component '{}'",
+                            speculative.proposer
+                        ));
+                    } else if context_port != token_embedding_input {
+                        // A folded carry re-enters through the fused input's
+                        // trailing half, so the DESTINATION port is the fused
+                        // `token_embedding_input` itself, never a separate port.
+                        errors.push(format!(
+                            "speculative port_bindings.target_hidden_context '{context_port}' must \
+                             equal the fused token_embedding_input '{token_embedding_input}'; a \
+                             folded carry re-enters through the fused input's trailing half, not a \
+                             separate proposer input port"
+                        ));
+                    }
+                }
+            }
+            match folded_carry_seed {
+                None => errors.push(
+                    "speculative chained proposal declares a folded_carry_output but no \
+                     folded_carry_seed naming the target output that seeds carry_0"
+                        .to_string(),
+                ),
+                Some(seed) => match workflow.components.get(&seed.component) {
+                    None => errors.push(format!(
+                        "speculative folded_carry_seed component '{}' is not a declared workflow \
+                         component",
+                        seed.component
+                    )),
+                    Some(seed_component) => {
+                        if !seed_component.ports.outputs.contains_key(&seed.output) {
+                            errors.push(format!(
+                                "speculative folded_carry_seed output '{}' is not an output port \
+                                 of component '{}'",
+                                seed.output, seed.component
+                            ));
+                        }
+                        // carry_0 is the target's OWN per-token hidden output, so
+                        // the seed must name the speculative target — a proposer
+                        // (or any non-target) seed is nonsensical and rejected.
+                        if seed.component != speculative.target {
+                            errors.push(format!(
+                                "speculative folded_carry_seed component '{}' must be the \
+                                 speculative target '{}'; the folded carry's first-step seed is \
+                                 the target's own hidden output",
+                                seed.component, speculative.target
+                            ));
+                        }
+                    }
+                },
+            }
+            match token_embedding {
+                None => errors.push(
+                    "speculative chained proposal declares a folded_carry_output but no \
+                     token_embedding naming where embed(last_token) is gathered from"
+                        .to_string(),
+                ),
+                Some(embedding) => match workflow.components.get(&embedding.component) {
+                    None => errors.push(format!(
+                        "speculative token_embedding component '{}' is not a declared \
+                         workflow component",
+                        embedding.component
+                    )),
+                    Some(embedding_component) => {
+                        // The fused input's leading half is `embed(last_token)`
+                        // gathered from the TARGET model's shared embedding, so
+                        // the table must resolve to a real initializer in the
+                        // named target model/artifact. Enforce all three facts
+                        // fail-closed: it is the target, the target is an ONNX
+                        // model that owns initializers, and the table is named.
+                        if embedding.component != speculative.target {
+                            errors.push(format!(
+                                "speculative token_embedding component '{}' must be the \
+                                 speculative target '{}'; a folded carry reuses the target \
+                                 model's embedding table",
+                                embedding.component, speculative.target
+                            ));
+                        }
+                        let names_onnx_artifact = matches!(
+                            &embedding_component.implementation,
+                            crate::schema::ComponentImplementation::Onnx { artifact }
+                                if !artifact.trim().is_empty()
+                        );
+                        if !names_onnx_artifact {
+                            errors.push(format!(
+                                "speculative token_embedding names table '{}' on component '{}', \
+                                 which declares no ONNX model artifact for that initializer to \
+                                 resolve against",
+                                embedding.table, embedding.component
+                            ));
+                        }
+                        if embedding.table.trim().is_empty() {
+                            errors.push(
+                                "speculative token_embedding table must name a real target \
+                                 initializer, not an empty string"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                },
+            }
+        }
+        // Every state-service port map the proposer owns, across all groups. A
+        // recurrence must resolve to a read_write alias in one of these.
+        let proposer_group_aliases = workflow
+            .serving
+            .as_ref()
+            .map(|serving| &serving.state_service.groups)
+            .into_iter()
+            .flat_map(|groups| groups.values())
+            .filter_map(|group| group.ports.get(&speculative.proposer))
+            .collect::<Vec<_>>();
+        let mut states = BTreeSet::new();
+        for binding in recurrent {
+            if !states.insert(&binding.state) {
+                errors.push(format!(
+                    "speculative chained proposal repeats recurrent state '{}'",
+                    binding.state
+                ));
+            }
+            if !workflow.state.contains_key(&binding.state) {
+                errors.push(format!(
+                    "speculative chained proposal references unknown recurrent state '{}'",
+                    binding.state
+                ));
+            }
+            if !speculative.rollback_state.contains(&binding.state) {
+                errors.push(format!(
+                    "speculative chained recurrent state '{}' must be listed in rollback_state",
+                    binding.state
+                ));
+            }
+            if !proposer.ports.inputs.contains_key(&binding.input) {
+                errors.push(format!(
+                    "speculative chained recurrence input '{}' is not an input port of component '{}'",
+                    binding.input, speculative.proposer
+                ));
+            }
+            if !proposer.ports.outputs.contains_key(&binding.output) {
+                errors.push(format!(
+                    "speculative chained recurrence output '{}' is not an output port of component '{}'",
+                    binding.output, speculative.proposer
+                ));
+            }
+            // A recurrence is a genuine state transition, so it must resolve to a
+            // read_write state-service alias on the proposer that advances this
+            // exact cell through the same input/output ports the binding names. A
+            // missing, read_only, or mismatched alias means the loop carry would
+            // never be persisted between proposer invocations — reject it
+            // fail-closed rather than silently dropping the recurrence.
+            match proposer_group_aliases
+                .iter()
+                .find_map(|ports| ports.get(&binding.state))
+            {
+                None => errors.push(format!(
+                    "speculative chained recurrent state '{}' has no state-service alias on \
+                     proposer '{}'; a recurrence must resolve through \
+                     serving.state_service.groups.*.ports.{}",
+                    binding.state, speculative.proposer, speculative.proposer
+                )),
+                Some(alias) => {
+                    if alias.access != crate::schema::StatePortAccess::ReadWrite {
+                        errors.push(format!(
+                            "speculative chained recurrent state '{}' resolves to a read_only \
+                             state-service alias on proposer '{}', but a recurrence must advance \
+                             the state (read_write)",
+                            binding.state, speculative.proposer
+                        ));
+                    }
+                    if alias.input != binding.input {
+                        errors.push(format!(
+                            "speculative chained recurrent state '{}' binds input '{}' but its \
+                             state-service alias names input '{}'",
+                            binding.state, binding.input, alias.input
+                        ));
+                    }
+                    match alias.output.as_deref() {
+                        Some(output) if output == binding.output => {}
+                        Some(output) => errors.push(format!(
+                            "speculative chained recurrent state '{}' binds output '{}' but its \
+                             state-service alias names output '{}'",
+                            binding.state, binding.output, output
+                        )),
+                        None => errors.push(format!(
+                            "speculative chained recurrent state '{}' binds output '{}' but its \
+                             state-service alias declares no output",
+                            binding.state, binding.output
+                        )),
+                    }
+                }
+            }
         }
     }
     let declared_groups = workflow

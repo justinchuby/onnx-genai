@@ -1816,7 +1816,7 @@ impl PipelineEngine {
                     .filter_map(|group| group.ports.get(component))
                     .flat_map(|aliases| aliases.values())
                     .filter(|alias| alias.access == StatePortAccess::ReadWrite)
-                    .map(|alias| (alias.output.clone(), alias.input.clone()))
+                    .filter_map(|alias| Some((alias.output.clone()?, alias.input.clone())))
                     .collect::<HashMap<_, _>>()
             })
             .unwrap_or_default();
