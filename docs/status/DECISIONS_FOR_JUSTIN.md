@@ -344,8 +344,7 @@ foundational choices.
   official artifacts arrive. Model-agnostic latent-state infrastructure may
   proceed only when justified by a released model contract; do not freeze an
   MLA ABI from K3 announcements.
-- **Pointer:** [`KIMI_K_READINESS.md` native MLA gap](../models/KIMI_K_READINESS.md#L136-L142),
-  [roadmap blocker](PROGRESS.md#L478-L484)
+- **Pointer:** [`KIMI_K_READINESS.md` native MLA gap](../models/KIMI_K_READINESS.md#L136-L142)
 
 ## Mobius exports — 2 decisions
 
@@ -384,5 +383,4 @@ foundational choices.
   deliberately as the PRs move. Do not wait for merge to test, but merge only
   after the frozen private-op/state contracts match.
 - **Pointer:** [GLM exporter dependency](../../.squad/decisions.md#L916-L924),
-  [DeepSeek primary target](../models/DEEPSEEK_CSA_MTP_RUNTIME.md#L3-L10),
-  [roadmap blocker](PROGRESS.md#L478-L484)
+  [DeepSeek primary target](../models/DEEPSEEK_CSA_MTP_RUNTIME.md#L3-L10)
