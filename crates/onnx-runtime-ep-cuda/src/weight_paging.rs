@@ -1381,18 +1381,20 @@ enum WeightAllocation {
         /// one. The slot is marked pending while its deferred decommit is in
         /// flight and is only reusable again once that decommit terminally
         /// completes; a decommit that quarantines poisons the slot instead.
-        slot_state: Option<Arc<SlotReleaseState>>,
+        slot_state: Option<Arc<SlotOperationState>>,
     },
 }
 
-/// Whether a stable weight slot may be mapped again.
+/// Whether a stable weight slot may be accessed or mapped again.
 ///
 /// A slot's virtual address is baked into captured graphs, so remapping it
 /// while its previous physical decommit is still in flight would let a page-in
-/// race a release over one address. The slot therefore carries explicit state:
-/// page-in fails closed unless the slot is idle.
+/// race a release over one address. A pinned-page diagnostic refill also writes
+/// that same address after dropping the residency lock. The slot therefore
+/// carries explicit state: lookups, refills, and page-ins fail closed unless the
+/// slot is idle.
 #[derive(Debug, Default)]
-pub(crate) struct SlotReleaseState {
+pub(crate) struct SlotOperationState {
     state: std::sync::atomic::AtomicU8,
 }
 
@@ -1408,7 +1410,7 @@ pub enum SlotStatus {
     Poisoned,
 }
 
-impl SlotReleaseState {
+impl SlotOperationState {
     const IDLE: u8 = 0;
     const PENDING: u8 = 1;
     const POISONED: u8 = 2;
@@ -1421,9 +1423,10 @@ impl SlotReleaseState {
         }
     }
 
-    /// Claim the slot for a deferred release. Returns `false` when a release is
-    /// already in flight or the slot is poisoned.
-    fn begin_release(&self) -> bool {
+    /// Claim the slot for an operation that must finish outside the residency
+    /// lock. Returns `false` when another operation is pending or the slot is
+    /// poisoned.
+    fn begin_pending(&self) -> bool {
         self.state
             .compare_exchange(
                 Self::IDLE,
@@ -1434,8 +1437,18 @@ impl SlotReleaseState {
             .is_ok()
     }
 
-    /// The deferred release completed; the address may be mapped again.
-    fn finish_release(&self) {
+    /// Claim the slot for a deferred release.
+    fn begin_release(&self) -> bool {
+        self.begin_pending()
+    }
+
+    /// Claim the slot before a pinned refill drops the residency lock.
+    fn begin_refill(&self) -> bool {
+        self.begin_pending()
+    }
+
+    /// A pending operation completed with valid slot contents.
+    fn finish_pending(&self) {
         let _ = self.state.compare_exchange(
             Self::PENDING,
             Self::IDLE,
@@ -1444,7 +1457,19 @@ impl SlotReleaseState {
         );
     }
 
-    /// The release did not complete. The slot is never reusable.
+    /// The deferred release completed; the address may be mapped again.
+    fn finish_release(&self) {
+        self.finish_pending();
+    }
+
+    /// A refill completed successfully, was not submitted, or terminally
+    /// completed before reporting an error. In all three cases no copy can
+    /// still mutate the address and its contents remain valid.
+    fn finish_refill(&self) {
+        self.finish_pending();
+    }
+
+    /// A pending operation did not complete. The slot is never reusable.
     fn poison(&self) {
         self.state.store(Self::POISONED, Ordering::Release);
     }
@@ -1461,7 +1486,7 @@ struct StableWeightSlot {
     len: usize,
     /// Shared with every page that occupies this slot, so a page-in can see
     /// that the previous page's decommit has not finished.
-    state: Arc<SlotReleaseState>,
+    state: Arc<SlotOperationState>,
 }
 
 /// A weight page's device memory, released after both stream tails.
@@ -1491,7 +1516,7 @@ enum WeightReleaseAction {
         allowance: onnx_runtime_memory_governor::MappedAllowance,
         ptr: CUdeviceptr,
         len: usize,
-        slot_state: Option<Arc<SlotReleaseState>>,
+        slot_state: Option<Arc<SlotOperationState>>,
     },
     /// A duplicate or already-poisoned stable-slot release. Nothing may touch
     /// the address again, so retain the exact allocator/allowance/slot state.
@@ -1500,7 +1525,7 @@ enum WeightReleaseAction {
         allowance: onnx_runtime_memory_governor::MappedAllowance,
         ptr: CUdeviceptr,
         len: usize,
-        slot_state: Option<Arc<SlotReleaseState>>,
+        slot_state: Option<Arc<SlotOperationState>>,
     },
 }
 
@@ -3154,6 +3179,13 @@ impl CudaWeightResidency {
         }
         let (allowance, lease) = {
             let mut inner = self.lock();
+            // Context loss is terminal for every baked address. In particular,
+            // a refill that was pending when teardown was confirmed must not
+            // later restore the slot to idle and expose a pointer into the dead
+            // context; finish_refill's compare-exchange preserves this poison.
+            for slot in inner.slots.values() {
+                slot.state.poison();
+            }
             let allowance = inner.mapped_allowance.take();
             let lease = inner.lease.take();
             inner.policy.budget = 0;
@@ -3714,6 +3746,24 @@ impl CudaWeightResidency {
             .expect("VMM residency helper requires physical admission");
         let mut inner = self.lock();
         if let Some(existing) = inner.pages.get(&key).cloned() {
+            let slot_state = inner.slots.get(&key).map(|slot| Arc::clone(&slot.state));
+            if let Some(state) = slot_state.as_ref() {
+                match state.status() {
+                    SlotStatus::Idle => {}
+                    SlotStatus::Pending => {
+                        return Err(WeightHandleError::DeviceBinding(format!(
+                            "stable weight slot for key {key} has a refill or release pending; \
+                             retry after that operation terminally completes"
+                        )));
+                    }
+                    SlotStatus::Poisoned => {
+                        return Err(WeightHandleError::DeviceBinding(format!(
+                            "stable weight slot for key {key} is poisoned; its device pointer \
+                             must never be returned or written again"
+                        )));
+                    }
+                }
+            }
             inner.record_hit(key);
             // #945 retained-page-staleness probes. Reached only when a probe env
             // is set; the shipped path takes the early return above unchanged.
@@ -3732,25 +3782,59 @@ impl CudaWeightResidency {
                 } else {
                     None
                 };
+                let refill_claim = if refill_every.is_some_and(|every| step % every == 0) {
+                    let state = slot_state.ok_or_else(|| {
+                        WeightHandleError::DeviceBinding(format!(
+                            "pinned resident key {key} has no stable-slot refill state"
+                        ))
+                    })?;
+                    if !state.begin_refill() {
+                        return Err(WeightHandleError::DeviceBinding(format!(
+                            "stable weight slot for key {key} could not claim its refill; \
+                             another operation is pending or the slot is poisoned"
+                        )));
+                    }
+                    Some(state)
+                } else {
+                    None
+                };
                 drop(inner);
                 if let Some(baseline) = baseline {
-                    let current = self.hash_page_granules(existing.ptr, existing.len)?;
+                    let current = match self.hash_page_granules(existing.ptr, existing.len) {
+                        Ok(current) => current,
+                        Err(error) => {
+                            if let Some(state) = refill_claim.as_ref() {
+                                state.finish_refill();
+                            }
+                            return Err(error);
+                        }
+                    };
                     report_pin_granule_diff(key, step, &baseline, &current);
                 }
-                if let Some(every) = refill_every
-                    && step % every == 0
-                {
+                if let Some(state) = refill_claim {
                     // Re-run the admission fill against the *same* device VA,
                     // re-copying the original host source. If corruption
                     // vanishes under this, the retained device copy had gone
                     // stale (host bytes are unchanged) — the decisive control.
-                    self.runtime.drain_for_unmap().map_err(|error| {
-                        WeightHandleError::DeviceBinding(format!(
+                    if let Err(error) = self.runtime.drain_for_unmap() {
+                        state.finish_refill();
+                        return Err(WeightHandleError::DeviceBinding(format!(
                             "pin-refill compute drain: {error}"
-                        ))
-                    })?;
-                    if let Err(failure) = fill(&self.runtime, existing.ptr).into_vmm_fill_result() {
-                        return Err(self.handle_pinned_refill_failure(key, existing, failure));
+                        )));
+                    }
+                    match fill(&self.runtime, existing.ptr).into_vmm_fill_result() {
+                        Ok(()) => state.finish_refill(),
+                        Err(failure) => {
+                            return Err(
+                                self.handle_pinned_refill_failure(key, existing, state, failure)
+                            );
+                        }
+                    }
+                    if state.status() != SlotStatus::Idle {
+                        return Err(WeightHandleError::DeviceBinding(format!(
+                            "stable weight slot for key {key} became poisoned during refill; \
+                             refusing to return its device pointer"
+                        )));
                     }
                     eprintln!(
                         "weight_pin_refill[#945]: key={key} step={step} re-filled \
@@ -3926,7 +4010,7 @@ impl CudaWeightResidency {
         let slot_state = match reused_slot.as_ref() {
             Some(slot) => Some(Arc::clone(&slot.state)),
             None if stable_slot => {
-                let state = Arc::new(SlotReleaseState::default());
+                let state = Arc::new(SlotOperationState::default());
                 inner.slots.insert(
                     key,
                     StableWeightSlot {
@@ -3982,6 +4066,7 @@ impl CudaWeightResidency {
         &self,
         key: u64,
         existing: Arc<CudaWeightPage>,
+        state: Arc<SlotOperationState>,
         failure: VmmFillFailure,
     ) -> WeightHandleError {
         let VmmFillFailure {
@@ -3990,15 +4075,18 @@ impl CudaWeightResidency {
         } = failure;
         let Some(source) = in_flight_source else {
             // NotSubmitted leaves the old destination untouched. Completed
-            // carries a completion witness, so both endpoints are safe and the
+            // carries a completion witness proving the submitted copy ended
+            // normally, so the new destination contents are valid and the
             // pooled staging source was already retired by the fill closure.
+            state.finish_refill();
             return error;
         };
 
         let mut inner = self.lock();
-        if let Some(slot) = inner.slots.get(&key) {
-            slot.state.poison();
-        }
+        // Poison while holding residency before removing the page. A concurrent
+        // lookup can observe Pending before this lock is acquired, or Poisoned
+        // after it, but can never observe an idle resident pointer.
+        state.poison();
         // Stop every later lookup before retaining the page. Its mapped charge
         // deliberately remains live because completion is unresolved.
         inner.remove_page(key);
@@ -4326,7 +4414,7 @@ impl CudaWeightResidency {
         ptr: NonNull<u8>,
         len: usize,
         has_stable_slot: bool,
-        slot_state: Option<Arc<SlotReleaseState>>,
+        slot_state: Option<Arc<SlotOperationState>>,
         failure: VmmFillFailure,
     ) -> SpanAdmitError {
         if let Some(source) = failure.in_flight_source {
@@ -4449,6 +4537,17 @@ impl CudaWeightResidency {
     fn get_hit(&self, key: u64) -> Option<Arc<CudaWeightPage>> {
         let mut inner = self.lock();
         if let Some(page) = inner.pages.get(&key).cloned() {
+            // A pinned refill writes this resident page after releasing `inner`.
+            // Decline every fast-path lookup until the refill has terminally
+            // completed; resident_vmm_with will return a retryable pending error
+            // or a terminal poisoned error without exposing the pointer.
+            if inner
+                .slots
+                .get(&key)
+                .is_some_and(|slot| slot.state.status() != SlotStatus::Idle)
+            {
+                return None;
+            }
             let is_pinned = inner.pinned.contains(&key);
             // #945 experiment 1: when forcing a periodic re-fill of a pinned key,
             // decline the fast-path hit here so the caller falls through to the
@@ -4823,6 +4922,7 @@ impl ResidencyInner {
         self.policy
             .next_evictable_index(eviction, &mut |key| {
                 !self.pinned.contains(&key)
+                    && self.slot_is_idle(key)
                     && self
                         .pages
                         .get(&key)
@@ -4844,6 +4944,7 @@ impl ResidencyInner {
         let mut best: Option<(u64, u64)> = None;
         for (&key, &bytes) in &self.policy.bytes_by_key {
             let evictable = !self.pinned.contains(&key)
+                && self.slot_is_idle(key)
                 && self
                     .pages
                     .get(&key)
@@ -4870,6 +4971,7 @@ impl ResidencyInner {
     ) -> Option<u64> {
         let is_evictable = |key: u64| -> bool {
             !self.pinned.contains(&key)
+                && self.slot_is_idle(key)
                 && self
                     .pages
                     .get(&key)
@@ -4933,10 +5035,14 @@ impl ResidencyInner {
     fn evict_to_fit(&mut self, incoming: u64, eviction: WeightEvictionPolicy) {
         let evicted = {
             let pages = &self.pages;
+            let slots = &self.slots;
             self.policy.evict_to_fit(incoming, eviction, |key| {
-                pages
+                slots
                     .get(&key)
-                    .is_some_and(|page| Arc::strong_count(page) == 1)
+                    .is_none_or(|slot| slot.state.status() == SlotStatus::Idle)
+                    && pages
+                        .get(&key)
+                        .is_some_and(|page| Arc::strong_count(page) == 1)
             })
         };
         for key in evicted {
@@ -4952,12 +5058,34 @@ impl ResidencyInner {
             }
         }
     }
+
+    fn slot_is_idle(&self, key: u64) -> bool {
+        self.slots
+            .get(&key)
+            .is_none_or(|slot| slot.state.status() == SlotStatus::Idle)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::EnvVarGuard;
+
+    #[test]
+    fn slot_operation_state_never_reopens_after_poison() {
+        let state = SlotOperationState::default();
+        assert!(state.begin_refill());
+        assert_eq!(state.status(), SlotStatus::Pending);
+        assert!(!state.begin_release());
+        state.poison();
+        state.finish_refill();
+        assert_eq!(state.status(), SlotStatus::Poisoned);
+
+        let completed = SlotOperationState::default();
+        assert!(completed.begin_refill());
+        completed.finish_refill();
+        assert_eq!(completed.status(), SlotStatus::Idle);
+    }
 
     /// `reset_global_offload_stats` clears the window counters and leaves every
     /// live gauge alone -- including the process-lifetime peak, which it must
@@ -5679,7 +5807,7 @@ mod tests {
         ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
     )]
     #[test]
-    fn pinned_refill_failure_quarantines_only_unresolved_copies() {
+    fn concurrent_pinned_refill_state_machine_quarantines_only_unresolved_copies() {
         use onnx_runtime_memory_governor::{
             DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole,
         };
@@ -5794,6 +5922,16 @@ mod tests {
             .map(VmmAdmit::expect_page)
             .expect("completed refill fault must leave the page reusable");
         assert_eq!(refilled_page.ptr, completed_ptr);
+        assert_eq!(
+            residency
+                .lock()
+                .slots
+                .get(&100)
+                .expect("successfully refilled slot")
+                .state
+                .status(),
+            SlotStatus::Idle
+        );
 
         let unresolved_bytes = vec![0x41u8; granule];
         let unresolved_page = residency
@@ -5816,24 +5954,77 @@ mod tests {
         let source_probe = Arc::clone(&source_dropped);
         let charged_before = governor.used(Tier::Device);
         let mapped_before = residency.stats().mapped_physical_bytes;
-        let unresolved_error = residency
-            .resident_vmm_with(
-                101,
-                DataType::Uint8,
-                vec![granule],
-                granule,
-                WeightEvictionPolicy::Lru,
-                false,
-                move |_, _| -> Result<(), VmmFillFailure> {
-                    Err(VmmFillFailure::may_be_in_flight(
-                        WeightHandleError::DeviceBinding(
-                            "injected pinned refill synchronization failure".into(),
-                        ),
-                        Box::new(DropProbe(source_probe)),
-                    ))
-                },
-            )
-            .expect_err("unresolved refill must quarantine the resident page");
+        let active_refills = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active_refills = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let second_fill_called = Arc::new(AtomicBool::new(false));
+        let (first_entered_tx, first_entered_rx) = std::sync::mpsc::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let (unresolved_error, concurrent_error) = std::thread::scope(|scope| {
+            let active_refills = Arc::clone(&active_refills);
+            let max_active_refills = Arc::clone(&max_active_refills);
+            let first = scope.spawn(|| {
+                residency
+                    .resident_vmm_with(
+                        101,
+                        DataType::Uint8,
+                        vec![granule],
+                        granule,
+                        WeightEvictionPolicy::Lru,
+                        false,
+                        move |runtime, ptr| -> Result<(), VmmFillFailure> {
+                            let active = active_refills.fetch_add(1, Ordering::AcqRel) + 1;
+                            max_active_refills.fetch_max(active, Ordering::AcqRel);
+                            first_entered_tx.send(()).expect("signal first refill");
+                            release_first_rx.recv().expect("release first refill");
+                            unsafe { runtime.htod(&unresolved_bytes, ptr) }.map_err(|error| {
+                                VmmFillFailure::completed(WeightHandleError::DeviceBinding(
+                                    error.to_string(),
+                                ))
+                            })?;
+                            active_refills.fetch_sub(1, Ordering::AcqRel);
+                            Err(VmmFillFailure::may_be_in_flight(
+                                WeightHandleError::DeviceBinding(
+                                    "injected pinned refill synchronization failure".into(),
+                                ),
+                                Box::new(DropProbe(source_probe)),
+                            ))
+                        },
+                    )
+                    .expect_err("unresolved refill must quarantine the resident page")
+            });
+
+            first_entered_rx.recv().expect("first refill entered");
+            assert_eq!(
+                residency
+                    .lock()
+                    .slots
+                    .get(&101)
+                    .expect("pending refill slot")
+                    .state
+                    .status(),
+                SlotStatus::Pending
+            );
+            let second_fill_probe = Arc::clone(&second_fill_called);
+            let concurrent_error = residency
+                .resident_vmm_with(
+                    101,
+                    DataType::Uint8,
+                    vec![granule],
+                    granule,
+                    WeightEvictionPolicy::Lru,
+                    false,
+                    move |_, _| -> Result<(), WeightHandleError> {
+                        second_fill_probe.store(true, Ordering::Release);
+                        Ok(())
+                    },
+                )
+                .expect_err("concurrent lookup must not return or rewrite a pending slot");
+            release_first_tx.send(()).expect("release first refill");
+            (first.join().expect("first refill thread"), concurrent_error)
+        });
+        assert!(concurrent_error.to_string().contains("pending"));
+        assert!(!second_fill_called.load(Ordering::Acquire));
+        assert_eq!(max_active_refills.load(Ordering::Acquire), 1);
         assert!(
             unresolved_error
                 .to_string()
@@ -5875,13 +6066,67 @@ mod tests {
         assert!(poisoned_error.to_string().contains("poisoned"));
         assert!(!fill_called.load(Ordering::Acquire));
 
+        let (teardown_entered_tx, teardown_entered_rx) = std::sync::mpsc::channel();
+        let (finish_teardown_tx, finish_teardown_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let refill = scope.spawn(|| {
+                residency
+                    .resident_vmm_with(
+                        100,
+                        DataType::Uint8,
+                        vec![granule],
+                        granule,
+                        WeightEvictionPolicy::Lru,
+                        false,
+                        move |_, _| -> Result<(), WeightHandleError> {
+                            teardown_entered_tx
+                                .send(())
+                                .expect("signal teardown refill");
+                            finish_teardown_rx.recv().expect("finish teardown refill");
+                            Ok(())
+                        },
+                    )
+                    .expect_err("teardown poison must prevent the pending refill pointer return")
+            });
+            teardown_entered_rx.recv().expect("teardown refill entered");
+            assert_eq!(
+                residency
+                    .lock()
+                    .slots
+                    .get(&100)
+                    .expect("teardown pending slot")
+                    .state
+                    .status(),
+                SlotStatus::Pending
+            );
+            residency.confirm_context_terminated();
+            finish_teardown_tx.send(()).expect("finish teardown refill");
+            let error = refill.join().expect("teardown refill thread");
+            assert!(error.to_string().contains("poisoned"));
+        });
+        assert_eq!(
+            residency
+                .lock()
+                .slots
+                .get(&100)
+                .expect("teardown poisoned slot")
+                .state
+                .status(),
+            SlotStatus::Poisoned
+        );
+        assert_eq!(
+            residency
+                .lock()
+                .slots
+                .get(&101)
+                .expect("unresolved poisoned slot")
+                .state
+                .status(),
+            SlotStatus::Poisoned
+        );
+
         drop(completed_page);
         drop(refilled_page);
-        residency.lock().remove_page_after_stream_sync(100);
-        assert!(
-            release_queue.wait_until_idle(DEFERRED_RELEASE_WAIT_TIMEOUT),
-            "completed-control page release"
-        );
     }
 
     #[cfg(feature = "gpu-tests")]
