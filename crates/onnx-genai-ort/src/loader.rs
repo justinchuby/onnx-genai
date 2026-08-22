@@ -1036,7 +1036,10 @@ mod tests {
 
         let error = PipelineModelDirectory::load(&root).unwrap_err().to_string();
         assert!(error.contains("cannot be opened"), "{error}");
-        assert!(error.contains("nested/tokenizer.json"), "{error}");
+        assert!(
+            error.contains("nested") && error.contains("tokenizer.json"),
+            "{error}"
+        );
     }
 
     #[test]

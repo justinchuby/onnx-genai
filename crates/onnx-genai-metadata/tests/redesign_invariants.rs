@@ -6,7 +6,8 @@
 //! so the fact under test is the only thing that varies.
 
 use onnx_genai_metadata::{
-    InferenceMetadata, cache_dependencies, semantic_identity_of_str, validate_metadata,
+    InferenceMetadata, WorkflowOutputRole, cache_dependencies, semantic_identity_of_str,
+    validate_metadata,
 };
 
 fn parse(document: &str) -> InferenceMetadata {
@@ -22,8 +23,17 @@ fn image_outputs_require_an_explicit_value_range() {
     let document = include_str!(
         "../../../examples/inference_metadata/catalogue/07-stable-diffusion-text-to-image.yaml"
     );
-    let missing_range = document.replacen("        value_range: negative_one_to_one\n", "", 1);
-    let errors = errors(&missing_range);
+    let mut metadata = parse(document);
+    metadata
+        .pipeline
+        .as_mut()
+        .expect("catalogue entry has a pipeline")
+        .workflow
+        .outputs
+        .get_mut("image")
+        .expect("catalogue entry has an image output")
+        .value_range = None;
+    let errors = validate_metadata(&metadata).expect_err("metadata must be rejected");
     assert!(
         errors
             .iter()
@@ -37,8 +47,17 @@ fn image_value_range_is_rejected_on_non_image_outputs() {
     let document = include_str!(
         "../../../examples/inference_metadata/catalogue/07-stable-diffusion-text-to-image.yaml"
     );
-    let invalid = document.replacen("        role: image\n", "        role: tensor\n", 1);
-    let errors = errors(&invalid);
+    let mut metadata = parse(document);
+    metadata
+        .pipeline
+        .as_mut()
+        .expect("catalogue entry has a pipeline")
+        .workflow
+        .outputs
+        .get_mut("image")
+        .expect("catalogue entry has an image output")
+        .role = WorkflowOutputRole::Tensor;
+    let errors = validate_metadata(&metadata).expect_err("metadata must be rejected");
     assert!(
         errors.iter().any(
             |error| error.contains("non-image output 'image' cannot declare image value_range")
