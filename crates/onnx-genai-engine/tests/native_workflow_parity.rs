@@ -19,6 +19,9 @@ use onnx_genai_engine::{
 };
 use onnx_genai_ort::{DataType, Value};
 
+#[path = "common/chained.rs"]
+mod chained;
+
 // ── package + fixture helpers ────────────────────────────────────────────────
 
 fn authored_package(
@@ -285,7 +288,7 @@ pipeline:
       adapter_abis: {}
       capabilities:
         [workflow_ssa, typed_emit, streaming_emit,
-         nested_control_flow, session_state_lease]
+         nested_control_flow, session_state_lease, linear_effects]
     inputs:
       initial: { contract: { dtype: int64, rank: 0, shape: [] }, role: { kind: opaque },
                  source: { kind: application, name: initial }, required: true }
@@ -594,6 +597,10 @@ fn speculative_workflow_parity() -> anyhow::Result<()> {
             "verifier.past_key_values.0.key",
             Value::from_slice_f32(&[], &[1, 2, 0, 8])?,
         )
+        .with_input(
+            "verifier.past_key_values.0.value",
+            Value::from_slice_f32(&[], &[1, 4, 0, 4])?,
+        )
         .with_input("grammar.initial_state", Value::from_slice_i64(&[0], &[1])?)
         .with_input(
             "grammar.transition_table",
@@ -762,6 +769,90 @@ fn native_unsupported_op_fails_closed() -> anyhow::Result<()> {
     assert!(
         message.contains("Uint64") || message.contains("uint64"),
         "error must name the unsupported dtype: {message}"
+    );
+    Ok(())
+}
+
+// ── chained speculative proposal (gemma4_chained) ────────────────────────────
+
+/// Required parity case for the interpreter-owned chained speculative proposal
+/// loop.
+///
+/// The hermetic `gemma4_chained` package declares
+/// `proposal_execution: {kind: chained, folded_carry_output: projected_state}`
+/// with an explicit `folded_carry_seed` and `token_embedding`, plus a borrowed,
+/// read-only `shared_kv` the drafter reads without writing back. Driving it must
+/// produce the *same* tokens on ORT and native: the whole proposal chain — fused
+/// `concat(embed(last_token), carry)` construction, per-step forward pass,
+/// folded-carry threading, acceptance, and rollback of the declared state cells
+/// — runs through the one interpreter, with only `invoke_onnx_component`
+/// differing between the two.
+///
+/// Coverage boundary this case deliberately does *not* claim: the tiny drafter
+/// slices only the carry half of its fused input, so its greedy tokens do not
+/// depend on embedding-gather correctness. `gemma4_chained_workflow.rs` covers
+/// the gather separately, against the package's own second copy of the table.
+#[test]
+fn chained_speculative_proposal_parity() -> anyhow::Result<()> {
+    assert_chained_parity(native_engine)
+}
+
+/// The same chained proposal on a CUDA-resident native backend. Its shapes all
+/// resolve from bound input symbols, so every step's tensors stay device
+/// resident; the tokens must still match the ORT reference exactly.
+#[cfg(feature = "native-cuda")]
+#[test]
+fn chained_speculative_proposal_parity_native_cuda() -> anyhow::Result<()> {
+    assert_chained_parity(native_cuda_engine)
+}
+
+fn assert_chained_parity(
+    build_native: impl Fn(&Path) -> anyhow::Result<PipelineEngine>,
+) -> anyhow::Result<()> {
+    let root = chained::fixture_root();
+    let mut ort = chained::ChainedFixture::new(ort_engine(&root)?)?;
+    let mut native = chained::ChainedFixture::new(build_native(&root)?)?;
+
+    // One proposal block: identical guaranteed token, identical drafts, identical
+    // cost. A native run that silently fell back to ORT would still match, so the
+    // run counters below rule that out.
+    let ort_proposal = ort.propose(chained::PROMPT_TOKENS, 4)?;
+    let native_proposal = native.propose(chained::PROMPT_TOKENS, 4)?;
+    assert_eq!(
+        ort_proposal, native_proposal,
+        "the chained proposal diverged between ORT and native"
+    );
+
+    // A full propose/verify/accept/reject/rollback decode, which is where the
+    // folded carry, the borrowed read-only shared KV, and the declared rollback
+    // state all have to agree.
+    let (ort_tokens, ort_tally) = ort.speculative_decode(8, 4)?;
+    let (native_tokens, native_tally) = native.speculative_decode(8, 4)?;
+    assert_eq!(
+        ort_tokens, native_tokens,
+        "speculative decoding diverged between ORT and native"
+    );
+    assert_eq!(
+        ort_tally, native_tally,
+        "the two backends took different accept/reject paths"
+    );
+    assert_eq!(
+        ort_tokens,
+        chained::greedy_reference(&root, 8)?,
+        "both backends must reproduce plain greedy decoding"
+    );
+    assert!(
+        ort_tally.rejections > 0 && ort_tally.rolled_back_cells > 0,
+        "the case must exercise rejection and rollback: {ort_tally:?}"
+    );
+
+    assert!(
+        ort.engine().native_component_run_count().is_none(),
+        "the ORT reference must hold no native sessions"
+    );
+    assert!(
+        native.engine().native_component_run_count().unwrap_or(0) > 0,
+        "the native run must have executed native component sessions, not fallen back to ORT"
     );
     Ok(())
 }

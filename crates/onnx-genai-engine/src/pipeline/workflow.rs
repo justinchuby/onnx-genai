@@ -649,6 +649,30 @@ impl PipelineEngine {
         for (name, value) in std::mem::take(&mut plan.values) {
             values.entry(name).or_insert(value);
         }
+        // Declared package outputs read the same here as they do from
+        // `run_pipeline`: host-resident. Internal SSA values are deliberately
+        // left where the backend produced them, so a native-CUDA proposal chain
+        // keeps its carry and borrowed KV device-resident instead of paying a
+        // host round-trip to be observed.
+        for output in self.workflow.outputs.keys() {
+            let row_prefix = format!("{output}.row.");
+            let event_prefix = format!("{output}.");
+            let names = values
+                .keys()
+                .filter(|name| {
+                    *name == output
+                        || name.starts_with(&row_prefix)
+                        || (name.starts_with(&event_prefix)
+                            && name[event_prefix.len()..]
+                                .chars()
+                                .all(|character| character.is_ascii_digit()))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for name in names {
+                self.materialize_workflow_value(&mut values, &name)?;
+            }
+        }
         Ok(values)
     }
 }

@@ -240,3 +240,27 @@ fn speculative_decode_equals_greedy_decode() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// Heterogeneous per-layer KV geometry (layer 0 sliding: head_dim 8, layer 1
+/// full: head_dim 16), the workflow-runtime successor to the direct-`Engine`
+/// `tiny-gemma4-assistant-mixed` regression.
+///
+/// Under the deleted `SharedKvProposerConfig` path a Rust KV *slicer* had to
+/// pick each shared-KV group's head width out of a materialized paged cache,
+/// which is exactly what got a uniform global geometry wrong. Here each group's
+/// ports declare their own head_dim and the interpreter binds them straight
+/// through, so the property is proven where it now lives: speculative decoding
+/// on a mixed-geometry package is still token-identical to plain greedy.
+#[test]
+fn mixed_head_dim_speculative_decode_equals_greedy_decode() -> anyhow::Result<()> {
+    let root = chained::mixed_fixture_root();
+    let mut fixture = ChainedFixture::with_geometry(engine(&root)?, chained::MIXED)?;
+    let (tokens, tally) = fixture.speculative_decode(8, 4)?;
+    assert_eq!(
+        tokens,
+        greedy_reference(&root, 8)?,
+        "mixed head_dim: speculative output must be token-identical to plain greedy"
+    );
+    assert!(tally.proposed > 0, "the proposer was not active: {tally:?}");
+    Ok(())
+}

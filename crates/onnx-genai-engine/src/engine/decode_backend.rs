@@ -159,7 +159,6 @@ pub(crate) fn reject_native_request_speculation(options: &GenerateOptions) -> an
         Some(SpeculativeMode::DraftModel) => Some("draft-model"),
         Some(SpeculativeMode::Mtp(_)) => None,
         Some(SpeculativeMode::Eagle3(_)) => Some("EAGLE-3"),
-        Some(SpeculativeMode::SharedKv(_)) => None,
     };
     if let Some(mode) = unsupported {
         anyhow::bail!(
@@ -171,11 +170,7 @@ pub(crate) fn reject_native_request_speculation(options: &GenerateOptions) -> an
     if options.num_speculative_tokens.is_some()
         && !matches!(
             options.speculative_mode.as_ref(),
-            Some(
-                SpeculativeMode::PromptLookup { .. }
-                    | SpeculativeMode::SharedKv(_)
-                    | SpeculativeMode::Mtp(_)
-            )
+            Some(SpeculativeMode::PromptLookup { .. } | SpeculativeMode::Mtp(_))
         )
     {
         anyhow::bail!(
@@ -196,7 +191,6 @@ pub(crate) struct NativeSpeculationPlan {
 #[derive(Clone, Copy)]
 pub(crate) enum NativeSpeculationKind {
     PromptLookup { ngram: usize, max_tokens: usize },
-    SharedKv,
     Mtp,
 }
 
@@ -220,10 +214,6 @@ pub(crate) fn native_speculation_plan(
             },
             *max_tokens,
         ),
-        SpeculativeMode::SharedKv(config) => (
-            NativeSpeculationKind::SharedKv,
-            config.num_speculative_tokens.saturating_add(1),
-        ),
         SpeculativeMode::Mtp(config) => (
             NativeSpeculationKind::Mtp,
             config.num_speculative_tokens.saturating_add(1),
@@ -236,12 +226,7 @@ pub(crate) fn native_speculation_plan(
     }
     let width = options
         .num_speculative_tokens
-        .map(|value| {
-            value.saturating_add(usize::from(matches!(
-                kind,
-                NativeSpeculationKind::SharedKv | NativeSpeculationKind::Mtp
-            )))
-        })
+        .map(|value| value.saturating_add(usize::from(matches!(kind, NativeSpeculationKind::Mtp))))
         .unwrap_or(default_width)
         .max(1);
     Some(NativeSpeculationPlan { kind, width })

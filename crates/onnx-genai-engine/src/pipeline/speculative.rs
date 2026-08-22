@@ -420,6 +420,44 @@ impl PipelineEngine {
         })
     }
 
+    /// Collect the declared `rollback_state` cells out of a completed pass.
+    ///
+    /// Each cell is resolved through the serving state contract to the target
+    /// output the pass wrote it from, so the caller never has to know which port
+    /// backs which cell. Values are aliased where the backend allows it, keeping
+    /// a device-resident cell on the device instead of forcing a host round-trip
+    /// just to be checkpointed.
+    pub fn speculative_rollback_state(
+        &self,
+        run: &PipelineTensors,
+    ) -> anyhow::Result<PipelineTensors> {
+        let contract = self
+            .speculative
+            .as_ref()
+            .context("package declares no speculative contract")?;
+        let mut state = PipelineTensors::new();
+        for cell in &contract.rollback_state {
+            let port =
+                target_state_output(&self.workflow, &contract.target, cell).with_context(|| {
+                    format!(
+                        "rollback_state cell '{cell}' names no output port on the speculative \
+                         target '{}'",
+                        contract.target
+                    )
+                })?;
+            let value_name = component_invocation(&self.workflow, &contract.target)
+                .and_then(|(_, outputs)| outputs.get(&port).cloned())
+                .with_context(|| {
+                    format!("the workflow binds no value to target output '{port}'")
+                })?;
+            let value = run.get(&value_name).with_context(|| {
+                format!("rollback_state cell '{cell}' has no value '{value_name}' in this pass")
+            })?;
+            state.insert(cell.clone(), clone_value(value)?);
+        }
+        Ok(state)
+    }
+
     /// Truncate every declared `rollback_state` cell to `length` positions.
     ///
     /// The sequence axis comes from the serving state-group the cell belongs to,
@@ -888,9 +926,9 @@ fn last_position_rows(value: &Value) -> anyhow::Result<Vec<Vec<f32>>> {
     let features = *shape.last().context("carry value has rank 0")?;
     let features = usize::try_from(features).context("carry value has a negative width")?;
     anyhow::ensure!(features > 0, "carry value has a zero-width feature axis");
-    let data = value
-        .to_vec_f32()
-        .map_err(|error| anyhow::anyhow!("carry value must be float32: {error}"))?;
+    let data = value.to_vec_f32().map_err(|error| {
+        anyhow::anyhow!("last_position_rows: carry value must be float32: {error}")
+    })?;
     anyhow::ensure!(
         data.len() % features == 0,
         "carry value holds {} elements, which is not a multiple of its {features}-wide feature axis",
@@ -1006,7 +1044,16 @@ fn truncate_along_axis(value: &Value, axis: usize, length: usize) -> anyhow::Res
         .map_err(|error| anyhow::anyhow!("failed to materialize the rolled-back state: {error}"))
 }
 
+/// Clone a workflow value without changing where it lives.
+///
+/// A value backed by an allocation it owns — a native session's device buffer,
+/// above all — is aliased in O(1) so it stays device-resident. Only an
+/// owned-host-backing value is deep-copied.
 fn clone_value(value: &Value) -> anyhow::Result<Value> {
+    if let Some(aliased) = value.try_alias_clone() {
+        return aliased
+            .map_err(|error| anyhow::anyhow!("failed to alias a workflow value: {error}"));
+    }
     value
         .clone_owned()
         .map_err(|error| anyhow::anyhow!("failed to clone a workflow value: {error}"))

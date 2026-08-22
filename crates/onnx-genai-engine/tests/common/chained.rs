@@ -13,7 +13,6 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use onnx_genai_engine::pipeline::PipelineEngine;
@@ -29,14 +28,45 @@ pub const HIDDEN: usize = 16;
 pub const VOCAB: usize = 32;
 /// Number of KV heads in each of the two target layers.
 pub const KV_HEADS: usize = 2;
-/// Per-head KV width.
+/// Per-head KV width of the homogeneous fixture.
 pub const HEAD_DIM: usize = 8;
+
+/// One package's per-layer KV geometry.
+///
+/// Gemma-4 splits sliding and full attention across different head widths, so a
+/// package's layers are not interchangeable. Carrying the geometry here is what
+/// lets the same driver run the homogeneous and the heterogeneous fixture: the
+/// declared port contracts differ, and the request has to honor them.
+#[derive(Debug, Clone, Copy)]
+pub struct ChainedGeometry {
+    /// Per-layer `(group, head_dim)`, layer 0 first.
+    pub layers: [(&'static str, usize); 2],
+}
+
+/// The homogeneous `gemma4_chained` package: both layers 2 heads x 8.
+pub const HOMOGENEOUS: ChainedGeometry = ChainedGeometry {
+    layers: [("sliding_attention", 8), ("full_attention", 8)],
+};
+
+/// The heterogeneous `gemma4_chained_mixed` package: sliding 8, full 16.
+pub const MIXED: ChainedGeometry = ChainedGeometry {
+    layers: [("sliding_attention", 8), ("full_attention", 16)],
+};
 /// A prompt inside the fixture's vocabulary and context bound.
 pub const PROMPT_TOKENS: &[i64] = &[3, 11, 7];
 
 pub fn fixture_root() -> PathBuf {
+    package_root("gemma4_chained")
+}
+
+pub fn mixed_fixture_root() -> PathBuf {
+    package_root("gemma4_chained_mixed")
+}
+
+fn package_root(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/onnx_genai_workflows/gemma4_chained")
+        .join("../../tests/fixtures/onnx_genai_workflows")
+        .join(name)
 }
 
 /// The package's declared `token_embedding` source.
@@ -94,6 +124,7 @@ pub fn target_greedy_map(root: &Path) -> anyhow::Result<Vec<i64>> {
 pub fn verification_request(
     tokens: &[i64],
     past: usize,
+    geometry: ChainedGeometry,
 ) -> anyhow::Result<PipelineGenerateRequest> {
     let sequence = tokens.len();
     let total = past + sequence;
@@ -135,31 +166,27 @@ pub fn verification_request(
             &[1, sequence as i64, 2 * HIDDEN as i64],
         )?,
     );
-    for layer in 0..2 {
+    for (layer, (group, head_dim)) in geometry.layers.iter().enumerate() {
         for role in ["key", "value"] {
             request = request.with_input(
                 format!("request.past_key_values.{layer}.{role}"),
-                kv_zeros(past)?,
+                kv_zeros(past, *head_dim)?,
             );
-        }
-    }
-    // The assistant borrows the target's KV read-only; before the target has run
-    // it sees the same prefix the target does.
-    for group in ["full_attention", "sliding_attention"] {
-        for role in ["key", "value"] {
+            // The assistant borrows the target's KV read-only; before the target
+            // has run it sees the same prefix the target does.
             request = request.with_input(
                 format!("request.shared_kv.{group}.{role}"),
-                kv_zeros(total.max(1))?,
+                kv_zeros(total.max(1), *head_dim)?,
             );
         }
     }
     Ok(request)
 }
 
-fn kv_zeros(positions: usize) -> anyhow::Result<Value> {
+fn kv_zeros(positions: usize, head_dim: usize) -> anyhow::Result<Value> {
     Ok(Value::from_vec_f32(
-        vec![0.0; KV_HEADS * positions * HEAD_DIM],
-        &[1, KV_HEADS as i64, positions as i64, HEAD_DIM as i64],
+        vec![0.0; KV_HEADS * positions * head_dim],
+        &[1, KV_HEADS as i64, positions as i64, head_dim as i64],
     )?)
 }
 
@@ -174,11 +201,19 @@ fn boolean(values: &[bool]) -> anyhow::Result<Value> {
 /// Drives the fixture through one `PipelineEngine`, whichever backend built it.
 pub struct ChainedFixture {
     engine: PipelineEngine,
+    geometry: ChainedGeometry,
 }
 
 impl ChainedFixture {
     pub fn new(engine: PipelineEngine) -> anyhow::Result<Self> {
-        Ok(Self { engine })
+        Self::with_geometry(engine, HOMOGENEOUS)
+    }
+
+    pub fn with_geometry(
+        engine: PipelineEngine,
+        geometry: ChainedGeometry,
+    ) -> anyhow::Result<Self> {
+        Ok(Self { engine, geometry })
     }
 
     pub fn engine(&self) -> &PipelineEngine {
@@ -188,7 +223,7 @@ impl ChainedFixture {
     /// Run the package's single pass over `tokens` and return every SSA value.
     pub fn run(&mut self, tokens: &[i64]) -> anyhow::Result<PipelineTensors> {
         self.engine
-            .run_pipeline_retained(verification_request(tokens, 0)?)
+            .run_pipeline_retained(verification_request(tokens, 0, self.geometry)?)
     }
 
     /// The target's greedy next token after consuming `tokens`.
@@ -228,7 +263,9 @@ impl ChainedFixture {
         let values = self.run_block(block)?;
         let logits = values.get("logits").expect("emitted target logits");
         let vocab = *logits.shape().last().expect("logits have a vocab axis") as usize;
-        let data = logits.to_vec_f32()?;
+        let data = logits
+            .to_vec_f32()
+            .map_err(|e| anyhow::anyhow!("verify logits: {e}"))?;
         let predictions = data
             .chunks_exact(vocab)
             .map(|row| {
@@ -245,20 +282,10 @@ impl ChainedFixture {
         Ok(predictions[start..start + block.len() + 1].to_vec())
     }
 
-    /// State cells after verifying a proposal block on top of the prompt.
+    /// Declared rollback state after verifying a proposal block on the prompt.
     pub fn verification_state(&mut self, block: &[i64]) -> anyhow::Result<PipelineTensors> {
         let values = self.run_block(block)?;
-        let mut state = HashMap::new();
-        for layer in 0..2 {
-            for role in ["key", "value"] {
-                let cell = format!("past_key_values.{layer}.{role}");
-                let produced = values
-                    .get(&format!("target.{cell}"))
-                    .unwrap_or_else(|| panic!("target produced no '{cell}'"));
-                state.insert(cell, produced.clone_owned()?);
-            }
-        }
-        Ok(state)
+        self.engine.speculative_rollback_state(&values)
     }
 
     /// Consume prompt + proposal block in one verification pass.
@@ -266,7 +293,7 @@ impl ChainedFixture {
         let mut tokens = PROMPT_TOKENS.to_vec();
         tokens.extend_from_slice(block);
         self.engine
-            .run_pipeline_retained(verification_request(&tokens, 0)?)
+            .run_pipeline_retained(verification_request(&tokens, 0, self.geometry)?)
     }
 
     /// Speculatively decode `budget` tokens: propose, verify, accept the
@@ -286,9 +313,11 @@ impl ChainedFixture {
             let mut context = PROMPT_TOKENS.to_vec();
             context.extend_from_slice(&committed);
 
-            let values = self
-                .engine
-                .run_pipeline_retained(verification_request(&context, 0)?)?;
+            let values = self.engine.run_pipeline_retained(verification_request(
+                &context,
+                0,
+                self.geometry,
+            )?)?;
             let guaranteed = i64::from(
                 values
                     .get("logits")
@@ -309,9 +338,11 @@ impl ChainedFixture {
             // Verify the whole block in one pass on top of the committed prefix.
             let mut block_context = context.clone();
             block_context.extend_from_slice(&proposal.tokens);
-            let verified = self
-                .engine
-                .run_pipeline_retained(verification_request(&block_context, 0)?)?;
+            let verified = self.engine.run_pipeline_retained(verification_request(
+                &block_context,
+                0,
+                self.geometry,
+            )?)?;
             let target_tokens =
                 block_aligned_predictions(&verified, context.len(), proposal.tokens.len())?;
             let acceptance = self
@@ -320,7 +351,7 @@ impl ChainedFixture {
             tally.accepted += acceptance.accepted;
             if acceptance.requires_rollback() {
                 tally.rejections += 1;
-                let mut state = state_cells(&verified)?;
+                let mut state = self.engine.speculative_rollback_state(&verified)?;
                 let length = context.len() + acceptance.committed.len();
                 self.engine.rollback_speculative_state(&mut state, length)?;
                 for (cell, value) in &state {
@@ -360,7 +391,9 @@ pub fn block_aligned_predictions(
 ) -> anyhow::Result<Vec<i64>> {
     let logits = values.get("logits").expect("emitted target logits");
     let vocab = *logits.shape().last().expect("logits have a vocab axis") as usize;
-    let data = logits.to_vec_f32()?;
+    let data = logits
+        .to_vec_f32()
+        .map_err(|e| anyhow::anyhow!("block_aligned_predictions logits: {e}"))?;
     let predictions = data
         .chunks_exact(vocab)
         .map(|row| {
@@ -375,21 +408,6 @@ pub fn block_aligned_predictions(
         .collect::<Vec<_>>();
     let start = context_len - 1;
     Ok(predictions[start..start + block_len + 1].to_vec())
-}
-
-/// The target's KV state cells from a completed pass.
-pub fn state_cells(values: &PipelineTensors) -> anyhow::Result<PipelineTensors> {
-    let mut state = HashMap::new();
-    for layer in 0..2 {
-        for role in ["key", "value"] {
-            let cell = format!("past_key_values.{layer}.{role}");
-            let produced = values
-                .get(&format!("target.{cell}"))
-                .unwrap_or_else(|| panic!("target produced no '{cell}'"));
-            state.insert(cell, produced.clone_owned()?);
-        }
-    }
-    Ok(state)
 }
 
 /// Plain greedy decoding of `budget` tokens from the fixture's own target map.

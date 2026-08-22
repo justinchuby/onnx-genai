@@ -32,7 +32,7 @@ pub(crate) use onnx_genai_kv::{
 pub(crate) use onnx_genai_metadata::InferenceMetadata;
 pub(crate) use onnx_genai_ort::{
     DataType, Eagle3DecodeSession, Environment, ModelDirectory, MtpDecodeSession, Session,
-    SessionOptions, SharedKvProposerSession, Tokenizer,
+    SessionOptions, Tokenizer,
 };
 pub(crate) use onnx_genai_scheduler::{
     CapacityProvider, CapacityProviders, FixedCapacity, GovernorReconfigureOutcome,
@@ -54,9 +54,9 @@ pub use crate::config::{
     MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
     PrioritizedGenerateRequest, PrioritizedGenerateResult, RecurrentPrefixCacheStats,
     RewindTokenCount, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint,
-    SessionForkCapability, SessionId, SessionPosition, SharedKvBinding, SharedKvProposerConfig,
-    SpeculativeMode, TokenLogprob, WeightAccessPattern, WeightPlacementReport, XtcConfig,
-    parse_device_policy, parse_resource_limit,
+    SessionForkCapability, SessionId, SessionPosition, SpeculativeMode, TokenLogprob,
+    WeightAccessPattern, WeightPlacementReport, XtcConfig, parse_device_policy,
+    parse_resource_limit,
 };
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub(crate) use crate::speculative::{
@@ -222,13 +222,11 @@ mod tests {
             #[cfg(feature = "native-backend")]
             native_max_sessions: 8,
             #[cfg(feature = "native-backend")]
-            native_shared_kv_proposer: None,
             #[cfg(feature = "native-backend")]
             native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
             draft: None,
             mtp: None,
             eagle3: None,
-            shared_kv_proposer: None,
             tokenizer,
             fim_config: None,
             num_speculative_tokens: 1,

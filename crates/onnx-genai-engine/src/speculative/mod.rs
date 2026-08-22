@@ -32,7 +32,7 @@ use anyhow::Context;
 use onnx_genai_kv::KvCacheOps;
 use onnx_genai_ort::{
     Eagle3DecodeOptions, Eagle3DecodeSession, MtpDecodeOptions, MtpDecodeSession, Session,
-    SharedKvInput, SharedKvProposerSession,
+    SharedKvInput,
 };
 use onnx_runtime_ir::{DataType as IrDataType, WeightRef};
 use onnx_runtime_loader::WeightStore;
@@ -1324,124 +1324,6 @@ where
     }
 }
 
-/// Shared-KV draft proposer (originally introduced for Gemma4 `*-assistant`).
-///
-/// The assistant owns no KV cache: it reads slices of the target model's paged
-/// KV cache through `shared_kv.*` inputs (provided via the proposer context) and
-/// carries its own internal `lm_head`. Each step consumes
-/// `inputs_embeds = concat(target_input_embedding(last_token), hidden)` (each `H`
-/// wide), emits full draft `logits`, and threads its `projected_state` output
-/// forward as the next step's `hidden`. The first step seeds `hidden` from the
-/// target's last hidden state and `last_token` from the last context token; the
-/// guaranteed target token is emitted for free and its assistant step only
-/// advances the threaded hidden state before real drafts begin.
-pub struct SharedKvProposer<'a> {
-    session: SharedKvProposerSession<'a>,
-    embedder: &'a dyn TokenEmbedder,
-}
-
-impl<'a> SharedKvProposer<'a> {
-    pub fn new(model: &'a Session, embedder: &'a dyn TokenEmbedder) -> anyhow::Result<Self> {
-        let session = SharedKvProposerSession::new(model).map_err(|error| {
-            anyhow::anyhow!("Failed to create shared-KV proposer decode session: {error}")
-        })?;
-        let hidden_size = session.signature().backbone_hidden_size;
-        if embedder.hidden_size() != hidden_size {
-            anyhow::bail!(
-                "shared-KV proposer embedding hidden size {} != backbone hidden size {hidden_size}",
-                embedder.hidden_size()
-            );
-        }
-        Ok(Self { session, embedder })
-    }
-
-    /// Target backbone hidden size `H` expected by this assistant.
-    pub fn hidden_size(&self) -> usize {
-        self.session.signature().backbone_hidden_size
-    }
-}
-
-impl SpeculativeProposer for SharedKvProposer<'_> {
-    fn propose(
-        &mut self,
-        context: &SpeculativeProposerContext<'_>,
-    ) -> anyhow::Result<SpeculativeProposal> {
-        let hidden = context
-            .target_hidden
-            .context("shared-KV proposer requires the target model's last hidden state")?;
-        let guaranteed_token = context
-            .guaranteed_token
-            .context("shared-KV proposer requires the target model's greedy next token")?;
-        let shared_kv = context
-            .shared_kv_slices
-            .context("shared-KV proposer requires target shared-KV slices")?;
-        let hidden_size = self.session.signature().backbone_hidden_size;
-        if hidden.len() != hidden_size {
-            anyhow::bail!(
-                "target_hidden length {} != shared-KV proposer hidden {hidden_size}",
-                hidden.len()
-            );
-        }
-        let seed_token = context
-            .context_tokens
-            .last()
-            .copied()
-            .context("shared-KV proposer requires at least one context token")?;
-
-        let draft_count = context.width.saturating_sub(1);
-        let mut tokens = Vec::with_capacity(draft_count + 1);
-        tokens.push(guaranteed_token);
-
-        // Reference contract (HF `SinglePositionMultiTokenCandidateGenerator`):
-        // each step feeds `inputs_embeds = concat(embed(last_token), hidden)`,
-        // where `embed` is the *target* model's raw input-token embedding and
-        // `hidden` is the target's last hidden state (step 0) or the assistant's
-        // own threaded `projected_state` (later steps). The RoPE position is held
-        // constant by the exported graph (derived from the shared-KV length), so
-        // the token embedding is the only per-step positional cue.
-        //
-        // The guaranteed target token is taken for free, but the assistant is
-        // still run once to advance the threaded hidden state to the position
-        // that follows it; that bootstrap step's own draft is discarded and
-        // `last_token` is pinned to the guaranteed token. Subsequent steps emit
-        // the real draft tokens.
-        let mut last_hidden = hidden.to_vec();
-        let mut last_token = seed_token;
-        let mut inputs_embeds = vec![0.0f32; 2 * hidden_size];
-        let position = i64::try_from(context.context_tokens.len().saturating_sub(1))
-            .context("shared-KV proposer position exceeds i64")?;
-        for step in 0..context.width {
-            self.embedder
-                .embed(last_token, &mut inputs_embeds[..hidden_size])?;
-            inputs_embeds[hidden_size..].copy_from_slice(&last_hidden);
-            let output = self
-                .session
-                .step(&inputs_embeds, position, shared_kv)
-                .map_err(|error| {
-                    anyhow::anyhow!("shared-KV proposer proposal step failed: {error}")
-                })?;
-            let drafted = TokenId::try_from(
-                argmax(&output.logits).context("shared-KV proposer produced empty draft logits")?,
-            )
-            .context("shared-KV proposer token id exceeds u32 range")?;
-            last_hidden = output.projected_state;
-            if step == 0 {
-                // Bootstrap: pin to the guaranteed target token so the drafts
-                // that follow condition on it exactly.
-                last_token = guaranteed_token;
-            } else {
-                tokens.push(drafted);
-                last_token = drafted;
-            }
-        }
-        Ok(SpeculativeProposal::linear(tokens))
-    }
-
-    fn name(&self) -> &str {
-        "shared_kv_proposer"
-    }
-}
-
 pub(crate) struct DraftModelProposer<'a> {
     draft_model: &'a mut DraftModel,
     draft_state: &'a mut DraftSession,
@@ -1626,10 +1508,6 @@ impl Engine {
                 .eagle3
                 .as_ref()
                 .is_some_and(|eagle3| eagle3.config == config),
-            SpeculativeMode::SharedKv(config) => self
-                .shared_kv_proposer
-                .as_ref()
-                .is_some_and(|assistant| assistant.config == config),
         };
         mode_available
             // Grammar processors carry per-request parser state; draft/verify
@@ -1710,12 +1588,7 @@ impl Engine {
 
             let prediction = self.load_target_prediction(session_id, state, &speculative_mode)?;
 
-            // Slice the target's paged KV for the assistant's shared_kv.* inputs.
-            let shared_kv_slices = if let SpeculativeMode::SharedKv(_) = &speculative_mode {
-                Some(self.shared_kv_proposer_slices(session_id)?)
-            } else {
-                None
-            };
+            let shared_kv_slices: Option<Vec<SharedKvInput>> = None;
 
             let draft_tokens = self.propose_candidates(
                 &speculative_mode,
@@ -1872,19 +1745,6 @@ impl Engine {
                     .context("EAGLE-3 speculation requested without a loaded EAGLE-3 head")?
                     + 1
             }
-            SpeculativeMode::SharedKv(_) => {
-                self.shared_kv_proposer
-                    .as_ref()
-                    .map(|assistant| {
-                        options
-                            .num_speculative_tokens
-                            .unwrap_or(assistant.num_speculative_tokens)
-                    })
-                    .context(
-                        "shared-KV proposer speculation requested without a loaded proposer model",
-                    )?
-                    + 1
-            }
             _ => options
                 .num_speculative_tokens
                 .unwrap_or(self.num_speculative_tokens),
@@ -1976,27 +1836,6 @@ impl Engine {
                     .cloned()
                     .context("EAGLE-3 target hidden-state list was empty")?;
                 (logits, Some(last_hidden), Some(layers))
-            } else if let SpeculativeMode::SharedKv(_) = speculative_mode {
-                let hidden_output = self
-                    .shared_kv_proposer
-                    .as_ref()
-                    .context(
-                        "shared-KV proposer speculation requested without a loaded proposer model",
-                    )?
-                    .config
-                    .target_hidden_output
-                    .clone();
-                let (logits, hidden) = next_session_token_logits_and_hidden(
-                    self.session
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
-                    self.kv_model.as_ref(),
-                    &mut self.kv_cache,
-                    session_id,
-                    state,
-                    &hidden_output,
-                )?;
-                (logits, Some(hidden), None)
             } else {
                 (
                     next_session_token_logits(
@@ -2093,14 +1932,6 @@ impl Engine {
                     proposer = proposer.with_token_map(token_map.clone())?;
                 }
                 proposer.propose(&proposer_context)?.tokens
-            }
-            SpeculativeMode::SharedKv(_) => {
-                let assistant = self.shared_kv_proposer.as_ref().context(
-                    "shared-KV proposer speculation requested without a loaded proposer model",
-                )?;
-                SharedKvProposer::new(&assistant.session, &assistant.embedder)?
-                    .propose(&proposer_context)?
-                    .tokens
             }
         };
         Ok(draft_tokens)
@@ -2468,26 +2299,6 @@ impl Engine {
         Ok(None)
     }
 
-    /// Slice the target model's paged KV cache into per-group `shared_kv.*`
-    /// tensors for the shared-KV proposer. Each configured group binds a single
-    /// representative target layer (the last listed `target_layers` index); the
-    /// assistant has no cache of its own, so these slices are materialized once
-    /// at the current base position and reused across all draft steps.
-    fn shared_kv_proposer_slices(
-        &self,
-        session_id: SessionId,
-    ) -> anyhow::Result<Vec<SharedKvInput>> {
-        let assistant = self
-            .shared_kv_proposer
-            .as_ref()
-            .context("shared-KV slicing requested without a loaded proposer model")?;
-        let materialized = self
-            .kv_cache
-            .materialize_sequence(session_id)
-            .map_err(|e| anyhow::anyhow!("Failed to materialize target KV for shared_kv: {e}"))?;
-        shared_kv_slices_from_materialized(&assistant.config.shared_kv, &materialized)
-    }
-
     pub(crate) fn sync_draft_to_target(&mut self, state: &mut EngineSession) -> anyhow::Result<()> {
         if let (Some(draft_model), Some(draft_state)) = (&mut self.draft, &mut state.draft) {
             DraftModelProposer::new(draft_model, draft_state).rewind(&state.tokens)?;
@@ -2512,40 +2323,6 @@ impl Engine {
         }
         Ok(())
     }
-}
-
-/// Slice a materialized target KV cache into per-group `shared_kv.*` proposer
-/// inputs, reading each group's `num_kv_heads`/`head_dim` from the **specific**
-/// target layer it references (the last listed `target_layers` index) rather
-/// than a single global geometry. This makes heterogeneous per-layer head_dim
-/// models (e.g. Gemma-4 sliding vs full) bind correctly.
-pub(crate) fn shared_kv_slices_from_materialized(
-    groups: &[crate::config::SharedKvBinding],
-    materialized: &onnx_genai_kv::MaterializedKv,
-) -> anyhow::Result<Vec<SharedKvInput>> {
-    let num_layers = materialized.layers.len();
-    let mut slices = Vec::with_capacity(groups.len());
-    for group in groups {
-        let layer_idx =
-            group.target_layers.last().copied().with_context(|| {
-                format!("shared_kv group '{}' has no target layers", group.name)
-            })?;
-        let layer = materialized.layers.get(layer_idx).with_context(|| {
-            format!(
-                "shared_kv group '{}' references target layer {} but only {} layers exist",
-                group.name, layer_idx, num_layers
-            )
-        })?;
-        slices.push(SharedKvInput {
-            name: group.name.clone(),
-            key: layer.key.clone(),
-            value: layer.value.clone(),
-            kv_heads: layer.num_kv_heads,
-            kv_len: materialized.sequence_len,
-            head_dim: layer.head_dim,
-        });
-    }
-    Ok(slices)
 }
 
 /// Whether every component may be silently swapped for an equivalent one.
@@ -2685,86 +2462,6 @@ mod tests {
                 );
             }
         }
-        Ok(())
-    }
-
-    /// The shared-KV slicer must read each group's `num_kv_heads`/`head_dim`
-    /// from the specific target layer it references, not a single global value.
-    /// With a heterogeneous cache (layer 0: 2×8 sliding, layer 1: 3×16 full),
-    /// the sliding group must bind 8-dim slices and the full group 16-dim, each
-    /// with its layer's own head count and buffer.
-    #[test]
-    fn shared_kv_slices_pick_per_layer_geometry() -> anyhow::Result<()> {
-        use crate::config::SharedKvBinding;
-        use onnx_genai_kv::{MaterializedKv, MaterializedLayerKv};
-
-        let seq_len = 2;
-        // Layer 0 (sliding): num_kv_heads=2, head_dim=8 → 2*2*8 = 32 floats.
-        let sliding_key: Vec<f32> = (0..2 * seq_len * 8).map(|v| v as f32).collect();
-        let sliding_value: Vec<f32> = (0..2 * seq_len * 8).map(|v| (v + 1000) as f32).collect();
-        // Layer 1 (full): num_kv_heads=3, head_dim=16 → 3*2*16 = 96 floats.
-        let full_key: Vec<f32> = (0..3 * seq_len * 16).map(|v| (v + 2000) as f32).collect();
-        let full_value: Vec<f32> = (0..3 * seq_len * 16).map(|v| (v + 3000) as f32).collect();
-
-        let materialized = MaterializedKv {
-            start_position: 0,
-            sink_len: 0,
-            sequence_len: seq_len,
-            layers: vec![
-                MaterializedLayerKv {
-                    key: sliding_key.clone(),
-                    value: sliding_value.clone(),
-                    num_kv_heads: 2,
-                    head_dim: 8,
-                },
-                MaterializedLayerKv {
-                    key: full_key.clone(),
-                    value: full_value.clone(),
-                    num_kv_heads: 3,
-                    head_dim: 16,
-                },
-            ],
-        };
-
-        let groups = vec![
-            SharedKvBinding {
-                name: "sliding_attention".into(),
-                target_layers: vec![0],
-            },
-            SharedKvBinding {
-                name: "full_attention".into(),
-                target_layers: vec![1],
-            },
-        ];
-
-        let slices = shared_kv_slices_from_materialized(&groups, &materialized)?;
-        assert_eq!(slices.len(), 2);
-
-        let sliding = &slices[0];
-        assert_eq!(sliding.name, "sliding_attention");
-        assert_eq!(sliding.kv_heads, 2, "sliding group must use layer 0 heads");
-        assert_eq!(
-            sliding.head_dim, 8,
-            "sliding group must use layer 0 head_dim"
-        );
-        assert_eq!(sliding.kv_len, seq_len);
-        assert_eq!(sliding.key, sliding_key);
-        assert_eq!(sliding.value, sliding_value);
-
-        let full = &slices[1];
-        assert_eq!(full.name, "full_attention");
-        assert_eq!(full.kv_heads, 3, "full group must use layer 1 heads");
-        assert_eq!(full.head_dim, 16, "full group must use layer 1 head_dim");
-        assert_eq!(full.kv_len, seq_len);
-        assert_eq!(full.key, full_key);
-        assert_eq!(full.value, full_value);
-
-        // An out-of-range target layer is a clear error, not a silent misread.
-        let bad = vec![SharedKvBinding {
-            name: "oob".into(),
-            target_layers: vec![9],
-        }];
-        assert!(shared_kv_slices_from_materialized(&bad, &materialized).is_err());
         Ok(())
     }
 
@@ -3332,7 +3029,6 @@ mod tests {
             SpeculativeMode::Eagle3(_) => "eagle3",
             SpeculativeMode::DraftModel => "draft_model",
             SpeculativeMode::PromptLookup { .. } => "prompt_lookup",
-            SpeculativeMode::SharedKv(_) => "shared_kv_proposer",
             SpeculativeMode::None => "none",
         };
         assert_eq!(selected, "mtp");
@@ -3355,7 +3051,6 @@ mod tests {
             SpeculativeMode::Mtp(_) => "mtp",
             SpeculativeMode::DraftModel => "draft_model",
             SpeculativeMode::PromptLookup { .. } => "prompt_lookup",
-            SpeculativeMode::SharedKv(_) => "shared_kv_proposer",
             SpeculativeMode::None => "none",
         };
         assert_eq!(selected, "eagle3");
