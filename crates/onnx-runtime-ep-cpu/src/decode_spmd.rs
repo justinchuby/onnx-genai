@@ -252,6 +252,12 @@ pub struct SpmdCounters {
     pub parks: u64,
     /// Times a parked worker woke without its node's sense having advanced and
     /// went back to sleep.
+    ///
+    /// Unlike `spin_hits` and `parks`, an increment here is not followed by a
+    /// barrier acknowledgement, so it has no release edge to make it visible to
+    /// a reader on another thread at a defined point. Treat it as eventually
+    /// consistent: fine for a threshold or a rate, not for an exact assertion
+    /// taken immediately after the wake.
     pub spurious_wakes: u64,
     /// Barriers where the dispatcher exhausted its spin budget waiting for a
     /// straggler and yielded the core. Only reachable when a worker is
@@ -477,8 +483,12 @@ impl SharedState {
         // the number of op-observations: counting at sleep time would leave a
         // worker parked for a not-yet-published op counted against a dispatch
         // that has not happened, and any snapshot would be off by up to one per
-        // worker. It also measures the quantity that matters -- wake latencies
-        // actually paid -- rather than sleeps entered.
+        // worker. It also measures closer to the quantity that matters -- wakes
+        // that served an op -- rather than sleeps entered. Not *exactly* wake
+        // latency paid: a publish landing during the `wait` call itself returns
+        // from the futex immediately, with no real sleep, and still counts here.
+        // That race is narrow and does not affect the identity (still counted
+        // once), but `parks` is an upper bound on wakes paid, not an equality.
         //
         // An observation can also land *here* without the worker ever sleeping:
         // the window expires, and the publish lands in the gap between breaking
