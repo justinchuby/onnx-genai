@@ -1,5 +1,12 @@
 # Examples
 
+## Inference metadata visualizer
+
+Open [`inference_metadata/visualizer.html`](inference_metadata/visualizer.html)
+directly from disk to inspect YAML or JSON inference metadata. The responsive
+single-file viewer is fully offline and includes workflow, state/serving,
+media, advanced capability, diagnostics, and recursive full-document views.
+
 ## ComfyUI import, converted and executed
 
 [`comfyui-import/`](comfyui-import/) walks a ComfyUI API-format workflow through
