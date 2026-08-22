@@ -96,6 +96,9 @@ fn build_kernel(
 }
 
 fn main() {
+    // Match the decode thread topology a served session runs in (#1749).
+    common::init_decode_topology();
+
     // `PROBE_BLOCK` exists because `int4_prefill_gebp_min_rows` returns a
     // *different* threshold for weights whose block size the column-blocked
     // kernels cannot take (`INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED`), and with

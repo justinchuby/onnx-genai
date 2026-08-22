@@ -179,6 +179,9 @@ struct Weight {
 }
 
 fn main() {
+    // Match the decode thread topology a served session runs in (#1749).
+    common::init_decode_topology();
+
     let block_size: usize = std::env::var("PROBE_BLOCK")
         .ok()
         .and_then(|v| v.parse().ok())
