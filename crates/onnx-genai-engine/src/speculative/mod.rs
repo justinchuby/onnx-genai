@@ -48,6 +48,9 @@ pub use tree::{
 /// Produces a target-model token embedding for an MTP proposal step.
 pub trait TokenEmbedder {
     fn hidden_size(&self) -> usize;
+    /// Number of token ids this embedder can embed. A token id at or beyond it
+    /// has no embedding row, so it can be neither embedded nor verified.
+    fn vocab_size(&self) -> usize;
     fn embed(&self, token: TokenId, out: &mut [f32]) -> anyhow::Result<()>;
 }
 
@@ -84,6 +87,10 @@ impl LinearEmbedder {
 impl TokenEmbedder for LinearEmbedder {
     fn hidden_size(&self) -> usize {
         self.hidden
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.vocab
     }
 
     fn embed(&self, token: TokenId, out: &mut [f32]) -> anyhow::Result<()> {
@@ -201,6 +208,10 @@ impl TokenEmbedder for TargetInitializerEmbedder {
         self.matrix.cols
     }
 
+    fn vocab_size(&self) -> usize {
+        self.matrix.rows
+    }
+
     fn embed(&self, token: TokenId, out: &mut [f32]) -> anyhow::Result<()> {
         let token = token as usize;
         if token >= self.matrix.rows {
@@ -289,6 +300,13 @@ impl TokenEmbedder for MtpEmbedder {
         match self {
             Self::Linear(embedder) => embedder.hidden_size(),
             Self::TargetInitializer(embedder) => embedder.hidden_size(),
+        }
+    }
+
+    fn vocab_size(&self) -> usize {
+        match self {
+            Self::Linear(embedder) => embedder.vocab_size(),
+            Self::TargetInitializer(embedder) => embedder.vocab_size(),
         }
     }
 
@@ -1192,6 +1210,24 @@ where
                 "proposer token map has {} entries but logits expose {} ids",
                 token_map.len(),
                 self.session.signature().draft_vocab_size
+            );
+        }
+        // Every mapped id is embedded through the target embedding table and
+        // verified against the target vocabulary, so an id at or beyond that
+        // vocabulary has no row and cannot be a real target token. Reject the
+        // whole map at load time rather than faulting mid-proposal on whichever
+        // draft id happens to select the out-of-range entry.
+        let vocab = self.embedder.vocab_size();
+        if let Some((index, mapped)) = token_map
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|&(_, id)| id as usize >= vocab)
+        {
+            anyhow::bail!(
+                "proposer token map entry {index} maps to target id {mapped}, but the \
+                 target/embedder vocabulary has only {vocab} ids; every mapped id must be a \
+                 valid target token"
             );
         }
         self.token_map = Some(token_map);
@@ -2981,6 +3017,10 @@ mod tests {
             2
         }
 
+        fn vocab_size(&self) -> usize {
+            usize::MAX
+        }
+
         fn embed(&self, _token: TokenId, out: &mut [f32]) -> anyhow::Result<()> {
             out.copy_from_slice(&[1.0, 0.0]);
             Ok(())
@@ -3195,6 +3235,39 @@ mod tests {
         let mapped = mapped.propose(&context)?;
         assert_eq!(mapped.tokens[0], plain.tokens[0]);
         assert_eq!(mapped.tokens[1], map[plain.tokens[1] as usize]);
+        Ok(())
+    }
+
+    /// Load-closed vocabulary bound: a token-map entry that indexes at or past
+    /// the target/embedder vocabulary has no embedding row and could never be a
+    /// real target token, so the map is rejected when it is installed — not
+    /// mid-proposal on whichever draft id happens to select it.
+    #[test]
+    fn eagle3_token_map_rejects_ids_beyond_target_vocab() -> anyhow::Result<()> {
+        const HIDDEN: usize = 16;
+        const VOCAB: usize = 32;
+        let _guard = eagle3_test_lock()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("eagle3 token-map test lock poisoned"))?;
+        let head = load_eagle3_head()?;
+        let weights = lcg_weights(0x2468_1357, VOCAB * HIDDEN);
+        // A full-length map (so it clears the length check) whose last entry
+        // indexes exactly at the vocabulary size — one past the last valid id.
+        let mut out_of_range = (0..VOCAB as TokenId).collect::<Vec<_>>();
+        *out_of_range.last_mut().expect("non-empty map") = VOCAB as TokenId;
+        let error = Eagle3Proposer::new(
+            &head,
+            Eagle3DecodeOptions::default(),
+            LinearEmbedder::new(weights, VOCAB, HIDDEN)?,
+        )?
+        .with_token_map(out_of_range)
+        .err()
+        .expect("an out-of-range token map must be rejected at load time");
+        let message = error.to_string();
+        assert!(
+            message.contains("target/embedder vocabulary") && message.contains(&VOCAB.to_string()),
+            "error must name the vocabulary bound: {message}"
+        );
         Ok(())
     }
 
