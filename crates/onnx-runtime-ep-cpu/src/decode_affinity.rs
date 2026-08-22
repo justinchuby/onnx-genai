@@ -872,7 +872,7 @@ pub fn plan_decode_affinity(worker_count: usize) -> std::result::Result<DecodePl
 /// measured worse (0.133 ms vs 0.079 ms) than leaving them compact. This
 /// function is for the fork-join pool, where a worker that is handed a share of
 /// the arithmetic genuinely wants its own core's front end.
-fn order_pin_targets(
+pub(crate) fn order_pin_targets(
     cpus: &[usize],
     cores: Option<&crate::core_topology::CoreTopology>,
 ) -> Vec<usize> {
