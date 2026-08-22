@@ -606,7 +606,7 @@ impl Kernel for RotaryEmbeddingKernel {
         let interleaved = i32::from(self.interleaved);
         let has_position_ids = i32::from(has_position_ids);
         let elements = inputs[0].numel() as u64;
-        let capture_error = if capturing {
+        let capture_error = if capturing || self.runtime.eager_sync_deferred() {
             self.runtime.capture_error_ptr()
         } else {
             0

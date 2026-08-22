@@ -20,8 +20,10 @@
 //! 3. **`GetHandle` returns the real stream handle.** The native
 //!    `cudaStream_t` is extracted from `CudaRuntime::stream_ptr()`.
 //!
-//! 4. **`Free` passes the true allocation size.** `DeviceAllocator` tracks
-//!    sizes in a `HashMap<usize, usize>`. Unknown pointers are no-op'd (S1 fix).
+//! 4. **`Free` preserves allocation identity.** `DeviceAllocator` retains the
+//!    exact EP-issued `DeviceBuffer` in a pointer-keyed table, so bound CUDA
+//!    ownership and its allocation generation reach deferred release unchanged.
+//!    Unknown pointers are no-op'd (S1 fix).
 //!
 //! **With the `cuda` feature ON**, `CreateEpFactories` attempts to construct
 //! the EP. If a CUDA GPU is available, it advertises one factory. If no GPU

@@ -87,6 +87,37 @@ fn the_execution_provider_allocates_through_a_caller_supplied_allocator() {
     );
 }
 
+/// Keep the public erased injection surface source- and runtime-compatible.
+///
+/// This intentionally erases the concrete type before calling `with_memory`;
+/// accepting only a concrete/generic allocator would compile other tests while
+/// breaking downstream callers that store `Arc<dyn DeviceAllocator>`.
+#[test]
+fn erased_arc_device_allocator_remains_a_working_with_memory_input() {
+    let counters = Arc::new(CountingAllocator::default());
+    let erased: Arc<dyn DeviceAllocator> = counters.clone();
+    let ep = CpuExecutionProvider::new().with_memory(erased);
+
+    let buffer = ep.allocate(256, 64).expect("erased allocator serves EP");
+    assert_eq!(counters.allocations.load(Ordering::Relaxed), 1);
+    ep.deallocate(buffer).expect("canonical EP release");
+    assert_eq!(counters.deallocations.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn eager_allocator_partial_decommit_is_actionably_unsupported() {
+    let ep = CpuExecutionProvider::new();
+    let buffer = ep.allocate(256, 64).expect("eager allocation");
+    let error = ep
+        .decommit_allocation_range(&buffer, 0, 64)
+        .expect_err("eager memory has no partial-decommit capability");
+    assert!(
+        error.to_string().contains("VirtualBacking"),
+        "unsupported result must name the missing capability: {error}"
+    );
+    ep.deallocate(buffer).expect("ordinary whole release");
+}
+
 /// A borrowed buffer must not reach the allocator's `deallocate`.
 ///
 /// Borrowed buffers alias memory someone else owns — an mmap'd weight file, or
