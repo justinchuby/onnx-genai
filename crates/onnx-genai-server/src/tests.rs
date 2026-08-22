@@ -1106,6 +1106,68 @@ async fn non_speech_registry_entry_does_not_expose_speech_route() {
     );
 }
 
+fn speech_state() -> AppState {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/onnx_genai_workflows/speech_wav");
+    AppState::load(&model_dir, Some("speech-wav".to_string())).expect("load speech fixture")
+}
+
+/// Raw `/v1/audio/speech` conformance against an ONNX-owned, self-contained
+/// workflow package: a text prompt assembled by a generic text-assembly adapter
+/// is synthesized into a buffered PCM16 WAV that honours the package's declared
+/// `media` contract (audio/wav, two channels, 24 kHz, 16-bit). The runtime only
+/// consumes canonical metadata fields, so this holds for any package that
+/// declares the same contract.
+#[tokio::test]
+async fn speech_endpoint_synthesizes_buffered_pcm16_wav() {
+    let response = app(speech_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/speech")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "speech-wav",
+                        "input": "hello world",
+                        "instructions": "the quick brown fox",
+                        "response_format": "wav",
+                        "stream": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("audio/wav")
+    );
+
+    let wav = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(wav.len() > 44, "WAV must carry a header plus PCM samples");
+    assert_eq!(&wav[0..4], b"RIFF");
+    assert_eq!(&wav[8..12], b"WAVE");
+    assert_eq!(&wav[12..16], b"fmt ");
+    // Audio format tag 1 == PCM.
+    assert_eq!(u16::from_le_bytes([wav[20], wav[21]]), 1);
+    // Channel count and sample rate come from the declared media contract.
+    assert_eq!(u16::from_le_bytes([wav[22], wav[23]]), 2);
+    assert_eq!(
+        u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]),
+        24000
+    );
+    // pcm_s16_le is 16-bit.
+    assert_eq!(u16::from_le_bytes([wav[34], wav[35]]), 16);
+    assert_eq!(&wav[36..40], b"data");
+}
+
 #[tokio::test]
 #[ignore = "synthetic Whisper-contract smoke test; run explicitly for audio server validation"]
 async fn audio_endpoints_route_through_tiny_whisper_pipeline() {
