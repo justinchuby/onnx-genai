@@ -4301,6 +4301,7 @@ pub fn bound_process_to_decode_budget() {
 
     match rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
+        .thread_name(prefill_worker_name)
         .build_global()
     {
         Ok(()) => eprintln!(
@@ -4313,6 +4314,25 @@ pub fn bound_process_to_decode_budget() {
              prefill/MLAS parallelism"
         ),
     }
+}
+
+/// Name for a worker in the process-wide prefill/MLAS Rayon pool.
+///
+/// Rayon does not name `build_global` workers by default, and an unnamed
+/// thread's `comm` defaults to the *process* name — so an unnamed pool of
+/// `N` workers reads, in `ps`/`top`/`/proc/<pid>/task`, as `N` extra copies
+/// of the host binary rather than as a pool. That made this pool the single
+/// largest unattributed block of threads in a budgeted process (an explicit
+/// budget of `N` more than doubles the thread count, and until now `N` of
+/// those were anonymous).
+///
+/// Deliberately short: Linux truncates `comm` to 15 bytes, so the longer
+/// `onnx-genai-`-prefixed convention used elsewhere in this crate collapses
+/// to `onnx-genai-deco`/`onnx-genai-spmd` and loses the index. This form
+/// survives truncation intact for every width this pool is ever built at,
+/// which is the whole point of naming it.
+fn prefill_worker_name(index: usize) -> String {
+    format!("nxgn-prefill-{index}")
 }
 
 /// Default persistent-pool worker count for `available` logical CPUs: half of
@@ -12017,29 +12037,17 @@ mod tests {
     #[test]
     fn the_blocked_int4_prefill_is_on_by_default() {
         let _guard = lock_dispatch_probe();
-        // SAFETY: the dispatch-probe lock serialises the tests that perturb
-        // process environment, which is the requirement `set_var`/`remove_var`
-        // carry; no other thread reads this variable concurrently.
-        unsafe {
-            std::env::remove_var("ONNX_GENAI_CPU_MM_INT4_PREFILL");
-        }
+        let mut env = crate::test_support::EnvVarGuard::unset("ONNX_GENAI_CPU_MM_INT4_PREFILL");
         assert!(
             borrowed_int4_prefill_block_enabled(),
             "the blocked int4 prefill must be enabled when the variable is unset"
         );
         for value in ["0", "off", "OFF"] {
-            // SAFETY: as above.
-            unsafe {
-                std::env::set_var("ONNX_GENAI_CPU_MM_INT4_PREFILL", value);
-            }
+            env.set_var("ONNX_GENAI_CPU_MM_INT4_PREFILL", value);
             assert!(
                 !borrowed_int4_prefill_block_enabled(),
                 "{value:?} must disable the blocked int4 prefill"
             );
-        }
-        // SAFETY: as above.
-        unsafe {
-            std::env::remove_var("ONNX_GENAI_CPU_MM_INT4_PREFILL");
         }
     }
 
@@ -13182,15 +13190,12 @@ mod tests {
             .map(|i| ((i * 17 % 127) as f32 - 63.0) / 50.0)
             .collect();
         let _guard = backend_env_lock().lock().unwrap();
-        let previous = std::env::var("ONNX_GENAI_CPU_MM_MLAS_QNBIT").ok();
+        let mut env = crate::test_support::EnvVarGuard::new();
         for (label, override_value) in [("default", None), ("explicit", Some("1"))] {
-            // SAFETY: the backend env lock serializes readers/writers of this var in tests.
-            unsafe {
-                match override_value {
-                    Some(value) => std::env::set_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT", value),
-                    None => std::env::remove_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT"),
-                }
-            }
+            match override_value {
+                Some(value) => env.set_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT", value),
+                None => env.remove_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT"),
+            };
             for (bits, block_size) in [(4usize, 128usize), (8, 128)] {
                 let weights: Vec<f32> = (0..n * k)
                     .map(|i| ((i * 31 % 251) as f32 - 125.0) / 50.0)
@@ -13253,13 +13258,6 @@ mod tests {
                         && kernel.packed_kai_qsi8_weight.get().is_none(),
                     "{label}: bits={bits} block{block_size} must prefer MLAS over the native KAI fallback",
                 );
-            }
-        }
-        // SAFETY: still holding the backend env lock; restore prior value.
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT", value),
-                None => std::env::remove_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT"),
             }
         }
     }
@@ -13333,12 +13331,10 @@ mod tests {
             return;
         }
 
-        let previous = std::env::var("NXRT_CPU_GEMM_BACKEND").ok();
-        // SAFETY: the backend env lock serializes readers/writers of this var.
         // Forced so the MLAS route is reached on hosts (x86_64) whose default
         // precedence prefers the native int4 kernel -- the store under test is
         // MLAS-only, so a native win would silently make this test vacuous.
-        unsafe { std::env::set_var("NXRT_CPU_GEMM_BACKEND", "mlas") };
+        let _env = crate::test_support::EnvVarGuard::set("NXRT_CPU_GEMM_BACKEND", "mlas");
 
         // Each round allocates the weight afresh so the allocator can hand back
         // a retired round's address, then drops it -- exactly the lifetime the
@@ -13427,13 +13423,6 @@ mod tests {
                  these addresses was served to this one"
             );
         }
-        // SAFETY: still holding the backend env lock; restore prior value.
-        unsafe {
-            match &previous {
-                Some(value) => std::env::set_var("NXRT_CPU_GEMM_BACKEND", value),
-                None => std::env::remove_var("NXRT_CPU_GEMM_BACKEND"),
-            }
-        }
         // Not an assertion. Address recycling is the allocator's choice, not the
         // code's: glibc's brk heap reuses these sizes readily, but an allocator
         // that serves each request fresh (ASan, valgrind, some musl and macOS
@@ -13500,9 +13489,7 @@ mod tests {
         let b = Owned::u8(&[n, blocks, blob], &packed);
         let scales_t = Owned::f32(&[n, blocks], &scales);
         let zero_points = Owned::u8(&[n, zp_blob], &zps);
-        let previous = std::env::var("NXRT_CPU_GEMM_BACKEND").ok();
-        // SAFETY: the backend env lock serializes readers/writers of this var.
-        unsafe { std::env::set_var("NXRT_CPU_GEMM_BACKEND", "mlas") };
+        let _env = crate::test_support::EnvVarGuard::set("NXRT_CPU_GEMM_BACKEND", "mlas");
         let run = || {
             let mut result = vec![0.0f32; m * n];
             let kernel = accuracy4_kernel(k, n, block_size);
@@ -13525,13 +13512,6 @@ mod tests {
 
         let (first_out, installer) = run();
         let (shared_out, sharer) = run();
-        // SAFETY: still holding the backend env lock; restore prior value.
-        unsafe {
-            match &previous {
-                Some(value) => std::env::set_var("NXRT_CPU_GEMM_BACKEND", value),
-                None => std::env::remove_var("NXRT_CPU_GEMM_BACKEND"),
-            }
-        }
         assert_eq!(
             first_out, shared_out,
             "both instances of one weight must produce the same output"
@@ -13613,9 +13593,7 @@ mod tests {
         // neither can be mistaken for the other by recycling.
         let first_scales = Owned::f32(&[n, blocks], &scales);
         let second_scales = Owned::f32(&[n, blocks], &doubled);
-        let previous = std::env::var("NXRT_CPU_GEMM_BACKEND").ok();
-        // SAFETY: the backend env lock serializes readers/writers of this var.
-        unsafe { std::env::set_var("NXRT_CPU_GEMM_BACKEND", "mlas") };
+        let _env = crate::test_support::EnvVarGuard::set("NXRT_CPU_GEMM_BACKEND", "mlas");
 
         let run = |scales_t: &Owned| {
             let mut result = vec![0.0f32; m * n];
@@ -13662,14 +13640,6 @@ mod tests {
             "a pack built for another scale tensor was served to this one: the \
              store key does not close the operands the pack is a function of"
         );
-
-        // SAFETY: still holding the backend env lock; restore prior value.
-        unsafe {
-            match &previous {
-                Some(value) => std::env::set_var("NXRT_CPU_GEMM_BACKEND", value),
-                None => std::env::remove_var("NXRT_CPU_GEMM_BACKEND"),
-            }
-        }
     }
 
     /// The store's insert/evict pair must stay consistent under concurrent use.
@@ -16950,6 +16920,34 @@ mod tests {
     }
 
     #[test]
+    fn prefill_worker_names_survive_linux_comm_truncation() {
+        // Linux stores `comm` in 15 bytes plus a NUL. A name longer than that
+        // is silently truncated, which is how the `onnx-genai-`-prefixed
+        // convention elsewhere in this crate loses its worker index. These
+        // names must stay legible for every width the pool is built at, so
+        // that a thread census can attribute them without guesswork.
+        const COMM_LEN: usize = 15;
+        for index in [0, 1, 9, 15, 31, 63, 99] {
+            let name = prefill_worker_name(index);
+            assert!(
+                name.len() <= COMM_LEN,
+                "`{name}` is {} bytes and would be truncated in /proc/<pid>/task/*/comm",
+                name.len()
+            );
+            assert!(
+                name.starts_with("nxgn-prefill-"),
+                "unexpected prefix: {name}"
+            );
+            assert!(
+                name.ends_with(&index.to_string()),
+                "`{name}` lost its worker index"
+            );
+        }
+        // Distinct workers must stay distinguishable.
+        assert_ne!(prefill_worker_name(0), prefill_worker_name(1));
+    }
+
+    #[test]
     fn explicit_budget_precedes_env_for_every_decode_pool() {
         assert_eq!(
             resolve_decode_threads_with_override(Some(6), Some("2"), 96),
@@ -17444,23 +17442,13 @@ mod tests {
         let scales_tensor = Owned::f32(&[n, blocks], &scales);
         let mut y = Owned::zeros_f32(&[m, n]);
 
-        let previous = std::env::var("ONNX_GENAI_CPU_MM_INT8_GEBP").ok();
-        // SAFETY: `_probe` is the lock every test that can reach this route
-        // takes, so no other test thread reads this var while it is swapped.
-        unsafe { std::env::set_var("ONNX_GENAI_CPU_MM_INT8_GEBP", "0") };
+        let _env = crate::test_support::EnvVarGuard::set("ONNX_GENAI_CPU_MM_INT8_GEBP", "0");
         let before = INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
         let executed = kernel.execute(
             &[a.view(), b.view(), scales_tensor.view()],
             &mut [y.view_mut()],
         );
         let after = INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
-        // SAFETY: same lock, still held via `_probe`.
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("ONNX_GENAI_CPU_MM_INT8_GEBP", value),
-                None => std::env::remove_var("ONNX_GENAI_CPU_MM_INT8_GEBP"),
-            }
-        }
         executed.unwrap();
         assert_eq!(
             after, before,
@@ -17647,20 +17635,10 @@ mod tests {
                          this comparison is vacuous"
                     );
 
-                    let previous = std::env::var("ONNX_GENAI_CPU_MM_INT8_GEBP").ok();
-                    // SAFETY: `_probe` is the lock every test that can reach
-                    // this route takes, so no other test thread reads this var
-                    // while it is swapped.
-                    unsafe { std::env::set_var("ONNX_GENAI_CPU_MM_INT8_GEBP", "0") };
+                    let _env =
+                        crate::test_support::EnvVarGuard::set("ONNX_GENAI_CPU_MM_INT8_GEBP", "0");
                     let mut dequant = Owned::zeros_f32(&[m, n]);
                     let executed = kernel.execute(&inputs, &mut [dequant.view_mut()]);
-                    // SAFETY: same lock, still held via `_probe`.
-                    unsafe {
-                        match previous {
-                            Some(value) => std::env::set_var("ONNX_GENAI_CPU_MM_INT8_GEBP", value),
-                            None => std::env::remove_var("ONNX_GENAI_CPU_MM_INT8_GEBP"),
-                        }
-                    }
                     executed.unwrap();
                     assert_eq!(
                         INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed),
@@ -20314,9 +20292,7 @@ mod tests {
         let below = at - 1;
 
         let _guard = backend_env_lock().lock().unwrap();
-        let previous = std::env::var("NXRT_CPU_GEMM_BACKEND").ok();
-        // SAFETY: the backend env lock serializes readers/writers of this var.
-        unsafe { std::env::set_var("NXRT_CPU_GEMM_BACKEND", "mlas") };
+        let _env = crate::test_support::EnvVarGuard::set("NXRT_CPU_GEMM_BACKEND", "mlas");
 
         let call = |m: usize| {
             let a = pseudo(m * k, 0.8);
@@ -20338,14 +20314,6 @@ mod tests {
 
         let decode = call(below);
         let prefill = call(at);
-
-        // SAFETY: still holding the backend env lock; restore prior value.
-        unsafe {
-            match &previous {
-                Some(value) => std::env::set_var("NXRT_CPU_GEMM_BACKEND", value),
-                None => std::env::remove_var("NXRT_CPU_GEMM_BACKEND"),
-            }
-        }
 
         if hand_int8_decode_has_native_dot() {
             assert_eq!(
@@ -20416,9 +20384,7 @@ mod tests {
         let kernel = accuracy4_kernel(k, n, block_size);
 
         let _guard = backend_env_lock().lock().unwrap();
-        let previous = std::env::var("NXRT_CPU_GEMM_BACKEND").ok();
-        // SAFETY: the backend env lock serializes readers/writers of this var.
-        unsafe { std::env::set_var("NXRT_CPU_GEMM_BACKEND", "mlas") };
+        let _env = crate::test_support::EnvVarGuard::set("NXRT_CPU_GEMM_BACKEND", "mlas");
 
         let a = pseudo(k, 0.8);
         let mut result = vec![0.0f32; n];
@@ -20435,14 +20401,6 @@ mod tests {
                 &mut result,
             )
             .unwrap();
-
-        // SAFETY: still holding the backend env lock; restore prior value.
-        unsafe {
-            match &previous {
-                Some(value) => std::env::set_var("NXRT_CPU_GEMM_BACKEND", value),
-                None => std::env::remove_var("NXRT_CPU_GEMM_BACKEND"),
-            }
-        }
 
         assert_eq!(
             routed, None,
@@ -20489,9 +20447,7 @@ mod tests {
         let scales_t = Owned::f32(&[n, k_blocks], &scales);
 
         let _guard = backend_env_lock().lock().unwrap();
-        let previous = std::env::var("NXRT_CPU_GEMM_BACKEND").ok();
-        // SAFETY: the backend env lock serializes readers/writers of this var.
-        unsafe { std::env::set_var("NXRT_CPU_GEMM_BACKEND", "mlas") };
+        let _env = crate::test_support::EnvVarGuard::set("NXRT_CPU_GEMM_BACKEND", "mlas");
 
         let a = pseudo(k, 0.8);
         let mut result = vec![0.0f32; n];
@@ -20508,14 +20464,6 @@ mod tests {
                 &mut result,
             )
             .unwrap();
-
-        // SAFETY: still holding the backend env lock; restore prior value.
-        unsafe {
-            match &previous {
-                Some(value) => std::env::set_var("NXRT_CPU_GEMM_BACKEND", value),
-                None => std::env::remove_var("NXRT_CPU_GEMM_BACKEND"),
-            }
-        }
 
         assert_eq!(
             served,
@@ -20570,12 +20518,10 @@ mod tests {
         let a = pseudo(k, 0.8);
 
         let _guard = backend_env_lock().lock().unwrap();
-        let previous = std::env::var("NXRT_CPU_GEMM_BACKEND").ok();
-        // SAFETY: the backend env lock serializes readers/writers of this var.
         // Force a non-MLAS backend to model the real-world default: MLAS SQNBit
         // routing for accuracy_level != 4 must not depend on the dense-GEMM
         // backend being MLAS.
-        unsafe { std::env::set_var("NXRT_CPU_GEMM_BACKEND", "generic") };
+        let _env = crate::test_support::EnvVarGuard::set("NXRT_CPU_GEMM_BACKEND", "generic");
         assert_ne!(
             crate::backend::CpuBackend::auto_detect(),
             crate::backend::CpuBackend::Mlas,
@@ -20602,14 +20548,6 @@ mod tests {
 
         let (acc0_served, acc0_result) = call(&test_kernel(k, n, block_size));
         let (acc4_served, _) = call(&accuracy4_kernel(k, n, block_size));
-
-        // SAFETY: still holding the backend env lock; restore prior value.
-        unsafe {
-            match &previous {
-                Some(value) => std::env::set_var("NXRT_CPU_GEMM_BACKEND", value),
-                None => std::env::remove_var("NXRT_CPU_GEMM_BACKEND"),
-            }
-        }
 
         assert_eq!(
             acc0_served,

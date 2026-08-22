@@ -227,6 +227,92 @@ This is the only ignorable surface. Unknown *core* fields still fail. A strict
 reader can therefore load a package that carries a newer optional profile
 without either guessing or refusing.
 
+### 4.3a Capability admission and complete built-in catalogue
+
+A **capability identifier** is a load-time promise by the reader. It is not a
+model name, component contract, deployment preference, or statement that a
+feature should be enabled. The package says "correct execution requires this
+semantic behavior"; the runtime either advertises that exact serialized string
+or rejects the package before execution.
+
+There are two declaration surfaces:
+
+- top-level `required_capabilities` states requirements not recoverable from the
+  workflow, including implementation and legacy model-package requirements;
+- `pipeline.workflow.manifest.capabilities` states requirements of the workflow
+  IR. The validator also derives requirements from structures such as loops,
+  emits, serving, state recurrence, and known adapter contracts, and rejects a
+  manifest that omits a capability its structure uses.
+
+Both fields intentionally accept extension-defined strings. Therefore no
+repository can enumerate every future vendor extension. The table below is the
+complete **built-in** vocabulary defined or advertised by this repository:
+**30 identifiers** — syntax/IR 10, state/serving 8, media 5, adapters 4,
+speculative 1, implementation 2, distributed 0. The source of truth is
+`onnx_genai_metadata::capabilities::BUILTIN`; a test compares that constant
+directly with this table. Adding a built-in identifier without documenting it
+fails CI. Extension-defined identifiers remain enumerable only by the runtime
+or producer that defines them and MUST still fail closed when unavailable.
+
+<!-- capability-catalogue:start -->
+| Serialized identifier | Category | Semantic feature admitted | Metadata that requires it | Runtime obligation and fail-closed rule | Representative examples and dependencies |
+| --- | --- | --- | --- | --- | --- |
+| `kv_cache` | state/serving | Runtime-owned autoregressive key/value state. | Explicit top-level `required_capabilities`; related state is described by workflow state-service groups. | Preserve the declared cache semantics and graph ABI; reject if no compatible cache implementation exists. | Decoder packages; commonly combined with an attention implementation capability. |
+| `grouped_query_attention` | implementation | Execution of grouped-query attention. | Explicit top-level `required_capabilities`; attention geometry remains a package fact, not an inferred grant. | Execute the declared GQA semantics or reject; never silently substitute MHA. | Gemma/Qwen-style decoders; often paired with `kv_cache`. |
+| `multi_head_attention` | implementation | Execution of ordinary multi-head attention. | Explicit top-level `required_capabilities`. | Execute MHA with the artifact's exact ABI or reject. | DeepSeek/GLM test fixtures; independent of GQA. |
+| `prefix_cache` | state/serving | Reuse of a compatible cached prefix. | Explicit top-level `required_capabilities`; reuse dependencies and state-group reuse facts constrain correctness. | Reuse only when all declared dependencies match; otherwise reject or do not admit the package if the capability is required. | Repeated-prefix text serving; builds on cache-state support. |
+| `continuous_batching` | state/serving | Interleaving, row compaction, and release while requests advance independently. | Explicit top-level `required_capabilities`; workflow `batch_layout`, serving values, and row-scoped ABIs provide the structural contract. | Apply one consistent row permutation to every request-aligned value and compact/release row-scoped components; reject if this cannot be guaranteed. | Batched decoder serving; depends on correct row semantics, not serialized row IDs. |
+| `control_flow_loop` | syntax/IR | Legacy admission of a runtime-controlled generation loop. | Explicit top-level `required_capabilities`; retained for bare/legacy packages. | Honor the loop contract or reject; do not guess termination defaults. | Legacy decoder metadata; new workflows use `workflow_ssa` plus structural loop capabilities. |
+| `image_preprocessing_program` | media | Typed, declarative image transform execution. | Explicit top-level `required_capabilities` with `preprocessing.image`. | Execute the declared transforms and tensor contracts exactly or reject. | Vision-language preprocessing; may combine with `packed_image_outputs`. |
+| `packed_image_outputs` | media | More than one packed image tensor output and its packing metadata. | Explicit top-level `required_capabilities` when the image program emits multiple packed tensors. | Preserve offsets/ownership and output contracts; reject readers that only understand one dense image tensor. | Multi-view or grid-aware VLM preprocessing; depends on `image_preprocessing_program`. |
+| `position_program` | media | Declarative construction of position IDs. | Explicit top-level `required_capabilities` with a preprocessing position program. | Produce the declared coordinates rather than inventing model-family position logic. | Vision-language token expansion and routed position construction. |
+| `multi_axis_positions` | media | Position coordinates whose position axis has rank greater than one. | Explicit top-level `required_capabilities` when the position program emits multi-axis coordinates. | Preserve every coordinate axis and its ordering; reject scalar-only position implementations. | Spatial/temporal multimodal positions; normally depends on `position_program`. |
+| `loop_carried_state` | state/serving | Legacy fixed-shape recurrent state with replace semantics. | Explicit top-level `required_capabilities`. | Carry the exact state tensor across iterations or reject. | Older recurrent decoder packages; structural workflows normally use state cells and `bounded_state_recurrence`. |
+| `dual_sequence_inputs` | media | One decoder invocation consumes raw-token and routed-sequence inputs together. | Explicit top-level `required_capabilities` when the decoder ABI exposes both. | Bind both inputs without dropping or conflating either sequence. | Multimodal embedding/routing pipelines; independent of model-family identity. |
+| `workflow_ssa` | syntax/IR | Typed SSA values and structural workflow execution. | Every `pipeline.workflow`; validator-derived and required in the manifest. | Compile/bind values without name guessing, enforce single assignment and lexical control-flow scope, or reject. | Every canonical catalogue workflow; foundation for the other workflow capabilities. |
+| `linear_effects` | syntax/IR | Explicit, linearly threaded external-effect domains. | Manifest declaration for workflows/components with external mutation semantics. | Preserve effect order, branch joins, retry class, and speculation safety; reject unsupported effect semantics. | Grammar state, telemetry, session mutation, and streams; pure tensor state does not need an effect. |
+| `serving_service_contract` | state/serving | Generic serving controls and runtime-owned state-service groups. | Presence of `pipeline.workflow.serving`; validator-derived and manifest-required. | Own active/done/accepted-length handling, state-group lifecycle, and declared rollback/fork bounds; reject incomplete service support. | Autoregressive, recurrent, weather-rollout, and hybrid speculative workflows. |
+| `parameter_adapters` | adapters | Parameter overlay/application against resolved targets. | Top-level `adapters`; validator-derived. | Apply only validated target bindings and the declared application ABI, or use an allowed portable fallback; otherwise reject. | LoRA adapter selection; coupled to `onnx-genai.adapters@1`, which is an ABI identifier rather than this capability string. |
+| `heterogeneous_adapter_batching` | adapters | Different adapter sets and scales for different request rows in one batch. | Top-level `adapters.selection`; validator-derived with `parameter_adapters`. | Keep adapter selection request-aligned through batching/compaction and never leak a row's adapter set to another row. | Batched LoRA serving; depends on `parameter_adapters` and row-safe batching. |
+| `session_state_lease` | state/serving | State whose lifetime extends across invocations under a runtime lease. | Any workflow state cell with `scope: session`; validator-derived and manifest-required. | Create, restore, isolate, expire, and release leased state according to its contract; reject if only invocation state is supported. | Full-duplex/audio sessions and long-running rollouts. |
+| `bounded_state_recurrence` | state/serving | Loop-carried state with metadata-declared bounded growth. | Any state cell with `recurrence.kind: bounded`; validator-derived and manifest-required. | Enforce the bound and recurrence axis without unbounded allocation or silent truncation. | Decoder masks/history, video schedules, nested audio loops. |
+| `advisory_state` | state/serving | Droppable/resettable state that cannot change semantic correctness or output distribution. | Any state cell with `class: advisory`; validator-derived and manifest-required. | Keep advisory state out of semantic checkpoints and permit reset only because correctness is invariant; reject if that distinction cannot be honored. | Adaptive speculative estimates; often paired with `adaptive_proposal_budget`. |
+| `adaptive_proposal_budget` | speculative | Runtime-visible adaptive choice of speculative proposal width. | A component contract with ID `onnx-genai.adaptive-proposal-budget`; validator-derived. | Execute the contract while treating estimate state as advisory; fixed or unsupported behavior must not masquerade as adaptive support. | Speculative proposer/verifier workflows; may use telemetry and advisory state. |
+| `grammar_guidance_adapter` | adapters | Stateful grammar clone/lookahead/commit ABI. | A component contract/adapter ABI `onnx-genai.grammar-guidance@1`; validator-derived. | Enforce the action-specific binding set, linear effect ordering, and speculation-safety declaration or reject. | JSON/grammar-constrained speculative decoding; combines with policy sampling rather than replacing it. |
+| `telemetry_adapter` | adapters | Versioned timestamp/elapsed adapter ABI. | A component contract/adapter ABI `onnx-genai.telemetry@1`; validator-derived. | Enforce exact action bindings and effect semantics; reject unknown actions instead of approximating timing. | Adaptive proposal metrics; optional unless the workflow invokes it. |
+| `nested_control_flow` | syntax/IR | Loops or branches nested inside structural workflow nodes. | Any compiled loop or branch; validator-derived and manifest-required. | Preserve lexical SSA, zero-trip loops, branch phi results, and effect joins at every nesting level or reject. | Diffusion, autoregressive, weather, and nested audio/music workflows. |
+| `loop_induction_values` | syntax/IR | A typed zero-based iteration value visible to policy components. | A loop with `iteration`; validator-derived and manifest-required. | Produce the declared scalar/per-row induction tensor and keep it scoped to the loop. | Diffusion scheduler lookup, termination equations, nested codec loops; depends on nested control-flow support. |
+| `typed_emit` | syntax/IR | Publication of a typed SSA value to a declared workflow output. | Every compiled `emit`; validator-derived and manifest-required. | Enforce output contract, mode, row semantics, and effect ordering; reject undeclared or incompatible output publication. | All canonical workflows that return or stream values. |
+| `streaming_emit` | syntax/IR | Incremental event publication during execution. | An `emit` with `mode: event`; validator-derived. | Preserve event order and effect semantics without converting it silently to only a final result. | Token/audio chunk streaming; depends on `typed_emit`. |
+| `emit_valid_length` | syntax/IR | Ragged valid-prefix publication from a fixed-capacity tensor. | An `emit` with `valid_length`; validator-derived and manifest-required. | Slice each request row to its valid prefix, maintain positional row ownership through compaction, and reject incompatible output layout. | Speculative accepted-token prefixes and masked generation; depends on `typed_emit`. |
+| `input_presence` | syntax/IR | An observable boolean for whether an optional caller/application tensor was supplied. | Any workflow input with `present_as`; validator requires the manifest entry. | Set the presence SSA value from actual caller presence, require control flow before optional use, and never fabricate sentinel tensors. | Text-only requests to a VLM and optional audio/image inputs; typically combines with `nested_control_flow`. |
+| `explicit_transfer` | syntax/IR | A device-transfer node in the planner's lowered internal IR. | Derived only from internal `WorkflowNode::Transfer`; authored workflow steps MUST NOT serialize transfers. | Execute the transfer with correct ordering/device semantics or reject the lowered plan. | Heterogeneous placement; no authored model example because placement owns transfer insertion. |
+<!-- capability-catalogue:end -->
+
+The following similar-looking strings are **not entries in this capability
+table**:
+
+- component contract IDs plus versions, such as
+  `onnx-genai.token-sampler@1`, `onnx-genai.token-sampler@2`,
+  `onnx-genai.termination-predicate@1`,
+  `onnx-genai.termination-predicate@2`, `onnx-genai.state-update@1`,
+  `onnx-genai.state-update@2`,
+  `onnx-genai.solver-step@1`, `onnx-genai.speculative-verifier@1`,
+  `onnx-genai.counter-rng@1`, and `onnx-genai.guidance-combine@1`;
+- adapter ABIs such as `onnx-genai.grammar-guidance@1`,
+  `onnx-genai.telemetry@1`, `onnx-genai.image-preprocess@1`, and
+  `onnx-genai.audio-preprocess@1`;
+- adapter application/loader identifiers such as `onnx-genai.adapters@1`,
+  `onnx-genai.adapters.hf-peft@1`,
+  `onnx-genai.adapters.safetensors@1`,
+  `onnx-genai.adapters.json@1`, and `onnxruntime.lora-adapter@1`;
+- bounded facts inside a state group, such as `rollback_positions`, `snapshot`,
+  `fork`, and `cascade`.
+
+Those strings select a versioned semantic ABI or state bound and are validated
+at the structure that owns them. They do not become negotiated capabilities
+merely because older comments used the word "capability" broadly.
+
 ### 4.4 Semantic identity
 
 `onnx_genai_metadata::identity::semantic_identity` computes a canonical hash

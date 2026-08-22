@@ -838,6 +838,14 @@ impl CudaExecutionProvider {
         let mut construction_queue_guard =
             CudaConstructionQueueGuard::new(Arc::clone(&release_queue));
         let attribution = Arc::new(CudaMappedAttribution::default());
+        if offload_policy.enabled {
+            // Before the pager exists, not after: weights on this runtime may be
+            // paged from here on, and a page is retired by `weight_paging`
+            // rather than by `deallocate`, so the interleave cache is never told
+            // the address died and must refuse to key on one. See
+            // [`crate::interleave_cache`].
+            runtime.set_weights_may_be_paged();
+        }
         let residency = offload_policy.enabled.then(|| {
             let budget = offload_policy
                 .device_budget_bytes
@@ -1569,6 +1577,9 @@ impl CudaExecutionProvider {
         &self,
         source: &'a S,
     ) -> crate::weight_paging::CudaWeightPager<'a, S> {
+        // Weights on this runtime may now be paged, and a page is retired
+        // without passing through `deallocate`. See [`crate::interleave_cache`].
+        self.runtime.set_weights_may_be_paged();
         crate::weight_paging::CudaWeightPager::new(Arc::clone(&self.runtime), source)
             .with_deferred_release_queue(Arc::clone(&self.release_queue))
             .with_context_scope(self.memory_binding.binding.context_scope())
@@ -1577,6 +1588,9 @@ impl CudaExecutionProvider {
     /// Build a bounded-VRAM [`CudaWeightResidency`] (WEIGHT_OFFLOAD Phase 3b
     /// page-in + eviction) sized by `budget_bytes`, sharing this EP's runtime.
     pub fn weight_residency(&self, budget_bytes: u64) -> crate::weight_paging::CudaWeightResidency {
+        // Weights on this runtime may now be paged, and a page is retired
+        // without passing through `deallocate`. See [`crate::interleave_cache`].
+        self.runtime.set_weights_may_be_paged();
         let residency =
             crate::weight_paging::CudaWeightResidency::new(Arc::clone(&self.runtime), budget_bytes)
                 .with_deferred_release_queue(Arc::clone(&self.release_queue));
@@ -2756,6 +2770,15 @@ impl ExecutionProvider for CudaExecutionProvider {
         if buffer.is_borrowed() {
             return Ok(0);
         }
+        // This address is about to stop naming this weight. Anything derived
+        // from it and keyed by it has to go now, before the allocator can hand
+        // the address to the next weight of the same size and let its key match
+        // (#1726). Doing it here, rather than at an agreed point in teardown,
+        // is what makes it precise -- entries for *other* live executors on
+        // this shared provider are untouched, and one of those may have the
+        // interleaved pointer baked into a captured graph.
+        self.runtime
+            .invalidate_interleaved_for(crate::runtime::cuptr(buffer.as_ptr()), buffer.len());
         let ownership = match buffer.into_bound_ownership() {
             Ok(owner) => owner,
             Err(foreign) => {
