@@ -2183,6 +2183,8 @@ dependencies = [
  "onnx-genai-ort-sys",
  "onnx-genai-runtime-config",
  "onnx-model-package",
+ "onnx-runtime-cuda-memory",
+ "onnx-runtime-ep-cuda",
  "onnx-runtime-loader",
  "onnx-runtime-memory-governor",
  "onnx-runtime-tracer",

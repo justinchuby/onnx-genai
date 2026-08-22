@@ -39,6 +39,37 @@ async fn image_app() -> axum::Router {
     app(state)
 }
 
+fn copy_tree(source: &std::path::Path, destination: &std::path::Path) {
+    std::fs::create_dir_all(destination).unwrap();
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let target = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+fn image_package_without_guidance_role() -> tempfile::TempDir {
+    let package = tempfile::tempdir().unwrap();
+    copy_tree(&diffusion_fixture_dir(), package.path());
+    let metadata_path = package.path().join("inference_metadata.yaml");
+    let metadata = std::fs::read_to_string(&metadata_path)
+        .unwrap()
+        .replace("\r\n", "\n");
+    let runtime_role = "        role:\n          kind: runtime\n          version: '1.0'\n          role: guidance_scale\n        source:\n          kind: application\n          name: guidance_scale";
+    let application_role = "        role:\n          kind: opaque\n        source:\n          kind: application\n          name: guidance_scale";
+    let updated = metadata.replace(runtime_role, application_role);
+    assert_ne!(
+        updated, metadata,
+        "fixture must contain the guidance runtime role"
+    );
+    std::fs::write(metadata_path, updated).unwrap();
+    package
+}
+
 async fn image_admin_app() -> axum::Router {
     let state = AppState::load_with_config(
         &diffusion_fixture_dir(),
@@ -422,6 +453,120 @@ async fn img2img_accepts_media_sized_json_and_preserves_payload_too_large() {
     .await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
     assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test]
+async fn txt2img_accepts_realistic_application_inputs_and_rejects_oversized_json() {
+    let app = image_app().await;
+    let latent = STANDARD.encode(vec![0_u8; 4 * 384 * 384 * 4]);
+    let (status, body) = response_json(
+        post_json(
+            app.clone(),
+            "/sdapi/v1/txt2img",
+            json!({
+                "application_inputs": {
+                    "latent": {
+                        "dtype": "float32",
+                        "shape": [1, 4, 384, 384],
+                        "data_b64": latent
+                    }
+                }
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not declared by workflow metadata"),
+        "{body}"
+    );
+
+    let oversized = "A".repeat(26 * 1024 * 1024);
+    let (status, body) = response_json(
+        post_json(
+            app,
+            "/sdapi/v1/txt2img",
+            json!({
+                "application_inputs": {
+                    "latent": {
+                        "dtype": "float32",
+                        "shape": [1],
+                        "data_b64": oversized
+                    }
+                }
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test]
+async fn a1111_application_inputs_do_not_bypass_legacy_control_roles() {
+    let package = image_package_without_guidance_role();
+    let state = AppState::load(package.path(), Some("application-image".to_string())).unwrap();
+    let app = app(state);
+    let scalar = STANDARD.encode(7.5_f32.to_le_bytes());
+    let (status, body) = response_json(
+        post_json(
+            app,
+            "/sdapi/v1/txt2img",
+            json!({
+                "cfg_scale": 8.0,
+                "application_inputs": {
+                    "guidance_scale": {
+                        "dtype": "float32",
+                        "shape": [1],
+                        "data_b64": scalar
+                    }
+                }
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("requested `cfg_scale` cannot be bound"),
+        "{body}"
+    );
+
+    let (status, body) = response_json(
+        post_json(
+            image_app().await,
+            "/sdapi/v1/img2img",
+            json!({
+                "init_images": ["not-base64"],
+                "denoising_strength": 0.5,
+                "application_inputs": {
+                    "latent": {
+                        "dtype": "float32",
+                        "shape": [1, 4, 8, 8],
+                        "data_b64": STANDARD.encode(vec![0_u8; 4 * 8 * 8 * 4])
+                    }
+                }
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no semantic image/media input"),
+        "{body}"
+    );
 }
 
 #[tokio::test]

@@ -511,6 +511,14 @@ Every image output must also declare its architecture-neutral `value_range`
 that contract and never guesses normalization from generated pixel content.
 Values within a small scale-relative floating-point tolerance of the declared
 endpoints are clamped as numerical noise; material range violations fail.
+Packages whose text/image preprocessing is not yet implemented in the server
+can explicitly bridge metadata inputs with an `application_inputs` object on
+either image API. Each entry names a workflow input whose source is
+`{kind: application}`, and supplies `dtype`, `shape`, and base64-encoded raw
+tensor bytes as `data_b64`. The server validates the name, dtype, rank, decoded
+byte count, and all required application inputs against metadata before
+execution. This is an explicit preprocessed-input contract: prompts and source
+images are not silently converted into opaque tensors.
 
 ```bash
 curl http://127.0.0.1:8080/v1/images/generations \
@@ -525,10 +533,11 @@ curl http://127.0.0.1:8080/sdapi/v1/txt2img \
 AUTOMATIC1111 compatibility includes `POST /sdapi/v1/txt2img`,
 `POST /sdapi/v1/img2img`, and discovery at `/sdapi/v1/sd-models`,
 `/sdapi/v1/samplers`, and `/sdapi/v1/options`. Images are returned as base64
-PNG. `img2img` is available only when metadata declares image/media and
-denoising-strength inputs. Its JSON body limit is 25 MiB so base64-encoded
-1024px-class source images fit while oversized uploads receive HTTP 413. URL
-responses, server-side image saving, scripts,
+PNG. `img2img` accepts semantic image/media plus denoising-strength roles, or
+explicit metadata-declared `application_inputs` when preprocessing was done by
+the caller. Image API JSON bodies are limited to 25 MiB so base64-encoded
+1024px-class source images and typed tensors fit while oversized uploads
+receive HTTP 413. URL responses, server-side image saving, scripts,
 extensions, ControlNet fields, and parameters the package cannot bind are
 rejected explicitly rather than ignored. OpenAI `output_format: png` and opaque
 backgrounds are supported; JPEG/WebP, transparency, and moderation requests are

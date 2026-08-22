@@ -628,6 +628,17 @@ Pin to even CPUs only (`taskset -c 0,2,4,...`); interleave arms within a cycle
 A/A arms disagree by more than 2%. Do not report a single sequential timing on
 this host.
 
+> **Superseded in part by §27 of the assignment ledger (#1712).** Both arms of
+> this A/B were later found not to be computing the same statistic, and the ORT
+> baseline invoked above no longer prints `steady_median_ms=`: `run()` now routes
+> every session count through `run_concurrent` and reports the **median**
+> aggregate throughput, because reporting `min`/`max` over repetitions on one
+> arm while the other ran single-shot was one of the four biases §27 documents.
+> Requirement 1 below ("use the minimum over >= 6 repetitions") is therefore
+> retained only as the historical record of this document's protocol; it is
+> **not** the current one. Prefer `benches/acc0_gap_matrix.py`, which enforces
+> the unified definition, per-cell A/A, and a quiet-host gate.
+
 Five protocol requirements were learned the hard way during the re-measurement
 and are not optional:
 
@@ -642,10 +653,29 @@ and are not optional:
    tokens gave min 1.234x and median 0.730x; at 240 tokens it gives 1.245x and
    1.412x. Do not pick the flattering statistic — extend the run.
 4. **Verify that a knob moves what it claims to.**
-   `ONNX_GENAI_CPU_DECODE_THREADS=2` produces timings *identical* to `=1`
-   (23.529 vs 23.527 ms/token), so the t=2 row in the first draft of this
-   document is not a 2-thread measurement and has been dropped rather than
-   restated.
+   The t=2 row in the first draft of this document read *identical* to `=1`
+   (23.529 vs 23.527 ms/token) and was dropped rather than restated, and the
+   same identity was reproduced during #1712 (23.6 vs 23.6 tok/s, pinned, qwen,
+   acc0). Dropping the row was right; the **explanation** first offered for it
+   was not.
+
+   **Correction (2026-08-22): the knob is not inert, and the timings above are
+   the artifact.** Under a controlled re-measurement on a quiet host — one
+   process per launch, arms interleaved, per-rep load guard, over-guard cells
+   discarded — `=2` runs at **20.447 ms/token against 40.039 for `=1`, a 1.96x
+   speedup**, with an **A/A null of 0.6%**. Per-thread attribution shows both
+   `=2` workers **99% busy** with 62 voluntary context switches over six
+   seconds, which is the opposite of parked. The "71% of a single core" figure
+   came from `/usr/bin/time`'s `Percent of CPU`, which is `(user+sys)/wall` and
+   therefore wall-derived — it degrades under contention exactly like the wall
+   time it was being used to corroborate. See
+   [2026-08-22-decode-width-scaling.md](2026-08-22-decode-width-scaling.md).
+
+   The protocol point stands and is strengthened: verify the knob *structurally*
+   rather than by timing. `w` in must give `w` SPMD threads out, which is a
+   categorical check valid even on a loaded host. Two configurations where this
+   knob really is vacuous — in-process width sweeps (the pool is a process-wide
+   `OnceLock`) and `THREADS=N` on an exactly-N-CPU cpuset — are documented there.
 5. **Run `PROBE_ACCURACY=0` as a null control** for any claim about this kernel.
    It must read 1.000x; if it does not, the harness is measuring something other
    than the route under test.

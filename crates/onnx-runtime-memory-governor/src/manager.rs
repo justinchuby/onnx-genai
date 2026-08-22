@@ -614,6 +614,11 @@ impl ProcessMemoryManager {
         self.inner.book.quota.used(tier)
     }
 
+    /// Whether two handles refer to the exact same process manager instance.
+    pub fn is_same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub fn downgrade(&self) -> WeakProcessMemoryManager {
         WeakProcessMemoryManager {
             inner: Arc::downgrade(&self.inner),

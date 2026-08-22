@@ -28,7 +28,7 @@ use onnx_runtime_ep_api::Result;
 
 use crate::backend::CpuBackend;
 use crate::dispatch_ledger::{Backend, KernelFamily};
-use crate::kernels::{matmul, simd_activations, softmax};
+use crate::kernels::{matmul, sdpa, simd_activations, softmax};
 
 /// Whether this build linked the MLAS reference at all. False in every shipped
 /// build. When false, the `*_mlas` entry points return `None` and the
@@ -150,17 +150,163 @@ pub fn gelu_mlas(input: &[f32], output: &mut [f32]) -> bool {
     }
 }
 
+// ─── Scaled dot-product attention ───────────────────────────────────────────
+
+/// One SDPA problem, in the shape the A/B entry points take.
+///
+/// This mirrors [`crate::kernels::sdpa::SdpaTensors`] plus the causal/scale
+/// configuration, so a caller can describe a case without depending on the
+/// kernel module's hook traits.
+#[derive(Clone, Copy, Debug)]
+pub struct SdpaCase {
+    /// Batch size.
+    pub batch: usize,
+    /// Query head count.
+    pub num_heads: usize,
+    /// Key/value head count; equal to `num_heads` for plain MHA, smaller for GQA.
+    pub num_kv_heads: usize,
+    /// Query sequence length; `1` is decode.
+    pub q_seq: usize,
+    /// Total key/value sequence length.
+    pub kv_seq: usize,
+    /// Q/K head dimension.
+    pub head_size: usize,
+    /// V head dimension; may differ from `head_size`.
+    pub v_head_size: usize,
+    /// Whether the causal (`unidirectional`) mask applies.
+    pub causal: bool,
+}
+
+impl SdpaCase {
+    /// Element count of `q`.
+    pub const fn q_len(&self) -> usize {
+        self.batch * self.num_heads * self.q_seq * self.head_size
+    }
+
+    /// Element count of `k`.
+    pub const fn k_len(&self) -> usize {
+        self.batch * self.num_kv_heads * self.kv_seq * self.head_size
+    }
+
+    /// Element count of `v`.
+    pub const fn v_len(&self) -> usize {
+        self.batch * self.num_kv_heads * self.kv_seq * self.v_head_size
+    }
+
+    /// Element count of the context output `y`.
+    pub const fn y_len(&self) -> usize {
+        self.batch * self.num_heads * self.q_seq * self.v_head_size
+    }
+
+    fn config(&self) -> sdpa::SdpaConfig {
+        sdpa::SdpaConfig {
+            scale: sdpa::ScaleMode::PostDot(1.0 / (self.head_size as f32).sqrt()),
+            softcap: None,
+            causal: self.causal,
+            past_seq: self.kv_seq.saturating_sub(self.q_seq),
+            causal_fill: f32::MIN,
+        }
+    }
+}
+
+struct ZeroBias;
+impl sdpa::AttnBias for ZeroBias {
+    fn at(&self, _b: usize, _head: usize, _i: usize, _j: usize) -> f32 {
+        0.0
+    }
+    fn is_identity(&self) -> bool {
+        true
+    }
+}
+
+struct ZeroMask;
+impl sdpa::KeyMask for ZeroMask {
+    fn at(&self, _b: usize, _i: usize, _j: usize) -> f32 {
+        0.0
+    }
+    fn is_identity(&self) -> bool {
+        true
+    }
+}
+
+/// Scaled dot-product attention, native route — the one a shipped build runs.
+///
+/// `y` is written in full: every one of [`SdpaCase::y_len`] elements is
+/// assigned, never accumulated into. Callers prefill it with a poison value and
+/// check none survives; see `tests/native_vs_mlas_differential.rs`.
+pub fn sdpa_native(case: &SdpaCase, q: &[f32], k: &[f32], v: &[f32], y: &mut [f32]) {
+    let tensors = sdpa::SdpaTensors {
+        q,
+        k,
+        v,
+        batch: case.batch,
+        num_heads: case.num_heads,
+        num_kv_heads: case.num_kv_heads,
+        q_seq: case.q_seq,
+        kv_seq: case.kv_seq,
+        head_size: case.head_size,
+        v_head_size: case.v_head_size,
+    };
+    sdpa::sdpa_f32_native(&tensors, &case.config(), &ZeroBias, &ZeroMask, y);
+}
+
+/// Scaled dot-product attention, MLAS reference route. See
+/// [`softmax_rows_mlas`] for the `bool`.
+///
+/// This is the route [`KernelFamily::AttentionTranspose`]'s plan entry means by
+/// "MLAS SGEMM for the QK^T and PV products", and the route that carried the
+/// dropped-output-partition defect in #1685. Its output contract is identical
+/// to [`sdpa_native`]: the whole of `y` is written, because both inner GEMMs
+/// run with `beta = 0`.
+pub fn sdpa_mlas(case: &SdpaCase, q: &[f32], k: &[f32], v: &[f32], y: &mut [f32]) -> bool {
+    #[cfg(feature = "mlas")]
+    {
+        let tensors = sdpa::SdpaTensors {
+            q,
+            k,
+            v,
+            batch: case.batch,
+            num_heads: case.num_heads,
+            num_kv_heads: case.num_kv_heads,
+            q_seq: case.q_seq,
+            kv_seq: case.kv_seq,
+            head_size: case.head_size,
+            v_head_size: case.v_head_size,
+        };
+        sdpa::sdpa_f32_mlas(&tensors, &case.config(), &ZeroBias, &ZeroMask, y);
+        true
+    }
+    #[cfg(not(feature = "mlas"))]
+    {
+        let _ = (case, q, k, v, y);
+        false
+    }
+}
+
 /// The families this module can A/B today. The migration doc's graduation rule
 /// requires a same-binary A/B, so a family absent here cannot graduate yet.
 pub const AB_COVERED: &[KernelFamily] = &[
     KernelFamily::MatMulF32,
     KernelFamily::Softmax,
     KernelFamily::Activations,
+    KernelFamily::AttentionTranspose,
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deterministic values in `[-1, 1)`, so an A/B failure reproduces.
+    fn ab_values(n: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (0..n)
+            .map(|_| {
+                state ^= state >> 33;
+                state = state.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+                ((state >> 40) as f32 / (1u64 << 23) as f32) - 1.0
+            })
+            .collect()
+    }
 
     #[test]
     fn gemm_backends_lead_with_a_native_baseline() {
@@ -250,6 +396,29 @@ mod tests {
                     );
                     let mut probe = [0.0f32; 4];
                     erf_mlas(&input, &mut probe) && gelu_mlas(&input, &mut probe)
+                }
+                KernelFamily::AttentionTranspose => {
+                    let case = SdpaCase {
+                        batch: 1,
+                        num_heads: 2,
+                        num_kv_heads: 1,
+                        q_seq: 3,
+                        kv_seq: 5,
+                        head_size: 4,
+                        v_head_size: 4,
+                        causal: true,
+                    };
+                    let q = ab_values(case.q_len(), 0x5D_0001);
+                    let k = ab_values(case.k_len(), 0x5D_0002);
+                    let v = ab_values(case.v_len(), 0x5D_0003);
+                    let mut native = vec![f32::NAN; case.y_len()];
+                    sdpa_native(&case, &q, &k, &v, &mut native);
+                    assert!(
+                        native.iter().all(|value| value.is_finite()),
+                        "the native A/B sdpa must write every output element, got {native:?}"
+                    );
+                    let mut probe = vec![f32::NAN; case.y_len()];
+                    sdpa_mlas(&case, &q, &k, &v, &mut probe)
                 }
                 other => panic!(
                     "{other} was added to AB_COVERED without an A/B entry point in this test"

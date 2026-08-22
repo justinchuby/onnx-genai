@@ -3,6 +3,318 @@
 Inference metadata is a concise structured workflow. Tensor math belongs in ONNX artifacts;
 the runtime interprets only `sequence`, `invoke`, `loop`, `branch`, and `emit`.
 
+## Policy components from first principles
+
+A generative system is not one neural network call. It is a repeated
+computation that decides what to run next, updates semantic state, and
+eventually publishes a result. A **policy component** is an executable,
+versioned tensor program for one of those decisions or state transforms.
+Usually it is a small ONNX graph invoked like any other component.
+
+The word "policy" here means **portable workflow semantics**, not an
+administrator's deployment policy:
+
+| Meaning of "policy" | Examples | Owner |
+|---|---|---|
+| **Executable workflow policy component** | sampling equations, EOS/length termination, diffusion scheduler step, CFG combine, accepted-prefix verification, cache-length/position update, overlap stitching | package/workflow; executed by the runtime |
+| **Deployment, scheduling, or QoS policy** | request priority, deadlines, batching window, device placement, memory budget, cache eviction, tenant quotas, speculative enablement/width | runtime/service deployment; never authored as model semantics |
+
+The distinction is correctness-critical. A sampler equation changes generated
+tokens and therefore travels with the package. A scheduler priority changes
+when a request runs but not what the package means, so it stays runtime-owned.
+
+### Three kinds of executable component
+
+```text
+caller tensors
+     |
+     v
++------------------- workflow ---------------------------------------+
+|  native/runtime binding  ->  policy graph  ->  neural model graph  |
+|  decode bytes, grammar       resize, sample,   decoder, denoiser,   |
+|  engine, telemetry ABI       terminate, CFG    encoder, codec       |
+|              \________________ typed SSA __________________/         |
++---------------------------------------------------------------------+
+     |
+     v
+runtime services: placement, batching, memory, KV allocation, QoS
+```
+
+| Component kind | What it represents | Typical implementation | What it MUST NOT hide |
+|---|---|---|---|
+| **Neural model component** | Learned mapping whose parameters are model weights. | ONNX decoder, encoder, denoiser, VAE, codec. | Sampling, scheduler defaults, host loops, or model-family runtime branches. |
+| **Native/runtime binding** | A capability whose semantics require a host library, device service, external state, or privileged effect. | Encoded-media decode, grammar engine, telemetry, parameter overlay. | Undeclared I/O, effects, filesystem/network access, or unversioned action semantics. |
+| **Policy component** | Portable tensor equations and semantic state transitions surrounding learned models. | Small ONNX graph, pure unless an explicit adapter ABI is required. | Deployment placement, queue policy, physical cache allocation, or request identity. |
+
+An ONNX file is not automatically a neural model: a six-node graph that
+computes `uncond + scale * (cond - uncond)` is a policy component. Conversely,
+a workflow `loop` is not itself a policy component; it is structural
+orchestration that invokes components.
+
+### Why policy is executable
+
+Sampling, termination, scheduler equations, cache-length and position
+updates, classifier-free guidance (CFG), state transforms, semantic scatter,
+accepted-prefix compaction, overlap stitching, and resampling all affect
+observable output. Leaving them in prose or model-family host code creates
+several incompatible truths:
+
+1. different runtimes fill in different defaults;
+2. a model-family branch becomes the only specification of an equation;
+3. producer and runtime upgrades silently change output;
+4. the computation cannot be validated, substituted, optimized, or fused;
+5. state and row behavior become implicit and fail under batching or rollback.
+
+Encoding the math as a component gives it typed ports, an artifact, a
+versioned semantic contract, explicit state, and an exact place in control
+flow. The runtime remains generic: it executes `invoke`, not
+`if model_family == ...`.
+
+Examples of **semantic** transforms that belong in policy graphs:
+
+- greedy or seeded stochastic sampling, logits filtering, and grammar-mask
+  application;
+- EOS/maximum-length predicates and per-row active/done updates;
+- attention-mask, position, logical-length, token-history, and semantic
+  scatter/gather updates;
+- diffusion timestep lookup, CFG combination, Euler/DPM-style solver
+  equations, noise/state scaling, and inpainting blends;
+- speculative acceptance/correction selection, accepted-prefix truncation,
+  rollback transforms, and proposal-budget adaptation;
+- codec/codebook loop counters, delay-pattern transforms, overlap-add/crossfade
+  stitching, and sample-rate conversion;
+- image/audio normalization, patch/grid construction, token expansion, and
+  multi-axis position construction when expressible as portable tensor math.
+
+Examples that **do not** belong there:
+
+- physical paged-KV append, block-table allocation, row-slot assignment, or
+  runtime compaction machinery;
+- queue ordering, batch formation, placement, graph capture, cache eviction,
+  deadlines, and tenant isolation;
+- immutable architecture facts such as head count, vocabulary size, cache
+  aliasing legality, or a component's ONNX opset imports.
+
+## Policy component contract
+
+Every policy component is governed by the same rules as every other workflow
+component, with additional attention to state and batching.
+
+### Inputs, outputs, and semantic bindings
+
+- Ports have dtype, rank, shape, optionality, and `batch_layout`.
+- The workflow binds SSA values to concrete ports.
+- A versioned `contract.id`/`version` gives stable semantic role names through
+  `contract.bindings`; implementations may use different concrete port names.
+- Parameters contain only non-tensor ABI facts. Request-varying controls such
+  as temperature, guidance scale, seed, or maximum length are typed tensors,
+  not baked artifact constants.
+- State transitions return next state explicitly. Ordinary tensor state is not
+  an external effect.
+
+```yaml
+components:
+  sampler:
+    implementation: { kind: onnx, artifact: policies/token_sampler.onnx }
+    contract:
+      id: onnx-genai.token-sampler
+      version: "2"
+      bindings:
+        logits: logits
+        active: active
+        done: done
+        temperature: temperature
+        top_k: top_k
+        top_p: top_p
+        min_p: min_p
+        seed: seed
+        counter: counter
+        token: token
+        next_counter: next_counter
+      parameters: { batching: per_row, inactive_rows: preserve }
+```
+
+The contract is semantic; it never asks the runtime to choose that
+implementation. Application-overridable components are substituted only after
+contract, port, effect, and equivalence validation.
+
+### Determinism, effects, and state ownership
+
+Policy graphs SHOULD be pure. Randomness is explicit counter-based state:
+`seed` and `counter` are inputs, and `next_counter` is an output. The same
+inputs then identify the same result subject to the selected implementation's
+declared numerical equivalence.
+
+External mutation uses a declared effect domain. Its retry class (`pure`,
+`idempotent`, `transactional`, or `non_retryable`) and speculation safety
+(`none`, `clonable`, or bounded `rewindable`) determine whether replay,
+branching, or speculation is legal. A runtime MUST NOT infer safety because an
+operation happens to have a harmless name.
+
+State has one owner:
+
+- the workflow owns semantic tensor values and declares invocation/session
+  scope, recurrence, and release boundary;
+- a state-service group lets the runtime own storage and lifecycle while the
+  package owns state kind, graph aliases, update discipline, and rollback/fork
+  bounds;
+- the runtime privately owns request IDs, slots, epochs, page tables, storage
+  layout, and compaction algorithms.
+
+### Batching and row semantics
+
+Policy components are batch programs, not scalar callbacks repeated by host
+code. `request_aligned` ports carry one entry per request along a declared
+axis; `token_packed` ports carry offsets and ownership; `shared` values are
+invariant; `runtime_sequence_state` is runtime-owned.
+
+A batching-safe per-row policy MUST:
+
+- produce each row from only that row's semantic inputs and explicit shared
+  values;
+- preserve inactive/done rows and their RNG/state when its contract says so;
+- avoid serialized request, slot, or epoch identifiers;
+- tolerate one runtime permutation being applied to every request-aligned
+  value during compaction;
+- publish ragged rows through `emit.valid_length`/`emit.when`, not by inventing
+  row IDs.
+
+Tensor scatter/gather that changes **semantic** state belongs in a policy
+component. Moving live request rows between physical slots is runtime
+compaction and does not.
+
+### Portability, versioning, admission, and security
+
+Portable policy components use the same ONNX semantics and typed workflow
+contract as model components. Version the semantic contract when role meaning,
+required bindings, state transition, or equivalence changes. Merely changing
+an optimized graph without changing meaning does not require a new contract.
+
+Admission is fail-closed:
+
+1. schema and semantic validation reject unknown core fields, missing values,
+   invalid control flow, incompatible ports, undeclared effects, and malformed
+   state;
+2. the workflow manifest declares every required capability, including those
+   derived from its structure;
+3. known contracts enforce exact versions/actions/binding obligations;
+4. component substitution must satisfy contract, port ABI, effects, state,
+   and equivalence;
+5. a missing capability or unsupported ABI rejects the package before work is
+   issued.
+
+An ONNX policy graph receives only bound tensors and has no implicit
+filesystem, network, clock, process, or device-control authority. A native
+binding is a larger trust boundary: its ABI MUST enumerate actions, bindings,
+effects, and state, and the runtime SHOULD sandbox or restrict it according to
+deployment trust policy. Metadata carries no artifact hashes; signatures,
+provenance, and byte integrity belong to the distribution layer.
+
+### Performance and fusion
+
+Component boundaries are semantic, not kernel boundaries. After validation and
+override selection, adjacent pure same-device policy and neural components may
+be linked into an execution island. That permits logits processing, sampling,
+state update, and termination to remain device-resident and optimizer-visible.
+
+Host control, external effects, device changes, dynamic allocation, and
+stateful native bindings form real boundaries. CUDA Graph capture additionally
+requires stable addresses/shapes and explicit RNG state. Fusion MUST preserve
+the component contracts and MUST NOT make a request-selected replacement,
+effect, inactive-row rule, or rollback point disappear.
+
+## End-to-end examples
+
+### Autoregressive decoder
+
+```text
+prompt -> [decoder neural graph] -> logits
+          -> [last-position/logits policy]
+          -> [sampler policy] -> token
+          -> [termination policy] -> done/active/continue
+          -> [token, mask, position, logical-length policies]
+          -> next loop iteration
+
+runtime beside the loop: KV storage, batching, placement, page allocation
+```
+
+The decoder carries present state to the next past state. A policy graph is
+needed only where tensor math changes semantic state, for example updating a
+fixed-cache cursor or truncating an accepted prefix. Physical KV append is not
+a policy graph.
+
+### Diffusion scheduler and CFG
+
+The text encoder, denoiser, and VAE are neural components. The schedule/timestep
+lookup, counter-based initial noise, model-input scaling, CFG equation, solver
+step, history update, and final scaling are policy components. The workflow
+loop states exactly how often they run. Euler and DPM++ can implement the same
+solver contract with different policy artifacts; runtime device placement and
+batch scheduling remain unchanged.
+
+### Speculative verification and rollback
+
+The proposer and target are neural components. A verifier policy computes
+accepted tokens, `accepted_len`, correction choice, and next RNG state. Emits
+publish only the valid accepted prefix. The runtime rewinds every state group
+named by the speculative contract before committing the accepted result.
+
+Qwen3.5 hybrid speculative decoding is a useful example, not a schema case:
+full-attention KV, linear-attention accumulator, and causal-convolution history
+are three ordinary state-service groups with mutually declared rollback
+cascades. All must snapshot/fork/rewind to the same accepted position. The
+schema contains no `qwen` branch.
+
+### Audio/music nested loops
+
+A SenseNova/Music3-style package can use an outer talker/frame loop, an inner
+predictor/codebook loop, neural talker/predictor/codec components, and policy
+components for sampling, termination, delay-pattern updates, cache lengths,
+frame assembly, overlap stitching, and resampling. Session state permits
+streaming interaction; typed emits publish audio chunks.
+
+This is still only nested `loop`/`invoke`/`emit` with typed state. "SenseNova"
+or "Music3" is never a schema discriminator, and the same structure applies to
+other speech, music, or multi-codebook generators.
+
+### Multimodal preprocessing
+
+Encoded media enters through a typed optional request input. A versioned native
+binding may decode a compressed format; portable policy graphs then resize,
+normalize, pad/crop, construct grids, expand placeholder tokens, and calculate
+position coordinates. Neural vision/audio encoders consume the resulting
+tensors, and an embedding/mixer component feeds the decoder.
+
+`present_as` branches around absent media without fake tensors. Multiple packed
+outputs use explicit offsets/ownership. Device placement and preprocessing
+cache eviction are runtime policies, while transform equations and packing
+semantics travel with the package.
+
+## Decision guide and anti-patterns
+
+| Question | Put it here |
+|---|---|
+| Is it portable tensor math that changes observable semantics or semantic state? | **Policy graph/component** |
+| Does it only order, repeat, branch, or publish already-defined computations? | **Workflow step/control flow** |
+| Does it require a host library, privileged runtime service, external mutation, or non-ONNX facility? | **Versioned native/runtime binding** with explicit effects |
+| Is it immutable truth about artifacts or architecture? | **Authored package fact** |
+| Does it choose resources, timing, isolation, optimization, or service quality? | **Runtime deployment/scheduling/QoS policy** |
+
+Anti-patterns:
+
+- `if family == "..."` in runtime code to select sampling, scheduler, cache
+  update, preprocessing, or rollback equations;
+- prose such as "use the usual sampler" or an unstated default seed/schedule;
+- encoding deployment choices (`cuda`, page size, batch window, priority) in a
+  policy component;
+- using a native binding for pure tensor math merely to avoid writing an ONNX
+  graph;
+- hiding external mutation or RNG behind a component declared pure;
+- serializing row IDs, slots, epochs, page tables, or transfer steps;
+- treating component boundaries as mandatory sessions/host round trips;
+- adding a model name, SenseNova/Music3 mode, or Qwen-specific state kind when
+  existing structural state/control-flow contracts express the behavior.
+
 ## Structural execution semantics
 
 - Root `steps` execute once per invocation, in order.
