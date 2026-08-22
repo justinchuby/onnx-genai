@@ -38,9 +38,6 @@
           "format": "double",
           "type": "number"
         },
-        "base_model_fingerprint": {
-          "type": "string"
-        },
         "bindings": {
           "default": [],
           "items": {
@@ -90,7 +87,6 @@
         "index",
         "identity",
         "version",
-        "base_model_fingerprint",
         "rank",
         "alpha",
         "dtype"
@@ -244,10 +240,6 @@
           "default": {},
           "type": "object"
         },
-        "base_model_fingerprint": {
-          "description": "`onnx-genai-targeted-base-v1:sha256:<lowercase hex>` compatibility fingerprint.",
-          "type": "string"
-        },
         "cache": {
           "$ref": "#/$defs/AdapterCacheContract",
           "default": {
@@ -282,7 +274,6 @@
         }
       },
       "required": [
-        "base_model_fingerprint",
         "target_manifest",
         "selection",
         "application_capability"
@@ -334,13 +325,6 @@
             "null"
           ]
         },
-        "config_sha256": {
-          "description": "Lowercase SHA-256 of the exact PEFT config bytes.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "format": {
           "$ref": "#/$defs/AdapterWeightFormat",
           "default": "json"
@@ -355,16 +339,11 @@
         "scale_encoding": {
           "$ref": "#/$defs/AdapterScaleEncoding",
           "description": "Whether alpha/rank remains to be applied or is already baked into B."
-        },
-        "sha256": {
-          "description": "Lowercase SHA-256 of the exact external artifact bytes.",
-          "type": "string"
         }
       },
       "required": [
         "location",
         "loader_capability",
-        "sha256",
         "scale_encoding"
       ],
       "type": "object"
@@ -1677,6 +1656,15 @@
           "title": "Forward-compatible extension value",
           "type": "string"
         }
+      ],
+      "type": "string"
+    },
+    "ImageOutputValueRange": {
+      "description": "Numeric interpretation of pixels emitted by an image workflow output.\n\nThis is an output contract, not a model-family hint: consumers must never\ninfer normalization from observed pixel values.",
+      "enum": [
+        "zero_to_one",
+        "negative_one_to_one",
+        "zero_to_255"
       ],
       "type": "string"
     },
@@ -3299,10 +3287,16 @@
           "enum": [
             "prompt_text",
             "prompt_tokens",
+            "negative_prompt_text",
+            "negative_prompt_tokens",
             "media",
             "max_iterations",
             "max_output_tokens",
             "seed",
+            "guidance_scale",
+            "width",
+            "height",
+            "denoising_strength",
             "sampling_temperature",
             "sampling_top_k",
             "sampling_top_p",
@@ -4580,29 +4574,22 @@
     },
     "TokenizerArtifact": {
       "additionalProperties": false,
-      "description": "One tokenizer artifact pinned to its exact bytes.",
+      "description": "One package-relative tokenizer artifact.",
       "properties": {
         "location": {
           "description": "Package-relative path of the artifact.",
           "minLength": 1,
           "type": "string"
-        },
-        "sha256": {
-          "description": "Lowercase SHA-256 of the exact artifact bytes.",
-          "maxLength": 64,
-          "minLength": 64,
-          "type": "string"
         }
       },
       "required": [
-        "location",
-        "sha256"
+        "location"
       ],
       "type": "object"
     },
     "TokenizerFacts": {
       "additionalProperties": false,
-      "description": "Byte-exact tokenizer facts.\n\nA request carries text, tokens, grammars, and JSON Schemas. Interpreting any\nof them requires the exact vocabulary the package was built against, so the\nartifact bytes are pinned rather than described by a family name.",
+      "description": "Tokenizer facts and package-relative artifacts.\n\nA request carries text, tokens, grammars, and JSON Schemas. Interpreting any\nof them requires the vocabulary contract the package was built against.",
       "properties": {
         "algorithm": {
           "description": "Tokenizer algorithm identifier, e.g. `bpe`, `unigram`, `wordpiece`.",
@@ -4610,7 +4597,7 @@
           "type": "string"
         },
         "artifacts": {
-          "description": "Package-relative tokenizer artifacts pinned by exact content hash.",
+          "description": "Package-relative tokenizer artifacts.",
           "items": {
             "$ref": "#/$defs/TokenizerArtifact"
           },
@@ -4919,6 +4906,16 @@
         },
         "stage": {
           "$ref": "#/$defs/OutputStage"
+        },
+        "value_range": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImageOutputValueRange"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -5362,7 +5359,7 @@
           "type": "null"
         }
       ],
-      "description": "Exact package facts needed to interpret request data correctly.\n\nTokenizer bytes, vocabulary size, special tokens, and the constraint\ndialects the package's parser accepts. Grammars and JSON Schemas\nthemselves are request data, not package metadata."
+      "description": "Exact package facts needed to interpret request data correctly.\n\nTokenizer artifacts, vocabulary size, special tokens, and the constraint\ndialects the package's parser accepts. Grammars and JSON Schemas\nthemselves are request data, not package metadata."
     },
     "pipeline": {
       "anyOf": [

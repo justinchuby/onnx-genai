@@ -100,6 +100,10 @@ fn converts_core_txt2img_into_canonical_workflow() {
         json!(20)
     );
     assert_eq!(workflow["outputs"]["image"]["role"], json!("image"));
+    assert_eq!(
+        workflow["outputs"]["image"]["value_range"],
+        json!("negative_one_to_one")
+    );
 }
 
 #[test]
@@ -139,6 +143,14 @@ fn guidance_becomes_two_encoder_passes_and_a_combine() {
     assert_eq!(
         workflow["inputs"]["request.guidance_scale"]["default"],
         json!(7.5)
+    );
+    assert_eq!(
+        workflow["inputs"]["request.guidance_scale"]["role"]["role"],
+        json!("guidance_scale")
+    );
+    assert_eq!(
+        workflow["inputs"]["request.negative_input_ids"]["role"]["role"],
+        json!("negative_prompt_tokens")
     );
 }
 
@@ -573,9 +585,7 @@ fn lora_workflow() -> Value {
 }
 
 fn adapter_contract() -> Value {
-    let fingerprint = format!("onnx-genai-targeted-base-v1:sha256:{}", "0".repeat(64));
     json!({
-        "base_model_fingerprint": fingerprint,
         "target_manifest": {"targets": [{
             "id": "denoiser.block0.to_q",
             "component": "denoiser",
@@ -591,14 +601,12 @@ fn adapter_contract() -> Value {
             "index": 0,
             "identity": "detail",
             "version": "1",
-            "base_model_fingerprint": fingerprint,
             "rank": 4,
             "alpha": 8.0,
             "dtype": "float32",
             "weights": [{
                 "location": "adapters/detail/weights.json",
                 "loader_capability": "onnx-genai.adapters.json@1",
-                "sha256": "0".repeat(64),
                 "scale_encoding": "alpha_over_rank",
                 "format": "json"
             }],

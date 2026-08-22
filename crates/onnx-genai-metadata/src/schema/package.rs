@@ -21,11 +21,10 @@ pub struct PackageFacts {
     pub constraint_languages: Vec<ConstraintLanguageFacts>,
 }
 
-/// Byte-exact tokenizer facts.
+/// Tokenizer facts and package-relative artifacts.
 ///
 /// A request carries text, tokens, grammars, and JSON Schemas. Interpreting any
-/// of them requires the exact vocabulary the package was built against, so the
-/// artifact bytes are pinned rather than described by a family name.
+/// of them requires the vocabulary contract the package was built against.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TokenizerFacts {
@@ -41,7 +40,7 @@ pub struct TokenizerFacts {
     #[serde(default)]
     pub byte_level: bool,
 
-    /// Package-relative tokenizer artifacts pinned by exact content hash.
+    /// Package-relative tokenizer artifacts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(min = 1))]
     pub artifacts: Vec<TokenizerArtifact>,
@@ -51,16 +50,13 @@ pub struct TokenizerFacts {
     pub special_tokens: BTreeMap<String, SpecialTokenFact>,
 }
 
-/// One tokenizer artifact pinned to its exact bytes.
+/// One package-relative tokenizer artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TokenizerArtifact {
     /// Package-relative path of the artifact.
     #[schemars(length(min = 1))]
     pub location: String,
-    /// Lowercase SHA-256 of the exact artifact bytes.
-    #[schemars(length(min = 64, max = 64))]
-    pub sha256: String,
 }
 
 /// One special token, pinned by id and exact surface bytes.

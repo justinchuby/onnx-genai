@@ -880,16 +880,6 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
     }
 }
 
-fn valid_adapter_base_fingerprint(value: &str) -> bool {
-    let Some(digest) = value.strip_prefix("onnx-genai-targeted-base-v1:sha256:") else {
-        return false;
-    };
-    digest.len() == 64
-        && digest
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn validate_adapter_selection_input(
     workflow: &WorkflowSpec,
@@ -958,13 +948,6 @@ fn validate_adapter_service(
     workflow: Option<&WorkflowSpec>,
     errors: &mut Vec<String>,
 ) {
-    if !valid_adapter_base_fingerprint(&service.base_model_fingerprint) {
-        errors.push(
-            "adapters.base_model_fingerprint must be \
-             onnx-genai-targeted-base-v1:sha256:<64 lowercase hexadecimal characters>"
-                .into(),
-        );
-    }
     if service.application_capability.trim().is_empty() {
         errors.push("adapters.application_capability must not be empty".into());
     } else if service.application_capability != "onnx-genai.adapters@1" {
@@ -1166,12 +1149,6 @@ fn validate_adapter_service(
                 artifact.identity, artifact.version
             ));
         }
-        if artifact.base_model_fingerprint != service.base_model_fingerprint {
-            errors.push(format!(
-                "{path}.base_model_fingerprint '{}' does not match service fingerprint '{}'",
-                artifact.base_model_fingerprint, service.base_model_fingerprint
-            ));
-        }
         if artifact.rank == 0 {
             errors.push(format!("{path}.rank must be greater than zero"));
         }
@@ -1249,20 +1226,10 @@ fn validate_adapter_service(
                     "{path}.weights[{index}].scale_encoding must be baked for ort_genai"
                 )),
             }
-            if weight.sha256.len() != 64
-                || !weight
-                    .sha256
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-            {
-                errors.push(format!(
-                    "{path}.weights[{index}].sha256 must be 64 lowercase hexadecimal characters"
-                ));
-            }
             let peft = weight.format == crate::schema::AdapterWeightFormat::HfPeft;
-            if peft != weight.config_location.is_some() || peft != weight.config_sha256.is_some() {
+            if peft != weight.config_location.is_some() {
                 errors.push(format!(
-                    "{path}.weights[{index}] hf_peft requires config_location and config_sha256; other formats forbid them"
+                    "{path}.weights[{index}] hf_peft requires config_location; other formats forbid it"
                 ));
             }
             if let Some(config_location) = &weight.config_location
@@ -1274,16 +1241,6 @@ fn validate_adapter_service(
             {
                 errors.push(format!(
                     "{path}.weights[{index}].config_location must be under package path adapters/{name}/"
-                ));
-            }
-            if let Some(config_sha256) = &weight.config_sha256
-                && (config_sha256.len() != 64
-                    || !config_sha256
-                        .bytes()
-                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
-            {
-                errors.push(format!(
-                    "{path}.weights[{index}].config_sha256 must be 64 lowercase hexadecimal characters"
                 ));
             }
         }
@@ -1572,6 +1529,16 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
             &output.contract,
             errors,
         );
+        match (&output.role, output.value_range) {
+            (crate::schema::WorkflowOutputRole::Image, None) => errors.push(format!(
+                "workflow image output '{name}' must declare value_range"
+            )),
+            (crate::schema::WorkflowOutputRole::Image, Some(_)) => {}
+            (_, Some(_)) => errors.push(format!(
+                "workflow non-image output '{name}' cannot declare image value_range"
+            )),
+            (_, None) => {}
+        }
     }
     for (name, component) in &workflow.components {
         if name.trim().is_empty() || name.contains('.') {
@@ -3624,7 +3591,7 @@ fn validate_state_port_layers(
                 by_role.entry(role).or_default().push((label, alias.layer));
             }
         }
-        for (role, aliases) in by_role {
+        for (role, aliases) in &by_role {
             if aliases.len() < 2 {
                 continue;
             }
@@ -3645,7 +3612,7 @@ fn validate_state_port_layers(
                 continue;
             }
             let mut seen = BTreeSet::new();
-            for (label, layer) in &aliases {
+            for (label, layer) in aliases {
                 let Some(layer) = layer else { continue };
                 if !seen.insert(*layer) {
                     errors.push(format!(
@@ -3655,6 +3622,45 @@ fn validate_state_port_layers(
                     ));
                 }
             }
+        }
+
+        let is_attention = matches!(
+            group.kind,
+            crate::schema::StateKind::FullAttention
+                | crate::schema::StateKind::SlidingAttention
+                | crate::schema::StateKind::MultiLatentAttention
+                | crate::schema::StateKind::CrossAttention
+        );
+        let key_aliases = by_role.get(&crate::schema::StatePortRole::Key);
+        let value_aliases = by_role.get(&crate::schema::StatePortRole::Value);
+        if !is_attention || (key_aliases.is_none() && value_aliases.is_none()) {
+            continue;
+        }
+
+        let layers = |aliases: Option<&Vec<(&String, Option<usize>)>>| {
+            aliases
+                .into_iter()
+                .flatten()
+                .map(|(_, layer)| layer.unwrap_or(0))
+                .collect::<BTreeSet<_>>()
+        };
+        let key_layers = layers(key_aliases);
+        let value_layers = layers(value_aliases);
+        if key_layers != value_layers {
+            let missing_values = key_layers
+                .difference(&value_layers)
+                .copied()
+                .collect::<Vec<_>>();
+            let missing_keys = value_layers
+                .difference(&key_layers)
+                .copied()
+                .collect::<Vec<_>>();
+            errors.push(format!(
+                "state service group '{group_name}' component '{component_name}' must bind \
+                 exactly one key and one value alias for the same attention layers; key layers \
+                 are {key_layers:?}, value layers are {value_layers:?}, missing value layers \
+                 are {missing_values:?}, missing key layers are {missing_keys:?}"
+            ));
         }
     }
 }
