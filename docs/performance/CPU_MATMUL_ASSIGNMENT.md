@@ -1936,16 +1936,22 @@ activation reuse**: 1.45x from group 1 to group 4, which also matches #1104's
 independently measured 1.46x.
 
 **The numerics move the wrong way and are shipped anyway, disclosed.** The
-N-blocked kernel's separated correction is up to **3.70x worse** relatively
-against f64 (2.422e-5 vs 6.739e-6). It stays within the pinned envelope, the
-envelope guard was sized to the *measurement* (8x) rather than to hope, and the
-tradeoff is stated rather than buried — a 1.48x decode win for a 3.7x relative
-error increase inside an envelope is a defensible trade only if both numbers
-are on the table.
+N-blocked kernel's separated correction is **3.59x worse** relatively against
+f64 on the worst cell measured (2.422e-5 vs 6.739e-6). It stays within the
+pinned envelope, the envelope guard was sized to the *measurement* (8x) rather
+than to hope, and the tradeoff is stated rather than buried — a 1.48x decode win
+for a 3.59x relative error increase inside an envelope is a defensible trade
+only if both numbers are on the table.
 
-Two lessons this file has now recorded twice each: an instrument in the timed
-path is a measurement error, not overhead (cf. §18); and "default off until
-measured" is a decision that expires silently unless a test asserts the default.
+Two lessons. An instrument in the timed path is a **measurement error, not
+overhead** — distinct from §18's probe, which was real kernel overhead that
+broke inlining and whose removal made the shipping kernel genuinely faster; this
+one changed nothing in production and only corrupted its own baseline. And
+"default off until measured" is a decision that **expires silently** unless a
+test asserts the default.
+
+Full record:
+[`docs/benchmarks/2026-08-21-int4-acc0-dormant-nblock.md`](../benchmarks/2026-08-21-int4-acc0-dormant-nblock.md).
 
 ### 24. The t=8 "wash" is worker-to-CPU placement, not the kernel (**negative result; runtime-owned**)
 
@@ -1962,8 +1968,16 @@ So there is no t=8 anomaly to tune for. There is a **width-12-and-above**
 collapse, and it is not the kernel.
 
 Two hypotheses were tried and discarded before the right one. Memory bandwidth:
-the host sustains 83 GB/s and the decode loop draws 41 GB/s, so it is not
-bandwidth-bound. Task grain: the shard count and barrier time move as expected.
+a STREAM-style all-thread sweep read 83 GB/s against a 41 GB/s decode draw —
+but that figure **does not reconcile with §22**, which measured this host at
+31-36 GB/s within a CCX and ~56.6 GB/s across both, and §22's numbers are the
+ones this file stands behind. Against those, 41 GB/s is 72% of the across-CCX
+ceiling and *above* the within-CCX one, so bandwidth cannot be dismissed by my
+83 GB/s sweep and is not dismissed here on that basis. It is ruled out by the
+placement A/B below instead, which holds shapes, bytes, thread count and binary
+constant and moves **only** which CPUs the workers sit on — a bandwidth ceiling
+does not care about that, and the result does. Task grain: the shard count and
+barrier time move as expected.
 
 **Root cause: `decode_spmd.rs::node_shards` pins worker *i* to
 `allowed_cpus()[i]` in logical order.** On this host SMT siblings are adjacent
@@ -1977,6 +1991,9 @@ physical-core 1.225x on the same binary and the same shapes.
 measurement and the placement evidence, for the runtime owner. Every timing in
 §23 and §25 is `taskset`-pinned to even CPUs as a consequence — an unpinned
 multi-thread number on this host is measuring the scheduler, not the kernel.
+
+Full record:
+[`docs/benchmarks/2026-08-21-decode-worker-cpu-placement.md`](../benchmarks/2026-08-21-decode-worker-cpu-placement.md).
 
 ### 25. `f16`/`bf16` decode diverged by *layout*, and the slow side was also the less accurate one (**fixed**)
 
@@ -1996,13 +2013,18 @@ lives in `MatMulKernel::execute_with_backend` and `fused_matmul_bias.rs` calls
 the free `matmul_dense_prepacked_into`, so a probe read `matmul_gemv=1
 fused_gemv=0`. It matters because the optimizer fuses `MatMul + Add(bias)`. The
 MatMul-side transposed row had **no test**: `decode_matmul` only ever built B as
-`[k,n]` — the fourth unmeasured-region-behind-a-gate this file records (cf. §11,
+`[k,n]` — the fifth unmeasured-region-behind-a-gate this file records (cf. §11,
 §12, §14, §19).
 
 **`[K,N]` crosses a page every `p`.** The stride between consecutive `p` is
 `n*2` bytes — 12 KB at n=6144 — and the L2 prefetcher does not cross page
-boundaries. Direct kernel A/B on identical bytes: `gemv_half_kn` is
-**1.56-2.98x** slower.
+boundaries. Direct kernel A/B on identical bytes, same call, only the stored
+order differing:
+
+| shape | `gemv_half_kn` us | `gemv_half_nk` us | penalty |
+|---|---|---|---|
+| qkv 4096x6144 | 5022 | 1688 | **2.98x** |
+| down 14336x4096 | 11015 | 7068 | **1.56x** |
 
 **The zero-memory alternative was tried first and is a negative result.**
 `_mm_prefetch` at distance 12 into the strided inner loop made `kn` *worse*
@@ -2033,8 +2055,10 @@ Production-path A/B, two builds, `taskset`-pinned, `steady_ms`:
 | bf16 | lm_head 896x151936 | 8.635 | 7.064 | **1.22x** |
 
 **The best row is not the interesting one.** `square` at 5.4x is a shape nobody
-runs; the model-shaped rows are 1.2-1.6x, and `lm_head` — which gains least at
-1.21x — is also the row that pays most, **272 MB** resident for one weight.
+runs; the large model-shaped rows (`mlp`, `lm_head`) are 1.2-1.6x, and
+`lm_head` — which gains least at 1.21x — is also the row that pays most,
+**272 MB** resident for one weight. The small `attn_out` projection sits between
+them at 2.25x/2.96x.
 
 **The memory-plan coupling is the part that could have gone badly.**
 `node_weight_transpose_cache_bytes` is what `engine/load.rs` budgets against
@@ -2052,7 +2076,7 @@ f32 widening, checked against the predictor itself.
 
 **Admission is no longer numerically neutral on this path.** Declining the cache
 changes *which kernel* runs and therefore output bits. Three contract comments
-still claimed neutrality and were corrected; an Opus review caught that the
+still claimed neutrality and were corrected; adversarial review caught that the
 commit message disclosed it but the comments a maintainer actually reads did
 not.
 
@@ -2067,3 +2091,6 @@ discriminator.
 x86 — 2845 us on qkv against MatMul's 1830 us after this change. It is a
 separate mechanism with its own memory-plan consequence and is not folded in
 here. Merged as `2e1cfb67c`.
+
+Full record:
+[`docs/benchmarks/2026-08-21-half-decode-layout-divergence.md`](../benchmarks/2026-08-21-half-decode-layout-divergence.md).
