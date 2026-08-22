@@ -4301,6 +4301,7 @@ pub fn bound_process_to_decode_budget() {
 
     match rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
+        .thread_name(prefill_worker_name)
         .build_global()
     {
         Ok(()) => eprintln!(
@@ -4313,6 +4314,25 @@ pub fn bound_process_to_decode_budget() {
              prefill/MLAS parallelism"
         ),
     }
+}
+
+/// Name for a worker in the process-wide prefill/MLAS Rayon pool.
+///
+/// Rayon does not name `build_global` workers by default, and an unnamed
+/// thread's `comm` defaults to the *process* name — so an unnamed pool of
+/// `N` workers reads, in `ps`/`top`/`/proc/<pid>/task`, as `N` extra copies
+/// of the host binary rather than as a pool. That made this pool the single
+/// largest unattributed block of threads in a budgeted process (an explicit
+/// budget of `N` more than doubles the thread count, and until now `N` of
+/// those were anonymous).
+///
+/// Deliberately short: Linux truncates `comm` to 15 bytes, so the longer
+/// `onnx-genai-`-prefixed convention used elsewhere in this crate collapses
+/// to `onnx-genai-deco`/`onnx-genai-spmd` and loses the index. This form
+/// survives truncation intact for every width this pool is ever built at,
+/// which is the whole point of naming it.
+fn prefill_worker_name(index: usize) -> String {
+    format!("nxgn-prefill-{index}")
 }
 
 /// Default persistent-pool worker count for `available` logical CPUs: half of
@@ -16897,6 +16917,34 @@ mod tests {
         assert_eq!(resolve_rayon_global_threads(Some(0), Some("8"), 96), None);
         // A degenerate host reports no parallelism to bound.
         assert_eq!(resolve_rayon_global_threads(Some(8), None, 0), None);
+    }
+
+    #[test]
+    fn prefill_worker_names_survive_linux_comm_truncation() {
+        // Linux stores `comm` in 15 bytes plus a NUL. A name longer than that
+        // is silently truncated, which is how the `onnx-genai-`-prefixed
+        // convention elsewhere in this crate loses its worker index. These
+        // names must stay legible for every width the pool is built at, so
+        // that a thread census can attribute them without guesswork.
+        const COMM_LEN: usize = 15;
+        for index in [0, 1, 9, 15, 31, 63, 99] {
+            let name = prefill_worker_name(index);
+            assert!(
+                name.len() <= COMM_LEN,
+                "`{name}` is {} bytes and would be truncated in /proc/<pid>/task/*/comm",
+                name.len()
+            );
+            assert!(
+                name.starts_with("nxgn-prefill-"),
+                "unexpected prefix: {name}"
+            );
+            assert!(
+                name.ends_with(&index.to_string()),
+                "`{name}` lost its worker index"
+            );
+        }
+        // Distinct workers must stay distinguishable.
+        assert_ne!(prefill_worker_name(0), prefill_worker_name(1));
     }
 
     #[test]
