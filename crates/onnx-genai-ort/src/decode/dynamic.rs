@@ -404,7 +404,10 @@ impl<'a> DecodeSession<'a> {
             })
             .map(|tensor| tensor.name.as_str())
             .collect::<Vec<_>>();
-        if !unassigned_state_inputs.is_empty() || !unassigned_state_outputs.is_empty() {
+        // Rank-3+ outputs without corresponding inputs may be auxiliary activations
+        // consumed by a chained proposer. Unassigned inputs are always stateful and
+        // still require an explicit state-service binding.
+        if !unassigned_state_inputs.is_empty() {
             return Err(OrtError::InvalidArgument(format!(
                 "cannot resolve decoder state from tensor shapes (inputs: {unassigned_state_inputs:?}, outputs: {unassigned_state_outputs:?}); bind the per-layer buffers in a pipeline.workflow.serving.state_service group"
             )));

@@ -32,6 +32,7 @@ non-schema keys.
 | 19 | [Operator ABI comparison](19-operator-abi-comparison.yaml) | Graph-visible operator/port distinctions |
 | 20 | [Qwen3.5 hybrid speculative decode](20-qwen3_5-hybrid-speculative-decoding.yaml) | Full-attention KV plus linear/conv replacement state with atomic rollback |
 | 21 | [Shared-prefix pixel flow](21-shared-prefix-pixel-flow.yaml) | Alternating CFG branches read frozen prefix state across a flow-matching loop |
+| 22 | [Qwen3 chained speculative decode](22-qwen3-chained-speculative-decoding.yaml) | Token-embedding chain with typed hidden/KV recurrence and mapped vocabulary |
 
 ## Shared-prefix alternating branches
 

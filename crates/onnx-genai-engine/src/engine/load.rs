@@ -2362,6 +2362,7 @@ fn load_eagle3_model(
 ) -> anyhow::Result<Option<Eagle3Model>> {
     let eagle3 = if let SpeculativeMode::Eagle3(eagle_config) = speculative_mode {
         crate::config::validate_eagle3_config(eagle_config)?;
+        let mut target_activation_dtype = None;
         for output_name in &eagle_config.target_hidden_outputs {
             let hidden_output = session
                 .outputs()
@@ -2370,12 +2371,27 @@ fn load_eagle3_model(
                 .with_context(|| {
                     format!("EAGLE-3 target model must expose hidden-state output '{output_name}'")
                 })?;
-            if hidden_output.dtype != DataType::Float32 {
+            if !matches!(
+                hidden_output.dtype,
+                DataType::Float32 | DataType::Float16 | DataType::BFloat16
+            ) {
                 anyhow::bail!(
-                    "EAGLE-3 target hidden-state output '{}' must be Float32, got {:?}",
+                    "chained proposer target context '{}' must be Float32, Float16, or BFloat16, got {:?}",
                     hidden_output.name,
                     hidden_output.dtype
                 );
+            }
+            if let Some(dtype) = target_activation_dtype {
+                if hidden_output.dtype != dtype {
+                    anyhow::bail!(
+                        "chained proposer target context outputs must share one dtype; '{}' is {:?}, expected {:?}",
+                        hidden_output.name,
+                        hidden_output.dtype,
+                        dtype
+                    );
+                }
+            } else {
+                target_activation_dtype = Some(hidden_output.dtype);
             }
             if hidden_output.shape.last().copied().filter(|dim| *dim > 0)
                 != Some(eagle_config.hidden_size as i64)
@@ -2404,6 +2420,13 @@ fn load_eagle3_model(
                 eagle_config.hidden_size
             );
         }
+        if Some(head_signature.activation_dtype) != target_activation_dtype {
+            anyhow::bail!(
+                "chained proposer activation dtype {:?} does not match target context dtype {:?}",
+                head_signature.activation_dtype,
+                target_activation_dtype
+            );
+        }
         let expected_fused = eagle_config.hidden_size * eagle_config.target_hidden_outputs.len();
         if head_signature.fused_hidden_size != expected_fused {
             anyhow::bail!(
@@ -2420,6 +2443,39 @@ fn load_eagle3_model(
             );
         }
         let embedding = read_f32_weights(&eagle_config.embedding_weights)?;
+        let token_map = eagle_config
+            .token_map
+            .as_ref()
+            .map(|path| {
+                let bytes = std::fs::read(path).with_context(|| {
+                    format!("Failed to read proposer vocabulary map '{}'", path.display())
+                })?;
+                if bytes.len() % std::mem::size_of::<i64>() != 0 {
+                    anyhow::bail!(
+                        "proposer vocabulary map '{}' has byte length {}, which is not divisible by 8",
+                        path.display(),
+                        bytes.len()
+                    );
+                }
+                bytes
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|bytes| {
+                        let token = i64::from_le_bytes(*bytes);
+                        TokenId::try_from(token).with_context(|| {
+                            format!("mapped proposer token id {token} is outside the target range")
+                        })
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()
+            })
+            .transpose()?;
+        if token_map
+            .as_ref()
+            .is_some_and(|map| map.len() < head_signature.draft_vocab_size)
+        {
+            anyhow::bail!("proposer vocabulary map has fewer entries than the draft vocabulary");
+        }
         Some(Eagle3Model {
             config: eagle_config.clone(),
             session: Box::new(head_session),
@@ -2429,6 +2485,7 @@ fn load_eagle3_model(
                 eagle_config.hidden_size,
             )
             .map_err(|error| anyhow::anyhow!("Invalid EAGLE-3 embedding weights: {error}"))?,
+            token_map,
             hidden_outputs: eagle_config.target_hidden_outputs.clone(),
             kv_mode: eagle_config.kv_mode,
             num_speculative_tokens: eagle_config.num_speculative_tokens,

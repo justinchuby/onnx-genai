@@ -351,6 +351,9 @@ pub struct Eagle3Config {
     pub target_hidden_outputs: Vec<String>,
     /// Raw little-endian f32 target embedding weights in `[vocab, hidden]` order.
     pub embedding_weights: PathBuf,
+    /// Optional raw little-endian i64 table mapping each proposer token id to
+    /// the corresponding target token id. Absent means identical vocabularies.
+    pub token_map: Option<PathBuf>,
     /// Target vocabulary size used by the shared embedding table.
     pub vocab_size: usize,
     /// Width of each target hidden state and token embedding.

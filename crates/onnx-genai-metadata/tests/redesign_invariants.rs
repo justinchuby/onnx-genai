@@ -475,6 +475,65 @@ fn speculative_rollback_bounds_must_cover_the_maximum_proposal_width() {
 }
 
 #[test]
+fn chained_proposer_requires_typed_ports_and_rollbackable_recurrence() {
+    let metadata = serving_workflow(
+        "permitted",
+        SOUND_CAPABILITIES,
+        "",
+        r#"
+speculative:
+  proposer: proposer
+  target: verifier
+  proposal_execution:
+    kind: chained
+    token_embedding_input: inputs_embeds
+    logits_output: draft_logits
+    recurrent:
+    - { state: cache, input: past_state, output: next_state }
+  vocabulary: { kind: mapped, artifact: draft_to_target.npy }
+  max_proposal_width: 4
+  distribution_preserving: true
+  rollback_state: [cache]
+"#,
+    )
+    .replacen(
+        "        ports: {}",
+        r#"        ports:
+          inputs:
+            inputs_embeds: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim] }
+            past_state: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim] }
+          outputs:
+            draft_logits: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim] }
+            next_state: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim] }"#,
+        1,
+    )
+    .replacen(
+        "      - kind: invoke\n        component: proposer",
+        "      - kind: invoke\n        component: proposer\n        inputs: { inputs_embeds: empty_cache, past_state: empty_cache }\n        outputs: { draft_logits: draft.logits, next_state: draft.next_state }",
+        1,
+    );
+    validate_metadata(&parse(&metadata)).expect("typed chained proposer must validate");
+
+    let missing_rollback = metadata.replace("  rollback_state: [cache]", "  rollback_state: []");
+    let reported = errors(&missing_rollback);
+    assert!(
+        reported
+            .iter()
+            .any(|error| error.contains("must be listed in rollback_state")),
+        "{reported:?}"
+    );
+
+    let bad_port = metadata.replace("logits_output: draft_logits", "logits_output: missing");
+    let reported = errors(&bad_port);
+    assert!(
+        reported
+            .iter()
+            .any(|error| error.contains("is not an output port")),
+        "{reported:?}"
+    );
+}
+
+#[test]
 fn past_present_alias_legality_survives_the_removal_of_storage_policy() {
     // `shared_buffer` was a storage decision. What it also carried — whether the
     // graph tolerates a past/present alias — is a real graph ABI fact and must

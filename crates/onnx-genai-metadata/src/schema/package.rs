@@ -369,6 +369,14 @@ pub struct SpeculativeContract {
     /// Workflow component that verifies proposals.
     #[schemars(length(min = 1))]
     pub target: String,
+    /// How the proposer materializes one candidate block.
+    ///
+    /// `block` components emit the complete proposal in one invocation.
+    /// `chained` components emit one distribution and recurrence update per
+    /// invocation; the runtime repeatedly invokes the same typed component up
+    /// to `max_proposal_width`.
+    #[serde(default)]
+    pub proposal_execution: SpeculativeProposalExecution,
     /// Proposer ports bound to target-owned values, by semantic role.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub port_bindings: BTreeMap<String, String>,
@@ -396,6 +404,42 @@ pub struct SpeculativeContract {
     /// State groups that must roll back when a proposal is rejected.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub rollback_state: BTreeSet<String>,
+}
+
+/// Execution shape of a speculative proposer.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SpeculativeProposalExecution {
+    /// One proposer invocation returns the complete token block.
+    #[default]
+    Block,
+    /// Repeated proposer invocations form an autoregressive proposal chain.
+    Chained {
+        /// Proposer input port receiving the previous selected token embedding.
+        #[schemars(length(min = 1))]
+        token_embedding_input: String,
+        /// Proposer output port carrying the next-token distribution.
+        #[schemars(length(min = 1))]
+        logits_output: String,
+        /// Loop-carried hidden/cache state updated by every proposer invocation.
+        #[serde(default)]
+        recurrent: Vec<SpeculativeRecurrenceBinding>,
+    },
+}
+
+/// One loop-carried proposer value in a chained proposal.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SpeculativeRecurrenceBinding {
+    /// Workflow state cell checkpointed before proposal and restored on rejection.
+    #[schemars(length(min = 1))]
+    pub state: String,
+    /// Proposer input port receiving the current value.
+    #[schemars(length(min = 1))]
+    pub input: String,
+    /// Proposer output port producing the next value.
+    #[schemars(length(min = 1))]
+    pub output: String,
 }
 
 /// Vocabulary relationship between a proposer and its target.
