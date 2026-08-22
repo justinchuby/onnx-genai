@@ -443,10 +443,109 @@ graph {
     }
   }
   node {
+    output: "v_Constant_20"
+    name: "Constant_node_20"
+    op_type: "Constant"
+    attribute {
+      name: "value_ints"
+      ints: 4
+      ints: 4
+      ints: 4
+      type: INTS
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "v_Shape_0"
+    input: "v_Constant_20"
+    output: "v_Concat_21"
+    name: "Concat_node_21"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: 0
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "v_Concat_21"
+    output: "v_ConstantOfShape_22"
+    name: "ConstantOfShape_node_22"
+    op_type: "ConstantOfShape"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        data_type: 1
+        raw_data: "\000\000\000\000"
+      }
+      type: TENSOR
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
     input: "past_key_values.0.key"
     input: "v_ConstantOfShape_19"
     output: "present.0.key"
-    name: "Concat_node_20"
+    name: "Concat_node_23"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: 2
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    input: "past_key_values.0.value"
+    input: "v_ConstantOfShape_22"
+    output: "present.0.value"
+    name: "Concat_node_24"
     op_type: "Concat"
     attribute {
       name: "axis"
@@ -517,6 +616,28 @@ graph {
       }
     }
   }
+  input {
+    name: "past_key_values.0.value"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "component.verifier.batch"
+          }
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_param: "component.verifier.past_sequence"
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
   output {
     name: "target_scores"
     type {
@@ -553,6 +674,28 @@ graph {
           }
           dim {
             dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "present.0.value"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "component.verifier.batch"
+          }
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_param: "component.verifier.past_sequence + 4"
+          }
+          dim {
+            dim_value: 4
           }
         }
       }
@@ -801,6 +944,50 @@ graph {
   }
   value_info {
     name: "v_ConstantOfShape_19"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+          }
+          dim {
+          }
+          dim {
+          }
+          dim {
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Constant_20"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 3
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Concat_21"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_ConstantOfShape_22"
     type {
       tensor_type {
         elem_type: 1

@@ -388,6 +388,15 @@ fn budget_for_allowance(allowance: Option<u64>) -> usize {
 /// clear cliff — a plausible outcome on a heavily contended machine, or with an
 /// allocator that recycles everything — the answer is [`FALLBACK_FLOOR_BYTES`],
 /// which is never worse than the previous hardcoded behaviour.
+/// Hard stop, so a pathological machine cannot make construction hang.
+///
+/// Checked between cycles rather than inside one, so the probe can exceed this
+/// by whatever the cycle in flight costs. That matters more than it sounds: the
+/// ladder's top rung touches 256 MiB, measured at ~20 ms on an idle Apple M
+/// series machine, so the real ceiling is this budget plus the largest rung
+/// reached — not this budget.
+pub(crate) const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
+
 pub fn calibrate_floor_bytes() -> usize {
     /// Below this there is no question: these are small allocations, which this
     /// crate has already measured as best left to the system allocator.
@@ -402,8 +411,6 @@ pub fn calibrate_floor_bytes() -> usize {
     /// Resident stores are ~10x under it and faults ~2x over it, so the decision
     /// does not sit near the boundary on any machine measured.
     const FAULTING_NS_PER_PAGE: f64 = 60.0;
-    /// Hard stop, so a pathological machine cannot make construction hang.
-    const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
 
     // Miri interprets every store, so touching a 256 MiB ladder rung page by
     // page would take minutes, and its modelled allocator has none of the
@@ -1147,15 +1154,42 @@ mod tests {
     }
 
     /// The probe is on the construction path of every EP, so its cost is paid by
-    /// every session. It is budgeted at 50 ms; anything near that is a bug.
+    /// every session.
+    ///
+    /// Takes the **minimum** of several calibrations rather than timing one.
+    /// Contention can only make a sample slower, never faster, so the minimum
+    /// approximates the cost on an idle machine no matter what else the runner
+    /// is doing — which is the number this test is actually about. Timing a
+    /// single call measured the runner's mood: it failed on
+    /// `Rust coverage (macOS arm64)` at 311 ms while asserting 250 ms, and a
+    /// pass told you only that nothing else was scheduled that instant.
+    ///
+    /// The envelope is empirical, not derived. `calibrate_floor_bytes` measures
+    /// ~30 ms idle on an Apple M series machine against its own 50 ms
+    /// `PROBE_BUDGET`, and that budget is checked between cycles, so the ceiling
+    /// is the budget plus the largest rung reached. A hosted runner is several
+    /// times slower than a developer machine, which is how a single sample
+    /// reached 311 ms without anything being wrong. With the minimum taken
+    /// instead, a failure here means calibration itself got slower.
     #[test]
     fn calibration_is_cheap_enough_to_run_at_construction() {
-        let start = std::time::Instant::now();
-        let _ = calibrate_floor_bytes();
-        let elapsed = start.elapsed();
+        const ROUNDS: usize = 5;
+        let budget = PROBE_BUDGET * 5;
+
+        let best = (0..ROUNDS)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                let _ = calibrate_floor_bytes();
+                start.elapsed()
+            })
+            .min()
+            .expect("ROUNDS is non-zero");
+
         assert!(
-            elapsed < std::time::Duration::from_millis(250),
-            "calibration took {elapsed:?}, which is too much to pay per cache"
+            best < budget,
+            "calibration's cheapest of {ROUNDS} runs took {best:?}, over the {budget:?} \
+             envelope; a slow runner cannot lower the minimum, so this is calibration \
+             itself, not the machine"
         );
     }
 

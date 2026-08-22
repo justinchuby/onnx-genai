@@ -311,6 +311,23 @@ mod mock_kernel_ctx {
     }
 
     /// Build a mock OrtApi with all the functions our Compute path needs.
+    /// Publish the mock table through the plugin's host-API global.
+    ///
+    /// That global is process-wide, so whatever it points at has to outlive
+    /// every test rather than just the one that published it. Passing a stack
+    /// local left it dangling the moment that test returned, and libtest runs
+    /// these in parallel: a test still inside `Compute` would read a frame
+    /// another test had already popped, and see an operand count of zero from
+    /// reused stack bytes. Leaking one table sidesteps the lifetime entirely,
+    /// and since every caller built an identical one there is nothing left for
+    /// the ordering to vary.
+    pub fn install_host_api() {
+        static API: std::sync::OnceLock<&'static ort::OrtApi> = std::sync::OnceLock::new();
+        let api: &'static ort::OrtApi = API.get_or_init(|| Box::leak(Box::new(mock_ort_api())));
+        // SAFETY: `api` is `'static`, and the plugin only reads through it.
+        unsafe { onnx_runtime_ep_plugin::status::set_host_api(api as *const ort::OrtApi) };
+    }
+
     pub fn mock_ort_api() -> ort::OrtApi {
         ort::OrtApi {
             CreateStatus: Some(mock_create_status),
@@ -342,10 +359,7 @@ fn compute_add_end_to_end() {
     use onnx_runtime_ir::DataType;
 
     // Set up mock API as the host.
-    let api = mock_ort_api();
-    let api_ptr: *const ort::OrtApi = &api;
-    // SAFETY: single-threaded test; set_host_api is safe to call before Compute.
-    unsafe { onnx_runtime_ep_plugin::status::set_host_api(api_ptr) };
+    install_host_api();
 
     // Prepare input tensors: a = [1.0, 2.0, 3.0, 4.0], b = [10.0, 20.0, 30.0, 40.0]
     STATE.with(|s| {
@@ -411,9 +425,7 @@ fn compute_add_broadcast() {
     };
     use onnx_runtime_ir::DataType;
 
-    let api = mock_ort_api();
-    let api_ptr: *const ort::OrtApi = &api;
-    unsafe { onnx_runtime_ep_plugin::status::set_host_api(api_ptr) };
+    install_host_api();
 
     STATE.with(|s| {
         *s.borrow_mut() = Some(MockKernelState {
@@ -541,9 +553,7 @@ fn run_node(
     };
     use onnx_runtime_ir::DataType;
 
-    let api = mock_ort_api();
-    let api_ptr: *const ort::OrtApi = &api;
-    unsafe { onnx_runtime_ep_plugin::status::set_host_api(api_ptr) };
+    install_host_api();
 
     STATE.with(|s| {
         *s.borrow_mut() = Some(MockKernelState {

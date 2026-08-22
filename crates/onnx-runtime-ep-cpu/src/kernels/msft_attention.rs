@@ -190,13 +190,6 @@ struct Bnsh {
     dim: usize,
 }
 
-impl Bnsh {
-    #[inline]
-    fn at(&self, b: usize, h: usize, s: usize, d: usize) -> f32 {
-        self.data[((b * self.heads + h) * self.seq + s) * self.dim + d]
-    }
-}
-
 /// Concatenate an optional past cache `[B, N, P, dim]` in front of `cur`
 /// `[B, N, L, dim]` along the sequence axis → `[B, N, P+L, dim]`.
 fn concat_cache(past: Option<&Bnsh>, cur: &Bnsh) -> Bnsh {
@@ -210,22 +203,45 @@ fn concat_cache(past: Option<&Bnsh>, cur: &Bnsh) -> Bnsh {
         };
     };
     let (batch, heads, dim) = (cur.batch, cur.heads, cur.dim);
+    // The caller validates these against the node's own attributes before
+    // building either tensor, so a mismatch is unreachable rather than merely
+    // unlikely. Assert it anyway: the plane-wise copy below would otherwise
+    // fail as an opaque slice-length panic, where the element-at-a-time scatter
+    // this replaced would have quietly read the wrong elements. Both are bugs;
+    // only one says so.
+    assert!(
+        past.batch == batch && past.heads == heads && past.dim == dim,
+        "Attention: past cache (b={},n={},h={}) incompatible with current \
+         (b={batch},n={heads},h={dim})",
+        past.batch,
+        past.heads,
+        past.dim
+    );
     let total = past.seq + cur.seq;
     let mut data = vec![0.0f32; batch * heads * total * dim];
-    for b in 0..batch {
-        for h in 0..heads {
-            for d in 0..dim {
-                for j in 0..past.seq {
-                    let dst = ((b * heads + h) * total + j) * dim + d;
-                    data[dst] = past.at(b, h, j, d);
-                }
-                for j in 0..cur.seq {
-                    let dst = ((b * heads + h) * total + past.seq + j) * dim + d;
-                    data[dst] = cur.at(b, h, j, d);
-                }
-            }
-        }
+    let plane = total * dim;
+    if plane == 0 || batch == 0 || heads == 0 {
+        return Bnsh {
+            data,
+            batch,
+            heads,
+            seq: total,
+            dim,
+        };
     }
+
+    // See the note in `attention.rs::concat_cache`: for a fixed
+    // `bh = b * heads + h` both sources are contiguous runs that land back to
+    // back in the destination plane, so this is two memcpys per plane rather
+    // than a stride-`dim` scalar scatter.
+    let past_plane = past.seq * dim;
+    let cur_plane = cur.seq * dim;
+    for (bh, out) in data.chunks_mut(plane).enumerate() {
+        let (head, tail) = out.split_at_mut(past_plane);
+        head.copy_from_slice(&past.data[bh * past_plane..bh * past_plane + past_plane]);
+        tail.copy_from_slice(&cur.data[bh * cur_plane..bh * cur_plane + cur_plane]);
+    }
+
     Bnsh {
         data,
         batch,
@@ -687,6 +703,107 @@ mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
     use onnx_runtime_ir::{Attribute, NodeId};
+
+    /// The element-at-a-time scatter `concat_cache` used to be, kept as an
+    /// independent oracle. Walks `d` outermost and writes with stride `dim`,
+    /// so it shares no index arithmetic with the memcpy form under test.
+    fn concat_cache_scalar_reference(past: &Bnsh, cur: &Bnsh) -> Vec<f32> {
+        let (batch, heads, dim) = (cur.batch, cur.heads, cur.dim);
+        let total = past.seq + cur.seq;
+        let mut data = vec![0.0f32; batch * heads * total * dim];
+        for b in 0..batch {
+            for h in 0..heads {
+                for d in 0..dim {
+                    for j in 0..past.seq {
+                        let dst = ((b * heads + h) * total + j) * dim + d;
+                        data[dst] = past.data[((b * heads + h) * past.seq + j) * dim + d];
+                    }
+                    for j in 0..cur.seq {
+                        let dst = ((b * heads + h) * total + past.seq + j) * dim + d;
+                        data[dst] = cur.data[((b * heads + h) * cur.seq + j) * dim + d];
+                    }
+                }
+            }
+        }
+        data
+    }
+
+    fn ramp(batch: usize, heads: usize, seq: usize, dim: usize, base: f32) -> Bnsh {
+        let n = batch * heads * seq * dim;
+        Bnsh {
+            data: (0..n).map(|i| base + i as f32 * 0.25).collect(),
+            batch,
+            heads,
+            seq,
+            dim,
+        }
+    }
+
+    /// `concat_cache` moves bytes and must not reorder a single element. The
+    /// memcpy-per-plane form has to agree with the old stride-`dim` scatter
+    /// bit for bit, including the ragged cases (`dim = 1`, a single past step,
+    /// an empty past, multi-batch multi-head) where a plane-stride mistake
+    /// would still produce a plausible-looking buffer.
+    /// The two branches the bit-identity grid steps over: no past cache at all
+    /// (first decode step / prefill), and a degenerate shape that hits the
+    /// `plane == 0` early return. Both must still report the concatenated
+    /// sequence length rather than falling out with the source's.
+    #[test]
+    fn concat_cache_handles_the_absent_past_and_degenerate_shapes() {
+        let cur = ramp(2, 3, 4, 5, 1000.0);
+        let got = concat_cache(None, &cur);
+        assert_eq!(
+            got.data, cur.data,
+            "no past must pass the current step through"
+        );
+        assert_eq!((got.batch, got.heads, got.seq, got.dim), (2, 3, 4, 5));
+
+        for &(batch, heads, past_seq, cur_seq, dim) in &[
+            (1, 1, 0, 0, 4),
+            (1, 2, 3, 1, 0),
+            (0, 2, 3, 1, 4),
+            (1, 0, 3, 1, 4),
+        ] {
+            let past = ramp(batch, heads, past_seq, dim, 1.0);
+            let cur = ramp(batch, heads, cur_seq, dim, 1000.0);
+            let got = concat_cache(Some(&past), &cur);
+            assert_eq!(
+                got.seq,
+                past_seq + cur_seq,
+                "degenerate shape b={batch} h={heads} p={past_seq} c={cur_seq} d={dim} \
+                 must still report the concatenated length"
+            );
+            assert_eq!(got.data.len(), batch * heads * (past_seq + cur_seq) * dim);
+        }
+    }
+
+    #[test]
+    fn concat_cache_is_bit_identical_to_the_scalar_scatter() {
+        for &(batch, heads, past_seq, cur_seq, dim) in &[
+            (1, 1, 1, 1, 1),
+            (1, 1, 0, 3, 4),
+            (1, 2, 3, 1, 4),
+            (2, 3, 5, 2, 7),
+            (1, 4, 17, 1, 8),
+            (3, 2, 1, 9, 5),
+            (2, 2, 4, 4, 1),
+        ] {
+            let past = ramp(batch, heads, past_seq, dim, 1.0);
+            let cur = ramp(batch, heads, cur_seq, dim, 1000.0);
+            let expected = concat_cache_scalar_reference(&past, &cur);
+            let got = concat_cache(Some(&past), &cur);
+
+            assert_eq!(got.seq, past_seq + cur_seq);
+            assert_eq!(got.batch, batch);
+            assert_eq!(got.heads, heads);
+            assert_eq!(got.dim, dim);
+            assert_eq!(
+                got.data, expected,
+                "concat_cache diverged from the scalar scatter at \
+                 batch={batch} heads={heads} past_seq={past_seq} cur_seq={cur_seq} dim={dim}"
+            );
+        }
+    }
 
     fn kernel(attrs: &[(&str, Attribute)]) -> Result<Box<dyn Kernel>> {
         let mut node = Node::new(NodeId(0), "Attention", vec![], vec![]);

@@ -377,12 +377,20 @@ impl ImagePreprocessor {
         if resolved_shape.len() == 4 {
             match layout {
                 ImageLayout::Nchw => {
-                    resolved_shape[2] = i64::from(config.height);
-                    resolved_shape[3] = i64::from(config.width);
+                    if resolved_shape[2] != -1 || program.dynamic_resize.is_none() {
+                        resolved_shape[2] = i64::from(config.height);
+                    }
+                    if resolved_shape[3] != -1 || program.dynamic_resize.is_none() {
+                        resolved_shape[3] = i64::from(config.width);
+                    }
                 }
                 ImageLayout::Nhwc => {
-                    resolved_shape[1] = i64::from(config.height);
-                    resolved_shape[2] = i64::from(config.width);
+                    if resolved_shape[1] != -1 || program.dynamic_resize.is_none() {
+                        resolved_shape[1] = i64::from(config.height);
+                    }
+                    if resolved_shape[2] != -1 || program.dynamic_resize.is_none() {
+                        resolved_shape[2] = i64::from(config.width);
+                    }
                 }
             }
         }

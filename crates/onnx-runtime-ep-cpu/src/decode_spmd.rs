@@ -426,9 +426,26 @@ pub struct SpmdDecodePools {
     /// shard behind a hard barrier.
     #[cfg(feature = "mlas")]
     work_stealing_pool: Option<mlas_sys::WorkStealingThreadPool>,
-    /// Workers assigned to each node, node-major, matching global worker index
-    /// order (workers `0..counts[0]` are node 0, and so on).
+    /// Compute shards assigned to each node, node-major, matching global worker
+    /// index order (shards `0..counts[0]` are node 0, and so on).
+    ///
+    /// This is the *partition* width. It exceeds the number of spawned worker
+    /// threads by one on the last node when [`Self::dispatcher_shard`] is set,
+    /// because the dispatcher computes that shard itself.
     node_worker_counts: Vec<usize>,
+    /// Worker *threads* per node, node-major. Equal to [`Self::node_worker_counts`]
+    /// except on the last node when the dispatcher owns a shard.
+    ///
+    /// This is what [`SharedState::publish`] counts down: only spawned threads
+    /// decrement `node_pending`, so the dispatcher's shard must not be included
+    /// or [`SharedState::wait`] would never observe zero.
+    node_thread_counts: Vec<usize>,
+    /// The global shard index the dispatcher computes inline, if any.
+    ///
+    /// Always the last index (`total_workers - 1`), which keeps the spawned
+    /// threads on a contiguous `0..total_threads` range so their global indices,
+    /// their node assignment and their CPU pinning are all unchanged.
+    dispatcher_shard: Option<usize>,
     total_workers: usize,
     schedule: DecodeSchedule,
 }
@@ -470,37 +487,59 @@ impl SpmdDecodePools {
     /// Build the pool from per-node worker shards. Global worker indices are
     /// laid out node-major (node 0's workers first) so row segments and weight
     /// placement line up with the node assignment.
-    fn build(shards: &[NodeShard]) -> Self {
-        Self::build_with_schedule(shards, decode_schedule())
+    ///
+    /// `dispatcher_shard` adds one compute shard, owned by the dispatcher rather
+    /// than by a spawned thread. See [`SpmdDecodePools::dispatcher_shard`].
+    fn build(shards: &[NodeShard], dispatcher_shard: bool) -> Self {
+        Self::build_with_schedule(shards, decode_schedule(), dispatcher_shard)
     }
 
-    fn build_with_schedule(shards: &[NodeShard], schedule: DecodeSchedule) -> Self {
+    fn build_with_schedule(
+        shards: &[NodeShard],
+        schedule: DecodeSchedule,
+        dispatcher_shard: bool,
+    ) -> Self {
         let node_count = shards.len();
         let mut worker_node = Vec::new();
-        let mut node_worker_counts = Vec::with_capacity(node_count);
+        let mut node_thread_counts = Vec::with_capacity(node_count);
         // Global (index, pinned cpu) assignment, node-major.
         let mut assignment: Vec<(usize, Option<usize>)> = Vec::new();
         for (node_position, shard) in shards.iter().enumerate() {
-            node_worker_counts.push(shard.workers);
+            node_thread_counts.push(shard.workers);
             for worker in 0..shard.workers {
                 worker_node.push(node_position);
                 let cpu = shard.cpus.get(worker % shard.cpus.len().max(1)).copied();
                 assignment.push((node_position, cpu));
             }
         }
-        let total_workers = assignment.len();
+        let total_threads = assignment.len();
+        // The dispatcher's shard is the last global index, so the spawned threads
+        // keep the contiguous `0..total_threads` range they already had.
+        let dispatcher_shard = (dispatcher_shard && node_count > 0).then_some(total_threads);
+        let mut node_worker_counts = node_thread_counts.clone();
+        if dispatcher_shard.is_some()
+            && let Some(last) = node_worker_counts.last_mut()
+        {
+            *last += 1;
+        }
+        let total_workers = total_threads + usize::from(dispatcher_shard.is_some());
 
         #[cfg(feature = "mlas")]
         if schedule == DecodeSchedule::Steal {
+            // The work-stealing pool is its own executor with no inline
+            // dispatcher, so there is no reserved CPU to reclaim: it spawns a
+            // thread per shard and the dispatcher never computes.
             return Self {
                 shared: None,
                 join_handles: Mutex::new(Vec::new()),
                 work_stealing_pool: Some(
-                    mlas_sys::WorkStealingThreadPool::new(total_workers)
+                    mlas_sys::WorkStealingThreadPool::new(total_threads)
                         .expect("spawn persistent work-stealing decode pool"),
                 ),
-                node_worker_counts,
-                total_workers,
+                node_worker_counts: node_thread_counts.clone(),
+                node_thread_counts,
+                dispatcher_shard: None,
+                total_workers: total_threads,
                 schedule,
             };
         }
@@ -518,7 +557,7 @@ impl SpmdDecodePools {
             shutdown: AtomicBool::new(false),
         });
 
-        let mut handles = Vec::with_capacity(total_workers);
+        let mut handles = Vec::with_capacity(total_threads);
         for (global_index, (node_position, cpu)) in assignment.into_iter().enumerate() {
             let shared = Arc::clone(&shared);
             let handle = thread::Builder::new()
@@ -540,9 +579,9 @@ impl SpmdDecodePools {
         // Block until every worker has entered its loop and is waiting for ops.
         // Without this, a dispatch issued before a worker starts would set the
         // op's pending count for that worker, which would never arrive to
-        // decrement it -- hanging the barrier. `total_workers` is bounded and
-        // each worker signals readiness immediately, so this is a brief spin.
-        while shared.ready.load(Ordering::Acquire) < total_workers {
+        // decrement it -- hanging the barrier. This counts spawned *threads*,
+        // not compute shards: the dispatcher's shard has no thread to wait for.
+        while shared.ready.load(Ordering::Acquire) < total_threads {
             std::hint::spin_loop();
         }
 
@@ -554,6 +593,8 @@ impl SpmdDecodePools {
             #[cfg(feature = "mlas")]
             work_stealing_pool: None,
             node_worker_counts,
+            node_thread_counts,
+            dispatcher_shard,
             total_workers,
             schedule,
         }
@@ -674,13 +715,31 @@ impl SpmdDecodePools {
             self.dispatch_inline(job);
             return;
         };
-        let job = Job {
+        let job_ptr = Job {
             data: std::ptr::from_ref(job).cast(),
             call: call::<F>,
         };
-        shared.publish(job, &self.node_worker_counts);
+        shared.publish(job_ptr, &self.node_thread_counts);
+        // Compute the dispatcher's own shard, when it has one, on the CPU the
+        // headroom reservation kept free. `catch_unwind` is load-bearing rather
+        // than defensive: the workers are already running against a `Job` that
+        // borrows `job` off *this* stack frame, so unwinding straight out of
+        // here would free the pointee while they still read it. Catch, complete
+        // the barrier, then resume the panic.
+        let unwind = self.dispatcher_shard.and_then(|global_index| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(global_index))).err()
+        });
         shared.wait();
         drop(claim);
+        if let Some(payload) = unwind {
+            // A worker panic during the same op stays latched in
+            // `poisoned_worker` and is reported by the next dispatch's
+            // `panic_if_poisoned`, which runs before it publishes anything. The
+            // dispatcher's own payload wins this frame because it is the one
+            // carrying the caller's stack; neither is lost, and `wait` above
+            // already guaranteed no worker is still running.
+            std::panic::resume_unwind(payload);
+        }
         shared.panic_if_poisoned();
     }
 
@@ -1277,12 +1336,114 @@ pub fn decode_path_label() -> &'static str {
     DECODE_PATH_LABEL.get().copied().unwrap_or("unresolved")
 }
 
+/// The width a decode request asked for, what it actually got, and which path
+/// served it.
+///
+/// Three separate mechanisms can quietly hand back fewer compute lanes than
+/// were requested -- [`reserve_single_group_headroom`], [`reserve_split_headroom`],
+/// and the single-CPU-cpuset fallback in [`build_from_env`] -- and all three
+/// report only through [`report_spmd_fallback`], which is `tracing::debug!` or
+/// `NXRT_CALIB_DEBUG`-gated. In a default benchmark run they are invisible, so a
+/// `t=N` row in a results table is a *label* rather than a measurement of width
+/// `N`. This is the read that turns it back into a measurement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DecodeWidth {
+    /// Compute lanes asked for: the explicit `ONNX_GENAI_CPU_DECODE_THREADS`
+    /// budget, or the default physical-core budget when unset. `None` means
+    /// either the width was never resolved (no decode has run yet) or the
+    /// caller opted out with `=0`, which is what `path` disambiguates.
+    pub requested: Option<usize>,
+    /// Compute lanes actually available. `None` until a decode path is chosen.
+    ///
+    /// On the persistent pool this is exact and includes the dispatcher's own
+    /// shard. On the flat path there is no fixed layout to report, so it is the
+    /// width of the Rayon pool **the calling thread is on** -- meaningful inside
+    /// `with_decode_pool_scope`, and the global width outside it. Same
+    /// convention as [`crate::kernels::matmul_nbits::active_decode_worker_count`].
+    pub realized: Option<usize>,
+    /// The selected path, as [`decode_path_label`] reports it.
+    pub path: &'static str,
+}
+
+impl DecodeWidth {
+    /// Whether the realized width matches what was asked for.
+    ///
+    /// `false` whenever a request was silently reduced, and also whenever the
+    /// width has not been resolved yet -- a harness that asserts on this cannot
+    /// accidentally pass by querying too early.
+    pub fn is_as_requested(&self) -> bool {
+        match (self.requested, self.realized) {
+            (Some(requested), Some(realized)) => requested == realized,
+            _ => false,
+        }
+    }
+}
+
+/// Report the requested vs realized decode width and the path that served it.
+///
+/// Deliberately **does not** build the pool: it reads the already-initialized
+/// statics, so calling it cannot change which path a process takes or when it is
+/// chosen. A harness should run at least one decode step first and then assert;
+/// before that the fields read `None` / `"unresolved"` and
+/// [`DecodeWidth::is_as_requested`] is `false`.
+pub fn decode_width() -> DecodeWidth {
+    let requested = REQUESTED_WIDTH.get().copied().flatten();
+    let realized = match POOLS.get() {
+        Some(Some(pools)) => Some(pools.total_workers()),
+        // The pool was resolved and declined: decode is on the flat path, whose
+        // width is whatever Rayon pool the caller is standing in.
+        Some(None) => Some(rayon::current_num_threads()),
+        None => None,
+    };
+    DecodeWidth {
+        requested,
+        realized,
+        path: decode_path_label(),
+    }
+}
+
+/// The width the caller asked for, recorded when the pool is resolved and before
+/// any of the reductions that can shrink it.
+///
+/// When an explicit request exists this is the *unclamped*
+/// [`crate::kernels::matmul_nbits::decode_thread_budget`], not the resolved
+/// width `build_from_env` receives. The resolver already clamps to
+/// `available_parallelism`, so recording its output would report a request of 8
+/// inside a 2-CPU cpuset as `2 requested, 2 realized` -- satisfied. That is
+/// exactly the silent mislabelling this read exists to expose, so the comparison
+/// has to be against what the user actually asked for.
+///
+/// With no explicit request this falls back to the resolved default width, which
+/// under default policy *is* the intended width -- there is no request for it to
+/// disagree with, so [`DecodeWidth::is_as_requested`] is meaningful on a
+/// default-configured run rather than trivially `false`.
+///
+/// `None` only while the pool is still unresolved, or when the caller opted out
+/// with `=0` (which never reaches the latch in [`pools`]).
+static REQUESTED_WIDTH: OnceLock<Option<usize>> = OnceLock::new();
+
 /// The lazily built persistent SPMD layout, or `None` when the mode is opted out
 /// or the safe auto-enable gate declines. Built once and reused for the whole
 /// process.
 pub fn pools() -> Option<&'static SpmdDecodePools> {
     POOLS
-        .get_or_init(|| build_from_env(default_threads()))
+        .get_or_init(|| {
+            let threads = default_threads();
+            // Latched here rather than inside `build_from_env` so the recorded
+            // request can only ever describe the pool that `POOLS` actually
+            // holds. `build_from_env` is `pub`; latching there would let a direct
+            // call record a width that no realized pool matches -- reintroducing
+            // the exact "the t=N label is a lie" failure this read exists to
+            // catch, through the front door.
+            //
+            // Prefer the unclamped `decode_thread_budget()`, falling back to
+            // `threads` only when nobody asked for a specific width. Under
+            // default policy the clamped width *is* the intended width, so there
+            // is no request for it to disagree with.
+            REQUESTED_WIDTH
+                .get_or_init(|| crate::kernels::matmul_nbits::decode_thread_budget().or(threads));
+            build_from_env(threads)
+        })
         .as_ref()
 }
 
@@ -1434,6 +1595,11 @@ pub fn build_from_env(threads: Option<usize>) -> Option<SpmdDecodePools> {
     // leave decode on the flat Rayon path. See `PERSISTENT_POOL_ENV`.
     let mode = persistence_mode();
     if !pool_mode_builds(mode) {
+        // An explicit `=0` opt-out is a decision, not an unresolved state: decode
+        // is definitively on the flat path. Without this the label reads
+        // "unresolved" forever and a harness cannot tell an opt-out apart from a
+        // process that has not decoded yet.
+        DECODE_PATH_LABEL.get_or_init(|| "flat");
         return None;
     }
     // Adaptive defers to an explicit decode-affinity request: if the user set
@@ -1443,6 +1609,10 @@ pub fn build_from_env(threads: Option<usize>) -> Option<SpmdDecodePools> {
     // `numa_pools`, everything else via the flat path + `plan_decode_affinity`).
     // `On` still builds the pool and keeps its documented precedence.
     if matches!(mode, PersistenceMode::Adaptive) && explicit_decode_affinity_set() {
+        // Also a decision: the user's affinity request drives decode via
+        // `numa_pools` or the flat path, so record that rather than leaving the
+        // label unresolved.
+        DECODE_PATH_LABEL.get_or_init(|| "flat");
         return None;
     }
     let Some(total) = threads else {
@@ -1453,6 +1623,7 @@ pub fn build_from_env(threads: Option<usize>) -> Option<SpmdDecodePools> {
         return None;
     };
     if total == 0 {
+        DECODE_PATH_LABEL.get_or_init(|| "flat");
         return None;
     }
     // Cpuset-aware dispatcher headroom: when the requested spinning-worker count
@@ -1477,7 +1648,36 @@ pub fn build_from_env(threads: Option<usize>) -> Option<SpmdDecodePools> {
     }
     report_pool_built(mode);
     let shards = node_shards(total);
-    Some(SpmdDecodePools::build(&shards))
+    // The dispatcher computes a shard exactly when the headroom reservation took
+    // a worker away to keep its CPU free. Then `total - 1` pinned threads plus
+    // the dispatcher give `total` compute lanes on `total` CPUs -- the requested
+    // width, with the anti-starvation reservation still in force.
+    //
+    // This is the common case, not a corner case: `bound_process_to_decode_budget`
+    // confines the process to exactly `total` CPUs at EP initialization, so an
+    // explicit budget *always* arrives here fully subscribed. Without the
+    // dispatcher shard, `ONNX_GENAI_CPU_DECODE_THREADS=N` silently buys `N-1`
+    // lanes -- and at `N=2` that is one lane, which trips the `total_workers <= 1`
+    // serial short-circuit and makes the knob indistinguishable from `=1`.
+    //
+    // Restricted to the single-group layout. On a NUMA split the dispatcher's
+    // node is not known at build time, so handing it a shard could pull that
+    // shard's weights across sockets; those layouts keep the previous behavior.
+    Some(SpmdDecodePools::build(
+        &shards,
+        dispatcher_owns_a_shard(&shards, total),
+    ))
+}
+
+/// Whether the inline dispatcher should own a compute shard.
+///
+/// True exactly when the single-group headroom reservation took a worker away
+/// to keep a CPU free for the dispatcher: giving that CPU back a compute lane
+/// restores the requested width without re-pinning a worker to every core. A
+/// group that already had headroom is left alone, or the pool would be one lane
+/// wider than the user asked for.
+fn dispatcher_owns_a_shard(shards: &[NodeShard], requested: usize) -> bool {
+    shards.len() == 1 && shards[0].workers < requested
 }
 
 /// Whether `ONNX_GENAI_CPU_DECODE_AFFINITY` is set to a non-empty value.
@@ -2006,7 +2206,7 @@ mod tests {
                 workers: 2,
             },
         ];
-        SpmdDecodePools::build_with_schedule(&shards, DecodeSchedule::Fixed)
+        SpmdDecodePools::build_with_schedule(&shards, DecodeSchedule::Fixed, false)
     }
 
     fn single_group_pool(workers: usize) -> SpmdDecodePools {
@@ -2022,7 +2222,19 @@ mod tests {
             cpus: vec![],
             workers,
         }];
-        SpmdDecodePools::build_with_schedule(&shards, schedule)
+        SpmdDecodePools::build_with_schedule(&shards, schedule, false)
+    }
+
+    /// A single group of `threads` spawned workers plus a dispatcher-owned
+    /// shard: the layout an explicit `ONNX_GENAI_CPU_DECODE_THREADS=threads + 1`
+    /// budget produces once the headroom reservation has taken its CPU back.
+    fn dispatcher_shard_pool(threads: usize) -> SpmdDecodePools {
+        let shards = vec![NodeShard {
+            index: 0,
+            cpus: vec![],
+            workers: threads,
+        }];
+        SpmdDecodePools::build_with_schedule(&shards, DecodeSchedule::Fixed, true)
     }
 
     #[test]
@@ -2248,6 +2460,547 @@ mod tests {
         for (index, value) in sharded.iter().enumerate() {
             assert_eq!(*value, index as f32, "row {index} was not written once");
         }
+    }
+
+    /// The regression guard for #1746. `bound_process_to_decode_budget` confines
+    /// the process to exactly `N` CPUs, so `reserve_single_group_headroom(N, N)`
+    /// always fires and leaves `N-1` pinned workers. Without a dispatcher-owned
+    /// shard the user's budget buys `N-1` compute lanes -- and at `N=2` that is
+    /// one lane, which trips the `total_workers <= 1` serial short-circuit and
+    /// makes `ONNX_GENAI_CPU_DECODE_THREADS=2` indistinguishable from `=1`.
+    ///
+    /// Deleting the dispatcher shard turns this red at every width.
+    #[test]
+    fn a_dispatcher_owned_shard_restores_the_requested_width() {
+        for threads in 1..=4usize {
+            let pool = dispatcher_shard_pool(threads);
+            assert_eq!(
+                pool.total_workers(),
+                threads + 1,
+                "{threads} pinned workers plus the dispatcher must be {} lanes",
+                threads + 1
+            );
+            assert_eq!(
+                pool.node_thread_counts.iter().sum::<usize>(),
+                threads,
+                "only {threads} threads may be spawned; the extra lane is the dispatcher"
+            );
+            pool.shutdown();
+        }
+    }
+
+    /// The `N=2` case specifically: one pinned worker plus the dispatcher must
+    /// actually execute on two threads, not take the serial short-circuit.
+    #[test]
+    fn a_two_lane_budget_fans_out_across_the_dispatcher_and_one_worker() {
+        let pool = dispatcher_shard_pool(1);
+        let n = 4096usize;
+        let k = 1024usize;
+        assert!(
+            output_chunk_len_for(pool.total_workers(), n, k) < n,
+            "the shape must be past the serial gate for this to test fan-out"
+        );
+
+        let threads: std::sync::Mutex<std::collections::HashSet<thread::ThreadId>> =
+            std::sync::Mutex::new(std::collections::HashSet::new());
+        let compute = |output_start: usize, outputs: &mut [f32]| {
+            threads
+                .lock()
+                .expect("thread-id set")
+                .insert(thread::current().id());
+            for (offset, out) in outputs.iter_mut().enumerate() {
+                *out = (output_start + offset) as f32;
+            }
+        };
+        let mut sharded = vec![0.0f32; n];
+        pool.dispatch_output_rows(&mut sharded, k, &compute);
+
+        let observed = threads.lock().expect("thread-id set").len();
+        assert_eq!(
+            observed, 2,
+            "a one-worker pool with a dispatcher shard must compute on two \
+             threads, but `compute` ran on {observed}"
+        );
+        for (index, value) in sharded.iter().enumerate() {
+            assert_eq!(*value, index as f32, "row {index} was not written once");
+        }
+        pool.shutdown();
+    }
+
+    /// The dispatcher's shard must cover its rows exactly once alongside the
+    /// worker shards -- an off-by-one in the partition would silently drop or
+    /// double-write rows rather than fail loudly.
+    #[test]
+    fn a_dispatcher_owned_shard_covers_its_rows_exactly_once() {
+        for threads in 1..=4usize {
+            for n in [1usize, 7, 64, 1000, 4096] {
+                let pool = dispatcher_shard_pool(threads);
+                let segments = pool.worker_row_segments(n);
+                assert_eq!(
+                    segments.len(),
+                    threads + 1,
+                    "one segment per lane including the dispatcher"
+                );
+                let mut covered = vec![0u32; n];
+                for (start, len) in segments {
+                    for hits in &mut covered[start..start + len] {
+                        *hits += 1;
+                    }
+                }
+                assert!(
+                    covered.iter().all(|&hits| hits == 1),
+                    "threads={threads} n={n}: rows must be covered exactly once"
+                );
+                pool.shutdown();
+            }
+        }
+    }
+
+    /// A panic in the *dispatcher's* shard must still complete the barrier
+    /// before unwinding.
+    ///
+    /// The published `Job` borrows the closure off the dispatcher's stack frame
+    /// and the workers are already running against it, so unwinding straight out
+    /// of the inline shard would free the pointee while they still read it --
+    /// a use-after-free, not merely a hang. The `catch_unwind` in `dispatch`
+    /// exists for this; removing it makes this test fail under Miri.
+    #[test]
+    fn a_panic_in_the_dispatcher_shard_still_waits_for_the_workers() {
+        let pool = dispatcher_shard_pool(2);
+        let dispatcher_lane = pool.total_workers() - 1;
+        let finished = Arc::new(AtomicUsize::new(0));
+
+        let observed = {
+            let finished = Arc::clone(&finished);
+            let job = move |global_index: usize| {
+                if global_index == dispatcher_lane {
+                    panic!("dispatcher shard failed");
+                }
+                // Give the dispatcher every chance to unwind first.
+                thread::sleep(Duration::from_millis(20));
+                finished.fetch_add(1, Ordering::Release);
+            };
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pool.dispatch(&job)))
+        };
+
+        assert!(
+            observed.is_err(),
+            "the dispatcher's panic must propagate to the caller"
+        );
+        assert_eq!(
+            finished.load(Ordering::Acquire),
+            dispatcher_lane,
+            "every worker shard must have completed before the panic escaped"
+        );
+        pool.shutdown();
+    }
+
+    /// The dispatcher shard is only claimed on the single-group layout, and only
+    /// when the headroom reservation actually took a worker away. A budget with
+    /// spare CPUs must be unchanged, or it would over-subscribe the request.
+    /// `decode_width` must never force the pool to build. Reading it is what a
+    /// harness does *before* deciding whether the run is trustworthy, so if the
+    /// read itself resolved the path it would both change process behaviour and
+    /// destroy the "not resolved yet" signal that keeps an early assertion from
+    /// passing vacuously.
+    #[test]
+    fn reading_the_decode_width_does_not_resolve_the_decode_path() {
+        let before = POOLS.get().is_some();
+        let width = decode_width();
+        assert_eq!(
+            POOLS.get().is_some(),
+            before,
+            "decode_width must not build the pool as a side effect"
+        );
+        if !before {
+            assert_eq!(width.realized, None);
+            assert!(
+                !width.is_as_requested(),
+                "an unresolved width must not report as satisfied, or a harness \
+                 that asserts too early passes for the wrong reason"
+            );
+        }
+    }
+
+    /// The whole point of the read: a request that was silently reduced must not
+    /// report as satisfied. Covers the reduction Roy's `t=N` rows could not see.
+    #[test]
+    fn a_reduced_width_does_not_report_as_requested() {
+        let reduced = DecodeWidth {
+            requested: Some(16),
+            realized: Some(15),
+            path: "spmd-pool",
+        };
+        assert!(
+            !reduced.is_as_requested(),
+            "16 requested and 15 realized is exactly the case a t=16 row would \
+             otherwise label as a width-16 measurement"
+        );
+
+        let honored = DecodeWidth {
+            requested: Some(16),
+            realized: Some(16),
+            path: "spmd-pool",
+        };
+        assert!(honored.is_as_requested());
+
+        // Dropping to the flat path is the other silent reduction: the width
+        // may even look larger, but it is not the pool that was asked for.
+        let flat = DecodeWidth {
+            requested: Some(2),
+            realized: Some(32),
+            path: "flat",
+        };
+        assert!(!flat.is_as_requested());
+    }
+
+    /// An unresolved width must stay unsatisfied no matter which half is
+    /// missing, so a harness cannot pass by asserting before it has decoded.
+    #[test]
+    fn a_half_known_width_is_never_satisfied() {
+        for (requested, realized) in [(Some(4), None), (None, Some(4)), (None, None)] {
+            let width = DecodeWidth {
+                requested,
+                realized,
+                path: "unresolved",
+            };
+            assert!(
+                !width.is_as_requested(),
+                "requested={requested:?} realized={realized:?} must not report satisfied"
+            );
+        }
+    }
+
+    #[test]
+    fn the_dispatcher_only_claims_a_shard_when_headroom_was_reserved() {
+        let group = |workers| {
+            vec![NodeShard {
+                index: 0,
+                cpus: vec![],
+                workers,
+            }]
+        };
+
+        // Fully subscribed: `reserve_single_group_headroom` gave up a worker to
+        // keep the dispatcher's CPU free, so the dispatcher computes that lane.
+        assert_eq!(reserve_single_group_headroom(4, 4), 3);
+        assert!(dispatcher_owns_a_shard(&group(3), 4));
+
+        // Headroom already existed: no CPU was reserved, so claiming a shard
+        // would make the pool one lane wider than the budget allows.
+        assert_eq!(reserve_single_group_headroom(4, 32), 4);
+        assert!(!dispatcher_owns_a_shard(&group(4), 4));
+
+        // A NUMA split keeps the previous behavior: the dispatcher's node is not
+        // known at build time, so its shard could land cross-socket.
+        let split = vec![
+            NodeShard {
+                index: 0,
+                cpus: vec![],
+                workers: 3,
+            },
+            NodeShard {
+                index: 1,
+                cpus: vec![],
+                workers: 3,
+            },
+        ];
+        assert!(!dispatcher_owns_a_shard(&split, 8));
+
+        let pool = single_group_pool(4);
+        assert_eq!(pool.total_workers(), 4);
+        assert!(pool.dispatcher_shard.is_none());
+        pool.shutdown();
+    }
+
+    const BUDGET_LANE_CHILD_ENV: &str = "ONNX_GENAI_TEST_BUDGET_LANE_CHILD";
+    const BUDGET_LANE_CONFINE_ENV: &str = "ONNX_GENAI_TEST_BUDGET_LANE_CONFINE";
+    const BUDGET_LANE_MARKER: &str = "BUDGET_LANE_RESULT=";
+    const BUDGET_LANE_SKIP_MARKER: &str = "BUDGET_LANE_SKIP=";
+
+    /// End-to-end guard for #1746, across the process boundary the defect lived
+    /// in.
+    ///
+    /// The off-by-one was not in either half. `bound_process_to_decode_budget`
+    /// correctly confines the process to `N` CPUs, and
+    /// `reserve_single_group_headroom` correctly keeps one allowed CPU free for
+    /// the dispatcher. It only appears when they *compose*: the confinement
+    /// makes the group fully subscribed, so the reservation always fires and the
+    /// budget silently buys `N-1` lanes.
+    ///
+    /// A subprocess per budget is required, not stylistic. Both halves latch --
+    /// `PROCESS_BUDGET_BOUND` is a `OnceLock` and the pool is a `OnceLock` --
+    /// and the child mutates process-wide CPU affinity, which would poison the
+    /// test runner. Unit tests on either half in isolation cannot see this;
+    /// that is precisely how it shipped.
+    #[test]
+    fn an_explicit_budget_buys_its_full_width_end_to_end() {
+        if std::env::var_os(BUDGET_LANE_CHILD_ENV).is_some() {
+            return; // The child arm runs as its own test below.
+        }
+        let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+        // A budget of 1 confines the process to one CPU, which `build_from_env`
+        // deliberately declines (no core left for the dispatcher), so the
+        // smallest budget that builds a pool is 2.
+        let budgets: Vec<usize> = [2usize, 4, 8]
+            .into_iter()
+            .filter(|&n| n <= available)
+            .collect();
+        if budgets.is_empty() {
+            eprintln!("skipped: needs >= 2 CPUs, host reports {available}");
+            return;
+        }
+
+        for budget in budgets {
+            let lane = run_budget_lane_child(budget, None).expect("the unconfined arm never skips");
+            let (allowed, nodes, threads, lanes) =
+                (lane.allowed, lane.nodes, lane.threads, lane.lanes);
+            let (requested, realized, path) = (lane.requested, lane.realized, lane.path.as_str());
+            if nodes != 1 {
+                // A budget that straddles NUMA nodes takes the split path, which
+                // keeps the previous per-node reservation. Not this test's case.
+                eprintln!("budget {budget}: skipped, {nodes}-node split layout");
+                continue;
+            }
+            // The introspection must agree with the pool it describes, on the
+            // real production path. A `t=N` row is only a width-N measurement if
+            // this holds, which is the whole reason the read exists.
+            assert_eq!(
+                (requested, realized, path),
+                (Some(budget), Some(budget), "spmd-pool"),
+                "budget {budget}: decode_width must report the realized width and \
+                 path, got requested={requested:?} realized={realized:?} path={path}"
+            );
+            assert_eq!(
+                lanes, budget,
+                "ONNX_GENAI_CPU_DECODE_THREADS={budget} must buy {budget} compute lanes, \
+                 got {lanes} ({threads} pinned threads on {allowed} allowed CPUs)"
+            );
+            assert!(
+                threads >= 1 && threads <= budget,
+                "budget {budget}: {threads} pinned threads is outside the budget"
+            );
+            if allowed == budget {
+                // The confinement landed, so the reservation must have fired and
+                // the dispatcher must be covering the lane it freed.
+                assert_eq!(
+                    threads,
+                    budget - 1,
+                    "budget {budget}: a fully-subscribed group must leave one CPU \
+                     free for the dispatcher"
+                );
+            }
+        }
+    }
+
+    /// One decoded `BUDGET_LANE_MARKER` line from a lane child.
+    struct BudgetLane {
+        allowed: usize,
+        nodes: usize,
+        threads: usize,
+        lanes: usize,
+        requested: Option<usize>,
+        realized: Option<usize>,
+        path: String,
+    }
+
+    /// Spawns the lane child at `budget`, optionally pre-confining it to
+    /// `confine` CPUs, and decodes its one result line.
+    fn run_budget_lane_child(budget: usize, confine: Option<usize>) -> Option<BudgetLane> {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.arg("--exact")
+            .arg("decode_spmd::tests::budget_lane_child")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .arg("--ignored")
+            .env(BUDGET_LANE_CHILD_ENV, budget.to_string())
+            .env(
+                crate::kernels::matmul_nbits::DECODE_THREADS_ENV,
+                budget.to_string(),
+            )
+            .env(PERSISTENT_POOL_ENV, "1")
+            // The child asserts an exact path label, so any ambient variable that
+            // can change which path is chosen has to be cleared, not inherited.
+            // `steal` would relabel the path "work-stealing-pool" and fail the
+            // assertion for a reason unrelated to decode width.
+            .env_remove(DECODE_SCHEDULE_ENV)
+            .env_remove(crate::decode_affinity::DECODE_AFFINITY_ENV);
+        if let Some(confine) = confine {
+            cmd.env(BUDGET_LANE_CONFINE_ENV, confine.to_string());
+        } else {
+            cmd.env_remove(BUDGET_LANE_CONFINE_ENV);
+        }
+        let output = cmd.output().expect("run decode-budget lane child");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "budget {budget} child failed ({}):\nstdout:\n{stdout}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if let Some(reason) = stdout.lines().find_map(|line| {
+            line.split_once(BUDGET_LANE_SKIP_MARKER)
+                .map(|(_, r)| r.trim())
+        }) {
+            eprintln!("budget {budget}: child skipped: {reason}");
+            return None;
+        }
+        let encoded = stdout
+            .lines()
+            .find_map(|line| {
+                line.split_once(BUDGET_LANE_MARKER)
+                    .map(|(_, rest)| rest.trim())
+            })
+            .unwrap_or_else(|| panic!("budget {budget} child emitted no result:\n{stdout}"));
+        let fields: Vec<&str> = encoded.split(',').collect();
+        assert_eq!(fields.len(), 7, "malformed lane result {encoded:?}");
+        let num = |i: usize| fields[i].parse::<usize>().unwrap();
+        // The child encodes an absent width as 0, which is never a valid width.
+        let opt = |i: usize| Some(num(i)).filter(|&n| n != 0);
+        Some(BudgetLane {
+            allowed: num(0),
+            nodes: num(1),
+            threads: num(2),
+            lanes: num(3),
+            requested: opt(4),
+            realized: opt(5),
+            path: fields[6].trim().to_owned(),
+        })
+    }
+
+    /// The counterpart to [`an_explicit_budget_buys_its_full_width_end_to_end`]:
+    /// when the host *cannot* honour the request, the read must say so.
+    ///
+    /// This is the case that makes the introspection worth having. A published
+    /// `t=N` row is a label, not a measurement, and the ways a request gets
+    /// silently reduced -- `reserve_single_group_headroom`,
+    /// `reserve_split_headroom`, and the single-CPU cpuset branch that drops
+    /// decode to the flat path -- all report only through `report_spmd_fallback`,
+    /// which is `tracing::debug!`/`NXRT_CALIB_DEBUG`-gated and therefore invisible
+    /// in a default benchmark run.
+    ///
+    /// Requesting 8 lanes inside a 2-CPU cpuset is that situation made
+    /// deterministic. The exact realized width is a policy detail this test
+    /// deliberately does not pin; what it pins is that the read never claims the
+    /// request was honoured when it was not.
+    #[test]
+    fn a_budget_the_host_cannot_honour_never_reports_as_requested() {
+        let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+        const CONFINE: usize = 2;
+        const REQUEST: usize = 8;
+        if available < REQUEST {
+            eprintln!("skipped: needs >= {REQUEST} CPUs, host reports {available}");
+            return;
+        }
+        let Some(lane) = run_budget_lane_child(REQUEST, Some(CONFINE)) else {
+            return; // No process-wide affinity mask on this host.
+        };
+        assert!(
+            lane.allowed <= CONFINE,
+            "the confinement must land, got {} allowed CPUs",
+            lane.allowed
+        );
+        assert_eq!(
+            lane.requested,
+            Some(REQUEST),
+            "the requested width must survive the reduction -- without it there is \
+             nothing to compare the realized width against"
+        );
+        assert!(
+            lane.realized.is_none_or(|r| r < REQUEST),
+            "a {CONFINE}-CPU cpuset cannot deliver {REQUEST} lanes, but the read \
+             reported {:?}",
+            lane.realized
+        );
+        // The whole contract in one line: this must be false whenever the label
+        // and the reality disagree.
+        let width = DecodeWidth {
+            requested: lane.requested,
+            realized: lane.realized,
+            path: "",
+        };
+        assert!(
+            !width.is_as_requested(),
+            "requested={:?} realized={:?} must not report as requested",
+            lane.requested,
+            lane.realized
+        );
+        // And the pool, if one was built, must agree with what the read said.
+        if lane.path == "spmd-pool" {
+            assert_eq!(
+                lane.realized,
+                Some(lane.lanes),
+                "the read must report the pool's own lane count"
+            );
+        }
+        eprintln!(
+            "requested={REQUEST} in a {CONFINE}-CPU cpuset -> allowed={} realized={:?} path={}",
+            lane.allowed, lane.realized, lane.path
+        );
+    }
+
+    /// The child arm of [`an_explicit_budget_buys_its_full_width_end_to_end`].
+    /// `#[ignore]`d so only the parent's explicit `--ignored --exact` run
+    /// executes it; it confines the process's CPU affinity and must not run in
+    /// the shared runner.
+    #[test]
+    #[ignore = "spawned by an_explicit_budget_buys_its_full_width_end_to_end"]
+    fn budget_lane_child() {
+        let Some(budget) = std::env::var_os(BUDGET_LANE_CHILD_ENV) else {
+            return;
+        };
+        let budget: usize = budget.to_string_lossy().parse().expect("budget");
+        // Optional pre-confinement, used by the reduced-width arm to make the
+        // host unable to honour the request. Applied before
+        // `bound_process_to_decode_budget` so the budget logic sees the smaller
+        // cpuset, exactly as an external `taskset` or container limit would
+        // present it.
+        if let Some(confined) = std::env::var_os(BUDGET_LANE_CONFINE_ENV) {
+            let confined: usize = confined.to_string_lossy().parse().expect("confine");
+            let cpus: Vec<usize> = (0..confined).collect();
+            if let Err(err) = crate::decode_affinity::set_current_thread_affinity(&cpus) {
+                // Only Linux implements a process-wide mask, so on other hosts
+                // there is no way to manufacture the reduction. Report a skip
+                // rather than failing: the arm is about the read's behaviour
+                // under reduction, not about affinity support.
+                println!("{BUDGET_LANE_SKIP_MARKER}{err}");
+                return;
+            }
+        }
+        // `pools()` reads the budget from the environment, so confirm the env the
+        // parent set agrees with the budget it asked for. Checked against the
+        // *unclamped* accessor, since under confinement the resolved width is
+        // deliberately smaller than the request.
+        assert_eq!(
+            crate::kernels::matmul_nbits::decode_thread_budget(),
+            Some(budget),
+            "the child's environment must carry the budget the parent requested"
+        );
+        // Exactly the production sequence: EP `initialize()` bounds the process,
+        // then the pool is built lazily at first decode.
+        crate::kernels::matmul_nbits::bound_process_to_decode_budget();
+        let allowed = crate::decode_affinity::allowed_cpus().map_or(0, |c| c.len());
+        // Deliberately the global `pools()` entry rather than `build_from_env`
+        // directly: that is what a real decode reaches, and it is the only way
+        // `decode_width` sees a resolved path -- so this arm checks the
+        // introspection a harness will assert on, not a parallel construction of
+        // it that could agree while production disagrees.
+        let pool = pools();
+        let (nodes, threads, lanes) = pool.map_or((0, 0, 0), |p| {
+            (
+                p.node_count(),
+                p.node_thread_counts.iter().sum::<usize>(),
+                p.total_workers(),
+            )
+        });
+        let width = decode_width();
+        println!(
+            "{BUDGET_LANE_MARKER}{allowed},{nodes},{threads},{lanes},{},{},{}",
+            width.requested.unwrap_or(0),
+            width.realized.unwrap_or(0),
+            width.path,
+        );
+        shutdown_pools();
     }
 
     #[test]

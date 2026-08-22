@@ -589,9 +589,10 @@ pub const WEIGHT_OFFLOAD_SCAN_RESISTANT_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_S
 /// The count-vs-byte residency gap therefore cannot be closed by an eviction-
 /// order change alone; it needs the structural lever deferred by #837 (a
 /// dedicated transient staging zone so a large tensor can be handed to the
-/// kernel *without* evicting a resident page). Kept default-OFF and wired only
-/// so the rejected approach and its evidence are reviewable; the default
-/// (size-blind) path is unaffected.
+/// kernel *without* evicting a resident page). The parser and implementation
+/// remain for the rejected experiment's tests and evidence, but CUDA provider
+/// construction rejects an enabled policy before initializing the device. The
+/// default (size-blind) path is unaffected.
 pub const WEIGHT_OFFLOAD_BYTE_AWARE_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_BYTE_AWARE";
 
 /// Parse [`WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV`]. Async page-in is **default-on**:
@@ -623,9 +624,8 @@ pub(crate) fn scan_resistant_from_env_value(value: Option<&str>) -> bool {
     }
 }
 
-/// Parse [`WEIGHT_OFFLOAD_BYTE_AWARE_ENV`]. Byte-aware residency defaults **OFF**
-/// (opt-in): only `1`/`true`/`yes`/`on` (case/whitespace-insensitive) enable it,
-/// every other value — including unset — keeps the size-blind admission path.
+/// Parse [`WEIGHT_OFFLOAD_BYTE_AWARE_ENV`] so CUDA provider construction can
+/// diagnose and reject attempts to enable the known-corrupting experiment.
 pub(crate) fn byte_aware_from_env_value(value: Option<&str>) -> bool {
     match value {
         Some(value) => matches!(
@@ -1211,12 +1211,9 @@ pub struct DeviceOffloadPolicy {
     /// MoE boundaries stay on LRU even when this is enabled to avoid regressing
     /// skewed expert selection.
     pub scan_resistant_dense: bool,
-    /// Use byte-aware admission on top of scan-resistant residency: keep the
-    /// largest tensors resident instead of whatever first-fit smalls landed in
-    /// the leftover budget. Default-off / opt-in via
-    /// `ONNX_GENAI_WEIGHT_OFFLOAD_BYTE_AWARE=1` (#837 item 3). Has no effect
-    /// unless `scan_resistant_dense` is also on, since it only refines the
-    /// `StableResident` bypass decision.
+    /// Request the known-corrupting byte-aware residency experiment. CUDA
+    /// provider construction rejects `true`; the field remains only to preserve
+    /// the rejected experiment's policy evidence.
     pub byte_aware_residency: bool,
     /// Eviction victim ordering for the size-blind admission path (#888
     /// investigation). Default [`EvictOrderProbe::Lru`] is byte-identical to the
@@ -3224,9 +3221,8 @@ impl CudaWeightResidency {
         self
     }
 
-    /// Select byte-aware admission (#837 item 3). Only refines the
-    /// `StableResident` bypass decision, so it has no effect unless
-    /// scan-resistant dense residency is also on.
+    /// Select the rejected byte-aware admission experiment for isolated policy
+    /// tests. CUDA provider construction never exposes an enabled pager.
     pub fn with_byte_aware_residency(mut self, byte_aware: bool) -> Self {
         self.byte_aware = byte_aware;
         self

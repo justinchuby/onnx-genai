@@ -61,18 +61,12 @@ pub struct GenerationDefaults {
 
 /// Configuration published with a standalone speculative proposer model.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, JsonSchema)]
-#[schemars(transform = schema_helpers::speculator_config_aliases)]
 pub struct SpeculatorConfig {
     /// Proposal architecture used by the speculator.
-    ///
-    /// The deprecated `method` alias is accepted on input.
-    #[serde(alias = "method")]
     pub proposal_type: ProposalType,
 
     /// Maximum number of tokens proposed per verifier step; defaults to 4.
-    ///
-    /// The deprecated `tokens_per_step` alias is accepted on input.
-    #[serde(default = "default_num_speculative_tokens", alias = "tokens_per_step")]
+    #[serde(default = "default_num_speculative_tokens")]
     #[schemars(range(min = 1))]
     pub num_speculative_tokens: usize,
 

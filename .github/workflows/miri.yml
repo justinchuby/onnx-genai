@@ -204,6 +204,27 @@ jobs:
           # and (2) retag read of type `[u64]` on thread `nxrt-task-0`".
           run_miri "onnx-runtime-ep-cpu task runtime nested dispatch (integration)" \
             env MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-num-cpus=4 -Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --test task_runtime_latency -- --ignored nested_dispatch_slot_pressure
+          # The persistent SPMD decode pool publishes a `Job` that holds a raw
+          # pointer to a closure borrowed off the *dispatcher's stack frame*,
+          # and the workers read through it until the barrier drains. Since
+          # #1746 the dispatcher also computes a shard inline, so a panic in
+          # that shard can unwind the frame the workers are still reading --
+          # a use-after-free that no native run reliably observes, because it
+          # depends on the worker being scheduled inside the unwind window.
+          # Only the panic-safety test is covered: the rest of the module does
+          # OS affinity and is not Miri-tractable.
+          #
+          # `-Zmiri-ignore-leaks` because the pool's workers are resident by
+          # design, and `-Zmiri-num-cpus=4` so the shards land on distinct
+          # threads instead of collapsing onto one.
+          #
+          # Verified both ways: as written it reports `test result: ok` in
+          # ~23s; removing the `catch_unwind` around the dispatcher's shard
+          # reports "Undefined Behavior: Data race detected between (1)
+          # non-atomic read on thread `onnx-genai-spmd` and (2) retag write of
+          # type `{closure@decode_spmd.rs}`".
+          run_miri "onnx-runtime-ep-cpu decode pool dispatcher shard" \
+            env MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-num-cpus=4 -Zmiri-ignore-leaks" cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --lib decode_spmd::tests::a_panic_in_the_dispatcher
           run_miri "onnx-runtime-ep-cpu strided" \
             cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --lib strided::tests
           run_miri "onnx-runtime-ep-cpu provider" \
