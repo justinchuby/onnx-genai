@@ -2322,6 +2322,12 @@ GB/s columns exist: ORT *demonstrates* that more bandwidth was available on this
 machine at that moment. We are therefore not limited by the memory system, and
 "the host is busy" cannot explain the difference — it was busy for both arms.
 
+A later quiet-host run of the same cell gives 272.7 vs 436.2 tok/s (28.5 → 39.7
+and 40.7 → 63.5 GB/s), i.e. **1.60x**. Both figures are draws from the bistable
+distribution characterised below; the qualitative point — ORT reaching a
+bandwidth we do not, under whatever conditions both arms share — is what is
+stable across them, not the specific multiplier.
+
 The complementary absolute framing (a single pinned core sustaining ~3.4 GB/s
 against a 31–36 GB/s per-CCX ceiling, ≈2.3 MACs/cycle against AVX2+FMA's 16, so
 ~14% of arithmetic peak) points the same way — at the nibble unpack and int→f32
@@ -2350,6 +2356,127 @@ If it holds, it has a second consequence worth stating plainly: **the `s=2`/`s=4
 so those cells were the baseline degrading, not the kernel improving — and no
 kernel change should be justified by them.
 
+### The mechanism: the acc0 kernel is per-*block* bound, not per-*nibble* bound
+
+This is the one result of this segment that is both quantitative and robust. It
+is a **within-sweep comparison of a single arm**, all four points taken
+back-to-back in one quiet window, so it does not depend on the ORT baseline or
+on absolute throughput being stable.
+
+Sweeping `block_size` varies how often the per-block epilogue runs while leaving
+the number of nibbles to unpack essentially unchanged. qwen, `t=16`, `s=1`,
+`accuracy_level = 0`:
+
+| block | tok/s | spread | bytes/token | achieved GB/s |
+|---|---|---|---|---|
+| 16 | 93.3 | 8.7% | 174.8 MB | 16.3 |
+| 32 | 195.2 | 7.0% | 145.7 MB | **28.4** |
+| 64 | 428.9 | 16.3% | 131.1 MB | **56.2** |
+| 128 | 352.8 | 57.6% | 123.8 MB | (spread too high to quote) |
+
+Single launch per row, so the *magnitudes* below are superseded by the paired
+measurement that follows; the table is kept because the monotone direction and
+the block-16 scalar cliff are both real.
+
+That single-shot sweep suggested ~2x per doubling. **It overstated the effect**,
+because block 64 happened to draw a fast placement (see the bistability section);
+this is precisely the trap this section is otherwise about. Re-measured properly
+as six interleaved, independently launched pairs:
+
+| pair | block 32 | block 64 | ratio |
+|---|---|---|---|
+| 1 | 190.7 | 307.0 | 1.61x |
+| 2 | 195.5 | 283.3 | 1.45x |
+| 3 | 204.0 | 281.9 | 1.38x |
+| 4 | 203.9 | 298.0 | 1.46x |
+| 5 | 192.5 | 278.0 | 1.44x |
+| 6 | 199.2 | 303.4 | 1.52x |
+| **median** | **197.4** | **290.7** | **1.47x** |
+
+**1.47x, six pairs out of six, with no overlap between the two distributions.**
+That is the load-bearing number; the 2.20x from the single sweep is withdrawn.
+
+Doubling the block size moves 1.11x less traffic and does 1.47x more work, and
+the nibble count is identical in both rows. A per-nibble cost cannot produce
+that. **The dominant cost is per-block work.**
+
+Worth noting the model this *fails* to match, since it bounds how well the
+mechanism is understood: counting instructions in the loop below predicts only
+~1.14x for 32→64 (block 64 amortises one epilogue over two chunks instead of
+one). The measured 1.47x is larger, so per-block cost is not just the visible
+instruction count — the branchy `BorrowedScales::get` discriminant test, the
+bounds-checked indexing, and the dependency chain through `blk[c]` into `acc[c]`
+are all per-block too. The *direction* is established; the full decomposition is
+not, and should not be claimed until a prototype confirms it.
+
+Block 16 is a separate effect and is not evidence for anything here: `chunks =
+block_size / 32` is **zero** at block 16, and `!block_size.is_multiple_of(32)`
+sends it to the scalar fallback entirely. It is slow because it is not
+vectorised at all.
+
+The code says the same thing. In `borrowed_int4_nblock4_avx2` the inner chunk
+loop runs `block_size / 32` times, so **at block 32 it runs exactly once**, and
+each block then pays a full epilogue:
+
+```rust
+for c in 0..group {
+    let scale = scales.get(scale_bases[c] + block);
+    let zero_point = layout.zero_point(zp_rows[c], block) as f32;
+    acc[c] = _mm256_fmadd_ps(blk[c], _mm256_set1_ps(scale), acc[c]);
+    correction[c] += scale * zero_point * activation_sums[block];
+}
+```
+
+At block 32 that epilogue — a bounds-checked scale fetch, a branchy
+`zero_point` lookup, a broadcast, an FMA, and three scalar float ops — runs
+**once per four FMAs of useful work**, per column. At block 64 it amortises over
+eight, at block 128 over sixteen. That is exactly the observed curve.
+
+Two further notes:
+
+* The benchmark passes **no zero-point tensor**, so `zp_rows[c]` is `None` and
+  `layout.zero_point` returns a constant. It is still being called per block per
+  column, inside the hot loop. That is pure overhead on the default production
+  path, with no numerical consequence to hoisting it.
+* `correction[c] += scale * zero_point * activation_sums[block]` is a scalar
+  chain across blocks. With `zp` constant it is `zp * dot(scales, activation_sums)`
+  — a reduction that could be computed 8-wide in a separate pass. That one is
+  **not** numerically free: f32 addition is not associative, so it must be
+  weighed against the acc0 exactness contract rather than assumed.
+
+This is §22's finding ("per-block bookkeeping was 1.68x of the int4 acc4 decode
+kernel — at block 32, at low thread counts") reappearing in the **acc0** kernel,
+where it was never fixed. It supersedes the unpack/convert hypothesis stated
+earlier in this section, which this sweep **falsifies**: if the nibble unpack
+dominated, block size would barely move the number.
+
+### The host is bistable, and a cpuset mask is not enough
+
+Eight interleaved ORT/native pairs on a quiet host:
+
+```
+ORT     338.6  421.8  442.0  428.6  440.1  223.0  293.5  255.0
+native  198.3  196.0  240.9  335.6  200.3  197.8  197.6  264.9
+```
+
+Both arms are bistable, and the tell is that the runs reporting *low* intra-run
+spread cluster at each arm's fast mode (ORT 442.0/428.6/440.1 at 0.4%/3.5%/3.0%;
+native 198.3/200.3/197.8/197.6 at 16%/0.2%/2.4%/4.0%). A run is either placed
+well and then internally stable, or placed badly and then also noisy.
+
+This is thread-to-L3-domain placement at process start. `taskset -c 0,2,...,30`
+constrains the pool to 16 distinct physical cores spanning **both** 32 MiB L3
+instances, but it does not determine which thread lands in which domain, and the
+weight set (145.7 MB) is far larger than either. So the earlier attribution of
+the slow cluster to "external contention" was itself incomplete: contention was
+real and was the dominant error term, but a second bistability survives on an
+idle host.
+
+**Consequence for all future numbers in this document: a cpuset mask is not
+sufficient pinning.** Per-thread placement has to be fixed, or every cell has to
+be reported as a distribution over independent process launches. Single-run
+ratios on this host are not reproducible, whichever arm they favour.
+
 ### Disposition
 
 * Harness unified and the definition written into the module docs as a table, so
@@ -2357,14 +2484,26 @@ kernel change should be justified by them.
 * Both arms print `spread_%`; the driver blocks on a quiet host and labels
   untrusted cells.
 * The 24-cell matrix, the 0.436x headline, and the "concurrency-dependent gap"
-  reading are **withdrawn pending re-measurement on an uncontended host**.
-* The one surviving quantitative claim is the within-window one: **ORT sustains
-  1.43x our achieved bandwidth on the same footprint in the same conditions**,
-  so the deficit is real, is not the memory system, and is not the host.
-* Next mechanism to attack is the **unpack/convert issue cost inside
-  `borrowed_int4_nblock4_avx2`**, which is kernel-owned. It is the hypothesis
-  most consistent with the evidence, and it is *not yet proven* — proving it
-  needs a quiet host and a mechanism-isolating ablation, not another matrix.
+  reading are **withdrawn**. A quiet-host re-measurement under the unified
+  definition puts `qwen t=16 s=1` at **0.625x** (A/A 1.042), but see the
+  bistability section: even that is one draw from a distribution, and the
+  matching `llama t=16 s=1` cell is **rejected by its own A/A of 0.796**, whose
+  20% self-noise is comparable to the 24% effect it was supposed to support.
+* We win `s=2`/`s=4` decisively (qwen 1.86x/2.18x, llama 2.27x/2.40x, effects far
+  larger than their A/A noise) — but our *absolute* throughput falls with session
+  count (qwen 272.7 → 192.2 → 152.9). Those cells are the baseline collapsing
+  (436.2 → 103.1 → 70.0), not us scaling, and must not be cited as kernel wins.
+* **Next mechanism, now identified rather than guessed: amortise the per-block
+  epilogue in `borrowed_int4_nblock4_avx2`.** The block sweep shows the kernel
+  reaches the machine's bandwidth ceiling at block 64 and half of it at the
+  production block 32, and the code shows why — at block 32 the chunk loop runs
+  once, so every four FMAs pay a scale fetch, a branchy `zero_point` lookup, a
+  broadcast, an FMA and three scalar ops. Hoisting the `zp_rows[c] == None` case
+  out of the block loop is numerically free and is the first thing to do;
+  vectorising the `correction` reduction is not free and must be weighed against
+  the acc0 exactness contract.
+* The earlier unpack/convert hypothesis in this section is **falsified** by that
+  same sweep and should not be picked up by the next reader.
 * The dispatch-width question was handed to the runtime owner with CPU-time
   evidence (total CPU-seconds flat across widths, `sys` time rising ~20x from
   `t<=2` to `t>=4`) rather than tuned around in the kernel.
