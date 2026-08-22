@@ -93,7 +93,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::decode_affinity::{NodeShard, NumaTopology};
-use crate::kernels::matmul_nbits::output_chunk_len;
+use crate::kernels::matmul_nbits::output_chunk_len_for;
 
 /// Environment switch selecting the persistent SPMD decode pool policy:
 /// **unset (the default) or `=1`** uses the persistent SPMD pool deterministically
@@ -811,12 +811,16 @@ impl SpmdDecodePools {
     /// flat path hands to `par_chunks_mut`, so the arithmetic is identical.
     /// Tiny ops (below the flat path's parallelization threshold) run serially
     /// on the dispatcher, so the same set of ops parallelize as before.
+    ///
+    /// The serial threshold is sized from [`Self::total_workers`], the executor
+    /// that will actually run the fan-out, and *not* from the ambient Rayon
+    /// width -- this pool is not a Rayon pool. See [`output_chunk_len_for`].
     pub fn dispatch_output_rows<F>(&self, result: &mut [f32], k: usize, compute: &F)
     where
         F: Fn(usize, &mut [f32]) + Sync,
     {
         let n = result.len();
-        if self.total_workers <= 1 || output_chunk_len(n, k) >= n {
+        if self.total_workers <= 1 || output_chunk_len_for(self.total_workers, n, k) >= n {
             compute(0, result);
             return;
         }
