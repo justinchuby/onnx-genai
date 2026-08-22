@@ -28,7 +28,7 @@ jobs:
           repository: onnxruntime/mobius
           # Exact producer revision from Mobius PR #537. Keep CI reproducible
           # until that commit is reachable from the upstream default branch.
-          ref: 3b73190bc352bf0794c6badfe2383c559506ca77
+          ref: f0e2acfd56b2b62d1e04be15a6cb54bddf24e08a
           path: validation/mobius
       - uses: actions/setup-python@v5
         with:

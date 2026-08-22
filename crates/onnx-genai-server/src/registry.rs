@@ -853,29 +853,9 @@ mod tests {
         tokenizer: Arc<Tokenizer>,
         last_request_at: u64,
     ) -> Arc<ModelHandle> {
-        let (tx, _rx) = mpsc::channel(1);
         Arc::new(ModelHandle {
             id: id.to_string(),
-            engine: EngineDriver {
-                commands: tx,
-                generation_capacity: Arc::new(Semaphore::new(0)),
-                generation_capacity_size: 0,
-                // A test double drives no engine, so there is no pool to
-                // mirror. Left in the default `Unknown` state rather than
-                // asserted not-applicable: nothing here has determined a
-                // decode path, and "pending" is the only claim that holds.
-                kv_telemetry: Default::default(),
-                resource_snapshot: Default::default(),
-                memory_strategy_plan: Arc::new(onnx_genai_engine::MemoryStrategyPlan::unknown(
-                    0,
-                    None,
-                    "registry test stub",
-                )),
-                device_authority: None,
-                // A stub drives no engine, so it advertises the honest "no
-                // batching" report used by every non-batching backend.
-                batching: Arc::new(crate::driver::BatchingReport::single_sequence_stub()),
-            },
+            engine: stub_engine_driver(),
             tokenizer,
             chat_template: None,
             model_max_context: None,
@@ -890,6 +870,66 @@ mod tests {
             warmed: AtomicBool::new(false),
             warmup_lock: std::sync::Mutex::new(()),
         })
+    }
+
+    fn stub_engine_driver() -> EngineDriver {
+        let (tx, _rx) = mpsc::channel(1);
+        EngineDriver {
+            commands: tx,
+            generation_capacity: Arc::new(Semaphore::new(0)),
+            generation_capacity_size: 0,
+            // A test double drives no engine, so there is no pool to
+            // mirror. Left in the default `Unknown` state rather than
+            // asserted not-applicable: nothing here has determined a
+            // decode path, and "pending" is the only claim that holds.
+            kv_telemetry: Default::default(),
+            resource_snapshot: Default::default(),
+            memory_strategy_plan: Arc::new(onnx_genai_engine::MemoryStrategyPlan::unknown(
+                0,
+                None,
+                "registry test stub",
+            )),
+            device_authority: None,
+            // A stub drives no engine, so it advertises the honest "no
+            // batching" report used by every non-batching backend.
+            batching: Arc::new(crate::driver::BatchingReport::single_sequence_stub()),
+        }
+    }
+
+    #[test]
+    fn registry_does_not_infer_speech_capability_from_adapter_files_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("inference_metadata.yaml"),
+            "pipeline:\n  workflow:\n    components:\n      prompt:\n        contract:\n          id: onnx-genai.text-assembly\n        implementation:\n          artifact: speech_processor.json\n",
+        )
+        .expect("metadata");
+        std::fs::write(
+            dir.path().join("speech_processor.json"),
+            r#"{"max_input_tokens":1,"max_output_units":1,"segments":[{"literal":"x"}]}"#,
+        )
+        .expect("processor");
+
+        let handle = ModelHandle::new(ModelHandleParts {
+            id: "adapter-only".to_string(),
+            model_dir: dir.path().to_path_buf(),
+            engine: stub_engine_driver(),
+            tokenizer: load_tokenizer(),
+            chat_template: None,
+            model_max_context: None,
+            generation_defaults: None,
+            fim_config: None,
+            pipeline: true,
+            multimodal: None,
+            speech_prompt: None,
+            image_pipeline: None,
+        })
+        .expect("handle");
+
+        assert!(
+            handle.speech_prompt.is_none(),
+            "registry must require the loader's compatible audio-output decision"
+        );
     }
 
     fn load_tokenizer() -> Arc<Tokenizer> {
