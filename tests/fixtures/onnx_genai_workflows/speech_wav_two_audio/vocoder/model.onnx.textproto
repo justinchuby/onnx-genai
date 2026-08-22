@@ -1,0 +1,278 @@
+ir_version: 8
+producer_name: "onnx-genai tiny-speech-wav fixture"
+graph {
+  node {
+    output: "ramp"
+    name: "node_Constant_0"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        dims: 1
+        dims: 64
+        data_type: 1
+        name: "ramp_value"
+        raw_data: "\000\000\000\000\000\000\200<\000\000\000=\000\000@=\000\000\200=\000\000\240=\000\000\300=\000\000\340=\000\000\000>\000\000\020>\000\000 >\000\0000>\000\000@>\000\000P>\000\000`>\000\000p>\000\000\200>\000\000\210>\000\000\220>\000\000\230>\000\000\240>\000\000\250>\000\000\260>\000\000\270>\000\000\300>\000\000\310>\000\000\320>\000\000\330>\000\000\340>\000\000\350>\000\000\360>\000\000\370>\000\000\000?\000\000\004?\000\000\010?\000\000\014?\000\000\020?\000\000\024?\000\000\030?\000\000\034?\000\000 ?\000\000$?\000\000(?\000\000,?\000\0000?\000\0004?\000\0008?\000\000<?\000\000@?\000\000D?\000\000H?\000\000L?\000\000P?\000\000T?\000\000X?\000\000\\?\000\000`?\000\000d?\000\000h?\000\000l?\000\000p?\000\000t?\000\000x?\000\000|?"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    output: "mean_scale"
+    name: "node_Constant_1"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        data_type: 1
+        name: "mean_scale_value"
+        raw_data: "o\022\203:"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    output: "two_pi"
+    name: "node_Constant_2"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        data_type: 1
+        name: "two_pi_value"
+        raw_data: "\333\017\311@"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    output: "channel_shift"
+    name: "node_Constant_3"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        data_type: 1
+        name: "channel_shift_value"
+        raw_data: "\000\000\000?"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    output: "amplitude0"
+    name: "node_Constant_4"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        data_type: 1
+        name: "amplitude0_value"
+        raw_data: "\000\000\000?"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    output: "amplitude1"
+    name: "node_Constant_5"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        data_type: 1
+        name: "amplitude1_value"
+        raw_data: "\315\314\314>"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    output: "unsqueeze_axes"
+    name: "node_Constant_6"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        data_type: 7
+        name: "unsqueeze_axes_value"
+        raw_data: "\002\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    input: "prompt_tokens"
+    output: "tokens_f"
+    name: "node_Cast_7"
+    op_type: "Cast"
+    attribute {
+      name: "to"
+      i: 1
+      type: INT
+    }
+  }
+  node {
+    input: "tokens_f"
+    output: "mean"
+    name: "node_ReduceMean_8"
+    op_type: "ReduceMean"
+    attribute {
+      name: "axes"
+      ints: 1
+      type: INTS
+    }
+    attribute {
+      name: "keepdims"
+      i: 1
+      type: INT
+    }
+  }
+  node {
+    input: "mean"
+    input: "mean_scale"
+    output: "mean_scaled"
+    name: "node_Mul_9"
+    op_type: "Mul"
+  }
+  node {
+    input: "mean_scaled"
+    input: "unsqueeze_axes"
+    output: "mean_col"
+    name: "node_Unsqueeze_10"
+    op_type: "Unsqueeze"
+  }
+  node {
+    input: "ramp"
+    input: "mean_col"
+    output: "phase0"
+    name: "node_Add_11"
+    op_type: "Add"
+  }
+  node {
+    input: "phase0"
+    input: "two_pi"
+    output: "angle0"
+    name: "node_Mul_12"
+    op_type: "Mul"
+  }
+  node {
+    input: "angle0"
+    output: "sin0"
+    name: "node_Sin_13"
+    op_type: "Sin"
+  }
+  node {
+    input: "sin0"
+    input: "amplitude0"
+    output: "channel0"
+    name: "node_Mul_14"
+    op_type: "Mul"
+  }
+  node {
+    input: "phase0"
+    input: "channel_shift"
+    output: "phase1"
+    name: "node_Add_15"
+    op_type: "Add"
+  }
+  node {
+    input: "phase1"
+    input: "two_pi"
+    output: "angle1"
+    name: "node_Mul_16"
+    op_type: "Mul"
+  }
+  node {
+    input: "angle1"
+    output: "sin1"
+    name: "node_Sin_17"
+    op_type: "Sin"
+  }
+  node {
+    input: "sin1"
+    input: "amplitude1"
+    output: "channel1"
+    name: "node_Mul_18"
+    op_type: "Mul"
+  }
+  node {
+    input: "channel0"
+    input: "channel1"
+    output: "audio"
+    name: "node_Concat_19"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: 1
+      type: INT
+    }
+  }
+  node {
+    input: "channel0"
+    output: "waveform"
+    name: "node_Identity_20"
+    op_type: "Identity"
+  }
+  name: "tiny_speech_wav_vocoder"
+  input {
+    name: "prompt_tokens"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence"
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "audio"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 2
+          }
+          dim {
+            dim_value: 64
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "waveform"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 64
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 13
+}

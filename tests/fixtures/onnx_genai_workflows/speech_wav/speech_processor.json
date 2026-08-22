@@ -1,0 +1,29 @@
+{
+  "max_input_tokens": 256,
+  "max_output_units": 64,
+  "state_advance_units": 0,
+  "segments": [
+    {
+      "field": "instructions",
+      "transforms": [
+        {
+          "kind": "strip_markdown"
+        },
+        {
+          "kind": "collapse_newlines"
+        }
+      ]
+    },
+    {
+      "literal": " "
+    },
+    {
+      "field": "input",
+      "transforms": [
+        {
+          "kind": "collapse_newlines"
+        }
+      ]
+    }
+  ]
+}

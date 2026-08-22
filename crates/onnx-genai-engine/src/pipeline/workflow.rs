@@ -319,6 +319,10 @@ fn workflow_adapter_registry()
                 ("onnx-genai.parameter-overlay", "1"),
                 PipelineEngine::run_parameter_overlay_adapter as WorkflowAdapterExecutor,
             ),
+            (
+                ("onnx-genai.text-assembly", "1"),
+                PipelineEngine::run_text_assembly_adapter as WorkflowAdapterExecutor,
+            ),
         ])
     });
     &REGISTRY
@@ -1075,7 +1079,12 @@ impl PipelineEngine {
                                 .output_names()
                                 .iter()
                                 .cloned()
-                                .zip(session.run(&resolved)?)
+                                .zip(session.run(&resolved).with_context(|| {
+                                    format!(
+                                        "workflow ONNX component '{selected_component}' execution \
+                                         failed"
+                                    )
+                                })?)
                                 .collect()
                         };
                         for (port, tensor) in produced {
@@ -1879,10 +1888,13 @@ impl PipelineEngine {
                     .insert(component.to_string(), Arc::clone(&allocator));
                 allocator
             };
-        let discovered = if selected_outputs
-            .keys()
-            .any(|output| !declaration.ports.outputs.contains_key(output))
-        {
+        let discovered = if selected_outputs.keys().any(|output| {
+            declaration
+                .ports
+                .outputs
+                .get(output)
+                .is_none_or(|contract| resolve_workflow_shape(contract, component_symbols).is_err())
+        }) {
             let mut values = session
                 .output_names()
                 .iter()
@@ -1971,7 +1983,18 @@ impl PipelineEngine {
                         format!("stable component '{component}' output '{output}' has no metadata")
                     })?;
                 let shape = if let Some(contract) = declaration.ports.outputs.get(output) {
-                    resolve_workflow_shape(contract, component_symbols)?
+                    resolve_workflow_shape(contract, component_symbols).or_else(|_| {
+                        discovered
+                            .as_ref()
+                            .and_then(|values| values.get(output))
+                            .map(|value| value.shape().to_vec())
+                            .with_context(|| {
+                                format!(
+                                    "stable component '{component}' output '{output}' shape \
+                                     discovery did not return that output"
+                                )
+                            })
+                    })?
                 } else {
                     discovered
                         .as_ref()
@@ -2034,6 +2057,26 @@ impl PipelineEngine {
         let produced = stable_component_outputs(&stable)?;
         bindings.insert(key, stable);
         Ok(produced)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "matches the shared workflow adapter executor ABI"
+    )]
+    fn run_text_assembly_adapter(
+        &self,
+        component: &str,
+        _inputs: &BTreeMap<String, String>,
+        _outputs: &BTreeMap<String, String>,
+        _declaration: &onnx_genai_metadata::WorkflowComponent,
+        _values: &mut PipelineTensors,
+        _symbols: &HashMap<String, i64>,
+        _component_symbols: &mut HashMap<String, i64>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "text-assembly adapter '{component}' is an API-boundary contract and cannot be \
+             invoked inside a tensor workflow"
+        )
     }
 
     #[expect(
@@ -2697,6 +2740,27 @@ fn workflow_request_value(
                 };
                 Ok(Some(Value::from_slice_i64(&data, &shape)?))
             }
+            GeneratePrompt::TokenRows(rows) => {
+                anyhow::ensure!(
+                    contract.rank == 2,
+                    "multi-row prompt token workflow input must have rank 2"
+                );
+                anyhow::ensure!(!rows.is_empty(), "multi-row prompt must not be empty");
+                let columns = rows[0].len();
+                anyhow::ensure!(
+                    rows.iter().all(|row| row.len() == columns),
+                    "multi-row prompt token rows must have equal lengths"
+                );
+                let data = rows
+                    .iter()
+                    .flatten()
+                    .map(|token| i64::from(*token))
+                    .collect::<Vec<_>>();
+                Ok(Some(Value::from_slice_i64(
+                    &data,
+                    &[rows.len() as i64, columns as i64],
+                )?))
+            }
             GeneratePrompt::Text(_) => anyhow::bail!(
                 "prompt_tokens request binding requires token ids; use a tokenizer adapter for text"
             ),
@@ -3121,19 +3185,35 @@ fn validate_workflow_value(
     }
     if let Some(shape) = &contract.shape {
         for (axis, (declared, actual)) in shape.iter().zip(value.shape()).enumerate() {
+            let symbolic_actual = if contract.batch_layout.request_axis() == Some(axis) {
+                let factor = i64::try_from(contract.batch_layout.request_expansion_factor())?;
+                anyhow::ensure!(
+                    factor > 0,
+                    "workflow value '{name}' has a zero request expansion factor"
+                );
+                if actual % factor != 0 {
+                    anyhow::bail!(
+                        "workflow value '{name}' axis {axis} is {actual}, which is not divisible \
+                         by its request expansion factor {factor}"
+                    );
+                }
+                actual / factor
+            } else {
+                *actual
+            };
             match declared {
                 TensorDimension::Fixed(expected) if expected != actual => anyhow::bail!(
                     "workflow value '{name}' axis {axis} is {actual}, expected {expected}"
                 ),
                 TensorDimension::Symbol(symbol) if dynamic_symbols.contains(symbol) => {}
                 TensorDimension::Symbol(symbol) => match symbols.get(symbol) {
-                    Some(expected) if expected != actual => anyhow::bail!(
-                        "workflow value '{name}' axis {axis} binds symbol '{symbol}' to {actual}, \
-                         but it was already {expected}"
+                    Some(expected) if *expected != symbolic_actual => anyhow::bail!(
+                        "workflow value '{name}' axis {axis} binds symbol '{symbol}' to \
+                         {symbolic_actual}, but it was already {expected}"
                     ),
                     Some(_) => {}
                     None => {
-                        symbols.insert(symbol.clone(), *actual);
+                        symbols.insert(symbol.clone(), symbolic_actual);
                     }
                 },
                 TensorDimension::Fixed(_) => {}
@@ -3778,10 +3858,15 @@ fn merge_inactive_rows(
             .get(batch_axis)
             .context("mixed active row carry batch axis exceeds tensor rank")?,
     )?;
+    let expansion = state.contract.batch_layout.request_expansion_factor();
     anyhow::ensure!(
-        active.len() == rows,
-        "loop active mask has {} rows for state batch {rows}",
-        active.len()
+        expansion > 0,
+        "mixed active row carry has a zero request expansion factor"
+    );
+    anyhow::ensure!(
+        active.len().saturating_mul(expansion) == rows,
+        "loop active mask has {} requests with expansion {expansion} for state batch {rows}",
+        active.len(),
     );
     anyhow::ensure!(
         next.shape().get(batch_axis) == current.shape().get(batch_axis),
@@ -3832,7 +3917,7 @@ fn merge_inactive_rows(
     let mut merged = next.to_raw_bytes()?;
     for current_index in 0..current.numel() {
         let row = (current_index / current_strides[batch_axis]) % current_shape[batch_axis];
-        if active[row] {
+        if active[row / expansion] {
             continue;
         }
         let mut remainder = current_index;
@@ -4080,6 +4165,11 @@ mod workflow_scalar_tests {
     use super::*;
 
     #[test]
+    fn text_assembly_is_admitted_as_an_api_boundary_adapter() {
+        assert!(supports_workflow_adapter("onnx-genai.text-assembly", "1"));
+    }
+
+    #[test]
     fn batched_loop_predicate_preserves_rows() {
         let mut values = PipelineTensors::new();
         values.insert(
@@ -4118,6 +4208,24 @@ mod workflow_scalar_tests {
         let merged = merge_inactive_rows(&current, &next, &[true, false], &state)
             .expect("merge active rows");
         assert_eq!(merged.to_vec_i64().expect("merged values"), [10, 20, 3, 4]);
+    }
+
+    #[test]
+    fn inactive_requests_keep_all_of_their_expanded_guidance_rows() {
+        let current = Value::from_slice_i64(&[1, 2, 3, 4, 5, 6, 7, 8], &[4, 2]).expect("current");
+        let next = Value::from_slice_i64(&[10, 20, 30, 40, 50, 60, 70, 80], &[4, 2]).expect("next");
+        let state: onnx_genai_metadata::WorkflowStateCell = serde_yaml::from_str(
+            "contract: { dtype: int64, rank: 2, shape: [guidance_rows, 2], batch_layout: { \
+             kind: request_expanded, axis: 0, factor: 2 } }\nscope: invocation\ninitializer: \
+             initial\nrecurrence: { kind: invariant }",
+        )
+        .expect("state");
+        let merged = merge_inactive_rows(&current, &next, &[true, false], &state)
+            .expect("merge expanded request rows");
+        assert_eq!(
+            merged.to_vec_i64().expect("merged values"),
+            [10, 20, 30, 40, 5, 6, 7, 8]
+        );
     }
 
     #[test]
@@ -4495,7 +4603,7 @@ service_group: decoder_cache
 #[cfg(test)]
 mod workflow_sampling_binding_tests {
     use super::*;
-    use crate::{GenerateOptions, GenerateRequest};
+    use crate::{GenerateOptions, GeneratePrompt, GenerateRequest};
     use onnx_genai_metadata::BatchLayout;
 
     fn request(configure: impl FnOnce(&mut GenerateOptions)) -> GenerateRequest {
@@ -4541,6 +4649,48 @@ mod workflow_sampling_binding_tests {
         assert_eq!(sampling.top_k, 64);
         assert_eq!(sampling.top_p, 0.9);
         assert_eq!(sampling.min_p, 0.05);
+    }
+
+    #[test]
+    fn multi_row_prompt_tokens_bind_as_rank_two() {
+        let mut request = request(|_| {});
+        request.prompt = GeneratePrompt::TokenRows(vec![vec![1, 2, 3], vec![4, 5, 6]]);
+        let contract = TensorContract {
+            dtype: "int64".to_string(),
+            rank: 2,
+            shape: None,
+            optional: false,
+            batch_layout: BatchLayout::default(),
+        };
+
+        let value = workflow_request_value(&RuntimeInputRole::PromptTokens, &request, &contract)
+            .expect("prompt binding")
+            .expect("prompt value");
+        assert_eq!(value.shape(), &[2, 3]);
+        assert_eq!(
+            value.to_vec_i64().expect("prompt rows"),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+    }
+
+    #[test]
+    fn multi_row_prompt_tokens_require_equal_lengths() {
+        let mut request = request(|_| {});
+        request.prompt = GeneratePrompt::TokenRows(vec![vec![1, 2], vec![3]]);
+        let contract = TensorContract {
+            dtype: "int64".to_string(),
+            rank: 2,
+            shape: None,
+            optional: false,
+            batch_layout: BatchLayout::default(),
+        };
+
+        let error =
+            match workflow_request_value(&RuntimeInputRole::PromptTokens, &request, &contract) {
+                Ok(_) => panic!("ragged rows must fail"),
+                Err(error) => error,
+            };
+        assert!(error.to_string().contains("equal lengths"));
     }
 
     #[test]
