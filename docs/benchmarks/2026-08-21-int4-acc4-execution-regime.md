@@ -628,6 +628,17 @@ Pin to even CPUs only (`taskset -c 0,2,4,...`); interleave arms within a cycle
 A/A arms disagree by more than 2%. Do not report a single sequential timing on
 this host.
 
+> **Superseded in part by §27 of the assignment ledger (#1712).** Both arms of
+> this A/B were later found not to be computing the same statistic, and the ORT
+> baseline invoked above no longer prints `steady_median_ms=`: `run()` now routes
+> every session count through `run_concurrent` and reports the **median**
+> aggregate throughput, because reporting `min`/`max` over repetitions on one
+> arm while the other ran single-shot was one of the four biases §27 documents.
+> Requirement 1 below ("use the minimum over >= 6 repetitions") is therefore
+> retained only as the historical record of this document's protocol; it is
+> **not** the current one. Prefer `benches/acc0_gap_matrix.py`, which enforces
+> the unified definition, per-cell A/A, and a quiet-host gate.
+
 Five protocol requirements were learned the hard way during the re-measurement
 and are not optional:
 
@@ -645,7 +656,12 @@ and are not optional:
    `ONNX_GENAI_CPU_DECODE_THREADS=2` produces timings *identical* to `=1`
    (23.529 vs 23.527 ms/token), so the t=2 row in the first draft of this
    document is not a 2-thread measurement and has been dropped rather than
-   restated.
+   restated. **Independently reproduced during #1712** (23.6 vs 23.6 tok/s,
+   pinned, qwen, acc0) together with a mechanism: `/usr/bin/time` reports the
+   `=2` run at **71% of a single core** against **98%** for `=1`, for the same
+   total user time. The second worker is parked rather than computing, so this
+   is a dispatch/wakeup defect in the persistent decode pool at small worker
+   counts, not a measurement artifact. Handed to the runtime owner; see §27.
 5. **Run `PROBE_ACCURACY=0` as a null control** for any claim about this kernel.
    It must read 1.000x; if it does not, the harness is measuring something other
    than the route under test.

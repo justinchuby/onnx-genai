@@ -98,9 +98,12 @@ def main():
 
 
 def run(args, path):
-    if args.sessions > 1:
-        return run_concurrent(args, path)
-    return run_one(args, path, report=True)
+    # One path for every session count. The previous split -- `run_concurrent`
+    # above 1, a median-of-per-token-times `run_one` at exactly 1 -- meant the
+    # baseline changed statistic at the single point where the native arm was
+    # being judged. See the ratio-definition table in
+    # `int4_decode_loop_ab.rs`.
+    return run_concurrent(args, path)
 
 
 def make_session(args, path):
@@ -111,34 +114,6 @@ def make_session(args, path):
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     so.log_severity_level = 3
     return ort.InferenceSession(path, so, providers=["CPUExecutionProvider"])
-
-
-def steady_median(args, sess):
-    rng = np.random.default_rng(1)
-    feeds = {f"A{i}": rng.standard_normal((1, k)).astype(np.float32)
-             for i, (k, _, _) in enumerate(PROJECTIONS[args.model])}
-
-    best = None
-    for _ in range(args.reps):
-        for _ in range(3):
-            sess.run(None, feeds)
-        s = []
-        for _ in range(args.tokens):
-            t0 = time.perf_counter()
-            sess.run(None, feeds)
-            s.append((time.perf_counter() - t0) * 1e3)
-        m = statistics.median(s)
-        best = m if best is None else min(best, m)
-    return best
-
-
-def run_one(args, path, report):
-    best = steady_median(args, make_session(args, path))
-    if report:
-        print(f"ORT model={args.model} block={args.block} acc={args.accuracy} "
-              f"t={args.threads} sessions=1 zp={int(args.zp)}  "
-              f"steady_median_ms={best:.3f}  tokens_s_total={1e3 / best:.1f}")
-    return best
 
 
 def run_concurrent(args, path):
@@ -159,7 +134,7 @@ def run_concurrent(args, path):
             sess.run(None, feeds)
 
     import threading
-    best = None
+    reps = []
     for _ in range(args.reps):
         start = threading.Barrier(args.sessions + 1)
         done = [0.0] * args.sessions
@@ -179,11 +154,16 @@ def run_concurrent(args, path):
         for t in threads:
             t.join()
         wall = time.perf_counter() - t0
-        tps = args.sessions * args.tokens / wall
-        best = tps if best is None else max(best, tps)
+        reps.append(args.sessions * args.tokens / wall)
+    # MEDIAN over repetitions, matching the native harness. `max` reported the
+    # luckiest run and hid the spread; against a single-shot opponent that is a
+    # systematic bias, not a tie-break.
+    best = statistics.median(reps)
+    spread = (max(reps) - min(reps)) / best * 100.0 if best else 0.0
     print(f"ORT model={args.model} block={args.block} acc={args.accuracy} "
           f"t={args.threads} sessions={args.sessions} zp={int(args.zp)}  "
-          f"tokens_s_total={best:.1f}  ms_token_equiv={1e3 * args.sessions / best:.3f}")
+          f"tokens_s_total={best:.1f}  ms_token_equiv={1e3 * args.sessions / best:.3f}  "
+          f"spread_pct={spread:.1f}")
     return best
 
 
