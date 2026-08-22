@@ -203,6 +203,16 @@ impl Engine {
             .generate_with_callbacks(request, on_admitted, callback)
     }
 
+    /// Encode a workflow's declared buffered-PCM16 audio output for serving.
+    pub fn encode_audio_output(
+        &self,
+        outputs: &PipelineOutputs,
+        output_name: &str,
+    ) -> anyhow::Result<crate::pipeline::EncodedAudio> {
+        self.workflow_runtime()?
+            .encode_audio_output(outputs, output_name)
+    }
+
     pub fn models(&self) -> anyhow::Result<&PipelineModels> {
         Ok(self.workflow_runtime()?.models())
     }

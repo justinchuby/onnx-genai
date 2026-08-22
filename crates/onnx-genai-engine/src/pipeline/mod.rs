@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 mod adapters;
 mod arg_reduce;
+mod audio;
 mod islands;
 #[cfg(feature = "native-backend")]
 mod native_component;
@@ -36,6 +37,7 @@ mod workflow;
 
 pub use adapters::{AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection};
 pub use arg_reduce::{ArgReduceRewrites, WideArgReduceLowering, lower_degenerate_arg_reductions};
+pub use audio::{EncodedAudio, encode_pcm16_wav, resample_planar};
 pub use islands::ExecutionIslandDiagnostic;
 pub use onnx_genai_metadata::WorkflowOutputRole;
 pub use row_state::{RowScopedState, RowTable, check_selection, gather_rows};
@@ -43,6 +45,12 @@ pub use workflow::{
     MISSING_REQUIRED_INPUT, WorkflowExecutionPlan, WorkflowPerformanceDiagnostic,
     is_missing_required_input,
 };
+
+pub fn has_buffered_pcm16_wav_output(workflow: &WorkflowSpec) -> bool {
+    audio::has_buffered_pcm16_wav_output(workflow)
+}
+
+pub use audio::buffered_pcm16_wav_output_names;
 
 pub type PipelineTensors = HashMap<String, Value>;
 
@@ -830,6 +838,24 @@ impl WorkflowRuntime {
             .map(|(name, _)| name)?;
         outputs.aggregate(name).or_else(|| {
             self.output_rows_for_role(outputs, role)
+                .into_iter()
+                .next()
+                .map(|(_, value)| value)
+        })
+    }
+
+    /// Return the aggregate output or the first row-wise output for an exact
+    /// output name. Unlike [`Self::structured_output_for_role`], this binds to
+    /// one specific declared output so a caller that resolved a particular audio
+    /// output serves exactly that output rather than the first of its role.
+    pub fn structured_output_for_name<'a>(
+        &self,
+        outputs: &'a PipelineOutputs,
+        name: &str,
+    ) -> Option<&'a Value> {
+        outputs.aggregate(name).or_else(|| {
+            outputs
+                .rows(name)
                 .into_iter()
                 .next()
                 .map(|(_, value)| value)

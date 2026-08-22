@@ -1571,6 +1571,9 @@ impl Engine {
     fn tokenize_prompt(&self, prompt: &GeneratePrompt) -> anyhow::Result<Vec<TokenId>> {
         match prompt {
             GeneratePrompt::TokenIds(tokens) => Ok(tokens.clone()),
+            GeneratePrompt::TokenRows(_) => {
+                anyhow::bail!("multi-row prompts are supported only by workflow pipelines")
+            }
             GeneratePrompt::Text(text) => self
                 .require_tokenizer()?
                 .encode(text)

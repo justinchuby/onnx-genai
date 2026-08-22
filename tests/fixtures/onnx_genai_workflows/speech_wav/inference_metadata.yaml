@@ -1,0 +1,86 @@
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      adapter_abis:
+        onnx-genai.text-assembly: '1'
+      capabilities:
+      - workflow_ssa
+      - linear_effects
+      - typed_emit
+    inputs:
+      request.prompt_tokens:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - sequence_length
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: prompt_tokens
+        source:
+          kind: request
+        required: true
+    outputs:
+      audio:
+        contract:
+          dtype: float32
+          rank: 3
+          shape:
+          - batch
+          - 2
+          - samples
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: audio
+        stage: pre_adapter
+        media:
+          container: wav
+          encoding: pcm_s16_le
+          sample_rate_hz: 24000
+          source_sample_rate_hz: 48000
+          channels: 2
+          delivery: buffered
+    components:
+      vocoder:
+        implementation:
+          kind: onnx
+          artifact: vocoder/model.onnx.textproto
+      speech_text_assembly:
+        implementation:
+          kind: adapter
+          abi: onnx-genai.text-assembly
+          version: '1'
+          artifact: speech_processor.json
+        contract:
+          id: onnx-genai.text-assembly
+          version: '1'
+    steps:
+    - kind: invoke
+      component: vocoder
+      inputs:
+        prompt_tokens: request.prompt_tokens
+      outputs:
+        audio: speech.audio
+    - kind: emit
+      value: speech.audio
+      output: audio
+      mode: replace
+package:
+  tokenizer:
+    algorithm: bpe
+    vocab_size: 32000
+    byte_level: true
+    special_tokens:
+      bos:
+        id: 2
+        content: <bos>
+      eos:
+        id: 3
+        content: <eos>

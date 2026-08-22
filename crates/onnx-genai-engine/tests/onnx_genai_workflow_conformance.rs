@@ -870,6 +870,34 @@ fn mobius_speculative_workflow_executes_rejection_and_correction() -> anyhow::Re
     Ok(())
 }
 
+#[test]
+fn mobius_hierarchical_audio_executes_nested_generation() -> anyhow::Result<()> {
+    let package = root("hierarchical_audio")?;
+    if !package.is_dir() {
+        return Ok(());
+    }
+    let mut engine = Engine::from_pipeline_dir(&package, EngineConfig::default())?;
+    let request = PipelineGenerateRequest::new(GenerateRequest {
+        prompt: GeneratePrompt::TokenIds(vec![1, 2, 3]),
+        options: options(2),
+    })
+    .with_input(
+        "request.prompt_tokens",
+        Value::from_slice_i64(&[1, 2, 3, 1, 4, 3], &[2, 3])?,
+    )
+    .with_input(
+        "request.max_frames_with_warmup",
+        Value::from_slice_i64(&[3], &[1])?,
+    )
+    .with_input("request.seed", Value::from_slice_i64(&[7], &[1])?);
+    let output = engine.run_pipeline_outputs(request)?;
+    let audio = &output["audio"];
+    assert_eq!(audio.shape()[..2], [1, 2]);
+    assert!(audio.shape()[2] > 0);
+    assert!(audio.to_vec_f32()?.iter().all(|sample| sample.is_finite()));
+    Ok(())
+}
+
 fn video_request(latent_frames: i64, batch: i64) -> anyhow::Result<PipelineGenerateRequest> {
     let rows = usize::try_from(batch)?;
     // [batch, latent_frames, channels, height, width]. Generating from the flat

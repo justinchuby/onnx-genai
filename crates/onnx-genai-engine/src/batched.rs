@@ -303,6 +303,9 @@ impl<'a> ContinuousBatchManager<'a> {
         }
         let prompt_tokens = match request.prompt {
             GeneratePrompt::TokenIds(tokens) => tokens,
+            GeneratePrompt::TokenRows(_) => {
+                anyhow::bail!("multi-row prompts are supported only by workflow pipelines")
+            }
             GeneratePrompt::Text(text) => self
                 .tokenizer
                 .encode(&text)
@@ -778,6 +781,9 @@ impl Engine {
             }
             let prompt_tokens = match request.prompt {
                 GeneratePrompt::TokenIds(tokens) => tokens,
+                GeneratePrompt::TokenRows(_) => {
+                    anyhow::bail!("multi-row prompts are supported only by workflow pipelines")
+                }
                 GeneratePrompt::Text(text) => self
                     .require_tokenizer()?
                     .encode(&text)
@@ -1209,6 +1215,9 @@ impl Engine {
         for mut request in requests {
             let prompt_tokens = match &request.prompt {
                 GeneratePrompt::TokenIds(tokens) => tokens.clone(),
+                GeneratePrompt::TokenRows(_) => {
+                    anyhow::bail!("multi-row prompts are supported only by workflow pipelines")
+                }
                 GeneratePrompt::Text(text) => self
                     .require_tokenizer()?
                     .encode(text)

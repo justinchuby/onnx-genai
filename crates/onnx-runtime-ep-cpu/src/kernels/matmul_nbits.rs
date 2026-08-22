@@ -19467,6 +19467,273 @@ mod tests {
         );
     }
 
+    /// The decode widths our published benchmark rows are labelled with.
+    ///
+    /// [`spmd_real_int4_parity_subprocess`] already asserts requested ==
+    /// realized, but only ever at [`parity_worker_count`] -- the largest odd
+    /// count that fits the host, which is 15 on a 16-core box. That is
+    /// precisely the one width nobody benchmarks. Every `t=1/2/4/8/16` row we
+    /// publish carries a width label that, until this test, nothing verified:
+    /// the harness reports the value it *requested* via
+    /// `ONNX_GENAI_CPU_DECODE_THREADS`, not the width the pool actually built.
+    const BENCHMARKED_DECODE_WIDTHS: [usize; 5] = [1, 2, 4, 8, 16];
+
+    /// Upper bound on the extra fully-subscribed probe width.
+    ///
+    /// The probe asks for as many lanes as the process has allowed CPUs so the
+    /// dispatcher-reservation path is reached, but on a many-core host that
+    /// would spin up ~one worker per core just to read a count. Above this many
+    /// allowed CPUs, skip it rather than make it cheap-but-meaningless: a
+    /// partial request lands back in the no-op branch the probe exists to
+    /// avoid, which would be coverage in name only.
+    const SPMD_WIDTH_FULL_SUBSCRIPTION_CAP: usize = 32;
+
+    /// Marker prefix for the realized-width child's single report line.
+    const SPMD_WIDTH_MARKER: &str = "SPMD_REALIZED_WIDTH:";
+
+    /// Set on the realized-width child; its value is the requested width.
+    const SPMD_WIDTH_CHILD_ENV: &str = "ONNX_GENAI_TEST_SPMD_REALIZED_WIDTH_CHILD";
+
+    /// Attempts allowed for the realized-width child before a
+    /// `STATUS_ACCESS_VIOLATION` is treated as a real failure.
+    const SPMD_WIDTH_CHILD_MAX_ATTEMPTS: u32 = 3;
+
+    /// What a realized-width child observed about the pool it built.
+    #[derive(Debug)]
+    struct RealizedWidth {
+        requested: usize,
+        available: usize,
+        allowed: usize,
+        nodes: usize,
+        workers: usize,
+        pool_built: bool,
+    }
+
+    /// Report the pool this process actually built. The width has to be
+    /// observed in a child because `pools()` is a process-wide `OnceLock`: the
+    /// first test to touch it fixes the width for every test after it, so a
+    /// width sweep is only measurable one process at a time.
+    #[test]
+    fn spmd_realized_width_subprocess() {
+        let _probe = lock_dispatch_probe();
+        let Ok(requested) = std::env::var(SPMD_WIDTH_CHILD_ENV) else {
+            return;
+        };
+        let requested: usize = requested
+            .parse()
+            .expect("the parent passes a decimal width");
+        let allowed = crate::decode_affinity::allowed_cpus().map_or(0, |cpus| cpus.len());
+        let (pool_built, workers, nodes) = match crate::decode_spmd::pools() {
+            Some(pool) => (true, pool.total_workers(), pool.node_count()),
+            None => (false, 0, 0),
+        };
+        println!(
+            "{SPMD_WIDTH_MARKER}requested={requested} available={} allowed={allowed} \
+             nodes={nodes} workers={workers} pool={}",
+            available_parallelism(),
+            u8::from(pool_built)
+        );
+    }
+
+    fn realized_width_report(requested: usize) -> RealizedWidth {
+        let width = requested.to_string();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("kernels::matmul_nbits::tests::spmd_realized_width_subprocess")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(SPMD_WIDTH_CHILD_ENV, &width)
+            .env(DECODE_THREADS_ENV, &width)
+            .env("RAYON_NUM_THREADS", &width)
+            .env(crate::decode_spmd::PERSISTENT_POOL_ENV, "1")
+            .env_remove(crate::decode_affinity::DECODE_AFFINITY_ENV)
+            // The exact assertion assumes the `Fixed` schedule. Under `mlas` a
+            // work-stealing pool spawns a thread per shard with no inline
+            // dispatcher, so it never reclaims the reserved CPU and a fully
+            // subscribed request realizes `allowed - 1` lanes. Measured: with
+            // `--features mlas` and a steal schedule, width 32 builds 31. No
+            // lane runs this test that way today, so don't weaken the
+            // assertion for it -- just refuse to inherit the schedule, the
+            // same way this spawn refuses to inherit an affinity override.
+            .env_remove(crate::decode_spmd::DECODE_SCHEDULE_ENV)
+            .env_remove(SPMD_PARITY_CHILD_ENV);
+
+        // Bounded retry scoped to *exactly* the known environmental crash
+        // signature, for the same reason `run_affinity_defer_child` carries one:
+        // this child builds a pool of spinning workers, and on native Windows
+        // ARM64 that occasionally faults the whole process with
+        // `STATUS_ACCESS_VIOLATION` and empty stderr during pool build/teardown
+        // (see #1745). A real assertion failure prints a Rust panic and so still
+        // fails fast on the first attempt; on Linux this signature never occurs.
+        let mut stdout = String::new();
+        for attempt in 1..=SPMD_WIDTH_CHILD_MAX_ATTEMPTS {
+            let output = command
+                .output()
+                .expect("run the realized-width child process");
+            stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            if is_environmental_access_violation_crash(
+                output.status.success(),
+                output.status.code(),
+                &stdout,
+                &stderr,
+                SPMD_WIDTH_MARKER,
+            ) && attempt < SPMD_WIDTH_CHILD_MAX_ATTEMPTS
+            {
+                eprintln!(
+                    "note: retrying realized-width child (requested={requested}) after \
+                     environmental STATUS_ACCESS_VIOLATION crash, attempt {attempt}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
+
+            assert!(
+                output.status.success(),
+                "realized-width child failed (requested={requested}, status={}):\nstdout:\n{stdout}\n\
+                 stderr:\n{stderr}",
+                child_status_detail(&output.status)
+            );
+            break;
+        }
+
+        let report = stdout
+            .lines()
+            .find_map(|line| {
+                line.find(SPMD_WIDTH_MARKER)
+                    .map(|at| &line[at + SPMD_WIDTH_MARKER.len()..])
+            })
+            .unwrap_or_else(|| {
+                panic!("the child emitted no width report for requested={requested}:\n{stdout}")
+            });
+        let field = |key: &str| -> usize {
+            let needle = format!("{key}=");
+            report
+                .split_whitespace()
+                .find_map(|pair| pair.strip_prefix(&needle))
+                .unwrap_or_else(|| panic!("the width report is missing `{key}`: {report}"))
+                .parse()
+                .unwrap_or_else(|_| panic!("`{key}` is not a decimal count: {report}"))
+        };
+        RealizedWidth {
+            requested: field("requested"),
+            available: field("available"),
+            allowed: field("allowed"),
+            nodes: field("nodes"),
+            workers: field("workers"),
+            pool_built: field("pool") == 1,
+        }
+    }
+
+    /// A `t=N` label must mean N workers actually ran.
+    ///
+    /// The width a benchmark asks for is not the width it gets. An explicit
+    /// request is clamped to the host's logical CPUs by
+    /// `resolve_persistent_decode_threads_with_override`, and
+    /// `reserve_single_group_headroom` then frees a CPU for the inline
+    /// dispatcher whenever the request would occupy the whole allowed cpuset.
+    /// Neither reduction is visible to a harness that reports the number it
+    /// requested, and #1746 is what that costs: for a while every explicit
+    /// budget silently bought `N-1` compute lanes, and at `N=2` the single
+    /// remaining lane tripped the serial short-circuit and made the knob
+    /// indistinguishable from `=1`. Nothing failed; the numbers were just
+    /// answering a different question than their labels claimed.
+    ///
+    /// So assert the contract end to end, at the widths we actually publish,
+    /// against facts a child process observed about itself rather than against
+    /// a recomputation of the code under test.
+    ///
+    /// The assertion is exact at every width, including full subscription:
+    /// since #1748 the dispatcher owns the shard the reservation frees, so
+    /// `total_workers` counts compute lanes and equals the request. Verified
+    /// here under `taskset` at 1, 2, 4, 8 and 32 CPUs -- the fully-subscribed
+    /// case is the *common* one in production, because
+    /// `bound_process_to_decode_budget` confines the process to exactly the
+    /// budgeted CPUs at EP init.
+    #[test]
+    fn every_benchmarked_decode_width_realizes_the_worker_count_it_requests() {
+        // The published widths alone leave the interesting hole unprobed: on a
+        // host with more allowed CPUs than the largest of them, every case
+        // satisfies `effective < allowed`, so the dispatcher reservation is a
+        // no-op and full subscription -- the shape #1746 broke, and the shape
+        // production actually runs after `bound_process_to_decode_budget` --
+        // is never reached. Add one probe that asks for the whole cpuset.
+        let allowed_now = crate::decode_affinity::allowed_cpus().map_or(0, |cpus| cpus.len());
+        let mut widths: Vec<usize> = BENCHMARKED_DECODE_WIDTHS.to_vec();
+        if (2..=SPMD_WIDTH_FULL_SUBSCRIPTION_CAP).contains(&allowed_now)
+            && !widths.contains(&allowed_now)
+        {
+            widths.push(allowed_now);
+        }
+
+        let mut saw_full_subscription = false;
+        for requested in widths {
+            let report = realized_width_report(requested);
+            assert_eq!(
+                report.requested, requested,
+                "the child echoed a width it was not asked for ({report:?})"
+            );
+
+            // A single-CPU cpuset leaves no core for the inline dispatcher
+            // alongside a spinning worker, so `build_from_env` documents a
+            // flat-path fallback rather than a self-starving pool.
+            if report.allowed == 1 {
+                assert!(
+                    !report.pool_built,
+                    "a single-CPU cpuset must fall back to the flat path, not build a \
+                     pool that starves its own dispatcher ({report:?})"
+                );
+                continue;
+            }
+            assert!(
+                report.pool_built,
+                "requested width {requested} built no persistent pool at all, so a decode \
+                 row labelled t={requested} never dispatched to one ({report:?})"
+            );
+
+            let effective = requested.min(report.available);
+
+            if report.nodes > 1 {
+                // `split_workers` + `reserve_split_headroom` rebalance per node,
+                // so only the bound is contractual on a NUMA host.
+                assert!(
+                    report.workers >= 1 && report.workers <= effective,
+                    "a NUMA-split pool realized {} workers, outside the contractual \
+                     1..={effective} ({report:?})",
+                    report.workers
+                );
+                continue;
+            }
+
+            saw_full_subscription |= report.allowed >= 2 && effective >= report.allowed;
+
+            assert_eq!(
+                report.workers, effective,
+                "requested width {requested} realized {} compute lanes, not the {effective} \
+                 it asked for ({report:?}) -- a decode benchmark row labelled t={requested} \
+                 would be reporting a width it never ran",
+                report.workers
+            );
+        }
+
+        // Say out loud when only the easy half ran. On a host with more allowed
+        // CPUs than the probe cap, no swept width reaches full subscription --
+        // so the dispatcher-shard path that #1746 broke goes unexercised and a
+        // green run here would mean less than it appears to. Derive this from
+        // what the children reported rather than from host assumptions, and
+        // only require it where the probe was actually capable of firing.
+        if (2..=SPMD_WIDTH_FULL_SUBSCRIPTION_CAP).contains(&allowed_now) {
+            assert!(
+                saw_full_subscription,
+                "no swept width reached full subscription on a {allowed_now}-CPU cpuset, so \
+                 the reservation path went untested and only the no-op half of the contract \
+                 was checked -- the full-subscription probe is not doing its job"
+            );
+        }
+    }
+
     #[test]
     fn spmd_adaptive_calibrated_decode_is_bit_identical_to_flat() {
         // Token-exactness of the adaptive path: with
@@ -20109,22 +20376,29 @@ mod tests {
     ///
     /// All four conditions must hold to treat the exit as the environmental flake:
     ///   1. the child exited unsuccessfully (`success` is `false`), AND
-    ///   2. it emitted no success marker (`{AFFINITY_DEFER_MARKER}ok`), AND
+    ///   2. it emitted no `success_marker`, AND
     ///   3. its stderr shows no Rust panic (no `panicked at` / `assertion`
     ///      text) — a genuine assertion failure must fail fast, never retry, AND
     ///   4. the exit code is exactly the Windows `STATUS_ACCESS_VIOLATION`
     ///      NTSTATUS. Matching that specific code keeps the retry Windows-only in
     ///      practice while the code stays portable.
+    ///
+    /// `success_marker` is the stdout token a child prints once it has actually
+    /// completed its work, so a fault raised *after* the result was already
+    /// emitted is correctly classified as non-environmental. Each caller passes
+    /// its own marker, because more than one child-spawning helper needs this
+    /// classification and they do not share a marker.
     fn is_environmental_access_violation_crash(
         success: bool,
         exit_code: Option<i32>,
         stdout: &str,
         stderr: &str,
+        success_marker: &str,
     ) -> bool {
         if success {
             return false;
         }
-        if stdout.contains(&format!("{AFFINITY_DEFER_MARKER}ok")) {
+        if stdout.contains(success_marker) {
             return false;
         }
         if stderr.contains("panicked at") || stderr.contains("assertion") {
@@ -20182,6 +20456,7 @@ mod tests {
                 output.status.code(),
                 &stdout,
                 &stderr,
+                &format!("{AFFINITY_DEFER_MARKER}ok"),
             ) && attempt < AFFINITY_DEFER_CHILD_MAX_ATTEMPTS
             {
                 eprintln!(
@@ -20254,6 +20529,7 @@ mod tests {
             Some(STATUS_ACCESS_VIOLATION),
             "",
             "",
+            &marker_ok,
         ));
 
         // A successful run is never retryable, regardless of exit code.
@@ -20262,6 +20538,7 @@ mod tests {
             Some(STATUS_ACCESS_VIOLATION),
             &marker_ok,
             "",
+            &marker_ok,
         ));
 
         // A real assertion failure (Rust panic in stderr) must fail fast.
@@ -20270,6 +20547,7 @@ mod tests {
             Some(STATUS_ACCESS_VIOLATION),
             "",
             "thread 'main' panicked at src/foo.rs:1:1:\nassertion failed",
+            &marker_ok,
         ));
 
         // Any other non-success exit code is not the known signature.
@@ -20277,10 +20555,11 @@ mod tests {
             false,
             Some(1),
             "",
-            ""
+            "",
+            &marker_ok,
         ));
         assert!(!is_environmental_access_violation_crash(
-            false, None, "", ""
+            false, None, "", "", &marker_ok,
         ));
 
         // Even with the access-violation code, an emitted success marker means the
@@ -20290,6 +20569,27 @@ mod tests {
             Some(STATUS_ACCESS_VIOLATION),
             &marker_ok,
             "",
+            &marker_ok,
+        ));
+
+        // The marker is per-caller: the realized-width child emits a different
+        // token, and classifying it against the affinity marker would call a
+        // completed run environmental. Each caller's own marker must be the one
+        // that suppresses the retry.
+        let width_report = format!("{SPMD_WIDTH_MARKER}requested=2 workers=2");
+        assert!(!is_environmental_access_violation_crash(
+            false,
+            Some(STATUS_ACCESS_VIOLATION),
+            &width_report,
+            "",
+            SPMD_WIDTH_MARKER,
+        ));
+        assert!(is_environmental_access_violation_crash(
+            false,
+            Some(STATUS_ACCESS_VIOLATION),
+            &width_report,
+            "",
+            &marker_ok,
         ));
     }
 

@@ -366,4 +366,8 @@ fn main() {
         };
         println!("{phase:>10} {ms:>12.3} {p90:>12.3} {total:>14.1} {spread:>9.1}");
     }
+
+    // After the phases, never before: the pool is built at first decode, so this
+    // is the earliest point the realized width exists to be read.
+    common::report_decode_width();
 }

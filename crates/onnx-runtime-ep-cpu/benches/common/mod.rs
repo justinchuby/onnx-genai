@@ -230,3 +230,55 @@ pub fn init_decode_topology() {
         .initialize(&Default::default())
         .expect("the CPU EP must initialize");
 }
+
+/// Print the decode width the run actually realized, next to the width it asked
+/// for.
+///
+/// Call this **after** at least one decode has run. The persistent pool is built
+/// lazily at first decode and [`decode_width`] is deliberately non-forcing, so
+/// calling it earlier reports `path=unresolved` and no realized width -- and
+/// would build the pool if it were forcing, changing the very topology the
+/// benchmark is measuring.
+///
+/// Why every row needs this: three paths silently reduce the realized width
+/// below the request -- the pre-clamp to `available_parallelism` in
+/// `resolve_persistent_decode_threads_with_override`, `reserve_split_headroom`
+/// on a NUMA split, and the single-CPU-cpuset branch that drops decode to the
+/// flat path entirely. Only the last is even `NXRT_CALIB_DEBUG`-visible; the
+/// other two log nothing. Without this line a `t=N` row is an unverified
+/// *label*: a sweep that silently pins every width to the same realized value
+/// prints a flat line that reads exactly like "this kernel does not scale"
+/// (#1763).
+///
+/// `reserve_single_group_headroom` is deliberately not in that list. It reduces
+/// the *spawned thread* count, but only in the single-group case, which is
+/// exactly where the dispatcher takes a shard of its own and adds the lane back.
+/// A 2-lane budget on a 2-CPU cpuset spawns one thread and still realizes two
+/// lanes -- verified, not assumed.
+///
+/// Reports rather than asserts. A reduced width is legitimate when the host
+/// genuinely cannot honour the request (an 8-lane budget in a 2-CPU cpuset), and
+/// aborting there would make a constrained container unable to benchmark at all.
+/// The `WIDTH-MISMATCH` token is for the caller -- human or matrix script -- to
+/// discard or mark the row, the same way a contended cell is marked UNTRUSTED.
+pub fn report_decode_width() {
+    let width = onnx_runtime_ep_cpu::decode_spmd::decode_width();
+    let show = |v: Option<usize>| v.map_or("unknown".to_string(), |v| v.to_string());
+    // Three outcomes, not two: a width that was reduced is a different problem
+    // from a width that was never resolved, and a matrix script wants to treat
+    // them differently -- the first invalidates the row's label, the second says
+    // no decode reached the persistent pool at all.
+    let verdict = if width.is_as_requested() {
+        "as_requested"
+    } else if width.requested.is_some() && width.realized.is_some() {
+        "WIDTH-MISMATCH"
+    } else {
+        "WIDTH-UNRESOLVED"
+    };
+    println!(
+        "decode_width requested={} realized={} path={} {verdict}",
+        show(width.requested),
+        show(width.realized),
+        width.path,
+    );
+}

@@ -465,6 +465,256 @@ pub enum WeightHandleError {
     DeviceBinding(String),
 }
 
+/// Why a candidate expert region did not enter a [`ResidencyPlan`] as
+/// resident.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResidencyDegradationReason {
+    /// The catalog itself was non-pageable (see
+    /// [`onnx_runtime_loader::NonPageableReason`]) — the plan cannot promise
+    /// per-expert placement for this value at all.
+    NonPageableCatalog(onnx_runtime_loader::NonPageableReason),
+    /// The policy chose to keep this value fully resident rather than emit
+    /// per-expert placement (the default/only shipped behavior today).
+    PolicyDeclinedSplit,
+    /// The policy asked for a plan this build-time seam cannot safely honor
+    /// (e.g. it referenced an expert index out of range, or overlapping
+    /// ranges) — the executor falls back to whole-bank residency and records
+    /// why.
+    RejectedByValidation(String),
+}
+
+/// One entry in a [`ResidencyPlan`]: what an execution boundary should do for
+/// one lazy-weight value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResidencyDecision {
+    /// Keep the whole initializer resident, exactly like today's shipped
+    /// behavior. `reason` is `None` for the default policy's decisions and
+    /// `Some(..)` when a catalog/validation problem forced this fallback.
+    WholeBankResident {
+        reason: Option<ResidencyDegradationReason>,
+    },
+    /// Placement/admission is unconstrained per expert (informational only —
+    /// this slice does not execute prefetch/eviction from this decision).
+    /// `experts` lists the candidate expert indices in ascending order (the
+    /// deterministic ordering requirement).
+    PerExpertCandidate { experts: Vec<usize> },
+}
+
+/// A validated, typed residency decision set for one build's lazy-weight
+/// candidates.
+///
+/// A `ResidencyPlan` is pure data: it names *which* value gets *which*
+/// decision. It never allocates, copies bytes, opens a CUDA stream, or owns a
+/// VA range — those stay the exclusive responsibility of
+/// `onnx-runtime-ep-cuda::weight_paging`'s `CudaWeightResidency` (or the
+/// executor's existing whole-bank materialization path on non-CUDA EPs).
+/// Building a plan and *acting* on it are two different lifecycle steps by
+/// construction: nothing in this type can mutate memory.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResidencyPlan {
+    decisions: std::collections::HashMap<ValueId, ResidencyDecision>,
+    /// Name of the policy that produced this plan, for telemetry.
+    policy_name: &'static str,
+}
+
+impl ResidencyPlan {
+    pub fn policy_name(&self) -> &'static str {
+        self.policy_name
+    }
+
+    pub fn decision(&self, value: ValueId) -> Option<&ResidencyDecision> {
+        self.decisions.get(&value)
+    }
+
+    /// Values in deterministic (ascending [`ValueId`]) order, for stable
+    /// telemetry/log output and reproducible tests.
+    pub fn ordered_values(&self) -> impl Iterator<Item = ValueId> + '_ {
+        let mut values: Vec<ValueId> = self.decisions.keys().copied().collect();
+        values.sort_unstable_by_key(|value| value.0);
+        values.into_iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.decisions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.decisions.is_empty()
+    }
+
+    /// Count of values with a resident decision that carries no degradation
+    /// reason (i.e. the policy's ordinary output, not a validation fallback).
+    /// Disjoint from [`Self::degraded_count`]: every entry is counted by
+    /// exactly one of the two.
+    pub fn resident_count(&self) -> usize {
+        self.decisions
+            .values()
+            .filter(|decision| {
+                matches!(
+                    decision,
+                    ResidencyDecision::WholeBankResident { reason: None }
+                )
+            })
+            .count()
+    }
+
+    /// Count of values whose decision carries an explicit degradation reason
+    /// (nonpageable catalog, policy decline, or validation rejection).
+    pub fn degraded_count(&self) -> usize {
+        self.decisions
+            .values()
+            .filter(|decision| {
+                matches!(
+                    decision,
+                    ResidencyDecision::WholeBankResident { reason: Some(_) }
+                )
+            })
+            .count()
+    }
+}
+
+/// Structural inputs a [`ResidencyPolicy`] may use to decide placement.
+///
+/// Deliberately excludes model names, op allowlists, and quantization-format
+/// branches: a policy may only look at [`LazyWeightBoundary`], the
+/// [`onnx_runtime_loader::WeightRegionCatalog`] (byte layout/pageability), and
+/// the caller-supplied budget/capability context.
+pub struct ResidencyPolicyInput<'a> {
+    pub boundary: LazyWeightBoundary,
+    pub catalog: &'a onnx_runtime_loader::WeightRegionCatalog,
+    /// Advisory device byte budget available for expert-bank residency, if
+    /// the caller has one. `None` means "unconstrained" (today's default).
+    pub budget_bytes: Option<u64>,
+}
+
+/// A pluggable placement/admission/eviction/prefetch/resize *decision*
+/// surface. A policy answers "which experts (if any) does this value split
+/// into for planning purposes", nothing else.
+///
+/// Implementations must not allocate, copy, synchronize, or hold VA/pointer
+/// state — see the module-level `ResidencyPlan` doc for why that split is
+/// enforced by type rather than convention.
+pub trait ResidencyPolicy: Send + Sync {
+    /// Stable identifier for telemetry (e.g. `"whole_bank_resident"`).
+    fn name(&self) -> &'static str;
+
+    /// Decide one value's residency for planning purposes only.
+    fn decide(&self, input: &ResidencyPolicyInput<'_>) -> ResidencyDecision;
+}
+
+/// The only shipped policy today: always keep every candidate value fully
+/// resident, exactly matching pre-#82 behavior byte-for-byte/handle-for-handle.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WholeBankResidentPolicy;
+
+impl ResidencyPolicy for WholeBankResidentPolicy {
+    fn name(&self) -> &'static str {
+        "whole_bank_resident"
+    }
+
+    fn decide(&self, input: &ResidencyPolicyInput<'_>) -> ResidencyDecision {
+        let reason = if input.catalog.is_pageable() {
+            None
+        } else {
+            match input.catalog.pageability() {
+                onnx_runtime_loader::Pageability::NonPageable(reason) => Some(
+                    ResidencyDegradationReason::NonPageableCatalog(reason.clone()),
+                ),
+                onnx_runtime_loader::Pageability::Pageable => None,
+            }
+        };
+        ResidencyDecision::WholeBankResident { reason }
+    }
+}
+
+/// Build a validated [`ResidencyPlan`] from the per-expert region candidates
+/// gathered at build time, running `policy` over each and validating its
+/// output before accepting it.
+///
+/// This is the one call site where a plan is *created*; nothing here
+/// allocates, copies, or synchronizes. Validation failures (an expert index
+/// referencing an expert count the catalog does not have, or a duplicate
+/// expert index) degrade that single value to `WholeBankResident` with
+/// [`ResidencyDegradationReason::RejectedByValidation`] rather than failing
+/// the whole plan or the model load — correctness always wins over honoring a
+/// policy's request.
+pub fn plan_residency<'a>(
+    candidates: impl IntoIterator<
+        Item = (
+            ValueId,
+            LazyWeightBoundary,
+            &'a onnx_runtime_loader::WeightRegionCatalog,
+        ),
+    >,
+    policy: &dyn ResidencyPolicy,
+    budget_bytes: Option<u64>,
+) -> ResidencyPlan {
+    let mut decisions = std::collections::HashMap::new();
+    for (value, boundary, catalog) in candidates {
+        let input = ResidencyPolicyInput {
+            boundary,
+            catalog,
+            budget_bytes,
+        };
+        let decision = policy.decide(&input);
+        let validated = validate_decision(catalog, decision);
+        decisions.insert(value, validated);
+    }
+    ResidencyPlan {
+        decisions,
+        policy_name: policy.name(),
+    }
+}
+
+/// Validate a policy's decision against the catalog it was derived from.
+/// Never panics: any inconsistency degrades to `WholeBankResident` with an
+/// explicit `RejectedByValidation` reason.
+fn validate_decision(
+    catalog: &onnx_runtime_loader::WeightRegionCatalog,
+    decision: ResidencyDecision,
+) -> ResidencyDecision {
+    match decision {
+        ResidencyDecision::PerExpertCandidate { experts } => {
+            if !catalog.is_pageable() {
+                return ResidencyDecision::WholeBankResident {
+                    reason: Some(ResidencyDegradationReason::RejectedByValidation(
+                        "policy proposed per-expert placement over a nonpageable catalog".into(),
+                    )),
+                };
+            }
+            let expert_count = catalog.layout().experts;
+            let mut seen = std::collections::HashSet::with_capacity(experts.len());
+            for &expert in &experts {
+                if expert >= expert_count {
+                    return ResidencyDecision::WholeBankResident {
+                        reason: Some(ResidencyDegradationReason::RejectedByValidation(format!(
+                            "expert index {expert} out of range for a {expert_count}-expert bank"
+                        ))),
+                    };
+                }
+                if !seen.insert(expert) {
+                    return ResidencyDecision::WholeBankResident {
+                        reason: Some(ResidencyDegradationReason::RejectedByValidation(format!(
+                            "expert index {expert} appears more than once in one plan entry"
+                        ))),
+                    };
+                }
+                if catalog.region(expert).is_none() {
+                    return ResidencyDecision::WholeBankResident {
+                        reason: Some(ResidencyDegradationReason::RejectedByValidation(format!(
+                            "expert {expert} has no validated byte range in its catalog"
+                        ))),
+                    };
+                }
+            }
+            let mut ordered = experts;
+            ordered.sort_unstable();
+            ResidencyDecision::PerExpertCandidate { experts: ordered }
+        }
+        whole_bank @ ResidencyDecision::WholeBankResident { .. } => whole_bank,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -571,5 +821,235 @@ mod tests {
             negotiated.materialize_host_fallback().unwrap().bytes(),
             &[1, 2, 3, 4]
         );
+    }
+
+    // -- ResidencyPlan / ResidencyPolicy tests -----------------------------
+
+    use onnx_runtime_ir::WeightRef;
+    use onnx_runtime_loader::{
+        ExpertQuantization, ExpertStorageOrder, ExpertTensorLayout, WeightRegionCatalog,
+    };
+
+    fn expert_layout() -> ExpertTensorLayout {
+        ExpertTensorLayout {
+            version: 1,
+            experts: 3,
+            rows_per_expert: 2,
+            storage_elements_per_row: 4,
+            order: ExpertStorageOrder::ExpertMajor,
+            quantization: Some(ExpertQuantization {
+                bits: 4,
+                block_size: 16,
+                blocks_per_row: 1,
+            }),
+        }
+    }
+
+    fn pageable_catalog() -> WeightRegionCatalog {
+        let layout = expert_layout();
+        let weight = WeightRef::External {
+            path: std::path::PathBuf::from("/nonexistent/weights.bin"),
+            offset: 16,
+            length: layout.experts * layout.rows_per_expert * layout.storage_elements_per_row,
+            dtype: DataType::Uint8,
+            dims: vec![
+                layout.experts,
+                layout.rows_per_expert,
+                layout.storage_elements_per_row,
+            ],
+        };
+        WeightRegionCatalog::classify(&weight, layout)
+    }
+
+    fn non_pageable_catalog() -> WeightRegionCatalog {
+        let mut layout = expert_layout();
+        layout.order = ExpertStorageOrder::Interleaved;
+        let weight = WeightRef::External {
+            path: std::path::PathBuf::from("/nonexistent/weights.bin"),
+            offset: 16,
+            length: layout.experts * layout.rows_per_expert * layout.storage_elements_per_row,
+            dtype: DataType::Uint8,
+            dims: vec![
+                layout.experts,
+                layout.rows_per_expert,
+                layout.storage_elements_per_row,
+            ],
+        };
+        WeightRegionCatalog::classify(&weight, layout)
+    }
+
+    /// Test-only alternate policy proving the trait boundary is
+    /// substitutable: it proposes splitting every pageable catalog into
+    /// per-expert candidates. This is never shipped as a default and must
+    /// not ship LRU/static-hot/q* behavior.
+    struct AlwaysSplitPolicy;
+
+    impl ResidencyPolicy for AlwaysSplitPolicy {
+        fn name(&self) -> &'static str {
+            "test_always_split"
+        }
+
+        fn decide(&self, input: &ResidencyPolicyInput<'_>) -> ResidencyDecision {
+            if input.catalog.is_pageable() {
+                ResidencyDecision::PerExpertCandidate {
+                    experts: (0..input.catalog.layout().experts).collect(),
+                }
+            } else {
+                ResidencyDecision::WholeBankResident { reason: None }
+            }
+        }
+    }
+
+    struct OutOfRangePolicy;
+
+    impl ResidencyPolicy for OutOfRangePolicy {
+        fn name(&self) -> &'static str {
+            "test_out_of_range"
+        }
+
+        fn decide(&self, _input: &ResidencyPolicyInput<'_>) -> ResidencyDecision {
+            ResidencyDecision::PerExpertCandidate {
+                experts: vec![9999],
+            }
+        }
+    }
+
+    struct DuplicatePolicy;
+
+    impl ResidencyPolicy for DuplicatePolicy {
+        fn name(&self) -> &'static str {
+            "test_duplicate"
+        }
+
+        fn decide(&self, _input: &ResidencyPolicyInput<'_>) -> ResidencyDecision {
+            ResidencyDecision::PerExpertCandidate {
+                experts: vec![0, 0],
+            }
+        }
+    }
+
+    fn value(id: u32) -> ValueId {
+        ValueId(id)
+    }
+
+    #[test]
+    fn whole_bank_resident_policy_matches_default_behavior_for_pageable_catalog() {
+        let catalog = pageable_catalog();
+        let plan = plan_residency(
+            [(value(1), LazyWeightBoundary::QMoe, &catalog)],
+            &WholeBankResidentPolicy,
+            None,
+        );
+        assert_eq!(plan.policy_name(), "whole_bank_resident");
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan.resident_count(), 1);
+        assert_eq!(plan.degraded_count(), 0);
+        assert_eq!(
+            plan.decision(value(1)),
+            Some(&ResidencyDecision::WholeBankResident { reason: None })
+        );
+    }
+
+    #[test]
+    fn whole_bank_resident_policy_surfaces_non_pageable_reason() {
+        let catalog = non_pageable_catalog();
+        let plan = plan_residency(
+            [(value(1), LazyWeightBoundary::QMoe, &catalog)],
+            &WholeBankResidentPolicy,
+            None,
+        );
+        assert_eq!(
+            plan.decision(value(1)),
+            Some(&ResidencyDecision::WholeBankResident {
+                reason: Some(ResidencyDegradationReason::NonPageableCatalog(
+                    onnx_runtime_loader::NonPageableReason::NotExpertMajor
+                ))
+            })
+        );
+    }
+
+    #[test]
+    fn alternate_policy_is_substitutable_and_produces_per_expert_candidates() {
+        let catalog = pageable_catalog();
+        let plan = plan_residency(
+            [(value(1), LazyWeightBoundary::QMoe, &catalog)],
+            &AlwaysSplitPolicy,
+            None,
+        );
+        assert_eq!(plan.policy_name(), "test_always_split");
+        assert_eq!(
+            plan.decision(value(1)),
+            Some(&ResidencyDecision::PerExpertCandidate {
+                experts: vec![0, 1, 2]
+            })
+        );
+    }
+
+    #[test]
+    fn out_of_range_expert_index_degrades_to_whole_bank_with_reason() {
+        let catalog = pageable_catalog();
+        let plan = plan_residency(
+            [(value(1), LazyWeightBoundary::QMoe, &catalog)],
+            &OutOfRangePolicy,
+            None,
+        );
+        assert_eq!(plan.resident_count(), 0);
+        match plan.decision(value(1)) {
+            Some(ResidencyDecision::WholeBankResident {
+                reason: Some(ResidencyDegradationReason::RejectedByValidation(_)),
+            }) => {}
+            other => panic!("expected rejected validation, got {other:?}"),
+        }
+        assert_eq!(plan.degraded_count(), 1);
+    }
+
+    #[test]
+    fn duplicate_expert_index_degrades_to_whole_bank_with_reason() {
+        let catalog = pageable_catalog();
+        let plan = plan_residency(
+            [(value(1), LazyWeightBoundary::QMoe, &catalog)],
+            &DuplicatePolicy,
+            None,
+        );
+        match plan.decision(value(1)) {
+            Some(ResidencyDecision::WholeBankResident {
+                reason: Some(ResidencyDegradationReason::RejectedByValidation(_)),
+            }) => {}
+            other => panic!("expected rejected validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn per_expert_candidate_over_non_pageable_catalog_is_rejected() {
+        let catalog = non_pageable_catalog();
+        let plan = plan_residency(
+            [(value(1), LazyWeightBoundary::QMoe, &catalog)],
+            &AlwaysSplitPolicy,
+            None,
+        );
+        // AlwaysSplitPolicy itself checks is_pageable(), so this exercises
+        // the policy's own fallback rather than validation -- assert it is
+        // still whole-bank resident, never a candidate over a non-pageable
+        // catalog.
+        assert!(matches!(
+            plan.decision(value(1)),
+            Some(ResidencyDecision::WholeBankResident { .. })
+        ));
+    }
+
+    #[test]
+    fn plan_residency_orders_values_deterministically() {
+        let catalog = pageable_catalog();
+        let plan = plan_residency(
+            [
+                (value(5), LazyWeightBoundary::QMoe, &catalog),
+                (value(1), LazyWeightBoundary::QMoe, &catalog),
+                (value(3), LazyWeightBoundary::QMoe, &catalog),
+            ],
+            &WholeBankResidentPolicy,
+            None,
+        );
+        let ordered: Vec<u32> = plan.ordered_values().map(|v| v.0).collect();
+        assert_eq!(ordered, vec![1, 3, 5]);
     }
 }
