@@ -4241,6 +4241,57 @@ fn resolve_rayon_global_threads(
 /// most once and only its first attempt logs.
 static PROCESS_BUDGET_BOUND: OnceLock<()> = OnceLock::new();
 
+/// Whether an explicit decode budget asks for more workers than the host has
+/// physical cores, returning that core count when it does.
+///
+/// `None` whenever the topology is unknown or the request fits: an unknown
+/// topology is never an occasion to warn, and neither is a budget at or below
+/// the core count.
+///
+/// Split out as a pure function because the interesting part is the policy, and
+/// this way it is testable without a host to interrogate.
+fn budget_beyond_physical_cores(threads: usize, physical: Option<usize>) -> Option<usize> {
+    physical.filter(|&cores| cores > 0 && threads > cores)
+}
+
+/// Warn once when an explicit decode budget oversubscribes the physical cores.
+///
+/// Every pool this budget sizes -- the global Rayon pool built below, the decode
+/// pool, and the task runtime's lanes -- is a worker set that either spins or
+/// fork-joins. Past one worker per physical core the surplus workers are SMT
+/// siblings of workers that already exist, and
+/// [`crate::core_topology::cap_spinning_workers`] already refuses to spin that
+/// many for exactly this reason.
+///
+/// The cost is paid twice, and it is large. Measured on a 16-physical-core /
+/// 32-logical host, raising the budget from 16 to 32 for an int4 decode GEMM:
+///
+/// | budget | steady-state wall | CPU per inference | pool construction |
+/// | --- | --- | --- | --- |
+/// | 16 | 0.921 ms | 13.99 ms | 1.55 CPU-s |
+/// | 32 | 0.934 ms | 15.17 ms | 3.67 CPU-s |
+///
+/// No wall-clock gain at all, 8% more CPU per inference, and 2.4x the one-off
+/// construction cost -- which is futex and yield-spin churn while ~2x the
+/// threads come up, and which grows faster than linearly in the worker count.
+/// Larger prefill shapes in the same diagnostic harness measured the same way
+/// or worse. The runtime honours the request either way; this only makes a
+/// request that cannot pay for itself visible instead of silent.
+fn report_budget_beyond_physical_cores(threads: usize) {
+    let Some(cores) =
+        budget_beyond_physical_cores(threads, crate::core_topology::allowed_physical_cores())
+    else {
+        return;
+    };
+    eprintln!(
+        "onnx-genai: CPU decode budget {threads} exceeds the {cores} physical cores available \
+         to this process; the surplus workers are SMT siblings that contend rather than add \
+         throughput, and they cost both CPU per inference and a larger one-off pool \
+         construction. Consider {DECODE_THREADS_ENV}={cores} unless a measurement on this host \
+         says otherwise"
+    );
+}
+
 /// Confine the whole process to the explicit decode budget so a user who caps
 /// cores (via `--cpu-cores N`, `ONNX_GENAI_CPU_DECODE_THREADS=N`, or
 /// [`set_decode_thread_budget`]) disturbs at most `N` CPUs -- covering prefill
@@ -4276,6 +4327,10 @@ pub fn bound_process_to_decode_budget() {
     else {
         return;
     };
+
+    // Before the affinity mask narrows the allowed set, so the request is judged
+    // against the machine the caller was looking at when they chose the budget.
+    report_budget_beyond_physical_cores(threads);
 
     // Apply the process CPU affinity mask *before* building the Rayon global
     // pool so its worker threads inherit the restricted CPU set.
@@ -21670,6 +21725,34 @@ mod tests {
                 "output {index} got the wrong `output_start`"
             );
         }
+    }
+
+    #[test]
+    fn budget_within_physical_cores_is_not_worth_warning_about() {
+        assert_eq!(super::budget_beyond_physical_cores(16, Some(16)), None);
+        assert_eq!(super::budget_beyond_physical_cores(8, Some(16)), None);
+        assert_eq!(super::budget_beyond_physical_cores(1, Some(16)), None);
+    }
+
+    #[test]
+    fn budget_past_physical_cores_reports_the_core_count() {
+        assert_eq!(super::budget_beyond_physical_cores(32, Some(16)), Some(16));
+        assert_eq!(super::budget_beyond_physical_cores(17, Some(16)), Some(16));
+    }
+
+    /// An unknown topology is never an occasion to warn: the whole point of the
+    /// warning is that we know the request cannot pay for itself, and without a
+    /// core count we do not know that.
+    #[test]
+    fn unknown_topology_never_warns() {
+        assert_eq!(super::budget_beyond_physical_cores(1024, None), None);
+    }
+
+    /// A zero core count means detection returned something meaningless rather
+    /// than a real single-core host, so it is treated as unknown.
+    #[test]
+    fn zero_physical_cores_is_treated_as_unknown() {
+        assert_eq!(super::budget_beyond_physical_cores(32, Some(0)), None);
     }
 
     /// The int4 prefill GEBP crossover is size-aware: a weight that stays
