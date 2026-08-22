@@ -7,7 +7,8 @@ use std::time::Instant;
 
 use anyhow::{Context, bail};
 use onnx_genai_metadata::{
-    ComponentImplementation, StateAliasing, WorkflowComponent, WorkflowNode, WorkflowSpec,
+    ComponentImplementation, StateAliasing, StatePortAccess, WorkflowComponent, WorkflowNode,
+    WorkflowSpec,
 };
 use onnx_genai_ort::{Allocator, IoBinding, Session, Value};
 use onnx_runtime_loader::proto::onnx::{
@@ -1405,6 +1406,9 @@ fn build_execution_island(
                     continue;
                 };
                 for alias in aliases.values() {
+                    if alias.access == StatePortAccess::ReadOnly {
+                        continue;
+                    }
                     let Some(input_value) = invocation.inputs.get(&alias.input) else {
                         continue;
                     };

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use super::*;
 use crate::decode::clone_value;
-use onnx_genai_metadata::StateAliasing;
+use onnx_genai_metadata::{StateAliasing, StatePortAccess};
 use onnx_genai_ort::{IoBinding, Session};
 
 type ResolvedComponentInvocation<'a> = (
@@ -1815,6 +1815,7 @@ impl PipelineEngine {
                     .filter(|group| group.aliasing != StateAliasing::Forbidden)
                     .filter_map(|group| group.ports.get(component))
                     .flat_map(|aliases| aliases.values())
+                    .filter(|alias| alias.access == StatePortAccess::ReadWrite)
                     .map(|alias| (alias.output.clone(), alias.input.clone()))
                     .collect::<HashMap<_, _>>()
             })
