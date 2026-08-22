@@ -69,14 +69,10 @@ fn every_catalogue_example_parses_and_validates() {
         }
         if path
             .file_name()
-            .is_some_and(|name| name == std::ffi::OsStr::new("23-gemma4-e2b-moe-decoder.yaml"))
+            .is_some_and(|name| name == std::ffi::OsStr::new("23-gemma4-e2b-decoder.yaml"))
         {
-            let moe = metadata
-                .model
-                .as_ref()
-                .and_then(|model| model.mixture_of_experts.as_ref())
-                .expect("23-gemma4-e2b declares a mixture-of-experts FFN");
-            assert_eq!(moe.experts_per_token, 2);
+            // This checkpoint is dense (no MoE); its real heterogeneity is head
+            // WIDTH — the global head_dim is larger than the local head_dim.
             let full_key = workflow.state["full_key_0"]
                 .contract
                 .shape
@@ -90,6 +86,14 @@ fn every_catalogue_example_parses_and_validates() {
             assert_ne!(
                 full_key[3], sliding_key[3],
                 "global and local layers must keep independent head widths"
+            );
+            assert!(
+                metadata
+                    .model
+                    .as_ref()
+                    .and_then(|model| model.mixture_of_experts.as_ref())
+                    .is_none(),
+                "the E2B target checkpoint is dense; no MoE metadata is invented"
             );
         }
         if path.file_name().is_some_and(|name| {

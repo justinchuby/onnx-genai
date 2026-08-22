@@ -33,8 +33,8 @@ non-schema keys.
 | 20 | [Qwen3.5 hybrid speculative decode](20-qwen3_5-hybrid-speculative-decoding.yaml) | Full-attention KV plus linear/conv replacement state with atomic rollback |
 | 21 | [Shared-prefix pixel flow](21-shared-prefix-pixel-flow.yaml) | Alternating CFG branches read frozen prefix state across a flow-matching loop |
 | 22 | [Qwen3 chained speculative decode](22-qwen3-chained-speculative-decoding.yaml) | Token-embedding chain with typed hidden/KV recurrence and mapped vocabulary |
-| 23 | [Gemma 4 E2B MoE decoder](23-gemma4-e2b-moe-decoder.yaml) | Hybrid full/sliding KV with heterogeneous global/local geometry, shared owners, and a sparse MoE FFN |
-| 24 | [Gemma 4 E2B assistant](24-gemma4-e2b-assistant-speculative.yaml) | Cacheless read-only shared-KV drafter with a chained proposal over a pruned vocabulary |
+| 23 | [Gemma 4 E2B decoder](23-gemma4-e2b-decoder.yaml) | Dense hybrid full/sliding KV with heterogeneous global/local head widths and shared owners |
+| 24 | [Gemma 4 E2B assistant](24-gemma4-e2b-assistant-speculative.yaml) | Cacheless read-only shared-KV drafter with a chained proposal over a pruned, ordered-embedding vocabulary |
 
 ## Shared-prefix alternating branches
 
@@ -115,23 +115,30 @@ semantics differ—not merely because two aliases have different shapes.
 ## Gemma 4 E2B target and pruned shared-KV assistant
 
 The Gemma 4 E2B pair (examples 23 and 24) exercises every hard fact of a
-hybrid-attention MoE target and its cacheless drafter with one generic
-vocabulary — no model name appears in the schema.
+hybrid-attention target and its cacheless drafter with one generic vocabulary —
+no model name appears in the schema.
 
 The **target** (`google/gemma-4-E2B-it`, example 23) is a plain decoder whose
 resolved decode ABI reports `kv_ownership: owned`. It declares:
 
 - separate `full_attention` (global, `evictable_prefix: false`) and
-  `sliding_attention` (local, `evictable_prefix: true`) groups;
-- heterogeneous global/local geometry: the two groups use independent
-  `full_head_dim`/`sliding_head_dim` widths, and the local group even exposes
-  different `sliding_key_heads` and `sliding_value_heads` counts;
-- fewer physical KV owners than logical layers — the full group names two owner
-  layers (0, 1) and the local group one (0), while later same-kind layers reuse
-  an owner's buffer inside the graph and expose no ports;
-- a sparse MoE FFN under `model.mixture_of_experts` with legal expert-parallel
-  sharding under `model.sharding.expert_parallel`. That structure is graph fact,
-  not a router node name.
+  `sliding_attention` (local window 512, `evictable_prefix: true`) groups;
+- heterogeneous global/local geometry: this checkpoint's real heterogeneity is
+  head WIDTH — the global `full_head_dim` (512) is twice the local
+  `sliding_head_dim` (256). It is grouped-query attention with one KV head
+  (`num_key_value_heads: 1`), so key and value share one head-count symbol per
+  group. (A model whose K and V head counts differ is equally expressible — see
+  example 1 — this checkpoint's do not.)
+- fewer physical KV owners than logical layers (`num_kv_shared_layers`) — the
+  full group names two owner layers (0, 1) and the local group one (0), while
+  later same-kind layers reuse an owner's buffer inside the graph and expose no
+  ports.
+
+This checkpoint is **dense** (`enable_moe_block: false` / `num_experts: null`),
+so it declares no MoE metadata — none is invented. The schema still expresses a
+sparse FFN through `model.mixture_of_experts` (+ `model.sharding.expert_parallel`)
+for MoE variants; `final_logit_softcapping` and `tie_word_embeddings` are
+graph-internal to the decoder artifact and are not restated as metadata.
 
 The **assistant** (`google/gemma-4-E2B-it-assistant`, example 24) shares one
 workflow with the target and owns no attention cache. Its full/sliding aliases
@@ -144,12 +151,17 @@ transitions; its only loop-carried cell is `projected_state` in a
   invocation, re-invoked up to `max_proposal_width`;
 - `port_bindings.target_hidden_context` and `shared_weights` declare the
   concatenated `inputs_embeds = concat(target_input_embedding(token), hidden)`
-  handoff and the borrowed target ordered-embedding table;
+  (`[batch, q, 2*hidden]`) handoff and the borrowed target ordered-embedding
+  table (`use_ordered_embeddings: true`);
 - `shared_state: [full_attention, sliding_attention]` names the frozen groups the
-  drafter reads, and it reads only a subset of the target's physical owners;
-- `vocabulary: {kind: subset, proposer_vocab_size}` is the pruned/sparse LM head
-  over a prefix-ordered slice of the target vocabulary. A pruned drafter is not
-  `distribution_preserving`, so the caller opts speculation in;
+  drafter reads;
+- the sparse, ordered-embedding LM head routes through centroids
+  (`num_centroids`, `centroid_intermediate_top_k`) inside the graph; the contract
+  only records the vocabulary RELATIONSHIP. This example uses
+  `vocabulary: {kind: subset, proposer_vocab_size}` (ordered embeddings make a
+  prefix subset well defined); a drafter emitting centroid/cluster ids that need
+  a translation table would use `{kind: mapped, artifact}`. Either way a pruned
+  drafter is not `distribution_preserving`, so the caller opts speculation in;
 - `rollback_state` lists every rewound target KV cell plus `projected_state`, and
   each of their groups covers `rollback_positions >= max_proposal_width`.
 

@@ -7,7 +7,7 @@
 //! numerical output. It asserts:
 //!
 //!   * the target owns its hybrid full/sliding KV (read-write), with
-//!     heterogeneous global/local head counts and widths, plus a sparse-MoE FFN;
+//!     heterogeneous global/local head widths, and is dense (no MoE invented);
 //!   * the assistant owns NO KV (its shared full/sliding aliases are
 //!     `read_only`, so the resolved ABI is `kv_ownership: shared` with no KV
 //!     transitions), and its only loop-carried cell is `projected_state`;
@@ -21,7 +21,7 @@ use onnx_genai_metadata::{
 };
 
 const TARGET: &str =
-    include_str!("../../../examples/inference_metadata/catalogue/23-gemma4-e2b-moe-decoder.yaml");
+    include_str!("../../../examples/inference_metadata/catalogue/23-gemma4-e2b-decoder.yaml");
 const ASSISTANT: &str = include_str!(
     "../../../examples/inference_metadata/catalogue/24-gemma4-e2b-assistant-speculative.yaml"
 );
@@ -32,10 +32,10 @@ fn parse(doc: &str) -> InferenceMetadata {
     metadata
 }
 
-/// The target decoder owns its hybrid attention KV, with independent global and
-/// local geometry, and declares a sparse mixture-of-experts FFN.
+/// The target decoder owns its hybrid attention KV with independent global and
+/// local head widths. This checkpoint is dense, so no MoE metadata is invented.
 #[test]
-fn target_owns_hybrid_moe_decoder() {
+fn target_owns_hybrid_dense_decoder() {
     let metadata = parse(TARGET);
     let workflow = &metadata.pipeline.as_ref().expect("pipeline").workflow;
 
@@ -71,9 +71,9 @@ fn target_owns_hybrid_moe_decoder() {
         "the local window drops old tokens"
     );
 
-    // Heterogeneous global/local geometry: the head widths differ, and the local
-    // group even exposes different key and value head counts. The dimensions are
-    // independent symbolic axes on the graph ports.
+    // Heterogeneous global/local geometry: this checkpoint's real heterogeneity
+    // is head WIDTH — the global head_dim differs from the local head_dim. The
+    // dimensions are independent symbolic axes on the graph ports.
     let dim = |cell: &str, axis: usize| {
         workflow.state[cell].contract.shape.as_ref().expect("shape")[axis].clone()
     };
@@ -81,11 +81,6 @@ fn target_owns_hybrid_moe_decoder() {
         dim("full_key_0", 3),
         dim("sliding_key_0", 3),
         "global vs local head width"
-    );
-    assert_ne!(
-        dim("sliding_key_0", 1),
-        dim("sliding_value_0", 1),
-        "local key and value head counts differ"
     );
 
     // Fewer physical KV owners than logical attention layers: the full group
@@ -97,15 +92,17 @@ fn target_owns_hybrid_moe_decoder() {
         .collect();
     assert_eq!(layers, std::collections::BTreeSet::from([0, 1]));
 
-    // The MoE FFN is a structural fact, declared once.
-    let moe = metadata
-        .model
-        .as_ref()
-        .and_then(|model| model.mixture_of_experts.as_ref())
-        .expect("target declares a mixture-of-experts FFN");
-    assert_eq!(moe.representation, "moe");
-    assert_eq!(moe.experts_per_token, 2);
-    assert_eq!(moe.routed_expert_count, 8);
+    // The shipping E2B checkpoint is dense: no MoE metadata is invented. (The
+    // schema still expresses a sparse FFN through `model.mixture_of_experts`
+    // for MoE variants; this checkpoint declares none.)
+    assert!(
+        metadata
+            .model
+            .as_ref()
+            .and_then(|model| model.mixture_of_experts.as_ref())
+            .is_none(),
+        "the E2B target checkpoint is dense"
+    );
 }
 
 /// The assistant reads the target's KV read-only and carries only its projected

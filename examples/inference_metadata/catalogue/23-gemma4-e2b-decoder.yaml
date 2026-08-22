@@ -1,47 +1,34 @@
-# Gemma 4 E2B text decoder. Real-package shape for the `google/gemma-4-E2B-it`
-# target: a hybrid full/sliding-window attention decoder with a sparse
-# mixture-of-experts FFN and heterogeneous global/local KV geometry.
+# Gemma 4 E2B text decoder; real-package shape for the `google/gemma-4-E2B-it`
+# target. This checkpoint is a DENSE hybrid full/sliding-window decoder — its
+# pinned config sets `enable_moe_block: false` / `num_experts: null`, so no MoE
+# metadata is invented here. (The schema can still express a sparse FFN through
+# `model.mixture_of_experts` for MoE variants; this dense checkpoint has none.)
 #
 # The schema carries no model name; artifact paths and this comment identify the
-# concrete package. The facts below are all graph-visible and generic:
+# concrete package. Every fact below is generic and graph-visible:
 #
 #   * Hybrid attention: `full_attention` (global) and `sliding_attention`
-#     (local) are separate state-service groups with different `kind` and
-#     `reuse` discipline. The local group's prefix is `evictable_prefix: true`
-#     (a fixed window drops old tokens); the global group is not evictable.
-#   * Heterogeneous global/local geometry: the global head width (`full_head_dim`)
-#     differs from the local head width (`sliding_head_dim`), and the local group
-#     even exposes different key and value head counts
-#     (`sliding_key_heads` vs `sliding_value_heads`). A runtime reads each graph
-#     port independently, so the groups need not agree on any of these axes.
-#   * Shared / borrowed KV layers: the decoder has more attention layers than it
-#     has physical KV buffers. The global group owns two physical layers (0, 1)
-#     and the local group owns one (0); later same-kind layers reuse an owner's
-#     buffer inside the graph, so they expose no state ports. `layer` orders and
-#     pairs the physical owners; it does not enumerate every logical layer.
-#   * Sparse MoE FFN: declared once, structurally, under `model.mixture_of_experts`
-#     (and legal expert-parallel sharding under `model.sharding.expert_parallel`).
-#     It is a graph structure fact, never a model family or router node name.
+#     (local, window 512) are separate state-service groups with different
+#     `kind` and `reuse` discipline. The config repeats one global layer after
+#     several local ones; the local group's prefix is `evictable_prefix: true`
+#     (the fixed window drops old tokens) and the global group's is not.
+#   * Heterogeneous global/local geometry: this checkpoint's real heterogeneity
+#     is head WIDTH — the global head_dim (512) is twice the local head_dim
+#     (256). The two groups therefore use independent `full_head_dim` and
+#     `sliding_head_dim` axes. It is grouped-query attention with one KV head
+#     (`num_key_value_heads: 1`), so key and value share one head-count symbol
+#     per group. (A model whose K and V head counts differ is equally
+#     expressible — see example 1 — this checkpoint's simply do not.)
+#   * Shared / borrowed KV layers: the config sets `num_kv_shared_layers`, so the
+#     decoder has far more attention layers than physical KV buffers. The global
+#     group owns two physical layers (0, 1) and the local group one (0); later
+#     same-kind layers reuse an owner's buffer inside the graph and expose no
+#     ports. `layer` orders and pairs the physical owners; it does not enumerate
+#     every logical layer.
+#
+# `final_logit_softcapping` and `tie_word_embeddings` are graph-internal to the
+# decoder artifact and are not restated as metadata.
 schema_version: v1
-model:
-  mixture_of_experts:
-    representation: moe
-    routed_expert_count: 8
-    shared_expert_count: 1
-    experts_per_token: 2
-    expert_intermediate_size: 32
-    shared_expert_intermediate_size: 32
-    activation: silu
-    router:
-      score_function: softmax
-      selection_method: top_k
-      normalize_weights: true
-      scaling_factor: 1.0
-  sharding:
-    expert_parallel:
-      expert_count: 8
-      contiguous_groups_only: true
-      replicated: [router]
 pipeline:
   workflow:
     manifest:
@@ -68,32 +55,32 @@ pipeline:
         source: {kind: request}
         required: true
       request.full_key_0:
-        contract: {dtype: float16, rank: 4, shape: [batch, full_key_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: opaque}
         source: {kind: application, name: full_key_0}
         required: true
       request.full_value_0:
-        contract: {dtype: float16, rank: 4, shape: [batch, full_value_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: opaque}
         source: {kind: application, name: full_value_0}
         required: true
       request.full_key_1:
-        contract: {dtype: float16, rank: 4, shape: [batch, full_key_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: opaque}
         source: {kind: application, name: full_key_1}
         required: true
       request.full_value_1:
-        contract: {dtype: float16, rank: 4, shape: [batch, full_value_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: opaque}
         source: {kind: application, name: full_value_1}
         required: true
       request.sliding_key_0:
-        contract: {dtype: float16, rank: 4, shape: [batch, sliding_key_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float16, rank: 4, shape: [batch, sliding_kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: opaque}
         source: {kind: application, name: sliding_key_0}
         required: true
       request.sliding_value_0:
-        contract: {dtype: float16, rank: 4, shape: [batch, sliding_value_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float16, rank: 4, shape: [batch, sliding_kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: opaque}
         source: {kind: application, name: sliding_value_0}
         required: true
@@ -108,24 +95,24 @@ pipeline:
         ports:
           inputs:
             input_ids: {dtype: int64, rank: 2, shape: [batch, sequence], batch_layout: {kind: request_aligned, axis: 0}}
-            full_key_0: {dtype: float16, rank: 4, shape: [batch, full_key_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
-            full_value_0: {dtype: float16, rank: 4, shape: [batch, full_value_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
-            full_key_1: {dtype: float16, rank: 4, shape: [batch, full_key_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
-            full_value_1: {dtype: float16, rank: 4, shape: [batch, full_value_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
-            sliding_key_0: {dtype: float16, rank: 4, shape: [batch, sliding_key_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
-            sliding_value_0: {dtype: float16, rank: 4, shape: [batch, sliding_value_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            full_key_0: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            full_value_0: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            full_key_1: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            full_value_1: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            sliding_key_0: {dtype: float16, rank: 4, shape: [batch, sliding_kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            sliding_value_0: {dtype: float16, rank: 4, shape: [batch, sliding_kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
           outputs:
             logits: {dtype: float16, rank: 3, shape: [batch, sequence, vocab], batch_layout: {kind: request_aligned, axis: 0}}
-            next_full_key_0: {dtype: float16, rank: 4, shape: [batch, full_key_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
-            next_full_value_0: {dtype: float16, rank: 4, shape: [batch, full_value_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
-            next_full_key_1: {dtype: float16, rank: 4, shape: [batch, full_key_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
-            next_full_value_1: {dtype: float16, rank: 4, shape: [batch, full_value_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
-            next_sliding_key_0: {dtype: float16, rank: 4, shape: [batch, sliding_key_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
-            next_sliding_value_0: {dtype: float16, rank: 4, shape: [batch, sliding_value_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            next_full_key_0: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            next_full_value_0: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            next_full_key_1: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            next_full_value_1: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            next_sliding_key_0: {dtype: float16, rank: 4, shape: [batch, sliding_kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            next_sliding_value_0: {dtype: float16, rank: 4, shape: [batch, sliding_kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
           roles: {input_ids: token_ids, logits: logits}
     state:
       full_key_0:
-        contract: {dtype: float16, rank: 4, shape: [batch, full_key_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         scope: invocation
         initializer: request.full_key_0
         recurrence: {kind: invariant}
@@ -133,7 +120,7 @@ pipeline:
         release_boundary: invocation
         service_group: full_attention
       full_value_0:
-        contract: {dtype: float16, rank: 4, shape: [batch, full_value_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         scope: invocation
         initializer: request.full_value_0
         recurrence: {kind: invariant}
@@ -141,7 +128,7 @@ pipeline:
         release_boundary: invocation
         service_group: full_attention
       full_key_1:
-        contract: {dtype: float16, rank: 4, shape: [batch, full_key_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         scope: invocation
         initializer: request.full_key_1
         recurrence: {kind: invariant}
@@ -149,7 +136,7 @@ pipeline:
         release_boundary: invocation
         service_group: full_attention
       full_value_1:
-        contract: {dtype: float16, rank: 4, shape: [batch, full_value_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         scope: invocation
         initializer: request.full_value_1
         recurrence: {kind: invariant}
@@ -157,7 +144,7 @@ pipeline:
         release_boundary: invocation
         service_group: full_attention
       sliding_key_0:
-        contract: {dtype: float16, rank: 4, shape: [batch, sliding_key_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float16, rank: 4, shape: [batch, sliding_kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         scope: invocation
         initializer: request.sliding_key_0
         recurrence: {kind: invariant}
@@ -165,7 +152,7 @@ pipeline:
         release_boundary: invocation
         service_group: sliding_attention
       sliding_value_0:
-        contract: {dtype: float16, rank: 4, shape: [batch, sliding_value_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float16, rank: 4, shape: [batch, sliding_kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         scope: invocation
         initializer: request.sliding_value_0
         recurrence: {kind: invariant}
