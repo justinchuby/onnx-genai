@@ -28,6 +28,7 @@ use std::sync::Arc;
 mod adapters;
 mod arg_reduce;
 mod audio;
+pub(crate) mod canonical_decode;
 mod islands;
 #[cfg(feature = "native-backend")]
 mod native_component;

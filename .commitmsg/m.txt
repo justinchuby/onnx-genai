@@ -1,0 +1,58 @@
+feat(engine): execute every generated request through the canonical workflow
+
+Architecture A, completed. A bare-decoder package keeps `model.io` as its sole
+serialized answer; the loader compiles that ABI into a canonical WorkflowSpec in
+memory and the interpreter's canonical decode loop executes it. There is no
+longer a direct decode path to fall back to.
+
+The split that makes this real rather than a wrapper is in `decode_loop.rs`:
+
+* `forward_step` is the `onnx-genai.autoregressive-decode` primitive -- one
+  decoder forward pass, taking the device greedy-argmax or device-sampling fast
+  path when it applies. KV stays the executor's business, exactly as the lowered
+  workflow declares (`management: runtime`), so device residency is untouched.
+* `select_and_commit_step` is the `onnx-genai.token-policy` primitive -- the
+  logit-processor chain, sampler, logprobs, KV commit, and stop/EOS detection.
+
+Both are the *only* implementations. `step_decode_loop` is now written on them,
+so a caller cannot reach a second copy of the policy.
+
+`pipeline::canonical_decode::run_canonical_decode` is the one token loop. It
+owns iteration count, the context-limit stop, the stop decision, and the emitted
+token stream; the body is forward-then-policy. `run_decode_loop` -- the second
+token loop only the direct `Engine` path could drive -- is deleted, and its unit
+tests re-point at the loop that remains. The ORT session path, both native decode
+sessions, and the workflow path now share it.
+
+Fail-closed, not mode-switched. `install_canonical_workflow` runs at load for
+every decoder package and asserts the lowered workflow declares the two contracts
+this runtime implements; a package that cannot be lowered fails to load.
+`generate_with_callbacks` then refuses outright if no canonical form is present,
+naming the fact that the old path no longer exists. Two hand-built test doubles
+tripped that guard on the first run -- they skip the loader -- and now carry the
+same lowering a real minimal decoder gets, rather than the guard being weakened.
+
+Parity, on real models: greedy goldens for phi35-mini int4, phi4-mini CUDA,
+qwen2.5-0.5b CUDA, qwen3-0.6b, and gpt-oss-20b are byte-identical to the
+pre-change baseline captured at c58eb5b2. The tokens did not move; only who
+produced them did.
+
+`canonical_execution_parity` (8) pins what goldens cannot: that a bare decoder is
+lowered at load and reports `provenance: lowered` while still serializing only
+`model.io`; that prefill, cached decode on a reused session, deterministic greedy
+generation, EOS stopping, seeded sampling, and batching (where the decode path
+supports it) all run through the canonical loop; that an authored workflow is
+executed as authored and never lowered beside itself; and -- the case the whole
+change rests on -- that the legacy direct path cannot be selected: no constructor
+skips lowering, and a runtime with its canonical form removed refuses to generate
+instead of falling back.
+
+Verified: onnx-genai-engine 72 targets green under `native-backend`; server /
+CLI / C ABI / metadata / bench 30 green; H200 native-cuda green
+(canonical_execution_parity 8, native_workflow_parity 12, corpus 5,
+one_runtime_e2e 5, fixture floor 3); `cargo fmt --all --check`; clippy
+`-D warnings` clean apart from a `too_many_arguments` lint on
+`engine/placement.rs`, which arrived with main (#1779) and this branch does not
+touch.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>

@@ -102,6 +102,18 @@ impl Engine {
         onnx_genai_metadata::lower_decoder_abi(io).map_err(|error| anyhow::anyhow!("{error}"))
     }
 
+    /// Drop the canonical workflow, so the next request has no path to take.
+    ///
+    /// Test-only. Nothing in the public API can produce this state — the loader
+    /// installs a canonical workflow for every package it accepts — so this
+    /// exists purely to let a test prove the refusal is real rather than
+    /// unreachable.
+    #[doc(hidden)]
+    pub fn forget_canonical_workflow_for_test(&mut self) {
+        self.workflow = None;
+        self.lowered_workflow = None;
+    }
+
     /// Whether this package is executed by the workflow interpreter.
     ///
     /// Callers should rarely need this: every operation below already resolves

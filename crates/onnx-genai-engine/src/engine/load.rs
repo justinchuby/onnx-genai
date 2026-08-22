@@ -33,17 +33,44 @@ impl Engine {
         }
     }
 
+    /// Compile this package's authored `model.io` into its canonical workflow.
+    ///
+    /// Runs once, at load, for every bare-decoder package: the result is what
+    /// the interpreter executes, so a package that cannot be lowered must fail
+    /// here rather than reach generation and find no path to take. The package
+    /// on disk is untouched — `model.io` stays its sole serialized answer.
+    fn install_canonical_workflow(mut self) -> anyhow::Result<Self> {
+        if self.workflow.is_some() {
+            // An authored workflow is already the canonical form.
+            return Ok(self);
+        }
+        let io = self.metadata.decoder_io().context(
+            "this package declares neither pipeline.workflow nor model.io, so there is no \
+             executable graph ABI to lower into a canonical workflow",
+        )?;
+        let lowered = onnx_genai_metadata::lower_decoder_abi(io).map_err(|error| {
+            anyhow::anyhow!(
+                "failed to lower this package's model.io into a canonical workflow: {error}"
+            )
+        })?;
+        crate::pipeline::canonical_decode::assert_canonical_contracts(&lowered)?;
+        self.lowered_workflow = Some(lowered);
+        Ok(self)
+    }
+
     /// Load a package from a directory.
     ///
     /// One entry point for both package shapes: a package that declares
     /// `pipeline.workflow` is loaded as workflow interpreter state, a package
-    /// that declares a bare decoder as decode-core state. The caller gets the
-    /// same type either way.
+    /// that declares a bare decoder is lowered into its canonical workflow. The
+    /// caller gets the same type either way, and both execute through the
+    /// interpreter.
     pub fn from_dir(model_dir: &Path, config: EngineConfig) -> anyhow::Result<Self> {
         if Self::declares_workflow(model_dir)? {
             return Self::from_pipeline_dir(model_dir, config);
         }
-        Self::from_dir_impl(model_dir, config, SessionOptions::default(), false, None)
+        Self::from_dir_impl(model_dir, config, SessionOptions::default(), false, None)?
+            .install_canonical_workflow()
     }
 
     /// Load a package using a caller-owned device authority provider.
@@ -63,7 +90,8 @@ impl Engine {
             SessionOptions::default(),
             false,
             Some(provider),
-        )
+        )?
+        .install_canonical_workflow()
     }
 
     /// Load a package from a directory with explicit ORT session options.
@@ -80,7 +108,8 @@ impl Engine {
             )
             .and_then(Self::from_workflow);
         }
-        Self::from_dir_impl(model_dir, config, session_options, true, None)
+        Self::from_dir_impl(model_dir, config, session_options, true, None)?
+            .install_canonical_workflow()
     }
 
     fn from_dir_impl(
@@ -314,6 +343,7 @@ impl Engine {
 
         Ok(Self {
             workflow: None,
+            lowered_workflow: None,
             decode_backend,
             metadata,
             metadata_hints,
@@ -1015,6 +1045,7 @@ impl Engine {
 
         Ok(Self {
             workflow: None,
+            lowered_workflow: None,
             decode_backend: EngineDecodeBackend::Native,
             metadata,
             metadata_hints,

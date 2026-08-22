@@ -8,7 +8,7 @@ pub(crate) use crate::decode::{
     next_session_token_logits, next_session_token_sampled,
 };
 pub(crate) use crate::decode_loop::{
-    DecodeLoopBackend, DecodeLoopState, exceeded_context_limit, run_decode_loop, step_decode_loop,
+    DecodeLoopBackend, DecodeLoopState, exceeded_context_limit, step_decode_loop,
 };
 pub(crate) use crate::kv_bridge::{
     KvModelInfo, PlacedPayload, RewindRequest, RewindRunnerPolicy, attach_pages_to_sequence,
@@ -195,6 +195,7 @@ mod tests {
 
         Ok(Engine {
             workflow: None,
+            lowered_workflow: Some(crate::pipeline::canonical_decode::test_canonical_workflow()),
             decode_backend: EngineDecodeBackend::Ort,
             metadata: InferenceMetadata::default(),
             metadata_hints: MetadataHints::default(),

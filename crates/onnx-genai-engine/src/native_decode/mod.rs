@@ -2,8 +2,9 @@
 
 use crate::config::{GenerateOptions, GenerateResult, GenerateTokenCallback};
 use crate::decode::DecodeBackend;
-use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
+use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState};
 use crate::logits::{ProcessorChain, TokenId};
+use crate::pipeline::canonical_decode::{CanonicalDecodeRequest, run_canonical_decode};
 use crate::sampling::sample_greedy;
 use anyhow::{Context, bail};
 use onnx_genai_metadata::{KvOwnership, ModelIoSpec, SequenceInputKind};
@@ -1397,13 +1398,15 @@ impl NativeDecodeSession {
             lookahead: std::collections::VecDeque::new(),
         };
         let mut state = DecodeLoopState::new(0, options.seed, options.top_logprobs);
-        run_decode_loop(
+        run_canonical_decode(
             &mut backend,
             &mut state,
-            options,
-            chain,
-            tokenizer,
-            options.max_context,
+            CanonicalDecodeRequest {
+                options,
+                chain,
+                tokenizer,
+                max_context: options.max_context,
+            },
             callback,
         )
     }
@@ -1510,13 +1513,15 @@ impl NativeDecodeSession {
             lookahead: std::collections::VecDeque::new(),
         };
         let mut state = DecodeLoopState::new(resume_from, options.seed, options.top_logprobs);
-        run_decode_loop(
+        run_canonical_decode(
             &mut backend,
             &mut state,
-            options,
-            chain,
-            tokenizer,
-            options.max_context,
+            CanonicalDecodeRequest {
+                options,
+                chain,
+                tokenizer,
+                max_context: options.max_context,
+            },
             callback,
         )
     }

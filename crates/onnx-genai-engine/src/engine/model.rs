@@ -20,6 +20,15 @@ pub struct Engine {
     /// Workflow interpreter state, present when the package declares
     /// `pipeline.workflow`.
     pub(crate) workflow: Option<Box<crate::pipeline::WorkflowRuntime>>,
+    /// The canonical workflow a bare-decoder package was lowered to.
+    ///
+    /// Compiled from the package's own `model.io` at load and held only here —
+    /// never written back, so the package still declares `model.io` alone. Its
+    /// presence is what makes "every generated request runs a canonical
+    /// workflow" a load-time fact rather than a hope: a decoder package that
+    /// could not be lowered fails to load instead of quietly taking a direct
+    /// path that no longer exists.
+    pub(crate) lowered_workflow: Option<onnx_genai_metadata::WorkflowSpec>,
     /// Resolved decoder execution backend.
     pub(crate) decode_backend: EngineDecodeBackend,
     /// Model inference metadata.
@@ -147,6 +156,7 @@ impl Engine {
         // duplicated into the decode core.
         Ok(Engine {
             workflow: Some(Box::new(workflow)),
+            lowered_workflow: None,
             decode_backend,
             metadata,
             metadata_hints: MetadataHints::default(),

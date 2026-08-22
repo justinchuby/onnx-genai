@@ -833,13 +833,22 @@ impl Engine {
         admission_callback: Option<&mut dyn FnMut()>,
         token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
-        // One entry point. A package that declares `pipeline.workflow` is driven
-        // by the interpreter over its declared `tokens` output; a package that
-        // declares a bare decoder is driven by the decode core below. The caller
-        // does not choose, and no longer holds a different type for each.
+        // One entry point, and one runtime beneath it. An authored
+        // `pipeline.workflow` is driven by the interpreter over its declared
+        // `tokens` output; a bare decoder is driven by the canonical workflow
+        // the loader compiled from its own `model.io`. There is no third path:
+        // a package that reached here without a canonical form is a load bug,
+        // and saying so is what keeps "every request runs a canonical workflow"
+        // checkable rather than asserted.
         if self.workflow.is_some() {
             return self.workflow_generate(request, admission_callback, token_callback);
         }
+        anyhow::ensure!(
+            self.lowered_workflow.is_some(),
+            "this package has no canonical workflow: it declares no pipeline.workflow and its \
+             model.io was never lowered. The direct decode path it would once have taken no \
+             longer exists, so this is a loader bug rather than a package problem"
+        );
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
             // Speculation still runs cold: the native speculative paths own
@@ -1075,13 +1084,20 @@ impl Engine {
                 session_id,
                 state: &mut state,
             };
-            run_decode_loop(
+            // Every generated token goes through the interpreter's canonical
+            // decode loop. The backend below is the `autoregressive-decode`
+            // executor -- one forward pass, KV stays its business -- and the
+            // policy inside the loop is the single sampling/stopping
+            // implementation, shared with authored workflows.
+            crate::pipeline::canonical_decode::run_canonical_decode(
                 &mut backend,
                 &mut loop_state,
-                &options,
-                &chain,
-                tokenizer,
-                max_context,
+                crate::pipeline::canonical_decode::CanonicalDecodeRequest {
+                    options: &options,
+                    chain: &chain,
+                    tokenizer,
+                    max_context,
+                },
                 callback.as_deref_mut(),
             )
         })()
@@ -2465,6 +2481,7 @@ mod tests {
         )?;
         let mut engine = Engine {
             workflow: None,
+            lowered_workflow: Some(crate::pipeline::canonical_decode::test_canonical_workflow()),
             decode_backend: EngineDecodeBackend::Native,
             metadata: InferenceMetadata::default(),
             metadata_hints: MetadataHints::default(),
@@ -2545,6 +2562,7 @@ mod tests {
         // decode_path alone.
         let mut engine = Engine {
             workflow: None,
+            lowered_workflow: Some(crate::pipeline::canonical_decode::test_canonical_workflow()),
             decode_backend: EngineDecodeBackend::Native,
             metadata: InferenceMetadata::default(),
             metadata_hints: MetadataHints::default(),

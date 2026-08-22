@@ -4,7 +4,7 @@ use onnx_genai_metadata::{
     WorkflowSpec,
 };
 
-use super::{WorkflowRuntime, PipelineOutputs};
+use super::{PipelineOutputs, WorkflowRuntime};
 
 const RESAMPLE_RADIUS: isize = 16;
 
