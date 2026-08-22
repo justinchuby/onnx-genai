@@ -163,6 +163,7 @@ struct ManagedCudaOrtAllocatorState {
     binding: ScopedMemoryBinding,
     authority: RegisteredMemoryAuthority,
     holder: RegisteredMemoryHolder,
+    context: Arc<CudaContext>,
     memory: Arc<dyn DeviceAllocator>,
     queue: Arc<CudaDeferredReleaseQueue>,
     roles: AllocationRoles,
@@ -198,6 +199,7 @@ impl ManagedCudaOrtAllocator {
         binding: ScopedMemoryBinding,
         authority: RegisteredMemoryAuthority,
         holder: RegisteredMemoryHolder,
+        context: Arc<CudaContext>,
         memory: Arc<dyn DeviceAllocator>,
         queue: Arc<CudaDeferredReleaseQueue>,
     ) -> Box<Self> {
@@ -217,6 +219,7 @@ impl ManagedCudaOrtAllocator {
                 binding,
                 authority,
                 holder,
+                context,
                 memory,
                 queue,
                 roles: AllocationRoles::split(),
@@ -466,6 +469,7 @@ impl ManagedCudaEnvironmentRegistration {
             binding,
             registered_authority.clone(),
             holder.clone(),
+            Arc::clone(&context),
             tracked_allocator,
             Arc::clone(&queue),
         );
@@ -607,7 +611,38 @@ unsafe extern "C" fn managed_cuda_free(
         }
         return;
     }
-    let prepared = match live.allocation.prepare_release() {
+    // ORT's registered device allocator is the backing allocator beneath its
+    // arena. `Free` has no stream argument, while `AllocOnStream` only lends an
+    // OrtSyncStream for the duration of the allocation callback. The bridge
+    // forces `use_ep_level_unified_stream=1`, but retaining that raw stream
+    // handle past the callback would still be a lifetime bug. Match CUDA's
+    // ordinary `cudaFree` safety contract instead: synchronize the durable,
+    // process-lifetime context before unmapping VMM pages. CUDA graph capture
+    // keeps arena allocations live through capture/replay, so these backing
+    // frees occur only after ORT has ended the capture window.
+    if let Err(error) = state
+        .context
+        .bind_to_thread()
+        .and_then(|()| state.context.synchronize())
+    {
+        eprintln!(
+            "onnx-genai-ort: WARNING: managed CUDA allocator could not establish device \
+             quiescence before release: {error}; retaining the allocation"
+        );
+        quarantine_live_allocation(state, live.allocation);
+        return;
+    }
+    if let Err(error) = live.allocation.release_now() {
+        let (error, _allocation) = error.into_parts();
+        eprintln!(
+            "onnx-genai-ort: WARNING: managed CUDA allocator could not release a quiescent \
+             allocation: {error}"
+        );
+    }
+}
+
+fn quarantine_live_allocation(state: &ManagedCudaOrtAllocatorState, allocation: ManagedAllocation) {
+    let prepared = match allocation.prepare_release() {
         Ok(prepared) => prepared,
         Err(error) => {
             let (error, _allocation) = error.into_parts();

@@ -31,13 +31,6 @@ fn cuda_ready() -> bool {
         && onnx_genai_ort::cuda_rt::device_memory_info(0).is_ok()
 }
 
-fn managed_cuda_config(device_id: i32) -> ManagedCudaAllocatorConfig {
-    managed_cuda_config_with_manager(
-        device_id,
-        ProcessMemoryManager::new().expect("process memory manager"),
-    )
-}
-
 fn managed_cuda_config_with_manager(
     device_id: i32,
     manager: ProcessMemoryManager,
@@ -116,9 +109,10 @@ fn a_cuda_session_can_route_internal_and_external_allocations_through_the_manage
         return;
     }
 
+    let manager = ProcessMemoryManager::new().expect("process memory manager");
     let env = Environment::new("managed-cuda-allocator-session").expect("env");
     let mut options = SessionOptions::with_execution_provider(ep_selection("cuda"));
-    options.use_managed_cuda_allocator(managed_cuda_config(0));
+    options.use_managed_cuda_allocator(managed_cuda_config_with_manager(0, manager.clone()));
     options = options.with_intra_op_threads(1);
 
     let session = Session::new(&env, &model, options).expect("CUDA session");
@@ -161,10 +155,25 @@ fn a_cuda_session_can_route_internal_and_external_allocations_through_the_manage
         .managed_cuda_allocator_stats(0)
         .expect("managed CUDA allocator stats");
     assert!(
-        after_free.deferred_release_enqueue_failures > 0,
-        "a free without a provably live ORT stream must be retained, not recorded on a stale \
-         handle: {after_free:?}"
+        after_free.deferred_release_enqueue_failures == 0
+            && after_free.deferred_release_quarantined == 0,
+        "a quiescent free must reclaim without quarantine: {after_free:?}"
     );
+    let plateau = manager.snapshot().expect("snapshot after first free");
+    assert_eq!(plateau.mapped_bytes, 0);
+    for _ in 0..16 {
+        drop(
+            Value::empty_in(&[1, 1], DataType::Float32, &allocator)
+                .expect("repeated managed allocation"),
+        );
+        let snapshot = manager.snapshot().expect("snapshot after repeated free");
+        assert_eq!(snapshot.mapped_bytes, 0);
+        assert_eq!(
+            snapshot.charged_bytes, plateau.charged_bytes,
+            "repeated allocate/free must reuse or reclaim physical capacity rather than \
+             monotonically charging it"
+        );
+    }
     drop(env);
     run_once(&session).expect("the CUDA session must run after its Environment wrapper is dropped");
     drop(session);
