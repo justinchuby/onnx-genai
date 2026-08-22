@@ -2261,6 +2261,126 @@ fn deepseek_shape_feeding_slice_window_keeps_logical_width() {
     );
 }
 
+/// Build `attention_mask → Cast → Unsqueeze → Expand(target) → Unsqueeze →
+/// capacity-form Attention`, the HY-MT1.5 mask builder. `mask_derived_target`
+/// picks whether the `Expand` target shape is built from `Shape(mask)` (the real
+/// model) or from an unrelated value.
+fn expand_mask_builder_graph(mask_derived_target: bool) -> (Graph, ValueId) {
+    use onnx_runtime_ir::static_shape;
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let sh = || static_shape([1]);
+
+    let mask = graph.create_named_value("attention_mask", DataType::Int64, sh());
+    graph.add_input(mask);
+    let q = graph.create_named_value("q", DataType::Float32, sh());
+    let other = graph.create_named_value("input_ids", DataType::Int64, sh());
+    graph.add_input(other);
+
+    let cast = graph.create_named_value("cast", DataType::Float32, sh());
+    graph.insert_node(Node::new(NodeId(0), "Cast", vec![Some(mask)], vec![cast]));
+    let unsq = graph.create_named_value("unsq", DataType::Float32, sh());
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "Unsqueeze",
+        vec![Some(cast)],
+        vec![unsq],
+    ));
+
+    // Target axes: batch/query from `input_ids`, and the mask length axis from
+    // either `Shape(mask)` (self-consistent) or `Shape(input_ids)` (not).
+    let shape_other = graph.create_named_value("shape_other", DataType::Int64, sh());
+    graph.insert_node(Node::new(
+        NodeId(2),
+        "Shape",
+        vec![Some(other)],
+        vec![shape_other],
+    ));
+    let len_axis = if mask_derived_target {
+        let shape_mask = graph.create_named_value("shape_mask", DataType::Int64, sh());
+        graph.insert_node(Node::new(
+            NodeId(3),
+            "Shape",
+            vec![Some(mask)],
+            vec![shape_mask],
+        ));
+        shape_mask
+    } else {
+        let shape_other2 = graph.create_named_value("shape_other2", DataType::Int64, sh());
+        graph.insert_node(Node::new(
+            NodeId(3),
+            "Shape",
+            vec![Some(other)],
+            vec![shape_other2],
+        ));
+        shape_other2
+    };
+    let target = graph.create_named_value("target", DataType::Int64, sh());
+    graph.insert_node(Node::new(
+        NodeId(4),
+        "Concat",
+        vec![Some(shape_other), Some(len_axis)],
+        vec![target],
+    ));
+
+    let expanded = graph.create_named_value("expanded", DataType::Float32, sh());
+    graph.insert_node(Node::new(
+        NodeId(5),
+        "Expand",
+        vec![Some(unsq), Some(target)],
+        vec![expanded],
+    ));
+    let mask_bias = graph.create_named_value("mask_bias", DataType::Float32, sh());
+    graph.insert_node(Node::new(
+        NodeId(6),
+        "Unsqueeze",
+        vec![Some(expanded)],
+        vec![mask_bias],
+    ));
+    let attn = graph.create_named_value("attn", DataType::Float32, sh());
+    graph.insert_node(capacity_form_attention(7, q, mask_bias, attn));
+    graph.add_output(attn);
+    (graph, mask)
+}
+
+/// HY-MT1.5's builder broadcasts the mask with `Expand`, whose target shape
+/// carries the mask length axis from `Shape(mask)` itself. Freezing is then a
+/// uniform substitution — the mask is expanded to exactly its own frozen width —
+/// so the binding is decode-freeze-safe and the decode step may capture.
+///
+/// Static freezing is still refused, because `Shape(mask)` is *consumed*: the
+/// multi-token prefill window needs the logical length. Only the weaker
+/// decode-time predicate holds.
+#[test]
+fn expand_with_mask_derived_target_is_decode_freeze_safe() {
+    let (graph, mask) = expand_mask_builder_graph(true);
+    assert!(
+        mask_binding_feeds_additive_causal_builder(&graph, mask),
+        "an Expand whose target length axis comes from Shape(mask) must be decode-freeze-safe"
+    );
+    assert!(
+        !mask_binding_feeds_capacity_form_attention(&graph, mask),
+        "a consumed Shape(mask) must still refuse *static* freezing"
+    );
+}
+
+/// The same builder, but the `Expand` target sources the length axis from
+/// somewhere the substitution does not reach. A mask frozen to `max_len` could
+/// not broadcast against a target still carrying the logical length, so this
+/// must be refused under both policies.
+#[test]
+fn expand_with_foreign_target_is_rejected() {
+    let (graph, mask) = expand_mask_builder_graph(false);
+    assert!(
+        !mask_binding_feeds_additive_causal_builder(&graph, mask),
+        "an Expand target not derived from Shape(mask) must not be freeze-safe"
+    );
+    assert!(
+        !mask_binding_feeds_capacity_form_attention(&graph, mask),
+        "an Expand target not derived from Shape(mask) must not be statically freezable"
+    );
+}
+
 #[test]
 fn minimal_cast_to_capacity_attention_routes_to_padded_capacity() {
     use onnx_runtime_ir::static_shape;
