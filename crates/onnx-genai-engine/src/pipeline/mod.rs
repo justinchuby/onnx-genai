@@ -215,12 +215,11 @@ fn workflow_initializer_reservation_bytes(
 }
 
 #[cfg(feature = "ort-cuda")]
-fn shared_cuda_allocator_config(
+fn managed_cuda_bridge_device_id(
     session_options: &SessionOptions,
     authority_provider: Option<&SharedMemoryAuthorityProvider>,
     authority_domain: &crate::memory_authority::DeviceCompatibilityDomain,
-    resource_governor: &EngineResourceGovernor,
-) -> anyhow::Result<Option<onnx_genai_ort::ManagedCudaAllocatorConfig>> {
+) -> anyhow::Result<Option<i32>> {
     if authority_provider.is_none() || !session_options.selects_cuda() {
         return Ok(None);
     }
@@ -244,6 +243,21 @@ fn shared_cuda_allocator_config(
         "shared CUDA allocator bridge targets device {shared_device_id}, but workflow session \
          options target CUDA device {session_device_id}"
     );
+    Ok(Some(session_device_id))
+}
+
+#[cfg(feature = "ort-cuda")]
+fn shared_cuda_allocator_config(
+    session_options: &SessionOptions,
+    authority_provider: Option<&SharedMemoryAuthorityProvider>,
+    authority_domain: &crate::memory_authority::DeviceCompatibilityDomain,
+    resource_governor: &EngineResourceGovernor,
+) -> anyhow::Result<Option<onnx_genai_ort::ManagedCudaAllocatorConfig>> {
+    let Some(session_device_id) =
+        managed_cuda_bridge_device_id(session_options, authority_provider, authority_domain)?
+    else {
+        return Ok(None);
+    };
     Ok(Some(onnx_genai_ort::ManagedCudaAllocatorConfig::new(
         session_device_id,
         resource_governor.process_memory_manager(),
@@ -386,6 +400,14 @@ impl PipelineEngine {
         #[cfg(not(feature = "native-cuda"))]
         let memory_strategy_overrides = crate::engine::MemoryStrategyOverrides::default();
         let managed_vmm = matches!(config.limits.vram_limit, crate::ResourceLimit::Bytes(_));
+        #[cfg(feature = "ort-cuda")]
+        let managed_cuda_device_id = managed_cuda_bridge_device_id(
+            &session_options,
+            authority_provider.as_ref(),
+            &authority_domain,
+        )?;
+        #[cfg(not(feature = "ort-cuda"))]
+        let managed_cuda_device_id: Option<i32> = None;
         let memory_strategy_plan = build_memory_strategy_plan(MemoryStrategyPlanInput {
             config: &config,
             resolved_vram_bytes,
@@ -414,8 +436,7 @@ impl PipelineEngine {
             force_managed_weight_streaming: crate::engine::force_managed_weight_streaming_enabled(),
         });
         log_memory_strategy_plan(&memory_strategy_plan, "workflow");
-        let runtime_manages_initializer_residency = !memory_strategy_plan.advisory_only
-            && memory_strategy_plan.runtime_application().managed_no_spill;
+        let runtime_manages_initializer_residency = managed_cuda_device_id.is_some();
         let source_initializer_reservation = workflow_initializer_reservation_bytes(
             model_weights_bytes,
             0,
@@ -431,10 +452,22 @@ impl PipelineEngine {
             None,
             model_weights_bytes,
             source_initializer_reservation,
-            None,
+            managed_cuda_device_id.and_then(|device| u32::try_from(device).ok()),
             authority_provider.as_ref(),
             &authority_domain,
         )?;
+        if runtime_manages_initializer_residency {
+            let available = onnx_runtime_memory_governor::MemoryGovernor::available(
+                &resource_governor.device_authority(),
+                onnx_runtime_memory_governor::Tier::Device,
+            );
+            anyhow::ensure!(
+                model_weights_bytes <= available,
+                "workflow source initializers require {model_weights_bytes} bytes before session \
+                 construction, but the shared managed CUDA authority has only {available} bytes \
+                 available"
+            );
+        }
         // CUDA Graph capture applies to stable linked execution islands. Enabling
         // it on every source component rejects valid setup/control-flow graphs
         // before the workflow planner can determine capture eligibility.
@@ -487,19 +520,37 @@ impl PipelineEngine {
         let additional_initializer_reservation = maximum_initializer_reservation
             .checked_sub(source_initializer_reservation)
             .context("workflow initializer reservation accounting underflow")?;
-        let island_reservation_admitted = match resource_governor.plan().reserve(
-            Holder::FixedDeviceReservation,
-            additional_initializer_reservation,
-        ) {
-            Ok(_) => true,
-            Err(error) => {
+        let island_reservation_admitted = if runtime_manages_initializer_residency {
+            let available = onnx_runtime_memory_governor::MemoryGovernor::available(
+                &resource_governor.device_authority(),
+                onnx_runtime_memory_governor::Tier::Device,
+            );
+            if maximum_island_initializer_bytes <= available {
+                true
+            } else {
                 tracing::warn!(
-                    additional_initializer_reservation,
-                    %error,
+                    additional_initializer_reservation = maximum_island_initializer_bytes,
+                    available,
                     "workflow execution-island fusion declined because duplicate initializer \
                      residency was not admitted"
                 );
                 false
+            }
+        } else {
+            match resource_governor.plan().reserve(
+                Holder::FixedDeviceReservation,
+                additional_initializer_reservation,
+            ) {
+                Ok(_) => true,
+                Err(error) => {
+                    tracing::warn!(
+                        additional_initializer_reservation,
+                        %error,
+                        "workflow execution-island fusion declined because duplicate initializer \
+                         residency was not admitted"
+                    );
+                    false
+                }
             }
         };
         let execution_islands = if island_reservation_admitted {
@@ -1013,15 +1064,19 @@ opset_import { domain: "" version: 13 }
 
         impl FixedAuthorityProvider {
             fn new(device_id: u32) -> Self {
-                let manager = ProcessMemoryManager::new().expect("process memory manager");
                 let capacity = onnx_genai_ort::cuda_rt::device_memory_info(device_id as i32)
                     .map(|memory| memory.total_bytes)
                     .unwrap_or(1 << 33);
+                Self::with_capacity(device_id, capacity as u64)
+            }
+
+            fn with_capacity(device_id: u32, capacity: u64) -> Self {
+                let manager = ProcessMemoryManager::new().expect("process memory manager");
                 Self {
                     manager,
                     authority: DeviceMemoryAuthority::new(
                         DeviceCompatibilityDomain::Cuda(device_id),
-                        capacity as u64,
+                        capacity,
                     ),
                 }
             }
@@ -1250,8 +1305,10 @@ pipeline:
                 .managed_cuda_allocator_stats(0)
                 .expect("managed CUDA allocator stats");
             assert!(
-                after_run.deferred_release_accepted > 0,
-                "runtime frees never flowed through the managed CUDA bridge queue: {after_run:?}"
+                after_run.deferred_release_quarantined == 0
+                    && after_run.deferred_release_enqueue_failures == 0,
+                "runtime frees must reclaim after device quiescence without quarantine: \
+                 {after_run:?}"
             );
             wait_for_allocator_idle(
                 &engine,
@@ -1357,8 +1414,89 @@ pipeline:
                 .managed_cuda_allocator_stats(0)
                 .expect("managed CUDA allocator stats");
             assert!(
-                stats.deferred_release_pending == 0 || stats.deferred_release_accepted > 0,
-                "graph-captured workflow did not preserve managed CUDA allocator accounting: {stats:?}"
+                stats.deferred_release_pending == 0
+                    && stats.deferred_release_quarantined == 0
+                    && stats.deferred_release_enqueue_failures == 0,
+                "graph-captured workflow did not settle managed CUDA allocator accounting: \
+                 {stats:?}"
+            );
+        }
+
+        #[test]
+        fn managed_initializer_residency_is_charged_once_near_the_device_limit() {
+            let _guard = ort_test_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !cuda_ready() {
+                return;
+            }
+
+            let root = package_root("near-budget-single-charge").expect("workflow fixture");
+            let options = SessionOptions::with_execution_provider(ep_selection("cuda"))
+                .with_intra_op_threads(1);
+            let calibration_provider = Arc::new(FixedAuthorityProvider::new(0));
+            let calibration =
+                PipelineEngine::from_dir_with_session_options_and_memory_authority_provider(
+                    &root,
+                    EngineConfig::default(),
+                    options.clone(),
+                    calibration_provider,
+                )
+                .expect("calibration pipeline engine");
+            let calibration_snapshot = calibration
+                .resource_governor
+                .process_memory_manager()
+                .snapshot()
+                .expect("calibration PMM snapshot");
+            let actual_initializer_charge = calibration_snapshot.charged_bytes;
+            assert!(actual_initializer_charge > 0);
+            let package_bytes = [
+                "decoder.onnx.textproto",
+                "sampler.onnx.textproto",
+                "termination.onnx.textproto",
+            ]
+            .into_iter()
+            .map(|name| {
+                fs::metadata(root.join(name))
+                    .expect("component metadata")
+                    .len()
+            })
+            .sum::<u64>();
+            drop(calibration);
+
+            let limit = actual_initializer_charge
+                .checked_add(package_bytes / 2)
+                .expect("near-budget limit");
+            let provider = Arc::new(FixedAuthorityProvider::with_capacity(0, limit));
+            let mut config = EngineConfig::default();
+            config.limits.vram_limit = ResourceLimit::Bytes(limit);
+            let engine =
+                PipelineEngine::from_dir_with_session_options_and_memory_authority_provider(
+                    &root, config, options, provider,
+                )
+                .expect("a model that fits once must not fail from a duplicate fixed reservation");
+            let snapshot = engine
+                .resource_governor
+                .process_memory_manager()
+                .snapshot()
+                .expect("near-budget PMM snapshot");
+            assert!(
+                snapshot.charged_bytes <= limit,
+                "managed initializer charges exceeded the shared authority limit: {snapshot:?}"
+            );
+            assert!(
+                engine
+                    .resource_governor
+                    .plan()
+                    .breakdown()
+                    .iter()
+                    .all(|(name, _, bytes)| *name != "fixed device reservation" || *bytes == 0),
+                "managed ORT initializer residency must not keep a second fixed reservation"
+            );
+            assert_eq!(
+                snapshot.authority_snapshots[0].used[0],
+                engine.resource_snapshot().vram.used,
+                "PMM and engine snapshots must report the same canonical device charge"
             );
         }
     }
