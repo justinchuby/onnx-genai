@@ -116,22 +116,20 @@ fn assistant_is_cacheless_read_only_reader() {
     let target_abi = decoder_abi(workflow, "target").expect("target ABI resolves");
     assert_eq!(target_abi.kv_ownership, Some(KvOwnership::Owned));
 
-    // The assistant half owns none: every full/sliding alias it holds is
-    // read-only, so the resolved ABI has no KV transitions and reports shared
-    // ownership. Its single loop-carried cell is the projected state.
+    // The assistant half owns nothing at all: every full/sliding alias it holds
+    // is read-only (no KV transitions, shared ownership), and its carry is
+    // folded into the fused inputs_embeds rather than a recurrent state cell —
+    // so the resolved ABI has no state pairs either.
     let assistant_abi = decoder_abi(workflow, "assistant").expect("assistant ABI resolves");
     assert_eq!(assistant_abi.kv_ownership, Some(KvOwnership::Shared));
     assert!(
         assistant_abi.kv_inputs.is_none(),
         "read-only shares are not KV transitions"
     );
-    let state_pairs = assistant_abi
-        .state_pairs
-        .as_ref()
-        .expect("projected-state recurrence");
-    assert_eq!(state_pairs.len(), 1);
-    assert_eq!(state_pairs[0].input, "projected_state");
-    assert_eq!(state_pairs[0].output, "next_projected_state");
+    assert!(
+        assistant_abi.state_pairs.is_none(),
+        "a folded carry is not a recurrent state cell"
+    );
 
     // The same state groups carry a read-write target alias and a read-only
     // assistant alias for the very same cells: one advances the prefix, the
@@ -179,17 +177,23 @@ fn assistant_speculative_contract_is_chained_pruned_and_rewindable() {
     assert_eq!(speculative.proposer, "assistant");
     assert_eq!(speculative.target, "target");
 
-    // Chained proposal: one distribution plus one recurrence update per step.
+    // Chained proposal with a FOLDED carry: the drafter emits its next carry as
+    // an output that re-enters through the fused inputs_embeds, so there is no
+    // separate recurrent binding.
     match &speculative.proposal_execution {
         SpeculativeProposalExecution::Chained {
             token_embedding_input,
             logits_output,
             recurrent,
+            folded_carry_output,
         } => {
             assert_eq!(token_embedding_input, "inputs_embeds");
             assert_eq!(logits_output, "draft_logits");
-            assert_eq!(recurrent.len(), 1);
-            assert_eq!(recurrent[0].state, "projected_state");
+            assert!(
+                recurrent.is_empty(),
+                "the carry is folded, not a separate port"
+            );
+            assert_eq!(folded_carry_output.as_deref(), Some("next_projected_state"));
         }
         other => panic!("expected a chained proposal, got {other:?}"),
     }
@@ -252,7 +256,7 @@ fn assistant_speculative_contract_is_chained_pruned_and_rewindable() {
 fn both_packages_lower_to_an_executable_plan() {
     for (label, doc, state_domain) in [
         ("target", TARGET, "state:full_key_0"),
-        ("assistant", ASSISTANT, "state:projected_state"),
+        ("assistant", ASSISTANT, "state:sliding_key_0"),
     ] {
         let metadata = parse(doc);
         let workflow = &metadata.pipeline.as_ref().expect("pipeline").workflow;

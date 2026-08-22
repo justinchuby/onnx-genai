@@ -2340,6 +2340,7 @@ fn validate_speculative_rollback(metadata: &InferenceMetadata, errors: &mut Vec<
         token_embedding_input,
         logits_output,
         recurrent,
+        folded_carry_output,
     } = &speculative.proposal_execution
         && let Some(proposer) = workflow.components.get(&speculative.proposer)
     {
@@ -2357,11 +2358,21 @@ fn validate_speculative_rollback(metadata: &InferenceMetadata, errors: &mut Vec<
                 speculative.proposer
             ));
         }
-        if recurrent.is_empty() {
+        if recurrent.is_empty() && folded_carry_output.is_none() {
             errors.push(
-                "speculative chained proposal must declare at least one recurrent binding"
+                "speculative chained proposal must declare at least one recurrent binding or a \
+                 folded_carry_output"
                     .to_string(),
             );
+        }
+        if let Some(folded) = folded_carry_output
+            && !proposer.ports.outputs.contains_key(folded)
+        {
+            errors.push(format!(
+                "speculative chained folded_carry_output '{folded}' is not an output port of \
+                 component '{}'",
+                speculative.proposer
+            ));
         }
         let mut states = BTreeSet::new();
         for binding in recurrent {

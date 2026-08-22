@@ -421,9 +421,22 @@ pub enum SpeculativeProposalExecution {
         /// Proposer output port carrying the next-token distribution.
         #[schemars(length(min = 1))]
         logits_output: String,
-        /// Loop-carried hidden/cache state updated by every proposer invocation.
+        /// Loop-carried hidden/cache state updated by every proposer invocation
+        /// through its own input port.
         #[serde(default)]
         recurrent: Vec<SpeculativeRecurrenceBinding>,
+        /// A loop-carried activation the proposer emits but re-consumes WITHOUT
+        /// a separate input port: it re-enters as the trailing segment of
+        /// `token_embedding_input`. The proposer's fused input is
+        /// `concat(token_embedding, carry)`, so the carry has no port and no
+        /// workflow state cell of its own. Its first-step value is the target
+        /// context named by `port_bindings.target_hidden_context`; each step
+        /// replaces it with this output. Because a folded carry is recomputed
+        /// from committed tokens on rejection rather than restored, it does not
+        /// appear in `rollback_state`. A chained proposer declares at least one
+        /// of `recurrent` or `folded_carry_output`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folded_carry_output: Option<String>,
     },
 }
 
