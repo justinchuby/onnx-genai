@@ -4178,9 +4178,20 @@
         }
       ]
     },
+    "StatePortAccess": {
+      "enum": [
+        "read_write",
+        "read_only"
+      ],
+      "type": "string"
+    },
     "StatePortAlias": {
       "additionalProperties": false,
       "properties": {
+        "access": {
+          "$ref": "#/$defs/StatePortAccess",
+          "description": "Whether this component may publish its output back into the state group.\n\nRead-only consumers receive the shared state input but their graph\noutput is not allowed to replace or alias the service-owned buffer."
+        },
         "input": {
           "type": "string"
         },

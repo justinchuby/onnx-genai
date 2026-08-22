@@ -125,7 +125,6 @@ fn unconditional_syncs_are_limited_to_capture_unsupported_paths() {
         "attention.rs::run_attention_phase2a".to_string(),
         "block_quantized_matmul.rs::execute".to_string(),
         "block_quantized_moe.rs::execute_with_workspace".to_string(),
-        "conv.rs::run".to_string(),
         "fused_gemm.rs::run".to_string(),
         "gemm.rs::run".to_string(),
         "mod_op.rs::run".to_string(),

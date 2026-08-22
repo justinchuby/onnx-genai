@@ -191,6 +191,7 @@ fn rejects_unrecognized_ep_names_without_conservative_append() {
         std::ptr::null_mut(),
         &resolved,
         false,
+        false,
         &CudaAttentionMode::Auto,
         &["CPUExecutionProvider".to_string()],
     )
@@ -231,6 +232,7 @@ fn invalid_plugin_requests_are_preserved_as_session_creation_errors() {
         std::ptr::null_mut(),
         &resolved,
         false,
+        false,
         &CudaAttentionMode::Auto,
         &["CPUExecutionProvider".to_string()],
     )
@@ -249,6 +251,7 @@ fn invalid_plugin_requests_are_preserved_as_session_creation_errors() {
         &Environment::new("empty-inline-plugin-test").expect("environment"),
         std::ptr::null_mut(),
         &resolved,
+        false,
         false,
         &CudaAttentionMode::Auto,
         &["CPUExecutionProvider".to_string()],
@@ -339,6 +342,7 @@ fn unavailable_named_provider_errors_instead_of_falling_back() {
         &Environment::new("webgpu-unavailable-test").expect("environment"),
         std::ptr::null_mut(),
         &resolved,
+        false,
         false,
         &CudaAttentionMode::Auto,
         &["CPUExecutionProvider".to_string()],
@@ -608,7 +612,7 @@ fn cpu_ort_auto_default_is_disabled_off_windows_arm64() {
 #[test]
 fn unfused_cuda_attention_uses_math_provider_option() {
     assert_eq!(
-        cuda_provider_options("3".to_string(), true, &CudaAttentionMode::Unfused),
+        cuda_provider_options("3".to_string(), true, false, &CudaAttentionMode::Unfused),
         vec![
             ("device_id".to_string(), "3".to_string()),
             ("enable_cuda_graph".to_string(), "1".to_string()),
@@ -616,12 +620,24 @@ fn unfused_cuda_attention_uses_math_provider_option() {
         ]
     );
     assert_eq!(
-        cuda_provider_options("0".to_string(), false, &CudaAttentionMode::Auto),
+        cuda_provider_options("0".to_string(), false, false, &CudaAttentionMode::Auto),
         vec![("device_id".to_string(), "0".to_string())]
     );
     assert_eq!(
-        cuda_provider_options("0".to_string(), false, &CudaAttentionMode::Fused),
+        cuda_provider_options("0".to_string(), false, false, &CudaAttentionMode::Fused),
         vec![("device_id".to_string(), "0".to_string())]
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn managed_cuda_allocator_forces_a_unified_cuda_stream() {
+    assert_eq!(
+        cuda_provider_options("0".to_string(), false, true, &CudaAttentionMode::Auto),
+        vec![
+            ("device_id".to_string(), "0".to_string()),
+            ("use_ep_level_unified_stream".to_string(), "1".to_string()),
+        ]
     );
 }
 
@@ -652,6 +668,7 @@ fn cuda_request_requires_compile_time_feature() {
         &Environment::new("cuda-feature-test").expect("environment"),
         std::ptr::null_mut(),
         &resolved,
+        false,
         false,
         &CudaAttentionMode::Auto,
         &[],
