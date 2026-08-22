@@ -2094,3 +2094,110 @@ here. Merged as `2e1cfb67c`.
 
 Full record:
 [`docs/benchmarks/2026-08-21-half-decode-layout-divergence.md`](../benchmarks/2026-08-21-half-decode-layout-divergence.md).
+
+## 26. `FusedMatMulBias` had no 16-bit decode GEMV — the fused form of a projection was the slow one (#1702)
+
+The optimizer fuses `MatMul + Add(bias)` into `FusedMatMulBias`. On x86 that
+fusion was a **pessimisation for every 16-bit weight**: `MatMul` had a 16-bit
+decode GEMV and `FusedMatMulBias` did not, so the fused node widened the whole
+constant weight to a resident `4 * K * N` f32 copy and ran an f32 GEMV over it.
+Applying the optimizer made the model slower, which is the exact inversion its
+cost model is supposed to prevent.
+
+Measured on the quiesced host (16 physical cores, `steady_ms`, three reps,
+interleaved before/after/`MatMul` in one binary):
+
+| shape | dtype | FMB before | FMB after | gain | `MatMul` | after/`MatMul` |
+|---|---|---|---|---|---|---|
+| mlp 4096x14336 | f16 | 2.687 | 1.730 | **1.55x** | 1.759 | 0.98x |
+| mlp 4096x14336 | bf16 | 2.845 | 1.723 | **1.65x** | 1.709 | 1.01x |
+| lm_head 4096x128256 | f16 | 8.595 | 6.862 | **1.25x** | 6.789 | 1.01x |
+| lm_head 4096x128256 | bf16 | 8.698 | 6.885 | **1.26x** | 6.784 | 1.01x |
+| qkv 4096x4096 | f16 | 1.407 | 0.175 | **8.04x** | 0.171 | 1.02x |
+| qkv 4096x4096 | bf16 | 1.427 | 0.152 | **9.39x** | 0.171 | 0.89x |
+| attn_out 4096x4096 | f16 | 0.289 | 0.026 | **11.12x** | 0.025 | 1.04x |
+| **f32 mlp (null control)** | f32 | 6.551 | 6.538 | **1.00x** | 6.656 | 0.98x |
+| **f32 lm_head (null control)** | f32 | 14.896 | 14.840 | **1.00x** | 14.795 | 1.00x |
+
+The `after/MatMul` column is the point: **0.98x–1.04x on every model-shaped
+row**. The fix is not a new kernel, it is deleting a divergence — `MatMul`'s
+decode arm was extracted into `try_half_decode_gemv` and both operators now
+call it, so the fused form is exactly as fast as the unfused one and the
+bias is a post-reduction epilogue that never touches summation order.
+
+The f32 rows are a **null control that was built into the workload rather than
+added afterwards**: `FusedMatMulBias`'s f32 path was already *faster* than
+`MatMul`'s, and it is unchanged at 1.00x. That rules out "the fused operator's
+plumbing is slow" as an explanation and localises the entire penalty to the
+missing 16-bit route.
+
+### The headline in #1702 was understated, and the reason is worth recording
+
+#1702 reported 1.55x. That is the mlp row and it is correct, but the range is
+1.25x–11.12x and the *first* measurement of the small shapes said 1.17x. The
+difference was **host load**: the first pass ran while the acc0 matrix was
+still executing at load average 20.94. Every number in it was void. This is the
+third time in this assignment that a contended host has produced a plausible,
+publishable, wrong number, so the rule is now explicit — `uptime` before every
+benchmark, and never run two of them at once. The cheap diagnostic that
+survives contention is the **cold/steady shape**, not the steady number:
+`MatMul` cold 4.673 / steady 0.602 (it builds a transpose) versus pre-fix FMB
+cold 1.832 / steady 1.691 (it never does), which identified the missing route
+correctly even while the timings were garbage.
+
+### A second defect, found by the guard rather than by review
+
+Routing `FusedMatMulBias` through the shared helper makes it retain the same
+`2 * K * N` transpose `MatMul` retains, so `node_weight_transpose_cache_bytes`
+owed it a prediction. It had an explicit arm saying the opposite —
+"`FusedMatMulBias` has no 16-bit GEMV on this target and retains nothing, so
+counting it would over-budget every fused projection" — a comment that was true
+when written and false the moment the operators were unified.
+
+Fixing the op name was **not sufficient, and believing it was would have shipped
+a dead predictor.** `node_weight_transpose_cache_bytes` opens with a blanket
+`if !node.is_default_domain() { return 0 }`, and the optimizer emits
+`FusedMatMulBias` into `com.microsoft`. The one node the predictor most needed
+to see was the one node it structurally could not. The unit test that caught
+this passed when written with `domain = ""` and failed the instant it used the
+domain the operator actually ships in; tests for domain-scoped code must use the
+shipping domain or they validate a code path that never executes.
+
+### The guard: classification derived from the registry, not from memory
+
+Both defects are the same shape — *an existing, governed cache gains a new
+route, and the accounting is not updated*. `weight-cache-guard.yml` cannot see
+it: that guard greps for new `OnceLock<..Cache..>` declarations, and no new
+cache was declared. A hand-written per-route reconciliation test cannot see it
+either, because the missing predictor arm and the missing test are the same
+omission — whoever forgets one forgets the other.
+
+The guard that does work derives its obligation from the **real registry**:
+`every_registered_cpu_op_is_classified_for_weight_cache_accounting` walks
+`OpRegistry::keys()` and fails until every registered op has been classified
+`CachesTransposedWeight` or `NoWeightCache(reason)`. Registering a kernel
+without deciding what it retains is now a test failure naming the op and the
+function to edit. It found 27 unclassified ops on first run.
+
+Three mutations confirm it is not decorative: excluding `FusedMatMulBias` from
+the shared arm, restoring the pre-#1702 op-name allowlist, and restoring the
+blanket non-default-domain bail each fail at least two of the four tests.
+Live reconciliation (`retained_transpose_bytes_are_bytes_the_plan_predicted`)
+closes the loop from the executing kernel's side, so the predictor and the
+kernel cannot agree on a number neither produces.
+
+### Honest limits
+
+* `node_matmul_dense_cache_bytes` still counts `FusedMatMulBias` at
+  `4 * numel * MATMUL_DENSE_DECODE_INSTANTIATIONS`. After this change the decode
+  path no longer fills it, so on a decode-only workload that is now an
+  **over**-prediction. Over-budgeting is the #1056-mandated safe direction and
+  prefill still fills it, so it is left alone deliberately rather than tightened
+  on a guess; it is recorded here so the next person does not rediscover it.
+* The `after/MatMul` ratios include two cells at 0.89x and 1.04x-1.09x on the
+  smallest shapes, where absolute times are 20-30 microseconds and run-to-run
+  noise exceeds the difference. Parity is claimed on the model-shaped rows
+  (0.98x-1.01x), not on those.
+
+Full record:
+[`docs/benchmarks/2026-08-22-fused-matmul-bias-half-gemv.md`](../benchmarks/2026-08-22-fused-matmul-bias-half-gemv.md).

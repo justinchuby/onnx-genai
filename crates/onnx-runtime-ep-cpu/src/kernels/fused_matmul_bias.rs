@@ -21,6 +21,8 @@ use super::matmul::{
     MatMulPrepack, matmul_dense_prepacked, matmul_dense_prepacked_into,
     output_is_direct_f32_eligible,
 };
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use super::matmul::{matmul_geometry, try_half_decode_gemv};
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use crate::backend::CpuBackend;
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
@@ -88,6 +90,44 @@ impl Kernel for FusedMatMulBiasKernel {
                     }
                     return write_dense_f32_narrow("FusedMatMulBias", &mut outputs[0], &result);
                 }
+            }
+        }
+
+        // x86 16-bit storage GEMV, through the *same* helper `MatMulKernel`
+        // calls (#1702). Before this, `FusedMatMulBias` had no 16-bit decode
+        // GEMV on x86 at all: `matmul_dense_prepacked_into` widened the whole
+        // constant weight to a resident `4 * K * N` f32 copy and ran an f32
+        // GEMV over it, measured 1.55x-3.02x slower than the identical
+        // `MatMul`. Since the optimizer fuses `MatMul + Add(bias)`, that made
+        // the *better-optimized* form of a projection the slower one.
+        //
+        // The bias epilogue is applied here, after the reduction, exactly as
+        // the two paths below apply it — never folded into the accumulation,
+        // which would change the summation order and therefore the bits.
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            let geom = matmul_geometry(&inputs[0], &inputs[1])?;
+            if let Some(mut result) =
+                try_half_decode_gemv(&self.prepack, &inputs[0], &inputs[1], &geom)?
+            {
+                let bias = to_dense_f32_widen("FusedMatMulBias", &inputs[2])?;
+                let bias_shape = inputs[2].shape;
+                if bias_shape.len() == 1 && bias_shape[0] == result.len() {
+                    for (o, &b) in result.iter_mut().zip(bias.iter()) {
+                        *o += b;
+                    }
+                } else {
+                    // Any other bias rank/shape keeps the generic numpy
+                    // broadcast, so a scalar bias, a `[1, N]` bias and a
+                    // `[M, N]` bias behave exactly as they did on the f32
+                    // route. Routing the GEMV must not narrow which biases
+                    // the operator accepts.
+                    let out_shape = outputs[0].shape.to_vec();
+                    broadcast_apply(&bias, bias_shape, &out_shape, |i, v| {
+                        result[i] += v;
+                    })?;
+                }
+                return write_dense_f32_narrow("FusedMatMulBias", &mut outputs[0], &result);
             }
         }
 
@@ -243,5 +283,218 @@ mod tests {
             out.to_f32(),
             vec![101., 202., 103., 204., 105., 206., 107., 208.]
         );
+    }
+}
+
+/// #1702: `FusedMatMulBias` must take the *same* 16-bit decode GEMV as
+/// `MatMul`, including the transposed-layout half of it.
+///
+/// These are route assertions, not value assertions. The two operators agreed
+/// on values the whole time #1381 was open — that is exactly why the
+/// divergence survived four rounds of numerics testing. Only a counter can
+/// tell them apart.
+#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+mod route_tests {
+    use super::*;
+    use crate::kernels::matmul::{
+        half_decode_gemv_calls, half_decode_transposed_calls, reset_half_decode_gemv_calls,
+        reset_half_decode_transposed_calls,
+    };
+    use crate::kernels::testutil::Owned;
+    use crate::kernels::weight_transpose::CacheEnabledScope;
+
+    fn f16_weight(k: usize, n: usize) -> Vec<f32> {
+        (0..k * n)
+            .map(|i| ((i as f32) * 0.017).sin() * 0.5)
+            .collect()
+    }
+
+    /// The headline of #1702: a constant `[K, N]` f16 weight at `m = 1` must
+    /// reach the GEMV *and* the transposed layout, not the in-place `[K, N]`
+    /// walk that runs 1.56-2.98x slower.
+    #[test]
+    fn fused_bias_decode_reaches_the_transposed_half_gemv() {
+        let _admit = CacheEnabledScope::new(true);
+        let (k, n) = (128usize, 64usize);
+        let b_vals = f16_weight(k, n);
+        let a = Owned::f16(
+            &[1, k],
+            &(0..k).map(|i| (i as f32 * 0.01).cos()).collect::<Vec<_>>(),
+        );
+        let b = Owned::f16(&[k, n], &b_vals);
+        let bias = Owned::f16(&[n], &(0..n).map(|i| i as f32 * 0.03).collect::<Vec<_>>());
+        let mut y = Owned::zeros(onnx_runtime_ir::DataType::Float16, &[1, n]);
+
+        let mut kernel = FusedMatMulBiasKernel::default();
+        kernel.set_constant_inputs(&[false, true, true]);
+        reset_half_decode_gemv_calls();
+        reset_half_decode_transposed_calls();
+        kernel
+            .execute(&[a.view(), b.view(), bias.view()], &mut [y.view_mut()])
+            .unwrap();
+
+        assert_eq!(
+            half_decode_gemv_calls(),
+            1,
+            "FusedMatMulBias decode must reach the 16-bit GEMV; before #1702 it \
+             widened the whole weight to a resident 4*K*N f32 copy instead"
+        );
+        assert_eq!(
+            half_decode_transposed_calls(),
+            1,
+            "and must reach it through the transposed [N, K] layout: the \
+             in-place [K, N] walk crosses a page every p and is the 1.56-2.98x \
+             penalty §25 measured"
+        );
+    }
+
+    /// The bias epilogue must not change with the route. Bit-identical, not
+    /// close: the GEMV and the f32 fallback accumulate in the same order.
+    #[test]
+    fn every_bias_shape_survives_the_new_route() {
+        let _admit = CacheEnabledScope::new(true);
+        let (k, n) = (96usize, 32usize);
+        let b_vals = f16_weight(k, n);
+        let a_vals: Vec<f32> = (0..k).map(|i| (i as f32 * 0.02).cos()).collect();
+        let a = Owned::f16(&[1, k], &a_vals);
+        let b = Owned::f16(&[k, n], &b_vals);
+
+        // Scalar, [1], [1, N], [N] — every rank numpy broadcast admits onto a
+        // [1, N] result. Narrowing this set would be a silent semantic
+        // regression that no timing would reveal.
+        let cases: Vec<(Vec<usize>, Vec<f32>)> = vec![
+            (vec![], vec![0.75]),
+            (vec![1], vec![-0.25]),
+            (vec![n], (0..n).map(|i| i as f32 * 0.05 - 0.4).collect()),
+            (vec![1, n], (0..n).map(|i| i as f32 * -0.02 + 0.1).collect()),
+        ];
+
+        for (shape, values) in cases {
+            let bias = Owned::f16(&shape, &values);
+            let run = |gemv: bool| -> Vec<f32> {
+                // Declining the transpose cache does not disable the GEMV, so
+                // the control here is the env gate the kernel reads.
+                let restore = std::env::var("ONNX_GENAI_CPU_MM_HALF_GEMV").ok();
+                if gemv {
+                    unsafe { std::env::remove_var("ONNX_GENAI_CPU_MM_HALF_GEMV") };
+                } else {
+                    unsafe { std::env::set_var("ONNX_GENAI_CPU_MM_HALF_GEMV", "0") };
+                }
+                let mut y = Owned::zeros_f32(&[1, n]);
+                let mut kernel = FusedMatMulBiasKernel::default();
+                kernel.set_constant_inputs(&[false, true, true]);
+                kernel
+                    .execute(&[a.view(), b.view(), bias.view()], &mut [y.view_mut()])
+                    .unwrap();
+                match restore {
+                    Some(v) => unsafe { std::env::set_var("ONNX_GENAI_CPU_MM_HALF_GEMV", v) },
+                    None => unsafe { std::env::remove_var("ONNX_GENAI_CPU_MM_HALF_GEMV") },
+                }
+                y.to_f32()
+            };
+            let with_gemv = run(true);
+            let without = run(false);
+            for (index, (got, want)) in with_gemv.iter().zip(&without).enumerate() {
+                assert!(
+                    (got - want).abs() <= 1e-3 * (1.0 + want.abs()),
+                    "bias shape {shape:?} index {index}: {got} vs {want}"
+                );
+            }
+        }
+    }
+
+    /// Live reconciliation for the route this PR adds: run the real kernel and
+    /// prove the bytes it actually retains are bytes
+    /// `node_weight_transpose_cache_bytes` predicted.
+    ///
+    /// The sibling tests in `matmul.rs`'s `weight_cache_accounting` check the
+    /// predictor as arithmetic over a graph. That is what makes the *omission*
+    /// impossible, but on its own it would still pass if the predictor and the
+    /// kernel agreed on a number neither of them actually produces. This one
+    /// closes the loop from the other end -- execute, then measure -- so the
+    /// pair together give the #1056 ratio-1.00 criterion for `FusedMatMulBias`.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn retained_transpose_bytes_are_bytes_the_plan_predicted() {
+        use onnx_runtime_ir::{DataType, Graph, Node, NodeId, TensorData, WeightRef, static_shape};
+
+        // Thread-local admission, never the process-global setter (#1056):
+        // this test runs under the parallel harness alongside others that read
+        // the same caches.
+        let _admit = CacheEnabledScope::new(true);
+
+        // Odd `k` so a tail-handling bug cannot hide behind a round shape.
+        let (k, n) = (67usize, 16usize);
+        let a_data: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.011).cos() * 0.5).collect();
+        let b_data = f16_weight(k, n);
+        let bias_data: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.31).sin()).collect();
+
+        let a = Owned::f16(&[1, k], &a_data);
+        let b = Owned::f16(&[k, n], &b_data);
+        let bias = Owned::f16(&[n], &bias_data);
+        let mut y = Owned::zeros_f32(&[1, n]);
+
+        let mut kernel = FusedMatMulBiasKernel::default();
+        kernel.set_constant_inputs(&[false, true, true]);
+        kernel
+            .execute(&[a.view(), b.view(), bias.view()], &mut [y.view_mut()])
+            .unwrap();
+
+        // Bytes the kernel really holds, read off the prepack this execution
+        // populated rather than off a global total the parallel harness shares.
+        let retained = kernel.prepack.retained_transpose_bytes();
+
+        // The prediction, for the graph this node would appear in -- built with
+        // the contrib domain the optimizer actually emits, since that is where
+        // the predictor was silently returning 0 (#1702).
+        let mut graph = Graph::new();
+        let av = graph.create_named_value("A", DataType::Float16, static_shape([1, k]));
+        let bv = graph.create_named_value("B", DataType::Float16, static_shape([k, n]));
+        let cv = graph.create_named_value("C", DataType::Float16, static_shape([n]));
+        let yv = graph.create_named_value("Y", DataType::Float16, static_shape([1, n]));
+        graph.add_input(av);
+        let mut node = Node::new(
+            NodeId(0),
+            "FusedMatMulBias",
+            vec![Some(av), Some(bv), Some(cv)],
+            vec![yv],
+        );
+        node.domain = "com.microsoft".to_string();
+        graph.insert_node(node);
+        graph.add_output(yv);
+        for (value, dims) in [(bv, vec![k, n]), (cv, vec![n])] {
+            let numel: usize = dims.iter().product();
+            graph.set_initializer(
+                value,
+                WeightRef::Inline(TensorData::from_raw(
+                    DataType::Float16,
+                    dims,
+                    vec![0u8; numel * 2],
+                )),
+            );
+        }
+        let predicted = crate::kernels::matmul::weight_transpose_cache_predicted_bytes(&graph);
+
+        if retained > 0 {
+            assert_eq!(
+                retained, predicted,
+                "FusedMatMulBias retained {retained} transpose bytes but the memory \
+                 plan budgeted {predicted}. Ratio must be 1.00 (#1056): an \
+                 under-prediction is the #1702 bug, an over-prediction wastes \
+                 budget every fused projection."
+            );
+        } else {
+            // Hosts without the 16-bit GEMV SIMD take the f32 dense path and
+            // retain no transpose. Over-prediction is the safe direction, so
+            // this is allowed -- but silently *skipping* is not, so assert the
+            // reason rather than returning early.
+            assert!(
+                !crate::kernels::half_gemv::simd_available(
+                    crate::kernels::half_gemm::HalfFormat::F16
+                ),
+                "no transpose was retained even though this host has the 16-bit \
+                 GEMV SIMD -- the route regressed to the f32 dense path"
+            );
+        }
     }
 }
