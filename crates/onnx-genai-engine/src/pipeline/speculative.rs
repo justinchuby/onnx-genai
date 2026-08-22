@@ -88,6 +88,7 @@ pub struct ChainedProposalOptions {
 }
 
 /// Resolved, contract-derived view of a chained proposal execution.
+#[derive(Debug)]
 struct ChainedPlan<'a> {
     proposer: &'a str,
     token_embedding_input: &'a str,
@@ -1054,4 +1055,160 @@ fn clone_value(value: &Value) -> anyhow::Result<Value> {
     value
         .clone_owned()
         .map_err(|error| anyhow::anyhow!("failed to clone a workflow value: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WORKFLOW: &str = r#"
+manifest:
+  capabilities: [workflow_ssa, typed_emit]
+inputs: {}
+outputs: {}
+components:
+  target:
+    implementation: {kind: onnx, artifact: target/model.onnx}
+    ports:
+      inputs: {}
+      outputs:
+        logits: {dtype: float32, rank: 3, shape: [batch, sequence, vocab]}
+        hidden_states.0: {dtype: float32, rank: 3, shape: [batch, sequence, hidden]}
+  assistant:
+    implementation: {kind: onnx, artifact: assistant/model.onnx}
+    ports:
+      inputs:
+        inputs_embeds: {dtype: float32, rank: 3, shape: [batch, sequence, fused]}
+      outputs:
+        logits: {dtype: float32, rank: 3, shape: [batch, sequence, vocab]}
+steps:
+- kind: invoke
+  component: assistant
+  inputs: {inputs_embeds: request.inputs_embeds}
+  outputs: {logits: draft.logits}
+- kind: invoke
+  component: target
+  inputs: {}
+  outputs: {logits: target.logits, hidden_states.0: target.hidden_states.0}
+"#;
+
+    fn workflow() -> WorkflowSpec {
+        serde_yaml::from_str(WORKFLOW).expect("workflow spec")
+    }
+
+    fn contract(execution: SpeculativeProposalExecution) -> SpeculativeContract {
+        SpeculativeContract {
+            proposer: "assistant".to_string(),
+            target: "target".to_string(),
+            proposal_execution: execution,
+            port_bindings: Default::default(),
+            shared_state: Default::default(),
+            shared_weights: Default::default(),
+            vocabulary: onnx_genai_metadata::SpeculativeVocabulary::Identical,
+            max_proposal_width: 4,
+            distribution_preserving: true,
+            rollback_state: Default::default(),
+        }
+    }
+
+    /// Keeping speculative values live is what stops island fusion from
+    /// swallowing a proposal's inputs. It must be scoped to packages that
+    /// actually declare a chained proposer: a package without one, or with a
+    /// `block` proposer that needs no chain, must contribute nothing, or every
+    /// workflow in the repo would silently lose fusion.
+    #[test]
+    fn only_a_chained_contract_keeps_values_live() {
+        assert!(externally_used_values(None, &workflow()).is_empty());
+        assert!(
+            externally_used_values(
+                Some(&contract(SpeculativeProposalExecution::Block)),
+                &workflow()
+            )
+            .is_empty()
+        );
+    }
+
+    /// A chained proposer's own bindings and its folded-carry seed are the
+    /// values the driver reads after the pass, so those exactly are the ones
+    /// fusion must not elide.
+    #[test]
+    fn a_chained_contract_keeps_its_bindings_and_carry_seed_live() {
+        let contract = contract(SpeculativeProposalExecution::Chained {
+            token_embedding_input: "inputs_embeds".to_string(),
+            logits_output: "logits".to_string(),
+            recurrent: Vec::new(),
+            folded_carry_output: Some("projected_state".to_string()),
+            folded_carry_seed: Some(onnx_genai_metadata::SpeculativeValueRef {
+                component: "target".to_string(),
+                output: "hidden_states.0".to_string(),
+            }),
+            token_embedding: Some(onnx_genai_metadata::TokenEmbeddingSource {
+                component: "target".to_string(),
+                table: "hidden_table".to_string(),
+            }),
+        });
+        let live = externally_used_values(Some(&contract), &workflow());
+        assert!(live.contains("request.inputs_embeds"), "{live:?}");
+        assert!(live.contains("draft.logits"), "{live:?}");
+        assert!(live.contains("target.hidden_states.0"), "{live:?}");
+        // The target's own logits are emitted by the workflow, not read by the
+        // proposal chain, so they are not force-kept here.
+        assert!(!live.contains("target.logits"), "{live:?}");
+    }
+
+    /// A folded carry re-enters through the fused input and owns no state cell,
+    /// so a package that declares one without saying where carry_0 comes from,
+    /// or without naming the embedding table, is rejected rather than
+    /// convention-inferred.
+    #[test]
+    fn a_folded_carry_must_declare_its_seed_and_embedding_table() {
+        let mut incomplete = contract(SpeculativeProposalExecution::Chained {
+            token_embedding_input: "inputs_embeds".to_string(),
+            logits_output: "logits".to_string(),
+            recurrent: Vec::new(),
+            folded_carry_output: Some("projected_state".to_string()),
+            folded_carry_seed: None,
+            token_embedding: None,
+        });
+        let error = ChainedPlan::resolve(&incomplete, &workflow())
+            .expect_err("a folded carry without a seed must not resolve");
+        assert!(
+            format!("{error:#}").contains("folded_carry_seed"),
+            "{error:#}"
+        );
+
+        // With a seed but no embedding table it is still under-declared.
+        if let SpeculativeProposalExecution::Chained {
+            folded_carry_seed, ..
+        } = &mut incomplete.proposal_execution
+        {
+            *folded_carry_seed = Some(onnx_genai_metadata::SpeculativeValueRef {
+                component: "target".to_string(),
+                output: "hidden_states.0".to_string(),
+            });
+        }
+        let error = ChainedPlan::resolve(&incomplete, &workflow())
+            .expect_err("a folded carry without an embedding table must not resolve");
+        assert!(
+            format!("{error:#}").contains("token_embedding"),
+            "{error:#}"
+        );
+    }
+
+    /// A chain that declares neither a recurrence nor a folded carry has nothing
+    /// to thread, so repeating the proposer would just re-emit one distribution.
+    #[test]
+    fn a_chained_proposer_must_declare_something_to_thread() {
+        let empty = contract(SpeculativeProposalExecution::Chained {
+            token_embedding_input: "inputs_embeds".to_string(),
+            logits_output: "logits".to_string(),
+            recurrent: Vec::new(),
+            folded_carry_output: None,
+            folded_carry_seed: None,
+            token_embedding: None,
+        });
+        let error = ChainedPlan::resolve(&empty, &workflow())
+            .expect_err("a chain with nothing to thread must not resolve");
+        assert!(format!("{error:#}").contains("recurrent"), "{error:#}");
+    }
 }
