@@ -635,6 +635,22 @@ impl PipelineEngine {
     ) -> anyhow::Result<PipelineOutputs> {
         WorkflowExecutionPlan::new(self, request)?.execute_outputs()
     }
+
+    pub(crate) fn run_workflow_retained(
+        &self,
+        request: PipelineGenerateRequest,
+    ) -> anyhow::Result<PipelineTensors> {
+        let mut plan = WorkflowExecutionPlan::new(self, request)?;
+        let (mut values, _) = plan.execute_retained()?;
+        // `execute_retained` parks the pass's inputs back on the plan for replay.
+        // A retained run has no replay — the caller wanted the whole value map —
+        // so fold them back in; a proposal chain binds the proposer's borrowed
+        // shared KV and masks straight from these request values.
+        for (name, value) in std::mem::take(&mut plan.values) {
+            values.entry(name).or_insert(value);
+        }
+        Ok(values)
+    }
 }
 
 impl<'a> WorkflowExecutionPlan<'a> {
@@ -778,6 +794,20 @@ impl<'a> WorkflowExecutionPlan<'a> {
     }
 
     pub fn execute_outputs(&mut self) -> anyhow::Result<PipelineOutputs> {
+        let (values, row_outputs) = self.execute_retained()?;
+        self.engine.package_outputs(values, row_outputs)
+    }
+
+    /// Execute the workflow and keep every SSA value the pass produced.
+    ///
+    /// [`Self::execute_outputs`] narrows this to the package's declared outputs.
+    /// Interpreter-level constructs that consume a completed pass — the chained
+    /// speculative driver reading its `folded_carry_seed` and the proposer's
+    /// borrowed shared-KV bindings, above all — need the values the workflow
+    /// bound internally, not just what it published.
+    pub fn execute_retained(
+        &mut self,
+    ) -> anyhow::Result<(PipelineTensors, BTreeMap<String, Vec<String>>)> {
         let started = std::time::Instant::now();
         let mut telemetry = WorkflowRunTelemetry {
             started: Some(started),
@@ -937,9 +967,8 @@ impl<'a> WorkflowExecutionPlan<'a> {
         counters.last_emitted_elements = telemetry.emitted_elements;
         drop(counters);
         let inputs = self.take_inputs(&mut values);
-        let outputs = engine.package_outputs(values, telemetry.row_outputs);
         self.values = inputs;
-        outputs
+        Ok((values, telemetry.row_outputs))
     }
 
     fn retain_inputs(&mut self, values: &mut PipelineTensors) {
@@ -1739,6 +1768,87 @@ impl PipelineEngine {
             }
         }
         Ok(())
+    }
+
+    /// Invoke one declared ONNX component with caller-supplied port values.
+    ///
+    /// This is the same execution seam a `WorkflowNode::Invoke` uses — port
+    /// contract validation, symbol binding, resolvable output shapes, and
+    /// [`Self::invoke_onnx_component`] — exposed for interpreter constructs
+    /// that drive a component outside the SSA step list, such as the chained
+    /// speculative proposal loop (`pipeline::speculative`). Keeping them on one
+    /// seam is what makes those constructs backend-neutral: ORT and native both
+    /// run through the identical path, with no second "invoke a component"
+    /// implementation to keep in sync.
+    pub(crate) fn invoke_component_values(
+        &self,
+        component: &str,
+        inputs: &[(&str, &Value)],
+        outputs: &std::collections::BTreeMap<String, String>,
+    ) -> anyhow::Result<Vec<(String, Value)>> {
+        let workflow = &self.workflow;
+        let declaration = workflow
+            .components
+            .get(component)
+            .with_context(|| format!("workflow component '{component}' is undeclared"))?;
+        anyhow::ensure!(
+            matches!(
+                declaration.implementation,
+                ComponentImplementation::Onnx { .. }
+            ),
+            "workflow component '{component}' is not an ONNX component"
+        );
+        let mut component_symbols = HashMap::new();
+        let component_dynamic_symbols = std::collections::HashSet::new();
+        for (port, value) in inputs {
+            if let Some(contract) = declaration.ports.inputs.get(*port) {
+                validate_workflow_value(
+                    port,
+                    value,
+                    contract,
+                    &mut component_symbols,
+                    &component_dynamic_symbols,
+                )?;
+            }
+        }
+        let output_shapes = resolve_component_output_shapes(
+            declaration,
+            outputs,
+            &component_symbols,
+            &component_dynamic_symbols,
+        );
+        let produced = self.invoke_onnx_component(
+            workflow,
+            component,
+            component,
+            declaration,
+            &component_symbols,
+            inputs,
+            outputs,
+            &output_shapes,
+        )?;
+        for (port, tensor) in &produced {
+            if let Some(contract) = declaration.ports.outputs.get(port) {
+                validate_workflow_value(
+                    port,
+                    tensor,
+                    contract,
+                    &mut component_symbols,
+                    &component_dynamic_symbols,
+                )?;
+            }
+        }
+        Ok(produced)
+    }
+
+    /// Copy a possibly device-resident value into host memory.
+    ///
+    /// Interpreter constructs that must read tensor bytes (a proposal loop's
+    /// argmax, a folded carry it re-packs into the next fused input) go through
+    /// here so a native-CUDA run stays correct without the caller knowing where
+    /// the value lives.
+    pub(crate) fn host_copy_of(&self, value: &Value) -> anyhow::Result<Value> {
+        self.materialize_workflow_value_copy(value)
     }
 
     /// Backend-neutral execution seam for a declared ONNX component.

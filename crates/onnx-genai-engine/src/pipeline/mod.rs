@@ -32,6 +32,7 @@ mod islands;
 #[cfg(feature = "native-backend")]
 mod native_component;
 mod row_state;
+pub mod speculative;
 mod workflow;
 
 pub use adapters::{AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection};
@@ -169,6 +170,11 @@ pub struct PipelineEngine {
     adapter_cache: RefCell<adapters::AdapterCache>,
     active_adapter_context: RefCell<Option<adapters::AdapterRunContext>>,
     preprocessing: Option<PreprocessingSpec>,
+    /// The package's speculative compatibility contract, when it declares one.
+    /// The chained proposal driver in [`speculative`] reads every field it needs
+    /// from here, so proposal execution is metadata-driven rather than keyed on
+    /// a model name.
+    speculative: Option<onnx_genai_metadata::SpeculativeContract>,
     /// Native (pure-Rust) component sessions, present only when the engine was
     /// built for `EngineDecodeBackend::Native`. The universal interpreter drives
     /// these through the same seam it uses for ORT sessions; see
@@ -535,6 +541,10 @@ impl PipelineEngine {
         }
         .map_err(|error| anyhow::anyhow!("Failed to load workflow components: {error}"))?;
 
+        let speculative = directory
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.speculative.clone());
         let workflow = directory.spec.workflow;
         let mut compiled_workflow = onnx_genai_metadata::compile_workflow(&workflow)
             .map_err(|error| anyhow::anyhow!("Failed to lower workflow metadata: {error}"))?;
@@ -550,10 +560,16 @@ impl PipelineEngine {
         // session creation. This is a topology-derived maximum: a component
         // invoked in two different islands contributes twice, while a candidate
         // the linker rejects contributes nothing.
+        // Values a speculative proposal driver consumes after a pass are real
+        // consumers island fusion cannot see; keep them live in both the
+        // reservation dry-run and the plan so the two agree.
+        let speculative_live_values =
+            speculative::externally_used_values(speculative.as_ref(), &workflow);
         let maximum_island_initializer_bytes = islands::maximum_execution_island_initializer_bytes(
             &compiled_workflow.graph,
             &workflow,
             &models,
+            &speculative_live_values,
         )?;
         let maximum_initializer_reservation = workflow_initializer_reservation_bytes(
             model_weights_bytes,
@@ -607,6 +623,7 @@ impl PipelineEngine {
                     &workflow,
                     &models,
                     &aliasable_output_values,
+                    &speculative_live_values,
                 )
                 .map_err(|error| {
                     anyhow::anyhow!("Failed to plan workflow execution islands: {error}")
@@ -682,6 +699,7 @@ impl PipelineEngine {
             adapter_cache: RefCell::new(adapters::AdapterCache::default()),
             active_adapter_context: RefCell::new(None),
             preprocessing: directory.preprocessing,
+            speculative,
             #[cfg(feature = "native-backend")]
             native_components,
             _ort_environment: ort_environment,
@@ -785,6 +803,22 @@ impl PipelineEngine {
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
         self.run_workflow(request)
+    }
+
+    /// Run the workflow and keep every value the pass bound, not only the
+    /// package's declared outputs.
+    ///
+    /// This is the seam interpreter-level constructs consume: a chained
+    /// speculative proposal reads its `folded_carry_seed` from the target output
+    /// the pass produced and binds the proposer's borrowed read-only KV from the
+    /// same values the workflow itself bound, so the proposal chain sees exactly
+    /// the tensors the package declared rather than a caller's reconstruction of
+    /// them.
+    pub fn run_pipeline_retained(
+        &mut self,
+        request: PipelineGenerateRequest,
+    ) -> anyhow::Result<PipelineTensors> {
+        self.run_workflow_retained(request)
     }
 
     /// Drop every reusable execution result this pipeline is holding, so the
