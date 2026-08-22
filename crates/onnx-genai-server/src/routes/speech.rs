@@ -51,12 +51,19 @@ pub(crate) async fn audio_speech(
     let token_rows = processor.token_rows(token_ids).map_err(|error| {
         ApiError::bad_request(format!("invalid speech guidance rows: {error:#}"))
     })?;
+    let output_units = request
+        .max_output_units
+        .unwrap_or(processor.max_output_units);
+    if output_units == 0 || output_units > processor.max_output_units {
+        return Err(ApiError::bad_request(format!(
+            "max_output_units must be between 1 and {}",
+            processor.max_output_units
+        )));
+    }
     let generation = GenerateRequest {
         prompt: GeneratePrompt::TokenRows(token_rows),
         options: GenerateOptions {
-            max_new_tokens: processor
-                .max_output_units
-                .saturating_add(processor.state_advance_units),
+            max_new_tokens: output_units.saturating_add(processor.state_advance_units),
             max_context: handle.model_max_context,
             ..GenerateOptions::default()
         },

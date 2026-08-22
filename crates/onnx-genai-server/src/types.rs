@@ -14,6 +14,9 @@ pub struct AudioSpeechRequest {
     pub response_format: String,
     #[serde(default)]
     pub stream: bool,
+    /// Optional bounded workflow-unit budget for short non-streaming renders.
+    #[serde(default)]
+    pub max_output_units: Option<usize>,
 }
 
 fn default_wav_response_format() -> String {
