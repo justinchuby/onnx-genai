@@ -60,6 +60,16 @@ fn error(message: impl Into<String>) -> EpError {
 ///
 /// [`CudaRuntime`]: crate::runtime::CudaRuntime
 pub(crate) trait InterleaveDevice {
+    /// An identity for this device that is unique among all devices alive in
+    /// this process, and never reused after one goes away.
+    ///
+    /// A cache binds to the first identity it serves and refuses another, which
+    /// is what turns "one cache per runtime" from a convention into something
+    /// the code enforces. Reused ids would defeat that -- the whole defect being
+    /// guarded against is an identity that gets handed to a second owner -- so
+    /// this must not be an address or an ordinal.
+    fn interleave_device_id(&self) -> u64;
+
     /// Allocate `bytes` of device memory.
     fn interleave_alloc(&self, bytes: usize) -> Result<CUdeviceptr>;
 
@@ -85,6 +95,19 @@ pub(crate) trait InterleaveDevice {
 #[derive(Debug, Default)]
 pub(crate) struct InterleaveCache {
     entries: Mutex<HashMap<(CUdeviceptr, usize), CUdeviceptr>>,
+    /// The device this cache has bound to, set on first use.
+    ///
+    /// Belt to the scoping's braces. Placing the cache on [`CudaRuntime`] is
+    /// what makes a device address a valid key, but that is a structural
+    /// argument, and structure is exactly what a later refactor can undo
+    /// without noticing -- this cache was a process global until this commit.
+    /// If one is ever shared between two devices again, the second one is
+    /// refused here rather than silently served the first one's weights. The
+    /// #1726 defect was so expensive precisely because it was silent, so the
+    /// backstop fails loud.
+    ///
+    /// [`CudaRuntime`]: crate::runtime::CudaRuntime
+    device: Mutex<Option<u64>>,
 }
 
 impl InterleaveCache {
@@ -101,6 +124,7 @@ impl InterleaveCache {
         packed: CUdeviceptr,
         bytes: usize,
     ) -> Result<(CUdeviceptr, bool)> {
+        self.bind(device.interleave_device_id())?;
         let key = (packed, bytes);
         if let Some(hit) = self.lookup(&key) {
             return Ok((hit, true));
@@ -131,9 +155,13 @@ impl InterleaveCache {
         Ok((built, false))
     }
 
-    /// Free every cached buffer. Called from the runtime's teardown, which is
-    /// what bounds an entry's life by the life of the allocator whose address
-    /// keys it.
+    /// Hand every cached buffer back to `device`'s allocator and forget it.
+    ///
+    /// Called from the runtime's teardown, which is what bounds an entry's life
+    /// by the life of the allocator whose address keys it. "Back to the
+    /// allocator" is the honest claim: `CudaRuntime::free_raw` may park a block
+    /// in its size-class pool rather than call `cuMemFree`. What matters for
+    /// #1726 is that the entry is gone, so no later weight can be served it.
     pub(crate) fn release_all<D: InterleaveDevice>(&self, device: &D) {
         let drained: Vec<CUdeviceptr> = self.lock().drain().map(|(_, ptr)| ptr).collect();
         for ptr in drained {
@@ -146,6 +174,23 @@ impl InterleaveCache {
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.lock().len()
+    }
+
+    /// Bind this cache to `device`, or fail if it already belongs to another.
+    fn bind(&self, device: u64) -> Result<()> {
+        let mut bound = self.device.lock().unwrap_or_else(|e| e.into_inner());
+        match *bound {
+            None => {
+                *bound = Some(device);
+                Ok(())
+            }
+            Some(owner) if owner == device => Ok(()),
+            Some(owner) => Err(error(format!(
+                "cache built for device {owner} was asked to serve device {device}; an entry is \
+                 keyed by a device address, which only names a weight for the device that minted \
+                 it (#1726)"
+            ))),
+        }
     }
 
     fn lookup(&self, key: &(CUdeviceptr, usize)) -> Option<CUdeviceptr> {
@@ -185,12 +230,15 @@ mod tests {
         frees: AtomicUsize,
         builds: AtomicUsize,
         capturing: std::sync::atomic::AtomicBool,
+        id: u64,
     }
 
     impl RecyclingDevice {
         fn new() -> Self {
+            static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
             Self {
                 next_address: AtomicUsize::new(0x1000),
+                id: NEXT_ID.fetch_add(1, Ordering::Relaxed) as u64,
                 ..Default::default()
             }
         }
@@ -234,6 +282,10 @@ mod tests {
     }
 
     impl InterleaveDevice for RecyclingDevice {
+        fn interleave_device_id(&self) -> u64 {
+            self.id
+        }
+
         fn interleave_alloc(&self, bytes: usize) -> Result<CUdeviceptr> {
             let ptr = self.raw_alloc(bytes);
             self.blocks.lock().unwrap().insert(ptr, vec![0; bytes]);
@@ -259,8 +311,15 @@ mod tests {
 
         fn interleave_build(&self, src: CUdeviceptr, dst: CUdeviceptr, bytes: usize) -> Result<()> {
             self.builds.fetch_add(1, Ordering::Relaxed);
-            let source = self.contents(src);
-            assert_eq!(source.len(), bytes, "build read the wrong length");
+            let block = self.contents(src);
+            // A device pointer plus a byte length may name a prefix of a block,
+            // which is what makes `bytes` part of the cache identity.
+            assert!(
+                bytes <= block.len(),
+                "build read {bytes} bytes past the end of a {}-byte block",
+                block.len()
+            );
+            let source = &block[..bytes];
             // Stand-in for the nibble interleave: any invertible per-byte
             // function whose output identifies the input it came from.
             let built: Vec<u8> = source.iter().map(|b| b.rotate_left(4)).collect();
@@ -270,6 +329,50 @@ mod tests {
 
         fn interleave_is_capturing(&self) -> Result<bool> {
             Ok(self.capturing.load(Ordering::Relaxed))
+        }
+    }
+
+    /// A stand-in for [`CudaRuntime`], which owns a device *and* the cache
+    /// keyed by that device's addresses.
+    ///
+    /// The tests go through this rather than constructing a bare
+    /// [`InterleaveCache`], so "two providers" means what it means in
+    /// production -- two owners, each with its own cache -- and a change that
+    /// put the cache back in one shared place would have to change this type to
+    /// keep the tests passing, which is the point.
+    ///
+    /// [`CudaRuntime`]: crate::runtime::CudaRuntime
+    struct FakeRuntime<'a> {
+        device: &'a RecyclingDevice,
+        interleave: InterleaveCache,
+    }
+
+    impl<'a> FakeRuntime<'a> {
+        fn new(device: &'a RecyclingDevice) -> Self {
+            Self {
+                device,
+                interleave: InterleaveCache::default(),
+            }
+        }
+
+        /// Mirrors `CudaRuntime::ensure_interleaved_int4`.
+        fn ensure_interleaved_int4(
+            &self,
+            packed: CUdeviceptr,
+            bytes: usize,
+        ) -> Result<(CUdeviceptr, bool)> {
+            self.interleave.ensure(self.device, packed, bytes)
+        }
+
+        fn interleaved_weight_count(&self) -> usize {
+            self.interleave.len()
+        }
+    }
+
+    /// Mirrors `Drop for CudaRuntime`.
+    impl Drop for FakeRuntime<'_> {
+        fn drop(&mut self) {
+            self.interleave.release_all(self.device);
         }
     }
 
@@ -308,14 +411,16 @@ mod tests {
         // Provider 1 loads a weight, routes it, then goes away.
         let first = weight(0x11, BYTES);
         let first_ptr = device.put(&first);
-        let cache_1 = InterleaveCache::default();
-        let (built_1, warm) = cache_1.ensure(&device, first_ptr, BYTES).unwrap();
-        assert!(!warm, "the first sight of a weight must build it");
-        assert_eq!(
-            digest(&device.contents(built_1)),
-            digest(&interleaved(&first))
-        );
-        cache_1.release_all(&device);
+        {
+            let provider = FakeRuntime::new(&device);
+            let (built, warm) = provider.ensure_interleaved_int4(first_ptr, BYTES).unwrap();
+            assert!(!warm, "the first sight of a weight must build it");
+            assert_eq!(provider.interleaved_weight_count(), 1);
+            assert_eq!(
+                digest(&device.contents(built)),
+                digest(&interleaved(&first))
+            );
+        }
         device.free(first_ptr);
 
         // Provider 2 loads a different weight of the same size. The allocator
@@ -328,14 +433,15 @@ mod tests {
         );
         assert_ne!(first, second, "the two weights must be distinguishable");
 
-        let cache_2 = InterleaveCache::default();
-        let (built_2, warm) = cache_2.ensure(&device, second_ptr, BYTES).unwrap();
+        let provider = FakeRuntime::new(&device);
+        let (built, warm) = provider.ensure_interleaved_int4(second_ptr, BYTES).unwrap();
         assert!(
             !warm,
-            "a weight this cache has never seen must be built, not served warm"
+            "a weight this provider has never seen must be built, not served warm"
         );
+        assert_eq!(provider.interleaved_weight_count(), 1);
         assert_eq!(
-            digest(&device.contents(built_2)),
+            digest(&device.contents(built)),
             digest(&interleaved(&second)),
             "served the previous weight's interleave at recycled address {second_ptr:#x}"
         );
@@ -367,17 +473,17 @@ mod tests {
             recycled_across_weights |= recycled;
             seen.push((ptr, which));
 
-            // Each provider gets its own cache, which is what runtime scoping
-            // means once a session is torn down and another starts.
-            let cache = InterleaveCache::default();
-            let (built, _) = cache.ensure(&device, ptr, BYTES).unwrap();
+            // A provider per round: one session loading a model, routing it, and
+            // being torn down before the next starts.
+            let provider = FakeRuntime::new(&device);
+            let (built, _) = provider.ensure_interleaved_int4(ptr, BYTES).unwrap();
             assert_eq!(
                 digest(&device.contents(built)),
                 digest(&interleaved(source)),
                 "round {round} (address {ptr:#x} recycled={recycled}): served an interleave \
                  built for a different weight at this address"
             );
-            cache.release_all(&device);
+            drop(provider);
             device.free(ptr);
         }
 
@@ -466,34 +572,79 @@ mod tests {
         device.free(ptr);
     }
 
-    /// The same weight at two byte lengths is two entries: `bytes` is part of
-    /// the identity, so a shorter view of the same address cannot be served a
-    /// longer weight's interleave.
+    /// Byte length is part of the identity: two lengths at the SAME address are
+    /// two entries.
+    ///
+    /// The address must be identical in both asks, or the test proves nothing --
+    /// two different addresses miss each other on the address component alone
+    /// and would still pass with `bytes` dropped from the key entirely.
     #[test]
     fn byte_length_is_part_of_the_identity() {
+        const LONG: usize = 1024;
+        const SHORT: usize = 512;
         let device = RecyclingDevice::new();
-        let long = weight(0x21, 1024);
+        let long = weight(0x21, LONG);
         let ptr = device.put(&long);
         let cache = InterleaveCache::default();
 
-        let (built_long, _) = cache.ensure(&device, ptr, 1024).unwrap();
+        let (built_long, warm) = cache.ensure(&device, ptr, LONG).unwrap();
+        assert!(!warm);
         assert_eq!(
             digest(&device.contents(built_long)),
             digest(&interleaved(&long))
         );
 
-        // A different length at the same address must not hit the entry above.
-        let short_source = weight(0x21, 512);
-        let short_ptr = device.put(&short_source);
-        let (built_short, warm) = cache.ensure(&device, short_ptr, 512).unwrap();
-        assert!(!warm);
+        // The same address, a shorter length: a prefix view of one weight must
+        // not be served the whole weight's interleave.
+        let (built_short, warm) = cache.ensure(&device, ptr, SHORT).unwrap();
+        assert!(
+            !warm,
+            "a different byte length at the same address hit the longer entry, \
+             so the length is not part of the identity"
+        );
         assert_ne!(built_short, built_long);
+        assert_eq!(cache.len(), 2, "the two lengths must be two entries");
         assert_eq!(
             digest(&device.contents(built_short)),
-            digest(&interleaved(&short_source))
+            digest(&interleaved(&long[..SHORT]))
         );
 
         cache.release_all(&device);
+    }
+
+    /// A cache that has served one device refuses another.
+    ///
+    /// The scoping -- the cache being a field of `CudaRuntime` -- is what makes
+    /// a device address a valid key, but that is structure, and a later refactor
+    /// can undo structure without noticing; this cache was a process global
+    /// until it was moved. If one is ever shared again, the second device is
+    /// refused rather than silently served the first one's weights.
+    #[test]
+    fn a_cache_that_has_served_one_device_refuses_another() {
+        const BYTES: usize = 256;
+        let first = RecyclingDevice::new();
+        let second = RecyclingDevice::new();
+        assert_ne!(first.interleave_device_id(), second.interleave_device_id());
+
+        let shared = InterleaveCache::default();
+        let ptr = first.put(&weight(1, BYTES));
+        shared.ensure(&first, ptr, BYTES).unwrap();
+
+        let error = shared
+            .ensure(&second, second.put(&weight(2, BYTES)), BYTES)
+            .expect_err("a cache bound to one device must refuse another");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("1726"),
+            "the refusal must name the defect it prevents: {message}"
+        );
+        assert_eq!(
+            second.builds.load(Ordering::Relaxed),
+            0,
+            "the refused device must not have built anything"
+        );
+
+        shared.release_all(&first);
     }
 
     /// Concurrent first sights of one weight settle on a single buffer, and the

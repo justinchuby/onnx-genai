@@ -6321,6 +6321,10 @@ fn use_scales_f16_zp_splitk_pf() -> bool {
 /// [`crate::interleave_cache`]; the device work is here because the interleave
 /// pass is a kernel in this module's NVRTC source.
 impl crate::interleave_cache::InterleaveDevice for CudaRuntime {
+    fn interleave_device_id(&self) -> u64 {
+        self.runtime_id()
+    }
+
     fn interleave_alloc(&self, bytes: usize) -> Result<CUdeviceptr> {
         self.alloc_raw(bytes)
     }
@@ -12860,9 +12864,11 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     /// process, across every session that ever loaded one.
     ///
     /// Exercises the same `release_all` that `Drop for CudaRuntime` calls, since
-    /// a dropped runtime can no longer be asked what it holds. That the buffer
-    /// really went back to the allocator is checked by asking for one the same
-    /// size and getting the same address.
+    /// a dropped runtime can no longer be asked what it holds. The assertion is
+    /// that the entry is gone -- the next ask must build again rather than be
+    /// served warm -- and not that the address came back from `alloc_raw`:
+    /// `free_raw` may park a block in its size-class pool or return it to the
+    /// driver depending on the pool budget, and either is correct here.
     #[test]
     fn tearing_down_a_runtime_releases_its_interleaved_weights() {
         const BYTES: usize = 2048;
@@ -12871,8 +12877,13 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             return;
         };
         let packed = runtime.alloc_raw(BYTES).unwrap();
-        let (built, _) = ensure_interleaved(&runtime, packed, BYTES).unwrap();
+        let (_, warm) = ensure_interleaved(&runtime, packed, BYTES).unwrap();
+        assert!(!warm);
         assert_eq!(runtime.interleaved_weight_count(), 1);
+        assert!(
+            ensure_interleaved(&runtime, packed, BYTES).unwrap().1,
+            "a cached weight must report warm before teardown"
+        );
 
         runtime.release_interleaved_weights();
 
@@ -12881,17 +12892,16 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             0,
             "teardown left interleaved weights behind"
         );
-        let reused = runtime.alloc_raw(BYTES).unwrap();
-        assert_eq!(
-            reused, built,
-            "the interleaved buffer was not handed back to the allocator"
+        let (_, warm) = ensure_interleaved(&runtime, packed, BYTES).unwrap();
+        assert!(
+            !warm,
+            "teardown dropped the buffer but left the entry, so a later weight \
+             at this address would be served a freed pointer"
         );
 
-        // SAFETY: both allocated by this runtime and freed once each.
-        unsafe {
-            runtime.free_raw(reused).unwrap();
-            runtime.free_raw(packed).unwrap();
-        }
+        runtime.release_interleaved_weights();
+        // SAFETY: allocated by this runtime above and freed once.
+        unsafe { runtime.free_raw(packed).unwrap() };
     }
 
     /// The prefetch-pipelined single-warp block-32 scales-fp16 int4 decode GEMV

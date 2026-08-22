@@ -448,6 +448,10 @@ fn raw_pool_size_class(bytes: usize) -> usize {
     }
 }
 
+/// Source of [`CudaRuntime::runtime_id`]. Monotonic and never reset, so an id
+/// is never handed to a second runtime.
+static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
+
 pub struct CudaRuntime {
     context: Arc<CudaContext>,
     stream: Arc<CudaStream>,
@@ -486,6 +490,13 @@ pub struct CudaRuntime {
     raw_pool_classes: Mutex<HashMap<CUdeviceptr, usize>>,
     raw_pool_retained: AtomicU64,
     raw_pool_hits: AtomicU64,
+    /// Identity for this runtime, unique in this process and never reused.
+    ///
+    /// Not the ordinal: several runtimes may share a device, and the point of
+    /// the id is to tell them apart. Not an address either -- a dropped
+    /// runtime's address can be handed to the next one, which is the very reuse
+    /// this guards against. See [`crate::interleave_cache`].
+    runtime_id: u64,
     /// Interleaved copies of int4 packed weights, keyed by the source weight's
     /// device address.
     ///
@@ -690,6 +701,7 @@ impl CudaRuntime {
             raw_pool_classes: Mutex::new(HashMap::new()),
             raw_pool_retained: AtomicU64::new(0),
             raw_pool_hits: AtomicU64::new(0),
+            runtime_id: NEXT_RUNTIME_ID.fetch_add(1, Ordering::Relaxed),
             interleave: crate::interleave_cache::InterleaveCache::default(),
             shared_blas_workspace: Mutex::new(None),
             raw_allocation_profile: RawAllocationProfile::new(raw_allocation_profile_enabled()),
@@ -1410,6 +1422,11 @@ impl CudaRuntime {
     pub fn is_capturing(&self) -> Result<bool> {
         Ok(self.graph_capture_status()?
             != cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE)
+    }
+
+    /// This runtime's process-unique identity. See [`Self::runtime_id`].
+    pub(crate) fn runtime_id(&self) -> u64 {
+        self.runtime_id
     }
 
     /// The interleaved copy of the `bytes`-byte int4 packed weight at `packed`,
