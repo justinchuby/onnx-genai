@@ -720,7 +720,9 @@ fn mobius_speculative_workflow_executes_rejection_and_correction() -> anyhow::Re
     )
     .with_input("telemetry.draft_ms", Value::from_slice_f32(&[1.0], &[1])?)
     .with_input("telemetry.target_ms", Value::from_slice_f32(&[1.0], &[1])?);
-    let request = if std::env::var_os("MOBIUS_WORKFLOW_CONFORMANCE_DIR").is_some() {
+    let producer_metadata =
+        std::fs::read_to_string(root("speculative")?.join("inference_metadata.yaml"))?;
+    let request = if producer_metadata.contains("request.verifier.past_key_values.0.value") {
         request.with_input(
             "verifier.past_key_values.0.value",
             Value::from_slice_f32(&[], &[1, 4, 0, 4])?,
@@ -735,11 +737,11 @@ fn mobius_speculative_workflow_executes_rejection_and_correction() -> anyhow::Re
 
 #[test]
 fn mobius_hierarchical_audio_executes_nested_generation() -> anyhow::Result<()> {
-    if std::env::var_os("MOBIUS_WORKFLOW_CONFORMANCE_DIR").is_none() {
+    let package = root("hierarchical_audio")?;
+    if !package.is_dir() {
         return Ok(());
     }
-    let mut engine =
-        Engine::from_pipeline_dir(&root("hierarchical_audio")?, EngineConfig::default())?;
+    let mut engine = Engine::from_pipeline_dir(&package, EngineConfig::default())?;
     let request = PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![1, 2, 3]),
         options: options(2),
