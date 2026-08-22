@@ -77,6 +77,8 @@ tokio = { workspace = true }
 axum = { workspace = true, features = ["multipart"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+regex = "1.12"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }

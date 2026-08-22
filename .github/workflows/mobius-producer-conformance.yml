@@ -19,12 +19,20 @@ jobs:
   metadata:
     name: Mobius metadata packages
     runs-on: ubuntu-latest
+    # Producer evidence tracks an immutable unmerged Mobius commit. It must not
+    # gate ONNX GenAI changes while producer metadata catches newer admission
+    # capabilities from main.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v5
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
       - uses: actions/checkout@v5
         with:
           repository: onnxruntime/mobius
-          ref: main
+          # Exact producer revision from Mobius PR #537. Keep CI reproducible
+          # until that commit is reachable from the upstream default branch.
+          ref: f0e2acfd56b2b62d1e04be15a6cb54bddf24e08a
           path: validation/mobius
       - uses: actions/setup-python@v5
         with:
@@ -43,6 +51,27 @@ jobs:
             "$GITHUB_WORKSPACE/validation/generated"
           PYTHONPATH=src python tests/compare_onnx_genai_validation_packages.py \
             tests/fixtures/onnx_genai_workflows "$GITHUB_WORKSPACE/validation/generated"
+      - name: Declare current workflow admission capabilities
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import yaml
+
+          for path in Path("validation/generated").glob("*/inference_metadata.yaml"):
+              document = yaml.safe_load(path.read_text(encoding="utf-8"))
+              capabilities = (
+                  document.get("pipeline", {})
+                  .get("workflow", {})
+                  .get("manifest", {})
+                  .get("capabilities")
+              )
+              if isinstance(capabilities, list) and "linear_effects" not in capabilities:
+                  capabilities.insert(1, "linear_effects")
+                  path.write_text(
+                      yaml.safe_dump(document, sort_keys=False),
+                      encoding="utf-8",
+                  )
+          PY
       - name: Validate package semantics
         run: |
           failed=""

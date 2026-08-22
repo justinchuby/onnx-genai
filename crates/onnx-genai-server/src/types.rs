@@ -5,6 +5,25 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Deserialize)]
+pub struct AudioSpeechRequest {
+    pub model: String,
+    pub input: String,
+    #[serde(default)]
+    pub instructions: String,
+    #[serde(default = "default_wav_response_format")]
+    pub response_format: String,
+    #[serde(default)]
+    pub stream: bool,
+    /// Optional bounded workflow-unit budget for short non-streaming renders.
+    #[serde(default)]
+    pub max_output_units: Option<usize>,
+}
+
+fn default_wav_response_format() -> String {
+    "wav".to_string()
+}
+
+#[derive(Debug, Deserialize)]
 pub struct EmbeddingRequest {
     pub model: String,
     pub input: EmbeddingInput,

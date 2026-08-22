@@ -87,7 +87,7 @@
 //!    only.
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -132,6 +132,9 @@ pub const DECODE_SCHEDULE_ENV: &str = "ONNX_GENAI_CPU_DECODE_SCHEDULE";
 /// default, which targets coarse parallel regions rather than per-token decode.
 const DEFAULT_BLOCKTIME: Duration = Duration::from_micros(500);
 
+/// Environment variable naming the worker active-spin window, in microseconds.
+const DECODE_BLOCKTIME_ENV: &str = "ONNX_GENAI_CPU_DECODE_BLOCKTIME_US";
+
 /// Pure `spin_loop` iterations at the start of the active window before the
 /// worker begins yielding the core to co-tenants between clock checks. A
 /// crossbeam-`Backoff`-style ramp: hammer the sense line first to catch the
@@ -152,15 +155,23 @@ const CLOCK_CHECK_STRIDE: u32 = 1 << 6;
 /// (maximally polite, higher wake latency). Unset uses [`DEFAULT_BLOCKTIME`].
 fn decode_blocktime() -> Duration {
     static V: OnceLock<Duration> = OnceLock::new();
-    *V.get_or_init(
-        || match std::env::var("ONNX_GENAI_CPU_DECODE_BLOCKTIME_US") {
-            Ok(raw) => match raw.trim().parse::<u64>() {
-                Ok(us) => Duration::from_micros(us),
-                Err(_) => DEFAULT_BLOCKTIME,
-            },
-            Err(_) => DEFAULT_BLOCKTIME,
-        },
-    )
+    *V.get_or_init(|| parse_decode_blocktime(std::env::var(DECODE_BLOCKTIME_ENV).ok().as_deref()))
+}
+
+/// Parse a [`DECODE_BLOCKTIME_ENV`] value, falling back to
+/// [`DEFAULT_BLOCKTIME`] for anything unset or unparseable.
+///
+/// Split out from [`decode_blocktime`] so the policy is testable without the
+/// environment. That is not a stylistic preference: `decode_blocktime` latches
+/// into a `OnceLock` on first `worker_wait`, so a test that set the variable and
+/// called it twice would compare the first value against itself and pass while
+/// measuring nothing -- the same latched-control defect as #1736. Testing the
+/// pure function cannot silently degrade that way, and `cargo test` runs a
+/// binary's tests on parallel threads where `set_var` racing another thread's
+/// `getenv` is a data race Rust 2024 forbids outright.
+fn parse_decode_blocktime(raw: Option<&str>) -> Duration {
+    raw.and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map_or(DEFAULT_BLOCKTIME, Duration::from_micros)
 }
 
 /// Spin iterations the (single, never-idle) dispatcher busy-waits on the
@@ -193,6 +204,90 @@ struct Padded<T>(T);
 struct Job {
     data: *const (),
     call: unsafe fn(*const (), usize),
+}
+
+/// Observable scheduling behaviour of the persistent SPMD decode pool.
+///
+/// Every field is monotonic since process start and is read as a *delta* across
+/// a measured phase, the way [`crate::task_runtime::testing::counters`] already
+/// is. They exist so a harness can assert **what the scheduler did** instead of
+/// inferring it from a timing difference: on a shared runner a park/wake
+/// regression and a noisy neighbour produce the same slowdown, and only one of
+/// them changes `parks`.
+///
+/// This closes a gap that made the blocktime knob untunable. Whether a worker
+/// spins through an inter-token gap or parks and pays a futex wake was
+/// observable only as wall time and process-wide `sys` time, both of which are
+/// contaminated by anything else on the host and by the harness's own gap
+/// generator. `spin_hits` and `parks` are per-worker, per-op, and immune to
+/// both.
+///
+/// Not collected on the `--features mlas` work-stealing schedule, which is a
+/// separate executor with its own wait policy and is never the production path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpmdCounters {
+    /// Ops published to the worker set through the barrier.
+    pub dispatches: u64,
+    /// Dispatches that found the single job slot already claimed and ran every
+    /// shard inline on the calling thread instead. A direct nested-dispatch and
+    /// concurrent-session signal: the pool serves one dispatcher at a time, so
+    /// the surplus degrades to serial rather than racing.
+    pub inline_dispatches: u64,
+    /// Times a worker's blocktime window caught the next op before it parked.
+    ///
+    /// Includes the case where the window expired but the op landed before the
+    /// worker actually slept: no wake was paid, which is the distinction this
+    /// pair of counters exists to draw.
+    pub spin_hits: u64,
+    /// Times a worker had to be woken from a futex park to observe an op.
+    ///
+    /// Counted when the observation completes rather than when the worker goes
+    /// to sleep, so `spin_hits + parks` is **exactly** the number of
+    /// op-observations: `dispatches * spawned_workers` at any point where no
+    /// dispatch is in flight. That identity is what makes these assertable
+    /// without timing. It holds while the pool is live; teardown bumps the same
+    /// sense line to release the workers, and that bump is indistinguishable
+    /// from an op here, so snapshots are taken before
+    /// [`SpmdDecodePools::shutdown`].
+    pub parks: u64,
+    /// Times a parked worker woke without its node's sense having advanced and
+    /// went back to sleep.
+    ///
+    /// Unlike `spin_hits` and `parks`, an increment here is not followed by a
+    /// barrier acknowledgement, so it has no release edge to make it visible to
+    /// a reader on another thread at a defined point. Treat it as eventually
+    /// consistent: fine for a threshold or a rate, not for an exact assertion
+    /// taken immediately after the wake.
+    pub spurious_wakes: u64,
+    /// Barriers where the dispatcher exhausted its spin budget waiting for a
+    /// straggler and yielded the core. Only reachable when a worker is
+    /// descheduled, so this is a direct oversubscription signal.
+    pub dispatcher_yields: u64,
+}
+
+/// One worker's counters, on its own cache line.
+///
+/// Per-worker rather than shared, and that is not micro-optimisation: these are
+/// bumped once per worker per op, at roughly 400 barriers per token, so a single
+/// shared line would take ~6400 contended RMWs per token at width 16. The module
+/// already has a measurement of what that costs -- sharing a line with
+/// [`SharedState::dispatching`] cost ~60% of dispatch latency (see its doc). An
+/// exclusively-owned line stays in the owning core's L1 and the RMW is a few
+/// nanoseconds.
+#[derive(Default)]
+struct WorkerCounters {
+    spin_hits: AtomicU64,
+    parks: AtomicU64,
+    spurious_wakes: AtomicU64,
+}
+
+/// Dispatcher-side counters. Bumped by whichever thread owns the barrier, at
+/// most once per op, and never touched from a worker's wait loop.
+#[derive(Default)]
+struct DispatchCounters {
+    dispatches: AtomicU64,
+    inline_dispatches: AtomicU64,
+    dispatcher_yields: AtomicU64,
 }
 
 /// State shared between the dispatcher (the engine thread running the forward)
@@ -259,6 +354,11 @@ struct SharedState {
     /// at ~400 barriers per token is ~230 us/token of pure coherency traffic.
     dispatching: Padded<AtomicBool>,
     shutdown: AtomicBool,
+    /// One padded counter block per *spawned* worker, indexed by global worker
+    /// index. The dispatcher's own shard (global index `total_threads`) never
+    /// enters [`SharedState::worker_wait`], so it has no entry here.
+    worker_counters: Vec<Padded<WorkerCounters>>,
+    dispatch_counters: Padded<DispatchCounters>,
 }
 
 // SAFETY: `job` is a raw pointer guarded by the publish/observe protocol on
@@ -306,6 +406,7 @@ impl SharedState {
     /// backstop for stragglers under oversubscription) rather than parking.
     fn wait(&self) {
         let mut spins = 0u32;
+        let mut yielded = false;
         loop {
             let done = self
                 .node_pending
@@ -317,6 +418,13 @@ impl SharedState {
             std::hint::spin_loop();
             spins = spins.wrapping_add(1);
             if spins >= DISPATCHER_SPIN_BEFORE_YIELD {
+                if !yielded {
+                    yielded = true;
+                    self.dispatch_counters
+                        .0
+                        .dispatcher_yields
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 thread::yield_now();
             }
         }
@@ -336,14 +444,25 @@ impl SharedState {
     /// bucket lock, so a [`SharedState::publish`] bump that races the arm makes
     /// `wait` return immediately instead of sleeping. The Acquire load pairs with
     /// publish's Release bump to make the job pointer and pending counts visible.
-    fn worker_wait(&self, node: usize, last_seen: u32, blocktime: Duration) -> u32 {
+    fn worker_wait(
+        &self,
+        node: usize,
+        global_index: usize,
+        last_seen: u32,
+        blocktime: Duration,
+    ) -> u32 {
+        let counters = &self.worker_counters[global_index].0;
         let sense = &self.node_sense[node].0;
         // Phase 1: bounded active spin (blocktime), spin_loop ramping into yield.
         let mut spins = 0u32;
         let start = Instant::now();
         loop {
             let current = sense.load(Ordering::Acquire);
-            if current != last_seen || self.shutdown.load(Ordering::Acquire) {
+            if current != last_seen {
+                counters.spin_hits.fetch_add(1, Ordering::Relaxed);
+                return current;
+            }
+            if self.shutdown.load(Ordering::Acquire) {
                 return current;
             }
             spins = spins.wrapping_add(1);
@@ -358,13 +477,64 @@ impl SharedState {
         }
         // Phase 2: park on the futex until the sense advances (or shutdown wakes
         // us via its own sense bump). Re-check under the guard for no lost wakeup.
+        //
+        // `parks` is counted when the observation *completes*, not when the
+        // worker goes to sleep. That is what makes `spin_hits + parks` exactly
+        // the number of op-observations: counting at sleep time would leave a
+        // worker parked for a not-yet-published op counted against a dispatch
+        // that has not happened, and any snapshot would be off by up to one per
+        // worker. It also measures closer to the quantity that matters -- wakes
+        // that served an op -- rather than sleeps entered. Not *exactly* wake
+        // latency paid: a publish landing during the `wait` call itself returns
+        // from the futex immediately, with no real sleep, and still counts here.
+        // That race is narrow and does not affect the identity (still counted
+        // once), but `parks` is an upper bound on wakes paid, not an equality.
+        //
+        // An observation can also land *here* without the worker ever sleeping:
+        // the window expires, and the publish lands in the gap between breaking
+        // out of phase 1 and the first check below. That worker paid no wake, so
+        // it is a spin hit. Attributing it to neither (the obvious reading of
+        // "phase 2 means parked") silently drops an observation, which is how
+        // this branch was found -- the accounting identity failed under a loaded
+        // runner, where the race is wide enough to hit.
+        let mut parked = false;
         loop {
             let current = sense.load(Ordering::Acquire);
-            if current != last_seen || self.shutdown.load(Ordering::Acquire) {
+            if current != last_seen {
+                if parked {
+                    counters.parks.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    counters.spin_hits.fetch_add(1, Ordering::Relaxed);
+                }
                 return current;
             }
+            if self.shutdown.load(Ordering::Acquire) {
+                return current;
+            }
+            if parked {
+                // Woken with the sense unchanged: a spurious futex wake, or a
+                // `wake_all` aimed at a sibling that had not yet re-armed.
+                counters.spurious_wakes.fetch_add(1, Ordering::Relaxed);
+            }
+            parked = true;
             atomic_wait::wait(sense, last_seen);
         }
+    }
+
+    fn counters(&self) -> SpmdCounters {
+        let dispatch = &self.dispatch_counters.0;
+        let mut counters = SpmdCounters {
+            dispatches: dispatch.dispatches.load(Ordering::Relaxed),
+            inline_dispatches: dispatch.inline_dispatches.load(Ordering::Relaxed),
+            dispatcher_yields: dispatch.dispatcher_yields.load(Ordering::Relaxed),
+            ..SpmdCounters::default()
+        };
+        for worker in &self.worker_counters {
+            counters.spin_hits += worker.0.spin_hits.load(Ordering::Relaxed);
+            counters.parks += worker.0.parks.load(Ordering::Relaxed);
+            counters.spurious_wakes += worker.0.spurious_wakes.load(Ordering::Relaxed);
+        }
+        counters
     }
 
     fn panic_if_poisoned(&self) {
@@ -555,6 +725,10 @@ impl SpmdDecodePools {
             poisoned_worker: AtomicUsize::new(0),
             dispatching: Padded(AtomicBool::new(false)),
             shutdown: AtomicBool::new(false),
+            worker_counters: (0..total_threads)
+                .map(|_| Padded(WorkerCounters::default()))
+                .collect(),
+            dispatch_counters: Padded(DispatchCounters::default()),
         });
 
         let mut handles = Vec::with_capacity(total_threads);
@@ -608,6 +782,18 @@ impl SpmdDecodePools {
     /// Number of node groups in the layout.
     pub fn node_count(&self) -> usize {
         self.node_worker_counts.len()
+    }
+
+    /// Snapshot this pool's scheduling counters. See [`SpmdCounters`].
+    ///
+    /// Monotonic since the pool was built, so a harness subtracts two snapshots
+    /// around the phase it cares about. Returns [`SpmdCounters::default`] on the
+    /// `--features mlas` work-stealing schedule, which has no barrier of ours to
+    /// instrument.
+    pub fn counters(&self) -> SpmdCounters {
+        self.shared
+            .as_ref()
+            .map_or_else(SpmdCounters::default, |shared| shared.counters())
     }
 
     fn uses_work_stealing(&self) -> bool {
@@ -712,6 +898,11 @@ impl SpmdDecodePools {
         // The pool serves one dispatcher at a time; a second one runs the same
         // shards inline rather than racing for the slot.
         let Some(claim) = DispatchClaim::try_claim(shared) else {
+            shared
+                .dispatch_counters
+                .0
+                .inline_dispatches
+                .fetch_add(1, Ordering::Relaxed);
             self.dispatch_inline(job);
             return;
         };
@@ -719,6 +910,11 @@ impl SpmdDecodePools {
             data: std::ptr::from_ref(job).cast(),
             call: call::<F>,
         };
+        shared
+            .dispatch_counters
+            .0
+            .dispatches
+            .fetch_add(1, Ordering::Relaxed);
         shared.publish(job_ptr, &self.node_thread_counts);
         // Compute the dispatcher's own shard, when it has one, on the CPU the
         // headroom reservation kept free. `catch_unwind` is load-bearing rather
@@ -1284,7 +1480,7 @@ fn worker_loop(shared: Arc<SharedState>, global_index: usize) {
     loop {
         // Bounded active spin (blocktime) then futex park; returns the observed
         // sense, or an unchanged value if shutdown was seen (re-checked below).
-        let current = shared.worker_wait(node, last_seen, blocktime);
+        let current = shared.worker_wait(node, global_index, last_seen, blocktime);
         if shared.shutdown.load(Ordering::Acquire) {
             return;
         }
@@ -1340,12 +1536,21 @@ pub fn decode_path_label() -> &'static str {
 /// served it.
 ///
 /// Three separate mechanisms can quietly hand back fewer compute lanes than
-/// were requested -- [`reserve_single_group_headroom`], [`reserve_split_headroom`],
-/// and the single-CPU-cpuset fallback in [`build_from_env`] -- and all three
-/// report only through [`report_spmd_fallback`], which is `tracing::debug!` or
-/// `NXRT_CALIB_DEBUG`-gated. In a default benchmark run they are invisible, so a
+/// were requested: the pre-clamp to `available_parallelism` in
+/// `resolve_persistent_decode_threads_with_override`,
+/// [`reserve_split_headroom`], and the single-CPU-cpuset fallback in
+/// [`build_from_env`]. Only the last reports through [`report_spmd_fallback`],
+/// which is itself `tracing::debug!` or `NXRT_CALIB_DEBUG`-gated; the other two
+/// log nothing at all. In a default benchmark run none of them are visible, so a
 /// `t=N` row in a results table is a *label* rather than a measurement of width
 /// `N`. This is the read that turns it back into a measurement.
+///
+/// [`reserve_single_group_headroom`] is deliberately *not* in that list. It does
+/// reduce the number of spawned threads, but it only runs in the single-group
+/// case, which is exactly the case where `dispatcher_owns_a_shard` is true, so
+/// the lane it takes is added straight back by the dispatcher's own shard. A
+/// 2-lane budget on a 2-CPU cpuset spawns one thread and still reports
+/// `realized = 2`, measured, because two lanes really do compute.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DecodeWidth {
     /// Compute lanes asked for: the explicit `ONNX_GENAI_CPU_DECODE_THREADS`
@@ -1399,6 +1604,19 @@ pub fn decode_width() -> DecodeWidth {
         requested,
         realized,
         path: decode_path_label(),
+    }
+}
+
+/// Snapshot the persistent decode pool's scheduling counters, or `None` when no
+/// persistent pool exists (never built, or the flat path was chosen).
+///
+/// Like [`decode_width`], this **peeks** rather than forcing: reading counters
+/// must not be what decides a process's decode path, or the instrument changes
+/// the thing it measures. A harness runs at least one decode step first.
+pub fn counters() -> Option<SpmdCounters> {
+    match POOLS.get() {
+        Some(Some(pools)) => Some(pools.counters()),
+        _ => None,
     }
 }
 
@@ -2262,6 +2480,65 @@ mod tests {
     }
 
     #[test]
+    fn an_unset_or_unparseable_blocktime_uses_the_default() {
+        assert_eq!(parse_decode_blocktime(None), DEFAULT_BLOCKTIME);
+        // Every rejected spelling must land on the default rather than on zero:
+        // silently parking immediately is a real behaviour change, not a
+        // conservative fallback.
+        for raw in [
+            "",
+            "   ",
+            "abc",
+            "-1",
+            "1.5",
+            "500us",
+            "18446744073709551616",
+        ] {
+            assert_eq!(
+                parse_decode_blocktime(Some(raw)),
+                DEFAULT_BLOCKTIME,
+                "{raw:?} is not a microsecond count and must fall back"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_zero_blocktime_parks_immediately_rather_than_taking_the_default() {
+        // Load-bearing, and the reason this policy is worth a test at all: the
+        // sibling knob `steal_tiles_per_worker` filters `> 0` and treats zero as
+        // "unset". Blocktime must not, because `0` is the one setting that makes
+        // a worker park without spinning -- the maximally-polite mode used to
+        // measure park/wake latency. Folding it into the default would silently
+        // give every such run a 500us spin window and make the measurement
+        // impossible while still appearing to work.
+        assert_eq!(parse_decode_blocktime(Some("0")), Duration::ZERO);
+        assert_ne!(parse_decode_blocktime(Some("0")), DEFAULT_BLOCKTIME);
+    }
+
+    #[test]
+    fn a_blocktime_is_read_as_microseconds_and_tolerates_surrounding_space() {
+        assert_eq!(
+            parse_decode_blocktime(Some("250")),
+            Duration::from_micros(250)
+        );
+        assert_eq!(
+            parse_decode_blocktime(Some(" 250\n")),
+            Duration::from_micros(250)
+        );
+        // Pins the unit. Reading the same digits as millis or nanos would be a
+        // 1000x error in either direction and every one of the tests above would
+        // still pass.
+        assert_ne!(
+            parse_decode_blocktime(Some("250")),
+            Duration::from_millis(250)
+        );
+        assert_ne!(
+            parse_decode_blocktime(Some("250")),
+            Duration::from_nanos(250)
+        );
+    }
+
+    #[test]
     fn reserve_single_group_headroom_frees_a_dispatcher_cpu_when_fully_subscribed() {
         // The pathological forced case: requested workers == allowed CPUs (e.g.
         // `taskset -c 0-31` with THREADS=32). One CPU must be reserved for the
@@ -2669,6 +2946,226 @@ mod tests {
                 "requested={requested:?} realized={realized:?} must not report satisfied"
             );
         }
+    }
+
+    /// Every op-observation is either a spin hit or a park-wake, exactly once
+    /// per spawned worker per dispatch.
+    ///
+    /// This is the assertion the counters exist for: it pins the scheduler's
+    /// accounting without measuring a single duration, so it cannot pass or fail
+    /// because of what else is running on the runner. A miscounted branch --
+    /// counting a park at sleep time instead of at wake time, or missing the
+    /// spin-window return -- breaks the identity immediately, while a timing
+    /// test would still pass.
+    #[test]
+    fn every_op_observation_is_counted_exactly_once_as_a_spin_hit_or_a_park() {
+        let workers = 3usize;
+        let pool = single_group_pool(workers);
+        let ops = 16u64;
+        for _ in 0..ops {
+            pool.dispatch_index_tasks(workers, &|_| {});
+        }
+        // Read while no dispatch is in flight: `dispatch` returns only after
+        // every worker has acknowledged, so all of this op's increments have
+        // landed and none of the next op's can have.
+        let counters = pool.counters();
+        assert_eq!(
+            counters.dispatches, ops,
+            "every dispatch reached the barrier"
+        );
+        assert_eq!(
+            counters.inline_dispatches, 0,
+            "nothing should degrade inline"
+        );
+        assert_eq!(
+            counters.spin_hits + counters.parks,
+            ops * workers as u64,
+            "each of {workers} workers must observe each of {ops} ops exactly \
+             once, as either a spin hit or a park-wake, but got \
+             {} spin hits and {} parks",
+            counters.spin_hits,
+            counters.parks,
+        );
+        pool.shutdown();
+    }
+
+    /// A re-entrant dispatch degrades to inline rather than racing the barrier,
+    /// and the counter says so.
+    ///
+    /// The pool has one job slot, so a shard closure that dispatches again --
+    /// the nested fan-out shape, and the same shape two concurrent sessions
+    /// produce -- must run every shard on the calling thread. That guarantee was
+    /// previously only a comment; this makes it observable, which is what a
+    /// concurrency harness needs to tell "the pool served both" from "one
+    /// session ran serially".
+    #[test]
+    fn a_re_entrant_dispatch_is_counted_inline_rather_than_racing_the_barrier() {
+        let workers = 2usize;
+        let pool = single_group_pool(workers);
+        let inner_runs = AtomicUsize::new(0);
+        let outer = |_task: usize| {
+            pool.dispatch_index_tasks(workers, &|_| {
+                inner_runs.fetch_add(1, Ordering::Relaxed);
+            });
+        };
+        pool.dispatch_index_tasks(workers, &outer);
+
+        let counters = pool.counters();
+        assert_eq!(
+            counters.dispatches, 1,
+            "only the outer dispatch may claim the slot"
+        );
+        assert_eq!(
+            counters.inline_dispatches, workers as u64,
+            "each worker's re-entrant dispatch must be declined back to it"
+        );
+        assert_eq!(
+            inner_runs.load(Ordering::Relaxed),
+            workers * workers,
+            "an inline dispatch still runs every shard, on the caller"
+        );
+        pool.shutdown();
+    }
+
+    /// An idle gap far longer than the blocktime window must park the workers.
+    ///
+    /// Timing-dependent by nature -- parking *is* a timing behaviour -- but the
+    /// margin is deliberate: the gap is an order of magnitude past the window,
+    /// so for this to fail a runnable worker would have to be starved of a core
+    /// for the whole gap, on a box where the rest of the test binary is
+    /// evidently getting scheduled. The complementary direction (back-to-back
+    /// dispatches never park) is *not* asserted, because that one really can
+    /// fail on a loaded runner: a descheduled worker's window expires while it
+    /// is off-CPU.
+    #[test]
+    fn an_idle_gap_far_longer_than_the_blocktime_parks_the_workers() {
+        let workers = 2usize;
+        let pool = single_group_pool(workers);
+        // Prime, so the count below covers only gapped dispatches.
+        pool.dispatch_index_tasks(workers, &|_| {});
+        let before = pool.counters();
+
+        let gap = decode_blocktime() * 20 + Duration::from_millis(5);
+        let rounds = 4u64;
+        for _ in 0..rounds {
+            thread::sleep(gap);
+            pool.dispatch_index_tasks(workers, &|_| {});
+        }
+
+        let after = pool.counters();
+        let parks = after.parks - before.parks;
+        assert!(
+            parks >= rounds,
+            "{rounds} gaps of {gap:?} against a {:?} blocktime window produced \
+             only {parks} park-wakes across {workers} workers: the window is \
+             not closing, so the pool holds cores through idle time",
+            decode_blocktime(),
+        );
+
+        // Now go idle once more *without* a following dispatch, and re-check the
+        // identity. This is the assertion that pins park-at-wake-time: counting
+        // a park when the worker goes to sleep passes every check above (each
+        // gap's park pairs 1:1 with the op that follows it) and breaks only
+        // here, where the pool parks with nothing left to wake it. That is
+        // exactly the state a real process sits in between requests, and the
+        // state any snapshot of a served process is taken in.
+        thread::sleep(gap);
+        let idle = pool.counters();
+        assert_eq!(
+            idle.spin_hits + idle.parks,
+            idle.dispatches * workers as u64,
+            "a pool parked with no pending op must not have counted the sleep \
+             as an observation: {} spin hits + {} parks against {} dispatches",
+            idle.spin_hits,
+            idle.parks,
+            idle.dispatches,
+        );
+        pool.shutdown();
+    }
+
+    /// A futex wake that carries no new op must be counted as spurious and must
+    /// not cost the pool the next op.
+    ///
+    /// The re-check under the futex guard is the pool's no-lost-wakeup argument,
+    /// and it was previously untested because a spurious wake cannot be waited
+    /// for -- so this manufactures one by waking the sense line without
+    /// advancing it, which is precisely the shape a `wake_all` aimed at a
+    /// sibling that had not re-armed produces.
+    #[test]
+    fn a_wake_that_carries_no_new_op_is_counted_spurious_and_loses_nothing() {
+        let workers = 2usize;
+        let pool = single_group_pool(workers);
+        pool.dispatch_index_tasks(workers, &|_| {});
+
+        // Let both workers exhaust the window and park.
+        let settle = decode_blocktime() * 20 + Duration::from_millis(5);
+        thread::sleep(settle);
+        let shared = pool
+            .shared
+            .as_ref()
+            .expect("the fixed schedule keeps state");
+        atomic_wait::wake_all(&shared.node_sense[0].0);
+        thread::sleep(settle);
+
+        let woken = pool.counters();
+        assert!(
+            woken.spurious_wakes >= 1,
+            "waking the sense line without advancing it must be observed as a \
+             spurious wake (expected up to {workers}, got {})",
+            woken.spurious_wakes,
+        );
+        assert_eq!(
+            woken.spin_hits + woken.parks,
+            woken.dispatches * workers as u64,
+            "a spurious wake is not an op-observation and must not be counted \
+             as one"
+        );
+
+        // The property the re-check exists for: the next op still lands.
+        let ran = AtomicUsize::new(0);
+        pool.dispatch_index_tasks(workers, &|_| {
+            ran.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(
+            ran.load(Ordering::Relaxed),
+            workers,
+            "every shard must still run after a spurious wake"
+        );
+        pool.shutdown();
+    }
+
+    /// Dispatching *at* the blocktime boundary must keep the accounting exact.
+    ///
+    /// The regression guard for the hole this instrumentation was born with:
+    /// when a publish lands between a worker's window expiring and the worker
+    /// actually sleeping, the observation belongs to neither phase's obvious
+    /// branch and was dropped. It survived the back-to-back and long-gap tests
+    /// (both sit far from the boundary) and only showed up when the whole test
+    /// binary ran in parallel and widened the race. A gap equal to the window is
+    /// the shape that hits it deliberately -- and it is also where a park/wake
+    /// tuning sweep spends most of its time, so the counters have to be exact
+    /// there or the sweep is measuring its own instrument.
+    #[test]
+    fn dispatches_at_the_blocktime_boundary_keep_the_accounting_exact() {
+        let workers = 2usize;
+        let pool = single_group_pool(workers);
+        let gap = decode_blocktime();
+        let ops = 40u64;
+        for _ in 0..ops {
+            thread::sleep(gap);
+            pool.dispatch_index_tasks(workers, &|_| {});
+        }
+        let counters = pool.counters();
+        assert_eq!(counters.dispatches, ops);
+        assert_eq!(
+            counters.spin_hits + counters.parks,
+            ops * workers as u64,
+            "{ops} dispatches at exactly the {gap:?} window lost observations: \
+             {} spin hits + {} parks",
+            counters.spin_hits,
+            counters.parks,
+        );
+        pool.shutdown();
     }
 
     #[test]
@@ -3586,6 +4083,8 @@ mod dispatch_claim_tests {
             poisoned_worker: AtomicUsize::new(0),
             dispatching: Padded(AtomicBool::new(false)),
             shutdown: AtomicBool::new(false),
+            worker_counters: Vec::new(),
+            dispatch_counters: Padded(DispatchCounters::default()),
         };
         {
             let claim = DispatchClaim::try_claim(&shared)
@@ -3615,6 +4114,8 @@ mod dispatch_claim_tests {
             poisoned_worker: AtomicUsize::new(0),
             dispatching: Padded(AtomicBool::new(false)),
             shutdown: AtomicBool::new(false),
+            worker_counters: Vec::new(),
+            dispatch_counters: Padded(DispatchCounters::default()),
         };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _claim = DispatchClaim::try_claim(&shared).expect("claim available");
