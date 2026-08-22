@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::capabilities as capability;
 use crate::schema::{InferenceMetadata, PipelineSpec, WorkflowNode, WorkflowSpec, WorkflowStep};
 
 struct ContractObligation {
@@ -72,12 +73,12 @@ impl Default for RuntimeCapabilities {
     fn default() -> Self {
         Self {
             supported: vec![
-                "kv_cache".to_string(),
-                "grouped_query_attention".to_string(),
-                "multi_head_attention".to_string(),
-                "prefix_cache".to_string(),
-                "continuous_batching".to_string(),
-                "control_flow_loop".to_string(),
+                capability::KV_CACHE.to_string(),
+                capability::GROUPED_QUERY_ATTENTION.to_string(),
+                capability::MULTI_HEAD_ATTENTION.to_string(),
+                capability::PREFIX_CACHE.to_string(),
+                capability::CONTINUOUS_BATCHING.to_string(),
+                capability::CONTROL_FLOW_LOOP.to_string(),
             ],
         }
     }
@@ -111,20 +112,20 @@ pub fn derived_capabilities(metadata: &InferenceMetadata) -> BTreeSet<String> {
     };
     let workflow = &pipeline.workflow;
     capabilities.extend(workflow.manifest.capabilities.iter().cloned());
-    capabilities.insert("workflow_ssa".to_string());
+    capabilities.insert(capability::WORKFLOW_SSA.to_string());
     if workflow.serving.is_some() {
-        capabilities.insert("serving_service_contract".to_string());
+        capabilities.insert(capability::SERVING_SERVICE_CONTRACT.to_string());
     }
     if metadata.adapters.is_some() {
-        capabilities.insert("parameter_adapters".to_string());
-        capabilities.insert("heterogeneous_adapter_batching".to_string());
+        capabilities.insert(capability::PARAMETER_ADAPTERS.to_string());
+        capabilities.insert(capability::HETEROGENEOUS_ADAPTER_BATCHING.to_string());
     }
     if workflow
         .state
         .values()
         .any(|state| state.scope == crate::schema::WorkflowStateScope::Session)
     {
-        capabilities.insert("session_state_lease".to_string());
+        capabilities.insert(capability::SESSION_STATE_LEASE.to_string());
     }
     if workflow.state.values().any(|state| {
         matches!(
@@ -132,14 +133,14 @@ pub fn derived_capabilities(metadata: &InferenceMetadata) -> BTreeSet<String> {
             crate::schema::ShapeRecurrence::Bounded { .. }
         )
     }) {
-        capabilities.insert("bounded_state_recurrence".to_string());
+        capabilities.insert(capability::BOUNDED_STATE_RECURRENCE.to_string());
     }
     if workflow
         .state
         .values()
         .any(|state| state.class == crate::schema::WorkflowStateClass::Advisory)
     {
-        capabilities.insert("advisory_state".to_string());
+        capabilities.insert(capability::ADVISORY_STATE.to_string());
     }
     for component in workflow.components.values() {
         match component
@@ -148,13 +149,13 @@ pub fn derived_capabilities(metadata: &InferenceMetadata) -> BTreeSet<String> {
             .map(|contract| contract.id.as_str())
         {
             Some("onnx-genai.adaptive-proposal-budget") => {
-                capabilities.insert("adaptive_proposal_budget".to_string());
+                capabilities.insert(capability::ADAPTIVE_PROPOSAL_BUDGET.to_string());
             }
             Some("onnx-genai.grammar-guidance") => {
-                capabilities.insert("grammar_guidance_adapter".to_string());
+                capabilities.insert(capability::GRAMMAR_GUIDANCE_ADAPTER.to_string());
             }
             Some("onnx-genai.telemetry") => {
-                capabilities.insert("telemetry_adapter".to_string());
+                capabilities.insert(capability::TELEMETRY_ADAPTER.to_string());
             }
             _ => {}
         }
@@ -179,15 +180,15 @@ fn collect_workflow_capabilities(node: &WorkflowNode, capabilities: &mut BTreeSe
             iteration,
             ..
         } => {
-            capabilities.insert("nested_control_flow".to_string());
+            capabilities.insert(capability::NESTED_CONTROL_FLOW.to_string());
             if iteration.is_some() {
-                capabilities.insert("loop_induction_values".to_string());
+                capabilities.insert(capability::LOOP_INDUCTION_VALUES.to_string());
             }
             collect_workflow_capabilities(setup, capabilities);
             collect_workflow_capabilities(body, capabilities);
         }
         WorkflowNode::Branch { cases, default, .. } => {
-            capabilities.insert("nested_control_flow".to_string());
+            capabilities.insert(capability::NESTED_CONTROL_FLOW.to_string());
             for case in cases.values() {
                 collect_workflow_capabilities(case, capabilities);
             }
@@ -198,16 +199,16 @@ fn collect_workflow_capabilities(node: &WorkflowNode, capabilities: &mut BTreeSe
         WorkflowNode::Emit {
             mode, valid_length, ..
         } => {
-            capabilities.insert("typed_emit".to_string());
+            capabilities.insert(capability::TYPED_EMIT.to_string());
             if matches!(mode, crate::schema::WorkflowEmitMode::Event) {
-                capabilities.insert("streaming_emit".to_string());
+                capabilities.insert(capability::STREAMING_EMIT.to_string());
             }
             if valid_length.is_some() {
-                capabilities.insert("emit_valid_length".to_string());
+                capabilities.insert(capability::EMIT_VALID_LENGTH.to_string());
             }
         }
         WorkflowNode::Transfer { .. } => {
-            capabilities.insert("explicit_transfer".to_string());
+            capabilities.insert(capability::EXPLICIT_TRANSFER.to_string());
         }
         WorkflowNode::ExecutionIsland { .. } => {}
     }
@@ -1986,16 +1987,16 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
         }
     }
 
-    let mut used = BTreeSet::from(["workflow_ssa".to_string()]);
+    let mut used = BTreeSet::from([capability::WORKFLOW_SSA.to_string()]);
     if workflow.serving.is_some() {
-        used.insert("serving_service_contract".to_string());
+        used.insert(capability::SERVING_SERVICE_CONTRACT.to_string());
     }
     if workflow
         .state
         .values()
         .any(|state| state.scope == crate::schema::WorkflowStateScope::Session)
     {
-        used.insert("session_state_lease".to_string());
+        used.insert(capability::SESSION_STATE_LEASE.to_string());
     }
     if workflow.state.values().any(|state| {
         matches!(
@@ -2003,21 +2004,21 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
             crate::schema::ShapeRecurrence::Bounded { .. }
         )
     }) {
-        used.insert("bounded_state_recurrence".to_string());
+        used.insert(capability::BOUNDED_STATE_RECURRENCE.to_string());
     }
     if workflow
         .state
         .values()
         .any(|state| state.class == crate::schema::WorkflowStateClass::Advisory)
     {
-        used.insert("advisory_state".to_string());
+        used.insert(capability::ADVISORY_STATE.to_string());
     }
     if workflow
         .inputs
         .values()
         .any(|input| input.present_as.is_some())
     {
-        used.insert("input_presence".to_string());
+        used.insert(capability::INPUT_PRESENCE.to_string());
     }
     collect_workflow_capabilities(&compiled.graph, &mut used);
     for capability in used.difference(&workflow.manifest.capabilities) {
