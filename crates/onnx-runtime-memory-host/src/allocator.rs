@@ -33,8 +33,9 @@ use onnx_runtime_memory_abi::{
 };
 use onnx_runtime_memory_api::{
     AllocationCommitRange, AllocationReleaseOutcome, DeviceAllocator, DeviceKey, MemoryError,
-    QuarantineReason, ReleaseAccounting, ResidualOwnership, SharedDevicePrefix, SharedMapping,
-    SharedPrefixCommitInfo, Tier, VirtualBacking,
+    ProviderContextPin, ProviderContextPinSource, QuarantineReason, ReleaseAccounting,
+    ResidualOwnership, SharedDevicePrefix, SharedMapping, SharedPrefixCommitInfo, Tier,
+    VirtualBacking,
 };
 
 use crate::error::{PluginError, status_to_memory_error};
@@ -98,6 +99,37 @@ struct HostBridge {
     /// an allocator can be dropped long before the module is, and it is the
     /// allocator's drop that would otherwise free the table.
     outstanding_releases: AtomicU64,
+    /// One pin per queued release, held on the provider/context the plugin
+    /// will free against.
+    ///
+    /// This lives in the bridge rather than in [`AllocatorCore`] for the same
+    /// reason `module` does: `AllocatorCore::drop` deliberately leaks this
+    /// block when releases are still outstanding, and a pin that died with
+    /// the allocator would stop guarding exactly the window it exists for —
+    /// the one between the allocator going away and the plugin retiring the
+    /// free.
+    ///
+    /// Pins are interchangeable. One allocator binds one context, so a
+    /// completion may drop any of them; keeping a stack avoids depending on
+    /// the ticket being known before the ABI call returns.
+    context_pins: Mutex<Vec<Box<dyn ProviderContextPin>>>,
+}
+
+impl HostBridge {
+    /// Give one provider/context pin back.
+    ///
+    /// The pin is moved out from under the lock and dropped after it is
+    /// released. Dropping a pin re-enters the governor to decrement the
+    /// context's transaction count and wake teardown, and the host's own lock
+    /// discipline says no foreign code runs while a host lock is held.
+    fn drop_one_context_pin(&self) {
+        let pin = self
+            .context_pins
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop();
+        drop(pin);
+    }
 }
 
 /// The callback table and the state behind it, as one heap-resident unit.
@@ -244,6 +276,11 @@ unsafe extern "C" fn host_release_completed(
         }
         bridge.module.release_retired();
         bridge.module.allocation_closed();
+        // Give the provider/context claim back before the callback-table
+        // counter, for the same reason that counter goes last: while
+        // `outstanding_releases` is still non-zero the bridge cannot be freed
+        // under us, and the pin lives in the bridge.
+        bridge.drop_one_context_pin();
         // Last, because it is what permits the table this callback is running
         // against to be freed. Decrementing it earlier would open a window in
         // which `AllocatorCore::drop` could free the bridge under our feet.
@@ -298,6 +335,16 @@ pub struct AllocatorCore {
     /// plain field cannot express.
     context: Option<Box<HostCallbackContext>>,
     module: Arc<PluginModule>,
+    /// The provider/context this mechanism allocates against, when one is
+    /// bound.
+    ///
+    /// `None` is the standalone case — a plugin driven with no execution
+    /// provider behind it, which is what the ABI tests do. It is deliberately
+    /// not an error: a mechanism with no provider has no context to outlive.
+    /// What is an error is queuing a deferred release against a bound context
+    /// that has stopped accepting work; see
+    /// [`PluginAllocator::enqueue_release`].
+    context_source: Option<Arc<dyn ProviderContextPinSource>>,
 }
 
 // SAFETY: the vtables are plain-data copies of function pointers plus an
@@ -794,8 +841,15 @@ impl PluginAllocator {
     /// Queue a stream-ordered release instead of freeing immediately.
     ///
     /// Returns the plugin's ticket. Until the matching completion arrives
-    /// through `release_completed`, the module, factory, allocator, and
-    /// callback table all stay pinned and unload stays refused.
+    /// through `release_completed`, the module, factory, allocator, callback
+    /// table, and — when one is bound — the provider/context all stay pinned
+    /// and unload stays refused.
+    ///
+    /// Refused outright when a provider/context is bound and no longer
+    /// accepting work. A release that cannot be pinned must not be queued: it
+    /// would retire against a context that teardown is already free to
+    /// dismantle, and the resulting driver-level double-free is silent on the
+    /// Rust side.
     ///
     /// # Safety
     ///
@@ -853,6 +907,30 @@ impl PluginAllocator {
 
         let allocation = core.abi_allocation(ptr, record);
         let mut ticket = 0u64;
+        // Pin the provider/context first. A refusal here must leave the
+        // allocation live and nothing counted, so it is taken before any
+        // counter moves and before the plugin is entered.
+        if let Some(source) = &core.context_source {
+            match source.pin() {
+                Ok(pin) => core
+                    .bridge()
+                    .context_pins
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(pin),
+                Err(error) => {
+                    core.insert_allocation(ptr, record);
+                    return Err(MemoryError::AllocationFailed {
+                        tier: core.tier().name(),
+                        requested: bytes as u64,
+                        reason: format!(
+                            "deferred release refused: {error}; the allocation stays live and \
+                             must be released through the canonical path before teardown"
+                        ),
+                    });
+                }
+            }
+        }
         // Count the queued release *before* the call so a completion that
         // arrives synchronously from inside `enqueue_release` cannot decrement
         // a counter that was never incremented.
@@ -868,6 +946,7 @@ impl PluginAllocator {
             core.bridge()
                 .outstanding_releases
                 .fetch_sub(1, Ordering::AcqRel);
+            core.bridge().drop_one_context_pin();
             core.insert_allocation(ptr, record);
             return Err(status_to_memory_error(
                 "enqueue_release",
@@ -1599,6 +1678,7 @@ pub(crate) fn open_allocator(
     factory: &PluginFactory,
     required_capability_flags: u64,
     reclaim: Option<Arc<dyn HostReclaim>>,
+    context_source: Option<Arc<dyn ProviderContextPinSource>>,
 ) -> Result<PluginAllocator, PluginError> {
     let module = Arc::clone(factory.module());
     let minor = module.negotiated().minor;
@@ -1627,6 +1707,7 @@ pub(crate) fn open_allocator(
             retired: Mutex::new(Vec::new()),
             module: Arc::clone(&module),
             outstanding_releases: AtomicU64::new(0),
+            context_pins: Mutex::new(Vec::new()),
         },
     );
 
@@ -1766,6 +1847,7 @@ pub(crate) fn open_allocator(
         live: Mutex::new(HashMap::new()),
         context: Some(context),
         module,
+        context_source,
     });
 
     let backing_view = core.backing.is_some().then(|| PluginVirtualBacking {

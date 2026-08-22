@@ -30,9 +30,9 @@ use onnx_runtime_memory_api::{
     AllocationIdentity, AllocationReleaseOutcome, AllocationReleaseState, AuthorityIdentity,
     BindingError, BindingIdentity, BindingRegistry, BindingResource, BoundVirtualBacking,
     DeviceAllocator, DeviceKey, MechanismIdentity, MechanismSnapshot, MemoryBinding,
-    OwningAllocation, PreparedAllocationRelease, ProviderContextIdentity, QuarantineReason,
-    RegisteredAuthority, RegisteredMechanism, RegisteredProviderContext, ReleaseAccounting,
-    ResidualOwnership,
+    OwningAllocation, PreparedAllocationRelease, ProviderContextIdentity, ProviderContextPin,
+    ProviderContextPinError, ProviderContextPinSource, QuarantineReason, RegisteredAuthority,
+    RegisteredMechanism, RegisteredProviderContext, ReleaseAccounting, ResidualOwnership,
 };
 
 use crate::{
@@ -1448,12 +1448,68 @@ impl RegisteredMemoryContext {
         self.record.registered.identity()
     }
 
-    pub fn device(&self) -> DeviceKey {
-        self.record.registered.device()
-    }
-
     pub fn label(&self) -> &str {
         &self.record.label
+    }
+
+    /// A pin source that keeps this context from completing teardown.
+    ///
+    /// Handed to mechanisms that queue deferred releases — notably plugin
+    /// allocators behind the nxmem ABI, which cannot depend on this crate.
+    /// Each pin is one entry in the same transaction count
+    /// [`ProcessMemoryManager::remove_provider_context`] waits on, so an
+    /// outstanding release blocks teardown through the mechanism that already
+    /// governs in-tree work rather than a parallel one.
+    pub fn pin_source(&self) -> Arc<dyn ProviderContextPinSource> {
+        Arc::new(ContextPinSource {
+            record: Arc::clone(&self.record),
+        })
+    }
+}
+
+/// Hands out [`ContextPin`]s for one registered provider context.
+#[derive(Debug)]
+struct ContextPinSource {
+    record: Arc<ContextRecord>,
+}
+
+impl ProviderContextPinSource for ContextPinSource {
+    fn context(&self) -> ProviderContextIdentity {
+        self.record.registered.identity()
+    }
+
+    fn pin(&self) -> Result<Box<dyn ProviderContextPin>, ProviderContextPinError> {
+        match self.record.begin_transaction() {
+            Ok(operation) => Ok(Box::new(ContextPin {
+                context: self.record.registered.identity(),
+                _operation: operation,
+            })),
+            // `begin_transaction` refuses for two reasons: the context is no
+            // longer `Active`, or its counter would overflow. Both are
+            // refusals to attach new work, which is what the caller needs to
+            // know; neither may be reported as a successful unpinned queue.
+            Err(AllocationTransactionError::TerminatedContext(identity)) => {
+                Err(ProviderContextPinError::ContextUnavailable(identity))
+            }
+            Err(_) => Err(ProviderContextPinError::PinCountOverflow(
+                self.record.registered.identity(),
+            )),
+        }
+    }
+}
+
+/// One outstanding claim on a provider context.
+#[derive(Debug)]
+struct ContextPin {
+    context: ProviderContextIdentity,
+    /// Dropping this decrements the context's transaction count and wakes
+    /// `wait_quiescent`. It is never read; the pin *is* the guard.
+    _operation: MemoryContextOperation,
+}
+
+impl ProviderContextPin for ContextPin {
+    fn context(&self) -> ProviderContextIdentity {
+        self.context
     }
 }
 

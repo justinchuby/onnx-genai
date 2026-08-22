@@ -142,7 +142,7 @@ ticket. Until that ticket retires:
 - the host's callback table stays alive, because `release_completed` will still
   be called through it.
 
-The pinning is at two different granularities and both matter. An
+The pinning is at three granularities and all of them matter. An
 `Arc<PluginModule>` keeps the plugin's *code* mapped; it says nothing about the
 host's *callback context*, which is a separate heap object the plugin captured
 a raw pointer to at open. A queued release holds both, so an allocator dropped
@@ -152,10 +152,29 @@ memory a plugin thread may still write to. `AllocatorCore::leaked_callback_table
 counts those; a non-zero value is a leak to be fixed at the call site, not a
 crash.
 
-**Not yet implemented:** the *provider/context* half. No execution provider is
-wired to this ABI in this phase, so "deferred release keeps the provider and
-its context pinned" has nothing to pin. Only the intra-boundary half — module
-and callback table — is implemented and tested here.
+The third is the *provider/context*, and it is the one the host cannot detect
+on its own. An allocator opened through `PluginFactory::open_with_provider_context`
+takes one pin per queued release on the provider context the free will retire
+against, and gives it back when the completion arrives. While any release is
+outstanding, that context cannot finish teardown; once a context stops
+accepting work, `enqueue_release` is refused outright and the allocation stays
+live for the canonical path.
+
+Refusing rather than queuing unpinned is deliberate. `release_completed`
+touches only host state, which is built to outlive the allocator, so a release
+retiring against a dismantled context produces **no Rust-visible error at all** —
+the plugin simply unmaps handles the provider's teardown already released.
+There is nothing to observe after the fact, which is why the gate has to be on
+the way in.
+
+`PluginFactory::open` remains the standalone case: a mechanism with no
+execution provider behind it has no context to outlive, and requiring one would
+be a regression rather than a tightening.
+
+**Still not wired:** no in-tree execution provider opens a plugin allocator yet,
+so nothing in production passes a pin source today. The mechanism and its
+guarantees exist and are tested; adopting them is the remaining half of
+`memory-plugin-provider-wiring`.
 
 ## Unloading a plugin
 
