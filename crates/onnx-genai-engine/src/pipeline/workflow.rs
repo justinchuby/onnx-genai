@@ -319,6 +319,10 @@ fn workflow_adapter_registry()
                 ("onnx-genai.parameter-overlay", "1"),
                 PipelineEngine::run_parameter_overlay_adapter as WorkflowAdapterExecutor,
             ),
+            (
+                ("onnx-genai.text-assembly", "1"),
+                PipelineEngine::run_text_assembly_adapter as WorkflowAdapterExecutor,
+            ),
         ])
     });
     &REGISTRY
@@ -1999,6 +2003,26 @@ impl PipelineEngine {
         let produced = stable_component_outputs(&stable)?;
         bindings.insert(key, stable);
         Ok(produced)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "matches the shared workflow adapter executor ABI"
+    )]
+    fn run_text_assembly_adapter(
+        &self,
+        component: &str,
+        _inputs: &BTreeMap<String, String>,
+        _outputs: &BTreeMap<String, String>,
+        _declaration: &onnx_genai_metadata::WorkflowComponent,
+        _values: &mut PipelineTensors,
+        _symbols: &HashMap<String, i64>,
+        _component_symbols: &mut HashMap<String, i64>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "text-assembly adapter '{component}' is an API-boundary contract and cannot be \
+             invoked inside a tensor workflow"
+        )
     }
 
     #[expect(
@@ -4054,6 +4078,11 @@ fn workflow_scalar_key(values: &PipelineTensors, name: &str) -> anyhow::Result<S
 #[cfg(test)]
 mod workflow_scalar_tests {
     use super::*;
+
+    #[test]
+    fn text_assembly_is_admitted_as_an_api_boundary_adapter() {
+        assert!(supports_workflow_adapter("onnx-genai.text-assembly", "1"));
+    }
 
     #[test]
     fn batched_loop_predicate_preserves_rows() {
