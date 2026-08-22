@@ -76,7 +76,10 @@ pub fn app(state: AppState) -> Router {
             "/v1/images/generations",
             post(routes::openai_images).layer(DefaultBodyLimit::max(MEDIA_UPLOAD_BODY_LIMIT)),
         )
-        .route("/sdapi/v1/txt2img", post(routes::a1111_txt2img))
+        .route(
+            "/sdapi/v1/txt2img",
+            post(routes::a1111_txt2img).layer(DefaultBodyLimit::max(MEDIA_UPLOAD_BODY_LIMIT)),
+        )
         .route(
             "/sdapi/v1/img2img",
             post(routes::a1111_img2img).layer(DefaultBodyLimit::max(MEDIA_UPLOAD_BODY_LIMIT)),

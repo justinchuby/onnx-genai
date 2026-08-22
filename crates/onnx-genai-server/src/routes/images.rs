@@ -5,7 +5,7 @@ use axum::{Json, extract::State};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
 use onnx_genai::{GenerateOptions, GeneratePrompt, GenerateRequest};
-use onnx_genai_metadata::ImageOutputValueRange;
+use onnx_genai_metadata::{ImageOutputValueRange, TensorDimension};
 use onnx_genai_ort::DataType;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
@@ -169,6 +169,7 @@ impl ApplicationTensor {
     fn lower(
         &self,
         contract: &onnx_genai_metadata::TensorContract,
+        shape_symbols: &mut BTreeMap<String, i64>,
     ) -> Result<ImageInputValue, ApiError> {
         if self.dtype != contract.dtype {
             return Err(ApiError::bad_request(format!(
@@ -188,6 +189,31 @@ impl ApplicationTensor {
             return Err(ApiError::bad_request(
                 "application input shapes must contain only non-negative dimensions",
             ));
+        }
+        if let Some(contract_shape) = contract.shape.as_ref() {
+            for (axis, (actual, expected)) in self.shape.iter().zip(contract_shape).enumerate() {
+                match expected {
+                    TensorDimension::Fixed(expected) if actual != expected => {
+                        return Err(ApiError::bad_request(format!(
+                            "application input shape {:?} does not match metadata shape {:?}: axis {axis} must be {expected}, got {actual}",
+                            self.shape, contract_shape
+                        )));
+                    }
+                    TensorDimension::Symbol(symbol) => {
+                        if let Some(bound) = shape_symbols.get(symbol) {
+                            if actual != bound {
+                                return Err(ApiError::bad_request(format!(
+                                    "application input shape {:?} violates metadata symbol '{symbol}': expected {bound} at axis {axis}, got {actual}",
+                                    self.shape
+                                )));
+                            }
+                        } else {
+                            shape_symbols.insert(symbol.clone(), *actual);
+                        }
+                    }
+                    TensorDimension::Fixed(_) => {}
+                }
+            }
         }
         let elements = self.shape.iter().try_fold(1_usize, |total, dimension| {
             let dimension = usize::try_from(*dimension)
@@ -381,49 +407,30 @@ async fn execute_a1111(
     let handle = resolve_model(&state.registry, "").await?;
     let uses_application_inputs = !request.application_inputs.is_empty();
     let spec = image_spec(&handle, !uses_application_inputs)?;
-    if spec.guidance_scale.is_none() && !uses_application_inputs {
-        return Err(ApiError::bad_request(
-            "the loaded workflow exposes no guidance_scale role required by the A1111 cfg_scale contract",
-        ));
-    }
     let sampler = resolve_sampler(
         spec,
         request.sampler_name.as_deref(),
         request.sampler_index.as_deref(),
     )?;
     let steps = resolve_steps(spec, request.steps)?;
-    let guidance = if uses_application_inputs && spec.guidance_scale.is_none() {
-        request.cfg_scale.unwrap_or(7.0)
-    } else {
-        resolve_guidance(spec, request.cfg_scale)?
-    };
-    let (width, height) =
-        if uses_application_inputs && spec.width.is_none() && spec.height.is_none() {
-            (request.width, request.height)
-        } else {
-            resolve_dimensions(spec, request.width, request.height)?
-        };
+    let guidance = resolve_guidance(spec, request.cfg_scale)?;
+    let (width, height) = resolve_dimensions(spec, request.width, request.height)?;
     let init_image = if img2img {
-        if spec.media.is_none() && !uses_application_inputs {
-            return Err(ApiError::bad_request(
+        let _media = spec.media.as_ref().ok_or_else(|| {
+            ApiError::bad_request(
                 "the loaded workflow declares no semantic image/media input, so img2img is unavailable",
-            ));
-        }
+            )
+        })?;
         if request.init_images.len() != 1 {
             return Err(ApiError::bad_request(
                 "img2img requires exactly one base64 entry in `init_images`",
             ));
         }
-        let bytes = decode_base64_image(&request.init_images[0])?;
-        spec.media.as_ref().map(|_| bytes)
+        Some(decode_base64_image(&request.init_images[0])?)
     } else {
         None
     };
-    let denoising_strength = if uses_application_inputs && spec.denoising_strength.is_none() {
-        None
-    } else {
-        resolve_denoising_strength(spec, img2img, request.denoising_strength)?
-    };
+    let denoising_strength = resolve_denoising_strength(spec, img2img, request.denoising_strength)?;
     let first_seed = resolve_seed(request.seed)?;
     let mut images = Vec::with_capacity(count);
     let mut all_seeds = Vec::with_capacity(count);
@@ -558,6 +565,7 @@ fn lower(
     }
     let mut prompt = Vec::new();
     let mut inputs = Vec::with_capacity(request.application_inputs.len() + 8);
+    let mut shape_symbols = BTreeMap::from([("batch".to_string(), 1)]);
     for (name, binding) in &spec.application_inputs {
         if binding.required && !request.application_inputs.contains_key(name) {
             return Err(ApiError::bad_request(format!(
@@ -571,7 +579,10 @@ fn lower(
                 "application input '{name}' is not declared by workflow metadata"
             ))
         })?;
-        inputs.push((name.clone(), tensor.lower(&binding.contract)?));
+        inputs.push((
+            name.clone(),
+            tensor.lower(&binding.contract, &mut shape_symbols)?,
+        ));
     }
     let prompt_binding = spec.prompt_tokens.as_ref();
     if let Some(binding) = prompt_binding {
@@ -583,15 +594,12 @@ fn lower(
             token_input(binding, &prompt)
                 .map_err(|error| ApiError::bad_request(format!("{error:#}")))?,
         ));
-    } else if request.application_inputs.is_empty() {
+    } else if !request.prompt.is_empty() || request.application_inputs.is_empty() {
         return Err(ApiError::bad_request(
-            "the image workflow declares no prompt_tokens runtime input that the HTTP API can bind",
+            "the image workflow declares no prompt_tokens runtime input; omit `prompt` and provide every required application input",
         ));
     }
-    if !request.negative_prompt.is_empty()
-        && spec.negative_prompt_tokens.is_none()
-        && request.application_inputs.is_empty()
-    {
+    if !request.negative_prompt.is_empty() && spec.negative_prompt_tokens.is_none() {
         return Err(ApiError::bad_request(
             "the loaded workflow has no negative_prompt_tokens input; omit `negative_prompt`",
         ));
@@ -1152,7 +1160,7 @@ mod tests {
                     shape: None,
                     optional: false,
                     batch_layout: Default::default(),
-                })
+                }, &mut BTreeMap::new())
                 .unwrap(),
             ImageInputValue::Raw {
                 bytes,
@@ -1171,14 +1179,43 @@ mod tests {
         };
 
         let error = tensor
-            .lower(&onnx_genai_metadata::TensorContract {
-                dtype: "float32".to_string(),
-                rank: 1,
-                shape: None,
-                optional: false,
-                batch_layout: Default::default(),
-            })
+            .lower(
+                &onnx_genai_metadata::TensorContract {
+                    dtype: "float32".to_string(),
+                    rank: 1,
+                    shape: None,
+                    optional: false,
+                    batch_layout: Default::default(),
+                },
+                &mut BTreeMap::new(),
+            )
             .unwrap_err();
         assert!(error.message.contains("expected 8"));
+    }
+
+    #[test]
+    fn application_tensor_rejects_fixed_and_symbolic_shape_mismatches() {
+        let contract = onnx_genai_metadata::TensorContract {
+            dtype: "float32".to_string(),
+            rank: 4,
+            shape: Some(vec![
+                TensorDimension::Symbol("batch".to_string()),
+                TensorDimension::Fixed(4),
+                TensorDimension::Symbol("height".to_string()),
+                TensorDimension::Symbol("width".to_string()),
+            ]),
+            optional: false,
+            batch_layout: Default::default(),
+        };
+        let tensor = ApplicationTensor {
+            dtype: "float32".to_string(),
+            shape: vec![1, 5, 8, 8],
+            data_b64: STANDARD.encode(vec![0_u8; 5 * 8 * 8 * 4]),
+        };
+        let mut symbols = BTreeMap::from([("batch".to_string(), 1)]);
+
+        let error = tensor.lower(&contract, &mut symbols).unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("axis 1 must be 4, got 5"));
     }
 }
