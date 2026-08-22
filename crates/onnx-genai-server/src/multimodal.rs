@@ -551,7 +551,7 @@ mod media_binding_tests {
     /// A workflow declaring exactly the given `media` runtime inputs.
     fn workflow(inputs: serde_json::Value) -> WorkflowSpec {
         serde_json::from_value(serde_json::json!({
-            "manifest": { "ir_version": "1.0", "capabilities": ["workflow_ssa"] },
+            "manifest": { "capabilities": ["workflow_ssa"] },
             "inputs": inputs,
             "outputs": {},
             "components": {},

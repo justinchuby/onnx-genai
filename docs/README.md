@@ -85,6 +85,7 @@ Generation-side design: [`SCHEDULING.md`](genai/SCHEDULING.md),
 [`PIPELINE.md`](genai/PIPELINE.md),
 [`MODEL_METADATA.md`](genai/MODEL_METADATA.md),
 [`MODEL_PACKAGE.md`](genai/MODEL_PACKAGE.md),
+[`MOBIUS_WORKFLOW_PRODUCER.md`](genai/MOBIUS_WORKFLOW_PRODUCER.md),
 [`NATIVE_BATCH_DECODE_2B_IMPL_SCOPING.md`](genai/NATIVE_BATCH_DECODE_2B_IMPL_SCOPING.md),
 [`DIFFUSION.md`](genai/DIFFUSION.md),
 [`COMFYUI_IMPORT.md`](genai/COMFYUI_IMPORT.md).
@@ -131,8 +132,9 @@ why): [`2026-08-19-test-health-baseline.md`](status/2026-08-19-test-health-basel
 — **check the date; a baseline decays.**
 
 ### `benchmarks/`, `portability/`, `research/`
-Pre-existing directories, unchanged: dated benchmark runs, portability notes,
-and research write-ups.
+Dated benchmark runs, including
+[`2026-08-21-mobius-workflow-conformance.md`](benchmarks/2026-08-21-mobius-workflow-conformance.md),
+plus portability notes and research write-ups.
 
 ## Two standing rules
 

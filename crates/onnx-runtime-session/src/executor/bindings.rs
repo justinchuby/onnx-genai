@@ -989,6 +989,20 @@ impl Executor {
                     .into(),
             ));
         }
+        // The installed graph for this slot can be reset out-of-band while our
+        // host-side signature/schedule stays live: a kernel-variant eviction
+        // retires kernels baked into a captured graph and resets BOTH the Primary
+        // (M=1 decode) and Verify (M=K speculative) EP slots. That desync is
+        // reachable only once both slots are populated (MTP: the M=1 base decode
+        // and the M=K verify each install a graph, doubling per-node kernel
+        // variants past the eviction bound). Replaying an emptied slot would
+        // hard-error ("no executable is installed"); detect it and report an
+        // invalidation so the caller re-warms and re-captures, exactly as it does
+        // for a control-flow branch flip.
+        if !self.ep.has_device_graph_in(self.graph_slot)? {
+            self.reset_device_graph()?;
+            return Ok(false);
+        }
         // Whole-subgraph capture (a single graph, no eager seams) keeps the
         // zero-host-work fast path: just relaunch the one installed graph.
         // Segmented capture must re-establish the run context and interleave

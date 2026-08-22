@@ -1271,6 +1271,25 @@ pub trait ExecutionProvider: Send + Sync {
         }
     }
 
+    /// Whether the named slot currently holds a replayable installed graph
+    /// executable.
+    ///
+    /// The executor uses this as a pre-replay liveness check: an installed graph
+    /// can be reset out-of-band (e.g. a kernel-variant eviction retires kernels
+    /// baked into a captured graph and resets its slot) while the executor's
+    /// host-side capture signature/schedule stays live. Replaying an emptied slot
+    /// would hard-error; querying this first lets the executor detect the
+    /// desync and re-warm/re-capture gracefully instead.
+    ///
+    /// The default reports `true` ("assume present, replay as usual") so EPs that
+    /// never lose an installed graph out-of-band keep their existing behavior;
+    /// only EPs whose slots can be emptied out-of-band (the CUDA EP) override this
+    /// with the real per-slot check.
+    fn has_device_graph_in(&self, slot: DeviceGraphSlot) -> Result<bool> {
+        let _ = slot;
+        Ok(true)
+    }
+
     /// Clear the provider's latching device-side validation error.
     ///
     /// Session executors call this at top-level request boundaries. Implementations

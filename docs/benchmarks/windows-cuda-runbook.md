@@ -389,6 +389,48 @@ returned nothing after each). If a run hangs, stop it by its specific PID
 
 ---
 
+## 6b. Host memory: `WorkingSet64` is the wrong metric (measured)
+
+Weights are `mmap`ed from the external-data file (`weights.rs`), and on Windows
+**mapped file pages that have been touched count toward the process working
+set**. Every weight byte is touched once to upload it to the device, so the
+whole external-data file shows up in `WorkingSet64` — even though it is OS file
+cache, is reclaimable under pressure, and was never allocated by us.
+
+Comparing backends on `WorkingSet64` therefore produces a large, entirely
+artificial difference. Measured on HY-MT1.5-1.8B (3480 MB `model.onnx.data`),
+sampling both counters **in the same sample set** so the two describe the same
+instant:
+
+| backend | working set | working set — private | mapped file pages |
+| --- | --- | --- | --- |
+| native | 4681 MB | **1028 MB** | 3654 MB |
+| ort | 1243 MB | **1147 MB** | 96 MB |
+
+On `WorkingSet64` native looks like it uses 3.4 GB more host memory. On private
+working set — the memory the process actually allocated — native is **119 MB
+lower** than ORT. The difference is the `mmap`, and nothing else.
+
+Use the private counter when comparing host memory:
+
+```powershell
+$s = (Get-Counter -Counter @(
+        '\Process(profile_native)\Working Set',
+        '\Process(profile_native)\Working Set - Private')).CounterSamples
+```
+
+Two traps inside this trap:
+
+- **`PrivateMemorySize64` is not the answer.** It reports committed private
+  *virtual* memory including non-resident pages, so it can exceed the working
+  set (measured here: 13524 MB for ORT against a 1243 MB working set).
+  Subtracting it from the working set is meaningless.
+- **Take both counters in one `Get-Counter` call.** Tracking each metric's peak
+  independently pairs values from different instants and can yield a negative
+  "mapped" figure — which is how this was first mis-measured.
+
+---
+
 ## 7. Measured vs. inferred
 
 | Claim | Status |
@@ -410,5 +452,7 @@ returned nothing after each). If a run hangs, stop it by its specific PID
 | `ort-prebuilt` ORT is CPU-only; `ort-sys` loads by absolute path | **measured** (artifact + code) |
 | conda `onnxruntime-gpu` 1.28.0 provides a working CUDA EP end to end (§4b) | **measured** (passed) |
 | ORT-CUDA needs *both* `ONNX_GENAI_ORT_LIB_DIR` and `ONNX_GENAI_EP_FALLBACK=1` | **measured** (each omission reproduced) |
+| `WorkingSet64` counts touched `mmap` weight pages; private working set is the metric for host memory (§6b) | **measured** (paired-instant counters, both backends) |
+| Native private working set is *lower* than ORT's on HY-MT1.5 (1028 vs 1147 MB) | **measured** (§6b) |
 | native-CUDA and ORT-CUDA agree token-for-token on `qwen05b-fresh` (32 greedy tokens) | **measured** (passed) |
 | End-to-end ORT-CUDA run | **not verified** (no CUDA-enabled ORT installed) |

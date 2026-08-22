@@ -356,9 +356,44 @@ impl PipelineModelDirectory {
             }
         }
 
-        let shared_tokenizer = root.join("tokenizer.json");
+        let declared_tokenizer = metadata
+            .package
+            .as_ref()
+            .and_then(|package| package.tokenizer.as_ref())
+            .filter(|tokenizer| !tokenizer.artifacts.is_empty());
+        let shared_tokenizer = if let Some(tokenizer) = declared_tokenizer {
+            let mut resolved = Vec::with_capacity(tokenizer.artifacts.len());
+            for artifact in &tokenizer.artifacts {
+                resolved.push(
+                    onnx_genai_metadata::resolve_package_artifact(
+                        root,
+                        &artifact.location,
+                        "package tokenizer",
+                    )
+                    .map_err(|error| OrtError::InvalidArgument(error.to_string()))?,
+                );
+            }
+            let canonical = resolved
+                .iter()
+                .find(|path| {
+                    path.file_name()
+                        .is_some_and(|name| name == "tokenizer.json")
+                })
+                .or_else(|| (resolved.len() == 1).then(|| &resolved[0]))
+                .ok_or_else(|| {
+                    OrtError::InvalidArgument(
+                        "package.tokenizer.artifacts must identify one canonical tokenizer.json \
+                         artifact when multiple tokenizer files are declared"
+                            .to_string(),
+                    )
+                })?;
+            Some(canonical.clone())
+        } else {
+            let legacy = root.join("tokenizer.json");
+            legacy.is_file().then_some(legacy)
+        };
         let tokenizer_paths = PipelineTokenizerPaths {
-            shared: shared_tokenizer.is_file().then_some(shared_tokenizer),
+            shared: shared_tokenizer,
             per_component: BTreeMap::new(),
         };
 
@@ -887,6 +922,161 @@ fn resolve_relative_file(root: &Path, relative: &str, description: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    const TOKENIZER_BYTES: &[u8] = b"{}";
+
+    fn copy_directory(source: &Path, destination: &Path) {
+        fs::create_dir_all(destination).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            if source_path.is_dir() {
+                copy_directory(&source_path, &destination_path);
+            } else {
+                fs::copy(source_path, destination_path).unwrap();
+            }
+        }
+    }
+
+    fn staged_pipeline(name: &str, location: &str) -> PathBuf {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/static_cache");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join("pipeline-tokenizer-artifacts")
+            .join(name);
+        let _ = fs::remove_dir_all(&root);
+        copy_directory(&source, &root);
+        let mut metadata = fs::read_to_string(source.join("inference_metadata.yaml")).unwrap();
+        let artifact = format!("    artifacts:\n    - location: {location}\n");
+        metadata = metadata.replace(
+            "    byte_level: true\n",
+            &format!("    byte_level: true\n{artifact}"),
+        );
+        fs::write(root.join("inference_metadata.yaml"), metadata).unwrap();
+        root
+    }
+
+    fn staged_legacy_pipeline(name: &str) -> PathBuf {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/static_cache");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join("pipeline-tokenizer-artifacts")
+            .join(name);
+        let _ = fs::remove_dir_all(&root);
+        copy_directory(&source, &root);
+        root
+    }
+
+    fn write_tokenizer(root: &Path, location: &str, bytes: &[u8]) {
+        let path = root.join(location);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn pipeline_resolves_nested_declared_tokenizer_artifact() {
+        let root = staged_pipeline("nested", "assets/tokenizers/tokenizer.json");
+        write_tokenizer(&root, "assets/tokenizers/tokenizer.json", TOKENIZER_BYTES);
+
+        let directory = PipelineModelDirectory::load(&root).unwrap();
+        let expected = root
+            .join("assets/tokenizers/tokenizer.json")
+            .canonicalize()
+            .unwrap();
+        assert_eq!(
+            directory.tokenizer_paths.shared.as_deref(),
+            Some(expected.as_path())
+        );
+    }
+
+    #[test]
+    fn pipeline_allows_declared_tokenizer_bytes_to_be_replaced() {
+        let root = staged_pipeline("replaceable", "tokenizer.json");
+        write_tokenizer(&root, "tokenizer.json", TOKENIZER_BYTES);
+        PipelineModelDirectory::load(&root).unwrap();
+
+        fs::write(root.join("tokenizer.json"), b"{\"replacement\":true}").unwrap();
+        let directory = PipelineModelDirectory::load(&root).unwrap();
+        assert_eq!(
+            directory.tokenizer_paths.shared,
+            Some(root.join("tokenizer.json").canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn pipeline_rejects_retired_tokenizer_hash_field() {
+        let root = staged_pipeline("retired-hash", "tokenizer.json");
+        write_tokenizer(&root, "tokenizer.json", TOKENIZER_BYTES);
+        let metadata_path = root.join("inference_metadata.yaml");
+        let metadata = fs::read_to_string(&metadata_path).unwrap().replace(
+            "    - location: tokenizer.json\n",
+            "    - location: tokenizer.json\n      sha256: retired\n",
+        );
+        fs::write(metadata_path, metadata).unwrap();
+
+        let error = PipelineModelDirectory::load(&root).unwrap_err().to_string();
+        assert!(error.contains("unknown field `sha256`"), "{error}");
+    }
+
+    #[test]
+    fn pipeline_rejects_missing_declared_tokenizer_file() {
+        let root = staged_pipeline("missing-file", "nested/tokenizer.json");
+
+        let error = PipelineModelDirectory::load(&root).unwrap_err().to_string();
+        assert!(error.contains("cannot be opened"), "{error}");
+        assert!(error.contains("nested/tokenizer.json"), "{error}");
+    }
+
+    #[test]
+    fn pipeline_rejects_declared_tokenizer_directory() {
+        let root = staged_pipeline("not-a-file", "nested/tokenizer.json");
+        fs::create_dir_all(root.join("nested/tokenizer.json")).unwrap();
+
+        let error = PipelineModelDirectory::load(&root).unwrap_err().to_string();
+        assert!(error.contains("is not a file"), "{error}");
+    }
+
+    #[test]
+    fn pipeline_rejects_tokenizer_path_escape() {
+        let root = staged_pipeline("escape", "../escaped-tokenizer.json");
+        fs::write(
+            root.parent().unwrap().join("escaped-tokenizer.json"),
+            TOKENIZER_BYTES,
+        )
+        .unwrap();
+
+        let error = PipelineModelDirectory::load(&root).unwrap_err().to_string();
+        assert!(error.contains("escapes package root"), "{error}");
+    }
+
+    #[test]
+    fn declared_tokenizer_is_not_overridden_by_unrelated_root_file() {
+        let root = staged_pipeline("explicit-beats-root", "nested/tokenizer.json");
+        write_tokenizer(&root, "nested/tokenizer.json", TOKENIZER_BYTES);
+        fs::write(root.join("tokenizer.json"), b"unrelated").unwrap();
+
+        let directory = PipelineModelDirectory::load(&root).unwrap();
+        assert_eq!(
+            directory.tokenizer_paths.shared,
+            Some(root.join("nested/tokenizer.json").canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn legacy_pipeline_without_artifacts_uses_root_tokenizer() {
+        let root = staged_legacy_pipeline("legacy-root");
+        write_tokenizer(&root, "tokenizer.json", TOKENIZER_BYTES);
+
+        let directory = PipelineModelDirectory::load(&root).unwrap();
+        assert_eq!(
+            directory.tokenizer_paths.shared,
+            Some(root.join("tokenizer.json"))
+        );
+    }
 
     #[test]
     fn same_stem_binary_and_textproto_are_one_logical_model() {

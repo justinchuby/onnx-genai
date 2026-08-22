@@ -1803,6 +1803,10 @@ impl Executor {
                 !self.binding_consumers_use_padded_capacity(vid)
             }
         });
+        let decode_freeze_safe_mask = self
+            .input_index
+            .get(&input_name)
+            .is_some_and(|&vid| self.binding_mask_is_decode_freeze_safe(vid));
         DeviceIoBinding::allocate(
             self.ep.clone(),
             DeviceBindingSpec {
@@ -1813,6 +1817,7 @@ impl Executor {
                 physical_shape,
                 logical_shape,
                 expose_logical_input_shape,
+                decode_freeze_safe_mask,
                 allocation_bytes: None,
                 committed_ranges: None,
             },
@@ -1837,6 +1842,10 @@ impl Executor {
                 !self.binding_consumers_use_padded_capacity(vid)
             }
         });
+        let decode_freeze_safe_mask = self
+            .input_index
+            .get(&input_name)
+            .is_some_and(|&vid| self.binding_mask_is_decode_freeze_safe(vid));
         DeviceIoBinding::allocate(
             self.ep.clone(),
             DeviceBindingSpec {
@@ -1847,6 +1856,7 @@ impl Executor {
                 physical_shape,
                 logical_shape,
                 expose_logical_input_shape,
+                decode_freeze_safe_mask,
                 allocation_bytes: Some(allocation_bytes),
                 committed_ranges: Some(committed_ranges),
             },
@@ -1889,6 +1899,10 @@ impl Executor {
                 !self.binding_consumers_use_padded_capacity(vid)
             }
         });
+        let decode_freeze_safe_mask = self
+            .input_index
+            .get(&input_name)
+            .is_some_and(|&vid| self.binding_mask_is_decode_freeze_safe(vid));
         // SAFETY: delegated to this function's contract.
         unsafe {
             DeviceIoBinding::from_external_memory(
@@ -1901,6 +1915,7 @@ impl Executor {
                     physical_shape,
                     logical_shape,
                     expose_logical_input_shape,
+                    decode_freeze_safe_mask,
                     allocation_bytes: None,
                     committed_ranges: None,
                 },
@@ -1927,6 +1942,7 @@ impl Executor {
                 physical_shape,
                 logical_shape,
                 expose_logical_input_shape: false,
+                decode_freeze_safe_mask: false,
                 allocation_bytes: None,
                 committed_ranges: None,
             },
@@ -1949,7 +1965,52 @@ impl Executor {
         found
     }
 
+    /// Name the direct consumers of `input` that are **not** padded-capacity-safe
+    /// — the ones that force the binding to expose its logical valid length and
+    /// therefore forfeit CUDA-graph capture. The predicate itself only answers
+    /// yes/no, so bring-up on a new architecture otherwise has to re-derive the
+    /// offender from the graph by hand; report it instead of inferring it.
+    pub(super) fn padded_capacity_offenders(&self, input: ValueId) -> Vec<String> {
+        let mut offenders = Vec::new();
+        for plan in &self.plan {
+            for (slot, value) in plan.inputs.iter().enumerate() {
+                if *value != Some(input) {
+                    continue;
+                }
+                let node = self.graph.node(plan.node_id);
+                if let Some(described) = describe_non_padded_consumer(node, slot) {
+                    offenders.push(described);
+                }
+            }
+        }
+        offenders
+    }
+
     pub(super) fn binding_consumers_use_padded_capacity(&self, input: ValueId) -> bool {
+        let padded = self.binding_consumers_use_padded_capacity_inner(input);
+        if !padded {
+            self.report_padded_capacity_decline(input);
+        }
+        padded
+    }
+
+    /// Emit the attribution for a padded-capacity decline. Gated behind
+    /// `ONNX_GENAI_CUDA_DEBUG_MASK_CAPACITY` so the default path stays silent,
+    /// matching the RMSNorm-fold attribution added in #1671.
+    fn report_padded_capacity_decline(&self, input: ValueId) {
+        let offenders = self.padded_capacity_offenders(input);
+        if offenders.is_empty() {
+            return;
+        }
+        if std::env::var("ONNX_GENAI_CUDA_DEBUG_MASK_CAPACITY").is_ok_and(|v| v != "0") {
+            eprintln!(
+                "mask_capacity_decline: non-capacity-aware consumer(s) {}",
+                offenders.join(", ")
+            );
+        }
+    }
+
+    fn binding_consumers_use_padded_capacity_inner(&self, input: ValueId) -> bool {
         let mut found = false;
         let mut all_direct_padded = true;
         for plan in &self.plan {
@@ -1977,6 +2038,20 @@ impl Executor {
         // `CumSum`/`Unsqueeze` (which stay non-padded-safe for any other topology,
         // e.g. GLM-5.2's indexer `Add`).
         mask_binding_feeds_capacity_form_attention(&self.graph, input)
+    }
+
+    /// Whether the mask binding `input` is *decode-freeze-safe*: it feeds only the
+    /// additive causal-mask builder cone terminating at capacity-form `Attention`,
+    /// so a single-token decode step (`q_seq == 1`) can freeze the mask to
+    /// physical capacity even when [`Self::binding_consumers_use_padded_capacity`]
+    /// declines to freeze it *statically* (because `Shape(mask)` leaks the padded
+    /// width into the multi-token prefill query-position window). The decode
+    /// window saturates at `q_seq == 1`, so a frozen decode mask is byte-identical
+    /// and keeps `logical == physical`, restoring CUDA-graph capture eligibility
+    /// for these models (e.g. DeepSeek-V2-Lite). GLM-5.2's indexer `Add` cone is
+    /// still excluded, so it is not decode-freeze-safe.
+    pub(super) fn binding_mask_is_decode_freeze_safe(&self, input: ValueId) -> bool {
+        mask_binding_feeds_additive_causal_builder(&self.graph, input)
     }
 
     /// The compiled graph, retained for the §55.4 EPContext dump path: the

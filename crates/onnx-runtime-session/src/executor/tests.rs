@@ -2265,6 +2265,33 @@ fn only_capacity_aware_inputs_keep_physical_capacity() {
     assert!(!kernel_input_uses_padded_capacity(&indexer_cast, 0));
 }
 
+/// A decline is only actionable if it names the consumer that caused it.
+/// `describe_non_padded_consumer` is the single place that formats that name,
+/// and it is derived from the same allowlist as the predicate so the two cannot
+/// drift apart.
+#[test]
+fn non_padded_consumers_are_named_for_attribution() {
+    let mut cast = Node::new(NodeId(0), "Cast", vec![], vec![]);
+    cast.name = "model/Cast_node_5".to_string();
+    assert_eq!(
+        describe_non_padded_consumer(&cast, 0).as_deref(),
+        Some("model/Cast_node_5(Cast)[input 0]")
+    );
+
+    // A capacity-safe consumer is not an offender and must not be reported,
+    // otherwise every model would look like it had a blocker.
+    let shape = Node::new(NodeId(1), "Shape", vec![], vec![]);
+    assert_eq!(describe_non_padded_consumer(&shape, 0), None);
+
+    // Non-zero slots are outside the allowlist regardless of op type, and an
+    // unnamed node still has to produce a usable message.
+    let unnamed = Node::new(NodeId(2), "Shape", vec![], vec![]);
+    assert_eq!(
+        describe_non_padded_consumer(&unnamed, 1).as_deref(),
+        Some("<unnamed>(Shape)[input 1]")
+    );
+}
+
 // A capacity-form default-domain `Attention`: mask at input 3, KV cache at
 // inputs 4/5 — so it derives the valid length from the mask frontier and binds
 // the KV cache at physical capacity, in either the causal or non-causal form.
@@ -2635,6 +2662,202 @@ fn mask_builder_to_attention_without_past_kv_is_rejected() {
     assert!(
         !mask_binding_feeds_capacity_form_attention(&graph, mask),
         "a mask cone reaching only a KV-less Attention must not be padded-safe"
+    );
+}
+
+// Build the DeepSeek-V2-Lite additive causal-mask builder cone with SYMBOLIC
+// shapes (the MLA / HF-causal-mask topology), so the mask/bias length symbol is
+// visible to the capture classifier. Returns the graph, the `attention_mask`
+// binding, the mask/bias length symbol, and the capacity-form `Attention` node.
+fn v2lite_symbolic_mask_graph() -> (Graph, ValueId, SymbolId, Node) {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    // The mask / total-sequence length axis (the symbol whose non-pinning keeps
+    // the whole cone + Attention eager). Lives on the mask input and its cone,
+    // NOT on any KV slot.
+    let seq = graph.create_symbol(None);
+    let m2 = |b, s| vec![sym(b), sym(s)];
+    let m3 = |b, s| vec![sym(b), st(1), sym(s)];
+
+    let mask = graph.create_named_value("attention_mask", DataType::Int64, m2(batch, seq));
+    graph.add_input(mask);
+    let cumsum = graph.create_named_value("cumsum", DataType::Int64, m2(batch, seq));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "CumSum",
+        vec![Some(mask)],
+        vec![cumsum],
+    ));
+    let unsq0 = graph.create_named_value("unsq0", DataType::Int64, m3(batch, seq));
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "Unsqueeze",
+        vec![Some(cumsum)],
+        vec![unsq0],
+    ));
+    let ge = graph.create_named_value("ge", DataType::Bool, m3(batch, seq));
+    graph.insert_node(Node::new(
+        NodeId(2),
+        "GreaterOrEqual",
+        vec![Some(unsq0)],
+        vec![ge],
+    ));
+    let unsq1 = graph.create_named_value("unsq1", DataType::Int64, m3(batch, seq));
+    graph.insert_node(Node::new(
+        NodeId(3),
+        "Unsqueeze",
+        vec![Some(mask)],
+        vec![unsq1],
+    ));
+    let padbool = graph.create_named_value("padbool", DataType::Bool, m3(batch, seq));
+    graph.insert_node(Node::new(
+        NodeId(4),
+        "Cast",
+        vec![Some(unsq1)],
+        vec![padbool],
+    ));
+    let and = graph.create_named_value("and", DataType::Bool, m3(batch, seq));
+    graph.insert_node(Node::new(
+        NodeId(5),
+        "And",
+        vec![Some(ge), Some(padbool)],
+        vec![and],
+    ));
+    let where_o = graph.create_named_value("where", DataType::Float32, m3(batch, seq));
+    graph.insert_node(Node::new(
+        NodeId(6),
+        "Where",
+        vec![Some(and)],
+        vec![where_o],
+    ));
+    let cast_o = graph.create_named_value("cast", DataType::Float32, m3(batch, seq));
+    graph.insert_node(Node::new(
+        NodeId(7),
+        "Cast",
+        vec![Some(where_o)],
+        vec![cast_o],
+    ));
+    let bias = graph.create_named_value(
+        "mask_bias",
+        DataType::Float32,
+        vec![sym(batch), st(1), st(1), sym(seq)],
+    );
+    graph.insert_node(Node::new(
+        NodeId(8),
+        "Unsqueeze",
+        vec![Some(cast_o)],
+        vec![bias],
+    ));
+
+    // Capacity-form `Attention` consuming the additive bias (input 3) with past
+    // KV bindings at inputs 4/5.
+    let q = graph.create_named_value("q", DataType::Float32, vec![sym(batch), st(1), st(256)]);
+    let attn =
+        graph.create_named_value("attn", DataType::Float32, vec![sym(batch), st(1), st(256)]);
+    let node = capacity_form_attention(10, q, bias, attn);
+    graph.insert_node(node.clone());
+    graph.add_output(attn);
+    (graph, mask, seq, node)
+}
+
+#[test]
+fn freeze_safe_mask_symbols_are_collected_and_admit_the_attention() {
+    // The DeepSeek-V2-Lite decode-freeze-safe mask/bias length symbol is NOT a
+    // KV-slot symbol, so `collect_capacity_pinned_kv_symbols` misses it and it
+    // keeps the whole causal-mask cone + every Attention that consumes the bias
+    // eager. `collect_freeze_safe_mask_symbols` recovers it, and pinning it makes
+    // the Attention capture-eligible.
+    let (mut graph, mask, seq, attn) = v2lite_symbolic_mask_graph();
+
+    // Precondition: this binding is classified decode-freeze-safe.
+    assert!(
+        mask_binding_feeds_additive_causal_builder(&graph, mask),
+        "the symbolic v2lite mask cone must be decode-freeze-safe"
+    );
+
+    // Make the mask/bias length symbol disqualifying (as inference minting does
+    // for the real model) so the Attention is baseline-eager on its bias edge.
+    graph.symbol_opaque.push(seq);
+    let baseline = compute_capture_disqualifying_symbols(&graph);
+    assert!(
+        baseline.contains(&seq),
+        "the mask/bias length symbol must be disqualifying baseline, got {baseline:?}"
+    );
+    assert!(
+        !node_capture_seq_independent(&graph, &attn, &baseline),
+        "without the pin the bias-consuming Attention must stay eager"
+    );
+
+    // The KV-slot pin alone does NOT recover the mask/bias symbol.
+    let kv_pinned = collect_capacity_pinned_kv_symbols(&graph);
+    assert!(
+        !kv_pinned.contains(&seq),
+        "the mask/bias symbol lives off the KV slots, so the KV pin must miss it, got {kv_pinned:?}"
+    );
+
+    // The freeze-safe mask collector recovers it.
+    let mask_pinned = collect_freeze_safe_mask_symbols(&graph);
+    assert!(
+        mask_pinned.contains(&seq),
+        "collect_freeze_safe_mask_symbols must recover the mask/bias length symbol, got {mask_pinned:?}"
+    );
+
+    // Pinning it excludes it from the disqualifying set and admits the Attention.
+    let mut pinned = kv_pinned;
+    pinned.extend(mask_pinned);
+    let pinned_set = compute_capture_disqualifying_symbols_excluding(&graph, &pinned);
+    assert!(
+        !pinned_set.contains(&seq),
+        "the pinned mask/bias symbol must be excluded from the disqualifying set, got {pinned_set:?}"
+    );
+    assert!(
+        node_capture_seq_independent(&graph, &attn, &pinned_set),
+        "with the freeze-safe mask pin the Attention must be capture-eligible"
+    );
+
+    // Idempotent.
+    assert_eq!(
+        collect_freeze_safe_mask_symbols(&graph),
+        collect_freeze_safe_mask_symbols(&graph),
+    );
+}
+
+#[test]
+fn freeze_safe_mask_symbols_empty_for_non_freeze_safe_masks() {
+    // GLM-5.2's indexer mixes the mask into a logical-width score via `Add` (not
+    // an additive-mask-builder op), so the cone is NOT decode-freeze-safe and no
+    // symbol is collected — the mask keeps exposing its logical length every step
+    // and its symbol must never be pinned into capture.
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let sym = Dim::Symbolic;
+    let batch = graph.create_symbol(None);
+    let seq = graph.create_symbol(None);
+    let sh = |b, s| vec![sym(b), sym(s)];
+    let mask = graph.create_named_value("attention_mask", DataType::Int64, sh(batch, seq));
+    graph.add_input(mask);
+    let score = graph.create_named_value("indexer_score", DataType::Float32, sh(batch, seq));
+    let cast = graph.create_named_value("cast", DataType::Float32, sh(batch, seq));
+    graph.insert_node(Node::new(NodeId(0), "Cast", vec![Some(mask)], vec![cast]));
+    let add = graph.create_named_value("add", DataType::Float32, sh(batch, seq));
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "Add",
+        vec![Some(cast), Some(score)],
+        vec![add],
+    ));
+    graph.add_output(add);
+    assert!(
+        !mask_binding_feeds_additive_causal_builder(&graph, mask),
+        "the GLM indexer Add cone must NOT be decode-freeze-safe"
+    );
+    assert!(
+        collect_freeze_safe_mask_symbols(&graph).is_empty(),
+        "a non-freeze-safe mask must contribute no pinned symbols"
     );
 }
 

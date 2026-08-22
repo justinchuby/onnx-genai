@@ -30,6 +30,12 @@ fn options(max_new_tokens: usize) -> GenerateOptions {
     options
 }
 
+fn deterministic_noise(batch: usize) -> Vec<f32> {
+    (0..batch * 4 * 4 * 4)
+        .map(|index| (index as f32 - 32.0) / 16.0)
+        .collect()
+}
+
 fn adapter_request(
     active: &[bool],
     values: &[f32],
@@ -443,11 +449,15 @@ fn mobius_vlm_workflow_executes_complete_image_path() -> anyhow::Result<()> {
 #[test]
 fn mobius_euler_diffusion_workflow_executes_complete_path() -> anyhow::Result<()> {
     let mut engine = Engine::from_pipeline_dir(&root("diffusion")?, EngineConfig::default())?;
+    let noise = deterministic_noise(1);
     let request = PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![1, 2]),
         options: options(2),
     })
-    .with_input("latent", Value::from_slice_f32(&[1.0; 64], &[1, 4, 4, 4])?);
+    .with_input(
+        "request.noise",
+        Value::from_slice_f32(&noise, &[1, 4, 4, 4])?,
+    );
     let output = engine.run_pipeline_outputs(request)?;
     assert_eq!(output["image"].shape(), [1, 3, 4, 4]);
     assert!(
@@ -466,6 +476,7 @@ fn mobius_euler_diffusion_workflow_executes_complete_path() -> anyhow::Result<()
 #[test]
 fn mobius_euler_diffusion_workflow_executes_batched() -> anyhow::Result<()> {
     let mut engine = Engine::from_pipeline_dir(&root("diffusion")?, EngineConfig::default())?;
+    let noise = deterministic_noise(2);
     let request = PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![1, 2]),
         options: options(2),
@@ -474,15 +485,30 @@ fn mobius_euler_diffusion_workflow_executes_batched() -> anyhow::Result<()> {
         "request.input_ids",
         Value::from_slice_i64(&[1, 2, 3, 4], &[2, 2])?,
     )
-    .with_input("latent", Value::from_slice_f32(&[1.0; 128], &[2, 4, 4, 4])?);
+    .with_input(
+        "request.noise",
+        Value::from_slice_f32(&noise, &[2, 4, 4, 4])?,
+    );
     let output = engine.run_pipeline_outputs(request)?;
     assert_eq!(output["image"].shape(), [2, 3, 4, 4]);
-    assert!(
-        output["image"]
-            .to_vec_f32()?
-            .iter()
-            .all(|value| value.is_finite())
-    );
+    let batched_image = output["image"].to_vec_f32()?;
+    assert!(batched_image.iter().all(|value| value.is_finite()));
+
+    for row in 0..2 {
+        let start = row * 64;
+        let independent_request = PipelineGenerateRequest::new(GenerateRequest {
+            prompt: GeneratePrompt::TokenIds(vec![1 + row as u32 * 2, 2 + row as u32 * 2]),
+            options: options(2),
+        })
+        .with_input(
+            "request.noise",
+            Value::from_slice_f32(&noise[start..start + 64], &[1, 4, 4, 4])?,
+        );
+        let independent = engine.run_pipeline_outputs(independent_request)?;
+        let independent_image = independent["image"].to_vec_f32()?;
+        let batched_row = &batched_image[row * 48..(row + 1) * 48];
+        assert_eq!(batched_row, independent_image);
+    }
     Ok(())
 }
 
