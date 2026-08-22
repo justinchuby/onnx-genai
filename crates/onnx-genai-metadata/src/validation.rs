@@ -2413,6 +2413,40 @@ fn validate_speculative_rollback(metadata: &InferenceMetadata, errors: &mut Vec<
                 speculative.proposer
             ));
         }
+        // A folded carry has no input port and no workflow state cell: its only
+        // anchor is the first-step target context named by
+        // `port_bindings.target_hidden_context`. Without that binding the runtime
+        // has no seed for the fused input, so a folded_carry_output is
+        // underspecified — reject it fail-closed. When present, the context must
+        // name the proposer input port the carry re-enters through.
+        if folded_carry_output.is_some() {
+            match speculative.port_bindings.get("target_hidden_context") {
+                None => errors.push(
+                    "speculative chained proposal declares a folded_carry_output but no \
+                     port_bindings.target_hidden_context to seed the first-step carry"
+                        .to_string(),
+                ),
+                Some(context_port) => {
+                    if !proposer.ports.inputs.contains_key(context_port) {
+                        errors.push(format!(
+                            "speculative port_bindings.target_hidden_context '{context_port}' is \
+                             not an input port of proposer component '{}'",
+                            speculative.proposer
+                        ));
+                    }
+                }
+            }
+        }
+        // Every state-service port map the proposer owns, across all groups. A
+        // recurrence must resolve to a read_write alias in one of these.
+        let proposer_group_aliases = workflow
+            .serving
+            .as_ref()
+            .map(|serving| &serving.state_service.groups)
+            .into_iter()
+            .flat_map(|groups| groups.values())
+            .filter_map(|group| group.ports.get(&speculative.proposer))
+            .collect::<Vec<_>>();
         let mut states = BTreeSet::new();
         for binding in recurrent {
             if !states.insert(&binding.state) {
@@ -2444,6 +2478,53 @@ fn validate_speculative_rollback(metadata: &InferenceMetadata, errors: &mut Vec<
                     "speculative chained recurrence output '{}' is not an output port of component '{}'",
                     binding.output, speculative.proposer
                 ));
+            }
+            // A recurrence is a genuine state transition, so it must resolve to a
+            // read_write state-service alias on the proposer that advances this
+            // exact cell through the same input/output ports the binding names. A
+            // missing, read_only, or mismatched alias means the loop carry would
+            // never be persisted between proposer invocations — reject it
+            // fail-closed rather than silently dropping the recurrence.
+            match proposer_group_aliases
+                .iter()
+                .find_map(|ports| ports.get(&binding.state))
+            {
+                None => errors.push(format!(
+                    "speculative chained recurrent state '{}' has no state-service alias on \
+                     proposer '{}'; a recurrence must resolve through \
+                     serving.state_service.groups.*.ports.{}",
+                    binding.state, speculative.proposer, speculative.proposer
+                )),
+                Some(alias) => {
+                    if alias.access != crate::schema::StatePortAccess::ReadWrite {
+                        errors.push(format!(
+                            "speculative chained recurrent state '{}' resolves to a read_only \
+                             state-service alias on proposer '{}', but a recurrence must advance \
+                             the state (read_write)",
+                            binding.state, speculative.proposer
+                        ));
+                    }
+                    if alias.input != binding.input {
+                        errors.push(format!(
+                            "speculative chained recurrent state '{}' binds input '{}' but its \
+                             state-service alias names input '{}'",
+                            binding.state, binding.input, alias.input
+                        ));
+                    }
+                    match alias.output.as_deref() {
+                        Some(output) if output == binding.output => {}
+                        Some(output) => errors.push(format!(
+                            "speculative chained recurrent state '{}' binds output '{}' but its \
+                             state-service alias names output '{}'",
+                            binding.state, binding.output, output
+                        )),
+                        None => errors.push(format!(
+                            "speculative chained recurrent state '{}' binds output '{}' but its \
+                             state-service alias declares no output",
+                            binding.state, binding.output
+                        )),
+                    }
+                }
             }
         }
     }

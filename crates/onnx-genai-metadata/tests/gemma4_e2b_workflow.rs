@@ -25,6 +25,9 @@ const TARGET: &str =
 const ASSISTANT: &str = include_str!(
     "../../../examples/inference_metadata/catalogue/24-gemma4-e2b-assistant-speculative.yaml"
 );
+const QWEN3: &str = include_str!(
+    "../../../examples/inference_metadata/catalogue/22-qwen3-chained-speculative-decoding.yaml"
+);
 
 fn parse(doc: &str) -> InferenceMetadata {
     let metadata = serde_yaml::from_str::<InferenceMetadata>(doc).expect("example parses");
@@ -346,6 +349,112 @@ fn a_folded_carry_output_must_be_a_proposer_output() {
             .any(|error| error.contains("folded_carry_output")
                 && error.contains("not an output port")),
         "expected a folded-output-port error, got: {errors:?}"
+    );
+}
+
+/// The folded-carry contract fails closed: a proposer that folds a carry back
+/// into its fused input MUST name the first-step target context through
+/// `port_bindings.target_hidden_context`, or the carry has no seed.
+#[test]
+fn a_folded_carry_requires_a_target_hidden_context_binding() {
+    let mutated = ASSISTANT.replace(
+        "  port_bindings:\n    target_hidden_context: inputs_embeds\n",
+        "",
+    );
+    assert_ne!(
+        mutated, ASSISTANT,
+        "the port_bindings block must be present to remove"
+    );
+    let metadata = serde_yaml::from_str::<InferenceMetadata>(&mutated).expect("mutated parses");
+    let errors = validate_metadata(&metadata)
+        .expect_err("a folded carry with no target_hidden_context must fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("port_bindings.target_hidden_context")),
+        "expected a missing-context error, got: {errors:?}"
+    );
+}
+
+/// The first-step context must be a real proposer input port: it is where the
+/// fused `concat(token_embedding, carry)` re-enters the graph.
+#[test]
+fn a_target_hidden_context_must_be_a_proposer_input() {
+    let mutated = ASSISTANT.replace(
+        "target_hidden_context: inputs_embeds",
+        "target_hidden_context: not_a_real_input",
+    );
+    assert_ne!(
+        mutated, ASSISTANT,
+        "the target_hidden_context line must be present to mutate"
+    );
+    let metadata = serde_yaml::from_str::<InferenceMetadata>(&mutated).expect("mutated parses");
+    let errors = validate_metadata(&metadata)
+        .expect_err("a target_hidden_context naming a non-input port must fail");
+    assert!(
+        errors.iter().any(
+            |error| error.contains("port_bindings.target_hidden_context")
+                && error.contains("not an input port")
+        ),
+        "expected a context-input-port error, got: {errors:?}"
+    );
+}
+
+/// A recurrence must resolve to a state-service alias the proposer owns: a
+/// binding whose cell has no `groups.*.ports.<proposer>` alias is rejected, so
+/// a "recurrence" that is never actually carried cannot slip through.
+#[test]
+fn a_recurrence_needs_a_proposer_state_service_alias() {
+    // `target_cache` is a valid rollback cell, but its alias lives on the
+    // verifier, not the proposer — the recurrence cannot resolve.
+    let mutated = QWEN3.replace("state: draft_cache", "state: target_cache");
+    assert_ne!(mutated, QWEN3, "the recurrent binding must be present");
+    let metadata = serde_yaml::from_str::<InferenceMetadata>(&mutated).expect("mutated parses");
+    let errors =
+        validate_metadata(&metadata).expect_err("a recurrence with no proposer alias must fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("no state-service alias on proposer")),
+        "expected a missing-alias error, got: {errors:?}"
+    );
+}
+
+/// A recurrence advances the cell, so its alias must be `read_write`: a
+/// `read_only` borrow is frozen and could never carry the loop forward.
+#[test]
+fn a_recurrence_alias_must_be_read_write() {
+    let mutated = QWEN3.replace(
+        "draft_cache: {input: past_key_values, output: present_key_values}",
+        "draft_cache: {input: past_key_values, output: present_key_values, access: read_only}",
+    );
+    assert_ne!(mutated, QWEN3, "the draft_cache alias must be present");
+    let metadata = serde_yaml::from_str::<InferenceMetadata>(&mutated).expect("mutated parses");
+    let errors = validate_metadata(&metadata).expect_err("a read_only recurrence alias must fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("read_only") && error.contains("read_write")),
+        "expected a read-only recurrence error, got: {errors:?}"
+    );
+}
+
+/// The recurrence and its alias must name the same output port: a mismatch
+/// means the runtime would carry a different value than the binding claims.
+#[test]
+fn a_recurrence_output_must_match_its_alias() {
+    let mutated = QWEN3.replace(
+        "draft_cache: {input: past_key_values, output: present_key_values}",
+        "draft_cache: {input: past_key_values, output: next_hidden}",
+    );
+    assert_ne!(mutated, QWEN3, "the draft_cache alias must be present");
+    let metadata = serde_yaml::from_str::<InferenceMetadata>(&mutated).expect("mutated parses");
+    let errors =
+        validate_metadata(&metadata).expect_err("a mismatched recurrence output must fail");
+    assert!(
+        errors.iter().any(|error| error.contains("binds output")
+            && error.contains("state-service alias names output")),
+        "expected an output-mismatch error, got: {errors:?}"
     );
 }
 
