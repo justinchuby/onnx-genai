@@ -1,34 +1,41 @@
-# Gemma 4 E2B assistant. Real-package shape for the pruned, shared-KV drafter
+# Gemma 4 E2B assistant. Canonical shape for the pruned, shared-KV drafter
 # `google/gemma-4-E2B-it-assistant` paired with its `google/gemma-4-E2B-it`
 # target in one speculative workflow.
 #
-# The schema carries no model name; artifact paths and this comment identify the
-# concrete pair. Every fact below is generic and graph-visible:
+# REDUCED ILLUSTRATION. The real drafter has 4 decoder layers (3 sliding + 1
+# full) that attend over the target's borrowed KV; the real target has 15
+# physical KV owners (3 full at layers 4/9/14, 12 sliding) among 35 layers. To
+# stay readable this example carries a reduced target slice (2 full owners + 1
+# sliding owner at illustrative indices); those owner counts/indices are
+# ILLUSTRATIVE, not real graph facts. The borrowed-KV and speculative CONTRACT,
+# however, is represented exactly as the real graph exposes it.
 #
-#   * Cacheless assistant: the drafter owns NO attention KV. It reads the
-#     target-owned `full_attention` and `sliding_attention` groups through
-#     `access: read_only` aliases, so it observes the committed prefix without
-#     advancing or aliasing it. This drafter is a pure reader — its graph emits
-#     no present KV at all — so its read-only aliases omit `output` entirely.
-#     (A reader whose kernel does emit a discarded present may still name it; the
-#     value is never a state transition either way.)
-#   * Heterogeneous, subset KV: the target owns two global layers (0, 1) and one
-#     local layer (0) with independent head counts and head widths; the drafter
-#     reads only global layer 0 and local layer 0, mapping its two attention
-#     layers onto a smaller set of physical target owners.
+# The generic, schema-level facts this example demonstrates:
+#
+#   * Cacheless drafter: it owns NO attention KV. It reads the target-owned
+#     `full_attention` and `sliding_attention` groups through `access: read_only`
+#     aliases, so it observes the committed prefix without advancing or aliasing
+#     it. This drafter is a pure reader — its graph emits no present KV at all —
+#     so its read-only aliases omit `output` entirely.
+#   * Single merged borrowed representative: the real drafter takes ONE
+#     `shared_kv.full_attention.{key,value}` and ONE
+#     `shared_kv.sliding_attention.{key,value}` input — a single merged view of
+#     each group that maps to no specific owner layer — so each read-only alias
+#     names one representative owner cell as its binding anchor and carries NO
+#     `layer`. The exact shared source is a runtime detail.
 #   * Concatenated target handoff, folded carry: the drafter's fused
 #     `inputs_embeds = concat(target_input_embedding(last_token), carry)`. The
-#     target input-embedding table is borrowed through
-#     `speculative.shared_weights` (ordered embeddings). The drafter emits
-#     `projected_state` as an output ONLY and takes no separate carry input: the
-#     carry re-enters as the trailing half of `inputs_embeds`. Its first-step
-#     value is the target hidden named by
-#     `speculative.port_bindings.target_hidden_context`, and each step replaces
-#     it with the drafter's output — declared as
-#     `proposal_execution.folded_carry_output`.
-#   * Owns nothing: because the carry is folded into the fused input rather than
-#     a state cell, the drafter has NO workflow state of its own at all — no KV
-#     (read-only borrows only) and no recurrent cell. Its resolved decode ABI is
+#     drafter emits `projected_state` as an output ONLY and takes no separate
+#     carry input: the carry re-enters as the trailing half of `inputs_embeds`.
+#     Its first-step value is the target hidden named by
+#     `speculative.port_bindings.target_hidden_context`, and each step replaces it
+#     with the drafter's output — declared as
+#     `proposal_execution.folded_carry_output`. The tied target input embedding is
+#     graph-internal to the target model, so no external `shared_weights` file is
+#     referenced.
+#   * Owns nothing: because the carry is folded into the fused input rather than a
+#     state cell, the drafter has NO workflow state of its own — no KV (read-only
+#     borrows only) and no recurrent cell. Its resolved decode ABI is
 #     `kv_ownership: shared` with no transitions and no state pairs.
 #   * Sparse / pruned, ordered-embedding LM head: this assistant sets
 #     `use_ordered_embeddings: true` and routes through centroids
@@ -41,9 +48,9 @@
 #     `{kind: mapped, artifact}`.) Because the centroid head is a lossy
 #     approximation, this drafter is marked not distribution preserving, so the
 #     caller must opt speculation in.
-#   * Rollback: a rejected proposal rewinds every target KV cell; the folded
-#     carry has no state cell and is recomputed from committed tokens, so it is
-#     not in `rollback_state`.
+#   * Rollback: a rejected proposal rewinds every target KV cell; the folded carry
+#     has no state cell and is recomputed from committed tokens, so it is not in
+#     `rollback_state`.
 schema_version: v1
 pipeline:
   workflow:
@@ -116,10 +123,10 @@ pipeline:
         ports:
           inputs:
             inputs_embeds: {dtype: float16, rank: 3, shape: [batch, sequence, fused_hidden], batch_layout: {kind: request_aligned, axis: 0}}
-            full_key_0: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
-            full_value_0: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
-            sliding_key_0: {dtype: float16, rank: 4, shape: [batch, sliding_kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
-            sliding_value_0: {dtype: float16, rank: 4, shape: [batch, sliding_kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            shared_kv.full_attention.key: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            shared_kv.full_attention.value: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            shared_kv.sliding_attention.key: {dtype: float16, rank: 4, shape: [batch, sliding_kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            shared_kv.sliding_attention.value: {dtype: float16, rank: 4, shape: [batch, sliding_kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
           outputs:
             draft_logits: {dtype: float16, rank: 3, shape: [batch, sequence, vocab], batch_layout: {kind: request_aligned, axis: 0}}
             next_projected_state: {dtype: float16, rank: 3, shape: [batch, sequence, hidden], batch_layout: {kind: request_aligned, axis: 0}}
@@ -198,10 +205,10 @@ pipeline:
       component: assistant
       inputs:
         inputs_embeds: request.inputs_embeds
-        full_key_0: request.full_key_0
-        full_value_0: request.full_value_0
-        sliding_key_0: request.sliding_key_0
-        sliding_value_0: request.sliding_value_0
+        shared_kv.full_attention.key: request.full_key_1
+        shared_kv.full_attention.value: request.full_value_1
+        shared_kv.sliding_attention.key: request.sliding_key_0
+        shared_kv.sliding_attention.value: request.sliding_value_0
       outputs:
         draft_logits: draft.logits
         next_projected_state: draft.projected_state
@@ -248,8 +255,8 @@ pipeline:
                 full_key_1: {input: full_key_1, output: next_full_key_1, role: key, layer: 1}
                 full_value_1: {input: full_value_1, output: next_full_value_1, role: value, layer: 1}
               assistant:
-                full_key_0: {input: full_key_0, access: read_only, role: key, layer: 0}
-                full_value_0: {input: full_value_0, access: read_only, role: value, layer: 0}
+                full_key_1: {input: shared_kv.full_attention.key, access: read_only, role: key}
+                full_value_1: {input: shared_kv.full_attention.value, access: read_only, role: value}
           sliding_attention:
             kind: sliding_attention
             sequence_axis: 2
@@ -262,8 +269,8 @@ pipeline:
                 sliding_key_0: {input: sliding_key_0, output: next_sliding_key_0, role: key, layer: 0}
                 sliding_value_0: {input: sliding_value_0, output: next_sliding_value_0, role: value, layer: 0}
               assistant:
-                sliding_key_0: {input: sliding_key_0, access: read_only, role: key, layer: 0}
-                sliding_value_0: {input: sliding_value_0, access: read_only, role: value, layer: 0}
+                sliding_key_0: {input: shared_kv.sliding_attention.key, access: read_only, role: key}
+                sliding_value_0: {input: shared_kv.sliding_attention.value, access: read_only, role: value}
 speculative:
   proposer: assistant
   target: target
@@ -281,7 +288,6 @@ speculative:
   port_bindings:
     target_hidden_context: inputs_embeds
   shared_state: [full_attention, sliding_attention]
-  shared_weights: [target_embedding.f32]
   vocabulary: {kind: identical}
   max_proposal_width: 4
   distribution_preserving: false

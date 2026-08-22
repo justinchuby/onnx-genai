@@ -158,14 +158,25 @@ fn assistant_is_cacheless_read_only_reader() {
         }
     }
 
-    // The assistant reads a subset of the target's physical owners: the target
-    // owns two global layers, the assistant reads only layer 0.
-    let full_target_layers = groups["full_attention"].ports["target"].len();
-    let full_assistant_layers = groups["full_attention"].ports["assistant"].len();
+    // The assistant reads a single merged representative of each group, so it
+    // binds fewer aliases than the target owns.
+    let full_target_ports = groups["full_attention"].ports["target"].len();
+    let full_assistant_ports = groups["full_attention"].ports["assistant"].len();
     assert!(
-        full_assistant_layers < full_target_layers,
-        "assistant reads a smaller owner set"
+        full_assistant_ports < full_target_ports,
+        "assistant borrows a single merged representative"
     );
+    // The merged borrow carries no layer index (it maps to no specific owner).
+    for alias in groups["full_attention"].ports["assistant"].values() {
+        assert!(
+            alias.layer.is_none(),
+            "a merged representative carries no layer"
+        );
+        assert!(
+            alias.output.is_none(),
+            "a pure reader exposes no present output"
+        );
+    }
 }
 
 /// The speculative wiring is a chained proposal over a pruned vocabulary that
@@ -198,7 +209,8 @@ fn assistant_speculative_contract_is_chained_pruned_and_rewindable() {
         other => panic!("expected a chained proposal, got {other:?}"),
     }
 
-    // Concatenated target hidden handoff and borrowed ordered embeddings.
+    // Concatenated target hidden handoff. The tied target embedding is
+    // graph-internal, so no external shared_weights file is referenced.
     assert_eq!(
         speculative
             .port_bindings
@@ -206,7 +218,10 @@ fn assistant_speculative_contract_is_chained_pruned_and_rewindable() {
             .map(String::as_str),
         Some("inputs_embeds")
     );
-    assert!(speculative.shared_weights.contains("target_embedding.f32"));
+    assert!(
+        speculative.shared_weights.is_empty(),
+        "the tied target embedding is graph-internal, not externally shared"
+    );
 
     // Read-only shared attention groups, not owned draft caches.
     assert!(speculative.shared_state.contains("full_attention"));
@@ -274,8 +289,8 @@ fn a_read_write_alias_still_requires_an_output() {
     // Flip one of the assistant's read-only borrows into a (default) read-write
     // alias while leaving it without an output port.
     let mutated = ASSISTANT.replace(
-        "full_key_0: {input: full_key_0, access: read_only, role: key, layer: 0}",
-        "full_key_0: {input: full_key_0, role: key, layer: 0}",
+        "full_key_1: {input: shared_kv.full_attention.key, access: read_only, role: key}",
+        "full_key_1: {input: shared_kv.full_attention.key, role: key}",
     );
     assert_ne!(
         mutated, ASSISTANT,
@@ -289,4 +304,74 @@ fn a_read_write_alias_still_requires_an_output() {
             .any(|error| error.contains("declares no output")),
         "expected a missing-output error, got: {errors:?}"
     );
+}
+
+/// The folded-carry contract fails closed: a chained proposer that declares
+/// neither a `recurrent` binding nor a `folded_carry_output` is rejected.
+#[test]
+fn a_chained_proposal_needs_a_recurrent_or_folded_carry() {
+    let mutated = ASSISTANT.replace("    folded_carry_output: next_projected_state\n", "");
+    assert_ne!(
+        mutated, ASSISTANT,
+        "the folded_carry_output line must be present to mutate"
+    );
+    let metadata = serde_yaml::from_str::<InferenceMetadata>(&mutated).expect("mutated parses");
+    let errors =
+        validate_metadata(&metadata).expect_err("a chained proposal with no carry must fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("at least one recurrent binding or a folded_carry_output")),
+        "expected a missing-carry error, got: {errors:?}"
+    );
+}
+
+/// The folded-carry output must be a real proposer output port.
+#[test]
+fn a_folded_carry_output_must_be_a_proposer_output() {
+    let mutated = ASSISTANT.replace(
+        "folded_carry_output: next_projected_state",
+        "folded_carry_output: not_a_real_port",
+    );
+    assert_ne!(
+        mutated, ASSISTANT,
+        "the folded_carry_output line must be present to mutate"
+    );
+    let metadata = serde_yaml::from_str::<InferenceMetadata>(&mutated).expect("mutated parses");
+    let errors = validate_metadata(&metadata)
+        .expect_err("a folded_carry_output naming a non-output port must fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("folded_carry_output")
+                && error.contains("not an output port")),
+        "expected a folded-output-port error, got: {errors:?}"
+    );
+}
+
+/// Backward-compatible with #1696: the separate-port `recurrent` form (no
+/// `folded_carry_output`) still validates — asserted on the checked-in Qwen3
+/// chained example.
+#[test]
+fn recurrent_chained_form_remains_valid() {
+    let doc = include_str!(
+        "../../../examples/inference_metadata/catalogue/22-qwen3-chained-speculative-decoding.yaml"
+    );
+    let metadata = serde_yaml::from_str::<InferenceMetadata>(doc).expect("qwen3 chained parses");
+    validate_metadata(&metadata).expect("the recurrent chained form still validates");
+    let speculative = metadata.speculative.as_ref().expect("speculative");
+    match &speculative.proposal_execution {
+        SpeculativeProposalExecution::Chained {
+            recurrent,
+            folded_carry_output,
+            ..
+        } => {
+            assert!(!recurrent.is_empty(), "qwen3 uses separate-port recurrence");
+            assert!(
+                folded_carry_output.is_none(),
+                "qwen3 declares no folded carry"
+            );
+        }
+        other => panic!("expected chained, got {other:?}"),
+    }
 }

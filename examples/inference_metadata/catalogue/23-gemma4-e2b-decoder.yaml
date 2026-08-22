@@ -1,30 +1,38 @@
-# Gemma 4 E2B text decoder; real-package shape for the `google/gemma-4-E2B-it`
+# Gemma 4 E2B text decoder; canonical shape for the `google/gemma-4-E2B-it`
 # target. This checkpoint is a DENSE hybrid full/sliding-window decoder — its
 # pinned config sets `enable_moe_block: false` / `num_experts: null`, so no MoE
 # metadata is invented here. (The schema can still express a sparse FFN through
 # `model.mixture_of_experts` for MoE variants; this dense checkpoint has none.)
 #
-# The schema carries no model name; artifact paths and this comment identify the
-# concrete package. Every fact below is generic and graph-visible:
+# REDUCED ILLUSTRATION. The real target has 35 decoder layers with a 5:1
+# local:global attention pattern and cross-layer KV sharing: 15 layers physically
+# own KV — 3 full-attention owners at layers 4, 9, 14 (head_dim 512) and 12
+# sliding-attention owners (head_dim 256) — while the other 20 layers share an
+# earlier owner's cache and expose no ports. To stay readable this example shows
+# a reduced slice (2 full owners + 1 sliding owner at illustrative indices); the
+# owner counts and layer indices in the YAML below are ILLUSTRATIVE, not the
+# model's real graph facts (those real numbers are stated in this comment). The
+# schema carries no model name; this comment states identity and real geometry.
+#
+# The generic, schema-level facts this example demonstrates:
 #
 #   * Hybrid attention: `full_attention` (global) and `sliding_attention`
 #     (local, window 512) are separate state-service groups with different
-#     `kind` and `reuse` discipline. The config repeats one global layer after
-#     several local ones; the local group's prefix is `evictable_prefix: true`
-#     (the fixed window drops old tokens) and the global group's is not.
-#   * Heterogeneous global/local geometry: this checkpoint's real heterogeneity
-#     is head WIDTH — the global head_dim (512) is twice the local head_dim
-#     (256). The two groups therefore use independent `full_head_dim` and
-#     `sliding_head_dim` axes. It is grouped-query attention with one KV head
-#     (`num_key_value_heads: 1`), so key and value share one head-count symbol
-#     per group. (A model whose K and V head counts differ is equally
-#     expressible — see example 1 — this checkpoint's simply do not.)
-#   * Shared / borrowed KV layers: the config sets `num_kv_shared_layers`, so the
-#     decoder has far more attention layers than physical KV buffers. The global
-#     group owns two physical layers (0, 1) and the local group one (0); later
-#     same-kind layers reuse an owner's buffer inside the graph and expose no
-#     ports. `layer` orders and pairs the physical owners; it does not enumerate
-#     every logical layer.
+#     `kind` and `reuse` discipline. The local group's prefix is
+#     `evictable_prefix: true` (the fixed window drops old tokens) and the global
+#     group's is not.
+#   * Heterogeneous global/local geometry: the real heterogeneity is head WIDTH —
+#     the global head_dim (512) is twice the local head_dim (256). The two groups
+#     therefore use independent `full_head_dim` and `sliding_head_dim` axes. It is
+#     grouped-query attention with one KV head (`num_key_value_heads: 1`), so key
+#     and value share one head-count symbol per group. (A model whose K and V
+#     head counts differ is equally expressible — see example 1 — this
+#     checkpoint's simply do not.)
+#   * Shared / borrowed KV layers: `num_kv_shared_layers` means far more attention
+#     layers than physical KV buffers. `layer` orders and pairs the physical
+#     owners; it does not enumerate every logical layer. (In the real model the
+#     owners are layers 4/9/14 full and 12 sliding; the reduced indices below
+#     stand in for them.)
 #
 # `final_logit_softcapping` and `tie_word_embeddings` are graph-internal to the
 # decoder artifact and are not restated as metadata.
