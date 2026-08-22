@@ -2155,7 +2155,17 @@ fn qmoe_expert_gemv_bandwidth_probe() {
     let ep = require_cuda();
     let runtime = ep.runtime().clone();
     let dtype = DataType::Float16;
-    let reps = env_usize("QMOE_GEMV_PROBE_REPS", 9).max(5);
+    // 25 reps, not 9: a follow-up local reproducibility sweep (3x reps=9 runs,
+    // then one reps=25 run, all on the same idle A100) showed
+    // `deepseek-v2-lite M=2` and `glm-5.2 M=1` occasionally landing their
+    // reps=9 median in a slower tail (e.g. 822us vs. a typical 673us; 520us
+    // vs. a typical 430us) purely from small-sample luck -- at reps=25 both
+    // medians settled tightly onto the typical/fast value every time, with
+    // only a narrow, rare excursion visible in `range_us`'s upper bound. This
+    // is small-sample median instability, not genuine 50/50 bimodal kernel
+    // behavior; raising the default trades ~15% more wall-clock time for a
+    // materially more trustworthy median on every configuration.
+    let reps = env_usize("QMOE_GEMV_PROBE_REPS", 25).max(5);
     let batch = env_usize("QMOE_GEMV_PROBE_BATCH", 16).max(1);
 
     // Bring the SM clock up BEFORE measuring anything (cuda-perf-measurement
