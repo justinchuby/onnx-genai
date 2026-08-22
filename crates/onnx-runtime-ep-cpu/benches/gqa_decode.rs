@@ -71,6 +71,8 @@ fn bind_decode_pool_width(threads: usize) {
 /// `sdpa_decode_group` call over the same KV window. Single-threaded on purpose
 /// — this isolates the memory-traffic difference from the decode scheduler.
 fn bench_sdpa_group_vs_row(c: &mut Criterion) {
+    // Match the decode thread topology a served session runs in (#1749).
+    common::init_decode_topology();
     let mut group_bench = c.benchmark_group("sdpa_group_vs_row");
     for (label, num_heads, kv_num_heads, head_size) in GEOMETRIES {
         let group = num_heads / kv_num_heads;

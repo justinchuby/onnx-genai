@@ -11,6 +11,8 @@
 //! Shapes are real encoder/decoder geometries rather than round numbers:
 //! Whisper-base encoder, BERT-base, ViT-L/14 and a 32/8/128 GQA decode step.
 
+mod common;
+
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use onnx_runtime_ep_cpu::kernels::sdpa::{
     NoBias, NoMask, ScaleMode, SdpaConfig, SdpaTensors, sdpa_f32, sdpa_f32_scalar,
@@ -73,6 +75,8 @@ fn values(n: usize, seed: u64) -> Vec<f32> {
 }
 
 fn bench_sdpa_simd(c: &mut Criterion) {
+    // Match the decode thread topology a served session runs in (#1749).
+    common::init_decode_topology();
     let mut group = c.benchmark_group("sdpa_f32");
     for geo in &GEOMETRIES {
         let batch = 1usize;

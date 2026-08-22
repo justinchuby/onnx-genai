@@ -79,6 +79,9 @@ fn time(name: &str, kernel: &dyn Kernel, ins: &[TensorView], out: &mut Tensor, e
 }
 
 fn main() {
+    // Match the decode thread topology a served session runs in (#1749).
+    common::init_decode_topology();
+
     // Decode (`[1, 1, H]`), prefill (`[1, S, H]`) and two sizes around the
     // vector dispatch threshold.
     let shapes: [(&str, Vec<usize>); 5] = [

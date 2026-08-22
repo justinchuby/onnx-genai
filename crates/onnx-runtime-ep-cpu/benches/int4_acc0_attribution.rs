@@ -52,6 +52,8 @@
 //! cargo bench -p onnx-runtime-ep-cpu --bench int4_acc0_attribution
 //! ```
 
+mod common;
+
 use std::time::Instant;
 
 /// Shapes taken from the projections that dominate llama/qwen decode.
@@ -207,6 +209,9 @@ fn bench(label: &str, reps: usize, mut f: impl FnMut()) -> f64 {
 }
 
 fn main() {
+    // Match the decode thread topology a served session runs in (#1749).
+    common::init_decode_topology();
+
     let reps: usize = std::env::var("REPS")
         .ok()
         .and_then(|v| v.parse().ok())
