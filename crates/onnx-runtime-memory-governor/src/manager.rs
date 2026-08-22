@@ -1452,6 +1452,17 @@ impl RegisteredMemoryContext {
         &self.record.label
     }
 
+    /// The device this context's allocations belong to.
+    ///
+    /// Reads through to the registered record rather than caching, so it
+    /// cannot drift from the registration. Callers live outside this crate —
+    /// `onnx-runtime-ep-cuda` labels its allocator mechanism with it — and
+    /// those callers compile only under a backend feature, so nothing in a
+    /// default build references this.
+    pub fn device(&self) -> DeviceKey {
+        self.record.registered.device()
+    }
+
     /// A pin source that keeps this context from completing teardown.
     ///
     /// Handed to mechanisms that queue deferred releases — notably plugin
