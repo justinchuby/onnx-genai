@@ -72,6 +72,8 @@ fn bind_decode_pool_width(threads: usize) {
 /// — this isolates the memory-traffic difference from the decode scheduler.
 fn bench_sdpa_group_vs_row(c: &mut Criterion) {
     // Match the decode thread topology a served session runs in (#1749).
+    // Idempotent, and called from every group member rather than just the
+    // first so coverage does not silently ride on `criterion_group!` order.
     common::init_decode_topology();
     let mut group_bench = c.benchmark_group("sdpa_group_vs_row");
     for (label, num_heads, kv_num_heads, head_size) in GEOMETRIES {
@@ -219,6 +221,10 @@ fn gqa_kernel(
 /// the bench twice (once with the variable set to `0`, once to `1`) to get the
 /// A/B. The current setting is reported in the benchmark id.
 fn bench_gqa_kernel_decode(c: &mut Criterion) {
+    // Match the decode thread topology a served session runs in (#1749).
+    // Idempotent, and called from every group member rather than just the
+    // first so coverage does not silently ride on `criterion_group!` order.
+    common::init_decode_topology();
     let fused = std::env::var("ONNX_GENAI_GQA_GROUP_FUSED").unwrap_or_else(|_| "default".into());
     let mut group_bench = c.benchmark_group("gqa_kernel_decode");
     // 8 workers is the bounded decode-pool width the runtime uses for M=1.
@@ -268,6 +274,10 @@ fn bench_gqa_kernel_decode(c: &mut Criterion) {
 /// read either way, so the ratio between arms reads directly as the fraction of
 /// cache traffic the append removes.
 fn bench_gqa_half_kv_append(c: &mut Criterion) {
+    // Match the decode thread topology a served session runs in (#1749).
+    // Idempotent, and called from every group member rather than just the
+    // first so coverage does not silently ride on `criterion_group!` order.
+    common::init_decode_topology();
     let mut group_bench = c.benchmark_group("gqa_half_kv_append");
     bind_decode_pool_width(8);
     for (label, num_heads, kv_num_heads, head_size) in GEOMETRIES {

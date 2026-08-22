@@ -76,6 +76,8 @@ fn values(n: usize, seed: u64) -> Vec<f32> {
 
 fn bench_sdpa_simd(c: &mut Criterion) {
     // Match the decode thread topology a served session runs in (#1749).
+    // Idempotent, and called from every group member rather than just the
+    // first so coverage does not silently ride on `criterion_group!` order.
     common::init_decode_topology();
     let mut group = c.benchmark_group("sdpa_f32");
     for geo in &GEOMETRIES {
