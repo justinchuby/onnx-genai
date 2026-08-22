@@ -7,7 +7,9 @@ use onnx_genai_ort::{
     DataType, Environment, ManagedCudaAllocatorConfig, Session, SessionOptions, Value,
     available_execution_providers, ep_selection,
 };
-use onnx_runtime_memory_governor::{DeviceKey, LeaseLedger, LedgerGovernor, ProcessMemoryManager};
+use onnx_runtime_memory_governor::{
+    DeviceKey, LeaseLedger, LedgerGovernor, ProcessMemoryLimits, ProcessMemoryManager,
+};
 
 fn tiny_llm() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm/model.onnx.textproto")
@@ -30,18 +32,24 @@ fn cuda_ready() -> bool {
 }
 
 fn managed_cuda_config(device_id: i32) -> ManagedCudaAllocatorConfig {
+    managed_cuda_config_with_manager(
+        device_id,
+        ProcessMemoryManager::new().expect("process memory manager"),
+    )
+}
+
+fn managed_cuda_config_with_manager(
+    device_id: i32,
+    manager: ProcessMemoryManager,
+) -> ManagedCudaAllocatorConfig {
     let governor = Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
         DeviceKey::device(device_id as u32),
         1 << 33,
         0,
         0,
     )));
-    ManagedCudaAllocatorConfig::new(
-        device_id,
-        ProcessMemoryManager::new().expect("process memory manager"),
-        governor,
-    )
-    .expect("managed CUDA allocator config")
+    ManagedCudaAllocatorConfig::new(device_id, manager, governor)
+        .expect("managed CUDA allocator config")
 }
 
 fn model_inputs(session: &Session) -> (Vec<Vec<u8>>, Vec<Vec<i64>>) {
@@ -149,5 +157,106 @@ fn a_cuda_session_can_route_internal_and_external_allocations_through_the_manage
     );
 
     drop(owner);
+    let after_free = env
+        .managed_cuda_allocator_stats(0)
+        .expect("managed CUDA allocator stats");
+    assert!(
+        after_free.deferred_release_enqueue_failures > 0,
+        "a free without a provably live ORT stream must be retained, not recorded on a stale \
+         handle: {after_free:?}"
+    );
+    drop(env);
+    run_once(&session).expect("the CUDA session must run after its Environment wrapper is dropped");
+    drop(session);
+}
+
+#[test]
+fn registration_requires_the_exact_process_memory_manager() {
+    let _guard = ort_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let model = tiny_llm();
+    if !model.exists() || !cuda_ready() {
+        return;
+    }
+
+    let env = Environment::new("managed-cuda-manager-identity").expect("env");
+    let first_manager = ProcessMemoryManager::new().expect("first manager");
+    let first = managed_cuda_config_with_manager(0, first_manager);
+    let mut options = SessionOptions::with_execution_provider(ep_selection("cuda"));
+    options.use_managed_cuda_allocator(first);
+    let session = Session::new(&env, &model, options).expect("first CUDA session");
+
+    let second_manager = ProcessMemoryManager::new().expect("second manager");
+    let second = managed_cuda_config_with_manager(0, second_manager);
+    let mut incompatible = SessionOptions::with_execution_provider(ep_selection("cuda"));
+    incompatible.use_managed_cuda_allocator(second);
+    let error = match Session::new(&env, &model, incompatible) {
+        Ok(_) => panic!("same device and authority shape from another manager must be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("different managed CUDA allocator")
+    );
+    drop(session);
+}
+
+#[test]
+fn failed_registration_rolls_back_manager_records() {
+    let _guard = ort_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let model = tiny_llm();
+    if !model.exists() || !cuda_ready() {
+        return;
+    }
+
+    let manager = ProcessMemoryManager::with_limits(ProcessMemoryLimits {
+        device_bytes: 0,
+        host_bytes: u64::MAX,
+        disk_bytes: u64::MAX,
+    })
+    .expect("limited manager");
+    let config = managed_cuda_config_with_manager(0, manager.clone());
+    let env = Environment::new("managed-cuda-registration-rollback").expect("env");
+    let mut options = SessionOptions::with_execution_provider(ep_selection("cuda"));
+    options.use_managed_cuda_allocator(config);
+    assert!(
+        Session::new(&env, &model, options).is_err(),
+        "delegating a nonzero CUDA authority into a zero-byte process limit must fail"
+    );
+
+    let snapshot = manager.snapshot().expect("manager snapshot after rollback");
+    assert_eq!(snapshot.authority_count, 0);
+    assert!(snapshot.mechanism_snapshots.is_empty());
+}
+
+#[test]
+fn device_loss_listener_remains_registered_strongly() {
+    let _guard = ort_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let model = tiny_llm();
+    if !model.exists() || !cuda_ready() {
+        return;
+    }
+
+    let manager = ProcessMemoryManager::new().expect("manager");
+    let config = managed_cuda_config_with_manager(0, manager.clone());
+    let env = Environment::new("managed-cuda-listener-retention").expect("env");
+    let mut options = SessionOptions::with_execution_provider(ep_selection("cuda"));
+    options.use_managed_cuda_allocator(config);
+    let session = Session::new(&env, &model, options).expect("CUDA session");
+
+    manager
+        .invalidate_device(DeviceKey::device(0), "test device loss")
+        .expect("invalidate device");
+    assert!(
+        env.managed_cuda_allocator_stats(0)
+            .expect("allocator stats")
+            .device_lost
+    );
     drop(session);
 }

@@ -85,7 +85,7 @@ pub struct Environment {
     managed_cuda_allocators: Mutex<
         std::collections::HashMap<
             i32,
-            crate::managed_cuda_allocator::ManagedCudaEnvironmentRegistration,
+            &'static crate::managed_cuda_allocator::ManagedCudaEnvironmentRegistration,
         >,
     >,
 }
@@ -313,11 +313,6 @@ impl Drop for Environment {
         let mut lifecycle = environment_lifecycle()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        #[cfg(feature = "cuda")]
-        self.managed_cuda_allocators
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
         if let Ok(api) = crate::error::api()
             && let Some(release) = api.ReleaseEnv
         {

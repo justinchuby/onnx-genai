@@ -1,14 +1,10 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fmt;
-use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{CudaContext, sys as cu};
-use onnx_runtime_cuda_memory::virtual_memory::{
-    confirm_physical_handle_pool_context_terminated, physical_pool_context_identity,
-};
 use onnx_runtime_cuda_memory::vmm_allocator::CudaVmmAllocator;
 use onnx_runtime_ep_cuda::deferred_release::{
     CudaDeferredReleaseQueue, ReleaseFence, ReleaseFenceSource, ReleaseObserver,
@@ -132,124 +128,15 @@ impl DeviceLossListener for OrtCudaDeviceLossForwarder {
     }
 }
 
-#[derive(Debug, Default)]
-struct ObservedOrtCudaStreams {
-    raw: Mutex<Vec<usize>>,
-}
-
-impl ObservedOrtCudaStreams {
-    fn record(&self, raw: *mut c_void) -> std::result::Result<(), String> {
-        if raw.is_null() {
-            return Err(String::from(
-                "ORT reported a null CUDA stream handle for a stream-aware allocation",
-            ));
-        }
-        let raw_value = raw as usize;
-        let mut streams = self
-            .raw
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !streams.contains(&raw_value) {
-            streams.push(raw_value);
-        }
-        Ok(())
-    }
-
-    fn current(&self) -> Vec<cu::CUstream> {
-        self.raw
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .copied()
-            .map(|raw| (raw as *mut std::ffi::c_void).cast())
-            .collect()
-    }
-}
-
 #[derive(Debug)]
-struct OrtCudaUnifiedStreamFences {
-    _context: Arc<CudaContext>,
-    device_id: i32,
-    stream: Arc<ObservedOrtCudaStreams>,
-}
+struct OrtCudaFailClosedFences;
 
-impl ReleaseFenceSource for OrtCudaUnifiedStreamFences {
+impl ReleaseFenceSource for OrtCudaFailClosedFences {
     fn record(&self) -> std::result::Result<Vec<Box<dyn ReleaseFence>>, String> {
-        let streams = self.stream.current();
-        if streams.is_empty() {
-            return Err(String::from(
-                "managed CUDA allocator bridge cannot defer a free before ORT exposes a CUDA stream",
-            ));
-        }
-        let _guard = crate::cuda_rt::DeviceGuard::set(self.device_id).map_err(|error| {
-            format!(
-                "could not make CUDA device {} current: {error}",
-                self.device_id
-            )
-        })?;
-        let mut fences: Vec<Box<dyn ReleaseFence>> = Vec::with_capacity(streams.len());
-        for stream in streams {
-            let mut event = std::ptr::null_mut();
-            check_cuda("cuEventCreate", unsafe {
-                cu::cuEventCreate(
-                    &mut event,
-                    cu::CUevent_flags::CU_EVENT_DISABLE_TIMING as u32,
-                )
-            })?;
-            if let Err(error) =
-                check_cuda("cuEventRecord", unsafe { cu::cuEventRecord(event, stream) })
-            {
-                unsafe {
-                    let _ = cu::cuEventDestroy_v2(event);
-                }
-                return Err(error);
-            }
-            fences.push(Box::new(OrtCudaEventFence {
-                _context: Arc::clone(&self._context),
-                device_id: self.device_id,
-                event,
-            }));
-        }
-        Ok(fences)
-    }
-}
-
-#[derive(Debug)]
-struct OrtCudaEventFence {
-    _context: Arc<CudaContext>,
-    device_id: i32,
-    event: cu::CUevent,
-}
-
-impl ReleaseFence for OrtCudaEventFence {
-    fn is_complete(&self) -> bool {
-        if crate::cuda_rt::DeviceGuard::set(self.device_id).is_err() {
-            return false;
-        }
-        matches!(
-            unsafe { cu::cuEventQuery(self.event) },
-            cu::CUresult::CUDA_SUCCESS
-        )
-    }
-}
-
-// SAFETY: the raw event handle is only queried or destroyed through CUDA driver
-// calls after making the owning device current on the calling thread.
-unsafe impl Send for OrtCudaEventFence {}
-// SAFETY: shared references only perform non-blocking event queries; final
-// destruction happens once from Drop.
-unsafe impl Sync for OrtCudaEventFence {}
-
-impl Drop for OrtCudaEventFence {
-    fn drop(&mut self) {
-        if self.event.is_null() {
-            return;
-        }
-        if crate::cuda_rt::DeviceGuard::set(self.device_id).is_ok() {
-            unsafe {
-                let _ = cu::cuEventDestroy_v2(self.event);
-            }
-        }
+        Err(String::from(
+            "ORT does not provide a lifetime token for allocator callback CUDA streams; \
+             retaining the allocation instead of recording on a possibly destroyed stream",
+        ))
     }
 }
 
@@ -267,61 +154,6 @@ impl ReleaseObserver for ManagedCudaOrtReleaseObserver {
 }
 
 #[derive(Debug)]
-struct TeardownTrackedAllocator {
-    inner: Arc<CudaVmmAllocator>,
-    completion: Arc<AtomicBool>,
-}
-
-impl Drop for TeardownTrackedAllocator {
-    fn drop(&mut self) {
-        self.completion.store(true, Ordering::Release);
-    }
-}
-
-impl DeviceAllocator for TeardownTrackedAllocator {
-    fn allocate(
-        &self,
-        bytes: usize,
-        align: usize,
-    ) -> std::result::Result<NonNull<u8>, onnx_runtime_memory_governor::MemoryError> {
-        self.inner.allocate(bytes, align)
-    }
-
-    unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, align: usize) {
-        unsafe { self.inner.deallocate(ptr, bytes, align) };
-    }
-
-    unsafe fn deallocate_with_unmapped(&self, ptr: NonNull<u8>, bytes: usize, align: usize) -> u64 {
-        unsafe { self.inner.deallocate_with_unmapped(ptr, bytes, align) }
-    }
-
-    unsafe fn release(
-        &self,
-        ptr: NonNull<u8>,
-        bytes: usize,
-        align: usize,
-    ) -> AllocationReleaseOutcome {
-        unsafe { self.inner.release(ptr, bytes, align) }
-    }
-
-    fn device(&self) -> DeviceKey {
-        self.inner.device()
-    }
-
-    fn commits_on_demand(&self) -> bool {
-        self.inner.commits_on_demand()
-    }
-
-    fn as_virtual_backing(&self) -> Option<&dyn onnx_runtime_memory_governor::VirtualBacking> {
-        self.inner.as_virtual_backing()
-    }
-
-    fn as_shared_mapping(&self) -> Option<&dyn onnx_runtime_memory_governor::SharedMapping> {
-        self.inner.as_shared_mapping()
-    }
-}
-
-#[derive(Debug)]
 struct LiveAllocation {
     allocation: ManagedAllocation,
     requires_stream_ordering: bool,
@@ -334,7 +166,6 @@ struct ManagedCudaOrtAllocatorState {
     memory: Arc<dyn DeviceAllocator>,
     queue: Arc<CudaDeferredReleaseQueue>,
     roles: AllocationRoles,
-    stream: Arc<ObservedOrtCudaStreams>,
     live_allocations: Mutex<HashMap<usize, LiveAllocation>>,
     live_bytes: AtomicU64,
     live_count: AtomicUsize,
@@ -369,7 +200,6 @@ impl ManagedCudaOrtAllocator {
         holder: RegisteredMemoryHolder,
         memory: Arc<dyn DeviceAllocator>,
         queue: Arc<CudaDeferredReleaseQueue>,
-        stream: Arc<ObservedOrtCudaStreams>,
     ) -> Box<Self> {
         Box::new(Self {
             base: onnx_genai_ort_sys::OrtAllocator {
@@ -390,7 +220,6 @@ impl ManagedCudaOrtAllocator {
                 memory,
                 queue,
                 roles: AllocationRoles::split(),
-                stream,
                 live_allocations: Mutex::new(HashMap::new()),
                 live_bytes: AtomicU64::new(0),
                 live_count: AtomicUsize::new(0),
@@ -422,22 +251,67 @@ impl ManagedCudaOrtAllocator {
     }
 }
 
+/// Process-lifetime owner for an allocator ORT may retain in sessions/OrtValues.
+///
+/// ORT installs the raw allocator pointer with a no-op deleter and exposes no
+/// last-user notification, so successful registrations are intentionally leaked.
 pub(crate) struct ManagedCudaEnvironmentRegistration {
-    env: NonNull<onnx_genai_ort_sys::OrtEnv>,
     device_id: i32,
     authority_id: onnx_runtime_memory_governor::MemoryAuthorityId,
-    memory_info: MemoryInfo,
     registered_allocator: Box<ManagedCudaOrtAllocator>,
-    queue: Arc<CudaDeferredReleaseQueue>,
-    device_lost: Arc<AtomicBool>,
-    allocator_teardown_complete: Arc<AtomicBool>,
-    context: RegisteredMemoryContext,
-    authority: RegisteredMemoryAuthority,
-    mechanism: RegisteredMemoryMechanism,
-    holder: RegisteredMemoryHolder,
+    _loss_listener: Arc<dyn DeviceLossListener>,
     manager: ProcessMemoryManager,
-    cuda_context_identity: usize,
-    cleanup_armed: AtomicBool,
+}
+
+/// Cleans every manager record if construction fails before ORT registration.
+struct RegistrationRollback {
+    manager: ProcessMemoryManager,
+    context: Option<RegisteredMemoryContext>,
+    authority: Option<RegisteredMemoryAuthority>,
+    mechanism: Option<RegisteredMemoryMechanism>,
+    holder: Option<RegisteredMemoryHolder>,
+    binding: Option<ScopedMemoryBinding>,
+    armed: bool,
+}
+
+impl RegistrationRollback {
+    fn new(manager: ProcessMemoryManager) -> Self {
+        Self {
+            manager,
+            context: None,
+            authority: None,
+            mechanism: None,
+            holder: None,
+            binding: None,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RegistrationRollback {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        drop(self.binding.take());
+        if let Some(mechanism) = self.mechanism.take() {
+            let _ = self.manager.retire(&mechanism);
+            let _ = self.manager.remove_mechanism(&mechanism);
+        }
+        if let Some(holder) = self.holder.take() {
+            let _ = self.manager.unregister_holder(&holder);
+        }
+        if let Some(authority) = self.authority.take() {
+            let _ = self.manager.remove_authority(&authority);
+        }
+        if let Some(context) = self.context.take() {
+            let _ = self.manager.remove_provider_context(&context);
+        }
+    }
 }
 
 impl ManagedCudaEnvironmentRegistration {
@@ -455,23 +329,12 @@ impl ManagedCudaEnvironmentRegistration {
             Arc::new(CudaContext::new(device_id as usize).map_err(|error| {
                 OrtError::Cuda(format!("CudaContext::new({device_id}): {error}"))
             })?);
-        let stream = Arc::new(ObservedOrtCudaStreams::default());
         let queue = CudaDeferredReleaseQueue::new(
-            Box::new(OrtCudaUnifiedStreamFences {
-                _context: Arc::clone(&context),
-                device_id,
-                stream: Arc::clone(&stream),
-            }),
+            Box::new(OrtCudaFailClosedFences),
             onnx_runtime_ep_cuda::deferred_release::DEFAULT_DEFERRED_RELEASE_CAPACITY,
         );
         let manager = config.manager().clone();
         let authority_id = config.authority_id();
-        let cuda_context_identity = physical_pool_context_identity(context.as_ref()).map_err(|error| {
-            OrtError::Cuda(format!(
-                "managed CUDA allocator could not identify CUDA context for device {device_id}: \
-                 {error}"
-            ))
-        })?;
         let device_lost = Arc::new(AtomicBool::new(false));
         let loss_listener: Arc<dyn DeviceLossListener> = Arc::new(OrtCudaDeviceLossForwarder {
             queue: Arc::clone(&queue),
@@ -480,6 +343,7 @@ impl ManagedCudaEnvironmentRegistration {
         let registration_generation = manager
             .register_device_loss_listener(device, &loss_listener)
             .map_err(|error| manager_error("register CUDA device-loss listener", error))?;
+        let mut rollback = RegistrationRollback::new(manager.clone());
         let governed_capacity = config
             .governor()
             .used(Tier::Device)
@@ -506,6 +370,7 @@ impl ManagedCudaEnvironmentRegistration {
                 ));
             }
         };
+        rollback.context = Some(registered_context.clone());
         let authority_resource = Arc::new(OrtCudaAuthorityPin {
             _device_id: device_id as u32,
         });
@@ -517,13 +382,13 @@ impl ManagedCudaEnvironmentRegistration {
         ) {
             Ok(authority) => authority,
             Err(error) => {
-                let _ = manager.remove_provider_context(&registered_context);
                 return Err(manager_error(
                     "register the managed CUDA accounting authority",
                     error,
                 ));
             }
         };
+        rollback.authority = Some(registered_authority.clone());
         if manager.process_limit(Tier::Device) != u64::MAX
             && !registered_authority.has_process_delegation(Tier::Device)
             && let Err(error) = manager.delegate_authority_capacity(
@@ -532,8 +397,6 @@ impl ManagedCudaEnvironmentRegistration {
                 governed_capacity,
             )
         {
-            let _ = manager.remove_authority(&registered_authority);
-            let _ = manager.remove_provider_context(&registered_context);
             return Err(manager_error(
                 "delegate process device capacity to the managed CUDA authority",
                 error,
@@ -550,11 +413,7 @@ impl ManagedCudaEnvironmentRegistration {
             config.governor().as_ref(),
             reservation_queue,
         )?;
-        let allocator_teardown_complete = Arc::new(AtomicBool::new(false));
-        let tracked_allocator: Arc<dyn DeviceAllocator> = Arc::new(TeardownTrackedAllocator {
-            inner: allocator,
-            completion: Arc::clone(&allocator_teardown_complete),
-        });
+        let tracked_allocator: Arc<dyn DeviceAllocator> = allocator;
         let mechanism = match manager.register_allocator(
             &registered_context,
             &registered_authority,
@@ -563,28 +422,20 @@ impl ManagedCudaEnvironmentRegistration {
         ) {
             Ok(mechanism) => mechanism,
             Err(error) => {
-                let _ = manager.remove_authority(&registered_authority);
-                let _ = manager.remove_provider_context(&registered_context);
                 return Err(manager_error("register the managed CUDA allocator", error));
             }
         };
+        rollback.mechanism = Some(mechanism.clone());
         if let Err(error) = manager.select(&mechanism) {
-            let _ = manager.retire(&mechanism);
-            let _ = manager.remove_mechanism(&mechanism);
-            let _ = manager.remove_authority(&registered_authority);
-            let _ = manager.remove_provider_context(&registered_context);
             return Err(manager_error("select the managed CUDA allocator", error));
         }
         let binding = match manager.bind_registered(&mechanism) {
             Ok(binding) => binding,
             Err(error) => {
-                let _ = manager.retire(&mechanism);
-                let _ = manager.remove_mechanism(&mechanism);
-                let _ = manager.remove_authority(&registered_authority);
-                let _ = manager.remove_provider_context(&registered_context);
                 return Err(manager_error("bind the managed CUDA allocator", error));
             }
         };
+        rollback.binding = Some(binding);
         let holder = match manager.register_holder(
             &registered_authority,
             format!("ort-cuda:{device_id} environment allocations"),
@@ -592,30 +443,24 @@ impl ManagedCudaEnvironmentRegistration {
         ) {
             Ok(holder) => holder,
             Err(error) => {
-                drop(binding);
-                let _ = manager.retire(&mechanism);
-                let _ = manager.remove_mechanism(&mechanism);
-                let _ = manager.remove_authority(&registered_authority);
-                let _ = manager.remove_provider_context(&registered_context);
                 return Err(manager_error(
                     "register the managed CUDA allocation holder",
                     error,
                 ));
             }
         };
+        rollback.holder = Some(holder.clone());
         if let Err(error) = manager.finish_device_registration(device, registration_generation) {
-            let _ = manager.retire(&mechanism);
-            let _ = manager.remove_mechanism(&mechanism);
-            let _ = manager.unregister_holder(&holder);
-            let _ = manager.remove_authority(&registered_authority);
-            let _ = manager.remove_provider_context(&registered_context);
             return Err(manager_error(
                 "finalize managed CUDA device registration",
                 error,
             ));
         }
 
-        let memory_info = MemoryInfo::cuda(device_id)?;
+        let binding = rollback
+            .binding
+            .take()
+            .expect("managed CUDA registration binding was recorded");
         let mut registered_allocator = ManagedCudaOrtAllocator::new(
             MemoryInfo::cuda(device_id)?,
             binding,
@@ -623,7 +468,6 @@ impl ManagedCudaEnvironmentRegistration {
             holder.clone(),
             tracked_allocator,
             Arc::clone(&queue),
-            stream,
         );
         let register = error::api()?
             .RegisterAllocator
@@ -634,166 +478,25 @@ impl ManagedCudaEnvironmentRegistration {
                 registered_allocator.as_ort_allocator(),
             )
         })?;
+        rollback.disarm();
 
         Ok(Self {
-            env: NonNull::new(environment.as_ptr().cast_mut()).ok_or(OrtError::NullPointer)?,
             device_id,
             authority_id,
-            memory_info,
             registered_allocator,
-            queue,
-            device_lost,
-            allocator_teardown_complete,
-            context: registered_context,
-            authority: registered_authority,
-            mechanism,
-            holder,
+            _loss_listener: loss_listener,
             manager,
-            cuda_context_identity,
-            cleanup_armed: AtomicBool::new(false),
         })
     }
 
     pub(crate) fn matches(&self, config: &ManagedCudaAllocatorConfig) -> bool {
-        self.device_id == config.device_id() && self.authority_id == config.authority_id()
+        self.device_id == config.device_id()
+            && self.authority_id == config.authority_id()
+            && self.manager.is_same_instance(config.manager())
     }
 
     pub(crate) fn stats(&self) -> ManagedCudaAllocatorStats {
         self.registered_allocator.stats()
-    }
-
-    fn arm_cleanup(&self) {
-        if self.cleanup_armed.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        if let Err(error) = self.manager.retire_context(&self.context) {
-            warn_cleanup(
-                "could not retire the managed CUDA context during teardown",
-                &error,
-            );
-        }
-        if let Err(error) = self.manager.retire(&self.mechanism) {
-            warn_cleanup(
-                "could not retire the managed CUDA allocator mechanism during teardown",
-                &error,
-            );
-        }
-        let manager = self.manager.downgrade();
-        let mechanism = self.mechanism.clone();
-        let holder = self.holder.clone();
-        let context = self.context.clone();
-        let authority = self.authority.clone();
-        let authority_id = authority.memory_authority_id();
-        let allocator_teardown_complete = Arc::clone(&self.allocator_teardown_complete);
-        let device_lost = Arc::clone(&self.device_lost);
-        let cuda_context_identity = self.cuda_context_identity;
-        self.queue.set_drain_callback(move || {
-            let Some(manager) = manager.upgrade() else {
-                return true;
-            };
-            if device_lost.load(Ordering::Acquire) {
-                if !allocator_teardown_complete.load(Ordering::Acquire) {
-                    return false;
-                }
-                if let Err(error) = manager.confirm_context_terminated(&context) {
-                    warn_cleanup(
-                        "could not confirm managed CUDA context termination after device loss",
-                        &error,
-                    );
-                    return true;
-                }
-                if let Some(authority_id) = authority_id {
-                    confirm_physical_handle_pool_context_terminated(
-                        cuda_context_identity,
-                        authority_id,
-                    );
-                }
-                if let Err(error) = manager.remove_mechanism(&mechanism)
-                    && !matches!(
-                        error,
-                        AllocationTransactionError::Binding(BindingError::UnregisteredMechanism(_))
-                    )
-                {
-                    warn_cleanup(
-                        "could not remove a terminated managed CUDA mechanism",
-                        &error,
-                    );
-                }
-                if let Err(error) = manager.unregister_holder(&holder) {
-                    warn_cleanup(
-                        "could not unregister the managed CUDA holder after device loss",
-                        &error,
-                    );
-                }
-                if let Err(error) = manager.remove_provider_context(&context) {
-                    warn_cleanup(
-                        "could not remove the managed CUDA context pin after device loss",
-                        &error,
-                    );
-                    return true;
-                }
-                if let Err(error) = manager.remove_authority(&authority)
-                    && !matches!(
-                        error,
-                        AllocationTransactionError::Binding(BindingError::AuthorityInUse(_))
-                    )
-                {
-                    warn_cleanup(
-                        "could not remove the managed CUDA authority after device loss",
-                        &error,
-                    );
-                }
-                return true;
-            }
-
-            match manager.remove_mechanism(&mechanism) {
-                Ok(())
-                | Err(AllocationTransactionError::Binding(BindingError::UnregisteredMechanism(
-                    _,
-                ))) => {}
-                Err(AllocationTransactionError::Binding(BindingError::InactiveMechanism {
-                    ..
-                })) => {
-                    return false;
-                }
-                Err(error) => {
-                    warn_cleanup(
-                        "could not remove the managed CUDA allocator mechanism after queue drain",
-                        &error,
-                    );
-                    return true;
-                }
-            }
-            if !allocator_teardown_complete.load(Ordering::Acquire) {
-                return false;
-            }
-            if let Err(error) = manager.unregister_holder(&holder) {
-                warn_cleanup(
-                    "could not unregister the managed CUDA holder after queue drain",
-                    &error,
-                );
-            }
-            if let Err(error) = manager.remove_provider_context(&context) {
-                warn_cleanup(
-                    "could not remove the managed CUDA context pin after queue drain",
-                    &error,
-                );
-                return true;
-            }
-            if let Err(error) = manager.remove_authority(&authority)
-                && !matches!(
-                    error,
-                    AllocationTransactionError::Binding(BindingError::AuthorityInUse(_))
-                )
-            {
-                warn_cleanup(
-                    "could not remove the managed CUDA authority after queue drain",
-                    &error,
-                );
-            }
-            true
-        });
-        self.queue.close_after_drain();
     }
 }
 
@@ -808,29 +511,16 @@ impl fmt::Debug for ManagedCudaEnvironmentRegistration {
     }
 }
 
-impl Drop for ManagedCudaEnvironmentRegistration {
-    fn drop(&mut self) {
-        if let Ok(api) = error::api()
-            && let Some(unregister) = api.UnregisterAllocator
-            && let Err(error) = crate::error::check_status(unsafe {
-                unregister(self.env.as_ptr(), self.memory_info.as_ptr())
-            })
-        {
-            eprintln!(
-                "onnx-genai-ort: WARNING: could not unregister managed CUDA allocator for device {}: \
-                 {error}",
-                self.device_id
-            );
-        }
-        self.arm_cleanup();
-    }
-}
-
 pub(crate) fn register_managed_cuda_allocator(
     environment: &Environment,
     config: &ManagedCudaAllocatorConfig,
-) -> Result<ManagedCudaEnvironmentRegistration> {
-    ManagedCudaEnvironmentRegistration::new(environment, config)
+) -> Result<&'static ManagedCudaEnvironmentRegistration> {
+    let registration = ManagedCudaEnvironmentRegistration::new(environment, config)?;
+    // ORT copies environment allocators into sessions and OrtValues behind a
+    // no-op deleter, and exposes no last-user notification. Keep the allocator,
+    // its manager registrations, CUDA context, queue, and listener alive for
+    // process lifetime so no callback can ever target freed Rust storage.
+    Ok(Box::leak(Box::new(registration)))
 }
 
 unsafe fn managed_cuda_allocator_from_base<'a>(
@@ -869,7 +559,7 @@ unsafe extern "C" fn managed_cuda_alloc_on_stream(
         return std::ptr::null_mut();
     };
     let native = unsafe { get_handle(stream) };
-    if allocator.state.stream.record(native).is_err() {
+    if native.is_null() {
         return std::ptr::null_mut();
     }
     allocate_cuda_ort_memory(allocator, size, allocator.state.roles.run, true)
@@ -917,14 +607,6 @@ unsafe extern "C" fn managed_cuda_free(
         }
         return;
     }
-    if state.stream.current().is_empty() {
-        eprintln!(
-            "onnx-genai-ort: WARNING: quarantining a managed CUDA allocation because ORT never \
-             exposed any CUDA stream before free"
-        );
-        drop(live);
-        return;
-    };
     let prepared = match live.allocation.prepare_release() {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -1120,14 +802,6 @@ fn device_total_memory_bytes(ordinal: u32) -> Option<usize> {
     }
 }
 
-fn check_cuda(operation: &str, result: cu::CUresult) -> std::result::Result<(), String> {
-    if result == cu::CUresult::CUDA_SUCCESS {
-        Ok(())
-    } else {
-        Err(format!("{operation} failed with CUDA result {result:?}"))
-    }
-}
-
 fn binding_error(operation: &str, error: BindingError) -> OrtError {
     OrtError::SessionCreation(format!("could not {operation}: {error}"))
 }
@@ -1136,6 +810,54 @@ fn manager_error(operation: &str, error: AllocationTransactionError) -> OrtError
     OrtError::SessionCreation(format!("could not {operation}: {error}"))
 }
 
-fn warn_cleanup(operation: &str, error: &impl fmt::Display) {
-    eprintln!("onnx-genai-ort: WARNING: {operation}: {error}");
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use onnx_runtime_memory_governor::HostAllocator;
+
+    #[derive(Debug)]
+    struct Pin;
+
+    #[test]
+    fn stream_fence_source_fails_closed_without_touching_a_raw_stream() {
+        let source = OrtCudaFailClosedFences;
+        let error = source
+            .record()
+            .expect_err("raw ORT streams have no lifetime token");
+        assert!(error.contains("possibly destroyed stream"));
+    }
+
+    #[test]
+    fn registration_rollback_removes_every_manager_record() {
+        let manager = ProcessMemoryManager::new().expect("manager");
+        let context = manager
+            .register_provider_context(DeviceKey::HOST, "test context", Arc::new(Pin))
+            .expect("context");
+        let authority = manager
+            .register_compatibility_authority(DeviceKey::HOST, "test authority", Arc::new(Pin))
+            .expect("authority");
+        let allocator: Arc<dyn DeviceAllocator> = Arc::new(HostAllocator);
+        let mechanism = manager
+            .register_allocator(&context, &authority, "test allocator", allocator)
+            .expect("mechanism");
+        manager.select(&mechanism).expect("select");
+        let binding = manager.bind_registered(&mechanism).expect("binding");
+        let holder = manager
+            .register_holder(&authority, "test holder", None)
+            .expect("holder");
+
+        drop(RegistrationRollback {
+            manager: manager.clone(),
+            context: Some(context),
+            authority: Some(authority),
+            mechanism: Some(mechanism),
+            holder: Some(holder),
+            binding: Some(binding),
+            armed: true,
+        });
+
+        let snapshot = manager.snapshot().expect("snapshot");
+        assert_eq!(snapshot.authority_count, 0);
+        assert!(snapshot.mechanism_snapshots.is_empty());
+    }
 }
