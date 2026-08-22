@@ -30,6 +30,12 @@
 //! live; the refusal hands the plugin back so the caller can retire the
 //! outstanding work and retry.
 //!
+//! An allocator opened through
+//! [`PluginFactory::open_with_provider_context`](loader::PluginFactory::open_with_provider_context)
+//! additionally pins the provider/context each queued release will retire
+//! against, so that provider cannot finish teardown while a plugin still owes
+//! it a free.
+//!
 //! [report]: onnx_runtime_memory_abi::NxmemUnloadReport
 
 // `NxmemStatus` carries its message inline, in a fixed 256-byte buffer, so that

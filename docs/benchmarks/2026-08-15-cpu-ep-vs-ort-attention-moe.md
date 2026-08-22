@@ -4536,3 +4536,432 @@ one is usually a single measurement.
 Neither investigation reported throughput: the box was shared, and a token-stream
 comparison is immune to contention while a timing number is not. Both conclusions
 rest on exact token ids and logprob margins, which are contention-independent.
+
+## 45. The route with a known defect was the route with no A/B (#1685)
+
+#1685 reported an SDPA fast-path failure under `--features mlas`: ~3% of runs on
+`main` left an 8-row hole of exact `0.0` in the output, or died with a SIGSEGV,
+tripping `identity specialization diverged`. The investigation found the bug
+**already fixed** — incidentally, by an unrelated PR, with nothing guarding it —
+and then found the more interesting thing: *why nobody had noticed either the
+break or the fix*.
+
+### 45.1 The defect: a straggler from a retired epoch
+
+`WorkStealingThreadPool::parallel_for` publishes one job into a single shared
+slot under `dispatch_lock`. `wait_for_completion` returns when `remaining`
+reaches zero — when the last **block** has run. A worker is not finished then:
+it is still inside `run_job`, holding a by-value copy of the old `Job` and
+looping in `claim_iterations` against the *shared* counters.
+
+Before `0f40538b2` (PR #828, which added the 12 lines as a side effect of an
+unrelated IR redesign) the dispatcher returned and released the lock at that
+moment. MLAS fans out under rayon in `sdpa_f32_fast`, so the next dispatch came
+from a different rayon worker, republished the loop bounds and bumped the epoch
+while the straggler was still live. The straggler then claimed a block of the
+**new** range and did two things at once:
+
+1. decremented the new job's `remaining` without running the new closure, so
+   `wait_for_completion` returned early and a partition **never executed** — a
+   `beta = 0` SGEMM left those rows of `C` untouched (the 8-row hole, `8 · dv`
+   contiguous zeros at a tile boundary: MLAS had split the 128-row `probs·V`
+   GEMM 16 ways); and
+2. invoked the **old** closure with an index from the **new** range, writing
+   through raw pointers past the end of the previous GEMM's `C` — the SIGSEGV.
+
+`wait_for_workers` closes both by making the dispatcher wait for
+`observed == worker_count` before clearing the `Job`.
+
+### 45.2 Why it would not reproduce, and what finally did
+
+Direct reproduction failed completely: 80 runs of the exact test, 40 runs at
+`--test-threads 8`, pool widths 4/8/16/32, 3000 iterations of a nested
+rayon×`sgemm` stress with NaN-prefilled `C`, and 6000 `sdpa_f32` invocations at
+the reported shape — **zero** holes.
+
+The reason is that the race needs two dispatches to *overlap*, and concurrent
+`parallel_for` calls are serialised by `dispatch_lock`. The window is only the
+gap between the last block finishing and the straggler leaving `run_job`, which
+is why the issue reports ~3% **per process** rather than per invocation.
+
+What settled it was a falsifier rather than a reproducer: remove
+`wait_for_workers` from current `main` and run four dispatcher threads against
+one 8-thread pool. The guard test passes in 0.12 s on `main` and fails in
+milliseconds without it — `range start index 16 out of range for slice of
+length 0`, i.e. a retired-epoch straggler running the old closure against the
+new range, which is #1685's SIGSEGV in safe-Rust form.
+
+**Rule.** When a race will not reproduce, stop trying to trigger it and try to
+*break the fix instead*. A falsifier that fails in milliseconds is a better
+regression guard than a reproducer that fires 3% of the time, and it is the one
+you can leave running in CI.
+
+### 45.3 The actual finding: the audit, not the kernel
+
+The kernel needed no fix. The coverage did:
+
+| Instrument | State before #1685 |
+|---|---|
+| `backend_ab.rs` `AB_COVERED` | `AttentionTranspose` **absent**, while its `PLAN` entry claimed `Graduation::Partial` — and the graduation rule *reads* `AB_COVERED` |
+| `tests/native_vs_mlas_differential.rs` | no attention row at all |
+| `benches/native_vs_mlas.rs` | no attention row at all |
+| `identity_hook_specialization_matches_the_general_epilogue` | compared two **zero-prefilled** buffers |
+| `scripts/ort_ab/gen_mha.py` | 7 cells, all bidirectional encoder shapes; `unidirectional` supported but never set; no `q_seq = 1`; no past-KV |
+| `mha_parity/cases.rs` | 12 goldens; the only past-KV case has `q_seq = 1`, so `causal = unidirectional && q_seq > 1` is **false** |
+
+The zero-prefill point is not theoretical. Dropping 8 rows per tile from the
+`probs·V` GEMM — 6144 of 98304 elements, #1685's exact signature — leaves the
+pre-existing test **passing**, because an unwritten element is indistinguishable
+from a legitimate `0.0` and a hole that lands identically in both compared runs
+cancels out. The same falsifier against the NaN-prefilled version reports
+`left 6144 of 98304 output elements unwritten; first at index 7680 =
+(tile 0, row 120, column 0)`.
+
+**Rule.** A buffer prefilled with the identity of the operation cannot
+distinguish "computed" from "skipped". Prefill with a value the kernel can never
+legitimately produce.
+
+### 45.4 An undefined benchmark cell is not a slow benchmark cell
+
+Adding causal and decode rows to `gen_mha.py` immediately produced 24/384
+parity failures on one cell: `q_seq = 8`, `kv_seq = 1024`, `unidirectional = 1`,
+no past-KV — chunked prefill expressed as one fused long K/V.
+
+That looked like a kernel bug and was not one. Sweeping a NumPy oracle over
+*every* causal offset in `0..=kv_seq` matched ORT at **none** of them, while the
+same oracle matches ORT to 1.2e-7 with `unidirectional = 0`, and matches to
+2.4e-7 at offset `past_seq` once a real past-KV cache is supplied. ORT's
+`unidirectional` is simply undefined when `q_seq != kv_seq` with no past input.
+
+So the cell was invalid: neither runtime was computing a defined answer, and any
+timing from it is meaningless. It is replaced by past-KV cells
+(`llama_decode_past1023`, `llama_chunk8_past1016`, `llama_chunk32_past992`),
+which is how the runtime actually emits chunked prefill, and `build_mha` now
+raises on the invalid combination rather than emitting a graph that will fail
+parity later.
+
+**Rule.** Before treating a parity failure as a kernel bug, check that the graph
+has a defined answer. An oracle sweep over the plausible conventions costs
+minutes and distinguishes "we are wrong" from "the question is malformed".
+
+### 45.5 The offset nothing was checking
+
+The same exercise exposed a second hole. `past_seq` is load-bearing only when
+`q_seq > 1` **and** the cache is non-empty; every self-attention golden has
+`past == 0` and the one past-KV golden has `q_seq == 1`. So the causal offset
+was verified by nothing.
+
+Hard-coding `past_seq = 0` leaves **all 12 pre-existing goldens passing**. The
+new `past_kv_chunked_prefill_causal` case (`S = 3`, `past = 6`,
+`unidirectional = 1`) is the only one that fails, at `max abs diff 2.22`. Our
+convention was already correct; it is now pinned.
+
+### 45.6 The kernel gap the new coverage did find
+
+With past-KV cells finally in the matrix, `llama_decode_past1023` measured
+**27.2x** ORT. `concat_cache` was the cause, and it was a pure layout mistake:
+
+```rust
+for d in 0..dim {            // head dim OUTSIDE
+    for j in 0..past.seq {   // sequence INSIDE
+        data[((b * heads + h) * total + j) * dim + d] = past.at(b, h, j, d);
+```
+
+`Bnsh` is contiguous `[b][h][s][d]`, so consecutive stores were `dim` floats —
+512 B at Llama's head size — apart. Every store touched a fresh cache line and
+the whole tensor was traversed `dim` times: a column-major walk of a row-major
+buffer, ~4.2 M near-certain misses per tensor, ~20 ms of a ~28 ms node. The
+operator spent most of a decode step copying its own cache.
+
+For a fixed `(b, h)` plane both sources are already laid out as the destination
+needs them, so the concat is two `copy_from_slice` calls, fanned across planes
+on the same `MIN_PARALLEL_TRANSPOSE_ELEMENTS` threshold the sibling transforms
+use. The two neighbouring functions document this exact rule in their doc
+comments; `concat_cache` was the one place that broke it, and no benchmark row
+supplied a past-KV cache, so nothing measured it.
+
+| cell (t=8) | before | after |
+|---|---|---|
+| `llama_decode_past1023` | 27.2x | 13.8x |
+| `llama_chunk8_past1016` | 24.8x | 13.1x |
+| `llama_chunk32_past992` | 27.7x | 18.5x |
+
+**Rule.** A convention documented in two of three sibling functions is not
+enforced anywhere. The third one is where the cost is.
+
+### 45.7 Complete results, production default build, 18 cells x 4 thread counts
+
+Default (MLAS-free) `bench_generic`: `nm`, `nm -D`, `strings` and `ldd` all
+report **0** MLAS symbols and no `libstdc++`. The same probes on a
+`--features mlas` build of the same crate report **842** symbols, 105 strings
+and a `libstdc++` link, so the probe is known to be able to see MLAS when it is
+there. `MultiHeadAttention` executes natively at 99.97% of node time, one call,
+no ORT fallback. 432/432 trials parity `PASS` (the 24 failures were the
+undefined cell, now removed).
+
+**Measurement conditions -- what the absolute milliseconds are and are not.**
+This grid was taken on a shared 16-physical/32-logical host on which other
+agents run benchmarks and full test suites. Roy has since measured the *same*
+cell at 197.2 and 22.8 tok/s in two windows -- an 8.6x swing from contention
+alone -- with intra-run spreads as tight as 6% in the corrupted samples. A
+tight spread only says contention was *steady* during the run; it does not say
+the host was quiet. I did not record host occupancy for this window, so I
+cannot certify it was.
+
+What survives that, and why:
+
+- **Ratios.** The arms are interleaved, so a steady occupancy tax inflates both
+  and cancels in `native/ort`. This covers the parity grid and the
+  `concat_cache` before/after figures in 45.6.
+- **The scaling shape in 45.8.** ORT improved 3.05 -> 1.06 ms across
+  `t = 1 -> 16` *in the same interleaved window* in which the native arm stayed
+  flat. Contention cannot starve one interleaved arm while the other scales
+  2.9x, so ORT is a positive control for core availability -- the same role the
+  842-symbol MLAS build plays for the symbol probe above. The finding also has
+  a timing-free leg: `sdpa_f32_simd` contains no fan-out at all.
+
+What does not survive: the **absolute** millisecond columns below. A steady
+occupancy tax is invisible in the spread *and* invisible in the ratio, and it
+is real. Treat them as shape, not as throughput numbers, and do not quote them
+as a baseline without re-measuring on a recorded quiet window. In particular
+the mild regression at `t = 16` (9.2 -> 14.4 ms) is small enough to be a
+contention artifact; nothing in 45.8 depends on it.
+
+**Rule.** A benchmark on a shared host must record host occupancy alongside the
+numbers, gating on the instantaneous runnable count
+(`cut -d' ' -f4 /proc/loadavg | cut -d/ -f1`) rather than the 1-minute load
+average, which is an EMA and misleads in both directions -- it stays high for a
+minute after a heavy run ends and reads low while a burst is still in flight.
+An unrecorded window cannot be defended later; it can only be re-run.
+
+`native/ort`, p50, lower is better; `(…)` is the same-invocation A/A null
+control arm:
+
+| cell | t=1 | t=4 | t=8 | t=16 | native ms t=1 → t=16 |
+|---|---|---|---|---|---|
+| `bert_base_b8_s128` | 5.36 (5.31) | 13.01 (8.97) | 15.50 (14.46) | 19.93 (20.97) | 38.2 → 42.3 |
+| `bert_base_decode_kv1024` | 1.51 (1.54) | 0.78 (0.76) | **0.55** (0.46) | 0.62 (0.58) | 1.2 → 1.3 |
+| `bert_base_s128` | 5.71 (5.73) | 9.99 (8.56) | 11.63 (10.64) | 11.65 (12.29) | 4.8 → 7.8 |
+| `bert_base_s384` | 7.04 (7.14) | 22.89 (15.69) | 23.36 (23.78) | 28.18 (32.36) | 52.7 → 59.7 |
+| `bert_large_s128` | 5.65 (5.67) | 11.29 (8.89) | 12.75 (14.01) | 15.75 (15.92) | 6.3 → 11.0 |
+| `clip_l14_s257` | 5.79 (5.74) | 14.00 (13.25) | 24.49 (25.95) | 24.83 (24.52) | 25.0 → 38.1 |
+| `llama_chunk32_past992` | 4.11 (4.18) | 11.69 (12.31) | 17.93 (17.64) | 24.29 (23.75) | 42.4 → 42.9 |
+| `llama_chunk8_past1016` | 3.41 (3.59) | 8.10 (7.59) | 11.77 (11.99) | 17.16 (17.15) | 17.6 → 21.9 |
+| `llama_decode_b8_kv1024` | 1.50 (1.50) | 1.44 (1.45) | 1.55 (1.53) | 1.53 (1.55) | 79.9 → 51.4 |
+| `llama_decode_kv1024` | 1.93 (1.88) | 1.14 (1.46) | 1.33 (1.22) | 1.24 (1.68) | 13.1 → 8.8 |
+| `llama_decode_kv128` | 1.50 (1.49) | 0.69 (0.75) | **0.63** (0.65) | 0.72 (0.63) | 0.6 → 0.8 |
+| `llama_decode_kv4096` | 1.59 (1.59) | 1.32 (1.35) | 1.40 (1.39) | 1.40 (1.68) | 42.2 → 31.8 |
+| `llama_decode_past1023` | 3.48 (3.49) | 8.21 (8.00) | 11.00 (9.65) | 15.03 (13.60) | 10.5 → 13.8 |
+| `llama_prefill_s128_causal` | 3.31 (3.35) | 5.67 (6.86) | 6.74 (7.67) | 9.96 (8.04) | 15.5 → 22.5 |
+| `llama_prefill_s512_causal` | 3.75 (3.73) | 12.34 (12.49) | 19.34 (19.30) | 21.86 (21.60) | 237.8 → 232.5 |
+| `phi35_prefill_s256_causal` | 4.02 (3.99) | 11.11 (10.67) | 15.20 (15.04) | 18.18 (17.25) | 51.8 → 52.8 |
+| `vit_b16_s197` | 5.64 (5.66) | 11.60 (11.33) | 11.37 (11.54) | 12.09 (16.70) | 10.9 → 11.3 |
+| `whisper_cross_s1500` | 6.16 (6.16) | 20.42 (21.55) | 31.52 (31.68) | 40.29 (40.46) | 182.6 → 181.3 |
+
+The null arm tracks the native arm within a few percent on every cell, so the
+ratios are the measurement and not the instrument.
+
+### 45.8 What the table actually says: the production SDPA route is single-threaded
+
+Read the last column. `native ms` is **flat** from 1 to 16 threads on every
+cell — 182.6 → 181.3 for whisper, 237.8 → 232.5 for `llama_prefill_s512`,
+42.4 → 42.9 for `chunk32`. The ratio degrades with thread count purely because
+ORT scales and we do not (`llama_decode_past1023`: ORT 3.05 ms → 1.06 ms across
+the same sweep).
+
+The code agrees with the measurement: `sdpa_f32_simd`, the route a **default**
+build takes on x86 and aarch64, is a plain `for b { for n { … } }` with no rayon
+fan-out at all. `sdpa_f32_fast` — the MLAS *research* route — does use
+`par_chunks_mut`. The shipped route is the serial one.
+
+That inverts how these ratios should be read. At `t = 1` the grid is 1.5–7.0x,
+which is a per-core efficiency gap. Everything above that is unclaimed
+parallelism, not kernel quality, and it is worth roughly the thread count. The
+decode cells that already win (`bert_base_decode_kv1024` 0.55x,
+`llama_decode_kv128` 0.63x) are the ones small enough that one core is enough.
+
+This is a separate workstream from #1685 and is filed as such rather than folded
+into a coverage PR; it also touches pool ownership, which is Sebastian's lane.
+Filed as **#1718**, carrying the flat `native_p50` column, the
+`llama_decode_past1023` thread-scaling control above, and the code observation.
+
+**Rule.** When a native/ORT ratio degrades monotonically with thread count while
+the native absolute time stays flat, stop optimising the kernel. The number is
+reporting the other runtime's scaling, not this one's arithmetic.
+
+### 45.9 Resolution, and one over-claim in 45.8 corrected
+
+#1718 is fixed: `sdpa_f32_simd` now fans out over flattened `(batch, head, query)`
+rows on the task runtime, above a measured 4 Mi-MAC floor. Full results, the
+threshold derivation and the falsifiers are in
+[`2026-08-22-sdpa-fanout.md`](2026-08-22-sdpa-fanout.md). The prefill and encoder
+cells above move -48% to -83% at t >= 4; `llama_prefill_s512_causal` — profiled at
+~73% SDPA on the critical path — goes **233.6 ms -> 30.7 ms (7.6x)** at t=16 with
+process CPU rising 137% -> 956%. That 7.6x is a 2-repeat focused A/B; the
+best-replicated win is `bert_base_s384` at -83.4% (6.0x, median of 3, 0.2% null
+arm).
+
+**But 45.8's "it is worth roughly the thread count" is wrong for the decode cells,
+and the correction matters more than the win.** Profiling
+`llama_decode_past1023` at t=16 — the exact cell 45.8 quotes as its
+thread-scaling control — shows it is **51% `__memmove_avx_unaligned_erms`**, under
+`concat_cache` and `load_bnsh`. `sdpa_f32_simd` is ~5.5% of samples, roughly 23%
+of wall. Amdahl therefore bounds *any* SDPA fix on that shape at about **1.3x**,
+not 16x, and the best-replicated measurement of that cell (**-21.7% at t=8**,
+11 trials, null arm +6.0%) sits essentially at that ceiling.
+
+The flat `native_p50` column was real and the code observation was correct. What
+did not follow is the sizing: a flat native column tells you parallelism is
+unclaimed, but not *how much* of the wall clock is available to claim. That
+requires attribution, and on decode-with-past shapes the attribution says the KV
+concat is the larger term. `concat_cache` also still reaches **global Rayon** in
+a pure-native build, which is a separate open lane.
+
+**Amended rule.** A flat native absolute time across thread counts identifies
+unclaimed parallelism, but it does not size the prize. Profile the cell before
+quoting a headroom multiple — otherwise you are asserting that the kernel you
+happened to be reading is the whole critical path.
+
+## 46. The residual was never steady state (a diagnostic, not a kernel)
+
+§38.7 closed with "the native-alone t=16→t=32 drift on the small shapes (roughly
+1.7×) survives everything above and has no explanation yet. It is the real
+remaining scheduler residual." It had an explanation. It is not a steady-state
+loss at all, and chasing it as one would have been wasted work.
+
+### 46.1 The drift reproduces, and then dissolves
+
+On latest `main`, native-only, arms interleaved, 9 reps, median ms — the drift is
+real at the harness's run count:
+
+| cell | t=16 | t=32 | drift |
+| --- | --- | --- | --- |
+| `qwen3_0p6b_qkv_t8` | 3.345 | 6.286 | 1.88× |
+| `qwen3_0p6b_qkv_t1` | 0.520 | 0.692 | 1.33× |
+| `qwen3_0p6b_mlp_t8` | 5.029 | 5.596 | 1.11× |
+
+Raising `--runs` from 7 to 40 removes it. Three reps at each width, same binary,
+same shapes:
+
+| t | native p50 (40 runs) | user CPU |
+| --- | --- | --- |
+| 16 | 1.325 / 1.735 / 1.051 ms | 2.33 / 2.23 / 2.13 s |
+| 32 | 1.223 / 1.724 / 1.039 ms | **4.39 / 4.43 / 4.38 s** |
+
+The wall times are the same to within noise. The CPU is not: t=32 burns almost
+exactly twice as much of it to produce the same answer in the same time.
+
+### 46.2 Splitting fixed from marginal
+
+Sweeping `--runs` and fitting CPU = fixed + marginal × runs separates the two
+terms cleanly. `gemm_nbits_qwen3_0p6b_qkv_t8`, native-only:
+
+| budget | fixed (CPU-s) | marginal (CPU-ms/inference) | steady-state wall |
+| --- | --- | --- | --- |
+| 2 | 0.13 | 8.19 | 4.531 ms |
+| 4 | 0.31 | 8.61 | 3.271 ms |
+| 8 | 0.63 | 8.05 | 1.588 ms |
+| 16 | 1.55 | 13.99 | 0.921 ms |
+| 32 | **3.67** | 15.17 | 0.934 ms |
+
+Two things fall out. The marginal cost per inference at t=16 and t=32 is
+essentially the same (13.99 vs 15.17), and so is the steady-state wall (0.921 vs
+0.934 — t=32 is very slightly *worse*). **There is no steady-state t=16→t=32
+drift.** What there is, is a fixed cost that grows faster than the budget does:
+roughly 2.4× per doubling against 2× the threads.
+
+That fixed cost is pool construction and warm-up, and it is entirely
+pre-existing. Measured against the phase-16 base binary it is identical — 0.64 /
+1.67 / 3.54 CPU-s at budgets 8 / 16 / 32, against 0.63 / 1.59 / 3.73 for current
+`main`. Phase 16 neither caused it nor fixed it.
+
+### 46.3 What the fixed cost is
+
+A single inference with no warmups, on a 512² dense model small enough that the
+arithmetic is irrelevant:
+
+| budget | user CPU | first-inference wall | threads created | futex calls | sched_yield |
+| --- | --- | --- | --- | --- | --- |
+| 8 | 0.23 s | 2.198 ms | 15 | 150 | 643 |
+| 32 | **2.24 s** | **27.895 ms** | 63 | 1611 | 3346 |
+
+Two CPU-seconds and 28 ms of first-inference latency, to compute a 512×512
+matrix product. It is model-independent, so it is not the kernel. Forcing
+`ONNX_GENAI_CPU_TASK_THREADS=1` does not reduce it (2.53 s vs 2.00 s on the int4
+cell — it gets slightly *worse*), so it is not the task runtime either. It is the
+Rayon pools coming up: futex and yield-spin churn while twice as many workers
+race to their loops.
+
+### 46.4 Past the physical core count, nothing is bought
+
+The obvious question is whether the extra workers earn their construction back on
+larger work. They do not. Steady-state wall, native-only, 25 runs after 10
+warmups, median of 3:
+
+| cell | budget 16 | budget 32 |
+| --- | --- | --- |
+| `llama3_8b_mlp_t512` | **969 ms** | 1537 ms |
+| `llama3_8b_qkv_t128` | **106.4 ms** | 109.5 ms |
+| `qwen3_0p6b_mlp_t512` | **109.2 ms** | 112.5 ms |
+| `qwen3_0p6b_qkv_t8` | **0.921 ms** | 0.934 ms |
+
+On this 16-physical-core / 32-logical host a 32-thread budget is never faster
+than a 16-thread one, in decode or in prefill, and on the largest prefill shape
+it is 1.6× slower. This is the same fact `cap_spinning_workers` already encodes
+for the task runtime's lanes, showing up one level out: past one worker per
+physical core, the surplus workers are SMT siblings of workers that already
+exist, and they contend instead of adding throughput.
+
+### 46.5 The default was already right
+
+The important control, and the one that decides what this phase should change:
+
+| configuration | CPU for 60 runs | native |
+| --- | --- | --- |
+| default (no thread env set) | **0.54 s** | 1.371 ms |
+| `--native-threads 32` | 4.72 s | 0.933 ms |
+
+The shipping default — a flat decode pool capped at eight workers and SMT-capped
+task lanes — costs 0.54 CPU-seconds. Asking explicitly for 32 costs 8.7× that to
+run 1.47× faster. **The runtime's default configuration is the efficient one.**
+Nothing in the production path is misconfigured; the benchmark harness is what
+asks for 32, and the runtime faithfully honours it.
+
+So the residual is not a runtime defect to fix. It is a request that cannot pay
+for itself, which the runtime accepted silently.
+
+### 46.6 What this phase changes
+
+Two things, both small.
+
+The first is a diagnostic. `bound_process_to_decode_budget` now warns once when
+an explicit budget exceeds the physical cores the process may use, naming the
+core count and pointing at `ONNX_GENAI_CPU_DECODE_THREADS`. It does not override
+the request — an explicit budget stays explicit — it just stops a configuration
+that doubles CPU for no wall gain from being invisible. `budget_beyond_physical_cores`
+is a pure function so the policy is testable without a host, and an unknown
+topology deliberately never warns.
+
+The second is this document. Every `--threads 32` figure in this ledger was taken
+on a configuration that §46.4 shows is strictly worse than `--threads 16` on this
+host, and §46.1 shows was additionally measured inside a warm-up transient that
+the 7-run harness never leaves. Combined with §38's finding that the paired
+harness depresses the native arm 2.7–4.8× on long cells, the wide-thread rows of
+this campaign have now had two independent instrument errors found in them.
+
+### 46.7 One caveat, and what is genuinely left
+
+The steady-state numbers above are a *tight loop*: back-to-back inferences with
+no serial work between them. That is the one regime in which Rayon's parking cost
+disappears, because its workers never get the chance to park. It flatters the
+pre-phase-16 base — which reaches 0.858 ms at budget 32 over 400 runs, against
+the 50 ms the 7-run harness reported for the same binary and cell. Real decode is
+the opposite shape: single-digit microseconds of serial work between parallel
+regions, which is exactly the gap `task_runtime_latency.rs` models with
+`busy_gap` and exactly why the task runtime exists. Neither 7 runs nor 400 is the
+honest number for decode; a gap-aware harness is, and this campaign does not have
+one at the model level.
+
+That is the real open item now, and it is a methodology item rather than a
+kernel one. The scheduler residual that §36.8 and §38.7 were chasing does not
+exist.

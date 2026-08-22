@@ -5,7 +5,8 @@ use axum::{Json, extract::State};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
 use onnx_genai::{GenerateOptions, GeneratePrompt, GenerateRequest};
-use onnx_genai_metadata::ImageOutputValueRange;
+use onnx_genai_metadata::{ImageOutputValueRange, TensorDimension};
+use onnx_genai_ort::DataType;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
@@ -41,6 +42,10 @@ pub(crate) struct OpenAiImageRequest {
     moderation: Option<OpenAiModeration>,
     #[serde(default)]
     user: Option<String>,
+    /// Non-standard bridge for metadata-declared application inputs that the
+    /// caller prepared outside the server (for example multimodal encoders).
+    #[serde(default)]
+    application_inputs: BTreeMap<String, ApplicationTensor>,
 }
 
 fn one() -> usize {
@@ -143,8 +148,100 @@ pub(crate) struct A1111ImageRequest {
     send_images: bool,
     #[serde(default)]
     save_images: bool,
+    /// Model-agnostic typed inputs for metadata sources with kind
+    /// `application`. These are explicit rather than silently inferred from
+    /// A1111 fields when a package has no server-side preprocessor.
+    #[serde(default)]
+    application_inputs: BTreeMap<String, ApplicationTensor>,
     #[serde(default, flatten)]
     extra: BTreeMap<String, JsonValue>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ApplicationTensor {
+    dtype: String,
+    shape: Vec<i64>,
+    data_b64: String,
+}
+
+impl ApplicationTensor {
+    fn lower(
+        &self,
+        contract: &onnx_genai_metadata::TensorContract,
+        shape_symbols: &mut BTreeMap<String, i64>,
+    ) -> Result<ImageInputValue, ApiError> {
+        if self.dtype != contract.dtype {
+            return Err(ApiError::bad_request(format!(
+                "application input dtype '{}' does not match metadata dtype '{}'",
+                self.dtype, contract.dtype
+            )));
+        }
+        if self.shape.len() != contract.rank {
+            return Err(ApiError::bad_request(format!(
+                "application input rank {} does not match metadata rank {}",
+                self.shape.len(),
+                contract.rank
+            )));
+        }
+        let dtype = parse_application_dtype(&self.dtype)?;
+        if self.shape.iter().any(|dimension| *dimension < 0) {
+            return Err(ApiError::bad_request(
+                "application input shapes must contain only non-negative dimensions",
+            ));
+        }
+        if let Some(contract_shape) = contract.shape.as_ref() {
+            for (axis, (actual, expected)) in self.shape.iter().zip(contract_shape).enumerate() {
+                match expected {
+                    TensorDimension::Fixed(expected) if actual != expected => {
+                        return Err(ApiError::bad_request(format!(
+                            "application input shape {:?} does not match metadata shape {:?}: axis {axis} must be {expected}, got {actual}",
+                            self.shape, contract_shape
+                        )));
+                    }
+                    TensorDimension::Symbol(symbol) => {
+                        if let Some(bound) = shape_symbols.get(symbol) {
+                            if actual != bound {
+                                return Err(ApiError::bad_request(format!(
+                                    "application input shape {:?} violates metadata symbol '{symbol}': expected {bound} at axis {axis}, got {actual}",
+                                    self.shape
+                                )));
+                            }
+                        } else {
+                            shape_symbols.insert(symbol.clone(), *actual);
+                        }
+                    }
+                    TensorDimension::Fixed(_) => {}
+                }
+            }
+        }
+        let elements = self.shape.iter().try_fold(1_usize, |total, dimension| {
+            let dimension = usize::try_from(*dimension)
+                .map_err(|_| ApiError::bad_request("application input dimension is too large"))?;
+            total
+                .checked_mul(dimension)
+                .ok_or_else(|| ApiError::bad_request("application input element count overflowed"))
+        })?;
+        let expected = elements
+            .checked_mul(dtype.size_of())
+            .ok_or_else(|| ApiError::bad_request("application input byte count overflowed"))?;
+        let bytes = STANDARD.decode(&self.data_b64).map_err(|error| {
+            ApiError::bad_request(format!("application input data_b64 is invalid: {error}"))
+        })?;
+        if bytes.len() != expected {
+            return Err(ApiError::bad_request(format!(
+                "application input contains {} decoded bytes, expected {expected} for dtype '{}' and shape {:?}",
+                bytes.len(),
+                self.dtype,
+                self.shape
+            )));
+        }
+        Ok(ImageInputValue::Raw {
+            bytes,
+            shape: self.shape.clone(),
+            dtype,
+        })
+    }
 }
 
 fn default_seed() -> i64 {
@@ -195,6 +292,7 @@ struct NormalizedImageRequest {
     sampler: Option<String>,
     init_image: Option<Vec<u8>>,
     denoising_strength: Option<f32>,
+    application_inputs: BTreeMap<String, ApplicationTensor>,
 }
 
 pub(crate) async fn openai_images(
@@ -240,7 +338,7 @@ pub(crate) async fn openai_images(
     }
 
     let handle = resolve_model(&state.registry, &request.model).await?;
-    let spec = image_spec(&handle)?;
+    let spec = image_spec(&handle, request.application_inputs.is_empty())?;
     let (width, height) = request
         .size
         .as_deref()
@@ -263,6 +361,7 @@ pub(crate) async fn openai_images(
             sampler: spec.samplers.first().cloned(),
             init_image: None,
             denoising_strength: None,
+            application_inputs: request.application_inputs.clone(),
         };
         let png = execute(&handle, spec, &normalized).await?;
         data.push(OpenAiImageData {
@@ -306,12 +405,8 @@ async fn execute_a1111(
         .ok_or_else(|| ApiError::bad_request("batch_size * n_iter overflowed"))?;
     validate_count(count)?;
     let handle = resolve_model(&state.registry, "").await?;
-    let spec = image_spec(&handle)?;
-    if spec.guidance_scale.is_none() {
-        return Err(ApiError::bad_request(
-            "the loaded workflow exposes no guidance_scale role required by the A1111 cfg_scale contract",
-        ));
-    }
+    let uses_application_inputs = !request.application_inputs.is_empty();
+    let spec = image_spec(&handle, !uses_application_inputs)?;
     let sampler = resolve_sampler(
         spec,
         request.sampler_name.as_deref(),
@@ -321,11 +416,11 @@ async fn execute_a1111(
     let guidance = resolve_guidance(spec, request.cfg_scale)?;
     let (width, height) = resolve_dimensions(spec, request.width, request.height)?;
     let init_image = if img2img {
-        if spec.media.is_none() {
-            return Err(ApiError::bad_request(
+        let _media = spec.media.as_ref().ok_or_else(|| {
+            ApiError::bad_request(
                 "the loaded workflow declares no semantic image/media input, so img2img is unavailable",
-            ));
-        }
+            )
+        })?;
         if request.init_images.len() != 1 {
             return Err(ApiError::bad_request(
                 "img2img requires exactly one base64 entry in `init_images`",
@@ -354,6 +449,7 @@ async fn execute_a1111(
             sampler: sampler.clone(),
             init_image: init_image.clone(),
             denoising_strength,
+            application_inputs: request.application_inputs.clone(),
         };
         let png = execute(&handle, spec, &normalized).await?;
         let decoded =
@@ -421,13 +517,18 @@ fn reject_a1111_unsupported(request: &A1111ImageRequest) -> Result<(), ApiError>
     Ok(())
 }
 
-fn image_spec(handle: &crate::registry::ModelHandle) -> Result<&ImagePipelineSpec, ApiError> {
+fn image_spec(
+    handle: &crate::registry::ModelHandle,
+    require_http_roles: bool,
+) -> Result<&ImagePipelineSpec, ApiError> {
     let spec = handle.image_pipeline.as_ref().ok_or_else(|| {
         ApiError::bad_request(
             "the selected model does not declare a pipeline image output in inference metadata",
         )
     })?;
-    if spec.prompt_tokens.is_none() || spec.steps.is_none() || spec.seed.is_none() {
+    if require_http_roles
+        && (spec.prompt_tokens.is_none() || spec.steps.is_none() || spec.seed.is_none())
+    {
         return Err(ApiError::bad_request(
             "the image workflow must declare prompt_tokens, max_iterations, and seed runtime roles for HTTP generation",
         ));
@@ -462,22 +563,49 @@ fn lower(
             "sampler '{sampler}' is not the solver declared by the loaded workflow"
         )));
     }
-    let mut prompt = handle
-        .tokenizer
-        .encode(&request.prompt)
-        .map_err(|error| ApiError::bad_request(format!("failed to tokenize prompt: {error}")))?;
-    let prompt_binding = spec.prompt_tokens.as_ref().ok_or_else(|| {
-        ApiError::bad_request(
-            "the image workflow declares no prompt_tokens runtime input that the HTTP API can bind",
-        )
-    })?;
-    let mut negative_tokens =
-        if !request.negative_prompt.is_empty() || spec.negative_prompt_tokens.is_some() {
-            let binding = spec.negative_prompt_tokens.as_ref().ok_or_else(|| {
-            ApiError::bad_request(
-                "the loaded workflow has no negative_prompt_tokens input; omit `negative_prompt`",
-            )
+    let mut prompt = Vec::new();
+    let mut inputs = Vec::with_capacity(request.application_inputs.len() + 8);
+    let mut shape_symbols = BTreeMap::from([("batch".to_string(), 1)]);
+    for (name, binding) in &spec.application_inputs {
+        if binding.required && !request.application_inputs.contains_key(name) {
+            return Err(ApiError::bad_request(format!(
+                "required metadata application input '{name}' was not provided"
+            )));
+        }
+    }
+    for (name, tensor) in &request.application_inputs {
+        let binding = spec.application_inputs.get(name).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "application input '{name}' is not declared by workflow metadata"
+            ))
         })?;
+        inputs.push((
+            name.clone(),
+            tensor.lower(&binding.contract, &mut shape_symbols)?,
+        ));
+    }
+    let prompt_binding = spec.prompt_tokens.as_ref();
+    if let Some(binding) = prompt_binding {
+        prompt = handle.tokenizer.encode(&request.prompt).map_err(|error| {
+            ApiError::bad_request(format!("failed to tokenize prompt: {error}"))
+        })?;
+        inputs.push((
+            binding.name.clone(),
+            token_input(binding, &prompt)
+                .map_err(|error| ApiError::bad_request(format!("{error:#}")))?,
+        ));
+    } else if !request.prompt.is_empty() || request.application_inputs.is_empty() {
+        return Err(ApiError::bad_request(
+            "the image workflow declares no prompt_tokens runtime input; omit `prompt` and provide every required application input",
+        ));
+    }
+    if !request.negative_prompt.is_empty() && spec.negative_prompt_tokens.is_none() {
+        return Err(ApiError::bad_request(
+            "the loaded workflow has no negative_prompt_tokens input; omit `negative_prompt`",
+        ));
+    }
+    let mut negative_tokens = if let Some(binding) = spec.negative_prompt_tokens.as_ref() {
+        if !request.negative_prompt.is_empty() || binding.required {
             let tokens = handle
                 .tokenizer
                 .encode(&request.negative_prompt)
@@ -487,7 +615,10 @@ fn lower(
             Some((binding, tokens))
         } else {
             None
-        };
+        }
+    } else {
+        None
+    };
     if let Some((_, negative)) = negative_tokens.as_mut() {
         let target = prompt.len().max(negative.len());
         let pad = ["<pad>", "[PAD]", "<|pad|>"]
@@ -507,11 +638,7 @@ fn lower(
             prompt: GeneratePrompt::TokenIds(prompt.clone()),
             options,
         },
-        inputs: vec![(
-            prompt_binding.name.clone(),
-            token_input(prompt_binding, &prompt)
-                .map_err(|error| ApiError::bad_request(format!("{error:#}")))?,
-        )],
+        inputs,
     };
     if let Some((binding, tokens)) = negative_tokens {
         lowered.inputs.push((
@@ -571,6 +698,26 @@ fn lower(
     Ok(lowered)
 }
 
+fn parse_application_dtype(dtype: &str) -> Result<DataType, ApiError> {
+    match dtype {
+        "float32" => Ok(DataType::Float32),
+        "float16" => Ok(DataType::Float16),
+        "bfloat16" => Ok(DataType::BFloat16),
+        "int8" => Ok(DataType::Int8),
+        "int16" => Ok(DataType::Int16),
+        "int32" => Ok(DataType::Int32),
+        "int64" => Ok(DataType::Int64),
+        "uint8" => Ok(DataType::Uint8),
+        "uint16" => Ok(DataType::Uint16),
+        "uint32" => Ok(DataType::Uint32),
+        "uint64" => Ok(DataType::Uint64),
+        "bool" => Ok(DataType::Bool),
+        _ => Err(ApiError::bad_request(format!(
+            "unsupported application input dtype '{dtype}'"
+        ))),
+    }
+}
+
 fn encode_png(
     image: ProducedImage,
     value_range: ImageOutputValueRange,
@@ -601,10 +748,12 @@ fn encode_png(
     }
     let (height, width, channel_first) = match image.shape.as_slice() {
         [1, 3, height, width] => (*height, *width, true),
+        [1, 3, 1, height, width] => (*height, *width, true),
         [1, height, width, 3] => (*height, *width, false),
+        [1, 1, height, width, 3] => (*height, *width, false),
         shape => {
             return Err(ApiError::internal(format!(
-                "image output must be [1,3,H,W] or [1,H,W,3], got {shape:?}"
+                "image output must contain one RGB image in NCHW, NTHWC, or NCTHW layout, got {shape:?}"
             )));
         }
     };
@@ -851,7 +1000,7 @@ pub(crate) async fn a1111_samplers(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<A1111Sampler>>, ApiError> {
     let handle = resolve_model(&state.registry, "").await?;
-    let spec = image_spec(&handle)?;
+    let spec = image_spec(&handle, false)?;
     Ok(Json(
         spec.samplers
             .iter()
@@ -868,7 +1017,7 @@ pub(crate) async fn a1111_options(
     State(state): State<AppState>,
 ) -> Result<Json<JsonValue>, ApiError> {
     let handle = resolve_model(&state.registry, "").await?;
-    let spec = image_spec(&handle)?;
+    let spec = image_spec(&handle, false)?;
     Ok(Json(json!({
         "sd_model_checkpoint": handle.id,
         "samples_format": "png",
@@ -900,6 +1049,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn single_frame_video_tensor_encodes_as_png() {
+        let png = encode_png(
+            ProducedImage {
+                values: vec![1.0, 0.0, 0.0],
+                shape: vec![1, 3, 1, 1, 1],
+            },
+            ImageOutputValueRange::ZeroToOne,
+        )
+        .unwrap();
+        assert_eq!(decode_pixel(&png), [255, 0, 0]);
     }
 
     #[test]
@@ -980,5 +1142,80 @@ mod tests {
             .unwrap_err();
             assert!(error.message.contains("violates declared"));
         }
+    }
+
+    #[test]
+    fn application_tensor_decodes_typed_raw_bytes() {
+        let tensor = ApplicationTensor {
+            dtype: "bfloat16".to_string(),
+            shape: vec![1, 2],
+            data_b64: STANDARD.encode([0_u8, 1, 2, 3]),
+        };
+
+        assert!(matches!(
+            tensor
+                .lower(&onnx_genai_metadata::TensorContract {
+                    dtype: "bfloat16".to_string(),
+                    rank: 2,
+                    shape: None,
+                    optional: false,
+                    batch_layout: Default::default(),
+                }, &mut BTreeMap::new())
+                .unwrap(),
+            ImageInputValue::Raw {
+                bytes,
+                shape,
+                dtype: DataType::BFloat16,
+            } if bytes == [0, 1, 2, 3] && shape == [1, 2]
+        ));
+    }
+
+    #[test]
+    fn application_tensor_rejects_wrong_byte_count() {
+        let tensor = ApplicationTensor {
+            dtype: "float32".to_string(),
+            shape: vec![2],
+            data_b64: STANDARD.encode([0_u8; 4]),
+        };
+
+        let error = tensor
+            .lower(
+                &onnx_genai_metadata::TensorContract {
+                    dtype: "float32".to_string(),
+                    rank: 1,
+                    shape: None,
+                    optional: false,
+                    batch_layout: Default::default(),
+                },
+                &mut BTreeMap::new(),
+            )
+            .unwrap_err();
+        assert!(error.message.contains("expected 8"));
+    }
+
+    #[test]
+    fn application_tensor_rejects_fixed_and_symbolic_shape_mismatches() {
+        let contract = onnx_genai_metadata::TensorContract {
+            dtype: "float32".to_string(),
+            rank: 4,
+            shape: Some(vec![
+                TensorDimension::Symbol("batch".to_string()),
+                TensorDimension::Fixed(4),
+                TensorDimension::Symbol("height".to_string()),
+                TensorDimension::Symbol("width".to_string()),
+            ]),
+            optional: false,
+            batch_layout: Default::default(),
+        };
+        let tensor = ApplicationTensor {
+            dtype: "float32".to_string(),
+            shape: vec![1, 5, 8, 8],
+            data_b64: STANDARD.encode(vec![0_u8; 5 * 8 * 8 * 4]),
+        };
+        let mut symbols = BTreeMap::from([("batch".to_string(), 1)]);
+
+        let error = tensor.lower(&contract, &mut symbols).unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("axis 1 must be 4, got 5"));
     }
 }

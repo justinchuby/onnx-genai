@@ -7,7 +7,8 @@ use std::time::Instant;
 
 use anyhow::{Context, bail};
 use onnx_genai_metadata::{
-    ComponentImplementation, StateAliasing, WorkflowComponent, WorkflowNode, WorkflowSpec,
+    ComponentImplementation, StateAliasing, StatePortAccess, WorkflowComponent, WorkflowNode,
+    WorkflowSpec,
 };
 use onnx_genai_ort::{Allocator, IoBinding, Session, Value};
 use onnx_runtime_loader::proto::onnx::{
@@ -137,6 +138,11 @@ impl ExecutionIsland {
 
     pub(crate) fn components(&self) -> &[String] {
         &self.components
+    }
+
+    #[cfg(all(test, feature = "ort-cuda"))]
+    pub(crate) fn session(&self) -> &Session {
+        &self.session
     }
 
     pub(crate) fn cuda_device_id(&self) -> Option<i32> {
@@ -1405,10 +1411,16 @@ fn build_execution_island(
                     continue;
                 };
                 for alias in aliases.values() {
+                    if alias.access == StatePortAccess::ReadOnly {
+                        continue;
+                    }
+                    let Some(output_port) = &alias.output else {
+                        continue;
+                    };
                     let Some(input_value) = invocation.inputs.get(&alias.input) else {
                         continue;
                     };
-                    let Some(output_value) = invocation.outputs.get(&alias.output) else {
+                    let Some(output_value) = invocation.outputs.get(output_port) else {
                         continue;
                     };
                     let input_name = linked
@@ -1428,7 +1440,7 @@ fn build_execution_island(
                         .with_context(|| {
                             format!(
                                 "execution island {id} cannot bind shared KV output '{}.{}'",
-                                invocation.component, alias.output
+                                invocation.component, output_port
                             )
                         })?;
                     shared_buffer_inputs.insert(input_name, output_name);

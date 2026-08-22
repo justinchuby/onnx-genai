@@ -206,9 +206,10 @@ impl<T: Copy + Default + Send + Sync> TransposeCache<T> {
             .cloned()
     }
 
-    /// Drop a single entry by key. Test-only; used to clear a stale entry left
-    /// at a since-recycled address so a peek has a deterministic starting point.
-    #[cfg(test)]
+    /// Drop a single entry by key.
+    ///
+    /// Called when the owner of an entry goes away, so that the entry cannot
+    /// outlive the buffer whose address keys it (#1726).
     pub fn remove(&self, key: &WeightTransposeKey) {
         self.entries
             .lock()
@@ -275,27 +276,53 @@ impl<T: Copy + Default + Send + Sync> TransposeCache<T> {
         n: usize,
         tag: u16,
     ) -> Option<Arc<Vec<T>>> {
+        self.get_or_insert_transpose_reporting(src, k, n, tag)
+            .map(|(transposed, _)| transposed)
+    }
+
+    /// [`get_or_insert_transpose_tagged`](Self::get_or_insert_transpose_tagged),
+    /// additionally reporting whether *this* call installed the entry.
+    ///
+    /// The flag is what makes eviction ownership well-defined (#1726). A caller
+    /// that merely shared an entry someone else installed must never evict it:
+    /// the installer may be the model-load prewarm, whose entry is meant to
+    /// outlive every transient consumer. `false` is returned for a hit, for the
+    /// racer that lost the insert, and for a degenerate empty matrix (never
+    /// inserted, so there is nothing to own).
+    pub fn get_or_insert_transpose_reporting(
+        &self,
+        src: &[T],
+        k: usize,
+        n: usize,
+        tag: u16,
+    ) -> Option<(Arc<Vec<T>>, bool)> {
         let key = WeightTransposeKey::tagged(src.as_ptr(), k, n, tag);
         if key.numel() != Some(src.len()) {
             return None;
         }
         if src.is_empty() {
-            return Some(Arc::new(Vec::new()));
+            return Some((Arc::new(Vec::new()), false));
         }
         if let Some(hit) = self.get(&key) {
-            return Some(hit);
+            return Some((hit, false));
         }
         let transposed = Arc::new(transpose_row_major(src, k, n));
         // A concurrent racer may have inserted an identical entry meanwhile.
-        // Keep whichever landed first so every reader shares one allocation.
-        Some(
-            self.entries
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .entry(key)
-                .or_insert(transposed)
-                .clone(),
-        )
+        // Keep whichever landed first so every reader shares one allocation --
+        // and let only that winner claim ownership of the eviction.
+        match self
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key)
+        {
+            std::collections::hash_map::Entry::Occupied(occupied) => {
+                Some((occupied.get().clone(), false))
+            }
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                Some((vacant.insert(transposed).clone(), true))
+            }
+        }
     }
 }
 
@@ -422,10 +449,54 @@ pub fn cached_transpose_f16(src: &[u16], k: usize, n: usize) -> Option<Arc<Vec<u
 /// [`cached_transpose_f16`] for either 16-bit format; `tag` separates the two
 /// interpretations sharing this `u16` map (0 = `f16`, 1 = `bf16`).
 pub fn cached_transpose_half(src: &[u16], k: usize, n: usize, tag: u16) -> Option<Arc<Vec<u16>>> {
+    cached_transpose_half_reporting(src, k, n, tag).map(|(transposed, _)| transposed)
+}
+
+/// [`cached_transpose_half`] reporting whether this call installed the entry,
+/// i.e. whether the caller owns its eviction (#1726).
+///
+/// A declined cache retains nothing, so its `false` is truthful: there is no
+/// global entry to evict.
+pub(crate) fn cached_transpose_half_reporting(
+    src: &[u16],
+    k: usize,
+    n: usize,
+    tag: u16,
+) -> Option<(Arc<Vec<u16>>, bool)> {
     if !cache_enabled() {
-        return transpose_uncached(src, k, n);
+        return transpose_uncached(src, k, n).map(|transposed| (transposed, false));
     }
-    WEIGHT_TRANSPOSE_F16.get_or_insert_transpose_tagged(src, k, n, tag)
+    WEIGHT_TRANSPOSE_F16.get_or_insert_transpose_reporting(src, k, n, tag)
+}
+
+/// [`cached_transpose_half_reporting`] for the f32 map.
+pub(crate) fn cached_transpose_f32_reporting(
+    src: &[f32],
+    k: usize,
+    n: usize,
+) -> Option<(Arc<Vec<f32>>, bool)> {
+    if !cache_enabled() {
+        return transpose_uncached(src, k, n).map(|transposed| (transposed, false));
+    }
+    WEIGHT_TRANSPOSE_F32.get_or_insert_transpose_reporting(src, k, n, 0)
+}
+
+/// Drop the f16 entry `key` names, if it is still present.
+///
+/// The caller is the owner that installed it: entries are keyed on the source
+/// buffer's *address*, and nothing in the key proves that the bytes there are
+/// still the ones that were transposed. An entry that outlives its source is a
+/// loaded gun -- the next allocation of the same shape and dtype to land on
+/// that address is served the previous weight's rows, with the right route and
+/// silently foreign numbers (#1726). Evicting at the owner's drop keeps every
+/// entry's lifetime inside its source's.
+pub(crate) fn evict_half(key: &WeightTransposeKey) {
+    WEIGHT_TRANSPOSE_F16.remove(key);
+}
+
+/// [`evict_half`] for the f32 map.
+pub(crate) fn evict_f32(key: &WeightTransposeKey) {
+    WEIGHT_TRANSPOSE_F32.remove(key);
 }
 
 /// Test-only: drop any f16 entry keyed on `(ptr, k, n)`.
@@ -435,7 +506,13 @@ pub fn cached_transpose_half(src: &[u16], k: usize, n: usize, tag: u16) -> Optio
 /// can remove is a stale one left by a freed buffer that nobody is using.
 #[cfg(test)]
 pub(crate) fn f16_cache_evict(ptr: *const u16, k: usize, n: usize) {
-    WEIGHT_TRANSPOSE_F16.remove(&WeightTransposeKey::new(ptr, k, n));
+    half_cache_evict(ptr, k, n, 0);
+}
+
+/// Test-only: drop a 16-bit entry keyed on `(ptr, k, n, tag)`.
+#[cfg(test)]
+pub(crate) fn half_cache_evict(ptr: *const u16, k: usize, n: usize, tag: u16) {
+    WEIGHT_TRANSPOSE_F16.remove(&WeightTransposeKey::tagged(ptr, k, n, tag));
 }
 
 /// Entry counts of the global caches as `(f16, f32)`.

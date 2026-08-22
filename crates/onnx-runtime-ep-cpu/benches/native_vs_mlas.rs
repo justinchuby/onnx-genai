@@ -53,6 +53,8 @@
 //! regresses every concurrent session on the box. A large `ratio` with a small
 //! `cpu_ratio` means exactly that, and is a reason to look before graduating.
 
+mod common;
+
 use std::hint::black_box;
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -410,6 +412,9 @@ fn bench_transcendentals() {
 }
 
 fn main() {
+    // Match the decode thread topology a served session runs in (#1749).
+    common::init_decode_topology();
+
     println!("# native vs MLAS, one binary, interleaved, median of {REPS} reps");
     println!(
         "# mlas_linked={}  graduation_ratio={GRADUATION_RATIO}  threads={}",

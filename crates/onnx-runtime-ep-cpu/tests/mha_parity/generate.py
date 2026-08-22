@@ -174,6 +174,33 @@ def make_cases():
         3,
     )
 
+    # (e2) chunked prefill / speculative decode: S > 1 *and* a non-empty past.
+    #
+    # This is the only shape in which the causal offset is load-bearing. Case
+    # (e) has S == 1, so `causal = unidirectional && q_seq > 1` is false and the
+    # mask never runs; every self-attention case has past == 0, so the offset is
+    # zero and a wrong offset is indistinguishable from the right one. Row `i`
+    # here must attend to `past + i` inclusive: getting the offset wrong is a
+    # silent wrong-answer bug on every prompt continuation.
+    #
+    # #1685's audit found this cell missing from the goldens, from the A/B
+    # differential and from the benchmark generator simultaneously.
+    rng = np.random.default_rng(105)
+    B, N, H, P, S = 1, 2, 4, 6, 3
+    D = N * H
+    add(
+        "past_kv_chunked_prefill_causal",
+        {
+            "query": rnd(rng, B, S, D),
+            "key": rnd(rng, B, S, D),
+            "value": rnd(rng, B, S, D),
+            "past_key": rnd(rng, B, N, P, H),
+            "past_value": rnd(rng, B, N, P, H),
+        },
+        {"num_heads": N, "unidirectional": 1},
+        3,
+    )
+
     # (f) differing V head size (H=4, H_v=3).
     rng = np.random.default_rng(6)
     B, S, N, H, Hv = 1, 3, 2, 4, 3

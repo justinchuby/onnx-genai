@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::capabilities as capability;
 use crate::schema::{InferenceMetadata, PipelineSpec, WorkflowNode, WorkflowSpec, WorkflowStep};
 
 struct ContractObligation {
@@ -72,12 +73,12 @@ impl Default for RuntimeCapabilities {
     fn default() -> Self {
         Self {
             supported: vec![
-                "kv_cache".to_string(),
-                "grouped_query_attention".to_string(),
-                "multi_head_attention".to_string(),
-                "prefix_cache".to_string(),
-                "continuous_batching".to_string(),
-                "control_flow_loop".to_string(),
+                capability::KV_CACHE.to_string(),
+                capability::GROUPED_QUERY_ATTENTION.to_string(),
+                capability::MULTI_HEAD_ATTENTION.to_string(),
+                capability::PREFIX_CACHE.to_string(),
+                capability::CONTINUOUS_BATCHING.to_string(),
+                capability::CONTROL_FLOW_LOOP.to_string(),
             ],
         }
     }
@@ -85,11 +86,9 @@ impl Default for RuntimeCapabilities {
 
 /// Validate the metadata document and required runtime capabilities.
 ///
-/// Reports structural defects and unsupported capabilities together, which is
-/// what a strict caller wants. A caller that can *proceed* without a capability
-/// — a bare decoder does not need `workflow_ssa` to be honoured — should use
-/// [`validate_structure_and_capabilities`] and decide for itself, rather than
-/// treating a capability it will never exercise as a malformed document.
+/// Reports structural defects and unsupported capabilities together. Canonical
+/// metadata is an execution contract: callers must reject unsupported required
+/// behavior rather than silently selecting a narrower legacy execution path.
 pub fn validate(
     metadata: &InferenceMetadata,
     runtime: &RuntimeCapabilities,
@@ -106,13 +105,9 @@ pub fn validate(
 
 /// Structural defects and unsupported capabilities, kept apart.
 ///
-/// These answer different questions. A structural defect means the document
-/// does not describe a runnable model and no caller can proceed. An unsupported
-/// capability means the package asks for a runtime feature this build lacks,
-/// which only matters if the caller would actually exercise it. Merging them
-/// into one list forces every caller to treat both as fatal, which is why a
-/// bare decoder used to be rejected for declaring workflow capabilities it
-/// never reaches.
+/// These answer different questions while remaining equally fatal at package
+/// admission. Keeping them separate lets loaders report whether the package is
+/// malformed or the runtime lacks behavior the package requires.
 #[derive(Debug, Default, Clone)]
 pub struct CapabilityReport {
     /// The document is malformed or self-inconsistent. Always fatal.
@@ -132,8 +127,10 @@ pub fn validate_structure_and_capabilities(
         .required_capabilities
         .iter()
         .cloned()
-        .chain(derived_capabilities(metadata));
+        .chain(derived_capabilities(metadata))
+        .collect::<BTreeSet<_>>();
     let unsupported_capabilities = required
+        .into_iter()
         .filter(|capability| !runtime.supported.contains(capability))
         .collect();
     CapabilityReport {
@@ -142,28 +139,30 @@ pub fn validate_structure_and_capabilities(
     }
 }
 
-/// Capabilities implied by concrete metadata features.
-pub fn derived_capabilities(metadata: &InferenceMetadata) -> BTreeSet<String> {
+fn metadata_only_required_capabilities(metadata: &InferenceMetadata) -> BTreeSet<String> {
     let mut capabilities = BTreeSet::new();
-    let Some(pipeline) = &metadata.pipeline else {
-        return capabilities;
-    };
-    let workflow = &pipeline.workflow;
-    capabilities.extend(workflow.manifest.capabilities.iter().cloned());
-    capabilities.insert("workflow_ssa".to_string());
-    if workflow.serving.is_some() {
-        capabilities.insert("serving_service_contract".to_string());
-    }
     if metadata.adapters.is_some() {
-        capabilities.insert("parameter_adapters".to_string());
-        capabilities.insert("heterogeneous_adapter_batching".to_string());
+        capabilities.insert(capability::PARAMETER_ADAPTERS.to_string());
+        capabilities.insert(capability::HETEROGENEOUS_ADAPTER_BATCHING.to_string());
+    }
+    capabilities
+}
+
+fn workflow_required_capabilities(
+    workflow: &WorkflowSpec,
+    compiled: Option<&WorkflowNode>,
+) -> BTreeSet<String> {
+    let mut capabilities = BTreeSet::new();
+    capabilities.insert(capability::WORKFLOW_SSA.to_string());
+    if workflow.serving.is_some() {
+        capabilities.insert(capability::SERVING_SERVICE_CONTRACT.to_string());
     }
     if workflow
         .state
         .values()
         .any(|state| state.scope == crate::schema::WorkflowStateScope::Session)
     {
-        capabilities.insert("session_state_lease".to_string());
+        capabilities.insert(capability::SESSION_STATE_LEASE.to_string());
     }
     if workflow.state.values().any(|state| {
         matches!(
@@ -171,35 +170,94 @@ pub fn derived_capabilities(metadata: &InferenceMetadata) -> BTreeSet<String> {
             crate::schema::ShapeRecurrence::Bounded { .. }
         )
     }) {
-        capabilities.insert("bounded_state_recurrence".to_string());
+        capabilities.insert(capability::BOUNDED_STATE_RECURRENCE.to_string());
     }
     if workflow
         .state
         .values()
         .any(|state| state.class == crate::schema::WorkflowStateClass::Advisory)
     {
-        capabilities.insert("advisory_state".to_string());
+        capabilities.insert(capability::ADVISORY_STATE.to_string());
+    }
+    if workflow
+        .inputs
+        .values()
+        .any(|input| input.present_as.is_some())
+    {
+        capabilities.insert(capability::INPUT_PRESENCE.to_string());
+    }
+    if workflow.inputs.values().any(|input| {
+        matches!(
+            &input.role,
+            crate::schema::SemanticInputRole::Runtime {
+                role: crate::schema::RuntimeInputRole::AdapterSegments
+                    | crate::schema::RuntimeInputRole::AdapterCounts
+                    | crate::schema::RuntimeInputRole::AdapterScales
+                    | crate::schema::RuntimeInputRole::AdapterActive,
+                ..
+            }
+        )
+    }) {
+        capabilities.insert(capability::HETEROGENEOUS_ADAPTER_BATCHING.to_string());
+    }
+    if !workflow.effects.is_empty()
+        || workflow
+            .components
+            .values()
+            .any(|component| !component.effects.is_empty())
+    {
+        capabilities.insert(capability::LINEAR_EFFECTS.to_string());
     }
     for component in workflow.components.values() {
-        match component
+        let contract_id = component
             .contract
             .as_ref()
-            .map(|contract| contract.id.as_str())
-        {
-            Some("onnx-genai.adaptive-proposal-budget") => {
-                capabilities.insert("adaptive_proposal_budget".to_string());
+            .map(|contract| contract.id.as_str());
+        let adapter_abi = match &component.implementation {
+            crate::schema::ComponentImplementation::Adapter { abi, .. } => Some(abi.as_str()),
+            _ => None,
+        };
+        for identifier in contract_id.into_iter().chain(adapter_abi) {
+            match identifier {
+                "onnx-genai.adaptive-proposal-budget" => {
+                    capabilities.insert(capability::ADAPTIVE_PROPOSAL_BUDGET.to_string());
+                }
+                "onnx-genai.grammar-guidance" => {
+                    capabilities.insert(capability::GRAMMAR_GUIDANCE_ADAPTER.to_string());
+                }
+                "onnx-genai.telemetry" => {
+                    capabilities.insert(capability::TELEMETRY_ADAPTER.to_string());
+                }
+                "onnx-genai.parameter-overlay" => {
+                    capabilities.insert(capability::PARAMETER_ADAPTERS.to_string());
+                }
+                _ => {}
             }
-            Some("onnx-genai.grammar-guidance") => {
-                capabilities.insert("grammar_guidance_adapter".to_string());
-            }
-            Some("onnx-genai.telemetry") => {
-                capabilities.insert("telemetry_adapter".to_string());
-            }
-            _ => {}
         }
     }
-    if let Ok(compiled) = crate::compile_workflow(workflow) {
-        collect_workflow_capabilities(&compiled.graph, &mut capabilities);
+    if let Some(compiled) = compiled {
+        collect_workflow_capabilities(compiled, &mut capabilities);
+    }
+    capabilities
+}
+
+fn metadata_required_capabilities(metadata: &InferenceMetadata) -> BTreeSet<String> {
+    let mut capabilities = metadata_only_required_capabilities(metadata);
+    if let Some(pipeline) = &metadata.pipeline {
+        let compiled = crate::compile_workflow(&pipeline.workflow).ok();
+        capabilities.extend(workflow_required_capabilities(
+            &pipeline.workflow,
+            compiled.as_ref().map(|compiled| &compiled.graph),
+        ));
+    }
+    capabilities
+}
+
+/// Capabilities implied by concrete metadata features.
+pub fn derived_capabilities(metadata: &InferenceMetadata) -> BTreeSet<String> {
+    let mut capabilities = metadata_required_capabilities(metadata);
+    if let Some(pipeline) = &metadata.pipeline {
+        capabilities.extend(pipeline.workflow.manifest.capabilities.iter().cloned());
     }
     capabilities
 }
@@ -211,22 +269,38 @@ fn collect_workflow_capabilities(node: &WorkflowNode, capabilities: &mut BTreeSe
                 collect_workflow_capabilities(node, capabilities);
             }
         }
-        WorkflowNode::Invoke { .. } => {}
+        WorkflowNode::Invoke { effects, .. } => {
+            if !effects.is_empty() {
+                capabilities.insert(capability::LINEAR_EFFECTS.to_string());
+            }
+        }
         WorkflowNode::Loop {
             setup,
             body,
             iteration,
+            effects,
             ..
         } => {
-            capabilities.insert("nested_control_flow".to_string());
+            capabilities.insert(capability::NESTED_CONTROL_FLOW.to_string());
             if iteration.is_some() {
-                capabilities.insert("loop_induction_values".to_string());
+                capabilities.insert(capability::LOOP_INDUCTION_VALUES.to_string());
+            }
+            if !effects.is_empty() {
+                capabilities.insert(capability::LINEAR_EFFECTS.to_string());
             }
             collect_workflow_capabilities(setup, capabilities);
             collect_workflow_capabilities(body, capabilities);
         }
-        WorkflowNode::Branch { cases, default, .. } => {
-            capabilities.insert("nested_control_flow".to_string());
+        WorkflowNode::Branch {
+            cases,
+            default,
+            effects,
+            ..
+        } => {
+            capabilities.insert(capability::NESTED_CONTROL_FLOW.to_string());
+            if !effects.is_empty() {
+                capabilities.insert(capability::LINEAR_EFFECTS.to_string());
+            }
             for case in cases.values() {
                 collect_workflow_capabilities(case, capabilities);
             }
@@ -237,16 +311,16 @@ fn collect_workflow_capabilities(node: &WorkflowNode, capabilities: &mut BTreeSe
         WorkflowNode::Emit {
             mode, valid_length, ..
         } => {
-            capabilities.insert("typed_emit".to_string());
+            capabilities.insert(capability::TYPED_EMIT.to_string());
             if matches!(mode, crate::schema::WorkflowEmitMode::Event) {
-                capabilities.insert("streaming_emit".to_string());
+                capabilities.insert(capability::STREAMING_EMIT.to_string());
             }
             if valid_length.is_some() {
-                capabilities.insert("emit_valid_length".to_string());
+                capabilities.insert(capability::EMIT_VALID_LENGTH.to_string());
             }
         }
         WorkflowNode::Transfer { .. } => {
-            capabilities.insert("explicit_transfer".to_string());
+            capabilities.insert(capability::EXPLICIT_TRANSFER.to_string());
         }
         WorkflowNode::ExecutionIsland { .. } => {}
     }
@@ -269,6 +343,19 @@ pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>
             metadata.pipeline.as_ref().map(|p| &p.workflow),
             &mut errors,
         );
+        if let Some(workflow) = metadata
+            .pipeline
+            .as_ref()
+            .map(|pipeline| &pipeline.workflow)
+        {
+            for capability in metadata_only_required_capabilities(metadata)
+                .difference(&workflow.manifest.capabilities)
+            {
+                errors.push(format!(
+                    "pipeline.workflow.manifest.capabilities is missing used capability '{capability}'"
+                ));
+            }
+        }
     }
     validate_preprocessing_workflow(metadata, &mut errors);
     validate_generation_contract(metadata, &mut errors);
@@ -1908,12 +1995,31 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                             alias.input
                         ));
                     }
-                    if !inferred_ports && !component.ports.outputs.contains_key(&alias.output) {
-                        errors.push(format!(
-                            "state service group '{group_name}' component '{component_name}' \
-                             output alias '{}' is not a declared port",
-                            alias.output
-                        ));
+                    match &alias.output {
+                        Some(output) => {
+                            if !inferred_ports && !component.ports.outputs.contains_key(output) {
+                                errors.push(format!(
+                                    "state service group '{group_name}' component \
+                                     '{component_name}' output alias '{output}' is not a declared \
+                                     port"
+                                ));
+                            }
+                        }
+                        None => {
+                            // Only a read-only borrow may omit its output: a
+                            // pure reader consumes a frozen buffer and advances
+                            // nothing, so it exposes no present port. A
+                            // read-write transition with no output could never
+                            // be written back.
+                            if alias.access != crate::schema::StatePortAccess::ReadOnly {
+                                errors.push(format!(
+                                    "state service group '{group_name}' component \
+                                     '{component_name}' read-write alias for input '{}' declares \
+                                     no output; only a read_only borrow may omit one",
+                                    alias.input
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -2025,40 +2131,7 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
         }
     }
 
-    let mut used = BTreeSet::from(["workflow_ssa".to_string()]);
-    if workflow.serving.is_some() {
-        used.insert("serving_service_contract".to_string());
-    }
-    if workflow
-        .state
-        .values()
-        .any(|state| state.scope == crate::schema::WorkflowStateScope::Session)
-    {
-        used.insert("session_state_lease".to_string());
-    }
-    if workflow.state.values().any(|state| {
-        matches!(
-            state.recurrence,
-            crate::schema::ShapeRecurrence::Bounded { .. }
-        )
-    }) {
-        used.insert("bounded_state_recurrence".to_string());
-    }
-    if workflow
-        .state
-        .values()
-        .any(|state| state.class == crate::schema::WorkflowStateClass::Advisory)
-    {
-        used.insert("advisory_state".to_string());
-    }
-    if workflow
-        .inputs
-        .values()
-        .any(|input| input.present_as.is_some())
-    {
-        used.insert("input_presence".to_string());
-    }
-    collect_workflow_capabilities(&compiled.graph, &mut used);
+    let used = workflow_required_capabilities(workflow, Some(&compiled.graph));
     for capability in used.difference(&workflow.manifest.capabilities) {
         errors.push(format!(
             "pipeline.workflow.manifest.capabilities is missing used capability '{capability}'"
@@ -2354,6 +2427,256 @@ fn validate_speculative_rollback(metadata: &InferenceMetadata, errors: &mut Vec<
             errors.push(format!(
                 "speculative.{role} '{component}' is not a declared workflow component"
             ));
+        }
+    }
+    if let crate::schema::SpeculativeProposalExecution::Chained {
+        token_embedding_input,
+        logits_output,
+        recurrent,
+        folded_carry_output,
+        folded_carry_seed,
+        token_embedding,
+    } = &speculative.proposal_execution
+        && let Some(proposer) = workflow.components.get(&speculative.proposer)
+    {
+        if !proposer.ports.inputs.contains_key(token_embedding_input) {
+            errors.push(format!(
+                "speculative chained proposer input '{token_embedding_input}' is not an input \
+                 port of component '{}'",
+                speculative.proposer
+            ));
+        }
+        if !proposer.ports.outputs.contains_key(logits_output) {
+            errors.push(format!(
+                "speculative chained proposer logits '{logits_output}' is not an output port of \
+                 component '{}'",
+                speculative.proposer
+            ));
+        }
+        if recurrent.is_empty() && folded_carry_output.is_none() {
+            errors.push(
+                "speculative chained proposal must declare at least one recurrent binding or a \
+                 folded_carry_output"
+                    .to_string(),
+            );
+        }
+        if let Some(folded) = folded_carry_output
+            && !proposer.ports.outputs.contains_key(folded)
+        {
+            errors.push(format!(
+                "speculative chained folded_carry_output '{folded}' is not an output port of \
+                 component '{}'",
+                speculative.proposer
+            ));
+        }
+        // A folded carry is pinned by three explicit ports so a runtime never
+        // infers by convention: the DESTINATION it lands in
+        // (`port_bindings.target_hidden_context`, a proposer input port), the
+        // carry_0 SOURCE (`folded_carry_seed`, a target output), and the
+        // embedding table for the fused input's leading half (`token_embedding`).
+        // Each is required when a folded carry is declared.
+        if folded_carry_output.is_some() {
+            match speculative.port_bindings.get("target_hidden_context") {
+                None => errors.push(
+                    "speculative chained proposal declares a folded_carry_output but no \
+                     port_bindings.target_hidden_context naming the destination proposer input \
+                     port the carry lands in"
+                        .to_string(),
+                ),
+                Some(context_port) => {
+                    if !proposer.ports.inputs.contains_key(context_port) {
+                        errors.push(format!(
+                            "speculative port_bindings.target_hidden_context '{context_port}' is \
+                             not an input port of proposer component '{}'",
+                            speculative.proposer
+                        ));
+                    } else if context_port != token_embedding_input {
+                        // A folded carry re-enters through the fused input's
+                        // trailing half, so the DESTINATION port is the fused
+                        // `token_embedding_input` itself, never a separate port.
+                        errors.push(format!(
+                            "speculative port_bindings.target_hidden_context '{context_port}' must \
+                             equal the fused token_embedding_input '{token_embedding_input}'; a \
+                             folded carry re-enters through the fused input's trailing half, not a \
+                             separate proposer input port"
+                        ));
+                    }
+                }
+            }
+            match folded_carry_seed {
+                None => errors.push(
+                    "speculative chained proposal declares a folded_carry_output but no \
+                     folded_carry_seed naming the target output that seeds carry_0"
+                        .to_string(),
+                ),
+                Some(seed) => match workflow.components.get(&seed.component) {
+                    None => errors.push(format!(
+                        "speculative folded_carry_seed component '{}' is not a declared workflow \
+                         component",
+                        seed.component
+                    )),
+                    Some(seed_component) => {
+                        if !seed_component.ports.outputs.contains_key(&seed.output) {
+                            errors.push(format!(
+                                "speculative folded_carry_seed output '{}' is not an output port \
+                                 of component '{}'",
+                                seed.output, seed.component
+                            ));
+                        }
+                        // carry_0 is the target's OWN per-token hidden output, so
+                        // the seed must name the speculative target — a proposer
+                        // (or any non-target) seed is nonsensical and rejected.
+                        if seed.component != speculative.target {
+                            errors.push(format!(
+                                "speculative folded_carry_seed component '{}' must be the \
+                                 speculative target '{}'; the folded carry's first-step seed is \
+                                 the target's own hidden output",
+                                seed.component, speculative.target
+                            ));
+                        }
+                    }
+                },
+            }
+            match token_embedding {
+                None => errors.push(
+                    "speculative chained proposal declares a folded_carry_output but no \
+                     token_embedding naming where embed(last_token) is gathered from"
+                        .to_string(),
+                ),
+                Some(embedding) => match workflow.components.get(&embedding.component) {
+                    None => errors.push(format!(
+                        "speculative token_embedding component '{}' is not a declared \
+                         workflow component",
+                        embedding.component
+                    )),
+                    Some(embedding_component) => {
+                        // The fused input's leading half is `embed(last_token)`
+                        // gathered from the TARGET model's shared embedding, so
+                        // the table must resolve to a real initializer in the
+                        // named target model/artifact. Enforce all three facts
+                        // fail-closed: it is the target, the target is an ONNX
+                        // model that owns initializers, and the table is named.
+                        if embedding.component != speculative.target {
+                            errors.push(format!(
+                                "speculative token_embedding component '{}' must be the \
+                                 speculative target '{}'; a folded carry reuses the target \
+                                 model's embedding table",
+                                embedding.component, speculative.target
+                            ));
+                        }
+                        let names_onnx_artifact = matches!(
+                            &embedding_component.implementation,
+                            crate::schema::ComponentImplementation::Onnx { artifact }
+                                if !artifact.trim().is_empty()
+                        );
+                        if !names_onnx_artifact {
+                            errors.push(format!(
+                                "speculative token_embedding names table '{}' on component '{}', \
+                                 which declares no ONNX model artifact for that initializer to \
+                                 resolve against",
+                                embedding.table, embedding.component
+                            ));
+                        }
+                        if embedding.table.trim().is_empty() {
+                            errors.push(
+                                "speculative token_embedding table must name a real target \
+                                 initializer, not an empty string"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                },
+            }
+        }
+        // Every state-service port map the proposer owns, across all groups. A
+        // recurrence must resolve to a read_write alias in one of these.
+        let proposer_group_aliases = workflow
+            .serving
+            .as_ref()
+            .map(|serving| &serving.state_service.groups)
+            .into_iter()
+            .flat_map(|groups| groups.values())
+            .filter_map(|group| group.ports.get(&speculative.proposer))
+            .collect::<Vec<_>>();
+        let mut states = BTreeSet::new();
+        for binding in recurrent {
+            if !states.insert(&binding.state) {
+                errors.push(format!(
+                    "speculative chained proposal repeats recurrent state '{}'",
+                    binding.state
+                ));
+            }
+            if !workflow.state.contains_key(&binding.state) {
+                errors.push(format!(
+                    "speculative chained proposal references unknown recurrent state '{}'",
+                    binding.state
+                ));
+            }
+            if !speculative.rollback_state.contains(&binding.state) {
+                errors.push(format!(
+                    "speculative chained recurrent state '{}' must be listed in rollback_state",
+                    binding.state
+                ));
+            }
+            if !proposer.ports.inputs.contains_key(&binding.input) {
+                errors.push(format!(
+                    "speculative chained recurrence input '{}' is not an input port of component '{}'",
+                    binding.input, speculative.proposer
+                ));
+            }
+            if !proposer.ports.outputs.contains_key(&binding.output) {
+                errors.push(format!(
+                    "speculative chained recurrence output '{}' is not an output port of component '{}'",
+                    binding.output, speculative.proposer
+                ));
+            }
+            // A recurrence is a genuine state transition, so it must resolve to a
+            // read_write state-service alias on the proposer that advances this
+            // exact cell through the same input/output ports the binding names. A
+            // missing, read_only, or mismatched alias means the loop carry would
+            // never be persisted between proposer invocations — reject it
+            // fail-closed rather than silently dropping the recurrence.
+            match proposer_group_aliases
+                .iter()
+                .find_map(|ports| ports.get(&binding.state))
+            {
+                None => errors.push(format!(
+                    "speculative chained recurrent state '{}' has no state-service alias on \
+                     proposer '{}'; a recurrence must resolve through \
+                     serving.state_service.groups.*.ports.{}",
+                    binding.state, speculative.proposer, speculative.proposer
+                )),
+                Some(alias) => {
+                    if alias.access != crate::schema::StatePortAccess::ReadWrite {
+                        errors.push(format!(
+                            "speculative chained recurrent state '{}' resolves to a read_only \
+                             state-service alias on proposer '{}', but a recurrence must advance \
+                             the state (read_write)",
+                            binding.state, speculative.proposer
+                        ));
+                    }
+                    if alias.input != binding.input {
+                        errors.push(format!(
+                            "speculative chained recurrent state '{}' binds input '{}' but its \
+                             state-service alias names input '{}'",
+                            binding.state, binding.input, alias.input
+                        ));
+                    }
+                    match alias.output.as_deref() {
+                        Some(output) if output == binding.output => {}
+                        Some(output) => errors.push(format!(
+                            "speculative chained recurrent state '{}' binds output '{}' but its \
+                             state-service alias names output '{}'",
+                            binding.state, binding.output, output
+                        )),
+                        None => errors.push(format!(
+                            "speculative chained recurrent state '{}' binds output '{}' but its \
+                             state-service alias declares no output",
+                            binding.state, binding.output
+                        )),
+                    }
+                }
+            }
         }
     }
     let declared_groups = workflow

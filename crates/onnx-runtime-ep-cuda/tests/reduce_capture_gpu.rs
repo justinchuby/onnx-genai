@@ -22,25 +22,32 @@
 //! of times per decode step (256 experts × 40 layers on Qwen3.6-35B-A3B), which
 //! is 98%+ of the eager seams that made native decode host/sync-bound.
 //!
-//! Lever A cached the cuDNN descriptors + workspace across calls with a stable
-//! signature and gated the trailing sync on `!capturing`. `ReduceKernel` now
-//! also routes **well-parallelised** f32 sum/mean (enough outputs to fill the
-//! SMs, or a small per-output group — the common decode shape) to the same
-//! capture-safe NVRTC block reduction f16/bf16 already use, and keeps cuDNN only
-//! for the low-parallelism "few outputs, huge group" regime. Both paths record
-//! cleanly into a captured segment. These tests prove:
+//! Lever A moved the live cuDNN workspace into the executor-owned persistent
+//! workspace path, cached only the host descriptors + queried byte size across
+//! calls with a stable signature, and gated the trailing sync on `!capturing`.
+//! `ReduceKernel` now also routes **well-parallelised** f32 sum/mean (enough
+//! outputs to fill the SMs, or a small per-output group — the common decode
+//! shape) to the same capture-safe NVRTC block reduction f16/bf16 already use,
+//! and keeps cuDNN only for the low-parallelism "few outputs, huge group"
+//! regime. Both paths record cleanly into a captured segment. These tests prove:
 //!   * a warmed float reduce reports capture-supported and its captured replay
 //!     is **byte-identical** to the eager result (both f16 and f32, and both the
 //!     NVRTC and the retained-cuDNN f32 regimes);
-//!   * the descriptor/workspace cache repopulates correctly when the input shape
-//!     changes across eager calls (no stale workspace → no wrong bytes);
+//!   * the descriptor cache plus prepared persistent workspace repopulate
+//!     correctly when the input shape changes across eager calls (no stale
+//!     workspace → no wrong bytes);
 //!   * a signature change *during* capture is rejected (no silent stale reuse).
 //!
 //! The suite skips cleanly when no CUDA runtime is present.
 
+mod common;
+
+use std::sync::Arc;
+
 use half::f16;
 use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, Kernel, TensorMut, TensorView,
+    WorkspaceAllocation,
 };
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
@@ -123,6 +130,7 @@ fn reduce_kernel(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_reduce(
+    ep: &CudaExecutionProvider,
     kernel: &dyn Kernel,
     dtype: DataType,
     data: &DeviceBuffer,
@@ -131,6 +139,7 @@ fn execute_reduce(
     n_axes: usize,
     output: &mut DeviceBuffer,
     out_shape: &[usize],
+    workspace: &mut Option<WorkspaceAllocation>,
 ) {
     let data_strides = compute_contiguous_strides(data_shape);
     let axes_shape = [n_axes];
@@ -159,13 +168,13 @@ fn execute_reduce(
         &out_strides,
         output.device(),
     )];
-    kernel
-        .execute(&inputs, &mut outputs)
+    common::execute_kernel(ep, kernel, &inputs, &mut outputs, workspace)
         .expect("standalone reduce execute");
 }
 
 #[allow(clippy::too_many_arguments)]
 fn try_execute_reduce(
+    ep: &CudaExecutionProvider,
     kernel: &dyn Kernel,
     dtype: DataType,
     data: &DeviceBuffer,
@@ -174,6 +183,7 @@ fn try_execute_reduce(
     n_axes: usize,
     output: &mut DeviceBuffer,
     out_shape: &[usize],
+    workspace: &mut Option<WorkspaceAllocation>,
 ) -> onnx_runtime_ep_api::Result<()> {
     let data_strides = compute_contiguous_strides(data_shape);
     let axes_shape = [n_axes];
@@ -202,7 +212,7 @@ fn try_execute_reduce(
         &out_strides,
         output.device(),
     )];
-    kernel.execute(&inputs, &mut outputs)
+    common::execute_kernel(ep, kernel, &inputs, &mut outputs, workspace)
 }
 
 fn read(ep: &CudaExecutionProvider, buffer: &DeviceBuffer, len: usize) -> Vec<u8> {
@@ -276,6 +286,7 @@ fn capture_matches_eager_and_oracle_shape(
     let mut captured = ep
         .allocate(rows * elem, 256)
         .expect("allocate captured out");
+    let mut workspace = None;
 
     // SAFETY: the axes allocation exactly covers the single-axis tensor.
     unsafe {
@@ -294,9 +305,11 @@ fn capture_matches_eager_and_oracle_shape(
         }
 
         // Warm the exact signature (eager). This populates the cuDNN descriptor
-        // + workspace cache and the warmed-axes copy, and marks the reduce
+        // + workspace-byte cache, allocates the executor-owned persistent
+        // workspace, warms the axes copy, and marks the reduce
         // capture-supported.
         execute_reduce(
+            &ep,
             kernel.as_ref(),
             dtype,
             &data,
@@ -305,6 +318,7 @@ fn capture_matches_eager_and_oracle_shape(
             1,
             &mut eager,
             &out_shape,
+            &mut workspace,
         );
         assert!(
             kernel.cuda_graph_compatible(),
@@ -316,6 +330,7 @@ fn capture_matches_eager_and_oracle_shape(
             .begin_graph_capture(&kernels)
             .expect("begin float reduce CUDA graph capture");
         execute_reduce(
+            &ep,
             kernel.as_ref(),
             dtype,
             &data,
@@ -324,6 +339,7 @@ fn capture_matches_eager_and_oracle_shape(
             1,
             &mut captured,
             &out_shape,
+            &mut workspace,
         );
         runtime
             .end_graph_capture()
@@ -375,6 +391,10 @@ fn capture_matches_eager_and_oracle_shape(
         );
     }
 
+    if let Some(workspace) = workspace {
+        ep.deallocate_workspace(workspace)
+            .expect("free prepared reduce workspace");
+    }
     for buffer in [captured, eager, axes, data] {
         ep.deallocate(buffer).expect("free CUDA test buffer");
     }
@@ -438,6 +458,135 @@ fn f32_low_parallelism_reduce_mean_uses_cudnn_and_captures() {
     capture_matches_eager_and_oracle_shape("ReduceMean", DataType::Float32, true, 1, 4096);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn f32_low_parallelism_reduce_prepared_workspace_uses_the_injected_allocator() {
+    let injected = Arc::new(common::ExternalEagerAllocator::new(
+        common::require_context("cuDNN Reduce prepared-workspace allocator substitution"),
+    ));
+    let ep =
+        require_cuda()
+            .with_memory(
+                Arc::clone(&injected) as Arc<dyn onnx_runtime_memory_governor::DeviceAllocator>
+            )
+            .expect("the injected allocator must be accepted for the visible CUDA device");
+    let runtime = ep.runtime();
+    let dtype = DataType::Float32;
+    let in_shape = [1usize, 1, 4096];
+    let out_shape = [1usize, 1, 1];
+    let kernel = reduce_kernel(&ep, "ReduceSum", dtype, &in_shape, 1, true, &out_shape);
+    let n = in_shape.iter().product::<usize>();
+    let data = ep.allocate(n * 4, 256).expect("allocate data");
+    let axes = ep.allocate(8, 256).expect("allocate axes");
+    let mut eager = ep.allocate(4, 256).expect("allocate eager out");
+    let mut captured = ep.allocate(4, 256).expect("allocate captured out");
+    unsafe {
+        runtime
+            .htod(&encode(&varied(n, 0.0), dtype), cuptr(data.as_ptr()))
+            .unwrap();
+        runtime.htod(&bytes(&[2i64]), cuptr(axes.as_ptr())).unwrap();
+    }
+
+    let calls_after_buffers = injected.cumemalloc_calls();
+    let mut workspace = None;
+    execute_reduce(
+        &ep,
+        kernel.as_ref(),
+        dtype,
+        &data,
+        &in_shape,
+        &axes,
+        1,
+        &mut eager,
+        &out_shape,
+        &mut workspace,
+    );
+    assert!(
+        workspace.is_some(),
+        "prepared reduce workspace must be allocated"
+    );
+    let calls_after_first = injected.cumemalloc_calls();
+    assert_eq!(
+        calls_after_first,
+        calls_after_buffers + 1,
+        "the first cuDNN reduce execute must allocate exactly one prepared workspace"
+    );
+    execute_reduce(
+        &ep,
+        kernel.as_ref(),
+        dtype,
+        &data,
+        &in_shape,
+        &axes,
+        1,
+        &mut captured,
+        &out_shape,
+        &mut workspace,
+    );
+    let calls_after_second = injected.cumemalloc_calls();
+    assert_eq!(
+        calls_after_second, calls_after_first,
+        "repeated cuDNN reduce executes must reuse the prepared workspace"
+    );
+    let eager_bytes = read(&ep, &eager, 4);
+    let repeat_bytes = read(&ep, &captured, 4);
+    assert_eq!(
+        repeat_bytes, eager_bytes,
+        "reusing the prepared reduce workspace changed the output"
+    );
+    assert!(kernel.cuda_graph_compatible());
+
+    let kernels: [&dyn Kernel; 1] = [kernel.as_ref()];
+    runtime
+        .begin_graph_capture(&kernels)
+        .expect("begin reduce capture");
+    execute_reduce(
+        &ep,
+        kernel.as_ref(),
+        dtype,
+        &data,
+        &in_shape,
+        &axes,
+        1,
+        &mut captured,
+        &out_shape,
+        &mut workspace,
+    );
+    runtime.end_graph_capture().expect("end reduce capture");
+    runtime.replay_graph().expect("replay captured reduce");
+    assert_eq!(
+        injected.cumemalloc_calls(),
+        calls_after_second,
+        "recording or replaying the reduce graph must not allocate a new workspace"
+    );
+    assert_eq!(
+        read(&ep, &captured, 4),
+        eager_bytes,
+        "captured reduce output diverged from eager output"
+    );
+    assert!(
+        runtime.reset_graph().unwrap(),
+        "reset captured reduce graph"
+    );
+
+    if let Some(workspace) = workspace.take() {
+        ep.deallocate_workspace(workspace)
+            .expect("free prepared reduce workspace");
+    }
+    for buffer in [captured, eager, axes, data] {
+        ep.deallocate(buffer).expect("free CUDA test buffer");
+    }
+    common::drain_releases(&ep, "Reduce prepared workspace teardown");
+    assert_eq!(
+        injected.frees(),
+        injected.cumemalloc_calls(),
+        "the injected allocator must observe every reduce buffer/workspace free"
+    );
+}
+
 /// A single kernel driven across two shapes to prove the cache key includes the
 /// shape: warm shape A, then run shape B, then shape A again — each must be
 /// numerically correct (a shape-blind cache would reuse A's workspace/descriptor
@@ -465,6 +614,7 @@ fn float_reduce_same_kernel_alternating_shapes_stays_correct() {
     // One shape-generic kernel: attribute-free, axes via input, so the same
     // kernel legitimately handles multiple runtime shapes.
     let kernel = reduce_kernel(&ep, "ReduceSum", dtype, &[4, 8], 1, true, &[4, 1]);
+    let mut workspace = None;
 
     for &(rows, cols) in &[(4usize, 8usize), (2usize, 32usize), (4usize, 8usize)] {
         let in_shape = [rows, cols];
@@ -480,6 +630,7 @@ fn float_reduce_same_kernel_alternating_shapes_stays_correct() {
                 .unwrap();
         }
         execute_reduce(
+            &ep,
             kernel.as_ref(),
             dtype,
             &data,
@@ -488,6 +639,7 @@ fn float_reduce_same_kernel_alternating_shapes_stays_correct() {
             1,
             &mut out,
             &out_shape,
+            &mut workspace,
         );
         let seen = decode(&encode(&logical, dtype), dtype);
         let expected = oracle_reduce_last_axis(&seen, rows, cols, false);
@@ -500,6 +652,10 @@ fn float_reduce_same_kernel_alternating_shapes_stays_correct() {
         }
         ep.deallocate(data).unwrap();
         ep.deallocate(out).unwrap();
+    }
+    if let Some(workspace) = workspace {
+        ep.deallocate_workspace(workspace)
+            .expect("free prepared reduce workspace");
     }
     ep.deallocate(axes).unwrap();
 }
@@ -529,6 +685,7 @@ fn float_reduce_shape_change_under_capture_is_rejected() {
     }
 
     let kernel = reduce_kernel(&ep, "ReduceSum", dtype, &[4, 8], 1, true, &[4, 1]);
+    let mut workspace = None;
 
     // Shape A: warm it.
     let a_in = [4usize, 8];
@@ -542,6 +699,7 @@ fn float_reduce_shape_change_under_capture_is_rejected() {
             .unwrap();
     }
     execute_reduce(
+        &ep,
         kernel.as_ref(),
         dtype,
         &data_a,
@@ -550,6 +708,7 @@ fn float_reduce_shape_change_under_capture_is_rejected() {
         1,
         &mut out_a,
         &a_out,
+        &mut workspace,
     );
     assert!(kernel.cuda_graph_compatible());
 
@@ -570,6 +729,7 @@ fn float_reduce_shape_change_under_capture_is_rejected() {
         .begin_graph_capture(&kernels)
         .expect("begin capture");
     let result = try_execute_reduce(
+        &ep,
         kernel.as_ref(),
         dtype,
         &data_b,
@@ -578,6 +738,7 @@ fn float_reduce_shape_change_under_capture_is_rejected() {
         1,
         &mut out_b,
         &b_out,
+        &mut workspace,
     );
     assert!(
         result.is_err(),
@@ -588,6 +749,10 @@ fn float_reduce_shape_change_under_capture_is_rejected() {
         .expect("abort the half-recorded capture");
     let _ = runtime.reset_graph();
 
+    if let Some(workspace) = workspace {
+        ep.deallocate_workspace(workspace)
+            .expect("free prepared reduce workspace");
+    }
     for buffer in [out_b, data_b, out_a, data_a, axes] {
         ep.deallocate(buffer).expect("free CUDA test buffer");
     }

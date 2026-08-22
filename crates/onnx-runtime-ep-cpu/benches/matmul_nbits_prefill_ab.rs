@@ -132,6 +132,9 @@ fn median(mut samples: Vec<f64>) -> f64 {
 }
 
 fn main() {
+    // Match the decode thread topology a served session runs in (#1749).
+    common::init_decode_topology();
+
     let cases = [
         Case {
             label: "int8 dense-fallback",

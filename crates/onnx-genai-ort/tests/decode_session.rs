@@ -17,6 +17,11 @@ fn tiny_scatter_llm() -> PathBuf {
         .join("../../tests/fixtures/tiny-llm-scatter/model.onnx.textproto")
 }
 
+fn tiny_orphan_output_decoder() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/tiny-orphan-output-decoder/model.onnx.textproto")
+}
+
 /// Explicit `static_cache` ABI matching the `tiny-llm-scatter` fixture
 /// graph's actual port names. The scatter control ports are shape-indistinguish-
 /// able integers, so they must be declared rather than name-guessed.
@@ -364,6 +369,65 @@ fn static_cache_without_metadata_errors_naming_the_key() {
         assert!(
             new_err.to_string().contains(expected),
             "error must name the canonical key '{expected}': {new_err}"
+        );
+    }
+}
+
+/// A decoder graph with a rank-3+ output the ABI does not account for is a
+/// malformed decoder: silently ignoring it (the old relaxation ignored every
+/// orphan rank-3+ output) would let a rewind or a rejected proposal
+/// desynchronize a cache the runtime never bound. Resolution must fail closed
+/// and name the offending output.
+#[test]
+fn undeclared_rank3_output_is_rejected_as_unpaired_state() {
+    let _guard = ort_test_lock().lock().expect("ORT test lock");
+    let session = Session::new(
+        test_environment(),
+        &tiny_orphan_output_decoder(),
+        deterministic_session_options(),
+    )
+    .expect("session");
+    // Declares logits but leaves the graph's rank-3 `orphan_state` output
+    // unaccounted for.
+    let io: onnx_genai_metadata::ModelIoSpec =
+        serde_json::from_str(r#"{"token_input": "input_ids", "logits_output": "logits"}"#)
+            .expect("io spec");
+    let err = match DecodeSession::new_with_io(&session, DecodeSessionOptions::default(), Some(&io))
+    {
+        Ok(_) => panic!("an unpaired rank-3 output must fail closed"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("cannot resolve decoder state") && message.contains("orphan_state"),
+        "error must name the unpaired output: {message}"
+    );
+}
+
+/// The same graph is accepted once the extra output is explicitly designated as
+/// the hidden/auxiliary activation a proposer or embedding head consumes: the
+/// narrowing rejects only undeclared outputs, not every rank-3 output.
+#[test]
+fn a_designated_hidden_output_is_not_rejected() {
+    let _guard = ort_test_lock().lock().expect("ORT test lock");
+    let session = Session::new(
+        test_environment(),
+        &tiny_orphan_output_decoder(),
+        deterministic_session_options(),
+    )
+    .expect("session");
+    let io: onnx_genai_metadata::ModelIoSpec = serde_json::from_str(
+        r#"{"token_input": "input_ids", "logits_output": "logits", "hidden_output": "orphan_state"}"#,
+    )
+    .expect("io spec");
+    // Designating `orphan_state` as the hidden output leaves no unaccounted
+    // rank-3 output, so resolution no longer fails closed on it.
+    if let Err(err) =
+        DecodeSession::new_with_io(&session, DecodeSessionOptions::default(), Some(&io))
+    {
+        assert!(
+            !err.to_string().contains("cannot resolve decoder state"),
+            "a designated hidden output must not be rejected as unpaired state: {err}"
         );
     }
 }

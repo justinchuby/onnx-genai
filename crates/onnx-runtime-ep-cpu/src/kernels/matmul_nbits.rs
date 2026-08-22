@@ -165,7 +165,7 @@ mod mm_profile {
 
 /// Overrides the bounded M=1 decode pool size; set to `0` to use the global
 /// Rayon pool as an escape hatch.
-const DECODE_THREADS_ENV: &str = "ONNX_GENAI_CPU_DECODE_THREADS";
+pub(crate) const DECODE_THREADS_ENV: &str = "ONNX_GENAI_CPU_DECODE_THREADS";
 
 /// `mlas-sys` reads the same knob to size its standalone pool. Fail the build
 /// rather than let the two names drift apart silently.
@@ -722,6 +722,58 @@ pub struct MatMulNBitsKernel {
     mlas_shards: OnceLock<Option<Arc<Vec<Option<MlasShard>>>>>,
     #[cfg(feature = "mlas")]
     mlas_packed: OnceLock<Option<Arc<MlasPreparedPacked>>>,
+    /// The shared-store keys this kernel *installed*, and is therefore
+    /// responsible for evicting when it drops (#1735). Empty when it only
+    /// shared an entry a sibling instance had already built.
+    #[cfg(feature = "mlas")]
+    mlas_owned: MlasPackedOwnership,
+}
+
+/// Packed weights a kernel installed in the process-global store must not
+/// outlive it (#1735) -- the same lifetime defect #1726 fixed for the
+/// weight-transpose caches, in the store that holds MLAS SQNBit packs.
+///
+/// The store is keyed on the operands' addresses and holds no claim on the
+/// buffers there. An address only names a weight while that weight is live;
+/// once freed, the next allocation of matching shape and pack parameters to
+/// land on it is served the previous weight's packed bytes, with the right
+/// route and silently foreign numbers. `clear_mlas_packed_caches` closes only
+/// the cross-*model* case, at `Executor` drop; this closes the transient weight
+/// freed while the process lives on.
+///
+/// Ownership is the installing call, never a hit: a kernel that shared its
+/// sibling's pack evicts nothing, so a prefill instance retiring cannot force
+/// the live decode instance to re-pack.
+///
+/// A separate type rather than a `Drop` on the kernel itself: `MatMulNBitsKernel`
+/// is built throughout the tests with functional-update syntax
+/// (`..test_kernel(..)`), and a type that implements `Drop` cannot be moved out
+/// of. Holding the responsibility in a field keeps the kernel freely movable
+/// while still running the eviction exactly once, when the kernel dies.
+#[cfg(feature = "mlas")]
+#[derive(Default)]
+struct MlasPackedOwnership {
+    shards: OnceLock<MlasPackedKey>,
+    packed: OnceLock<MlasPackedKey>,
+}
+
+#[cfg(feature = "mlas")]
+impl Drop for MlasPackedOwnership {
+    fn drop(&mut self) {
+        let shards = self.shards.get();
+        let packed = self.packed.get();
+        if shards.is_none() && packed.is_none() {
+            return;
+        }
+        with_mlas_packed_caches(|caches| {
+            if let Some(key) = shards {
+                caches.remove_shards(key);
+            }
+            if let Some(key) = packed {
+                caches.remove_packed(key);
+            }
+        });
+    }
 }
 
 /// One contiguous output-column shard of an MLAS SQNBit-packed weight: columns
@@ -775,10 +827,13 @@ impl MlasPreparedPacked {
 ///
 /// `addr` alone is **not** an identity: an allocator recycles a freed weight's
 /// address for a later same-shaped weight (the #845/#1079 hazard that cost a
-/// full debugging cycle). The shape fields close the different-shape case; the
-/// remaining same-address, same-shape, across-model-lifetimes window is a
-/// lifetime problem, closed by [`clear_mlas_packed_caches`] on `Executor` drop
-/// -- the exact boundary at which `weight_transpose::clear_all` runs. The
+/// full debugging cycle). The shape fields close the different-shape case, and
+/// the operand addresses close the same-shape-different-scales case. What no
+/// key can close is the *lifetime* case -- an address names a weight only while
+/// that weight is live -- so the entry is bounded by its installer instead:
+/// `MatMulNBitsKernel::drop` evicts what it installed (#1735), and
+/// [`clear_mlas_packed_caches`] clears the rest at `Executor` drop, the exact
+/// boundary at which `weight_transpose::clear_all` runs. The
 /// N-shard partition is *not* a field because it is a pure function of the fixed
 /// process topology and `n` (see [`MatMulNBitsKernel::mlas_shard_segments`]), so
 /// two instances of one node always partition identically.
@@ -786,6 +841,13 @@ impl MlasPreparedPacked {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct MlasPackedKey {
     addr: usize,
+    /// Address of the scales tensor, and of the zero-points tensor when present
+    /// (`0` when absent). The pack is a function of all three operands -- an
+    /// `Int8` pack bakes scale and zero-point into per-block sums -- so keying
+    /// on the quantized weight alone would let two nodes that share a `B`
+    /// initializer but carry different scales be served each other's pack.
+    scales_addr: usize,
+    zero_points_addr: usize,
     n: usize,
     k: usize,
     bits: usize,
@@ -796,8 +858,11 @@ struct MlasPackedKey {
 
 #[cfg(feature = "mlas")]
 impl MlasPackedKey {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         addr: usize,
+        scales_addr: usize,
+        zero_points_addr: usize,
         n: usize,
         k: usize,
         bits: usize,
@@ -807,6 +872,8 @@ impl MlasPackedKey {
     ) -> Self {
         Self {
             addr,
+            scales_addr,
+            zero_points_addr,
             n,
             k,
             bits,
@@ -835,6 +902,12 @@ struct MlasPackedCaches {
     packed: Mutex<HashMap<MlasPackedKey, Arc<MlasPreparedPacked>>>,
 }
 
+/// A store lookup's result: the shared entry, and whether *this* call installed
+/// it. Only the installer owns the eviction (#1735), so the flag has to survive
+/// all the way back to the caller rather than being folded into the `Arc`.
+#[cfg(feature = "mlas")]
+type MlasStoreEntry<T> = Result<Option<(Arc<T>, bool)>>;
+
 #[cfg(feature = "mlas")]
 impl MlasPackedCaches {
     /// Return the shared N-sharded pack for `key`, building it on a miss with
@@ -846,7 +919,7 @@ impl MlasPackedCaches {
         &self,
         key: MlasPackedKey,
         build: impl FnOnce() -> Result<Option<Vec<Option<MlasShard>>>>,
-    ) -> Result<Option<Arc<Vec<Option<MlasShard>>>>> {
+    ) -> MlasStoreEntry<Vec<Option<MlasShard>>> {
         if let Some(hit) = self
             .shards
             .lock()
@@ -854,7 +927,7 @@ impl MlasPackedCaches {
             .get(&key)
             .cloned()
         {
-            return Ok(Some(hit));
+            return Ok(Some((hit, false)));
         }
         let Some(built) = build()? else {
             return Ok(None);
@@ -862,14 +935,19 @@ impl MlasPackedCaches {
         let arc = Arc::new(built);
         // A concurrent racer may have inserted an identical entry meanwhile;
         // keep whichever landed first so every reader shares one allocation.
-        Ok(Some(
-            self.shards
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .entry(key)
-                .or_insert(arc)
-                .clone(),
-        ))
+        match self
+            .shards
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key)
+        {
+            std::collections::hash_map::Entry::Occupied(occupied) => {
+                Ok(Some((occupied.get().clone(), false)))
+            }
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                Ok(Some((vacant.insert(arc).clone(), true)))
+            }
+        }
     }
 
     /// Full-width analogue of [`Self::get_or_build_shards`].
@@ -877,7 +955,7 @@ impl MlasPackedCaches {
         &self,
         key: MlasPackedKey,
         build: impl FnOnce() -> Result<Option<MlasPreparedPacked>>,
-    ) -> Result<Option<Arc<MlasPreparedPacked>>> {
+    ) -> MlasStoreEntry<MlasPreparedPacked> {
         if let Some(hit) = self
             .packed
             .lock()
@@ -885,20 +963,47 @@ impl MlasPackedCaches {
             .get(&key)
             .cloned()
         {
-            return Ok(Some(hit));
+            return Ok(Some((hit, false)));
         }
         let Some(built) = build()? else {
             return Ok(None);
         };
         let arc = Arc::new(built);
-        Ok(Some(
-            self.packed
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .entry(key)
-                .or_insert(arc)
-                .clone(),
-        ))
+        match self
+            .packed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key)
+        {
+            std::collections::hash_map::Entry::Occupied(occupied) => {
+                Ok(Some((occupied.get().clone(), false)))
+            }
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                Ok(Some((vacant.insert(arc).clone(), true)))
+            }
+        }
+    }
+
+    /// Drop the entry `key` names from the sharded store, if still present.
+    ///
+    /// The caller is the kernel that *installed* it. Entries are keyed on the
+    /// operands' addresses, and nothing in the key proves the bytes there are
+    /// still the ones that were packed, so an entry outliving its source is
+    /// served to whatever lands on that address next -- the #1726 defect, in a
+    /// store whose values are packed weights rather than transposes.
+    fn remove_shards(&self, key: &MlasPackedKey) {
+        self.shards
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
+    }
+
+    /// [`Self::remove_shards`] for the full-width store.
+    fn remove_packed(&self, key: &MlasPackedKey) {
+        self.packed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
     }
 
     fn clear(&self) {
@@ -915,6 +1020,9 @@ impl MlasPackedCaches {
 
 /// The process-global packed store, the **only** store production uses.
 #[cfg(feature = "mlas")]
+// Under `cfg(test)` every kernel installs into the thread-local store below,
+// so this one is genuinely unreachable there; it is the production store.
+#[cfg_attr(test, allow(dead_code))]
 static MLAS_PACKED_GLOBAL: LazyLock<MlasPackedCaches> = LazyLock::new(MlasPackedCaches::default);
 
 #[cfg(all(test, feature = "mlas"))]
@@ -949,19 +1057,47 @@ fn with_mlas_packed_caches<R>(f: impl FnOnce(&MlasPackedCaches) -> R) -> R {
     }
 }
 
+/// Test-only: how many entries the active packed store holds, as
+/// `(shards, packed)`. Used to assert that a retiring kernel evicts exactly what
+/// it installed and nothing a live sibling still needs (#1735).
+#[cfg(all(test, feature = "mlas"))]
+fn mlas_store_len() -> (usize, usize) {
+    with_mlas_packed_caches(|caches| {
+        (
+            caches
+                .shards
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            caches
+                .packed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+        )
+    })
+}
+
 /// Evict every shared MLAS SQNBit packed weight.
 ///
 /// **Must** run when an `Executor` drops, for the same reason
 /// `weight_transpose::clear_all` does: the store is keyed on `(address, shape,
 /// pack params)`, which makes a stale hit impossible for a *different-shaped*
 /// weight, but a later model whose mmap places a same-shaped weight at a
-/// recycled address would still match. Clearing on `Executor` drop closes that
-/// window and bounds the store across model lifetimes. In production only the
+/// recycled address would still match. Clearing on `Executor` drop bounds the
+/// store across model lifetimes; a kernel outliving nothing but its own weight
+/// is handled earlier, by `MatMulNBitsKernel::drop` evicting what it installed
+/// (#1735). This runs *before* the executor frees its weight buffers, which is
+/// what makes the teardown ordering safe rather than merely lucky. In production only the
 /// global store exists; the per-test thread-locals are cleared by their threads
 /// ending, so this is a no-op for them.
 #[cfg(feature = "mlas")]
 pub fn clear_mlas_packed_caches() {
-    MLAS_PACKED_GLOBAL.clear();
+    // Through `with_mlas_packed_caches`, not `MLAS_PACKED_GLOBAL` directly: under
+    // `cfg(test)` the kernels install into the thread-local store, so clearing
+    // the global one would drain a store nothing in the test ever touched and
+    // silently leave the real entries resident.
+    with_mlas_packed_caches(|caches| caches.clear());
 }
 
 /// No-op stand-in when the `mlas` feature is off, so the executor's drop path
@@ -1334,6 +1470,8 @@ impl KernelFactory for MatMulNBitsFactory {
             packed_u8_weight: OnceLock::new(),
             packed_u8_n16_weight: OnceLock::new(),
             packed_kai_qsi8_weight: OnceLock::new(),
+            #[cfg(feature = "mlas")]
+            mlas_owned: MlasPackedOwnership::default(),
             #[cfg(feature = "mlas")]
             mlas_shards: OnceLock::new(),
             #[cfg(feature = "mlas")]
@@ -2956,12 +3094,25 @@ impl MatMulNBitsKernel {
     fn mlas_packed_key(
         &self,
         packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
         has_zero_points: bool,
         comp: mlas_sys::SQNBitComputeType,
     ) -> Option<MlasPackedKey> {
         let addr = contiguous_host_slice::<u8>(packed)?.as_ptr() as usize;
+        // The pack is a function of every operand that feeds it, so all of them
+        // are part of the identity. A non-contiguous or device-side scales
+        // tensor has no stable host address, which makes the whole weight
+        // unshareable rather than shareable under a partial identity.
+        let scales_addr = contiguous_host_addr(scales)?;
+        let zero_points_addr = match zero_points {
+            Some(view) => contiguous_host_addr(view)?,
+            None => 0,
+        };
         Some(MlasPackedKey::new(
             addr,
+            scales_addr,
+            zero_points_addr,
             self.n,
             self.k,
             self.bits,
@@ -2991,10 +3142,24 @@ impl MatMulNBitsKernel {
                 self.build_mlas_shards(packed, scales, zero_points, comp)
             })
         };
-        match self.mlas_packed_key(packed, zero_points.is_some(), comp) {
-            Some(key) => with_mlas_packed_caches(|caches| caches.get_or_build_shards(key, build)),
-            None => Ok(build()?.map(Arc::new)),
+        let Some(key) =
+            self.mlas_packed_key(packed, scales, zero_points, zero_points.is_some(), comp)
+        else {
+            return Ok(build()?.map(Arc::new));
+        };
+        let Some((shards, installed)) =
+            with_mlas_packed_caches(|caches| caches.get_or_build_shards(key, build))?
+        else {
+            return Ok(None);
+        };
+        if installed {
+            // Only the installing call owns the eviction (#1735). A kernel that
+            // merely shared its sibling's pack must leave it alone, or the first
+            // instance to drop would pull the packed weight out from under a
+            // live sibling and force it to re-pack.
+            let _ = self.mlas_owned.shards.set(key);
         }
+        Ok(Some(shards))
     }
 
     /// Full-width analogue of [`Self::shared_mlas_shards`] for the `NO_SHARD`
@@ -3012,10 +3177,20 @@ impl MatMulNBitsKernel {
                 self.build_mlas_packed(packed, scales, zero_points, comp)
             })
         };
-        match self.mlas_packed_key(packed, zero_points.is_some(), comp) {
-            Some(key) => with_mlas_packed_caches(|caches| caches.get_or_build_packed(key, build)),
-            None => Ok(build()?.map(Arc::new)),
+        let Some(key) =
+            self.mlas_packed_key(packed, scales, zero_points, zero_points.is_some(), comp)
+        else {
+            return Ok(build()?.map(Arc::new));
+        };
+        let Some((prepared, installed)) =
+            with_mlas_packed_caches(|caches| caches.get_or_build_packed(key, build))?
+        else {
+            return Ok(None);
+        };
+        if installed {
+            let _ = self.mlas_owned.packed.set(key);
         }
+        Ok(Some(prepared))
     }
 
     /// Full-width analogue of [`Self::shared_mlas_shards`] for the
@@ -3029,10 +3204,20 @@ impl MatMulNBitsKernel {
         comp: mlas_sys::SQNBitComputeType,
     ) -> Result<Option<Arc<MlasPreparedPacked>>> {
         let build = || self.build_mlas_prepacked(packed, scales, zero_points, comp);
-        match self.mlas_packed_key(packed, zero_points.is_some(), comp) {
-            Some(key) => with_mlas_packed_caches(|caches| caches.get_or_build_packed(key, build)),
-            None => Ok(build()?.map(Arc::new)),
+        let Some(key) =
+            self.mlas_packed_key(packed, scales, zero_points, zero_points.is_some(), comp)
+        else {
+            return Ok(build()?.map(Arc::new));
+        };
+        let Some((prepared, installed)) =
+            with_mlas_packed_caches(|caches| caches.get_or_build_packed(key, build))?
+        else {
+            return Ok(None);
+        };
+        if installed {
+            let _ = self.mlas_owned.packed.set(key);
         }
+        Ok(Some(prepared))
     }
 
     /// Pack the constant int4 weight into one MLAS SQNBit shard per entry of
@@ -4056,6 +4241,57 @@ fn resolve_rayon_global_threads(
 /// most once and only its first attempt logs.
 static PROCESS_BUDGET_BOUND: OnceLock<()> = OnceLock::new();
 
+/// Whether an explicit decode budget asks for more workers than the host has
+/// physical cores, returning that core count when it does.
+///
+/// `None` whenever the topology is unknown or the request fits: an unknown
+/// topology is never an occasion to warn, and neither is a budget at or below
+/// the core count.
+///
+/// Split out as a pure function because the interesting part is the policy, and
+/// this way it is testable without a host to interrogate.
+fn budget_beyond_physical_cores(threads: usize, physical: Option<usize>) -> Option<usize> {
+    physical.filter(|&cores| cores > 0 && threads > cores)
+}
+
+/// Warn once when an explicit decode budget oversubscribes the physical cores.
+///
+/// Every pool this budget sizes -- the global Rayon pool built below, the decode
+/// pool, and the task runtime's lanes -- is a worker set that either spins or
+/// fork-joins. Past one worker per physical core the surplus workers are SMT
+/// siblings of workers that already exist, and
+/// [`crate::core_topology::cap_spinning_workers`] already refuses to spin that
+/// many for exactly this reason.
+///
+/// The cost is paid twice, and it is large. Measured on a 16-physical-core /
+/// 32-logical host, raising the budget from 16 to 32 for an int4 decode GEMM:
+///
+/// | budget | steady-state wall | CPU per inference | pool construction |
+/// | --- | --- | --- | --- |
+/// | 16 | 0.921 ms | 13.99 ms | 1.55 CPU-s |
+/// | 32 | 0.934 ms | 15.17 ms | 3.67 CPU-s |
+///
+/// No wall-clock gain at all, 8% more CPU per inference, and 2.4x the one-off
+/// construction cost -- which is futex and yield-spin churn while ~2x the
+/// threads come up, and which grows faster than linearly in the worker count.
+/// Larger prefill shapes in the same diagnostic harness measured the same way
+/// or worse. The runtime honours the request either way; this only makes a
+/// request that cannot pay for itself visible instead of silent.
+fn report_budget_beyond_physical_cores(threads: usize) {
+    let Some(cores) =
+        budget_beyond_physical_cores(threads, crate::core_topology::allowed_physical_cores())
+    else {
+        return;
+    };
+    eprintln!(
+        "onnx-genai: CPU decode budget {threads} exceeds the {cores} physical cores available \
+         to this process; the surplus workers are SMT siblings that contend rather than add \
+         throughput, and they cost both CPU per inference and a larger one-off pool \
+         construction. Consider {DECODE_THREADS_ENV}={cores} unless a measurement on this host \
+         says otherwise"
+    );
+}
+
 /// Confine the whole process to the explicit decode budget so a user who caps
 /// cores (via `--cpu-cores N`, `ONNX_GENAI_CPU_DECODE_THREADS=N`, or
 /// [`set_decode_thread_budget`]) disturbs at most `N` CPUs -- covering prefill
@@ -4092,6 +4328,10 @@ pub fn bound_process_to_decode_budget() {
         return;
     };
 
+    // Before the affinity mask narrows the allowed set, so the request is judged
+    // against the machine the caller was looking at when they chose the budget.
+    report_budget_beyond_physical_cores(threads);
+
     // Apply the process CPU affinity mask *before* building the Rayon global
     // pool so its worker threads inherit the restricted CPU set.
     #[cfg(target_os = "linux")]
@@ -4116,6 +4356,7 @@ pub fn bound_process_to_decode_budget() {
 
     match rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
+        .thread_name(prefill_worker_name)
         .build_global()
     {
         Ok(()) => eprintln!(
@@ -4128,6 +4369,25 @@ pub fn bound_process_to_decode_budget() {
              prefill/MLAS parallelism"
         ),
     }
+}
+
+/// Name for a worker in the process-wide prefill/MLAS Rayon pool.
+///
+/// Rayon does not name `build_global` workers by default, and an unnamed
+/// thread's `comm` defaults to the *process* name — so an unnamed pool of
+/// `N` workers reads, in `ps`/`top`/`/proc/<pid>/task`, as `N` extra copies
+/// of the host binary rather than as a pool. That made this pool the single
+/// largest unattributed block of threads in a budgeted process (an explicit
+/// budget of `N` more than doubles the thread count, and until now `N` of
+/// those were anonymous).
+///
+/// Deliberately short: Linux truncates `comm` to 15 bytes, so the longer
+/// `onnx-genai-`-prefixed convention used elsewhere in this crate collapses
+/// to `onnx-genai-deco`/`onnx-genai-spmd` and loses the index. This form
+/// survives truncation intact for every width this pool is ever built at,
+/// which is the whole point of naming it.
+fn prefill_worker_name(index: usize) -> String {
+    format!("nxgn-prefill-{index}")
 }
 
 /// Default persistent-pool worker count for `available` logical CPUs: half of
@@ -4560,6 +4820,19 @@ pub(crate) fn spmd_decode_active() -> Option<&'static crate::decode_spmd::SpmdDe
     } else {
         None
     }
+}
+
+/// Whether *some* bounded decode pool owns this thread's forward pass.
+///
+/// The routing predicate for kernels that are not themselves decode
+/// projections but run inside a decode forward — attention, above all. When it
+/// is true the decode workers are resident and (under the SPMD scope) spinning,
+/// so a fan-out belongs on [`decode_parallel_output_row_blocks`] rather than on
+/// any second executor that would compete with them for the same cores. When it
+/// is false there is no decode pool to contend with and the task runtime is the
+/// right home. Keys off the active scope, never off op or model identity.
+pub(crate) fn decode_pool_active() -> bool {
+    spmd_decode_active().is_some() || numa_decode_active().is_some()
 }
 
 #[cfg(test)]
@@ -6939,6 +7212,21 @@ fn contiguous_host_slice<'a, T>(view: &TensorView<'a>) -> Option<&'a [T]> {
     // SAFETY: the executor guarantees the TensorView backing is valid for `'a`; callers validate
     // the dtype before selecting T, and contiguous views contain exactly `numel` elements.
     Some(unsafe { std::slice::from_raw_parts(view.data_ptr::<T>(), view.numel()) })
+}
+
+/// Address of a contiguous host-visible tensor's first byte, for use as part of
+/// a cache identity. Returns `None` for device or strided tensors, which have no
+/// stable host address to key on.
+///
+/// Deliberately not `contiguous_host_slice::<u8>`: that would build a slice of
+/// `numel` *elements* typed as bytes, understating the length for any wider
+/// dtype. Only the address is wanted here, so no slice is formed at all.
+#[cfg(feature = "mlas")]
+fn contiguous_host_addr(view: &TensorView) -> Option<usize> {
+    if !view.device.is_host_accessible() || !view.is_contiguous() {
+        return None;
+    }
+    Some(view.data_ptr::<u8>() as usize)
 }
 
 fn borrowed_scales<'a>(view: &TensorView<'a>) -> Option<BorrowedScales<'a>> {
@@ -9910,7 +10198,33 @@ const MIN_OUTPUTS_PER_TASK: usize = 16;
 const MANY_THREAD_CUTOFF: usize = 48;
 
 pub(crate) fn output_chunk_len(n: usize, k: usize) -> usize {
-    let threads = effective_fan_out_width();
+    output_chunk_len_for(effective_fan_out_width(), n, k)
+}
+
+/// [`output_chunk_len`] for an executor whose width is known independently of
+/// the ambient Rayon pool.
+///
+/// The Rayon fan-outs partition the pool they are already installed on, so
+/// reading the width back out of Rayon is exactly right for them. The persistent
+/// SPMD pool is *not* a Rayon pool: it owns its own workers and dispatches
+/// through a broadcast barrier, so `rayon::current_num_threads()` describes an
+/// unrelated executor. Letting it choose the SPMD grain has two costs, both
+/// measured on a 32-vCPU/16-core EPYC 9V74:
+///
+/// 1. **A silent cliff.** `RAYON_NUM_THREADS=1` made `output_chunk_len` return
+///    the whole output, so [`crate::decode_spmd::SpmdDecodePools::dispatch_output_rows`]
+///    took its serial short-circuit and ran every projection on the dispatcher
+///    thread while 15 SPMD workers sat spinning: 2.82 ms/token to 39.97 ms/token
+///    (14.2x) on the `qwen` int4 decode loop, with the pool fully built.
+/// 2. **A pool nobody asked for.** `rayon::current_num_threads()` *builds* the
+///    global pool, so a decode that never touches Rayon still paid for
+///    `available_parallelism()` worth of threads: 49 process threads for a
+///    16-core budget (15 SPMD workers plus 32 global Rayon workers plus main).
+///
+/// Sizing the SPMD grain from `total_workers` fixes both: the partition matches
+/// the executor that will actually run it, and the decode path stops
+/// constructing a Rayon pool it never dispatches to.
+pub(crate) fn output_chunk_len_for(threads: usize, n: usize, k: usize) -> usize {
     let total_work = n.saturating_mul(k);
     // Small projections amortize Rayon well on one socket, but dispatching each
     // one across a larger pool costs more than its GEMV on the dual-socket host.
@@ -10547,6 +10861,8 @@ mod tests {
             packed_nbits_weight: OnceLock::new(),
             packed_u8_n16_weight: OnceLock::new(),
             packed_kai_qsi8_weight: OnceLock::new(),
+            #[cfg(feature = "mlas")]
+            mlas_owned: MlasPackedOwnership::default(),
             #[cfg(feature = "mlas")]
             mlas_shards: OnceLock::new(),
             #[cfg(feature = "mlas")]
@@ -11776,29 +12092,17 @@ mod tests {
     #[test]
     fn the_blocked_int4_prefill_is_on_by_default() {
         let _guard = lock_dispatch_probe();
-        // SAFETY: the dispatch-probe lock serialises the tests that perturb
-        // process environment, which is the requirement `set_var`/`remove_var`
-        // carry; no other thread reads this variable concurrently.
-        unsafe {
-            std::env::remove_var("ONNX_GENAI_CPU_MM_INT4_PREFILL");
-        }
+        let mut env = crate::test_support::EnvVarGuard::unset("ONNX_GENAI_CPU_MM_INT4_PREFILL");
         assert!(
             borrowed_int4_prefill_block_enabled(),
             "the blocked int4 prefill must be enabled when the variable is unset"
         );
         for value in ["0", "off", "OFF"] {
-            // SAFETY: as above.
-            unsafe {
-                std::env::set_var("ONNX_GENAI_CPU_MM_INT4_PREFILL", value);
-            }
+            env.set_var("ONNX_GENAI_CPU_MM_INT4_PREFILL", value);
             assert!(
                 !borrowed_int4_prefill_block_enabled(),
                 "{value:?} must disable the blocked int4 prefill"
             );
-        }
-        // SAFETY: as above.
-        unsafe {
-            std::env::remove_var("ONNX_GENAI_CPU_MM_INT4_PREFILL");
         }
     }
 
@@ -12941,15 +13245,12 @@ mod tests {
             .map(|i| ((i * 17 % 127) as f32 - 63.0) / 50.0)
             .collect();
         let _guard = backend_env_lock().lock().unwrap();
-        let previous = std::env::var("ONNX_GENAI_CPU_MM_MLAS_QNBIT").ok();
+        let mut env = crate::test_support::EnvVarGuard::new();
         for (label, override_value) in [("default", None), ("explicit", Some("1"))] {
-            // SAFETY: the backend env lock serializes readers/writers of this var in tests.
-            unsafe {
-                match override_value {
-                    Some(value) => std::env::set_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT", value),
-                    None => std::env::remove_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT"),
-                }
-            }
+            match override_value {
+                Some(value) => env.set_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT", value),
+                None => env.remove_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT"),
+            };
             for (bits, block_size) in [(4usize, 128usize), (8, 128)] {
                 let weights: Vec<f32> = (0..n * k)
                     .map(|i| ((i * 31 % 251) as f32 - 125.0) / 50.0)
@@ -13014,13 +13315,456 @@ mod tests {
                 );
             }
         }
-        // SAFETY: still holding the backend env lock; restore prior value.
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT", value),
-                None => std::env::remove_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT"),
-            }
+    }
+
+    /// A freed quantized weight must not lend its MLAS pack to the next weight
+    /// that lands on its address (#1735).
+    ///
+    /// The shared store is keyed on the operands' addresses and holds no claim
+    /// on the buffers there, so a recycled allocation of matching shape and pack
+    /// parameters is served the *previous* weight's packed bytes. The route
+    /// counter still increments, because the right route did run -- it just
+    /// multiplied another weight's rows. This is #1726's defect in the packed
+    /// store rather than the transpose caches.
+    ///
+    /// The rounds matter. The packed weight here is ~2 MiB, which glibc serves
+    /// by `mmap` at first; freeing one raises the dynamic mmap threshold so
+    /// later same-size requests are cut from the brk heap, where the address is
+    /// promptly reused. The first rounds establish the recycling the later
+    /// rounds detect, which is why a single allocate/free pair sees nothing.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn a_recycled_weight_address_must_not_serve_the_previous_weights_mlas_pack() {
+        let _probe = lock_dispatch_probe();
+        let _guard = backend_env_lock().lock().unwrap();
+        let (k, n, block_size) = (2048usize, 2048usize, 32usize);
+        let blocks = k.div_ceil(block_size);
+        let blob = block_size * 4 / 8;
+        let zp_blob = (blocks * 4).div_ceil(8);
+
+        // Two clearly different weights: a stale pack cannot be mistaken for
+        // accumulation-order noise, because the two produce different columns.
+        let first_w: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 31 % 251) as f32 - 125.0) / 50.0)
+            .collect();
+        let second_w: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 17 % 241) as f32 - 120.0) / 37.0)
+            .collect();
+        // m=4, not 1: MLAS refuses asymmetric CompInt8 at M=1 on hosts without
+        // a correct AVX2 kernel (`host_supports_mlas_sqnbit_m1_asym_int8`), and
+        // a refused route would make this test vacuous. The packed store under
+        // test is shared by every `m`.
+        let m = 4usize;
+        let activations: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 17 % 127) as f32 - 63.0) / 50.0)
+            .collect();
+        let quantized: Vec<(Vec<u8>, Vec<f32>, Vec<u8>)> = [&first_w, &second_w]
+            .iter()
+            .map(|w| {
+                let (packed, scales, zps, _) = quantize(w, n, k, block_size, true);
+                (
+                    packed,
+                    scales,
+                    zps.expect("asymmetric quantization emits qzeros"),
+                )
+            })
+            .collect();
+
+        if mlas_sys::SQNBitPackedB::new(
+            n,
+            k,
+            4,
+            block_size,
+            mlas_sys::SQNBitComputeType::Int8,
+            &quantized[0].0,
+            &quantized[0].1,
+            Some(&quantized[0].2),
+        )
+        .is_none()
+        {
+            eprintln!("MLAS QNBit unavailable on this host; skipping #1735 falsifier");
+            return;
         }
+
+        // Forced so the MLAS route is reached on hosts (x86_64) whose default
+        // precedence prefers the native int4 kernel -- the store under test is
+        // MLAS-only, so a native win would silently make this test vacuous.
+        let _env = crate::test_support::EnvVarGuard::set("NXRT_CPU_GEMM_BACKEND", "mlas");
+
+        // Each round allocates the weight afresh so the allocator can hand back
+        // a retired round's address, then drops it -- exactly the lifetime the
+        // store must not outlive.
+        let decode = |which: usize| -> (Vec<f32>, [usize; 3], bool) {
+            let (packed, scales, zps) = &quantized[which];
+            let b = Owned::u8(&[n, blocks, blob], packed);
+            let scales_t = Owned::f32(&[n, blocks], scales);
+            let zero_points = Owned::u8(&[n, zp_blob], zps);
+            // The whole key, not just the weight: a stale hit needs all three
+            // operand addresses to collide, so tracking only the weight's would
+            // let the run report "recycled" while the key never matched -- the
+            // test would then pass without exercising anything.
+            let addr = [
+                b.view().data_ptr::<u8>() as usize,
+                scales_t.view().data_ptr::<u8>() as usize,
+                zero_points.view().data_ptr::<u8>() as usize,
+            ];
+            let mut result = vec![0.0f32; m * n];
+            let kernel = accuracy4_kernel(k, n, block_size);
+            let ran = kernel
+                .try_mlas_sqnbit(
+                    &b.view(),
+                    &scales_t.view(),
+                    Some(&zero_points.view()),
+                    None,
+                    true,
+                    &activations,
+                    m,
+                    None,
+                    &mut result,
+                )
+                .expect("the MLAS SQNBit route must not error");
+            (result, addr, ran.is_some())
+        };
+
+        // Reference outputs are taken against a *drained* store, so each is
+        // packed from its own weight by construction. Deriving them from the
+        // first round instead would let a stale hit poison the reference and
+        // turn the per-round comparison into a tautology.
+        let truth: Vec<Vec<f32>> = (0..2)
+            .map(|which| {
+                clear_mlas_packed_caches();
+                decode(which).0
+            })
+            .collect();
+        clear_mlas_packed_caches();
+        assert_ne!(
+            truth[0], truth[1],
+            "the two weights must produce different outputs, or a stale pack \
+             would be undetectable"
+        );
+
+        let mut seen: Vec<([usize; 3], usize)> = Vec::new();
+        let mut recycled_across_weights = false;
+        for round in 0..8 {
+            let which = round % 2;
+            // Allocator-independent, and the assertion that actually carries this
+            // test: the previous round's kernel has retired, so whatever it
+            // installed must be gone. Address recycling below is a second,
+            // stronger-but-hostier arm; this one holds on every allocator.
+            assert_eq!(
+                mlas_store_len(),
+                (0, 0),
+                "round {round}: the retired kernel left its pack in the store, \
+                 where a later weight at its address can inherit it"
+            );
+            let (got, addr, routed) = decode(which);
+            assert!(
+                routed,
+                "round {round}: the MLAS SQNBit route must run, or this test \
+                 cannot observe the store it exists to check"
+            );
+            // Only a *cross-weight* reuse recreates the hazard: a weight landing
+            // on its own former address would be served a pack of identical
+            // bytes and prove nothing.
+            let recycled = seen
+                .iter()
+                .any(|&(seen_addr, seen_which)| seen_addr == addr && seen_which != which);
+            recycled_across_weights |= recycled;
+            seen.push((addr, which));
+            assert_eq!(
+                got, truth[which],
+                "round {round} (weight {which}, key addresses {addr:#x?}, \
+                 recycled={recycled}): a pack cached for a previous weight at \
+                 these addresses was served to this one"
+            );
+        }
+        // Not an assertion. Address recycling is the allocator's choice, not the
+        // code's: glibc's brk heap reuses these sizes readily, but an allocator
+        // that serves each request fresh (ASan, valgrind, some musl and macOS
+        // configurations) would fail a *correct* implementation here. The
+        // per-round store-drain assertion above covers the mechanism without
+        // depending on it. Reported loudly so a run that skipped this arm is
+        // never mistaken for one that exercised it.
+        if !recycled_across_weights {
+            eprintln!(
+                "NOTE: no full key was reused across weights in {} rounds, so \
+                 this allocator did not exercise the recycling arm; the \
+                 per-round eviction assertion still covered the mechanism. \
+                 Key addresses: {:#x?}",
+                seen.len(),
+                seen
+            );
+        }
+    }
+
+    /// A pack must survive the drop of a kernel that merely *shared* it (#1735).
+    ///
+    /// Ownership is the installing call, not everyone who reaches the entry. A
+    /// node's prefill and decode instances key identically, so the sharing this
+    /// store exists for (#1056: one packed copy per weight, not one per shape
+    /// instantiation) only holds if a retiring sibling leaves the entry alone.
+    /// Evicting on any drop would make the survivor re-pack -- the cost the
+    /// shared store was built to remove.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn a_shared_mlas_pack_outlives_the_sibling_that_only_shared_it() {
+        let _probe = lock_dispatch_probe();
+        let _guard = backend_env_lock().lock().unwrap();
+        let (k, n, block_size) = (128usize, 256usize, 32usize);
+        let blocks = k.div_ceil(block_size);
+        let blob = block_size * 4 / 8;
+        let zp_blob = (blocks * 4).div_ceil(8);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 31 % 251) as f32 - 125.0) / 50.0)
+            .collect();
+        // See the recycled-address test: M=1 asymmetric CompInt8 is refused on
+        // this host, so drive the store at m=4.
+        let m = 4usize;
+        let activations: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 17 % 127) as f32 - 63.0) / 50.0)
+            .collect();
+        let (packed, scales, zps, _) = quantize(&weights, n, k, block_size, true);
+        let zps = zps.expect("asymmetric quantization emits qzeros");
+        if mlas_sys::SQNBitPackedB::new(
+            n,
+            k,
+            4,
+            block_size,
+            mlas_sys::SQNBitComputeType::Int8,
+            &packed,
+            &scales,
+            Some(&zps),
+        )
+        .is_none()
+        {
+            eprintln!("MLAS QNBit unavailable on this host; skipping #1735 sharing test");
+            return;
+        }
+
+        let b = Owned::u8(&[n, blocks, blob], &packed);
+        let scales_t = Owned::f32(&[n, blocks], &scales);
+        let zero_points = Owned::u8(&[n, zp_blob], &zps);
+        let _env = crate::test_support::EnvVarGuard::set("NXRT_CPU_GEMM_BACKEND", "mlas");
+        let run = || {
+            let mut result = vec![0.0f32; m * n];
+            let kernel = accuracy4_kernel(k, n, block_size);
+            let ran = kernel
+                .try_mlas_sqnbit(
+                    &b.view(),
+                    &scales_t.view(),
+                    Some(&zero_points.view()),
+                    None,
+                    true,
+                    &activations,
+                    m,
+                    None,
+                    &mut result,
+                )
+                .expect("the MLAS SQNBit route must not error");
+            assert!(ran.is_some(), "the MLAS SQNBit route must run");
+            (result, kernel)
+        };
+
+        let (first_out, installer) = run();
+        let (shared_out, sharer) = run();
+        assert_eq!(
+            first_out, shared_out,
+            "both instances of one weight must produce the same output"
+        );
+        assert!(
+            installer.mlas_owned.shards.get().is_some(),
+            "the first instance to reach the store must record that it installed \
+             the entry"
+        );
+        assert!(
+            sharer.mlas_owned.shards.get().is_none(),
+            "an instance that hit an existing entry must not claim ownership of \
+             it, or it would evict a live sibling's pack"
+        );
+
+        let resident = |label: &str| {
+            assert!(
+                mlas_store_len().0 > 0,
+                "{label}: the shared pack must still be resident"
+            );
+        };
+        resident("with both instances alive");
+        drop(sharer);
+        resident("after the sharing instance retired");
+        drop(installer);
+        assert_eq!(
+            mlas_store_len().0,
+            0,
+            "once the installing instance retires, nothing keyed on that weight \
+             may remain in the store"
+        );
+    }
+
+    /// A pack is a function of the scales too, not just the quantized blob (#1735).
+    ///
+    /// A CompInt8 pack bakes the scales (and zero points) into its per-block
+    /// sums, so keying only on the quantized weight's address makes two nodes
+    /// that share a `B` initializer but carry different scales serve each other
+    /// packs. Both operands are live here, so this is an identity gap rather
+    /// than the lifetime gap the recycled-address test covers.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn one_quantized_blob_under_two_scale_tensors_must_not_share_a_pack() {
+        let _probe = lock_dispatch_probe();
+        let _guard = backend_env_lock().lock().unwrap();
+        let (k, n, block_size) = (128usize, 256usize, 32usize);
+        let blocks = k.div_ceil(block_size);
+        let blob = block_size * 4 / 8;
+        let zp_blob = (blocks * 4).div_ceil(8);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 31 % 251) as f32 - 125.0) / 50.0)
+            .collect();
+        let m = 4usize;
+        let activations: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 17 % 127) as f32 - 63.0) / 50.0)
+            .collect();
+        let (packed, scales, zps, _) = quantize(&weights, n, k, block_size, true);
+        let zps = zps.expect("asymmetric quantization emits qzeros");
+        if mlas_sys::SQNBitPackedB::new(
+            n,
+            k,
+            4,
+            block_size,
+            mlas_sys::SQNBitComputeType::Int8,
+            &packed,
+            &scales,
+            Some(&zps),
+        )
+        .is_none()
+        {
+            eprintln!("MLAS QNBit unavailable on this host; skipping #1735 scales-identity test");
+            return;
+        }
+        let doubled: Vec<f32> = scales.iter().map(|s| s * 2.0).collect();
+
+        let b = Owned::u8(&[n, blocks, blob], &packed);
+        let zero_points = Owned::u8(&[n, zp_blob], &zps);
+        // Both scale tensors stay alive, so their addresses are distinct and
+        // neither can be mistaken for the other by recycling.
+        let first_scales = Owned::f32(&[n, blocks], &scales);
+        let second_scales = Owned::f32(&[n, blocks], &doubled);
+        let _env = crate::test_support::EnvVarGuard::set("NXRT_CPU_GEMM_BACKEND", "mlas");
+
+        let run = |scales_t: &Owned| {
+            let mut result = vec![0.0f32; m * n];
+            let kernel = accuracy4_kernel(k, n, block_size);
+            let ran = kernel
+                .try_mlas_sqnbit(
+                    &b.view(),
+                    &scales_t.view(),
+                    Some(&zero_points.view()),
+                    None,
+                    true,
+                    &activations,
+                    m,
+                    None,
+                    &mut result,
+                )
+                .expect("the MLAS SQNBit route must not error");
+            assert!(ran.is_some(), "the MLAS SQNBit route must run");
+            (result, kernel)
+        };
+
+        // References against a drained store, so each is packed from its own
+        // scales by construction.
+        clear_mlas_packed_caches();
+        let want_first = run(&first_scales).0;
+        clear_mlas_packed_caches();
+        let want_second = run(&second_scales).0;
+        clear_mlas_packed_caches();
+        assert_ne!(
+            want_first, want_second,
+            "doubling the scales must change the output, or this test has no power"
+        );
+
+        // The installer is held so its entry is still resident when the second
+        // scales tensor reaches the store on the same quantized blob.
+        let (got_first, _installer) = run(&first_scales);
+        let (got_second, _second) = run(&second_scales);
+        assert_eq!(
+            got_first, want_first,
+            "the installing pack must be unaffected"
+        );
+        assert_eq!(
+            got_second, want_second,
+            "a pack built for another scale tensor was served to this one: the \
+             store key does not close the operands the pack is a function of"
+        );
+    }
+
+    /// The store's insert/evict pair must stay consistent under concurrent use.
+    ///
+    /// Exercises `MlasPackedCaches` directly rather than through kernels: the
+    /// per-test store is thread-local (so kernels on different threads cannot
+    /// contend), while the production store is process-global and genuinely
+    /// shared. This drives the same `Mutex`/`entry`/`remove` paths the global
+    /// store uses, including an installer and a sharer racing for one key.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn the_packed_store_stays_consistent_under_concurrent_install_and_evict() {
+        let caches = MlasPackedCaches::default();
+        let key_at = |addr: usize| {
+            MlasPackedKey::new(
+                addr,
+                addr + 1,
+                0,
+                8,
+                8,
+                4,
+                32,
+                false,
+                mlas_sys::SQNBitComputeType::Fp32,
+            )
+        };
+        std::thread::scope(|scope| {
+            for thread in 0..8usize {
+                let caches = &caches;
+                scope.spawn(move || {
+                    for round in 0..64usize {
+                        // Overlapping keys across threads, so installs and hits
+                        // race for the same entries.
+                        let key = key_at(round % 4);
+                        let installed_count = std::cell::Cell::new(0usize);
+                        let got = caches
+                            .get_or_build_shards(key, || {
+                                installed_count.set(installed_count.get() + 1);
+                                Ok(Some(Vec::new()))
+                            })
+                            .expect("building an empty shard vector cannot fail");
+                        let (_arc, installed) =
+                            got.expect("a build returning Some must yield an entry");
+                        assert!(
+                            installed_count.get() <= 1,
+                            "the build closure must run at most once per call"
+                        );
+                        if installed {
+                            caches.remove_shards(&key);
+                        }
+                        if thread % 2 == 0 {
+                            caches.remove_shards(&key_at(round % 4));
+                        }
+                    }
+                });
+            }
+        });
+        // Every installer removed its own entry, and `remove` of an absent key
+        // is a no-op, so the store must drain rather than leak.
+        for addr in 0..4usize {
+            caches.remove_shards(&key_at(addr));
+        }
+        assert_eq!(
+            (
+                caches.shards.lock().unwrap().len(),
+                caches.packed.lock().unwrap().len()
+            ),
+            (0, 0),
+            "the store must not leak entries after concurrent install/evict"
+        );
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -16231,6 +16975,34 @@ mod tests {
     }
 
     #[test]
+    fn prefill_worker_names_survive_linux_comm_truncation() {
+        // Linux stores `comm` in 15 bytes plus a NUL. A name longer than that
+        // is silently truncated, which is how the `onnx-genai-`-prefixed
+        // convention elsewhere in this crate loses its worker index. These
+        // names must stay legible for every width the pool is built at, so
+        // that a thread census can attribute them without guesswork.
+        const COMM_LEN: usize = 15;
+        for index in [0, 1, 9, 15, 31, 63, 99] {
+            let name = prefill_worker_name(index);
+            assert!(
+                name.len() <= COMM_LEN,
+                "`{name}` is {} bytes and would be truncated in /proc/<pid>/task/*/comm",
+                name.len()
+            );
+            assert!(
+                name.starts_with("nxgn-prefill-"),
+                "unexpected prefix: {name}"
+            );
+            assert!(
+                name.ends_with(&index.to_string()),
+                "`{name}` lost its worker index"
+            );
+        }
+        // Distinct workers must stay distinguishable.
+        assert_ne!(prefill_worker_name(0), prefill_worker_name(1));
+    }
+
+    #[test]
     fn explicit_budget_precedes_env_for_every_decode_pool() {
         assert_eq!(
             resolve_decode_threads_with_override(Some(6), Some("2"), 96),
@@ -16725,23 +17497,13 @@ mod tests {
         let scales_tensor = Owned::f32(&[n, blocks], &scales);
         let mut y = Owned::zeros_f32(&[m, n]);
 
-        let previous = std::env::var("ONNX_GENAI_CPU_MM_INT8_GEBP").ok();
-        // SAFETY: `_probe` is the lock every test that can reach this route
-        // takes, so no other test thread reads this var while it is swapped.
-        unsafe { std::env::set_var("ONNX_GENAI_CPU_MM_INT8_GEBP", "0") };
+        let _env = crate::test_support::EnvVarGuard::set("ONNX_GENAI_CPU_MM_INT8_GEBP", "0");
         let before = INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
         let executed = kernel.execute(
             &[a.view(), b.view(), scales_tensor.view()],
             &mut [y.view_mut()],
         );
         let after = INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
-        // SAFETY: same lock, still held via `_probe`.
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("ONNX_GENAI_CPU_MM_INT8_GEBP", value),
-                None => std::env::remove_var("ONNX_GENAI_CPU_MM_INT8_GEBP"),
-            }
-        }
         executed.unwrap();
         assert_eq!(
             after, before,
@@ -16928,20 +17690,10 @@ mod tests {
                          this comparison is vacuous"
                     );
 
-                    let previous = std::env::var("ONNX_GENAI_CPU_MM_INT8_GEBP").ok();
-                    // SAFETY: `_probe` is the lock every test that can reach
-                    // this route takes, so no other test thread reads this var
-                    // while it is swapped.
-                    unsafe { std::env::set_var("ONNX_GENAI_CPU_MM_INT8_GEBP", "0") };
+                    let _env =
+                        crate::test_support::EnvVarGuard::set("ONNX_GENAI_CPU_MM_INT8_GEBP", "0");
                     let mut dequant = Owned::zeros_f32(&[m, n]);
                     let executed = kernel.execute(&inputs, &mut [dequant.view_mut()]);
-                    // SAFETY: same lock, still held via `_probe`.
-                    unsafe {
-                        match previous {
-                            Some(value) => std::env::set_var("ONNX_GENAI_CPU_MM_INT8_GEBP", value),
-                            None => std::env::remove_var("ONNX_GENAI_CPU_MM_INT8_GEBP"),
-                        }
-                    }
                     executed.unwrap();
                     assert_eq!(
                         INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed),
@@ -19595,9 +20347,7 @@ mod tests {
         let below = at - 1;
 
         let _guard = backend_env_lock().lock().unwrap();
-        let previous = std::env::var("NXRT_CPU_GEMM_BACKEND").ok();
-        // SAFETY: the backend env lock serializes readers/writers of this var.
-        unsafe { std::env::set_var("NXRT_CPU_GEMM_BACKEND", "mlas") };
+        let _env = crate::test_support::EnvVarGuard::set("NXRT_CPU_GEMM_BACKEND", "mlas");
 
         let call = |m: usize| {
             let a = pseudo(m * k, 0.8);
@@ -19619,14 +20369,6 @@ mod tests {
 
         let decode = call(below);
         let prefill = call(at);
-
-        // SAFETY: still holding the backend env lock; restore prior value.
-        unsafe {
-            match &previous {
-                Some(value) => std::env::set_var("NXRT_CPU_GEMM_BACKEND", value),
-                None => std::env::remove_var("NXRT_CPU_GEMM_BACKEND"),
-            }
-        }
 
         if hand_int8_decode_has_native_dot() {
             assert_eq!(
@@ -19697,9 +20439,7 @@ mod tests {
         let kernel = accuracy4_kernel(k, n, block_size);
 
         let _guard = backend_env_lock().lock().unwrap();
-        let previous = std::env::var("NXRT_CPU_GEMM_BACKEND").ok();
-        // SAFETY: the backend env lock serializes readers/writers of this var.
-        unsafe { std::env::set_var("NXRT_CPU_GEMM_BACKEND", "mlas") };
+        let _env = crate::test_support::EnvVarGuard::set("NXRT_CPU_GEMM_BACKEND", "mlas");
 
         let a = pseudo(k, 0.8);
         let mut result = vec![0.0f32; n];
@@ -19716,14 +20456,6 @@ mod tests {
                 &mut result,
             )
             .unwrap();
-
-        // SAFETY: still holding the backend env lock; restore prior value.
-        unsafe {
-            match &previous {
-                Some(value) => std::env::set_var("NXRT_CPU_GEMM_BACKEND", value),
-                None => std::env::remove_var("NXRT_CPU_GEMM_BACKEND"),
-            }
-        }
 
         assert_eq!(
             routed, None,
@@ -19770,9 +20502,7 @@ mod tests {
         let scales_t = Owned::f32(&[n, k_blocks], &scales);
 
         let _guard = backend_env_lock().lock().unwrap();
-        let previous = std::env::var("NXRT_CPU_GEMM_BACKEND").ok();
-        // SAFETY: the backend env lock serializes readers/writers of this var.
-        unsafe { std::env::set_var("NXRT_CPU_GEMM_BACKEND", "mlas") };
+        let _env = crate::test_support::EnvVarGuard::set("NXRT_CPU_GEMM_BACKEND", "mlas");
 
         let a = pseudo(k, 0.8);
         let mut result = vec![0.0f32; n];
@@ -19789,14 +20519,6 @@ mod tests {
                 &mut result,
             )
             .unwrap();
-
-        // SAFETY: still holding the backend env lock; restore prior value.
-        unsafe {
-            match &previous {
-                Some(value) => std::env::set_var("NXRT_CPU_GEMM_BACKEND", value),
-                None => std::env::remove_var("NXRT_CPU_GEMM_BACKEND"),
-            }
-        }
 
         assert_eq!(
             served,
@@ -19851,12 +20573,10 @@ mod tests {
         let a = pseudo(k, 0.8);
 
         let _guard = backend_env_lock().lock().unwrap();
-        let previous = std::env::var("NXRT_CPU_GEMM_BACKEND").ok();
-        // SAFETY: the backend env lock serializes readers/writers of this var.
         // Force a non-MLAS backend to model the real-world default: MLAS SQNBit
         // routing for accuracy_level != 4 must not depend on the dense-GEMM
         // backend being MLAS.
-        unsafe { std::env::set_var("NXRT_CPU_GEMM_BACKEND", "generic") };
+        let _env = crate::test_support::EnvVarGuard::set("NXRT_CPU_GEMM_BACKEND", "generic");
         assert_ne!(
             crate::backend::CpuBackend::auto_detect(),
             crate::backend::CpuBackend::Mlas,
@@ -19883,14 +20603,6 @@ mod tests {
 
         let (acc0_served, acc0_result) = call(&test_kernel(k, n, block_size));
         let (acc4_served, _) = call(&accuracy4_kernel(k, n, block_size));
-
-        // SAFETY: still holding the backend env lock; restore prior value.
-        unsafe {
-            match &previous {
-                Some(value) => std::env::set_var("NXRT_CPU_GEMM_BACKEND", value),
-                None => std::env::remove_var("NXRT_CPU_GEMM_BACKEND"),
-            }
-        }
 
         assert_eq!(
             acc0_served,
@@ -20685,6 +21397,70 @@ mod tests {
         assert_eq!(deferred_decode_width(), None);
     }
 
+    /// The SPMD decode pool is not a Rayon pool, so its fan-out grain must come
+    /// from its own worker count.
+    ///
+    /// `output_chunk_len` reads `rayon::current_num_threads()`, which describes
+    /// an executor the SPMD pool never dispatches to. When the ambient pool is
+    /// narrower than the SPMD pool the shared rule collapses to "run it all
+    /// serially", and `dispatch_output_rows` then hands the whole projection to
+    /// the dispatcher thread while every SPMD worker sits spinning --
+    /// `RAYON_NUM_THREADS=1` cost 14.2x on the `qwen` int4 decode loop.
+    /// `output_chunk_len_for` takes the width as an argument so the partition
+    /// matches the executor that will actually run it.
+    #[test]
+    fn the_spmd_grain_is_independent_of_the_ambient_rayon_width() {
+        let (n, k) = (4096usize, 1024usize);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("one-thread pool");
+
+        let (ambient, explicit) = pool.install(|| {
+            (
+                output_chunk_len(n, k),
+                output_chunk_len_for(rayon::current_num_threads().max(16), n, k),
+            )
+        });
+
+        assert_eq!(
+            ambient, n,
+            "a one-wide ambient pool must not split the output -- this is the \
+             value the SPMD pool used to read"
+        );
+        assert!(
+            explicit < n,
+            "a 16-wide SPMD pool must still split the output when the ambient \
+             Rayon pool is one thread (got {explicit} for n = {n})"
+        );
+    }
+
+    /// The width argument, not the ambient pool, is what moves the grain.
+    #[test]
+    fn output_chunk_len_for_matches_the_ambient_rule_at_the_ambient_width() {
+        let (n, k) = (6144usize, 4096usize);
+        assert_eq!(
+            output_chunk_len(n, k),
+            output_chunk_len_for(effective_fan_out_width(), n, k),
+            "the ambient wrapper must be exactly the width-taking rule applied \
+             to the ambient width"
+        );
+        assert_eq!(
+            output_chunk_len_for(1, n, k),
+            n,
+            "one worker cannot split the output"
+        );
+        assert_eq!(
+            output_chunk_len_for(0, n, k),
+            n,
+            "a zero width must degrade to serial, not divide by zero"
+        );
+        assert!(
+            output_chunk_len_for(16, n, k) <= output_chunk_len_for(2, n, k),
+            "more workers must not produce a coarser partition"
+        );
+    }
+
     /// The fallback half: work that genuinely routes to Rayon must still run,
     /// and correctly, with the decode pool built on demand underneath it. A
     /// deferred width below `MIN_ROUTED_FAN_OUT_WIDTH` is the `Wide` arm.
@@ -20949,6 +21725,34 @@ mod tests {
                 "output {index} got the wrong `output_start`"
             );
         }
+    }
+
+    #[test]
+    fn budget_within_physical_cores_is_not_worth_warning_about() {
+        assert_eq!(super::budget_beyond_physical_cores(16, Some(16)), None);
+        assert_eq!(super::budget_beyond_physical_cores(8, Some(16)), None);
+        assert_eq!(super::budget_beyond_physical_cores(1, Some(16)), None);
+    }
+
+    #[test]
+    fn budget_past_physical_cores_reports_the_core_count() {
+        assert_eq!(super::budget_beyond_physical_cores(32, Some(16)), Some(16));
+        assert_eq!(super::budget_beyond_physical_cores(17, Some(16)), Some(16));
+    }
+
+    /// An unknown topology is never an occasion to warn: the whole point of the
+    /// warning is that we know the request cannot pay for itself, and without a
+    /// core count we do not know that.
+    #[test]
+    fn unknown_topology_never_warns() {
+        assert_eq!(super::budget_beyond_physical_cores(1024, None), None);
+    }
+
+    /// A zero core count means detection returned something meaningless rather
+    /// than a real single-core host, so it is treated as unknown.
+    #[test]
+    fn zero_physical_cores_is_treated_as_unknown() {
+        assert_eq!(super::budget_beyond_physical_cores(32, Some(0)), None);
     }
 
     /// The int4 prefill GEBP crossover is size-aware: a weight that stays

@@ -400,6 +400,17 @@ fn auto_dynamic_lending_for(
     governor_present && policy.managed_no_spill && lending_enabled
 }
 
+fn validate_offload_policy(policy: &DeviceOffloadPolicy) -> Result<()> {
+    if policy.byte_aware_residency {
+        return Err(EpError::KernelFailed(
+            "cuda_ep: byte-aware weight residency is disabled because real-GPU validation found \
+             token-identity corruption; the byte-aware policy must remain disabled"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Refuse an allocator that does not serve `expected_index`.
 ///
 /// Split out of [`CudaExecutionProvider::with_memory`] so the decision can be
@@ -818,6 +829,7 @@ impl CudaExecutionProvider {
         governor: Option<Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>>,
         manager: Option<ProcessMemoryManager>,
     ) -> Result<Self> {
+        validate_offload_policy(&offload_policy)?;
         let runtime = Arc::new(CudaRuntime::new(ordinal)?);
         let csa_metrics = Arc::new(CsaMetrics::default());
         let registry = build_cuda_registry_with_metrics(runtime.clone(), csa_metrics.clone());
@@ -838,6 +850,14 @@ impl CudaExecutionProvider {
         let mut construction_queue_guard =
             CudaConstructionQueueGuard::new(Arc::clone(&release_queue));
         let attribution = Arc::new(CudaMappedAttribution::default());
+        if offload_policy.enabled {
+            // Before the pager exists, not after: weights on this runtime may be
+            // paged from here on, and a page is retired by `weight_paging`
+            // rather than by `deallocate`, so the interleave cache is never told
+            // the address died and must refuse to key on one. See
+            // [`crate::interleave_cache`].
+            runtime.set_weights_may_be_paged();
+        }
         let residency = offload_policy.enabled.then(|| {
             let budget = offload_policy
                 .device_budget_bytes
@@ -998,7 +1018,6 @@ impl CudaExecutionProvider {
         }
         if let (Some(residency), Some(arena), Some(governor)) =
             (provider.residency.as_ref(), provider.memory.vmm(), governor)
-            && arena.physical_pool_authority().is_some()
         {
             residency
                 .install_vmm_admission(Arc::clone(arena), governor)
@@ -1570,6 +1589,9 @@ impl CudaExecutionProvider {
         &self,
         source: &'a S,
     ) -> crate::weight_paging::CudaWeightPager<'a, S> {
+        // Weights on this runtime may now be paged, and a page is retired
+        // without passing through `deallocate`. See [`crate::interleave_cache`].
+        self.runtime.set_weights_may_be_paged();
         crate::weight_paging::CudaWeightPager::new(Arc::clone(&self.runtime), source)
             .with_deferred_release_queue(Arc::clone(&self.release_queue))
             .with_context_scope(self.memory_binding.binding.context_scope())
@@ -1578,6 +1600,9 @@ impl CudaExecutionProvider {
     /// Build a bounded-VRAM [`CudaWeightResidency`] (WEIGHT_OFFLOAD Phase 3b
     /// page-in + eviction) sized by `budget_bytes`, sharing this EP's runtime.
     pub fn weight_residency(&self, budget_bytes: u64) -> crate::weight_paging::CudaWeightResidency {
+        // Weights on this runtime may now be paged, and a page is retired
+        // without passing through `deallocate`. See [`crate::interleave_cache`].
+        self.runtime.set_weights_may_be_paged();
         let residency =
             crate::weight_paging::CudaWeightResidency::new(Arc::clone(&self.runtime), budget_bytes)
                 .with_deferred_release_queue(Arc::clone(&self.release_queue));
@@ -2757,6 +2782,15 @@ impl ExecutionProvider for CudaExecutionProvider {
         if buffer.is_borrowed() {
             return Ok(0);
         }
+        // This address is about to stop naming this weight. Anything derived
+        // from it and keyed by it has to go now, before the allocator can hand
+        // the address to the next weight of the same size and let its key match
+        // (#1726). Doing it here, rather than at an agreed point in teardown,
+        // is what makes it precise -- entries for *other* live executors on
+        // this shared provider are untouched, and one of those may have the
+        // interleaved pointer baked into a captured graph.
+        self.runtime
+            .invalidate_interleaved_for(crate::runtime::cuptr(buffer.as_ptr()), buffer.len());
         let ownership = match buffer.into_bound_ownership() {
             Ok(owner) => owner,
             Err(foreign) => {
@@ -3221,6 +3255,12 @@ impl ExecutionProvider for CudaExecutionProvider {
         ))
     }
 
+    fn raw_device_allocation_site_stats(
+        &self,
+    ) -> Vec<onnx_runtime_ep_api::RawDeviceAllocationSiteStats> {
+        self.runtime.raw_allocation_site_stats()
+    }
+
     fn reserve_workspace(
         &self,
         bytes: u64,
@@ -3430,6 +3470,80 @@ impl Drop for CudaExecutionProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    use onnx_runtime_ep_api::{
+        ExecutionProvider, ExternalMmapRegion, LazyWeight, MmapRegionSource, ResidentWeight,
+        WeightHandleError,
+    };
+    use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, Tier};
+
+    use crate::test_support::EnvVarGuard;
+
+    #[test]
+    fn known_unsafe_byte_aware_residency_is_rejected_before_cuda_initialization() {
+        let error = validate_offload_policy(&DeviceOffloadPolicy {
+            byte_aware_residency: true,
+            ..DeviceOffloadPolicy::default()
+        })
+        .expect_err("known-corrupting residency policy must fail closed");
+
+        assert!(error.to_string().contains("token-identity corruption"));
+    }
+
+    struct HostMmap {
+        mapping_id: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl MmapRegionSource for HostMmap {
+        fn region_bytes(
+            &self,
+            region: &ExternalMmapRegion,
+        ) -> std::result::Result<&[u8], WeightHandleError> {
+            if region.mapping_id != self.mapping_id {
+                return Err(WeightHandleError::DeviceBinding(format!(
+                    "unknown mapping {}",
+                    region.mapping_id
+                )));
+            }
+            let end = region
+                .offset
+                .checked_add(region.len)
+                .ok_or_else(|| WeightHandleError::DeviceBinding("region overflow".into()))?;
+            self.bytes
+                .get(region.offset..end)
+                .ok_or_else(|| WeightHandleError::DeviceBinding("region out of bounds".into()))
+        }
+
+        fn full_mapping_bytes(&self, mapping_id: usize) -> Option<&[u8]> {
+            (mapping_id == self.mapping_id).then_some(self.bytes.as_slice())
+        }
+    }
+
+    fn lazy_weight_bytes(bytes: &[u8], offset: usize) -> (LazyWeight, HostMmap) {
+        let mapping_id = 71;
+        let len = bytes.len();
+        let mut backing = vec![0xAB; offset];
+        backing.extend_from_slice(bytes);
+        let host = HostMmap {
+            mapping_id,
+            bytes: backing,
+        };
+        let region = ExternalMmapRegion {
+            mapping_id,
+            offset,
+            len,
+        };
+        let shape = vec![len];
+        let resident = bytes.to_vec();
+        let lazy = LazyWeight::block_quantized_moe(DataType::Uint8, shape.clone(), vec![region], {
+            let shape = shape.clone();
+            move || ResidentWeight::new(DataType::Uint8, shape.clone(), resident.clone())
+        })
+        .expect("lazy weight");
+        (lazy, host)
+    }
 
     /// The bug behind #1288/#1514 was a fixed 64 GiB reservation on a card
     /// whose VRAM is 80 GiB, so the arena could not even span the device it
@@ -3531,6 +3645,169 @@ extern "C" __global__ void spin_delay(long long spin) {
         assert!(
             compute_done.is_complete() && copy_done.is_complete(),
             "ExecutionProvider::sync must block until both CUDA streams complete"
+        );
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn governed_provider_lazy_weight_page_in_refuses_silent_alloc_raw_fallback_without_a_mapped_allowance()
+     {
+        let mut env = EnvVarGuard::acquire();
+        env.set(
+            crate::vmm_allocator::CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV,
+            "0",
+        );
+
+        let governor = Arc::new(LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0)));
+        let provider = match CudaExecutionProvider::initialized_with_offload_policy_and_governor(
+            0,
+            DeviceOffloadPolicy {
+                enabled: true,
+                device_budget_bytes: Some((2usize << 20) as u64),
+                ..DeviceOffloadPolicy::default()
+            },
+            governor,
+        ) {
+            Ok(provider) => provider,
+            Err(error) => {
+                eprintln!(
+                    "skipping governed lazy-weight fallback test: CUDA EP unavailable ({error})"
+                );
+                return;
+            }
+        };
+        let residency = provider.residency().expect("weight offload residency");
+        assert!(
+            residency.stable_va_paging_active(),
+            "the governed no-pool VMM path must still install stable-VA weight paging"
+        );
+        let arena = provider.memory.vmm().expect("built-in VMM allocator");
+        assert!(
+            arena.physical_pool_stats().is_none(),
+            "premise: this covers the no-pool governed VMM path"
+        );
+
+        let payload = vec![0x5Au8; 4096];
+        let (lazy, host) = lazy_weight_bytes(&payload, 128);
+        let before = provider.runtime().allocation_counts();
+        let error = ExecutionProvider::page_lazy_weight(&provider, 1, &lazy, &host)
+            .expect_err("page-in must fail closed until the mapped allowance is adopted");
+        assert!(
+            error.to_string().contains("mapped-byte allowance"),
+            "the refusal must explain the missing governed allowance: {error}"
+        );
+        assert_eq!(
+            provider.runtime().allocation_counts(),
+            before,
+            "a refused governed page-in must not silently fall back to alloc_raw"
+        );
+        assert_eq!(
+            residency.stats().page_ins,
+            0,
+            "a pre-admission refusal must not mutate residency state"
+        );
+        assert_eq!(
+            arena.committed_and_reserved().0,
+            0,
+            "a refused page-in must not commit any VMM bytes"
+        );
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn governed_provider_lazy_weight_paging_uses_vmm_without_raw_alloc_even_without_a_physical_pool()
+     {
+        let mut env = EnvVarGuard::acquire();
+        env.set(
+            crate::vmm_allocator::CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV,
+            "0",
+        );
+
+        let governor = Arc::new(LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0)));
+        let provider_governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync> =
+            governor.clone();
+        let provider = match CudaExecutionProvider::initialized_with_offload_policy_and_governor(
+            0,
+            DeviceOffloadPolicy {
+                enabled: true,
+                device_budget_bytes: Some((2usize << 20) as u64),
+                ..DeviceOffloadPolicy::default()
+            },
+            provider_governor,
+        ) {
+            Ok(provider) => provider,
+            Err(error) => {
+                eprintln!("skipping governed lazy-weight VMM test: CUDA EP unavailable ({error})");
+                return;
+            }
+        };
+        let residency = provider.residency().expect("weight offload residency");
+        assert!(
+            residency.stable_va_paging_active(),
+            "the governed no-pool VMM path must still install stable-VA weight paging"
+        );
+        let arena = Arc::clone(provider.memory.vmm().expect("built-in VMM allocator"));
+        assert!(
+            arena.physical_pool_stats().is_none(),
+            "premise: this covers the no-pool governed VMM path"
+        );
+        provider
+            .adopt_memory_governor(governor.as_ref(), Tier::Device, HolderId::new(915))
+            .expect("adopt mapped weight allowance");
+
+        let runtime = Arc::clone(provider.runtime());
+        let before = runtime.allocation_counts();
+        let payload = vec![0x41u8; 4096];
+        let (lazy, host) = lazy_weight_bytes(&payload, 256);
+        let paged = ExecutionProvider::page_lazy_weight(&provider, 7, &lazy, &host)
+            .expect("page-in succeeds")
+            .expect("offload enabled");
+        assert_eq!(paged.len(), payload.len());
+        assert_eq!(
+            runtime.allocation_counts(),
+            before,
+            "governed VMM weight pages must not allocate through alloc_raw"
+        );
+        assert!(
+            arena.committed_and_reserved().0 > 0,
+            "the VMM allocator must own committed bytes for the paged weight"
+        );
+        let stats = residency.stats();
+        assert_eq!(stats.page_ins, 1);
+        assert_eq!(stats.evictions, 0);
+        assert!(
+            stats.mapped_physical_bytes > 0,
+            "the governed path must account mapped bytes through the weight allowance"
+        );
+
+        let queue = Arc::clone(provider.release_queue());
+        drop(paged);
+        drop(provider);
+        assert!(
+            queue.wait_until_idle(Duration::from_secs(30)),
+            "provider teardown must flush deferred VMM weight releases: {:?}",
+            queue.stats()
+        );
+        assert_eq!(
+            runtime.allocation_counts(),
+            before,
+            "teardown of a governed VMM weight page must not free through free_raw"
+        );
+        assert_eq!(
+            arena.committed_and_reserved().0,
+            0,
+            "teardown must release the committed VMM bytes after the deferred queue drains"
+        );
+        assert_eq!(
+            queue.stats().quarantined,
+            0,
+            "teardown must not retain ownership on the success path"
         );
     }
 
@@ -3937,14 +4214,11 @@ extern "C" __global__ void spin_delay(long long spin) {
     fn public_constructor_installs_configured_physical_pool() {
         use cudarc::driver::{LaunchConfig, PushKernelArg};
 
-        // SAFETY: single-process test. Only the pool bound is configured; the
-        // arena itself needs no switch since Phase 7.
-        unsafe {
-            std::env::set_var(
-                crate::vmm_allocator::CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV,
-                (64usize << 20).to_string(),
-            );
-        }
+        let mut env = EnvVarGuard::acquire();
+        env.set(
+            crate::vmm_allocator::CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV,
+            &(64usize << 20).to_string(),
+        );
         let provider = CudaExecutionProvider::new(0).expect("public CUDA provider");
         assert!(
             provider
@@ -4383,12 +4657,11 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
         use cudarc::driver::{LaunchConfig, PushKernelArg};
         use onnx_runtime_memory_governor::{LeaseLedger, LedgerGovernor};
 
-        unsafe {
-            std::env::set_var(
-                crate::vmm_allocator::CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV,
-                (64usize << 20).to_string(),
-            );
-        }
+        let mut env = EnvVarGuard::acquire();
+        env.set(
+            crate::vmm_allocator::CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV,
+            &(64usize << 20).to_string(),
+        );
         let governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync> =
             Arc::new(LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0)));
         let first = CudaExecutionProvider::new_with_offload_policy_and_governor(

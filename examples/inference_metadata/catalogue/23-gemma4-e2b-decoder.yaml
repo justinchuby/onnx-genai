@@ -1,0 +1,220 @@
+# Gemma 4 E2B text decoder; canonical shape for the `google/gemma-4-E2B-it`
+# target. This checkpoint is a DENSE hybrid full/sliding-window decoder — its
+# pinned config sets `enable_moe_block: false` / `num_experts: null`, so no MoE
+# metadata is invented here. (The schema can still express a sparse FFN through
+# `model.mixture_of_experts` for MoE variants; this dense checkpoint has none.)
+#
+# REDUCED ILLUSTRATION. The real target has 35 decoder layers with a 5:1
+# local:global attention pattern and cross-layer KV sharing: 15 layers physically
+# own KV — 3 full-attention owners at layers 4, 9, 14 (head_dim 512) and 12
+# sliding-attention owners (head_dim 256) — while the other 20 layers share an
+# earlier owner's cache and expose no ports. To stay readable this example shows
+# a reduced slice (2 full owners + 1 sliding owner at illustrative indices); the
+# owner counts and layer indices in the YAML below are ILLUSTRATIVE, not the
+# model's real graph facts (those real numbers are stated in this comment). The
+# schema carries no model name; this comment states identity and real geometry.
+#
+# The generic, schema-level facts this example demonstrates:
+#
+#   * Hybrid attention: `full_attention` (global) and `sliding_attention`
+#     (local, window 512) are separate state-service groups with different
+#     `kind` and `reuse` discipline. The local group's prefix is
+#     `evictable_prefix: true` (the fixed window drops old tokens) and the global
+#     group's is not.
+#   * Heterogeneous global/local geometry: the real heterogeneity is head WIDTH —
+#     the global head_dim (512) is twice the local head_dim (256). The two groups
+#     therefore use independent `full_head_dim` and `sliding_head_dim` axes. It is
+#     grouped-query attention with one KV head (`num_key_value_heads: 1`), so key
+#     and value share one head-count symbol per group. (A model whose K and V
+#     head counts differ is equally expressible — see example 1 — this
+#     checkpoint's simply do not.)
+#   * Shared / borrowed KV layers: `num_kv_shared_layers` means far more attention
+#     layers than physical KV buffers. `layer` orders and pairs the physical
+#     owners; it does not enumerate every logical layer. (In the real model the
+#     owners are layers 4/9/14 full and 12 sliding; the reduced indices below
+#     stand in for them.)
+#
+# `final_logit_softcapping` and `tie_word_embeddings` are graph-internal to the
+# decoder artifact and are not restated as metadata.
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      capabilities: [workflow_ssa, typed_emit, serving_service_contract]
+    inputs:
+      request.active:
+        contract: {dtype: bool, rank: 1, shape: [batch], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: opaque}
+        source: {kind: application, name: active}
+        required: true
+      request.done:
+        contract: {dtype: bool, rank: 1, shape: [batch], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: opaque}
+        source: {kind: application, name: done}
+        required: true
+      request.accepted_len:
+        contract: {dtype: int64, rank: 1, shape: [batch], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: opaque}
+        source: {kind: application, name: accepted_len}
+        required: true
+      request.input_ids:
+        contract: {dtype: int64, rank: 2, shape: [batch, sequence], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: runtime, version: '1.0', role: prompt_tokens}
+        source: {kind: request}
+        required: true
+      request.full_key_0:
+        contract: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: opaque}
+        source: {kind: application, name: full_key_0}
+        required: true
+      request.full_value_0:
+        contract: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: opaque}
+        source: {kind: application, name: full_value_0}
+        required: true
+      request.full_key_1:
+        contract: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: opaque}
+        source: {kind: application, name: full_key_1}
+        required: true
+      request.full_value_1:
+        contract: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: opaque}
+        source: {kind: application, name: full_value_1}
+        required: true
+      request.sliding_key_0:
+        contract: {dtype: float16, rank: 4, shape: [batch, sliding_kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: opaque}
+        source: {kind: application, name: sliding_key_0}
+        required: true
+      request.sliding_value_0:
+        contract: {dtype: float16, rank: 4, shape: [batch, sliding_kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: opaque}
+        source: {kind: application, name: sliding_value_0}
+        required: true
+    outputs:
+      logits:
+        contract: {dtype: float16, rank: 3, shape: [batch, sequence, vocab], batch_layout: {kind: request_aligned, axis: 0}}
+        role: tensor
+        stage: pre_adapter
+    components:
+      decoder:
+        implementation: {kind: onnx, artifact: gemma4_e2b/decoder.onnx.textproto}
+        ports:
+          inputs:
+            input_ids: {dtype: int64, rank: 2, shape: [batch, sequence], batch_layout: {kind: request_aligned, axis: 0}}
+            full_key_0: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            full_value_0: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            full_key_1: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            full_value_1: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            sliding_key_0: {dtype: float16, rank: 4, shape: [batch, sliding_kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            sliding_value_0: {dtype: float16, rank: 4, shape: [batch, sliding_kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+          outputs:
+            logits: {dtype: float16, rank: 3, shape: [batch, sequence, vocab], batch_layout: {kind: request_aligned, axis: 0}}
+            next_full_key_0: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            next_full_value_0: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            next_full_key_1: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            next_full_value_1: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            next_sliding_key_0: {dtype: float16, rank: 4, shape: [batch, sliding_kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+            next_sliding_value_0: {dtype: float16, rank: 4, shape: [batch, sliding_kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+          roles: {input_ids: token_ids, logits: logits}
+    state:
+      full_key_0:
+        contract: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        scope: invocation
+        initializer: request.full_key_0
+        recurrence: {kind: invariant}
+        management: runtime
+        release_boundary: invocation
+        service_group: full_attention
+      full_value_0:
+        contract: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        scope: invocation
+        initializer: request.full_value_0
+        recurrence: {kind: invariant}
+        management: runtime
+        release_boundary: invocation
+        service_group: full_attention
+      full_key_1:
+        contract: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        scope: invocation
+        initializer: request.full_key_1
+        recurrence: {kind: invariant}
+        management: runtime
+        release_boundary: invocation
+        service_group: full_attention
+      full_value_1:
+        contract: {dtype: float16, rank: 4, shape: [batch, full_kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        scope: invocation
+        initializer: request.full_value_1
+        recurrence: {kind: invariant}
+        management: runtime
+        release_boundary: invocation
+        service_group: full_attention
+      sliding_key_0:
+        contract: {dtype: float16, rank: 4, shape: [batch, sliding_kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        scope: invocation
+        initializer: request.sliding_key_0
+        recurrence: {kind: invariant}
+        management: runtime
+        release_boundary: invocation
+        service_group: sliding_attention
+      sliding_value_0:
+        contract: {dtype: float16, rank: 4, shape: [batch, sliding_kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        scope: invocation
+        initializer: request.sliding_value_0
+        recurrence: {kind: invariant}
+        management: runtime
+        release_boundary: invocation
+        service_group: sliding_attention
+    steps:
+    - kind: invoke
+      component: decoder
+      inputs:
+        input_ids: request.input_ids
+        full_key_0: request.full_key_0
+        full_value_0: request.full_value_0
+        full_key_1: request.full_key_1
+        full_value_1: request.full_value_1
+        sliding_key_0: request.sliding_key_0
+        sliding_value_0: request.sliding_value_0
+      outputs:
+        logits: decoder.logits
+        next_full_key_0: decoder.full_key_0
+        next_full_value_0: decoder.full_value_0
+        next_full_key_1: decoder.full_key_1
+        next_full_value_1: decoder.full_value_1
+        next_sliding_key_0: decoder.sliding_key_0
+        next_sliding_value_0: decoder.sliding_value_0
+    - kind: emit
+      value: decoder.logits
+      output: logits
+      mode: replace
+    serving:
+      active: request.active
+      done: request.done
+      accepted_len: request.accepted_len
+      state_service:
+        groups:
+          full_attention:
+            kind: full_attention
+            sequence_axis: 2
+            layout: bnsh
+            update: {kind: append}
+            reuse: {prefix_reusable: true, evictable_prefix: false}
+            ports:
+              decoder:
+                full_key_0: {input: full_key_0, output: next_full_key_0, role: key, layer: 0}
+                full_value_0: {input: full_value_0, output: next_full_value_0, role: value, layer: 0}
+                full_key_1: {input: full_key_1, output: next_full_key_1, role: key, layer: 1}
+                full_value_1: {input: full_value_1, output: next_full_value_1, role: value, layer: 1}
+          sliding_attention:
+            kind: sliding_attention
+            sequence_axis: 2
+            layout: bnsh
+            update: {kind: append}
+            reuse: {prefix_reusable: true, evictable_prefix: true}
+            ports:
+              decoder:
+                sliding_key_0: {input: sliding_key_0, output: next_sliding_key_0, role: key, layer: 0}
+                sliding_value_0: {input: sliding_value_0, output: next_sliding_value_0, role: value, layer: 0}

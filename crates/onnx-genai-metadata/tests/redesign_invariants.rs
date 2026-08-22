@@ -6,7 +6,8 @@
 //! so the fact under test is the only thing that varies.
 
 use onnx_genai_metadata::{
-    InferenceMetadata, cache_dependencies, semantic_identity_of_str, validate_metadata,
+    InferenceMetadata, WorkflowOutputRole, cache_dependencies, semantic_identity_of_str,
+    validate_metadata,
 };
 
 fn parse(document: &str) -> InferenceMetadata {
@@ -22,8 +23,17 @@ fn image_outputs_require_an_explicit_value_range() {
     let document = include_str!(
         "../../../examples/inference_metadata/catalogue/07-stable-diffusion-text-to-image.yaml"
     );
-    let missing_range = document.replacen("        value_range: negative_one_to_one\n", "", 1);
-    let errors = errors(&missing_range);
+    let mut metadata = parse(document);
+    metadata
+        .pipeline
+        .as_mut()
+        .expect("catalogue entry has a pipeline")
+        .workflow
+        .outputs
+        .get_mut("image")
+        .expect("catalogue entry has an image output")
+        .value_range = None;
+    let errors = validate_metadata(&metadata).expect_err("metadata must be rejected");
     assert!(
         errors
             .iter()
@@ -37,8 +47,17 @@ fn image_value_range_is_rejected_on_non_image_outputs() {
     let document = include_str!(
         "../../../examples/inference_metadata/catalogue/07-stable-diffusion-text-to-image.yaml"
     );
-    let invalid = document.replacen("        role: image\n", "        role: tensor\n", 1);
-    let errors = errors(&invalid);
+    let mut metadata = parse(document);
+    metadata
+        .pipeline
+        .as_mut()
+        .expect("catalogue entry has a pipeline")
+        .workflow
+        .outputs
+        .get_mut("image")
+        .expect("catalogue entry has an image output")
+        .role = WorkflowOutputRole::Tensor;
+    let errors = validate_metadata(&metadata).expect_err("metadata must be rejected");
     assert!(
         errors.iter().any(
             |error| error.contains("non-image output 'image' cannot declare image value_range")
@@ -112,7 +131,7 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: { onnx-genai.parameter-overlay: "1" }
-      capabilities: [workflow_ssa, typed_emit, parameter_adapters, heterogeneous_adapter_batching]
+      capabilities: [workflow_ssa, linear_effects, typed_emit, parameter_adapters, heterogeneous_adapter_batching]
     inputs:
       request.adapter_segments:
         contract: { dtype: int64, rank: 2, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
@@ -309,12 +328,17 @@ fn serving_workflow(
     effects: &str,
     speculative: &str,
 ) -> String {
+    let linear_effects = if effects.is_empty() {
+        ""
+    } else {
+        ", linear_effects"
+    };
     format!(
         r#"
 pipeline:
   workflow:
     manifest:
-      capabilities: [workflow_ssa, serving_service_contract]
+      capabilities: [workflow_ssa, serving_service_contract{linear_effects}]
     inputs:
       active:
         contract: {{ dtype: bool, rank: 1, shape: [batch], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
@@ -470,6 +494,73 @@ fn speculative_rollback_bounds_must_cover_the_maximum_proposal_width() {
     let reported = errors(&effect_too_narrow);
     assert!(
         reported.iter().any(|error| error.contains("rewinds 2")),
+        "{reported:?}"
+    );
+}
+
+#[test]
+fn chained_proposer_requires_typed_ports_and_rollbackable_recurrence() {
+    let metadata = serving_workflow(
+        "permitted",
+        SOUND_CAPABILITIES,
+        "",
+        r#"
+speculative:
+  proposer: proposer
+  target: verifier
+  proposal_execution:
+    kind: chained
+    token_embedding_input: inputs_embeds
+    logits_output: draft_logits
+    recurrent:
+    - { state: cache, input: past_state, output: next_state }
+  vocabulary: { kind: mapped, artifact: draft_to_target.npy }
+  max_proposal_width: 4
+  distribution_preserving: true
+  rollback_state: [cache]
+"#,
+    )
+    .replacen(
+        "        ports: {}",
+        r#"        ports:
+          inputs:
+            inputs_embeds: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim] }
+            past_state: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim] }
+          outputs:
+            draft_logits: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim] }
+            next_state: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim] }"#,
+        1,
+    )
+    .replacen(
+        "      - kind: invoke\n        component: proposer",
+        "      - kind: invoke\n        component: proposer\n        inputs: { inputs_embeds: empty_cache, past_state: empty_cache }\n        outputs: { draft_logits: draft.logits, next_state: draft.next_state }",
+        1,
+    )
+    // The proposer's recurrence advances `cache`, so the decoder_cache group
+    // must expose a read_write proposer alias for it: the verifier alias alone
+    // does not carry the proposer's loop, and a chained recurrence must resolve
+    // through serving.state_service.groups.*.ports.proposer.
+    .replace(
+        "              verifier:\n                cache: { input: past_key_values, output: present_key_values }",
+        "              verifier:\n                cache: { input: past_key_values, output: present_key_values }\n              proposer:\n                cache: { input: past_state, output: next_state }",
+    );
+    validate_metadata(&parse(&metadata)).expect("typed chained proposer must validate");
+
+    let missing_rollback = metadata.replace("  rollback_state: [cache]", "  rollback_state: []");
+    let reported = errors(&missing_rollback);
+    assert!(
+        reported
+            .iter()
+            .any(|error| error.contains("must be listed in rollback_state")),
+        "{reported:?}"
+    );
+
+    let bad_port = metadata.replace("logits_output: draft_logits", "logits_output: missing");
+    let reported = errors(&bad_port);
+    assert!(
+        reported
+            .iter()
+            .any(|error| error.contains("is not an output port")),
         "{reported:?}"
     );
 }
@@ -692,7 +783,7 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: { onnx-genai.grammar-guidance: "1" }
-      capabilities: [workflow_ssa]
+      capabilities: [workflow_ssa, grammar_guidance_adapter]
     inputs: {}
     components:
       grammar:
@@ -1050,7 +1141,8 @@ fn the_speculative_region_covers_every_component_in_the_loop_body() {
     let with_sidecar = workflow
         .replace(
             "capabilities: [workflow_ssa, serving_service_contract]",
-            "capabilities: [workflow_ssa, serving_service_contract, nested_control_flow]",
+            "capabilities: [workflow_ssa, serving_service_contract, linear_effects, \
+             nested_control_flow]",
         )
         .replace(
             r#"      verifier:
@@ -1124,8 +1216,8 @@ fn runtime_owned_state_cannot_be_exported_under_an_alias() {
     let aliased = serving_workflow("permitted", SOUND_CAPABILITIES, "", "")
         .replace(
             "capabilities: [workflow_ssa, serving_service_contract]",
-            "capabilities: [workflow_ssa, serving_service_contract, nested_control_flow, \
-             typed_emit]",
+            "capabilities: [workflow_ssa, serving_service_contract, linear_effects, \
+             nested_control_flow, typed_emit]",
         )
         .replace(
             "      empty_cache:",

@@ -15,6 +15,7 @@ onnx-runtime-memory-api = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+onnx-runtime-memory-governor = { workspace = true }
 onnx-runtime-memory-testplugin = { workspace = true }
 
 [lints]

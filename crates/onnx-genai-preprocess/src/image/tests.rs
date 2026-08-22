@@ -1213,6 +1213,39 @@ preprocessing:
 }
 
 #[test]
+fn dynamic_pixel_output_keeps_source_image_dimensions_unbound() {
+    const PROGRAM: &str = r#"
+preprocessing:
+  image:
+    transforms:
+      - op: decode_rgb
+      - op: resize
+        mode: pixel_area
+        min_pixels: 262144
+        max_pixels: 4194304
+        size_multiple: 32
+        interpolation: lanczos3
+      - op: rescale
+        scale: 0.00392156862745098
+      - op: normalize
+        mean: [0.485, 0.456, 0.406]
+        std: [0.229, 0.224, 0.225]
+    outputs:
+      - name: pixel_values
+        content: pixels
+        dtype: fp16
+"#;
+    let preprocessor = typed_preprocessor(&[1, 3, -1, -1], PROGRAM);
+    let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(96, 64, Rgb([1, 2, 3])));
+    let bundle = preprocessor.preprocess(&[image]).unwrap();
+
+    assert_eq!(
+        bundle.tensor("pixel_values").unwrap().shape,
+        [1, 3, 448, 640]
+    );
+}
+
+#[test]
 fn pixel_area_rounding_matches_python_ties_to_even() {
     assert_eq!(round_to_multiple_ties_even(16, 32), 0);
     assert_eq!(round_to_multiple_ties_even(48, 32), 64);

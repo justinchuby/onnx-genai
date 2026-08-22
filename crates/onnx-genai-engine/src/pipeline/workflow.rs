@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use super::*;
 use crate::decode::clone_value;
-use onnx_genai_metadata::StateAliasing;
+use onnx_genai_metadata::{StateAliasing, StatePortAccess};
 use onnx_genai_ort::{IoBinding, Session};
 
 type ResolvedComponentInvocation<'a> = (
@@ -1857,6 +1857,40 @@ impl PipelineEngine {
                 .map(|(name, value)| ((*name).to_string(), value.shape().to_vec()))
                 .collect(),
         );
+        // Shape-changing policy components (for example an append recurrence)
+        // intentionally expose an output symbol that is not bound by their
+        // inputs. Such outputs cannot use a fixed-address CUDA binding: ORT
+        // must allocate the newly discovered shape on each invocation.
+        if selected_outputs.keys().any(|output| {
+            declaration
+                .ports
+                .outputs
+                .get(output)
+                .is_some_and(|contract| {
+                    resolve_workflow_shape(contract, component_symbols).is_err()
+                })
+        }) {
+            let mut values = session
+                .output_names()
+                .iter()
+                .cloned()
+                .zip(session.run(resolved)?)
+                .collect::<HashMap<_, _>>();
+            return selected_outputs
+                .keys()
+                .map(|output| {
+                    values
+                        .remove(output)
+                        .map(|value| (output.clone(), value))
+                        .with_context(|| {
+                            format!(
+                                "dynamic component '{component}' did not return selected output \
+                                 '{output}'"
+                            )
+                        })
+                })
+                .collect();
+        }
         let shared = workflow
             .serving
             .as_ref()
@@ -1868,7 +1902,8 @@ impl PipelineEngine {
                     .filter(|group| group.aliasing != StateAliasing::Forbidden)
                     .filter_map(|group| group.ports.get(component))
                     .flat_map(|aliases| aliases.values())
-                    .map(|alias| (alias.output.clone(), alias.input.clone()))
+                    .filter(|alias| alias.access == StatePortAccess::ReadWrite)
+                    .filter_map(|alias| Some((alias.output.clone()?, alias.input.clone())))
                     .collect::<HashMap<_, _>>()
             })
             .unwrap_or_default();
@@ -3013,7 +3048,7 @@ fn resolve_workflow_shape(
 
 fn resolve_workflow_adapter_shape(
     contract: &TensorContract,
-    symbols: &HashMap<String, i64>,
+    _symbols: &HashMap<String, i64>,
 ) -> anyhow::Result<Vec<i64>> {
     let shape = contract
         .shape
@@ -3023,7 +3058,12 @@ fn resolve_workflow_adapter_shape(
         .iter()
         .map(|dimension| match dimension {
             TensorDimension::Fixed(value) => Ok(*value),
-            TensorDimension::Symbol(symbol) => Ok(symbols.get(symbol).copied().unwrap_or(-1)),
+            // Adapter outputs are produced before their concrete dimensions
+            // exist. A symbol here is a typed dynamic axis, not permission to
+            // borrow an equal-spelled extent from another component artifact
+            // (for example a source image and generated latent that both call
+            // their private axes "height").
+            TensorDimension::Symbol(_) => Ok(-1),
         })
         .collect()
 }

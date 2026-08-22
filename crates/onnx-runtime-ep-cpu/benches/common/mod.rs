@@ -203,3 +203,30 @@ pub fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
         );
     }
 }
+
+/// Put this benchmark process into the same decode thread topology a served
+/// session runs in.
+///
+/// `CpuExecutionProvider::initialize` is the earliest per-session hook and the
+/// only place an explicit `ONNX_GENAI_CPU_DECODE_THREADS` budget becomes a
+/// process-wide bound on prefill/MLAS Rayon parallelism and, on Linux, on CPU
+/// affinity. A benchmark that never calls it runs every row on an *unbounded*
+/// process, so a `t=N` row measures N decode workers competing with a
+/// full-width Rayon pool on every core -- not the configuration production runs
+/// (#1749).
+///
+/// Deliberately the real `CpuExecutionProvider::initialize` rather than a copy
+/// of what it currently does. A reimplementation would silently stop matching
+/// the moment `initialize` grows a second responsibility, which is exactly the
+/// drift that leaves a benchmark measuring a configuration nothing ships.
+///
+/// A no-op unless a budget is set, and idempotent: the underlying bound latches
+/// on first call. Benches that install their own fixed-width Rayon pool (see
+/// `kernels.rs`, which sweeps `[1, 8]`) will oversubscribe that pool onto a
+/// smaller budget's cores -- which is what production does with the same two
+/// settings, and is why this is applied there too rather than special-cased.
+pub fn init_decode_topology() {
+    CpuExecutionProvider::new()
+        .initialize(&Default::default())
+        .expect("the CPU EP must initialize");
+}

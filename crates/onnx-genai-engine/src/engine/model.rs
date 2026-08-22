@@ -145,6 +145,7 @@ pub(crate) struct Eagle3Model {
     pub(crate) config: Eagle3Config,
     pub(crate) session: Box<Session>,
     pub(crate) embedder: LinearEmbedder,
+    pub(crate) token_map: Option<Vec<TokenId>>,
     pub(crate) hidden_outputs: Vec<String>,
     pub(crate) kv_mode: onnx_genai_ort::Eagle3DraftKvMode,
     pub(crate) num_speculative_tokens: usize,

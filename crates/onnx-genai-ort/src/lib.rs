@@ -47,6 +47,8 @@ pub mod error;
 pub mod governed_allocator;
 pub mod io_roles;
 pub mod loader;
+#[cfg(feature = "cuda")]
+mod managed_cuda_allocator;
 pub mod mtp;
 mod pipeline_admission;
 pub mod profile;
@@ -77,6 +79,8 @@ pub use loader::{
     graph_io_from_model_path, graph_io_from_model_path_for_kv_pairs,
     graph_io_from_model_path_for_names, model_weight_bytes,
 };
+#[cfg(feature = "cuda")]
+pub use managed_cuda_allocator::{ManagedCudaAllocatorConfig, ManagedCudaAllocatorStats};
 pub use mtp::{
     MtpDecodeOptions, MtpDecodeSession, MtpDraftKvMode, MtpHeadSignature, MtpStepOutput,
 };

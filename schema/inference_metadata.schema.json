@@ -3734,6 +3734,13 @@
           "description": "Proposer ports bound to target-owned values, by semantic role.",
           "type": "object"
         },
+        "proposal_execution": {
+          "$ref": "#/$defs/SpeculativeProposalExecution",
+          "default": {
+            "kind": "block"
+          },
+          "description": "How the proposer materializes one candidate block.\n\n`block` components emit the complete proposal in one invocation.\n`chained` components emit one distribution and recurrence update per\ninvocation; the runtime repeatedly invokes the same typed component up\nto `max_proposal_width`."
+        },
         "proposer": {
           "description": "Workflow component that proposes tokens.",
           "minLength": 1,
@@ -3778,6 +3785,136 @@
         "target",
         "vocabulary",
         "max_proposal_width"
+      ],
+      "type": "object"
+    },
+    "SpeculativeProposalExecution": {
+      "description": "Execution shape of a speculative proposer.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "One proposer invocation returns the complete token block.",
+          "properties": {
+            "kind": {
+              "const": "block",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Repeated proposer invocations form an autoregressive proposal chain.",
+          "properties": {
+            "folded_carry_output": {
+              "description": "Proposer OUTPUT port producing the folded carry for the NEXT step\n(carry_k, k>=1). The carry has no dedicated input port: it re-enters\nas the trailing segment of the proposer's fused\n`token_embedding_input` (`concat(embed(last_token), carry)`), so it\nowns no workflow state cell. Three ports pin the fold EXPLICITLY, so\na runtime never infers by convention:\n\n* DESTINATION: `port_bindings.target_hidden_context` names the\n  proposer input port the carry lands in. For a folded carry it must\n  equal `token_embedding_input`: the carry occupies the fused input's\n  trailing half, so the destination is that fused input, never a\n  separate port.\n* carry_0 SOURCE: `folded_carry_seed` names the target output read\n  as the carry on the first step.\n* carry_k SOURCE: this field, the proposer output on every later\n  step.\n\nBecause a folded carry is recomputed from committed tokens on\nrejection rather than restored, it does not appear in\n`rollback_state`. A chained proposer declares at least one of\n`recurrent` or `folded_carry_output`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "folded_carry_seed": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SpeculativeValueRef"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "carry_0 seed: the target component OUTPUT read as the folded carry on\nthe FIRST step, before the proposer has produced a carry. Named\nexplicitly (`component` + `output`) so a runtime reads it rather than\ninferring \"the target hidden output\" by convention. Its `component`\nmust be the speculative target, since carry_0 is the target's own\nper-token hidden output. Required whenever `folded_carry_output` is\npresent."
+            },
+            "kind": {
+              "const": "chained",
+              "type": "string"
+            },
+            "logits_output": {
+              "description": "Proposer output port carrying the next-token distribution.",
+              "minLength": 1,
+              "type": "string"
+            },
+            "recurrent": {
+              "default": [],
+              "description": "Loop-carried hidden/cache state updated by every proposer invocation\nthrough its own input port.",
+              "items": {
+                "$ref": "#/$defs/SpeculativeRecurrenceBinding"
+              },
+              "type": "array"
+            },
+            "token_embedding": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TokenEmbeddingSource"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Where a runtime obtains `embed(last_token)` for the LEADING half of\nthe fused `token_embedding_input`. A folded-carry proposer graph\nconsumes only the fused input, so it reads no embedding initializer of\nits own and `speculative.shared_weights` stays empty; this names the\nmodel-agnostic embedding table the runtime gathers the leading half\nfrom (never extracted heuristically from a graph). Its `component`\nmust be the speculative target — an ONNX model that owns the named\n`table` initializer — so the table resolves to a real initializer in\nthe target model/artifact. Required whenever `folded_carry_output` is\npresent."
+            },
+            "token_embedding_input": {
+              "description": "Proposer input port receiving the previous selected token embedding.",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "token_embedding_input",
+            "logits_output"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SpeculativeRecurrenceBinding": {
+      "additionalProperties": false,
+      "description": "One loop-carried proposer value in a chained proposal.",
+      "properties": {
+        "input": {
+          "description": "Proposer input port receiving the current value.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "output": {
+          "description": "Proposer output port producing the next value.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "state": {
+          "description": "Workflow state cell checkpointed before proposal and restored on rejection.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "state",
+        "input",
+        "output"
+      ],
+      "type": "object"
+    },
+    "SpeculativeValueRef": {
+      "additionalProperties": false,
+      "description": "An explicit reference to a value a workflow component produces.\n\nBoth halves are named so a speculative runtime resolves the value from the\ndeclared graph I/O, never by string convention or shape guessing.",
+      "properties": {
+        "component": {
+          "description": "The workflow component that produces the value.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "output": {
+          "description": "The declared output port of that component carrying the value.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "component",
+        "output"
       ],
       "type": "object"
     },
@@ -4084,9 +4221,28 @@
         }
       ]
     },
+    "StatePortAccess": {
+      "description": "State access performed by one component binding.",
+      "oneOf": [
+        {
+          "const": "read_write",
+          "description": "The component consumes the current value and produces its successor.",
+          "type": "string"
+        },
+        {
+          "const": "read_only",
+          "description": "The component consumes a frozen value; any graph output is discarded.",
+          "type": "string"
+        }
+      ]
+    },
     "StatePortAlias": {
       "additionalProperties": false,
       "properties": {
+        "access": {
+          "$ref": "#/$defs/StatePortAccess",
+          "description": "Whether this component advances the state or only observes a frozen\nvalue produced by another component in the same service group.\n\nA read-only binding still names the graph's present output when the\nartifact exposes one for kernel ABI reasons, but that output is not a\nstate transition and must not be aliased back onto the input."
+        },
         "input": {
           "type": "string"
         },
@@ -4100,7 +4256,11 @@
           ]
         },
         "output": {
-          "type": "string"
+          "description": "Graph output port carrying this pair's next-step value.\n\nRequired for a read-write transition. A `read_only` binding MAY omit it:\na pure borrowed-state reader — e.g. a shared-KV drafter that consumes\nanother decoder's cache and advances nothing — exposes no present output\nat all, so there is nothing to name. A read-only reader whose artifact\nstill emits a discarded present output for kernel-ABI reasons may name it\nhere, but that value is never a state transition.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "role": {
           "anyOf": [
@@ -4115,8 +4275,7 @@
         }
       },
       "required": [
-        "input",
-        "output"
+        "input"
       ],
       "type": "object"
     },
@@ -4571,6 +4730,27 @@
         }
       ],
       "type": "string"
+    },
+    "TokenEmbeddingSource": {
+      "additionalProperties": false,
+      "description": "Explicit, model-agnostic source of the token embedding a chained proposer\nfolds into the leading half of its fused input.\n\nA folded-carry proposer never reads an embedding initializer inside its own\ngraph, so the table cannot be recovered from the proposer graph. This names\nthe component whose embedding the runtime reuses and the initializer that\nholds it, so gathering `embed(last_token)` is a declared contract rather than\na per-model heuristic.",
+      "properties": {
+        "component": {
+          "description": "The workflow component whose token-embedding table is reused. For a\nfolded carry this must be the speculative target, whose vocabulary the\nproposer shares and whose ONNX model owns the `table` initializer.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "table": {
+          "description": "The named embedding table (graph initializer) on that component, e.g.\n`model.embed_tokens.weight`. A `[vocab, hidden]` row-major matrix. It\nmust name a real initializer in the target model/artifact.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "component",
+        "table"
+      ],
+      "type": "object"
     },
     "TokenizerArtifact": {
       "additionalProperties": false,
