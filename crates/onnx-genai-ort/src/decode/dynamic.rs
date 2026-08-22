@@ -375,10 +375,24 @@ impl<'a> DecodeSession<'a> {
             attention_mask_input.as_deref(),
             position_ids_input.as_deref(),
             io.and_then(|io| io.inputs_embeds_input.as_deref()),
+            io.and_then(|io| io.encoder_hidden_states_input.as_deref()),
+            io.and_then(|io| io.audio_features_input.as_deref()),
         ]
         .into_iter()
         .flatten()
         .chain(kv_pairs.iter().map(|pair| pair.past.as_str()))
+        .chain(
+            io.and_then(|io| io.cross_kv_inputs.as_deref())
+                .into_iter()
+                .flatten()
+                .map(String::as_str),
+        )
+        .chain(
+            io.and_then(|io| io.state_pairs.as_deref())
+                .into_iter()
+                .flatten()
+                .map(|pair| pair.input.as_str()),
+        )
         .collect::<HashSet<_>>();
         let assigned_outputs = [
             Some(logits_output.as_str()),
@@ -387,6 +401,18 @@ impl<'a> DecodeSession<'a> {
         .into_iter()
         .flatten()
         .chain(kv_pairs.iter().map(|pair| pair.present.as_str()))
+        .chain(
+            io.and_then(|io| io.cross_kv_outputs.as_deref())
+                .into_iter()
+                .flatten()
+                .map(String::as_str),
+        )
+        .chain(
+            io.and_then(|io| io.state_pairs.as_deref())
+                .into_iter()
+                .flatten()
+                .map(|pair| pair.output.as_str()),
+        )
         .collect::<HashSet<_>>();
         let unassigned_state_inputs = session
             .inputs()
@@ -404,12 +430,20 @@ impl<'a> DecodeSession<'a> {
             })
             .map(|tensor| tensor.name.as_str())
             .collect::<Vec<_>>();
-        // Rank-3+ outputs without corresponding inputs may be auxiliary activations
-        // consumed by a chained proposer. Unassigned inputs are always stateful and
-        // still require an explicit state-service binding.
-        if !unassigned_state_inputs.is_empty() {
+        // A rank-3+ output is legitimate only when the ABI accounts for it:
+        // logits, the declared hidden/auxiliary output a chained proposer or
+        // embedding head consumes (`hidden_output`, a `hidden_states` port role),
+        // a paired present-KV (self- or cross-attention), or a declared recurrent
+        // `state_pairs` output — all resolved into `assigned_outputs` above. Any
+        // OTHER unassigned rank-3+ output is an unpaired state-like tensor: a
+        // `present`-shaped cache with no `past` input, or an undeclared recurrent
+        // output. Silently ignoring it (the old behavior) would let a rejected
+        // proposal or a rewind desynchronize a cache the runtime never bound, so
+        // reject it symmetrically with an unassigned input rather than guessing it
+        // is a harmless activation.
+        if !unassigned_state_inputs.is_empty() || !unassigned_state_outputs.is_empty() {
             return Err(OrtError::InvalidArgument(format!(
-                "cannot resolve decoder state from tensor shapes (inputs: {unassigned_state_inputs:?}, outputs: {unassigned_state_outputs:?}); bind the per-layer buffers in a pipeline.workflow.serving.state_service group"
+                "cannot resolve decoder state from tensor shapes (inputs: {unassigned_state_inputs:?}, outputs: {unassigned_state_outputs:?}); give a hidden/auxiliary output the hidden_states port role, or bind the per-layer buffers in a pipeline.workflow.serving.state_service group"
             )));
         }
         let share_buffer = options.past_present_share_buffer.unwrap_or(false);
