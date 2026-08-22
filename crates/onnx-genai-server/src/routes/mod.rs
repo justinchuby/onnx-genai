@@ -52,6 +52,7 @@ use crate::{
 
 mod admin;
 mod completions;
+mod images;
 mod multimodal;
 mod sessions;
 mod speech;
@@ -71,6 +72,9 @@ pub use completions::{
 };
 pub(crate) use completions::{
     chat_completions, collect_generation_result, completions, embeddings,
+};
+pub(crate) use images::{
+    a1111_img2img, a1111_models, a1111_options, a1111_samplers, a1111_txt2img, openai_images,
 };
 pub(crate) use multimodal::audio_transcriptions;
 pub(crate) use sessions::{create_session, delete_session};
@@ -451,6 +455,15 @@ impl ApiError {
             retry_after_secs: Some(OVERLOAD_RETRY_AFTER_SECS),
         }
     }
+
+    fn payload_too_large(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: message.into(),
+            kind: "invalid_request_error",
+            retry_after_secs: None,
+        }
+    }
 }
 
 fn generation_failure(error: DriverFailure) -> ApiError {
@@ -487,6 +500,9 @@ where
     async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
         match Json::<T>::from_request(request, state).await {
             Ok(Json(value)) => Ok(Self(value)),
+            Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+                Err(ApiError::payload_too_large(rejection.body_text()))
+            }
             Err(rejection) => Err(ApiError::bad_request(describe_json_rejection(&rejection))),
         }
     }

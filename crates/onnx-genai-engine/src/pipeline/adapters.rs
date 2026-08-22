@@ -5,7 +5,6 @@ use onnx_genai_metadata::{
 };
 use onnx_genai_ort::Value;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::Path;
@@ -485,14 +484,6 @@ fn load_adapter(
     }
     let bytes = fs::read(&path)
         .with_context(|| format!("failed to load adapter artifact '{}'", path.display()))?;
-    let actual = format!("{:x}", Sha256::digest(&bytes));
-    if actual != weight.sha256 {
-        anyhow::bail!(
-            "adapter artifact '{}' checksum mismatch: expected {}, got {actual}",
-            path.display(),
-            weight.sha256
-        );
-    }
     let bundle: JsonBundle = serde_json::from_slice(&bytes)
         .with_context(|| format!("adapter artifact '{}' is invalid JSON", path.display()))?;
     let bundles = bundle.targets;
@@ -556,24 +547,18 @@ mod tests {
         AdapterTargetBinding, AdapterWeightArtifact, LoraTargetDescriptor, LoraTargetManifest,
     };
 
-    fn artifact(name: &str, location: &str, bytes: &[u8]) -> AdapterArtifact {
+    fn artifact(name: &str, location: &str, _bytes: &[u8]) -> AdapterArtifact {
         AdapterArtifact {
             index: usize::from(name == "blue"),
             identity: name.to_string(),
             version: "1".to_string(),
-            base_model_fingerprint: format!(
-                "onnx-genai-targeted-base-v1:sha256:{}",
-                "a".repeat(64)
-            ),
             rank: 1,
             alpha: 1.0,
             dtype: "float32".to_string(),
             weights: vec![AdapterWeightArtifact {
                 location: location.to_string(),
                 loader_capability: "onnx-genai.adapters.json@1".to_string(),
-                sha256: format!("{:x}", Sha256::digest(bytes)),
                 config_location: None,
-                config_sha256: None,
                 scale_encoding: AdapterScaleEncoding::AlphaOverRank,
                 format: AdapterWeightFormat::Json,
             }],
@@ -593,10 +578,6 @@ mod tests {
 
     fn service_contract(red: &[u8], blue: &[u8], max_entries: usize) -> AdapterServiceContract {
         AdapterServiceContract {
-            base_model_fingerprint: format!(
-                "onnx-genai-targeted-base-v1:sha256:{}",
-                "a".repeat(64)
-            ),
             target_manifest: LoraTargetManifest {
                 targets: vec![LoraTargetDescriptor {
                     id: "projection".to_string(),
@@ -905,7 +886,7 @@ mod tests {
     }
 
     #[test]
-    fn artifact_checksum_and_shape_are_enforced() {
+    fn artifact_replacement_is_allowed_but_shape_is_enforced() {
         let root = std::env::current_dir()
             .expect("current directory")
             .join("target")
@@ -913,15 +894,16 @@ mod tests {
         fs::create_dir_all(root.join("adapters/red")).expect("create red adapter test directory");
         fs::create_dir_all(root.join("adapters/blue")).expect("create blue adapter test directory");
         let valid = br#"{"targets":{"projection":{"a":[1.0,0.0],"b":[1.0,2.0]}}}"#;
-        fs::write(root.join("adapters/red/adapter.json"), b"corrupt")
-            .expect("write corrupt adapter");
+        let replacement =
+            br#"{ "targets": { "projection": { "a": [1.0, 0.0], "b": [1.0, 2.0] } } }"#;
+        fs::write(root.join("adapters/red/adapter.json"), replacement)
+            .expect("write replacement adapter");
         fs::write(root.join("adapters/blue/adapter.json"), valid).expect("write blue adapter");
         let service = service_contract(valid, valid, 2);
         let selection = AdapterSelection::default().with_row([AdapterActivation::new("red", 1.0)]);
-        let error = AdapterCache::default()
+        AdapterCache::default()
             .prepare(&root, &service, &selection, &[true])
-            .expect_err("checksum mismatch must fail");
-        assert!(error.to_string().contains("checksum mismatch"));
+            .expect("semantically compatible replacement bytes must load");
 
         let malformed = br#"{"targets":{"projection":{"a":[1.0],"b":[1.0,2.0]}}}"#;
         fs::write(root.join("adapters/red/adapter.json"), malformed)

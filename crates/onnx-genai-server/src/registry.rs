@@ -17,6 +17,7 @@ use onnx_genai_ort::{ChatTemplate, Tokenizer};
 
 use crate::{
     driver::EngineDriver,
+    image_generation::ImagePipelineSpec,
     models_config::ModelSpec,
     multimodal::MultimodalSpecs,
     state::{ServerConfig, ServerMemoryAuthorities, build_handle_with_authorities},
@@ -56,6 +57,7 @@ pub(crate) struct ModelHandle {
     /// graph. Shared with the CLI so both front ends admit the same inputs.
     pub(crate) multimodal: Option<MultimodalSpecs>,
     pub(crate) speech_prompt: Option<Arc<crate::speech::SpeechPromptProcessor>>,
+    pub(crate) image_pipeline: Option<ImagePipelineSpec>,
     /// Whether the package declares a channel whose content the caller must not
     /// be shown, i.e. whether a generated turn carries private reasoning that
     /// has to be filtered out of everything this server returns.
@@ -86,6 +88,7 @@ pub(crate) struct ModelHandleParts {
     pub(crate) fim_config: Option<FimConfig>,
     pub(crate) pipeline: bool,
     pub(crate) multimodal: Option<MultimodalSpecs>,
+    pub(crate) image_pipeline: Option<ImagePipelineSpec>,
 }
 
 impl ModelHandle {
@@ -101,6 +104,7 @@ impl ModelHandle {
             fim_config,
             pipeline,
             multimodal,
+            image_pipeline,
         } = parts;
         let private_channels = declares_private_channels(&model_dir);
         let speech_prompt = crate::speech::load_speech_prompt_processor(&model_dir)?;
@@ -115,6 +119,7 @@ impl ModelHandle {
             pipeline,
             multimodal,
             speech_prompt,
+            image_pipeline,
             private_channels,
             last_request_at: AtomicU64::new(now_millis()),
             warmed: AtomicBool::new(false),
@@ -122,8 +127,8 @@ impl ModelHandle {
         })
     }
 
-    /// Run exactly one deterministic token generation to initialize lazy runtime
-    /// allocations. Repeated calls after a successful warmup are no-ops.
+    /// Run one deterministic generation matching the loaded model's output
+    /// contract to initialize lazy runtime allocations.
     fn warmup(&self) -> anyhow::Result<Duration> {
         if self.warmed.load(Ordering::Acquire) {
             return Ok(Duration::ZERO);
@@ -135,22 +140,27 @@ impl ModelHandle {
         if self.warmed.load(Ordering::Acquire) {
             return Ok(Duration::ZERO);
         }
-        let prompt = self
-            .tokenizer
-            .encode("warmup")
-            .context("failed to tokenize warmup prompt")?;
         let started = Instant::now();
-        self.engine.warmup(
-            GenerateRequest {
-                prompt: GeneratePrompt::TokenIds(prompt),
-                options: GenerateOptions {
-                    max_new_tokens: 1,
-                    max_context: self.model_max_context,
-                    ..GenerateOptions::default()
+        if let Some(image_pipeline) = &self.image_pipeline {
+            let request = image_pipeline.warmup_request(&self.tokenizer, self.model_max_context)?;
+            self.engine.warmup_image(request)?;
+        } else {
+            let prompt = self
+                .tokenizer
+                .encode("warmup")
+                .context("failed to tokenize warmup prompt")?;
+            self.engine.warmup(
+                GenerateRequest {
+                    prompt: GeneratePrompt::TokenIds(prompt),
+                    options: GenerateOptions {
+                        max_new_tokens: 1,
+                        max_context: self.model_max_context,
+                        ..GenerateOptions::default()
+                    },
                 },
-            },
-            self.pipeline,
-        )?;
+                self.pipeline,
+            )?;
+        }
         self.warmed.store(true, Ordering::Release);
         Ok(started.elapsed())
     }
@@ -873,6 +883,7 @@ mod tests {
             pipeline: false,
             multimodal: None,
             speech_prompt: None,
+            image_pipeline: None,
             private_channels: false,
             last_request_at: AtomicU64::new(last_request_at),
             warmed: AtomicBool::new(false),

@@ -60,6 +60,13 @@ impl Executor {
         }
         let _depth_guard = DepthGuard;
         let nested = depth > 0;
+        if !nested {
+            // The validation word is shared by eager and captured CUDA kernels,
+            // but its meaning is request-local. Clear any prior request before
+            // this one can enqueue work; failures are correctness failures and
+            // must propagate through the EP seam.
+            self.ep.reset_device_validation_error()?;
+        }
         self.reset_run_state()?;
 
         // Keep the setup span around shape resolution, Stage-2 restoration,
@@ -97,11 +104,48 @@ impl Executor {
             stage2,
             measure_activation_plan,
         );
+        let validation = if nested {
+            Ok(())
+        } else {
+            self.finish_device_validation()
+        };
         let unbound = self.unbind_borrowed_inputs();
-        match (outcome, unbound) {
-            (Ok(result), Ok(())) => Ok(result),
-            (Err(e), _) => Err(e),
-            (Ok(_), Err(e)) => Err(e),
+        match (outcome, validation, unbound) {
+            (_, Err(e), _) => Err(e),
+            (Err(e), _, _) => Err(e),
+            (Ok(_), _, Err(e)) => Err(e),
+            (Ok(result), Ok(()), Ok(())) => Ok(result),
+        }
+    }
+
+    fn finish_device_validation(&self) -> Result<()> {
+        // This is the one request-level host boundary for deferred eager work
+        // and for captured replay. The CUDA EP's explicit sync is unconditional,
+        // so the latch read observes every kernel from this request.
+        self.ep.sync()?;
+        let checked = self.ep.check_device_capture_error();
+        // Clear after the synchronized read as well as before the next request:
+        // callers inspecting a failed run cannot leave poison behind, and a
+        // reset failure is never silently discarded.
+        let reset = self.ep.reset_device_validation_error();
+        match (checked, reset) {
+            (Ok(0), Ok(())) => Ok(()),
+            (Ok(flags), Ok(())) => Err(EpError::KernelFailed(format!(
+                "{}: device validation failed (flags=0x{flags:x})",
+                self.ep.name()
+            ))
+            .into()),
+            (Err(error), Ok(())) | (Ok(0), Err(error)) => Err(error.into()),
+            (Ok(flags), Err(reset_error)) => Err(SessionError::Internal(format!(
+                "{}: device validation failed (flags=0x{flags:x}); additionally failed to reset \
+                 the device validation latch: {reset_error}",
+                self.ep.name()
+            ))),
+            (Err(check_error), Err(reset_error)) => Err(SessionError::Internal(format!(
+                "{}: failed to check the device validation latch: {check_error}; additionally \
+                 failed to reset it: {reset_error}",
+                self.ep.name()
+            ))),
         }
     }
 

@@ -1,7 +1,6 @@
 //! Q3 for #777 — is write protection on a **shared prefix** granule *sound* and
-//! *non-sticky*? In its own test binary so that if a write to a read-only
-//! mapping poisons the CUDA context, only this probe is affected and the finding
-//! is unambiguous.
+//! *non-sticky*? This isolated binary records the hardware answer without
+//! contaminating any other test's CUDA context.
 //!
 //! A shared prefix granule is read-only by construction: it is committed prefix
 //! that every concurrent sequence maps and reads; only the sequence extending
@@ -17,19 +16,20 @@
 //! **That would be a kill finding for this mechanism, and this probe reports it
 //! rather than working around it.**
 //!
-//! Two write paths are exercised into the read-only shared prefix — a
-//! synchronous copy-engine `cuMemcpyHtoD_v2` and an asynchronous
-//! `cuMemsetD8Async` whose fault surfaces at the stream sync (closest to a
-//! kernel-issued store). After each, context health is probed with
-//! `cuCtxSynchronize` plus a fresh independent allocate/write/read, and — the
-//! sharing-specific check — the *other* sharer of the same physical page is read
-//! back to confirm the rejected write did not corrupt it.
+//! Copy-engine and memset writes are rejected non-stickily and leave the other
+//! sharer uncorrupted. A real kernel `st.global`, however, faults with
+//! `CUDA_ERROR_ILLEGAL_ADDRESS` and poisons the context on A100, like any CUDA
+//! illegal address. Shared-prefix protection is therefore fail-stop: it prevents
+//! silent cross-request KV corruption but cannot recover an invalid kernel.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use cudarc::driver::CudaContext;
 use cudarc::driver::sys as cu;
+
+mod support;
+use support::{read_through_device, write_through_device};
 
 /// Arbitrary non-zero byte written to the prefix while writable, to confirm
 /// reads work and the shared page is intact. Not a production fill.
@@ -125,13 +125,6 @@ fn write_host(address: cu::CUdeviceptr, value: u8, len: usize) {
     check("cuMemcpyHtoD_v2", result);
 }
 
-fn read_host(address: cu::CUdeviceptr, len: usize) -> Vec<u8> {
-    let mut bytes = vec![0u8; len];
-    let result = unsafe { cu::cuMemcpyDtoH_v2(bytes.as_mut_ptr().cast(), address, bytes.len()) };
-    check("cuMemcpyDtoH_v2", result);
-    bytes
-}
-
 /// Does the context still work? A fresh reservation, commit, write, and read on
 /// a brand-new VA — nothing to do with the shared prefix — must all succeed. If
 /// the earlier write poisoned the context, these fail with a sticky error.
@@ -174,16 +167,14 @@ fn context_is_healthy(device: i32, granule: usize) -> Result<(), cu::CUresult> {
     outcome
 }
 
-/// Q3 — a shared prefix granule mapped `PROT_READ` rejects both a synchronous
-/// and an asynchronous write, the context survives both (non-sticky), and the
-/// rejected write does not corrupt the copy seen by the other sharer of the same
-/// physical page.
+/// Q3 — copy-engine writes are non-sticky, but a production-shaped kernel store
+/// proves that read-only shared-prefix protection poisons the CUDA context.
 #[cfg_attr(
     not(feature = "gpu-tests"),
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
-fn shared_prefix_write_fault_is_loud_non_sticky_and_non_corrupting() {
+fn shared_prefix_kernel_write_fault_is_sticky() {
     let context = require_cuda();
     context.bind_to_thread().expect("bind CUDA context");
     let device = 0;
@@ -215,6 +206,9 @@ fn shared_prefix_write_fault_is_loud_non_sticky_and_non_corrupting() {
 
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         write_host(victim, PREFIX_MARKER, granule);
+        check("cuCtxSynchronize(initial fill)", unsafe {
+            cu::cuCtxSynchronize()
+        });
         set_access_flags(
             device,
             victim,
@@ -223,12 +217,12 @@ fn shared_prefix_write_fault_is_loud_non_sticky_and_non_corrupting() {
         );
 
         // A read of the read-only shared prefix still works, through both VAs.
-        let via_victim = read_host(victim, 4096);
+        let via_victim = read_through_device(victim, 4096);
         assert!(
             via_victim.iter().all(|&b| b == PREFIX_MARKER),
             "a read of the read-only shared prefix must still succeed and return its contents"
         );
-        let via_other = read_host(other, 4096);
+        let via_other = read_through_device(other, 4096);
         assert!(
             via_other.iter().all(|&b| b == PREFIX_MARKER),
             "the other sharer must read the same shared prefix bytes"
@@ -253,7 +247,7 @@ fn shared_prefix_write_fault_is_loud_non_sticky_and_non_corrupting() {
             ),
         }
         // Corruption check: the other sharer still reads the original prefix.
-        let other_after_sync = read_host(other, 4096);
+        let other_after_sync = read_through_device(other, 4096);
         assert!(
             other_after_sync.iter().all(|&b| b == PREFIX_MARKER),
             "the rejected synchronous write must NOT have corrupted the shared page seen by the \
@@ -290,11 +284,25 @@ fn shared_prefix_write_fault_is_loud_non_sticky_and_non_corrupting() {
             ),
         }
 
+        let (kernel_write, kernel_sync) = write_through_device(victim, 0x00);
         eprintln!(
-            "Q3 result: the read-only shared prefix rejects both synchronous and asynchronous \
-             writes, the context survives both, and the other sharer's copy is uncorrupted -- \
-             write-protection is a non-sticky, non-corrupting defence for prefix sharing on this \
-             hardware."
+            "Q3 kernel store into PROT_READ shared prefix: launch {kernel_write:?}, \
+             sync {kernel_sync:?}"
+        );
+        assert!(
+            kernel_write != cu::CUresult::CUDA_SUCCESS || kernel_sync != cu::CUresult::CUDA_SUCCESS,
+            "a kernel store to the read-only shared prefix must surface a fault"
+        );
+        let context_error = context_is_healthy(device, granule)
+            .expect_err("a kernel protection fault is expected to poison the CUDA context");
+        eprintln!(
+            "Q3 KILL FINDING: kernel write fault is sticky; recovery returned {context_error:?}"
+        );
+
+        eprintln!(
+            "Q3 result: copy-engine writes are rejected non-stickily, but a production-shaped \
+             kernel store poisons the context -- shared-prefix protection is fail-stop, not a \
+             recoverable kernel-error boundary."
         );
     }));
 

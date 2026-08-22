@@ -17,6 +17,7 @@ use onnx_genai_engine::{
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
+use crate::image_generation::{ImageExecutionRequest, ProducedImage};
 use crate::metrics::GenerationMetrics;
 use crate::multimodal::MultimodalInput;
 
@@ -124,6 +125,12 @@ pub(crate) enum DriverCommand {
         request: Box<GenerateRequest>,
         reply: oneshot::Sender<anyhow::Result<EncodedAudio>>,
         permit: OwnedSemaphorePermit,
+    },
+    GenerateImage {
+        request: Box<ImageExecutionRequest>,
+        reply: oneshot::Sender<anyhow::Result<ProducedImage>>,
+        permit: OwnedSemaphorePermit,
+        track_metrics: bool,
     },
     GenerateFim {
         prefix: String,
@@ -513,6 +520,7 @@ impl EngineDriver {
             crate::metrics::generation_queue_cancelled();
             return Err(GenerateSubmitError::DriverStopped);
         }
+
         Ok(DriverGeneration {
             admission: admission_rx,
             events: rx,
@@ -547,6 +555,57 @@ impl EngineDriver {
             .await
             .map_err(|_| GenerateSubmitError::DriverStopped)?
             .map_err(|error| GenerateSubmitError::Failed(DriverFailure::from_engine_error(&error)))
+    }
+
+    pub(crate) async fn generate_image(
+        &self,
+        request: ImageExecutionRequest,
+    ) -> Result<anyhow::Result<ProducedImage>, GenerateSubmitError> {
+        let permit = self
+            .generation_capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| GenerateSubmitError::Overloaded)?;
+        let (reply, receiver) = oneshot::channel();
+        crate::metrics::generation_queued();
+        if self
+            .commands
+            .send(DriverCommand::GenerateImage {
+                request: Box::new(request),
+                reply,
+                permit,
+                track_metrics: true,
+            })
+            .await
+            .is_err()
+        {
+            crate::metrics::generation_queue_cancelled();
+            return Err(GenerateSubmitError::DriverStopped);
+        }
+        receiver
+            .await
+            .map_err(|_| GenerateSubmitError::DriverStopped)
+    }
+
+    pub(crate) fn warmup_image(&self, request: ImageExecutionRequest) -> anyhow::Result<()> {
+        let permit = self
+            .generation_capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| anyhow::anyhow!("generation capacity exceeded"))?;
+        let (reply, receiver) = oneshot::channel();
+        self.commands
+            .blocking_send(DriverCommand::GenerateImage {
+                request: Box::new(request),
+                reply,
+                permit,
+                track_metrics: false,
+            })
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
+        receiver
+            .blocking_recv()
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))??;
+        Ok(())
     }
 
     pub(crate) async fn generate_fim(
@@ -713,6 +772,32 @@ fn run_pipeline_driver(
                 let result = engine
                     .run_pipeline_outputs(PipelineGenerateRequest::new(*request))
                     .and_then(|outputs| engine.encode_audio_output(&outputs));
+                let _ = reply.send(result);
+            }
+            DriverCommand::GenerateImage {
+                request,
+                reply,
+                permit: _permit,
+                track_metrics,
+            } => {
+                let _metrics = track_metrics.then(GenerationMetrics::start);
+                let result = (|| {
+                    let outputs = engine.run_pipeline_outputs(request.into_pipeline()?)?;
+                    let image = engine
+                        .structured_output_for_role(
+                            &outputs,
+                            onnx_genai_engine::pipeline::WorkflowOutputRole::Image,
+                        )
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "workflow completed without emitting its declared image output"
+                            )
+                        })?;
+                    Ok(ProducedImage {
+                        values: image.to_vec_f32_lossy()?,
+                        shape: image.shape().to_vec(),
+                    })
+                })();
                 let _ = reply.send(result);
             }
             DriverCommand::CreateSession(response) => {
@@ -1192,6 +1277,7 @@ fn deferred_permit_holder_count(deferred: &VecDeque<DriverCommand>) -> usize {
                 command,
                 DriverCommand::Generate { .. }
                     | DriverCommand::GeneratePipeline { .. }
+                    | DriverCommand::GenerateImage { .. }
                     | DriverCommand::GenerateFim { .. }
                     | DriverCommand::SynthesizeSpeech { .. }
             )
@@ -1424,6 +1510,12 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
                 "speech synthesis requires a workflow pipeline model"
             )));
         }
+        DriverCommand::GenerateImage { reply, .. } => {
+            crate::metrics::generation_queue_cancelled();
+            let _ = reply.send(Err(anyhow::anyhow!(
+                "image generation requires a metadata-declared pipeline model"
+            )));
+        }
         DriverCommand::Embed {
             input_ids,
             options,
@@ -1509,6 +1601,51 @@ fn deliver_driver_event(
 /// an ordinary error that ends the generation.
 fn deliver_event(events: &mpsc::Sender<DriverEvent>, event: DriverEvent) -> anyhow::Result<()> {
     deliver_driver_event(events, event, DELIVERY_GRACE).map_err(anyhow::Error::new)
+}
+
+#[cfg(test)]
+mod image_metrics_tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::state::AppState;
+
+    #[tokio::test]
+    async fn failed_image_execution_restores_pending_metric() {
+        let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/comfyui_workflows/txt2img_sd15");
+        let state = AppState::load(&model_dir, Some("image-metrics-error".to_string())).unwrap();
+        let handle = state
+            .registry
+            .resolve("image-metrics-error")
+            .unwrap()
+            .unwrap();
+        let baseline = crate::metrics::snapshot().pending_requests;
+
+        // Omitting the required application-owned negative-prompt input makes
+        // the workflow fail after the image command starts.
+        let result = handle
+            .engine
+            .generate_image(ImageExecutionRequest {
+                request: GenerateRequest {
+                    prompt: onnx_genai::GeneratePrompt::TokenIds(vec![2, 3]),
+                    options: GenerateOptions {
+                        max_new_tokens: 1,
+                        seed: Some(1),
+                        ..GenerateOptions::default()
+                    },
+                },
+                inputs: Vec::new(),
+            })
+            .await
+            .expect("image command submitted");
+
+        assert!(
+            result.is_err(),
+            "malformed image workflow request must fail"
+        );
+        assert_eq!(crate::metrics::snapshot().pending_requests, baseline);
+    }
 }
 
 /// Why a driver event could not be handed to its consumer.

@@ -23,6 +23,7 @@ members = [
     "crates/onnx-runtime-memory",
     "crates/onnx-runtime-virtual-memory",
     "crates/onnx-runtime-cuda-memory",
+    "crates/onnx-runtime-memory-api",
     "crates/onnx-runtime-memory-governor",
     "crates/onnx-runtime-cpuinfo",
     "crates/onnx-runtime-loader",
@@ -72,6 +73,11 @@ members = [
     "crates/onnx-runtime-ep-nxrt-host",
     "crates/onnx-runtime-ep-nxrt-testplugin",
 
+    # ── Dynamic memory-plugin ABI (nxmem — issue #1186 phase 6) ──
+    "crates/onnx-runtime-memory-abi",
+    "crates/onnx-runtime-memory-host",
+    "crates/onnx-runtime-memory-testplugin",
+
     # ── Vendored ONNX Runtime MLAS bindings ──
     # Registered as a member so `cargo build -p mlas-sys` resolves. Nothing
     # reaches it by default: only `--features onnx-runtime-ep-cpu/mlas` pulls it
@@ -102,7 +108,10 @@ default-members = [
     "crates/onnx-runtime-memory",
     "crates/onnx-runtime-virtual-memory",
     "crates/onnx-runtime-cuda-memory",
+    "crates/onnx-runtime-memory-api",
     "crates/onnx-runtime-memory-governor",
+    "crates/onnx-runtime-memory-abi",
+    "crates/onnx-runtime-memory-host",
     "crates/onnx-runtime-cpuinfo",
     "crates/onnx-runtime-loader",
     "crates/onnx-model-package",
@@ -202,6 +211,7 @@ onnx-runtime-ir = { path = "crates/onnx-runtime-ir", version = "=0.1.0-dev.5" }
 onnx-runtime-memory = { path = "crates/onnx-runtime-memory", version = "=0.1.0-dev.5" }
 onnx-runtime-virtual-memory = { path = "crates/onnx-runtime-virtual-memory", version = "=0.1.0-dev.5" }
 onnx-runtime-cuda-memory = { path = "crates/onnx-runtime-cuda-memory", version = "=0.1.0-dev.5" }
+onnx-runtime-memory-api = { path = "crates/onnx-runtime-memory-api", version = "=0.1.0-dev.5" }
 onnx-runtime-memory-governor = { path = "crates/onnx-runtime-memory-governor", version = "=0.1.0-dev.5" }
 onnx-runtime-cpuinfo = { path = "crates/onnx-runtime-cpuinfo", version = "=0.1.0-dev.5" }
 onnx-runtime-loader = { path = "crates/onnx-runtime-loader", version = "=0.1.0-dev.5" }
@@ -232,6 +242,11 @@ onnx-runtime-ep-cuda-plugin = { path = "crates/onnx-runtime-ep-cuda-plugin", ver
 onnx-runtime-ep-nxrt-abi = { path = "crates/onnx-runtime-ep-nxrt-abi", version = "=0.1.0-dev.5" }
 onnx-runtime-ep-nxrt-host = { path = "crates/onnx-runtime-ep-nxrt-host", version = "=0.1.0-dev.5" }
 onnx-runtime-ep-nxrt-testplugin = { path = "crates/onnx-runtime-ep-nxrt-testplugin", version = "=0.1.0-dev.5" }
+
+# Dynamic memory-plugin ABI (nxmem)
+onnx-runtime-memory-abi = { path = "crates/onnx-runtime-memory-abi", version = "=0.1.0-dev.5" }
+onnx-runtime-memory-host = { path = "crates/onnx-runtime-memory-host", version = "=0.1.0-dev.5" }
+onnx-runtime-memory-testplugin = { path = "crates/onnx-runtime-memory-testplugin" }
 
 # Test-only helper crate (publish = false, no version pin needed).
 onnx-runtime-ort-testkit = { path = "crates/onnx-runtime-ort-testkit" }

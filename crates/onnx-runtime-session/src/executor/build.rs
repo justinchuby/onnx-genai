@@ -2007,6 +2007,24 @@ impl Executor {
                 "mask_capacity_decline: non-capacity-aware consumer(s) {}",
                 offenders.join(", ")
             );
+            // The direct-consumer list only explains the fast path. When the
+            // topology-gated fallbacks also declined, name the reason each gave.
+            // `Disqualify` drives static freezing; `Allow` is the weaker
+            // decode-freeze-safe classification that actually decides whether a
+            // single-token decode step may still capture, so report both.
+            if let Some(reason) =
+                mask_cone_rejection(&self.graph, input, ShapeConsumptionPolicy::Disqualify)
+            {
+                eprintln!("mask_capacity_decline: static freeze rejected: {reason}");
+            }
+            match mask_cone_rejection(&self.graph, input, ShapeConsumptionPolicy::Allow) {
+                Some(reason) => {
+                    eprintln!("mask_capacity_decline: decode-freeze-safe rejected: {reason}")
+                }
+                None => eprintln!(
+                    "mask_capacity_decline: decode-freeze-safe HOLDS (capture may still proceed)"
+                ),
+            }
         }
     }
 

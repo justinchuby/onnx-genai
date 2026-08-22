@@ -368,8 +368,17 @@ impl Engine {
         // existing load path unchanged. See #384 and the qwen3.5-27B enablement.
         maybe_fill_hybrid_io_from_graph(&mut metadata, &model_directory.model_path);
         let runtime_caps = onnx_genai_metadata::RuntimeCapabilities::default();
-        if let Err(errors) = onnx_genai_metadata::validate(&metadata, &runtime_caps) {
-            anyhow::bail!("Invalid inference metadata: {errors:?}");
+        let report =
+            onnx_genai_metadata::validate_structure_and_capabilities(&metadata, &runtime_caps);
+        if !report.structural.is_empty() {
+            anyhow::bail!("Invalid inference metadata: {:?}", report.structural);
+        }
+        if !report.unsupported_capabilities.is_empty() {
+            tracing::info!(
+                "inference metadata declares capabilities this runtime does not implement: {}; \
+                 continuing because the decode path does not exercise them",
+                report.unsupported_capabilities.join(", ")
+            );
         }
         // Native MTP self-speculation seeds its draft head from a target hidden
         // output. The native decode session only records that hidden state when
@@ -576,8 +585,13 @@ impl Engine {
         // per transposed constant weight) is the third buffer folded into
         // `resident_f32_cache_bytes`, so the same verdict governs it. When
         // declined, the `MatMul`/`Gemm` kernels transpose per call and retain
-        // nothing (byte-identical output, only slower decode) instead of holding
-        // the session-lifetime copies resident over budget.
+        // nothing instead of holding the session-lifetime copies resident over
+        // budget. That is byte-identical everywhere except the x86 f16/bf16
+        // decode GEMV, where admission picks the kernel too: a declined
+        // session reads the [K, N] weight in place with a different (slower,
+        // and further from an f64 reference) accumulation order, so its decode
+        // output differs in the low bits. See
+        // `set_weight_transpose_cache_enabled`.
         onnx_runtime_ep_cpu::set_weight_transpose_cache_enabled(
             memory_strategy_plan.f32_weight_cache_admitted,
         );
@@ -682,6 +696,8 @@ impl Engine {
                     cuda_offload_policy,
                     #[cfg(feature = "native-cuda")]
                     cuda_memory_governor: std::sync::Arc::new(governor.device_authority()),
+                    #[cfg(feature = "native-cuda")]
+                    process_memory_manager: governor.process_memory_manager(),
                     io: metadata.decoder_io(),
                     metadata_max_len: metadata
                         .model
@@ -1149,10 +1165,23 @@ fn resolve_metadata_and_decode_path(
     shared_kv: crate::decode::SharedKvOffer,
     capture_requested: bool,
 ) -> anyhow::Result<MetadataResolution> {
-    // Validate capabilities
+    // Structural defects mean the document does not describe a runnable model,
+    // so they stay fatal. Unsupported capabilities are a different question:
+    // this is the bare-decoder decode path, which never reaches workflow
+    // features like `workflow_ssa` or `serving_service_contract`, so refusing
+    // to load over them rejects packages that would run correctly. Report them
+    // and continue.
     let runtime_caps = onnx_genai_metadata::RuntimeCapabilities::default();
-    if let Err(errors) = onnx_genai_metadata::validate(&metadata, &runtime_caps) {
-        anyhow::bail!("Invalid inference metadata: {errors:?}");
+    let report = onnx_genai_metadata::validate_structure_and_capabilities(&metadata, &runtime_caps);
+    if !report.structural.is_empty() {
+        anyhow::bail!("Invalid inference metadata: {:?}", report.structural);
+    }
+    if !report.unsupported_capabilities.is_empty() {
+        tracing::info!(
+            "inference metadata declares capabilities this runtime does not implement: {}; \
+             continuing because the decode path does not exercise them",
+            report.unsupported_capabilities.join(", ")
+        );
     }
 
     let sliding_window = crate::decode::sliding_window_from_metadata(&metadata)?;

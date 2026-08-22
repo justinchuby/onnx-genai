@@ -329,6 +329,22 @@ const GEMM_F16_TILE: usize = 16;
 /// #1261 via `ONNX_GENAI_DECODE_GEMV_LOOP_MAX_M` rather than trusting this number
 /// on a different GPU.
 const DECODE_GEMV_LOOP_MAX_M_DEFAULT: usize = 8;
+/// The decode GEMVs load activation chunks as `uint4` (8 fp16 values). The base
+/// allocation is aligned, so every per-row sub-view remains 16-byte aligned only
+/// when the row stride `K * sizeof(fp16)` is a multiple of 16 bytes.
+const GEMV_F16_ACTIVATION_VECTOR_ELEMENTS: usize = 8;
+
+fn decode_gemv_loop_rows_aligned(k: usize) -> bool {
+    k.is_multiple_of(GEMV_F16_ACTIVATION_VECTOR_ELEMENTS)
+}
+
+fn marlin_weight_inputs_are_constant(constant_inputs: &[bool], gate_up_swiglu: bool) -> bool {
+    if gate_up_swiglu {
+        constant_inputs.get(1) == Some(&true) && constant_inputs.get(3) == Some(&true)
+    } else {
+        constant_inputs.get(1) == Some(&true)
+    }
+}
 
 /// Resolve the looped-decode-GEMV batch bound, honoring the
 /// `ONNX_GENAI_DECODE_GEMV_LOOP_MAX_M` override (read once per process). Setting
@@ -6296,10 +6312,10 @@ fn use_scales_f16_zp_splitk_pf() -> bool {
 }
 
 /// Module-global cache of offline nibble-interleaved int4 weights, keyed by the
-/// source (packed) device pointer, byte length, and device ordinal. Mirrors the
-/// Marlin repack cache: weights are immutable initializers, so the device
-/// interleave runs once and every later call — including captured CUDA-graph
-/// replays — reuses the cached buffer with no allocation.
+/// source (packed) device pointer, byte length, and device ordinal. Weights are
+/// immutable initializers, so the device interleave runs once and every later
+/// call — including captured CUDA-graph replays — reuses the cached buffer with
+/// no allocation.
 struct InterleaveEntry {
     ptr: CUdeviceptr,
     runtime: Arc<CudaRuntime>,
@@ -6733,6 +6749,8 @@ impl KernelFactory for MatMulNBitsFactory {
             block_size,
             accuracy_level,
             accuracy4_workspace,
+            marlin_repack_cache: marlin_gemm::RepackCache::new(self.runtime.clone()),
+            constant_inputs: [false; 8],
             fold_bias_post_round: node
                 .attr(crate::optimizer::MATMUL_NBITS_FOLDED_BIAS_ATTR)
                 .and_then(onnx_runtime_ir::Attribute::as_int)
@@ -6951,6 +6969,12 @@ pub struct MatMulNBitsKernel {
     block_size: usize,
     accuracy_level: i64,
     accuracy4_workspace: Option<Mutex<Accuracy4Workspace>>,
+    /// Repacked immutable weights owned by this kernel. Owner scoping prevents a
+    /// later kernel from hitting stale contents when CUDA reuses an address.
+    marlin_repack_cache: marlin_gemm::RepackCache,
+    /// Session-lifetime graph constants. Only immutable weights may enter the
+    /// owner-scoped Marlin repack cache.
+    constant_inputs: [bool; 8],
     /// Set when this node's bias input came from folding a standalone `Add`
     /// (see [`crate::optimizer::MATMUL_NBITS_FOLDED_BIAS_ATTR`]). The fp16 GEMV
     /// then reproduces the two-op `fp16(fp16(acc) + bias)` rounding.
@@ -6980,6 +7004,10 @@ pub struct MatMulNBitsKernel {
 }
 
 impl MatMulNBitsKernel {
+    fn marlin_weight_inputs_constant(&self) -> bool {
+        marlin_weight_inputs_are_constant(&self.constant_inputs, self.gate_up_swiglu)
+    }
+
     fn run(
         &self,
         inputs: &[TensorView],
@@ -7106,6 +7134,26 @@ impl MatMulNBitsKernel {
         self.last_call_capture_safe
             .store(m == 1 && group_indices.is_none(), Ordering::Relaxed);
         if m == 1 && group_indices.is_none() {
+            // The Marlin repack is a second, tensor-core-layout copy of this
+            // op's weights, allocated raw (invisible to the VMM arena) and
+            // never evicted. It is only read by the `M > 1` tensor-core GEMM,
+            // so once execution reaches single-token decode it is pure device
+            // overhead — measured at ~384 MiB on a 1.8B model whose weights are
+            // under 1 GiB, which was the whole of our peak-VRAM deficit against
+            // llama.cpp.
+            //
+            // Releasing here rather than at a phase boundary keeps the rule
+            // local to the fact that justifies it: this branch is exactly the
+            // condition under which the buffers cannot be read. The atomic load
+            // is the steady-state cost; the drop happens at most once per
+            // prefill→decode transition, and a later prefill simply repacks
+            // again (a cost, never a wrong answer). Never during capture, where
+            // freeing device memory would invalidate the graph.
+            if self.marlin_repack_cache.retained_bytes() > 0
+                && !self.runtime.is_capturing().unwrap_or(true)
+            {
+                self.marlin_repack_cache.release_all();
+            }
             if self.bits == 4
                 && self.block_size == 128
                 && let Some(zero_points) = zero_points
@@ -7800,7 +7848,11 @@ impl MatMulNBitsKernel {
             // sync-free, so the batch decode graph captures and replays it.
             // Streaming: the resident weight is read M times from VRAM, not
             // re-streamed, so the weight-offload HtoD 1/N amortization is intact.
-            if m <= decode_gemv_loop_max_m() && !self.gate_up_swiglu && !self.decomposed_silu {
+            if m <= decode_gemv_loop_max_m()
+                && decode_gemv_loop_rows_aligned(self.k)
+                && !self.gate_up_swiglu
+                && !self.decomposed_silu
+            {
                 onnx_runtime_ep_api::record_kernel_variant!(
                     "gemv_f16_batched_loop",
                     "M={} small-batch decode: {} single-row decode GEMV launches (one per row), \
@@ -7927,15 +7979,19 @@ impl MatMulNBitsKernel {
                 }
             }
             // Opt-in Marlin int4 tensor-core GEMM for the M>1 path. Gated on
-            // SM80+, int4, no g_idx (checked above), no fused SwiGLU/RMSNorm
-            // epilogue yet, and `ONNX_GENAI_MARLIN_M_GT_1`. On any ineligibility
-            // or runtime error it falls through to the byte-identical portable
+            // SM80+, int4, immutable initializer weights, no g_idx (checked
+            // above), no fused SwiGLU/RMSNorm epilogue yet, and
+            // `ONNX_GENAI_MARLIN_M_GT_1`. Runtime weights cannot use Marlin:
+            // the kernel-owned address key is valid only while an immutable
+            // constant remains bound to this kernel. On any ineligibility or
+            // runtime error it falls through to the byte-identical portable
             // tiled GEMM below (Rule 11 fallback contract).
             if marlin_gemm::marlin_m_gt_1_enabled()
                 && self.bits == 4
                 && !self.gate_up_swiglu
                 && !self.decomposed_silu
                 && !self.rmsnorm_prologue
+                && self.marlin_weight_inputs_constant()
                 && marlin_gemm::device_supports_marlin(
                     self.runtime.capabilities().compute_capability(),
                 )
@@ -7992,6 +8048,7 @@ impl MatMulNBitsKernel {
                     && self.bits == 4
                     && !self.gate_up_swiglu
                     && !self.decomposed_silu
+                    && self.marlin_weight_inputs_constant()
                     && marlin_gemm::device_supports_marlin(
                         self.runtime.capabilities().compute_capability(),
                     )
@@ -8215,8 +8272,9 @@ impl MatMulNBitsKernel {
     ///
     /// Eligibility (SM80, int4, no fused SwiGLU/RMSNorm epilogue, opt-in flag)
     /// is checked by the caller; here we validate the numeric shape contract
-    /// (`K` divisible by 16 and by the group size) and ensure the weights are
-    /// repacked into the tensor-core layout exactly once.
+    /// (`K` divisible by 16 and by the group size). The caller also requires B
+    /// to be an immutable graph constant before the kernel-owned cache is
+    /// entered, then the weight is repacked into the tensor-core layout once.
     #[allow(clippy::too_many_arguments)]
     fn try_launch_marlin_gemm(
         &self,
@@ -8243,8 +8301,7 @@ impl MatMulNBitsKernel {
             .require_nvrtc_half_headers("MatMulNBits Marlin int4 tensor-core GEMM")?;
 
         let packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
-        let (weights_ptr, warm) = marlin_gemm::ensure_repacked(
-            &self.runtime,
+        let (weights_ptr, warm) = self.marlin_repack_cache.ensure_repacked(
             packed_ptr,
             self.n,
             self.k,
@@ -8329,8 +8386,7 @@ impl MatMulNBitsKernel {
             .require_nvrtc_half_headers("MatMulNBits Marlin int4 tensor-core GEMM (rmsnorm)")?;
 
         let packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
-        let (weights_ptr, weights_warm) = marlin_gemm::ensure_repacked(
-            &self.runtime,
+        let (weights_ptr, weights_warm) = self.marlin_repack_cache.ensure_repacked(
             packed_ptr,
             self.n,
             self.k,
@@ -8500,15 +8556,13 @@ impl MatMulNBitsKernel {
 
         let packed_gate_ptr = cuptr(packed_gate.data_ptr::<u8>() as *const c_void);
         let packed_up_ptr = cuptr(packed_up.data_ptr::<u8>() as *const c_void);
-        let (weights_gate, gate_w_warm) = marlin_gemm::ensure_repacked(
-            &self.runtime,
+        let (weights_gate, gate_w_warm) = self.marlin_repack_cache.ensure_repacked(
             packed_gate_ptr,
             self.n,
             self.k,
             self.block_size,
         )?;
-        let (weights_up, up_w_warm) = marlin_gemm::ensure_repacked(
-            &self.runtime,
+        let (weights_up, up_w_warm) = self.marlin_repack_cache.ensure_repacked(
             packed_up_ptr,
             self.n,
             self.k,
@@ -9163,6 +9217,7 @@ impl MatMulNBitsKernel {
             // more than 1 ULP. It stays on the prefill/Marlin path (advertised
             // capture-unsafe at M>1) pending a decision on that bound in #1334.
             if m <= decode_gemv_loop_max_m()
+                && decode_gemv_loop_rows_aligned(self.k)
                 && let Some(gamma) = gamma
             {
                 onnx_runtime_ep_api::record_kernel_variant!(
@@ -9271,6 +9326,7 @@ impl MatMulNBitsKernel {
             // tiled gate/up prefill on ineligibility or launch error.
             if marlin_gemm::marlin_m_gt_1_enabled()
                 && self.bits == 4
+                && self.marlin_weight_inputs_constant()
                 && marlin_gemm::device_supports_marlin(
                     self.runtime.capabilities().compute_capability(),
                 )
@@ -11084,6 +11140,12 @@ impl MatMulNBitsKernel {
 }
 
 impl Kernel for MatMulNBitsKernel {
+    fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
+        for (index, is_constant) in self.constant_inputs.iter_mut().enumerate() {
+            *is_constant = constant_inputs.get(index).copied().unwrap_or(false);
+        }
+    }
+
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         self.run(inputs, outputs, None)
     }
@@ -11221,6 +11283,18 @@ mod tests {
     use onnx_runtime_ir::{DataType, DeviceId};
 
     use super::*;
+
+    #[test]
+    fn marlin_repack_requires_constant_weight_inputs() {
+        let mut constant_inputs = [false; 8];
+        assert!(!marlin_weight_inputs_are_constant(&constant_inputs, false));
+        constant_inputs[1] = true;
+        assert!(marlin_weight_inputs_are_constant(&constant_inputs, false));
+
+        assert!(!marlin_weight_inputs_are_constant(&constant_inputs, true));
+        constant_inputs[3] = true;
+        assert!(marlin_weight_inputs_are_constant(&constant_inputs, true));
+    }
 
     /// Guards the `ONNX_GENAI_INTERLEAVE_DEQUANT` / `ONNX_GENAI_GEMV_PIPELINE`
     /// levers, which the interleaved-dequant byte-identity test flips by writing
@@ -11492,6 +11566,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -11737,6 +11813,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -11984,6 +12062,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: true,
             decomposed_silu: decomposed,
@@ -12069,15 +12149,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             "warm gate/up Marlin replay must be byte-identical to the cold run"
         );
         if check_capture {
-            // The cold-miss (NOT capture-safe) contract is asserted with
-            // guaranteed-unique buffers in `marlin_m_gt_1_op_parity_and_capture_safety`.
-            // Here the module-global repack/scratch pools may already be warm from a
-            // prior test (freed device addresses get reused), so only the positive
-            // guarantee — a warm replay IS capture-safe — is order-independent.
-            assert!(
-                warm_safe,
-                "warm gate/up Marlin call reuses pooled buffers and must be capture-safe"
-            );
+            assert!(warm_safe, "warm gate/up call must remain capture-safe");
         }
     }
 
@@ -12384,6 +12456,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -12582,6 +12656,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -12891,7 +12967,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
 
     /// GEMM. Drives the real `MatMulNBitsKernel::run` dispatch with
     /// `ONNX_GENAI_MARLIN_M_GT_1=1` so the `m > 1` seam routes to Marlin,
-    /// exercising eligibility gating, the device repack + module-level cache, and
+    /// exercising eligibility gating, the device repack + kernel-owned cache, and
     /// the launch. Validates the output against an f64 dequant→GEMM oracle
     /// (asymmetric zero points) within the relayout tolerance, and asserts the
     /// capture-safety contract: the first (cold) call repacks and reports
@@ -12916,7 +12992,9 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             return;
         }
 
-        let m = 8usize;
+        // M=16 is the first height above the default looped-GEMV boundary, so
+        // this exercises the Marlin dispatch rather than the M<=8 decode loop.
+        let m = 16usize;
         let k = 4096usize;
         let n = 70usize;
         let block_size = 128usize;
@@ -13066,6 +13144,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -13504,6 +13584,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -14226,6 +14308,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -14379,6 +14463,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 block_size,
                 accuracy_level: 4,
                 accuracy4_workspace: None,
+                marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+                constant_inputs: [true; 8],
                 fold_bias_post_round: false,
                 gate_up_swiglu: false,
                 decomposed_silu: false,
@@ -14974,6 +15060,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 block_size,
                 accuracy_level: 4,
                 accuracy4_workspace: None,
+                marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+                constant_inputs: [true; 8],
                 fold_bias_post_round: false,
                 gate_up_swiglu: false,
                 decomposed_silu: false,
@@ -15248,6 +15336,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 block_size,
                 accuracy_level: 4,
                 accuracy4_workspace: None,
+                marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+                constant_inputs: [true; 8],
                 fold_bias_post_round: false,
                 gate_up_swiglu: true,
                 decomposed_silu: false,
@@ -15924,6 +16014,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -16184,6 +16276,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -16455,6 +16549,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -16472,6 +16568,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+            constant_inputs: [true; 8],
             fold_bias_post_round: true,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -16732,6 +16830,8 @@ extern "C" __global__ void ref_silu_mul_f16(
                 block_size,
                 accuracy_level: 4,
                 accuracy4_workspace: None,
+                marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+                constant_inputs: [true; 8],
                 fold_bias_post_round: false,
                 gate_up_swiglu: false,
                 decomposed_silu: false,
@@ -17120,6 +17220,8 @@ extern "C" __global__ void ref_silu_mul_f16(
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -17607,6 +17709,8 @@ extern "C" __global__ void ref_silu_mul_f16(
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -17624,6 +17728,8 @@ extern "C" __global__ void ref_silu_mul_f16(
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: true,
             decomposed_silu: false,
@@ -18181,6 +18287,8 @@ extern "C" __global__ void ref_silu_mul_f16(
                 block_size,
                 accuracy_level: 4,
                 accuracy4_workspace: None,
+                marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+                constant_inputs: [true; 8],
                 fold_bias_post_round: false,
                 gate_up_swiglu: true,
                 decomposed_silu: false,
@@ -18198,6 +18306,8 @@ extern "C" __global__ void ref_silu_mul_f16(
                 block_size,
                 accuracy_level: 4,
                 accuracy4_workspace: None,
+                marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+                constant_inputs: [true; 8],
                 fold_bias_post_round: false,
                 gate_up_swiglu: true,
                 decomposed_silu: false,
@@ -18557,6 +18667,8 @@ extern "C" __global__ void ref_silu_mul_f16(
                             block_size,
                             accuracy_level: 4,
                             accuracy4_workspace: None,
+                            marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+                            constant_inputs: [true; 8],
                             fold_bias_post_round: false,
                             gate_up_swiglu: true,
                             decomposed_silu: decomposed,
@@ -19012,6 +19124,8 @@ extern "C" __global__ void ref_silu_mul_f16(
                 block_size,
                 accuracy_level: 4,
                 accuracy4_workspace: None,
+                marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+                constant_inputs: [true; 8],
                 fold_bias_post_round: fold,
                 gate_up_swiglu: false,
                 decomposed_silu: false,
@@ -19377,6 +19491,8 @@ extern "C" __global__ void ref_silu_mul_f16(
             block_size,
             accuracy_level: 0,
             accuracy4_workspace: None,
+            marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -19623,6 +19739,8 @@ extern "C" __global__ void ref_silu_mul_f16(
             block_size,
             accuracy_level: 0,
             accuracy4_workspace: None,
+            marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -19886,6 +20004,8 @@ extern "C" __global__ void ref_silu_mul_f16(
             block_size,
             accuracy_level: 0,
             accuracy4_workspace: None,
+            marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+            constant_inputs: [true; 8],
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -20338,6 +20458,8 @@ extern "C" __global__ void ref_silu_mul_f16(
                     block_size: BLOCK,
                     accuracy_level: 4,
                     accuracy4_workspace: None,
+                    marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+                    constant_inputs: [true; 8],
                     fold_bias_post_round: false,
                     gate_up_swiglu: false,
                     decomposed_silu: false,

@@ -354,6 +354,17 @@ pub struct CudaRuntime {
     raw_pool_classes: Mutex<HashMap<CUdeviceptr, usize>>,
     raw_pool_retained: AtomicU64,
     raw_pool_hits: AtomicU64,
+    /// The one cuBLASLt workspace shared by every GEMM on this runtime's
+    /// compute stream. Allocated on first use and never freed until the
+    /// runtime drops.
+    ///
+    /// cuBLASLt scratch does not carry state between calls, and work on a
+    /// single stream is serial, so one buffer per stream is exactly as correct
+    /// as one per call — while a per-call allocation costs
+    /// [`WORKSPACE_BYTES`] for every attention op in flight. Measured on a
+    /// 32-layer 1.8B model, the per-call path put hundreds of MiB of raw
+    /// device memory behind a prefill that needed 32 MiB.
+    shared_blas_workspace: Mutex<Option<CUdeviceptr>>,
     host_to_device_copies: AtomicU64,
     device_to_host_copies: AtomicU64,
     async_host_to_device_copies: AtomicU64,
@@ -364,13 +375,13 @@ pub struct CudaRuntime {
     /// dependency. See [`CudaRuntime::record_copy_fence`].
     fences: Mutex<HashMap<u64, CudaEvent>>,
     next_fence_id: AtomicU64,
-    /// Persistent four-byte device word into which capture-safe kernels latch an
-    /// out-of-range bounds violation detected during CUDA-graph replay. It is set
-    /// (via `atomicOr`) by device kernels and never auto-cleared on the device;
-    /// only an explicit host [`CudaRuntime::reset_capture_error`] (invoked on
-    /// graph reset / re-capture) returns it to zero. The host reads it at the
-    /// existing per-step logits sync so a poisoned replay becomes a hard error
-    /// before the produced token is consumed.
+    /// Persistent four-byte device word into which kernels latch an out-of-range
+    /// bounds violation during deferred eager execution or CUDA-graph replay. It
+    /// is set (via `atomicOr`) and never auto-cleared on the device;
+    /// only an explicit host [`CudaRuntime::reset_capture_error`] returns it to
+    /// zero. Session request boundaries and graph reset/re-capture use that reset.
+    /// The host reads it after a request synchronization so eager or captured
+    /// validation failures become hard errors before outputs are consumed.
     capture_error: CUdeviceptr,
     /// When set, the public [`CudaRuntime::synchronize`] becomes a no-op so the
     /// redundant trailing per-op eager device syncs (issued by kernels on the
@@ -538,6 +549,7 @@ impl CudaRuntime {
             raw_pool_classes: Mutex::new(HashMap::new()),
             raw_pool_retained: AtomicU64::new(0),
             raw_pool_hits: AtomicU64::new(0),
+            shared_blas_workspace: Mutex::new(None),
             host_to_device_copies: AtomicU64::new(0),
             device_to_host_copies: AtomicU64::new(0),
             async_host_to_device_copies: AtomicU64::new(0),
@@ -677,10 +689,9 @@ impl CudaRuntime {
     /// Read the latching capture-error word device → host, returning the raw
     /// violation bitmask (zero when no capture-safe kernel has tripped).
     ///
-    /// This does not clear the latch: once set, every subsequent captured replay
-    /// stays poisoned until [`CudaRuntime::reset_capture_error`]. Callers invoke
-    /// this at the per-step logits D2H sync, so the trailing stream synchronize
-    /// is already satisfied and no additional serialization is introduced.
+    /// This does not clear the latch: once set, subsequent work stays poisoned
+    /// until [`CudaRuntime::reset_capture_error`]. Callers invoke this only after
+    /// a request-level host synchronization boundary.
     pub fn check_capture_error(&self) -> Result<u32> {
         let mut bytes = [0_u8; std::mem::size_of::<u32>()];
         // SAFETY: `capture_error` is a live four-byte device allocation owned by
@@ -690,7 +701,7 @@ impl CudaRuntime {
     }
 
     /// Clear the latching capture-error word back to the un-poisoned state.
-    /// Invoked on graph reset / re-capture so a fresh generation starts clean.
+    /// Invoked at session request boundaries and on graph reset / re-capture.
     pub fn reset_capture_error(&self) -> Result<()> {
         // SAFETY: `capture_error` is a live four-byte device allocation owned by
         // this runtime for its whole lifetime.
@@ -1295,6 +1306,28 @@ impl CudaRuntime {
     /// Device bytes currently held in the `alloc_raw` pool.
     pub fn raw_pool_retained_bytes(&self) -> u64 {
         self.raw_pool_retained.load(Ordering::Relaxed)
+    }
+
+    /// The cuBLASLt workspace shared by every GEMM on this runtime's stream.
+    ///
+    /// Allocated on first use and retained for the runtime's lifetime, so a
+    /// warm call makes no allocation and stays CUDA-graph capture-safe. Callers
+    /// must not free the returned pointer.
+    ///
+    /// Sharing is sound because cuBLASLt scratch carries nothing between calls
+    /// and work on one stream is serial: two GEMMs on this runtime cannot be
+    /// mid-flight at once, so they cannot observe each other's scratch.
+    pub fn shared_blas_workspace(&self, bytes: usize) -> Result<CUdeviceptr> {
+        let mut slot = self
+            .shared_blas_workspace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(ptr) = *slot {
+            return Ok(ptr);
+        }
+        let ptr = self.alloc_raw(bytes)?;
+        *slot = Some(ptr);
+        Ok(ptr)
     }
 
     fn take_pooled(&self, class: usize) -> Option<CUdeviceptr> {

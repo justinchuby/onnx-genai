@@ -2733,6 +2733,12 @@ fn workflow_request_value(
         RuntimeInputRole::PromptText => {
             anyhow::bail!("prompt_text request binding requires a versioned tokenizer adapter")
         }
+        RuntimeInputRole::NegativePromptText
+        | RuntimeInputRole::NegativePromptTokens
+        | RuntimeInputRole::GuidanceScale
+        | RuntimeInputRole::Width
+        | RuntimeInputRole::Height
+        | RuntimeInputRole::DenoisingStrength => Ok(None),
         RuntimeInputRole::MaxIterations | RuntimeInputRole::MaxOutputTokens => {
             scalar_i64(request.options.max_new_tokens as i64).map(Some)
         }

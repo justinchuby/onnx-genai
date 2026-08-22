@@ -140,15 +140,34 @@ pub struct WeightTransposeKey {
     addr: usize,
     k: usize,
     n: usize,
+    /// Distinguishes interpretations that share an element *width*.
+    ///
+    /// The f16 cache stores raw `u16` bit patterns, and `f16` and `bf16` are
+    /// both 16 bits -- so without this the two would collide on `(addr, k, n)`
+    /// alone. They do collide in practice: a freed `f16` weight's address is
+    /// readily recycled for a `bf16` one of the same shape, and the hit would
+    /// then reinterpret every weight rather than miss. The address alone was
+    /// only ever sufficient while exactly one dtype used each map.
+    tag: u16,
 }
 
 impl WeightTransposeKey {
     /// Build the key for the transpose of a `[k, n]` matrix based at `ptr`.
+    ///
+    /// Uses tag 0, which is correct for any cache whose element type has a
+    /// single interpretation (the f32 map, and the f16 map's `f16` entries).
     pub fn new<T>(ptr: *const T, k: usize, n: usize) -> Self {
+        Self::tagged(ptr, k, n, 0)
+    }
+
+    /// [`new`](Self::new) for a map whose element type is shared by more than
+    /// one dtype; `tag` names which one.
+    pub fn tagged<T>(ptr: *const T, k: usize, n: usize, tag: u16) -> Self {
         Self {
             addr: ptr as usize,
             k,
             n,
+            tag,
         }
     }
 
@@ -244,7 +263,19 @@ impl<T: Copy + Default + Send + Sync> TransposeCache<T> {
     /// inserted: they cost nothing to produce and would otherwise let a caller
     /// with a degenerate shape grow the map.
     pub fn get_or_insert_transpose(&self, src: &[T], k: usize, n: usize) -> Option<Arc<Vec<T>>> {
-        let key = WeightTransposeKey::new(src.as_ptr(), k, n);
+        self.get_or_insert_transpose_tagged(src, k, n, 0)
+    }
+
+    /// [`get_or_insert_transpose`](Self::get_or_insert_transpose) for a map
+    /// shared by several dtypes of the same width.
+    pub fn get_or_insert_transpose_tagged(
+        &self,
+        src: &[T],
+        k: usize,
+        n: usize,
+        tag: u16,
+    ) -> Option<Arc<Vec<T>>> {
+        let key = WeightTransposeKey::tagged(src.as_ptr(), k, n, tag);
         if key.numel() != Some(src.len()) {
             return None;
         }
@@ -385,10 +416,16 @@ pub(crate) fn f32_cache_evict(ptr: *const f32, k: usize, n: usize) {
 /// When the cache is declined ([`cache_enabled`] is `false`) the transpose is
 /// computed per call and not retained (#1056).
 pub fn cached_transpose_f16(src: &[u16], k: usize, n: usize) -> Option<Arc<Vec<u16>>> {
+    cached_transpose_half(src, k, n, 0)
+}
+
+/// [`cached_transpose_f16`] for either 16-bit format; `tag` separates the two
+/// interpretations sharing this `u16` map (0 = `f16`, 1 = `bf16`).
+pub fn cached_transpose_half(src: &[u16], k: usize, n: usize, tag: u16) -> Option<Arc<Vec<u16>>> {
     if !cache_enabled() {
         return transpose_uncached(src, k, n);
     }
-    WEIGHT_TRANSPOSE_F16.get_or_insert_transpose(src, k, n)
+    WEIGHT_TRANSPOSE_F16.get_or_insert_transpose_tagged(src, k, n, tag)
 }
 
 /// Test-only: drop any f16 entry keyed on `(ptr, k, n)`.
@@ -950,5 +987,43 @@ mod tests {
             "both f32 shapes must be cached"
         );
         assert!(f16_after > f16_before, "the f16 entry must be cached");
+    }
+
+    /// `f16` and `bf16` share the `u16` cache, so the key must separate them.
+    ///
+    /// Found the hard way: routing `bf16` decode through this cache made a
+    /// `bf16` weight hit an `f16` entry left by a freed buffer at the same
+    /// address, and every weight was silently reinterpreted -- the failure
+    /// surfaced as `-0.0000216 != -0.8984375`, and only in company, because it
+    /// needs the allocator to recycle the address. Asserting on the *key*
+    /// instead of hoping for that reuse makes the guard deterministic.
+    #[test]
+    fn the_two_16_bit_formats_do_not_share_a_cache_entry() {
+        let k = 4usize;
+        let n = 3usize;
+        // Same bits, two interpretations: as f16 these are ~1.0, as bf16 they
+        // are ~2.0, so a crossed hit is unmistakable in the values too.
+        let src: Vec<u16> = (0..k * n).map(|i| 0x3C00 + i as u16).collect();
+
+        let as_f16 = cached_transpose_half(&src, k, n, 0).expect("f16 transpose");
+        let as_bf16 = cached_transpose_half(&src, k, n, 1).expect("bf16 transpose");
+
+        assert_eq!(
+            WeightTransposeKey::tagged(src.as_ptr(), k, n, 0).tag,
+            0,
+            "the f16 tag must be the untagged default so existing entries keep their key"
+        );
+        assert_ne!(
+            WeightTransposeKey::tagged(src.as_ptr(), k, n, 0),
+            WeightTransposeKey::tagged(src.as_ptr(), k, n, 1),
+            "one address and shape must not key both formats"
+        );
+        // Both are the same permutation of the same bits -- the point is that
+        // each format got its *own* entry, not that the contents differ.
+        assert_eq!(as_f16.as_slice(), as_bf16.as_slice());
+        assert!(
+            !Arc::ptr_eq(&as_f16, &as_bf16),
+            "a bf16 lookup must not be served the f16 allocation"
+        );
     }
 }

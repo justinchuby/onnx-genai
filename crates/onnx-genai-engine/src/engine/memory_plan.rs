@@ -34,52 +34,104 @@
 
 use onnx_runtime_memory_governor::{HolderId, MemoryError, MemoryGovernor, MemoryRole, Tier};
 
-/// Who holds a lease, so the governor can attribute and ask for a release.
+/// Declares the holder registry from one list, so the enum, [`Holder::ALL`] and
+/// [`Holder::id`] cannot disagree.
 ///
-/// An enum rather than scattered constants: the previous arrangement was three
-/// `HolderId::new(N)` definitions in two files, unique by inspection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "RecurrentState and Activations name claims that are not charged yet -- \
-                  see #639 and #514. They are defined here rather than added later so the \
-                  identity space is decided in one place, which is the whole reason this \
-                  enum replaced three hand-picked constants."
-    )
-)]
-pub(crate) enum Holder {
+/// They used to be three hand-maintained lists. `all_covers_every_holder_id`
+/// looked like it caught a variant missing from `ALL`, and did not: it checks
+/// the ids in `ALL` are exactly `1..=ALL.len()`, so a variant left out shortens
+/// the very range being checked and the test still passes. The convention was
+/// unenforceable by the compiler, and the honest options were to say so or to
+/// stop writing the list twice. This is the second.
+///
+/// A local macro rather than a derive: nothing here needs the generality of
+/// `strum`, the whole registry is one screen, and adding a dependency to read
+/// back a variant list is a poor trade against nine lines of `macro_rules!`.
+/// `role`, `name` and `tier` are deliberately left as ordinary matches -- they
+/// are prose-heavy, they differ per holder rather than following the list, and
+/// the compiler already forces them to be exhaustive.
+macro_rules! holder_registry {
+    ($( $(#[$meta:meta])* $variant:ident = $id:literal ),+ $(,)?) => {
+        /// Who holds a lease, so the governor can attribute and ask for a release.
+        ///
+        /// An enum rather than scattered constants: the previous arrangement was
+        /// three `HolderId::new(N)` definitions in two files, unique by
+        /// inspection.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[cfg_attr(
+            not(test),
+            expect(
+                dead_code,
+                reason = "RecurrentState and Activations name claims that are not charged yet -- \
+                          see #639 and #514. They are defined here rather than added later so the \
+                          identity space is decided in one place, which is the whole reason this \
+                          enum replaced three hand-picked constants."
+            )
+        )]
+        pub(crate) enum Holder {
+            $( $(#[$meta])* $variant, )+
+        }
+
+        impl Holder {
+            /// Every holder, generated from the same list as the enum itself.
+            ///
+            /// Production code matches on holders exhaustively and the compiler
+            /// enforces that, so nothing outside the tests iterates this today.
+            /// It is still the registry rather than test scaffolding -- the id
+            /// space is recorded in traces and must not shift with build
+            /// features, which is why the variants are unconditional even when
+            /// only one build configuration constructs them.
+            #[allow(dead_code)]
+            pub(crate) const ALL: [Holder; [$(Holder::$variant),+].len()] =
+                [$(Holder::$variant),+];
+
+            /// The identifier the governor accounts against.
+            ///
+            /// The first values are pinned to what the previous constants used,
+            /// so a trace recorded before this module is still readable against
+            /// one after. Ids are written next to their variant above; nothing
+            /// requires them to be consecutive, but `all_covers_every_holder_id`
+            /// pins that they are, which is what keeps the space readable.
+            pub(crate) const fn id(self) -> HolderId {
+                HolderId::new(match self {
+                    $(Holder::$variant => $id,)+
+                })
+            }
+        }
+    };
+}
+
+holder_registry! {
     /// The target model's KV page pool.
-    KvPool,
+    KvPool = 1,
     /// A composite pipeline's KV page pool.
-    PipelineKvPool,
+    PipelineKvPool = 2,
     /// A speculative draft model's own KV page pool.
-    DraftKvPool,
+    DraftKvPool = 3,
     /// The device weight-residency cache, when weight offload is enabled.
-    WeightResidency,
-    /// The CPU EP's warm host cache for dequantized MoE experts.
-    WeightOffloadHostCache,
+    WeightResidency = 4,
     /// Fixed-size recurrent state for hybrid decoders.
-    RecurrentState,
-    /// Semantic-prefix snapshots of recurrent/native loop-carried state.
-    RecurrentPrefixSnapshot,
-    /// The native decode path's past/present KV tensors.
-    ///
-    /// Distinct from the `*KvPool` holders: those are page pools that lease
-    /// their capacity when constructed. The native path's page table carries no
-    /// storage, so its real KV is the session's own tensors, which the
-    /// execution provider allocates without telling the ledger.
-    NativeKvCache,
+    RecurrentState = 5,
     /// Intermediate activations for one graph execution.
-    Activations,
+    Activations = 6,
     /// The fixed device reservation the engine's ceiling already accounts for --
     /// model weights and runtime overhead.
     ///
     /// Charged as a lease so the ledger's device tier can be the device itself.
     /// Seeding that tier with the KV sub-budget instead was what stopped every
     /// other holder from joining it.
-    FixedDeviceReservation,
+    FixedDeviceReservation = 7,
+    /// The native decode path's past/present KV tensors.
+    ///
+    /// Distinct from the `*KvPool` holders: those are page pools that lease
+    /// their capacity when constructed. The native path's page table carries no
+    /// storage, so its real KV is the session's own tensors, which the
+    /// execution provider allocates without telling the ledger.
+    NativeKvCache = 8,
+    /// Semantic-prefix snapshots of recurrent/native loop-carried state.
+    RecurrentPrefixSnapshot = 9,
+    /// The CPU EP's warm host cache for dequantized MoE experts.
+    WeightOffloadHostCache = 10,
     /// The standing device pool held by a pipeline component session (a vision
     /// encoder, say) that is loaded lazily alongside the decoder.
     ///
@@ -90,58 +142,18 @@ pub(crate) enum Holder {
     /// co-resident tenants each admitting against the whole card is how a
     /// 3264-patch vision prefill drove a 30B decoder into `CUDA_ERROR_OUT_OF_MEMORY`
     /// with the card genuinely full.
-    PipelineComponentPool,
+    PipelineComponentPool = 11,
+    /// The standing device pool held by a speculative proposer's own session.
+    ///
+    /// Distinct from [`Holder::DraftKvPool`], which is the draft model's host
+    /// page pool. This is the device arena and weight-residency cache its
+    /// execution provider builds for itself -- the same blind spot
+    /// [`Holder::PipelineComponentPool`] exists for, on the other co-resident
+    /// session the engine loads next to the decoder.
+    DraftModelPool = 12,
 }
 
 impl Holder {
-    /// Every holder, so a list of them is maintained in one place.
-    ///
-    /// Two hand-copied lists in the tests below drifted apart the moment a
-    /// variant was added, and the drift is silent: a uniqueness test that does
-    /// not mention a holder still passes. `all_covers_every_holder_id` ties
-    /// this to the id space so a new variant cannot be left out quietly.
-    ///
-    /// Production code matches on holders exhaustively and the compiler
-    /// enforces that, so nothing outside the tests iterates this today. It is
-    /// still the registry rather than test scaffolding -- the id space is
-    /// recorded in traces and must not shift with build features, which is why
-    /// the variants are unconditional even when only one build configuration
-    /// constructs them.
-    #[allow(dead_code)]
-    pub(crate) const ALL: [Holder; 11] = [
-        Holder::PipelineComponentPool,
-        Holder::KvPool,
-        Holder::PipelineKvPool,
-        Holder::DraftKvPool,
-        Holder::WeightResidency,
-        Holder::WeightOffloadHostCache,
-        Holder::RecurrentState,
-        Holder::RecurrentPrefixSnapshot,
-        Holder::NativeKvCache,
-        Holder::Activations,
-        Holder::FixedDeviceReservation,
-    ];
-
-    /// The identifier the governor accounts against.
-    ///
-    /// The first three values are pinned to what the previous constants used, so
-    /// a trace recorded before this module is still readable against one after.
-    pub(crate) const fn id(self) -> HolderId {
-        HolderId::new(match self {
-            Holder::KvPool => 1,
-            Holder::PipelineKvPool => 2,
-            Holder::DraftKvPool => 3,
-            Holder::WeightResidency => 4,
-            Holder::WeightOffloadHostCache => 10,
-            Holder::RecurrentState => 5,
-            Holder::RecurrentPrefixSnapshot => 9,
-            Holder::NativeKvCache => 8,
-            Holder::Activations => 6,
-            Holder::FixedDeviceReservation => 7,
-            Holder::PipelineComponentPool => 11,
-        })
-    }
-
     /// What this holder's bytes are, which decides how they are treated under
     /// pressure.
     pub(crate) const fn role(self) -> MemoryRole {
@@ -158,7 +170,9 @@ impl Holder {
             Holder::FixedDeviceReservation => MemoryRole::Weights,
             // A standing pool the component keeps for as long as the session
             // lives, not a per-step scratch buffer.
-            Holder::PipelineComponentPool => MemoryRole::Workspace { step_scoped: false },
+            Holder::PipelineComponentPool | Holder::DraftModelPool => {
+                MemoryRole::Workspace { step_scoped: false }
+            }
         }
     }
 
@@ -176,6 +190,7 @@ impl Holder {
             Holder::Activations => "activations",
             Holder::FixedDeviceReservation => "fixed device reservation",
             Holder::PipelineComponentPool => "pipeline component device pool",
+            Holder::DraftModelPool => "speculative proposer device pool",
         }
     }
 
@@ -202,7 +217,8 @@ impl Holder {
             | Holder::NativeKvCache
             | Holder::Activations
             | Holder::FixedDeviceReservation
-            | Holder::PipelineComponentPool => Tier::Device,
+            | Holder::PipelineComponentPool
+            | Holder::DraftModelPool => Tier::Device,
         }
     }
 }
@@ -303,15 +319,26 @@ impl ModelMemoryPlan {
     /// holder never held that many -- a caller correcting a double count needs
     /// to know what it actually corrected.
     ///
-    /// Gated with its only caller: the native decode path is where an
-    /// on-demand allocator is asked about, and an ungated helper is dead code
-    /// in every other build.
-    #[cfg(feature = "native-backend")]
+    /// One holder may have several entries: workflow source sessions and their
+    /// linked execution islands are admitted in separate phases. Release spans
+    /// those entries so refunding a declined island maximum cannot stop at the
+    /// source-session claim.
     pub(crate) fn release(&mut self, holder: Holder, bytes: u64) -> u64 {
-        let Some(entry) = self.entries.iter_mut().find(|entry| entry.holder == holder) else {
-            return 0;
-        };
-        entry.lease.shrink(bytes)
+        let mut remaining = bytes;
+        let mut released = 0_u64;
+        for entry in self
+            .entries
+            .iter_mut()
+            .filter(|entry| entry.holder == holder)
+        {
+            let shrunk = entry.lease.shrink(remaining);
+            released = released.saturating_add(shrunk);
+            remaining -= shrunk;
+            if remaining == 0 {
+                break;
+            }
+        }
+        released
     }
 
     /// Give the startup weight reservation back before the provider adopts it.
@@ -563,15 +590,22 @@ mod tests {
     /// including the uniqueness check below, which would then pass while not
     /// checking the new holder at all.
     ///
-    /// Ids are consecutive from 1, so a gap in that range means a variant is
-    /// missing here.
+    /// Ids in `ALL` are consecutive from 1, so a duplicate or a gap shows up
+    /// here.
+    ///
+    /// This used to carry a hole: a variant added to the enum and never added
+    /// to `ALL` shortened `ALL.len()`, which is the range being checked, so the
+    /// loop never asked about it and the test passed. `ALL` is now generated
+    /// from the same list as the enum by `holder_registry!`, so that variant
+    /// cannot exist -- a new holder lands in `ALL` whether or not anyone
+    /// remembers it, and if its id is not the next one, this goes red.
     #[test]
     fn all_covers_every_holder_id() {
         for id in 1..=Holder::ALL.len() as u64 {
             assert!(
                 Holder::ALL.iter().any(|holder| holder.id().get() == id),
-                "no holder in Holder::ALL has id {id}; a variant was given an id but not \
-                 added to ALL, so nothing that iterates holders covers it"
+                "no holder in Holder::ALL has id {id}; the listed holders do not occupy a \
+                 consecutive id space, so something that iterates them skips an id in range"
             );
         }
     }
@@ -691,6 +725,23 @@ mod tests {
         assert!(matches!(refused, MemoryError::TierExhausted { .. }));
 
         assert_eq!(plan.bytes_on(Tier::Device), reservation + 500);
+    }
+
+    #[test]
+    fn releasing_a_holder_spans_each_reservation_entry() {
+        let governor = governor(1000);
+        let mut plan = ModelMemoryPlan::new(governor.clone());
+        plan.reserve(Holder::FixedDeviceReservation, 100)
+            .expect("source session fits");
+        plan.reserve(Holder::FixedDeviceReservation, 75)
+            .expect("linked sessions fit");
+
+        assert_eq!(
+            plan.release(Holder::FixedDeviceReservation, 125),
+            125,
+            "releasing an unused linked-session maximum must not stop at the source entry"
+        );
+        assert_eq!(governor.used(Tier::Device), 50);
     }
 
     /// A holder's tier is a property of the holder, not a call-site argument.

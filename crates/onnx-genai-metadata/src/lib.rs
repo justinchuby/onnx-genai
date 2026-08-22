@@ -50,12 +50,12 @@ pub use parser::{
     MtpProposerSpec, SharedKvProposerSpec, SpeculatorConfigSource, SpeculatorDescriptor,
     SpeculatorProposerKind, SpeculatorProposerStatus, detect_speculator, find_metadata_path,
     load_metadata, load_metadata_from_dir, load_metadata_package, load_metadata_with_identity,
-    load_pipeline_spec,
+    load_pipeline_spec, resolve_package_artifact,
 };
 pub use schema::*;
 pub use validation::{
-    PipelineValidationError, RuntimeCapabilities, derived_capabilities, validate,
-    validate_metadata, validate_pipeline_spec,
+    CapabilityReport, PipelineValidationError, RuntimeCapabilities, derived_capabilities, validate,
+    validate_metadata, validate_pipeline_spec, validate_structure_and_capabilities,
 };
 
 /// Generates the inference-metadata JSON Schema with deterministic object-key ordering.

@@ -680,6 +680,7 @@ pipeline:
       result:
         contract: { dtype: float32, rank: 4, shape: [total_patches, 3, 2, 2] }
         role: image
+        value_range: zero_to_one
         stage: post_adapter
     components:
       preprocess:

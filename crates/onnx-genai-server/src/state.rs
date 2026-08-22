@@ -10,7 +10,7 @@ use onnx_genai::{Engine, EngineConfig};
 use onnx_genai_engine::NativeDecodeDevice;
 use onnx_genai_engine::{
     DeviceCompatibilityDomain, DeviceMemoryAuthority, KvDType, MappedGrowthMetrics,
-    MemoryAuthorityProvider, ResourceLimit,
+    MemoryAuthorityProvider, ProcessMemoryManager, ResourceLimit,
 };
 use onnx_genai_ort::{ChatTemplate, ModelDirectory, PipelineModelDirectory, Tokenizer};
 
@@ -33,6 +33,7 @@ const DEFAULT_MAX_BATCH: usize = 4;
 pub(crate) struct ServerMemoryAuthorities {
     effective_limit: Mutex<ResourceLimit>,
     authorities: Mutex<HashMap<DeviceCompatibilityDomain, DeviceMemoryAuthority>>,
+    process_memory_manager: ProcessMemoryManager,
 }
 
 impl ServerMemoryAuthorities {
@@ -40,6 +41,8 @@ impl ServerMemoryAuthorities {
         Self {
             effective_limit: Mutex::new(configured_limit),
             authorities: Mutex::new(HashMap::new()),
+            process_memory_manager: ProcessMemoryManager::new()
+                .expect("process memory manager identity is available"),
         }
     }
 
@@ -220,6 +223,10 @@ impl ServerMemoryAuthorities {
 }
 
 impl MemoryAuthorityProvider for ServerMemoryAuthorities {
+    fn process_memory_manager(&self) -> ProcessMemoryManager {
+        self.process_memory_manager.clone()
+    }
+
     fn validate_limit(
         &self,
         domain: &DeviceCompatibilityDomain,
@@ -545,6 +552,7 @@ impl AppState {
             fim_config,
             pipeline: false,
             multimodal: None,
+            image_pipeline: None,
         })
         .expect("test model handle");
         let registry = ModelRegistry::from_handle(Arc::new(handle), config.clone());
@@ -709,6 +717,7 @@ pub(crate) fn build_handle_with_authorities(
         fim_config,
         pipeline: false,
         multimodal: None,
+        image_pipeline: None,
     })
 }
 
@@ -721,6 +730,7 @@ fn build_pipeline_handle(
     directory: PipelineModelDirectory,
     authorities: Arc<ServerMemoryAuthorities>,
 ) -> anyhow::Result<ModelHandle> {
+    let image_pipeline = crate::image_generation::ImagePipelineSpec::from_pipeline(&directory.spec);
     let tokenizer_path = crate::multimodal::tokenizer_path(model_dir, &directory)?;
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Failed to load pipeline tokenizer: {e}"))?;
@@ -746,6 +756,7 @@ fn build_pipeline_handle(
         fim_config: None,
         pipeline: true,
         multimodal: Some(multimodal),
+        image_pipeline,
     })
 }
 

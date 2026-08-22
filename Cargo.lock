@@ -2124,7 +2124,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "sha2",
  "thiserror 2.0.19",
  "tokenizers",
  "tokio",
@@ -2506,6 +2505,7 @@ dependencies = [
  "onnx-runtime-ep-api",
  "onnx-runtime-ep-cpu",
  "onnx-runtime-ir",
+ "onnx-runtime-memory-governor",
  "onnx-runtime-ort-testkit",
 ]
 
@@ -2554,11 +2554,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "onnx-runtime-memory-abi"
+version = "0.1.0-dev.5"
+
+[[package]]
+name = "onnx-runtime-memory-api"
+version = "0.1.0-dev.5"
+dependencies = [
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "onnx-runtime-memory-governor"
 version = "0.1.0-dev.5"
 dependencies = [
  "criterion",
+ "onnx-runtime-memory-api",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "onnx-runtime-memory-host"
+version = "0.1.0-dev.5"
+dependencies = [
+ "libloading 0.8.9",
+ "onnx-runtime-memory-abi",
+ "onnx-runtime-memory-api",
+ "onnx-runtime-memory-testplugin",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "onnx-runtime-memory-testplugin"
+version = "0.1.0-dev.5"
+dependencies = [
+ "onnx-runtime-memory-abi",
 ]
 
 [[package]]
