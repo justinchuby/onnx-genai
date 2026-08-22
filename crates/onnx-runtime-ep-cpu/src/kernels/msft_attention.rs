@@ -203,6 +203,20 @@ fn concat_cache(past: Option<&Bnsh>, cur: &Bnsh) -> Bnsh {
         };
     };
     let (batch, heads, dim) = (cur.batch, cur.heads, cur.dim);
+    // The caller validates these against the node's own attributes before
+    // building either tensor, so a mismatch is unreachable rather than merely
+    // unlikely. Assert it anyway: the plane-wise copy below would otherwise
+    // fail as an opaque slice-length panic, where the element-at-a-time scatter
+    // this replaced would have quietly read the wrong elements. Both are bugs;
+    // only one says so.
+    assert!(
+        past.batch == batch && past.heads == heads && past.dim == dim,
+        "Attention: past cache (b={},n={},h={}) incompatible with current \
+         (b={batch},n={heads},h={dim})",
+        past.batch,
+        past.heads,
+        past.dim
+    );
     let total = past.seq + cur.seq;
     let mut data = vec![0.0f32; batch * heads * total * dim];
     let plane = total * dim;
@@ -730,6 +744,39 @@ mod tests {
     /// bit for bit, including the ragged cases (`dim = 1`, a single past step,
     /// an empty past, multi-batch multi-head) where a plane-stride mistake
     /// would still produce a plausible-looking buffer.
+    /// The two branches the bit-identity grid steps over: no past cache at all
+    /// (first decode step / prefill), and a degenerate shape that hits the
+    /// `plane == 0` early return. Both must still report the concatenated
+    /// sequence length rather than falling out with the source's.
+    #[test]
+    fn concat_cache_handles_the_absent_past_and_degenerate_shapes() {
+        let cur = ramp(2, 3, 4, 5, 1000.0);
+        let got = concat_cache(None, &cur);
+        assert_eq!(
+            got.data, cur.data,
+            "no past must pass the current step through"
+        );
+        assert_eq!((got.batch, got.heads, got.seq, got.dim), (2, 3, 4, 5));
+
+        for &(batch, heads, past_seq, cur_seq, dim) in &[
+            (1, 1, 0, 0, 4),
+            (1, 2, 3, 1, 0),
+            (0, 2, 3, 1, 4),
+            (1, 0, 3, 1, 4),
+        ] {
+            let past = ramp(batch, heads, past_seq, dim, 1.0);
+            let cur = ramp(batch, heads, cur_seq, dim, 1000.0);
+            let got = concat_cache(Some(&past), &cur);
+            assert_eq!(
+                got.seq,
+                past_seq + cur_seq,
+                "degenerate shape b={batch} h={heads} p={past_seq} c={cur_seq} d={dim} \
+                 must still report the concatenated length"
+            );
+            assert_eq!(got.data.len(), batch * heads * (past_seq + cur_seq) * dim);
+        }
+    }
+
     #[test]
     fn concat_cache_is_bit_identical_to_the_scalar_scatter() {
         for &(batch, heads, past_seq, cur_seq, dim) in &[

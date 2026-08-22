@@ -710,6 +710,39 @@ mod tests {
     /// bit for bit, including the ragged cases (`dim = 1`, a single past step,
     /// an empty past, multi-batch multi-head) where a plane-stride mistake
     /// would still produce a plausible-looking buffer.
+    /// The two branches the bit-identity grid steps over: no past cache at all
+    /// (first decode step / prefill), and a degenerate shape that hits the
+    /// `plane == 0` early return. Both must still report the concatenated
+    /// sequence length rather than falling out with the source's.
+    #[test]
+    fn concat_cache_handles_the_absent_past_and_degenerate_shapes() {
+        let cur = ramp(2, 3, 4, 5, 1000.0);
+        let got = concat_cache(None, &cur, "key").expect("no past is always valid");
+        assert_eq!(
+            got.data, cur.data,
+            "no past must pass the current step through"
+        );
+        assert_eq!((got.batch, got.heads, got.seq, got.dim), (2, 3, 4, 5));
+
+        for &(batch, heads, past_seq, cur_seq, dim) in &[
+            (1, 1, 0, 0, 4),
+            (1, 2, 3, 1, 0),
+            (0, 2, 3, 1, 4),
+            (1, 0, 3, 1, 4),
+        ] {
+            let past = ramp(batch, heads, past_seq, dim, 1.0);
+            let cur = ramp(batch, heads, cur_seq, dim, 1000.0);
+            let got = concat_cache(Some(&past), &cur, "key").expect("degenerate shapes are valid");
+            assert_eq!(
+                got.seq,
+                past_seq + cur_seq,
+                "degenerate shape b={batch} h={heads} p={past_seq} c={cur_seq} d={dim} \
+                 must still report the concatenated length"
+            );
+            assert_eq!(got.data.len(), batch * heads * (past_seq + cur_seq) * dim);
+        }
+    }
+
     #[test]
     fn concat_cache_is_bit_identical_to_the_scalar_scatter() {
         for &(batch, heads, past_seq, cur_seq, dim) in &[
