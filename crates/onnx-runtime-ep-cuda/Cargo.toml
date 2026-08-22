@@ -34,7 +34,7 @@ cuda-13000 = [
     "onnx-runtime-cuda-memory/cuda-13000",
 ]
 # Opt-in for real CUDA integration tests. Without this feature they are reported as ignored.
-gpu-tests = []
+gpu-tests = ["onnx-runtime-cuda-memory/gpu-tests"]
 
 [dependencies]
 onnx-runtime-ir = { workspace = true }
