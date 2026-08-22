@@ -1402,20 +1402,24 @@ pub fn decode_width() -> DecodeWidth {
     }
 }
 
-/// The width the caller explicitly asked for, recorded before any of the
-/// reductions that can shrink it.
+/// The width the caller asked for, recorded when the pool is resolved and before
+/// any of the reductions that can shrink it.
 ///
-/// Deliberately the *unclamped* request from
-/// [`crate::kernels::matmul_nbits::decode_thread_budget`] rather than the
-/// resolved width `build_from_env` receives: the resolver already clamps to
-/// `available_parallelism`, so recording its output would make a request of 8
-/// inside a 2-CPU cpuset report as "8 requested, 2 realized"... no, worse, as
-/// "2 requested, 2 realized" -- satisfied. That is precisely the silent
-/// mislabelling this type exists to expose, so the comparison has to be against
-/// what the user actually typed.
+/// When an explicit request exists this is the *unclamped*
+/// [`crate::kernels::matmul_nbits::decode_thread_budget`], not the resolved
+/// width `build_from_env` receives. The resolver already clamps to
+/// `available_parallelism`, so recording its output would report a request of 8
+/// inside a 2-CPU cpuset as `2 requested, 2 realized` -- satisfied. That is
+/// exactly the silent mislabelling this read exists to expose, so the comparison
+/// has to be against what the user actually asked for.
 ///
-/// `None` when nobody asked for a specific width (default policy) or when the
-/// caller opted out with `=0`.
+/// With no explicit request this falls back to the resolved default width, which
+/// under default policy *is* the intended width -- there is no request for it to
+/// disagree with, so [`DecodeWidth::is_as_requested`] is meaningful on a
+/// default-configured run rather than trivially `false`.
+///
+/// `None` only while the pool is still unresolved, or when the caller opted out
+/// with `=0` (which never reaches the latch in [`pools`]).
 static REQUESTED_WIDTH: OnceLock<Option<usize>> = OnceLock::new();
 
 /// The lazily built persistent SPMD layout, or `None` when the mode is opted out
@@ -1423,7 +1427,23 @@ static REQUESTED_WIDTH: OnceLock<Option<usize>> = OnceLock::new();
 /// process.
 pub fn pools() -> Option<&'static SpmdDecodePools> {
     POOLS
-        .get_or_init(|| build_from_env(default_threads()))
+        .get_or_init(|| {
+            let threads = default_threads();
+            // Latched here rather than inside `build_from_env` so the recorded
+            // request can only ever describe the pool that `POOLS` actually
+            // holds. `build_from_env` is `pub`; latching there would let a direct
+            // call record a width that no realized pool matches -- reintroducing
+            // the exact "the t=N label is a lie" failure this read exists to
+            // catch, through the front door.
+            //
+            // Prefer the unclamped `decode_thread_budget()`, falling back to
+            // `threads` only when nobody asked for a specific width. Under
+            // default policy the clamped width *is* the intended width, so there
+            // is no request for it to disagree with.
+            REQUESTED_WIDTH
+                .get_or_init(|| crate::kernels::matmul_nbits::decode_thread_budget().or(threads));
+            build_from_env(threads)
+        })
         .as_ref()
 }
 
@@ -1574,18 +1594,6 @@ pub fn build_from_env(threads: Option<usize>) -> Option<SpmdDecodePools> {
     // calibrator can time the live decode step on it. `Off` (`=0`) and `THREADS=0`
     // leave decode on the flat Rayon path. See `PERSISTENT_POOL_ENV`.
     let mode = persistence_mode();
-    // Recorded before any of the reductions below can shrink it, and before the
-    // early returns that drop decode to the flat path, so `decode_width` can
-    // always answer "what was asked for" even when the answer to "what did you
-    // get" is "something else entirely".
-    //
-    // `decode_thread_budget()` and not `threads`: the caller's `threads` has
-    // already been clamped to the cpuset by
-    // `resolve_persistent_decode_threads_with_override`, so using it would
-    // compare the reduced width against itself and report every reduction as
-    // satisfied.
-    REQUESTED_WIDTH
-        .get_or_init(|| crate::kernels::matmul_nbits::decode_thread_budget().or(threads));
     if !pool_mode_builds(mode) {
         // An explicit `=0` opt-out is a decision, not an unresolved state: decode
         // is definitively on the flat path. Without this the label reads
@@ -2811,6 +2819,11 @@ mod tests {
                 budget.to_string(),
             )
             .env(PERSISTENT_POOL_ENV, "1")
+            // The child asserts an exact path label, so any ambient variable that
+            // can change which path is chosen has to be cleared, not inherited.
+            // `steal` would relabel the path "work-stealing-pool" and fail the
+            // assertion for a reason unrelated to decode width.
+            .env_remove(DECODE_SCHEDULE_ENV)
             .env_remove(crate::decode_affinity::DECODE_AFFINITY_ENV);
         if let Some(confine) = confine {
             cmd.env(BUDGET_LANE_CONFINE_ENV, confine.to_string());
