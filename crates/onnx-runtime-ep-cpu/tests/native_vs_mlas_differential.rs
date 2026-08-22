@@ -519,24 +519,50 @@ fn concurrent_sdpa_sessions_lose_no_work() {
 
     let sessions = 4usize;
     let rounds = 24usize;
-    std::thread::scope(|scope| {
-        for session in 0..sessions {
-            let (case, q, k, v) = (case, &q, &k, &v);
-            scope.spawn(move || {
-                for round in 0..rounds {
-                    let label = format!("session {session} round {round}");
-                    let mut native = vec![f32::NAN; case.y_len()];
-                    backend_ab::sdpa_native(&case, q, k, v, &mut native);
-                    assert_no_unwritten(&format!("{label} native"), &case, &native);
+    let run = move || {
+        std::thread::scope(|scope| {
+            for session in 0..sessions {
+                let (case, q, k, v) = (case, &q, &k, &v);
+                scope.spawn(move || {
+                    for round in 0..rounds {
+                        let label = format!("session {session} round {round}");
+                        let mut native = vec![f32::NAN; case.y_len()];
+                        backend_ab::sdpa_native(&case, q, k, v, &mut native);
+                        assert_no_unwritten(&format!("{label} native"), &case, &native);
 
-                    let mut mlas = vec![f32::NAN; case.y_len()];
-                    if backend_ab::sdpa_mlas(&case, q, k, v, &mut mlas) {
-                        assert_no_unwritten(&format!("{label} mlas"), &case, &mlas);
+                        let mut mlas = vec![f32::NAN; case.y_len()];
+                        if backend_ab::sdpa_mlas(&case, q, k, v, &mut mlas) {
+                            assert_no_unwritten(&format!("{label} mlas"), &case, &mlas);
+                        }
                     }
-                }
-            });
-        }
-    });
+                });
+            }
+        });
+    };
+
+    // Run on a watchdog thread. The failure this guards has two forms: lost
+    // work, which the NaN scan above catches, and a pool that never returns at
+    // all, which would otherwise hang the suite until CI's own timeout killed
+    // it with no diagnosis attached.
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("sdpa-concurrency-watchdog".into())
+        .spawn(move || {
+            let verdict = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+            let _ = done.send(verdict.is_ok());
+        })
+        .expect("watchdog thread must start");
+
+    match finished.recv_timeout(std::time::Duration::from_secs(120)) {
+        Ok(true) => {}
+        // The inner panic has already printed its own message and location.
+        Ok(false) => panic!("a concurrent SDPA session failed; see the panic above"),
+        Err(_) => panic!(
+            "concurrent SDPA sessions never finished: the shared pool stopped making \
+             progress, which is what happens when a straggler from a retired epoch \
+             decrements the next job's completion counter past zero (#1685)"
+        ),
+    }
 }
 
 /// `Erf` and exact `Gelu` keep an MLAS route because it measured faster. The

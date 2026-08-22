@@ -152,11 +152,21 @@ fn parallel_for_returns_only_after_every_worker_has_left_the_closure() {
         .expect("watchdog thread must start");
 
     match finished.recv_timeout(std::time::Duration::from_secs(120)) {
-        Ok(Ok(peak)) => assert!(
-            peak > 1,
-            "no two workers were ever in the closure at once, so this run never \
-             exercised the concurrency it claims to guard"
-        ),
+        Ok(Ok(peak)) => {
+            // On a single-vCPU runner the workers can be serialised end to end,
+            // so overlap is not guaranteed and its absence is not a defect.
+            // Everywhere else, no overlap means the run never exercised the
+            // concurrency this test claims to guard, and reporting a pass would
+            // be false assurance.
+            let parallel = std::thread::available_parallelism().map_or(1, |n| n.get());
+            if parallel > 1 {
+                assert!(
+                    peak > 1,
+                    "no two workers were ever in the closure at once on a {parallel}-way \
+                     machine, so this run never exercised the concurrency it claims to guard"
+                );
+            }
+        }
         Ok(Err(message)) => panic!("{message}"),
         Err(_) => panic!(
             "the dispatch loop never finished: the pool deadlocked, which is what \
