@@ -25,7 +25,7 @@ jobs:
         with:
           repository: onnxruntime/mobius
           # Switch back to main after the producer PR merges.
-          ref: copilot/sensenova-canonical-metadata
+          ref: main
           path: validation/mobius
       - uses: actions/setup-python@v5
         with:
