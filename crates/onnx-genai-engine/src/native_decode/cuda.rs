@@ -584,7 +584,7 @@ pub struct CudaGraphDebugStats {
     pub growth_keeps: u64,
     pub allocation_counts: DeviceAllocationCounts,
     /// Opt-in source attribution for eager allocations outside DeviceAllocator.
-    pub raw_allocation_sites: Vec<onnx_runtime_ep_cuda::CudaRawAllocationSiteStats>,
+    pub raw_allocation_sites: Vec<onnx_runtime_ep_api::RawDeviceAllocationSiteStats>,
     /// Named decode-level predicate that declined capture, whether before the
     /// first attempt or during the runtime capture audit.
     pub decline_reason: Option<String>,
