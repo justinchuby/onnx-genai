@@ -45,9 +45,9 @@
 //! | `disp/tok` | barriers per token. A route invariant: if it moves across gaps, the gap knob changed the work, not the scheduling |
 //! | `spin/tok`, `park/tok` | op-observations caught in the spin window vs paid for with a futex wake |
 //! | `park%` | `parks / (spin_hits + parks)` -- the width-independent form, and the quantity blocktime actually moves |
-//! | `obs/disp` | op-observations per dispatch. Derived, and its job is to be **boring**: the spawned worker count, integral, identical in every cell. If it moves, that cell dispatched to a different number of workers and its latency is not comparable however tight its spread |
+//! | `obs/disp` | op-observations per dispatch. Derived, and its job is to be **boring**: integral and identical in every cell. If it moves, that cell dispatched to a different number of workers and its latency is not comparable however tight its spread. It is the count of *spawned* workers, which is the header's `realized` width **minus one** whenever the inline dispatcher owns a compute shard -- so `obs/disp = 15` beside `realized = 16` is correct and informative, not an off-by-one. That case is reachable on the explicit-budget path and not on the default one, which is exactly why the two are not interchangeable arms |
 //! | `inline/tok` | dispatches that found the slot claimed and ran serially. Nonzero means concurrent sessions or nested dispatch contended for the pool |
-//! | `dy/tok` | dispatcher yields per token. **Saturating**: the dispatcher spins ~10 us then yields once, so every op longer than that yields, and a real projection always is. Measured at 1.0/dispatch on an idle host -- it is a useful invariant, not a contention signal |
+//! | `dy/tok` | dispatcher yields per token. Strongly **width-dependent**: the dispatcher publishes, computes its own shard, then spins ~10 us before yielding once, so a yield means the last worker lagged the dispatcher's own arrival by more than that. Measured at zero gap on an idle host: 0.004/dispatch at width 4, ~0.9 at width 16, non-monotonic between. Straggler spread, not contention, and only comparable at a fixed width |
 //! | `vcsw` / `ivcsw` | voluntary / involuntary context switches per token. `vcsw` is the kernel's independent view of parking and should track `park/tok` |
 //! | `rss_mb` | `ru_maxrss`, a process **high-water mark**. Absolute, never a delta -- a high-water mark cannot be differenced, and doing so prints noise that looks like a leak |
 //! | `spread%` | `(max - min) / median` of `ms_tok` across repetitions |
@@ -72,9 +72,16 @@
 //!    as `spread%` instead of silently ordering the results.
 //! 3. **An output hash** over every cell's final activations. The gap is
 //!    supposed to change *when* work happens and never *what* it computes; if
-//!    two cells disagree the harness prints `GAP-CHANGED-ROUTE` and the matrix
-//!    is void. This is the check that would have caught a gap that quietly moved
-//!    the run off the persistent pool.
+//!    two cells disagree the harness prints `GAP-CHANGED-OUTPUT` and the matrix
+//!    is void.
+//!
+//!    Its limits, stated because the first draft of this comment overclaimed
+//!    them: `MatMulNBits` at `m = 1` does each output column's whole K-reduction
+//!    inside one worker's shard, so the result is bit-identical no matter which
+//!    pool ran it or how wide. Verified -- width 4 and width 16 print the same
+//!    digest. So this catches a gap that changed the *computation*; it cannot
+//!    catch one that changed only the *schedule*. `obs/disp` and the header's
+//!    realized width are the controls for that.
 //!
 //! # Env
 //!
@@ -122,6 +129,13 @@
 //! | 500 us (default) | 6.963 | 1.7% | 75.6 | **22.30** | 33.4 |
 //! | 5000 us | 7.042 | 0.8% | 82.9 | **65.43** | 3.2 |
 //!
+//! Each row is one process launch, which -- see the bimodality section below --
+//! makes the `ms_tok` column a draw from a two-mode distribution rather than a
+//! point estimate. That weakens nothing here: the conclusion drawn from it is
+//! that latency is *indistinguishable*, and an unmodelled second mode can only
+//! make it more so. The `sys_ms` column is not affected, being monotone across
+//! four points with a mechanism.
+//!
 //! Two things fall out, and the second was not what the window was believed to
 //! be trading:
 //!
@@ -147,6 +161,46 @@
 //! yield loop, and width enters only by multiplying the number of workers
 //! running it. Anything that shortens the window -- or replaces the yield ramp
 //! with a park -- moves that column; adding or removing wakes does not.
+//!
+//! # Second result, and a warning: the pool is bimodal per process launch
+//!
+//! Read the table above as a distribution, not as four numbers. At width 16 and
+//! zero gap, repeated launches of the *same* binary with the *same* environment
+//! land in one of two clearly separated regimes, and `park%` names which:
+//!
+//! | regime | `ms_tok` | `cpu_ms/tok` | `park%` | in-run `spread_%` |
+//! |---|---|---|---|---|
+//! | fast | ~2.51 | ~41.8 | ~5 | 0.1--0.5 |
+//! | slow | ~11.5--11.9 | ~55--65 | ~71--73 | 1.4--78 |
+//!
+//! Twelve launches across three configurations: every configuration produced
+//! both regimes. This matters more than any single row here, for two reasons.
+//!
+//! **It is not (only) cache placement.** The regimes differ by 14x in `park%`,
+//! which is a scheduling state, and the slow regime burns *less* CPU while
+//! taking 4.6x longer -- the workers are asleep, not thrashing. A placement
+//! explanation predicts more CPU per token, not less.
+//!
+//! **A small sample will hand you a confident wrong answer.** Three launches of
+//! an explicit `ONNX_GENAI_CPU_DECODE_THREADS=16` arm against three of the
+//! default arm gave 9.3/11.0/12.0 against 4.83/4.82/4.81 -- consistent, tight
+//! in-run spreads, and a clean mechanistic story (the explicit path builds 15
+//! workers plus a dispatcher shard rather than 16 workers). A fourth and fifth
+//! launch put the explicit arm at 2.51 and the default arm at 10.0, and the
+//! story evaporated. In-run `spread_%` did not warn: the fast regime's runs are
+//! internally *stable*, at 0.1--0.5%.
+//!
+//! So: **no per-launch number from this harness is publishable at width >= 8
+//! without repeated launches**, and a difference between two configurations
+//! needs enough launches to see both regimes in both arms. Ratios taken *within*
+//! one launch (the interleaved cells) are safe -- that is what the interleaving
+//! is for -- but a comparison across launches is not. The blocktime sweep above
+//! survives this because its conclusion rests on `sys_ms` moving 12x
+//! monotonically across four points with a mechanism, and on the latency column
+//! being *indistinguishable*; bimodality can only widen that latter claim.
+//!
+//! Chasing which regime a launch lands in, and why the counters can see it, is
+//! the next piece of scheduler work rather than something this harness settles.
 
 mod common;
 
@@ -313,6 +367,10 @@ fn usage() -> Usage {
     }
 }
 
+/// No `getrusage` off Unix. Returns zeros, and `main` prints a
+/// `resource_metrics=unavailable` banner so a reader cannot mistake a column of
+/// `0.000` for a measured one -- an unmeasured number that looks like a measured
+/// number is the failure this harness exists to avoid.
 #[cfg(not(unix))]
 fn usage() -> Usage {
     Usage::default()
@@ -341,10 +399,13 @@ struct Pass {
     ivcsw_tok: f64,
     rss_mb: f64,
     /// Observations per dispatch: `(spin_hits + parks) / dispatches`. Derived,
-    /// not measured, and its job is to be *boring* -- it must be the (integral)
-    /// spawned worker count and identical in every cell. A cell where it moves
-    /// dispatched to a different number of workers than its neighbours, which
-    /// makes that cell's latency incomparable no matter how tight its spread.
+    /// not measured, and its job is to be *boring* -- it must be integral and
+    /// identical in every cell. A cell where it moves dispatched to a different
+    /// number of workers than its neighbours, which makes that cell's latency
+    /// incomparable no matter how tight its spread.
+    ///
+    /// This is the count of *spawned* workers, so it is one below the header's
+    /// realized width whenever the inline dispatcher owns a compute shard.
     obs_disp: f64,
     hash: u64,
     /// Whether every session in the cell computed the same outputs.
@@ -640,6 +701,11 @@ fn main() {
         "blocktime_us={} (ONNX_GENAI_CPU_DECODE_BLOCKTIME_US; latched once per process)",
         decode_spmd::blocktime().as_micros()
     );
+    if cfg!(not(unix)) {
+        println!(
+            "resource_metrics=unavailable (no getrusage on this target: cpu_ms, sys_ms, vcsw, ivcsw and rss_mb are NOT measured)"
+        );
+    }
     common::report_decode_width();
 
     println!(
@@ -729,7 +795,7 @@ fn main() {
         );
     } else {
         println!(
-            "GAP-CHANGED-ROUTE baseline={} {:#018x}; disagreeing: {}",
+            "GAP-CHANGED-OUTPUT baseline={} {:#018x}; disagreeing: {}",
             decode_hashes[0].0,
             decode_hashes[0].1,
             mismatched
