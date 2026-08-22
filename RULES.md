@@ -13,8 +13,6 @@ These durable rules bind every human contributor and every AI coding agent worki
 - Prefer descriptive `Result`s over panics on user-facing paths; panic-fence FFI, fail closed on invalid input, and separate user/configuration errors from internal invariant failures.
 - Reviewers must report weak, opaque, context-losing, or unactionable errors as real findings.
 
-See [`docs/status/PROGRESS.md`](docs/status/PROGRESS.md).
-
 ## 2. Stay model-, vendor-, and EP-agnostic
 
 **Runtime behavior is driven by model metadata, ONNX semantics, registries, capabilities, and explicit configuration—not hardcoded identities or hidden guesses.**
@@ -28,8 +26,6 @@ See [`docs/status/PROGRESS.md`](docs/status/PROGRESS.md).
 - A fusion must generalize across every model that exhibits the pattern. Optimize per pattern category, not for one model; hardcoded shape constants that only match one model are review-blocking.
 - Fusion lives inside the EP claim/compile path. Reusable pattern matching and rewriting belongs in the IR crate, not ad-hoc per-EP string or shape checks.
 
-See [`docs/genai/MODEL_METADATA.md`](docs/genai/MODEL_METADATA.md) and [`docs/status/PROGRESS.md`](docs/status/PROGRESS.md).
-
 ## 3. Make pre-release changes cleanly
 
 **Do not add backward-compatibility aliases, deprecation layers, or migration shims for our own pre-release APIs.**
@@ -38,7 +34,7 @@ See [`docs/genai/MODEL_METADATA.md`](docs/genai/MODEL_METADATA.md) and [`docs/st
 - Do not retain duplicate old symbols “just in case.”
 - This does not waive product compatibility requirements such as supported ONNX opsets or the documented ORT/plugin ABI surface.
 
-See [`docs/status/PROGRESS.md`](docs/status/PROGRESS.md) and [`docs/architecture/CRATE_RESERVATION.md`](docs/architecture/CRATE_RESERVATION.md).
+See [`docs/architecture/CRATE_RESERVATION.md`](docs/architecture/CRATE_RESERVATION.md).
 
 ## 4. Prefer explicit, inspectable behavior
 
@@ -66,7 +62,7 @@ See [`docs/execution/EAGER.md` §1](docs/execution/EAGER.md#1-design-principles)
 - Runtime Rust crates: `onnx-runtime-*`; GenAI-stack Rust crates: `onnx-genai-*`.
 - Do not reintroduce legacy `ort2_*` public symbols.
 
-See [`docs/status/PROGRESS.md`](docs/status/PROGRESS.md) and [`docs/architecture/CRATE_RESERVATION.md`](docs/architecture/CRATE_RESERVATION.md).
+See [`docs/architecture/CRATE_RESERVATION.md`](docs/architecture/CRATE_RESERVATION.md).
 
 ## 7. Ship stable-ABI Python wheels
 
@@ -83,8 +79,6 @@ See [`docs/status/PROGRESS.md`](docs/status/PROGRESS.md) and [`docs/architecture
 - Cover changed success and failure paths, including error text when actionability is part of the contract.
 - Update fixtures, expected counts, snapshots, conformance checks, and documentation examples with the API or behavior they describe.
 - Run the smallest relevant test/lint set before landing; do not leave known CI cleanup to the next contributor.
-
-See [`docs/status/PROGRESS.md`](docs/status/PROGRESS.md) for the project’s test, conformance, clippy, Miri, and audit expectations.
 
 ## 9. Run portably across hardware tiers
 
