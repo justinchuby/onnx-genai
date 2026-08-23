@@ -807,6 +807,79 @@ pub(crate) fn runtime_managed_seeds(workflow: &WorkflowSpec) -> HashSet<String> 
         .collect()
 }
 
+/// Which serving-service control signal a workflow value carries.
+///
+/// The three roles the serving contract names are not free parameters of a
+/// request: a row that has just been admitted is live, is not finished, and has
+/// had nothing accepted for it yet. Naming them as an enum is what lets the
+/// seed be derived from the *role* rather than from any property of the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServingControl {
+    Active,
+    Done,
+    AcceptedLen,
+}
+
+impl ServingControl {
+    /// The value this control holds for a newly admitted row.
+    ///
+    /// Expressed as the literal a package would have declared for it, so the
+    /// derived seed goes through the same materialization — and the same
+    /// symbolic-extent rebinding — as a declared default.
+    pub(crate) fn admission_seed(self) -> onnx_genai_metadata::LiteralValue {
+        use onnx_genai_metadata::{LiteralValue, ScalarValue};
+        match self {
+            Self::Active => LiteralValue::Scalar(ScalarValue::Bool(true)),
+            Self::Done => LiteralValue::Scalar(ScalarValue::Bool(false)),
+            Self::AcceptedLen => LiteralValue::Scalar(ScalarValue::Integer(0)),
+        }
+    }
+}
+
+/// Package inputs that exist only to seed the serving service's own controls.
+///
+/// `pipeline.workflow.serving.{active,done,accepted_len}` is the package
+/// declaring that the *runtime* owns those three signals: the token policy
+/// writes them, the loop's `continue_when` reads them, and the batch service
+/// permutes them when it compacts. A caller has nothing to say about them —
+/// asking an application whether the row it just submitted is already `done` is
+/// asking for a second answer to a question the serving service has already
+/// answered, and the two could disagree.
+///
+/// So a serving control that resolves to a workflow input is seeded here from
+/// its declared role rather than demanded of the request. Nothing is invented:
+/// a caller-supplied value still wins, a package-declared default still wins
+/// over this, and an input the serving contract does not name is untouched and
+/// stays exactly as required as it was.
+///
+/// The name a serving role carries is either a workflow input directly or a
+/// state cell whose `initializer` is one — the canonical decoder emitter
+/// declares cells, a composite package binds the inputs straight through — so
+/// both spellings resolve to the same seed.
+pub(crate) fn serving_control_seeds(workflow: &WorkflowSpec) -> BTreeMap<String, ServingControl> {
+    let Some(serving) = workflow.serving.as_ref() else {
+        return BTreeMap::new();
+    };
+    [
+        (Some(&serving.active), ServingControl::Active),
+        (Some(&serving.done), ServingControl::Done),
+        (serving.accepted_len.as_ref(), ServingControl::AcceptedLen),
+    ]
+    .into_iter()
+    .filter_map(|(value, role)| Some((value?, role)))
+    .filter_map(|(value, role)| {
+        let seed = match workflow.state.get(value) {
+            Some(cell) => cell.initializer.as_str(),
+            None => value.as_str(),
+        };
+        workflow
+            .inputs
+            .contains_key(seed)
+            .then(|| (seed.to_string(), role))
+    })
+    .collect()
+}
+
 /// A hosted interpreter over a canonical decoder workflow, for unit tests.
 ///
 /// The loop a unit test drives must be a *declared* loop, or the test proves

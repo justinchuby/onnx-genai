@@ -371,12 +371,17 @@ impl Engine {
             .rollback_speculative_state(state, length)
     }
 
+    /// The declared token-embedding table, as the proposer consumes it.
+    ///
+    /// Takes the whole [`onnx_genai_metadata::TokenEmbeddingSource`] rather
+    /// than a name pair because the declared normalizer is part of what the
+    /// table *is*: a caller holding only `(component, table)` cannot say
+    /// whether the rows it gets are the ones a proposer must be fed.
     pub fn embedding_table(
         &self,
-        component: &str,
-        table: &str,
+        source: &onnx_genai_metadata::TokenEmbeddingSource,
     ) -> anyhow::Result<crate::pipeline::speculative::EmbeddingTable> {
-        self.workflow_runtime().embedding_table(component, table)
+        self.workflow_runtime().embedding_table(source)
     }
 
     /// How many times this runtime read an embedding table out of an artifact.

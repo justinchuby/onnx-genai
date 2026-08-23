@@ -2601,6 +2601,21 @@ fn validate_speculative_rollback(metadata: &InferenceMetadata, errors: &mut Vec<
                                     .to_string(),
                             );
                         }
+                        // A normalizer is a positive, finite factor. Zero,
+                        // negative, NaN and infinity all produce a table the
+                        // proposer reads without complaint and drafts nothing
+                        // useful from -- the exact silent failure this field was
+                        // added to remove, reintroduced through its own value.
+                        if let Some(scale) = embedding.scale
+                            && !(scale.is_finite() && scale > 0.0)
+                        {
+                            errors.push(format!(
+                                "speculative token_embedding.scale is {scale}; a normalizer the \
+                                 target applies to an embedding row must be finite and positive, \
+                                 and a package that applies none omits the field rather than \
+                                 declaring 0"
+                            ));
+                        }
                     }
                 },
             }

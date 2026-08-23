@@ -91,7 +91,10 @@ Generation-side design: [`SCHEDULING.md`](genai/SCHEDULING.md),
 [`MOBIUS_WORKFLOW_PRODUCER.md`](genai/MOBIUS_WORKFLOW_PRODUCER.md),
 [`NATIVE_BATCH_DECODE_2B_IMPL_SCOPING.md`](genai/NATIVE_BATCH_DECODE_2B_IMPL_SCOPING.md),
 [`DIFFUSION.md`](genai/DIFFUSION.md),
-[`COMFYUI_IMPORT.md`](genai/COMFYUI_IMPORT.md).
+[`COMFYUI_IMPORT.md`](genai/COMFYUI_IMPORT.md),
+[`CHAINED_SPECULATIVE_EVIDENCE.md`](genai/CHAINED_SPECULATIVE_EVIDENCE.md)
+(what a published chained-speculative package has to prove, and the recorded
+H200 run that proves it).
 
 ### `quantization/`
 Quantized formats and MoE: [`SUB4BIT_QUANT.md`](quantization/SUB4BIT_QUANT.md),
