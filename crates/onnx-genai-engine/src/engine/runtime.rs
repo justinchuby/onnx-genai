@@ -318,23 +318,82 @@ impl Engine {
         Ok(scheduled)
     }
 
+    /// Every token id this model ends generation on.
+    ///
+    /// A model may end a turn with one token and a message with another; both
+    /// stop it. The package's own declaration comes first because it is the
+    /// package speaking about itself — a package that ships no tokenizer
+    /// side-files still states its EOS — and the tokenizer's ids extend it
+    /// rather than replacing it, so neither source can silently drop the
+    /// other's.
     fn default_eos_token_ids(&self) -> Vec<TokenId> {
-        self.tokenizer
+        let mut ids = self.declared_eos_token_ids();
+        for id in self
+            .tokenizer
             .as_ref()
             .map(Tokenizer::eos_token_ids)
             .unwrap_or_default()
+        {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids
     }
 
+    /// EOS ids the package's workflow declares, via the `eos_token_ids` role.
+    ///
+    /// Read from the workflow's own literal default, so a package states its
+    /// stop condition in the one place it states everything else. Without this
+    /// the declaration is inert: it would be materialized into the graph's
+    /// inputs and never reach the runtime's stop policy, which is what "declared
+    /// but dead" meant.
+    fn declared_eos_token_ids(&self) -> Vec<TokenId> {
+        let Ok(workflow) =
+            canonical_workflow(self.workflow.as_deref(), self.lowered_workflow.as_ref())
+        else {
+            return Vec::new();
+        };
+        workflow
+            .inputs
+            .values()
+            .filter(|input| {
+                matches!(
+                    &input.role,
+                    onnx_genai_metadata::SemanticInputRole::Runtime { role, .. }
+                        if *role == onnx_genai_metadata::RuntimeInputRole::EosTokenIds
+                )
+            })
+            .filter_map(|input| input.default.as_ref())
+            .flat_map(literal_token_ids)
+            .collect()
+    }
+
+    /// Apply the model's stop condition to a request.
+    ///
+    /// Every declared EOS id becomes a stop sequence, not just the first. A
+    /// model with two end tokens is stopped by either, which a single
+    /// `eos_token_id` field cannot express — and silently dropping the rest
+    /// means generation runs past its end and emits control tokens as text.
+    ///
+    /// A caller's explicit `eos_token_id` selects which id is *reported* as the
+    /// EOS, and does not suppress the others: the model's end tokens are facts
+    /// about the model, and a request narrowing them would make the runtime emit
+    /// tokens the model meant as terminal.
     fn apply_eos_defaults(&self, options: &mut GenerateOptions) {
-        if !options.stop_on_eos || options.eos_token_id.is_some() {
+        if !options.stop_on_eos {
             return;
         }
         let ids = self.default_eos_token_ids();
-        if let Some(&id) = ids.first() {
+        if options.eos_token_id.is_none()
+            && let Some(&id) = ids.first()
+        {
             options.eos_token_id = Some(id);
         }
         for id in ids {
-            push_unique_stop_sequence(&mut options.stop_sequences, StopSequence::Tokens(vec![id]));
+            if !options.eos_token_ids.contains(&id) {
+                options.eos_token_ids.push(id);
+            }
         }
     }
 
@@ -2467,6 +2526,25 @@ impl Engine {
         self.scheduler.complete(session_id);
         result
     }
+}
+
+/// Token ids carried by a workflow literal, scalar or list.
+///
+/// A package may declare one end token or several with the same field; reading
+/// both shapes here is what keeps "declare your EOS" from having two spellings.
+fn literal_token_ids(literal: &onnx_genai_metadata::LiteralValue) -> Vec<TokenId> {
+    use onnx_genai_metadata::{LiteralValue, ScalarValue};
+    let scalars = match literal {
+        LiteralValue::Scalar(scalar) => std::slice::from_ref(scalar),
+        LiteralValue::Elements(elements) => elements.as_slice(),
+    };
+    scalars
+        .iter()
+        .filter_map(|scalar| match scalar {
+            ScalarValue::Integer(value) => TokenId::try_from(*value).ok(),
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]

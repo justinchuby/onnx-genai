@@ -158,6 +158,7 @@ libc = "0.2"
 [dev-dependencies]
 async-trait = { workspace = true }
 proptest = "1.9"
+tempfile = "3"
 
 [lints]
 workspace = true

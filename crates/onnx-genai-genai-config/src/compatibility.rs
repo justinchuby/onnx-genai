@@ -264,6 +264,11 @@ impl GenAiConfig {
                     .unwrap_or("model.onnx"),
                 &onnx_genai_metadata::decoder_workflow::DecoderFacts {
                     max_sequence_length: self.max_sequence_length(),
+                    // `genai_config.json` already normalizes a scalar or an
+                    // array here, so a model with several end tokens carries
+                    // all of them across instead of losing every id but the
+                    // first at the boundary.
+                    eos_token_ids: eos_token_ids(self),
                     // When the caller supplied the decoder's graph, state the
                     // ports it actually has. Guessing a state tensor's rank
                     // produces a contract the session validator rejects for
@@ -703,7 +708,7 @@ impl GenAiConfig {
     /// untouched) unless the derivation yields at least one recurrent state pair —
     /// the exact case the shape-inference path cannot resolve. Pure-dense decoders
     /// (no state pairs) always return `None`.
-    pub fn derive_model_io_spec_from_graph(
+    pub fn derive_decoder_abi_from_graph(
         graph: &ModelGraphInfo,
     ) -> Option<onnx_genai_metadata::DecoderAbi> {
         use onnx_genai_metadata::{DecoderAbi, LoopStatePair};
@@ -848,4 +853,13 @@ fn port_contracts_from_graph(
             )
         })
         .collect()
+}
+
+/// Every end-of-generation token id a `genai_config.json` declares.
+fn eos_token_ids(config: &GenAiConfig) -> Vec<i64> {
+    match config.model.eos_token_id.as_ref() {
+        Some(crate::wire_types::EosTokenId::Single(id)) => vec![*id],
+        Some(crate::wire_types::EosTokenId::Many(ids)) => ids.clone(),
+        None => Vec::new(),
+    }
 }

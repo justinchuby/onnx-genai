@@ -127,6 +127,44 @@ Do not hand-write this. See [Converting a package](#converting-a-package).
    your structure requires and rejects a manifest that omits one, so the list
    is checkable rather than decorative.
 
+## End-of-generation tokens
+
+A model may end a turn with one token and a message with another. Both stop it,
+so the declaration is a **set**:
+
+```yaml
+    inputs:
+      package.eos_token_ids:
+        contract: {dtype: int64, rank: 1, shape: [eos_count]}
+        role: {kind: runtime, version: '1.0', role: eos_token_ids}
+        source: {kind: literal}
+        required: false
+        externally_suppliable: true
+        default: [200002, 200012]     # e.g. <|eot|> and <|eom|>
+```
+
+The axis is symbolic (`eos_count`) and the element list states its extent, so
+adding a third end token is a one-line change with no other edit.
+
+Three things follow from declaring it here:
+
+* **The package states its own stop condition.** A package that ships no
+  `generation_config.json` or `tokenizer_config.json` still stops correctly,
+  because the workflow says how.
+* **Every declared id terminates.** Not just the first. Keeping only one means
+  generation runs past its end and emits control tokens as ordinary text — a
+  silent failure that reads like the model rambling.
+* **A request cannot disarm the others.** `GenerateOptions::eos_token_id` names
+  which id a finished result *reports* and adds to the set; it does not narrow
+  it. A model's end tokens are facts about the model, and emitting one as text
+  is never what a caller meant.
+
+The engine merges the package's declaration with the tokenizer's ids (package
+first, neither able to drop the other) into `GenerateOptions::eos_token_ids`,
+and `GenerateOptions::terminates` is the only thing that reads it — so the
+single-row loop, the batched loop, the speculative verifier and a constrained
+decode cannot disagree about whether a model has finished.
+
 ## What "single decoder" means to the runtime
 
 A package is a single decoder when its workflow has **exactly one ONNX

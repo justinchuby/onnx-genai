@@ -2996,6 +2996,11 @@
           "type": "string"
         },
         {
+          "const": "eos_token_ids",
+          "description": "Token ids that end generation.\n\nA set, not a single id: a model may end a turn with one token and a\nmessage with another, and both must stop. Declaring it here is what lets\nthe runtime's stop policy read a package's EOS from the package instead\nof rediscovering it from tokenizer side-files it may not ship.",
+          "type": "string"
+        },
+        {
           "const": "row_selection",
           "description": "Runtime-minted gather of source batch positions for beam or speculative\nrow expansion. Values are positions inside the current batch, never\nscheduler slots, request IDs, or epochs.",
           "type": "string"

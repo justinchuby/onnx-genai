@@ -210,12 +210,12 @@ impl Engine {
             config.limits.vram_limit,
         )?;
         let metadata = load_inference_metadata(&model_directory)?;
-        let model_io = metadata.decoder_io();
-        let kv_inputs = model_io
-            .and_then(|io| io.kv_inputs.clone())
+        let decoder_abi = metadata.decoder_io();
+        let kv_inputs = decoder_abi
+            .and_then(|abi| abi.kv_inputs.clone())
             .unwrap_or_default();
-        let kv_outputs = model_io
-            .and_then(|io| io.kv_outputs.clone())
+        let kv_outputs = decoder_abi
+            .and_then(|abi| abi.kv_outputs.clone())
             .unwrap_or_default();
         let graph_io = onnx_genai_ort::graph_io_from_model_path_for_kv_pairs(
             &model_directory.model_path,
@@ -223,11 +223,15 @@ impl Engine {
             &kv_outputs,
         )
         .map_err(|e| anyhow::anyhow!("Failed to read decoder graph I/O for KV geometry: {e}"))?;
-        let kv_model =
-            infer_kv_model_info(&graph_io, model_io, config.page_size, config.kv_cache_dtype)?;
+        let kv_model = infer_kv_model_info(
+            &graph_io,
+            decoder_abi,
+            config.page_size,
+            config.kv_cache_dtype,
+        )?;
         let plan_kv_config = match kv_model.as_ref() {
             Some(kv_model) => governor_kv_config(Some(kv_model), &config)?,
-            None if model_io_declares_only_fixed_state(model_io) => {
+            None if decoder_abi_declares_only_fixed_state(decoder_abi) => {
                 governor_no_paged_kv_config(&config)?
             }
             None => governor_kv_config(None, &config)?,
@@ -477,11 +481,11 @@ impl Engine {
         let fim_config = load_fim_config_from_model_dir(&model_directory.root)?;
         let kv_model = {
             let _span = onnx_genai_ort::prof_span!("engine.native_kv_model_info");
-            let model_io = metadata.decoder_io();
-            let kv_inputs = model_io
+            let decoder_abi = metadata.decoder_io();
+            let kv_inputs = decoder_abi
                 .and_then(|io| io.kv_inputs.clone())
                 .unwrap_or_default();
-            let kv_outputs = model_io
+            let kv_outputs = decoder_abi
                 .and_then(|io| io.kv_outputs.clone())
                 .unwrap_or_default();
             let graph_io = onnx_genai_ort::graph_io_from_model_path_for_kv_pairs(
@@ -492,13 +496,18 @@ impl Engine {
             .map_err(|e| {
                 anyhow::anyhow!("Failed to read native decoder graph I/O for KV geometry: {e}")
             })?;
-            infer_kv_model_info(&graph_io, model_io, config.page_size, config.kv_cache_dtype)
-                .context("failed to infer native decoder KV geometry from model graph I/O")?
+            infer_kv_model_info(
+                &graph_io,
+                decoder_abi,
+                config.page_size,
+                config.kv_cache_dtype,
+            )
+            .context("failed to infer native decoder KV geometry from model graph I/O")?
         };
-        let model_io = metadata.decoder_io();
+        let decoder_abi = metadata.decoder_io();
         let governor_kv_config = match kv_model.as_ref() {
             Some(kv_model) => governor_native_kv_config(Some(kv_model), &config)?,
-            None if model_io_declares_only_fixed_state(model_io) => {
+            None if decoder_abi_declares_only_fixed_state(decoder_abi) => {
                 governor_no_paged_kv_config(&config)?
             }
             None => governor_kv_config(None, &config)?,
@@ -547,7 +556,7 @@ impl Engine {
             let graph = onnx_runtime_loader::load_model(&model_directory.model_path)
                 .context("loading native graph for recurrent-state memory planning")?;
             let recurrent_bytes =
-                crate::native_decode::recurrent_state_bytes_from_graph(&graph, model_io)?;
+                crate::native_decode::recurrent_state_bytes_from_graph(&graph, decoder_abi)?;
             kv_bytes.saturating_add(recurrent_bytes)
         } else {
             0
@@ -1141,8 +1150,7 @@ fn maybe_fill_hybrid_io_from_graph(metadata: &mut InferenceMetadata, model_path:
     let Some(graph_info) = crate::engine::decoder_graph_info_from_model_path(model_path) else {
         return;
     };
-    let Some(io) =
-        onnx_genai_genai_config::GenAiConfig::derive_model_io_spec_from_graph(&graph_info)
+    let Some(io) = onnx_genai_genai_config::GenAiConfig::derive_decoder_abi_from_graph(&graph_info)
     else {
         return;
     };

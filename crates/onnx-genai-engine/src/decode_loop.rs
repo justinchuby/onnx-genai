@@ -282,7 +282,11 @@ pub(crate) fn commit_selected_token(
         state.generated_text.push_str(&token_text);
     }
     let finish_reason = if chain.is_empty() {
-        (options.stop_on_eos && options.eos_token_id == Some(token_id))
+        // Same question, same answer as the processor path below: a model with
+        // several end tokens must stop on any of them whether or not a
+        // processor chain happens to be configured.
+        options
+            .terminates(token_id)
             .then_some(FinishReason::EosToken)
     } else {
         let context = ProcessorContext {

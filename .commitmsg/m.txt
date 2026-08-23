@@ -1,53 +1,69 @@
-fix(metadata): a package with many graphs is not a single decoder
+fix(engine): a model with several end tokens stops on any of them
 
-Auditing our published Hugging Face packages for the migration workstream found
-a defect no in-repo fixture had the shape to catch.
+Multi-EOS was broken in three independent places, and the failure was silent:
+generation ran past its end and emitted control tokens as ordinary text, which
+reads like the model rambling rather than like a runtime dropping a
+declaration. Muse-Glimmer needs both `<|eot|>` and `<|eom|>`.
 
-`justinchuby/sensenova-u1.5-8b-mot-onnx-canonical` declares 187 components, 186
-of them ONNX graphs. Exactly one — its text head — carries `token_ids`/`logits`
-roles, because that is what a text head is. `is_single_decoder_workflow` asked
-`sole_decoder_component(..).is_some()`, which is the question "*which* component
-is the decoder" and is deliberately answerable for composite packages: that
-resolver exists precisely so a vision-language package can name its decoder.
-Reusing it as "is this package *only* a decoder" answered yes for that package,
-and the loader would have handed 186 graphs to the fused single-graph executor
-that can run one. Every VLM classified the same way — the repo's own
-`onnx_genai_workflows/vlm` fixture included.
+**1. A package could not express the set.** `literal_shape` resolved every
+symbolic axis to 1, so a `[eos_count]` contract with a two-element literal
+failed with "declares 2 elements but its contract holds 1" — a package
+describing itself correctly was unloadable. The singleton guess is right for a
+*scalar* literal, which nothing else sizes; an **element list carries its own
+extent**, and discarding it threw away the only information available. When
+exactly one axis is symbolic the list now divides out the fixed axes to size it.
+With more than one unbound axis the split is genuinely ambiguous, so the guess
+stands and the caller gets the element-count error, which names the real
+problem.
 
-The predicate now asks what the phrase means: does this workflow execute **one**
-ONNX graph? Components the runtime implements (`binding`, such as the token
-policy) are not graphs and do not count. Pinned by
-`a_multi_component_package_is_not_a_single_decoder` over five fixtures spanning
-both answers.
+**2. The declaration was dead.** `package.eos_ids` was a name a fixture used;
+nothing read it. There is now a semantic role, `eos_token_ids`, so a package
+declares its stop condition where it declares everything else, and
+`declared_eos_token_ids` reads it into the stop policy. A package shipping no
+tokenizer side-files still stops correctly. The package's ids and the
+tokenizer's are merged (package first) so neither source can silently drop the
+other's.
 
-**`validate_metadata` gains `--metadata-only` and `--shape`.** Full package
-validation requires every artifact to be present, which is right for a runtime
-and useless for a publisher: the package this bug was found in is 49 GB, and
-requiring its weights before its metadata could be checked would mean nobody
-checks metadata before uploading it. `--shape` reports single-decoder vs
-composite vs no-workflow, which is the triage question when migrating a fleet —
-and is how the misclassification became visible.
+**3. The policy compared one id.** `options.eos_token_id == Some(token)`
+appeared in three places — the processor path, the no-chain fast path in
+`decode_loop`, and the constraint processor's `is_eos`, which decides whether a
+grammar may finish. Each was a separate answer to the same question, and a
+grammar treating a model's second end token as ordinary text while the loop
+treated it as terminal is exactly the kind of disagreement that is impossible to
+debug from the output. `GenerateOptions::terminates` is now the single decision
+and all three call it.
 
-**New: `docs/genai/CANONICAL_SINGLE_DECODER_PACKAGE.md`.** The authoring
-reference the HF workstream needs: the shape in one picture, the five rules that
-are easy to get wrong (roles name ports; state is declared once; a fixed-capacity
-cache is not also growing pairs; the token policy is a binding; declare your
-capabilities), what "single decoder" means to the runtime and why it is narrower
-than "has a decoder", and the convert/validate/republish workflow.
+`eos_token_id` keeps its meaning as the id a result *reports* and a caller's
+addition to the set — it does not narrow it. A model's end tokens are facts
+about the model; a request cannot make the runtime emit one as text.
 
-**Published-package audit — no metadata replacement required.** Recorded in that
-document with revisions and a reproduction recipe:
+An earlier attempt routed the extra ids through `stop_sequences`. That stopped
+generation but reported `FinishReason::StopSequence`, which tells a caller
+"you hit a stop string" when the model ended its own output. Reusing an
+adjacent mechanism produced the right control flow and the wrong answer, so the
+policy carries the set instead.
 
-* `justinchuby/sensenova-u1.5-8b-mot-onnx-canonical` @ `541afaea1` — already
-  canonical, validates against this branch, correctly composite.
-* `justinchuby/gemma-4-e2b-it-onnx` @ `9bcf2cb1c` — 13 variants of
-  `genai_config.json`, a foreign format the importer converts. Unaffected.
+The importer and the migration tool both carry every id across:
+`genai_config.json` already normalizes a scalar or an array, and the converter
+reads the package's generation defaults.
 
-Third-party models we consume are not ours to republish and ship formats this
-change does not touch.
+**Tests** (`tests/multi_eos.rs`, 4 cases): a package can declare several ids at
+all (the `literal_shape` regression); each declared id stops generation, once at
+the first generated token to exercise prefill and once at a later token to
+exercise cached decode; a request naming one id does not disarm the others (the
+Muse-Glimmer shape); and the declaration survives a session.
 
-Verified: 73/73 engine targets; 57/57 across metadata, scheduler, ort,
-genai-config, model-package, preprocess, CLI, C API and server — exit 0; fmt;
-clippy `-D warnings`; goldens byte-identical.
+Also: the last stale `model_io` identifiers are renamed
+(`derive_model_io_spec_from_graph` → `derive_decoder_abi_from_graph`, and the
+locals in `engine/load.rs`). No `io:` key exists anywhere in the repository, and
+the only remaining mentions of the retired block are the rejection that explains
+it and the migration guidance that names the conversion.
+
+Verified: 74/74 engine targets; downstream metadata, scheduler, ort,
+genai-config, model-package, preprocess, CLI, C API, onnx-std green — the one
+server failure is the known `stalled_output_route_does_not_block_another_completion`
+load-flake, 3/3 in isolation; H200 CUDA — multi_eos 4,
+canonical_execution_parity 8, native_workflow_parity 12, one_runtime_e2e 5,
+real-model corpus 5; fmt; clippy `-D warnings`; goldens byte-identical.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>

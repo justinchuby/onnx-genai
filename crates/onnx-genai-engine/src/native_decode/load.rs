@@ -462,7 +462,7 @@ impl NativeDecodeSession {
             inputs: session.inputs().iter().map(to_graph_tensor).collect(),
             outputs: session.outputs().iter().map(to_graph_tensor).collect(),
         };
-        onnx_genai_genai_config::GenAiConfig::derive_model_io_spec_from_graph(&graph).filter(
+        onnx_genai_genai_config::GenAiConfig::derive_decoder_abi_from_graph(&graph).filter(
             |derived| {
                 derived
                     .state_pairs

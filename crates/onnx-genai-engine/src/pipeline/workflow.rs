@@ -2993,6 +2993,13 @@ fn workflow_request_value(
         RuntimeInputRole::MaxIterations | RuntimeInputRole::MaxOutputTokens => {
             scalar_i64(request.options.max_new_tokens as i64).map(Some)
         }
+        // A request may narrow the package's EOS set; when it says nothing the
+        // package's own declared literal stands, which is why this yields
+        // `None` rather than an empty tensor that would mean "nothing stops".
+        RuntimeInputRole::EosTokenIds => match request.options.eos_token_id {
+            Some(id) => Ok(Some(Value::from_slice_i64(&[i64::from(id)], &[1])?)),
+            None => Ok(None),
+        },
         RuntimeInputRole::Seed => {
             scalar_i64(request.options.seed.unwrap_or_default() as i64).map(Some)
         }
@@ -3095,7 +3102,7 @@ fn workflow_literal_value(
     literal: &LiteralValue,
     contract: &TensorContract,
 ) -> anyhow::Result<Value> {
-    let shape = literal_shape(contract)?;
+    let shape = literal_shape(literal, contract)?;
     workflow_literal_value_with_shape(literal, contract, &shape)
 }
 
@@ -3335,22 +3342,57 @@ fn typed_image_bytes<T, const N: usize>(
     Value::from_raw_bytes(bytes, shape, dtype).map_err(Into::into)
 }
 
-fn literal_shape(contract: &TensorContract) -> anyhow::Result<Vec<i64>> {
+/// Concrete shape for a literal, given what the literal itself says.
+///
+/// A symbolic axis has no extent until something binds it. For a *scalar*
+/// literal nothing does, so the axis starts as a singleton and later
+/// request/component values unify the shared symbol.
+///
+/// An **element list is different: it carries its own extent.** A package that
+/// declares `[eos_token_ids]` and lists two ids has stated the axis is 2, and
+/// guessing 1 discards the only information available — which is why a
+/// multi-EOS package failed with "declares 2 elements but its contract holds 1"
+/// against a shape it had described correctly. When exactly one axis is
+/// symbolic, the list divides out the fixed axes to size it. With more than one
+/// unbound axis the split is genuinely ambiguous, so the singleton guess stands
+/// and the caller gets the element-count error, which names the real problem.
+fn literal_shape(literal: &LiteralValue, contract: &TensorContract) -> anyhow::Result<Vec<i64>> {
     let Some(shape) = &contract.shape else {
         if contract.rank == 0 {
             return Ok(Vec::new());
         }
         anyhow::bail!("literal workflow input requires a fully declared shape");
     };
-    shape
+    let symbolic_axes = shape
+        .iter()
+        .filter(|dimension| matches!(dimension, TensorDimension::Symbol(_)))
+        .count();
+    let fixed_extent: i64 = shape
+        .iter()
+        .filter_map(|dimension| match dimension {
+            TensorDimension::Fixed(value) => Some(*value),
+            TensorDimension::Symbol(_) => None,
+        })
+        .product();
+    let symbolic_extent = match literal {
+        LiteralValue::Elements(elements) if symbolic_axes == 1 && fixed_extent > 0 => {
+            let elements = elements.len() as i64;
+            anyhow::ensure!(
+                elements % fixed_extent == 0,
+                "workflow literal lists {elements} elements, which does not divide evenly \
+                 across the contract's fixed axes ({fixed_extent} elements per symbolic step)"
+            );
+            elements / fixed_extent
+        }
+        _ => 1,
+    };
+    Ok(shape
         .iter()
         .map(|dimension| match dimension {
-            TensorDimension::Fixed(value) => Ok(*value),
-            // A scalar literal initializes an otherwise-unbound symbolic axis as a singleton.
-            // Concrete request/component values can subsequently unify shared symbols.
-            TensorDimension::Symbol(_) => Ok(1),
+            TensorDimension::Fixed(value) => *value,
+            TensorDimension::Symbol(_) => symbolic_extent,
         })
-        .collect()
+        .collect())
 }
 
 fn shape_numel(shape: &[i64]) -> usize {

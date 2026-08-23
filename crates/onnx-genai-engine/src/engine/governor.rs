@@ -1035,7 +1035,7 @@ fn governor_tokens_per_page(config: &EngineConfig) -> anyhow::Result<u64> {
     Ok(tokens_per_page)
 }
 
-pub(crate) fn model_io_declares_only_fixed_state(
+pub(crate) fn decoder_abi_declares_only_fixed_state(
     io: Option<&onnx_genai_metadata::DecoderAbi>,
 ) -> bool {
     let Some(io) = io else {
@@ -1537,7 +1537,7 @@ mod tests {
         }))
         .unwrap();
 
-        assert!(model_io_declares_only_fixed_state(Some(&io)));
+        assert!(decoder_abi_declares_only_fixed_state(Some(&io)));
         let kv_config = governor_no_paged_kv_config(&EngineConfig::default()).unwrap();
         assert_eq!(kv_config.page_size_bytes, None);
         assert!(!kv_config.page_geometry_required);

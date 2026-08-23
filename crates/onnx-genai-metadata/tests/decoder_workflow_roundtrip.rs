@@ -121,6 +121,7 @@ fn rebuilding_each_package_reproduces_its_abi() {
             "model.onnx",
             &DecoderFacts {
                 max_sequence_length: None,
+                eos_token_ids: Vec::new(),
                 port_contracts,
             },
         )

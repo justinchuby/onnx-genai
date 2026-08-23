@@ -135,6 +135,16 @@ fn migrate(package: &Path, check_only: bool, abi_path: Option<&Path>) -> Fallibl
         // cache discipline, and a contract that disagrees with the graph is
         // rejected at load — so the conversion asks the artifact rather than
         // assuming.
+        // Carried across from the package's own generation defaults, so a
+        // model with several end tokens keeps all of them. Losing every id but
+        // the first is silent: generation simply runs past its end.
+        eos_token_ids: document
+            .get("generation")
+            .and_then(|generation| generation.get("defaults"))
+            .and_then(|defaults| defaults.get("eos_token_ids"))
+            .and_then(serde_yaml::Value::as_sequence)
+            .map(|ids| ids.iter().filter_map(serde_yaml::Value::as_i64).collect())
+            .unwrap_or_default(),
         port_contracts: onnx_genai_engine::graph_port_contracts(
             &package_directory(package).join(&artifact),
         )

@@ -1164,9 +1164,22 @@ pub struct GenerateOptions {
     pub seed: Option<u64>,
     /// Text or token sequences that terminate generation when matched as a suffix.
     pub stop_sequences: Vec<StopSequence>,
-    /// Optional EOS token id.
+    /// The end token a finished result reports, and a caller's optional
+    /// request-level addition to the model's own set.
+    ///
+    /// A single id cannot describe a model that ends a turn with one token and
+    /// a message with another, so it is not what decides termination —
+    /// [`Self::eos_token_ids`] is. This names which id a caller cares about and
+    /// which one `FinishReason::EosToken` refers to.
     pub eos_token_id: Option<TokenId>,
-    /// Whether matching `eos_token_id` terminates generation.
+    /// Every token id that ends generation.
+    ///
+    /// Resolved by the engine from the package's declared `eos_token_ids` and
+    /// its tokenizer, then extended by [`Self::eos_token_id`]. This is the
+    /// authority; [`Self::terminates`] is the only thing that reads it, so
+    /// there is one place the question is answered.
+    pub eos_token_ids: Vec<TokenId>,
+    /// Whether an end token terminates generation.
     pub stop_on_eos: bool,
     /// Optional maximum total context length (prompt + generated tokens).
     /// Used when model metadata does not declare `model.max_sequence_length`.
@@ -1215,6 +1228,7 @@ impl Default for GenerateOptions {
             seed: None,
             stop_sequences: Vec::new(),
             eos_token_id: None,
+            eos_token_ids: Vec::new(),
             stop_on_eos: true,
             max_context: None,
             num_speculative_tokens: None,
@@ -1259,6 +1273,19 @@ pub struct SamplingOverrides {
 }
 
 impl GenerateOptions {
+    /// Whether `token` ends generation.
+    ///
+    /// The single place that question is answered, so the fast path, the
+    /// batched path and the speculative verifier cannot disagree about whether
+    /// a model has finished. A model's declared end tokens all terminate; a
+    /// caller's `eos_token_id` extends that set rather than narrowing it,
+    /// because the model's end tokens are facts about the model and emitting
+    /// one as ordinary text is never what a caller meant.
+    pub fn terminates(&self, token: TokenId) -> bool {
+        self.stop_on_eos
+            && (self.eos_token_ids.contains(&token) || self.eos_token_id == Some(token))
+    }
+
     /// Whether token selection is greedy: the maximum logit wins, deterministically.
     ///
     /// `temperature == 0.0` means the same thing as `greedy` -- a zero-temperature
