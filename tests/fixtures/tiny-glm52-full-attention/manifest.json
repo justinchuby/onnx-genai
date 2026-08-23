@@ -3,17 +3,16 @@
   "mobius_commit": "d33c33b347bac987cbeff52dca6c1d595ac7780f",
   "seed": 0,
   "architecture": "glm_moe_dsa",
-  "use_dsa": true,
+  "use_dsa": false,
   "emission": [
-    "pkg.nxrt::IndexShare",
     "com.microsoft::QMoE"
   ],
   "prompt_ids": [
     123
   ],
   "files": {
-    "model.onnx.textproto": 850675,
-    "inference_metadata.yaml": 37460,
+    "model.onnx.textproto": 729692,
+    "inference_metadata.yaml": 37448,
     "tokenizer.json": 4680
   }
 }

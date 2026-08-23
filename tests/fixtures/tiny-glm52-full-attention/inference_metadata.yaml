@@ -666,7 +666,7 @@ pipeline:
               rank: 2
               shape:
               - batch
-              - past_sequence_len + sequence_len
+              - past_seq_len + seq_len
               batch_layout:
                 kind: request_aligned
                 axis: 0
@@ -719,9 +719,9 @@ pipeline:
               rank: 4
               shape:
               - batch
-              - 1
+              - 4
               - past_sequence_len
-              - 104
+              - 24
               batch_layout:
                 kind: request_aligned
                 axis: 0
@@ -730,9 +730,9 @@ pipeline:
               rank: 4
               shape:
               - batch
-              - 1
+              - 4
               - past_sequence_len
-              - 64
+              - 16
               batch_layout:
                 kind: request_aligned
                 axis: 0
@@ -741,9 +741,9 @@ pipeline:
               rank: 4
               shape:
               - batch
-              - 1
+              - 4
               - past_sequence_len
-              - 96
+              - 24
               batch_layout:
                 kind: request_aligned
                 axis: 0
@@ -752,9 +752,9 @@ pipeline:
               rank: 4
               shape:
               - batch
-              - 1
+              - 4
               - past_sequence_len
-              - 64
+              - 16
               batch_layout:
                 kind: request_aligned
                 axis: 0
@@ -1139,9 +1139,9 @@ pipeline:
           rank: 4
           shape:
           - batch
-          - 1
+          - 4
           - past_sequence_len
-          - 104
+          - 24
           batch_layout:
             kind: request_aligned
             axis: 0
@@ -1160,9 +1160,9 @@ pipeline:
           rank: 4
           shape:
           - batch
-          - 1
+          - 4
           - past_sequence_len
-          - 64
+          - 16
           batch_layout:
             kind: request_aligned
             axis: 0
@@ -1181,9 +1181,9 @@ pipeline:
           rank: 4
           shape:
           - batch
-          - 1
+          - 4
           - past_sequence_len
-          - 96
+          - 24
           batch_layout:
             kind: request_aligned
             axis: 0
@@ -1202,9 +1202,9 @@ pipeline:
           rank: 4
           shape:
           - batch
-          - 1
+          - 4
           - past_sequence_len
-          - 64
+          - 16
           batch_layout:
             kind: request_aligned
             axis: 0

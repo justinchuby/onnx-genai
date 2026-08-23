@@ -41,7 +41,14 @@ impl NativeProposerSession {
             NativeDecodeDevice::Cuda { index } => DevicePreference::Gpu { index },
             NativeDecodeDevice::Plugin { .. } => DevicePreference::Cpu,
         };
-        let mut builder = InferenceSession::builder().model(path).device(preference);
+        let mut builder = InferenceSession::builder()
+            .model(path)
+            .device(preference)
+            // See the `.option("optimization", "basic")` rationale in
+            // `native_decode/load.rs`'s `load_with_weight_offload_host_cache`:
+            // quantized MoE weight relayouts need constant folding before
+            // weight-placement analysis runs.
+            .option("optimization", "basic");
         if let NativeDecodeDevice::Plugin {
             library,
             registration_name,

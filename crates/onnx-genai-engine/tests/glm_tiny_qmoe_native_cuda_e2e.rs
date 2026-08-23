@@ -27,7 +27,26 @@ use onnx_genai_engine::{
     SpeculativeMode,
 };
 
-const ANCHOR_IDS: &[u32] = &[62, 164, 59, 205, 48, 166, 27, 9, 221, 190, 123, 108];
+const ANCHOR_IDS: &[u32] = &[33, 221, 186, 142, 162, 143, 148, 18, 18, 18, 18, 18];
+
+/// Resolve the fixture's model file. The repo's convention (see
+/// `.gitignore`'s `*.onnx` rule with a `!**/*.onnx.textproto` carve-out) is
+/// to commit only the self-contained, git-friendly `model.onnx.textproto`
+/// twin -- never the binary `model.onnx` -- so a fresh checkout only ever has
+/// the `.textproto`. Binary `model.onnx` is still accepted for callers who
+/// point `GLM_TINY_QMOE_E2E_DIR` at a locally-regenerated, not-yet-converted
+/// fixture directory.
+fn resolve_model_path(dir: &Path) -> Option<PathBuf> {
+    let onnx = dir.join("model.onnx");
+    if onnx.is_file() {
+        return Some(onnx);
+    }
+    let textproto = dir.join("model.onnx.textproto");
+    if textproto.is_file() {
+        return Some(textproto);
+    }
+    None
+}
 
 fn fixture_dir() -> Option<PathBuf> {
     let dir = std::env::var_os("GLM_TINY_QMOE_E2E_DIR")
@@ -36,27 +55,22 @@ fn fixture_dir() -> Option<PathBuf> {
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../tests/fixtures/tiny-glm52-qmoe-indexshare")
         });
-    let required = [
-        "model.onnx",
-        "model.onnx.data",
-        "inference_metadata.yaml",
-        "tokenizer.json",
-    ];
-    let missing: Vec<_> = required
-        .iter()
-        .filter(|name| !dir.join(name).is_file())
-        .collect();
+    let mut missing: Vec<String> = Vec::new();
+    if resolve_model_path(&dir).is_none() {
+        missing.push("model.onnx or model.onnx.textproto".to_string());
+    }
+    for name in ["inference_metadata.yaml", "tokenizer.json"] {
+        if !dir.join(name).is_file() {
+            missing.push(name.to_string());
+        }
+    }
     if missing.is_empty() {
         Some(dir)
     } else {
         eprintln!(
             "skipping GLM-5.2 native eager regression: fixture {} is missing {}",
             dir.display(),
-            missing
-                .iter()
-                .map(|name| name.as_ref())
-                .collect::<Vec<&str>>()
-                .join(", ")
+            missing.join(", ")
         );
         None
     }
@@ -83,7 +97,8 @@ fn generate(engine: &mut Engine) -> anyhow::Result<Vec<u32>> {
 }
 
 fn assert_current_emission(dir: &Path) -> anyhow::Result<()> {
-    let model = dir.join("model.onnx");
+    let model = resolve_model_path(dir)
+        .ok_or_else(|| anyhow::anyhow!("{} has no model.onnx(.textproto)", dir.display()))?;
     let graph = onnx_runtime_loader::load_model(&model)?;
     assert_eq!(
         graph
