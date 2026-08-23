@@ -178,10 +178,38 @@ fn parse_decode_blocktime(raw: Option<&str>) -> Duration {
 
 /// Spin iterations the (single, never-idle) dispatcher busy-waits on the
 /// completion counters before yielding. The dispatcher runs the barrier inline
-/// and needs the workers' results the instant they land, so it spins rather than
-/// parks; the yield after the budget only lets a descheduled straggler worker get
-/// a core under oversubscription.
+/// and needs the workers' results the instant they land, so it spins before it
+/// yields; the yields after the budget let a descheduled straggler worker get a
+/// core under oversubscription, and are themselves bounded by
+/// [`dispatcher_yields_before_park`].
 const DISPATCHER_SPIN_BEFORE_YIELD: u32 = 1 << 12;
+
+/// Default number of `sched_yield` calls the dispatcher makes, after its spin
+/// budget, before parking on the completion futex.
+///
+/// This covers the case the yield backstop actually exists for -- a straggler
+/// that is merely descheduled and needs a core to finish a shard that is nearly
+/// done -- while bounding the cost when the shard is genuinely long. At roughly
+/// a microsecond per yield on an idle core this is a window of order 100 us,
+/// two orders of magnitude below the millisecond-scale dispatches where the
+/// unbounded loop was burning a whole core, and comfortably above the wake
+/// latency a park pays to replace it.
+const DEFAULT_DISPATCHER_YIELDS_BEFORE_PARK: u32 = 128;
+
+/// Env override for [`DEFAULT_DISPATCHER_YIELDS_BEFORE_PARK`]. `0` parks as soon
+/// as the spin budget is exhausted; a very large value restores the historical
+/// never-park behaviour. Latched once per process, like the blocktime.
+const DISPATCHER_YIELDS_ENV: &str = "ONNX_GENAI_CPU_DECODE_DISPATCHER_YIELDS";
+
+fn dispatcher_yields_before_park() -> u32 {
+    static V: OnceLock<u32> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var(DISPATCHER_YIELDS_ENV)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u32>().ok())
+            .unwrap_or(DEFAULT_DISPATCHER_YIELDS_BEFORE_PARK)
+    })
+}
 
 /// Default number of dynamic tiles per resident worker in work-stealing mode.
 /// One tile per worker preserves the coarse MLAS QNBit shard size that made
@@ -378,6 +406,17 @@ struct SharedState {
     /// enters [`SharedState::worker_wait`], so it has no entry here.
     worker_counters: Vec<Padded<WorkerCounters>>,
     dispatch_counters: Padded<DispatchCounters>,
+    /// Bumped by the worker that retires the last outstanding shard of an op, so
+    /// a dispatcher that parked in [`SharedState::wait`] can be woken.
+    ///
+    /// Separate from `node_sense`, which runs the other direction (dispatcher to
+    /// workers). Only the *last* worker of an op touches this, so it is one
+    /// extra RMW per dispatch, not per worker.
+    completion_sense: Padded<AtomicU32>,
+    /// Set while the dispatcher is parked, or committed to parking, on
+    /// `completion_sense`. Lets the completing worker skip the `wake` syscall
+    /// entirely in the common case where the dispatcher is still spinning.
+    dispatcher_parked: Padded<AtomicBool>,
 }
 
 // SAFETY: `job` is a raw pointer guarded by the publish/observe protocol on
@@ -420,32 +459,109 @@ impl SharedState {
     ///
     /// There is exactly one dispatcher at a time -- enforced by
     /// [`SharedState::dispatching`], which callers claim through
-    /// [`DispatchClaim::try_claim`] before publishing. It is never idle and
-    /// needs the results the instant they land, so it spins (with a yield
-    /// backstop for stragglers under oversubscription) rather than parking.
+    /// [`DispatchClaim::try_claim`] before publishing. It wants the results the
+    /// instant they land, so it spins first; but it must not spin *forever*.
+    ///
+    /// # Why this parks
+    ///
+    /// This loop used to call `thread::yield_now()` on **every** iteration once
+    /// past `DISPATCHER_SPIN_BEFORE_YIELD`, with no upper bound -- so the
+    /// dispatcher hammered `sched_yield` for the entire remaining duration of
+    /// every dispatch it did not win the race on. That is a syscall storm
+    /// proportional to the shard length, not to the wake latency it was there to
+    /// hide. Measured on llama int4 `accuracy_level=0` decode, zero inter-token
+    /// gap, one worker per physical core, quiet host:
+    ///
+    /// | width | wall ms/token | **sys** ms/token | dispatches/token |
+    /// |---|---|---|---|
+    /// | 2 | 35.7 | **16.0** | 5 |
+    /// | 3 | 23.9 | **12.0** | 5 |
+    /// | 4 | 18.0 | **10.2** | 5 |
+    ///
+    /// At width 2 that is 3.2 ms of kernel time per dispatch against a ~7 ms
+    /// dispatch -- an entire core burned in the scheduler, producing nothing.
+    ///
+    /// Note this is *not* the same loop as [`SharedState::worker_wait`], where
+    /// substituting spinning for yielding was measured to be a wash (kernel time
+    /// down, user time up by the same amount, total CPU flat). That result does
+    /// not transfer: a worker that stops yielding still burns its core in user
+    /// mode, whereas a dispatcher that *parks* burns nothing at all. Spinning
+    /// harder here would only relabel the waste from `sys` to `user`.
+    ///
+    /// So the escalation is now bounded: spin, then a fixed number of yields to
+    /// cover the short waits that a park would only slow down, then park on
+    /// `completion_sense` until the last worker retires the op. The yield budget
+    /// is [`dispatcher_yields_before_park`].
     fn wait(&self) {
+        self.wait_with_yield_budget(dispatcher_yields_before_park());
+    }
+
+    fn wait_with_yield_budget(&self, yield_budget: u32) {
         let mut spins = 0u32;
         let mut yielded = false;
+        let mut yields = 0u32;
         loop {
-            let done = self
-                .node_pending
-                .iter()
-                .all(|counter| counter.0.load(Ordering::Acquire) == 0);
-            if done {
+            if self.all_workers_done() {
                 return;
             }
             std::hint::spin_loop();
             spins = spins.wrapping_add(1);
-            if spins >= DISPATCHER_SPIN_BEFORE_YIELD {
-                if !yielded {
-                    yielded = true;
-                    self.dispatch_counters
-                        .0
-                        .dispatcher_yields
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                thread::yield_now();
+            if spins < DISPATCHER_SPIN_BEFORE_YIELD {
+                continue;
             }
+            if !yielded {
+                yielded = true;
+                self.dispatch_counters
+                    .0
+                    .dispatcher_yields
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if yields < yield_budget {
+                yields = yields.saturating_add(1);
+                thread::yield_now();
+                continue;
+            }
+            self.park_until_complete();
+        }
+    }
+
+    fn all_workers_done(&self) -> bool {
+        self.node_pending
+            .iter()
+            .all(|counter| counter.0.load(Ordering::Acquire) == 0)
+    }
+
+    /// Block on `completion_sense` until a worker signals that the op is done.
+    ///
+    /// The handshake with [`SharedState::signal_completion`] is the standard
+    /// two-sided futex protocol, and both sides need `SeqCst` on the
+    /// store-then-load pair or a wakeup can be lost: the dispatcher publishes
+    /// `dispatcher_parked` then reads `completion_sense`, while the worker
+    /// publishes `completion_sense` then reads `dispatcher_parked`. If either
+    /// side's store were allowed to sink past its load, both could conclude the
+    /// other had not arrived -- the worker skipping the `wake` while the
+    /// dispatcher commits to the sleep. `atomic_wait::wait` re-checks the value
+    /// under the futex bucket lock, so a bump that lands inside the call itself
+    /// returns immediately rather than sleeping.
+    fn park_until_complete(&self) {
+        let observed = self.completion_sense.0.load(Ordering::SeqCst);
+        self.dispatcher_parked.0.store(true, Ordering::SeqCst);
+        if !self.all_workers_done() && self.completion_sense.0.load(Ordering::SeqCst) == observed {
+            atomic_wait::wait(&self.completion_sense.0, observed);
+        }
+        self.dispatcher_parked.0.store(false, Ordering::SeqCst);
+    }
+
+    /// Called by the worker that brought its node's pending count to zero. Wakes
+    /// a parked dispatcher, and does nothing but one relaxed check when the
+    /// dispatcher is still spinning -- which is the common case.
+    fn signal_completion(&self) {
+        if !self.all_workers_done() {
+            return;
+        }
+        self.completion_sense.0.fetch_add(1, Ordering::SeqCst);
+        if self.dispatcher_parked.0.load(Ordering::SeqCst) {
+            atomic_wait::wake_all(&self.completion_sense.0);
         }
     }
 
@@ -748,6 +864,8 @@ impl SpmdDecodePools {
                 .map(|_| Padded(WorkerCounters::default()))
                 .collect(),
             dispatch_counters: Padded(DispatchCounters::default()),
+            completion_sense: Padded(AtomicU32::new(0)),
+            dispatcher_parked: Padded(AtomicBool::new(false)),
         });
 
         let mut handles = Vec::with_capacity(total_threads);
@@ -1461,10 +1579,12 @@ struct WorkerCompletion<'a> {
 
 impl WorkerCompletion<'_> {
     fn complete(self) {
-        self.shared.node_pending[self.node]
-            .0
-            .fetch_sub(1, Ordering::AcqRel);
+        let shared = self.shared;
+        let node = self.node;
         std::mem::forget(self);
+        if shared.node_pending[node].0.fetch_sub(1, Ordering::AcqRel) == 1 {
+            shared.signal_completion();
+        }
     }
 }
 
@@ -1479,9 +1599,15 @@ impl Drop for WorkerCompletion<'_> {
                 Ordering::Relaxed,
             )
             .ok();
-        self.shared.node_pending[self.node]
+        if self.shared.node_pending[self.node]
             .0
-            .fetch_sub(1, Ordering::AcqRel);
+            .fetch_sub(1, Ordering::AcqRel)
+            == 1
+        {
+            // A panicking worker still has to release a parked dispatcher, or
+            // the poisoned pool would hang instead of reporting.
+            self.shared.signal_completion();
+        }
     }
 }
 
@@ -4799,12 +4925,17 @@ mod dispatch_claim_tests {
         }
     }
 
-    #[test]
-    fn an_uncontended_dispatch_releases_the_claim_for_the_next_one() {
-        let shared = SharedState {
-            node_sense: Vec::new(),
+    /// A `SharedState` with only the barrier fields populated: `pending` workers
+    /// outstanding on a single node, no spawned threads and no job. Enough to
+    /// drive the dispatcher-side publish/wait protocol directly.
+    fn barrier_only_shared_state(pending: usize) -> SharedState {
+        let nodes = usize::from(pending > 0);
+        SharedState {
+            node_sense: (0..nodes).map(|_| Padded(AtomicU32::new(0))).collect(),
             job: UnsafeCell::new(None),
-            node_pending: Vec::new(),
+            node_pending: (0..nodes)
+                .map(|_| Padded(AtomicUsize::new(pending)))
+                .collect(),
             worker_node: Vec::new(),
             ready: AtomicUsize::new(0),
             poisoned_worker: AtomicUsize::new(0),
@@ -4812,7 +4943,85 @@ mod dispatch_claim_tests {
             shutdown: AtomicBool::new(false),
             worker_counters: Vec::new(),
             dispatch_counters: Padded(DispatchCounters::default()),
+            completion_sense: Padded(AtomicU32::new(0)),
+            dispatcher_parked: Padded(AtomicBool::new(false)),
+        }
+    }
+
+    /// The dispatcher must be woken by the worker that retires the last shard.
+    ///
+    /// Asserted through a channel with a timeout rather than by simply calling
+    /// `wait_with_yield_budget` on this thread: a lost wakeup is a *hang*, and a
+    /// hang in CI reads as an infrastructure timeout rather than as this test
+    /// failing. The budget is `0` so the dispatcher parks the moment its spin
+    /// budget is exhausted, which is the path under test; the worker sleeps long
+    /// enough that the dispatcher is reliably asleep before it signals, so the
+    /// wake is genuinely required and not satisfied by the pre-park re-check.
+    ///
+    /// Verified by mutation: deleting the `wake_all` in `signal_completion` makes
+    /// this time out. The `SeqCst` pair is *not* covered -- x86 is TSO, so a
+    /// weakened ordering still passes here and would only fail on a weakly
+    /// ordered target. It is argued for in `park_until_complete`, not asserted.
+    #[test]
+    fn a_parked_dispatcher_is_woken_by_the_last_worker_to_finish() {
+        let shared = std::sync::Arc::new(barrier_only_shared_state(1));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dispatcher = {
+            let shared = std::sync::Arc::clone(&shared);
+            thread::spawn(move || {
+                shared.wait_with_yield_budget(0);
+                let _ = tx.send(());
+            })
         };
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !shared.all_workers_done(),
+            "the fixture must still have the op outstanding, or the dispatcher \
+             would return without ever parking and the test would pass vacuously"
+        );
+        if shared.node_pending[0].0.fetch_sub(1, Ordering::AcqRel) == 1 {
+            shared.signal_completion();
+        }
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("a parked dispatcher must be woken when the op completes");
+        dispatcher.join().expect("dispatcher thread");
+    }
+
+    /// The park must survive many consecutive ops: `completion_sense` is
+    /// monotonic and re-read on every park, so a stale observed value would make
+    /// exactly one of these iterations sleep forever.
+    ///
+    /// Every iteration sleeps before signalling for the same reason the single-op
+    /// test does. Without it the signal usually lands before the dispatcher has
+    /// exhausted its spin budget, `park_until_complete` returns on the pre-park
+    /// re-check, and the loop asserts nothing about waking -- verified: this test
+    /// passed unchanged with `wake_all` deleted until the sleep was added.
+    #[test]
+    fn repeated_parks_never_lose_a_wakeup() {
+        let shared = std::sync::Arc::new(barrier_only_shared_state(1));
+        for _ in 0..16 {
+            shared.node_pending[0].0.store(1, Ordering::Release);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let dispatcher = {
+                let shared = std::sync::Arc::clone(&shared);
+                thread::spawn(move || {
+                    shared.wait_with_yield_budget(0);
+                    let _ = tx.send(());
+                })
+            };
+            thread::sleep(Duration::from_millis(5));
+            if shared.node_pending[0].0.fetch_sub(1, Ordering::AcqRel) == 1 {
+                shared.signal_completion();
+            }
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("every op must release the dispatcher");
+            dispatcher.join().expect("dispatcher thread");
+        }
+    }
+
+    #[test]
+    fn an_uncontended_dispatch_releases_the_claim_for_the_next_one() {
+        let shared = barrier_only_shared_state(0);
         {
             let claim = DispatchClaim::try_claim(&shared)
                 .expect("an unclaimed pool must hand out the claim");
@@ -4832,18 +5041,7 @@ mod dispatch_claim_tests {
 
     #[test]
     fn a_panic_inside_the_critical_section_still_releases_the_claim() {
-        let shared = SharedState {
-            node_sense: Vec::new(),
-            job: UnsafeCell::new(None),
-            node_pending: Vec::new(),
-            worker_node: Vec::new(),
-            ready: AtomicUsize::new(0),
-            poisoned_worker: AtomicUsize::new(0),
-            dispatching: Padded(AtomicBool::new(false)),
-            shutdown: AtomicBool::new(false),
-            worker_counters: Vec::new(),
-            dispatch_counters: Padded(DispatchCounters::default()),
-        };
+        let shared = barrier_only_shared_state(0);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _claim = DispatchClaim::try_claim(&shared).expect("claim available");
             panic!("a worker poisoned the pool");
