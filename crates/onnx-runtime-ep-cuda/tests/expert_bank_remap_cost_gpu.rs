@@ -1142,12 +1142,44 @@ fn print_go_no_go(
     label: &str,
     k: usize,
     median_total_remap_us: f64,
-    qmoe_step_us_range: (f64, f64),
-    step_budget_us: f64,
+    qmoe_layer_kernel_us_range: (f64, f64),
+    whole_token_interval_us: f64,
 ) {
-    // Maximum affordable promotions per token = floor(step_budget / remap_cost).
-    let max_per_token = if median_total_remap_us > 0.0 {
-        (step_budget_us / median_total_remap_us).floor() as usize
+    // NOTE on quantities compared here (see #1823's review finding on #1829):
+    // `qmoe_layer_kernel_us_range` is the wall-clock time of ONE QMoE kernel
+    // invocation for a decode-shaped (rows=1) input -- i.e. one MoE-FFN
+    // layer's forward pass for one token, as measured in #1813
+    // (`.squad/decisions/inbox/deckard-1810-composable-vmm-spike-results.md`,
+    // "median exec (µs)" column). It is NOT a whole decode-step/token
+    // duration; a real model has ~dozens of layers plus attention, norms,
+    // etc. per token.
+    //
+    // `whole_token_interval_us` is an independently measured, real,
+    // end-to-end whole-model decode-step interval for the SAME model
+    // (DeepSeek-V2-Lite int4, CUDA greedy, graph capture ON) from
+    // `.squad/decisions/inbox/gaff-deepseek-v2-mask-graph-capture.md`:
+    // 165.3 tok/s -> ~6.05 ms/token = 6050 µs/token. It is used ONLY as an
+    // upper-bound denominator below, not as a budget: it is a whole-model
+    // number, and any remap must actually fit inside its OWN layer's compute
+    // window (`qmoe_layer_kernel_us_range`), not float freely across the rest
+    // of the token's unrelated work.
+    let (layer_lo_us, layer_hi_us) = qmoe_layer_kernel_us_range;
+
+    // Whether the measured remap cost fits inside a *single MoE layer's own*
+    // QMoE-kernel compute window -- the only budget a per-layer-blocking
+    // remap can actually hide inside. If it does not fit here, no whole-token
+    // arithmetic below can rescue it: the remap still stalls the layer's
+    // critical path.
+    let fits_within_layer_window = median_total_remap_us <= layer_hi_us;
+
+    // Purely arithmetic, NOT-ATTAINABLE upper bound: how many serial remaps
+    // of this cost *would* fit in one whole decode-step interval, IF every
+    // other bit of per-token work (all other layers, attention, norms, host
+    // overhead, ...) were free. This is a ceiling on a hypothetical, not a
+    // real budget -- the real budget for THIS remap is still the single
+    // layer's own compute window above.
+    let unattainable_serial_ceiling_over_whole_token = if median_total_remap_us > 0.0 {
+        (whole_token_interval_us / median_total_remap_us).floor() as usize
     } else {
         usize::MAX
     };
@@ -1158,34 +1190,58 @@ fn print_go_no_go(
         median_total_remap_us
     );
     println!(
-        "  QMoE decode step time (from #1813): {:.0}–{:.0} µs",
-        qmoe_step_us_range.0, qmoe_step_us_range.1
+        "  single QMoE-layer kernel execution time, decode-shaped rows=1 (from #1813): {:.0}–{:.0} µs \
+         [NOT a whole decode-step/token duration]",
+        layer_lo_us, layer_hi_us
     );
-    println!("  assumed step budget: {:.0} µs", step_budget_us);
     println!(
-        "  max affordable per-token granule remaps: {}",
-        max_per_token
+        "  independently measured whole-model decode-step interval (DeepSeek-V2-Lite int4, \
+         CUDA greedy, graph-on, 165.3 tok/s, from gaff-deepseek-v2-mask-graph-capture.md): \
+         {:.0} µs/token (~{:.2} ms/token)",
+        whole_token_interval_us,
+        whole_token_interval_us / 1000.0
+    );
+    println!(
+        "  fits within a single QMoE layer's own compute window ({:.0}µs high end)? {}",
+        layer_hi_us,
+        if fits_within_layer_window {
+            "YES"
+        } else {
+            "NO"
+        }
+    );
+    println!(
+        "  unattainable arithmetic ceiling -- serial remaps of this cost that would fit in one \
+         WHOLE {:.0}µs token interval IF all other per-token work were free (NOT a real budget, \
+         NOT achievable, only an upper bound): {}",
+        whole_token_interval_us, unattainable_serial_ceiling_over_whole_token
     );
 
-    // One expert = granules_per_expert granules; for rough verdict use cost per expert-group.
-    if max_per_token >= k {
+    if !fits_within_layer_window {
         println!(
-            "  VERDICT: potentially PER-TOKEN-AFFORDABLE for k={k} remaps/step at this shape \
-             (max={max_per_token} ≥ k={k}) — but see BOUNDARY-ONLY caveats below."
+            "  VERDICT: this remap ({:.1}µs) exceeds a single QMoE layer's own kernel compute \
+             window ({:.0}–{:.0}µs) and so CANNOT be hidden locally inside that layer's step; \
+             k={k} granule(s) required per remap event. NOT ready for per-token/per-layer remap; \
+             boundary-level only with the current API (see hard blocker below, which applies \
+             independently of any latency arithmetic).",
+            median_total_remap_us, layer_lo_us, layer_hi_us
         );
     } else {
         println!(
-            "  VERDICT: NOT per-token affordable for k={k} remaps/step: \
-             at {:.1}µs/remap only {max_per_token} remaps fit in {:.0}µs budget; \
-             k={k} required. BOUNDARY-ONLY (per N tokens or per safe-point).",
-            median_total_remap_us, step_budget_us
+            "  VERDICT: this remap ({:.1}µs) would fit inside a single QMoE layer's own kernel \
+             compute window ({:.0}–{:.0}µs) for k={k} granule(s) on latency grounds alone -- but \
+             see the independent hard blocker below: NOT ready for per-token; boundary-level only \
+             with the current API regardless of latency.",
+            median_total_remap_us, layer_lo_us, layer_hi_us
         );
     }
     println!(
-        "  BOUNDARY-ONLY caveat: even if the raw µs fits, remap must be synchronized against \
-         all in-flight kernels reading the OLD mapping before proceeding. Production primitives \
-         do NOT currently enforce this ordering automatically — that is a gap requiring a \
-         stream-sync / deferred-release queue integration before per-token remap is safe."
+        "  INDEPENDENT HARD BLOCKER (applies regardless of the latency verdict above): remap \
+         must be synchronized against all in-flight kernels reading the OLD mapping before \
+         proceeding. Production primitives do NOT currently enforce this ordering automatically \
+         (no stream-order guarantee) -- that is a gap requiring stream-sync / deferred-release \
+         queue integration before per-token or dispatch-time remap is safe, independent of \
+         whether the raw µs cost would otherwise fit."
     );
 }
 
@@ -1448,10 +1504,31 @@ fn remap_cost_timing_decomposition_all_configs() {
     let shapes = [QWEN15_MOE_A27B, SYNTH_256_EXPERT];
     let k_values = [1usize, 2, 4, 8];
 
-    // QMoE step time range from #1813 decision doc (µs): ~150–430 for these shapes.
-    let qmoe_step_range = (150.0_f64, 430.0_f64);
-    // Conservative step budget = low end (most constrained shape).
-    let step_budget_us = qmoe_step_range.0;
+    // Single QMoE-kernel invocation time (one MoE-FFN layer, decode-shaped
+    // rows=1 input) from #1813's decision doc
+    // (`.squad/decisions/inbox/deckard-1810-composable-vmm-spike-results.md`,
+    // "median exec (µs)" column): ~150–430 µs for the Qwen1.5-MoE-A2.7B and
+    // DeepSeek-V2-Lite shapes measured there. This is ONE LAYER's kernel
+    // time, not a whole decode-step/token duration -- see `print_go_no_go`'s
+    // doc comment for why the two must not be conflated.
+    //
+    // NOTE: #1813 measured this range for 60-64-expert shapes
+    // (Qwen1.5-MoE-A2.7B, DeepSeek-V2-Lite). It was NOT independently
+    // measured for the 256-expert synthetic shape used elsewhere in this
+    // benchmark; applying it to that shape too is a plausible assumption
+    // (decode-shaped QMoE execution only touches top_k experts regardless of
+    // total expert count) rather than a directly-measured fact for that row.
+    let qmoe_layer_kernel_range = (150.0_f64, 430.0_f64);
+
+    // Independently measured whole-model decode-step interval for
+    // DeepSeek-V2-Lite int4 (CUDA greedy, graph capture ON), from
+    // `.squad/decisions/inbox/gaff-deepseek-v2-mask-graph-capture.md`:
+    // 165.3 tok/s -> ~6.05 ms/token = 6050 µs/token. Used ONLY as the
+    // denominator for an explicitly-labeled, NOT-attainable arithmetic
+    // ceiling in `print_go_no_go` -- never as a per-remap budget. The real
+    // budget for a per-layer-blocking remap is that layer's own compute
+    // window (`qmoe_layer_kernel_range`), not the whole token's interval.
+    let whole_token_interval_us = 6_050.0_f64;
 
     println!(
         "\n=== Remap Cost Benchmark — {} steps, {} runs, {} shapes, {} K values ===",
@@ -1554,8 +1631,8 @@ fn remap_cost_timing_decomposition_all_configs() {
                     &format!("{} {trace_name}", shape.name),
                     k,
                     med_total,
-                    qmoe_step_range,
-                    step_budget_us,
+                    qmoe_layer_kernel_range,
+                    whole_token_interval_us,
                 );
             }
         }
