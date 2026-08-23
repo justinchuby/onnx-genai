@@ -3027,7 +3027,13 @@ mod tests {
             let core_count = cores.leaders_within(&planned).len();
             let mut seen_cores = std::collections::BTreeSet::new();
             for &cpu in &shards[0].cpus[..core_count] {
-                let core = cores.leaders_within(&[cpu]).first().copied().unwrap_or(cpu);
+                // Identify the core by its sibling group, not by
+                // `leaders_within(&[cpu])` -- that answers "the leader among
+                // *these* CPUs" and so returns `cpu` itself for a one-element
+                // slice, which would make this check vacuously pass.
+                let core: Vec<usize> = cores
+                    .siblings_of(cpu)
+                    .map_or_else(|| vec![cpu], <[usize]>::to_vec);
                 assert!(
                     seen_cores.insert(core),
                     "cpu {cpu} shares a physical core with an earlier pin target in {:?}",
