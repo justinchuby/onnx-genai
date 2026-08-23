@@ -279,6 +279,18 @@ Unpacked:
      on both arms passes it wholesale. It is what lets you keep measuring on a
      shared box instead of waiting for a quiet one that never arrives, not a
      substitute for the interleaving.
+  3. **Better still, measure foreign CPU on your own core set.** #1814 landed
+     `benches/common/host_contention.rs` on `main` after this table was taken.
+     It reads busy jiffies on the process's `Cpus_allowed_list` and subtracts
+     the process's own CPU, so the remainder is *foreign load on the cores you
+     were actually confined to*. That closes the hole in the guard above
+     directly: contention landing evenly on both arms is invisible to a
+     differential CPU-efficiency check but shows up here as a positive foreign
+     column. It also demonstrates why the host-level gates are insufficient —
+     one foreign thread on a 32-CPU box does not move `/proc/loadavg` field 4,
+     yet on a barrier-synchronised dispatch it cost a clean 2× at N=2. The
+     tables below predate it and were guarded by the weaker method; a
+     re-measurement should use it.
 - **At a stated width.** The verdict is a function of how many cores the process
   is given, for the reason in the previous bullet: the two routes do not scale
   alike. Measured directly, six idle physical cores in one L3 domain against all
