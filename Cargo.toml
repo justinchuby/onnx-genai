@@ -26,6 +26,7 @@ members = [
     "crates/onnx-runtime-memory-api",
     "crates/onnx-runtime-memory-governor",
     "crates/onnx-runtime-cpuinfo",
+    "crates/onnx-runtime-hostmon",
     "crates/onnx-runtime-loader",
     "crates/onnx-model-package",
     "crates/onnx-runtime-shape-inference",
@@ -113,6 +114,7 @@ default-members = [
     "crates/onnx-runtime-memory-abi",
     "crates/onnx-runtime-memory-host",
     "crates/onnx-runtime-cpuinfo",
+    "crates/onnx-runtime-hostmon",
     "crates/onnx-runtime-loader",
     "crates/onnx-model-package",
     "crates/onnx-runtime-shape-inference",
@@ -214,6 +216,7 @@ onnx-runtime-cuda-memory = { path = "crates/onnx-runtime-cuda-memory", version =
 onnx-runtime-memory-api = { path = "crates/onnx-runtime-memory-api", version = "=0.1.0-dev.5" }
 onnx-runtime-memory-governor = { path = "crates/onnx-runtime-memory-governor", version = "=0.1.0-dev.5" }
 onnx-runtime-cpuinfo = { path = "crates/onnx-runtime-cpuinfo", version = "=0.1.0-dev.5" }
+onnx-runtime-hostmon = { path = "crates/onnx-runtime-hostmon", version = "=0.1.0-dev.5" }
 onnx-runtime-loader = { path = "crates/onnx-runtime-loader", version = "=0.1.0-dev.5" }
 onnx-model-package = { path = "crates/onnx-model-package", version = "=0.1.0-dev.5" }
 onnx-runtime-shape-inference = { path = "crates/onnx-runtime-shape-inference", version = "=0.1.0-dev.5" }

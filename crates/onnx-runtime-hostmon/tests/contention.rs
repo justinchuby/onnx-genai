@@ -1,17 +1,19 @@
-//! Tests for `benches/common/host_contention.rs`.
+//! Tests for the contention measurement.
 //!
-//! They live here rather than in a `#[cfg(test)]` module beside the code for a
-//! specific reason. Every bench target in this crate is declared
-//! `harness = false`, so `cargo test --bench <name>` *runs the benchmark* and
-//! never runs a test module inside it, and when such a module is compiled as
-//! part of a `harness = false` bench its `#[test]` functions are stripped. Tests
-//! written next to that module are therefore compiled-and-discarded: they can
-//! only ever pass, because they never run. That is exactly the failure the
-//! module itself exists to prevent one level up -- a number that was never
-//! measured -- so it would be a poor place to keep its own tests.
+//! These are integration tests against the crate's public API rather than a
+//! `#[cfg(test)]` module inside `lib.rs`, because every consumer reaches this
+//! code the same way -- across the crate boundary -- and a test that can see
+//! private items can pass on a surface no caller can actually use.
+//!
+//! They previously lived in `onnx-runtime-ep-cpu/tests/` and pulled the module
+//! in through a `#[path]` include, because the code sat inside a bench target
+//! declared `harness = false`, where `#[test]` functions are compiled and then
+//! stripped -- tests written beside it could only ever pass, because they never
+//! ran. Moving the code into its own crate removes that hazard rather than
+//! working around it, which is why the include is gone.
 
-#[path = "../benches/common/host_contention.rs"]
-mod host_contention;
+use onnx_runtime_hostmon as host_contention;
+use onnx_runtime_hostmon::{parse_cpu_list, threads_off_mask};
 
 #[cfg(target_os = "linux")]
 use host_contention::{AllowedCpus, snapshot};
@@ -253,6 +255,7 @@ fn an_unmeasured_repetition_can_never_be_printed_as_a_clean_zero() {
         foreign_pct: pct,
         total_pct: pct,
         measured: true,
+        own_time_complete: true,
     };
     let unmeasured = Contention::default();
 
@@ -268,4 +271,170 @@ fn an_unmeasured_repetition_can_never_be_printed_as_a_clean_zero() {
 
     assert_eq!(foreign_column(&[clean(0.1), clean(0.2), clean(0.3)]), "0.2");
     assert_eq!(foreign_column(&[]), "n/a");
+}
+
+/// `Cpus_allowed_list` is range notation, and every later check is a subset test
+/// against whatever this returns. A parser that silently dropped part of a range
+/// would shrink the set a thread is believed to be allowed on, which turns an
+/// off-mask thread into an apparently confined one -- a fabricated pass.
+#[test]
+fn a_kernel_cpu_list_parses_ranges_singletons_and_mixtures() {
+    assert_eq!(parse_cpu_list("0"), Some(vec![0]));
+    assert_eq!(parse_cpu_list("0-3"), Some(vec![0, 1, 2, 3]));
+    assert_eq!(parse_cpu_list("0-1,4,6-7"), Some(vec![0, 1, 4, 6, 7]));
+    // Inclusive at the top: `0-3` is four CPUs, not three. An exclusive range
+    // would drop the highest CPU of every mask.
+    assert_eq!(parse_cpu_list("2-2"), Some(vec![2]));
+    assert_eq!(parse_cpu_list("  0-1 \n"), Some(vec![0, 1]));
+}
+
+/// Malformed input must not yield a partial set, for the same reason: a short
+/// list reads as "confined to fewer CPUs", which is the direction that passes.
+#[test]
+fn a_malformed_cpu_list_is_rejected_rather_than_truncated() {
+    assert_eq!(parse_cpu_list(""), None);
+    assert_eq!(parse_cpu_list("x"), None);
+    assert_eq!(parse_cpu_list("0-"), None);
+    assert_eq!(
+        parse_cpu_list("0,x,2"),
+        None,
+        "a bad element must fail the whole list, not be skipped"
+    );
+    assert_eq!(
+        parse_cpu_list("3-1"),
+        None,
+        "a reversed range is malformed, not empty"
+    );
+}
+
+/// The probe has to actually look at this process's threads. Asserted by
+/// narrowing the *claimed* allowed set rather than by changing any affinity, so
+/// the test needs no privileges and cannot disturb a concurrent benchmark.
+#[cfg(target_os = "linux")]
+#[test]
+fn threads_are_counted_against_the_set_they_are_checked_against() {
+    let allowed = host_contention::AllowedCpus::current().expect("a mask is readable on Linux");
+    assert!(!allowed.is_empty());
+
+    // Against the real mask every thread is by definition inside it.
+    assert_eq!(
+        threads_off_mask(&allowed.cpus),
+        Some(0),
+        "every thread is confined to the mask it inherited"
+    );
+
+    // Against an empty set nothing can be inside, so the count must be the
+    // whole thread list. A probe that returned a constant 0 -- the value that
+    // certifies the subtraction as complete -- passes the assertion above and
+    // fails this one.
+    let off = threads_off_mask(&[]).expect("the thread list is readable");
+    assert!(
+        off >= 1,
+        "an empty allowed set leaves every thread off-mask, got {off}"
+    );
+}
+
+/// The whole point of the probe: an off-mask thread must downgrade the reading
+/// from an estimate to a lower bound.
+#[test]
+fn a_thread_outside_the_mask_marks_the_subtraction_incomplete() {
+    let t0 = Instant::now();
+    let make = |own_off: Option<usize>, busy: u64, own: u64, at: Instant| {
+        ContentionSnapshot::from_parts_with_off_mask(at, vec![0], vec![busy], own, own_off)
+    };
+    let one_second = t0 + Duration::from_secs(1);
+
+    let complete = contention(
+        Some(&make(Some(0), 0, 0, t0)),
+        Some(&make(Some(0), jiffies(1.0), jiffies(0.5), one_second)),
+    );
+    assert!(complete.measured && complete.own_time_complete);
+
+    for off in [Some(1), None] {
+        let partial = contention(
+            Some(&make(off, 0, 0, t0)),
+            Some(&make(off, jiffies(1.0), jiffies(0.5), one_second)),
+        );
+        assert!(
+            partial.measured,
+            "an off-mask thread does not invalidate the window, it weakens it"
+        );
+        assert!(
+            !partial.own_time_complete,
+            "off_mask={off:?} must not certify the own-time subtraction"
+        );
+        assert!(
+            (partial.foreign_pct - complete.foreign_pct).abs() < 1e-9,
+            "the number itself is unchanged; only its interpretation is"
+        );
+    }
+
+    // An escape in only one half of the window still spans it.
+    let half = contention(
+        Some(&make(Some(1), 0, 0, t0)),
+        Some(&make(Some(0), jiffies(1.0), jiffies(0.5), one_second)),
+    );
+    assert!(
+        !half.own_time_complete,
+        "a thread that escaped during the window must not be certified by a clean end snapshot"
+    );
+}
+
+/// `is_contended` stays sound on a lower bound; `is_clean` must not.
+#[test]
+fn a_lower_bound_can_prove_contention_but_never_cleanliness() {
+    let bound = |pct: f64| Contention {
+        foreign_pct: pct,
+        total_pct: pct,
+        measured: true,
+        own_time_complete: false,
+    };
+    let exact = |pct: f64| Contention {
+        own_time_complete: true,
+        ..bound(pct)
+    };
+
+    // Above the threshold, an under-reporting measurement still proves the row
+    // is dirty -- the true value is at least this.
+    assert!(bound(50.0).is_contended());
+    assert!(!bound(50.0).is_clean());
+
+    // Below it, the lower bound proves nothing, so `is_clean` must refuse even
+    // though `is_contended` is false. This is the asymmetry: a caller using
+    // `!is_contended()` as "clean" would accept this row.
+    assert!(!bound(0.0).is_contended());
+    assert!(
+        !bound(0.0).is_clean(),
+        "a lower bound of zero is not evidence of quiet"
+    );
+    assert!(exact(0.0).is_clean());
+
+    // Unmeasured is never clean and never contended.
+    assert!(!Contention::default().is_clean());
+    assert!(!Contention::default().is_contended());
+}
+
+/// The printed cell has to say that it is a bound, or the marking is invisible
+/// exactly where it matters -- in the table someone reads later.
+#[test]
+fn a_bounded_cell_is_printed_as_a_bound() {
+    let mk = |pct: f64, complete: bool| Contention {
+        foreign_pct: pct,
+        total_pct: pct,
+        measured: true,
+        own_time_complete: complete,
+    };
+    assert_eq!(foreign_column(&[mk(3.0, true); 3]), "3.0");
+    assert_eq!(foreign_column(&[mk(3.0, false); 3]), ">3.0");
+    // Both qualifiers can apply at once and neither may swallow the other.
+    assert_eq!(
+        foreign_column(&[Contention::default(), mk(3.0, false), mk(9.0, false)]),
+        ">9.0*"
+    );
+    // One bounded rep among complete ones still bounds the cell: the median may
+    // be the bounded sample, and which sample it is is not stable across runs.
+    assert_eq!(
+        foreign_column(&[mk(3.0, true), mk(3.0, true), mk(3.0, false)]),
+        ">3.0"
+    );
 }

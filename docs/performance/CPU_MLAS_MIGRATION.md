@@ -280,7 +280,9 @@ Unpacked:
      shared box instead of waiting for a quiet one that never arrives, not a
      substitute for the interleaving.
   3. **Better still, measure foreign CPU on your own core set.** #1814 landed
-     `benches/common/host_contention.rs` on `main` after this table was taken.
+     the measurement on `main` after this table was taken (now the
+     `onnx-runtime-hostmon` crate, and reported as `host_foreign` by
+     `bench_generic`).
      It reads busy jiffies on the process's `Cpus_allowed_list` and subtracts
      the process's own CPU, so the remainder is *foreign load on the cores you
      were actually confined to*. That closes the hole in the guard above
