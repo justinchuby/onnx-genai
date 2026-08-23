@@ -4848,7 +4848,10 @@ is ~1. **The tax is one-directional and grows with `T`** -- exactly the shape
 45.8 reported as a native scaling failure. A ratio cancels a symmetric tax; this
 one is asymmetric by construction.
 
-**2. The arms may not even have had the same cores.** Sebastian has since shown
+**2. The arms may not even have had the same cores.** *(This leg named the
+wrong mechanism. The one it names is excluded below; a different one, and a
+larger asymmetry, is what the rest of this section establishes.)* Sebastian has
+since shown
 (#1729, from `/proc/<pid>/task/*/status`, no timing involved) that the EP's
 default 16-wide pool pins its workers to cpus 0-15, which on this host is 8
 physical cores with two workers per core, and one of the two L3 domains. cpu0
@@ -4918,8 +4921,18 @@ itself:
 `scatter_across_cores` (`decode_affinity.rs:560`) ranks physical-core leaders
 ahead of SMT siblings, and that is what it does here: at `T = 16` the mask is
 16 *distinct physical cores* spanning both L3 domains, not the compact
-`cpus 0-15` set. **So the `#1729` pathology really is excluded on both
-mechanisms** -- the second one places well.
+`cpus 0-15` set. **So the `#1729` pathology -- two spinning workers per core --
+is excluded on both mechanisms.**
+
+That is not the same as calling the spread mask good, and 26.2 of this document
+is the reason to be careful: it measured exactly this `0,2,...,30` layout as
+**worse** (0.133 ms vs 0.079 ms) for a pinned multi-worker decode pool, because
+straddling two CCXs costs more than SMT sharing when the working set fits in one
+CCX's L3. Both can be true, and here they are: that penalty is paid by a *pool*,
+through cross-CCX barrier and shared-data traffic, and these rows never build
+one -- the SPMD pool is never entered and 45.8 shows the SDPA route has no
+fan-out at all. So the spread is harmless *for these rows specifically*, and
+anyone quoting this paragraph for a pool workload should read 26.2 instead.
 
 **And a third asymmetry, which is the real find, and it is confirmed.**
 Affinity is inherited at thread creation, and the two arms are built on
@@ -4941,8 +4954,11 @@ mask. The unconfined threads are unnamed, so they inherit the process name,
 and there are exactly `T - 1` of them: ORT's intra-op pool, spawned at session
 construction, before the mask existed.
 
-**At `T = 16` that is a native arm confined to 16 physical cores while ORT's 15
-spinning workers roam all 32 logical CPUs** -- including the SMT siblings of
+At `T = 16` the mask is measured but the thread census is not: the
+`--native-only` launch that read it has no ORT arm. Carrying the `T - 1` rule
+across gives **a native arm confined to 16 physical cores while ~15 ORT workers
+roam all 32 logical CPUs** -- inferred from two points, not counted at 16 --
+including the SMT siblings of
 the very cores the native arm cannot leave. This does not replace reason 1, it
 sharpens it: the spin tax is not merely concurrent with the native sample, it
 is free to land on the sibling of every core the native arm is pinned to,
@@ -4981,7 +4997,8 @@ claims a millisecond.
 `6e8c31ebd` were on 8 physical cores and do need re-taking. For the single-node
 SDPA/MHA rows in 45.7-45.10, both placement mechanisms are now settled and they
 land on opposite sides: the `#1729` per-worker mask never reached these rows,
-and the process budget mask that *did* reach them places well. **The rows are
+and the process budget mask that *did* reach them spreads one thread per
+physical core, which for these rows is harmless (see the 26.2 caveat above). **The rows are
 still not clean, but the reason is no longer placement -- it is that the ORT arm
 escaped the mask entirely.** They need re-taking for that and for reason 1;
 re-take with `ONNX_GENAI_CPU_DECODE_AFFINITY=off` and a `--native-only` or
