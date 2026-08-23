@@ -185,8 +185,24 @@ impl Engine {
             on_admitted();
         }
         let runtime = &*self.workflow;
+        // A prompt is text; a workflow input declaring the `prompt_tokens` role
+        // wants ids. Encoding it here, with the package's own tokenizer, is
+        // what lets `generate("hello")` work on a package whose components the
+        // interpreter invokes — the alternative was refusing the request and
+        // telling the caller to tokenize, which is the runtime declining to do
+        // the one thing it has the tokenizer for.
+        let mut request = request;
+        if let crate::config::GeneratePrompt::Text(text) = &request.request.prompt {
+            let tokenizer = runtime.package_tokenizer().context(
+                "this package declares a prompt_tokens input but ships no tokenizer, so a text                  prompt cannot be encoded for it; supply token ids instead",
+            )?;
+            let encoded = tokenizer
+                .encode(text)
+                .map_err(|error| anyhow::anyhow!("failed to encode the prompt: {error}"))?;
+            request.request.prompt = crate::config::GeneratePrompt::TokenIds(encoded);
+        }
         let options = request.request.options.clone();
-        let tokenizer = runtime.models().tokenizer_for("");
+        let tokenizer = runtime.package_tokenizer();
         crate::pipeline::generation::run_declared_generation(
             runtime, &options, tokenizer, request, None, callback,
         )

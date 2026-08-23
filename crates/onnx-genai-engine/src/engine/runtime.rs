@@ -1042,14 +1042,6 @@ impl Engine {
         admission_callback: Option<&mut dyn FnMut()>,
         token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
-        if !self.holds_decode_core() {
-            return self.generate_in_workflow_session(
-                session_id,
-                crate::pipeline::PipelineGenerateRequest::new(request),
-                admission_callback,
-                token_callback,
-            );
-        }
         self.generate_in_session_with_priority_and_callback(
             session_id,
             request,
@@ -1093,6 +1085,24 @@ impl Engine {
         mut admission_callback: Option<&mut dyn FnMut()>,
         mut callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        // A package with no decode core keeps its conversation in the
+        // session-scoped cells its workflow declares. Routing here rather than
+        // in one of the wrappers above is what makes every `generate_in_session`
+        // variant reach it — a caller that picked the priority form should not
+        // get a different answer about whether sessions exist.
+        if !self.holds_decode_core() {
+            anyhow::ensure!(
+                custom_sampler.is_none(),
+                "a package whose components the interpreter invokes declares its sampler; a \
+                 caller-supplied one would replace a step the package states in its own graph"
+            );
+            return self.generate_in_workflow_session(
+                session_id,
+                crate::pipeline::PipelineGenerateRequest::new(request),
+                admission_callback,
+                callback,
+            );
+        }
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
             if priority != Priority::Normal {

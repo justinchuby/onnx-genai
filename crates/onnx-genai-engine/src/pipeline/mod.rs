@@ -895,6 +895,15 @@ impl WorkflowRuntime {
         })
     }
 
+    /// The tokenizer this package ships, when it ships one.
+    ///
+    /// A workflow package need not: an image-generation pipeline has no text to
+    /// encode, and inventing an empty tokenizer for it would turn a load-time
+    /// fact into a runtime surprise.
+    pub(crate) fn package_tokenizer(&self) -> Option<&Tokenizer> {
+        self.models.tokenizer_for("")
+    }
+
     fn tokenizer(&self) -> anyhow::Result<&Tokenizer> {
         self.models
             .tokenizer_for("")

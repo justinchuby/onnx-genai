@@ -1,7 +1,0 @@
-gpt_oss_20b_cpu	/home/justinchu/.foundry/cache/models/Microsoft/gpt-oss-20b-generic-cpu-1/v1	[416,405,271,622,392,13225,11,392,659,495,4834,659,392,58502,739,26178,38193,7943,581,1309,316,1199,2700,851]
-phi35_mini_int4_cpu	/home/justinchu/.foundry/cache/models/Microsoft/Phi-3.5-mini-instruct-generic-cpu-2/v2	[30751,31512,306,29915,29885,1985,373,263,2060,988,306,817,304,1653,263,15171,6270,10754,363,263,26797,1848,8720,4086]
-phi4_mini_cuda	/home/justinchu/.foundry/cache/models/Microsoft/Phi-4-mini-instruct-cuda-gpu-5/v5	[869,11,357,1309,261,10079,39384,11713,316,11659,48902,7416,13,357,1682,316,2501,261,620,8305,3566,306,261,4857]
-qwen25_0_5b_cuda	/home/justinchu/.foundry/cache/models/Microsoft/qwen2.5-0.5b-instruct-cuda-gpu-4/v4-bs128	[521,2625,3554,40,614,264,3405,911,279,330,82,1,304,330,82,38618,3263,358,614,264,4238,879,374,264]
-qwen25_1_5b_cuda\tMISSING_DIR\t/home/justinchu/.foundry/cache/models/Microsoft/qwen2.5-1.5b-instruct-cuda-gpu-4/v4-bs128
-qwen35_0_8b_hybrid_cpu	/home/justinchu/.foundry/cache/models/Microsoft/qwen3.5-0.8b-generic-cpu-2/v2	ERROR
-qwen3_0_6b_cpu	/home/justinchu/.foundry/cache/models/Microsoft/qwen3-0.6b-generic-cpu-4/v4	[3988,0,358,2776,773,12035,311,387,1588,0,358,2776,773,12035,311,387,1588,0,358,2776,773,12035,311,387]

@@ -1,68 +1,69 @@
-perf(speculative): narrow and score where the tensors already are
+evidence(goldens): run the pinned packages against a clean main baseline
 
-A chained proposal's per-token work is supposed to stay on the device that
-produced it. Whether it does was, until now, unmeasurable from inside the
-process — a reintroduced copy shows up months later as "it got slower",
-attributed to anything but the line responsible.
+The previous `REAL_MODEL_EVIDENCE.md` was captured at `5a58eafa`, described a
+lowering step that no longer exists, and compared nothing to `main`. It has been
+replaced with a matrix produced by running one probe against two builds — a
+clean `origin/main@cb81745b0` worktree and this branch — on the same machine
+against the same bytes.
 
-**The measurement first.** `WorkflowRuntime` counts every device→host
-materialization it performs. The count lives in
-`materialize_workflow_value_copy`, which is the one place such a copy can
-happen, so a future caller is counted without having to remember to count
-itself. `chained_speculative_proposal_parity_native_cuda` reads it across a
-propose/verify/reject/rollback decode on an H200.
+**The load-bearing result.** `justinchuby/qwen3-0.6b-onnx-genai@a89c02d3` decodes
+16 greedy tokens byte-identically on both:
 
-That measurement is what makes the rest of this honest. The count today is
-**16** for `speculative_decode(8, 4)`, and the assertion is a ratchet at that
-number rather than a zero, because 16 is what the remaining work costs and
-claiming otherwise would be a lie the tokens would not catch: a chain that
-staged everything on the host produces byte-identical output.
+    3988,0,358,2776,773,12035,311,387,1588,0,358,2776,773,12035,311,387
 
-The two remaining sites are named in the assertion. Both are the *folded carry*:
-its seed, once per proposal, and the carry itself, once per draft token. Both
-exist because the fused proposer input is assembled on the host —
-`concat(embed(token), carry)` — so the carry has to come down to be
-concatenated and the whole fused input goes back up. Removing them needs the
-fused input built in device memory, which is a device-side scatter this seam
-does not have; faking it with a staging copy would satisfy the counter and
-change nothing.
+Those are not the same code path. `main` loaded this package from its
+`genai_config.json` and ran it on the fused decode core, *ignoring the
+`pipeline.workflow` it ships*; head reads the declared workflow — eleven ONNX
+components, an in-graph sampler, an in-graph termination predicate — and runs it
+through the interpreter. Same weights, different execution, same tokens.
 
-**What did move.**
+**Two packages `main` cannot run at all.**
+`onnx-genai-example-gemma4-e2b@b1189a9b` fails before generating
+(`cannot resolve decoder state from tensor shapes`) and
+`onnx-genai-example-gemma4-e2b-speculative@3e5d3b6a` fails to *load*
+(`declared kv_outputs port 'present.4.key' is not exposed by the graph`). Both
+load on head and open sessions. That is also why the composite paths have no
+baseline comparison: there is nothing on `main` that runs them.
 
-*Narrowing happens where the value is.* A borrowed proposer binding used to be
-copied to the host in full and then narrowed to one position, discarding every
-byte of the copy on the next line. `ResidentTensorOps::last_along_axis` narrows
-in place: on a device value whose sequence axis is outermost this is a pointer
-view via the new `Value::alias_with_offset`, and on an inner axis it refuses
-rather than staging — a strided device copy belongs to the provider that owns
-the stream.
+**Two behaviour changes, reported rather than summarised away.** Seeded sampling
+differs, because head uses the sampler the package declares instead of
+substituting the runtime's. And multi-turn continuation is *lost* for
+`qwen3_0_6b`: `main` carried KV across turns through the decode core, head
+executes the package as declared and its workflow declares no `scope: session`
+state, so each turn is independent and `prefix_cache_hit_len` is honestly `0`.
+That is a real regression for this package, called out as one, with both possible
+fixes named and neither taken here.
 
-*Argmax reads four bytes, not a vocabulary.* The per-draft-token argmax copied
-a `[1, 1, vocab]` row down to find one token id — ≈300 KiB at vocab 151936 in
-f16, per token. `device_argmax_rows` runs the same kernel the decode fast path
-already uses, directly on the ORT device pointer, with the same lowest-index
-tie-break and NaN handling as `Value::argmax_last_row` so no token changes.
+**Two defects the pinned packages found, fixed here.** `generate_in_session` on a
+package with no decode core reached `require_tokenizer()` and failed, because
+only the `_with_callbacks` wrapper had been routed to the interpreted session
+path — every variant now routes through the same place. And a text prompt against
+a package declaring a `prompt_tokens` input was refused with "use a tokenizer
+adapter for text" *even when the package shipped `tokenizer.json`*; the runtime
+now encodes with the package's own tokenizer. Without that second fix, result one
+above could not have been measured at all.
 
-*The embedding table is read once.* A `[vocab, hidden]` initializer was read off
-disk on every `propose_chained`. A loaded package's artifact cannot change under
-it, so it is now cached for the runtime's life.
+**A gap, stated.** Both Gemma4 packages declare `request.active`/`done`/
+`accepted_len` as required application inputs with no default, so
+`Engine::generate` with a bare prompt cannot seed them. Composite speculative
+generation at widths 1/2/4 against *those two packages* therefore has no
+measurement here, and the hermetic `gemma4_chained` fixture is not substituted
+for it — that fixture is covered separately, including the CUDA
+propose/verify/reject/rollback gate, and conflating the two would be the kind of
+evidence that reads as coverage without being it.
 
-**Fail-closed.** `tensor_ops_for` returns host ops for a host value and CUDA ops
-for a device one; a device value in a build with no device implementation is an
-error naming both remedies — select the host backend, or build with `ort-cuda` —
-never a quiet copy.
+`capture_pinned.sh` prints `COVERED=`, writes `MISSING_DIR` for an absent package
+and the probe's error for a failing one, and has no allow-empty escape hatch: a
+corpus that quietly emptied would diff clean.
 
-`Value::alias_with_offset` takes an *element* offset rather than a byte offset,
-because a byte offset invites exactly one mistake — forgetting the dtype width —
-that a device pointer will not diagnose until a kernel reads garbage.
+Also: the FIM streaming case asserted its headers arrived within 100 ms. That
+budget measures the machine, not the ordering property — it fails on a saturated
+box under `--test-threads=$(nproc)` while the request itself takes milliseconds.
+Measured end-to-end (load plus six 64-token generations) head is 115 ms against
+the baseline's 109 ms, so the budget is now two seconds, which still separates
+"after admission" from "after generation" by orders of magnitude.
 
-Verified on H200: all 12 `native_workflow_parity` cases including both chained
-parity gates; 9 `gemma4_chained_workflow` cases; the alias-offset cases; engine
-and ort suites; fmt; clippy `-D warnings`.
-
-Note: `onnx-genai-ort`'s `selected_non_dense_candidate_fails_explicitly` fails
-identically on `origin/main@cb81745b0`, checked in a clean worktree. It is not
-from this branch.
+Verified: 241 server tests, engine suites, fmt, clippy `-D warnings`.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 Signed-off-by: Copilot <223556219+Copilot@users.noreply.github.com>

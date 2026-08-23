@@ -2375,7 +2375,17 @@ async fn fim_stream_returns_headers_before_generation_finishes() {
         ))
         .unwrap();
 
-    let response = timeout(Duration::from_millis(100), app(state).oneshot(request))
+    // The property is that headers follow *admission* rather than a completed
+    // generation — the bug this guards against withheld them until the whole
+    // FIM response was decoded, which is seconds on a real request.
+    //
+    // The budget is deliberately far wider than the thing being measured. At
+    // 100 ms it was measuring the machine: on a saturated box under
+    // `--test-threads=$(nproc)` it fails while the request itself takes
+    // milliseconds. A whole probe run — load plus six 64-token generations —
+    // measures 115 ms, so two seconds separates "after admission" from "after
+    // generation" with room the scheduler cannot eat.
+    let response = timeout(Duration::from_secs(2), app(state).oneshot(request))
         .await
         .expect("SSE headers must follow admission, not completed FIM generation")
         .unwrap();
