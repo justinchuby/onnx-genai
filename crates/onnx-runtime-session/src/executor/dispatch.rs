@@ -515,6 +515,7 @@ impl Executor {
             ep: &ep,
             graph: &self.graph,
             weight_handles: &self.weight_handles,
+            expert_region_candidates: &self.expert_region_candidates,
             buffers: &mut self.buffers,
             buffer_shapes: &mut self.buffer_shapes,
             shared_buffers: &mut self.shared_buffers,
@@ -1322,6 +1323,7 @@ struct KernelDispatchContext<'a> {
     ep: &'a Arc<dyn ExecutionProvider>,
     graph: &'a Graph,
     weight_handles: &'a HashMap<ValueId, WeightHandle>,
+    expert_region_candidates: &'a HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
     buffers: &'a mut HashMap<ValueId, DeviceBuffer>,
     buffer_shapes: &'a mut HashMap<ValueId, Vec<usize>>,
     shared_buffers: &'a mut HashMap<ValueId, Arc<SharedTensorBuffer>>,
@@ -1615,6 +1617,43 @@ impl KernelDispatchContext<'_> {
                 })
                 .collect::<Vec<_>>()
         });
+
+        // Acquire a routed-residency guard for QMoE-family boundary nodes
+        // (issue #82 slice 5). This is the one dispatch-time authority: no
+        // parallel ad-hoc residency check exists elsewhere. Fused-routing
+        // kernels cannot name their routed set host-side before launch, so
+        // `FusedRoutingUnknown` is the only requirement this call site can
+        // construct today; `acquire_routed_residency`'s CUDA impl always
+        // proves `WholeBank` in response (see its doc comment). The guard is
+        // held exactly as long as `kernel_inputs`/the paged weight pins are
+        // held below, and dropped at the same point, so the resize seam
+        // cannot observe a safe point mid-dispatch. Capture: this call
+        // itself does not gate on capture state; the guard's presence is
+        // what makes `resize_safe_point` fail closed, and captured nodes
+        // never call this residency's resize path while replaying, so a
+        // guard acquired during capture recording remains valid for the
+        // node's normal (non-captured) re-dispatch semantics without needing
+        // separate capture-lifetime bookkeeping here.
+        let _routed_residency_guard = if LazyWeightBoundary::QMoe
+            .matches(&node.domain, &node.op_type)
+            || LazyWeightBoundary::BlockQuantizedMoe.matches(&node.domain, &node.op_type)
+        {
+            inputs.iter().find_map(|value| {
+                let value = (*value)?;
+                let catalog = self.expert_region_candidates.get(&value)?;
+                self.ep
+                    .acquire_routed_residency(
+                        value.0 as u64,
+                        onnx_runtime_ep_api::RoutedResidencyRequirement::FusedRoutingUnknown,
+                        catalog,
+                    )
+                    .ok()
+                    .flatten()
+            })
+        } else {
+            None
+        };
+
         let execution = {
             let _s = phase_span!("exec_kernel.compute");
             let metadata = views
@@ -1754,6 +1793,7 @@ impl KernelDispatchContext<'_> {
             })?;
 
         drop(kernel_inputs);
+        drop(_routed_residency_guard);
         for backing in out_bufs {
             if let Some(buf) = backing.internal {
                 self.buffers.insert(backing.vid, buf);
