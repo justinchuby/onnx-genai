@@ -444,6 +444,33 @@ impl Executor {
             .copied()
             .collect::<HashSet<_>>();
         for &vid in &external_values {
+            // A producer-less value bound only as an external *output* (a bare
+            // initializer, or a value `ConstantFolding` collapsed to one
+            // because it has no *node* consumer — only being a graph output
+            // kept it alive) is never visited by node dispatch, so nothing
+            // ever refills this buffer once dropped here. Keep it resident —
+            // it is immutable for the session's lifetime (see
+            // `materialize_initializers`) — so `collect_run_outputs` can still
+            // seed the external binding from it after this per-run wipe,
+            // instead of leaving the caller's device buffer at its
+            // uninitialized allocation state forever.
+            //
+            // `value.producer.is_none()` is also true for a producer-less
+            // graph *input* passed straight through to an output (the other
+            // case `Graph::validate`'s rule 5 recognizes). That sub-case has
+            // no resident buffer from `materialize_initializers` (which only
+            // populates from `graph.initializers`), so it is unaffected by
+            // this guard either way — `collect_run_outputs`'s seed-copy below
+            // simply no-ops for it, same as before this fix, rather than
+            // regressing anything.
+            if !external.inputs.contains_key(&vid)
+                && self
+                    .graph
+                    .try_value(vid)
+                    .is_some_and(|value| value.producer.is_none())
+            {
+                continue;
+            }
             if let Some(old) = self.buffers.remove(&vid) {
                 self.ep.deallocate(old)?;
             }
@@ -842,7 +869,28 @@ impl Executor {
         let mut host_output_bytes = 0usize;
         let output_vids: Vec<ValueId> = self.graph.outputs.clone();
         for vid in output_vids {
-            if external.outputs.contains_key(&vid) {
+            if let Some(ext) = external.outputs.get(&vid) {
+                // A graph output with no producing node (e.g. a bare
+                // initializer, or a value `ConstantFolding` collapsed to one
+                // because it has no *node* consumer — only being a graph
+                // output kept it alive) is never visited by node dispatch, so
+                // nothing ever writes through its externally-bound device
+                // pointer. Left alone, a CUDA IO-binding/capture caller reads
+                // back that binding's uninitialized allocation. Seed it here,
+                // every run, from the resident internal buffer — kept alive
+                // for exactly this purpose by `prepare_run_buffers` — which is
+                // a cheap, byte-identical copy of already-correct data, not a
+                // recomputation.
+                if self
+                    .graph
+                    .try_value(vid)
+                    .is_some_and(|value| value.producer.is_none())
+                    && let Some(src) = self.buffers.get(&vid)
+                {
+                    let mut dst = ext.writable_buffer()?;
+                    let size = src.len().min(dst.len());
+                    self.ep.copy(src, &mut dst, size)?;
+                }
                 results.push(None);
                 continue;
             }

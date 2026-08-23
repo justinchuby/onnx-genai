@@ -18,7 +18,7 @@ pipeline:
           rank: 2
           shape:
           - batch
-          - sequence_len
+          - sequence_length
           batch_layout:
             kind: request_aligned
             axis: 0
@@ -339,9 +339,9 @@ pipeline:
           artifact: model.onnx
         ports:
           roles:
-            input_ids: token_ids
             attention_mask: attention_mask
             position_ids: position_ids
+            input_ids: token_ids
             logits: logits
       token_sampler:
         implementation:
@@ -666,7 +666,7 @@ pipeline:
               rank: 2
               shape:
               - batch
-              - past_sequence_len + sequence_len
+              - past_sequence_length + sequence_length
               batch_layout:
                 kind: request_aligned
                 axis: 0
@@ -720,8 +720,8 @@ pipeline:
               shape:
               - batch
               - 1
-              - past_sequence_len
-              - 104
+              - past_sequence_length
+              - 16
               batch_layout:
                 kind: request_aligned
                 axis: 0
@@ -731,8 +731,8 @@ pipeline:
               shape:
               - batch
               - 1
-              - past_sequence_len
-              - 64
+              - past_sequence_length
+              - 16
               batch_layout:
                 kind: request_aligned
                 axis: 0
@@ -742,8 +742,8 @@ pipeline:
               shape:
               - batch
               - 1
-              - past_sequence_len
-              - 96
+              - past_sequence_length
+              - 16
               batch_layout:
                 kind: request_aligned
                 axis: 0
@@ -753,8 +753,8 @@ pipeline:
               shape:
               - batch
               - 1
-              - past_sequence_len
-              - 64
+              - past_sequence_length
+              - 16
               batch_layout:
                 kind: request_aligned
                 axis: 0
@@ -1140,8 +1140,8 @@ pipeline:
           shape:
           - batch
           - 1
-          - past_sequence_len
-          - 104
+          - past_sequence_length
+          - 16
           batch_layout:
             kind: request_aligned
             axis: 0
@@ -1161,8 +1161,8 @@ pipeline:
           shape:
           - batch
           - 1
-          - past_sequence_len
-          - 64
+          - past_sequence_length
+          - 16
           batch_layout:
             kind: request_aligned
             axis: 0
@@ -1182,8 +1182,8 @@ pipeline:
           shape:
           - batch
           - 1
-          - past_sequence_len
-          - 96
+          - past_sequence_length
+          - 16
           batch_layout:
             kind: request_aligned
             axis: 0
@@ -1203,8 +1203,8 @@ pipeline:
           shape:
           - batch
           - 1
-          - past_sequence_len
-          - 64
+          - past_sequence_length
+          - 16
           batch_layout:
             kind: request_aligned
             axis: 0

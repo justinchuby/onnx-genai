@@ -13,26 +13,61 @@
 //! * **Elementwise integer `Add`/`Sub`/`Mul`** on two *same-shape* constant
 //!   `int32`/`int64` tensors are evaluated with **checked** arithmetic; any
 //!   overflow aborts the fold rather than emit a wrong constant.
+//! * **`Concat`** of constant tensors along a static axis (used to assemble a
+//!   `Reshape` shape from a literal prefix plus a folded `Shape` suffix).
+//! * **`Reshape`/`Transpose`** of a constant tensor are pure data relayouts —
+//!   no arithmetic, no precision loss, output size never exceeds input size —
+//!   so they are folded **regardless of tensor size** (see
+//!   [`MAX_WEIGHT_FOLD_ELEMS`]). Model builders emit these around quantized
+//!   MoE expert weights to reorder HF's `gate_up_proj` layout into the
+//!   interleaved layout `QMoE`'s CPU/CUDA kernels require (e.g. mobius's
+//!   `_interleave_gate_up_rows`), relying on the runtime to fold them into a
+//!   literal initializer at load time — exactly what stock ORT's own
+//!   constant-folding does. Without this, downstream weight-placement
+//!   analysis (which requires `QMoE`'s expert-weight inputs to be literal
+//!   initializers) fails on a semantically-valid graph.
 //!
-//! Everything else is left untouched. Folding is bounded to
-//! [`MAX_FOLD_ELEMS`] elements so large weight tensors are never materialized,
-//! and dispatch is purely on op type — no model-specific names. The invariant
-//! is: **never produce a wrong constant.** When in doubt, do not fold.
+//! Everything else is left untouched. `Constant`/`Shape`/`Add`/`Sub`/`Mul`/
+//! `Concat` folding is bounded to [`MAX_FOLD_ELEMS`] elements — they exist
+//! for shape computation, so a larger operand indicates something other than
+//! a shape value. `Reshape`/`Transpose` use the much larger
+//! [`MAX_WEIGHT_FOLD_ELEMS`] instead, since folding them is just a bounded
+//! memcpy/permute with no combinatorial cost. Dispatch is purely on op type —
+//! no model-specific names. The invariant is: **never produce a wrong
+//! constant.** When in doubt, do not fold.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 
 use onnx_runtime_ir::{
     Attribute, DataType, Graph, NodeId, TensorData, ValueId, WeightRef, as_static_shape,
-    is_fully_static, read_vec_le, static_shape,
+    checked_numel, is_fully_static, read_vec_le, static_shape,
 };
 
 use crate::error::Result;
 use crate::pass::{OptimizationPass, PassContext};
 
-/// Upper bound on the number of elements this pass will materialize. Keeps
-/// folding limited to shape-computation-sized tensors, never model weights.
+/// Upper bound on the number of elements this pass will materialize for
+/// `Shape`/`Add`/`Sub`/`Mul`/`Concat`. Keeps folding limited to
+/// shape-computation-sized tensors.
 const MAX_FOLD_ELEMS: usize = 1024;
+
+/// Upper bound on the number of elements `Reshape`/`Transpose` will
+/// materialize. These ops never grow data (output size == input size) and
+/// perform no arithmetic, so they are safe to fold at weight scale; this is
+/// only a sanity ceiling against a corrupt/adversarial shape, not a
+/// performance-motivated limit like [`MAX_FOLD_ELEMS`].
+///
+/// Correctness-wise this bound is deliberately generous. It has no *load-time
+/// cost* budget attached: `"basic"` optimization (this pass plus dead-node
+/// elimination) now runs unconditionally on the production native-decode load
+/// path (`onnx-genai-engine::native_decode::{load,proposer}`), so a real
+/// (non-tiny) model with a long `Reshape`/`Transpose` weight-relayout chain
+/// over large expert tensors folds every time that model loads, not just
+/// once. That is a legitimate follow-up (a byte/time budget, or scoping the
+/// unconditional `"basic"` opt-in more narrowly) tracked separately — it does
+/// not change the folds' correctness, which this pass still guarantees.
+const MAX_WEIGHT_FOLD_ELEMS: usize = 1 << 30;
 
 /// Folds constant-input nodes into initializers (bounded, integer/shape only).
 #[derive(Clone, Copy, Debug, Default)]
@@ -85,6 +120,9 @@ impl OptimizationPass for ConstantFolding {
                         "Constant" => eval_constant(node),
                         "Shape" => fold_shape(graph, node),
                         "Add" | "Sub" | "Mul" => fold_binary_int(graph, node),
+                        "Concat" => fold_concat(graph, node),
+                        "Reshape" => fold_reshape(graph, node),
+                        "Transpose" => fold_transpose(graph, node),
                         _ => None,
                     };
                     (node.outputs[0], folded)
@@ -139,7 +177,7 @@ fn is_candidate(node: &onnx_runtime_ir::Node) -> bool {
         && node.outputs.len() == 1
         && matches!(
             node.op_type.as_str(),
-            "Constant" | "Shape" | "Add" | "Sub" | "Mul"
+            "Constant" | "Shape" | "Add" | "Sub" | "Mul" | "Concat" | "Reshape" | "Transpose"
         )
 }
 
@@ -147,9 +185,6 @@ fn unresolved_inputs(graph: &Graph, node: &onnx_runtime_ir::Node) -> Option<Vec<
     match node.op_type.as_str() {
         "Constant" => Some(Vec::new()),
         "Shape" => {
-            if node.attr("start").is_some() || node.attr("end").is_some() {
-                return None;
-            }
             let input = node.inputs.first().copied().flatten()?;
             let shape = &graph.try_value(input)?.shape;
             if shape.len() <= MAX_FOLD_ELEMS && is_fully_static(shape) {
@@ -165,6 +200,40 @@ fn unresolved_inputs(graph: &Graph, node: &onnx_runtime_ir::Node) -> Option<Vec<
             let inputs = [node.inputs[0]?, node.inputs[1]?];
             Some(
                 inputs
+                    .into_iter()
+                    .filter(|&input| inline_const(graph, input).is_none())
+                    .collect(),
+            )
+        }
+        "Concat" => {
+            if node.inputs.is_empty() {
+                return None;
+            }
+            let inputs: Vec<ValueId> = node.inputs.iter().copied().collect::<Option<_>>()?;
+            Some(
+                inputs
+                    .into_iter()
+                    .filter(|&input| inline_const(graph, input).is_none())
+                    .collect(),
+            )
+        }
+        "Reshape" => {
+            if node.attr("allowzero").and_then(Attribute::as_int) == Some(1) {
+                return None; // rare `allowzero=1` semantics: bail conservatively
+            }
+            let data = node.inputs.first().copied().flatten()?;
+            let shape = node.inputs.get(1).copied().flatten()?;
+            Some(
+                [data, shape]
+                    .into_iter()
+                    .filter(|&input| inline_const(graph, input).is_none())
+                    .collect(),
+            )
+        }
+        "Transpose" => {
+            let data = node.inputs.first().copied().flatten()?;
+            Some(
+                [data]
                     .into_iter()
                     .filter(|&input| inline_const(graph, input).is_none())
                     .collect(),
@@ -209,27 +278,35 @@ fn eval_constant(node: &onnx_runtime_ir::Node) -> Option<TensorData> {
     None
 }
 
-/// Fold `Shape(x)` when `x` has a fully-static shape into an `int64` vector.
-///
-/// Conservative: bails if `start`/`end` attributes are present (a slice of the
-/// shape) so we never emit a partial result.
+/// Fold `Shape(x)` when `x` has a fully-static shape into an `int64` vector,
+/// honoring the optional `start`/`end` slice attributes (Python-style
+/// slicing semantics: negative indices count from the end, out-of-range
+/// values clamp).
 fn fold_shape(graph: &Graph, node: &onnx_runtime_ir::Node) -> Option<TensorData> {
-    if node.attr("start").is_some() || node.attr("end").is_some() {
-        return None;
-    }
     let input = node.inputs.first().copied().flatten()?;
     let shape = &graph.try_value(input)?.shape;
     let dims = as_static_shape(shape)?;
     if dims.len() > MAX_FOLD_ELEMS {
         return None;
     }
-    let mut data = Vec::with_capacity(dims.len() * 8);
-    for &d in &dims {
+    let rank = dims.len() as i64;
+    let clamp = |v: i64| -> usize { v.clamp(0, rank) as usize };
+    let start = node
+        .attr("start")
+        .and_then(Attribute::as_int)
+        .map_or(0, |v| clamp(if v < 0 { v + rank } else { v }));
+    let end = node
+        .attr("end")
+        .and_then(Attribute::as_int)
+        .map_or(dims.len(), |v| clamp(if v < 0 { v + rank } else { v }));
+    let sliced = if start < end { &dims[start..end] } else { &[] };
+    let mut data = Vec::with_capacity(sliced.len() * 8);
+    for &d in sliced {
         data.extend_from_slice(&(d as i64).to_le_bytes());
     }
     Some(TensorData::from_raw(
         DataType::Int64,
-        vec![dims.len()],
+        vec![sliced.len()],
         data,
     ))
 }
@@ -285,6 +362,212 @@ fn fold_binary_int(graph: &Graph, node: &onnx_runtime_ir::Node) -> Option<Tensor
     }
 }
 
+/// Fold `Concat` of same-dtype constant tensors along a static axis.
+///
+/// Bounded to [`MAX_FOLD_ELEMS`] like the other shape-value folds above —
+/// `Concat` here exists only to assemble a `Reshape` shape from a literal
+/// prefix plus a folded `Shape` suffix, never to concatenate model weights.
+fn fold_concat(graph: &Graph, node: &onnx_runtime_ir::Node) -> Option<TensorData> {
+    let axis_attr = node.attr("axis").and_then(Attribute::as_int)?;
+    let inputs: Vec<&TensorData> = node
+        .inputs
+        .iter()
+        .map(|slot| inline_const(graph, (*slot)?))
+        .collect::<Option<_>>()?;
+    let first = *inputs.first()?;
+    if first.dtype == DataType::String || !first.strings.is_empty() {
+        return None;
+    }
+    let elem_size = first.dtype.byte_size();
+    if elem_size == 0 {
+        return None; // sub-byte packed types unsupported here
+    }
+    let rank = first.dims.len();
+    if rank == 0 {
+        return None;
+    }
+    let axis = normalize_axis(axis_attr, rank)?;
+    let mut axis_sum = 0usize;
+    for t in &inputs {
+        if t.dtype != first.dtype || t.dims.len() != rank {
+            return None;
+        }
+        for (i, (&a, &b)) in t.dims.iter().zip(first.dims.iter()).enumerate() {
+            if i != axis && a != b {
+                return None;
+            }
+        }
+        axis_sum = axis_sum.checked_add(t.dims[axis])?;
+    }
+    let mut out_dims = first.dims.clone();
+    out_dims[axis] = axis_sum;
+    let numel = checked_numel(&out_dims)?;
+    if numel > MAX_FOLD_ELEMS {
+        return None;
+    }
+    let outer: usize = out_dims[..axis].iter().product();
+    let inner: usize = out_dims[axis + 1..].iter().product();
+    let mut out_bytes = vec![0u8; numel.checked_mul(elem_size)?];
+    let mut dst = 0usize;
+    for o in 0..outer {
+        for t in &inputs {
+            let slab_len = t.dims[axis].checked_mul(inner)?.checked_mul(elem_size)?;
+            let src_off = o.checked_mul(slab_len)?;
+            let src = t.data.get(src_off..src_off + slab_len)?;
+            out_bytes[dst..dst + slab_len].copy_from_slice(src);
+            dst += slab_len;
+        }
+    }
+    Some(TensorData::from_raw(first.dtype, out_dims, out_bytes))
+}
+
+fn normalize_axis(axis: i64, rank: usize) -> Option<usize> {
+    let r = rank as i64;
+    let a = if axis < 0 { axis + r } else { axis };
+    (0..r).contains(&a).then_some(a as usize)
+}
+
+/// Fold `Reshape` of a constant tensor. A pure metadata change: the raw
+/// bytes are copied byte-for-byte (no element reordering), so this is safe
+/// for any dtype (including sub-byte packed ones) and any size up to
+/// [`MAX_WEIGHT_FOLD_ELEMS`].
+fn fold_reshape(graph: &Graph, node: &onnx_runtime_ir::Node) -> Option<TensorData> {
+    let data_id = node.inputs.first().copied().flatten()?;
+    let shape_id = node.inputs.get(1).copied().flatten()?;
+    let data = inline_const(graph, data_id)?;
+    let shape_tensor = inline_const(graph, shape_id)?;
+    if shape_tensor.dtype != DataType::Int64 {
+        return None;
+    }
+    if data.dtype == DataType::String || !data.strings.is_empty() {
+        return None;
+    }
+    let numel = data.checked_numel()?;
+    if numel > MAX_WEIGHT_FOLD_ELEMS {
+        return None;
+    }
+    let shape_vals = read_i64(shape_tensor)?;
+    let resolved = resolve_reshape_dims(&data.dims, &shape_vals)?;
+    if checked_numel(&resolved)? != numel {
+        return None;
+    }
+    Some(TensorData::from_raw(
+        data.dtype,
+        resolved,
+        data.data.clone(),
+    ))
+}
+
+/// Resolve ONNX `Reshape` target dims: `0` copies the input dim at that
+/// position, at most one `-1` is inferred from the remaining element count,
+/// anything else is taken literally.
+fn resolve_reshape_dims(input_dims: &[usize], shape_vals: &[i64]) -> Option<Vec<usize>> {
+    let mut resolved = Vec::with_capacity(shape_vals.len());
+    let mut infer_at: Option<usize> = None;
+    for (i, &v) in shape_vals.iter().enumerate() {
+        if v == -1 {
+            if infer_at.is_some() {
+                return None; // at most one -1
+            }
+            infer_at = Some(i);
+            resolved.push(0); // placeholder, filled in below
+        } else if v == 0 {
+            resolved.push(*input_dims.get(i)?);
+        } else {
+            resolved.push(usize::try_from(v).ok()?);
+        }
+    }
+    if let Some(i) = infer_at {
+        let known = resolved
+            .iter()
+            .enumerate()
+            .filter(|&(idx, _)| idx != i)
+            .try_fold(1usize, |acc, (_, &d)| acc.checked_mul(d))?;
+        if known == 0 {
+            return None; // ambiguous / would divide by zero
+        }
+        let total = checked_numel(input_dims)?;
+        if total % known != 0 {
+            return None;
+        }
+        resolved[i] = total / known;
+    }
+    Some(resolved)
+}
+
+/// Fold `Transpose` of a constant tensor by physically permuting its raw
+/// bytes according to `perm` (or the default reversed-axis order). Bounded
+/// to [`MAX_WEIGHT_FOLD_ELEMS`]; sub-byte packed dtypes are rejected since
+/// permuting axes could split a packed byte across output elements.
+fn fold_transpose(graph: &Graph, node: &onnx_runtime_ir::Node) -> Option<TensorData> {
+    let input = node.inputs.first().copied().flatten()?;
+    let data = inline_const(graph, input)?;
+    if data.dtype == DataType::String || !data.strings.is_empty() {
+        return None;
+    }
+    let elem_size = data.dtype.byte_size();
+    if elem_size == 0 {
+        return None;
+    }
+    let rank = data.dims.len();
+    let perm: Vec<usize> = match node.attr("perm").and_then(Attribute::as_ints) {
+        Some(ints) => {
+            if ints.len() != rank {
+                return None;
+            }
+            let mut p = Vec::with_capacity(rank);
+            for &v in ints {
+                let v = usize::try_from(v).ok()?;
+                if v >= rank {
+                    return None;
+                }
+                p.push(v);
+            }
+            p
+        }
+        None => (0..rank).rev().collect(),
+    };
+    let mut seen = vec![false; rank];
+    for &p in &perm {
+        if std::mem::replace(&mut seen[p], true) {
+            return None; // not a permutation
+        }
+    }
+    let numel = data.checked_numel()?;
+    if numel > MAX_WEIGHT_FOLD_ELEMS {
+        return None;
+    }
+    if data.data.len() != numel.checked_mul(elem_size)? {
+        return None; // malformed tensor; be conservative
+    }
+    let out_dims: Vec<usize> = perm.iter().map(|&p| data.dims[p]).collect();
+    let mut in_strides = vec![1usize; rank];
+    for i in (0..rank.saturating_sub(1)).rev() {
+        in_strides[i] = in_strides[i + 1].checked_mul(data.dims[i + 1])?;
+    }
+    let mut out_strides = vec![1usize; rank];
+    for i in (0..rank.saturating_sub(1)).rev() {
+        out_strides[i] = out_strides[i + 1].checked_mul(out_dims[i + 1])?;
+    }
+    let mut out_bytes = vec![0u8; numel.checked_mul(elem_size)?];
+    let mut idx = vec![0usize; rank];
+    for o in 0..numel {
+        let mut rem = o;
+        for (k, stride) in out_strides.iter().enumerate() {
+            idx[k] = rem / stride;
+            rem %= stride;
+        }
+        let mut in_flat = 0usize;
+        for (k, &p) in perm.iter().enumerate() {
+            in_flat += idx[k] * in_strides[p];
+        }
+        let src = in_flat * elem_size;
+        let dst = o * elem_size;
+        out_bytes[dst..dst + elem_size].copy_from_slice(&data.data[src..src + elem_size]);
+    }
+    Some(TensorData::from_raw(data.dtype, out_dims, out_bytes))
+}
+
 fn read_i64(t: &TensorData) -> Option<Vec<i64>> {
     if t.data.len() != t.numel() * 8 {
         return None;
@@ -302,6 +585,7 @@ fn read_i32(t: &TensorData) -> Option<Vec<i32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DeadNodeElimination;
     use onnx_runtime_ir::{Node, NodeId};
     use onnx_runtime_loader::{Model, encode_model};
 
@@ -337,6 +621,9 @@ mod tests {
                     "Constant" => eval_constant(&node),
                     "Shape" => fold_shape(graph, &node),
                     "Add" | "Sub" | "Mul" => fold_binary_int(graph, &node),
+                    "Concat" => fold_concat(graph, &node),
+                    "Reshape" => fold_reshape(graph, &node),
+                    "Transpose" => fold_transpose(graph, &node),
                     _ => None,
                 };
                 let Some(tensor) = folded else { continue };
@@ -805,5 +1092,259 @@ mod tests {
 
         ConstantFolding.run(&mut g, &PassContext::new()).unwrap();
         assert_eq!(g.num_nodes(), 1, "float folding is out of scope in v1");
+    }
+
+    fn raw_const_init(
+        graph: &mut Graph,
+        name: &str,
+        dtype: DataType,
+        dims: Vec<usize>,
+        data: Vec<u8>,
+    ) -> ValueId {
+        let shape = static_shape(dims.clone());
+        let v = graph.create_named_value(name, dtype, shape);
+        graph.set_initializer(
+            v,
+            WeightRef::Inline(TensorData::from_raw(dtype, dims, data)),
+        );
+        v
+    }
+
+    fn ints_attr_node(op_type: &str, inputs: Vec<Option<ValueId>>, outputs: Vec<ValueId>) -> Node {
+        Node::new(NodeId(0), op_type, inputs, outputs)
+    }
+
+    #[test]
+    fn folds_reshape_with_literal_shape() {
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let data = raw_const_init(&mut g, "x", DataType::Uint8, vec![2, 3], (0u8..6).collect());
+        let shape = const_init(&mut g, "shape", vec![1], &[6]);
+        let out = g.create_named_value("out", DataType::Uint8, static_shape([6]));
+        g.insert_node(ints_attr_node(
+            "Reshape",
+            vec![Some(data), Some(shape)],
+            vec![out],
+        ));
+        g.add_output(out);
+
+        ConstantFolding.run(&mut g, &PassContext::new()).unwrap();
+        let t = inline_const(&g, out).expect("Reshape folded to initializer");
+        assert_eq!(t.dims, vec![6]);
+        assert_eq!(t.data, (0u8..6).collect::<Vec<_>>());
+        assert!(g.validate().is_ok());
+    }
+
+    #[test]
+    fn folds_reshape_with_inferred_dim() {
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let data = raw_const_init(&mut g, "x", DataType::Uint8, vec![2, 3], (0u8..6).collect());
+        let shape = const_init(&mut g, "shape", vec![2], &[3, -1]);
+        let out = g.create_named_value("out", DataType::Uint8, static_shape([3, 2]));
+        g.insert_node(ints_attr_node(
+            "Reshape",
+            vec![Some(data), Some(shape)],
+            vec![out],
+        ));
+        g.add_output(out);
+
+        ConstantFolding.run(&mut g, &PassContext::new()).unwrap();
+        let t = inline_const(&g, out).expect("Reshape folded to initializer");
+        assert_eq!(t.dims, vec![3, 2]);
+        assert_eq!(t.data, (0u8..6).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn folds_reshape_beyond_shape_fold_bound() {
+        // Reshape/Transpose must fold at weight scale, well past MAX_FOLD_ELEMS
+        // (the bound reserved for shape-computation-sized Add/Sub/Mul/Concat).
+        let numel = MAX_FOLD_ELEMS * 4;
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let data = raw_const_init(&mut g, "x", DataType::Uint8, vec![numel], vec![0u8; numel]);
+        let shape = const_init(&mut g, "shape", vec![2], &[2, (numel / 2) as i64]);
+        let out = g.create_named_value("out", DataType::Uint8, static_shape([2, numel / 2]));
+        g.insert_node(ints_attr_node(
+            "Reshape",
+            vec![Some(data), Some(shape)],
+            vec![out],
+        ));
+        g.add_output(out);
+
+        ConstantFolding.run(&mut g, &PassContext::new()).unwrap();
+        let t = inline_const(&g, out).expect("large Reshape must still fold");
+        assert_eq!(t.dims, vec![2, numel / 2]);
+    }
+
+    #[test]
+    fn folds_transpose_permutes_bytes() {
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        // 2x3 tensor: rows [0,1,2] and [3,4,5]; perm=[1,0] transposes to
+        // 3x2: [0,3, 1,4, 2,5].
+        let data = raw_const_init(
+            &mut g,
+            "x",
+            DataType::Uint8,
+            vec![2, 3],
+            vec![0, 1, 2, 3, 4, 5],
+        );
+        let out = g.create_named_value("out", DataType::Uint8, static_shape([3, 2]));
+        let mut node = ints_attr_node("Transpose", vec![Some(data)], vec![out]);
+        node.attributes
+            .insert("perm".into(), Attribute::Ints(vec![1, 0]));
+        g.insert_node(node);
+        g.add_output(out);
+
+        ConstantFolding.run(&mut g, &PassContext::new()).unwrap();
+        let t = inline_const(&g, out).expect("Transpose folded to initializer");
+        assert_eq!(t.dims, vec![3, 2]);
+        assert_eq!(t.data, vec![0, 3, 1, 4, 2, 5]);
+    }
+
+    #[test]
+    fn folds_concat_along_axis_zero() {
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let a = const_init(&mut g, "a", vec![2], &[1, 2]);
+        let b = const_init(&mut g, "b", vec![3], &[3, 4, 5]);
+        let out = g.create_named_value("out", DataType::Int64, static_shape([5]));
+        let mut node = ints_attr_node("Concat", vec![Some(a), Some(b)], vec![out]);
+        node.attributes.insert("axis".into(), Attribute::Int(0));
+        g.insert_node(node);
+        g.add_output(out);
+
+        ConstantFolding.run(&mut g, &PassContext::new()).unwrap();
+        let t = inline_const(&g, out).expect("Concat folded to initializer");
+        assert_eq!(read_i64(t).unwrap(), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn folds_gate_up_interleave_chain_to_a_literal_initializer() {
+        // Mirrors mobius's `_interleave_gate_up_rows`: reorder fc1 gate/up
+        // rows from HF-concatenated `[E, 2*inter, ...]` layout to QMoE's
+        // interleaved `[g_0, u_0, g_1, u_1, ...]` layout, entirely at
+        // constant-fold time (relying on Shape(start=2)+Concat+Reshape+
+        // Transpose+Concat+Reshape all folding into one literal initializer).
+        let num_experts = 2usize;
+        let half = 2usize;
+        let fc1_out = 2 * half;
+        let trailing = 3usize;
+        let numel = num_experts * fc1_out * trailing;
+
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        let tensor = raw_const_init(
+            &mut g,
+            "fc1_experts_weights",
+            DataType::Uint8,
+            vec![num_experts, fc1_out, trailing],
+            (0u8..numel as u8).collect(),
+        );
+
+        let trailing_shape = g.create_named_value("trailing", DataType::Int64, static_shape([1]));
+        let mut shape_node = ints_attr_node("Shape", vec![Some(tensor)], vec![trailing_shape]);
+        shape_node
+            .attributes
+            .insert("start".into(), Attribute::Int(2));
+        g.insert_node(shape_node);
+
+        let split_const = g.create_named_value("split_const", DataType::Int64, static_shape([3]));
+        let mut split_const_node = ints_attr_node("Constant", vec![], vec![split_const]);
+        split_const_node.attributes.insert(
+            "value_ints".into(),
+            Attribute::Ints(vec![num_experts as i64, 2, half as i64]),
+        );
+        g.insert_node(split_const_node);
+
+        let split_shape = g.create_named_value("split_shape", DataType::Int64, static_shape([4]));
+        let mut split_concat = ints_attr_node(
+            "Concat",
+            vec![Some(split_const), Some(trailing_shape)],
+            vec![split_shape],
+        );
+        split_concat
+            .attributes
+            .insert("axis".into(), Attribute::Int(0));
+        g.insert_node(split_concat);
+
+        let reshaped = g.create_named_value(
+            "reshaped",
+            DataType::Uint8,
+            static_shape([num_experts, 2, half, trailing]),
+        );
+        g.insert_node(ints_attr_node(
+            "Reshape",
+            vec![Some(tensor), Some(split_shape)],
+            vec![reshaped],
+        ));
+
+        let transposed = g.create_named_value(
+            "transposed",
+            DataType::Uint8,
+            static_shape([num_experts, half, 2, trailing]),
+        );
+        let mut transpose_node =
+            ints_attr_node("Transpose", vec![Some(reshaped)], vec![transposed]);
+        transpose_node
+            .attributes
+            .insert("perm".into(), Attribute::Ints(vec![0, 2, 1, 3]));
+        g.insert_node(transpose_node);
+
+        let merge_const = g.create_named_value("merge_const", DataType::Int64, static_shape([2]));
+        let mut merge_const_node = ints_attr_node("Constant", vec![], vec![merge_const]);
+        merge_const_node.attributes.insert(
+            "value_ints".into(),
+            Attribute::Ints(vec![num_experts as i64, fc1_out as i64]),
+        );
+        g.insert_node(merge_const_node);
+
+        let merge_shape = g.create_named_value("merge_shape", DataType::Int64, static_shape([3]));
+        let mut merge_concat = ints_attr_node(
+            "Concat",
+            vec![Some(merge_const), Some(trailing_shape)],
+            vec![merge_shape],
+        );
+        merge_concat
+            .attributes
+            .insert("axis".into(), Attribute::Int(0));
+        g.insert_node(merge_concat);
+
+        let result = g.create_named_value(
+            "result",
+            DataType::Uint8,
+            static_shape([num_experts, fc1_out, trailing]),
+        );
+        g.insert_node(ints_attr_node(
+            "Reshape",
+            vec![Some(transposed), Some(merge_shape)],
+            vec![result],
+        ));
+        g.add_output(result);
+
+        ConstantFolding.run(&mut g, &PassContext::new()).unwrap();
+        DeadNodeElimination
+            .run(&mut g, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(
+            g.num_nodes(),
+            0,
+            "the entire interleave chain must fold to a literal initializer"
+        );
+        let t = inline_const(&g, result).expect("result must be a literal initializer");
+        assert_eq!(t.dims, vec![num_experts, fc1_out, trailing]);
+        // Expert 0 rows: g0=[0,1,2] g1=[3,4,5] u0=[6,7,8] u1=[9,10,11].
+        // Expert 1 rows: g0=[12,13,14] g1=[15,16,17] u0=[18,19,20] u1=[21,22,23].
+        // Interleaved as [g0,u0,g1,u1] per expert.
+        assert_eq!(
+            t.data,
+            vec![
+                0, 1, 2, 6, 7, 8, 3, 4, 5, 9, 10, 11, //
+                12, 13, 14, 18, 19, 20, 15, 16, 17, 21, 22, 23,
+            ]
+        );
+        assert!(g.validate().is_ok());
     }
 }
