@@ -200,17 +200,20 @@ Ordered by *decode-path impact × distance from parity*, which is also
    it, and `AttentionTranspose`, `MoE` and `GemmF32` cannot fully graduate until
    it does. Hardest: MLAS is a mature, hand-tuned, multi-ISA SGEMM.
 2. **Activations.** Already the closest — Tanh and Sigmoid *have* graduated. Erf
-   and exact Gelu remain: MLAS is **1.34–1.56×** on Erf and **1.10–1.12×** on
-   exact Gelu in the re-measurement below.
+   and exact Gelu remain: on the `narrow` arm of the re-measurement below MLAS
+   is **1.34–1.56×** on Erf and **1.10–1.12×** on exact Gelu (`wide`:
+   **1.34–1.64×** and **1.12–1.18×**).
 3. **Normalization.** Already ours; listed so it stays measured, not to be
    absorbed.
 4. **Softmax.** *Largely closed.* This entry used to read "the widest measured
    gap and the easiest structural win", because the native route was a scalar
    `f32::exp` loop ~9× off MLAS. `softmax_avx2` (#1234) and then #1416 landed on
    `main`, and the re-measurement below puts the ratio at **0.82–0.87** across
-   the three softmax cases. The MLAS control arm is stationary to within 4%
-   across that same comparison, so **1.24–1.27× of it is attributable native
-   work**, matching what #1416 claimed for the row kernel. What remains is the
+   the three softmax cases on the `narrow` arm (**0.80–0.83** on `wide`). The
+   then-vs-now attribution is a separate, width-matched comparison: measured on
+   `wide` against the archived #1173 numbers, the MLAS control arm is stationary
+   to within **4.2%**, so **1.24–1.27× is attributable native work**, matching
+   what #1416 claimed for the row kernel. What remains is the
    `exp` polynomial and the two-pass row traversal, on the decode critical path
    for every token. Still short of the 1.05 graduation bar, but no longer the
    headline gap.
@@ -270,8 +273,12 @@ Unpacked:
      drop any invocation materially below the median of its siblings. A rep that
      was descheduled is not a slow rep, it is an untrusted one — a distinction
      owed to #1809, where adding this guard moved an A/A null from 52% to
-     0.04–0.56%. It is what makes this table measurable on a shared box at all,
-     rather than requiring a quiet one that never arrives.
+     0.04–0.56%. Note what it does and does not do here: **in-process
+     interleaving is what protects the ratio**; this guard only catches
+     *differential* descheduling between the arms. Contention that lands evenly
+     on both arms passes it wholesale. It is what lets you keep measuring on a
+     shared box instead of waiting for a quiet one that never arrives, not a
+     substitute for the interleaving.
 - **At a stated width.** The verdict is a function of how many cores the process
   is given, for the reason in the previous bullet: the two routes do not scale
   alike. Measured directly, six idle physical cores in one L3 domain against all
@@ -321,6 +328,17 @@ alternating which arm runs first**, on a host that was explicitly *not* quiet
   against a median of 14.17.
 
 `spread` is `(max − min) / median` of the ratio across that arm's trusted reps.
+
+**Read the `ratio` column as a median of per-rep ratios, not as the quotient of
+the two columns beside it.** Each rep contributes its own `mlas / native`, and
+the median is taken over those; the `ns/unit` columns are independently the
+medians of their own times. Because a median does not distribute over division,
+the two disagree slightly — `decode 1×2048×2048` shows 0.0684 / 0.0617 = 1.109
+by column but 1.117 by rep. The per-rep form is the correct one to quote,
+because it pairs each MLAS invocation with the native invocation it was
+interleaved against, which is the whole point of interleaving; the quotient of
+medians silently pairs measurements that were never adjacent. The gap between
+the two is itself a smell — where it is large, the arm is unstable.
 
 **The mask was verified to hold, not assumed.** #1815 observed the neighbouring
 `bench_generic` harness spawning its ORT arm *outside* the affinity confinement
@@ -392,12 +410,15 @@ threshold and a 134% spread, the bench will eventually hand you a
 tell you it was a coin flip. Had the previous revision of this table been run
 once more, it could have graduated a route on this row.
 
-**3. The narrow arm is the more trustworthy one even though it has fewer cores.**
-Its spreads are 4–42% against the wide arm's 5–134%, and it lost no reps to the
-efficiency guard. Isolation beat parallelism: six idle cores in one L3 domain
-produce a repeatable number, and thirty-two logical CPUs shared with someone
-else's build do not. When these two disagree, prefer the arm whose reps agree —
-and say which one you used.
+**3. The narrow arm is the more trustworthy one overall, though not on every
+row.** Its spreads run **4–82%** against the wide arm's **5–134%**, and it lost
+no reps to the efficiency guard. Isolation beat parallelism: six idle cores in
+one L3 domain produce a more repeatable number than thirty-two logical CPUs
+shared with someone else's build. But the honest qualifier is that `odd
+37×1023×511` is an 82% coin flip on the narrow arm too — wider than eleven of
+the twelve wide-arm rows — so "narrow is tighter" is an aggregate statement, not
+a per-row guarantee. Prefer the arm whose reps agree **on the row you care
+about**, and say which one you used.
 
 Net: **`decode 1×2048×2048` is the first f32 GEMM case to show a real native
 win**, at 1.117 on the narrow arm — but it is `native-graduates-but-costs-more-cpu`
@@ -416,8 +437,12 @@ The trap in reading that as kernel progress is that the machine changed
 underneath *both* arms between the two measurements. What makes it decomposable
 is that **no vendored MLAS kernel has changed since #1173** — the only
 `mlas-sys` edits are the additive straggler handshake in `work_stealing_pool.rs`
-(#828, diagnosed in #1714), which adds waiting rather than removing it. So the
-MLAS column is a control arm. Compare **like width to like width**: the previous
+(#828, diagnosed in #1714). That provenance is a *prior*, not the proof: the
+"it only adds waiting" argument is one-directional, and in any case a control
+that silently got slower would inflate the ratio just as badly as one that got
+faster. The load-bearing evidence is the **direct then→now measurement of the
+MLAS column itself**, below — the control is shown to have held still rather
+than assumed to have. Compare **like width to like width**: the previous
 revision and the `wide` arm above were both taken on all 32 logical CPUs.
 
 | softmax case | MLAS then → now (control) | native then → now | ratio |
@@ -426,8 +451,12 @@ revision and the `wide` arm above were both taken on all 32 logical CPUs.
 | attn 32×512 | 0.6636 → 0.6357 (−4.2%) | 1.0083 → 0.7944 (1.27×) | 0.66 → 0.80 |
 | prefill 128×4096 | 0.6368 → 0.6265 (−1.6%) | 0.9312 → 0.7527 (1.24×) | 0.68 → 0.83 |
 
-The control is stationary to within 4% across all three, so the native column is
-real work: **1.24–1.27×**, which is exactly what #1416 claimed for the row
+(Ratios in this table are quotients of medians on both sides, since the archived
+revision recorded only medians; that is why the "now" column differs in the last
+digit from the median-of-ratios in the wide table above.)
+
+The control is stationary to within 4.2% across all three, so the native column
+is real work: **1.24–1.27×**, which is exactly what #1416 claimed for the row
 kernel. That is the cleanest attribution in this document, and it only exists
 because the comparison arm was left untouched. Prefer this decomposition over
 raw absolute columns whenever the table is re-measured across an infrastructure
@@ -435,8 +464,11 @@ change.
 
 **One activation row wants a second look.** `erf 1 Mi` is the only case where
 the **native** arm went the wrong way at matched width: 0.4551 → 0.5167, 13.5%
-slower, against a `wide` spread of only 7.5%, so the move is larger than the
-measurement's own scatter. But its MLAS control is *not* stationary here
+slower. The nearest scatter figure available is the `wide` arm's **8%** spread,
+but that is a spread of *ratios* and this is a move in a *native time*, so the
+two are not strictly commensurable — read it as "larger than the run-to-run
+scatter of anything else in this row", not as a significance test. And its MLAS
+control is *not* stationary here
 (0.3565 → 0.3174, 11% faster), so unlike softmax this cannot be attributed to
 our kernel from these numbers alone — a 25% relative swing with both arms moving
 is as consistent with a bandwidth or placement effect as with a regression.
@@ -444,9 +476,12 @@ is as consistent with a bandwidth or placement effect as with a regression.
 
 The f32 GEMM rows carry **no attribution at all**, and it is worth being explicit
 about why rather than quietly presenting the improved ratios. `decode 1×2048×2048`
-went 0.238 → 0.934 at matched width, which looks like a large native win — and
-the native column did improve (0.1309 → 0.0715, 1.83×). But the control moved
-further: MLAS went 0.0311 → 0.0633, i.e. **2.0× slower with no kernel change**.
+went **0.238 → 0.885** at matched width (both computed as a quotient of medians,
+since the archived revision recorded only medians — hence 0.885 rather than the
+0.934 median-of-ratios in the wide table above), which looks like a large native
+win, and the native column did improve (0.1309 → 0.0715, 1.83×). But the control
+moved further: MLAS went 0.0311 → 0.0633, i.e. **2.0× slower with no kernel
+change**.
 When the control arm moves by more than the effect, the arms are no longer
 comparable across revisions, and the only defensible statement is the current
 ratio at a stated width with its spread attached. GEMM remains the widest gap

@@ -973,10 +973,18 @@ mod tests {
     /// `docs/performance/CPU_MATMUL_ASSIGNMENT.md` had recorded the correct
     /// fact the whole time; nothing compared the two.
     ///
-    /// Prose cannot be type-checked, so this is the cheapest available
-    /// falsifier: it does not verify that the description is *right*, only that
-    /// the knob it names is still real. That is the half that goes stale
-    /// silently.
+    /// Prose cannot be type-checked, so this is a cheap falsifier rather than a
+    /// complete one. Two limits are deliberate and worth stating, because an
+    /// overclaimed guarantee is the thing this test exists to punish:
+    ///
+    /// * It checks that the named knob is still **read**, not that the
+    ///   surrounding description of its behaviour is correct. Requiring the
+    ///   name to appear in an `env::var` call or an `_ENV` constant — rather
+    ///   than merely somewhere in the sources — is what keeps a name that
+    ///   survives only inside a test's `EnvVarGuard` from passing as live.
+    /// * It does not catch the inverse defect: a variable that genuinely gates
+    ///   dispatch but that no `PlanEntry` mentions. Nothing here enumerates the
+    ///   gates, so that direction needs a reader, not a test.
     #[test]
     fn ledger_prose_only_names_environment_variables_that_still_exist() {
         let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -993,17 +1001,30 @@ mod tests {
             for text in [entry.dtypes, entry.isa, entry.threads, entry.shape_gate] {
                 for name in environment_variable_names(text) {
                     let quoted = format!("\"{name}\"");
+                    let read_sites: Vec<&str> = sources
+                        .lines()
+                        .filter(|line| line.contains(&quoted) && is_env_read_site(line))
+                        .collect();
                     assert!(
-                        sources.contains(&quoted),
+                        !read_sites.is_empty(),
                         "{}: ledger prose names environment variable `{name}`, but no \
-                         source file in this crate contains the literal {quoted}. Either \
-                         the variable was removed (update the prose) or it moved crates \
-                         (widen this test deliberately).",
+                         source file in this crate passes {quoted} to `env::var`/`var_os` \
+                         or binds it to an `_ENV` constant. Occurrences in test guards do \
+                         not count -- a name that only a test sets is not a live knob. \
+                         Either the variable was retired (update the prose) or it moved \
+                         crates (widen this test deliberately).",
                         entry.family
                     );
                 }
             }
         }
+    }
+
+    /// Does this line actually wire the literal it contains up to the process
+    /// environment? `env::set_var` is deliberately excluded: a test or bench
+    /// that *sets* a variable is not evidence that anything reads it.
+    fn is_env_read_site(line: &str) -> bool {
+        line.contains("env::var(") || line.contains("env::var_os(") || line.contains(": &str =")
     }
 
     /// Concatenate every `.rs` file under `dir`, recursively.
@@ -1024,13 +1045,18 @@ mod tests {
     }
 
     /// Pull `SHOUTY_SNAKE_CASE` tokens that look like environment variables out
-    /// of prose. Restricted to the two prefixes the EP actually uses so that
-    /// ordinary shouty words (ISA names like `AVX2`, `NEON`) are not mistaken
-    /// for knobs.
+    /// of prose.
+    ///
+    /// The prefix list is the checked surface, not the crate's full set of
+    /// knobs: the EP also reads `ONNX_RUNTIME_EP_CPU_*`, `EP_INTRA_OP` and
+    /// `GEMM_AB_*`, none of which any `PlanEntry` currently names. Add a prefix
+    /// here when a ledger entry starts naming one, rather than widening to all
+    /// shouty words — ISA names like `AVX2` and `NEON` are not knobs.
     fn environment_variable_names(text: &str) -> Vec<String> {
+        const CHECKED_PREFIXES: [&str; 3] = ["NXRT_", "ONNX_GENAI_", "ONNX_RUNTIME_EP_"];
         text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .filter(|token| {
-                (token.starts_with("NXRT_") || token.starts_with("ONNX_GENAI_")) && token.len() > 5
+                CHECKED_PREFIXES.iter().any(|p| token.starts_with(p)) && token.len() > 5
             })
             .map(str::to_owned)
             .collect()
