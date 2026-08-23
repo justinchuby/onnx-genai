@@ -637,6 +637,15 @@ pub struct SpmdDecodePools {
     dispatcher_shard: Option<usize>,
     total_workers: usize,
     schedule: DecodeSchedule,
+    /// The CPU each spawned worker was pinned to, global-worker-index order, or
+    /// `None` for an unpinned worker.
+    ///
+    /// Retained purely so the realized *placement* can be asserted. The pool
+    /// already reports its realized *width* (`decode_width`, `as_requested`),
+    /// and #1792 was the case where that report was honest while the placement
+    /// underneath it was not -- the count was never the thing that was wrong.
+    /// A label nothing can check is a label that drifts.
+    worker_cpus: Vec<Option<usize>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -751,6 +760,7 @@ impl SpmdDecodePools {
         });
 
         let mut handles = Vec::with_capacity(total_threads);
+        let worker_cpus: Vec<Option<usize>> = assignment.iter().map(|&(_, cpu)| cpu).collect();
         for (global_index, (node_position, cpu)) in assignment.into_iter().enumerate() {
             let shared = Arc::clone(&shared);
             let handle = thread::Builder::new()
@@ -790,12 +800,54 @@ impl SpmdDecodePools {
             dispatcher_shard,
             total_workers,
             schedule,
+            worker_cpus,
         }
     }
 
     /// Total decode workers across all node groups.
     pub fn total_workers(&self) -> usize {
         self.total_workers
+    }
+
+    /// The CPU each spawned worker is pinned to, global-worker-index order.
+    /// `None` in a slot means that worker is unpinned; an all-`None` slice means
+    /// the pool is not pinned at all (`ONNX_GENAI_CPU_DECODE_AFFINITY=off`, or a
+    /// host without pinning support).
+    ///
+    /// Exposed so the realized placement can be checked against what the pool
+    /// *claims*. See [`Self::placement_is_one_worker_per_physical_core`].
+    pub fn worker_cpus(&self) -> &[Option<usize>] {
+        &self.worker_cpus
+    }
+
+    /// Whether the pinned workers occupy distinct physical cores.
+    ///
+    /// `None` only when the question is unanswerable: an unpinned pool (no
+    /// placement claim to check) or an undiscoverable core topology.
+    /// `Some(false)` states literally that at least two pinned workers share a
+    /// core's front end. It is deliberately not qualified by whether that was
+    /// avoidable -- a pool asked for more workers than the host has cores must
+    /// still admit that it doubled up. The caller knows the budget; this does
+    /// not, and inferring it from the pinned set alone is circular, because a
+    /// collapsed placement covers exactly as few cores as it landed on.
+    ///
+    /// This is the placement counterpart to `decode_width().is_as_requested()`.
+    /// Width was always reported and asserted; placement was neither, and #1792
+    /// is what that costs -- a pool can report `realized=16 as_requested` while
+    /// running on half the cores it claims.
+    pub fn placement_is_one_worker_per_physical_core(&self) -> Option<bool> {
+        let cores = crate::core_topology::host()?;
+        let pinned: Vec<usize> = self.worker_cpus.iter().flatten().copied().collect();
+        if pinned.is_empty() {
+            return None;
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        Some(pinned.iter().all(|&cpu| {
+            let core: Vec<usize> = cores
+                .siblings_of(cpu)
+                .map_or_else(|| vec![cpu], <[usize]>::to_vec);
+            seen.insert(core)
+        }))
     }
 
     /// Number of node groups in the layout.
@@ -3135,6 +3187,97 @@ mod tests {
     /// passes against the unfixed code, because the bug was never in the
     /// helpers -- it was that the builder never called them. Deleting the early
     /// return in `node_shards_with` fails this and only this.
+    /// A pool that reports its width honestly must also *place* honestly.
+    ///
+    /// #1792's lesson: `decode_width()` said `realized=16 as_requested` while
+    /// the workers sat on 8 physical cores, and nothing checked. The width was
+    /// never the thing that was wrong. This asserts the half that was missing.
+    #[test]
+    fn a_pinned_pool_places_one_worker_per_physical_core() {
+        let cpus: Vec<usize> = match crate::core_topology::host() {
+            // Two full physical cores' worth of CPUs, spread the way the
+            // placement policy spreads them.
+            Some(cores) if cores.core_count() >= 2 => crate::decode_affinity::order_pin_targets(
+                &(0..cores.logical_count()).collect::<Vec<_>>(),
+                Some(cores),
+            ),
+            _ => return,
+        };
+        let cores = crate::core_topology::host().expect("checked above");
+        let workers = cores.core_count().min(4);
+        let pools = SpmdDecodePools::build_with_schedule(
+            &[NodeShard {
+                index: 0,
+                cpus,
+                workers,
+            }],
+            DecodeSchedule::Fixed,
+            false,
+        );
+        let pinned: Vec<usize> = pools.worker_cpus().iter().flatten().copied().collect();
+        assert_eq!(
+            pinned.len(),
+            workers,
+            "every worker of a pinned pool must have a pin target"
+        );
+        assert_eq!(
+            pools.placement_is_one_worker_per_physical_core(),
+            Some(true),
+            "pinned workers landed on {pinned:?}, which shares a physical core"
+        );
+        pools.shutdown();
+    }
+
+    /// The same predicate must be able to say *no*, or it is decoration.
+    #[test]
+    fn placement_reports_a_shared_core_as_a_defect() {
+        let Some(cores) = crate::core_topology::host() else {
+            return;
+        };
+        // Find one physical core with at least two siblings, and pin two
+        // workers onto it -- exactly the layout #1729 removed.
+        let Some(pair) = cores.cores().iter().find(|group| group.len() >= 2) else {
+            return; // non-SMT host: the bad layout is unrepresentable
+        };
+        let pools = SpmdDecodePools::build_with_schedule(
+            &[NodeShard {
+                index: 0,
+                cpus: vec![pair[0], pair[1]],
+                workers: 2,
+            }],
+            DecodeSchedule::Fixed,
+            false,
+        );
+        assert_eq!(
+            pools.placement_is_one_worker_per_physical_core(),
+            Some(false),
+            "two workers on cpus {:?} share a core and must be reported as such",
+            &pair[..2]
+        );
+        pools.shutdown();
+    }
+
+    /// An unpinned pool has no placement claim to check, and must not be
+    /// reported as a defect.
+    #[test]
+    fn an_unpinned_pool_makes_no_placement_claim() {
+        let pools = SpmdDecodePools::build_with_schedule(
+            &[NodeShard {
+                index: 0,
+                cpus: Vec::new(),
+                workers: 2,
+            }],
+            DecodeSchedule::Fixed,
+            false,
+        );
+        assert!(
+            pools.worker_cpus().iter().all(Option::is_none),
+            "an empty CPU set must leave every worker unpinned"
+        );
+        assert_eq!(pools.placement_is_one_worker_per_physical_core(), None);
+        pools.shutdown();
+    }
+
     #[test]
     fn node_shards_consults_the_explicit_request_before_default_placement() {
         let sentinel = NodeShard {
