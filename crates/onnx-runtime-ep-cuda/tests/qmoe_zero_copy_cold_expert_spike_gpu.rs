@@ -76,7 +76,7 @@
 //! --query-compute-apps` first):
 //! ```text
 //! CUDA_VISIBLE_DEVICES=<idle gpu> cargo test -p onnx-runtime-ep-cuda \
-//!   --features cuda --release --test qmoe_zero_copy_cold_expert_spike \
+//!   --features cuda --release --test qmoe_zero_copy_cold_expert_spike_gpu \
 //!   -- --ignored --nocapture --test-threads=1
 //! ```
 
@@ -1258,7 +1258,7 @@ fn run_correctness_and_bandwidth_matrix(shape: QmoeShape) {
 // Entry points. #[ignore]: needs a live idle CUDA device and page-locks host
 // RAM; these are measurements, not CI gates. Run with:
 //   CUDA_VISIBLE_DEVICES=<idle> cargo test -p onnx-runtime-ep-cuda \
-//     --features cuda --release --test qmoe_zero_copy_cold_expert_spike \
+//     --features cuda --release --test qmoe_zero_copy_cold_expert_spike_gpu \
 //     -- --ignored --nocapture --test-threads=1
 // ---------------------------------------------------------------------------
 

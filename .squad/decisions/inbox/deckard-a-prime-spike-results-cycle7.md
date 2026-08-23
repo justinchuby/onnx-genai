@@ -3,10 +3,13 @@
 **Author:** Deckard (CUDA/Perf)
 **Scope:** answers the two spikes assigned to Deckard in
 `roy-a-prime-downgraded-provisional-cycle7.md`. Spike #3 (resize-starvation)
-is explicitly out of scope here.
+is **partially answered**: the sequential, single-threaded 1000-cycle stress
+test below shows no starvation or counter drift under back-to-back
+decode-cadence load. Concurrent/multi-stream starvation is explicitly
+**not** covered and remains a separate follow-up spike.
 
 **PR:** squad/82-a-prime-cold-expert-spike ->
-`crates/onnx-runtime-ep-cuda/tests/qmoe_zero_copy_cold_expert_spike.rs`
+`crates/onnx-runtime-ep-cuda/tests/qmoe_zero_copy_cold_expert_spike_gpu.rs`
 (EXPERIMENTAL, `#[ignore]`d, not wired into any production dispatch path).
 
 ## Spike #1 (mixed-backing feasibility) -- CONFIRMED NO
@@ -98,7 +101,7 @@ Four hard gates were added by Fact Checker review after the initial spike. All f
 
 1. **No mixed per-expert VRAM+host composition claimed or built.** Re-confirmed: nothing in this spike constructs a single tensor with some experts VRAM-resident and others host-mapped. All arms remain whole-tensor granularity (fc1/fc2/fc3 each independently bound one way). This was already true in the first version of this spike; restated here explicitly per the gate.
 2. **Prior 5.6 GB/s (issue #880) and #925's 6.795 GB ceiling do NOT transfer here and were not reused.** #880's ~5.6 GB/s figure is RTX 4060 Laptop / WDDM only (confirmed by re-reading the issue body directly: "Results (RTX 4060 Laptop, 8 GiB, WDDM...)"). #925's ~6.795 GB ceiling is dense Qwen2.5-14B-Instruct weight streaming on H200/Linux, not MoE/A100 — also confirmed directly. This spike's ~32-36 GB/s (all-cold) / ~26-29 GB/s (mixed fc1-cold) figures are freshly measured, on A100/Linux, on a real QMoE int4 GEMV kernel path, and are reported as their own number, not compared against or blended with either prior figure except to note they are NOT the same regime.
-3. **Resize-starvation stress added and run**: new test `qmoe_routed_residency_guard_resize_starvation_stress_1000_steps` drives the REAL `CudaWeightResidency::acquire_routed_residency`/`resize_safe_point`/`execute_resize` machinery through 1000 back-to-back acquire→resize-attempt(rejected)→release→resize-attempt(accepted, executed, then shrunk back) cycles, single-threaded (simulating sequential decode-step dispatch). Result: 1000/1000 resize attempts while a guard is held were correctly rejected `NotSafePoint`, and 1000/1000 resize attempts in the inter-step gap succeeded — **no starvation observed** under this back-to-back single-threaded cadence. This is a bounded, partial answer to spike #3: it proves the guard-counted resize seam is exact and non-leaking under sequential decode-cadence load, but does **not** cover concurrent-stream/multi-thread dispatch, which is a separate, larger follow-up spike (explicitly flagged as out of scope here, same as originally scoped).
+3. **Resize-starvation stress added and run**: new test `qmoe_routed_residency_guard_resize_starvation_stress_1000_steps` drives the REAL `CudaWeightResidency::acquire_routed_residency`/`resize_safe_point`/`execute_resize` machinery through 1000 back-to-back acquire→resize-attempt(rejected)→release→resize-attempt(accepted, executed, then shrunk back) cycles, single-threaded (simulating sequential decode-step dispatch). Result: 1000/1000 resize attempts while a guard is held were correctly rejected `NotSafePoint`, and 1000/1000 resize attempts in the inter-step gap succeeded — **no starvation observed** under this back-to-back single-threaded cadence. This is a bounded, partial answer to spike #3: it proves the guard-counted resize seam is exact and non-leaking under sequential decode-cadence load, but does **not** cover concurrent-stream/multi-thread dispatch, which remains a separate, larger follow-up spike.
 4. **`qwen15-moe-qmoe` (Qwen1.5-MoE-A2.7B) real cold-bytes/step now measured directly**, not assumed: new shape `QWEN15_MOE_A27B` (experts=60, hidden=2048, inter=1408, top_k=4 — cited from https://huggingface.co/Qwen/Qwen1.5-MoE-A2.7B/blob/main/config.json) added as a third fixture alongside DeepSeek-V2-Lite (64e) and its 256-expert wide variant. All three now print a **measured** (not modeled) "real cold bytes/step" line before any control run: at `qwen1.5-moe-a2.7b` shape, per-expert gate/up/down = 2,162,688 B each, touched_experts(top_k)=4, total = 25,952,256 B (24.75 MiB)/decode-step if all touched experts were cold. Bandwidth for this shape: all-cold ~31.5 GB/s, mixed fc1-cold ~25.8 GB/s (7.32x / 2.98x slower than all-VRAM respectively) — consistent with the other two shapes.
 
 **Correction to a stale precondition** (per this update's own instruction, not previously reflected here): Mobius #550 now emits DeepSeek-V4 as one QMoE and #555 emits GLM-5.2 via shared QMoE — the exporter prerequisite for those two production-shaped fixtures is closed, though full downloadable artifacts remain absent from this box. This does not change any verdict below (this spike used the smaller, already-available `qwen15-moe-qmoe`/DeepSeek-V2-Lite-shaped/GLM-5.2-shaped-cited fixtures, all synthetic-filled but shape-faithful), but is recorded so a future spike knows real DeepSeek-V4/GLM-5.2 artifacts may now be obtainable rather than blocked on the exporter.
@@ -123,7 +126,7 @@ Resize-starvation: 1000/1000 clean (no starvation, no counter drift) under seque
 
 ```
 CUDA_VISIBLE_DEVICES=<idle gpu> cargo test -p onnx-runtime-ep-cuda \
-  --features cuda --release --test qmoe_zero_copy_cold_expert_spike \
+  --features cuda --release --test qmoe_zero_copy_cold_expert_spike_gpu \
   -- --ignored --nocapture --test-threads=1
 ```
 
