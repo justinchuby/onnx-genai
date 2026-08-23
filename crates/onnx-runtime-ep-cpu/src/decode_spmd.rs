@@ -1071,6 +1071,14 @@ impl SpmdDecodePools {
                     // became ready". The deadline is a backstop against a
                     // condition that can no longer be satisfied; one that just
                     // was satisfied is not that case.
+                    //
+                    // This `Acquire` re-load gives the break path exactly the
+                    // synchronisation the normal loop exit gives, so the
+                    // `Relaxed` `pin_failed` reads below are equally justified
+                    // on both. Note the branch is asserted by reasoning, not by
+                    // a test: reaching it requires a worker to announce inside
+                    // the window between two adjacent atomic loads, which no
+                    // deterministic test can force.
                     if ready >= total_threads {
                         break;
                     }
@@ -1896,11 +1904,21 @@ fn worker_loop(shared: Arc<SharedState>, global_index: usize) {
     // this worker is waiting for it.
     let mut last_seen: u32 = 0;
     let blocktime = decode_blocktime();
-    // `AcqRel`, not `Release`. The `Acquire` half chains this RMW to the
-    // previous worker's, so every worker's pre-readiness stores -- notably
-    // `pin_failed[i]`, which the builder reads `Relaxed` -- are ordered before
-    // the builder's `Acquire` load of `ready`. Downgrading to `Release` would
-    // leave only the release-sequence head ordered and make that read a race.
+    // The `Release` half is load-bearing: it orders this worker's pre-readiness
+    // stores -- notably `pin_failed[i]`, which the builder reads `Relaxed`
+    // after the barrier -- before the builder's `Acquire` load of `ready`.
+    //
+    // `Release` alone would suffice. A release sequence headed by a release
+    // store extends through every subsequent read-modify-write on that
+    // location whatever ordering those RMWs use, and every announcement here
+    // is an RMW; so the final `fetch_add` that brings `ready` to
+    // `total_threads` lies in the release sequence headed by *each* worker's
+    // store, and the builder's `Acquire` load of that value synchronizes-with
+    // all of them. The `Acquire` half is therefore not required -- no worker
+    // reads another worker's pre-readiness state -- and is kept only as a
+    // harmless superset. Do not read it as "Release would be a race": it would
+    // not be. What must not change is that this stays a *release* operation
+    // and stays sequenced after the `pin_failed` store.
     shared.ready.fetch_add(1, Ordering::AcqRel);
     loop {
         // Bounded active spin (blocktime) then futex park; returns the observed
