@@ -50,6 +50,10 @@ vary it; the "flat line" was one configuration measured five times.
 
 Sweeping the real knob, block 32 / accuracy 4:
 
+> **Superseded (2026-08-23).** The t=1 and t=2 cells below are wrong and the
+> ±0.7% error bar on 8→16 is withdrawn — see the correction at the end of this
+> section.
+
 | `ONNX_GENAI_CPU_DECODE_THREADS` | 1 | 2 | 4 | 8 | 16 | 32 |
 |---|---|---|---|---|---|---|
 | ms/token | 22.949 | 22.893 | 11.584 | 5.866 | 3.302 | see §4* |
@@ -72,6 +76,31 @@ impose minimum task sizes) -- but I did not confirm it, and it is recorded here
 as an open question rather than an explanation. No conclusion in this document
 depends on it. Second, scaling decays past 16 (§4 could not measure t=32
 reliably).
+
+> **Correction (2026-08-23).** Both halves of the paragraph above are now
+> resolved, and the resolution is that the *table* is wrong rather than
+> unexplained.
+>
+> * **t=1 ≡ t=2 is false.** Re-measured with one process per cell and
+>   `realized=` verified from the binary, **t=2 is 1.96x t=1** (7.278 vs 14.300
+>   ms/token) against a **0.00% A/A null**. The granularity-floor hypothesis
+>   above is also wrong: the gate admits fan-out at width 2 at these shapes. The
+>   cause was harness-side (#1771, #1740). Note that t=1 runs `path=flat` --
+>   serial on the dispatcher, not a one-worker pool -- so the 1.96x is "vs
+>   serial".
+> * **The "±0.7%" on 8→16 is withdrawn, and the t=32 instability was the same
+>   phenomenon one column to the right.** The t=32 samples recorded above,
+>   `1.801 / 3.178 / 3.170`, are not noise without a central value: they are
+>   **bimodal**, and w=16 is bimodal too. Over six independent launches w=16
+>   spans 1.476-9.064 ms/token (514%) while w=8 spans 3.195-3.509 (9.8%), with
+>   the slow launches tracking SMT-sibling occupancy on the unpinned CPUs. At
+>   w≥16 the run holds every physical core and has no headroom, so a co-tenant
+>   on the hardware siblings takes throughput straight out of the measurement.
+>   The three repetitions that produced ±0.7% all landed in the fast mode. The
+>   refusal to headline t=32 was right; it should have been extended to t=16.
+>
+> Full method and data:
+> [2026-08-23-acc4-decode-width-remeasurement.md](2026-08-23-acc4-decode-width-remeasurement.md).
 
 **Lesson, now written into the bench header: verify that the knob you are
 sweeping moves the thing you think it moves.** A wrong "does not scale" verdict

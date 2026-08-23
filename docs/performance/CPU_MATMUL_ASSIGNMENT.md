@@ -1662,10 +1662,38 @@ Two cheaper hypotheses were tested and **both are closed negative**:
 
 - *"The kernel does not thread-scale."* An artifact: `RAYON_NUM_THREADS` does
   not size the decode pool (`configured_decode_threads` reads
-  `available_parallelism` and `ONNX_GENAI_CPU_DECODE_THREADS`). The real knob
-  gives 22.949/22.893/11.584/5.866/3.302 ms/token at 1/2/4/8/16 threads —
-  8→16 is **1.77x, ±0.7% over three interleaved repetitions**. (t=1≡t=2 is
-  unexplained and recorded as an open question, not an explanation.)
+  `available_parallelism` and `ONNX_GENAI_CPU_DECODE_THREADS`). That much
+  stands. **The width curve originally recorded here does not, and has been
+  re-measured (2026-08-23);** the numbers below replace
+  `22.949/22.893/11.584/5.866/3.302 ms/token at 1/2/4/8/16`.
+  - **`t=1` ≡ `t=2` was wrong, not unexplained.** It was recorded here as "an
+    open question, not an explanation"; the honest disposition is that it is
+    **false**. On a re-measurement with one process per cell, `t=2` is
+    **1.96x** faster than `t=1` (7.278 vs 14.300 ms/token) against a **0.00%
+    A/A null** over five reps per arm. This independently reproduces, on a
+    different shape and accuracy level, the 1.96x that §27 records for acc0 —
+    two unrelated configurations agreeing on the same factor. The cause is
+    harness-side and mechanical (#1771), not a property of the pool.
+  - **`t=1` is a different code path, so every ratio against it is "vs
+    serial".** The bench reports `path=flat` at width 1 and `path=spmd-pool`
+    from width 2 up: at `total_workers <= 1` `dispatch_output_rows` takes a
+    serial short-circuit and runs on the *dispatcher*, while the spawned worker
+    receives no dispatch at all. "1.96x over `t=1`" therefore means "over the
+    serial dispatcher", not "over a one-worker pool".
+  - **The `8→16 = 1.77x ±0.7%` error bar is withdrawn as unsupportable on a
+    shared host.** Over six independent launches `w=16` spans **1.476–9.064
+    ms/token (514%)** while `w=8` spans 3.195–3.509 (9.8%), and the slow `w=16`
+    launches track SMT-sibling occupancy on the unpinned CPUs. At `w=16` the
+    run holds all 16 physical cores and has no headroom, so a co-tenant on the
+    hardware siblings degrades it non-linearly; at `w=8` there is slack and the
+    number is robust. The original `±0.7%` was three repetitions that happened
+    to land in one mode. **`w=16` is not measurable on this host while it is
+    shared**, and `8→16` is left unquoted rather than given a false interval.
+  - Trustworthy cells, five reps each, `realized=`/`as_requested` verified per
+    cell: **14.300 / 7.278 / 3.784 ms/token at t=1/2/4** — 1.00x / 1.96x /
+    3.78x, spreads 2.25% / 1.73% / 2.60%. `w=8` is stable at ~3.3 ms but is
+    already near the plateau. Full record:
+    [`docs/benchmarks/2026-08-23-acc4-decode-width-remeasurement.md`](../benchmarks/2026-08-23-acc4-decode-width-remeasurement.md).
 - *"Production is stuck on the narrow flat pool, so 1.77x is free."* False.
   `default_persistent_threads(32)` is 16 and `PERSISTENT_POOL_DEFAULT` is
   `true`, so `is_forced()` holds; every pool configuration reachable from this
