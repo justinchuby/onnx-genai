@@ -139,3 +139,44 @@ fn rebuilding_each_package_reproduces_its_abi() {
         );
     }
 }
+
+/// A package with more than one graph is never "a single decoder", however
+/// recognizable its decoder is.
+///
+/// This is the distinction that a real published package caught: a 187-component
+/// any-to-any model has exactly one component carrying `token_ids`/`logits`
+/// roles — its text head — so "has a recognizable decoder" was true of it. Had
+/// that stood in for "is only a decoder", the loader would have handed a
+/// 186-graph package to the fused single-graph executor, which cannot run the
+/// other 185. The same mistake classifies every vision-language package.
+#[test]
+fn a_multi_component_package_is_not_a_single_decoder() {
+    use onnx_genai_metadata::is_single_decoder_workflow;
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for (relative, expected_single) in [
+        // One ONNX graph plus the runtime's token policy.
+        ("tests/fixtures/tiny-llm", true),
+        ("tests/fixtures/tiny-llm-scatter", true),
+        // A vision encoder, a projector and a decoder. Its decoder is
+        // recognizable; the package is not a decoder.
+        ("tests/fixtures/onnx_genai_workflows/vlm", false),
+        ("tests/fixtures/onnx_genai_workflows/gemma4_chained", false),
+        ("tests/fixtures/onnx_genai_workflows/tts", false),
+    ] {
+        let path = root.join(relative).join("inference_metadata.yaml");
+        let metadata =
+            load_metadata(&path).unwrap_or_else(|error| panic!("{relative}: must load: {error}"));
+        let workflow = &metadata
+            .pipeline
+            .as_ref()
+            .unwrap_or_else(|| panic!("{relative}: must declare a workflow"))
+            .workflow;
+        assert_eq!(
+            is_single_decoder_workflow(workflow),
+            expected_single,
+            "{relative}: misclassified; it declares {} components",
+            workflow.components.len()
+        );
+    }
+}

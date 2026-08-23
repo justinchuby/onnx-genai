@@ -140,8 +140,36 @@ pub fn sole_decoder_component(workflow: &WorkflowSpec) -> Option<&str> {
 /// whether a package is "just a decoder" — the engine choosing an executor, the
 /// CLI and server deciding whether to build multimodal input specs — asks here,
 /// so no two of them can reach different conclusions about the same package.
+///
+/// # This is not the same question as [`sole_decoder_component`]
+///
+/// That one asks *which* component is the decoder, and answers it for composite
+/// packages too: a vision-language package has one decoder among its encoder,
+/// projector and decoder components, which is exactly why the resolver exists.
+/// Treating "has a recognizable decoder" as "is only a decoder" would classify
+/// every VLM — and every any-to-any package with a text head — as a bare
+/// decoder, and route it to the fused single-graph executor that cannot run its
+/// other components at all.
+///
+/// So the question asked here is the one the phrase actually means: does this
+/// workflow execute **one** ONNX graph? Components the *runtime* implements
+/// (`binding`, such as the token policy) are not graphs and do not count; an
+/// adapter or a second ONNX component does.
 pub fn is_single_decoder_workflow(workflow: &WorkflowSpec) -> bool {
-    sole_decoder_component(workflow).is_some()
+    if sole_decoder_component(workflow).is_none() {
+        return false;
+    }
+    workflow
+        .components
+        .values()
+        .filter(|component| {
+            !matches!(
+                component.implementation,
+                crate::schema::ComponentImplementation::Binding
+            )
+        })
+        .count()
+        == 1
 }
 
 /// Find the single port of `component` carrying `role`.
