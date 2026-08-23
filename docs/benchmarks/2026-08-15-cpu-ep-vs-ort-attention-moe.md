@@ -4904,33 +4904,88 @@ This is documented in-tree, by Sebastian, in the `#1746` addendum to
 it goes through the production session-load path, so it gets the mask. I read
 that addendum as being about his harness and did not check mine against it.
 
-**What follows without needing the mask's value.** `scatter_across_cores`
-(`decode_affinity.rs:560`) ranks physical-core leaders ahead of SMT siblings,
-so the budget mask is *shaped* to avoid the doubling-up that `#1729` fixed --
-the recorded production line for a budget of 2 is `[0, 2]`, two distinct cores,
-not `[0, 1]`. I have **not** observed the mask at `T = 16` on an unrestricted
-host, so I am not asserting it is benign. The settled part is only that the two
-mechanisms are different code with different placement rules.
+**The mask's value, now observed rather than reasoned about.** Read from
+`/proc/<pid>/task/*/status` on live `bench_generic` runs on this host, with no
+outer `taskset`, so the process saw all 32 logical CPUs before confining
+itself:
 
-**And a third asymmetry, which is the real find here.** Affinity is inherited
-at thread creation, and the two arms are built on opposite sides of the mask:
-`bench_generic` constructs `ort_session` at `:691` and *then*
-`InferenceSession::load` at `:703`, and it is that load which applies the
-confinement. So ORT's intra-op pool is spawned **before** the process is
-confined and the native EP's threads **after** it. If ORT's pool is created at
-session construction, the paired runs gave ORT the full 32 logical CPUs while
-the native arm ran on `T`. That is the same direction as reason 1 and it also
-grows with `T`. **Suspected, not observed** -- it is settled by reading
-`Cpus_allowed_list` per thread from `/proc/<pid>/task/*/status` on a live
-paired run, grouped by thread name, which needs a quiet host and is queued.
+| `--native-threads` | mask the process gave itself |
+|---|---|
+| 2 | `[0, 2]` |
+| 4 | `[0, 2, 4, 6]` |
+| 16 | `[0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30]` |
+
+`scatter_across_cores` (`decode_affinity.rs:560`) ranks physical-core leaders
+ahead of SMT siblings, and that is what it does here: at `T = 16` the mask is
+16 *distinct physical cores* spanning both L3 domains, not the compact
+`cpus 0-15` set. **So the `#1729` pathology really is excluded on both
+mechanisms** -- the second one places well.
+
+**And a third asymmetry, which is the real find, and it is confirmed.**
+Affinity is inherited at thread creation, and the two arms are built on
+opposite sides of the mask: `bench_generic` constructs `ort_session` at `:691`
+and *then* `InferenceSession::load` at `:703`, and it is that load which
+applies the confinement. So ORT's intra-op pool is spawned **before** the
+process is confined and the native EP's threads **after** it.
+
+That is exactly what `/proc` shows. Same runs, threads grouped by name and
+mask:
+
+| `T` | confined to the budget mask | **unconfined, `0-31`** |
+|---|---|---|
+| 2 | 3 x `bench_generic`, 1 x `nxrt-task-0` | **1** |
+| 4 | 5 x `bench_generic`, 3 x `nxrt-task-N` | **3** |
+
+Every `nxrt-task-N` worker -- the native task runtime -- carries the budget
+mask. The unconfined threads are unnamed, so they inherit the process name,
+and there are exactly `T - 1` of them: ORT's intra-op pool, spawned at session
+construction, before the mask existed.
+
+**At `T = 16` that is a native arm confined to 16 physical cores while ORT's 15
+spinning workers roam all 32 logical CPUs** -- including the SMT siblings of
+the very cores the native arm cannot leave. This does not replace reason 1, it
+sharpens it: the spin tax is not merely concurrent with the native sample, it
+is free to land on the sibling of every core the native arm is pinned to,
+while the native arm has nowhere else to go. And like reason 1 it grows with
+`T`, which is the shape 45.8 read as a native scaling failure.
+
+`--ort-intra-threads T` does **not** equalise this. It equalises the thread
+*counts*; the CPU *sets* differ by construction.
+
+**Mitigation, verified.** Setting `ONNX_GENAI_CPU_DECODE_AFFINITY=off` makes
+`explicit_decode_affinity_requested()` true, so `bound_process_to_decode_budget`
+stands its auto-mask down:
+
+```
+onnx-genai: CPU decode budget 16 bounds the prefill/MLAS Rayon pool; process
+CPU affinity is left to the explicit ONNX_GENAI_CPU_DECODE_AFFINITY setting
+```
+
+Re-probed at `T = 4`, all 11 threads then read `Cpus_allowed_list: 0-31` --
+both arms unconfined, symmetric. **Any re-measurement of these rows should set
+it**, together with `--native-only` or `--ort-intra-threads 1` for reason 1.
+
+Worth carrying to `#1792`, which reports this knob as *inert* on the default
+SPMD path: it is not inert here. It is the only switch that disables the
+process self-confinement. The same environment variable is dead in one
+mechanism and load-bearing in the other, which is a worse story for a user
+than either finding alone.
+
+**On the cost of these probes.** They are `/proc` reads, not timings, so host
+contention cannot corrupt them -- which is why they were taken on a busy host
+(runnable 33) rather than queued behind it. The widest arm was a single
+`--runs 1` native-only launch. Nothing here is a benchmark and nothing here
+claims a millisecond.
 
 **Consequence for the re-measurement queue.** Decode rows taken before
 `6e8c31ebd` were on 8 physical cores and do need re-taking. For the single-node
-SDPA/MHA rows in 45.7-45.10, the `#1729` mechanism specifically is excluded, but
-**they are not placement-clean and nobody should treat them as such** -- they
-were taken inside a self-imposed `T`-CPU mask whose interaction with the ORT arm
-is an open question. They need re-taking regardless, for reason 1, which is
-sufficient on its own.
+SDPA/MHA rows in 45.7-45.10, both placement mechanisms are now settled and they
+land on opposite sides: the `#1729` per-worker mask never reached these rows,
+and the process budget mask that *did* reach them places well. **The rows are
+still not clean, but the reason is no longer placement -- it is that the ORT arm
+escaped the mask entirely.** They need re-taking for that and for reason 1;
+re-take with `ONNX_GENAI_CPU_DECODE_AFFINITY=off` and a `--native-only` or
+`--ort-intra-threads 1` arm, which removes both.
 
 **Rule.** Disproving one mechanism is not disproving the class. I traced the
 knob to the pool I already suspected, found it did not reach me, and wrote
@@ -4965,6 +5020,15 @@ about a tax that one arm imposes on the other, and a spin-waiting pool in the
 comparison arm is exactly that. Check what the other arm's runtime is doing
 while your arm is being timed -- and check it before, not after, you publish a
 scaling curve.
+
+**Rule.** Process-wide state applied *during* setup makes construction order
+part of the experiment design. Affinity is inherited at thread creation, so
+"which arm was built first" silently decided which arm got the whole machine.
+Nothing in the harness expresses that ordering as a decision; it is just the
+order two `let` bindings happen to appear in. When a runtime mutates the
+process, every thread that already exists is outside the change and every
+thread created later is inside it -- so audit setup order, not just the
+measured region.
 
 **Rule.** "The control scaled, so cores were available" is only valid when the
 control is independent of the treatment. Here the control *was* the competitor.
