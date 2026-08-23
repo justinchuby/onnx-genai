@@ -49,11 +49,15 @@ struct Args {
     /// runs native alone so ORT's intra-op threadpool is not spinning and polluting native samples.
     #[arg(long)]
     native_only: bool,
-    /// ORT `intra_op_num_threads` for the timed session. `0` keeps ORT's default
-    /// (one thread per logical core), which is what a user gets out of the box;
-    /// set it to the native decode-pool width for a thread-matched comparison.
-    #[arg(long, default_value_t = 0)]
-    ort_intra_threads: i32,
+    /// ORT `intra_op_num_threads` for the timed session. Unset matches the ORT
+    /// pool to the native budget whenever this process is confined to fewer CPUs
+    /// than ORT would size its pool from, because an unmatched pool spins on
+    /// exactly the cores the native arm is confined to and inflates the native
+    /// number only (measured 10x at width 4). Pass `0` for ORT's own default of
+    /// one thread per logical core -- what a user gets out of the box, but not a
+    /// matched A/B on a narrowed budget.
+    #[arg(long)]
+    ort_intra_threads: Option<i32>,
     /// ORT `inter_op_num_threads` for the timed session. `0` keeps ORT's
     /// default. Single-node benchmarks have no parallel subgraphs, so this only
     /// matters for multi-node graphs where ORT's inter-op pool is an advantage
@@ -849,6 +853,15 @@ fn host_fields(host: &onnx_runtime_hostmon::Contention) -> String {
 /// Warns when the native arm is confined to fewer CPUs than the ORT arm's pool
 /// spans.
 ///
+/// Since #1839 this is a **backstop**, not the primary remedy:
+/// [`resolve_ort_intra_threads`] now matches the ORT pool to the native budget
+/// by default, so on a confined host this is normally silent. It still earns its
+/// place because it runs *after* the native pool has been built and keys on the
+/// realized affinity mask, so it fires in the two cases the startup resolution
+/// cannot see: an explicit `--ort-intra-threads` wider than the mask (the user
+/// asked for the unmatched comparison, and the row should say so), and a native
+/// pool that ends up narrower than the width that was requested.
+///
 /// `--native-threads N` confines the *whole process* to N CPUs, but ORT's
 /// intra-op pool is sized from the machine and spins between runs. In an
 /// interleaved A/B those spinning threads land on the same N CPUs the native arm
@@ -912,11 +925,125 @@ fn ort_pool_bias_warning(
     ))
 }
 
+/// Chooses the ORT intra-op width for the timed session, matching it to the
+/// native budget when the native arm is confined and the user has not chosen a
+/// width.
+///
+/// The bias this removes is measured in #1839: `--native-threads N` confines the
+/// native arm to N lanes, but ORT sizes its intra-op pool from the *machine* and
+/// spins between runs, so in an interleaved A/B those spinning threads land on
+/// exactly the cores the native arm is confined to. On this model (4096x4096
+/// int4, M=1) at width 4 that inflated the native p50 from 0.760 ms to 7.642 ms
+/// -- **10x, one-directional, on the native number only** -- and constraining
+/// the ORT pool removed it. In a result row that is indistinguishable from
+/// "native does not scale", and it grows as the budget narrows.
+///
+/// #1835 warned about it. A warning was the wrong remedy: the run that needs it
+/// is the one where nobody passed a thread flag at all, and a warning on stderr
+/// does not stop the biased number from being printed, copied into a table and
+/// believed. Interleaving exists to cancel drift, so defaulting to
+/// `--native-only` would lose something real; matching the widths keeps the
+/// interleave and removes the bias.
+///
+/// Precedence, and why each rule is where it is:
+///
+/// 1. **An explicit positive `--ort-intra-threads` always wins.** Changing the
+///    default must not take away the ability to ask for a specific width.
+/// 2. `--native-only` keeps its existing meaning (pool of 1, parked, out of the
+///    way of the timed native runs). It outranks an explicit *non-positive*
+///    value, because ORT's "size it yourself" sentinel would otherwise un-park
+///    the pool that flag exists to park.
+/// 3. An explicit non-positive value on its own is a deliberate opt-out of
+///    matching: "out-of-the-box ORT versus a confined native arm" is a
+///    legitimate question -- it is just not a *matched* one, and the row should
+///    be the result of asking for it rather than of forgetting a flag.
+/// 4. Otherwise the budget is the **narrower** of the width the operator asked
+///    the native pool for and the CPUs this process is actually allowed to run
+///    on at startup. Both sources matter and neither subsumes the other:
+///    `taskset -c 0-3 bench_generic` with no flag is confined just as hard as
+///    `--native-threads 4`, and `taskset -c 0-7 --native-threads 4` gives the
+///    native arm 4 lanes inside an 8-CPU mask, where equal *width* is 4.
+///
+/// The match is applied only when the budget is strictly narrower than ORT's own
+/// default, so on an unconfined host this is a no-op: ORT's default is already
+/// one thread per logical core. The change therefore bites in exactly the
+/// confined case that is biased and nowhere else.
+///
+/// Resolution happens at startup, before either session is built, because
+/// `intra_op_num_threads` is a session-construction option. That is *earlier*
+/// than the point where the native pool has pinned itself, so the realized mask
+/// is not yet available here -- which is why [`ort_pool_bias_warning`] stays as
+/// a backstop. It runs after the pool exists, keys on the realized mask, and so
+/// still fires if the pool ends up narrower than the width that was requested.
+fn resolve_ort_intra_threads(
+    explicit: Option<i32>,
+    native_only: bool,
+    requested_native_width: Option<usize>,
+    startup_cpus: Option<usize>,
+    ort_default_width: Option<usize>,
+) -> (i32, Option<String>) {
+    // A non-positive explicit value is ORT's "size it yourself" sentinel, so it
+    // is an opt-out of matching rather than a width -- but it must not also opt
+    // out of `--native-only`'s parked pool, which exists precisely so ORT is not
+    // spinning during the native timing. Ordering these three rules the other
+    // way round silently un-parks the pool for anyone who wrote both flags.
+    if let Some(explicit) = explicit
+        && explicit > 0
+    {
+        return (explicit, None);
+    }
+    if native_only {
+        return (1, None);
+    }
+    if explicit.is_some() {
+        return (0, None);
+    }
+    let budget = match (requested_native_width, startup_cpus) {
+        (Some(width), Some(cpus)) => Some(width.min(cpus)),
+        (Some(width), None) => Some(width),
+        (None, Some(cpus)) => Some(cpus),
+        (None, None) => None,
+    };
+    let (Some(budget), Some(ort_default)) = (budget, ort_default_width) else {
+        return (0, None);
+    };
+    if budget == 0 || budget >= ort_default {
+        return (0, None);
+    }
+    let budget_i32 = i32::try_from(budget).unwrap_or(i32::MAX);
+    (
+        budget_i32,
+        Some(format!(
+            "NOTE: the native arm is confined to {budget} CPUs, so the interleaved ORT arm's \
+             intra-op pool was matched to {budget} threads instead of ORT's default of \
+             {ort_default}. An unmatched ORT pool spins on exactly the cores the native arm is \
+             confined to and inflates the native number only (measured 10x at width 4, #1839). \
+             Pass --ort-intra-threads 0 for ORT's out-of-the-box pool, which is a real question \
+             but not a matched comparison."
+        )),
+    )
+}
+
 fn build_arm() -> &'static str {
     if cfg!(feature = "mlas") {
         "mlas-reference"
     } else {
         "native"
+    }
+}
+
+/// Labels *why* the row's `ort_intra_threads` has the value it does.
+///
+/// The width alone cannot distinguish "4 because the operator asked for 4" from
+/// "4 because the tool matched a confined native budget", and those two rows
+/// answer different questions. Printing the provenance beside the value is what
+/// lets a row be re-read months later without re-deriving it from the command
+/// line -- the same reason `native_path` is printed beside `native_pool_width`.
+fn ort_width_source(explicit: bool, matched: bool) -> &'static str {
+    match (explicit, matched) {
+        (true, _) => "explicit",
+        (false, true) => "matched-native-budget",
+        (false, false) => "ort-default",
     }
 }
 
@@ -971,13 +1098,16 @@ fn main() -> Result<()> {
         .filter(|width| *width > 0);
 
     let environment = Environment::new("bench-generic")?;
-    let ort_intra_threads = if args.ort_intra_threads > 0 {
-        args.ort_intra_threads
-    } else if args.native_only {
-        1
-    } else {
-        0
-    };
+    let (ort_intra_threads, ort_width_note) = resolve_ort_intra_threads(
+        args.ort_intra_threads,
+        args.native_only,
+        requested_width,
+        onnx_runtime_hostmon::AllowedCpus::current().map(|allowed| allowed.len()),
+        onnx_runtime_hostmon::online_cpus(),
+    );
+    if let Some(note) = &ort_width_note {
+        eprintln!("{note}");
+    }
     let mut ort_options = SessionOptions::with_execution_provider(ep_selection("cpu"))
         .with_intra_op_threads(ort_intra_threads);
     ort_options.inter_op_num_threads = args.ort_inter_threads;
@@ -1144,7 +1274,7 @@ fn main() -> Result<()> {
         "result: native={:.3} ms ({:.2} infer/s) ort={:.3} ms ({:.2} infer/s) \
          native/ort={:.3} native_p90={:.3} ort_p90={:.3} native_min={:.3} ort_min={:.3} \
          native_spread={:.2} ort_spread={:.2} native_threads={native_threads} {} {} \
-         ort_intra_threads={ort_intra_threads} arm={} parity={}",
+         ort_intra_threads={ort_intra_threads} ort_width_src={} arm={} parity={}",
         native.p50,
         1_000.0 / native.p50,
         ort.p50,
@@ -1158,6 +1288,7 @@ fn main() -> Result<()> {
         ort.spread(),
         report_native_width(requested_width),
         host_fields(&host),
+        ort_width_source(args.ort_intra_threads.is_some(), ort_width_note.is_some()),
         build_arm(),
         if parity_pass { "PASS" } else { "FAIL" }
     );
@@ -1613,5 +1744,115 @@ mod ort_pool_bias_tests {
         assert!(ort_pool_bias_warning(false, Some(4), 0, None).is_none());
         // ...but an explicit ORT width needs no host count to be comparable.
         assert!(ort_pool_bias_warning(false, Some(4), 16, None).is_some());
+    }
+
+    /// The default that #1839 asks for: a confined native arm gets a
+    /// width-matched ORT pool without anyone having to remember a flag.
+    #[test]
+    fn a_confined_native_budget_matches_the_ort_pool_by_default() {
+        let (width, note) = resolve_ort_intra_threads(None, false, Some(4), Some(32), Some(32));
+        assert_eq!(
+            width, 4,
+            "the ORT pool must be matched to the native budget"
+        );
+        let note = note.expect("silently changing what the row measures is the failure mode");
+        assert!(
+            note.contains("--ort-intra-threads 0"),
+            "the note must name the escape hatch back to ORT's default: {note}"
+        );
+        assert!(
+            note.contains("#1839"),
+            "the note must be traceable to the measurement that justifies it: {note}"
+        );
+    }
+
+    /// External confinement is the case nobody passes a flag for, so it is the
+    /// case most likely to publish the biased number.
+    #[test]
+    fn an_externally_confined_process_is_matched_with_no_flag_at_all() {
+        let (width, note) = resolve_ort_intra_threads(None, false, None, Some(4), Some(32));
+        assert_eq!(width, 4);
+        assert!(note.is_some());
+    }
+
+    /// Equal *width* is the target, so the narrower of the two confinements wins
+    /// -- 4 lanes inside an 8-CPU mask is a 4-wide native arm.
+    #[test]
+    fn the_narrower_of_the_two_confinements_sets_the_budget() {
+        assert_eq!(
+            resolve_ort_intra_threads(None, false, Some(4), Some(8), Some(32)).0,
+            4
+        );
+        assert_eq!(
+            resolve_ort_intra_threads(None, false, Some(16), Some(8), Some(32)).0,
+            8
+        );
+    }
+
+    /// The whole point of keeping the flag: asking for out-of-the-box ORT is a
+    /// real question, and an explicit answer must survive the new default.
+    #[test]
+    fn an_explicit_width_is_honoured_including_an_explicit_ort_default() {
+        assert_eq!(
+            resolve_ort_intra_threads(Some(0), false, Some(4), Some(4), Some(32)),
+            (0, None),
+            "an explicit 0 must still mean ORT's own pool, not a matched one"
+        );
+        assert_eq!(
+            resolve_ort_intra_threads(Some(16), false, Some(4), Some(4), Some(32)).0,
+            16
+        );
+        assert_eq!(
+            resolve_ort_intra_threads(Some(8), true, Some(4), Some(4), Some(32)).0,
+            8,
+            "--native-only must not override a width the operator asked for"
+        );
+        assert_eq!(
+            resolve_ort_intra_threads(Some(0), true, Some(4), Some(4), Some(32)),
+            (1, None),
+            "an explicit ORT default must not un-park the pool --native-only parked"
+        );
+    }
+
+    /// A default change is only safe if it is inert everywhere it is not needed.
+    #[test]
+    fn nothing_changes_on_an_unconfined_host_or_under_native_only() {
+        assert_eq!(
+            resolve_ort_intra_threads(None, false, Some(32), Some(32), Some(32)),
+            (0, None),
+            "matching a full-width budget would be ORT's default under another name"
+        );
+        assert_eq!(
+            resolve_ort_intra_threads(None, false, None, None, Some(32)),
+            (0, None)
+        );
+        assert_eq!(
+            resolve_ort_intra_threads(None, true, Some(4), Some(4), Some(32)),
+            (1, None),
+            "--native-only keeps its parked pool of one"
+        );
+    }
+
+    /// An unreadable host count is not evidence of confinement. Guessing here
+    /// would silently narrow ORT on a host we simply failed to measure.
+    #[test]
+    fn an_unknown_host_width_leaves_the_ort_pool_alone() {
+        assert_eq!(
+            resolve_ort_intra_threads(None, false, Some(4), Some(4), None),
+            (0, None)
+        );
+        assert_eq!(
+            resolve_ort_intra_threads(None, false, Some(0), Some(0), Some(32)),
+            (0, None),
+            "a zero budget is an opt-out, not a request for a zero-wide pool"
+        );
+    }
+
+    /// The row has to say which question it answered; the width alone cannot.
+    #[test]
+    fn the_row_reports_where_the_ort_width_came_from() {
+        assert_eq!(ort_width_source(true, false), "explicit");
+        assert_eq!(ort_width_source(false, true), "matched-native-budget");
+        assert_eq!(ort_width_source(false, false), "ort-default");
     }
 }
