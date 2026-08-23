@@ -225,6 +225,25 @@ scripts/hostlock.sh run --owner leon \
 `--gate N` additionally waits for the *instantaneous runnable count* to fall to
 N before starting, which drains load from people who never took the lock.
 
+The lock and the gate decide whether to **start**. They cannot tell you
+afterwards whether the numbers are any good, because they sample instants: a
+gate sampled either side of a 2 s arm reported "runnable 2-4, clean" for runs
+that were getting 50-70% of a core, against a 52% A/A null. Add
+`--expect-cores N --min-efficiency F` to decide whether to **believe** it:
+
+```sh
+scripts/hostlock.sh run --owner leon --reason "softmax 28-cell matrix" \
+    --gate 4 --expect-cores 16 --min-efficiency 0.90 \
+    -- python3 scripts/ort_ab/ab.py ...
+```
+
+That compares the CPU the command actually consumed against `N x wall` and
+exits 6 if it falls short, so an unattended harness stops instead of
+publishing. It needs no quiet host -- it tells you which reps to throw away.
+Set `F` from a measured quiet-host run of *your* workload, not from 1.0: a
+benchmark with a deliberate inter-token gap is legitimately below 1.0 and is
+not contended.
+
 Gate on that runnable count (`cut -d' ' -f4 /proc/loadavg | cut -d/ -f1`), not
 on the 1-minute load average: `loadavg` is an exponential moving average, so it
 stays high for a minute after a heavy run has ended and reads low while a burst
