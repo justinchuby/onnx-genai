@@ -2047,9 +2047,22 @@ fn explicit_affinity_shards_for(
 }
 
 fn node_shards(total: usize) -> Vec<NodeShard> {
+    node_shards_with(total, explicit_affinity_shards)
+}
+
+/// [`node_shards`] with the explicit-request lookup injected.
+///
+/// The seam exists so a test can prove the request is *consulted at all*. That
+/// is the whole defect in #1792: the helpers below can each be correct while
+/// `node_shards` never calls them, and every unit test of the helpers still
+/// passes. Deleting the early return has to fail something.
+fn node_shards_with(
+    total: usize,
+    explicit: impl FnOnce(usize) -> Option<Vec<NodeShard>>,
+) -> Vec<NodeShard> {
     // An explicit request wins over the default placement. Without this the
     // persistent pool reads the env var for exactly nothing.
-    if let Some(shards) = explicit_affinity_shards(total) {
+    if let Some(shards) = explicit(total) {
         return shards;
     }
     let allowed = crate::decode_affinity::allowed_cpus();
@@ -2831,6 +2844,56 @@ mod tests {
         );
         assert!(off[0].cpus.is_empty());
         assert_eq!(node[0].cpus, vec![16, 17, 18, 19]);
+    }
+
+    /// `node_shards` must *consult* the explicit request, not merely have a
+    /// correct helper sitting next to it.
+    ///
+    /// This is the anti-vacuity guard for #1792. Every other test here also
+    /// passes against the unfixed code, because the bug was never in the
+    /// helpers -- it was that the builder never called them. Deleting the early
+    /// return in `node_shards_with` fails this and only this.
+    #[test]
+    fn node_shards_consults_the_explicit_request_before_default_placement() {
+        let sentinel = NodeShard {
+            index: 7,
+            cpus: vec![100, 101],
+            workers: 2,
+        };
+        let shards = node_shards_with(16, |total| {
+            assert_eq!(total, 16, "the worker count must reach the request");
+            Some(vec![sentinel.clone()])
+        });
+        assert_eq!(
+            shards.len(),
+            1,
+            "an honored request must replace default placement outright"
+        );
+        assert_eq!(shards[0].cpus, sentinel.cpus);
+        assert_eq!(shards[0].index, 7);
+        assert_eq!(shards[0].workers, 2);
+    }
+
+    /// ...and with no request, placement is what it was before this change.
+    /// That is the regression that would matter most: routing everything
+    /// through the parser would silently unpin the default pool, because
+    /// `DecodeAffinity::parse(None)` is `Off`.
+    #[test]
+    fn no_explicit_request_leaves_default_placement_intact() {
+        let defaulted = node_shards_with(16, |_| None);
+        // Whatever this host's topology, the default path never returns an
+        // empty schedule or a pool with no workers.
+        assert!(!defaulted.is_empty());
+        assert!(defaulted.iter().map(|s| s.workers).sum::<usize>() > 0);
+        // Deferring must reach the real placement policy, not the unpinned
+        // single shard `off` produces: on any host with a known allowed set the
+        // default path pins.
+        if crate::decode_affinity::allowed_cpus().is_some_and(|cpus| !cpus.is_empty()) {
+            assert!(
+                defaulted.iter().any(|shard| !shard.cpus.is_empty()),
+                "default placement pins when the allowed set is known"
+            );
+        }
     }
 
     #[test]
