@@ -67,7 +67,7 @@ pub use epcontext::{
 pub use error::LoaderError;
 pub use weights::{
     ExpertQuantization, ExpertStorageOrder, ExpertTensorLayout, ExpertWeightRegion,
-    NonPageableReason, Pageability, WeightRegionCatalog, WeightStore,
+    NonPageableReason, Pageability, WeightRegionCatalog, WeightStore, qmoe_expert_tensor_layout,
 };
 pub use writer::{EpContextDumpConfig, EpContextPartition, dump_ep_context};
 

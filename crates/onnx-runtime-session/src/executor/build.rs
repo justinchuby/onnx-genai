@@ -364,21 +364,44 @@ pub(super) fn format_node_identity(scope: &str, node_id: NodeId, node: &Node) ->
     }
 }
 
-pub(super) fn build_lazy_weight_handles(
+/// Build lazy-weight handles exactly as before, plus (additively) per-expert
+/// region candidates for `com.microsoft::QMoE` expert-bank initializers.
+///
+/// The candidate map is measurement-neutral bookkeeping only (issue #82's
+/// first slice): nothing here changes which initializers become lazy, how
+/// many [`ExternalMmapRegion`]s a [`LazyWeight`] carries, or how many
+/// allocations/H2D copies the CUDA paging path performs. A QMoE initializer
+/// whose layout cannot be proven pageable is recorded with its
+/// [`onnx_runtime_loader::NonPageableReason`] rather than silently omitted.
+pub(super) fn build_lazy_weight_handles_and_candidates(
     graph: &Graph,
     weights: &Arc<WeightStore>,
     ep: &dyn ExecutionProvider,
-) -> Result<HashMap<ValueId, WeightHandle>> {
+) -> Result<(
+    HashMap<ValueId, WeightHandle>,
+    HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
+)> {
     let capabilities = ep.capabilities();
     if !capabilities.advertises(onnx_runtime_ep_api::NXRT_WEIGHT_PAGING_CAPABILITY) {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), HashMap::new()));
     }
 
+    let qmoe_layouts = qmoe_expert_layouts_by_value(graph);
+
     let mut handles = HashMap::new();
+    let mut candidates = HashMap::new();
     for candidate in lazy_weight_candidates(graph) {
         let value = candidate.value;
         let boundary = candidate.boundary;
         let weight = &graph.initializers[&value];
+        if boundary == LazyWeightBoundary::QMoe
+            && let Some(layout) = qmoe_layouts.get(&value)
+        {
+            candidates.insert(
+                value,
+                onnx_runtime_loader::WeightRegionCatalog::classify(weight, layout.clone()),
+            );
+        }
         let Some((mapping_id, offset, len)) = weights.external_mmap_provenance(weight) else {
             continue;
         };
@@ -407,10 +430,217 @@ pub(super) fn build_lazy_weight_handles(
         })?;
         handles.insert(value, WeightHandle::Lazy(lazy));
     }
-    Ok(handles)
+    Ok((handles, candidates))
+}
+
+/// Build the default [`onnx_runtime_ep_api::ResidencyPlan`] for this build's
+/// per-expert region candidates.
+///
+/// This is the one call site where a plan is *created*. It always uses
+/// [`onnx_runtime_ep_api::WholeBankResidentPolicy`] today — the only shipped
+/// policy — so the produced plan is handle-for-handle/byte-for-byte
+/// equivalent to pre-#82 behavior: every candidate value resolves to
+/// `WholeBankResident`. A future slice may take the policy as a parameter;
+/// this slice intentionally does not expose that knob outside tests.
+pub(super) fn plan_default_residency(
+    graph: &Graph,
+    candidates: &HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
+) -> onnx_runtime_ep_api::ResidencyPlan {
+    plan_residency_with(
+        graph,
+        candidates,
+        &onnx_runtime_ep_api::WholeBankResidentPolicy,
+    )
+}
+
+/// Test/measurement seam: build a plan with an arbitrary
+/// [`onnx_runtime_ep_api::ResidencyPolicy`], to prove the boundary is
+/// substitutable without wiring a second production call site.
+pub(super) fn plan_residency_with(
+    graph: &Graph,
+    candidates: &HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
+    policy: &dyn onnx_runtime_ep_api::ResidencyPolicy,
+) -> onnx_runtime_ep_api::ResidencyPlan {
+    let boundary_by_value: HashMap<ValueId, LazyWeightBoundary> = lazy_weight_candidates(graph)
+        .into_iter()
+        .map(|candidate| (candidate.value, candidate.boundary))
+        .collect();
+    let inputs = candidates.iter().filter_map(|(value, catalog)| {
+        boundary_by_value
+            .get(value)
+            .map(|&boundary| (*value, boundary, catalog))
+    });
+    onnx_runtime_ep_api::plan_residency(inputs, policy, None)
+}
+
+/// Derive an [`onnx_runtime_loader::ExpertTensorLayout`] for every QMoE
+/// expert-bank initializer value in `graph`, keyed by the initializer's
+/// [`ValueId`].
+///
+/// Mirrors `onnx-genai-engine::engine::placement::qmoe_layers`'s input-index
+/// convention (fc1 packed/scales/zero-points at 2/3/11, fc2 at 5/6/12, and an
+/// optional fc3 triple at 8/9/13) so both call sites derive layouts from the
+/// same node attributes/initializer shapes and cannot silently drift onto
+/// different byte-range formulas. A value absent from the returned map either
+/// isn't a QMoE expert-bank tensor, or its node/attributes/shape could not
+/// support deriving a layout at all (as opposed to deriving one that then
+/// fails [`onnx_runtime_loader::WeightRegionCatalog::classify`]'s validation,
+/// which is instead recorded as a `NonPageable` catalog by the caller).
+fn qmoe_expert_layouts_by_value(
+    graph: &Graph,
+) -> HashMap<ValueId, onnx_runtime_loader::ExpertTensorLayout> {
+    let mut layouts = HashMap::new();
+    for (_, node) in graph.nodes.iter() {
+        if !(node.op_type == "QMoE" && (node.domain.is_empty() || node.domain == "com.microsoft")) {
+            continue;
+        }
+        let Some(bits) = qmoe_int_attr(node, "expert_weight_bits", 4)
+            .ok()
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|bits| matches!(bits, 1 | 2 | 4 | 8))
+        else {
+            continue;
+        };
+        let Some(block_size) = qmoe_int_attr(node, "block_size", 0)
+            .ok()
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|block_size| *block_size > 0)
+        else {
+            continue;
+        };
+        for &(packed_idx, scales_idx, zero_idx) in &[(2, 3, 11), (5, 6, 12), (8, 9, 13)] {
+            if packed_idx == 8 && node.inputs.get(8).and_then(|slot| *slot).is_none() {
+                continue;
+            }
+            qmoe_push_expert_layout(
+                graph,
+                node,
+                scales_idx,
+                packed_idx,
+                bits,
+                block_size,
+                &mut layouts,
+            );
+            qmoe_push_expert_layout(
+                graph,
+                node,
+                scales_idx,
+                scales_idx,
+                bits,
+                block_size,
+                &mut layouts,
+            );
+            if node.inputs.get(zero_idx).and_then(|slot| *slot).is_some() {
+                qmoe_push_expert_layout(
+                    graph,
+                    node,
+                    scales_idx,
+                    zero_idx,
+                    bits,
+                    block_size,
+                    &mut layouts,
+                );
+            }
+        }
+    }
+    layouts
+}
+
+/// Derive and record the layout for one QMoE input tensor at `input_index`,
+/// using the sibling scales tensor at `scales_index` to read `blocks_per_row`
+/// (the scales tensor's own storage-elements-per-row axis).
+///
+/// Whenever `value` resolves to a graph initializer, an entry is always
+/// recorded (never silently omitted): a derivable expert-major layout is
+/// recorded as-is, and a value whose shape/sibling scales cannot support
+/// deriving one (e.g. non-rank-3 dims) is instead recorded with
+/// [`onnx_runtime_loader::ExpertStorageOrder::Interleaved`], which
+/// [`onnx_runtime_loader::WeightRegionCatalog::classify`] turns into an
+/// explicit `NonPageableReason::NotExpertMajor` rather than the value
+/// vanishing from the candidate map entirely.
+fn qmoe_push_expert_layout(
+    graph: &Graph,
+    node: &Node,
+    scales_index: usize,
+    input_index: usize,
+    bits: usize,
+    block_size: usize,
+    layouts: &mut HashMap<ValueId, onnx_runtime_loader::ExpertTensorLayout>,
+) -> Option<()> {
+    let value = node.inputs.get(input_index).and_then(|slot| *slot)?;
+    let weight = qmoe_initializer(graph, value)?;
+    let derived = (|| {
+        let scales_value = node.inputs.get(scales_index).and_then(|slot| *slot)?;
+        let scales_weight = qmoe_initializer(graph, scales_value)?;
+        let scales_dims = scales_weight.dims();
+        if scales_dims.len() != 3 {
+            return None;
+        }
+        let blocks_per_row = scales_dims[2];
+        onnx_runtime_loader::qmoe_expert_tensor_layout(
+            bits,
+            block_size,
+            blocks_per_row,
+            weight.dims(),
+        )
+    })();
+    let layout = derived.unwrap_or(onnx_runtime_loader::ExpertTensorLayout {
+        version: 1,
+        experts: 0,
+        rows_per_expert: 0,
+        storage_elements_per_row: 0,
+        order: onnx_runtime_loader::ExpertStorageOrder::Interleaved,
+        quantization: None,
+    });
+    layouts.insert(value, layout);
+    Some(())
+}
+
+/// Resolve `value` to the [`onnx_runtime_ir::WeightRef`] it initializes,
+/// following one `Cast` producer (the same convention
+/// `onnx-genai-engine::engine::placement` uses for QMoE inputs that a graph
+/// rewrite has cast to a wider compute dtype).
+fn qmoe_initializer(graph: &Graph, value: ValueId) -> Option<&onnx_runtime_ir::WeightRef> {
+    if let Some(weight) = graph.initializers.get(&value) {
+        return Some(weight);
+    }
+    let producer = graph.values.get(value)?.producer?;
+    let node = graph.nodes.get(producer)?;
+    if node.domain.is_empty() && node.op_type == "Cast" {
+        let source = node.inputs.first().and_then(|slot| *slot)?;
+        return graph.initializers.get(&source);
+    }
+    None
+}
+
+fn qmoe_int_attr(node: &Node, name: &'static str, default: i64) -> std::result::Result<i64, ()> {
+    match node.attr(name) {
+        Some(attr) => attr.as_int().ok_or(()),
+        None => Ok(default),
+    }
 }
 
 impl Executor {
+    /// Per-expert region candidates recorded for `com.microsoft::QMoE` lazy
+    /// weights, keyed by initializer [`ValueId`]. See
+    /// [`Executor::expert_region_candidates`](state) for the additive,
+    /// measurement-neutral contract this exposes.
+    #[cfg(test)]
+    pub(super) fn expert_region_candidates(
+        &self,
+    ) -> &HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog> {
+        &self.expert_region_candidates
+    }
+
+    /// The default [`onnx_runtime_ep_api::ResidencyPlan`] built for this
+    /// executor's expert region candidates. Read-only outside tests today —
+    /// no dispatch-time consumer exists yet; this exposes the plan purely
+    /// for telemetry/measurement and future policy wiring.
+    #[cfg(test)]
+    pub(super) fn residency_plan(&self) -> &onnx_runtime_ep_api::ResidencyPlan {
+        &self.residency_plan
+    }
+
     /// Compile a graph + weights into a runnable executor on the CPU EP.
     pub(crate) fn build(
         graph: Graph,
@@ -435,17 +665,34 @@ impl Executor {
             Self::place_graph(&mut graph, &weights, &mut ep, require_cuda)?;
         // Topological order up front: also validates the selected graph is a DAG.
         let order = graph.topological_order()?;
-        let weight_handles = {
+        let (weight_handles, expert_region_candidates) = {
             let mut span = trace_span("session.lazy_weight_handles", "session");
-            let handles = build_lazy_weight_handles(&graph, &weights, ep.as_ref())?;
+            let (handles, candidates) =
+                build_lazy_weight_handles_and_candidates(&graph, &weights, ep.as_ref())?;
             if let Some(span) = span.as_mut() {
                 span.set_args(
                     Args::new()
                         .with("handles", handles.len() as u64)
-                        .with("initializers", graph.initializers.len() as u64),
+                        .with("initializers", graph.initializers.len() as u64)
+                        .with("expert_region_candidates", candidates.len() as u64),
                 );
             }
-            handles
+            (handles, candidates)
+        };
+
+        let residency_plan = {
+            let mut span = trace_span("session.residency_plan", "session");
+            let plan = plan_default_residency(&graph, &expert_region_candidates);
+            if let Some(span) = span.as_mut() {
+                span.set_args(
+                    Args::new()
+                        .with("policy", plan.policy_name().to_string())
+                        .with("resident", plan.resident_count() as u64)
+                        .with("degraded", plan.degraded_count() as u64)
+                        .with("total", plan.len() as u64),
+                );
+            }
+            plan
         };
 
         let (mut value_shapes, mut value_dtypes, buffers, buffer_shapes) =
@@ -482,6 +729,8 @@ impl Executor {
             ep,
             graph_slot: DeviceGraphSlot::Primary,
             weight_handles,
+            expert_region_candidates,
+            residency_plan,
             prefetch_issue_nodes: std::sync::Mutex::new(HashMap::new()),
             prefetch_lookahead_nodes: dense_weight_prefetch_lookahead_nodes(),
             buffers,

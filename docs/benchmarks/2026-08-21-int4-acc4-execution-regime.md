@@ -33,6 +33,29 @@ see [The recommendation](#the-recommendation).
 > was inflated, and a methodology defect in the multi-session rows are in
 > [Confirmed on the real kernel](#confirmed-on-the-real-kernel).
 
+> **Superseded width labels (2026-08-22, #1771).** Every `t=N` row in this
+> document was taken before **#1766** (`11cb8e5f3`), on a process that never
+> called `CpuExecutionProvider::initialize()`. The decode budget sized the SPMD
+> pool but did not *bound the process*: affinity stayed at all logical CPUs and
+> the global Rayon pool ran full width at every budget. So a row labelled `t=8`
+> means "8 SPMD workers inside an unbounded process", not "8-wide execution".
+>
+> Be precise about what that does and does not invalidate. Each speedup here is
+> a **paired A/B whose two arms shared the same broken topology**, so the
+> *ratios* survive — 1.686x at t=1 and 1.380x at block 64 are still the measured
+> effect of removing per-block bookkeeping. What does not survive is any claim
+> that attributes an effect **to a width**, because the width on the label was
+> not the width that ran. Specifically: the "wash at t=8", the t=16 rows, "the
+> one place bandwidth does bind is full width", and every cross-width comparison
+> in [The regime](#the-regime-instruction-bound-not-bandwidth-bound) need
+> re-deriving on post-#1766 main before they are built on or re-quoted.
+>
+> Rows taken from now on carry their realized width inline (#1764, #1770):
+> `decode_width requested=2 realized=2 path=spmd-pool as_requested`. The
+> contract behind that label is asserted in CI at every benchmarked width by
+> `every_benchmarked_decode_width_realizes_the_worker_count_it_requests`
+> (#1747), so a future sweep cannot silently print a width it never ran.
+
 This extends rather than contradicts #1619, which already found that "most of
 the win is not the byte saving" but "removing per-block overhead". The finding
 here is that a 1.6x of per-block overhead was still left on the table.

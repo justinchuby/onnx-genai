@@ -16,12 +16,12 @@ memmap2 = { workspace = true }
 libloading = { workspace = true }
 onnx-genai-ort-sys = { workspace = true }
 onnx-runtime-ir = { workspace = true }
+onnx-runtime-loader = { workspace = true }
 onnx-runtime-optimizer = { workspace = true }
 onnx-runtime-tracer = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-onnx-runtime-loader = { workspace = true }
 
 [lints]
 workspace = true

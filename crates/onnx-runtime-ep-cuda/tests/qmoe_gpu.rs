@@ -18,7 +18,7 @@ use onnx_runtime_ep_api::{
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
-use onnx_runtime_ep_cuda::runtime::cuptr;
+use onnx_runtime_ep_cuda::runtime::{CudaRuntime, cuptr};
 use onnx_runtime_ir::{
     Attribute, DataType, DeviceId, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
 };
@@ -1506,8 +1506,25 @@ fn qmoe_prefill_handles_empty_experts_and_all_routes_to_one_expert() {
 // (hidden=2048, moe_intermediate=1408, 64 experts, top-6). The bench is opt-in
 // (set QMOE_BENCH=1) so ordinary `cargo test` runs skip the heavy loop; ncu
 // filters the launches with `-k qmoe_linear`.
+//
+// NOTE (issue #82 baseline cycle): `median_e2e` below is per-iteration cost of
+// `run_gpu`, which rebuilds the `Graph`/`Model`, fetches a fresh `Kernel`, and
+// re-allocates + re-uploads (H2D) every input tensor -- including the full
+// fc1/fc2/fc3 expert weight banks -- on EVERY timed iteration (see
+// `run_gpu_impl`). That makes this number dominated by model reconstruction
+// and full weight re-upload, not by the expert-GEMV kernel's own achieved
+// bandwidth. It is left as-is (still a valid "cost of calling this op from
+// scratch every time" measurement) but is NOT a kernel bandwidth probe. See
+// `qmoe_expert_gemv_bandwidth_probe` below for one that allocates/uploads
+// once and times only repeated `kernel.execute()` calls.
 // ---------------------------------------------------------------------------
 
+/// `hidden_size=2048`, `moe_intermediate_size=1408`, `n_routed_experts=64`,
+/// `num_experts_per_tok=6` -- `huggingface.co/deepseek-ai/DeepSeek-V2-Lite`
+/// `config.json`, confirmed against the upstream file 2026-08-22 (this case
+/// predates that citation; the numbers were already correct). `n_shared_experts=2`
+/// is a separate always-on dense MLP added to the routed-expert output in the
+/// real model and is not part of the QMoE node modeled here.
 fn deepseek_v2_lite_decode_case() -> Case {
     Case {
         experts: 64,
@@ -1559,6 +1576,819 @@ fn qmoe_deepseek_decode_bench() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Sound QMoE expert-GEMV/GEMM bandwidth probe (issue #82 baseline).
+//
+// Unlike `qmoe_deepseek_decode_bench` above, every device allocation and H2D
+// upload happens exactly once per (model shape, M) configuration, before any
+// timing loop starts (measurement-discipline: "allocate outside the timed
+// region"). Only repeated `kernel.execute()` calls are timed, so the number
+// this reports is the expert-GEMV/GEMM kernel's own achieved bandwidth, not
+// the cost of rebuilding the graph/model or re-uploading expert weights.
+//
+// It follows the same *mechanical* host-vs-device split used by
+// `decode_gemv_achieved_bandwidth_by_projection_shape` in `matmul_nbits.rs`
+// (host wall-clock around a batch of raw launches, separately from a batch of
+// the same launches bracketed by two CUDA events with one
+// `event::synchronize` at the end), but it deliberately does NOT attempt
+// `begin_graph_capture`/`replay_graph`. QMoE's capture eligibility is
+// conditional on a stateful `warmed` flag set by a prior eager pass
+// (`QMoEKernel::capture_support`, `src/kernels/qmoe.rs`) and
+// `BlockQuantizedMoEKernel::capture_support` is unconditionally `Unsupported`
+// -- relying on capture here would make the very thing this probe reports on
+// (fast-path/capture eligibility) also decide whether the timing methodology
+// itself is valid. Every sample below is instead `BATCH` raw `execute()`
+// launches between two events (the "repeat-launch + CUDA-event/single-sync"
+// pattern, not graph replay), which is also the honest cost of the *current*
+// uncaptured decode step in production.
+//
+// CORRECTION (cycle-5 follow-up, superseding the paragraph this replaces):
+// `QMoEKernel::execute` used to end with
+// `let result = if capturing { Ok(()) } else { self.runtime.synchronize() };`,
+// and this comment originally attributed the host_us/gpu_us convergence below
+// to that call being an *unconditional, blocking* device synchronize. That
+// attribution was wrong, and was falsified by direct measurement: removing
+// the call entirely (`execute` is now unconditionally async on the
+// non-capturing path; see `src/kernels/qmoe.rs`) changed the numbers below by
+// <0.1%, run to run -- i.e. within measurement noise, not a regression fix.
+// The reason: `CudaRuntime::synchronize` has been a conditional, deferred
+// no-op by default since #1383 (`ONNX_GENAI_DEFER_EAGER_SYNC`, on by
+// default) -- *before* this probe existed -- so that call was never actually
+// blocking in the default configuration this probe (and #1383's own
+// production default) runs under.
+//
+// The real mechanism, confirmed with a temporary per-launch host timer
+// (`Instant`-bracketed, not committed): the grouped path's own CPU-side
+// dispatch cost -- every `nvrtc_function` lookup plus `cuLaunchKernel` call
+// across `launch_grouping`/`launch_gather`/`launch_grouped_linear`/
+// `launch_linear`/`launch_activation`/`launch_combine` -- is only ~40us
+// total for the heaviest probed case (GLM-5.2, M=8), nowhere near the
+// ~7ms `host_us` reported for that case. What actually converges `host_us`
+// toward `gpu_us` as M grows is queue-depth saturation: this harness's own
+// between-rep drain (see `median_us` below) was *also* the same no-op
+// `synchronize()` call, so back-to-back reps' asynchronously-enqueued
+// kernels were never drained between reps, and once the host can enqueue
+// faster than a genuinely memory-bandwidth-bound grouped kernel sequence
+// (3.5-25% of peak HBM bandwidth; see the measurements below) can drain, the
+// *enqueuing* `cuLaunchKernel` calls themselves start blocking on a full
+// queue -- an ordinary, expected consequence of a real device-bound
+// workload pushed through a bounded async queue, not a synchronization
+// defect. `median_us` below now drains for real between reps
+// (`drain_for_unmap`), which isolates each rep's own host-dispatch cost
+// instead of also capturing residual queue-depth blocking. At M=1
+// fused-decode the two numbers stay apart regardless, simply because that
+// path issues far fewer kernels per call and its GPU work is comparatively
+// tiny, so the queue never fills.
+// ---------------------------------------------------------------------------
+
+/// A100-SXM4-80GB HBM2e datasheet peak. Percent-of-peak below is only
+/// meaningful on this device; see the identical constant/comment in
+/// `decode_gemv_achieved_bandwidth_by_projection_shape` (`matmul_nbits.rs`).
+const A100_SXM4_80GB_PEAK_GBPS: f64 = 2039.0;
+
+/// A real target model's routed-expert MoE shape. Every numeric field is read
+/// verbatim from the model's published `config.json` -- none are invented
+/// (`measurement-discipline`: shapes must come from a cited real config).
+#[derive(Clone, Copy, Debug)]
+struct MoeModelShape {
+    name: &'static str,
+    hidden: usize,
+    inter: usize,
+    experts: usize,
+    top_k: usize,
+}
+
+/// `hidden_size=2048`, `moe_intermediate_size=1408`, `n_routed_experts=64`,
+/// `num_experts_per_tok=6`, `hidden_act=silu` --
+/// `huggingface.co/deepseek-ai/DeepSeek-V2-Lite/raw/main/config.json`, fetched
+/// 2026-08-22. `n_shared_experts=2` is a separate always-on dense MLP added to
+/// the routed-expert output and is out of scope for the QMoE node measured
+/// here (matches `deepseek_v2_lite_decode_case` above).
+const DEEPSEEK_V2_LITE_MOE: MoeModelShape = MoeModelShape {
+    name: "deepseek-v2-lite",
+    hidden: 2048,
+    inter: 1408,
+    experts: 64,
+    top_k: 6,
+};
+
+/// `hidden_size=6144`, `moe_intermediate_size=2048`, `n_routed_experts=256`,
+/// `num_experts_per_tok=8`, `hidden_act=silu`, `model_type=glm_moe_dsa` --
+/// `huggingface.co/zai-org/GLM-5.2/raw/main/config.json`, fetched 2026-08-22.
+/// `n_shared_experts=1` is likewise a separate dense path, out of scope here.
+/// `glm_moe_dsa` matches the architecture family already named in this repo's
+/// `tests/fixtures/tiny-glm52-qmoe-indexshare/manifest.json`.
+const GLM_5_2_MOE: MoeModelShape = MoeModelShape {
+    name: "glm-5.2",
+    hidden: 6144,
+    inter: 2048,
+    experts: 256,
+    top_k: 8,
+};
+
+/// Builds the `Case` for one (real model shape, decode batch `rows`) point on
+/// the probe's matrix. `bits: 4`, `block_size: 16` (hardcoded by `model_node`)
+/// and `affine: false` are this repo's existing QMoE test/deployment
+/// convention for these two models (matches `deepseek_v2_lite_decode_case`),
+/// not a field either upstream `config.json` specifies -- neither config names
+/// a serving quantization scheme, so this is a stated methodology choice, not
+/// a config citation.
+fn moe_bench_case(shape: MoeModelShape, rows: usize) -> Case {
+    Case {
+        experts: shape.experts,
+        rows,
+        hidden: shape.hidden,
+        inter: shape.inter,
+        bits: 4,
+        top_k: shape.top_k,
+        activation: "swiglu",
+        swiglu_fusion: 0,
+        affine: false,
+        fc3: true,
+        biases: false,
+        normalize: true,
+        router_weights: true,
+    }
+}
+
+/// A reduced-expert-count proxy of `shape`'s bench case, used ONLY to prove
+/// numerical correctness against the CPU oracle at a tractable `quantize()`
+/// cost: `quantize()`'s per-element dequant construction at GLM-5.2's real
+/// 256-expert scale takes upward of ten CPU-minutes per projection (measured
+/// on this box), which is fine to pay once but not four times (one per M) on
+/// top of the bandwidth sweep itself. Expert COUNT does not change any
+/// per-expert GEMV/GEMM dequantization or matmul numerics -- each expert's
+/// weights are independent -- so a correctness pass at a smaller expert count
+/// is evidence for the same kernel code path the bandwidth run below
+/// exercises, while still being large enough (`top_k + 2`) that the M > 1
+/// grouped/gather-scatter path has at least one non-selected expert to skip.
+/// hidden, inter, top_k, bits, and activation are identical to the real case.
+fn correctness_proxy_case(shape: MoeModelShape, rows: usize) -> Case {
+    let mut case = moe_bench_case(shape, rows);
+    case.experts = (shape.top_k + 2).max(8).min(shape.experts);
+    case
+}
+
+/// Cheap LCG fill -- same generator as
+/// `decode_gemv_achieved_bandwidth_by_projection_shape` in `matmul_nbits.rs`
+/// uses for the same reason: bandwidth does not depend on weight VALUES, only
+/// on byte traffic and access pattern.
+fn fast_fill_bytes(len: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed ^ 0x9e37_79b9_7f4a_7c15;
+    (0..len)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 56) as u8
+        })
+        .collect()
+}
+
+/// Byte-shape-identical to `quantize()`'s output (same packed/scale array
+/// sizes for the given `experts`/`out_features`/`in_features`/`bits`/
+/// `block_size`) but filled with [`fast_fill_bytes`] instead of run through
+/// `quantize()`'s per-element dequant construction -- seconds instead of
+/// minutes at GLM-5.2's full 256-expert scale. Scales are a fixed small
+/// constant rather than LCG-filled bits, so no NaN/Inf/denormal value can
+/// reach the GEMV and skew its timing; the packed weight nibbles are safe to
+/// fill arbitrarily because they are just integer codes dequantized by that
+/// scale, never interpreted as floats directly. No zero points: every case
+/// this probe builds has `affine: false`.
+fn fast_fill_quantized(
+    experts: usize,
+    out_features: usize,
+    in_features: usize,
+    bits: usize,
+    block_size: usize,
+    seed: u64,
+) -> Quantized {
+    let pack_size = 8 / bits;
+    let packed_in = in_features / pack_size;
+    let blocks = in_features / block_size;
+    let packed = fast_fill_bytes(experts * out_features * packed_in, seed);
+    let scales = vec![0.02f32; experts * out_features * blocks];
+    Quantized {
+        packed: HostTensor::u8(&[experts, out_features, packed_in], packed),
+        scales: HostTensor::f32(&[experts, out_features, blocks], &scales),
+        zero_points: None,
+    }
+}
+
+/// Same 15-input layout as `case_inputs` (matching `model_node`'s attribute
+/// contract exactly) but expert weight banks come from
+/// [`fast_fill_quantized`] instead of `quantize()`. Activation/router/
+/// aggregation are cheap regardless of expert count, so they keep
+/// `case_inputs`'s real deterministic formulas -- only the weight banks,
+/// which are what makes GLM-5.2's real scale intractable, are fast-filled.
+/// Requires `!case.affine && !case.biases`, which every case
+/// [`moe_bench_case`] builds satisfies.
+fn fast_case_inputs(case: Case, dtype: DataType) -> Vec<Option<HostTensor>> {
+    assert!(!case.affine, "fast_case_inputs has no zero-point fill path");
+    assert!(!case.biases, "fast_case_inputs has no bias fill path");
+    const BLOCK_SIZE: usize = 16;
+    let fc1_size = if case.activation == "swiglu" && case.swiglu_fusion != 0 {
+        case.inter * 2
+    } else {
+        case.inter
+    };
+    let x: Vec<f32> = (0..case.rows * case.hidden)
+        .map(|index| ((index * 19 + 3) % 29) as f32 / 13.0 - 1.0)
+        .collect();
+    let router: Vec<f32> = (0..case.rows * case.experts)
+        .map(|index| ((index * 7 + 5) % 17) as f32 / 4.0 - 2.0)
+        .collect();
+    let aggregation: Vec<f32> = (0..case.rows * case.experts)
+        .map(|index| 0.1 + ((index * 5 + 2) % 11) as f32 / 10.0)
+        .collect();
+    let fc1 = fast_fill_quantized(
+        case.experts,
+        fc1_size,
+        case.hidden,
+        case.bits,
+        BLOCK_SIZE,
+        1,
+    );
+    let fc2 = fast_fill_quantized(
+        case.experts,
+        case.hidden,
+        case.inter,
+        case.bits,
+        BLOCK_SIZE,
+        2,
+    );
+    let fc3 = case.fc3.then(|| {
+        fast_fill_quantized(
+            case.experts,
+            case.inter,
+            case.hidden,
+            case.bits,
+            BLOCK_SIZE,
+            3,
+        )
+    });
+    vec![
+        Some(HostTensor::activation(dtype, &[case.rows, case.hidden], &x)),
+        Some(HostTensor::f32(&[case.rows, case.experts], &router)),
+        Some(fc1.packed),
+        Some(fc1.scales),
+        None,
+        Some(fc2.packed),
+        Some(fc2.scales),
+        None,
+        fc3.as_ref().map(|weights| weights.packed.clone()),
+        fc3.as_ref().map(|weights| weights.scales.clone()),
+        None,
+        None,
+        None,
+        None,
+        case.router_weights
+            .then(|| HostTensor::f32(&[case.rows, case.experts], &aggregation)),
+    ]
+}
+
+/// Packed weight + fp32-scale bytes for one expert's `[out_features,
+/// in_features]` projection, no zero points (`affine: false` here, matching
+/// `quantize()`'s symmetric path). Scales are fp32 -- not fp16 -- because
+/// `qmoe.rs`'s CUDA kernels declare `const float* fc1_scales` /
+/// `fc2_scales` / `fc3_scales` and `case_inputs` uploads `HostTensor::f32`
+/// scale tensors accordingly; this is why the byte accounting here is
+/// re-derived from this file's own `quantize()` layout instead of reusing the
+/// int4/fp16-scale formula in `cuda-perf-measurement/SKILL.md` verbatim (that
+/// formula was written for `MatMulNBits`, whose scales really are fp16).
+fn expert_projection_bytes(
+    out_features: usize,
+    in_features: usize,
+    bits: usize,
+    block_size: usize,
+) -> u64 {
+    let pack_size = 8 / bits;
+    let packed_in = in_features / pack_size;
+    let blocks = in_features / block_size;
+    (out_features * packed_in) as u64 + (out_features * blocks * 4) as u64
+}
+
+/// Total fc1 (gate) + fc3 (up) + fc2 (down) bytes for ONE expert under this
+/// probe's cases (`fc3: true`, unfused SwiGLU, so fc1/fc3 share the
+/// `[inter, hidden]` shape and fc2 is `[hidden, inter]`).
+fn expert_bytes(case: Case) -> u64 {
+    const BLOCK_SIZE: usize = 16; // hardcoded by `model_node`'s `block_size` attribute
+    let gate = expert_projection_bytes(case.inter, case.hidden, case.bits, BLOCK_SIZE);
+    let up = expert_projection_bytes(case.inter, case.hidden, case.bits, BLOCK_SIZE);
+    let down = expert_projection_bytes(case.hidden, case.inter, case.bits, BLOCK_SIZE);
+    gate + up + down
+}
+
+/// Replicates the kernel's top-k tie-break (`qmoe_route`'s
+/// `total_order_key`: descending value, ascending index on ties) on the host,
+/// against the actual `router_probs` this call uploads, so the "how many
+/// distinct experts does this call actually touch" count used for the
+/// bandwidth roofline is derived from the exact routing decision the kernel
+/// makes, rather than assumed.
+fn top_k_distinct_experts(case: Case, router: &[f32]) -> std::collections::BTreeSet<usize> {
+    let mut touched = std::collections::BTreeSet::new();
+    for row in 0..case.rows {
+        let row_router = &router[row * case.experts..(row + 1) * case.experts];
+        let mut order: Vec<usize> = (0..case.experts).collect();
+        order.sort_by(|&a, &b| {
+            row_router[b]
+                .partial_cmp(&row_router[a])
+                .unwrap()
+                .then(a.cmp(&b))
+        });
+        touched.extend(order.into_iter().take(case.top_k));
+    }
+    touched
+}
+
+/// Boolean mirror of `assert_fused_gate_up_decode_case` above (same three
+/// conditions: `rows == 1`, `rows * top_k <= 16`, and an fc3/activation/fusion
+/// combination the `qmoe_gate_up_activate` launch gate accepts), so this probe
+/// can report which dispatch path (fused decode vs. grouped/gather-scatter)
+/// is structurally expected at each M without panicking for M > 1 -- this
+/// reads the same public `Case` fields `qmoe.rs`'s `fused_gate_up_decode`
+/// eligibility check reads; it does not add or change any kernel-internal
+/// instrumentation (no paging/residency/kernel changes in this PR).
+fn is_fused_decode_eligible(case: Case) -> bool {
+    case.rows == 1
+        && case.rows * case.top_k <= 16
+        && ((case.fc3 && matches!(case.activation, "silu" | "swiglu"))
+            || (!case.fc3 && case.activation == "swiglu" && case.swiglu_fusion != 0))
+}
+
+/// Persistent GPU state for one (shape, M) point: built and uploaded exactly
+/// once by [`setup_gemv_bench`], then reused for every timed `execute()`
+/// call. No *device* allocation, H2D copy, or `Graph`/`Kernel` construction
+/// happens after `setup_gemv_bench` returns -- `execute_once` still builds a
+/// small host-side `Vec<TensorView>` per call (via `views`), which is
+/// intentional: that bookkeeping cost is part of what `median_us`'s
+/// `host_us` leg is measuring, not something this harness hides.
+struct GemvBenchSetup {
+    kernel: Box<dyn onnx_runtime_ep_api::Kernel>,
+    buffers: Vec<Option<DeviceBuffer>>,
+    input_shapes: Vec<Vec<usize>>,
+    input_strides: Vec<Vec<i64>>,
+    input_dtypes: Vec<DataType>,
+    input_ptrs: Vec<Option<DevicePtr>>,
+    output_buffer: DeviceBuffer,
+    output_ptr: DevicePtrMut,
+    output_shape: [usize; 2],
+    output_strides: Vec<i64>,
+    output_bytes: usize,
+    dtype: DataType,
+    device_id: DeviceId,
+}
+
+impl GemvBenchSetup {
+    fn views(&self) -> Vec<TensorView<'_>> {
+        self.input_shapes
+            .iter()
+            .zip(&self.input_strides)
+            .zip(&self.input_ptrs)
+            .enumerate()
+            .map(|(index, ((shape, strides), ptr))| match ptr {
+                Some(ptr) => TensorView::new(
+                    *ptr,
+                    self.input_dtypes[index],
+                    shape,
+                    strides,
+                    self.device_id,
+                ),
+                None => TensorView::absent(self.input_dtypes[index]),
+            })
+            .collect()
+    }
+
+    fn output_view(&self) -> TensorMut<'_> {
+        TensorMut::new(
+            self.output_ptr,
+            self.dtype,
+            &self.output_shape,
+            &self.output_strides,
+            self.device_id,
+        )
+    }
+
+    fn execute_once(&self) -> onnx_runtime_ep_api::Result<()> {
+        self.kernel
+            .execute(&self.views(), &mut [self.output_view()])
+    }
+
+    /// Reads the output back and frees every buffer. Consumes `self` so a
+    /// torn-down setup cannot be executed again.
+    fn teardown(self, ep: &CudaExecutionProvider) -> onnx_runtime_ep_api::Result<Vec<u8>> {
+        let runtime = ep.runtime();
+        runtime.synchronize()?;
+        let mut bytes = vec![0u8; self.output_bytes];
+        // SAFETY: `output_buffer` was sized `output_bytes` when allocated.
+        unsafe { runtime.dtoh(&mut bytes, cuptr(self.output_buffer.as_ptr()))? };
+        for buffer in self.buffers.into_iter().flatten() {
+            ep.deallocate(buffer)?;
+        }
+        ep.deallocate(self.output_buffer)?;
+        Ok(bytes)
+    }
+}
+
+fn decode_output_bytes(bytes: &[u8], dtype: DataType) -> Vec<f32> {
+    match dtype {
+        DataType::Float32 => bytes
+            .chunks_exact(4)
+            .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+            .collect(),
+        DataType::Float16 => bytes
+            .chunks_exact(2)
+            .map(|bytes| f16::from_bits(u16::from_ne_bytes(bytes.try_into().unwrap())).to_f32())
+            .collect(),
+        DataType::BFloat16 => bytes
+            .chunks_exact(2)
+            .map(|bytes| bf16::from_bits(u16::from_ne_bytes(bytes.try_into().unwrap())).to_f32())
+            .collect(),
+        other => panic!("unsupported output dtype {other:?}"),
+    }
+}
+
+fn setup_gemv_bench(
+    ep: &CudaExecutionProvider,
+    case: Case,
+    dtype: DataType,
+    inputs: &[Option<HostTensor>],
+) -> onnx_runtime_ep_api::Result<GemvBenchSetup> {
+    let output_shape = [case.rows, case.hidden];
+    let (graph, node) = model_node(inputs, dtype, &output_shape, case);
+    let model = Model::new(&graph);
+    let concrete_shapes: Vec<_> = inputs
+        .iter()
+        .filter_map(|input| input.as_ref().map(|input| input.shape.clone()))
+        .collect();
+    let kernel = ep.get_kernel(model.graph.node(node), &concrete_shapes, 1)?;
+    let runtime = ep.runtime();
+    let mut buffers = Vec::<Option<DeviceBuffer>>::new();
+    for input in inputs {
+        if let Some(input) = input {
+            let buffer = ep.allocate(input.bytes.len(), 256)?;
+            // SAFETY: allocation size equals the source tensor byte length.
+            unsafe { runtime.htod(&input.bytes, cuptr(buffer.as_ptr()))? };
+            buffers.push(Some(buffer));
+        } else {
+            buffers.push(None);
+        }
+    }
+    let input_shapes: Vec<Vec<usize>> = inputs
+        .iter()
+        .map(|input| {
+            input
+                .as_ref()
+                .map(|input| input.shape.clone())
+                .unwrap_or_default()
+        })
+        .collect();
+    let input_strides: Vec<Vec<i64>> = inputs
+        .iter()
+        .map(|input| {
+            input
+                .as_ref()
+                .map(|input| compute_contiguous_strides(&input.shape))
+                .unwrap_or_default()
+        })
+        .collect();
+    let input_dtypes: Vec<DataType> = inputs
+        .iter()
+        .enumerate()
+        .map(|(index, input)| {
+            input
+                .as_ref()
+                .map(|input| input.dtype)
+                .unwrap_or_else(|| absent_dtype(index, dtype))
+        })
+        .collect();
+    let input_ptrs: Vec<Option<DevicePtr>> = buffers
+        .iter()
+        .map(|buffer| buffer.as_ref().map(|buffer| DevicePtr(buffer.as_ptr())))
+        .collect();
+
+    let output_bytes = case.rows * case.hidden * dtype.byte_size();
+    let mut output_buffer = ep.allocate(output_bytes, 256)?;
+    let output_ptr = DevicePtrMut(output_buffer.as_mut_ptr());
+    let output_strides = compute_contiguous_strides(&output_shape);
+
+    let setup = GemvBenchSetup {
+        kernel,
+        buffers,
+        input_shapes,
+        input_strides,
+        input_dtypes,
+        input_ptrs,
+        output_buffer,
+        output_ptr,
+        output_shape,
+        output_strides,
+        output_bytes,
+        dtype,
+        device_id: ep.device_id(),
+    };
+    // First call also compiles the NVRTC module and (for the fused decode
+    // path) sets QMoE's `warmed` flag; never time it. Use the unconditional
+    // drain (not `synchronize`, a no-op by default per #1383) so the first
+    // *timed* call in `median_us` never inherits overlap from this call.
+    setup.execute_once()?;
+    runtime.drain_for_unmap()?;
+    Ok(setup)
+}
+
+/// Times one sample: `batch` raw `execute()` calls bracketed by two CUDA
+/// events (single `event::synchronize` + `elapsed()`, divided by `batch`),
+/// and a separate wall-clock enqueue loop (drained for real only between
+/// reps, via `drain_for_unmap` -- see the module doc's correction above for
+/// why not `synchronize`). No graph capture is attempted (see the module doc
+/// above). `execute()` is fully async on its non-capturing path (as of
+/// cycle-5; see `src/kernels/qmoe.rs`), so `median_host_us` reflects real
+/// per-batch host dispatch cost, not a per-call blocking round trip; at
+/// large M it can still approach `median_gpu_us` once the host enqueues
+/// faster than the (memory-bandwidth-bound) grouped kernels can drain and
+/// the driver's launch queue saturates -- an expected property of a
+/// genuinely device-bound workload, not a synchronization artifact.
+/// Returns `(median_gpu_us, median_host_us, sorted_gpu_samples_us)`.
+fn median_us(
+    setup: &GemvBenchSetup,
+    runtime: &CudaRuntime,
+    reps: usize,
+    batch: usize,
+) -> (f64, f64, Vec<f64>) {
+    use cudarc::driver::result::event;
+    use cudarc::driver::sys::CUevent_flags;
+
+    // Host dispatch cost first, on the only path this probe has (uncaptured).
+    let mut host = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let enqueue_begin = std::time::Instant::now();
+        for _ in 0..batch {
+            setup.execute_once().unwrap();
+        }
+        host.push(enqueue_begin.elapsed().as_secs_f64() * 1e6 / batch as f64);
+        // `drain_for_unmap`, not `synchronize`: the latter is a no-op under
+        // the default `defer_eager_sync` (on since #1383), so it would never
+        // actually drain the stream between reps, letting one rep's enqueued
+        // kernels bleed into the next rep's host timing window once the
+        // driver's launch queue is deep enough. This drain sits outside the
+        // timed window above, so it does not inflate `host_us` -- it only
+        // isolates one rep's host-dispatch measurement from the next rep's
+        // device work.
+        runtime.drain_for_unmap().unwrap();
+    }
+    host.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let host_us = host[host.len() / 2];
+
+    let mut gpu = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let start = event::create(CUevent_flags::CU_EVENT_DEFAULT).unwrap();
+        let end = event::create(CUevent_flags::CU_EVENT_DEFAULT).unwrap();
+        // SAFETY: both events belong to this context and bracket `batch`
+        // back-to-back `execute()` launches on the runtime's own stream.
+        unsafe {
+            event::record(start, runtime.stream_ptr()).unwrap();
+            for _ in 0..batch {
+                setup.execute_once().unwrap();
+            }
+            event::record(end, runtime.stream_ptr()).unwrap();
+            event::synchronize(end).unwrap();
+            gpu.push(event::elapsed(start, end).unwrap() as f64 / batch as f64 * 1000.0);
+            event::destroy(start).ok();
+            event::destroy(end).ok();
+        }
+    }
+    gpu.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = gpu[gpu.len() / 2];
+    (median, host_us, gpu)
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn qmoe_expert_gemv_bandwidth_probe() {
+    let ep = require_cuda();
+    let runtime = ep.runtime().clone();
+    let dtype = DataType::Float16;
+    // 25 reps, not 9: a follow-up local reproducibility sweep (3x reps=9 runs,
+    // then one reps=25 run, all on the same idle A100) showed
+    // `deepseek-v2-lite M=2` and `glm-5.2 M=1` occasionally landing their
+    // reps=9 median in a slower tail (e.g. 822us vs. a typical 673us; 520us
+    // vs. a typical 430us) purely from small-sample luck -- at reps=25 both
+    // medians settled tightly onto the typical/fast value every time, with
+    // only a narrow, rare excursion visible in `range_us`'s upper bound. This
+    // is small-sample median instability, not genuine 50/50 bimodal kernel
+    // behavior; raising the default trades ~15% more wall-clock time for a
+    // materially more trustworthy median on every configuration.
+    let reps = env_usize("QMOE_GEMV_PROBE_REPS", 25).max(5);
+    let batch = env_usize("QMOE_GEMV_PROBE_BATCH", 16).max(1);
+
+    // Bring the SM clock up BEFORE measuring anything (cuda-perf-measurement
+    // Trap 5): an idle A100 in this environment can sit far below its rated
+    // clock with persistence mode off, and a probe that starts timing
+    // immediately reports whatever partial ramp it happened to catch. Ramp on
+    // the heaviest configuration (GLM-5.2, M=8) so the device is loaded the
+    // way the largest probed decode step loads it, until the timing itself
+    // stops improving AND at least 8s of continuous work has elapsed.
+    let ramp_case = moe_bench_case(GLM_5_2_MOE, 8);
+    let ramp_inputs = fast_case_inputs(ramp_case, dtype);
+    let ramp_setup = setup_gemv_bench(&ep, ramp_case, dtype, &ramp_inputs).unwrap();
+    let ramp_start = std::time::Instant::now();
+    let ramp_deadline = ramp_start + std::time::Duration::from_secs(30);
+    let mut previous = f64::INFINITY;
+    let mut ramp_trace = Vec::new();
+    loop {
+        let (now, _, _) = median_us(&ramp_setup, &runtime, 5, batch);
+        ramp_trace.push(now);
+        let settled = now > previous * 0.985;
+        previous = now;
+        if settled && ramp_start.elapsed() >= std::time::Duration::from_secs(8) {
+            break;
+        }
+        if std::time::Instant::now() >= ramp_deadline {
+            eprintln!(
+                "WARNING: clock had not settled after 30s of ramping; absolute numbers \
+                 below are not comparable across runs"
+            );
+            break;
+        }
+    }
+    let ramp_best = ramp_trace.iter().cloned().fold(f64::INFINITY, f64::min);
+    println!(
+        "clock ramp on glm-5.2 M=8: {:.0} -> {:.0} us over {} readings in {:.1}s (best {:.0} us, \
+         {:.0}% off the first)",
+        ramp_trace[0],
+        ramp_trace[ramp_trace.len() - 1],
+        ramp_trace.len(),
+        ramp_start.elapsed().as_secs_f64(),
+        ramp_best,
+        100.0 * (ramp_trace[0] - ramp_best) / ramp_trace[0]
+    );
+    let (first_before, _, _) = median_us(&ramp_setup, &runtime, reps, batch);
+    ramp_setup.teardown(&ep).unwrap();
+
+    println!(
+        "{:<16} {:>2} {:>10} {:>10} {:>10} {:>9} {:>9} {:>9} {:>9} {:>10}",
+        "shape",
+        "M",
+        "dispatch",
+        "correct",
+        "median_us",
+        "host_us",
+        "distinct",
+        "routes",
+        "GB/s",
+        "%peak(dedup)"
+    );
+
+    for shape in [DEEPSEEK_V2_LITE_MOE, GLM_5_2_MOE] {
+        for &rows in &[1usize, 2, 4, 8] {
+            // --- Correctness gate, at a reduced expert count (see
+            // `correctness_proxy_case`), through the REAL `quantize()` +
+            // CPU-oracle path. A fast wrong kernel must not pass, and this
+            // must happen before any timing is trusted. ---
+            let proxy_case = correctness_proxy_case(shape, rows);
+            let proxy_inputs = case_inputs(proxy_case, dtype);
+            let proxy_cpu_inputs = rounded_cpu_inputs(&proxy_inputs, dtype);
+            let expected = run_cpu(proxy_case, &proxy_cpu_inputs);
+            let proxy_setup = setup_gemv_bench(&ep, proxy_case, dtype, &proxy_inputs).unwrap();
+            let proxy_bytes = {
+                let runtime = ep.runtime();
+                runtime.synchronize().unwrap();
+                let mut bytes = vec![0u8; proxy_setup.output_bytes];
+                // SAFETY: `output_buffer` was sized `output_bytes`.
+                unsafe {
+                    runtime
+                        .dtoh(&mut bytes, cuptr(proxy_setup.output_buffer.as_ptr()))
+                        .unwrap()
+                };
+                bytes
+            };
+            let actual = decode_output_bytes(&proxy_bytes, dtype);
+            assert_conforms(&actual, &expected, proxy_case, dtype);
+            proxy_setup.teardown(&ep).unwrap();
+
+            // --- Bandwidth measurement, at the REAL model expert count, with
+            // fast-filled weights (see `fast_case_inputs` for why: values do
+            // not matter for a bandwidth number, and `quantize()` at GLM-5.2's
+            // real 256-expert scale is not tractable to pay 4x per shape). ---
+            let case = moe_bench_case(shape, rows);
+            let inputs = fast_case_inputs(case, dtype);
+            let setup = setup_gemv_bench(&ep, case, dtype, &inputs).unwrap();
+
+            let router = host_f32(inputs[1].as_ref().unwrap());
+            let distinct = top_k_distinct_experts(case, &router);
+            let total_routes = case.rows * case.top_k;
+            let dispatch = if is_fused_decode_eligible(case) {
+                "fused_decode"
+            } else {
+                "grouped"
+            };
+
+            let (median_gpu_us, host_us, gpu_samples) = median_us(&setup, &runtime, reps, batch);
+            let per_expert_bytes = expert_bytes(case) as f64;
+            let dedup_bytes = per_expert_bytes * distinct.len() as f64;
+            let no_dedup_bytes = per_expert_bytes * total_routes as f64;
+            let gbps_dedup = dedup_bytes / (median_gpu_us * 1e-6) / 1e9;
+            let gbps_no_dedup = no_dedup_bytes / (median_gpu_us * 1e-6) / 1e9;
+            let pct_dedup = 100.0 * gbps_dedup / A100_SXM4_80GB_PEAK_GBPS;
+            let pct_no_dedup = 100.0 * gbps_no_dedup / A100_SXM4_80GB_PEAK_GBPS;
+            let range_us = (
+                gpu_samples.first().copied().unwrap_or(median_gpu_us),
+                gpu_samples.last().copied().unwrap_or(median_gpu_us),
+            );
+
+            println!(
+                "{:<16} {:>2} {:>10} {:>10} {:>10.2} {:>9.2} {:>9} {:>9} {:>9.0} {:>11.1}%",
+                shape.name,
+                rows,
+                dispatch,
+                "pass",
+                median_gpu_us,
+                host_us,
+                distinct.len(),
+                total_routes,
+                gbps_dedup,
+                pct_dedup
+            );
+            // Stable machine-readable line (issue #82 baseline):
+            // {model_shape, M, iterations, median_us, achieved_GBps, pct_of_theoretical_memory_bw}.
+            // Two bandwidth hypotheses are reported because the grouped path's
+            // actual dedup behaviour is exactly what this probe is trying to
+            // establish evidence for, not assume; if `pct_of_theoretical_memory_bw`
+            // under the dedup hypothesis exceeds 100%, that falsifies the dedup
+            // assumption for this configuration (a fast KERNEL cannot exceed the
+            // hardware's bandwidth; an inflated PERCENTAGE means the byte count
+            // fed into it was too small).
+            println!(
+                "QMOE_GEMV_BW model_shape={} M={} iterations={} median_us={:.3} \
+                 achieved_GBps_dedup={:.1} pct_of_theoretical_memory_bw_dedup={:.2} \
+                 achieved_GBps_no_dedup={:.1} pct_of_theoretical_memory_bw_no_dedup={:.2} \
+                 host_us={:.3} range_us=[{:.3},{:.3}] distinct_experts={} total_routes={} \
+                 dispatch={} correctness=pass",
+                shape.name,
+                rows,
+                reps * batch,
+                median_gpu_us,
+                gbps_dedup,
+                pct_dedup,
+                gbps_no_dedup,
+                pct_no_dedup,
+                host_us,
+                range_us.0,
+                range_us.1,
+                distinct.len(),
+                total_routes,
+                dispatch,
+            );
+            if pct_dedup > 100.0 {
+                eprintln!(
+                    "WARNING: {} M={} achieved {:.1}% of peak under the dedup byte hypothesis; \
+                     an impossible result means the grouped path is reading fewer bytes than \
+                     `distinct_experts * per_expert_bytes` assumes (e.g. re-using a cached read),\
+                     not that the kernel exceeds hardware bandwidth",
+                    shape.name, rows, pct_dedup
+                );
+            }
+
+            setup.teardown(&ep).unwrap();
+        }
+    }
+
+    // Re-measure the ramp configuration last. If the device drifted (clock
+    // throttle, a neighbour starting work) the sweep above compared
+    // configurations measured under different conditions.
+    let ramp_inputs_after = fast_case_inputs(ramp_case, dtype);
+    let ramp_setup_after = setup_gemv_bench(&ep, ramp_case, dtype, &ramp_inputs_after).unwrap();
+    let (first_after, _, _) = median_us(&ramp_setup_after, &runtime, reps, batch);
+    ramp_setup_after.teardown(&ep).unwrap();
+    let drift = (first_after - first_before).abs() / first_before;
+    if drift > 0.03 {
+        eprintln!(
+            "WARNING: glm-5.2 M=8 drifted {:.1}% across the sweep ({:.1} -> {:.1} us); the \
+             device was not stable and these rows are not comparable",
+            100.0 * drift,
+            first_before,
+            first_after
+        );
+    } else {
+        println!("\ndevice stable across sweep: {:.1}% drift", 100.0 * drift);
+    }
+
+    assert!(
+        first_before.is_finite() && first_before > 0.0,
+        "QMoE GEMV bandwidth probe produced no usable timing"
+    );
+}
+
 #[cfg_attr(
     not(feature = "gpu-tests"),
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
@@ -1601,4 +2431,349 @@ fn qmoe_occ_is_bit_identical() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cycle-5 regression coverage: `QMoEKernel::execute` no longer ends with an
+// unconditional `runtime.synchronize()` (see `src/kernels/qmoe.rs`). These
+// tests guard the two invariants that call used to (accidentally) protect --
+// scratch-growth-free safety and `Drop` teardown safety -- now that each is
+// its own explicit, narrowly-scoped drain, plus a direct check that `execute`
+// itself no longer blocks the host for device completion.
+// ---------------------------------------------------------------------------
+
+/// Builds one QMoE kernel from `template` (only `hidden`/`inter`/`experts`/
+/// `bits`/`top_k`/activation/etc. matter here; `template.rows` is ignored --
+/// shapes are never baked into kernel construction: `QMoEFactory::create`
+/// takes `_input_shapes` by name only, see `src/kernels/qmoe.rs`). The
+/// returned kernel is reused across many `execute()` calls with independently
+/// varying row counts, which is exactly what exercises `ScratchPool`'s
+/// growth path.
+fn build_qmoe_kernel(
+    ep: &CudaExecutionProvider,
+    template: Case,
+    dtype: DataType,
+) -> Box<dyn onnx_runtime_ep_api::Kernel> {
+    let inputs = case_inputs(template, dtype);
+    let output_shape = [template.rows, template.hidden];
+    let (graph, node) = model_node(&inputs, dtype, &output_shape, template);
+    let model = Model::new(&graph);
+    let concrete_shapes: Vec<_> = inputs
+        .iter()
+        .filter_map(|input| input.as_ref().map(|input| input.shape.clone()))
+        .collect();
+    ep.get_kernel(model.graph.node(node), &concrete_shapes, 1)
+        .expect("QMoE kernel construction must succeed for a well-formed case")
+}
+
+/// Everything an in-flight `execute()` call owns until its output is read
+/// back. Splitting "enqueue" from "read back" (unlike a single helper that
+/// does both) lets a caller issue several `execute()` calls on one kernel
+/// back-to-back with **no** intervening drain -- which is the only way to
+/// create a genuine overlap window where a growth-triggered free in
+/// `ScratchPool::ensure` could race a still-in-flight previous launch. A
+/// helper that always reads back immediately (via `dtoh`, which
+/// unconditionally force-synchronizes -- see `CudaRuntime::dtoh`) would drain
+/// the stream after every single call, making such a race structurally
+/// impossible to observe regardless of whether `ensure`'s drain is present.
+struct PendingExecution {
+    buffers: Vec<Option<DeviceBuffer>>,
+    output_buffer: DeviceBuffer,
+    output_shape: [usize; 2],
+    dtype: DataType,
+}
+
+impl PendingExecution {
+    /// Reads back this call's output -- which force-synchronizes first (see
+    /// `CudaRuntime::dtoh`), so by the time this returns every kernel this
+    /// call (and any earlier still-pending call) enqueued has retired -- then
+    /// frees this call's device buffers.
+    fn read_back_and_free(
+        self,
+        ep: &CudaExecutionProvider,
+    ) -> onnx_runtime_ep_api::Result<Vec<f32>> {
+        let runtime = ep.runtime();
+        let output_bytes = self.output_shape[0] * self.output_shape[1] * self.dtype.byte_size();
+        let mut bytes = vec![0u8; output_bytes];
+        // SAFETY: `output_buffer` was sized `output_bytes`.
+        unsafe { runtime.dtoh(&mut bytes, cuptr(self.output_buffer.as_ptr()))? };
+        for buffer in self.buffers.into_iter().flatten() {
+            ep.deallocate(buffer)?;
+        }
+        ep.deallocate(self.output_buffer)?;
+        Ok(decode_output_bytes(&bytes, self.dtype))
+    }
+
+    /// Hands this call's device buffers to `ep.deallocate` (the provider's
+    /// deferred-release queue, ordered after this call's completion events --
+    /// see `CudaExecutionProvider::deallocate_with_unmapped`) **without**
+    /// reading the output back and therefore without forcing a drain. Unlike
+    /// `read_back_and_free`, this does not prove the launch has completed by
+    /// the time it returns -- it is used only to release a call's buffers
+    /// through the same safe, event-ordered path production code uses, while
+    /// deliberately leaving open the possibility that the launch is still
+    /// in flight when this returns (e.g. to test dropping the kernel itself
+    /// while a launch may still be outstanding).
+    fn free_without_readback(self, ep: &CudaExecutionProvider) -> onnx_runtime_ep_api::Result<()> {
+        for buffer in self.buffers.into_iter().flatten() {
+            ep.deallocate(buffer)?;
+        }
+        ep.deallocate(self.output_buffer)?;
+        Ok(())
+    }
+}
+
+/// Uploads this call's inputs and issues one `execute()` call against an
+/// already-built kernel (unlike `run_gpu_impl`, which builds a fresh kernel
+/// every call), **without** reading the output back -- the returned
+/// [`PendingExecution`] must be read back (via `read_back_and_free`) for the
+/// result to be observed and for its device buffers to be freed.
+fn enqueue_with_existing_kernel(
+    ep: &CudaExecutionProvider,
+    kernel: &dyn onnx_runtime_ep_api::Kernel,
+    case: Case,
+    inputs: &[Option<HostTensor>],
+    dtype: DataType,
+) -> onnx_runtime_ep_api::Result<PendingExecution> {
+    let runtime = ep.runtime();
+    let mut buffers = Vec::<Option<DeviceBuffer>>::new();
+    for input in inputs {
+        if let Some(input) = input {
+            let buffer = ep.allocate(input.bytes.len(), 256)?;
+            // SAFETY: allocation size equals the source tensor byte length.
+            unsafe { runtime.htod(&input.bytes, cuptr(buffer.as_ptr()))? };
+            buffers.push(Some(buffer));
+        } else {
+            buffers.push(None);
+        }
+    }
+    let strides: Vec<_> = inputs
+        .iter()
+        .map(|input| {
+            input
+                .as_ref()
+                .map(|input| compute_contiguous_strides(&input.shape))
+        })
+        .collect();
+    let views: Vec<_> = inputs
+        .iter()
+        .zip(&buffers)
+        .zip(&strides)
+        .enumerate()
+        .map(
+            |(index, ((input, buffer), strides))| match (input, buffer, strides) {
+                (Some(input), Some(buffer), Some(strides)) => TensorView::new(
+                    DevicePtr(buffer.as_ptr()),
+                    input.dtype,
+                    &input.shape,
+                    strides,
+                    ep.device_id(),
+                ),
+                _ => TensorView::absent(absent_dtype(index, dtype)),
+            },
+        )
+        .collect();
+    let output_shape = [case.rows, case.hidden];
+    let output_bytes = case.rows * case.hidden * dtype.byte_size();
+    let mut output_buffer = ep.allocate(output_bytes, 256)?;
+    let output_strides = compute_contiguous_strides(&output_shape);
+    kernel.execute(
+        &views,
+        &mut [TensorMut::new(
+            DevicePtrMut(output_buffer.as_mut_ptr()),
+            dtype,
+            &output_shape,
+            &output_strides,
+            ep.device_id(),
+        )],
+    )?;
+    drop(views);
+    Ok(PendingExecution {
+        buffers,
+        output_buffer,
+        output_shape,
+        dtype,
+    })
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn qmoe_scratch_pool_regrows_and_shrinks_across_calls_matches_cpu() {
+    // One long-lived kernel instance, exercised with a row-count sequence
+    // that deliberately mixes: growth (1->8), a repeat at the same size
+    // (8->8, no realloc), shrink-without-realloc (8->2), and repeated
+    // re-growth (2->8, 8->16, 16->1, 1->16, 16->2) -- forcing
+    // `ScratchPool::ensure` to free-and-grow its slots (fc1/fc3/activation/
+    // route-output/grouping scratch) many times over the same kernel's
+    // lifetime. Consecutive calls are deliberately enqueued back-to-back with
+    // NO intervening drain/readback (via `enqueue_with_existing_kernel`,
+    // reading back one call behind): a helper that reads back immediately
+    // after every call would force a full stream drain each time (`dtoh`
+    // unconditionally calls `force_synchronize` -- see `CudaRuntime::dtoh`),
+    // which would make it structurally impossible to ever observe a missing
+    // drain in `ScratchPool::ensure`'s growth path, since the previous call's
+    // launches would always have already retired before the next call's
+    // `ensure()` could free anything. With no intervening drain, a call that
+    // triggers growth runs its free-then-realloc while the *previous* call's
+    // launches may genuinely still be in flight -- exactly the precondition a
+    // missing `drain_for_unmap` there would need to actually corrupt data
+    // (via this pool's shared, size-classed, cross-kernel free list handing
+    // the just-freed pointer to a concurrent allocation before the old
+    // launch finishes reading it). Every call's result is still checked
+    // against the CPU oracle: a fast wrong kernel must not pass.
+    let ep = require_cuda();
+    let dtype = DataType::Float16;
+    // Same shape as `qmoe_decode_fused_silu_fc3_matches_cpu`: satisfies the
+    // `fused_gate_up_decode` gate at rows==1, and the grouped path at
+    // rows>1, so both scratch-slot sets (decode vs. grouping) are exercised.
+    let template = Case {
+        experts: 4,
+        rows: 1,
+        hidden: 16,
+        inter: 16,
+        bits: 4,
+        top_k: 2,
+        activation: "silu",
+        swiglu_fusion: 0,
+        affine: true,
+        fc3: true,
+        biases: true,
+        normalize: true,
+        router_weights: false,
+    };
+    let kernel = build_qmoe_kernel(&ep, template, dtype);
+    let mut prior: Option<(Case, Vec<f32>, PendingExecution)> = None;
+    for &rows in &[1usize, 8, 8, 2, 8, 4, 16, 1, 16, 2] {
+        let mut case = template;
+        case.rows = rows;
+        let inputs = case_inputs(case, dtype);
+        let expected = run_cpu(case, &rounded_cpu_inputs(&inputs, dtype));
+        let pending = enqueue_with_existing_kernel(&ep, kernel.as_ref(), case, &inputs, dtype)
+            .unwrap_or_else(|error| panic!("execute failed at rows={rows}: {error}"));
+        // Read back and check the *previous* call now, one call behind: its
+        // launch (and this call's, just issued) may both still be in flight
+        // at this point, since this call's `ensure()` (already run, above)
+        // had no intervening drain forced by the test harness itself.
+        if let Some((prev_case, prev_expected, prev_pending)) = prior.take() {
+            let actual = prev_pending
+                .read_back_and_free(&ep)
+                .unwrap_or_else(|error| {
+                    panic!("readback failed at rows={}: {error}", prev_case.rows)
+                });
+            assert_conforms(&actual, &prev_expected, prev_case, dtype);
+        }
+        prior = Some((case, expected, pending));
+    }
+    // Drain and check the final call too.
+    if let Some((case, expected, pending)) = prior {
+        let actual = pending
+            .read_back_and_free(&ep)
+            .unwrap_or_else(|error| panic!("final readback failed: {error}"));
+        assert_conforms(&actual, &expected, case, dtype);
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn qmoe_execute_does_not_block_host_for_device_completion() {
+    // Direct regression test for the change under test: a single, uncaptured
+    // `execute()` call on a genuinely slow (memory-bandwidth-bound) grouped
+    // shape must return to the host in a small fraction of the time its own
+    // kernels take to actually finish on the device. This would fail if an
+    // unconditional device sync (`runtime.synchronize`/`force_synchronize`)
+    // were reintroduced at the end of `execute()`, independent of any queue-
+    // depth effects from batching (this test uses `batch=1`, one call per
+    // sample, each rep separated by a real drain).
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let dtype = DataType::Float16;
+    let case = moe_bench_case(GLM_5_2_MOE, 8);
+    let inputs = fast_case_inputs(case, dtype);
+    let setup = setup_gemv_bench(&ep, case, dtype, &inputs).unwrap();
+
+    // batch=1: `median_us` cannot mask a reintroduced blocking sync behind
+    // queue-depth pipelining across many launches per sample.
+    let (median_gpu_us, median_host_us, _) = median_us(&setup, runtime, 10, 1);
+
+    assert!(
+        median_gpu_us > 500.0,
+        "expected a genuinely slow grouped-path sample to give this test signal, got \
+         median_gpu_us={median_gpu_us:.1}"
+    );
+    assert!(
+        median_host_us < median_gpu_us * 0.5,
+        "execute() appears to block the host for device completion: \
+         median_host_us={median_host_us:.3} is not a small fraction of \
+         median_gpu_us={median_gpu_us:.3} (an unconditional device sync at the end of \
+         execute() would make these converge)"
+    );
+
+    setup.teardown(&ep).unwrap();
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn qmoe_drop_after_inflight_launch_leaves_runtime_usable() {
+    // `Drop for QMoEKernel` now performs its own best-effort drain before
+    // freeing scratch (since `execute()` no longer syncs on every call, a
+    // just-issued launch may still be in flight when the kernel is dropped).
+    // Build a kernel, issue a heavy async call, drop the kernel immediately
+    // without waiting on it, then prove the runtime/stream is still correct
+    // for a completely independent subsequent operation -- both a fresh
+    // QMoE kernel and a plain host<->device round trip.
+    //
+    // Deliberately do NOT read the call's output back before dropping: `dtoh`
+    // unconditionally force-synchronizes (see `CudaRuntime::dtoh`), which
+    // would guarantee the launch has already retired by the time `drop(kernel)`
+    // runs -- making this test unable to ever exercise the case its name
+    // describes. `free_without_readback` releases the call's buffers through
+    // the provider's own deferred-release queue (event-ordered, not a raw
+    // synchronous free) without forcing that drain, so the launch may
+    // genuinely still be in flight when the kernel is dropped.
+    let ep = require_cuda();
+    let dtype = DataType::Float16;
+    let template = qmoe_64expert_case(64);
+    {
+        let kernel = build_qmoe_kernel(&ep, template, dtype);
+        let inputs = case_inputs(template, dtype);
+        let pending =
+            enqueue_with_existing_kernel(&ep, kernel.as_ref(), template, &inputs, dtype).unwrap();
+        pending.free_without_readback(&ep).unwrap();
+        // Immediately drop the kernel -- its heavy grouped launch may well
+        // still be in flight on the stream at this point.
+        drop(kernel);
+    }
+
+    // The runtime must still be correct for an unrelated follow-up op.
+    let runtime = ep.runtime();
+    let probe_bytes: Vec<u8> = (0u8..=255).collect();
+    let buffer = ep.allocate(probe_bytes.len(), 256).unwrap();
+    // SAFETY: allocation size equals `probe_bytes.len()`.
+    unsafe { runtime.htod(&probe_bytes, cuptr(buffer.as_ptr())).unwrap() };
+    let mut readback = vec![0u8; probe_bytes.len()];
+    // SAFETY: `buffer` was sized `probe_bytes.len()`.
+    unsafe { runtime.dtoh(&mut readback, cuptr(buffer.as_ptr())).unwrap() };
+    assert_eq!(
+        readback, probe_bytes,
+        "runtime state corrupted after kernel drop"
+    );
+    ep.deallocate(buffer).unwrap();
+
+    // And a fresh QMoE kernel on the same runtime must still compute
+    // correctly (proves the stream itself is still healthy, not just plain
+    // htod/dtoh).
+    let case = qmoe_64expert_case(8);
+    let inputs = case_inputs(case, dtype);
+    let expected = run_cpu(case, &rounded_cpu_inputs(&inputs, dtype));
+    let actual = run_gpu(&ep, case, &inputs, dtype).unwrap();
+    assert_conforms(&actual, &expected, case, dtype);
 }

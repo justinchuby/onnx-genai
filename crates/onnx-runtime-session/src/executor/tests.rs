@@ -3286,6 +3286,7 @@ impl ExecutionProvider for WeightDeliveryEp {
         }
         if LazyWeightBoundary::BlockQuantizedMoe.matches(&op.domain, &op.op_type)
             || LazyWeightBoundary::MatMulNBits.matches(&op.domain, &op.op_type)
+            || LazyWeightBoundary::QMoe.matches(&op.domain, &op.op_type)
             || (op.is_default_domain() && op.op_type == "Identity")
         {
             KernelMatch::Supported {
@@ -3879,6 +3880,168 @@ fn two_node_weight_delivery_fixture() -> (Graph, Arc<WeightStore>, std::path::Pa
     let mut store = WeightStore::new();
     store.map_external(&path).unwrap();
     (graph, Arc::new(store), path)
+}
+
+/// A `com.microsoft::QMoE` node with one expert-major fc1 packed/scales pair
+/// (2 experts, 3 rows/expert, 4 storage elements/row) as external
+/// initializers, plus an activation input and output so it type-checks as a
+/// minimal QMoE graph. Used to exercise issue #82's per-expert region
+/// candidate bookkeeping without touching kernel execution.
+fn qmoe_expert_region_fixture() -> (Graph, Arc<WeightStore>, std::path::PathBuf) {
+    static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+    let root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap().join("target"))
+        .join("weight-handle-tests");
+    std::fs::create_dir_all(&root).unwrap();
+    let id = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
+    let path = root.join(format!(
+        "qmoe-expert-region-{}-{id}.bin",
+        std::process::id()
+    ));
+    // fc1 packed: 2 experts * 3 rows * 4 storage elements (Uint8) = 24 bytes.
+    // fc1 scales: 2 experts * 3 rows * 1 block = 6 bytes (Float32 dtype but we
+    // only need declared length/dims to match for this fixture).
+    std::fs::write(&path, [0u8; 24 + 6]).unwrap();
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert("com.microsoft".into(), 1);
+    let activation =
+        graph.create_named_value("activation", DataType::Float32, static_shape([1, 4]));
+    graph.add_input(activation);
+    let packed = graph.create_named_value("fc1_packed", DataType::Uint8, static_shape([2, 3, 4]));
+    graph.set_initializer(
+        packed,
+        WeightRef::External {
+            path: path.clone(),
+            offset: 0,
+            length: 24,
+            dtype: DataType::Uint8,
+            dims: vec![2, 3, 4],
+        },
+    );
+    let scales = graph.create_named_value("fc1_scales", DataType::Uint8, static_shape([2, 3, 1]));
+    graph.set_initializer(
+        scales,
+        WeightRef::External {
+            path: path.clone(),
+            offset: 24,
+            length: 6,
+            dtype: DataType::Uint8,
+            dims: vec![2, 3, 1],
+        },
+    );
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([1, 4]));
+    let mut node = Node::new(
+        NodeId(0),
+        "QMoE",
+        vec![
+            Some(activation),
+            None,
+            Some(packed),
+            Some(scales),
+            None,
+            Some(packed),
+            Some(scales),
+        ],
+        vec![output],
+    );
+    node.domain = "com.microsoft".to_owned();
+    node.attributes
+        .insert("expert_weight_bits".to_owned(), Attribute::Int(4));
+    node.attributes
+        .insert("block_size".to_owned(), Attribute::Int(32));
+    graph.insert_node(node);
+    graph.add_output(output);
+
+    let mut store = WeightStore::new();
+    store.map_external(&path).unwrap();
+    (graph, Arc::new(store), path)
+}
+
+#[test]
+fn qmoe_expert_region_candidates_partition_expert_major_bank_without_changing_handle_output() {
+    let (graph, weights, _path) = qmoe_expert_region_fixture();
+    let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let ep = WeightDeliveryEp::new(true, deliveries);
+    let executor = Executor::build(graph, weights, Arc::new(ep)).unwrap();
+
+    // Existing behavior unchanged: still exactly one lazy weight handle per
+    // initializer (fc1 packed + fc1 scales), each with exactly one region.
+    assert_eq!(executor.weight_handles.len(), 2);
+    for handle in executor.weight_handles.values() {
+        let WeightHandle::Lazy(lazy) = handle else {
+            panic!("expected a lazy weight handle");
+        };
+        assert_eq!(lazy.regions.len(), 1);
+    }
+
+    // Additive: both QMoE initializers got a per-expert region candidate.
+    let candidates = executor.expert_region_candidates();
+    assert_eq!(candidates.len(), 2);
+    for catalog in candidates.values() {
+        assert!(catalog.is_pageable(), "{:?}", catalog.pageability());
+        // Regions exactly partition the tensor: contiguous, non-overlapping.
+        let mut expected_start = 0usize;
+        for expert in 0..2 {
+            let range = catalog
+                .relative_range(expert)
+                .unwrap_or_else(|| panic!("expert {expert} must have a region"));
+            assert_eq!(range.start, expected_start);
+            expected_start = range.end;
+        }
+        assert!(catalog.region(2).is_none());
+    }
+}
+
+#[test]
+fn qmoe_expert_region_candidates_record_reason_for_non_rank3_layout() {
+    let (mut graph, weights, path) = qmoe_expert_region_fixture();
+    // Corrupt the fc1 packed initializer to rank-2 so it can no longer derive
+    // an expert-major layout; the candidate map must still record a reason
+    // via `NonPageableReason`, not silently omit or panic.
+    let packed_value = graph
+        .initializers
+        .keys()
+        .copied()
+        .find(|value| graph.value(*value).name.as_deref() == Some("fc1_packed"))
+        .expect("fc1_packed initializer must exist");
+    graph.set_initializer(
+        packed_value,
+        WeightRef::External {
+            path: path.clone(),
+            offset: 0,
+            length: 24,
+            dtype: DataType::Uint8,
+            dims: vec![6, 4],
+        },
+    );
+
+    let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let ep = WeightDeliveryEp::new(true, deliveries);
+    let executor = Executor::build(graph, weights, Arc::new(ep)).unwrap();
+
+    // Rank-2 dims cannot derive an expert-major layout, but the value must
+    // still be recorded (not silently dropped) with an explicit
+    // `NonPageableReason`; the untouched rank-3 scales tensor is still
+    // pageable.
+    let candidates = executor.expert_region_candidates();
+    assert_eq!(candidates.len(), 2);
+    let packed_catalog = candidates
+        .get(&packed_value)
+        .expect("rank-2 fc1_packed must still be recorded, not silently omitted");
+    assert!(!packed_catalog.is_pageable());
+    assert_eq!(
+        packed_catalog.pageability(),
+        &onnx_runtime_loader::Pageability::NonPageable(
+            onnx_runtime_loader::NonPageableReason::NotExpertMajor
+        )
+    );
+
+    // The weight handle map is unaffected either way: still exactly one lazy
+    // handle per initializer, proving the invalid layout does not change
+    // existing binder/allocation behavior.
+    assert_eq!(executor.weight_handles.len(), 2);
 }
 
 #[test]
@@ -8188,4 +8351,126 @@ fn weight_derived_caches_are_cleared_before_their_buffers_are_freed() {
              entries keyed on addresses the allocator may hand to the next model"
         );
     }
+}
+
+#[test]
+fn qmoe_residency_plan_default_policy_matches_whole_bank_resident_for_pageable_candidates() {
+    let (graph, weights, _path) = qmoe_expert_region_fixture();
+    let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let ep = WeightDeliveryEp::new(true, deliveries);
+    let executor = Executor::build(graph, weights, Arc::new(ep)).unwrap();
+
+    let plan = executor.residency_plan();
+    let candidates = executor.expert_region_candidates();
+    assert_eq!(plan.policy_name(), "whole_bank_resident");
+    // Same cardinality as the expert region candidates: the plan covers
+    // exactly the values that have a QMoE catalog, no more, no fewer.
+    assert_eq!(plan.len(), candidates.len());
+    assert_eq!(plan.resident_count(), plan.len());
+    assert_eq!(plan.degraded_count(), 0);
+    for value in candidates.keys() {
+        assert_eq!(
+            plan.decision(*value),
+            Some(&onnx_runtime_ep_api::ResidencyDecision::WholeBankResident { reason: None })
+        );
+    }
+
+    // Existing behavior fully unchanged: still one lazy handle per
+    // initializer, each with exactly one region.
+    assert_eq!(executor.weight_handles.len(), 2);
+}
+
+#[test]
+fn qmoe_residency_plan_surfaces_non_pageable_reason_without_changing_handles() {
+    let (mut graph, weights, path) = qmoe_expert_region_fixture();
+    let packed_value = graph
+        .initializers
+        .keys()
+        .copied()
+        .find(|value| graph.value(*value).name.as_deref() == Some("fc1_packed"))
+        .expect("fc1_packed initializer must exist");
+    graph.set_initializer(
+        packed_value,
+        WeightRef::External {
+            path: path.clone(),
+            offset: 0,
+            length: 24,
+            dtype: DataType::Uint8,
+            dims: vec![6, 4],
+        },
+    );
+
+    let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let ep = WeightDeliveryEp::new(true, deliveries);
+    let executor = Executor::build(graph, weights, Arc::new(ep)).unwrap();
+
+    let plan = executor.residency_plan();
+    match plan.decision(packed_value) {
+        Some(onnx_runtime_ep_api::ResidencyDecision::WholeBankResident {
+            reason:
+                Some(onnx_runtime_ep_api::ResidencyDegradationReason::NonPageableCatalog(reason)),
+        }) => {
+            assert_eq!(
+                reason,
+                &onnx_runtime_loader::NonPageableReason::NotExpertMajor
+            );
+        }
+        other => panic!("expected non-pageable whole-bank reason, got {other:?}"),
+    }
+    assert_eq!(
+        plan.degraded_count(),
+        1,
+        "non-pageable reason counts as degraded"
+    );
+    assert_eq!(executor.weight_handles.len(), 2);
+}
+
+/// Prove the residency-policy seam is substitutable at the executor's own
+/// candidate/boundary wiring, without any production dispatch path consuming
+/// the result -- this is the "test-only alternate policy" required to show
+/// the trait is not an inert marker.
+#[test]
+fn qmoe_residency_plan_seam_is_substitutable_with_an_alternate_policy() {
+    use onnx_runtime_ep_api::{ResidencyDecision, ResidencyPolicy, ResidencyPolicyInput};
+
+    struct AlwaysSplit;
+    impl ResidencyPolicy for AlwaysSplit {
+        fn name(&self) -> &'static str {
+            "test_always_split"
+        }
+        fn decide(&self, input: &ResidencyPolicyInput<'_>) -> ResidencyDecision {
+            if input.catalog.is_pageable() {
+                ResidencyDecision::PerExpertCandidate {
+                    experts: (0..input.catalog.layout().experts).collect(),
+                }
+            } else {
+                ResidencyDecision::WholeBankResident { reason: None }
+            }
+        }
+    }
+
+    let (graph, weights, _path) = qmoe_expert_region_fixture();
+    let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let ep = WeightDeliveryEp::new(true, deliveries);
+    let executor = Executor::build(graph, weights, Arc::new(ep)).unwrap();
+
+    let candidates = executor.expert_region_candidates();
+    let plan =
+        crate::executor::build::plan_residency_with(&executor.graph, candidates, &AlwaysSplit);
+    assert_eq!(plan.policy_name(), "test_always_split");
+    assert!(!plan.is_empty());
+    for value in candidates.keys() {
+        assert!(matches!(
+            plan.decision(*value),
+            Some(ResidencyDecision::PerExpertCandidate { .. })
+        ));
+    }
+
+    // Substituting the policy must not touch the default plan stored on the
+    // executor, nor the weight-handle/binding output.
+    assert_eq!(
+        executor.residency_plan().policy_name(),
+        "whole_bank_resident"
+    );
+    assert_eq!(executor.weight_handles.len(), 2);
 }

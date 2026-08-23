@@ -100,6 +100,14 @@ harness = false
 name = "int4_decode_loop_ab"
 harness = false
 
+# The gap-aware companion to `int4_decode_loop_ab`: same workload, verbatim,
+# with a configurable inter-token gap. `int4_decode_loop_ab` is its zero-gap
+# row, which is the one workload where parking can never pay off -- so the
+# blocktime window cannot be tuned from it.
+[[bench]]
+name = "decode_gap_park_ab"
+harness = false
+
 [[bench]]
 name = "int4_acc0_attribution"
 harness = false
