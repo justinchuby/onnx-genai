@@ -1058,6 +1058,14 @@ of them:
   request with no session are the same execution — declaring a conversation
   costs a package nothing when nobody asks for one.
 
+  The `recurrence` bound is load-bearing: a continuation is not loop-carried and
+  so never reaches the carry path's recurrence check, and this is the only place
+  it is honoured. A turn whose conversation would exceed it is refused before it
+  runs, and a turn whose own generation would exceed it is refused rather than
+  stored — a session left in a state its own declaration forbids has no way
+  back. Neither refusal changes what the session already held; `reset_session`
+  releases it.
+
   This is what a decoder whose prefill starts from empty state declares. Such a
   package's cache is rebuilt from the conversation on each turn; nothing in the
   document asks the prefill to accept a cache it was never authored to take, and

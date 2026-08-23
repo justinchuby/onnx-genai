@@ -549,6 +549,33 @@ pub(crate) fn workflow_prompt_continuation(
     })
 }
 
+/// The declared upper bound on a continuation cell's length, if the pass bound
+/// a value for it.
+///
+/// The validator makes the bound mandatory on a continuation, so a package's
+/// context limit is a fact this cell states. Reading it here is what makes that
+/// statement load-bearing rather than decorative: nothing else checks it,
+/// because a continuation is deliberately not loop-carried and so never reaches
+/// the carry path's recurrence check.
+fn continuation_bound(
+    state: &onnx_genai_metadata::WorkflowStateCell,
+    values: &PipelineTensors,
+) -> anyhow::Result<Option<usize>> {
+    let max = match &state.recurrence {
+        onnx_genai_metadata::ShapeRecurrence::Growing { max, .. }
+        | onnx_genai_metadata::ShapeRecurrence::Bounded { max, .. } => max,
+        onnx_genai_metadata::ShapeRecurrence::Invariant => return Ok(None),
+    };
+    if !values.contains_key(max) {
+        return Ok(None);
+    }
+    workflow_usize_rows(values, max)?
+        .into_iter()
+        .min()
+        .map(Ok)
+        .transpose()
+}
+
 /// Read the tokens a session-scoped continuation cell holds, as a flat row.
 fn continuation_tokens(value: &Value) -> anyhow::Result<Vec<i64>> {
     let shape = value.shape();
@@ -629,21 +656,43 @@ pub fn workflow_carries_session_state(workflow: &WorkflowSpec) -> bool {
             Step::Loop {
                 setup,
                 steps,
+                continue_when,
+                max_iterations,
                 carried: carries,
                 ..
             } => {
                 carried.extend(carries.iter().map(|carry| carry.cell.clone()));
+                read.extend(carries.iter().filter_map(|carry| carry.initial.clone()));
+                read.insert(continue_when.clone());
+                read.insert(max_iterations.clone());
                 setup.iter().for_each(|step| walk(step, carried, read));
                 steps.iter().for_each(|step| walk(step, carried, read));
             }
-            Step::Branch { cases, default, .. } => {
+            Step::Branch {
+                predicate,
+                cases,
+                default,
+                outputs,
+            } => {
+                read.insert(predicate.clone());
+                for phi in outputs.values() {
+                    read.extend(phi.cases.values().cloned());
+                    read.extend(phi.default.iter().cloned());
+                }
                 cases.values().for_each(|step| walk(step, carried, read));
                 if let Some(default) = default {
                     walk(default, carried, read);
                 }
             }
-            Step::Emit { value, .. } => {
+            Step::Emit {
+                value,
+                when,
+                valid_length,
+                ..
+            } => {
                 read.insert(value.clone());
+                read.extend(when.iter().cloned());
+                read.extend(valid_length.iter().cloned());
             }
         }
     }
@@ -1030,6 +1079,23 @@ impl<'a> WorkflowExecutionPlan<'a> {
             )?;
         }
         let input_names = values.keys().cloned().collect::<Vec<_>>();
+        // The bound the continuation cell declares is the package's own context
+        // limit, and this is the only place it can be checked: a continuation is
+        // deliberately not loop-carried, so it never reaches the carry path's
+        // recurrence check. Refusing here means the turn that would overflow is
+        // refused before it runs, naming the conversation rather than failing
+        // somewhere inside the decoder graph with a shape nobody can attribute.
+        if let Some(conversation) = continued_prompt.as_deref()
+            && let Some((cell, _, _, state)) = workflow_prompt_continuation(workflow)
+            && let Some(bound) = continuation_bound(state, &values)?
+        {
+            anyhow::ensure!(
+                conversation.len() <= bound,
+                "this session's conversation is {} tokens and '{cell}' declares a bound of \
+                 {bound}; reset or close the session to start a new one, or send a shorter turn",
+                conversation.len()
+            );
+        }
         let input_aliases = workflow
             .inputs
             .iter()
@@ -1274,6 +1340,20 @@ impl<'a> WorkflowExecutionPlan<'a> {
                         tokens_output,
                     )?);
                     let length = conversation.len() as i64;
+                    // A turn's own generation can be what carries the
+                    // conversation past the bound. Storing it anyway would leave
+                    // the session in a state its own declaration forbids, and
+                    // every later turn would fail with the same overflow and no
+                    // way back.
+                    if let Some(bound) = continuation_bound(state, &values)?
+                        && conversation.len() > bound
+                    {
+                        anyhow::bail!(
+                            "this turn leaves a conversation of {} tokens and '{cell}' declares a \
+                             bound of {bound}; reset or close the session to start a new one",
+                            conversation.len()
+                        );
+                    }
                     let shape = match state.contract.rank {
                         1 => vec![length],
                         2 => vec![1, length],

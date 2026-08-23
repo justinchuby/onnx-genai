@@ -155,8 +155,10 @@ Each turn's prompt becomes the conversation followed by the caller's tokens, and
 the conversation then absorbs both that prompt and what the turn published. Every
 input derived from the prompt — its length, the mask the state initializer builds
 from it — is derived from the whole conversation, so a package whose prefill
-starts from empty state needs no new graph to continue one. `session_state_lease`
-belongs in the manifest; §12.5a of
+starts from empty state needs no new graph to continue one. The `recurrence`
+bound is the package's context limit and is enforced: a turn that would carry the
+conversation past it is refused, naming the bound, rather than failing inside the
+decoder graph. `session_state_lease` belongs in the manifest; §12.5a of
 [the metadata decisions](INFERENCE_METADATA_DECISIONS.md) states the rules the
 validator enforces.
 

@@ -297,3 +297,59 @@ fn a_package_with_no_declared_conversation_refuses_a_session() -> anyhow::Result
     );
     Ok(())
 }
+
+/// The bound the conversation declares is the bound it keeps.
+///
+/// A continuation is deliberately not loop-carried, so it never reaches the
+/// carry path's recurrence check — this is the only place its declared `max` is
+/// honoured. Without it the conversation would grow past the package's context
+/// limit and the turn that crossed it would fail somewhere inside the decoder
+/// graph, with a shape error nobody could attribute to a session.
+#[test]
+fn a_conversation_is_refused_past_the_bound_it_declares() -> anyhow::Result<()> {
+    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("short_context_package");
+    let _ = std::fs::remove_dir_all(&scratch);
+    copy_package(&scratch)?;
+    let metadata = scratch.join("inference_metadata.yaml");
+    let mut document: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&metadata)?)?;
+    // Only the conversation's bound is narrowed. Narrowing `package.max_context`
+    // would narrow the cache cells with it and prove nothing about this check.
+    let limit: serde_yaml::Value = serde_yaml::from_str(
+        "contract: { dtype: int64, rank: 1, shape: [1] }\n\
+         role: { kind: opaque }\n\
+         source: { kind: literal }\n\
+         required: false\n\
+         default: 6\n",
+    )?;
+    document["pipeline"]["workflow"]["inputs"]
+        .as_mapping_mut()
+        .expect("workflow declares inputs")
+        .insert("package.conversation_limit".into(), limit);
+    document["pipeline"]["workflow"]["state"]["conversation"]["recurrence"]["max"] =
+        serde_yaml::Value::String("package.conversation_limit".into());
+    std::fs::write(&metadata, serde_yaml::to_string(&document)?)?;
+
+    let mut engine = Engine::from_dir(&scratch, EngineConfig::default())?;
+    let session = engine.create_session()?;
+    // Four prompt tokens and two generated leaves the conversation exactly at
+    // the bound, which is legal.
+    engine.generate_in_session(session, tokens(&[2, 4, 6, 3], 2))?;
+    assert_eq!(engine.session_token_count(session)?, 6);
+
+    let refused = engine
+        .generate_in_session(session, tokens(&[5, 7], 2))
+        .expect_err("a turn past the declared bound must be refused");
+    let message = format!("{refused:#}");
+    assert!(
+        message.contains("declares a bound of 6"),
+        "the refusal names the bound and the conversation: {message}"
+    );
+    // The refusal left the conversation as it was, so the session is still
+    // usable once it is reset.
+    assert_eq!(engine.session_token_count(session)?, 6);
+    engine.reset_session(session)?;
+    engine.generate_in_session(session, tokens(&[5, 7], 2))?;
+    assert_eq!(engine.session_token_count(session)?, 4);
+    Ok(())
+}

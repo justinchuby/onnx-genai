@@ -3947,8 +3947,23 @@ fn session_tokens(body: &Value) -> u64 {
         .unwrap_or_else(|| panic!("a session response reports its token count: {body}"))
 }
 
+fn turn_tokens(body: &Value) -> u64 {
+    body["usage"]["prompt_tokens"]
+        .as_u64()
+        .expect("prompt tokens")
+        + body["usage"]["completion_tokens"]
+            .as_u64()
+            .expect("completion tokens")
+}
+
 /// Three turns in one session accumulate one conversation; a fourth id does not
 /// see it; deleting the session releases it.
+///
+/// The arithmetic is what makes this non-vacuous. `usage` reports the *turn* —
+/// the tokens this request sent and this request produced — while
+/// `session_token_count` reports the conversation. If a turn restarted, the
+/// conversation would grow by the turn's generation alone and the equality
+/// below would be short by exactly the turn's prompt.
 #[tokio::test]
 async fn chat_completions_continue_a_conversation_across_requests() {
     let scratch = tempfile::tempdir().expect("scratch directory");
@@ -3958,43 +3973,35 @@ async fn chat_completions_continue_a_conversation_across_requests() {
     let router = app(state);
 
     let session = "sess-multi-turn";
-    let (status, first) = chat_turn(router.clone(), Some(session), "hello world").await;
-    assert_eq!(status, StatusCode::OK, "{first}");
-    let after_first = session_tokens(&first);
-    assert!(
-        after_first > 0,
-        "the first turn leaves its prompt and generation behind"
-    );
-
-    let (status, second) = chat_turn(router.clone(), Some(session), "the quick").await;
-    assert_eq!(status, StatusCode::OK, "{second}");
-    let after_second = session_tokens(&second);
-    assert!(
-        after_second > after_first,
-        "the second turn extends the conversation: {after_first} -> {after_second}"
-    );
-
-    let (status, third) = chat_turn(router.clone(), Some(session), "brown fox").await;
-    assert_eq!(status, StatusCode::OK, "{third}");
+    let mut conversation = 0u64;
+    let mut turns = Vec::new();
+    for prompt in ["hello world", "the quick", "brown fox"] {
+        let (status, body) = chat_turn(router.clone(), Some(session), prompt).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        conversation += turn_tokens(&body);
+        assert_eq!(
+            session_tokens(&body),
+            conversation,
+            "after {} turn(s) the conversation is every turn's prompt and generation: {body}",
+            turns.len() + 1
+        );
+        turns.push(body);
+    }
+    let third = turns.pop().expect("three turns");
     let after_third = session_tokens(&third);
     assert!(
-        after_third > after_second,
-        "the third turn continues turns one and two: {after_second} -> {after_third}"
-    );
-    // The third turn was decoded from the whole conversation: everything the
-    // first two turns sent and published is still in front of it.
-    assert!(
-        after_third >= after_first * 3,
-        "turn 3's context is the conversation, not its own prompt: {after_third} against a first          turn of {after_first}"
+        after_third > turn_tokens(&third),
+        "the third turn was decoded from more than its own request"
     );
     assert_eq!(third["session_id"].as_str(), Some(session));
 
     // A different id is a different conversation, from its first turn.
     let (status, isolated) = chat_turn(router.clone(), Some("sess-other"), "brown fox").await;
     assert_eq!(status, StatusCode::OK, "{isolated}");
-    assert!(
-        session_tokens(&isolated) < after_third,
-        "an independent session starts its own conversation"
+    assert_eq!(
+        session_tokens(&isolated),
+        turn_tokens(&isolated),
+        "an independent session's first turn is its own request and nothing else"
     );
 
     // And the session the server handed out is released when it is deleted.
