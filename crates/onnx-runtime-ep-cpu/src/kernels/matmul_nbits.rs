@@ -4700,7 +4700,7 @@ fn decode_affinity_cpus(threads: usize) -> std::result::Result<Option<Vec<usize>
 
 /// Log the decode-affinity auto-policy decision once (info): whether pinning was
 /// auto-enabled, declined (cpuset/single-node/unsupported OS), and why.
-fn report_decode_affinity_policy(message: &str) {
+pub(crate) fn report_decode_affinity_policy(message: &str) {
     static REPORTED: OnceLock<()> = OnceLock::new();
     if REPORTED.set(()).is_ok() {
         eprintln!(
