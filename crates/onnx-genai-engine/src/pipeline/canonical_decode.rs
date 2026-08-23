@@ -2,8 +2,18 @@
 //!
 //! A bare-decoder package has no serialized workflow; the loader compiles its
 //! `model.io` into one (`onnx_genai_metadata::canonical`). This module executes
-//! that lowered workflow, so a plain decoder and an authored workflow reach the
-//! same runtime instead of two.
+//! that lowered workflow, so a plain decoder is no longer a *second kind of
+//! package* that decodes without one.
+//!
+//! To be precise about what that does and does not mean: a lowered decoder and
+//! an authored workflow both execute a `WorkflowSpec`, but not through the same
+//! executor. An authored workflow runs the general interpreter
+//! (`pipeline::workflow::run_workflow_node`) and may express token selection as
+//! an in-graph ONNX policy; a lowered decoder runs *this* body so it keeps the
+//! rich Rust sampler, paged KV, sessions, and speculative decode — none of which
+//! has an in-graph representation. What is unified is that there is exactly one
+//! single-row autoregressive loop and one next-token policy, not that there is
+//! one executor for every package shape.
 //!
 //! # What runs the workflow, and what runs the model
 //!

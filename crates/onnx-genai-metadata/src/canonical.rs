@@ -42,8 +42,12 @@
 //!   paged / share-buffer / CUDA-graph executors keep owning their KV and no
 //!   per-step host round-trip is introduced.
 //! * [`TOKEN_POLICY_CONTRACT`] — next-token selection and stop detection,
-//!   backed by the one Rust sampling/stopping policy, so a lowered decoder and
-//!   an authored workflow share a single implementation.
+//!   backed by the one Rust sampling/stopping policy (`processors.rs`), which is
+//!   the only next-token implementation any *Rust-side* loop uses. An authored
+//!   workflow that expresses selection as an in-graph ONNX policy is a different
+//!   thing: its sampling runs in the graph, not through this contract. The
+//!   contract exists so a lowered decoder keeps the rich Rust sampler rather
+//!   than needing an ONNX one.
 //!
 //! Everything else — the loop, its induction value, the stopping predicate, and
 //! the tokens emit — is ordinary workflow structure the interpreter owns.

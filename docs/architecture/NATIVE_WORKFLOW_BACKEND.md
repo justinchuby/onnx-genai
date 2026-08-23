@@ -42,9 +42,12 @@ did not share an implementation:
    `engine/runtime.rs::generate_with_callbacks`.
 
 4. **The autoregressive token loop** — this one is **already unified**.
-   `decode_loop.rs::run_decode_loop` + the `DecodeLoopBackend` trait own the
-   single token loop, and both `SessionDecodeLoopBackend` (ORT) and
-   `NativeLoopAdapter` (native) implement it. Sampling, stopping, constraint
+   One token loop plus the `DecodeLoopBackend` trait own single-row decode, and
+   both `SessionDecodeLoopBackend` (ORT) and `NativeLoopAdapter` (native)
+   implement it. (That loop was `decode_loop.rs::run_decode_loop` when this was
+   written; it is now `pipeline::canonical_decode`, which reads its body from
+   the canonical workflow — see
+   [`WORKFLOW_RUNTIME_UNIFICATION.md`](WORKFLOW_RUNTIME_UNIFICATION.md).) Sampling, stopping, constraint
    application and KV commit have one authoritative home
    (`processors.rs::select_next_token*`, `finish_reason_after_token`,
    `ensure_constrained_finish`, `decode_loop.rs::commit_selected_token`,
@@ -107,7 +110,7 @@ sampling and stopping expressed as ordinary policy components
 (`token_sampler.onnx`, `termination.onnx`) and KV/length carried by
 loop-carried state cells. Running that workflow on the native backend therefore
 runs AR decode **through the one interpreter loop** — no second or third loop is
-introduced. The optimized `run_decode_loop` / `NativeDecodeSession` path
+introduced. The optimized single-row / `NativeDecodeSession` path
 (device sampling fast paths, in-place KV) remains the specialized executor for
 the direct `Engine`; §6 describes folding it under the interpreter's decoder
 `Loop` node as a *specialized component executor* rather than a parallel loop.
@@ -223,11 +226,13 @@ invariants are observable through a per-backend run counter.
   execution-island / graph-capture optimizations stay ORT-only (fail-closed under
   Native); reusing device output buffers across loop steps instead of allocating
   per step is a perf follow-up, not a correctness gap.
-* **Follow-up boundary B — specialized AR executor.** Recognize the canonical
-  single-decoder `Loop` and delegate it to `run_decode_loop` /
-  `NativeDecodeSession` as a specialized component executor (device sampling
-  fast paths, in-place KV) instead of re-entering the generic interpreter per
-  token. Correctness is already delivered by the generic loop; this is a
+* **Follow-up boundary B — specialized AR executor. DONE**, in the form
+  described by [`WORKFLOW_RUNTIME_UNIFICATION.md`](WORKFLOW_RUNTIME_UNIFICATION.md):
+  the canonical single-decoder `Loop` is read by `pipeline::canonical_decode`,
+  which dispatches by contract id to `NativeDecodeSession` / the ORT backend as
+  specialized component executors (device sampling fast paths, in-place KV)
+  instead of re-entering the generic interpreter per token. Correctness was
+  already delivered by the generic loop; this was a
   perf/entropy fold, not a behaviour change.
 * **Follow-up boundary C — direct `Engine` façade.** Re-express the direct
   `Engine`'s bespoke native session lifecycle and ORT/native routing as a thin

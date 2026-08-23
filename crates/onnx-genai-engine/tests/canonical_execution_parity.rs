@@ -173,12 +173,17 @@ fn seeded_sampling_runs_through_the_canonical_loop() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Batched generation, where the decode path supports it, uses the same loop.
+/// Batched generation is a different iteration shape, not an exemption.
+///
+/// It advances N rows per forward pass, so it is deliberately *not* the
+/// canonical single-row body — but it is still this runtime producing tokens,
+/// so it must be refused just the same when no canonical workflow exists.
+/// Asserting only the token counts would leave batching a silent hole.
 ///
 /// Skipped with a reason on a decode path that cannot batch, rather than
 /// asserting a capability the fixture does not have.
 #[test]
-fn batching_runs_through_the_canonical_loop() -> anyhow::Result<()> {
+fn batched_generation_is_held_to_the_canonical_precondition() -> anyhow::Result<()> {
     let mut engine = engine()?;
     let capability = engine.batching_capability();
     if !capability.supports_batching() {
@@ -193,6 +198,21 @@ fn batching_runs_through_the_canonical_loop() -> anyhow::Result<()> {
     for result in &results {
         assert_eq!(result.token_ids.len(), 4);
     }
+
+    // Token counts alone would not show batching honours the canonical
+    // precondition — it advances N rows per pass, so it is a different
+    // iteration shape and could plausibly have been left unguarded. Removing
+    // the canonical form must make it refuse too, otherwise batching is a hole
+    // in "no package decodes without a canonical workflow".
+    engine.forget_canonical_workflow_for_test();
+    let error = engine
+        .generate_batched_static(vec![greedy(4), greedy(4)])
+        .expect_err("batched generation must refuse a runtime with no canonical workflow");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("no canonical workflow"),
+        "expected a canonical-workflow refusal, got: {message}"
+    );
     Ok(())
 }
 

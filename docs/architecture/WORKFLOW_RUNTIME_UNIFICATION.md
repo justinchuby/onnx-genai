@@ -314,14 +314,23 @@ touched, so a reviewer can check the claim rather than take it.
 **Phase 4 — delete the superseded orchestration.**
 - `crates/onnx-genai-engine/src/engine/runtime.rs`: every decode entry point —
   `generate_with_callbacks`, `generate_in_session_with_priority_and_callback`,
-  and `prepare_active_generate` / `step_active_generate` (the scheduler's
-  prioritized drive) — resolves the canonical workflow through the shared
-  `canonical_workflow` accessor before it can decode, and then runs the
-  canonical body. There is no declaration switch left to choose a legacy path
-  with; `canonical_execution_parity.rs` pins the refusal for all four.
+  `prepare_active_generate` / `step_active_generate` (the scheduler's
+  prioritized drive), and both native paths — resolves the canonical workflow
+  through the shared `canonical_workflow` accessor before it can decode, and
+  then runs the canonical body. There is no declaration switch left to choose a
+  legacy path with; `canonical_execution_parity.rs` pins the refusal.
 - `crates/onnx-genai-engine/src/session.rs`: `ActiveGenerate` carries the
   resolved `CanonicalBody`, so the prioritized drive is the same body as the
   run-to-completion loop rather than a parallel implementation of it.
+
+**Every token-producing entry point is held to the canonical precondition.**
+Not just the single-row ones. `batched.rs::generate_batched_static` and
+`continuous_batch_manager` (the single admission point for both continuous-batch
+entry points) resolve `canonical_workflow(..)` before they can decode, as do the
+two native paths — and all four native/batched guards run *before* scheduler
+admission, so a refusal never consumes a slot or disturbs session state.
+`canonical_execution_parity` pins the refusal for the four single-row entry
+points and for batched generation.
 
 **Two loops remain, and they are not duplicates.**
 `batched.rs` (N rows advancing together) and the speculative

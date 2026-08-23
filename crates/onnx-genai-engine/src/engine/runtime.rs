@@ -382,6 +382,10 @@ impl Engine {
         options.max_context = self.max_context_for_request(&options);
         let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
         let speculation_plan = native_speculation_plan(&options, &chain);
+        // Resolved before admission: a package with no canonical workflow must
+        // be refused before it can take a scheduler slot or touch the decode
+        // workspace, so a refusal never leaves state behind to unwind.
+        canonical_workflow(self.workflow.as_deref(), self.lowered_workflow.as_ref())?;
         let scheduler_session_id = self.next_native_session_id();
         let scheduled = self.admit_generate_request_with_scheduler(
             scheduler_session_id,
@@ -2128,7 +2132,7 @@ impl Engine {
 /// Written as a free function over the fields rather than a `&self` method so it
 /// stays disjoint from the mutable borrows of `native_session` / `kv_cache` that
 /// surround every decode call site.
-fn canonical_workflow<'a>(
+pub(crate) fn canonical_workflow<'a>(
     workflow: Option<&'a crate::pipeline::WorkflowRuntime>,
     lowered: Option<&'a onnx_genai_metadata::WorkflowSpec>,
 ) -> anyhow::Result<&'a onnx_genai_metadata::WorkflowSpec> {
@@ -2246,6 +2250,9 @@ impl Engine {
         if !self.native_sessions.contains_key(&session_id) {
             anyhow::bail!("session {session_id} not found");
         }
+        // Resolved before admission, for the same reason as the cold path: a
+        // refusal must not consume a scheduler slot or disturb session state.
+        canonical_workflow(self.workflow.as_deref(), self.lowered_workflow.as_ref())?;
         let scheduled = self.admit_generate_request_with_scheduler(
             session_id,
             prompt_tokens.len(),

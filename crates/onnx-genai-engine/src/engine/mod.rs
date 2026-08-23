@@ -77,6 +77,7 @@ mod model;
 #[cfg(feature = "native-backend")]
 mod placement;
 mod runtime;
+pub(crate) use runtime::canonical_workflow;
 pub(crate) mod session_state;
 mod speculative_load;
 mod workflow_api;

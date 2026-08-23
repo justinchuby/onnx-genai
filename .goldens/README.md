@@ -11,9 +11,11 @@ later capture must match it token for token.
 Coverage is whatever this machine has; entries read `MISSING_DIR` when a package
 is absent, which keeps a thin run visibly thin instead of silently green.
 
-## `after_prioritized.tsv`
+## `after_review2.tsv`
 
-Captured after the scheduler's prioritized drive was moved onto the canonical
-body (`ActiveGenerate` carrying a resolved `CanonicalBody`) and `step_decode_loop`
-was deleted. Byte-identical to `after_lowering.tsv` and `after_execution.tsv`,
-so the last caller to move produced no token change on any real model.
+Captured after the last two migrations: the scheduler's prioritized drive moved
+onto the canonical body (`ActiveGenerate` carrying a resolved `CanonicalBody`,
+`step_decode_loop` deleted), and the canonical guard hoisted above scheduler
+admission on both native paths. Byte-identical to `after_lowering.tsv` and
+`after_execution.tsv`, so moving the last callers changed no token on any real
+model.

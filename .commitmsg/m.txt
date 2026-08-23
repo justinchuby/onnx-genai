@@ -1,53 +1,48 @@
-fix(engine): route the prioritized drive through the canonical body
+fix(engine): close the guard gaps the final review found
 
-The Opus verification pass found the last caller that still owned its own
-iteration. `drive_prioritized_requests` / `drive_prioritized_arrivals` went
-`prepare_active_generate` -> `step_active_generate` -> `step_decode_loop`,
-never resolving the canonical workflow. So the claim "every single-row
-autoregressive request executes the lowered workflow" was true of the
-run-to-completion paths and false of the scheduler's per-step drive — which is
-the path the server actually uses under load.
+The final rubber-duck review confirmed the two carried findings resolved but
+found the ordering fix had not been applied uniformly, and that two claims in
+the module docs were simply false. Both are fixed here.
 
-Rather than add a second guard, factor the loop so there is one body:
+**The guard ordering was fixed on ORT only.** Both native paths still resolved
+the canonical workflow *after* scheduler admission and workspace prep
+(`generate_native_cold_with_callback`, `generate_native_in_session_with_callbacks`),
+and on failure returned via `?` without `scheduler.complete(..)` — leaking the
+admission, unlike the workspace-prep error immediately above which unwinds it
+explicitly. Both guards now run before admission, so a refusal cannot consume a
+slot or disturb session state and there is nothing to unwind.
 
-* `CanonicalBody::resolve` binds the spec's loop body once, and
-  `step_canonical_body` runs one iteration of it. `run_canonical_decode` is now
-  that same body run to completion, so "run" and "step" are not two policies.
-* `ActiveGenerate` carries the resolved body, so the scheduler resolves the
-  workflow when it prepares a request instead of re-reading the spec per token.
-* `step_decode_loop` is **deleted**. With `run_decode_loop` already gone, no
-  loop in the crate can decode without a canonical workflow to read.
+**Batched and continuous decode were not guarded at all.** They advance N rows
+per pass rather than one, so they are deliberately not the canonical single-row
+body — but they are still this runtime producing tokens, and they would have
+decoded happily with no canonical workflow present. That is a real hole in "no
+package decodes without a canonical workflow", not a technicality.
+`generate_batched_static` and `continuous_batch_manager` (the single admission
+point both continuous entry points funnel through) now resolve the guard, and
+`batching_runs_through_the_canonical_loop` — which asserted only token counts
+and so could not have caught this — is rewritten as
+`batched_generation_is_held_to_the_canonical_precondition` and asserts the
+refusal.
 
-Also from the review:
+**Two docstrings claimed more than the code delivers.** `canonical.rs` said a
+lowered decoder and an authored workflow "share a single implementation" of the
+token policy, and `canonical_decode.rs` said they "reach the same runtime
+instead of two". Neither is true: the contracts are dispatched only on the
+lowered path, and an authored workflow runs the general interpreter with
+in-graph sampling. Both now state what is actually unified — one single-row
+autoregressive loop and one Rust next-token policy — and why the lowered path
+has its own executor at all (the rich sampler, paged KV, sessions and
+speculative decode have no in-graph representation).
 
-* The guard is hoisted above admission and KV mutation in
-  `generate_in_session_with_priority_and_callback`, so a package without a
-  canonical workflow is refused before it can mutate session state, and the ORT
-  speculative branch can no longer return ahead of it.
-* `BodyStep::Emit` is load-bearing: it carries the output it targets,
-  resolution rejects an emit into an undeclared output, and a body that never
-  emits the tokens output is refused. Previously `Emit` resolved to a no-op, so
-  the spec could say "emit nothing" and the loop would still stream tokens.
-* Seven `resolve_body` unit tests pin those refusals, each mutating the real
-  lowering into a spec that would still load but describes something this
-  runtime cannot honestly execute.
-* `canonical_execution_parity` gains a fourth refusal case covering the
-  prioritized drive, so the fail test now proves all four entry points.
+Also: `NATIVE_WORKFLOW_BACKEND.md` and the July benchmark note still described
+`run_decode_loop` as live; they now name the symbol that exists and mark the
+"specialized AR executor" follow-up as delivered.
 
-Docs: §1 is marked as the pre-change measurement, §6 is rewritten from
-"remaining code" to what actually landed, and the stale `run_decode_loop` /
-`step_decode_loop` references are corrected. §6 also states plainly why
-`batched.rs` and the speculative propose/verify block remain: they are
-different iteration shapes over the same policy primitives, not second copies
-of the single-row loop.
-
-Verified: 72/72 engine targets (native-backend); downstream server/CLI/CAPI/
-metadata (the one failure, `fim_stream_returns_headers_before_generation_
-finishes`, is the known load-flake and passes 3/3 in isolation); H200 CUDA —
-canonical_execution_parity 8, canonical_lowering_corpus 5, gemma4_chained_
-workflow 8, native_workflow_parity 12, one_runtime_e2e 5, fixture floor 3;
-fmt --check; clippy -D warnings. All five real foundry models are
-byte-identical to both the pre-change baseline and the post-execution capture,
-so moving the last caller changed no token anywhere.
+Verified: 72/72 engine targets (native-backend); 32/32 downstream
+server/CLI/CAPI/metadata, exit 0; H200 CUDA — canonical_execution_parity 8,
+native_workflow_parity 12, one_runtime_e2e 5, gemma4_chained_workflow 8,
+fixture floor 3; fmt --check; clippy -D warnings. All five real foundry models
+remain byte-identical to the pre-change baseline, which matters here because
+this commit changed the native decode paths.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>

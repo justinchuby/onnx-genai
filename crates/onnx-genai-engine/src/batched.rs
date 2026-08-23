@@ -770,6 +770,15 @@ impl Engine {
                 "batched static generation requires a STATIC-CACHE model; past/present batching is deferred"
             );
         }
+        // Batched decode advances N rows per forward pass rather than one, so
+        // it is a different *iteration shape* from the canonical single-row
+        // body — but it is still this runtime generating tokens, so it is held
+        // to the same precondition: a package with no canonical workflow cannot
+        // decode by any route.
+        crate::engine::canonical_workflow(
+            self.workflow.as_deref(),
+            self.lowered_workflow.as_ref(),
+        )?;
 
         let mut results = vec![None; requests.len()];
         let mut rows = Vec::new();
@@ -1016,6 +1025,13 @@ impl Engine {
         if max_batch == 0 {
             anyhow::bail!("continuous batch max_batch must be greater than zero");
         }
+        // The single admission point for both continuous-batch entry points, so
+        // the canonical precondition is checked once, here, rather than once per
+        // caller where a new caller could forget it.
+        crate::engine::canonical_workflow(
+            self.workflow.as_deref(),
+            self.lowered_workflow.as_ref(),
+        )?;
         // Native backend (#750 stage 4): wire the manager onto the native CUDA
         // persistent batch path. Stage 3a made the fused forward ragged (per-row
         // `row_lens`/`position_ids`/mask window) and stage 3b built the two seams
