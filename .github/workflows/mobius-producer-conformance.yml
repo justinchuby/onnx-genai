@@ -23,7 +23,8 @@ jobs:
     # below), so producer-side regressions surface here in the logs and check
     # output but must not gate ONNX GenAI PRs -- they are fixed upstream in
     # Mobius. Job-level continue-on-error keeps the workflow run green while
-    # preserving every step's output/artifacts; the job is not a required
+    # still exposing the failing job/step logs and the check signal (it does
+    # not make later steps run after a failure); the job is not a required
     # status check.
     continue-on-error: true
     steps:
