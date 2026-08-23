@@ -4,7 +4,8 @@
 # component ports and roles, and the state_service group that owns the KV
 # cache. A single decoder is not a special package shape — it is a workflow
 # with one ONNX component and one runtime-bound token policy.
-schema_version: '1.0'
+model:
+  max_sequence_length: 16
 pipeline:
   workflow:
     manifest:
@@ -109,7 +110,7 @@ pipeline:
         source:
           kind: literal
         required: false
-        default: 4096
+        default: 16
       package.state_seed:
         contract:
           dtype: float32
@@ -156,7 +157,7 @@ pipeline:
         source:
           kind: request
         required: false
-        default: 4096
+        default: 16
     outputs:
       tokens:
         contract:
@@ -206,20 +207,6 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
-            past_key_values.1.key:
-              dtype: float32
-              rank: 4
-              optional: false
-              batch_layout:
-                kind: request_aligned
-                axis: 0
-            past_key_values.1.value:
-              dtype: float32
-              rank: 4
-              optional: false
-              batch_layout:
-                kind: request_aligned
-                axis: 0
             position_ids:
               dtype: int64
               rank: 2
@@ -243,20 +230,6 @@ pipeline:
                 kind: request_aligned
                 axis: 0
             present.0.value:
-              dtype: float32
-              rank: 4
-              optional: false
-              batch_layout:
-                kind: request_aligned
-                axis: 0
-            present.1.key:
-              dtype: float32
-              rank: 4
-              optional: false
-              batch_layout:
-                kind: request_aligned
-                axis: 0
-            present.1.value:
               dtype: float32
               rank: 4
               optional: false
@@ -399,38 +372,6 @@ pipeline:
         management: runtime
         release_boundary: invocation
         service_group: decoder_kv
-      decoder_kv.0002:
-        contract:
-          dtype: float32
-          rank: 4
-          optional: false
-          batch_layout:
-            kind: request_aligned
-            axis: 0
-        class: semantic
-        scope: invocation
-        initializer: package.state_seed
-        recurrence:
-          kind: invariant
-        management: runtime
-        release_boundary: invocation
-        service_group: decoder_kv
-      decoder_kv.0003:
-        contract:
-          dtype: float32
-          rank: 4
-          optional: false
-          batch_layout:
-            kind: request_aligned
-            axis: 0
-        class: semantic
-        scope: invocation
-        initializer: package.state_seed
-        recurrence:
-          kind: invariant
-        management: runtime
-        release_boundary: invocation
-        service_group: decoder_kv
       done:
         contract:
           dtype: bool
@@ -477,7 +418,7 @@ pipeline:
             kind: full_attention
             sequence_axis: 2
             layout: head_major_bnsh
-            aliasing: forbidden
+            aliasing: permitted
             reuse:
               prefix_reusable: true
               evictable_prefix: true
@@ -496,16 +437,6 @@ pipeline:
                   output: present.0.value
                   role: value
                   layer: 0
-                decoder_kv.0002:
-                  input: past_key_values.1.key
-                  output: present.1.key
-                  role: key
-                  layer: 1
-                decoder_kv.0003:
-                  input: past_key_values.1.value
-                  output: present.1.value
-                  role: value
-                  layer: 1
     steps:
     - kind: loop
       setup: []
@@ -517,15 +448,11 @@ pipeline:
           input_ids: request.input_ids
           past_key_values.0.key: decoder_kv.0000
           past_key_values.0.value: decoder_kv.0001
-          past_key_values.1.key: decoder_kv.0002
-          past_key_values.1.value: decoder_kv.0003
           position_ids: application.position_ids
         outputs:
           logits: step.logits
           present.0.key: body.decoder_kv.0000
           present.0.value: body.decoder_kv.0001
-          present.1.key: body.decoder_kv.0002
-          present.1.value: body.decoder_kv.0003
       - kind: invoke
         component: token_policy
         inputs:
@@ -556,10 +483,6 @@ pipeline:
         next: body.decoder_kv.0000
       - cell: decoder_kv.0001
         next: body.decoder_kv.0001
-      - cell: decoder_kv.0002
-        next: body.decoder_kv.0002
-      - cell: decoder_kv.0003
-        next: body.decoder_kv.0003
       - cell: active
         next: body.active
       - cell: done

@@ -35,7 +35,7 @@ otel = []
 # feature still runs on machines without an NVIDIA driver — the collector
 # degrades to `available == false`. Implemented in `src/cupti.rs`; this is the
 # only module allowed to use `unsafe` (see the crate-level attribute in lib.rs).
-cupti = ["dep:libloading"]
+cupti = ["dep:libloading", "dep:onnx-genai-cuda-version-guard"]
 
 [dependencies]
 serde = { workspace = true }
@@ -46,6 +46,10 @@ prost = { workspace = true, optional = true }
 # Runtime dlopen/dlsym of libcupti for the `cupti` feature. Pure Rust, no
 # link-time CUDA dependency; only pulled in when `cupti` is enabled.
 libloading = { workspace = true, optional = true }
+# Canonical CUDA library names and pip-wheel layout, shared with the CUDA EP's
+# loader so the two cannot drift. Zero dependencies of its own; only pulled in
+# when cupti is enabled.
+onnx-genai-cuda-version-guard = { path = "../onnx-genai-cuda-version-guard", version = "=0.1.0-dev.5", optional = true }
 # Intel ITT (VTune/Inspector) task annotations for the `itt` feature. Links the
 # static `ittnotify` C library (built from vendored source by `ittapi-sys` via
 # `cc`, no system/`protoc` dependency); only pulled in when `itt` is enabled. The

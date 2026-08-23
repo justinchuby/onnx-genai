@@ -1031,6 +1031,24 @@ fn run_static_batch_until_idle(
         route_continuous_events(manager.poll(), &mut routes, &mut abandoned);
         reported_occupancy = publish_batch_occupancy(manager.occupancy(), reported_occupancy);
         if manager.is_idle() {
+            // Ending the batch's declared pass is what reconciles its emit with
+            // the tokens its executor committed, row by row. Doing it here
+            // rather than dropping the manager is what keeps that check on the
+            // path this server actually takes.
+            //
+            // The failure is *logged*, not routed: by the time the batch is
+            // idle every route has been removed by the terminal event that
+            // retired it, so there is nobody left to tell. What the log says is
+            // that the tokens this batch already delivered are not the tokens
+            // its declared workflow published — which is an operator-facing
+            // fact about the build, not a per-request error.
+            if let Err(err) = manager.drain() {
+                tracing::error!(
+                    error = %format!("{err:#}"),
+                    steps = reported_occupancy.steps,
+                    "the continuous batch's declared emit disagrees with the tokens its                      executor committed"
+                );
+            }
             break;
         }
     }

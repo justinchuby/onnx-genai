@@ -1463,7 +1463,7 @@ fn cupti_available() -> bool {
 /// must inject before any tracing begins. We hand it the live `sys.path` (which
 /// reflects the real venv/user-site even when `VIRTUAL_ENV`/`PYTHONPATH` are
 /// unset and `/proc/self/exe` is the base interpreter) plus this extension's own
-/// directory and its parent, so pip-installed `nvidia-cuda-cupti-cu13` sitting
+/// directory and its parent, so pip-installed `nvidia-cuda-cupti` sitting
 /// beside nxrt is found with zero setup. The tracer probes each root for the
 /// pip layout `<root>/nvidia/cuda_cupti/lib/libcupti.so*`.
 /// Empty and relative entries are excluded so discovery cannot load a planted

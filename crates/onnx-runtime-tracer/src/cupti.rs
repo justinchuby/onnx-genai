@@ -386,16 +386,27 @@ fn discover_site_packages(prefix: &Path, roots: &mut Vec<PathBuf>) {
 }
 
 fn push_pip_cupti_candidates(site_packages: &Path, os: TargetOs, candidates: &mut Vec<PathBuf>) {
-    let library_subdir = if os == TargetOs::Windows {
-        "bin"
-    } else {
-        "lib"
+    // Layout comes from `onnx-genai-cuda-version-guard`, shared with the CUDA
+    // EP's loader. NVIDIA republished these wheels under a consolidated layout
+    // (`nvidia/cu13/{bin,lib}/<arch>`), and this crate and the EP each held a
+    // hand-written copy of the older `nvidia/<component>/{bin,lib}` shape — so
+    // both went stale at once, and fixing one would have left the other silently
+    // failing to find a CUPTI that is installed.
+    let host_os = match os {
+        TargetOs::Windows => onnx_genai_cuda_version_guard::HostOs::Windows,
+        TargetOs::Linux => onnx_genai_cuda_version_guard::HostOs::Linux,
+        TargetOs::Macos => onnx_genai_cuda_version_guard::HostOs::Macos,
+        TargetOs::Other => onnx_genai_cuda_version_guard::HostOs::Other,
     };
-    let library_dir = site_packages.join("nvidia/cuda_cupti").join(library_subdir);
-    for soname in libcupti_names_for(os) {
-        let candidate = library_dir.join(soname);
-        if !candidates.contains(&candidate) {
-            candidates.push(candidate);
+    for relative in
+        onnx_genai_cuda_version_guard::wheel_component_directories("cuda_cupti", host_os)
+    {
+        let library_dir = site_packages.join(relative);
+        for soname in libcupti_names_for(os) {
+            let candidate = library_dir.join(soname);
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
         }
     }
 }
@@ -847,7 +858,7 @@ impl CuptiProfiler {
     ///
     /// [`TracerError::CuptiUnavailable`] if `libcupti` is missing, unusable, or
     /// too old — the message names the attempted paths, the underlying cause,
-    /// and the `pip install nvidia-cuda-cupti-cu13` fix.
+    /// and the `pip install nvidia-cuda-cupti` fix.
     pub fn require() -> Result<Self> {
         let api = CuptiApi::require()?;
         Ok(Self {
@@ -1066,7 +1077,7 @@ impl CuptiCollector {
     ///
     /// This is an **explicit** GPU-tracing request: when CUPTI is unavailable it
     /// returns an actionable [`TracerError::CuptiUnavailable`] (RULES.md #1)
-    /// naming the `pip install nvidia-cuda-cupti-cu13` fix. Callers that want the
+    /// naming the `pip install nvidia-cuda-cupti` fix. Callers that want the
     /// graceful "skip if absent" behavior (auto-selection) should go through
     /// [`CuptiFactory::try_create`], which returns `Ok(None)` when CUPTI is
     /// missing.
@@ -1209,21 +1220,36 @@ mod tests {
         let site_packages = Path::new("/venv/lib/python3.12/site-packages");
         let mut linux = Vec::new();
         push_pip_cupti_candidates(site_packages, TargetOs::Linux, &mut linux);
+        // The consolidated layout is searched first, since it is what current
+        // wheels publish...
         assert_eq!(
             linux[0],
-            PathBuf::from(
-                "/venv/lib/python3.12/site-packages/nvidia/cuda_cupti/lib/libcupti.so.13"
-            )
+            site_packages.join("nvidia/cu13/lib/x86_64/libcupti.so.13")
         );
+        // ...and the older per-component layout stays reachable, so a machine
+        // holding either is served.
+        assert!(linux.contains(&site_packages.join("nvidia/cuda_cupti/lib/libcupti.so.13")));
 
         let mut windows = Vec::new();
         push_pip_cupti_candidates(site_packages, TargetOs::Windows, &mut windows);
         assert_eq!(
             windows[0],
-            PathBuf::from(
-                "/venv/lib/python3.12/site-packages/nvidia/cuda_cupti/bin/cupti64_13.dll"
-            )
+            site_packages.join("nvidia/cu13/bin/x86_64/cupti64_13.dll")
         );
+        assert!(windows.contains(&site_packages.join("nvidia/cuda_cupti/bin/cupti64_13.dll")));
+        // Windows keeps DLLs in `bin`, the Unix platforms in `lib` -- the
+        // per-OS distinction this test is named for. Checked on the layout
+        // suffix only: the site-packages prefix itself contains "lib".
+        for path in &windows {
+            let tail = path
+                .strip_prefix(site_packages)
+                .expect("candidate is under site-packages");
+            assert!(
+                !tail.to_string_lossy().replace('\\', "/").contains("/lib"),
+                "windows candidate used a lib directory: {}",
+                tail.display()
+            );
+        }
     }
 
     #[test]
@@ -1307,7 +1333,7 @@ mod tests {
                 .err()
                 .expect("explicit request must error when absent");
             assert!(
-                err.to_string().contains("nvidia-cuda-cupti-cu13"),
+                err.to_string().contains("nvidia-cuda-cupti"),
                 "actionable: {err}"
             );
         }
@@ -1347,7 +1373,7 @@ mod tests {
             );
             // HOW: the concrete pip fix, version-matched.
             assert!(
-                msg.contains("pip install nvidia-cuda-cupti-cu13"),
+                msg.contains("pip install nvidia-cuda-cupti"),
                 "HOW missing: {msg}"
             );
             // The variant carries structured, debuggable context.
@@ -1355,12 +1381,29 @@ mod tests {
         }
     }
 
+    /// A library that is certainly loadable on the host, used only to obtain a
+    /// real `Library` handle so a genuinely failed `dlsym` can be exercised.
+    ///
+    /// The test needs *any* real library, not libc specifically; naming libc
+    /// unconditionally made this fail on Windows, where there is no
+    /// `libc.so.6`, for a reason unrelated to what is being tested.
+    fn a_loadable_system_library() -> PathBuf {
+        if cfg!(target_os = "windows") {
+            PathBuf::from("kernel32.dll")
+        } else if cfg!(target_os = "macos") {
+            PathBuf::from("libSystem.B.dylib")
+        } else {
+            PathBuf::from("libc.so.6")
+        }
+    }
+
     #[test]
     fn missing_symbol_error_retains_loaded_path_and_underlying_error() {
-        let loaded_path = PathBuf::from("libc.so.6");
-        // SAFETY: libc is loaded only to exercise a real failed dlsym.
-        let library =
-            unsafe { libloading::Library::new(&loaded_path) }.expect("load libc for symbol test");
+        let loaded_path = a_loadable_system_library();
+        // SAFETY: a stock system library is loaded only to exercise a real
+        // failed dlsym; no symbol from it is called.
+        let library = unsafe { libloading::Library::new(&loaded_path) }
+            .expect("load a system library for the symbol test");
         let loaded = LoadedCuptiLibrary {
             library,
             attempted: vec![loaded_path.clone()],
@@ -1382,16 +1425,28 @@ mod tests {
             "WHY missing: {msg}"
         );
         assert!(
-            msg.contains("pip install nvidia-cuda-cupti-cu13"),
+            msg.contains("pip install nvidia-cuda-cupti"),
             "HOW missing: {msg}"
         );
-        assert!(msg.contains("libc.so.6"), "loaded path missing: {msg}");
+        assert!(
+            msg.contains(&loaded_path.display().to_string()),
+            "loaded path missing: {msg}"
+        );
         assert!(
             msg.contains("nxrt_cupti_symbol_that_does_not_exist"),
             "symbol name missing: {msg}"
         );
+        // The loader's own words are preserved rather than swallowed. The exact
+        // phrasing is the platform's, not ours -- "undefined symbol" from dlsym,
+        // "GetProcAddress failed" from Windows -- so assert the property, not one
+        // platform's spelling.
+        let underlying = if cfg!(target_os = "windows") {
+            "GetProcAddress"
+        } else {
+            "undefined symbol"
+        };
         assert!(
-            msg.contains("undefined symbol"),
+            msg.contains(underlying),
             "underlying symbol error missing: {msg}"
         );
         assert!(matches!(
