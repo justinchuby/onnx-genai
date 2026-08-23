@@ -19,12 +19,15 @@ which kernel the production default even runs. Route counters instrumented from
 operator entry through to the innermost arm, over a real decode step at
 `accuracy_level = 0`:
 
-> **Note (2026-08-23):** the `1.84x` inherited here is a **`threads = 1`**
-> figure — the only acc0 cell with an ORT baseline — and the acc0 gap at
-> production width is unmeasured. The route findings below are categorical
-> (which kernel runs) and are unaffected by that; only the *sizing* of the gap
-> is. See the scope note in
-> [2026-08-21-int4-acc4-execution-regime.md](2026-08-21-int4-acc4-execution-regime.md).
+> **Note (2026-08-23, revised):** the `1.84x` inherited here **no longer
+> holds** — re-measured on `e189244ba` the acc0 gap is **1.12x at t=1, 1.15x at
+> t=4, 1.12x at t=8**. Part of that closure is the work this very document
+> motivated: enabling the register-blocked kernel at `accuracy_level = 0`
+> (#1679) was one of three acc0 merges that landed after the 1.84x was taken.
+> The route findings below are categorical (which kernel runs) and stand
+> unchanged; only the *sizing* of the gap moved, and it moved because the
+> dormant kernel was woken up. See
+> [2026-08-23-acc0-gap-vs-ort-by-width.md](2026-08-23-acc0-gap-vs-ort-by-width.md).
 
 | counter | count |
 |---|---|

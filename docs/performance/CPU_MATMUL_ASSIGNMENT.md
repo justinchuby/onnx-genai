@@ -1940,22 +1940,47 @@ t=1 and t=4 rows have headroom and are unaffected; **t=8 is the widest row
 worth arguing from.**
 
 **The default path did not move and is now the bigger target.** This kernel is
-gated to `accuracy_level = 4`; production default is 0, where native is 56.307
-ms/token against ORT's 30.632 — **1.84x**, unchanged. **That figure is
-`threads = 1` only.** It is the sole acc0 cell with an ORT baseline: the source
-table has one further acc0 row (t=8, native 14.091) with no ORT number beside
-it, so **the acc0 gap at production width is unmeasured**. That matters more
-than a missing label usually would, because the acc4 table immediately above
-shows the gap moving from 3.01x at t=1 to 1.47x at t=16 on the same shape —
-width is one of the largest effects in this section. Do not quote 1.84x as
-"the acc0 gap" without the `t=1` qualifier, and do not assume it survives to
-t=8/16. Note also that at t=1 the native side runs `path=flat`, confined by
-the decode budget to a single CPU with no pool built at all (§20), so this is
-a serial-vs-ORT-single-thread comparison specifically. That it nearly equals
-the new acc4 gap is a coincidence of this shape and this width, not a shared
-cause. Nothing here is progress on acc0.
+gated to `accuracy_level = 4`; production default is 0, where native was 56.307
+ms/token against ORT's 30.632 — **1.84x** at the time this was written.
 
-Full record:
+> **Re-measured 2026-08-23: the acc0 gap is ~1.12x, and 1.84x is stale.** On
+> `e189244ba`, llama / block 32 / one session / matched core budget, three
+> independent launches per width: **t=1 1.120x** (native 35.36 ms, ORT 31.99,
+> 1.4% across launches), **t=4 1.148x** (17.1%, the weakest row), **t=8 1.120x**
+> (5.0%). The gap is flat across the measurable range, so
+> acc0 is neither a scaling problem nor the top target any more.
+>
+> The old figure was **not mislabelled — it was a correct measurement of a tree
+> that no longer exists.** The control that establishes this is the ORT arm:
+> it reproduces to **+4.4%** (30.632 → 31.99 ms), same binary, same graph, same
+> host, same statistic, so the harness and the definition are comparable and
+> the entire movement is on our side. Native went 56.307 → 35.36 at t=1
+> (1.59x) and 14.091 → 4.57 at t=8 (3.08x). Six merges landed after
+> `e9754e7ef` published the number, three of them direct acc0 kernel work
+> (#1667 broke the serial f32 reduction chain, 5.75x t=1; #1679 enabled the
+> register-blocked kernel *at acc0*; #1783 folded the zero-point unpack) and
+> three of which change what a width means (#1728, #1794, #1746).
+>
+> The 2026-08-23 scope note this replaces said the figure was `t=1`-only and
+> that the production-width gap was unmeasured. Both were true; both missed
+> that the `t=1` number was itself three kernel merges out of date. **A number
+> that was right when taken is more durable than one that was wrong** — its
+> provenance looks impeccable, so it is never challenged, and it keeps a closed
+> problem at the top of the list while the real top item goes unexamined. The
+> lesson is not "label the width", it is **re-measure before ranking work off a
+> figure you did not take today**.
+>
+> Still true and unchanged: at t=1 the native side runs `path=flat`, confined by
+> the decode budget to a single CPU with no pool built at all (§20), so that row
+> compares native-serial against ORT-single-thread. **t=16 remains unresolved**
+> — every cell at that width was taken against a sibling `cargo test` and
+> discarded; the contaminated cells hint at ~1.6x and native was in the slow
+> mode of its 514% bimodality for all of them, so it is a hypothesis, not a
+> result, and it is the cell closest to an unconfined production process.
+> Full record:
+> [`docs/benchmarks/2026-08-23-acc0-gap-vs-ort-by-width.md`](../benchmarks/2026-08-23-acc0-gap-vs-ort-by-width.md).
+
+Full record for the acc4 table above:
 [`docs/benchmarks/2026-08-21-int4-acc4-execution-regime.md`](../benchmarks/2026-08-21-int4-acc4-execution-regime.md).
 
 ### 23. The register-blocked int4 decode kernel shipped default-off and stayed dormant for its whole life (**fixed**)

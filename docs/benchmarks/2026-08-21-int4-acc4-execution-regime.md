@@ -475,31 +475,38 @@ than the 1.79x row.** I am not claiming parity at t=16 on this evidence.
 ### The default path is untouched and is now the worse gap
 
 This kernel is gated to `accuracy_level = 4`. Production default is
-`accuracy_level = 0`, and measuring both sides there on the same host:
+`accuracy_level = 0`, and measuring both sides there on the same host
+(**this table is superseded — see the note directly below it**):
 
 | threads | ORT acc0 | native acc0 | gap |
 |---|---|---|---|
 | 1 | 30.632 ms/tok | 56.307 | **1.84x** |
 | 8 | — | 14.091 | — |
 
-> **Scope note (2026-08-23).** The `1.84x` is a **`threads = 1`** figure and is
-> the only acc0 cell with an ORT baseline — the t=8 row has no ORT number, so
-> **the acc0 gap at production width is unmeasured**. This is not a pedantic
-> label: on the acc4 table in this same document the gap moves from 3.01x at
-> t=1 to 1.47x at t=16, so width is among the largest effects here and 1.84x
-> should not be assumed to survive to t=8/16. At t=1 the native side also runs
-> `path=flat`, confined by the decode budget to one CPU with no pool built
-> (see
-> [2026-08-23-acc4-decode-width-remeasurement.md](2026-08-23-acc4-decode-width-remeasurement.md)),
-> so this row compares native-serial against ORT-single-thread specifically.
-> Measuring ORT acc0 at t=4/8 is the prerequisite for sizing acc0 work.
+> **Superseded 2026-08-23 — the table above is stale, not merely unlabelled.**
+> Re-measured on `e189244ba` with a matched core budget and three independent
+> launches per width, the acc0 gap is **1.120x at t=1** (native 35.36 ms, ORT
+> 31.99), **1.148x at t=4**, **1.120x at t=8**. The rows above were correct when
+> taken; they predate #1667 (broke the serial f32 reduction chain in the int4
+> decode GEMV, 5.75x t=1), #1679 (enabled the register-blocked kernel *at
+> `accuracy_level = 0`*) and #1783 (folded the zero-point unpack), plus three
+> merges that change what a width means (#1728, #1794, #1746).
+>
+> The control is the ORT arm: it reproduces to **+4.4%** (30.632 → 31.99 ms) on
+> the same host and statistic, so the comparison is sound and the whole
+> movement is on our side — native went 56.307 → 35.36 at t=1 and 14.091 → 4.57
+> at t=8. An earlier note here said the figure was `t=1`-only and that the
+> production-width gap was unmeasured. Both were true and both missed that the
+> `t=1` number was three kernel merges out of date. Full record:
+> [2026-08-23-acc0-gap-vs-ort-by-width.md](2026-08-23-acc0-gap-vs-ort-by-width.md).
 
-So the honest summary is that we have moved the *opt-in* path from 3.01x to
-1.79x and left the *default* path at 1.84x, where it was. Those two numbers
-being nearly equal is a coincidence of this shape, not a shared cause: the acc4
-gap is now dominated by the t=8 scaling anomaly, while the acc0 gap is a
-different kernel entirely. **Closing acc0 is a separate, larger piece of work
-and nothing here should be read as progress on it.**
+So the honest summary *at the time of writing* was that we had moved the
+*opt-in* path from 3.01x to 1.79x and left the *default* path at 1.84x, where
+it was. Nothing in this document was progress on acc0, and that remains true of
+this document. What is no longer true is the conclusion drawn from it: acc0 was
+closed to ~1.12x by the three kernel merges listed in the note above, within
+two days of this being written, and the figure here outlived the tree it
+measured. **Do not rank work off this table.**
 
 Two implementation details cost more than they saved and are recorded so they
 are not re-tried:
