@@ -240,6 +240,7 @@ pub(crate) struct WorkflowPerformanceCounters {
     last_stage_elapsed_ns: BTreeMap<String, u128>,
     last_emit_events: u64,
     last_emitted_elements: u64,
+    last_loop_ended_by_predicate: bool,
 }
 
 /// Persistent execution state for repeated runs of one compiled workflow.
@@ -266,6 +267,14 @@ struct WorkflowRunTelemetry {
     emit_timestamps_ns: Vec<u128>,
     max_iterations_only: bool,
     loop_iterations: u64,
+    /// Whether the outermost generation loop ended because its liveness
+    /// predicate went false, rather than because it exhausted its bound.
+    ///
+    /// This is *why generation stopped*, and it is only knowable here: the loop
+    /// is the thing that decided. Without it a caller has to guess, and the
+    /// guess that was being made was "always the bound", so a workflow that
+    /// stopped at EOS reported `MaxTokens`.
+    loop_ended_by_predicate: bool,
     component_invocations: u64,
     emit_events: u64,
     emitted_elements: u64,
@@ -597,6 +606,18 @@ impl WorkflowRuntime {
             rows: row_outputs,
         })
     }
+    /// Why the last generation stopped.
+    ///
+    /// `true` when the outermost loop's liveness predicate went false — the
+    /// model's own stop — and `false` when it exhausted its iteration bound.
+    /// Read by the generate path so a composite workflow reports the reason it
+    /// actually finished for.
+    pub(crate) fn last_generation_ended_by_predicate(&self) -> bool {
+        self.workflow_performance
+            .borrow()
+            .last_loop_ended_by_predicate
+    }
+
     pub fn workflow_performance_diagnostic(&self) -> WorkflowPerformanceDiagnostic {
         let counters = self.workflow_performance.borrow();
         let elapsed_seconds = counters.last_elapsed_ns as f64 / 1_000_000_000.0;
@@ -1003,6 +1024,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
         counters.last_ttft_ns = telemetry.first_emit_ns;
         counters.last_emit_timestamps_ns = telemetry.emit_timestamps_ns;
         counters.last_loop_iterations = telemetry.loop_iterations;
+        counters.last_loop_ended_by_predicate = telemetry.loop_ended_by_predicate;
         counters.last_component_invocations = telemetry.component_invocations;
         counters.last_stage_runs = telemetry.stage_runs;
         counters.last_stage_elapsed_ns = telemetry.stage_elapsed_ns;
@@ -1389,6 +1411,10 @@ impl WorkflowRuntime {
                         workflow_bool_rows(values, continue_when)?
                     };
                     if !active_rows.iter().any(|active| *active) {
+                        // The loop stopped because the model said it was done,
+                        // not because it ran out of budget. Recording which is
+                        // the only way a caller can report the real reason.
+                        telemetry.loop_ended_by_predicate = true;
                         break;
                     }
                     telemetry.loop_iterations += 1;
@@ -5277,5 +5303,38 @@ mod node_host_tests {
             values.contains_key("out"),
             "the host must define every output the invocation declares"
         );
+    }
+}
+
+/// The loop records why it stopped.
+#[cfg(test)]
+mod loop_stop_cause_tests {
+    use super::*;
+
+    /// A fresh run has not yet ended by predicate.
+    ///
+    /// The flag must start false, because it is read as "the model stopped
+    /// itself" and a default of true would report every bound-exhausted run as
+    /// an EOS — the exact inversion of the bug it fixes.
+    #[test]
+    fn the_stop_cause_defaults_to_the_bound() {
+        let telemetry = WorkflowRunTelemetry::default();
+        assert!(
+            !telemetry.loop_ended_by_predicate,
+            "an unstarted run must not claim the model ended it"
+        );
+    }
+
+    /// The counters carry the cause out of the run, which is the only way the
+    /// generate path can see it.
+    #[test]
+    fn the_stop_cause_reaches_the_counters() {
+        let mut counters = WorkflowPerformanceCounters::default();
+        let telemetry = WorkflowRunTelemetry {
+            loop_ended_by_predicate: true,
+            ..WorkflowRunTelemetry::default()
+        };
+        counters.last_loop_ended_by_predicate = telemetry.loop_ended_by_predicate;
+        assert!(counters.last_loop_ended_by_predicate);
     }
 }

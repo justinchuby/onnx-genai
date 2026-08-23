@@ -98,7 +98,7 @@ pipeline:
         contract:
           dtype: float32
           rank: 3
-          shape: [batch, cache_capacity, 4]
+          shape: [batch, cache_capacity, 16]
           batch_layout: {kind: request_aligned, axis: 0}
         role: {kind: opaque}
         source: {kind: literal}
@@ -126,12 +126,12 @@ pipeline:
             key_cache.0:
               dtype: float32
               rank: 3
-              shape: [batch, cache_capacity, 4]
+              shape: [batch, cache_capacity, 16]
               batch_layout: {kind: request_aligned, axis: 0}
             value_cache.0:
               dtype: float32
               rank: 3
-              shape: [batch, cache_capacity, 4]
+              shape: [batch, cache_capacity, 16]
               batch_layout: {kind: request_aligned, axis: 0}
             write_indices:
               dtype: int64
@@ -152,12 +152,12 @@ pipeline:
             updated_key_cache.0:
               dtype: float32
               rank: 3
-              shape: [batch, cache_capacity, 4]
+              shape: [batch, cache_capacity, 16]
               batch_layout: {kind: request_aligned, axis: 0}
             updated_value_cache.0:
               dtype: float32
               rank: 3
-              shape: [batch, cache_capacity, 4]
+              shape: [batch, cache_capacity, 16]
               batch_layout: {kind: request_aligned, axis: 0}
             next_write_indices:
               dtype: int64
@@ -259,7 +259,7 @@ pipeline:
         contract:
           dtype: float32
           rank: 3
-          shape: [batch, cache_capacity, 4]
+          shape: [batch, cache_capacity, 16]
           batch_layout: {kind: request_aligned, axis: 0}
         scope: invocation
         initializer: package.cache
@@ -271,7 +271,7 @@ pipeline:
         contract:
           dtype: float32
           rank: 3
-          shape: [batch, cache_capacity, 4]
+          shape: [batch, cache_capacity, 16]
           batch_layout: {kind: request_aligned, axis: 0}
         scope: invocation
         initializer: package.cache

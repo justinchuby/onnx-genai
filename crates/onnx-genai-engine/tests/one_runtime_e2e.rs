@@ -11,7 +11,9 @@
 
 use std::path::{Path, PathBuf};
 
-use onnx_genai_engine::{Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest};
+use onnx_genai_engine::{
+    Engine, EngineConfig, FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest,
+};
 
 fn decoder_package() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm")
@@ -148,5 +150,56 @@ fn tokenization_is_one_api_across_shapes() -> anyhow::Result<()> {
     let workflow = Engine::from_dir(&workflow_package(), EngineConfig::default())?;
     let workflow_tokens = workflow.tokenize("hello world")?;
     assert!(!workflow_tokens.is_empty());
+    Ok(())
+}
+
+/// A composite workflow reports why it actually stopped.
+///
+/// Before this, every composite generation returned `MaxTokens` — a constant,
+/// not an observation. A workflow that ended at its own EOS told the caller it
+/// had run out of budget, which is the single distinction a finish reason
+/// exists to make: a client deciding whether to continue a truncated response
+/// would have continued one the model considered complete.
+///
+/// The reason now comes from the loop, which is the only thing that knows: the
+/// liveness predicate going false is the model's own stop, exhausting the bound
+/// is the caller's.
+///
+/// # What this asserts, and what it does not
+///
+/// The bound case is asserted here. The predicate case is **not** asserted
+/// end-to-end, because no committed composite fixture both executes through
+/// `generate` and stops on its own liveness predicate: the authored `decoder`
+/// fixture always runs to its bound, `gemma4_chained` is driven through the
+/// proposal API, and `tiny-llm-scatter-workflow` declares graph ports its ONNX
+/// model does not expose. Asserting it against a fixture that cannot reach the
+/// state would be a test that passes for the wrong reason, so the gap is
+/// recorded rather than papered over. The mechanism is covered at unit level by
+/// `loop_ended_by_predicate`.
+#[test]
+fn a_composite_workflow_reports_the_reason_it_stopped() -> anyhow::Result<()> {
+    let package = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/onnx_genai_workflows/decoder");
+    let mut engine = Engine::from_dir(&package, EngineConfig::default())?;
+
+    // This package ships no tokenizer adapter, so the prompt is token ids.
+    let tokens = |limit: usize| GenerateRequest {
+        prompt: GeneratePrompt::TokenIds(vec![1]),
+        options: GenerateOptions {
+            max_new_tokens: limit,
+            greedy: true,
+            temperature: 0.0,
+            stop_on_eos: false,
+            ..GenerateOptions::default()
+        },
+    };
+
+    let bounded = engine.generate(tokens(2))?;
+    assert_eq!(
+        bounded.finish_reason,
+        FinishReason::MaxTokens,
+        "a run that exhausts its bound must say so: {bounded:?}"
+    );
+    assert_eq!(bounded.token_ids.len(), 2, "{bounded:?}");
     Ok(())
 }

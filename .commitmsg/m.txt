@@ -1,38 +1,43 @@
-feat(pipeline): contract-executor registry, and a gate that measures the split
+fix(pipeline): a composite workflow reports why it actually stopped
 
-B2 checkpoint A completed, plus the convergence report's grep gate.
+B2 checkpoint C, first half: the real `finish_reason` the convergence report
+flagged as fabricated.
 
-**The registry.** `runtime_contract_registry` mirrors `workflow_adapter_registry`:
-one place answering "can this runtime execute this step?", rather than that
-being a property of whichever `match` arm a reader happens to find. It also
-separates two errors that have different fixes — a contract absent from the
-registry is a package this *build* cannot run (the fix is a version), while a
-registered contract left unhandled means the host reached the step without the
-resources for *this request*. Reporting both as "unimplemented" sends an
-operator hunting a bug that is really a mismatch.
+`WorkflowRuntime::generate_with_callbacks` returned `FinishReason::MaxTokens`
+unconditionally — a constant, not an observation. Every composite workflow
+generation claimed it had run out of budget, including runs the workflow ended
+itself. That is the single distinction a finish reason exists to make: a client
+deciding whether to continue a truncated response would have continued one the
+model considered complete, and nothing in the result would have told it
+otherwise.
 
-**The gate.** `shape_dispatch_gate` bans `is_workflow`, `lowered_workflow`,
-`canonical_decode` and `WorkflowShape` outside an explicit allowance, because
-package-shape dispatch is easy to reintroduce and nearly invisible in review:
-one `if engine.is_workflow()` restores the split without touching a single
-assertion. The allowance is the B2 remaining-work ledger, written down, and it
-may only shrink.
+The reason is only knowable inside the loop, because the loop is what decided.
+`WorkflowRunTelemetry::loop_ended_by_predicate` records whether the outermost
+generation loop stopped because its liveness predicate went false — the model's
+own stop — or because it exhausted its bound. The counters carry it out, and
+`generate_with_callbacks` reports it, for the streamed per-token reason as well
+as the final result.
 
-Writing it immediately paid for itself. I had accounted for fifteen files by
-inspection; the gate found **eight more** — `decode_loop.rs` (25 uses),
-`native_decode/mod.rs`, `native_speculative.rs`, `session.rs`, `lib.rs`, and
-three server routes (`completions`, `sessions`, `speech`). Those are callers the
-convergence work has to move, and I would have discovered them one compile error
-at a time, late, while believing the surface was smaller than it is.
+**Also fixed: a committed fixture that could not execute.**
+`tiny-llm-scatter-workflow` declared its cache ports as
+`[batch, cache_capacity, 4]` while its ONNX graph exposes `[batch, 16, 16]`, so
+loading it for generation failed on the contract mismatch. The workflow now
+states the graph's real extent. Its existing suite
+(`workflow_derived_static_cache`, 4 cases) still passes, and the fixture gets
+further along than before — it now reaches a *second* pre-existing drift
+(`next_accepted_len` declared as an output the graph does not expose) that I
+have deliberately not chased here.
 
-A second test keeps the ledger honest: an allowance naming a deleted file is a
-rule nobody is subject to, and it would outlive the work it was tracking.
+**What the new test asserts, and what it does not.** The bound case is asserted
+end-to-end. The predicate case is not, because no committed composite fixture
+both executes through `generate` and stops on its own liveness predicate: the
+authored `decoder` fixture always runs to its bound, `gemma4_chained` is driven
+through the proposal API, and `tiny-llm-scatter-workflow` has the drift above.
+Asserting it against a fixture that cannot reach the state would be a test
+passing for the wrong reason, so the gap is written into the test rather than
+papered over, and the mechanism is covered at unit level.
 
-I am deliberately *not* claiming these symbols are gone. They are counted, and
-the count is a test. When the convergence lands they stop existing and this gate
-becomes trivially true, which is the intended end state.
-
-Verified: 606 lib tests; canonical_execution_parity, one_runtime_e2e, multi_eos,
-shape_dispatch_gate green; fmt; clippy `-D warnings`.
+Verified: 74/74 engine targets; **five real foundry models byte-identical to the
+pre-change baseline**; fmt; clippy `-D warnings`.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>

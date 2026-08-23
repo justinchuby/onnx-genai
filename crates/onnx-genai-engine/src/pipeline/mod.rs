@@ -986,6 +986,15 @@ impl WorkflowRuntime {
             on_admitted();
         }
         let values = self.run_workflow_outputs(request)?;
+        // Why the loop stopped, from the loop itself. Reporting `MaxTokens`
+        // unconditionally — as this did — tells a caller that a workflow which
+        // ended at its own EOS ran out of budget, which is the one thing a
+        // finish reason exists to distinguish.
+        let finish_reason = if self.last_generation_ended_by_predicate() {
+            FinishReason::EosToken
+        } else {
+            FinishReason::MaxTokens
+        };
         let output = self
             .workflow
             .outputs
@@ -1022,14 +1031,14 @@ impl WorkflowRuntime {
                 callback(GenerateToken {
                     token_id,
                     text: token_text,
-                    finish_reason: (index + 1 == tokens.len()).then_some(FinishReason::MaxTokens),
+                    finish_reason: (index + 1 == tokens.len()).then(|| finish_reason.clone()),
                 })?;
             }
         }
         Ok(GenerateResult {
             text,
             token_ids: tokens,
-            finish_reason: FinishReason::MaxTokens,
+            finish_reason,
             prefix_cache_hit_len: 0,
             logprobs: None,
             budget_cap: None,
