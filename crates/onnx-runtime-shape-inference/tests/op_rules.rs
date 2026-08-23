@@ -283,8 +283,8 @@ fn assert_symbolic(dim: &DimExpr) {
 #[test]
 fn expanded_registry_catalog_count_is_pinned() {
     let registry = InferenceRegistry::default_registry();
-    assert_eq!(registry.operator_count(), 218);
-    assert_eq!(registry.entry_count(), 263);
+    assert_eq!(registry.operator_count(), 219);
+    assert_eq!(registry.entry_count(), 264);
 }
 
 fn recurrent_node(op: &str, outputs: usize, direction: &str, hidden_size: i64) -> Node {
@@ -6232,4 +6232,90 @@ fn split_to_sequence_then_concat_from_sequence_recovers_a_tensor() {
     assert_eq!(shape.len(), 2);
     assert_eq!(shape[0], c(2), "batch dim recovered");
     assert_symbolic(&shape[1]);
+}
+
+#[test]
+fn tensor_scatter_keeps_the_cache_shape_and_dtype() {
+    // The cache is fixed-capacity: the update writes a window into it, so the
+    // present cache has exactly the past cache's shape even though `update` is
+    // shorter along the sequence axis.
+    let n = node("TensorScatter", 3, 1);
+    let outs = run(
+        &n,
+        vec![
+            tin(DataType::Float16, vec![c(2), c(8), c(1024), c(128)]),
+            tin(DataType::Float16, vec![c(2), c(8), c(1), c(128)]),
+            tin(DataType::Int64, vec![c(2)]),
+        ],
+        24,
+    );
+    assert_eq!(out_shape(&outs), vec![c(2), c(8), c(1024), c(128)]);
+    assert_eq!(out_dtype(&outs), DataType::Float16);
+}
+
+#[test]
+fn tensor_scatter_accepts_the_two_input_prefill_form() {
+    let n = node("TensorScatter", 2, 1);
+    let outs = run(
+        &n,
+        vec![
+            tin(DataType::Float32, vec![c(1), c(4), c(64), c(16)]),
+            tin(DataType::Float32, vec![c(1), c(4), c(12), c(16)]),
+        ],
+        24,
+    );
+    assert_eq!(out_shape(&outs), vec![c(1), c(4), c(64), c(16)]);
+}
+
+#[test]
+fn tensor_scatter_rejects_an_update_longer_than_the_cache() {
+    let n = node("TensorScatter", 2, 1);
+    let error = try_run(
+        &n,
+        vec![
+            tin(DataType::Float32, vec![c(1), c(4), c(64), c(16)]),
+            tin(DataType::Float32, vec![c(1), c(4), c(65), c(16)]),
+        ],
+        24,
+    )
+    .expect_err("an update that cannot fit must not infer");
+    assert_invalid(error, "TensorScatter", "exceeds cache capacity");
+}
+
+#[test]
+fn tensor_scatter_rejects_a_non_sequence_dimension_mismatch() {
+    // Only the sequence axis may differ; a head-count mismatch is a real error
+    // rather than something to infer through.
+    let n = node("TensorScatter", 2, 1);
+    let error = try_run(
+        &n,
+        vec![
+            tin(DataType::Float32, vec![c(1), c(4), c(64), c(16)]),
+            tin(DataType::Float32, vec![c(1), c(5), c(8), c(16)]),
+        ],
+        24,
+    )
+    .expect_err("a mismatched non-sequence dimension must not infer");
+    assert_invalid(error, "TensorScatter", "must match past_cache dimension");
+}
+
+#[test]
+fn tensor_scatter_rejects_an_axis_that_selects_the_batch_dimension() {
+    // `write_indices` is indexed by the batch coordinate, so the sequence axis
+    // has to sit after it.
+    let n = with_attr(node("TensorScatter", 2, 1), "axis", Attribute::Int(0));
+    let error = try_run(
+        &n,
+        vec![
+            tin(DataType::Float32, vec![c(2), c(64), c(16)]),
+            tin(DataType::Float32, vec![c(2), c(1), c(16)]),
+        ],
+        24,
+    )
+    .expect_err("axis 0 must not infer");
+    assert_invalid(
+        error,
+        "TensorScatter",
+        "must not select the batch dimension",
+    );
 }

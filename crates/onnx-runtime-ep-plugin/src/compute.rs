@@ -279,6 +279,11 @@ impl ShapeInference {
             | "QMoE"
             | "ScatterND"
             | "ScatterElements"
+            // `TensorScatter` (opset 24) is the standardized KV-cache write. It
+            // models an in-place update of a fixed-capacity buffer, so the
+            // present cache carries exactly the past cache's shape even though
+            // the `update` input is shorter along the sequence axis.
+            | "TensorScatter"
             | "Trilu"
             | "Clip" => Self::SameAsInput(0),
 
@@ -460,6 +465,7 @@ impl ShapeInference {
             | "QMoE"
             | "ScatterND"
             | "ScatterElements"
+            | "TensorScatter"
             | "Trilu"
             | "Clip" => Self::SameAsInput(0),
 
