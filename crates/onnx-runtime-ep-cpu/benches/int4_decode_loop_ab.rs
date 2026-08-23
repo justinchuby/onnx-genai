@@ -119,6 +119,15 @@ fn median(mut samples: Vec<f64>) -> f64 {
 /// comment in the session loop.
 static CHECKSUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// One repetition of one phase.
+struct Rep {
+    ms: f64,
+    p90: f64,
+    tps: f64,
+    wall: f64,
+    cpu: Option<common::CpuTime>,
+}
+
 fn main() {
     // Match the decode thread topology a served session runs in (#1749).
     common::init_decode_topology();
@@ -265,10 +274,10 @@ fn main() {
         samples
     };
 
-    // One repetition of one phase. Returns `(median_ms_token, p90, tokens_s_total)`.
-    let measure = |warm: bool| -> (f64, f64, f64) {
+    // One repetition of one phase.
+    let measure = |warm: bool| -> Rep {
         let barrier = std::sync::Barrier::new(sessions + 1);
-        let (per_session, wall) = std::thread::scope(|scope| {
+        let (per_session, wall, cpu) = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..sessions)
                 .map(|_| {
                     let barrier = &barrier;
@@ -278,9 +287,19 @@ fn main() {
             // Releases every session at once, then starts the clock. All
             // warmup and allocation is already behind us at this point.
             barrier.wait();
+            // Bracketed by exactly the same two points as `wall`, so
+            // `cpu / (wall * width)` is a busy fraction over the measured
+            // window and nothing else. Read after the barrier so pool
+            // construction and the three warmup steps are outside it.
+            let cpu0 = common::process_cpu_time();
             let start = Instant::now();
             let out: Vec<Vec<f64>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-            (out, start.elapsed().as_secs_f64())
+            let elapsed = start.elapsed().as_secs_f64();
+            let cpu = match (cpu0, common::process_cpu_time()) {
+                (Some(a), Some(b)) => Some(b.since(a)),
+                _ => None,
+            };
+            (out, elapsed, cpu)
         });
 
         let mut all: Vec<f64> = per_session.into_iter().flatten().collect();
@@ -290,24 +309,30 @@ fn main() {
         // Aggregate throughput is the number the pool question is really about:
         // a wider fork can cut one session's latency and still lose once
         // sessions have to share the machine.
-        (ms, p90, (sessions * tokens) as f64 / wall)
+        Rep {
+            ms,
+            p90,
+            tps: (sessions * tokens) as f64 / wall,
+            wall,
+            cpu,
+        }
     };
 
     for (phase, warm) in [("cold", false), ("steady", true)] {
         // `cold` is inherently single-shot: repeating it would measure a warm
         // run. Only `steady` is repeated.
         let n = if warm { reps } else { 1 };
-        let mut rows: Vec<(f64, f64, f64)> = Vec::with_capacity(n);
+        let mut rows: Vec<Rep> = Vec::with_capacity(n);
         for _ in 0..n {
             rows.push(measure(warm));
         }
-        let ms = median(rows.iter().map(|r| r.0).collect());
-        let p90 = median(rows.iter().map(|r| r.1).collect());
+        let ms = median(rows.iter().map(|r| r.ms).collect());
+        let p90 = median(rows.iter().map(|r| r.p90).collect());
         // MEDIAN over repetitions, deliberately not min/max. Reporting the
         // best repetition makes every arm look like its luckiest run and makes
         // the spread invisible, which is how a 2x measurement artifact can
         // survive review (see the ratio-definition note in the module docs).
-        let mut tps: Vec<f64> = rows.iter().map(|r| r.2).collect();
+        let mut tps: Vec<f64> = rows.iter().map(|r| r.tps).collect();
         let total = median(tps.clone());
         tps.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let spread = if total > 0.0 {
@@ -316,6 +341,47 @@ fn main() {
             0.0
         };
         println!("{phase:>10} {ms:>12.3} {p90:>12.3} {total:>14.1} {spread:>9.1}");
+
+        // A separate line, and deliberately not prefixed with the phase name:
+        // the existing matrix scripts key the throughput row on a leading
+        // `steady`, and a second line starting the same way would be parsed as
+        // one and fail on the first field.
+        //
+        // Every field comes from ONE repetition -- the one whose throughput is
+        // the median, which is exactly the repetition the `tps` column above
+        // reports, since `median` here returns `sorted[len / 2]` rather than
+        // interpolating. Taking an independent median per quantity looks
+        // equivalent and is not: `tps = tokens / wall`, so sorting by `tps`
+        // ascending and sorting by `wall` ascending are *reversed* orders, and
+        // at an even repetition count the two medians land on different
+        // repetitions. The resulting row describes no run that ever happened,
+        // and `cpu / (wall * width)` inherits the full rep-to-rep spread as
+        // bias -- measured at 4.4% to 29.7% against an identity that is 0.00%
+        // when the row is self-consistent.
+        //
+        // `user` and `sys` are reported separately rather than summed because
+        // they distinguish work from waiting: `sched_yield` is charged to `sys`.
+        if rows.iter().all(|r| r.cpu.is_some()) {
+            let mut by_tps: Vec<usize> = (0..rows.len()).collect();
+            by_tps.sort_by(|&a, &b| rows[a].tps.partial_cmp(&rows[b].tps).unwrap());
+            let rep = &rows[by_tps[by_tps.len() / 2]];
+            let cpu = rep.cpu.unwrap();
+            let counted = (sessions * tokens) as f64;
+            let cpu_s = cpu.total_s();
+            println!(
+                "cpu phase={phase} user_s={:.4} sys_s={:.4} cpu_s={cpu_s:.4} \
+                 wall_s={:.4} tokens={counted:.0} tps_rep={:.4} \
+                 cpu_s_per_token={:.6} sys_frac={:.4}",
+                cpu.user_s,
+                cpu.sys_s,
+                rep.wall,
+                rep.tps,
+                cpu_s / counted,
+                if cpu_s > 0.0 { cpu.sys_s / cpu_s } else { 0.0 },
+            );
+        } else {
+            println!("cpu phase={phase} unavailable");
+        }
     }
 
     println!(

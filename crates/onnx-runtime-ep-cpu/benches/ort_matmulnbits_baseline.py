@@ -14,6 +14,7 @@ what a GEMM's cost depends on.
 
 import argparse
 import os
+import resource
 import statistics
 import time
 
@@ -135,6 +136,7 @@ def run_concurrent(args, path):
 
     import threading
     reps = []
+    cpu_reps = []
     for _ in range(args.reps):
         start = threading.Barrier(args.sessions + 1)
         done = [0.0] * args.sessions
@@ -150,11 +152,21 @@ def run_concurrent(args, path):
         for t in threads:
             t.start()
         start.wait()
+        # Bracketed by exactly the two points that bracket `wall`, so
+        # `cpu / (wall * threads)` is a busy fraction over the measured window
+        # and nothing else. `getrusage(RUSAGE_SELF)` sums every thread of the
+        # process, which is what makes it comparable to the native arm's
+        # `/proc/self/stat` read -- and both are unaffected by a neighbour
+        # stealing wall, unlike `/usr/bin/time`'s wall-derived `Percent of CPU`.
+        r0 = resource.getrusage(resource.RUSAGE_SELF)
         t0 = time.perf_counter()
         for t in threads:
             t.join()
         wall = time.perf_counter() - t0
+        r1 = resource.getrusage(resource.RUSAGE_SELF)
         reps.append(args.sessions * args.tokens / wall)
+        cpu_reps.append((r1.ru_utime - r0.ru_utime,
+                         r1.ru_stime - r0.ru_stime, wall))
     # MEDIAN over repetitions, matching the native harness. `max` reported the
     # luckiest run and hid the spread; against a single-shot opponent that is a
     # systematic bias, not a tie-break.
@@ -164,6 +176,27 @@ def run_concurrent(args, path):
           f"t={args.threads} sessions={args.sessions} zp={int(args.zp)}  "
           f"tokens_s_total={best:.1f}  ms_token_equiv={1e3 * args.sessions / best:.3f}  "
           f"spread_pct={spread:.1f}")
+    # Every field comes from ONE repetition -- the one whose throughput is the
+    # median under the *native harness's* definition, `sorted[len // 2]`, which
+    # is not what `statistics.median` does at an even repetition count (it
+    # averages the two middle values, producing a number no repetition
+    # produced). Mixing repetitions across fields makes `cpu / (wall * threads)`
+    # carry the rep-to-rep spread as bias; the identity
+    # `tps = busy * threads / cpu_per_token` then fails by that spread, which is
+    # how this was caught. `tokens_s_total` above is left on the original
+    # definition so previously published rows stay comparable, and `tps_rep` is
+    # emitted next to the CPU fields so a consumer can use a self-consistent
+    # triple without having to know which definition produced the headline.
+    order = sorted(range(len(reps)), key=lambda i: reps[i])
+    rep = order[len(order) // 2]
+    user_s, sys_s, wall_s = cpu_reps[rep]
+    counted = args.sessions * args.tokens
+    cpu_s = user_s + sys_s
+    print(f"cpu phase=steady user_s={user_s:.4f} sys_s={sys_s:.4f} "
+          f"cpu_s={cpu_s:.4f} wall_s={wall_s:.4f} tokens={counted} "
+          f"tps_rep={reps[rep]:.4f} "
+          f"cpu_s_per_token={cpu_s / counted:.6f} "
+          f"sys_frac={(sys_s / cpu_s if cpu_s else 0.0):.4f}")
     return best
 
 

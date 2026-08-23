@@ -166,7 +166,7 @@ def native(binary, model, block, acc, threads, sessions, tokens, reps, extra=Non
     if extra:
         env.update(extra)
     r = sh(f"taskset -c {PIN} {binary}", env)
-    steady, width_line = None, None
+    steady, width_line, cpu = None, None, None
     for line in r.stdout.splitlines() + r.stderr.splitlines():
         if line.strip().startswith("steady"):
             f = line.split()
@@ -174,6 +174,21 @@ def native(binary, model, block, acc, threads, sessions, tokens, reps, extra=Non
                       "tps": float(f[3]), "spread": float(f[4])}
         if line.strip().startswith("decode_width"):
             width_line = line.strip()
+        # Optional: only binaries built after the CPU-accounting change emit
+        # it, so its absence is not an error -- older harnesses and older
+        # binaries keep working and simply carry no `cpu_*` keys.
+        if line.strip().startswith("cpu phase=steady ") and "unavailable" not in line:
+            cpu = {}
+            for field in line.split()[1:]:
+                if "=" not in field:
+                    continue
+                k, v = field.split("=", 1)
+                if k == "phase":
+                    continue
+                try:
+                    cpu[k] = float(v)
+                except ValueError:
+                    pass
     if steady is None:
         sys.stderr.write(r.stdout + r.stderr)
         raise RuntimeError("native arm produced no steady row")
@@ -191,6 +206,8 @@ def native(binary, model, block, acc, threads, sessions, tokens, reps, extra=Non
         # other mismatch invalidates the row's label.
         if not (threads == 1 and "path=flat" in width_line):
             raise RuntimeError(f"native width vacuous: {width_line}")
+    if cpu:
+        steady["cpu"] = cpu
     return steady
 
 
@@ -205,7 +222,26 @@ def ort(model, block, acc, threads, sessions, tokens, reps, pin=None):
     if not m:
         sys.stderr.write(r.stdout + r.stderr)
         raise RuntimeError("ORT arm produced no throughput")
-    return {"tps": float(m.group(1)), "spread": float(m.group(2)), "pin": pin}
+    out = {"tps": float(m.group(1)), "spread": float(m.group(2)), "pin": pin}
+    # Same optional-`cpu`-row contract as `native`: field names and order are
+    # identical on both sides, so one parser reads both and a missing row is
+    # simply an older script rather than an error.
+    for line in r.stdout.splitlines():
+        if line.strip().startswith("cpu phase=steady "):
+            cpu = {}
+            for field in line.split()[1:]:
+                if "=" not in field:
+                    continue
+                k, v = field.split("=", 1)
+                if k == "phase":
+                    continue
+                try:
+                    cpu[k] = float(v)
+                except ValueError:
+                    pass
+            if cpu:
+                out["cpu"] = cpu
+    return out
 
 
 def competing_load():
