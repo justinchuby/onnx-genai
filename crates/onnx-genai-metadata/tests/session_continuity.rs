@@ -245,3 +245,38 @@ fn a_session_cell_binding_an_unknown_state_group_is_refused() {
         "which pipeline.workflow.serving.state_service.groups does not declare",
     );
 }
+
+/// A bound that names nothing is not a bound.
+///
+/// The runtime reads it before the turn that would exceed it runs and again when
+/// the turn completes, and it is the only check on a continuation's length — a
+/// continuation is not loop-carried, so it never reaches the carry path where a
+/// recurrence value is otherwise resolved. A symbol no input declares would make
+/// the check silently pass.
+#[test]
+fn a_continuations_bound_must_name_a_declared_input() {
+    rejects(
+        &document(
+            &conversation_cell(&[(
+                "recurrence",
+                "{ kind: bounded, axis: 1, max: package.context_window }",
+            )]),
+            "session_state_lease, bounded_state_recurrence",
+        ),
+        "not a declared workflow input",
+    );
+}
+
+/// A bound a request may omit is not a bound either.
+#[test]
+fn a_continuations_bound_must_have_a_value_by_the_time_a_turn_is_admitted() {
+    let no_default = document(
+        &conversation_cell(&[]),
+        "session_state_lease, bounded_state_recurrence",
+    )
+    .replace(
+        "        required: false\n        default: 64\n",
+        "        required: false\n",
+    );
+    rejects(&no_default, "declares no default");
+}

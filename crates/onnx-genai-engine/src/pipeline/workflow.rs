@@ -549,31 +549,39 @@ pub(crate) fn workflow_prompt_continuation(
     })
 }
 
-/// The declared upper bound on a continuation cell's length, if the pass bound
-/// a value for it.
+/// The declared upper bound on a continuation cell's length.
 ///
-/// The validator makes the bound mandatory on a continuation, so a package's
-/// context limit is a fact this cell states. Reading it here is what makes that
-/// statement load-bearing rather than decorative: nothing else checks it,
-/// because a continuation is deliberately not loop-carried and so never reaches
-/// the carry path's recurrence check.
+/// The validator makes the bound mandatory on a continuation and requires it to
+/// name a declared workflow input, so the value is bound before the pass starts
+/// and is knowable both when a turn is admitted and when it completes. Reading
+/// it here is what makes that statement load-bearing rather than decorative:
+/// nothing else checks it, because a continuation is deliberately not
+/// loop-carried and so never reaches the carry path's recurrence check.
+///
+/// A missing value is an error, not a skipped check. Returning "no bound" for a
+/// symbol the document named would be the silent version of the failure this
+/// exists to prevent.
 fn continuation_bound(
+    cell: &str,
     state: &onnx_genai_metadata::WorkflowStateCell,
     values: &PipelineTensors,
-) -> anyhow::Result<Option<usize>> {
+) -> anyhow::Result<usize> {
     let max = match &state.recurrence {
         onnx_genai_metadata::ShapeRecurrence::Growing { max, .. }
         | onnx_genai_metadata::ShapeRecurrence::Bounded { max, .. } => max,
-        onnx_genai_metadata::ShapeRecurrence::Invariant => return Ok(None),
+        onnx_genai_metadata::ShapeRecurrence::Invariant => anyhow::bail!(
+            "session continuation state '{cell}' declares no growth bound, but a conversation \
+             grows with every turn"
+        ),
     };
-    if !values.contains_key(max) {
-        return Ok(None);
-    }
+    // Per-row bounds would be several conversations; a session is one, so the
+    // narrowest row is the bound the conversation has to keep.
     workflow_usize_rows(values, max)?
         .into_iter()
         .min()
-        .map(Ok)
-        .transpose()
+        .with_context(|| {
+            format!("session continuation state '{cell}' bound '{max}' carries no value")
+        })
 }
 
 /// Read the tokens a session-scoped continuation cell holds, as a flat row.
@@ -636,70 +644,49 @@ fn published_conversation_tokens(
 
 /// Whether this workflow declares state a session can actually carry.
 ///
-/// A session-scoped cell is carried when the loop carries it, when a step
-/// reaches it through the value its initializer names, or when its lease states
-/// the request binding it rejoins. A package with none of those has nothing to
-/// continue a conversation with, and saying so is what stops a caller opening a
-/// session whose every turn silently restarts.
+/// Two mechanisms carry a lease, and only two. A **loop-carried** cell is seeded
+/// from the lease when the pass enters its loop. A **continuation** rejoins the
+/// request binding before the pass starts. Anything else — a session-scoped cell
+/// that no loop carries and whose lease no contract names — is written back
+/// every pass and read by nothing, so a session over it restarts every turn.
+///
+/// Reporting that honestly is what lets `create_session` refuse instead of
+/// handing out a conversation the runtime cannot continue. It deliberately
+/// mirrors what the interpreter does rather than what a document might have
+/// meant: a cell whose `initializer` some step happens to name is *not* carried,
+/// because that step reads the value this pass computed, never the lease.
 pub fn workflow_carries_session_state(workflow: &WorkflowSpec) -> bool {
     let mut carried = std::collections::HashSet::new();
-    let mut read = std::collections::HashSet::new();
     fn walk(
         step: &onnx_genai_metadata::WorkflowStep,
         carried: &mut std::collections::HashSet<String>,
-        read: &mut std::collections::HashSet<String>,
     ) {
         use onnx_genai_metadata::WorkflowStep as Step;
         match step {
-            Step::Sequence { steps } => steps.iter().for_each(|step| walk(step, carried, read)),
-            Step::Invoke { inputs, .. } => read.extend(inputs.values().cloned()),
+            Step::Sequence { steps } => steps.iter().for_each(|step| walk(step, carried)),
             Step::Loop {
                 setup,
                 steps,
-                continue_when,
-                max_iterations,
                 carried: carries,
                 ..
             } => {
                 carried.extend(carries.iter().map(|carry| carry.cell.clone()));
-                read.extend(carries.iter().filter_map(|carry| carry.initial.clone()));
-                read.insert(continue_when.clone());
-                read.insert(max_iterations.clone());
-                setup.iter().for_each(|step| walk(step, carried, read));
-                steps.iter().for_each(|step| walk(step, carried, read));
+                setup.iter().for_each(|step| walk(step, carried));
+                steps.iter().for_each(|step| walk(step, carried));
             }
-            Step::Branch {
-                predicate,
-                cases,
-                default,
-                outputs,
-            } => {
-                read.insert(predicate.clone());
-                for phi in outputs.values() {
-                    read.extend(phi.cases.values().cloned());
-                    read.extend(phi.default.iter().cloned());
-                }
-                cases.values().for_each(|step| walk(step, carried, read));
+            Step::Branch { cases, default, .. } => {
+                cases.values().for_each(|step| walk(step, carried));
                 if let Some(default) = default {
-                    walk(default, carried, read);
+                    walk(default, carried);
                 }
             }
-            Step::Emit {
-                value,
-                when,
-                valid_length,
-                ..
-            } => {
-                read.insert(value.clone());
-                read.extend(when.iter().cloned());
-                read.extend(valid_length.iter().cloned());
-            }
+            Step::Invoke { .. } | Step::Emit { .. } => {}
         }
     }
     workflow
         .steps
         .iter()
-        .for_each(|step| walk(step, &mut carried, &mut read));
+        .for_each(|step| walk(step, &mut carried));
     workflow
         .state
         .iter()
@@ -710,7 +697,6 @@ pub fn workflow_carries_session_state(workflow: &WorkflowSpec) -> bool {
                 .as_ref()
                 .is_some_and(|lease| lease.continuation.is_some())
                 || carried.contains(cell)
-                || read.contains(&state.initializer)
         })
 }
 
@@ -1087,8 +1073,8 @@ impl<'a> WorkflowExecutionPlan<'a> {
         // somewhere inside the decoder graph with a shape nobody can attribute.
         if let Some(conversation) = continued_prompt.as_deref()
             && let Some((cell, _, _, state)) = workflow_prompt_continuation(workflow)
-            && let Some(bound) = continuation_bound(state, &values)?
         {
+            let bound = continuation_bound(cell, state, &values)?;
             anyhow::ensure!(
                 conversation.len() <= bound,
                 "this session's conversation is {} tokens and '{cell}' declares a bound of \
@@ -1345,9 +1331,8 @@ impl<'a> WorkflowExecutionPlan<'a> {
                     // the session in a state its own declaration forbids, and
                     // every later turn would fail with the same overflow and no
                     // way back.
-                    if let Some(bound) = continuation_bound(state, &values)?
-                        && conversation.len() > bound
-                    {
+                    let bound = continuation_bound(cell, state, &values)?;
+                    if conversation.len() > bound {
                         anyhow::bail!(
                             "this turn leaves a conversation of {} tokens and '{cell}' declares a \
                              bound of {bound}; reset or close the session to start a new one",

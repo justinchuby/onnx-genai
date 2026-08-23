@@ -2515,14 +2515,40 @@ fn validate_session_continuity(workflow: &WorkflowSpec, errors: &mut Vec<String>
             ));
         }
         match &cell.recurrence {
-            crate::schema::ShapeRecurrence::Bounded { axis, .. }
-            | crate::schema::ShapeRecurrence::Growing { axis, .. } => {
+            crate::schema::ShapeRecurrence::Bounded { axis, max }
+            | crate::schema::ShapeRecurrence::Growing { axis, max, .. } => {
                 if *axis != cell.contract.rank.saturating_sub(1) {
                     errors.push(format!(
                         "{path} continues a conversation along axis {axis}, but tokens accumulate \
                          on the final axis of a rank-{} contract",
                         cell.contract.rank
                     ));
+                }
+                // A continuation is not loop-carried, so its bound never reaches
+                // the carry path where a recurrence value is otherwise resolved.
+                // The runtime reads it before the pass runs and again when the
+                // pass completes, and both reads need a value that exists by
+                // then — which is a declared input, not an SSA value some step
+                // produces partway through.
+                match workflow.inputs.get(max) {
+                    None => errors.push(format!(
+                        "{path}.recurrence.max names '{max}', which is not a declared workflow \
+                         input; a conversation's bound has to be readable before the turn that \
+                         would exceed it runs"
+                    )),
+                    Some(input) => {
+                        validate_integer_scalar_contract(
+                            &input.contract,
+                            &format!("{path}.recurrence.max"),
+                            errors,
+                        );
+                        if !input.required && input.default.is_none() {
+                            errors.push(format!(
+                                "{path}.recurrence.max names optional input '{max}', which \
+                                 declares no default; a bound a request may omit is not a bound"
+                            ));
+                        }
+                    }
                 }
             }
             crate::schema::ShapeRecurrence::Invariant => errors.push(format!(

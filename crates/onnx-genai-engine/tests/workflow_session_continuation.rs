@@ -353,3 +353,39 @@ fn a_conversation_is_refused_past_the_bound_it_declares() -> anyhow::Result<()> 
     assert_eq!(engine.session_token_count(session)?, 4);
     Ok(())
 }
+
+/// A lease nothing reads is not a conversation, and is refused as one.
+///
+/// A session-scoped cell that no loop carries and whose lease names no
+/// continuation is written back on every pass and read by nothing: the runtime
+/// hands a lease back only to a loop carry or to a continuation. Reporting such
+/// a package as session-capable because some step happens to name the cell's
+/// initializer would be the fail-open version of exactly this regression — the
+/// step reads the value the pass computed, never the lease.
+#[test]
+fn a_session_cell_no_loop_carries_is_not_a_conversation() -> anyhow::Result<()> {
+    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("unread_lease_package");
+    let _ = std::fs::remove_dir_all(&scratch);
+    copy_package(&scratch)?;
+    let metadata = scratch.join("inference_metadata.yaml");
+    let mut document: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&metadata)?)?;
+    // Keep the cell session-scoped and keep its initializer a value the steps
+    // read — drop only the contract that says how the lease rejoins a turn.
+    document["pipeline"]["workflow"]["state"]["conversation"]["session"]
+        .as_mapping_mut()
+        .expect("the conversation declares a lease")
+        .remove(serde_yaml::Value::String("continuation".into()))
+        .expect("the conversation declares a continuation");
+    std::fs::write(&metadata, serde_yaml::to_string(&document)?)?;
+
+    let mut engine = Engine::from_dir(&scratch, EngineConfig::default())?;
+    let refused = engine
+        .create_session()
+        .expect_err("a lease no loop carries cannot continue a conversation");
+    assert!(
+        format!("{refused:#}").contains("scope: session"),
+        "the refusal names what the package has to declare: {refused:#}"
+    );
+    Ok(())
+}

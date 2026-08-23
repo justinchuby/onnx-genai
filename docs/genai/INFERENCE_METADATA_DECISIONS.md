@@ -1024,13 +1024,12 @@ adds no network-aware `receive` or `await` operation.
 Scope says *keep this*. It does not say how the next invocation reaches what was
 kept, and a package that leaves that unanswered advertises a continuity it does
 not have — every turn restarts and the failure reaches a caller as a model that
-forgot what it was told. There are exactly two answers, and a document gives one
-of them:
+forgot what it was told. The runtime hands a lease back through exactly two
+mechanisms, and a document uses one of them:
 
-- **The graph reads it.** A loop carries the cell, or a step consumes the value
-  its `initializer` names. The lease is then opaque: the runtime hands the kept
-  value back where the document already reads it. This is what a full-duplex or
-  streaming package does.
+- **A loop carries the cell.** Its lease is what seeds the carry when the pass
+  enters the loop, in place of the initializer the document names. This is what a
+  full-duplex or streaming package does.
 - **The request binding rejoins it**, declared on the lease:
 
   ```yaml
@@ -1073,15 +1072,17 @@ of them:
 
 The validator enforces the corollaries. A continuation must be `scope: session`,
 `class: semantic`, `management: runtime`, `release_boundary: session`, and must
-grow; it must name a declared `prompt_tokens` input and a declared `tokens`
+grow along a bound that names a declared input with a value by the time a turn is
+admitted; it must name a declared `prompt_tokens` input and a declared `tokens`
 output whose contracts match the cell's; it must not also be loop-carried, which
 would be two answers about the same value; and a workflow declares at most one,
 because a package has one conversation. A session-scoped cell binding a
 `service_group` must resolve to a declared group that aliases it.
 
 A package that publishes a token stream and declares no session state the
-interpreter can carry is refused a session at `create_session` rather than handed
-one whose turns silently restart. A package that publishes no token stream has no
+interpreter can carry — no loop-carried session cell and no continuation — is
+refused a session at `create_session` rather than handed one whose turns silently
+restart. A package that publishes no token stream has no
 conversation to lose, and its session is an ordinary handle.
 
 ### 12.6 Private state and checkpoints
