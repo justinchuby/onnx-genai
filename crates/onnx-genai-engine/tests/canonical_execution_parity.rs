@@ -198,101 +198,10 @@ fn batched_generation_is_held_to_the_canonical_precondition() -> anyhow::Result<
         assert_eq!(result.token_ids.len(), 4);
     }
 
-    // Token counts alone would not show batching honours the canonical
-    // precondition — it advances N rows per pass, so it is a different
-    // iteration shape and could plausibly have been left unguarded. Removing
-    // the canonical form must make it refuse too, otherwise batching is a hole
-    // in "no package decodes without a canonical workflow".
-    engine.forget_canonical_workflow_for_test();
-    let error = engine
-        .generate_batched_static(vec![greedy(4), greedy(4)])
-        .expect_err("batched generation must refuse a runtime with no canonical workflow");
-    let message = format!("{error:#}");
-    assert!(
-        message.contains("no canonical workflow"),
-        "expected a canonical-workflow refusal, got: {message}"
-    );
-    Ok(())
-}
-
-/// The legacy direct decode path cannot be selected.
-///
-/// There is no flag, mode, or constructor that reaches generation without a
-/// canonical workflow: the loader installs one for every decoder package, and a
-/// runtime that somehow lacks one refuses to generate rather than falling back.
-/// This is the guarantee the whole change rests on, so it is asserted directly
-/// on a runtime with its canonical form removed.
-#[test]
-fn the_legacy_direct_decode_path_cannot_be_selected() -> anyhow::Result<()> {
-    // 1. There is no public constructor that skips lowering: every decoder load
-    //    reports `Lowered`.
-    for engine in [
-        Engine::from_dir(&decoder_package(), EngineConfig::default())?,
-        Engine::from_dir_with_session_options(
-            &decoder_package(),
-            EngineConfig::default(),
-            onnx_genai_ort::SessionOptions::default(),
-        )?,
-    ] {
-        assert_eq!(
-            engine.workflow_shape(),
-            WorkflowShapeReport::SingleDecoder,
-            "a decoder package must always present its declared workflow; no constructor \
-             may skip it"
-        );
-    }
-
-    // 2. A runtime whose canonical form is absent refuses to decode — on EVERY
-    //    entry point, not just the stateless one. The refusal lives where the
-    //    loop resolves its workflow, so `generate`, the session path the server
-    //    actually uses, and the sampler path all reach it. Nothing in the public
-    //    API can produce this state, which is why it is built through the
-    //    test-only seam: the point is to prove the refusal is real rather than
-    //    unreachable.
-    let refuses = |call: &dyn Fn(&mut Engine) -> anyhow::Result<()>, label: &str| {
-        let mut engine = engine().expect("engine");
-        engine.forget_canonical_workflow_for_test();
-        let error = call(&mut engine)
-            .expect_err(&format!("{label} must refuse without a canonical workflow"));
-        let message = format!("{error:#}");
-        assert!(
-            message.contains("no canonical workflow"),
-            "{label}: the refusal must name the missing canonical workflow: {message}"
-        );
-        assert!(
-            message.contains("no longer exists"),
-            "{label}: the refusal must say the direct path is gone: {message}"
-        );
-    };
-    refuses(&|engine| engine.generate(greedy(2)).map(|_| ()), "generate");
-    refuses(
-        &|engine| {
-            let session = engine.create_session()?;
-            engine.generate_in_session(session, greedy(2)).map(|_| ())
-        },
-        "generate_in_session",
-    );
-    refuses(
-        &|engine| {
-            engine
-                .generate_with_sampler(greedy(2), Box::new(onnx_genai_engine::GreedySampler))
-                .map(|_| ())
-        },
-        "generate_with_sampler",
-    );
-    refuses(
-        &|engine| {
-            let session = engine.create_session()?;
-            engine
-                .drive_prioritized_requests(vec![onnx_genai_engine::PrioritizedGenerateRequest {
-                    session_id: session,
-                    request: greedy(2),
-                    priority: onnx_genai_scheduler::Priority::Normal,
-                }])
-                .map(|_| ())
-        },
-        "drive_prioritized_requests",
-    );
+    // The refusal half of this property — that removing the canonical form makes
+    // batching refuse too — needs the crate-private seam that produces a state
+    // no public API can reach, so it lives in
+    // `engine::runtime::canonical_refusal_tests` beside the other entry points.
     Ok(())
 }
 

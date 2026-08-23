@@ -1,69 +1,68 @@
-fix(engine): a model with several end tokens stops on any of them
+fix(engine): multi-EOS on the batched routes; seal the test seam; drop the PR-local fixture guard
 
-Multi-EOS was broken in three independent places, and the failure was silent:
-generation ran past its end and emitted control tokens as ordinary text, which
-reads like the model rambling rather than like a runtime dropping a
-declaration. Muse-Glimmer needs both `<|eot|>` and `<|eom|>`.
+Addresses review B1 and the contained N-items. B2 (making the interpreter own
+the AR loop) and B3 (baseline-from-main evidence) are **not** in this commit;
+see the PR discussion for the blocker.
 
-**1. A package could not express the set.** `literal_shape` resolved every
-symbolic axis to 1, so a `[eos_count]` contract with a two-element literal
-failed with "declares 2 elements but its contract holds 1" — a package
-describing itself correctly was unloadable. The singleton guess is right for a
-*scalar* literal, which nothing else sizes; an **element list carries its own
-extent**, and discarding it threw away the only information available. When
-exactly one axis is symbolic the list now divides out the fixed axes to size it.
-With more than one unbound axis the split is genuinely ambiguous, so the guess
-stands and the caller gets the element-count error, which names the real
-problem.
+**B1 — batched routes resolved their own EOS.** `ContinuousBatchManager::submit`
+and `generate_batched_static` each set `eos_token_id` from the tokenizer's
+*first* id and never saw the package's declaration. That is the server's default
+route for a fixed-capacity package, so a multi-EOS model stopped correctly in
+single-row generation and ran past its end under serving — invisible from the
+API. Both now resolve the full set from the same source the single-row path
+uses, through one shared `apply_eos_policy`; the manager carries the resolved
+set because it holds a tokenizer, not the engine, and cannot reach the workflow
+once it holds a mutable session borrow.
 
-**2. The declaration was dead.** `package.eos_ids` was a name a fixture used;
-nothing read it. There is now a semantic role, `eos_token_ids`, so a package
-declares its stop condition where it declares everything else, and
-`declared_eos_token_ids` reads it into the stop policy. A package shipping no
-tokenizer side-files still stops correctly. The package's ids and the
-tokenizer's are merged (package first) so neither source can silently drop the
-other's.
+`generate_batched_static` also checked "is this a static-cache model" *before*
+the canonical guard, so an unloadable package was reported as a batching
+capability problem. The invariant is now the prior question.
 
-**3. The policy compared one id.** `options.eos_token_id == Some(token)`
-appeared in three places — the processor path, the no-chain fast path in
-`decode_loop`, and the constraint processor's `is_eos`, which decides whether a
-grammar may finish. Each was a separate answer to the same question, and a
-grammar treating a model's second end token as ordinary text while the loop
-treated it as terminal is exactly the kind of disagreement that is impossible to
-debug from the output. `GenerateOptions::terminates` is now the single decision
-and all three call it.
+**The batched test is deliberately in-crate.** No CPU fixture in this repository
+can batch — a shared KV buffer needs an EP reporting fixed-capacity present
+binding, and `batching_capability` asserts exactly that absence. An end-to-end
+batched case would therefore *skip*, and a skipped test reporting success is
+worse than no test. `batched::tests::
+a_continuous_row_stops_on_a_non_first_declared_end_token` drives a real
+`ContinuousBatchManager` row loop over a scripted decode and requires the row to
+end at a **non-first** declared id; with the old code the row runs to the
+budget. The `multi_eos` module header records why the end-to-end case is absent
+rather than pretending it ran.
 
-`eos_token_id` keeps its meaning as the id a result *reports* and a caller's
-addition to the set — it does not narrow it. A model's end tokens are facts
-about the model; a request cannot make the runtime emit one as text.
+Investigating this surfaced that `Engine::generate` on a fixed-capacity package
+has never worked end-to-end: `tiny-llm-scatter-workflow` fails on a contract/graph
+mismatch (`key_cache.0` axis 2 declares 4, the graph exposes 16). Pre-existing
+and pre-dating this branch — the static-cache fixtures are only ever driven
+through `StaticCacheDecodeSession` directly. Recorded, not silently worked
+around.
 
-An earlier attempt routed the extra ids through `stop_sequences`. That stopped
-generation but reported `FinishReason::StopSequence`, which tells a caller
-"you hit a stop string" when the model ended its own output. Reusing an
-adjacent mechanism produced the right control flow and the wrong answer, so the
-policy carries the set instead.
+**Malformed EOS declarations now error.** `literal_token_ids` used `filter_map`,
+so a package declaring `[2, -1]` silently kept one id — the package says "these
+tokens end me" and the runtime quietly keeps a subset. It returns `Result`, and
+`apply_eos_defaults`/`fim_options` propagate it.
 
-The importer and the migration tool both carry every id across:
-`genai_config.json` already normalizes a scalar or an array, and the converter
-reads the package's generation defaults.
+**`forget_canonical_workflow_for_test` is `#[cfg(test)] pub(crate)`.** It
+produces a state no public API can reach, which is the whole point of the
+refusal it supports; exposing it made that state reachable. The refusal tests
+move in-crate to `canonical_refusal_tests` and gain a fifth entry point
+(`generate_batched_static`).
 
-**Tests** (`tests/multi_eos.rs`, 4 cases): a package can declare several ids at
-all (the `literal_shape` regression); each declared id stops generation, once at
-the first generated token to exercise prefill and once at a later token to
-exercise cached decode; a request naming one id does not disarm the others (the
-Muse-Glimmer shape); and the declaration survives a session.
+**The PR-local fixture guard is deleted.** Main's repository-wide, zero-allowlist
+`onnx-std/tests/fixture_ir_opset_guard.rs` supersedes it, and my own guard's doc
+said to replace it when that landed. It passes on this branch's fixtures.
 
-Also: the last stale `model_io` identifiers are renamed
-(`derive_model_io_spec_from_graph` → `derive_decoder_abi_from_graph`, and the
-locals in `engine/load.rs`). No `io:` key exists anywhere in the repository, and
-the only remaining mentions of the retired block are the rejection that explains
-it and the migration guidance that names the conversion.
+I tried extending that guard to inline model literals in `.rs` sources and
+reverted it: raising `opset_import` from 13 to 24 without porting the ops
+produces *invalid* models (`ReduceMax` moved `axes` from attribute to input in
+opset 18, and the bumped fixture was rejected by ORT). Many inline literals are
+also deliberate legacy-IR *parser* inputs — a loader must still parse IR 8 to be
+tested for it. Committed fixture files have generators and are the right scope;
+inline literals are not fixtures. This branch's own inline models are at the
+floor.
 
-Verified: 74/74 engine targets; downstream metadata, scheduler, ort,
-genai-config, model-package, preprocess, CLI, C API, onnx-std green — the one
-server failure is the known `stalled_output_route_does_not_block_another_completion`
-load-flake, 3/3 in isolation; H200 CUDA — multi_eos 4,
-canonical_execution_parity 8, native_workflow_parity 12, one_runtime_e2e 5,
-real-model corpus 5; fmt; clippy `-D warnings`; goldens byte-identical.
+Verified: 73/73 engine targets; downstream metadata, scheduler, CLI, C API,
+onnx-std green — the one server failure is the known
+`fim_stream_returns_headers_before_generation_finishes` load-flake, 3/3 in
+isolation; fmt; clippy `-D warnings`.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>

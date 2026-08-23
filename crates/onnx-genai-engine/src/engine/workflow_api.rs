@@ -86,12 +86,13 @@ impl Engine {
 
     /// Drop the canonical workflow, so the next request has no path to take.
     ///
-    /// Test-only. Nothing in the public API can produce this state — the loader
-    /// installs a canonical workflow for every package it accepts — so this
-    /// exists purely to let a test prove the refusal is real rather than
-    /// unreachable.
-    #[doc(hidden)]
-    pub fn forget_canonical_workflow_for_test(&mut self) {
+    /// Test-only, and **not** public: nothing outside this crate may produce a
+    /// runtime with no workflow, because that state is precisely what the
+    /// loader exists to prevent. Exposing it would make the unreachable state
+    /// reachable, which is the opposite of what the refusal it supports is
+    /// asserting.
+    #[cfg(test)]
+    pub(crate) fn forget_canonical_workflow_for_test(&mut self) {
         self.workflow = None;
         self.lowered_workflow = None;
     }

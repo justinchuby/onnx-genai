@@ -9,6 +9,22 @@
 //! These cases pin the whole path: the package can *declare* a set, the
 //! declaration reaches the stop policy, and every declared id stops generation
 //! in prefill, in cached decode, and across a session.
+//!
+//! # Batched routes
+//!
+//! The batched and continuous-batch routes resolve the same end tokens, from
+//! the same source, through the same `apply_eos_policy`. That is asserted where
+//! it can be asserted without a backend: `batched::tests::
+//! a_continuous_row_stops_on_a_non_first_declared_end_token` drives a real
+//! `ContinuousBatchManager` row loop over a scripted decode and requires the row
+//! to end at a *non-first* declared id.
+//!
+//! It is deliberately not asserted end-to-end here. Batching needs a shared KV
+//! buffer, which needs an execution provider reporting fixed-capacity present
+//! binding — no CPU fixture in this repository can batch, and the existing
+//! `batching_capability` suite asserts precisely that absence. An end-to-end
+//! case pointed at a CPU fixture would skip, and a skipped test that reports
+//! success is worse than no test.
 
 use std::path::{Path, PathBuf};
 
@@ -21,14 +37,13 @@ fn decoder_package() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm")
 }
 
-/// A package whose workflow declares `ids` as its end tokens.
-///
-/// Staged as a copy so the committed fixture keeps describing a single-EOS
-/// model: the multi-EOS shape is the thing under test, not the fixture's
-/// identity.
 fn package_declaring_eos(ids: &[i64]) -> anyhow::Result<tempfile::TempDir> {
+    package_declaring_eos_from(&decoder_package(), ids)
+}
+
+fn package_declaring_eos_from(source: &Path, ids: &[i64]) -> anyhow::Result<tempfile::TempDir> {
     let staged = tempfile::tempdir()?;
-    for entry in std::fs::read_dir(decoder_package())? {
+    for entry in std::fs::read_dir(source)? {
         let entry = entry?;
         if entry.file_type()?.is_file() {
             std::fs::copy(entry.path(), staged.path().join(entry.file_name()))?;

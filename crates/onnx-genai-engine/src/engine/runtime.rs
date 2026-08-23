@@ -326,8 +326,8 @@ impl Engine {
     /// side-files still states its EOS — and the tokenizer's ids extend it
     /// rather than replacing it, so neither source can silently drop the
     /// other's.
-    fn default_eos_token_ids(&self) -> Vec<TokenId> {
-        let mut ids = self.declared_eos_token_ids();
+    pub(crate) fn default_eos_token_ids(&self) -> anyhow::Result<Vec<TokenId>> {
+        let mut ids = self.declared_eos_token_ids()?;
         for id in self
             .tokenizer
             .as_ref()
@@ -338,7 +338,7 @@ impl Engine {
                 ids.push(id);
             }
         }
-        ids
+        Ok(ids)
     }
 
     /// EOS ids the package's workflow declares, via the `eos_token_ids` role.
@@ -348,11 +348,11 @@ impl Engine {
     /// the declaration is inert: it would be materialized into the graph's
     /// inputs and never reach the runtime's stop policy, which is what "declared
     /// but dead" meant.
-    fn declared_eos_token_ids(&self) -> Vec<TokenId> {
+    fn declared_eos_token_ids(&self) -> anyhow::Result<Vec<TokenId>> {
         let Ok(workflow) =
             canonical_workflow(self.workflow.as_deref(), self.lowered_workflow.as_ref())
         else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         workflow
             .inputs
@@ -365,8 +365,9 @@ impl Engine {
                 )
             })
             .filter_map(|input| input.default.as_ref())
-            .flat_map(literal_token_ids)
-            .collect()
+            .map(literal_token_ids)
+            .collect::<anyhow::Result<Vec<_>>>()
+            .map(|groups| groups.concat())
     }
 
     /// Apply the model's stop condition to a request.
@@ -380,21 +381,9 @@ impl Engine {
     /// EOS, and does not suppress the others: the model's end tokens are facts
     /// about the model, and a request narrowing them would make the runtime emit
     /// tokens the model meant as terminal.
-    fn apply_eos_defaults(&self, options: &mut GenerateOptions) {
-        if !options.stop_on_eos {
-            return;
-        }
-        let ids = self.default_eos_token_ids();
-        if options.eos_token_id.is_none()
-            && let Some(&id) = ids.first()
-        {
-            options.eos_token_id = Some(id);
-        }
-        for id in ids {
-            if !options.eos_token_ids.contains(&id) {
-                options.eos_token_ids.push(id);
-            }
-        }
+    fn apply_eos_defaults(&self, options: &mut GenerateOptions) -> anyhow::Result<()> {
+        apply_eos_policy(options, &self.default_eos_token_ids()?);
+        Ok(())
     }
 
     /// Effective context limit for a request, combining model metadata,
@@ -433,7 +422,7 @@ impl Engine {
         reject_native_request_speculation(&request.options)?;
         request.options.validate()?;
         let mut options = request.options;
-        self.apply_eos_defaults(&mut options);
+        self.apply_eos_defaults(&mut options)?;
         let prompt_tokens = self.tokenize_prompt(&request.prompt)?;
         if prompt_tokens.is_empty() {
             anyhow::bail!("prompt must contain at least one token");
@@ -878,7 +867,7 @@ impl Engine {
     ) -> anyhow::Result<GenerateResult> {
         let prompt = fim_config.format_prompt(prefix.as_ref(), suffix.as_ref());
         let mut request = GenerateRequest::new(prompt);
-        request.options = self.fim_options(fim_config, options);
+        request.options = self.fim_options(fim_config, options)?;
         self.generate_with_callbacks(request, admission_callback, token_callback)
     }
 
@@ -1069,7 +1058,7 @@ impl Engine {
         self.last_speculative_stats = SpeculativeStats::default();
         request.options.validate()?;
         let mut options = request.options.clone();
-        self.apply_eos_defaults(&mut options);
+        self.apply_eos_defaults(&mut options)?;
         let prompt_tokens = self.tokenize_prompt(&request.prompt)?;
         if prompt_tokens.is_empty() {
             anyhow::bail!("prompt must contain at least one token");
@@ -1583,8 +1572,12 @@ impl Engine {
         self.fim_config.as_ref()
     }
 
-    fn fim_options(&self, fim_config: &FimConfig, mut options: GenerateOptions) -> GenerateOptions {
-        self.apply_eos_defaults(&mut options);
+    fn fim_options(
+        &self,
+        fim_config: &FimConfig,
+        mut options: GenerateOptions,
+    ) -> anyhow::Result<GenerateOptions> {
+        self.apply_eos_defaults(&mut options)?;
         for token in [
             fim_config.prefix_token.as_str(),
             fim_config.middle_token.as_str(),
@@ -1604,7 +1597,7 @@ impl Engine {
                 );
             }
         }
-        options
+        Ok(options)
     }
 
     fn max_context_for_request(&self, options: &GenerateOptions) -> Option<usize> {
@@ -1858,7 +1851,7 @@ impl Engine {
     ) -> anyhow::Result<ActiveGenerate> {
         request.request.options.validate()?;
         let mut options = request.request.options.clone();
-        self.apply_eos_defaults(&mut options);
+        self.apply_eos_defaults(&mut options)?;
         let prompt_tokens = self.tokenize_prompt(&request.request.prompt)?;
         if prompt_tokens.is_empty() {
             anyhow::bail!("prompt must contain at least one token");
@@ -2295,7 +2288,7 @@ impl Engine {
         request.options.validate()?;
         let mut options = request.options;
         reject_native_request_speculation(&options)?;
-        self.apply_eos_defaults(&mut options);
+        self.apply_eos_defaults(&mut options)?;
         let prompt_tokens = self.tokenize_prompt(&request.prompt)?;
         if prompt_tokens.is_empty() {
             anyhow::bail!("prompt must contain at least one token");
@@ -2532,7 +2525,7 @@ impl Engine {
 ///
 /// A package may declare one end token or several with the same field; reading
 /// both shapes here is what keeps "declare your EOS" from having two spellings.
-fn literal_token_ids(literal: &onnx_genai_metadata::LiteralValue) -> Vec<TokenId> {
+fn literal_token_ids(literal: &onnx_genai_metadata::LiteralValue) -> anyhow::Result<Vec<TokenId>> {
     use onnx_genai_metadata::{LiteralValue, ScalarValue};
     let scalars = match literal {
         LiteralValue::Scalar(scalar) => std::slice::from_ref(scalar),
@@ -2540,9 +2533,20 @@ fn literal_token_ids(literal: &onnx_genai_metadata::LiteralValue) -> Vec<TokenId
     };
     scalars
         .iter()
-        .filter_map(|scalar| match scalar {
-            ScalarValue::Integer(value) => TokenId::try_from(*value).ok(),
-            _ => None,
+        .map(|scalar| match scalar {
+            // Dropping a malformed id would be the worst outcome: the package
+            // says "these tokens end me", the runtime silently keeps a subset,
+            // and generation runs past an end token the author declared. A
+            // package that cannot state its stop condition must fail to load,
+            // not load with a quietly smaller one.
+            ScalarValue::Integer(value) => TokenId::try_from(*value).map_err(|_| {
+                anyhow::anyhow!(
+                    "declared end-of-generation token id {value} is not a valid token id"
+                )
+            }),
+            other => anyhow::bail!(
+                "declared end-of-generation token ids must be integers; found {other:?}"
+            ),
         })
         .collect()
 }
@@ -2771,5 +2775,176 @@ mod tests {
             "native backend must not build a >1 continuous batch manager"
         );
         Ok(())
+    }
+}
+
+/// Apply a model's end tokens to a request.
+///
+/// The one implementation, shared by the single-row path, the continuous batch
+/// manager and static batching. Three copies of this is how a model stops
+/// correctly on one route and runs past its end on another — which is
+/// unobservable from the API and shows up as a serving-only bug.
+pub(crate) fn apply_eos_policy(options: &mut GenerateOptions, ids: &[TokenId]) {
+    if !options.stop_on_eos {
+        return;
+    }
+    if options.eos_token_id.is_none()
+        && let Some(&id) = ids.first()
+    {
+        options.eos_token_id = Some(id);
+    }
+    for &id in ids {
+        if !options.eos_token_ids.contains(&id) {
+            options.eos_token_ids.push(id);
+        }
+    }
+}
+
+/// The legacy direct decode path cannot be selected.
+///
+/// There is no flag, mode, or constructor that reaches generation without a
+/// canonical workflow: the loader installs one for every package it accepts, and
+/// a runtime that somehow lacks one refuses rather than falling back.
+///
+/// These live in-crate because they need `forget_canonical_workflow_for_test`,
+/// which produces a state no public API can reach. Exposing that seam would make
+/// the unreachable state reachable — the opposite of what these assert.
+#[cfg(test)]
+mod canonical_refusal_tests {
+    use crate::config::{GenerateOptions, GeneratePrompt, GenerateRequest};
+    use crate::{Engine, EngineConfig};
+    use std::path::PathBuf;
+
+    fn decoder_package() -> PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm")
+    }
+
+    fn engine() -> anyhow::Result<Engine> {
+        Engine::from_dir(&decoder_package(), EngineConfig::default())
+    }
+
+    fn greedy(tokens: usize) -> GenerateRequest {
+        GenerateRequest {
+            prompt: GeneratePrompt::Text("hello world".to_string()),
+            options: GenerateOptions {
+                max_new_tokens: tokens,
+                greedy: true,
+                temperature: 0.0,
+                stop_on_eos: false,
+                ..GenerateOptions::default()
+            },
+        }
+    }
+
+    /// Every entry point refuses, not just the stateless one.
+    ///
+    /// The refusal lives where the loop resolves its workflow, so `generate`,
+    /// the session path the server actually uses, the sampler path, the
+    /// scheduler's prioritized drive, and batching all reach it. A guard that
+    /// covered only one of them would leave the others able to decode with no
+    /// declared workflow.
+    #[test]
+    fn every_decode_entry_point_refuses_without_a_canonical_workflow() {
+        let refuses = |call: &dyn Fn(&mut Engine) -> anyhow::Result<()>, label: &str| {
+            let mut engine = engine().expect("engine");
+            engine.forget_canonical_workflow_for_test();
+            let error = call(&mut engine)
+                .expect_err(&format!("{label} must refuse without a canonical workflow"));
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("no canonical workflow"),
+                "{label}: the refusal must name the missing canonical workflow: {message}"
+            );
+            assert!(
+                message.contains("no longer exists"),
+                "{label}: the refusal must say the direct path is gone: {message}"
+            );
+        };
+
+        refuses(&|engine| engine.generate(greedy(2)).map(|_| ()), "generate");
+        refuses(
+            &|engine| {
+                let session = engine.create_session()?;
+                engine.generate_in_session(session, greedy(2)).map(|_| ())
+            },
+            "generate_in_session",
+        );
+        refuses(
+            &|engine| {
+                engine
+                    .generate_with_sampler(greedy(2), Box::new(crate::GreedySampler))
+                    .map(|_| ())
+            },
+            "generate_with_sampler",
+        );
+        refuses(
+            &|engine| {
+                let session = engine.create_session()?;
+                engine
+                    .drive_prioritized_requests(vec![crate::PrioritizedGenerateRequest {
+                        session_id: session,
+                        request: greedy(2),
+                        priority: onnx_genai_scheduler::Priority::Normal,
+                    }])
+                    .map(|_| ())
+            },
+            "drive_prioritized_requests",
+        );
+        refuses(
+            &|engine| {
+                engine
+                    .generate_batched_static(vec![greedy(2), greedy(2)])
+                    .map(|_| ())
+            },
+            "generate_batched_static",
+        );
+    }
+
+    /// No public constructor skips the workflow.
+    #[test]
+    fn every_constructor_presents_the_declared_workflow() -> anyhow::Result<()> {
+        for engine in [
+            Engine::from_dir(&decoder_package(), EngineConfig::default())?,
+            Engine::from_dir_with_session_options(
+                &decoder_package(),
+                EngineConfig::default(),
+                onnx_genai_ort::SessionOptions::default(),
+            )?,
+        ] {
+            assert_eq!(
+                engine.workflow_shape(),
+                crate::WorkflowShapeReport::SingleDecoder,
+                "a decoder package must always present its declared workflow"
+            );
+        }
+        Ok(())
+    }
+
+    /// A package whose declared end tokens are malformed fails loudly.
+    ///
+    /// Filtering them out would mean the package says "these tokens end me" and
+    /// the runtime silently keeps a subset — generation then runs past an end
+    /// token its author declared, which is invisible from the API.
+    #[test]
+    fn a_malformed_end_token_declaration_is_an_error() {
+        use onnx_genai_metadata::{LiteralValue, ScalarValue};
+        let error = super::literal_token_ids(&LiteralValue::Elements(vec![
+            ScalarValue::Integer(2),
+            ScalarValue::Integer(-1),
+        ]))
+        .expect_err("a negative token id is not a token id");
+        assert!(
+            format!("{error:#}").contains("not a valid token id"),
+            "{error:#}"
+        );
+
+        let error = super::literal_token_ids(&LiteralValue::Scalar(ScalarValue::String(
+            "eos".to_string(),
+        )))
+        .expect_err("a string is not a token id");
+        assert!(
+            format!("{error:#}").contains("must be integers"),
+            "{error:#}"
+        );
     }
 }
