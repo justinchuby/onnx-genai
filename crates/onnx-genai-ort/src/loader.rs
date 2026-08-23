@@ -1141,9 +1141,34 @@ mod tests {
         assert_eq!(paths, vec![binary]);
     }
 
+    /// A fixture that exists only to carry a non-dense graph output.
+    ///
+    /// These tests used to point at `tiny-glm52-qmoe-indexshare`, a real
+    /// end-to-end model fixture. #1832 regenerated it and `logits` became an
+    /// ordinary dense tensor, which deleted the premise both tests rest on
+    /// without either test mentioning the fixture's shape. A dedicated fixture
+    /// cannot be regenerated out from under them by unrelated model work.
     fn non_dense_logits_fixture() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/tiny-glm52-qmoe-indexshare/model.onnx.textproto")
+            .join("../../tests/fixtures/non-dense-graph-io/model.onnx.textproto")
+    }
+
+    /// Guards the premise of the two tests below: if this fails, they are
+    /// vacuous rather than wrong, and the fixture is what needs fixing.
+    #[test]
+    fn the_non_dense_fixture_really_does_declare_a_non_dense_output() {
+        let error = graph_io_from_model_path_for_names(
+            &non_dense_logits_fixture(),
+            &[],
+            &["logits".to_string()],
+        )
+        .expect_err("the fixture's `logits` must not be a dense tensor")
+        .to_string();
+
+        assert!(
+            error.contains("not a dense tensor type"),
+            "fixture no longer carries a non-dense `logits`: {error}"
+        );
     }
 
     #[test]
