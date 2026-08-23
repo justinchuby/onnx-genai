@@ -1,0 +1,130 @@
+# Minimal graph whose `logits` output is deliberately NOT a dense tensor.
+#
+# Owned by the `loader.rs` tests that exercise the two halves of the
+# selected-port contract in `graph_io_from_model_path_for_names`:
+#
+#   * a selected non-dense port must fail with a named type error, and
+#   * an *unrelated* non-dense port must never be parsed, so it cannot block
+#     otherwise-valid KV geometry.
+#
+# Both halves need a port that is genuinely non-dense. They previously borrowed
+# `tiny-glm52-qmoe-indexshare`, which is a real end-to-end decode fixture; when
+# #1832 regenerated it, `logits` became a dense f32 tensor. That turned one test
+# red and left its sibling green but vacuous -- there was no longer any
+# non-dense port for it to ignore. This fixture exists so that regenerating a
+# decode fixture cannot quietly delete the only input these tests depend on.
+#
+# Only `graph.input`, `graph.output` and `graph.initializer` are read by
+# `graph_io_from_model_path_filtered`, so there are deliberately no nodes:
+# nothing here needs to be runnable, and a node list would just be one more
+# thing for a future regeneration to churn.
+ir_version: 11
+producer_name: "onnx-genai-tests"
+producer_version: "0.1.0"
+graph {
+  name: "non_dense_logits"
+  input {
+    name: "past_key_values.0.key"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 2
+          }
+          dim {
+            dim_param: "past_sequence_len"
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "past_key_values.0.value"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 2
+          }
+          dim {
+            dim_param: "past_sequence_len"
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "logits"
+    type {
+      sequence_type {
+        elem_type {
+          tensor_type {
+            elem_type: 1
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "present.0.key"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 2
+          }
+          dim {
+            dim_param: "total_sequence_len"
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "present.0.value"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 2
+          }
+          dim {
+            dim_param: "total_sequence_len"
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 21
+}

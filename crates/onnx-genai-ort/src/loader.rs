@@ -1141,9 +1141,36 @@ mod tests {
         assert_eq!(paths, vec![binary]);
     }
 
+    /// A graph whose `logits` output is deliberately non-dense.
+    ///
+    /// Dedicated to these tests rather than borrowed from a decode fixture.
+    /// The previous fixture, `tiny-glm52-qmoe-indexshare`, is a real
+    /// end-to-end model; #1832 regenerated it and `logits` became a dense f32
+    /// tensor. That reddened `selected_non_dense_candidate_fails_explicitly`
+    /// and, worse, left `selected_dense_kv_ignores_unrelated_non_dense_logits`
+    /// green while there was no longer anything non-dense for it to ignore.
     fn non_dense_logits_fixture() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/tiny-glm52-qmoe-indexshare/model.onnx.textproto")
+            .join("../../tests/fixtures/non-dense-logits/model.onnx.textproto")
+    }
+
+    /// The premise both non-dense tests rest on, asserted rather than assumed.
+    ///
+    /// Neither sibling can detect this on its own: if `logits` becomes dense,
+    /// the "ignores unrelated" test still passes, because a fixture with no
+    /// non-dense port trivially fails to be blocked by one. This asserts the
+    /// fixture is still adversarial, so the vacuity is loud instead of silent.
+    #[test]
+    fn the_non_dense_fixture_is_actually_non_dense() {
+        let error = graph_io_from_model_path(&non_dense_logits_fixture())
+            .expect_err("the fixture's whole purpose is to contain a non-dense port")
+            .to_string();
+
+        assert!(
+            error.contains("graph I/O 'logits' is not a dense tensor type"),
+            "fixture no longer has a non-dense `logits`; the tests that depend \
+             on it are now vacuous. Restore it rather than relaxing this. Got: {error}"
+        );
     }
 
     #[test]
