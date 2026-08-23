@@ -181,13 +181,28 @@ pub(crate) struct WorkflowRuntime {
     /// run months later, attributed to anything but the line that caused it.
     /// Counting the transfers makes it a property a test can hold.
     host_staging_count: std::cell::Cell<u64>,
+    /// Bytes this runtime read back out of device memory deliberately.
+    ///
+    /// The counter above says *how many times* a whole tensor came down; this
+    /// one says how much came down on the one path that is allowed to bring
+    /// anything down at all — the token id a device argmax produces. Four bytes
+    /// per row is the budget, and stating it as a number is what stops "only
+    /// the token ids" from quietly becoming "the token ids and one small
+    /// tensor".
+    device_readback_bytes: std::cell::Cell<u64>,
     /// Embedding tables read out of a component's artifact, cached for the
-    /// runtime's life.
+    /// runtime's life, keyed by `(component, table, residency)`.
     ///
     /// Re-reading a `[vocab, hidden]` initializer off disk once per proposal is
     /// pure waste — the file cannot change under a loaded package — and at real
-    /// vocabularies it is the dominant cost of starting a proposal.
-    embedding_tables: RefCell<HashMap<(String, String), std::rc::Rc<speculative::EmbeddingTable>>>,
+    /// vocabularies it is the dominant cost of starting a proposal. The
+    /// residency is part of the key because a device mirror and the host copy
+    /// it was uploaded from are different tensors answering the same question,
+    /// and the mirror must be uploaded once, not once per draft token.
+    embedding_tables:
+        RefCell<HashMap<(String, String, i32), std::rc::Rc<speculative::EmbeddingTable>>>,
+    /// How many times an embedding table was read out of an artifact.
+    embedding_table_loads: std::cell::Cell<u64>,
     /// Nodes this runtime executed through a declared contract, by contract id.
     ///
     /// Selection of an algorithmic executor is supposed to come from what the
@@ -394,7 +409,9 @@ impl WorkflowRuntime {
             workflow_execution_generation: Cell::new(0),
             workflow_session_state: RefCell::new(HashMap::new()),
             host_staging_count: std::cell::Cell::new(0),
+            device_readback_bytes: std::cell::Cell::new(0),
             embedding_tables: RefCell::new(HashMap::new()),
+            embedding_table_loads: std::cell::Cell::new(0),
             contract_executions: RefCell::new(std::collections::BTreeMap::new()),
             adapter_service: None,
             adapter_cache: RefCell::new(adapters::AdapterCache::default()),
@@ -744,7 +761,9 @@ impl WorkflowRuntime {
                 workflow_execution_generation: Cell::new(0),
                 workflow_session_state: RefCell::new(HashMap::new()),
                 host_staging_count: std::cell::Cell::new(0),
+                device_readback_bytes: std::cell::Cell::new(0),
                 embedding_tables: RefCell::new(HashMap::new()),
+                embedding_table_loads: std::cell::Cell::new(0),
                 contract_executions: RefCell::new(std::collections::BTreeMap::new()),
                 adapter_service: directory.adapters,
                 adapter_cache: RefCell::new(adapters::AdapterCache::default()),
@@ -786,6 +805,28 @@ impl WorkflowRuntime {
             .map(|set| set.borrow().device_residency_counts())
     }
 
+    /// Where a declared component will execute its tensors.
+    ///
+    /// Placement is configured, not discovered: the native backend is built for
+    /// a resolved device, and every component it holds a session for runs
+    /// there. An interpreter construct that has to *build* a tensor for a
+    /// component — a speculative chain's fused proposer input — can therefore
+    /// build it in the right memory the first time, instead of assembling it on
+    /// the host and letting the binding upload it once per draft token.
+    ///
+    /// Anything else — the ORT backend, or a native CPU device — is host, which
+    /// is what keeps a CPU or ORT run byte-identical to what it was.
+    pub(crate) fn component_execution_residency(&self) -> device_ops::Residency {
+        #[cfg(feature = "native-backend")]
+        if let Some(components) = self.native_components.as_ref()
+            && let Some(ordinal) = components.borrow().cuda_ordinal()
+            && let Ok(device) = i32::try_from(ordinal)
+        {
+            return device_ops::Residency::Cuda(device);
+        }
+        device_ops::Residency::Host
+    }
+
     /// The workflow this runtime executes.
     pub(crate) fn workflow_spec(&self) -> &onnx_genai_metadata::WorkflowSpec {
         &self.workflow
@@ -794,6 +835,11 @@ impl WorkflowRuntime {
     /// How many device→host materializations this runtime has performed.
     pub fn host_staging_count(&self) -> u64 {
         self.host_staging_count.get()
+    }
+
+    /// How many bytes this runtime has deliberately read back off a device.
+    pub fn device_readback_bytes(&self) -> u64 {
+        self.device_readback_bytes.get()
     }
 
     /// How many nodes this runtime executed per declared contract.

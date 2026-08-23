@@ -262,6 +262,30 @@ that constructs and runs a canonical workflow.
     step's single position, derived from the declared port contracts — so a
     borrowed-KV drafter's `kv_sequence`-keyed mask is untouched while its
     `sequence`-keyed position ids are narrowed.
+  * Every tensor the chain touches stays in the residency that produced it.
+    `pipeline/device_ops.rs` is the backend-neutral seam that makes that
+    expressible: `slice_axis` (with `last_along_axis` / `truncate_axis` as its
+    two windows), `gather_rows`, `scatter_into_last_axis`, `zeros`, `argmax_rows`
+    and the single sanctioned crossing, `adopt`. A host implementation and a CUDA
+    implementation answer the same questions, and a value with no implementation
+    for where it lives is an error naming both remedies — never a quiet copy to
+    the host. A rejection therefore truncates the declared KV cells *on the
+    device* (the transfer that used to dominate the workflow: the whole cache
+    down and back, per rejection), a step's `concat(embed(token), carry)` is
+    gathered and scattered into one device buffer allocated once per proposal,
+    and a draft token costs a four-byte argmax read-back instead of a
+    vocabulary-wide download. The declared embedding table is read out of the
+    artifact once and mirrored into the chain's residency once, for the
+    runtime's life.
+  * The chain's residency is where the proposer *executes*
+    (`WorkflowRuntime::component_execution_residency`), which is configured
+    rather than discovered, so the fused input is built in the right memory from
+    the first step. `invoke_component_values` takes the symbols a proposer's
+    outputs declare and its inputs do not — a vocabulary, above all — proven
+    from the workflow's own bound values, because an output whose shape cannot
+    be resolved has no device buffer sized for it and comes back through host
+    memory. A hint contradicting an input's actual extent is a validation
+    error, not an override.
 
   Deleted with it (Rule 3, no facade): `SpeculativeMode::SharedKv`,
   `SharedKvProposerConfig`, `SharedKvBinding`,
@@ -289,7 +313,18 @@ that constructs and runs a canonical workflow.
   Proven by `gemma4_chained_workflow` (8 cases) and
   `native_workflow_parity::chained_speculative_proposal_parity{,_native_cuda}` —
   identical proposals, identical accept/reject/rollback paths, and identical
-  tokens on ORT, native-CPU, and device-resident native-CUDA (H200).
+  tokens on ORT, native-CPU, and device-resident native-CUDA (H200) — and, for
+  *where* the work happened,
+  `native_workflow_parity::chained_proposal_stays_device_resident_native_cuda`:
+  zero device→host materializations across a full speculative decode, exactly
+  four bytes read back per proposer invocation, and every rolled-back state cell
+  still resident on its own device at the truncated length.
+  `repeated_proposals_do_not_retain_device_memory_native_cuda` holds free device
+  memory flat across a hundred proposals, which is what proves the aliases a
+  step holds release the buffers they borrow.
+  `device_ops::cuda_tests` is the differential layer beneath both: every device
+  slice, gather, scatter, argmax (ties and NaN included) and adoption must equal
+  what the host implementation produces, element for element.
 
 - **Phase 1b — autoregressive decode beneath the interpreter — LANDED.**
   The decode loop no longer hard-codes its own iteration: `pipeline/generation.rs`

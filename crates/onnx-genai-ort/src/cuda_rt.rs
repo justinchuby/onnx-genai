@@ -44,6 +44,8 @@ type CudaDeviceSynchronizeFn = unsafe extern "C" fn() -> i32;
 type CudaSetDeviceFn = unsafe extern "C" fn(i32) -> i32;
 type CudaGetDeviceFn = unsafe extern "C" fn(*mut i32) -> i32;
 type CudaMemGetInfoFn = unsafe extern "C" fn(*mut usize, *mut usize) -> i32;
+type CudaMallocFn = unsafe extern "C" fn(*mut *mut c_void, usize) -> i32;
+type CudaFreeFn = unsafe extern "C" fn(*mut c_void) -> i32;
 
 struct CudaRt {
     // Kept alive so the resolved function pointers remain valid; never called
@@ -56,6 +58,8 @@ struct CudaRt {
     set_device: CudaSetDeviceFn,
     get_device: CudaGetDeviceFn,
     mem_get_info: CudaMemGetInfoFn,
+    malloc: CudaMallocFn,
+    free: CudaFreeFn,
 }
 
 // SAFETY: the resolved `cudart` entry points are plain C functions that are
@@ -93,6 +97,8 @@ fn load() -> std::result::Result<CudaRt, String> {
         let set_device = unsafe { lib.get::<CudaSetDeviceFn>(b"cudaSetDevice\0") };
         let get_device = unsafe { lib.get::<CudaGetDeviceFn>(b"cudaGetDevice\0") };
         let mem_get_info = unsafe { lib.get::<CudaMemGetInfoFn>(b"cudaMemGetInfo\0") };
+        let malloc = unsafe { lib.get::<CudaMallocFn>(b"cudaMalloc\0") };
+        let free = unsafe { lib.get::<CudaFreeFn>(b"cudaFree\0") };
         match (
             memcpy,
             memcpy_async,
@@ -101,6 +107,8 @@ fn load() -> std::result::Result<CudaRt, String> {
             set_device,
             get_device,
             mem_get_info,
+            malloc,
+            free,
         ) {
             (
                 Ok(memcpy),
@@ -110,6 +118,8 @@ fn load() -> std::result::Result<CudaRt, String> {
                 Ok(set_device),
                 Ok(get_device),
                 Ok(mem_get_info),
+                Ok(malloc),
+                Ok(free),
             ) => {
                 // Copy the function pointers out before `lib` is moved into the
                 // struct; the borrows on `lib` end here.
@@ -120,6 +130,8 @@ fn load() -> std::result::Result<CudaRt, String> {
                 let set_device = *set_device;
                 let get_device = *get_device;
                 let mem_get_info = *mem_get_info;
+                let malloc = *malloc;
+                let free = *free;
                 return Ok(CudaRt {
                     _lib: lib,
                     memcpy,
@@ -129,11 +141,13 @@ fn load() -> std::result::Result<CudaRt, String> {
                     set_device,
                     get_device,
                     mem_get_info,
+                    malloc,
+                    free,
                 });
             }
             _ => {
                 last_err = format!(
-                    "{name}: missing cudaMemcpy/cudaMemcpyAsync/cudaMemset/cudaDeviceSynchronize/cudaSetDevice/cudaGetDevice/cudaMemGetInfo symbol"
+                    "{name}: missing cudaMemcpy/cudaMemcpyAsync/cudaMemset/cudaDeviceSynchronize/cudaSetDevice/cudaGetDevice/cudaMemGetInfo/cudaMalloc/cudaFree symbol"
                 );
             }
         }
@@ -256,6 +270,99 @@ impl Drop for DeviceGuard {
             // is best-effort (the process is likely already erroring out) so the
             // return code is intentionally ignored.
             let _ = unsafe { (rt.set_device)(self.prev) };
+        }
+    }
+}
+
+/// A device allocation this process owns, freed when the guard drops.
+///
+/// The address is a plain `usize` so it can be handed to
+/// [`crate::Value::from_external_memory_with_owner`] as a raw pointer while the
+/// guard travels with the value that borrows it: the allocation outlives every
+/// view derived from it, which is the property a device-resident slice depends
+/// on. Dropping the guard is the *only* way the memory is released, so there is
+/// no path where a live tensor points at freed device memory.
+#[derive(Debug)]
+pub struct CudaAllocation {
+    device_ptr: usize,
+    bytes: usize,
+    device_id: i32,
+}
+
+// SAFETY: the guard owns nothing but a device address and the ordinal it was
+// allocated on. `cudaFree` is callable from any thread once the owning device is
+// current, which `Drop` makes it.
+unsafe impl Send for CudaAllocation {}
+unsafe impl Sync for CudaAllocation {}
+
+impl CudaAllocation {
+    /// Allocate `bytes` of device memory on `device_id`.
+    ///
+    /// A zero-byte request is rejected rather than served with a null pointer:
+    /// every caller here is building a tensor, and a tensor with no allocation
+    /// has no address to publish.
+    pub fn new(device_id: i32, bytes: usize) -> Result<Self> {
+        if bytes == 0 {
+            return Err(OrtError::InvalidArgument(
+                "cannot allocate a zero-byte CUDA buffer; a tensor with no elements has no device \
+                 address to publish"
+                    .to_string(),
+            ));
+        }
+        let _guard = DeviceGuard::set(device_id)?;
+        let rt = runtime()?;
+        let mut device_ptr: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `device_ptr` is a valid out-parameter and `cudaMalloc` matches
+        // the `cudart` ABI; it allocates on the device `DeviceGuard` made
+        // current.
+        let code = unsafe { (rt.malloc)(&mut device_ptr, bytes) };
+        if code != 0 {
+            return Err(OrtError::InvalidArgument(format!(
+                "cudaMalloc({bytes} bytes) on CUDA device {device_id} failed with CUDA error code \
+                 {code}; the device may be out of memory"
+            )));
+        }
+        if device_ptr.is_null() {
+            return Err(OrtError::InvalidArgument(format!(
+                "cudaMalloc({bytes} bytes) on CUDA device {device_id} reported success but \
+                 returned a null device pointer"
+            )));
+        }
+        Ok(Self {
+            device_ptr: device_ptr as usize,
+            bytes,
+            device_id,
+        })
+    }
+
+    /// The device address of the allocation.
+    pub fn device_ptr(&self) -> usize {
+        self.device_ptr
+    }
+
+    /// How many bytes the allocation holds.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// The CUDA device the allocation lives on.
+    pub fn device_id(&self) -> i32 {
+        self.device_id
+    }
+}
+
+impl Drop for CudaAllocation {
+    fn drop(&mut self) {
+        // Freeing on the wrong current device is a CUDA error, so pin first; a
+        // failure here is best-effort (the process is already unwinding or
+        // shutting down) and would have nowhere to be reported.
+        let Ok(_guard) = DeviceGuard::set(self.device_id) else {
+            return;
+        };
+        if let Ok(rt) = runtime() {
+            // SAFETY: `device_ptr` came from `cudaMalloc` on this device and has
+            // not been freed; `cudaFree` matches the `cudart` ABI.
+            let _ = unsafe { (rt.free)(self.device_ptr as *mut c_void) };
         }
     }
 }

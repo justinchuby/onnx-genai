@@ -1938,11 +1938,21 @@ impl WorkflowRuntime {
     /// seam is what makes those constructs backend-neutral: ORT and native both
     /// run through the identical path, with no second "invoke a component"
     /// implementation to keep in sync.
+    ///
+    /// `symbol_hints` binds shape symbols the caller has already proven for
+    /// this component but that none of the inputs it is binding carry — a
+    /// vocabulary an output declares and no input mentions, above all. Without
+    /// them such an output has no resolvable shape, so no device buffer can be
+    /// sized for it and the run has to hand it back through host memory: a
+    /// per-invocation download of the very tensor the caller then wants scored
+    /// on the device. A hint that contradicts an input's actual extent is a
+    /// validation error, not a silent override, so a wrong hint fails closed.
     pub(crate) fn invoke_component_values(
         &self,
         component: &str,
         inputs: &[(&str, &Value)],
         outputs: &std::collections::BTreeMap<String, String>,
+        symbol_hints: &HashMap<String, i64>,
     ) -> anyhow::Result<Vec<(String, Value)>> {
         let workflow = &self.workflow;
         let declaration = workflow
@@ -1956,7 +1966,7 @@ impl WorkflowRuntime {
             ),
             "workflow component '{component}' is not an ONNX component"
         );
-        let mut component_symbols = HashMap::new();
+        let mut component_symbols = symbol_hints.clone();
         let component_dynamic_symbols = std::collections::HashSet::new();
         for (port, value) in inputs {
             if let Some(contract) = declaration.ports.inputs.get(*port) {
@@ -1997,16 +2007,6 @@ impl WorkflowRuntime {
             }
         }
         Ok(produced)
-    }
-
-    /// Copy a possibly device-resident value into host memory.
-    ///
-    /// Interpreter constructs that must read tensor bytes (a proposal loop's
-    /// argmax, a folded carry it re-packs into the next fused input) go through
-    /// here so a native-CUDA run stays correct without the caller knowing where
-    /// the value lives.
-    pub(crate) fn host_copy_of(&self, value: &Value) -> anyhow::Result<Value> {
-        self.materialize_workflow_value_copy(value)
     }
 
     /// Backend-neutral execution seam for a declared ONNX component.

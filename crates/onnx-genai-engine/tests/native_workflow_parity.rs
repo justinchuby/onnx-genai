@@ -840,30 +840,35 @@ fn assert_chained_parity(
     // and be invisible to every assertion above — which is exactly why the
     // per-token transfers were there to begin with.
     let native_staging_before = native.engine().host_staging_count();
+    let native_readback_before = native.engine().device_readback_bytes();
     let (ort_tokens, ort_tally) = ort.speculative_decode(8, 4)?;
     let (native_tokens, native_tally) = native.speculative_decode(8, 4)?;
-    // A ratchet, not a zero, and the difference is the honest part.
+    // Zero, and the zero is the point.
     //
-    // Two sites still cross the bus per proposal: the folded carry seed
-    // (`folded_carry_seed`, once per proposal) and the folded carry itself
-    // (`folded_carry_output`, once per draft token). Both exist because the
-    // fused proposer input is assembled on the host — `concat(embed(token),
-    // carry)` — so the carry has to come down to be concatenated and the whole
-    // fused input goes back up. Removing them needs the fused input to be
-    // built in device memory, which is a device-side scatter this seam does not
-    // yet have and which would be wrong to fake with a staging copy.
-    //
-    // What this number does is stop the count *growing*. The two sites are
-    // named, so a third one is a failing assertion rather than a slow run
-    // nobody attributes; and when the fused input moves onto the device this
-    // becomes zero and the assertion says so.
-    const KNOWN_FOLDED_CARRY_STAGING: u64 = 16;
+    // Every tensor a proposal step touches — the borrowed read-only shared KV,
+    // the folded carry seed, the per-step carry, the gathered embedding row,
+    // the fused input they are written into, the logits, and the rolled-back
+    // state — is narrowed, gathered, assembled, scored and truncated where it
+    // already is. Nothing is materialized on the host, so a reintroduced copy
+    // is a failing assertion rather than a slow run nobody attributes.
     let staged = native.engine().host_staging_count() - native_staging_before;
+    assert_eq!(
+        staged, 0,
+        "the proposal chain performed {staged} device→host materializations; every tensor it \
+         touches is supposed to be narrowed, gathered, assembled and scored where it already is"
+    );
+    // The one sanctioned transfer, stated as a budget rather than a hope: four
+    // bytes per proposer invocation, which is the token id the device argmax
+    // produced. `proposer_invocations` counts both backends' identical chains,
+    // so the native half is exactly half the tally.
+    let readback = native.engine().device_readback_bytes() - native_readback_before;
+    let token_id_bytes = (native_tally.proposer_invocations * std::mem::size_of::<u32>()) as u64;
     assert!(
-        staged <= KNOWN_FOLDED_CARRY_STAGING,
-        "the proposal chain performed {staged} device→host materializations, above the \
-         {KNOWN_FOLDED_CARRY_STAGING} the host-assembled fused input still requires; a new one \
-         has been introduced"
+        readback <= token_id_bytes,
+        "the proposal chain read {readback} bytes back off the device, above the \
+         {token_id_bytes} its {} token ids account for; something other than a token id is \
+         crossing the bus",
+        native_tally.proposer_invocations
     );
     assert_eq!(
         ort_tokens, native_tokens,
@@ -890,6 +895,147 @@ fn assert_chained_parity(
     assert!(
         native.engine().native_component_run_count().unwrap_or(0) > 0,
         "the native run must have executed native component sessions, not fallen back to ORT"
+    );
+    // The table is a package artifact, so it is read once for the runtime's
+    // life however many rounds the decode takes.
+    for engine in [ort.engine(), native.engine()] {
+        assert_eq!(
+            engine.embedding_table_loads(),
+            1,
+            "the declared embedding table must be read out of the artifact exactly once"
+        );
+    }
+    Ok(())
+}
+
+/// Every tensor of a chained proposal stays on the device that produced it.
+///
+/// The parity case above proves the *tokens* are the same; this proves *where*
+/// they were computed, which no token comparison can see. A chain that narrowed
+/// a borrowed KV binding by copying it down, argmaxed a logits row on the host,
+/// assembled `concat(embed(token), carry)` in host memory, or rolled a rejected
+/// proposal back through a full KV download would produce byte-identical output
+/// and be invisible to every assertion in `assert_chained_parity`.
+///
+/// The three claims are stated as numbers rather than as an absence:
+///
+/// * no device→host materialization at all;
+/// * exactly four bytes back per proposer invocation — the token id the device
+///   argmax produced, and nothing else;
+/// * every rolled-back state cell still resident on the device it was written
+///   on, at the truncated length.
+#[cfg(feature = "native-cuda")]
+#[test]
+fn chained_proposal_stays_device_resident_native_cuda() -> anyhow::Result<()> {
+    let root = chained::fixture_root();
+    let mut native = chained::ChainedFixture::new(native_cuda_engine(&root)?)?;
+
+    let staging_before = native.engine().host_staging_count();
+    let readback_before = native.engine().device_readback_bytes();
+    let (_, outputs_before) = native
+        .engine()
+        .native_device_residency_counts()
+        .expect("the native backend exposes device-residency counts");
+    let (committed, tally) = native.speculative_decode(8, 4)?;
+    assert!(!committed.is_empty(), "the decode must commit tokens");
+    assert!(
+        tally.rejections > 0 && tally.rolled_back_cells > 0,
+        "the case must exercise rejection and rollback: {tally:?}"
+    );
+
+    assert_eq!(
+        native.engine().host_staging_count() - staging_before,
+        0,
+        "the proposal chain materialized a device tensor on the host"
+    );
+    let readback = native.engine().device_readback_bytes() - readback_before;
+    let token_id_bytes = (tally.proposer_invocations * std::mem::size_of::<u32>()) as u64;
+    assert_eq!(
+        readback,
+        token_id_bytes,
+        "the chain read {readback} bytes back off the device; a device-resident chain reads back \
+         exactly one {}-byte token id per proposer invocation, and it made {} of them",
+        std::mem::size_of::<u32>(),
+        tally.proposer_invocations
+    );
+
+    // The proposer's own outputs stayed on the device. A chain whose logits and
+    // folded carry came back through host memory would still argmax correctly
+    // and still tally identically — it would just pay a download per draft
+    // token, which is precisely the cost this is here to detect.
+    let (_, outputs_after) = native
+        .engine()
+        .native_device_residency_counts()
+        .expect("the native backend exposes device-residency counts");
+    let proposer_outputs = 2 * tally.proposer_invocations as u64;
+    assert!(
+        outputs_after - outputs_before >= proposer_outputs,
+        "the chain published {} device-resident outputs across {} proposer invocations; each one \
+         produces a logits row and a folded carry, so at least {proposer_outputs} of them must \
+         have stayed on the device",
+        outputs_after - outputs_before,
+        tally.proposer_invocations
+    );
+
+    // A rejection rolls the declared state back where it lives. The cells are
+    // `[batch, heads, sequence, head_dim]`, so the kept prefix is strided —
+    // the case that used to download the whole cache and upload it again.
+    let block = vec![committed[0]; 3];
+    let mut state = native.verification_state(&block)?;
+    let length = chained::PROMPT_TOKENS.len() + 1;
+    native
+        .engine()
+        .rollback_speculative_state(&mut state, length)?;
+    assert!(!state.is_empty(), "the package must declare rollback state");
+    for (cell, value) in &state {
+        assert!(
+            !value.is_host_resident()?,
+            "rolled-back state cell '{cell}' came back host-resident"
+        );
+        assert_eq!(
+            value.device_id()?,
+            0,
+            "rolled-back state cell '{cell}' moved off the device it was written on"
+        );
+        assert_eq!(
+            value.shape()[2] as usize,
+            length,
+            "rolled-back state cell '{cell}' kept the wrong number of positions"
+        );
+    }
+    Ok(())
+}
+
+/// A thousand proposals hold no device memory.
+///
+/// Every step of a device-resident chain allocates: a gathered embedding row, a
+/// narrowed carry aliasing the proposer's output binding, a truncated state
+/// cell. Each of those keeps its owner alive exactly as long as it is used, and
+/// the proof that the ownership is right is that free device memory comes back
+/// to where it started rather than drifting down — which a leak of one binding
+/// per draft token would not.
+#[cfg(feature = "native-cuda")]
+#[test]
+fn repeated_proposals_do_not_retain_device_memory_native_cuda() -> anyhow::Result<()> {
+    let root = chained::fixture_root();
+    let mut native = chained::ChainedFixture::new(native_cuda_engine(&root)?)?;
+
+    // Warm up: the first rounds allocate the session's arena, the embedding
+    // table's device mirror, and the fused input buffer, none of which are
+    // per-proposal.
+    for _ in 0..8 {
+        native.propose(chained::PROMPT_TOKENS, 4)?;
+    }
+    let settled = onnx_genai_ort::cuda_rt::device_memory_info(0)?.free_bytes;
+    for _ in 0..100 {
+        native.propose(chained::PROMPT_TOKENS, 4)?;
+    }
+    let after = onnx_genai_ort::cuda_rt::device_memory_info(0)?.free_bytes;
+    assert!(
+        after >= settled,
+        "100 proposals retained {} bytes of device memory that the first eight did not; an alias \
+         is outliving the buffer it borrows",
+        settled - after
     );
     Ok(())
 }
