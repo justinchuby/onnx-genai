@@ -161,9 +161,14 @@ die() {
 # Start time (field 22) of a pid, robust to a comm containing spaces or
 # parentheses: everything up to and including the last ')' is dropped, which
 # removes fields 1 and 2, so field 22 becomes field 20 of the remainder.
+# NOTE the 2>/dev/null precedes the input redirection. Bash performs
+# redirections left to right, so with the usual `<file 2>/dev/null` ordering
+# the "No such file or directory" for a departed pid is emitted BEFORE stderr
+# is silenced -- which put two lines of shell noise in front of every `status`
+# on a stale lock, and in front of anything parsing it.
 proc_start_time() {
     local pid=$1 rest
-    rest=$(tr -d '\0' <"/proc/${pid}/stat" 2>/dev/null | sed 's/.*) //') || return 1
+    rest=$(tr -d '\0' 2>/dev/null <"/proc/${pid}/stat" | sed 's/.*) //') || return 1
     [ -n "$rest" ] || return 1
     awk '{print $20}' <<<"$rest"
 }
@@ -173,7 +178,7 @@ proc_start_time() {
 # open between them and cannot disagree about which process they describe.
 proc_state_and_start() {
     local pid=$1 rest
-    rest=$(tr -d '\0' <"/proc/${pid}/stat" 2>/dev/null | sed 's/.*) //') || return 1
+    rest=$(tr -d '\0' 2>/dev/null <"/proc/${pid}/stat" | sed 's/.*) //') || return 1
     [ -n "$rest" ] || return 1
     awk '{print $1, $20}' <<<"$rest"
 }
@@ -230,39 +235,58 @@ meta_set() {
 }
 
 # 0 if the recorded anchor process is still running, 1 otherwise.
+# True when a pid names a process that is genuinely still running.
+#
+# A SIGKILLed process whose parent has not wait()ed for it is a ZOMBIE:
+# /proc/<pid> still exists and its start time still matches, so a liveness
+# check built from those two facts alone reports HELD on a corpse forever.
+# That is worst on the `run` path, which sets ttl=0 on the reasoning that its
+# own pid is exact -- exact, and still resolving, to a dead process. Every
+# agent harness here launches long commands without an immediate wait(), so
+# this is the common shape, not the exotic one.
+#
+# But state Z is NOT proof of death. When a thread-group leader exits via
+# pthread_exit() while other threads keep running, /proc/<tgid>/stat reports Z
+# for a fully live process (`ps` shows `Zl ... <defunct>`). Treating that as
+# dead reaps a LIVE holder mid-benchmark, which is the worse of the two errors
+# by a wide margin. Threads: is signal->nr_threads -- non-reaped tasks in the
+# group -- so a true zombie reads 1 and a live leader reads more. If status
+# cannot be read, or reads as something that is not a number, we have no
+# evidence of death and the process is treated as alive: there is deliberately
+# no numeric default here, because a default is a constant nothing tests.
+pid_is_live() {
+    local pid=$1 info state threads
+    [ -n "$pid" ] || return 1
+    info=$(proc_state_and_start "$pid") || return 1
+    state=${info%% *}
+    [ "$state" = Z ] || return 0
+    threads=$(awk '/^Threads:/ { print $2; exit }' "/proc/${pid}/status" 2>/dev/null)
+    case "$threads" in
+        '' | *[!0-9]*) return 0 ;;
+        *) [ "$threads" -gt 1 ] ;;
+    esac
+}
+
+# True when the lock's anchor is running but the lock cannot be VERIFIED,
+# because it carries no start_time. Kept separate from holder_alive: for a
+# lock that does have a start_time, a live pid with the wrong one is a
+# recycled pid and must NOT count as alive.
+unverifiable_live_anchor() {
+    local a s
+    a=$(meta_get anchor_pid) || return 1
+    s=$(meta_get start_time) || s=""
+    [ -n "$a" ] && [ -z "$s" ] || return 1
+    pid_is_live "$a"
+}
+
 holder_alive() {
-    local pid start info state now
+    local pid start info now
     pid=$(meta_get anchor_pid) || return 1
     start=$(meta_get start_time) || return 1
     [ -n "$pid" ] && [ -n "$start" ] || return 1
+    pid_is_live "$pid" || return 1
     info=$(proc_state_and_start "$pid") || return 1
-    state=${info%% *}
     now=${info##* }
-    # A SIGKILLed process whose parent has not wait()ed for it is a ZOMBIE:
-    # /proc/<pid> still exists and the start time still matches, so both of
-    # the checks below pass on a corpse and the lock is reported HELD
-    # forever. That is the exact failure this design promises to survive, and
-    # it is worst on the `run` path, which sets ttl=0 on the reasoning that
-    # its own pid is exact -- exact, and still resolving, to a dead process.
-    # Every agent harness here launches long commands without an immediate
-    # wait(), so this is the common shape, not the exotic one.
-    #
-    # But state Z is NOT proof of death. When a thread-group leader exits via
-    # pthread_exit() while other threads keep running, /proc/<tgid>/stat
-    # reports Z for a fully live process (`ps` shows `Zl ... <defunct>`).
-    # Treating that as dead reaps a LIVE holder mid-benchmark, which is the
-    # worse of the two errors by a wide margin. Threads: is signal->nr_threads
-    # -- non-reaped tasks in the group -- so a true zombie reads 1 and a live
-    # leader reads more. If status cannot be read at all we have no evidence
-    # of death, so the lock stands: there is deliberately no numeric default
-    # here, because a default is a constant nothing tests.
-    if [ "$state" = Z ]; then
-        local threads
-        threads=$(awk '/^Threads:/ { print $2; exit }' "/proc/${pid}/status" 2>/dev/null)
-        if [ -n "$threads" ] && [ "$threads" -le 1 ]; then
-            return 1
-        fi
-    fi
     # A recycled pid has a different start time, so this is not just "does
     # some process with this number exist".
     [ "$now" = "$start" ]
@@ -286,17 +310,20 @@ holder_expired() {
 
 # 0 if the lock is reapable: its anchor died, or it outlived its TTL.
 #
-# A lock with no readable metadata is NOT evidence of a dead holder -- it is
-# most likely a lock from an older or newer version of this script, or one
-# being written by a peer. Refuse to reap it until it is clearly abandoned,
-# so that an unparseable lock degrades to "busy" rather than "free".
+# A lock with no readable metadata is NOT evidence of a dead holder. The
+# reachable cause is a lock caught MID-WRITE by a peer, or one damaged on
+# disk; a future version that stops writing a field would be another. It is
+# not a past version: start_time has been written by every revision since
+# this script landed, so no release has ever produced an anchor without one.
+# Refuse to reap such a lock until it is clearly abandoned, so that an
+# unparseable lock degrades to "busy" rather than "free".
 reapable() {
     # "Cannot verify liveness" must not be treated as "the holder is dead".
     # The grace below used to apply only to a ZERO-BYTE meta, so a lock with
-    # content but no readable anchor_pid/start_time -- which is precisely the
-    # older-or-newer-version case the comment above names -- skipped it,
-    # fell through to `! holder_alive`, and had a LIVE holder's box stolen
-    # out from under it. The protection did not cover its own rationale.
+    # content but no readable anchor_pid/start_time -- a lock caught mid-write
+    # being the reachable way to get one -- skipped it, fell through to
+    # `! holder_alive`, and had a LIVE holder's box stolen out from under it.
+    # The protection did not cover its own rationale.
     local a s
     a=$(meta_get anchor_pid) || a=""
     s=$(meta_get start_time) || s=""
@@ -306,14 +333,18 @@ reapable() {
     # must not apply. The grace is 300s and the runs it protects are 40
     # minutes, so routing a live-but-unverifiable holder through it does not
     # prevent the theft, it schedules it.
-    if [ -n "$a" ] && [ -z "$s" ] && [ -d "/proc/${a}" ]; then
+    # Note the predicate is unverifiable_live_anchor and not `[ -d /proc/$a ]`:
+    # a ZOMBIE anchor passes the directory test, and with ttl=0 -- the `run`
+    # path's default -- holder_expired is never true, so a corpse would hold
+    # the box forever with the bounding grace disabled on its behalf. A dead
+    # anchor therefore falls through to the clock, which is what bounds it.
+    if unverifiable_live_anchor; then
         # ...but do not void the holder's OWN declared expiry while doing it.
         # Returning unconditionally here replaced a bounded wedge with an
         # unbounded one: a lock with a live anchor and no readable start_time
-        # would outlive any ttl forever, `wait` would block on a lock everyone
-        # agrees has expired, and EXPIRED would be unreachable for that whole
-        # class. The anti-theft property only needs the CLOCK-BASED grace
-        # disabled, not the expiry the holder asked for.
+        # would outlive any ttl forever and `wait` would block on a lock
+        # everyone agrees has expired. The anti-theft property only needs the
+        # CLOCK-BASED grace disabled, not the expiry the holder asked for.
         holder_expired
         return $?
     fi
@@ -359,7 +390,7 @@ reap_if_dead() {
         local pid owner
         pid=$(meta_get anchor_pid 2>/dev/null || echo '?')
         owner=$(meta_get owner 2>/dev/null || echo '?')
-        if holder_alive; then
+        if holder_alive || unverifiable_live_anchor; then
             echo "hostlock: WARNING taking over a lock held by ${owner} (pid ${pid}, still alive) after its $(meta_get ttl)s TTL expired" >&2
             echo "hostlock: WARNING if ${owner} is still benchmarking, both sets of numbers are now suspect" >&2
         else
@@ -436,7 +467,11 @@ publish_lock() {
 # they take it. Report what the tool will actually do.
 lock_state() {
     [ -d "$LOCK_DIR" ] || { echo FREE; return 0; }
-    if holder_alive; then
+    # unverifiable_live_anchor is the class this tool cannot verify but can
+    # SEE running. Routing it through the STALE arm made `status` say "is
+    # gone" about a pid the reaper had just confirmed present -- the same
+    # false-abandonment message the HELD and EXPIRED arms were fixed for.
+    if holder_alive || unverifiable_live_anchor; then
         if holder_expired; then echo EXPIRED; else echo HELD; fi
     elif reapable; then
         echo STALE
@@ -614,8 +649,15 @@ cmd_status() {
             echo "  reason: ${reason}"
             echo "  runnable=$(runnable_now)"
             ;;
-        *)
+        STALE)
             echo "STALE  holder ${owner} pid=${pid} is gone; next acquire will reap it"
+            echo "  reason: ${reason}"
+            echo "  runnable=$(runnable_now)"
+            ;;
+        *)
+            # lock_state saw no lock dir; it was released under us since the
+            # test above. Report what is true now rather than a stale label.
+            echo "FREE  (runnable=$(runnable_now))"
             ;;
     esac
     return 0

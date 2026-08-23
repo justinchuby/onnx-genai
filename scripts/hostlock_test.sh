@@ -36,7 +36,7 @@ HL=scripts/hostlock.sh
 pass=0
 fail=0
 
-cleanup() { rm -rf "$LOCK" "$LOCK".reaper "$LOCK".dead.* "$LOCK".stage.* "$LOCK".dead.* "$LOCK".gate 2>/dev/null; }
+cleanup() { rm -rf "$LOCK" "$LOCK".reaper "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid 2>/dev/null; }
 trap cleanup EXIT
 
 chk() {
@@ -49,6 +49,42 @@ chk() {
         echo "          want: $3"
         fail=$((fail + 1))
     fi
+}
+
+# Spawn a REAL zombie and echo "<zombie_pid> <keeper_pid>".
+#
+# A pid that is present-and-dead cannot be produced by killing a child of this
+# shell: bash reaps it, /proc/<pid> disappears, and what is left is an ABSENT
+# pid, which exercises a different branch. The only way to hold a corpse
+# visible in /proc is a parent that deliberately never wait()s -- which is
+# also exactly how every agent harness here launches work (Popen, no wait).
+# The caller must kill the keeper when finished.
+spawn_zombie() {
+    local f="$LOCK.zombie.$$" z="" par
+    rm -f "$f"
+    # >/dev/null is load-bearing, not tidiness: this runs inside $(...), and a
+    # background child that inherits the substitution's stdout keeps the pipe
+    # open, so the caller blocks until the keeper exits -- by which time init
+    # has reaped the corpse and the fixture is an ABSENT pid, silently testing
+    # the other branch.
+    python3 -c '
+import subprocess, sys, time
+c = subprocess.Popen(["sleep", "300"])
+open(sys.argv[1], "w").write(str(c.pid))
+c.kill()          # SIGKILL, and deliberately no wait(): the child stays a zombie
+time.sleep(120)
+' "$f" >/dev/null 2>&1 &
+    par=$!
+    for _ in $(seq 1 20); do
+        [ -s "$f" ] && { z=$(cat "$f"); break; }
+        sleep 0.5
+    done
+    for _ in $(seq 1 20); do
+        [ "$(sed 's/.*) //' "/proc/${z}/stat" 2>/dev/null | awk '{print $1}')" = Z ] && break
+        sleep 0.5
+    done
+    rm -f "$f"
+    echo "$z $par"
 }
 
 # Deliver a signal to a pid we spawned ourselves.
@@ -784,6 +820,13 @@ if [ -n "$pid1_uid" ] && [ "$pid1_uid" != "$(id -u)" ]; then
         "$($HL provenance --oneline | tr ' ' '\n' | sed -n 's/^held_uid=//p')" "$pid1_uid"
 else
     echo "  SKIP  held_uid vs a foreign anchor (pid 1 uid unreadable or same as ours)"
+    # A SKIP must not silently reduce the assertion count: in a root container
+    # this branch is taken, and with nothing here the only check that pins
+    # held_uid to the kernel disappears with no total to notice it. Assert the
+    # weaker thing that is still true, so the count stays invariant and the
+    # pinned total at the end of this file keeps its power.
+    chk "held_uid is at least present and numeric when the foreign anchor is unavailable" \
+        "$($HL provenance --oneline | tr ' ' '\n' | grep -c '^held_uid=[0-9]')" "1"
 fi
 cleanup
 $HL acquire --owner leon --ttl 600 --reason "moe matrix" >/dev/null 2>&1
@@ -956,21 +999,51 @@ chk "and is still the owner after the grace lapses" "$(st owner)" "alice"
 # ...but the anti-theft guard must disable the CLOCK-BASED grace only, not the
 # expiry the holder itself declared. Returning "not reapable" unconditionally
 # here replaced a bounded wedge with an unbounded one: the lock would outlive
-# any ttl forever, `wait` would block on a lock everyone agrees has expired,
-# and EXPIRED would be unreachable for this whole class of lock.
+# any ttl forever, and `wait` would block on a lock everyone agrees has
+# expired. Guard against a vacuous pass first: if any assertion above has
+# already let the lock be reaped, the acquire below succeeds for the wrong
+# reason and this -- the primary assertion for the primary fix -- passes
+# without exercising anything.
+chk "the ttl fixture starts from a lock that is still alice's" "$(st owner)" "alice"
 printf 'owner=alice\nanchor_pid=%s\nacquired_epoch=%s\nttl=1\nreason=live but overrun\n' \
     "$h" "$(( $(date +%s) - 4000 ))" >"$LOCK/meta"
-chk "a live holder with no start_time still honours its own ttl" \
-    "$($HL acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "0"
+# The LABEL for that class has to be right too, and this is the third arm of
+# the same defect: HELD said "is gone" (fixed), EXPIRED said "is gone"
+# (fixed), and then the reaper announced "reaping stale lock from dead pid N"
+# about a pid the guard immediately above had just verified was RUNNING --
+# suppressing the "still alive ... both sets of numbers are now suspect"
+# warning in exactly the case it applies to. A takeover from a live holder is
+# the one event in this tool that can corrupt somebody's benchmark, so it is
+# the one message that must never be downgraded to routine housekeeping.
+chk "an overrun live holder with no start_time is EXPIRED, not STALE" "$(st state)" "EXPIRED"
+exp_text=$($HL status 2>&1 | tr '\n' ' ')
+chk "and the human text does not call that live pid gone" \
+    "$(echo "$exp_text" | grep -c 'is gone')" "0"
+chk "and it says the ttl ran out" \
+    "$(echo "$exp_text" | grep -c '^EXPIRED')" "1"
+rm -f "$LOCK.warn"
+$HL acquire --owner leon --ttl 600 >/dev/null 2>"$LOCK.warn"
+chk "a live holder with no start_time still honours its own ttl" "$?" "0"
+chk "and the takeover warns the holder is STILL ALIVE" \
+    "$(grep -c 'still alive' "$LOCK.warn")" "1"
+chk "and warns that both sets of numbers are suspect" \
+    "$(grep -c 'both sets of numbers' "$LOCK.warn")" "1"
+chk "and never claims it reaped a dead pid" \
+    "$(grep -c 'dead pid' "$LOCK.warn")" "0"
+rm -f "$LOCK.warn"
 sig "$h" 9
 wait "$h" 2>/dev/null
 cleanup
-# The converse of the guard above: an anchor pid that is PRESENT and DEAD,
-# with no start_time. Nothing else in this file has that shape -- every other
-# fixture either carries a start_time or has no anchor_pid at all -- so
-# deleting the `[ -d /proc/$a ]` liveness test from that guard made every
-# unparseable lock permanently unreapable, which is the exact wedge this
-# commit exists to avoid, and left the suite green.
+# The converse of the guard above: an anchor pid that is DEAD, with no
+# start_time. Nothing else in this file has that shape -- every other fixture
+# either carries a start_time or has no anchor_pid at all -- so deleting the
+# liveness test from that guard made every unparseable lock permanently
+# unreapable, which is the exact wedge this commit exists to avoid, and left
+# the suite green.
+#
+# dead_pid() is fully reaped, so /proc/<pid> does NOT exist: this is the
+# ABSENT-and-dead shape. The present-and-dead shape is a zombie and is tested
+# immediately below; both must reach the clock, by different routes.
 dead=$(dead_pid)
 mkdir -p "$LOCK"
 printf 'owner=ghost\nanchor_pid=%s\nacquired_epoch=%s\nttl=3600\nreason=dead anchor, old script\n' \
@@ -983,6 +1056,28 @@ chk "a dead anchor with no start_time is reapable past the grace" \
     "$($HL acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "0"
 chk "and that takeover is labelled unverifiable too" \
     "$($HL provenance | sed -n 's/^takeover=//p')" "unverifiable"
+cleanup
+# The present-and-dead shape, which is the one that actually wedges the box.
+# A ZOMBIE anchor passes `[ -d /proc/$pid ]`, so writing the anti-theft guard
+# in terms of the directory rather than in terms of real liveness hands a
+# corpse the same protection a live holder gets -- and on the `run` path,
+# where ttl=0, holder_expired is never true, so nothing bounds it: the grace
+# that would have released the box is disabled on behalf of a dead process,
+# forever. That is a strictly worse wedge than the one the guard replaced.
+zline=$(spawn_zombie); zapid=${zline%% *}; zakeeper=${zline##* }
+chk "the fixture anchor really is a zombie" \
+    "$(sed 's/.*) //' "/proc/${zapid}/stat" 2>/dev/null | awk '{print $1}')" "Z"
+mkdir -p "$LOCK"
+printf 'owner=ghost\nanchor_pid=%s\nacquired_epoch=%s\nttl=0\nreason=zombie anchor, meta caught mid-write\n' \
+    "$zapid" "$(date +%s)" >"$LOCK/meta"
+touch -d "@$(( $(date +%s) - 200 ))" "$LOCK"
+chk "a zombie anchor with no start_time is protected inside the grace" \
+    "$($HL acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "2"
+touch -d "@$(( $(date +%s) - 400 ))" "$LOCK"
+chk "a zombie anchor with no start_time is reapable past the grace, ttl=0 and all" \
+    "$($HL acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "0"
+sig "$zakeeper" 9
+wait "$zakeeper" 2>/dev/null
 cleanup
 # The grace itself must be pinned. Every assertion above creates its lock
 # immediately before checking, so now-mtime is 0 and ANY grace >= 1 passes --
@@ -1015,6 +1110,28 @@ chk "held while the anchor lives" "$(st state)" "HELD"
 sig "$holder" 9
 wait "$holder" 2>/dev/null
 chk "SIGKILL leaves the lock behind, reported STALE" "$(st state)" "STALE"
+# The STALE arm of the human branch had no assertion at all: replacing its
+# whole body with `echo "FREE (nobody is here)"` left the suite green, because
+# every STALE check in this file went through porcelain. That is the one arm
+# where saying FREE is actively dangerous -- a stale lock still covers a host
+# that may be loaded, and "next acquire will reap it" is the sentence that
+# tells a human to go through the tool instead of round it.
+stale_text=$($HL status 2>&1 | tr '\n' ' ')
+# 2>&1 deliberately: this assertion is anchored, so anything the script leaks
+# on stderr breaks it. That is how the departed-pid redirection noise was
+# found -- `<"/proc/$pid/stat" 2>/dev/null` silences tr but not bash's own
+# "No such file or directory", because redirections apply left to right, so
+# every status on a stale lock printed two lines of shell error first.
+chk "the STALE human text says STALE, with nothing leaked in front of it" \
+    "$(echo "$stale_text" | grep -c '^STALE')" "1"
+chk "and status writes nothing at all on stderr for a departed pid" \
+    "$($HL status 2>&1 >/dev/null | wc -c)" "0"
+chk "and names the owner it is about to reap" \
+    "$(echo "$stale_text" | grep -c 'holder alice')" "1"
+chk "and says a reap is what happens next" \
+    "$(echo "$stale_text" | grep -c 'is gone')" "1"
+chk "and still reports occupancy, because a stale lock does not stop the load" \
+    "$(echo "$stale_text" | tr ' ' '\n' | grep -c '^runnable=[0-9]')" "1"
 chk "the next acquirer recovers the box" \
     "$($HL acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "0"
 chk "and is told it was a takeover, not a free box" \
@@ -1181,6 +1298,30 @@ teardown_body=$(awk '/^run_teardown\(\) \{/,/^\}/' "$HL" \
 # shellcheck disable=SC2016  # matching source text literally, not expanding it
 chk "and the teardown guard is exactly a start-time comparison" "$teardown_body" \
 'run_teardown() {|local child=$1 name=$2 code=$3|if [ -n "$child" ] && [ -n "$RUN_CHILD_START" ]; then|local now|now=$(proc_start_time "$child" 2>/dev/null || echo "")|if [ "$now" = "$RUN_CHILD_START" ]; then|kill -TERM "$child" 2>/dev/null|wait "$child" 2>/dev/null|fi|fi|remove_lock_if_mine|echo "hostlock: released (${name})" >&2|exit "$code"|}|'
+
+# ...and the ORDER of that teardown's inputs is load-bearing, which the golden
+# body above cannot see: it is a body, not a position. Moving
+# `RUN_CHILD_START=$(...)` back above the three traps leaves that golden text
+# byte-identical while reopening the window it was written to close -- a
+# signal arriving during the fork that reads the start time would take bash's
+# default action, leaking the lock and orphaning a forty-minute benchmark.
+run_body=$(awk '/^cmd_run\(\) \{/,/^\}/' "$HL" | sed -E '/^[[:space:]]*#/d; s/^[[:space:]]+//; /^$/d')
+# Match the INSTALLING traps only: `trap - INT TERM HUP` on the way out is
+# also a trap line and is legitimately last, so a bare '^trap ' compares the
+# wrong one and reports "no" for correct code.
+trap_last=$(echo "$run_body" | grep -n '^trap .*run_teardown' | tail -1 | cut -d: -f1)
+start_at=$(echo "$run_body" | grep -n '^RUN_CHILD_START=' | head -1 | cut -d: -f1)
+chk "cmd_run installs all three traps before it reads the child's start time" \
+    "$([ -n "$trap_last" ] && [ -n "$start_at" ] && [ "$trap_last" -lt "$start_at" ] && echo yes || echo no)" "yes"
+chk "and there are three of them" "$(echo "$run_body" | grep -c '^trap .*run_teardown')" "3"
+
+# Finally, pin the assertion count itself. Two of the checks in this file sit
+# behind environment probes, and an assertion that quietly stops running is
+# indistinguishable from one that passes -- which is the same failure mode as
+# the inert R1 block and the vacuous STALE arm that this PR exists to fix.
+# Both probe branches now assert something, so the total is invariant across
+# environments; if a refactor drops a check, this fails and says so.
+chk "every assertion in this file ran" "$((pass + fail + 1))" "208"
 
 echo
 echo "passed=${pass} failed=${fail}"
