@@ -18,6 +18,14 @@
 # `graph_io_from_model_path_filtered`, so there are deliberately no nodes:
 # nothing here needs to be runnable, and a node list would just be one more
 # thing for a future regeneration to churn.
+#
+# Hand-authored, with no generator: `crates/onnx-std/tests/fixture_ir_opset_guard.rs`
+# enumerates every committed `*.textproto`/`*.onnx` via `git ls-files` and has no
+# allowlist, so this file must satisfy the floor (IR >= 11, exactly one default
+# `ai.onnx` opset >= 24) directly. The guard's suggested remedy is "regenerate the
+# fixture via its generator", which does not apply here -- raise the numbers below
+# by hand when the floor moves. Having no nodes makes the node-schema half of the
+# floor vacuous for this file, so only the two version fields ever need touching.
 ir_version: 11
 producer_name: "onnx-genai-tests"
 producer_version: "0.1.0"
@@ -126,5 +134,5 @@ graph {
 }
 opset_import {
   domain: ""
-  version: 21
+  version: 24
 }
