@@ -68,8 +68,10 @@
 //! under greedy decode.
 //!
 //! The worker count is
-//! [`crate::kernels::matmul_nbits::configured_persistent_decode_threads`] (about
-//! half the logical CPUs); a `THREADS=0` opt-out leaves the decode path unchanged.
+//! [`crate::kernels::matmul_nbits::configured_persistent_decode_threads`] (one
+//! worker per *allowed physical core*, falling back to half the logical CPUs
+//! only when the core topology is undiscoverable); a `THREADS=0` opt-out leaves
+//! the decode path unchanged.
 //!
 //! # Precedence when on (default or `=1`) vs the affinity control
 //!
@@ -259,9 +261,26 @@ pub struct SpmdCounters {
     /// consistent: fine for a threshold or a rate, not for an exact assertion
     /// taken immediately after the wake.
     pub spurious_wakes: u64,
-    /// Barriers where the dispatcher exhausted its spin budget waiting for a
-    /// straggler and yielded the core. Only reachable when a worker is
-    /// descheduled, so this is a direct oversubscription signal.
+    /// Barriers where the dispatcher exhausted its spin budget waiting for the
+    /// workers and yielded the core.
+    ///
+    /// **Strongly width- and regime-dependent; not an oversubscription signal.**
+    /// The dispatcher publishes the op, computes its own shard when it has one,
+    /// and only then spins on the completion counters, yielding once after
+    /// `DISPATCHER_SPIN_BEFORE_YIELD` (~10 us). So a yield means the *last*
+    /// worker lagged the dispatcher's own arrival at the barrier by more than
+    /// that -- a statement about spread across workers, not about how long the
+    /// op takes. Measured on an idle, un-oversubscribed host at zero gap:
+    /// 0.004 yields per dispatch at width 4, ~0.9 at width 16, with the
+    /// intervening widths non-monotonic. Read it as a straggler-spread
+    /// indicator, and only ever against a fixed width.
+    ///
+    /// (Two earlier versions of this doc were wrong in opposite directions --
+    /// first "only reachable when a worker is descheduled", then "any op longer
+    /// than the spin budget yields, so it saturates at 1.0/dispatch". Both were
+    /// reasoned from the code; the first was falsified by measuring at width 16
+    /// and the second by measuring at width 4. Neither had been measured across
+    /// the axis that actually moves it.)
     pub dispatcher_yields: u64,
 }
 
@@ -1620,6 +1639,26 @@ pub fn counters() -> Option<SpmdCounters> {
     }
 }
 
+/// The active-spin window a decode worker holds a core before parking, as the
+/// running process resolved it.
+///
+/// `decode_blocktime` latches into a `OnceLock` on the first `worker_wait`, so
+/// a sweep over `ONNX_GENAI_CPU_DECODE_BLOCKTIME_US` has to be *across process
+/// launches*; setting the variable a second time inside one process changes
+/// nothing and the two arms silently measure the same window (#1736's shape). A
+/// harness therefore has to report the window it actually ran with, and it has
+/// to read it from here rather than re-parse the environment itself -- a second
+/// parser is a second implementation that can drift from the one the workers
+/// obey, and would keep printing the requested value after the real policy
+/// changed.
+///
+/// Reading this *does* latch the window if nothing has yet, which is harmless
+/// (the value is a pure function of the environment) but means a harness should
+/// still call it at report time, after the decode it describes.
+pub fn blocktime() -> Duration {
+    decode_blocktime()
+}
+
 /// The width the caller asked for, recorded when the pool is resolved and before
 /// any of the reductions that can shrink it.
 ///
@@ -1689,8 +1728,9 @@ pub fn shutdown_pools() {
 
 /// Resolve the persistent pool's worker count. Honors `ONNX_GENAI_CPU_DECODE_THREADS`
 /// when set (`0` opts out); when unset it uses the persistent-specific default
-/// (about half the logical CPUs), *not* the flat pool's eight-worker ceiling --
-/// see [`crate::kernels::matmul_nbits::configured_persistent_decode_threads`].
+/// (one worker per allowed physical core), *not* the flat pool's eight-worker
+/// ceiling -- see
+/// [`crate::kernels::matmul_nbits::configured_persistent_decode_threads`].
 fn default_threads() -> Option<usize> {
     crate::kernels::matmul_nbits::configured_persistent_decode_threads()
 }
@@ -1918,6 +1958,7 @@ fn explicit_decode_affinity_set() -> bool {
 /// throughput.
 fn node_shards(total: usize) -> Vec<NodeShard> {
     let allowed = crate::decode_affinity::allowed_cpus();
+    let cores = crate::core_topology::host();
     if let Some(topology) = NumaTopology::detect() {
         let topology = topology.restrict_to_allowed(allowed.as_deref());
         if let Some(mut shards) = topology.split_workers(total) {
@@ -1926,13 +1967,17 @@ fn node_shards(total: usize) -> Vec<NodeShard> {
             // node's completion counter can be read without contending with a
             // pinned spinning worker.
             reserve_split_headroom(&mut shards);
+            for shard in shards.iter_mut() {
+                shard.cpus = crate::decode_affinity::order_pin_targets(&shard.cpus, cores);
+            }
             return shards;
         }
     }
     // Single-node / non-NUMA / no-pinning fallback: one group. Pin to the
     // process's allowed CPUs when known (best-effort), else leave unpinned.
-    let cpus = allowed.unwrap_or_default();
-    let workers = reserve_single_group_headroom(total, cpus.len());
+    let cpus = crate::decode_affinity::order_pin_targets(&allowed.unwrap_or_default(), cores);
+    let core_count = cores.map_or(0, |cores| cores.leaders_within(&cpus).len());
+    let workers = reserve_single_group_headroom(total, cpus.len(), core_count);
     vec![NodeShard {
         index: 0,
         cpus,
@@ -1946,10 +1991,16 @@ fn node_shards(total: usize) -> Vec<NodeShard> {
 /// run; reserving *per node* (see [`reserve_split_headroom`]) rather than once
 /// globally guarantees the spare core lands on whichever socket the scheduler
 /// places the dispatcher on, and keeps every node's completion-counter reads
-/// unblocked on a NUMA-split layout. One is enough because the workers already
-/// plateau around half the logical CPUs (memory-bandwidth bound), so giving up
-/// the single highest-index core costs nothing measurable while removing the
+/// unblocked on a NUMA-split layout. One is enough because there is exactly one
+/// inline dispatcher thread to house, so giving up the single highest-index core
+/// costs one worker's share of a bandwidth-bound loop while removing the
 /// starvation cliff.
+///
+/// This used to be justified by the workers plateauing "around half the logical
+/// CPUs", which stopped being the sizing rule when the default became one worker
+/// per allowed physical core: on a non-SMT host the pool is now deliberately
+/// wide enough that this reserve is what keeps it from being *fully*
+/// subscribed.
 const DISPATCHER_RESERVED_CPUS: usize = 1;
 
 /// Cap a single pinned worker group so at least [`DISPATCHER_RESERVED_CPUS`]
@@ -1964,8 +2015,25 @@ const DISPATCHER_RESERVED_CPUS: usize = 1;
 /// `ONNX_GENAI_CPU_DECODE_THREADS=N` on an exactly-N-CPU cpuset gets N-1 pinned
 /// workers (never zero); the single-CPU case is handled earlier by falling back
 /// to the flat path in [`build_from_env`].
-fn reserve_single_group_headroom(total: usize, allowed_count: usize) -> usize {
-    if allowed_count == 0 || total < allowed_count {
+fn reserve_single_group_headroom(total: usize, allowed_count: usize, core_count: usize) -> usize {
+    if allowed_count == 0 {
+        return total;
+    }
+    // Within the physical-core budget the pool runs one worker per core, so the
+    // inline dispatcher has nowhere to go but some worker's SMT sibling -- and
+    // that worker becomes a straggler the whole barrier waits for on every op.
+    // Measured on qwen int4 `accuracy_level=0` decode, 16 physical cores, no
+    // cpuset: 16 workers 4.41 ms/token against 15 workers 2.81 ms/token (1.57x).
+    // Past the core budget the workers already share cores because the user asked
+    // for more threads than there are cores, so the historical logical-CPU
+    // reserve applies instead -- reserving cores there is a 1.28x regression
+    // (8-logical/4-core cpuset: 7 workers 10.58 ms against 3 workers 13.56 ms).
+    if core_count > 0 && total <= core_count {
+        return total
+            .min(core_count.saturating_sub(DISPATCHER_RESERVED_CPUS))
+            .max(1);
+    }
+    if total < allowed_count {
         return total;
     }
     allowed_count
@@ -2411,6 +2479,56 @@ mod tests {
         );
     }
 
+    /// #1680: a shard must hand out one CPU per *physical* core before it reuses
+    /// any SMT sibling. `node_shards` previously returned `allowed_cpus()` in
+    /// kernel order, and workers pin to `cpus[worker % len]`, so on a host whose
+    /// siblings are adjacent (`0,1` one core, `2,3` the next) a 16-worker pool
+    /// packed onto 8 physical cores. Measured cost on qwen int4 `accuracy_level=0`
+    /// decode: 4.65 ms/token against 2.80 ms/token one-worker-per-core (1.66x).
+    ///
+    /// Skipped where the SMT map is unavailable, and vacuous-but-harmless on a
+    /// host without SMT (there every CPU is its own leader).
+    #[test]
+    fn shard_cpus_prefer_distinct_physical_cores() {
+        // Host-independent half. The loop below can only run where `/sys`
+        // exposes a sibling map, which a minimal container does not, so on its
+        // own this test passes vacuously exactly where it would be most useful.
+        // Assert the ordering contract the shard builder relies on against a
+        // synthetic SMT host first, so the property is covered everywhere.
+        let synthetic = crate::core_topology::CoreTopology::from_sibling_groups(
+            (0..8).map(|c| vec![c * 2, c * 2 + 1]),
+        );
+        let all: Vec<usize> = (0..16).collect();
+        let ordered = crate::decode_affinity::order_pin_targets(&all, Some(&synthetic));
+        let mut leaders = synthetic.leaders_within(&all);
+        leaders.sort_unstable();
+        let mut first_eight: Vec<usize> = ordered.iter().take(8).copied().collect();
+        first_eight.sort_unstable();
+        assert_eq!(
+            first_eight, leaders,
+            "the first workers must take one CPU per physical core before any \
+             worker doubles up on an SMT sibling: {ordered:?}"
+        );
+
+        let Some(cores) = crate::core_topology::host() else {
+            return;
+        };
+        for shard in node_shards(4) {
+            if shard.cpus.is_empty() {
+                continue;
+            }
+            let mut want = cores.leaders_within(&shard.cpus);
+            want.sort_unstable();
+            let mut got: Vec<usize> = shard.cpus.iter().take(want.len()).copied().collect();
+            got.sort_unstable();
+            assert_eq!(
+                got, want,
+                "shard {} must place one worker per physical core before reusing a sibling",
+                shard.index
+            );
+        }
+    }
+
     fn two_group_pool() -> SpmdDecodePools {
         let shards = vec![
             NodeShard {
@@ -2544,24 +2662,47 @@ mod tests {
         // `taskset -c 0-31` with THREADS=32). One CPU must be reserved for the
         // inline dispatcher, so 31 workers are pinned and the highest-index
         // allowed CPU stays free (workers pin to cpus[0..workers] round-robin).
-        assert_eq!(reserve_single_group_headroom(32, 32), 31);
+        // `core_count == 0` is "SMT map unavailable" and keeps the logical rule.
+        assert_eq!(reserve_single_group_headroom(32, 32, 0), 31);
         // Oversubscription (workers > allowed) is likewise capped to allowed - 1.
-        assert_eq!(reserve_single_group_headroom(40, 32), 31);
+        assert_eq!(reserve_single_group_headroom(40, 32, 0), 31);
         // Even an explicit THREADS=N on an exactly-N-CPU cpuset still reserves the
         // dispatcher core: N-1 workers, never N and never zero.
-        assert_eq!(reserve_single_group_headroom(2, 2), 1);
+        assert_eq!(reserve_single_group_headroom(2, 2, 0), 1);
+    }
+
+    /// #1680: on an SMT host the logical-CPU reserve never fires for the default
+    /// budget -- 16 workers against 32 allowed logical CPUs looks like headroom,
+    /// but the 16 workers occupy all 16 *physical* cores and the inline
+    /// dispatcher is left to share a core with one of them. Measured 4.41 ms/token
+    /// against 2.81 ms/token for 15 workers (qwen int4 `accuracy_level=0`).
+    #[test]
+    fn reserve_single_group_headroom_reserves_a_physical_core_within_the_core_budget() {
+        // The measured defect: 16-core SMT host, no cpuset, default budget.
+        assert_eq!(reserve_single_group_headroom(16, 32, 16), 15);
+        // Genuine headroom below the core budget is untouched.
+        assert_eq!(reserve_single_group_headroom(8, 32, 16), 8);
+        assert_eq!(reserve_single_group_headroom(1, 32, 16), 1);
+        // A cpuset of 4 cores / 8 logical CPUs, asked for exactly the core budget.
+        assert_eq!(reserve_single_group_headroom(4, 8, 4), 3);
+        // Past the core budget the user explicitly asked for SMT oversubscription,
+        // where reserving cores measured 1.28x slower (10.58 ms -> 13.56 ms), so
+        // the logical-CPU reserve still governs.
+        assert_eq!(reserve_single_group_headroom(16, 8, 4), 7);
+        // Single-core cpuset still yields a worker rather than zero.
+        assert_eq!(reserve_single_group_headroom(2, 2, 1), 1);
     }
 
     #[test]
     fn reserve_single_group_headroom_is_a_noop_when_headroom_exists_or_affinity_unknown() {
         // Requested workers < allowed CPUs: genuine headroom already exists, so
         // the count is unchanged (the numa-split / flat paths are untouched too).
-        assert_eq!(reserve_single_group_headroom(16, 32), 16);
-        assert_eq!(reserve_single_group_headroom(31, 32), 31);
+        assert_eq!(reserve_single_group_headroom(16, 32, 0), 16);
+        assert_eq!(reserve_single_group_headroom(31, 32, 0), 31);
         // allowed_count == 0 means the allowed set is unknown; workers run
         // unpinned and cannot occupy every core, so nothing is capped.
-        assert_eq!(reserve_single_group_headroom(32, 0), 32);
-        assert_eq!(reserve_single_group_headroom(1, 0), 1);
+        assert_eq!(reserve_single_group_headroom(32, 0, 0), 32);
+        assert_eq!(reserve_single_group_headroom(1, 0, 0), 1);
     }
 
     #[test]
@@ -3180,12 +3321,15 @@ mod tests {
 
         // Fully subscribed: `reserve_single_group_headroom` gave up a worker to
         // keep the dispatcher's CPU free, so the dispatcher computes that lane.
-        assert_eq!(reserve_single_group_headroom(4, 4), 3);
+        // Four allowed CPUs over four physical cores (no SMT), so the core
+        // budget and the logical budget agree and both reserve one.
+        assert_eq!(reserve_single_group_headroom(4, 4, 4), 3);
         assert!(dispatcher_owns_a_shard(&group(3), 4));
 
         // Headroom already existed: no CPU was reserved, so claiming a shard
-        // would make the pool one lane wider than the budget allows.
-        assert_eq!(reserve_single_group_headroom(4, 32), 4);
+        // would make the pool one lane wider than the budget allows. Four
+        // workers on a 32-logical/16-core host is far inside both budgets.
+        assert_eq!(reserve_single_group_headroom(4, 32, 16), 4);
         assert!(!dispatcher_owns_a_shard(&group(4), 4));
 
         // A NUMA split keeps the previous behavior: the dispatcher's node is not
@@ -3214,6 +3358,11 @@ mod tests {
     const BUDGET_LANE_CONFINE_ENV: &str = "ONNX_GENAI_TEST_BUDGET_LANE_CONFINE";
     const BUDGET_LANE_MARKER: &str = "BUDGET_LANE_RESULT=";
     const BUDGET_LANE_SKIP_MARKER: &str = "BUDGET_LANE_SKIP=";
+
+    /// Total attempts for a single lane child before surfacing a failure. One
+    /// nominal attempt plus two retries: the environmental crash is rare, so a
+    /// small bound rides through it without masking a persistent problem.
+    const BUDGET_LANE_CHILD_MAX_ATTEMPTS: u32 = 3;
 
     /// End-to-end guard for #1746, across the process boundary the defect lived
     /// in.
@@ -3303,6 +3452,71 @@ mod tests {
 
     /// Spawns the lane child at `budget`, optionally pre-confining it to
     /// `confine` CPUs, and decodes its one result line.
+    /// Is this lane-child exit the known environmental Windows ARM64 crash?
+    ///
+    /// The child has two completion tokens, a result and a skip, and either one
+    /// means it finished its work — so a fault raised after one was printed is
+    /// not the environmental crash. Both must therefore be absent before a retry
+    /// is justified, which is why this asks the shared classifier about each
+    /// marker and requires them to agree.
+    fn lane_child_crash_is_environmental(
+        success: bool,
+        exit_code: Option<i32>,
+        stdout: &str,
+        stderr: &str,
+    ) -> bool {
+        [BUDGET_LANE_MARKER, BUDGET_LANE_SKIP_MARKER]
+            .iter()
+            .all(|marker| {
+                crate::test_support::is_environmental_access_violation_crash(
+                    success, exit_code, stdout, stderr, marker,
+                )
+            })
+    }
+
+    /// Locks the lane-child retry to *exactly* the known environmental Windows
+    /// ARM64 `STATUS_ACCESS_VIOLATION`, so a real regression can never be
+    /// retried into a false pass.
+    ///
+    /// The retry exists because that crash failed a documentation-only PR
+    /// (#1772), which no amount of correct code can prevent. The risk it
+    /// introduces is the opposite one: a genuine assertion failure that is
+    /// silently re-run until it passes. Every non-signature exit below must
+    /// therefore be classified non-retryable.
+    #[test]
+    fn lane_child_retry_covers_only_the_environmental_crash() {
+        const AV: Option<i32> = Some(crate::test_support::STATUS_ACCESS_VIOLATION);
+        let result = format!("{BUDGET_LANE_MARKER}16,1,16,16,2,2,1");
+        let skip = format!("{BUDGET_LANE_SKIP_MARKER}only one CPU online");
+
+        // The signature: unsuccessful, no completion token, no panic, AV code.
+        assert!(lane_child_crash_is_environmental(false, AV, "", ""));
+
+        // A real assertion failure must fail fast even with an AV code.
+        assert!(!lane_child_crash_is_environmental(
+            false,
+            AV,
+            "",
+            "thread 'main' panicked at src/foo.rs:1:1:\nassertion failed",
+        ));
+
+        // Success is never retryable, and neither is any other exit code.
+        assert!(!lane_child_crash_is_environmental(true, AV, &result, ""));
+        assert!(!lane_child_crash_is_environmental(false, Some(1), "", ""));
+        assert!(!lane_child_crash_is_environmental(false, None, "", ""));
+
+        // Both completion tokens mean the child finished its work, so a fault
+        // after either one is not the environmental crash. This is the part the
+        // shared classifier cannot express on its own: it takes a single marker,
+        // and a lane child may legitimately emit either.
+        assert!(!lane_child_crash_is_environmental(false, AV, &result, ""));
+        assert!(!lane_child_crash_is_environmental(false, AV, &skip, ""));
+
+        // Interleaved with the harness's own output, as `--nocapture` produces.
+        let noisy = format!("running 1 test\n{skip}\ntest budget_lane_child ... ok");
+        assert!(!lane_child_crash_is_environmental(false, AV, &noisy, ""));
+    }
+
     fn run_budget_lane_child(budget: usize, confine: Option<usize>) -> Option<BudgetLane> {
         let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
         cmd.arg("--exact")
@@ -3327,14 +3541,42 @@ mod tests {
         } else {
             cmd.env_remove(BUDGET_LANE_CONFINE_ENV);
         }
-        let output = cmd.output().expect("run decode-budget lane child");
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        assert!(
-            output.status.success(),
-            "budget {budget} child failed ({}):\nstdout:\n{stdout}\nstderr:\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let stdout = {
+            // Native Windows ARM64 runners intermittently fault this child during
+            // SPMD pool build/teardown with `STATUS_ACCESS_VIOLATION` and empty
+            // stderr — not a Rust panic, not one of our assertions. It failed a
+            // documentation-only PR (#1772), so it fails PRs that cannot possibly
+            // have caused it. Retry only that exact signature; a real assertion
+            // failure still fails fast on the first attempt, and on Linux the
+            // signature never occurs, so behaviour there is unchanged.
+            let mut attempt = 1;
+            loop {
+                let output = cmd.output().expect("run decode-budget lane child");
+                let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                let environmental = lane_child_crash_is_environmental(
+                    output.status.success(),
+                    output.status.code(),
+                    &stdout,
+                    &stderr,
+                );
+                if environmental && attempt < BUDGET_LANE_CHILD_MAX_ATTEMPTS {
+                    eprintln!(
+                        "note: retrying decode-budget lane child (budget={budget}) after \
+                         environmental STATUS_ACCESS_VIOLATION crash, attempt {attempt}"
+                    );
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
+                }
+                assert!(
+                    output.status.success(),
+                    "budget {budget} child failed ({}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                    crate::test_support::child_status_detail(&output.status),
+                );
+                break stdout;
+            }
+        };
         if let Some(reason) = stdout.lines().find_map(|line| {
             line.split_once(BUDGET_LANE_SKIP_MARKER)
                 .map(|(_, r)| r.trim())

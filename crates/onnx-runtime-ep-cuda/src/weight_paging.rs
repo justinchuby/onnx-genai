@@ -2648,6 +2648,51 @@ pub struct CudaWeightResidency {
     /// fence-safety argument.
     staging_pool: Arc<PinnedStagingPool>,
     inner: Mutex<ResidencyInner>,
+    /// Count of live [`onnx_runtime_ep_api::RoutedResidencyProof`] guards
+    /// acquired via [`CudaWeightResidency::acquire_routed_residency`]. Only
+    /// this residency owner increments/decrements it (on acquire / on the
+    /// returned guard's `Drop`), so it cannot be forged or bypassed from
+    /// outside this module. `resize_safe_point` folds it into
+    /// `routed_guards_active` so a resize fails closed while any dispatch
+    /// still holds a proof that a region set stays resident.
+    routed_guards_active: AtomicU64,
+}
+
+/// RAII handle for a live [`onnx_runtime_ep_api::RoutedResidencyProof`],
+/// minted only by [`CudaWeightResidency::acquire_routed_residency`].
+///
+/// Holds an `Arc` back to the residency that issued it so `Drop` can
+/// decrement `routed_guards_active` even if the guard outlives the call
+/// site that acquired it (e.g. passed into an async completion callback).
+/// This is deliberately the *only* way to obtain or release a slot in that
+/// counter: there is no public constructor and no public field, so a policy
+/// or kernel cannot fabricate a proof or forget to release one short of
+/// leaking the guard itself (which fails closed — a leaked guard keeps
+/// blocking resize, never silently allows an unsafe one).
+pub struct RoutedResidencyGuard {
+    proof: onnx_runtime_ep_api::RoutedResidencyProof,
+    residency: Arc<CudaWeightResidency>,
+}
+
+impl RoutedResidencyGuard {
+    /// The typed proof this guard keeps alive.
+    pub fn proof(&self) -> &onnx_runtime_ep_api::RoutedResidencyProof {
+        &self.proof
+    }
+}
+
+impl onnx_runtime_ep_api::RoutedResidencyGuardHandle for RoutedResidencyGuard {
+    fn proof(&self) -> &onnx_runtime_ep_api::RoutedResidencyProof {
+        &self.proof
+    }
+}
+
+impl Drop for RoutedResidencyGuard {
+    fn drop(&mut self) {
+        self.residency
+            .routed_guards_active
+            .fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 struct PhysicalAdmission {
@@ -2925,20 +2970,110 @@ impl WeightResidencyPolicy {
     }
 }
 
+impl From<onnx_runtime_ep_api::EvictionClass> for WeightEvictionPolicy {
+    fn from(class: onnx_runtime_ep_api::EvictionClass) -> Self {
+        match class {
+            onnx_runtime_ep_api::EvictionClass::Lru => WeightEvictionPolicy::Lru,
+            onnx_runtime_ep_api::EvictionClass::StableResident => {
+                WeightEvictionPolicy::StableResident
+            }
+        }
+    }
+}
+
+/// The concrete, shipped [`onnx_runtime_ep_api::ResidencyPolicy`] for the CUDA
+/// weight-offload cache. This is the *decision* authority migrated out of the
+/// two call sites it used to live in directly:
+///
+///   - `eviction_for_boundary` (now [`Self::eviction_class`]): which churn
+///     population (LRU vs. scan-resistant stable-resident) a boundary's spans
+///     join.
+///   - the `pin_this` computation inside `admit_committed_span` (now
+///     [`Self::should_pin`]): whether one admitted span enters the static
+///     hot-set pin, given the caller's already-pinned snapshot.
+///
+/// It never allocates, copies, evicts, or holds VA/pointer state — victim
+/// selection (`next_evictable_key`/`smallest_evictable`/
+/// `evictable_key_by_probe`), admission bookkeeping (`mark_pinned`), and the
+/// byte-aware/eviction-order diagnostic probes stay exclusively in
+/// [`CudaWeightResidency`]/[`ResidencyInner`] because they require live
+/// `Arc::strong_count`/slot-idle runtime state this pure policy is not given
+/// and must not reach for.
+///
+/// `evict_order_probe` (#888) and `byte_aware` (#837 item 3, rejected) are
+/// deliberately NOT part of this policy: both are off-by-default diagnostic
+/// experiments, not the shipped decision surface this slice migrates.
+#[derive(Clone, Copy, Debug)]
+struct CudaHotSetResidencyPolicy {
+    scan_resistant_dense: bool,
+    static_pin_keys: Option<&'static HashSet<u64>>,
+    static_pin_config: Option<(u64, u64)>,
+}
+
+impl CudaHotSetResidencyPolicy {
+    /// Build the policy from the process environment, matching
+    /// `DeviceOffloadPolicy::from_env`'s `scan_resistant_dense` plus the two
+    /// independent static-pin activation paths (`static_pin_keys` takes
+    /// priority over `static_pin_config` when both are set, exactly as the
+    /// pre-migration `pin_this` computation did).
+    fn from_env(scan_resistant_dense: bool) -> Self {
+        Self {
+            scan_resistant_dense,
+            static_pin_keys: static_pin_keys(),
+            static_pin_config: static_pin_config(),
+        }
+    }
+}
+
+impl onnx_runtime_ep_api::ResidencyPolicy for CudaHotSetResidencyPolicy {
+    fn name(&self) -> &'static str {
+        "cuda_hot_set"
+    }
+
+    fn decide(
+        &self,
+        input: &onnx_runtime_ep_api::ResidencyPolicyInput<'_>,
+    ) -> onnx_runtime_ep_api::ResidencyDecision {
+        // This policy does not yet split per-expert placement; it only
+        // migrates eviction-class/pin admission. Delegate to the whole-bank
+        // default so its plan-shaped output is unchanged from today.
+        onnx_runtime_ep_api::WholeBankResidentPolicy.decide(input)
+    }
+
+    fn eviction_class(&self, boundary: LazyWeightBoundary) -> onnx_runtime_ep_api::EvictionClass {
+        if self.scan_resistant_dense
+            && matches!(
+                boundary,
+                LazyWeightBoundary::MatMul | LazyWeightBoundary::MatMulNBits
+            )
+        {
+            onnx_runtime_ep_api::EvictionClass::StableResident
+        } else {
+            onnx_runtime_ep_api::EvictionClass::Lru
+        }
+    }
+
+    fn should_pin(&self, input: &onnx_runtime_ep_api::AdmissionPolicyInput) -> bool {
+        if let Some(keys) = self.static_pin_keys {
+            keys.contains(&input.key) && !input.already_pinned
+        } else if let Some((threshold, budget)) = self.static_pin_config {
+            input.len_bytes >= threshold
+                && !input.already_pinned
+                && input.pinned_bytes_used.saturating_add(input.len_bytes) <= budget
+        } else {
+            false
+        }
+    }
+}
+
 fn eviction_for_boundary(
     scan_resistant_dense: bool,
     boundary: LazyWeightBoundary,
 ) -> WeightEvictionPolicy {
-    if scan_resistant_dense
-        && matches!(
-            boundary,
-            LazyWeightBoundary::MatMul | LazyWeightBoundary::MatMulNBits
-        )
-    {
-        WeightEvictionPolicy::StableResident
-    } else {
-        WeightEvictionPolicy::Lru
-    }
+    use onnx_runtime_ep_api::ResidencyPolicy as _;
+    CudaHotSetResidencyPolicy::from_env(scan_resistant_dense)
+        .eviction_class(boundary)
+        .into()
 }
 
 impl CudaWeightResidency {
@@ -2980,6 +3115,7 @@ impl CudaWeightResidency {
                 pin_hit_step: HashMap::new(),
                 pin_granule_hashes: HashMap::new(),
             }),
+            routed_guards_active: AtomicU64::new(0),
         }
     }
 
@@ -3042,6 +3178,7 @@ impl CudaWeightResidency {
                 pin_hit_step: HashMap::new(),
                 pin_granule_hashes: HashMap::new(),
             }),
+            routed_guards_active: AtomicU64::new(0),
         })
     }
 
@@ -3140,6 +3277,268 @@ impl CudaWeightResidency {
         inner.lease = Some(lease);
         replace_global_budget(old, granted);
         Ok(granted)
+    }
+
+    /// Current [`onnx_runtime_ep_api::ResizeSafePoint`] snapshot for this
+    /// cache: capture state comes from `runtime`, pending-deferred-release
+    /// count comes from the installed provider queue (`0` when none is
+    /// installed, matching `reclaim_mapped`'s own "no queue" refusal path),
+    /// and in-flight admission comes from the existing bookkeeping this
+    /// residency already tracks for the quarantine/no-progress paths.
+    /// `multi_device` is always `true` when `device_count` is more than one:
+    /// no existing barrier/authority in this codebase coordinates a resize
+    /// across devices/TP, so a caller running under TP must pass its own
+    /// device count and this fails closed rather than invent one.
+    pub fn resize_safe_point(&self, device_count: usize) -> onnx_runtime_ep_api::ResizeSafePoint {
+        let capturing = self.runtime.is_capturing().unwrap_or(true);
+        let pending_deferred_releases = self
+            .queue
+            .as_ref()
+            .map_or(0, |queue| queue.pending() as u64);
+        let admission_in_flight = !in_flight_fill_quarantine()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty();
+        onnx_runtime_ep_api::ResizeSafePoint {
+            capturing,
+            pending_deferred_releases,
+            admission_in_flight,
+            multi_device: device_count > 1,
+            routed_guards_active: self.routed_guards_active.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Prove residency for a QMoE-family dispatch and mint a guard that keeps
+    /// this residency's resize seam closed until the guard is dropped.
+    ///
+    /// This wraps [`onnx_runtime_ep_api::prove_routed_residency`] (pure
+    /// validation over `catalog`) with the one piece only this residency
+    /// owner can add: an unforgeable, counted lifetime. The bytes themselves
+    /// are already resident by the time this is called — every input this
+    /// method's caller (`execute_kernel`) is proving over has already been
+    /// paged in via the existing `resident_mapped` call on the same
+    /// dispatch — so this mints the typed attestation of *which* coverage
+    /// claim (whole-bank, today always) the caller may rely on, and blocks
+    /// `resize_safe_point` from reporting a safe point for as long as any
+    /// guard remains alive, so a concurrent resize cannot relocate or unmap
+    /// what this dispatch was just promised is resident.
+    pub fn acquire_routed_residency(
+        self: &Arc<Self>,
+        requirement: onnx_runtime_ep_api::RoutedResidencyRequirement,
+        catalog: &onnx_runtime_loader::WeightRegionCatalog,
+    ) -> RoutedResidencyGuard {
+        let proof = onnx_runtime_ep_api::prove_routed_residency(requirement, catalog);
+        self.routed_guards_active.fetch_add(1, Ordering::SeqCst);
+        RoutedResidencyGuard {
+            proof,
+            residency: Arc::clone(self),
+        }
+    }
+
+    /// Execute an accepted [`onnx_runtime_ep_api::ResidencyResizePlan`].
+    ///
+    /// This is the *only* place a resize plan turns into bytes actually
+    /// moved: a grow calls the existing `MemoryLease::grow` path (the same
+    /// one `admit_committed_span`'s over-budget handling already uses); a
+    /// shrink calls the existing `ReclaimableMappedHolder::reclaim_mapped`
+    /// (the same governor-driven LRU-eviction-and-wait-for-idle mechanism)
+    /// when a mapped allowance is installed, or the equivalent plain-lease
+    /// evict-then-shrink otherwise. Neither mechanism is reimplemented here —
+    /// this method only re-validates the safe point immediately before
+    /// committing (in case time passed between planning and execution) and
+    /// reports what happened.
+    ///
+    /// Fails closed rather than shrinking without a lease: an ungoverned
+    /// cache (no `lease`, no `mapped_allowance`) has nothing a shrink could
+    /// safely return bytes to, mirroring `set_ungoverned_budget`'s existing
+    /// refusal to shrink once nothing governs the budget.
+    pub fn execute_resize(
+        &self,
+        plan: onnx_runtime_ep_api::ResidencyResizePlan,
+        device_count: usize,
+    ) -> onnx_runtime_ep_api::ResidencyResizeOutcome {
+        use onnx_runtime_ep_api::{ResidencyResizeOutcome, ResidencyResizePlan, ResizeRejection};
+
+        let safe_point = self.resize_safe_point(device_count);
+        let request = match plan {
+            ResidencyResizePlan::Rejected { request, reason } => {
+                let (before, _) = self.budget();
+                return ResidencyResizeOutcome {
+                    direction: request.direction,
+                    requested_bytes: request.target_bytes,
+                    accepted_bytes: 0,
+                    before_bytes: before,
+                    after_bytes: before,
+                    rejection: Some(reason),
+                    rollback_count: 0,
+                    safe_point,
+                };
+            }
+            ResidencyResizePlan::Accepted(request) => request,
+        };
+
+        let (before, governed) = self.budget();
+        // Re-check the safe point right before committing: planning and
+        // execution can be separated in time by the caller, and nothing
+        // about a `ResidencyResizePlan::Accepted` promises the world hasn't
+        // moved since it was built.
+        if let Some(reason) = safe_point.blocking_reason() {
+            return ResidencyResizeOutcome {
+                direction: request.direction,
+                requested_bytes: request.target_bytes,
+                accepted_bytes: 0,
+                before_bytes: before,
+                after_bytes: before,
+                rejection: Some(ResizeRejection::NotSafePoint(reason)),
+                rollback_count: 0,
+                safe_point,
+            };
+        }
+
+        match request.direction {
+            onnx_runtime_ep_api::ResizeDirection::Grow => {
+                let mut inner = self.inner.lock().expect("residency lock poisoned");
+                match inner.lease.as_mut() {
+                    Some(lease) => match lease.grow(request.target_bytes) {
+                        Ok(()) => {
+                            inner.policy.budget =
+                                inner.policy.budget.saturating_add(request.target_bytes);
+                            let after = inner.policy.budget;
+                            replace_global_budget(before, after);
+                            ResidencyResizeOutcome {
+                                direction: request.direction,
+                                requested_bytes: request.target_bytes,
+                                accepted_bytes: request.target_bytes,
+                                before_bytes: before,
+                                after_bytes: after,
+                                rejection: None,
+                                rollback_count: 0,
+                                safe_point,
+                            }
+                        }
+                        Err(error) => ResidencyResizeOutcome {
+                            direction: request.direction,
+                            requested_bytes: request.target_bytes,
+                            accepted_bytes: 0,
+                            before_bytes: before,
+                            after_bytes: before,
+                            rejection: Some(ResizeRejection::ExecutionFailed(error.to_string())),
+                            rollback_count: 1,
+                            safe_point,
+                        },
+                    },
+                    None => ResidencyResizeOutcome {
+                        direction: request.direction,
+                        requested_bytes: request.target_bytes,
+                        accepted_bytes: 0,
+                        before_bytes: before,
+                        after_bytes: before,
+                        rejection: Some(ResizeRejection::ExecutionFailed(
+                            "growing an ungoverned budget has no lease to grow; adopt a governed \
+                             budget first"
+                                .into(),
+                        )),
+                        rollback_count: 0,
+                        safe_point,
+                    },
+                }
+            }
+            onnx_runtime_ep_api::ResizeDirection::Shrink => {
+                if !governed {
+                    // Mirrors `set_ungoverned_budget`'s existing refusal to
+                    // shrink once nothing governs the budget: shrinking here
+                    // would return bytes no lease is tracking.
+                    return ResidencyResizeOutcome {
+                        direction: request.direction,
+                        requested_bytes: request.target_bytes,
+                        accepted_bytes: 0,
+                        before_bytes: before,
+                        after_bytes: before,
+                        rejection: Some(ResizeRejection::ExecutionFailed(
+                            "shrinking an ungoverned budget has no lease/allowance to release \
+                             into; refusing rather than silently shrinking a resident cache"
+                                .into(),
+                        )),
+                        rollback_count: 0,
+                        safe_point,
+                    };
+                }
+                let has_mapped_allowance = self
+                    .inner
+                    .lock()
+                    .expect("residency lock poisoned")
+                    .mapped_allowance
+                    .is_some();
+                if has_mapped_allowance {
+                    use onnx_runtime_memory_governor::ReclaimableMappedHolder as _;
+                    match self.reclaim_mapped(request.target_bytes) {
+                        Ok(report) => {
+                            let after = before.saturating_sub(report.reclaimed_bytes);
+                            ResidencyResizeOutcome {
+                                direction: request.direction,
+                                requested_bytes: request.target_bytes,
+                                accepted_bytes: report.reclaimed_bytes,
+                                before_bytes: before,
+                                after_bytes: after,
+                                rejection: None,
+                                rollback_count: 0,
+                                safe_point,
+                            }
+                        }
+                        Err(error) => ResidencyResizeOutcome {
+                            direction: request.direction,
+                            requested_bytes: request.target_bytes,
+                            accepted_bytes: 0,
+                            before_bytes: before,
+                            after_bytes: before,
+                            rejection: Some(ResizeRejection::ExecutionFailed(error.to_string())),
+                            rollback_count: 1,
+                            safe_point,
+                        },
+                    }
+                } else {
+                    // Governed by a plain `MemoryLease` (no mapped-allowance
+                    // VMM path installed): evict LRU pages directly and shrink
+                    // the lease by exactly what was freed, same population
+                    // `reclaim_mapped` uses for the VMM path.
+                    let mut inner = self.inner.lock().expect("residency lock poisoned");
+                    let mut reclaimed = 0u64;
+                    let max_attempts = inner.pages.len();
+                    let mut attempts = 0usize;
+                    while reclaimed < request.target_bytes && attempts < max_attempts {
+                        let Some(key) = inner.next_evictable_key(WeightEvictionPolicy::Lru) else {
+                            break;
+                        };
+                        let bytes = inner.policy.bytes_by_key.get(&key).copied().unwrap_or(0);
+                        // Use the same helper every other eviction call site
+                        // uses so the process-global resident-byte/eviction
+                        // gauges stay in lockstep with this instance's own
+                        // accounting, instead of drifting stale.
+                        inner.remove_page(key);
+                        reclaimed = reclaimed.saturating_add(bytes);
+                        attempts += 1;
+                    }
+                    let returned = match inner.lease.as_mut() {
+                        Some(lease) => lease.shrink(reclaimed),
+                        None => 0,
+                    };
+                    inner.policy.budget = inner.policy.budget.saturating_sub(returned);
+                    let after = inner.policy.budget;
+                    drop(inner);
+                    replace_global_budget(before, after);
+                    ResidencyResizeOutcome {
+                        direction: request.direction,
+                        requested_bytes: request.target_bytes,
+                        accepted_bytes: returned,
+                        before_bytes: before,
+                        after_bytes: after,
+                        rejection: None,
+                        rollback_count: 0,
+                        safe_point,
+                    }
+                }
+            }
+        }
     }
 
     /// Select the asynchronous (default `true`) vs synchronous page-in path.
@@ -4165,17 +4564,22 @@ impl CudaWeightResidency {
         // to fit right now) so that a qualifying tensor which fits early — before
         // the budget fills — is still protected from later churn eviction, which
         // is what keeps it out of the evict-and-re-admit corruption population.
-        let pin_this = if let Some(keys) = static_pin_keys() {
-            keys.contains(&key) && !inner.pinned.contains(&key)
-        } else {
-            match static_pin_config() {
-                Some((threshold, budget)) => {
-                    (len as u64) >= threshold
-                        && !inner.pinned.contains(&key)
-                        && inner.pinned_bytes.saturating_add(len as u64) <= budget
-                }
-                None => false,
-            }
+        let pin_this = {
+            use onnx_runtime_ep_api::ResidencyPolicy as _;
+            // #82 migration: this used to be an inline `pin_this` computation
+            // reading `static_pin_keys`/`static_pin_config` directly. It now
+            // delegates to `CudaHotSetResidencyPolicy::should_pin`, which is a
+            // pure function of the same env-derived config plus an explicit
+            // snapshot of live pin state — `admit_committed_span` remains the
+            // sole executing authority; the policy only answers the question.
+            CudaHotSetResidencyPolicy::from_env(self.scan_resistant_dense).should_pin(
+                &onnx_runtime_ep_api::AdmissionPolicyInput {
+                    key,
+                    len_bytes: len as u64,
+                    already_pinned: inner.pinned.contains(&key),
+                    pinned_bytes_used: inner.pinned_bytes,
+                },
+            )
         };
         loop {
             let required_owned = physical
@@ -6866,5 +7270,536 @@ mod tests {
         assert_eq!(moe.hits, 178);
         assert_eq!(moe.page_ins, 62);
         assert_eq!(moe.evictions, 59);
+    }
+
+    // -- #82 migration: CudaHotSetResidencyPolicy agreement + unit coverage --
+
+    #[test]
+    fn hot_set_policy_eviction_class_agrees_with_old_eviction_for_boundary() {
+        use onnx_runtime_ep_api::{EvictionClass, ResidencyPolicy as _};
+
+        // Every (scan_resistant_dense, boundary) combination this crate
+        // exercises must select the same eviction population the
+        // pre-migration free function did (still present as a thin delegate
+        // for this exact regression).
+        let boundaries = [
+            LazyWeightBoundary::MatMul,
+            LazyWeightBoundary::MatMulNBits,
+            LazyWeightBoundary::QMoe,
+        ];
+        for scan_resistant_dense in [false, true] {
+            for boundary in boundaries {
+                let old = eviction_for_boundary(scan_resistant_dense, boundary);
+                let new = CudaHotSetResidencyPolicy::from_env(scan_resistant_dense)
+                    .eviction_class(boundary);
+                let new_as_old: WeightEvictionPolicy = new.into();
+                assert_eq!(
+                    old, new_as_old,
+                    "policy disagrees with legacy eviction_for_boundary for \
+                     scan_resistant_dense={scan_resistant_dense} boundary={boundary:?}"
+                );
+                match boundary {
+                    LazyWeightBoundary::MatMul | LazyWeightBoundary::MatMulNBits
+                        if scan_resistant_dense =>
+                    {
+                        assert_eq!(new, EvictionClass::StableResident);
+                    }
+                    _ => assert_eq!(new, EvictionClass::Lru),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hot_set_policy_defaults_never_pin_matching_shipped_env() {
+        use onnx_runtime_ep_api::{AdmissionPolicyInput, ResidencyPolicy as _};
+
+        // No pin env vars set in this test process: both activation paths are
+        // `None`, so the policy must never recommend a pin, matching the
+        // shipped size-blind default exactly.
+        let policy = CudaHotSetResidencyPolicy {
+            scan_resistant_dense: true,
+            static_pin_keys: None,
+            static_pin_config: None,
+        };
+        assert!(!policy.should_pin(&AdmissionPolicyInput {
+            key: 7,
+            len_bytes: u64::MAX,
+            already_pinned: false,
+            pinned_bytes_used: 0,
+        }));
+    }
+
+    #[test]
+    fn hot_set_policy_pin_keys_take_priority_over_threshold() {
+        use onnx_runtime_ep_api::{AdmissionPolicyInput, ResidencyPolicy as _};
+
+        let mut keys = HashSet::new();
+        keys.insert(42u64);
+        let keys: &'static HashSet<u64> = Box::leak(Box::new(keys));
+        let policy = CudaHotSetResidencyPolicy {
+            scan_resistant_dense: false,
+            static_pin_keys: Some(keys),
+            // Threshold path would reject this tiny span; the explicit
+            // key allow-list must still win and admit it.
+            static_pin_config: Some((u64::MAX, u64::MAX)),
+        };
+        assert!(policy.should_pin(&AdmissionPolicyInput {
+            key: 42,
+            len_bytes: 1,
+            already_pinned: false,
+            pinned_bytes_used: 0,
+        }));
+        // A key outside the allow-list is never pinned even though the
+        // threshold path (if consulted) would have nothing to say either way.
+        assert!(!policy.should_pin(&AdmissionPolicyInput {
+            key: 43,
+            len_bytes: 1,
+            already_pinned: false,
+            pinned_bytes_used: 0,
+        }));
+        // Already pinned: never re-pin (idempotent, matches legacy `pin_this`).
+        assert!(!policy.should_pin(&AdmissionPolicyInput {
+            key: 42,
+            len_bytes: 1,
+            already_pinned: true,
+            pinned_bytes_used: 0,
+        }));
+    }
+
+    #[test]
+    fn hot_set_policy_threshold_path_respects_budget() {
+        use onnx_runtime_ep_api::{AdmissionPolicyInput, ResidencyPolicy as _};
+
+        let policy = CudaHotSetResidencyPolicy {
+            scan_resistant_dense: false,
+            static_pin_keys: None,
+            static_pin_config: Some((100, 250)),
+        };
+        // Below threshold: never pins regardless of budget headroom.
+        assert!(!policy.should_pin(&AdmissionPolicyInput {
+            key: 1,
+            len_bytes: 99,
+            already_pinned: false,
+            pinned_bytes_used: 0,
+        }));
+        // At/above threshold and within budget: pins.
+        assert!(policy.should_pin(&AdmissionPolicyInput {
+            key: 1,
+            len_bytes: 200,
+            already_pinned: false,
+            pinned_bytes_used: 0,
+        }));
+        // At/above threshold but would exceed budget: does not pin.
+        assert!(!policy.should_pin(&AdmissionPolicyInput {
+            key: 1,
+            len_bytes: 200,
+            already_pinned: false,
+            pinned_bytes_used: 100,
+        }));
+    }
+
+    #[test]
+    fn hot_set_policy_decide_delegates_to_whole_bank_default() {
+        use onnx_runtime_ep_api::{ResidencyDecision, ResidencyPolicy as _};
+
+        // This slice migrates eviction-class/pin admission only; per-expert
+        // placement is unchanged, so `decide()` must still produce the
+        // byte-identical whole-bank plan the default policy would.
+        let policy = CudaHotSetResidencyPolicy {
+            scan_resistant_dense: true,
+            static_pin_keys: None,
+            static_pin_config: None,
+        };
+        let layout = onnx_runtime_loader::ExpertTensorLayout {
+            version: 1,
+            experts: 3,
+            rows_per_expert: 2,
+            storage_elements_per_row: 4,
+            order: onnx_runtime_loader::ExpertStorageOrder::ExpertMajor,
+            quantization: Some(onnx_runtime_loader::ExpertQuantization {
+                bits: 4,
+                block_size: 16,
+                blocks_per_row: 1,
+            }),
+        };
+        let weight = onnx_runtime_ir::WeightRef::External {
+            path: std::path::PathBuf::from("/nonexistent/weights.bin"),
+            offset: 16,
+            length: layout.experts * layout.rows_per_expert * layout.storage_elements_per_row,
+            dtype: DataType::Uint8,
+            dims: vec![
+                layout.experts,
+                layout.rows_per_expert,
+                layout.storage_elements_per_row,
+            ],
+        };
+        let catalog = onnx_runtime_loader::WeightRegionCatalog::classify(&weight, layout);
+        let input = onnx_runtime_ep_api::ResidencyPolicyInput {
+            boundary: LazyWeightBoundary::QMoe,
+            catalog: &catalog,
+            budget_bytes: None,
+        };
+        assert_eq!(
+            policy.decide(&input),
+            ResidencyDecision::WholeBankResident { reason: None }
+        );
+    }
+
+    // -- ResidencyResizeRequest / ResizeSafePoint / execute_resize --
+
+    fn grow_request(bytes: u64) -> onnx_runtime_ep_api::ResidencyResizeRequest {
+        onnx_runtime_ep_api::ResidencyResizeRequest {
+            direction: onnx_runtime_ep_api::ResizeDirection::Grow,
+            target_bytes: bytes,
+            priority: 0,
+        }
+    }
+
+    fn shrink_request(bytes: u64) -> onnx_runtime_ep_api::ResidencyResizeRequest {
+        onnx_runtime_ep_api::ResidencyResizeRequest {
+            direction: onnx_runtime_ep_api::ResizeDirection::Shrink,
+            target_bytes: bytes,
+            priority: 0,
+        }
+    }
+
+    /// Default behavior stays unchanged: an ungoverned cache's budget is
+    /// untouched by a resize request, and the request is refused explicitly
+    /// rather than silently doing nothing.
+    #[test]
+    fn ungoverned_cache_refuses_grow_and_shrink_leaving_budget_untouched() {
+        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
+            eprintln!(
+                "SKIPPED (no CUDA runtime): the ungoverned resize refusal check did NOT run."
+            );
+            return;
+        };
+        let residency = CudaWeightResidency::new(runtime, 500);
+        assert_eq!(residency.budget(), (500, false));
+
+        let plan =
+            onnx_runtime_ep_api::plan_resize(grow_request(100), residency.resize_safe_point(1));
+        let outcome = residency.execute_resize(plan, 1);
+        assert!(!outcome.is_success());
+        assert_eq!(residency.budget(), (500, false));
+
+        let plan =
+            onnx_runtime_ep_api::plan_resize(shrink_request(100), residency.resize_safe_point(1));
+        let outcome = residency.execute_resize(plan, 1);
+        assert!(!outcome.is_success());
+        assert_eq!(residency.budget(), (500, false));
+    }
+
+    /// Growing a governed budget moves exactly the requested bytes through
+    /// the existing `MemoryLease::grow` primitive and updates the visible
+    /// budget/ledger accounting to match.
+    #[test]
+    fn governed_grow_moves_exactly_the_requested_bytes() {
+        use onnx_runtime_memory_governor::{
+            HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, Tier,
+        };
+
+        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
+            eprintln!("SKIPPED (no CUDA runtime): the governed grow check did NOT run.");
+            return;
+        };
+        let residency = CudaWeightResidency::new(runtime, 400);
+        let governor = LedgerGovernor::new(LeaseLedger::new(1000, 0, 0));
+        residency
+            .adopt_governed_budget(&governor, Tier::Device, HolderId::new(9))
+            .expect("400 of 1000 is affordable");
+        assert_eq!(residency.budget(), (400, true));
+
+        let plan =
+            onnx_runtime_ep_api::plan_resize(grow_request(200), residency.resize_safe_point(1));
+        let outcome = residency.execute_resize(plan, 1);
+        assert!(outcome.is_success(), "{outcome:?}");
+        assert_eq!(outcome.before_bytes, 400);
+        assert_eq!(outcome.after_bytes, 600);
+        assert_eq!(outcome.accepted_bytes, 200);
+        assert_eq!(residency.budget(), (600, true));
+        assert_eq!(governor.available(Tier::Device), 400);
+    }
+
+    /// Growing beyond what the governor can afford fails the request and
+    /// leaves the budget exactly as it was -- a rejected grow leaves no
+    /// partial-success-shaped state.
+    #[test]
+    fn governed_grow_beyond_capacity_fails_and_leaves_budget_unchanged() {
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, Tier};
+
+        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
+            eprintln!("SKIPPED (no CUDA runtime): the over-capacity grow check did NOT run.");
+            return;
+        };
+        let residency = CudaWeightResidency::new(runtime, 400);
+        let governor = LedgerGovernor::new(LeaseLedger::new(1000, 0, 0));
+        residency
+            .adopt_governed_budget(&governor, Tier::Device, HolderId::new(9))
+            .expect("400 of 1000 is affordable");
+
+        let plan = onnx_runtime_ep_api::plan_resize(
+            grow_request(1_000_000),
+            residency.resize_safe_point(1),
+        );
+        let outcome = residency.execute_resize(plan, 1);
+        assert!(!outcome.is_success());
+        assert_eq!(outcome.before_bytes, 400);
+        assert_eq!(outcome.after_bytes, 400);
+        assert_eq!(outcome.accepted_bytes, 0);
+        assert_eq!(residency.budget(), (400, true));
+    }
+
+    /// A no-op (zero-byte) resize request is rejected before it reaches the
+    /// executor, and never mutates the budget.
+    #[test]
+    fn zero_byte_resize_is_a_rejected_noop() {
+        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
+            eprintln!("SKIPPED (no CUDA runtime): the no-op resize check did NOT run.");
+            return;
+        };
+        let residency = CudaWeightResidency::new(runtime, 400);
+        let plan =
+            onnx_runtime_ep_api::plan_resize(grow_request(0), residency.resize_safe_point(1));
+        assert!(matches!(
+            plan,
+            onnx_runtime_ep_api::ResidencyResizePlan::Rejected {
+                reason: onnx_runtime_ep_api::ResizeRejection::NoOp,
+                ..
+            }
+        ));
+        let outcome = residency.execute_resize(plan, 1);
+        assert!(!outcome.is_success());
+        assert_eq!(residency.budget(), (400, false));
+    }
+
+    /// A plan-time rejection preserves the original request's direction and
+    /// byte count in the outcome, so telemetry inspecting a rejected shrink
+    /// never reports it as a grow (or vice versa).
+    #[test]
+    fn rejected_plan_outcome_preserves_the_original_shrink_direction() {
+        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
+            eprintln!(
+                "SKIPPED (no CUDA runtime): the rejected-shrink-direction check did NOT run."
+            );
+            return;
+        };
+        let residency = CudaWeightResidency::new(runtime, 400);
+        let unsafe_point = onnx_runtime_ep_api::ResizeSafePoint {
+            multi_device: true,
+            ..Default::default()
+        };
+        let plan = onnx_runtime_ep_api::plan_resize(shrink_request(64), unsafe_point);
+        let outcome = residency.execute_resize(plan, 2);
+        assert!(!outcome.is_success());
+        assert_eq!(
+            outcome.direction,
+            onnx_runtime_ep_api::ResizeDirection::Shrink
+        );
+        assert_eq!(outcome.requested_bytes, 64);
+        assert_eq!(outcome.accepted_bytes, 0);
+    }
+
+    /// `resize_safe_point` reports `multi_device: true` whenever more than
+    /// one device is in play, and any resize built from that snapshot fails
+    /// closed rather than attempting cross-device coordination that does not
+    /// exist yet.
+    #[test]
+    fn resize_safe_point_fails_closed_for_multi_device() {
+        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
+            eprintln!("SKIPPED (no CUDA runtime): the multi-device fail-closed check did NOT run.");
+            return;
+        };
+        let residency = CudaWeightResidency::new(runtime, 400);
+        let point = residency.resize_safe_point(2);
+        assert!(point.multi_device);
+        assert!(!point.is_safe());
+        let plan = onnx_runtime_ep_api::plan_resize(grow_request(1), point);
+        assert!(matches!(
+            plan,
+            onnx_runtime_ep_api::ResidencyResizePlan::Rejected {
+                reason: onnx_runtime_ep_api::ResizeRejection::NotSafePoint(_),
+                ..
+            }
+        ));
+    }
+
+    /// Repeated grow-then-shrink oscillation returns the budget to exactly
+    /// where it started, proving the accounting has no drift across cycles.
+    #[test]
+    fn repeated_grow_shrink_oscillation_returns_to_the_starting_budget() {
+        use onnx_runtime_memory_governor::{
+            HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, Tier,
+        };
+
+        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
+            eprintln!("SKIPPED (no CUDA runtime): the oscillation check did NOT run.");
+            return;
+        };
+        let residency = CudaWeightResidency::new(runtime, 400);
+        let governor = LedgerGovernor::new(LeaseLedger::new(1000, 0, 0));
+        residency
+            .adopt_governed_budget(&governor, Tier::Device, HolderId::new(9))
+            .expect("400 of 1000 is affordable");
+
+        for _ in 0..5 {
+            let grow_plan =
+                onnx_runtime_ep_api::plan_resize(grow_request(100), residency.resize_safe_point(1));
+            let grow_outcome = residency.execute_resize(grow_plan, 1);
+            assert!(grow_outcome.is_success(), "{grow_outcome:?}");
+
+            // Nothing is resident (no pages paged in), so a shrink has no
+            // evictable population and its own lease-side `.shrink()` still
+            // returns exactly what the eviction loop reclaimed (0 here) --
+            // asserting the loop always terminates rather than looping
+            // forever with nothing left to evict.
+            let shrink_plan = onnx_runtime_ep_api::plan_resize(
+                shrink_request(100),
+                residency.resize_safe_point(1),
+            );
+            let shrink_outcome = residency.execute_resize(shrink_plan, 1);
+            assert!(shrink_outcome.is_success(), "{shrink_outcome:?}");
+        }
+        assert_eq!(
+            residency.budget(),
+            (900, true),
+            "5 grows of 100 with nothing evictable to shrink net +500 over the 400 byte start"
+        );
+        assert_eq!(governor.available(Tier::Device), 100);
+    }
+
+    // -- RoutedResidencyGuard / acquire_routed_residency --
+
+    fn expert_catalog(pageable: bool) -> onnx_runtime_loader::WeightRegionCatalog {
+        let mut layout = onnx_runtime_loader::ExpertTensorLayout {
+            version: 1,
+            experts: 3,
+            rows_per_expert: 2,
+            storage_elements_per_row: 4,
+            order: onnx_runtime_loader::ExpertStorageOrder::ExpertMajor,
+            quantization: Some(onnx_runtime_loader::ExpertQuantization {
+                bits: 4,
+                block_size: 16,
+                blocks_per_row: 1,
+            }),
+        };
+        if !pageable {
+            layout.order = onnx_runtime_loader::ExpertStorageOrder::Interleaved;
+        }
+        let weight = onnx_runtime_ir::WeightRef::External {
+            path: std::path::PathBuf::from("/nonexistent/weights.bin"),
+            offset: 16,
+            length: layout.experts * layout.rows_per_expert * layout.storage_elements_per_row,
+            dtype: DataType::Uint8,
+            dims: vec![
+                layout.experts,
+                layout.rows_per_expert,
+                layout.storage_elements_per_row,
+            ],
+        };
+        onnx_runtime_loader::WeightRegionCatalog::classify(&weight, layout)
+    }
+
+    /// A held guard always proves whole-bank today (no kernel surfaces
+    /// routed ids host-side) and increments the live-guard counter that
+    /// `resize_safe_point` folds into `routed_guards_active`; dropping it
+    /// releases the count.
+    #[test]
+    fn acquired_guard_reports_whole_bank_and_blocks_resize_until_dropped() {
+        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
+            eprintln!("SKIPPED (no CUDA runtime): the routed-guard lifecycle check did NOT run.");
+            return;
+        };
+        let residency = std::sync::Arc::new(CudaWeightResidency::new(runtime, 400));
+        let catalog = expert_catalog(true);
+
+        assert!(residency.resize_safe_point(1).is_safe());
+
+        let guard = residency.acquire_routed_residency(
+            onnx_runtime_ep_api::RoutedResidencyRequirement::FusedRoutingUnknown,
+            &catalog,
+        );
+        assert_eq!(
+            guard.proof().coverage(),
+            &onnx_runtime_ep_api::RoutedResidencyCoverage::WholeBank {
+                reason: onnx_runtime_ep_api::WholeBankReason::FusedRoutingHasNoHostVisibility
+            }
+        );
+
+        let point = residency.resize_safe_point(1);
+        assert_eq!(point.routed_guards_active, 1);
+        assert!(!point.is_safe());
+        let plan =
+            onnx_runtime_ep_api::plan_resize(grow_request(1), residency.resize_safe_point(1));
+        assert!(matches!(
+            plan,
+            onnx_runtime_ep_api::ResidencyResizePlan::Rejected {
+                reason: onnx_runtime_ep_api::ResizeRejection::NotSafePoint(_),
+                ..
+            }
+        ));
+
+        drop(guard);
+        assert!(residency.resize_safe_point(1).is_safe());
+    }
+
+    /// Two concurrently-held guards each count independently; a resize
+    /// stays blocked until *both* are dropped, and the counter is exact
+    /// (never negative, never double-released) across overlapping lifetimes.
+    #[test]
+    fn concurrent_guards_are_counted_independently_and_released_in_either_order() {
+        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
+            eprintln!("SKIPPED (no CUDA runtime): the concurrent-guard count check did NOT run.");
+            return;
+        };
+        let residency = std::sync::Arc::new(CudaWeightResidency::new(runtime, 400));
+        let catalog = expert_catalog(true);
+
+        let guard_a = residency.acquire_routed_residency(
+            onnx_runtime_ep_api::RoutedResidencyRequirement::FusedRoutingUnknown,
+            &catalog,
+        );
+        let guard_b = residency.acquire_routed_residency(
+            onnx_runtime_ep_api::RoutedResidencyRequirement::FusedRoutingUnknown,
+            &catalog,
+        );
+        assert_eq!(residency.resize_safe_point(1).routed_guards_active, 2);
+
+        drop(guard_a);
+        let mid_point = residency.resize_safe_point(1);
+        assert_eq!(mid_point.routed_guards_active, 1);
+        assert!(!mid_point.is_safe());
+
+        drop(guard_b);
+        assert!(residency.resize_safe_point(1).is_safe());
+    }
+
+    /// A `HostKnownExperts` requirement over a non-pageable catalog still
+    /// mints a guard (never fails/panics): it degrades to whole-bank with an
+    /// explicit reason, exactly as the pure `prove_routed_residency` function
+    /// does, and still counts toward `routed_guards_active`.
+    #[test]
+    fn guard_over_non_pageable_catalog_degrades_to_whole_bank_and_still_blocks_resize() {
+        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
+            eprintln!(
+                "SKIPPED (no CUDA runtime): the non-pageable guard degradation check did NOT run."
+            );
+            return;
+        };
+        let residency = std::sync::Arc::new(CudaWeightResidency::new(runtime, 400));
+        let catalog = expert_catalog(false);
+
+        let guard = residency.acquire_routed_residency(
+            onnx_runtime_ep_api::RoutedResidencyRequirement::HostKnownExperts { experts: vec![0] },
+            &catalog,
+        );
+        assert!(matches!(
+            guard.proof().coverage(),
+            onnx_runtime_ep_api::RoutedResidencyCoverage::WholeBank {
+                reason: onnx_runtime_ep_api::WholeBankReason::InvalidExactSet(_)
+            }
+        ));
+        assert_eq!(residency.resize_safe_point(1).routed_guards_active, 1);
     }
 }

@@ -92,10 +92,11 @@ fn qmoe_layer(
     }
     let bits = bits as usize;
     let mut regions = Vec::new();
-    push_qmoe_pair(graph, node, 2, 3, 11, bits, block_size, &mut regions)?;
-    push_qmoe_pair(graph, node, 5, 6, 12, bits, block_size, &mut regions)?;
+    let quant = QmoeQuant { bits, block_size };
+    push_qmoe_pair(graph, node, QmoeExpertSlots::FC1, quant, &mut regions)?;
+    push_qmoe_pair(graph, node, QmoeExpertSlots::FC2, quant, &mut regions)?;
     if node.inputs.get(8).and_then(|slot| *slot).is_some() {
-        push_qmoe_pair(graph, node, 8, 9, 13, bits, block_size, &mut regions)?;
+        push_qmoe_pair(graph, node, QmoeExpertSlots::FC3, quant, &mut regions)?;
     }
     if regions.is_empty() {
         return Ok(None);
@@ -112,16 +113,61 @@ fn qmoe_layer(
     }))
 }
 
+/// The three input slots one QMoE expert weight occupies: packed weights,
+/// scales, and optional zero points.
+///
+/// A struct rather than three positional `usize` arguments because the call
+/// sites otherwise read `2, 3, 11` and there is nothing in that to stop a
+/// scales index landing in the zero-points slot.
+#[derive(Clone, Copy)]
+struct QmoeExpertSlots {
+    packed: usize,
+    scales: usize,
+    zero_points: usize,
+}
+
+impl QmoeExpertSlots {
+    /// `fc1_experts_weights` / `_scales` / `_zero_points`.
+    const FC1: Self = Self {
+        packed: 2,
+        scales: 3,
+        zero_points: 11,
+    };
+    /// `fc2_experts_weights` / `_scales` / `_zero_points`.
+    const FC2: Self = Self {
+        packed: 5,
+        scales: 6,
+        zero_points: 12,
+    };
+    /// `fc3_experts_weights` / `_scales` / `_zero_points`, present only on
+    /// gated MoE variants.
+    const FC3: Self = Self {
+        packed: 8,
+        scales: 9,
+        zero_points: 13,
+    };
+}
+
+/// The quantisation parameters shared by every expert tensor of one QMoE node.
+#[derive(Clone, Copy)]
+struct QmoeQuant {
+    bits: usize,
+    block_size: usize,
+}
+
 fn push_qmoe_pair(
     graph: &Graph,
     node: &Node,
-    packed_index: usize,
-    scales_index: usize,
-    zero_points_index: usize,
-    bits: usize,
-    block_size: usize,
+    slots: QmoeExpertSlots,
+    quant: QmoeQuant,
     regions: &mut Vec<WeightRegionCatalog>,
 ) -> anyhow::Result<()> {
+    let QmoeExpertSlots {
+        packed: packed_index,
+        scales: scales_index,
+        zero_points: zero_points_index,
+    } = slots;
+    let QmoeQuant { bits, block_size } = quant;
     let packed = required_initializer(graph, node, packed_index)?;
     let scales = required_initializer(graph, node, scales_index)?;
     let packed_dims = qmoe_dims(packed, packed_index)?;

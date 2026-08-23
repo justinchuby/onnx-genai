@@ -757,6 +757,29 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(None)
     }
 
+    /// Prove routed-bank residency for a QMoE-family dispatch and mint a
+    /// guard the executor keeps alive for the kernel's lifetime, exactly like
+    /// [`Self::page_lazy_weight`]'s `PagedWeight`.
+    ///
+    /// `requirement` names what the caller (today, always
+    /// [`crate::RoutedResidencyRequirement::FusedRoutingUnknown`] — no QMoE or
+    /// BlockQuantizedMoE kernel in this codebase surfaces routed expert ids to
+    /// the host before or during dispatch) can prove before launch; `catalog`
+    /// is the same per-boundary [`onnx_runtime_loader::WeightRegionCatalog`]
+    /// `page_lazy_weight` callers already have from `expert_region_candidates`.
+    /// The default returns `None`: stock EPs (and the CUDA EP when offload is
+    /// disabled) never mint a guard and the executor does not gate resize on
+    /// one, matching every other lazy-weight default in this trait.
+    fn acquire_routed_residency(
+        &self,
+        key: u64,
+        requirement: crate::RoutedResidencyRequirement,
+        catalog: &onnx_runtime_loader::WeightRegionCatalog,
+    ) -> Result<Option<Box<dyn crate::RoutedResidencyGuardHandle>>> {
+        let _ = (key, requirement, catalog);
+        Ok(None)
+    }
+
     /// Best-effort lookahead page-in for a lazy weight the executor knows will be
     /// needed by a later node. Returns `true` only when a transfer was actually
     /// enqueued, so callers can distinguish a real prefetch from a no-op or

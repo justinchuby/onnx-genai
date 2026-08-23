@@ -587,9 +587,44 @@ pub struct ResidencyPolicyInput<'a> {
     pub budget_bytes: Option<u64>,
 }
 
+/// Eviction-order class a policy assigns to spans admitted at one
+/// [`LazyWeightBoundary`]. This names *which* churn population an admitted
+/// span joins; it never touches an `Arc`, a page, or a byte — the executing
+/// cache (e.g. `onnx-runtime-ep-cuda::weight_paging::CudaWeightResidency`)
+/// still owns victim selection, admission, and eviction mechanics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvictionClass {
+    /// Ordinary least-recently-used churn population.
+    Lru,
+    /// Retained ahead of LRU churn (still evictable to avoid OOM, but never
+    /// chosen ahead of an ordinary LRU victim) — today's scan-resistant dense
+    /// path.
+    StableResident,
+}
+
+/// Structural, per-admission inputs for the static hot-set pin decision.
+/// Deliberately carries only byte-length and *caller-supplied* live-state
+/// snapshots (already-pinned membership, bytes pinned so far) rather than
+/// letting the policy reach into cache internals directly — the policy
+/// remains a pure decision function of these inputs, never a second owner of
+/// the pin set itself.
+#[derive(Clone, Copy, Debug)]
+pub struct AdmissionPolicyInput {
+    /// Opaque per-weight identity key (stable within one cache instance).
+    pub key: u64,
+    /// Byte length of the span being admitted.
+    pub len_bytes: u64,
+    /// Whether `key` is already in the executing cache's pinned set.
+    pub already_pinned: bool,
+    /// Total bytes already committed to the pinned set (excluding `key`).
+    pub pinned_bytes_used: u64,
+}
+
 /// A pluggable placement/admission/eviction/prefetch/resize *decision*
 /// surface. A policy answers "which experts (if any) does this value split
-/// into for planning purposes", nothing else.
+/// into for planning purposes", "which churn population does this boundary's
+/// spans join", and "should this specific span enter the static hot set",
+/// nothing else.
 ///
 /// Implementations must not allocate, copy, synchronize, or hold VA/pointer
 /// state — see the module-level `ResidencyPlan` doc for why that split is
@@ -600,6 +635,22 @@ pub trait ResidencyPolicy: Send + Sync {
 
     /// Decide one value's residency for planning purposes only.
     fn decide(&self, input: &ResidencyPolicyInput<'_>) -> ResidencyDecision;
+
+    /// Eviction-order class for spans admitted at `boundary`. Default: always
+    /// ordinary LRU (today's non-scan-resistant behavior) — a policy opts
+    /// into stable-resident treatment explicitly.
+    fn eviction_class(&self, boundary: LazyWeightBoundary) -> EvictionClass {
+        let _ = boundary;
+        EvictionClass::Lru
+    }
+
+    /// Whether to admit this span into the static hot-set pin, once and for
+    /// the life of the cache. Default: never pin (today's byte-identical
+    /// default with no pin configuration engaged).
+    fn should_pin(&self, input: &AdmissionPolicyInput) -> bool {
+        let _ = input;
+        false
+    }
 }
 
 /// The only shipped policy today: always keep every candidate value fully
@@ -624,6 +675,348 @@ impl ResidencyPolicy for WholeBankResidentPolicy {
             }
         };
         ResidencyDecision::WholeBankResident { reason }
+    }
+}
+
+/// Direction of a policy-issued elastic resize request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResizeDirection {
+    /// Ask the executing residency cache to make more bytes available
+    /// (mirrors the existing over-budget `MemoryLease::grow` path).
+    Grow,
+    /// Ask the executing residency cache to give bytes back (mirrors the
+    /// existing `ReclaimableMappedHolder::reclaim_mapped` path).
+    Shrink,
+}
+
+/// A policy-issued elastic resize *intent*: "I would like the budget to move
+/// by this many bytes, in this direction." This type never allocates, frees,
+/// copies, or relocates a virtual address — it is pure data describing a
+/// desired outcome. Only the existing Resource Governor / PMM / VMM / weight
+/// paging authorities (`MemoryLease::grow`/`shrink`,
+/// `ReclaimableMappedHolder::reclaim_mapped`) execute a resize; this type is
+/// the seam a [`ResidencyPolicy`] uses to ask for one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidencyResizeRequest {
+    pub direction: ResizeDirection,
+    /// Byte delta requested, always measured as a magnitude regardless of
+    /// direction (i.e. never negative-encoded).
+    pub target_bytes: u64,
+    /// Higher priority requests may preempt lower ones when several policies
+    /// or callers contend for one resize opportunity; opaque to the executor
+    /// beyond ordering. `0` is the default/lowest priority.
+    pub priority: u32,
+}
+
+/// Everything a resize commit must be true about before any state mutates.
+/// Constructed by the caller from the *existing* signals this slice reuses
+/// rather than duplicates: [`CudaRuntime::is_capturing`]-equivalent capture
+/// state, the provider deferred-release queue's pending count, and whether a
+/// page admission is currently in flight. A resize may only be validated
+/// against a snapshot that reports every field `false`/`0`.
+///
+/// [`CudaRuntime::is_capturing`]: <../onnx_runtime_ep_cuda/struct.CudaRuntime.html#method.is_capturing>
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ResizeSafePoint {
+    /// `true` if any graph slot in use is mid-capture/replay.
+    pub capturing: bool,
+    /// Count of deferred releases the provider's queue has not yet settled.
+    pub pending_deferred_releases: u64,
+    /// `true` if a page admission (page-in) is currently in flight and has
+    /// not yet reached a terminal state.
+    pub admission_in_flight: bool,
+    /// `true` when this call is running under multi-device/tensor-parallel
+    /// execution. No existing barrier/authority coordinates a resize across
+    /// devices, so a resize under TP must fail closed rather than invent
+    /// distributed synchronization.
+    pub multi_device: bool,
+    /// Count of live [`RoutedResidencyProof`] guards. Any live guard —
+    /// whole-bank or exact-set — promised its holder that the covered region
+    /// set stays resident and unrelocated for the guard's lifetime; a resize
+    /// that committed while one is alive could break that promise, so a
+    /// nonzero count fails the safe-point check closed.
+    pub routed_guards_active: u64,
+}
+
+impl ResizeSafePoint {
+    /// `true` only when every unsafe condition is absent.
+    pub fn is_safe(&self) -> bool {
+        !self.capturing
+            && self.pending_deferred_releases == 0
+            && !self.admission_in_flight
+            && !self.multi_device
+            && self.routed_guards_active == 0
+    }
+
+    /// Human-readable reason the current snapshot is not a safe point, or
+    /// `None` when [`Self::is_safe`] is `true`. Checked in a fixed priority
+    /// order so the reason reported is deterministic across otherwise-tied
+    /// snapshots.
+    pub fn blocking_reason(&self) -> Option<&'static str> {
+        if self.capturing {
+            return Some("a CUDA graph is currently capturing or replaying");
+        }
+        if self.pending_deferred_releases > 0 {
+            return Some("deferred weight-page releases have not settled");
+        }
+        if self.admission_in_flight {
+            return Some("a page admission is currently in flight");
+        }
+        if self.multi_device {
+            return Some(
+                "no existing barrier/authority coordinates a resize across devices/TP; \
+                 failing closed rather than inventing distributed synchronization",
+            );
+        }
+        if self.routed_guards_active > 0 {
+            return Some(
+                "a RoutedResidencyProof guard is alive and promised its covered region \
+                 set stays resident and unrelocated for its lifetime",
+            );
+        }
+        None
+    }
+}
+
+/// Why a [`ResidencyResizeRequest`] was rejected before any state mutated, or
+/// why a resize that began committing had to roll back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResizeRejection {
+    /// [`ResizeSafePoint::is_safe`] was `false`; see the wrapped reason.
+    NotSafePoint(&'static str),
+    /// The request would relocate or expose a currently cold/unmapped
+    /// (potentially routed) expert; refused rather than risk correctness.
+    WouldExposeColdExpert,
+    /// The executor tried to commit and the underlying governor/lease/reclaim
+    /// primitive refused or could not fully satisfy the request; the message
+    /// is that primitive's own error text.
+    ExecutionFailed(String),
+    /// `target_bytes` was zero — nothing to do; not an error, but not a plan
+    /// either.
+    NoOp,
+}
+
+/// A validated, *not-yet-executed* resize decision: pure data naming what
+/// would happen, produced by [`plan_resize`]. Executing it (calling
+/// `reclaim_mapped`/`lease.grow`/`lease.shrink`) is a distinct later step
+/// owned entirely by `onnx-runtime-ep-cuda::weight_paging` /
+/// `onnx-runtime-memory-governor`, exactly like [`ResidencyPlan`] vs its
+/// execution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResidencyResizePlan {
+    /// Safe to attempt; not yet committed.
+    Accepted(ResidencyResizeRequest),
+    /// Rejected before any state mutated. Keeps the original `request` (not
+    /// just the reason) so an execution/telemetry layer can still report
+    /// which direction/byte count was asked for, even though nothing
+    /// happened.
+    Rejected {
+        request: ResidencyResizeRequest,
+        reason: ResizeRejection,
+    },
+}
+
+/// Outcome of executing an accepted [`ResidencyResizePlan`]. Always reports
+/// what actually happened, even a partial grow/shrink or an outright failure,
+/// so telemetry and tests can observe exact before/after state rather than
+/// trusting the request was fully honored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResidencyResizeOutcome {
+    pub direction: ResizeDirection,
+    pub requested_bytes: u64,
+    /// Bytes the executor actually moved the budget by. May be less than
+    /// `requested_bytes` on a best-effort partial shrink/grow, or `0` on
+    /// rejection.
+    pub accepted_bytes: u64,
+    pub before_bytes: u64,
+    pub after_bytes: u64,
+    /// `None` on full success; `Some(reason)` on rejection or a failed
+    /// commit that rolled back.
+    pub rejection: Option<ResizeRejection>,
+    /// How many times the commit attempt rolled back before returning.
+    pub rollback_count: u32,
+    pub safe_point: ResizeSafePoint,
+}
+
+impl ResidencyResizeOutcome {
+    pub fn is_success(&self) -> bool {
+        self.rejection.is_none()
+    }
+}
+
+/// Validate a [`ResidencyResizeRequest`] against a [`ResizeSafePoint`]
+/// snapshot before any state mutates. This is the one place a resize
+/// *request* becomes a resize *plan*; nothing here allocates, copies,
+/// synchronizes, or touches a lease/allowance/VA. The executor (CUDA weight
+/// paging + governor) is solely responsible for turning an
+/// [`ResidencyResizePlan::Accepted`] into bytes actually moved.
+pub fn plan_resize(
+    request: ResidencyResizeRequest,
+    safe_point: ResizeSafePoint,
+) -> ResidencyResizePlan {
+    if request.target_bytes == 0 {
+        return ResidencyResizePlan::Rejected {
+            request,
+            reason: ResizeRejection::NoOp,
+        };
+    }
+    if let Some(reason) = safe_point.blocking_reason() {
+        return ResidencyResizePlan::Rejected {
+            request,
+            reason: ResizeRejection::NotSafePoint(reason),
+        };
+    }
+    ResidencyResizePlan::Accepted(request)
+}
+
+/// What a dispatch is asking to be proven resident before it launches.
+///
+/// Fused-routing kernels (today, every shipped `QMoE`/`BlockQuantizedMoE`
+/// CUDA kernel) select experts entirely on-device inside the same launch that
+/// consumes their weights — the host never sees `selected_experts` before or
+/// during dispatch. [`RoutedResidencyRequirement::FusedRoutingUnknown`] names
+/// that honestly. [`RoutedResidencyRequirement::HostKnownExperts`] exists for
+/// a future (or non-fused) kernel that computes routing host-side, or on a
+/// separate pre-pass, before the weight-touching sub-kernels launch; no
+/// kernel in this codebase constructs it today.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RoutedResidencyRequirement {
+    /// The caller cannot name the routed set before launch. The only lawful
+    /// proof for this requirement is [`RoutedResidencyCoverage::WholeBank`].
+    FusedRoutingUnknown,
+    /// The caller already knows exactly which experts this dispatch will
+    /// touch (e.g. a host-side or pre-pass routing step ran first).
+    /// `experts` need not be sorted or deduplicated; [`prove_routed_residency`]
+    /// normalizes and validates it.
+    HostKnownExperts { experts: Vec<usize> },
+}
+
+/// Why a [`RoutedResidencyProof`] covers the whole bank instead of an exact
+/// expert set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WholeBankReason {
+    /// The requirement was [`RoutedResidencyRequirement::FusedRoutingUnknown`]
+    /// — routing is fused into the kernel and no host pre-launch visibility
+    /// exists. This is the only reachable reason for QMoE/BlockQuantizedMoE
+    /// as shipped today.
+    FusedRoutingHasNoHostVisibility,
+    /// Host-known expert IDs were supplied but failed validation (an
+    /// out-of-range index, or the catalog itself is non-pageable), so the
+    /// proof safely degrades to whole-bank rather than risk exposing a cold
+    /// expert.
+    InvalidExactSet(String),
+}
+
+/// What a [`RoutedResidencyProof`] actually covers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RoutedResidencyCoverage {
+    /// Every expert region in the bank is proven resident for the guard's
+    /// lifetime. `reason` records why an exact set was not used.
+    WholeBank { reason: WholeBankReason },
+    /// Exactly these experts (sorted ascending, deduplicated) are proven
+    /// resident; no other expert region is guaranteed resident by this proof.
+    ExactExperts { experts: Vec<usize> },
+}
+
+/// An unforgeable, RAII-shaped proof that a QMoE/BlockQuantizedMoE dispatch's
+/// expert-bank residency requirement has been satisfied for the lifetime of
+/// this value.
+///
+/// Only [`prove_routed_residency`] can construct one (the private `_sealed`
+/// field has no public constructor and no field a caller outside this module
+/// can set), so a kernel or policy cannot fabricate a proof to bypass the
+/// residency owner. While a guard is alive, [`RoutedResidencyProof::blocks_resize`]
+/// tells the resize seam (`plan_resize`/`ResizeSafePoint`) to fail closed
+/// rather than relocate or unmap a region this proof promised was resident —
+/// dropping the guard (stream completion / deferred release settled) is what
+/// releases that constraint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoutedResidencyProof {
+    coverage: RoutedResidencyCoverage,
+    _sealed: (),
+}
+
+impl RoutedResidencyProof {
+    pub fn coverage(&self) -> &RoutedResidencyCoverage {
+        &self.coverage
+    }
+
+    /// `true` for every proof: a live guard of any coverage (whole-bank or
+    /// exact-set) blocks a concurrent resize, because a resize that succeeded
+    /// mid-dispatch could relocate or unmap a region this proof promised was
+    /// resident for the launch's lifetime.
+    pub fn blocks_resize(&self) -> bool {
+        true
+    }
+}
+
+/// Object-safe handle for a live per-EP routed-residency guard (e.g.
+/// `onnx-runtime-ep-cuda::weight_paging::RoutedResidencyGuard`), so
+/// [`crate::provider::ExecutionProvider::acquire_routed_residency`] can
+/// return one without this crate depending on any specific EP backend.
+/// Dropping the box is what releases the guard; `proof` exposes the typed
+/// attestation it holds.
+pub trait RoutedResidencyGuardHandle: Send + Sync {
+    fn proof(&self) -> &RoutedResidencyProof;
+}
+
+/// The one function that turns a [`RoutedResidencyRequirement`] into a
+/// [`RoutedResidencyProof`].
+///
+/// This is pure validation over `catalog`; it never allocates, copies, pages,
+/// or synchronizes. The residency owner (`CudaWeightResidency`) is what
+/// already guarantees every expert's bytes are resident before this is
+/// called (today: whole-initializer paging, so any coverage this returns is
+/// already true by construction); this function's job is only to produce the
+/// typed, unforgeable attestation of *which* coverage claim dispatch may rely
+/// on, and to refuse (degrading to whole-bank) rather than certify an
+/// exact-set claim that fails validation.
+///
+/// * [`RoutedResidencyRequirement::FusedRoutingUnknown`] always yields
+///   [`RoutedResidencyCoverage::WholeBank`] with
+///   [`WholeBankReason::FusedRoutingHasNoHostVisibility`] — the only lawful
+///   proof when the host has no pre-launch visibility into the routed set.
+/// * [`RoutedResidencyRequirement::HostKnownExperts`] yields
+///   [`RoutedResidencyCoverage::ExactExperts`] (sorted, deduplicated) only
+///   when the catalog is pageable and every index is in range; otherwise it
+///   degrades to [`RoutedResidencyCoverage::WholeBank`] with
+///   [`WholeBankReason::InvalidExactSet`].
+pub fn prove_routed_residency(
+    requirement: RoutedResidencyRequirement,
+    catalog: &onnx_runtime_loader::WeightRegionCatalog,
+) -> RoutedResidencyProof {
+    let coverage = match requirement {
+        RoutedResidencyRequirement::FusedRoutingUnknown => RoutedResidencyCoverage::WholeBank {
+            reason: WholeBankReason::FusedRoutingHasNoHostVisibility,
+        },
+        RoutedResidencyRequirement::HostKnownExperts { experts } => {
+            if !catalog.is_pageable() {
+                RoutedResidencyCoverage::WholeBank {
+                    reason: WholeBankReason::InvalidExactSet(
+                        "catalog is not pageable; cannot certify an exact expert set".into(),
+                    ),
+                }
+            } else {
+                let mut sorted = experts;
+                sorted.sort_unstable();
+                sorted.dedup();
+                match sorted
+                    .iter()
+                    .find(|&&expert| catalog.region(expert).is_none())
+                {
+                    Some(&bad) => RoutedResidencyCoverage::WholeBank {
+                        reason: WholeBankReason::InvalidExactSet(format!(
+                            "expert index {bad} is out of range for this catalog"
+                        )),
+                    },
+                    None => RoutedResidencyCoverage::ExactExperts { experts: sorted },
+                }
+            }
+        }
+    };
+    RoutedResidencyProof {
+        coverage,
+        _sealed: (),
     }
 }
 
@@ -1051,5 +1444,235 @@ mod tests {
         );
         let ordered: Vec<u32> = plan.ordered_values().map(|v| v.0).collect();
         assert_eq!(ordered, vec![1, 3, 5]);
+    }
+
+    // -- ResidencyResizeRequest / ResizeSafePoint / plan_resize --
+
+    fn grow_request(bytes: u64) -> ResidencyResizeRequest {
+        ResidencyResizeRequest {
+            direction: ResizeDirection::Grow,
+            target_bytes: bytes,
+            priority: 0,
+        }
+    }
+
+    fn shrink_request(bytes: u64) -> ResidencyResizeRequest {
+        ResidencyResizeRequest {
+            direction: ResizeDirection::Shrink,
+            target_bytes: bytes,
+            priority: 0,
+        }
+    }
+
+    #[test]
+    fn plan_resize_accepts_at_a_safe_point() {
+        let plan = plan_resize(grow_request(1024), ResizeSafePoint::default());
+        assert_eq!(plan, ResidencyResizePlan::Accepted(grow_request(1024)));
+    }
+
+    #[test]
+    fn plan_resize_rejects_zero_byte_request_as_noop() {
+        let plan = plan_resize(grow_request(0), ResizeSafePoint::default());
+        assert_eq!(
+            plan,
+            ResidencyResizePlan::Rejected {
+                request: grow_request(0),
+                reason: ResizeRejection::NoOp,
+            }
+        );
+    }
+
+    #[test]
+    fn plan_resize_rejects_during_capture() {
+        let unsafe_point = ResizeSafePoint {
+            capturing: true,
+            ..Default::default()
+        };
+        let plan = plan_resize(shrink_request(512), unsafe_point);
+        assert!(matches!(
+            plan,
+            ResidencyResizePlan::Rejected {
+                reason: ResizeRejection::NotSafePoint(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn plan_resize_rejects_with_pending_deferred_releases() {
+        let unsafe_point = ResizeSafePoint {
+            pending_deferred_releases: 3,
+            ..Default::default()
+        };
+        let plan = plan_resize(shrink_request(512), unsafe_point);
+        assert!(matches!(
+            plan,
+            ResidencyResizePlan::Rejected {
+                reason: ResizeRejection::NotSafePoint(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn plan_resize_rejects_with_admission_in_flight() {
+        let unsafe_point = ResizeSafePoint {
+            admission_in_flight: true,
+            ..Default::default()
+        };
+        let plan = plan_resize(grow_request(512), unsafe_point);
+        assert!(matches!(
+            plan,
+            ResidencyResizePlan::Rejected {
+                reason: ResizeRejection::NotSafePoint(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn plan_resize_fails_closed_under_multi_device() {
+        let unsafe_point = ResizeSafePoint {
+            multi_device: true,
+            ..Default::default()
+        };
+        let plan = plan_resize(shrink_request(512), unsafe_point);
+        let ResidencyResizePlan::Rejected {
+            reason: ResizeRejection::NotSafePoint(reason),
+            ..
+        } = plan
+        else {
+            panic!("multi-device must fail closed, not silently coordinate a resize");
+        };
+        assert!(reason.contains("barrier"));
+    }
+
+    #[test]
+    fn safe_point_blocking_reason_is_deterministic_when_several_conditions_hold() {
+        // Capture always wins first, regardless of what else is also unsafe.
+        let point = ResizeSafePoint {
+            capturing: true,
+            pending_deferred_releases: 5,
+            admission_in_flight: true,
+            multi_device: true,
+            routed_guards_active: 1,
+        };
+        assert!(!point.is_safe());
+        assert_eq!(
+            point.blocking_reason(),
+            Some("a CUDA graph is currently capturing or replaying")
+        );
+    }
+
+    #[test]
+    fn resize_outcome_reports_success_only_without_rejection() {
+        let success = ResidencyResizeOutcome {
+            direction: ResizeDirection::Grow,
+            requested_bytes: 100,
+            accepted_bytes: 100,
+            before_bytes: 0,
+            after_bytes: 100,
+            rejection: None,
+            rollback_count: 0,
+            safe_point: ResizeSafePoint::default(),
+        };
+        assert!(success.is_success());
+
+        let failure = ResidencyResizeOutcome {
+            rejection: Some(ResizeRejection::WouldExposeColdExpert),
+            ..success
+        };
+        assert!(!failure.is_success());
+    }
+
+    #[test]
+    fn fused_routing_unknown_always_yields_whole_bank() {
+        let catalog = pageable_catalog();
+        let proof =
+            prove_routed_residency(RoutedResidencyRequirement::FusedRoutingUnknown, &catalog);
+        assert_eq!(
+            proof.coverage(),
+            &RoutedResidencyCoverage::WholeBank {
+                reason: WholeBankReason::FusedRoutingHasNoHostVisibility
+            }
+        );
+        assert!(proof.blocks_resize());
+    }
+
+    #[test]
+    fn host_known_experts_over_a_pageable_catalog_yields_exact_sorted_deduped_set() {
+        let catalog = pageable_catalog();
+        let proof = prove_routed_residency(
+            RoutedResidencyRequirement::HostKnownExperts {
+                experts: vec![2, 0, 0, 1],
+            },
+            &catalog,
+        );
+        assert_eq!(
+            proof.coverage(),
+            &RoutedResidencyCoverage::ExactExperts {
+                experts: vec![0, 1, 2]
+            }
+        );
+    }
+
+    #[test]
+    fn host_known_experts_over_a_non_pageable_catalog_degrades_to_whole_bank_with_reason() {
+        let catalog = non_pageable_catalog();
+        let proof = prove_routed_residency(
+            RoutedResidencyRequirement::HostKnownExperts { experts: vec![0] },
+            &catalog,
+        );
+        let RoutedResidencyCoverage::WholeBank {
+            reason: WholeBankReason::InvalidExactSet(reason),
+        } = proof.coverage()
+        else {
+            panic!("a non-pageable catalog must never certify an exact expert set");
+        };
+        assert!(reason.contains("not pageable"));
+    }
+
+    #[test]
+    fn host_known_experts_with_an_out_of_range_index_degrades_to_whole_bank_with_reason() {
+        let catalog = pageable_catalog();
+        // `expert_layout()` has 3 experts (indices 0..=2); 99 is out of range.
+        let proof = prove_routed_residency(
+            RoutedResidencyRequirement::HostKnownExperts {
+                experts: vec![0, 99],
+            },
+            &catalog,
+        );
+        let RoutedResidencyCoverage::WholeBank {
+            reason: WholeBankReason::InvalidExactSet(reason),
+        } = proof.coverage()
+        else {
+            panic!("an out-of-range expert index must never be certified");
+        };
+        assert!(reason.contains("99"));
+    }
+
+    #[test]
+    fn resize_safe_point_fails_closed_while_a_routed_guard_is_active() {
+        let point = ResizeSafePoint {
+            routed_guards_active: 1,
+            ..Default::default()
+        };
+        assert!(!point.is_safe());
+        assert_eq!(
+            point.blocking_reason(),
+            Some(
+                "a RoutedResidencyProof guard is alive and promised its covered region \
+                 set stays resident and unrelocated for its lifetime"
+            )
+        );
+    }
+
+    #[test]
+    fn resize_safe_point_is_safe_with_no_routed_guards() {
+        let point = ResizeSafePoint {
+            routed_guards_active: 0,
+            ..Default::default()
+        };
+        assert!(point.is_safe());
     }
 }

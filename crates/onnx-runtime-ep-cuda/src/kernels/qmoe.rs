@@ -1461,6 +1461,33 @@ impl<'a> QuantizedExperts<'a> {
 }
 
 impl Kernel for QMoEKernel {
+    /// Returning `Ok(())` does not, by itself, imply the launched kernels have
+    /// completed on the device: like the rest of the CUDA EP's single-in-order-
+    /// stream eager path, the trailing `self.runtime.synchronize()` call below
+    /// is a no-op by default (see `CudaRuntime::synchronize`'s doc comment on
+    /// `defer_eager_sync`). Kernel-to-kernel ordering is guaranteed by the
+    /// stream; any host-visible read (`dtoh`/`dtod`) self-synchronizes before
+    /// its copy. This call used to be relied on (accidentally, since it was
+    /// already inert under the default configuration) to protect two things
+    /// that are now handled explicitly instead:
+    ///
+    /// - scratch-growth-free safety: `ScratchPool::ensure` now drains the
+    ///   stream itself with `drain_for_unmap` (an unconditional barrier,
+    ///   unlike `synchronize`), only when a slot actually grows (see its doc
+    ///   comment) — the case this really guards against.
+    /// - teardown safety: `Drop for QMoEKernel` now performs its own
+    ///   best-effort `drain_for_unmap` before freeing scratch, since it can no
+    ///   longer assume a prior call already synced.
+    ///
+    /// The trailing `synchronize()` call itself is kept, not removed: it
+    /// establishes no correctness guarantee of its own in the default
+    /// configuration (that is now entirely the job of the two `drain_for_unmap`
+    /// call sites above), but keeping it means `ONNX_GENAI_DEFER_EAGER_SYNC=0`'s
+    /// debug escape hatch still forces this kernel to become fully synchronous
+    /// too, exactly like every other kernel in this EP (e.g.
+    /// `MatMulNBitsKernel::run`'s main GEMV path) — so a device-side error from
+    /// this call's kernels still surfaces synchronously from `execute` itself
+    /// under that debug flag, matching prior behavior.
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         if !(7..=21).contains(&inputs.len()) || outputs.len() != 1 {
             return Err(error(format!(
@@ -1967,15 +1994,19 @@ impl Kernel for QMoEKernel {
             rows,
             hidden,
         )?;
-        let result = if capturing {
-            Ok(())
-        } else {
-            self.runtime.synchronize()
-        };
-        if result.is_ok() && !capturing {
+        // All kernels above are enqueued on the single in-order EP stream, so
+        // kernel-to-kernel ordering is already guaranteed without waiting here,
+        // and no host-visible read of their output happens in this function
+        // (see the doc comment on this impl). The `synchronize()` call below is
+        // a no-op by default (`defer_eager_sync`); it exists only so the
+        // `ONNX_GENAI_DEFER_EAGER_SYNC=0` debug escape hatch still applies to
+        // this kernel like every other one in the EP — see the doc comment on
+        // this impl.
+        if !capturing {
+            self.runtime.synchronize()?;
             self.warmed.store(true, Ordering::Relaxed);
         }
-        result
+        Ok(())
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -2753,6 +2784,14 @@ impl Default for ScratchPool {
 }
 
 impl ScratchPool {
+    /// Returns a device pointer with capacity for at least `bytes`, growing
+    /// the slot (freeing any smaller previous allocation) on demand.
+    ///
+    /// Growth is the one place in `QMoEKernel::execute` that still needs an
+    /// unconditional device drain (see the call to `drain_for_unmap` below):
+    /// `execute` itself is otherwise fully asynchronous, so a launch from the
+    /// *previous* call may still be reading the old, undersized pointer when
+    /// this call wants to free it.
     fn ensure(
         &mut self,
         runtime: &CudaRuntime,
@@ -2771,10 +2810,28 @@ impl ScratchPool {
                 slot.capacity
             )));
         }
+        if slot.ptr != 0 {
+            // `free_raw` returns to a shared, size-classed pool rather than the
+            // driver in the common case, so a stale pointer can be handed to an
+            // unrelated caller almost immediately — there is no synchronization
+            // inside `alloc_raw`/`free_raw` to rely on. A prior `execute()` call
+            // may still have in-flight kernels reading this slot (the trailing
+            // per-op sync that used to force this ordering was removed; see
+            // `QMoEKernel::execute`), so this growth path is now the only place
+            // that needs an unconditional barrier before freeing the old
+            // pointer. Drain *before* allocating the replacement (mirroring
+            // `BroadcastMetadataCache::prepare` in `elementwise.rs`): if the
+            // drain fails, nothing new has been allocated yet, so there is
+            // nothing to leak on this error path. Growth is rare (first time a
+            // kernel instance sees a shape larger than any previous call), so
+            // this cost is not paid on the steady-state path.
+            runtime.drain_for_unmap()?;
+        }
         let fresh = runtime.alloc_raw(bytes)?;
         if slot.ptr != 0 {
-            // SAFETY: the previous pointer came from this runtime and is replaced
-            // only after the new allocation succeeds.
+            // SAFETY: the previous pointer came from this runtime, every prior
+            // kernel that could read it has retired (drained above), and it is
+            // replaced only after the new allocation succeeds.
             unsafe {
                 let _ = runtime.free_raw(slot.ptr);
             }
@@ -2791,10 +2848,20 @@ impl Drop for QMoEKernel {
             .scratch
             .get_mut()
             .expect("cuda_ep QMoE scratch pool poisoned");
+        if scratch.slots.iter().any(|slot| slot.ptr != 0) {
+            // `execute()` no longer syncs after every call, so a launch from
+            // the last call may still be in flight and reading these scratch
+            // buffers. `Drop` can't propagate a `Result`, so this is a
+            // best-effort barrier: on error (e.g. a poisoned/lost device) we
+            // still proceed to free, matching the pre-existing "errors are
+            // swallowed at teardown" behavior of the `free_raw` calls below.
+            let _ = self.runtime.drain_for_unmap();
+        }
         for slot in scratch.slots.iter_mut().rev() {
             if slot.ptr != 0 {
-                // SAFETY: every non-zero pointer came from this runtime and is
-                // freed exactly once when the kernel is dropped.
+                // SAFETY: every non-zero pointer came from this runtime, the
+                // drain above (best-effort) has retired prior in-flight
+                // kernels, and each pointer is freed exactly once here.
                 let _ = unsafe { self.runtime.free_raw(slot.ptr) };
                 slot.ptr = 0;
                 slot.capacity = 0;
