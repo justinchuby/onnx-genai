@@ -851,45 +851,28 @@ impl EmbeddingTable {
         if super::device_ops::residency_of(&self.value)? == residency {
             return Ok(self);
         }
-        match residency {
-            super::device_ops::Residency::Host => anyhow::bail!(
-                "an embedding table already resident on a device is not brought back to the host; \
-                 gather it where it is, or run this package on the host backend"
-            ),
-            #[cfg(feature = "ort-cuda")]
-            super::device_ops::Residency::Cuda(device) => {
-                let mirror = Value::empty_cuda(self.value.shape(), self.value.dtype(), device)
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "failed to allocate a [{}, {}] embedding table on CUDA device \
-                                 {device}: {error}",
-                            self.vocab,
-                            self.hidden
-                        )
-                    })?;
-                mirror
-                    .copy_from_cuda(&self.value, device)
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "failed to upload a [{}, {}] embedding table to CUDA device {device}: \
-                         {error}",
-                            self.vocab,
-                            self.hidden
-                        )
-                    })?;
-                Ok(Self {
-                    vocab: self.vocab,
-                    hidden: self.hidden,
-                    value: mirror,
-                })
-            }
-            #[cfg(not(feature = "ort-cuda"))]
-            super::device_ops::Residency::Cuda(device) => anyhow::bail!(
-                "the proposal chain runs on CUDA device {device}, but this build has no device \
-                 tensor operations to hold an embedding table there. Rebuild with the `ort-cuda` \
-                 (or `native-cuda`) feature, or run this package on the host backend."
-            ),
-        }
+        anyhow::ensure!(
+            residency != super::device_ops::Residency::Host,
+            "an embedding table already resident on a device is not brought back to the host; \
+             gather it where it is, or run this package on the host backend"
+        );
+        // Adoption is the seam's own crossing, so this upload is ordered against
+        // the kernels that will read the table by the same fence every other
+        // device write goes through — rather than by an invariant this function
+        // would otherwise have to state and the next caller remember.
+        let mirror = super::device_ops::tensor_ops_for_residency(residency)?
+            .adopt(&self.value)
+            .with_context(|| {
+                format!(
+                    "failed to make a [{}, {}] embedding table resident on {residency}",
+                    self.vocab, self.hidden
+                )
+            })?;
+        Ok(Self {
+            vocab: self.vocab,
+            hidden: self.hidden,
+            value: mirror,
+        })
     }
 
     /// The embedding row for `token`.

@@ -531,6 +531,19 @@ impl CudaTensorOps {
     /// producing stream before the value exists (`value_from_output_binding`
     /// and `device_tensor_to_value` in `native_component.rs`), so a producer
     /// kernel is never still writing what these copies read.
+    ///
+    /// The barrier is per *operation*, not per proposal step, which is two to
+    /// three more than correctness strictly needs — the writes of one step all
+    /// land on the same legacy stream, so only the last batch before a launch
+    /// has to be waited on. Hoisting it to the caller was rejected: a fence a
+    /// caller can forget buys microseconds and pays for them in a class of bug
+    /// that presents as wrong output on large models and as nothing at all on
+    /// the fixtures. What it replaces is two to three orders of magnitude
+    /// larger anyway — a vocabulary-wide download per draft token and a whole
+    /// KV cache per rejection. The way to make it free is to issue the copies
+    /// on the execution provider's own stream so they are kernel-ordered
+    /// without any barrier; that needs the provider's stream handle at this
+    /// seam, which it does not have today.
     fn fence(&self) -> anyhow::Result<()> {
         let _guard = onnx_genai_ort::cuda_rt::DeviceGuard::set(self.device)?;
         onnx_genai_ort::cuda_rt::device_synchronize().map_err(Into::into)
@@ -589,6 +602,12 @@ impl ResidentTensorOps for CudaTensorOps {
     }
 
     fn zeros(&self, shape: &[i64], dtype: DataType) -> anyhow::Result<Value> {
+        // A tensor with no elements has no device address to publish; the
+        // module's one exception to residency preservation applies here too, so
+        // that the rule holds in every branch rather than in most of them.
+        if shape.contains(&0) {
+            return HostTensorOps.zeros(shape, dtype);
+        }
         let value = self.zeroed_unfenced(shape, dtype)?;
         self.fence()?;
         Ok(value)

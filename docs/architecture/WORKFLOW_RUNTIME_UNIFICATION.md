@@ -269,9 +269,14 @@ that constructs and runs a canonical workflow.
     and the single sanctioned crossing, `adopt`. A host implementation and a CUDA
     implementation answer the same questions, and a value with no implementation
     for where it lives is an error naming both remedies — never a quiet copy to
-    the host. A rejection therefore truncates the declared KV cells *on the
-    device* (the transfer that used to dominate the workflow: the whole cache
-    down and back, per rejection), a step's `concat(embed(token), carry)` is
+    the host. Device writes issue on cudart's legacy stream while the providers
+    run kernels on non-blocking streams, so every write batch ends in one
+    barrier — two to three more per step than correctness strictly needs, and
+    deliberately so: a fence a caller can forget is a silent-wrong-answer class,
+    and what it replaces is orders of magnitude larger. A rejection therefore
+    truncates the declared KV cells *on the device* (the transfer that used to
+    dominate the workflow: the whole cache down and back, per rejection), a
+    step's `concat(embed(token), carry)` is
     gathered and scattered into one device buffer allocated once per proposal,
     and a draft token costs a four-byte argmax read-back instead of a
     vocabulary-wide download. The declared embedding table is read out of the
