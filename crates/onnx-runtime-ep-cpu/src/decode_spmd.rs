@@ -183,6 +183,14 @@ thread_local! {
     /// failure the barrier cannot distinguish from slowness -- a worker that
     /// will never arrive.
     static FAIL_WORKER_BEFORE_READY: Cell<usize> = const { Cell::new(usize::MAX) };
+
+    /// Test injection of the *other* case: every worker announces, but late.
+    /// Without this the healthy-pool test is vacuous, because real workers
+    /// announce within the spin budget and the deadline is never consulted at
+    /// all -- so it would pass with a 1ms timeout just as happily as a 120s
+    /// one. A delay long enough to push the barrier onto its yield/clock path
+    /// is what makes "slow is not the same as broken" an actual assertion.
+    static DELAY_WORKER_BEFORE_READY_MS: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Read on the builder thread only: both the barrier and the pre-spawn fault
@@ -976,6 +984,8 @@ impl SpmdDecodePools {
         // (default) thread-local and silently never fire.
         #[cfg(test)]
         let fail_worker_before_ready = FAIL_WORKER_BEFORE_READY.with(Cell::get);
+        #[cfg(test)]
+        let delay_worker_before_ready = DELAY_WORKER_BEFORE_READY_MS.with(Cell::get);
         for (global_index, (node_position, cpu)) in assignment.into_iter().enumerate() {
             let shared = Arc::clone(&shared);
             let pin_failed = Arc::clone(&pin_failed);
@@ -995,6 +1005,10 @@ impl SpmdDecodePools {
                         fail_worker_before_ready != global_index,
                         "injected fault: worker {global_index} dies before announcing"
                     );
+                    #[cfg(test)]
+                    if delay_worker_before_ready > 0 {
+                        thread::sleep(Duration::from_millis(delay_worker_before_ready));
+                    }
                     worker_loop(shared, global_index);
                 })
                 .expect("spawn persistent SPMD decode worker");
@@ -1037,6 +1051,16 @@ impl SpmdDecodePools {
                     && ready_since.elapsed() >= pool_ready_timeout()
                 {
                     let ready = shared.ready.load(Ordering::Acquire);
+                    // The loop condition and this load are two separate reads,
+                    // so a worker can announce between them. Accept that pool
+                    // rather than tearing down a healthy one and reporting the
+                    // self-contradictory "N of N workers announced ... never
+                    // became ready". The deadline is a backstop against a
+                    // condition that can no longer be satisfied; one that just
+                    // was satisfied is not that case.
+                    if ready >= total_threads {
+                        break;
+                    }
                     // Release the workers that *did* start, using the same
                     // publish-then-wake sequence as `shutdown()`: the stop flag
                     // alone is not enough, because a worker already parked on
@@ -1859,6 +1883,11 @@ fn worker_loop(shared: Arc<SharedState>, global_index: usize) {
     // this worker is waiting for it.
     let mut last_seen: u32 = 0;
     let blocktime = decode_blocktime();
+    // `AcqRel`, not `Release`. The `Acquire` half chains this RMW to the
+    // previous worker's, so every worker's pre-readiness stores -- notably
+    // `pin_failed[i]`, which the builder reads `Relaxed` -- are ordered before
+    // the builder's `Acquire` load of `ready`. Downgrading to `Release` would
+    // leave only the release-sequence head ordered and make that read a race.
     shared.ready.fetch_add(1, Ordering::AcqRel);
     loop {
         // Bounded active spin (blocktime) then futex park; returns the observed
@@ -3513,15 +3542,8 @@ mod tests {
             })
     }
 
-    /// A failed build must not leave its surviving workers running.
-    ///
-    /// The backstop's whole purpose is to stop holding a machine, so panicking
-    /// while leaving parked or spinning workers behind would only relocate the
-    /// defect. Runs in a child process because thread identity cannot be
-    /// established in-process: `/proc/<pid>/task/*/comm` truncates at 15 bytes,
-    /// so every worker of every pool reports the same `onnx-genai-spmd`, and a
-    /// concurrently-running test's pool is indistinguishable from this one's.
-    /// A child owns all of its threads, which makes the count exact.
+    /// Selects child mode for [`ready_leak_child`].
+    #[cfg(target_os = "linux")]
     const READY_LEAK_CHILD_ENV: &str = "ONNX_GENAI_TEST_READY_LEAK_CHILD";
 
     /// Threads in this process whose name marks them as SPMD decode workers.
@@ -3580,7 +3602,15 @@ mod tests {
         println!("spmd_threads_after={live}");
     }
 
-    /// Panicking is not enough: the workers that did start have to go away.
+    /// A failed build must not leave its surviving workers running.
+    ///
+    /// The backstop's whole purpose is to stop holding a machine, so panicking
+    /// while leaving parked or spinning workers behind would only relocate the
+    /// defect. Runs in a child process because thread identity cannot be
+    /// established in-process: `/proc/<pid>/task/*/comm` truncates at 15 bytes,
+    /// so every worker of every pool reports the same `onnx-genai-spmd`, and a
+    /// concurrently-running test's pool is indistinguishable from this one's.
+    /// A child owns all of its threads, which makes the count exact.
     #[test]
     #[cfg(target_os = "linux")]
     #[cfg_attr(miri, ignore = "Miri cannot spawn the child process this needs")]
@@ -3692,6 +3722,15 @@ mod tests {
     /// A liveness guard that trips under load is worse than none: it converts a
     /// scheduling hiccup into a crash, which is why the production deadline is
     /// far beyond any real startup rather than tuned close to it.
+    ///
+    /// The injected delay is what makes this an assertion rather than a
+    /// tautology. Real workers announce within the spin budget, so the barrier
+    /// never reaches its clock check and the deadline is never consulted -- a
+    /// version of this test without the delay passes just as happily with a 1ms
+    /// timeout as with 120s, and so proves nothing about the deadline at all.
+    /// Delaying every worker past the spin budget forces the barrier onto the
+    /// yield/clock path with the deadline genuinely in play, which is the only
+    /// arrangement in which "slow is not the same as broken" can be tested.
     #[test]
     fn a_healthy_pool_never_trips_the_readiness_backstop() {
         assert_eq!(
@@ -3699,9 +3738,12 @@ mod tests {
             usize::MAX,
             "no fault may be injected on the thread building a healthy pool"
         );
-        // A deadline this tight would trip on any real stall; the pool still
-        // builds, because healthy workers announce in microseconds.
-        POOL_READY_TIMEOUT_MS.with(|slot| slot.set(2_000));
+        const DELAY_MS: u64 = 300;
+        const DEADLINE_MS: u64 = 5_000;
+        POOL_READY_TIMEOUT_MS.with(|slot| slot.set(DEADLINE_MS));
+        DELAY_WORKER_BEFORE_READY_MS.with(|slot| slot.set(DELAY_MS));
+
+        let started = Instant::now();
         let pools = SpmdDecodePools::build_with_schedule(
             &[NodeShard {
                 index: 0,
@@ -3711,8 +3753,19 @@ mod tests {
             DecodeSchedule::Fixed,
             false,
         );
+        let elapsed = started.elapsed();
+        DELAY_WORKER_BEFORE_READY_MS.with(|slot| slot.set(0));
         POOL_READY_TIMEOUT_MS.with(|slot| slot.set(0));
+
         assert_eq!(pools.total_workers(), 4);
+        // Proves the barrier actually waited rather than exiting on the fast
+        // path: without this, a build that never consulted the deadline would
+        // satisfy the test and the deadline logic would go unexercised.
+        assert!(
+            elapsed >= Duration::from_millis(DELAY_MS),
+            "the barrier returned in {elapsed:?}, before the injected {DELAY_MS}ms \
+             delay could have elapsed, so it never reached the deadline path"
+        );
         pools.shutdown();
     }
 
