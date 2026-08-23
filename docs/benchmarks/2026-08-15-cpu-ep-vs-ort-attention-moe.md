@@ -4710,15 +4710,16 @@ cannot certify it was.
 
 What survives that, and why:
 
-- **Ratios.** The arms are interleaved, so a steady occupancy tax inflates both
-  and cancels in `native/ort`. This covers the parity grid and the
-  `concat_cache` before/after figures in 45.6.
-- **The scaling shape in 45.8.** ORT improved 3.05 -> 1.06 ms across
-  `t = 1 -> 16` *in the same interleaved window* in which the native arm stayed
-  flat. Contention cannot starve one interleaved arm while the other scales
-  2.9x, so ORT is a positive control for core availability -- the same role the
-  842-symbol MLAS build plays for the symbol probe above. The finding also has
-  a timing-free leg: `sdpa_f32_simd` contains no fan-out at all.
+- **Ratios, but only against a *symmetric* tax.** The arms are interleaved, so
+  an occupancy tax that falls on both equally cancels in `native/ort`. It does
+  **not** cancel when the tax falls on one arm only, which is the case here --
+  see 45.9. The `concat_cache` before/after figures in 45.6 are native-vs-native
+  and keep their footing; the native-vs-ORT ratios do not.
+- **The scaling shape in 45.8** rests on the code, not on the timings:
+  `sdpa_f32_simd` contains no fan-out at all, so the native arm cannot scale
+  with thread count whatever the host is doing. **The timing-based version of
+  this argument, which appeared here and claimed ORT was a positive control for
+  core availability, was wrong and is retracted in 45.9.**
 
 What does not survive: the **absolute** millisecond columns below. A steady
 occupancy tax is invisible in the spread *and* invisible in the ratio, and it
@@ -4821,6 +4822,69 @@ a pure-native build, which is a separate open lane.
 unclaimed parallelism, but it does not size the prize. Profile the cell before
 quoting a headroom multiple — otherwise you are asserting that the kernel you
 happened to be reading is the whole critical path.
+
+### 45.9 Retraction: ORT was not a positive control, it was the tax
+
+The caveat in 45.7 argued that the native-vs-ORT ratios survived host
+contention because the arms are interleaved and because ORT scaling 2.9x in the
+same window proved cores were available to both. **That argument is wrong.** It
+assumed the two arms faced the same host. They did not, in two ways that both
+push the same direction and both grow with thread count.
+
+**1. The ORT arm's thread pool is the thing taxing the native arm.** In a paired
+run `bench_generic` builds `ort_session` once and keeps it alive for the whole
+measurement loop, alternating `measure_native()` and `measure_ort()` inside it.
+ORT's intra-op pool spin-waits between its runs, so it is burning cores *during*
+the native timing. This is not a new discovery -- `ab.py`'s own docstring says
+so, and puts it at "up to 6x depression on long cells", which is why
+`--native-only` exists. I used the paired mode, correctly, because the
+comparison is native-vs-ORT; I then reasoned about the result as though the
+paired-mode tax were not there.
+
+The part that matters for 45.8: `ab.py` passes the same width to both arms,
+`--native-threads T` **and** `--ort-intra-threads T`. So at `T = 16` there are
+~16 ORT threads spinning while the native sample is taken, and at `T = 1` there
+is ~1. **The tax is one-directional and grows with `T`** -- exactly the shape
+45.8 reported as a native scaling failure. A ratio cancels a symmetric tax; this
+one is asymmetric by construction.
+
+**2. The arms may not even have had the same cores.** Sebastian has since shown
+(#1729, from `/proc/<pid>/task/*/status`, no timing involved) that the EP's
+default 16-wide pool pins its workers to cpus 0-15, which on this host is 8
+physical cores with two workers per core, and one of the two L3 domains. cpu0
+additionally carries a permanent external competitor -- a pinned scalar probe
+gets 0.503 of the throughput there that it gets on any other CPU. ORT's pool is
+not pinned and roams all 32 logical CPUs. Whether this reached the
+single-node MHA graphs measured here is **not yet verified** -- it needs a
+`/proc` read against a live bench process, which is queued behind the current
+host owner -- but `ONNX_GENAI_CPU_DECODE_THREADS` is the knob `bench_generic`
+sets for the native arm and it is the same knob that governs the pool
+`decode_affinity` places, so it cannot be assumed away.
+
+**What still stands.** The finding of 45.8 -- the shipped SDPA route claims no
+parallelism -- is a statement about code: `sdpa_f32_simd` is a plain
+`for b { for n { ... } }` with no fan-out, while `sdpa_f32_fast` beside it uses
+`par_chunks_mut`. Native cannot scale with `T` whatever the host does. That leg
+never depended on a timing and is unaffected.
+
+**What does not.** The size of the gap at high `T`, the 13.6x figure at
+`t = 16`, and the mild regression from 9.2 to 14.4 ms between `t = 8` and
+`t = 16`. That regression now has a mechanism pointing at the instrument rather
+than the kernel: it is where ORT's spinning pool is widest. Re-measure with
+`--native-only` arms against a fixed reference, or with `--ort-intra-threads`
+held at 1 while `--native-threads` sweeps, before quoting any of it.
+
+**Rule.** An A/B is only a controlled experiment if the *harness* treats the
+arms symmetrically. Interleaving controls for drift over time; it does nothing
+about a tax that one arm imposes on the other, and a spin-waiting pool in the
+comparison arm is exactly that. Check what the other arm's runtime is doing
+while your arm is being timed -- and check it before, not after, you publish a
+scaling curve.
+
+**Rule.** "The control scaled, so cores were available" is only valid when the
+control is independent of the treatment. Here the control *was* the competitor.
+A positive control has to be something that cannot be causing the effect it is
+being used to rule out.
 
 ## 46. The residual was never steady state (a diagnostic, not a kernel)
 

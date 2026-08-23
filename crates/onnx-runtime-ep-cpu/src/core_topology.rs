@@ -21,13 +21,48 @@
 //! capping" as blocker #1 for the entire t=8/16 column, and this module is that
 //! discovery step.
 //!
-//! # What it does *not* do
+//! # The compact-mask result, and how much of it survived
 //!
-//! It does not spread work across physical cores. Pinning one thread per
-//! physical core across `0,2,…,30` on the same host measured **worse** (0.133 ms
-//! vs 0.079 ms) because the working set fits one CCX's L3, so the compact mask
-//! is correct and stays. The lever is capping how many *spinning* workers live
-//! inside that compact mask, not widening it.
+//! This section used to read: "It does not spread work across physical cores.
+//! Pinning one thread per physical core across `0,2,…,30` on the same host
+//! measured **worse** (0.133 ms vs 0.079 ms) because the working set fits one
+//! CCX's L3, so the compact mask is correct and stays." That conclusion has been
+//! superseded for the persistent SPMD decode pool, and the reason is worth
+//! recording rather than deleting.
+//!
+//! What the 0.133/0.079 experiment did not separate is the **dispatcher**. The
+//! inline dispatcher spin-waits on the completion counters, so once every
+//! physical core holds a worker it has nowhere to run but some worker's SMT
+//! sibling — and that worker becomes the straggler the whole barrier waits for,
+//! on every op. Pinning only the dispatcher thread and changing nothing else
+//! measured **2.1x** (19.58 ms/token on a CPU inside the worker set against
+//! 8.77 ms on a free core), with ~600 involuntary context switches per token in
+//! the contended case. A bare spread therefore pays the locality cost *and*
+//! creates a straggler, which is a fair description of the losing arm.
+//!
+//! [`crate::decode_spmd`] now spreads one worker per physical core **and**
+//! reserves a core for the dispatcher. Quiet-host A/B against the compact
+//! layout, four launches per arm with an A/A null agreeing to 0.17%: 3.2%
+//! faster on llama and **29% less CPU per token**, and the dispatcher-yield
+//! counter falls 5.00 to 0.00 per token, which is the straggler mechanism
+//! closing.
+//!
+//! Two parts of the old conclusion **do** survive and should not be re-litigated
+//! without measurement:
+//!
+//! * **Locality is real.** The spread crosses the L3 boundary (`0-15` and
+//!   `16-31` are separate 32 MiB domains on this host) and that costs something;
+//!   it is outweighed here, not absent.
+//! * **Compactness is robust to co-tenants.** Because the compact layout uses
+//!   half the machine, a co-tenant can be placed on the idle half. Measured with
+//!   four DRAM-bandwidth hogs: compact 4.54 ms/token against spread 5.03--6.26.
+//!   With eight hogs covering both halves the ranking inverts (compact 15.92
+//!   against spread 6.08), because then the compact layout has 8 contended cores
+//!   and the spread has 16. The spread is the right default for a dedicated host
+//!   or a cpuset, which is the deployment target; it is not free on a shared box.
+//!
+//! Capping how many *spinning* workers live inside a mask remains a separate and
+//! still-useful lever.
 //!
 //! # Portability
 //!
