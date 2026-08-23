@@ -3226,22 +3226,25 @@ mod tests {
         assert_eq!(node_cpus, vec![16, 17, 18, 19]);
     }
 
-    /// Whether this environment can pin a thread at all.
+    /// Whether this environment can pin a thread to every one of `cpus`.
     ///
     /// Probes the pinning primitive *directly* rather than through the pool, so
     /// it stays independent of the bookkeeping under test: a defect that made
-    /// `worker_cpus` report nothing must not also switch these tests off. Miri
-    /// and some sandboxes reject the affinity syscall, where a placement
-    /// assertion would be testing the sandbox, not the pool.
-    fn environment_can_pin() -> bool {
-        let Some(cpu) =
-            crate::decode_affinity::allowed_cpus().and_then(|cpus| cpus.first().copied())
-        else {
-            return false;
-        };
-        std::thread::spawn(move || crate::decode_affinity::pin_current_thread_to_cpu(cpu).is_ok())
-            .join()
-            .unwrap_or(false)
+    /// `worker_cpus` report nothing must not also switch these tests off.
+    ///
+    /// It probes the exact CPUs the caller will use, not a representative one.
+    /// Under Miri the affinity shim accepts cpu 0 and rejects the rest, so a
+    /// single-CPU probe reports "pinning works" and the test then fails on the
+    /// sandbox's virtual topology instead of on the pool.
+    fn environment_can_pin(cpus: &[usize]) -> bool {
+        !cpus.is_empty()
+            && cpus.iter().all(|&cpu| {
+                std::thread::spawn(move || {
+                    crate::decode_affinity::pin_current_thread_to_cpu(cpu).is_ok()
+                })
+                .join()
+                .unwrap_or(false)
+            })
     }
 
     /// A pool that reports its width honestly must also *place* honestly.
@@ -3251,9 +3254,6 @@ mod tests {
     /// never the thing that was wrong. This asserts the half that was missing.
     #[test]
     fn a_pinned_pool_places_one_worker_per_physical_core() {
-        if !environment_can_pin() {
-            return;
-        }
         let cpus: Vec<usize> = match crate::core_topology::host() {
             // Two full physical cores' worth of CPUs, spread the way the
             // placement policy spreads them.
@@ -3265,6 +3265,9 @@ mod tests {
         };
         let cores = crate::core_topology::host().expect("checked above");
         let workers = cores.core_count().min(4);
+        if !environment_can_pin(&cpus[..workers.min(cpus.len())]) {
+            return;
+        }
         let pools = SpmdDecodePools::build_with_schedule(
             &[NodeShard {
                 index: 0,
@@ -3291,9 +3294,6 @@ mod tests {
     /// The same predicate must be able to say *no*, or it is decoration.
     #[test]
     fn placement_reports_a_shared_core_as_a_defect() {
-        if !environment_can_pin() {
-            return;
-        }
         let Some(cores) = crate::core_topology::host() else {
             return;
         };
@@ -3302,6 +3302,9 @@ mod tests {
         let Some(pair) = cores.cores().iter().find(|group| group.len() >= 2) else {
             return; // non-SMT host: the bad layout is unrepresentable
         };
+        if !environment_can_pin(&pair[..2]) {
+            return;
+        }
         let pools = SpmdDecodePools::build_with_schedule(
             &[NodeShard {
                 index: 0,
@@ -3328,9 +3331,6 @@ mod tests {
     /// count honest, placement unexamined, the exact shape of #1729.
     #[test]
     fn a_partially_pinned_pool_is_not_scored_on_its_pinned_half() {
-        if !environment_can_pin() {
-            return;
-        }
         let Some(cores) = crate::core_topology::host() else {
             return;
         };
@@ -3341,6 +3341,9 @@ mod tests {
             &(0..cores.logical_count()).collect::<Vec<_>>(),
             Some(cores),
         );
+        if !environment_can_pin(&spread[..2]) {
+            return;
+        }
         // One shard pinned to distinct cores, one shard deliberately free.
         let pools = SpmdDecodePools::build_with_schedule(
             &[
