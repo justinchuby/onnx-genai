@@ -1,12 +1,13 @@
 # Workflow-runtime unification: making `pipeline.workflow` the sole runtime
 
-Status: **Phase 0, Phase 1, the runtime-type collapse, and the canonical
-lowering have landed.** One public runtime type remains, no caller dispatches on
-package shape, and a bare decoder now *has* a canonical `WorkflowSpec` — compiled
-in memory from its own `model.io`, which stays the sole serialized answer. The
-remaining step is having the interpreter **execute** that lowered workflow for
-plain decoders and deleting the decode-core orchestration; §7 records the
-parent's decision (option A) and what is still to build. The parent ratified REPLACE + DELETE (no
+Status: **Option A is implemented.** One public runtime type; no caller
+dispatches on package shape; a bare decoder is lowered at load into a canonical
+`WorkflowSpec` (its `model.io` staying the sole serialized answer) and **every
+single-row autoregressive request executes that workflow** through
+`pipeline::canonical_decode::run_canonical_decode`, which reads its loop body
+from the spec and dispatches by contract id. The second token loop
+(`run_decode_loop`) is deleted. §7 records what landed, and the two loops that
+remain because they are different algorithms rather than duplicates. The parent ratified REPLACE + DELETE (no
 compatibility facade, no permanent delegator) and assigned this consolidation to
 the owner of PR #1723. Its two gate conditions are both satisfied: `#1716` is on
 `main` (`7b79b3f5`), merged here (never rebased), and the hermetic executable
@@ -322,72 +323,77 @@ Shared infrastructure both engines already use — `engine/load.rs`,
 `placement.rs`, `session_state.rs` — is **kept**; it is not duplicated
 orchestration.
 
-## 7. Canonical lowering (parent decision A) — landed, and what remains
+## 7. Canonical lowering and execution (option A) — landed
 
-The parent chose **A: in-memory-only canonical lowering.** Authored bare-decoder
-metadata is unchanged and still valid; `model.io` remains the sole serialized
-source; the runtime compiles it into an internal canonical `WorkflowSpec` at
-load. No schema relaxation, no package re-authoring.
+### Lowering
 
-### Landed
+`onnx_genai_metadata::canonical` compiles a bare decoder's `model.io` into a
+canonical `WorkflowSpec`, in memory only.
 
-`onnx_genai_metadata::canonical` is the compiler.
+* **Deterministic and derived** — same `ModelIoSpec` in, byte-identical document
+  out. Nothing writes it back, so `validate_model_io_against_workflow` never sees
+  a pair and no published package needs re-authoring.
+* **No schema change** — both canonical components are `binding` components
+  identified by contract id (`onnx-genai.autoregressive-decode`,
+  `onnx-genai.token-policy`), dispatched the way workflow adapters already are.
+* **KV stays with its executor** — lowered state cells are `management: runtime`,
+  so the paged / share-buffer / CUDA-graph executors keep owning their KV and no
+  per-step host round-trip is introduced.
+* **Honest provenance** — `/v1/debug/config.workflow_provenance` reports
+  `authored` | `lowered` | `none`; `pipeline` keeps its meaning (does the file
+  *serialize* a workflow), so a lowered decoder reports `pipeline: false`.
 
-* **Deterministic and derived.** A pure function of the declared ABI — same
-  `ModelIoSpec` in, byte-identical document out. That is what makes the lowered
-  form derived rather than a second authored answer: it cannot drift from
-  `model.io`, because it is recomputed from it on every load. Nothing writes it
-  back, so `validate_model_io_against_workflow` never sees a pair.
-* **No schema change.** Both canonical components are `binding` components
-  identified by contract id — `onnx-genai.autoregressive-decode` (one decoder
-  forward pass) and `onnx-genai.token-policy` (next-token selection and stop
-  detection) — dispatched the way workflow adapters already are. The published
-  JSON schema is untouched.
-* **KV stays with its executor.** The lowered state cells are declared
-  `management: runtime`, the schema's existing word for "the runtime owns these
-  buffers", so the paged / share-buffer / CUDA-graph executors keep owning their
-  KV. The interpreter owns the *loop*, not the KV bytes — which is what keeps
-  device residency intact.
-* **Honest provenance.** `Engine::workflow_provenance()` and
-  `/v1/debug/config.workflow_provenance` report `authored` | `lowered` | `none`.
-  `pipeline` keeps its old meaning (does the package *serialize* a workflow), so
-  a lowered decoder reports `pipeline: false, workflow_provenance: "lowered"` and
-  no report claims the file contains something it does not.
-* **Proven.** 7 unit cases plus `canonical_lowering_corpus` over the real corpus
-  (7 packages: phi35-mini int4 shared-buffer, qwen3-0.6b int4, qwen2.5-0.5b CUDA,
-  qwen2.5-coder-7b, phi4-mini CUDA, gpt-oss-20b MoE, qwen3.5-2b), asserting
-  deterministic lowering and exact ABI mirroring. Greedy goldens over 5 real
-  models are byte-identical before and after. See
-  [`.goldens/REAL_MODEL_EVIDENCE.md`](../../.goldens/REAL_MODEL_EVIDENCE.md).
+### Execution
 
-### Remaining, by symbol
+`run_canonical_decode` is the one single-row autoregressive loop. It resolves its
+body from the workflow (`resolve_body`) and dispatches each step by contract id,
+so the spec determines what runs and in what order — a body naming an
+unimplemented contract, or one that never applies a policy, is an error.
 
-Lowering produces the canonical workflow; the interpreter does not yet *run* it
-for a plain decoder. `Engine::generate_with_callbacks` still routes a
-non-workflow package to the decode core. To finish:
+The per-step work is split so the loop owns the iteration and the executor owns
+the model:
 
-1. **`PipelineModels` for a component-less package** (`onnx-genai-ort/loader.rs`)
-   — the lowered workflow declares two `binding` components and zero ONNX
-   artifacts, so the component store must be constructible without a `pipeline`
-   metadata section. Needs a constructor; no schema change.
-2. **Ownership inversion** — the interpreter must reach the decode executor.
-   `Engine` currently owns `WorkflowRuntime`; either flatten the two field sets
-   into the one struct (field names collide only on `decode_backend`,
-   `memory_strategy_plan`, and the governor, all already reconciled) or thread
-   the executor through `run_workflow_node`.
-3. **The two contract executors** (`pipeline/workflow.rs`) — dispatch
-   `onnx-genai.autoregressive-decode` to the resolved decode session and
-   `onnx-genai.token-policy` to `processors.rs::select_next_token*` /
-   `finish_reason_after_token`, so sampling and stopping have exactly one
-   implementation shared with authored workflows.
-4. **Route and delete** — point `Engine::generate*` at `run_workflow` for lowered
-   packages, then delete `decode_loop.rs::run_decode_loop` as a *loop* (its
-   policy helpers stay, now called from the node) and the generate-time
-   declaration switch.
-5. **Re-prove** — the goldens in `.goldens/` are the parity gate: the same 5 real
-   models must still produce byte-identical greedy streams, plus the H200 CUDA
-   suites.
+* `decode_loop::forward_step` — one decoder forward pass, taking the device
+  greedy-argmax or device-sampling fast path when it applies.
+* `decode_loop::select_and_commit_step` — the logit-processor chain, sampler,
+  logprobs, KV commit, and stop/EOS detection.
 
-Step 3 is where the design earns or loses: if the decode executor ends up owning
-the token loop rather than one forward pass, the result is the opaque node the
-parent explicitly ruled out.
+Both are the only implementations; `step_decode_loop` is written on them.
+
+**Fail-closed, not mode-switched.** `install_canonical_workflow` runs at load for
+every decoder package and asserts the lowered workflow declares the two contracts
+this runtime implements. Every decode entry point then resolves the canonical
+workflow through `canonical_workflow(..)` before decoding, so `generate`,
+`generate_in_session*` (the server's path), and `generate_with_sampler` are all
+refused if none is present — proven by
+`canonical_execution_parity::the_legacy_direct_decode_path_cannot_be_selected`,
+which exercises all three.
+
+### What remains, and why it is not duplication
+
+Two loops are not `run_canonical_decode`, because they are different algorithms:
+
+* **continuous batching** (`batched.rs`) advances N rows per forward pass;
+* **speculative decoding** (`speculative/mod.rs`, `native_speculative.rs`)
+  iterates a proposed block, not a token.
+
+Neither is a second *policy*: both drive the same primitives —
+`processors::select_next_token*`, `logprob_for_token`, `commit_selected_token`,
+`ensure_constrained_finish`, `finish_result` — so sampling and stopping have one
+implementation across all three loops. Folding their iteration shapes into the
+single-row loop would require a row-scoped policy seam and a block-scoped one;
+that is the honest next step, and it is a capability change rather than a
+deduplication.
+
+### Evidence
+
+* Greedy goldens over 5 real models (phi35-mini int4, phi4-mini CUDA,
+  qwen2.5-0.5b CUDA, qwen3-0.6b, gpt-oss-20b) byte-identical to the pre-change
+  baseline at `c58eb5b2` — see [`.goldens/`](../../.goldens/).
+* `canonical_execution_parity` (8): lowering at load, prefill, cached decode on a
+  reused session, deterministic greedy, EOS stop, seeded sampling, batching where
+  supported, authored-stays-authored, and the legacy-path refusal on every entry
+  point.
+* `canonical_lowering_corpus` (5) over 7 real packages, which now **fails** if it
+  covered nothing unless `ONNX_GENAI_ALLOW_EMPTY_CORPUS=1` says the machine is
+  weightless.

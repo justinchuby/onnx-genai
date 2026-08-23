@@ -418,6 +418,8 @@ impl Engine {
             .tokenizer
             .as_ref()
             .context("this package declares no tokenizer, so it cannot decode text")?;
+        let workflow =
+            canonical_workflow(self.workflow.as_deref(), self.lowered_workflow.as_ref())?;
         let result = if let Some(plan) = speculation_plan {
             let mut stats = SpeculativeStats::default();
             let result = (|| {
@@ -492,6 +494,7 @@ impl Engine {
                 &options,
                 &chain,
                 tokenizer,
+                workflow,
                 callback,
             )
         };
@@ -843,12 +846,6 @@ impl Engine {
         if self.workflow.is_some() {
             return self.workflow_generate(request, admission_callback, token_callback);
         }
-        anyhow::ensure!(
-            self.lowered_workflow.is_some(),
-            "this package has no canonical workflow: it declares no pipeline.workflow and its \
-             model.io was never lowered. The direct decode path it would once have taken no \
-             longer exists, so this is a loader bug rather than a package problem"
-        );
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
             // Speculation still runs cold: the native speculative paths own
@@ -1066,13 +1063,16 @@ impl Engine {
                 });
             }
 
-            // Borrow the tokenizer before the disjoint mutable borrows below:
-            // the decode backend takes `&mut self.kv_cache` / `&mut
-            // self.scheduler`, so a later `&self` accessor call would overlap.
+            // Borrow the tokenizer and the canonical workflow before the
+            // disjoint mutable borrows below: the decode backend takes
+            // `&mut self.kv_cache` / `&mut self.scheduler`, so a later `&self`
+            // accessor call would overlap.
             let tokenizer = self
                 .tokenizer
                 .as_ref()
                 .context("this package declares no tokenizer, so it cannot decode text")?;
+            let workflow =
+                canonical_workflow(self.workflow.as_deref(), self.lowered_workflow.as_ref())?;
             let mut backend = SessionDecodeLoopBackend {
                 session: self
                     .session
@@ -1097,6 +1097,7 @@ impl Engine {
                     chain: &chain,
                     tokenizer,
                     max_context,
+                    workflow,
                 },
                 callback.as_deref_mut(),
             )
@@ -2081,6 +2082,25 @@ impl Engine {
     }
 }
 
+/// Resolve the canonical workflow from the two fields that can hold one.
+///
+/// Written as a free function over the fields rather than a `&self` method so it
+/// stays disjoint from the mutable borrows of `native_session` / `kv_cache` that
+/// surround every decode call site.
+fn canonical_workflow<'a>(
+    workflow: Option<&'a crate::pipeline::WorkflowRuntime>,
+    lowered: Option<&'a onnx_genai_metadata::WorkflowSpec>,
+) -> anyhow::Result<&'a onnx_genai_metadata::WorkflowSpec> {
+    if let Some(workflow) = workflow {
+        return Ok(workflow.workflow_spec());
+    }
+    lowered.context(
+        "this package has no canonical workflow: it declares no pipeline.workflow and its \
+         model.io was never lowered. The direct decode path it would once have taken no longer \
+         exists, so this is a loader bug rather than a package problem",
+    )
+}
+
 struct SessionDecodeLoopBackend<'a> {
     session: &'a Session,
     kv_model: Option<&'a KvModelInfo>,
@@ -2352,6 +2372,8 @@ impl Engine {
                     .tokenizer
                     .as_ref()
                     .context("this package declares no tokenizer, so it cannot decode text")?;
+                let workflow =
+                    canonical_workflow(self.workflow.as_deref(), self.lowered_workflow.as_ref())?;
                 let native = self
                     .native_session
                     .as_mut()
@@ -2374,6 +2396,7 @@ impl Engine {
                     &options,
                     &chain,
                     tokenizer,
+                    workflow,
                     callback,
                 )?
             };

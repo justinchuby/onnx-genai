@@ -222,22 +222,43 @@ fn the_legacy_direct_decode_path_cannot_be_selected() -> anyhow::Result<()> {
         );
     }
 
-    // 2. A runtime whose canonical form is absent refuses to generate. Nothing
-    //    in the public API can produce this state — which is the point — so it
-    //    is constructed through the test-only seam to prove the guard exists.
-    let mut engine = engine()?;
-    engine.forget_canonical_workflow_for_test();
-    let error = engine
-        .generate(greedy(2))
-        .expect_err("a runtime with no canonical workflow must refuse to generate");
-    let message = format!("{error:#}");
-    assert!(
-        message.contains("no canonical workflow"),
-        "the refusal must name the missing canonical workflow: {message}"
+    // 2. A runtime whose canonical form is absent refuses to decode — on EVERY
+    //    entry point, not just the stateless one. The refusal lives where the
+    //    loop resolves its workflow, so `generate`, the session path the server
+    //    actually uses, and the sampler path all reach it. Nothing in the public
+    //    API can produce this state, which is why it is built through the
+    //    test-only seam: the point is to prove the refusal is real rather than
+    //    unreachable.
+    let refuses = |call: &dyn Fn(&mut Engine) -> anyhow::Result<()>, label: &str| {
+        let mut engine = engine().expect("engine");
+        engine.forget_canonical_workflow_for_test();
+        let error = call(&mut engine)
+            .expect_err(&format!("{label} must refuse without a canonical workflow"));
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("no canonical workflow"),
+            "{label}: the refusal must name the missing canonical workflow: {message}"
+        );
+        assert!(
+            message.contains("no longer exists"),
+            "{label}: the refusal must say the direct path is gone: {message}"
+        );
+    };
+    refuses(&|engine| engine.generate(greedy(2)).map(|_| ()), "generate");
+    refuses(
+        &|engine| {
+            let session = engine.create_session()?;
+            engine.generate_in_session(session, greedy(2)).map(|_| ())
+        },
+        "generate_in_session",
     );
-    assert!(
-        message.contains("no longer exists"),
-        "the refusal must say the direct path is gone, not merely unavailable: {message}"
+    refuses(
+        &|engine| {
+            engine
+                .generate_with_sampler(greedy(2), Box::new(onnx_genai_engine::GreedySampler))
+                .map(|_| ())
+        },
+        "generate_with_sampler",
     );
     Ok(())
 }

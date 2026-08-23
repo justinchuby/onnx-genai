@@ -706,6 +706,11 @@ impl WorkflowRuntime {
             .map(|set| set.borrow().device_residency_counts())
     }
 
+    /// The workflow this runtime executes.
+    pub(crate) fn workflow_spec(&self) -> &onnx_genai_metadata::WorkflowSpec {
+        &self.workflow
+    }
+
     pub(crate) fn governor(&self) -> &EngineResourceGovernor {
         &self.resource_governor
     }

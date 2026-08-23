@@ -71,6 +71,27 @@ fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/root"))
 }
 
+/// Fail a corpus case that covered nothing, unless the machine declares it has
+/// no corpus.
+///
+/// A case that iterates an empty corpus and returns `Ok` reports success without
+/// checking anything — exactly the silent pass this suite's doc claims not to
+/// allow. A weightless machine must therefore opt out explicitly with
+/// `ONNX_GENAI_ALLOW_EMPTY_CORPUS=1`, which turns a green run into a legible
+/// "covered nothing" rather than an indistinguishable pass.
+fn require_corpus_coverage(case: &str, covered: usize) {
+    if covered > 0 {
+        return;
+    }
+    assert!(
+        std::env::var_os("ONNX_GENAI_ALLOW_EMPTY_CORPUS").is_some(),
+        "{case} covered no real packages. Install at least one corpus package (see \
+         corpus_inventory for the list this machine is missing), or set \
+         ONNX_GENAI_ALLOW_EMPTY_CORPUS=1 to acknowledge a weightless run."
+    );
+    eprintln!("CANONICAL_CORPUS {case}: covered nothing (ONNX_GENAI_ALLOW_EMPTY_CORPUS set)");
+}
+
 fn open(dir: &Path) -> Option<Engine> {
     if !dir.is_dir() {
         return None;
@@ -148,6 +169,7 @@ fn real_packages_lower_deterministically() {
         eprintln!("CANONICAL_CORPUS_LOWERED {label}");
     }
     eprintln!("CANONICAL_CORPUS_DETERMINISM covered={covered}");
+    require_corpus_coverage("real_packages_lower_deterministically", covered);
 }
 
 /// The lowered decoder component's ports are exactly the resolved ABI's ports.
@@ -211,6 +233,7 @@ fn lowered_ports_mirror_the_resolved_abi() {
         covered += 1;
     }
     eprintln!("CANONICAL_CORPUS_PORT_MIRROR covered={covered}");
+    require_corpus_coverage("lowered_ports_mirror_the_resolved_abi", covered);
 }
 
 /// Lowering never mutates the package's serialized metadata.
@@ -247,6 +270,10 @@ fn real_packages_keep_model_io_as_the_sole_serialized_answer() {
         covered += 1;
     }
     eprintln!("CANONICAL_CORPUS_UNMUTATED covered={covered}");
+    require_corpus_coverage(
+        "real_packages_keep_model_io_as_the_sole_serialized_answer",
+        covered,
+    );
 }
 
 /// An authored workflow package is never lowered beside its own workflow.

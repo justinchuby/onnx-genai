@@ -1372,8 +1372,9 @@ impl NativeDecodeSession {
         options: &GenerateOptions,
         chain: &ProcessorChain,
         tokenizer: &Tokenizer,
+        workflow: &onnx_genai_metadata::WorkflowSpec,
     ) -> anyhow::Result<GenerateResult> {
-        self.generate_with_callback(prompt_tokens, options, chain, tokenizer, None)
+        self.generate_with_callback(prompt_tokens, options, chain, tokenizer, workflow, None)
     }
 
     /// Generate through the shared loop and optionally stream generated tokens.
@@ -1383,6 +1384,7 @@ impl NativeDecodeSession {
         options: &GenerateOptions,
         chain: &ProcessorChain,
         tokenizer: &Tokenizer,
+        workflow: &onnx_genai_metadata::WorkflowSpec,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         if prompt_tokens.is_empty() {
@@ -1406,6 +1408,7 @@ impl NativeDecodeSession {
                 chain,
                 tokenizer,
                 max_context: options.max_context,
+                workflow,
             },
             callback,
         )
@@ -1482,6 +1485,7 @@ impl NativeDecodeSession {
         options: &GenerateOptions,
         chain: &ProcessorChain,
         tokenizer: &Tokenizer,
+        workflow: &onnx_genai_metadata::WorkflowSpec,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         if prompt_tokens.is_empty() {
@@ -1490,7 +1494,14 @@ impl NativeDecodeSession {
         let resume_from = resume_from.min(prompt_tokens.len());
         if resume_from == 0 || resume_from > self.current_len {
             // Full reset path — no valid KV prefix to reuse.
-            return self.generate_with_callback(prompt_tokens, options, chain, tokenizer, callback);
+            return self.generate_with_callback(
+                prompt_tokens,
+                options,
+                chain,
+                tokenizer,
+                workflow,
+                callback,
+            );
         }
         // Rewind KV to resume_from if we've advanced beyond it (e.g. diverged prefix).
         if self.current_len > resume_from {
@@ -1521,6 +1532,7 @@ impl NativeDecodeSession {
                 chain,
                 tokenizer,
                 max_context: options.max_context,
+                workflow,
             },
             callback,
         )

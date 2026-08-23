@@ -431,6 +431,15 @@ pub(crate) fn exceeded_context_limit(
 
 #[cfg(test)]
 mod tests {
+    /// The canonical workflow these loop tests execute.
+    ///
+    /// The loop reads its body from a workflow, so a unit test must supply one;
+    /// using the same lowering a minimal real decoder gets keeps the test on the
+    /// production path instead of a bespoke shape.
+    fn canonical_workflow() -> onnx_genai_metadata::WorkflowSpec {
+        crate::pipeline::canonical_decode::test_canonical_workflow()
+    }
+
     use super::*;
     use crate::processors::build_processor_chain;
     use std::path::Path;
@@ -537,6 +546,7 @@ mod tests {
 
     #[test]
     fn sampled_fastpath_error_falls_back_to_seeded_host_sampling() -> anyhow::Result<()> {
+        let canonical = canonical_workflow();
         let options = GenerateOptions {
             max_new_tokens: 3,
             greedy: false,
@@ -560,6 +570,7 @@ mod tests {
                 chain: &chain,
                 tokenizer: &tokenizer,
                 max_context: None,
+                workflow: &canonical,
             },
             None,
         )?;
@@ -574,6 +585,7 @@ mod tests {
                 chain: &chain,
                 tokenizer: &tokenizer,
                 max_context: None,
+                workflow: &canonical,
             },
             None,
         )?;
@@ -610,6 +622,7 @@ mod tests {
                     chain: &chain,
                     tokenizer: &tokenizer,
                     max_context: None,
+                    workflow: &canonical_workflow(),
                 },
                 None,
             )?
@@ -625,6 +638,7 @@ mod tests {
 
     #[test]
     fn sampled_fastpath_not_applicable_does_not_latch_off() -> anyhow::Result<()> {
+        let canonical = canonical_workflow();
         // `Ok(None)` (e.g. the multi-token prefill step) must fall back to host
         // sampling for that step WITHOUT disabling the device fast path, so the
         // backend keeps being asked on every subsequent step.
@@ -651,6 +665,7 @@ mod tests {
                 chain: &chain,
                 tokenizer: &tokenizer,
                 max_context: None,
+                workflow: &canonical,
             },
             None,
         )?;
@@ -665,6 +680,7 @@ mod tests {
                 chain: &chain,
                 tokenizer: &tokenizer,
                 max_context: None,
+                workflow: &canonical,
             },
             None,
         )?;
@@ -680,6 +696,7 @@ mod tests {
 
     #[test]
     fn unsupported_sampled_runner_never_runs_device_step() -> anyhow::Result<()> {
+        let canonical = canonical_workflow();
         // A backend that cannot sample on the device (`sampled_fastpath_supported`
         // is false) must never have `next_token_sampled` invoked. That method runs
         // a model step which advances KV state; if it were called and then failed,
@@ -710,6 +727,7 @@ mod tests {
                 chain: &chain,
                 tokenizer: &tokenizer,
                 max_context: None,
+                workflow: &canonical,
             },
             None,
         )?;
@@ -733,6 +751,7 @@ mod tests {
         assert!(chain.is_empty());
         let tokenizer = tokenizer()?;
 
+        let canonical = canonical_workflow();
         let mut plain_backend = MockBackend::new(false);
         let mut plain_state = DecodeLoopState::new(0, options.seed, None);
         let plain = crate::pipeline::canonical_decode::run_canonical_decode(
@@ -743,6 +762,7 @@ mod tests {
                 chain: &chain,
                 tokenizer: &tokenizer,
                 max_context: None,
+                workflow: &canonical,
             },
             None,
         )?;
@@ -753,6 +773,7 @@ mod tests {
             assert!(!token.text.is_empty());
             Ok(())
         };
+        let canonical = canonical_workflow();
         let mut streamed_backend = MockBackend::new(false);
         let mut streamed_state = DecodeLoopState::new(0, options.seed, None);
         let streamed = crate::pipeline::canonical_decode::run_canonical_decode(
@@ -763,6 +784,7 @@ mod tests {
                 chain: &chain,
                 tokenizer: &tokenizer,
                 max_context: None,
+                workflow: &canonical,
             },
             Some(&mut callback),
         )?;

@@ -1,58 +1,54 @@
-feat(engine): execute every generated request through the canonical workflow
+fix(engine): address the Opus rubber-duck review
 
-Architecture A, completed. A bare-decoder package keeps `model.io` as its sole
-serialized answer; the loader compiles that ABI into a canonical WorkflowSpec in
-memory and the interpreter's canonical decode loop executes it. There is no
-longer a direct decode path to fall back to.
+An Opus 4.8 review challenged three claims. Two were right and are fixed here;
+one was wrong and the docs now state what is actually true.
 
-The split that makes this real rather than a wrapper is in `decode_loop.rs`:
+RIGHT — the lowered workflow was decoration. `lowered_workflow` was stored and
+only ever read as `.is_some()`; the contract ids were validated at load but
+nothing dispatched on them, so a bespoke Rust loop ran while the spec sat unused.
+`run_canonical_decode` now resolves its loop body *from the workflow*
+(`resolve_body`) and dispatches each step by contract id. Reorder the emitted
+steps, name a contract this runtime does not implement, or omit the policy, and
+execution changes or fails accordingly. The spec is executed, not attested.
 
-* `forward_step` is the `onnx-genai.autoregressive-decode` primitive -- one
-  decoder forward pass, taking the device greedy-argmax or device-sampling fast
-  path when it applies. KV stays the executor's business, exactly as the lowered
-  workflow declares (`management: runtime`), so device residency is untouched.
-* `select_and_commit_step` is the `onnx-genai.token-policy` primitive -- the
-  logit-processor chain, sampler, logprobs, KV commit, and stop/EOS detection.
+RIGHT — the fail-closed guard covered one entry point. It sat in
+`generate_with_callbacks`, so `generate_in_session*` -- the path the server
+actually uses -- and `generate_with_sampler` reached decode without it. The check
+now lives where the loop resolves its workflow, which every decode entry point
+must pass through, and the test drives all three rather than only `generate()`.
 
-Both are the *only* implementations. `step_decode_loop` is now written on them,
-so a caller cannot reach a second copy of the policy.
+WRONG — "batched decoding is a second sampling implementation". It is not:
+`batched.rs` and `speculative/mod.rs` both call the shared
+`select_next_token_with_rng` / `logprob_for_token` / `commit_selected_token` /
+`ensure_constrained_finish` / `finish_result`. What they have is a different
+iteration shape -- N rows per forward pass, and a proposed block rather than a
+token -- which is inherent to what they do, not duplication. The module doc and
+the design note now say exactly that instead of claiming one loop reaches every
+request, which was overstated.
 
-`pipeline::canonical_decode::run_canonical_decode` is the one token loop. It
-owns iteration count, the context-limit stop, the stop decision, and the emitted
-token stream; the body is forward-then-policy. `run_decode_loop` -- the second
-token loop only the direct `Engine` path could drive -- is deleted, and its unit
-tests re-point at the loop that remains. The ORT session path, both native decode
-sessions, and the workflow path now share it.
+Also from the review:
 
-Fail-closed, not mode-switched. `install_canonical_workflow` runs at load for
-every decoder package and asserts the lowered workflow declares the two contracts
-this runtime implements; a package that cannot be lowered fails to load.
-`generate_with_callbacks` then refuses outright if no canonical form is present,
-naming the fact that the old path no longer exists. Two hand-built test doubles
-tripped that guard on the first run -- they skip the loader -- and now carry the
-same lowering a real minimal decoder gets, rather than the guard being weakened.
+* `canonical_lowering_corpus` passed silently on a weightless machine, which its
+  own doc said it must not. Its cases now fail when they covered nothing unless
+  `ONNX_GENAI_ALLOW_EMPTY_CORPUS=1` acknowledges the run.
+* `one_runtime_e2e::session_lifecycle_is_one_api` tolerated the very behavior it
+  claimed to enforce -- an `Ok` from a workflow package's `create_session()` fell
+  through the `if let Some(error)`. It now requires the refusal.
+* Stale `run_decode_loop` references in `native_speculative.rs` and
+  `profile_native.rs` fixed; the function is gone.
 
-Parity, on real models: greedy goldens for phi35-mini int4, phi4-mini CUDA,
-qwen2.5-0.5b CUDA, qwen3-0.6b, and gpt-oss-20b are byte-identical to the
-pre-change baseline captured at c58eb5b2. The tokens did not move; only who
-produced them did.
+The review also confirmed, by diffing against main, that the `forward_step` /
+`select_and_commit_step` split preserves the old `step_decode_loop` exactly:
+device-sample `Ok(None)`-stays-armed vs `Err`-latches-off, the single RNG draw
+reused by the host fallback, logprob capture only on the host branch, and
+`commit_token` before `commit_selected_token`. Goldens agree -- the same 5 real
+models remain byte-identical to the c58eb5b2 baseline.
 
-`canonical_execution_parity` (8) pins what goldens cannot: that a bare decoder is
-lowered at load and reports `provenance: lowered` while still serializing only
-`model.io`; that prefill, cached decode on a reused session, deterministic greedy
-generation, EOS stopping, seeded sampling, and batching (where the decode path
-supports it) all run through the canonical loop; that an authored workflow is
-executed as authored and never lowered beside itself; and -- the case the whole
-change rests on -- that the legacy direct path cannot be selected: no constructor
-skips lowering, and a runtime with its canonical form removed refuses to generate
-instead of falling back.
-
-Verified: onnx-genai-engine 72 targets green under `native-backend`; server /
-CLI / C ABI / metadata / bench 30 green; H200 native-cuda green
-(canonical_execution_parity 8, native_workflow_parity 12, corpus 5,
-one_runtime_e2e 5, fixture floor 3); `cargo fmt --all --check`; clippy
-`-D warnings` clean apart from a `too_many_arguments` lint on
-`engine/placement.rs`, which arrived with main (#1779) and this branch does not
-touch.
+Verified: engine 72 targets green under `native-backend`; downstream 30 green
+(one timing-sensitive server streaming test flaked under full-suite load and
+passes 3/3 in isolation, same class as the earlier stalled-output flake); H200
+native-cuda green (canonical_execution_parity 8, native_workflow_parity 12,
+one_runtime_e2e 5, fixture floor 3); fmt clean; clippy `-D warnings` clean apart
+from a `too_many_arguments` lint on `engine/placement.rs` that arrived with main.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>

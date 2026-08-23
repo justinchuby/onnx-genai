@@ -98,17 +98,17 @@ fn session_lifecycle_is_one_api() -> anyhow::Result<()> {
         "a closed session must no longer resolve"
     );
 
+    // A workflow package owns no engine sessions. It must say so, not silently
+    // hand back a session that nothing backs.
     let mut workflow = Engine::from_dir(&workflow_package(), EngineConfig::default())?;
     let error = workflow
         .create_session()
-        .err()
-        .map(|error| format!("{error:#}"));
-    if let Some(message) = error {
-        assert!(
-            !message.is_empty(),
-            "a workflow package must explain why it has no engine sessions"
-        );
-    }
+        .expect_err("a workflow package must refuse to open an engine session");
+    let message = format!("{error:#}");
+    assert!(
+        !message.is_empty(),
+        "a workflow package must explain why it has no engine sessions"
+    );
     Ok(())
 }
 

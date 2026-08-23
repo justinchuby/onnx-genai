@@ -3155,7 +3155,7 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
     if args.speculative != SpeculativeArg::None {
         bail!(
             "--speculative is not supported on the --pipeline path: Engine drives its \
-             autoregressive decode through the strict one-token-per-step run_decode_loop, which \
+             autoregressive decode through the strict one-token-per-step canonical decode loop, which \
              has no k-token verify/rewind hook. Native prompt-lookup speculation is wired only \
              into the single-model Engine path (use --steady without --pipeline). Requesting \
              speculation here would be silently ignored and report misleading (greedy) numbers."
