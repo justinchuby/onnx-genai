@@ -1,0 +1,141 @@
+fix(ep-cuda): restore the CUDA lane -- five defects, only the first of which was reported
+
+The `CUDA compile (Linux x86_64)` lane has been red since #1836 (`6e4b0ebb3`);
+last green was `cb81745b0`. The reported compile error was masking two further
+failures, so fixing it alone would have moved the lane from "red at build" to
+"red at the honesty script". Two more arrived on `main` while this PR was open,
+in #1884 and #1895. All five are fixed here; the lane cannot go green on any
+proper subset.
+
+1. Unresolved import (the reported error).
+
+`content_preserving_transition_gpu.rs` imported
+`transition_granule_range_with_phase8_faults` unconditionally, but that item is
+gated `#[cfg(any(test, feature = "gpu-tests"))]`. The `test` arm does not cover
+an integration test: `tests/*.rs` are separate crates linking the library built
+*without* `cfg(test)`, so the item is genuinely absent in the
+`without-gpu-tests` configuration. Invisible to any local run that passes
+`--features gpu-tests`.
+
+Fixed with a two-arm local shim, mirroring `with_faults` in
+`crates/onnx-runtime-cuda-memory/tests/virtual_memory_gpu.rs`, which already
+solves this exact problem for `CudaVirtualBacking::with_driver_faults`. The
+gate itself is left alone: widening it would ship a driver fault injector that
+can force `cuMemUnmap`/`cuMemMap`/`cuMemSetAccess` to fail into production, and
+`required-features` is precisely what the honesty script exists to forbid
+("exists only with gpu-tests enabled; CUDA tests must not hide from CPU
+inventory").
+
+#1895 (`1be9f2cc2`) reached this file first, with `#![cfg(feature =
+"gpu-tests")]` on the whole target -- the option rejected above. It fixed the
+compile and traded it for an inventory failure on the same lane: `main` at
+`1be9f2cc2` reports "content_preserving_transition_gpu: Cargo reported no
+integration tests" plus 19 x "test exists only with gpu-tests enabled" (job
+`97266415620`). The target was not repaired, it was hidden. That line is
+removed here and the module doc records why, so the option is not re-tried a
+third time.
+
+2. Five non-ignored tests in a `_gpu` target (4 honesty violations).
+
+`verify_cuda_test_honesty.py` requires every test in a `_gpu` target to be
+ignored, not passed, on a CPU-only runner -- that is how the suite is stopped
+from reporting green for a GPU it never touched.
+
+Three were genuinely CPU-only predicate tests over `verify_safe_point`. Moved
+to a new non-`_gpu` target rather than `#[ignore]`d: silencing them would have
+greened the lane by deleting coverage, and target naming is the escape hatch
+the script's own comment names for CPU-only tests in a CUDA crate.
+
+Moving them alone would *also* have stopped them running. A non-`_gpu` target
+is skipped by the honesty script, and `workspace_test_packages.py` deny-lists
+this crate from every offline lane, so the target would have been compiled and
+never executed. The CUDA lane therefore gains an explicit `--test
+content_preserving_transition` step, alongside the two CPU-only targets in this
+crate that already have one for the same reason.
+
+The other two asserted nothing -- `fault_injection_safe_point_recheck_rejects`
+is comments plus a `println!` and self-describes as "a documentation test";
+`zero_len_is_committed_noop` `println!`s that the behaviour is "verified by
+implementation". Both passed unconditionally. Removed. The first has real
+sibling coverage in `fault_injection_recheck_safe_point_rejected_gpu`; the
+second does not -- the `len == 0` early return has no test anywhere. Deleting a
+test that asserts nothing loses no coverage, but the gap is pre-existing and
+real, and a genuine test needs a device (the early return still takes
+`&CudaRuntime`/`&mut CudaReservation`), so it is left for a GPU-capable change
+rather than papered over.
+
+Added `safe_point_accepts_a_clean_state`, because the three moved tests only
+ever assert `is_err()` and so all three survive a mutant that makes
+`verify_safe_point` reject unconditionally. Verified: under that mutant the
+inherited three pass and only the new test fails.
+
+3. The manifest guard checked a proxy, not the property it claimed.
+
+The check was the literal substring `"gpu-tests = []"`, so #1860 turned it red
+by changing the value to `["onnx-runtime-cuda-memory/gpu-tests"]` -- a
+legitimate and necessary forwarding. Now matches the feature *key* whatever its
+value, extracted into `declares_gpu_tests_feature` so it is covered by the
+script's own `--self-test` fixtures, which it previously was not.
+
+The key is looked for only inside the `[features]` table. Review falsified the
+first version of this fix: a file-wide regex also accepts a *dependency* named
+`gpu-tests`, or one under `[target.'cfg(...)'.dependencies]` -- the same proxy
+mistake in a new costume, inside the fix for that mistake. Twelve fixtures now,
+including both false-positive shapes.
+
+4. A GPU test in a `_gpu` target with no `#[ignore]` (#1895).
+
+`causal_conv_with_state_gpu::the_standard_domain_spelling_reaches_the_same_kernel`
+calls `require_cuda()` exactly like its two siblings but is missing their
+`#[cfg_attr(not(feature = "gpu-tests"), ignore = ...)]`, so it ran and failed on
+a CPU runner. Fixed by adding the sibling attribute verbatim; no design choice
+involved.
+
+5. A CPU-only test inside a `_gpu` target (#1884).
+
+`expert_route_telemetry_probe_gpu::cpu_oracle_and_validator_self_consistent`
+passes in both configurations, which the script reports as "executed without
+gpu-tests". Its doc comment states the intent plainly: it "runs without a GPU so
+the reference cannot silently rot".
+
+`#[ignore]` would clear the checker by destroying exactly that property -- an
+ignored test runs nowhere -- so this takes the same route as defect 2. The
+pure-CPU oracle (`cpu_bitmap`, `cpu_dedup`, `consume_and_validate`,
+`synth_routes` and the header indices) moves verbatim to a shared
+`tests/expert_route_oracle/mod.rs`, which is a module and not a target: Cargo
+auto-discovers `tests/*.rs` and `tests/*/main.rs` only. Both the `_gpu` target
+and a new `expert_route_telemetry_probe` target declare it, so there is one
+copy of the oracle and the seven GPU tests keep diffing against the same code
+the CPU test checks. The new target gets its own `ci.yml` step, for the reason
+in defect 2.
+
+Verified live in its new home by mutation rather than by its own green: perturb
+the shift in `cpu_bitmap` -> FAILED, revert -> ok. "It compiles in the new file"
+is not evidence that it executes there, which is the defect an earlier review
+caught in defect 2's target.
+
+Each fix independently falsified by re-introducing it: import -> E0432;
+un-ignored test -> "must be ignored, not pass" (+3 inventory errors); manifest
+value -> "must define a gpu-tests feature"; missing `cfg_attr` -> "1 tests
+failed while checking ignored status"; relocated CPU test -> "executed without
+gpu-tests; CUDA tests must be ignored, not pass".
+
+Honesty script exits 0: 530 tests/79 targets identical in both configurations,
+530 ignored without gpu-tests, 0 passed on this no-CUDA host.
+`cargo clippy -p onnx-runtime-ep-cuda --features cuda -- -D warnings` clean (the
+lane's exact command, both invocations of it); both explicit `ci.yml` test steps
+pass 4/4 and 1/1; fmt clean.
+
+Not fixed here: `cargo clippy -p onnx-runtime-ep-cuda --features cuda
+--all-targets -- -D warnings` reports 23 pre-existing errors and dies on
+`index_share_gpu` and `qmoe_zero_copy_cold_expert_spike_gpu` before reaching the
+rest, so 23 is a floor, not a total. None are in a file this PR touches -- no
+diagnostic location matches any of them. No lane runs that command: both
+ep-cuda clippy steps omit `--all-targets` and `workspace_test_packages.py`
+deny-lists the crate. A real gap, but a separate one; folding it in would put
+unrelated files in a lane-restoration PR.
+
+Closes #1875
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+

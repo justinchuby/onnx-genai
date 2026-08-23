@@ -207,6 +207,10 @@ fn causal_conv_with_state_matches_cpu_for_batched_decode() {
 /// standard-domain CPU oracle, and it matches the contrib-domain CUDA result
 /// bit for bit — if the registration were missing, `run_cuda` would find no
 /// kernel and the node would never reach this EP at all.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn the_standard_domain_spelling_reaches_the_same_kernel() {
     let ep = require_cuda();

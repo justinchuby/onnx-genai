@@ -229,7 +229,51 @@ def validate_active_no_cuda_result(result: ActiveResult) -> list[str]:
     return errors
 
 
+def declares_gpu_tests_feature(manifest: str) -> bool:
+    """True if the manifest defines a `gpu-tests` feature, whatever its value.
+
+    The property this guard cares about is that the feature *exists*, so that
+    `--features gpu-tests` is a meaningful flag for the crate. An earlier
+    version matched the literal string `gpu-tests = []`, which silently
+    conflated "declares the feature" with "declares it with an empty value" and
+    so rejected the legitimate forwarding form
+    `gpu-tests = ["onnx-runtime-cuda-memory/gpu-tests"]`.
+
+    The key is looked for only inside the `[features]` table. A file-wide match
+    would accept a *dependency* named `gpu-tests`, or one under a
+    `[target.'cfg(...)'.dependencies]` table -- which is the same mistake in a
+    new costume: matching a string that usually co-occurs with the property
+    instead of the property itself.
+    """
+    in_features = False
+    for raw_line in manifest.splitlines():
+        line = raw_line.strip()
+        if line.startswith("["):
+            in_features = line.split("#", 1)[0].strip() == "[features]"
+            continue
+        if in_features and re.match(r"gpu-tests\s*=", line):
+            return True
+    return False
+
+
 def self_test() -> None:
+    for manifest, expected in (
+        ("[features]\ngpu-tests = []\n", True),
+        ('[features]\ngpu-tests = ["onnx-runtime-cuda-memory/gpu-tests"]\n', True),
+        ("[features]\ngpu-tests = [\n    \"dep/gpu-tests\",\n]\n", True),
+        ('[dependencies]\nfoo = "1"\n\n[features]\ngpu-tests = []\n', True),
+        ('[features]\ngpu-tests = []\n\n[dependencies]\nfoo = "1"\n', True),
+        ("[features] # the table\ngpu-tests = []\n", True),
+        ("[features]\ndefault = []\n", False),
+        ("[features]\n# gpu-tests = []\n", False),
+        ("[features]\ngpu-tests-extra = []\n", False),
+        ("[dependencies]\nfoo = { features = [\"gpu-tests\"] }\n", False),
+        ('[dependencies]\ngpu-tests = "1.0"\n', False),
+        ('[target.\'cfg(unix)\'.dependencies]\ngpu-tests = "1.0"\n', False),
+    ):
+        if declares_gpu_tests_feature(manifest) is not expected:
+            raise AssertionError(f"gpu-tests feature detection wrong for: {manifest!r}")
+
     for cpu_target in (
         "deferred_release_queue",
         "no_built_in_eager_allocator",
@@ -338,7 +382,7 @@ def main() -> int:
     errors: list[str] = []
     for crate in CUDA_CRATES:
         manifest = (crate / "Cargo.toml").read_text(encoding="utf-8")
-        if "gpu-tests = []" not in manifest:
+        if not declares_gpu_tests_feature(manifest):
             errors.append(f"crates/{crate.name}/Cargo.toml must define a gpu-tests feature")
 
     base_binaries = build_test_binaries(BASE_CONFIG)

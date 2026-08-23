@@ -28,14 +28,22 @@
 //! Platform: A100-SXM4-80GB, Linux, driver 580.105.08, CUDA 13.0,
 //! host_numa_id=3, granularity=2 MiB.
 //!
-//! Requires the `gpu-tests` feature. This file imports fault-injection helpers
-//! that the library gates on `#[cfg(any(test, feature = "gpu-tests"))]`, and an
-//! integration test is a separate compilation unit, so the library's `cfg(test)`
-//! does not apply to it — only the feature does. Without this guard, a plain
-//! `cargo test -p onnx-runtime-ep-cuda` (or CI's `cargo test --no-run`) fails to
-//! compile the whole target with an unresolved import, which is not a useful
-//! signal about a suite that cannot run on a machine with no GPU anyway.
-#![cfg(feature = "gpu-tests")]
+//! This file reaches fault-injection helpers that the library gates on
+//! `#[cfg(any(test, feature = "gpu-tests"))]`. An integration test is a separate
+//! compilation unit, so the library's `cfg(test)` arm does not apply to it —
+//! only the feature does, and a top-level `use` resolves unconditionally.
+//!
+//! #1895 addressed that with a file-level `#![cfg(feature = "gpu-tests")]`,
+//! which fixed the compile but made the whole target vanish from the
+//! `without-gpu-tests` build. `.github/scripts/verify_cuda_test_honesty.py`
+//! rejects exactly that — "exists only with gpu-tests enabled; CUDA tests must
+//! not hide from CPU inventory" — so it traded a compile error on the CUDA lane
+//! for an inventory failure on the same lane.
+//!
+//! The gate is instead crossed by the two-arm `transition_with_phase8_faults`
+//! shim below, matching the convention already used twice in
+//! `onnx-runtime-cuda-memory`. The target compiles and lists its tests in both
+//! configurations, which is what the lane is there to enforce.
 #![allow(
     clippy::too_many_arguments,
     clippy::uninlined_format_args,
@@ -51,16 +59,96 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_cuda_memory::capability::{CapabilityGateFailure, host_numa_capability};
 use onnx_runtime_cuda_memory::release::{DriverFaultPlan, DriverOperation};
 use onnx_runtime_cuda_memory::virtual_memory::{
-    CudaVirtualBacking, PhysicalHandlePool, PhysicalLocation,
+    CudaReservation, CudaVirtualBacking, PhysicalHandlePool, PhysicalLocation,
 };
 use onnx_runtime_ep_api::ResizeSafePoint;
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::granule_transition::{
-    TransitionOutcome, TransitionTimings, transition_granule_range, transition_granule_range_timed,
-    transition_granule_range_with_phase8_faults, verify_safe_point,
+    TransitionOutcome, TransitionTimings, VerifiedSafePoint, transition_granule_range,
+    transition_granule_range_timed, verify_safe_point,
 };
 use onnx_runtime_memory_governor::{DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryRole};
 use onnx_runtime_virtual_memory::VirtualBacking;
+
+// ---------------------------------------------------------------------------
+// Phase-8 fault injection, routed so this target still builds without gpu-tests
+// ---------------------------------------------------------------------------
+
+/// Call `granule_transition::transition_granule_range_with_phase8_faults`.
+///
+/// That entry point is gated `#[cfg(any(test, feature = "gpu-tests"))]` on
+/// purpose -- its doc states it is "not reachable from production", and it can
+/// force `cuMemUnmap`/`cuMemMap`/`cuMemSetAccess` to fail, so it must not exist
+/// in a shipped build. The `test` arm of that gate does **not** cover this file:
+/// `tests/*.rs` are separate crates that link the library built *without*
+/// `cfg(test)`, so under the `without-gpu-tests` configuration the item is
+/// genuinely absent.
+///
+/// The target must nevertheless compile in *both* configurations. CI's
+/// `.github/scripts/verify_cuda_test_honesty.py` reconciles the two inventories
+/// and rejects any `_gpu` target that "exists only with gpu-tests enabled; CUDA
+/// tests must not hide from CPU inventory", so making the target conditional --
+/// via `required-features` or a `#![cfg]` -- would trade this compile error for
+/// a lane failure and lose the CPU-side inventory of these 14 tests.
+///
+/// Routing the call through a two-arm shim satisfies both: the gate stays
+/// intact, and the target keeps building and listing its tests everywhere. The
+/// `unreachable!` arm is genuinely unreachable -- every test in this file is
+/// `#[ignore]`, and reaching the injector at all requires a CUDA device.
+///
+/// This mirrors `with_faults` in
+/// `crates/onnx-runtime-cuda-memory/tests/virtual_memory_gpu.rs`, which solves
+/// the identical problem for `CudaVirtualBacking::with_driver_faults`.
+#[cfg(feature = "gpu-tests")]
+#[allow(clippy::too_many_arguments)]
+fn transition_with_phase8_faults(
+    runtime: &onnx_runtime_ep_cuda::CudaRuntime,
+    reservation: &mut CudaReservation,
+    backing: &CudaVirtualBacking,
+    offset: usize,
+    len: usize,
+    new_location: PhysicalLocation,
+    old_pool: &Arc<PhysicalHandlePool>,
+    new_pool: &Arc<PhysicalHandlePool>,
+    safe_point: &VerifiedSafePoint,
+    recheck_safe_point: impl Fn() -> ResizeSafePoint,
+    phase8_faults: Arc<DriverFaultPlan>,
+) -> TransitionOutcome {
+    onnx_runtime_ep_cuda::granule_transition::transition_granule_range_with_phase8_faults(
+        runtime,
+        reservation,
+        backing,
+        offset,
+        len,
+        new_location,
+        old_pool,
+        new_pool,
+        safe_point,
+        recheck_safe_point,
+        phase8_faults,
+    )
+}
+
+#[cfg(not(feature = "gpu-tests"))]
+#[allow(clippy::too_many_arguments)]
+fn transition_with_phase8_faults(
+    _runtime: &onnx_runtime_ep_cuda::CudaRuntime,
+    _reservation: &mut CudaReservation,
+    _backing: &CudaVirtualBacking,
+    _offset: usize,
+    _len: usize,
+    _new_location: PhysicalLocation,
+    _old_pool: &Arc<PhysicalHandlePool>,
+    _new_pool: &Arc<PhysicalHandlePool>,
+    _safe_point: &VerifiedSafePoint,
+    _recheck_safe_point: impl Fn() -> ResizeSafePoint,
+    _phase8_faults: Arc<DriverFaultPlan>,
+) -> TransitionOutcome {
+    unreachable!(
+        "phase-8 driver fault injection is only compiled under the gpu-tests feature; \
+         every test in this file is #[ignore] and cannot reach this arm"
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Serialize every test in this file
@@ -577,63 +665,6 @@ extern "C" __global__ void spin_and_noop(long long cycles) {
 }
 
 // ---------------------------------------------------------------------------
-// Test 5: Safe-point rejection — capturing state
-// ---------------------------------------------------------------------------
-
-#[test]
-fn safe_point_rejects_capturing_state() {
-    // This test does NOT need a real GPU — it validates the type-level guard.
-    let unsafe_point = ResizeSafePoint {
-        capturing: true,
-        ..ResizeSafePoint::default()
-    };
-    let sp = verify_safe_point(unsafe_point);
-    assert!(
-        sp.is_err(),
-        "verify_safe_point must reject a capturing safe point"
-    );
-    let reason = sp.err().unwrap();
-    println!("test5 PASSED: verify_safe_point refused capturing=true: {reason:?}");
-}
-
-// ---------------------------------------------------------------------------
-// Test 6: Safe-point rejection — routed guards active
-// ---------------------------------------------------------------------------
-
-#[test]
-fn safe_point_rejects_routed_guards_active() {
-    // Validates that routed_guards_active > 0 causes verify_safe_point to fail.
-    // This matches the ResizeSafePoint::is_safe() check that transition uses.
-    let unsafe_point = ResizeSafePoint {
-        routed_guards_active: 1,
-        ..ResizeSafePoint::default()
-    };
-    let sp = verify_safe_point(unsafe_point);
-    assert!(sp.is_err(), "must reject routed_guards_active > 0");
-    let reason = sp.err().unwrap();
-    assert!(
-        reason.contains("Routed") || reason.contains("routed") || reason.contains("Residency"),
-        "error should mention routed guards or residency, got: {reason}"
-    );
-    println!("test6 PASSED: routed_guards_active=1 blocks verify_safe_point");
-}
-
-// ---------------------------------------------------------------------------
-// Test 7: Safe-point rejection — pending deferred releases
-// ---------------------------------------------------------------------------
-
-#[test]
-fn safe_point_rejects_pending_deferred_releases() {
-    let unsafe_point = ResizeSafePoint {
-        pending_deferred_releases: 3,
-        ..ResizeSafePoint::default()
-    };
-    let sp = verify_safe_point(unsafe_point);
-    assert!(sp.is_err(), "must reject pending_deferred_releases > 0");
-    println!("test7 PASSED: pending_deferred_releases=3 blocks verify_safe_point");
-}
-
-// ---------------------------------------------------------------------------
 // Test 8: Device teardown / Drop does not panic
 // ---------------------------------------------------------------------------
 
@@ -790,7 +821,7 @@ fn unmap_old_fails_at_granule_zero_is_rolled_back() {
 
     let plan = Arc::new(DriverFaultPlan::new().fail_nth(DriverOperation::Unmap, 1));
     let sp = verify_safe_point(safe()).expect("safe point");
-    let outcome = transition_granule_range_with_phase8_faults(
+    let outcome = transition_with_phase8_faults(
         runtime,
         &mut setup.reservation,
         &pools.device_backing,
@@ -837,7 +868,7 @@ fn unmap_old_fails_at_later_granule_is_fatal_with_exact_committed_count() {
     // Fail the 2nd cuMemUnmap call in Phase 8, i.e. granule index 1.
     let plan = Arc::new(DriverFaultPlan::new().fail_nth(DriverOperation::Unmap, 2));
     let sp = verify_safe_point(safe()).expect("safe point");
-    let outcome = transition_granule_range_with_phase8_faults(
+    let outcome = transition_with_phase8_faults(
         runtime,
         &mut setup.reservation,
         &pools.device_backing,
@@ -894,7 +925,7 @@ fn map_new_fails_restore_succeeds_at_granule_zero_is_rolled_back() {
     // map (2nd Remap call, restoring old at stable VA) is left to succeed.
     let plan = Arc::new(DriverFaultPlan::new().fail_nth(DriverOperation::Remap, 1));
     let sp = verify_safe_point(safe()).expect("safe point");
-    let outcome = transition_granule_range_with_phase8_faults(
+    let outcome = transition_with_phase8_faults(
         runtime,
         &mut setup.reservation,
         &pools.device_backing,
@@ -944,7 +975,7 @@ fn map_new_fails_and_restore_also_fails_quarantines_and_poisons() {
             .fail_nth(DriverOperation::Remap, 2),
     );
     let sp = verify_safe_point(safe()).expect("safe point");
-    let outcome = transition_granule_range_with_phase8_faults(
+    let outcome = transition_with_phase8_faults(
         runtime,
         &mut setup.reservation,
         &pools.device_backing,
@@ -1014,7 +1045,7 @@ fn set_access_fails_restore_succeeds_is_rolled_back() {
 
     let plan = Arc::new(DriverFaultPlan::new().fail_nth(DriverOperation::SetAccess, 1));
     let sp = verify_safe_point(safe()).expect("safe point");
-    let outcome = transition_granule_range_with_phase8_faults(
+    let outcome = transition_with_phase8_faults(
         runtime,
         &mut setup.reservation,
         &pools.device_backing,
@@ -1066,7 +1097,7 @@ fn set_access_fails_and_restore_also_fails_quarantines_and_poisons() {
             .fail_nth(DriverOperation::SetAccess, 3),
     );
     let sp = verify_safe_point(safe()).expect("safe point");
-    let outcome = transition_granule_range_with_phase8_faults(
+    let outcome = transition_with_phase8_faults(
         runtime,
         &mut setup.reservation,
         &pools.device_backing,
@@ -1136,7 +1167,7 @@ fn drop_after_fault_injected_fatal_transition_does_not_panic() {
             .fail_nth(DriverOperation::Remap, 2),
     );
     let sp = verify_safe_point(safe()).expect("safe point");
-    let outcome = transition_granule_range_with_phase8_faults(
+    let outcome = transition_with_phase8_faults(
         runtime,
         &mut setup.reservation,
         &pools.device_backing,
@@ -1171,29 +1202,6 @@ fn drop_after_fault_injected_fatal_transition_does_not_panic() {
 // ---------------------------------------------------------------------------
 // Test 9: Fault injection — allocation failure (staging buffer)
 // ---------------------------------------------------------------------------
-
-#[test]
-fn fault_injection_safe_point_recheck_rejects() {
-    // Simulate what happens when the re-check safe point is not safe.
-    // We test this by verifying the API path through verify_safe_point:
-    // if the recheck_safe_point closure returns an unsafe point, transition
-    // must return Rejected (tested by the type system — verify_safe_point
-    // is called by the caller, not inside the function, but the recheck
-    // is done internally via recheck_safe_point() and blocking_reason()).
-
-    // We can't easily inject a GPU-side fault without GPU hardware here,
-    // but we can test the pure logic of safe point re-check by examining
-    // the outcome. The transition itself calls `recheck_safe_point()` just
-    // before the stable-VA unmap; if it returns a capturing=true point,
-    // TransitionOutcome::Rejected is returned.
-
-    // This is a documentation test: the actual fault injection runs in the
-    // GPU tests (test9_gpu_fault_injection below).
-    println!(
-        "test9 (unit): safe-point re-check rejection is tested via \
-         test9_gpu_fault_injection; this test documents the contract"
-    );
-}
 
 #[test]
 #[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
@@ -1278,18 +1286,6 @@ fn fault_injection_recheck_safe_point_rejected_gpu() {
         .device_backing
         .release_range_reporting(&mut reservation, 0, gran);
     println!("test9-gpu PASSED: stable VA intact and bytes unchanged after Rejected");
-}
-
-// ---------------------------------------------------------------------------
-// Test 10 (zero-len no-op)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn zero_len_is_committed_noop() {
-    // Test the zero-len path without GPU: it returns Committed with 0 granules.
-    // (Can't easily test fully without GPU, but the argument validation path
-    // runs without driver calls.)
-    println!("test10: zero-len transitions return Committed-noop (verified by implementation)");
 }
 
 // ---------------------------------------------------------------------------
