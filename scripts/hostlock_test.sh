@@ -220,7 +220,7 @@ for trial in 1 2 3; do
     cleanup
     log="$LOCK.racea.log"
     race 40 a "$log"
-    chk "trial $trial: exactly one winner" "$(grep -c 'acquired by' "$log")" "1"
+    chk "trial $trial: exactly one winner" "$(grep -c 'outcome=acquired' "$log")" "1"
     rm -f "$log"
 done
 
@@ -229,7 +229,7 @@ for trial in 1 2 3; do
     forge_stale_lock
     log="$LOCK.raceb.log"
     race 40 b "$log"
-    chk "trial $trial: exactly one winner" "$(grep -c 'acquired by' "$log")" "1"
+    chk "trial $trial: exactly one winner" "$(grep -c 'outcome=acquired' "$log")" "1"
     chk "trial $trial: reaped exactly once" "$(grep -c 'reaping stale' "$log")" "1"
     rm -f "$log"
 done
@@ -385,9 +385,78 @@ echo "== gate =="
 cleanup
 $HL acquire --owner leon --gate 10000 --ttl 600 >/dev/null 2>&1
 chk "a trivially satisfied gate does not block" "$(st state)" "HELD"
+chk "a satisfied gate is recorded" "$($HL provenance | sed -n 's/^gate=//p' | cut -d: -f1)" "satisfied"
 cleanup
-out=$($HL acquire --owner leon --gate 0 --gate-timeout 3 --ttl 600 2>&1)
-chk "an unsatisfiable gate proceeds and warns" "$(echo "$out" | grep -c 'gate timed out')" "1"
+
+# The gate must FAIL CLOSED. A gate that warns and proceeds returns success
+# for a satisfied precondition and for an abandoned one, so every row emitted
+# afterwards is labelled gated either way -- it converts contamination into a
+# label, which is worse than not gating. This is a real defect observed in a
+# hand-rolled gate on this host, whose `for ... sleep 10; done; return 0`
+# proceeded on expiry.
+rc=$($HL acquire --owner leon --gate 0 --gate-timeout 3 --ttl 600 >/dev/null 2>&1; echo $?)
+chk "an unsatisfiable gate fails closed (5)" "$rc" "5"
+chk "a failed gate leaves no lock behind" "$(st state)" "FREE"
+cleanup
+
+# NOT `out=$(...)`: command substitution runs the acquirer in a subshell that
+# exits immediately, so $PPID -- the liveness anchor -- is dead on arrival and
+# the lock reads STALE rather than HELD. Redirect to a file so the anchor is
+# this script's own shell, which is what a real caller has.
+$HL acquire --owner leon --gate 0 --gate-timeout 3 --ttl 600 --on-gate-timeout proceed >"$LOCK.out" 2>&1
+chk "proceeding past the gate requires asking for it" "$(grep -c 'gate timed out' "$LOCK.out")" "1"
+chk "and still acquires" "$(st state)" "HELD"
+rm -f "$LOCK.out"
+chk "and is recorded as timed_out_proceeded" "$($HL provenance | sed -n 's/^gate=//p' | cut -d: -f1)" "timed_out_proceeded"
+cleanup
+
+chk "--on-gate-timeout rejects a bogus value" \
+    "$($HL acquire --owner leon --on-gate-timeout maybe >/dev/null 2>&1; echo $?)" "1"
+cleanup
+
+echo "== a reaped acquire is not the same event as a clean one =="
+# Reclaiming a lock does not stop the dead holder's benchmark, so "somebody
+# died holding this" has to be distinguishable from "the box was free".
+cleanup
+$HL acquire --owner leon --ttl 600 >/dev/null 2>&1
+chk "a clean acquire records takeover=none" "$($HL provenance | sed -n 's/^takeover=//p')" "none"
+cleanup
+
+forge_stale_lock
+out=$($HL acquire --owner leon --ttl 600 2>&1)
+chk "a reaping acquire says so on stdout" "$(echo "$out" | grep -c 'outcome=acquired_after_reap')" "1"
+chk "and records which kind of takeover" "$($HL provenance | sed -n 's/^takeover=//p')" "stale_pid"
+cleanup
+
+forge_stale_lock
+rc=$($HL acquire --owner leon --ttl 600 --strict-reap >/dev/null 2>&1; echo $?)
+chk "--strict-reap refuses a takeover (4)" "$rc" "4"
+chk "and does not hold the lock it refused" "$(st state)" "FREE"
+cleanup
+
+echo "== provenance =="
+cleanup
+chk "provenance on a free host reports no claim" \
+    "$($HL provenance | sed -n 's/^declared=//p')" "no"
+$HL acquire --owner leon --reason "moe matrix" --ttl 600 >/dev/null 2>&1
+chk "provenance names the holder" "$($HL provenance | sed -n 's/^held_by=//p')" "leon"
+chk "provenance carries the reason into the row" \
+    "$($HL provenance | sed -n 's/^reason=//p')" "moe matrix"
+chk "provenance marks a held lock as declared" \
+    "$($HL provenance | sed -n 's/^declared=//p')" "yes"
+# No universal threshold is honest, so absent an expectation the answer is
+# "unknown" rather than a guess.
+chk "contended is unknown without an expectation" \
+    "$($HL provenance | sed -n 's/^contended=//p')" "unknown"
+chk "contended is answerable when the caller supplies one" \
+    "$($HL provenance --expect-runnable 100000 | sed -n 's/^contended=//p')" "no"
+chk "and reports contention when the expectation is not met" \
+    "$($HL provenance --expect-runnable 0 | sed -n 's/^contended=//p')" "yes"
+chk "--oneline emits exactly one line" "$($HL provenance --oneline | wc -l)" "1"
+chk "--oneline carries the same fields" \
+    "$($HL provenance --oneline | tr ' ' '\n' | grep -c '^held_by=leon$')" "1"
+chk "--expect-runnable rejects a non-integer" \
+    "$($HL provenance --expect-runnable two >/dev/null 2>&1; echo $?)" "1"
 cleanup
 
 echo
