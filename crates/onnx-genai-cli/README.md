@@ -102,7 +102,7 @@ There are two separate resolution steps:
 
 - **Build time (`ort-sys/build.rs`)** finds headers and a link/development
   install in this order: `ORT_LIB_DIR`, `ORT_ROOT`, `pkg-config`, then a
-  SHA-256-pinned ORT 1.28.0 download into Cargo's `OUT_DIR`.
+  SHA-256-pinned ORT 1.29.0 download into Cargo's `OUT_DIR`.
 - **Run time** chooses the shared library the process actually loads in this
   order: `ONNX_GENAI_ORT_LIB` (exact file), `ONNX_GENAI_ORT_LIB_DIR`
   (containing directory), active `CONDA_PREFIX`, active `VIRTUAL_ENV`, the
