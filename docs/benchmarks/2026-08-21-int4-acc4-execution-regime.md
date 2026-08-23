@@ -482,6 +482,18 @@ This kernel is gated to `accuracy_level = 4`. Production default is
 | 1 | 30.632 ms/tok | 56.307 | **1.84x** |
 | 8 | — | 14.091 | — |
 
+> **Scope note (2026-08-23).** The `1.84x` is a **`threads = 1`** figure and is
+> the only acc0 cell with an ORT baseline — the t=8 row has no ORT number, so
+> **the acc0 gap at production width is unmeasured**. This is not a pedantic
+> label: on the acc4 table in this same document the gap moves from 3.01x at
+> t=1 to 1.47x at t=16, so width is among the largest effects here and 1.84x
+> should not be assumed to survive to t=8/16. At t=1 the native side also runs
+> `path=flat`, confined by the decode budget to one CPU with no pool built
+> (see
+> [2026-08-23-acc4-decode-width-remeasurement.md](2026-08-23-acc4-decode-width-remeasurement.md)),
+> so this row compares native-serial against ORT-single-thread specifically.
+> Measuring ORT acc0 at t=4/8 is the prerequisite for sizing acc0 work.
+
 So the honest summary is that we have moved the *opt-in* path from 3.01x to
 1.79x and left the *default* path at 1.84x, where it was. Those two numbers
 being nearly equal is a coincidence of this shape, not a shared cause: the acc4

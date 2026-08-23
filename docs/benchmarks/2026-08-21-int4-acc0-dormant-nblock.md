@@ -19,6 +19,13 @@ which kernel the production default even runs. Route counters instrumented from
 operator entry through to the innermost arm, over a real decode step at
 `accuracy_level = 0`:
 
+> **Note (2026-08-23):** the `1.84x` inherited here is a **`threads = 1`**
+> figure — the only acc0 cell with an ORT baseline — and the acc0 gap at
+> production width is unmeasured. The route findings below are categorical
+> (which kernel runs) and are unaffected by that; only the *sizing* of the gap
+> is. See the scope note in
+> [2026-08-21-int4-acc4-execution-regime.md](2026-08-21-int4-acc4-execution-regime.md).
+
 | counter | count |
 |---|---|
 | `entry_bits4` | 95 |

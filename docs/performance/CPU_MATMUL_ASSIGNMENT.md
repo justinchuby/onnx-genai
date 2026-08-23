@@ -1929,11 +1929,31 @@ which is ORT's fastest configuration (they cost ORT ~26%: 9.885 vs 7.816 ms,
 min over three windows each)
 and therefore the harder comparison.
 
+A fourth qualification, added 2026-08-23: **the t=16 row should not be relied
+on at all on a shared host.** Six independent launches at that width span
+1.476–9.064 ms/token (514%) against 3.195–3.509 (9.8%) at t=8 — see §20. The
+native before/after cells there are 1.804 and 1.452, a 1.24x improvement, and
+both sit inside the launch-to-launch spread of a *single* arm at that width;
+the 1.18x gap figure inherits the same problem, since it is 1.452 divided by
+an ORT number. Neither is resolvable by the measurement that produced it. The
+t=1 and t=4 rows have headroom and are unaffected; **t=8 is the widest row
+worth arguing from.**
+
 **The default path did not move and is now the bigger target.** This kernel is
 gated to `accuracy_level = 4`; production default is 0, where native is 56.307
-ms/token against ORT's 30.632 — **1.84x**, unchanged. That it nearly equals the
-new acc4 gap is a coincidence of this shape, not a shared cause. Nothing here is
-progress on acc0.
+ms/token against ORT's 30.632 — **1.84x**, unchanged. **That figure is
+`threads = 1` only.** It is the sole acc0 cell with an ORT baseline: the source
+table has one further acc0 row (t=8, native 14.091) with no ORT number beside
+it, so **the acc0 gap at production width is unmeasured**. That matters more
+than a missing label usually would, because the acc4 table immediately above
+shows the gap moving from 3.01x at t=1 to 1.47x at t=16 on the same shape —
+width is one of the largest effects in this section. Do not quote 1.84x as
+"the acc0 gap" without the `t=1` qualifier, and do not assume it survives to
+t=8/16. Note also that at t=1 the native side runs `path=flat`, confined by
+the decode budget to a single CPU with no pool built at all (§20), so this is
+a serial-vs-ORT-single-thread comparison specifically. That it nearly equals
+the new acc4 gap is a coincidence of this shape and this width, not a shared
+cause. Nothing here is progress on acc0.
 
 Full record:
 [`docs/benchmarks/2026-08-21-int4-acc4-execution-regime.md`](../benchmarks/2026-08-21-int4-acc4-execution-regime.md).
