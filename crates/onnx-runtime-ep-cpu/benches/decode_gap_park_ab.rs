@@ -399,7 +399,7 @@ fn median(mut samples: Vec<f64>) -> f64 {
 }
 
 /// One measured pass of one cell.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Pass {
     ms_tok: f64,
     p90: f64,
@@ -432,6 +432,122 @@ struct Pass {
     hash: u64,
     /// Whether every session in the cell computed the same outputs.
     sessions_agree: bool,
+    /// Per-worker barrier attribution over this pass's window, in global worker
+    /// index order. Empty when no persistent pool exists.
+    ///
+    /// The aggregate columns above sum across workers and therefore cannot
+    /// separate "one worker is late on every op" from "every worker is a little
+    /// slower" -- two states with different causes, different owners and the
+    /// same `park_%`. This is the only field that can.
+    workers: Vec<WorkerDelta>,
+}
+
+/// One worker's share of a pass, differenced across the measured window.
+#[derive(Clone, Copy, Default)]
+struct WorkerDelta {
+    cpu: Option<usize>,
+    last_arrivals: u64,
+    timed_ops: u64,
+    wake_ns: u64,
+    work_ns: u64,
+}
+
+/// Print the per-worker barrier attribution for one cell, summed over its reps.
+///
+/// Two questions, in the order they have to be asked:
+///
+/// 1. **Is one worker late, or are all of them slow?** `conc` is the busiest
+///    worker's share of last arrivals divided by the `1/w` that chance alone
+///    gives it. `conc = 1.0` is a perfectly even barrier; `conc = w` is one
+///    worker gating every single dispatch. This needs no clock and is free, so
+///    it is always printed.
+/// 2. **If one worker is late, is it late because it woke late or because it
+///    had more work?** That needs the ns timings, which cost two clock reads
+///    per worker per op and are only collected under
+///    `ONNX_GENAI_CPU_DECODE_WORKER_PROFILE=1`. Without them the per-worker
+///    table is omitted rather than printed as zeros, because a column of zeros
+///    reads as "no wake latency" instead of "not measured".
+fn report_stragglers(rows: &[Pass]) {
+    let width = rows.iter().map(|p| p.workers.len()).max().unwrap_or(0);
+    if width == 0 {
+        return;
+    }
+    let mut totals = vec![WorkerDelta::default(); width];
+    for row in rows {
+        for (index, worker) in row.workers.iter().enumerate() {
+            let slot = &mut totals[index];
+            slot.cpu = worker.cpu;
+            slot.last_arrivals += worker.last_arrivals;
+            slot.timed_ops += worker.timed_ops;
+            slot.wake_ns += worker.wake_ns;
+            slot.work_ns += worker.work_ns;
+        }
+    }
+    let arrivals: u64 = totals.iter().map(|w| w.last_arrivals).sum();
+    if arrivals == 0 {
+        return;
+    }
+    let busiest = totals
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, w)| w.last_arrivals)
+        .map_or(0, |(index, _)| index);
+    let share = totals[busiest].last_arrivals as f64 / arrivals as f64;
+    let cpu = totals[busiest]
+        .cpu
+        .map_or_else(|| "-".to_string(), |c| c.to_string());
+    println!(
+        "  stragglers w={width} busiest=worker{busiest}(cpu {cpu}) share={:.1}% \
+         even={:.1}% conc={:.2}x",
+        share * 100.0,
+        100.0 / width as f64,
+        share * width as f64,
+    );
+    if totals.iter().all(|w| w.timed_ops == 0) {
+        return;
+    }
+    println!(
+        "  {:>7} {:>5} {:>8} {:>8} {:>10} {:>10}",
+        "worker", "cpu", "last_%", "ops", "wake_us", "work_us"
+    );
+    for (index, worker) in totals.iter().enumerate() {
+        let ops = worker.timed_ops.max(1) as f64;
+        println!(
+            "  {:>7} {:>5} {:>8.1} {:>8} {:>10.3} {:>10.3}",
+            index,
+            worker
+                .cpu
+                .map_or_else(|| "-".to_string(), |c| c.to_string()),
+            worker.last_arrivals as f64 / arrivals as f64 * 100.0,
+            worker.timed_ops,
+            worker.wake_ns as f64 / ops / 1e3,
+            worker.work_ns as f64 / ops / 1e3,
+        );
+    }
+}
+
+fn worker_deltas(
+    before: &[decode_spmd::SpmdWorkerProfile],
+    after: &[decode_spmd::SpmdWorkerProfile],
+) -> Vec<WorkerDelta> {
+    after
+        .iter()
+        .enumerate()
+        .map(|(index, a)| {
+            // A pool cannot gain or lose workers mid-pass, so a missing `before`
+            // row would mean the two snapshots describe different pools. Fall
+            // back to a zero baseline rather than silently reporting `after` as
+            // a delta, which would read as a huge straggler.
+            let b = before.get(index).copied().unwrap_or_default();
+            WorkerDelta {
+                cpu: a.cpu,
+                last_arrivals: a.last_arrivals.saturating_sub(b.last_arrivals),
+                timed_ops: a.timed_ops.saturating_sub(b.timed_ops),
+                wake_ns: a.wake_ns.saturating_sub(b.wake_ns),
+                work_ns: a.work_ns.saturating_sub(b.work_ns),
+            }
+        })
+        .collect()
 }
 
 fn main() {
@@ -651,6 +767,7 @@ fn main() {
                 usage(),
                 decode_spmd::counters().unwrap_or_default(),
                 host_contention::snapshot(),
+                decode_spmd::worker_profiles().unwrap_or_default(),
             );
             barrier.wait();
             let out: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
@@ -658,13 +775,14 @@ fn main() {
                 usage(),
                 decode_spmd::counters().unwrap_or_default(),
                 host_contention::snapshot(),
+                decode_spmd::worker_profiles().unwrap_or_default(),
             );
             (out, before, after)
         });
 
         let total_tokens = (sessions * tokens) as f64;
-        let (ru0, c0, cn0) = before;
-        let (ru1, c1, cn1) = after;
+        let (ru0, c0, cn0, wp0) = before;
+        let (ru1, c1, cn1, wp1) = after;
         let contention = host_contention::contention(cn0.as_ref(), cn1.as_ref());
         let per = |a: u64, b: u64| (b.saturating_sub(a)) as f64 / total_tokens;
         let spin = per(c0.spin_hits, c1.spin_hits);
@@ -713,6 +831,7 @@ fn main() {
             // as one across cells.
             hash: hashes[0],
             sessions_agree: hashes.iter().all(|&h| h == hashes[0]),
+            workers: worker_deltas(&wp0, &wp1),
         }
     };
 
@@ -797,6 +916,10 @@ fn main() {
             spread,
             host_contention::foreign_column(&rows.iter().map(|p| p.contention).collect::<Vec<_>>(),),
         );
+
+        if cell.decode {
+            report_stragglers(rows);
+        }
 
         if rows.iter().any(|p| p.contention.is_contended()) {
             let worst = rows
