@@ -72,6 +72,10 @@ pub enum BuildError {
         inputs: usize,
         outputs: usize,
     },
+    /// The workflow declares no single generation loop to re-author.
+    NoGenerationLoop,
+    /// The generation loop does not declare the step this policy replaces.
+    MissingIterationStep { contract: &'static str },
 }
 
 impl std::fmt::Display for BuildError {
@@ -93,6 +97,15 @@ impl std::fmt::Display for BuildError {
                 formatter,
                 "this decoder declares {inputs} '{group}' state inputs and {outputs} outputs; \
                  they pair positionally, so the counts must match"
+            ),
+            Self::NoGenerationLoop => formatter.write_str(
+                "this workflow declares no single generation loop, so there is no iteration to \
+                 re-author into another policy",
+            ),
+            Self::MissingIterationStep { contract } => write!(
+                formatter,
+                "this workflow's generation loop invokes no component declaring '{contract}', so \
+                 the step another iteration policy would replace is not there to replace"
             ),
         }
     }
@@ -554,6 +567,305 @@ pub fn decoder_workflow(
     Ok(spec)
 }
 
+/// Which iteration algorithm a generation loop's body declares.
+///
+/// A workflow's loop says *how many* iterations may run and *when* to stop. What
+/// one iteration **is** — a token, a row-major step across N sequences, a
+/// proposed block verified in one pass — is said by the component the body
+/// invokes and the contract that component declares. These are the three
+/// iteration algorithms this runtime registers an executor for, named so that a
+/// caller can ask for the body that declares one instead of a runtime inferring
+/// it from the package's shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum IterationPolicy {
+    /// One decoder forward pass and one token policy per iteration.
+    SingleToken,
+    /// One shared forward pass advancing every live row per iteration.
+    ContinuousBatch,
+    /// One proposal-and-verification block per iteration.
+    SpeculativeBlock,
+}
+
+impl IterationPolicy {
+    /// Contract a body declaring this policy names, if it is not the default.
+    pub fn contract(self) -> Option<&'static str> {
+        match self {
+            Self::SingleToken => None,
+            Self::ContinuousBatch => Some(CONTINUOUS_BATCH_CONTRACT),
+            Self::SpeculativeBlock => Some(SPECULATIVE_BLOCK_CONTRACT),
+        }
+    }
+
+    /// Component name a body declaring this policy invokes.
+    pub fn component(self) -> &'static str {
+        match self {
+            Self::SingleToken => DECODER_COMPONENT,
+            Self::ContinuousBatch => BATCH_STEP_COMPONENT,
+            Self::SpeculativeBlock => SPECULATIVE_BLOCK_COMPONENT,
+        }
+    }
+}
+
+/// Author the same generation as a loop whose body declares `policy`.
+///
+/// The loop is not rewritten: its bound, its liveness predicate, its carried
+/// cells, its termination and its emits are the ones the package already
+/// declares, and they stay byte-identical. What changes is the *body* — the two
+/// steps a single-token iteration declares (`autoregressive-decode` then
+/// `token-policy`) become one step declaring the block contract, bound to
+/// exactly the same values.
+///
+/// That is the whole selection mechanism. A runtime holding this document
+/// dispatches the body's node to whichever executor it registered for the
+/// contract the node names; nothing reads the package's file layout, its
+/// decode path or its model identity to decide which iteration algorithm runs.
+/// Authoring is done here, in the same module that authors the single-token
+/// body, so the three bodies cannot drift into three different statements of
+/// the same loop.
+pub fn iteration_variant(
+    spec: &WorkflowSpec,
+    policy: IterationPolicy,
+) -> Result<WorkflowSpec, BuildError> {
+    let Some(contract) = policy.contract() else {
+        return Ok(spec.clone());
+    };
+
+    let body = generation_loop_body(spec).ok_or(BuildError::NoGenerationLoop)?;
+    let decode = body_step_declaring(spec, body, AUTOREGRESSIVE_DECODE_CONTRACT).ok_or(
+        BuildError::MissingIterationStep {
+            contract: AUTOREGRESSIVE_DECODE_CONTRACT,
+        },
+    )?;
+    let selection = body_step_declaring(spec, body, TOKEN_POLICY_CONTRACT).ok_or(
+        BuildError::MissingIterationStep {
+            contract: TOKEN_POLICY_CONTRACT,
+        },
+    )?;
+    let decoder = spec
+        .components
+        .get(decode.0)
+        .ok_or(BuildError::NoGenerationLoop)?;
+    let token_policy = spec
+        .components
+        .get(selection.0)
+        .ok_or(BuildError::NoGenerationLoop)?;
+
+    // The block consumes what the decoder consumed and defines what the policy
+    // defined. Copying rather than restating them is what keeps the variant a
+    // re-authoring of one loop instead of a second description of it: a package
+    // that binds an extra decoder port, or a static-cache package whose policy
+    // publishes `cache_lengths`, carries that through untouched.
+    let block = WorkflowComponent {
+        implementation: ComponentImplementation::Binding,
+        ports: ComponentPorts {
+            inputs: decoder.ports.inputs.clone(),
+            outputs: merged(&decoder.ports.outputs, &token_policy.ports.outputs),
+            roles: decoder.ports.roles.clone(),
+        },
+        contract: Some(crate::schema::ComponentContract {
+            id: contract.to_string(),
+            version: CONTRACT_VERSION.to_string(),
+            equivalence: block_equivalence(policy),
+            bindings: BTreeMap::new(),
+            parameters: BTreeMap::new(),
+        }),
+        application_overridable: false,
+        effects: decoder.effects.clone(),
+        // A row-major step keeps one request's state per row and must follow a
+        // scheduler compacting the rows underneath it, so it declares the row
+        // ABI. A proposal block advances a single sequence, and declaring a row
+        // axis it does not have would claim an ABI it cannot implement.
+        row_scope: matches!(policy, IterationPolicy::ContinuousBatch).then_some(
+            crate::schema::ComponentRowScope {
+                axis: 0,
+                stateful: true,
+            },
+        ),
+        cache_affects_state: decoder.cache_affects_state.clone(),
+    };
+
+    let component = policy.component().to_string();
+    let mut variant = spec.clone();
+    variant.components.remove(decode.0);
+    variant.components.remove(selection.0);
+    variant.components.insert(component.clone(), block);
+    // The re-authored emit publishes a per-row prefix, which is a capability the
+    // manifest must declare: a runtime reads the manifest to decide whether it
+    // can execute the document at all.
+    variant
+        .manifest
+        .capabilities
+        .insert("emit_valid_length".to_string());
+    // The state service names the component whose ports each cell aliases. That
+    // component is now the block, and leaving the decoder's name behind would
+    // declare a KV group bound to something the workflow no longer declares.
+    rebind_state_service(&mut variant, decode.0, &component);
+    let Some(loop_steps) = variant.steps.iter_mut().find_map(|step| match step {
+        WorkflowStep::Loop { steps, .. } if declares_token_emit(steps) => Some(steps),
+        _ => None,
+    }) else {
+        return Err(BuildError::NoGenerationLoop);
+    };
+    *loop_steps = rebuild_body(loop_steps, decode, selection, policy);
+    Ok(variant)
+}
+
+/// Merge two port maps, letting the second win a name collision.
+fn merged<T: Clone>(
+    first: &BTreeMap<String, T>,
+    second: &BTreeMap<String, T>,
+) -> BTreeMap<String, T> {
+    let mut merged = first.clone();
+    merged.extend(
+        second
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    merged
+}
+
+/// Point every state-service alias at the component that now owns the ports.
+fn rebind_state_service(spec: &mut WorkflowSpec, from: &str, to: &str) {
+    let Some(serving) = spec.serving.as_mut() else {
+        return;
+    };
+    for group in serving.state_service.groups.values_mut() {
+        if let Some(aliases) = group.ports.remove(from) {
+            group.ports.insert(to.to_string(), aliases);
+        }
+        if let Some(StateUpdate::IndexedScatter {
+            write_indices_ports,
+            kv_length_ports,
+            ..
+        }) = group.update.as_mut()
+        {
+            if let Some(port) = write_indices_ports.remove(from) {
+                write_indices_ports.insert(to.to_string(), port);
+            }
+            if let Some(port) = kv_length_ports.remove(from) {
+                kv_length_ports.insert(to.to_string(), port);
+            }
+        }
+    }
+}
+
+/// Equivalence a substituted block implementation must preserve.
+///
+/// A row-major batch is the same arithmetic for each row as a single-row step,
+/// so a package may be batched without a caller agreeing to a different
+/// distribution. A speculative block only guarantees the target model's
+/// distribution when its acceptance rule says so, which is a per-request
+/// opt-in; declaring it merely `semantic` is what keeps a runtime from turning
+/// it on by itself.
+fn block_equivalence(policy: IterationPolicy) -> crate::schema::EquivalenceClass {
+    match policy {
+        IterationPolicy::ContinuousBatch => crate::schema::EquivalenceClass::Bitwise,
+        _ => crate::schema::EquivalenceClass::Semantic,
+    }
+}
+
+type BodyStep<'s> = (
+    &'s str,
+    &'s BTreeMap<String, String>,
+    &'s BTreeMap<String, String>,
+);
+
+fn rebuild_body(
+    body: &[WorkflowStep],
+    decode: BodyStep<'_>,
+    selection: BodyStep<'_>,
+    policy: IterationPolicy,
+) -> Vec<WorkflowStep> {
+    let accepted = selection
+        .2
+        .get(POLICY_ACCEPTED_PORT)
+        .cloned()
+        .unwrap_or_else(|| body_value(ACCEPTED_CELL));
+    let mut steps = Vec::with_capacity(body.len());
+    for step in body {
+        match step {
+            WorkflowStep::Invoke { component, .. } if component == decode.0 => {
+                steps.push(WorkflowStep::Invoke {
+                    component: policy.component().to_string(),
+                    inputs: decode.1.clone(),
+                    outputs: merged(decode.2, selection.2),
+                });
+            }
+            WorkflowStep::Invoke { component, .. } if component == selection.0 => {}
+            // A single-token iteration emits one token per row, so its emit
+            // needs no length: the tensor *is* the step's contribution. A batch
+            // row may sit out a step and a verified block may contribute
+            // several tokens, so the re-authored emit publishes a *prefix* whose
+            // per-row length is the `accepted_len` the step declares. That is
+            // also what makes the output row-wise, which is what gives each row
+            // its own liveness guard rather than row 0's.
+            WorkflowStep::Emit {
+                value,
+                output,
+                mode,
+                when,
+                axis,
+                ..
+            } if output == TOKENS_OUTPUT => {
+                steps.push(WorkflowStep::Emit {
+                    value: value.clone(),
+                    output: output.clone(),
+                    mode: mode.clone(),
+                    when: when.clone(),
+                    valid_length: Some(accepted.clone()),
+                    axis: Some(axis.unwrap_or(1)),
+                });
+            }
+            other => steps.push(other.clone()),
+        }
+    }
+    steps
+}
+
+fn declares_token_emit(body: &[WorkflowStep]) -> bool {
+    body.iter()
+        .any(|step| matches!(step, WorkflowStep::Emit { output, .. } if output == TOKENS_OUTPUT))
+}
+
+/// The package's sole generation loop body, if it declares one.
+fn generation_loop_body(spec: &WorkflowSpec) -> Option<&[WorkflowStep]> {
+    let mut found = None;
+    for step in &spec.steps {
+        if let WorkflowStep::Loop { steps, .. } = step
+            && declares_token_emit(steps)
+        {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(steps.as_slice());
+        }
+    }
+    found
+}
+
+/// The body's invocation of a component declaring `contract`.
+fn body_step_declaring<'s>(
+    spec: &'s WorkflowSpec,
+    body: &'s [WorkflowStep],
+    contract: &str,
+) -> Option<BodyStep<'s>> {
+    body.iter().find_map(|step| match step {
+        WorkflowStep::Invoke {
+            component,
+            inputs,
+            outputs,
+        } if spec
+            .components
+            .get(component)
+            .and_then(|declared| declared.contract.as_ref())
+            .is_some_and(|declared| declared.id == contract) =>
+        {
+            Some((component.as_str(), inputs, outputs))
+        }
+        _ => None,
+    })
+}
+
 /// Accumulates the parallel declarations one graph port implies.
 ///
 /// A single port shows up in four places — the component's port list, its role
@@ -956,6 +1268,29 @@ pub const TOKEN_POLICY_CONTRACT: &str = "onnx-genai.token-policy";
 /// the optimized path be a node inside a workflow rather than a second loop
 /// beside one.
 pub const AUTOREGRESSIVE_DECODE_CONTRACT: &str = "onnx-genai.autoregressive-decode";
+/// Component name a continuous-batch body invokes.
+pub const BATCH_STEP_COMPONENT: &str = "batch_step";
+/// Contract identifying one shared forward pass advancing every live row.
+///
+/// The row-major counterpart of [`AUTOREGRESSIVE_DECODE_CONTRACT`] fused with
+/// [`TOKEN_POLICY_CONTRACT`]: one iteration decodes every live row through a
+/// single forward pass and applies the same per-row token policy, publishing a
+/// row-vector liveness predicate the loop already knows how to read. It is one
+/// contract rather than two because the fusion is the point — a batch that
+/// decoded and then selected as separate declared steps would have to
+/// materialize every row's scores as an SSA value, which is exactly the
+/// device→host copy the row router exists to avoid.
+pub const CONTINUOUS_BATCH_CONTRACT: &str = "onnx-genai.continuous-batch";
+/// Component name a speculative-block body invokes.
+pub const SPECULATIVE_BLOCK_COMPONENT: &str = "speculative_block";
+/// Contract identifying one propose-verify-accept block.
+///
+/// An iteration proposes several candidate tokens, verifies them in one target
+/// pass, accepts the longest agreeing prefix and rolls the rejected suffix back
+/// out of every cell that advanced. It publishes the accepted tokens as one
+/// emit, so the loop's bound counts *blocks* while the package's `accepted_len`
+/// cell carries how many tokens each block contributed.
+pub const SPECULATIVE_BLOCK_CONTRACT: &str = "onnx-genai.speculative-block";
 /// Policy port consuming the decoder's scores.
 const POLICY_LOGITS_PORT: &str = "logits";
 /// Policy port producing the selected token.
@@ -1354,7 +1689,6 @@ mod validation_tests {
 #[cfg(test)]
 mod tests_support {
     use super::*;
-
     /// Shared dense decoder ABI, so the conversion and validation suites agree
     /// on what "an ordinary decoder" means.
     pub(super) fn dense_abi() -> DecoderAbi {
@@ -1482,5 +1816,260 @@ mod roundtrip_coverage {
         let back = read_back(&abi);
         assert_eq!(back.aliasing, Some(StateAliasing::Forbidden));
         assert_eq!(back.kv_layout, Some(KvCacheLayout::head_major_bnsh()));
+    }
+}
+
+#[cfg(test)]
+mod iteration_policy_tests {
+    use super::tests_support::dense_abi;
+    use super::*;
+
+    fn single_token() -> WorkflowSpec {
+        decoder_workflow(&dense_abi(), "model.onnx", &DecoderFacts::default())
+            .expect("a dense decoder is expressible as a workflow")
+    }
+
+    fn loop_body(spec: &WorkflowSpec) -> &[WorkflowStep] {
+        spec.steps
+            .iter()
+            .find_map(|step| match step {
+                WorkflowStep::Loop { steps, .. } => Some(steps.as_slice()),
+                _ => None,
+            })
+            .expect("a generation workflow declares a loop")
+    }
+
+    fn invoked_contracts(spec: &WorkflowSpec) -> Vec<&str> {
+        loop_body(spec)
+            .iter()
+            .filter_map(|step| match step {
+                WorkflowStep::Invoke { component, .. } => spec
+                    .components
+                    .get(component)
+                    .and_then(|declared| declared.contract.as_ref())
+                    .map(|contract| contract.id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The default policy is the document the package already declares.
+    #[test]
+    fn the_single_token_policy_is_the_declared_body() {
+        let spec = single_token();
+        let variant = iteration_variant(&spec, IterationPolicy::SingleToken)
+            .expect("the identity re-authoring cannot fail");
+        assert_eq!(variant, spec);
+        assert_eq!(
+            invoked_contracts(&spec),
+            vec![AUTOREGRESSIVE_DECODE_CONTRACT, TOKEN_POLICY_CONTRACT]
+        );
+    }
+
+    /// Each non-default policy authors a body naming exactly its own contract.
+    ///
+    /// This is the selection mechanism stated at the authoring end: three
+    /// bodies, three contracts, and nothing about the package changed between
+    /// them.
+    #[test]
+    fn each_policy_authors_its_own_contract() {
+        for (policy, contract) in [
+            (IterationPolicy::ContinuousBatch, CONTINUOUS_BATCH_CONTRACT),
+            (
+                IterationPolicy::SpeculativeBlock,
+                SPECULATIVE_BLOCK_CONTRACT,
+            ),
+        ] {
+            let variant = iteration_variant(&single_token(), policy)
+                .expect("a declared single-token loop can be re-authored");
+            assert_eq!(
+                invoked_contracts(&variant),
+                vec![contract],
+                "{policy:?} declares one iteration step"
+            );
+            assert!(
+                !variant.components.contains_key(DECODER_COMPONENT)
+                    && !variant.components.contains_key(POLICY_COMPONENT),
+                "{policy:?} replaces the single-token steps rather than adding to them"
+            );
+        }
+    }
+
+    /// The loop itself is untouched: same bound, predicate, carries and setup.
+    ///
+    /// A variant that quietly changed the stop condition or dropped a carried
+    /// cell would be a different generation wearing the same package's name.
+    /// Two things *do* change beside the body, and both are asserted rather
+    /// than waved past: the state service names the component that now owns the
+    /// ports, and the manifest gains the emit capability the re-authored emit
+    /// uses.
+    #[test]
+    fn re_authoring_changes_only_the_body() {
+        let spec = single_token();
+        let variant = iteration_variant(&spec, IterationPolicy::ContinuousBatch)
+            .expect("a declared single-token loop can be re-authored");
+        let (
+            WorkflowStep::Loop {
+                continue_when,
+                max_iterations,
+                termination,
+                carried,
+                iteration,
+                setup,
+                ..
+            },
+            WorkflowStep::Loop {
+                continue_when: variant_continue,
+                max_iterations: variant_max,
+                termination: variant_termination,
+                carried: variant_carried,
+                iteration: variant_iteration,
+                setup: variant_setup,
+                ..
+            },
+        ) = (&spec.steps[0], &variant.steps[0])
+        else {
+            panic!("both declare a loop");
+        };
+        assert_eq!(continue_when, variant_continue);
+        assert_eq!(max_iterations, variant_max);
+        assert_eq!(termination, variant_termination);
+        assert_eq!(carried, variant_carried);
+        assert_eq!(iteration, variant_iteration);
+        assert_eq!(setup, variant_setup);
+        assert_eq!(spec.inputs, variant.inputs);
+        assert_eq!(spec.outputs, variant.outputs);
+        assert_eq!(spec.state, variant.state);
+        // The re-authored emit publishes a per-row prefix, so the manifest must
+        // declare that capability -- and must declare nothing else new.
+        let gained = variant
+            .manifest
+            .capabilities
+            .difference(&spec.manifest.capabilities)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(gained, BTreeSet::from(["emit_valid_length".to_string()]));
+        assert!(
+            spec.manifest
+                .capabilities
+                .is_subset(&variant.manifest.capabilities)
+        );
+        let (serving, variant_serving) = (
+            spec.serving.as_ref().expect("declared"),
+            variant.serving.as_ref().expect("declared"),
+        );
+        assert_eq!(serving.active, variant_serving.active);
+        assert_eq!(serving.done, variant_serving.done);
+        assert_eq!(serving.accepted_len, variant_serving.accepted_len);
+        // Only the component the aliases name moves; the aliases themselves are
+        // the same ports on the same cells.
+        for (group, declared) in &serving.state_service.groups {
+            let variant_group = &variant_serving.state_service.groups[group];
+            assert_eq!(
+                declared.ports[DECODER_COMPONENT],
+                variant_group.ports[BATCH_STEP_COMPONENT]
+            );
+        }
+    }
+
+    /// The block binds what the decoder bound and defines what both defined.
+    ///
+    /// The decoder's state outputs stay bound because the loop still carries
+    /// those cells: an executor that owns the cache defines them or leaves them
+    /// to the service, exactly as the single-token decode executor does.
+    #[test]
+    fn the_block_inherits_both_ends_of_the_step_it_replaces() {
+        let spec = single_token();
+        let decode = loop_body(&spec)
+            .iter()
+            .find_map(|step| match step {
+                WorkflowStep::Invoke {
+                    component,
+                    inputs,
+                    outputs,
+                } if component == DECODER_COMPONENT => Some((inputs.clone(), outputs.clone())),
+                _ => None,
+            })
+            .expect("the single-token body invokes the decoder");
+        let policy_outputs = loop_body(&spec)
+            .iter()
+            .find_map(|step| match step {
+                WorkflowStep::Invoke {
+                    component, outputs, ..
+                } if component == POLICY_COMPONENT => Some(outputs.clone()),
+                _ => None,
+            })
+            .expect("the single-token body invokes the token policy");
+
+        let variant = iteration_variant(&spec, IterationPolicy::SpeculativeBlock)
+            .expect("a declared single-token loop can be re-authored");
+        let (inputs, outputs) = loop_body(&variant)
+            .iter()
+            .find_map(|step| match step {
+                WorkflowStep::Invoke {
+                    component,
+                    inputs,
+                    outputs,
+                } if component == SPECULATIVE_BLOCK_COMPONENT => Some((inputs, outputs)),
+                _ => None,
+            })
+            .expect("the re-authored body invokes the block");
+        assert_eq!(inputs, &decode.0);
+        assert_eq!(outputs, &merged(&decode.1, &policy_outputs));
+        for (port, value) in policy_outputs.iter().chain(decode.1.iter()) {
+            assert_eq!(
+                outputs.get(port),
+                Some(value),
+                "the block defines '{port}' where the step it replaced did"
+            );
+        }
+    }
+
+    /// A row-major step declares the row ABI; a proposal block does not.
+    #[test]
+    fn only_the_row_major_body_declares_row_scope() {
+        let batch = iteration_variant(&single_token(), IterationPolicy::ContinuousBatch)
+            .expect("re-authored");
+        assert_eq!(
+            batch.components[BATCH_STEP_COMPONENT].row_scope,
+            Some(crate::schema::ComponentRowScope {
+                axis: 0,
+                stateful: true
+            })
+        );
+        let block = iteration_variant(&single_token(), IterationPolicy::SpeculativeBlock)
+            .expect("re-authored");
+        assert_eq!(
+            block.components[SPECULATIVE_BLOCK_COMPONENT].row_scope,
+            None
+        );
+    }
+
+    /// Every authored variant is a package this schema accepts.
+    #[test]
+    fn every_variant_validates() {
+        for policy in [
+            IterationPolicy::SingleToken,
+            IterationPolicy::ContinuousBatch,
+            IterationPolicy::SpeculativeBlock,
+        ] {
+            let workflow = iteration_variant(&single_token(), policy).expect("re-authored");
+            let mut metadata = crate::schema::InferenceMetadata::default();
+            metadata.pipeline = Some(crate::schema::PipelineSpec { workflow });
+            if let Err(errors) = crate::validation::validate_metadata(&metadata) {
+                panic!("{policy:?} must author a valid package, got: {errors:#?}");
+            }
+        }
+    }
+
+    /// A workflow with no generation loop has no iteration to re-author.
+    #[test]
+    fn a_package_without_a_generation_loop_is_refused() {
+        let mut spec = single_token();
+        spec.steps.clear();
+        assert_eq!(
+            iteration_variant(&spec, IterationPolicy::ContinuousBatch),
+            Err(BuildError::NoGenerationLoop)
+        );
     }
 }

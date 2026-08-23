@@ -1021,6 +1021,18 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
+    // Standard ONNX-domain spelling, opset 27. Same contract as the contrib op
+    // (rank-3 `[B, C, L]`, depthwise `[C, 1, k]` weight, `k-1` carry state,
+    // `none`/`silu`/`swish` activation), so it reuses the same kernel rather
+    // than growing a second implementation to keep in step — matching what the
+    // CPU EP does for this op and what both EPs already do for
+    // `LinearAttention`.
+    reg.register(
+        OpKey::new("CausalConvWithState", "", 27),
+        Box::new(causal_conv_with_state::CausalConvWithStateFactory {
+            runtime: runtime.clone(),
+        }),
+    );
     reg.register(
         OpKey::new("LinearAttention", "com.microsoft", 1),
         Box::new(linear_attention::LinearAttentionFactory {

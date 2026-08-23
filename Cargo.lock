@@ -2689,6 +2689,7 @@ dependencies = [
  "ittapi",
  "libc",
  "libloading 0.8.9",
+ "onnx-genai-cuda-version-guard",
  "prost",
  "serde",
  "serde_json",

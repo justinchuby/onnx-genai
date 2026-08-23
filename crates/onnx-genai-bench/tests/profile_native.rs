@@ -264,6 +264,7 @@ fn resolve_compare_binary() -> Option<PathBuf> {
 }
 
 /// Assert the throughput and roofline floors for a given model.
+#[allow(clippy::too_many_arguments)]
 fn assert_floor(
     label: &str,
     is_measurement_rig: bool,

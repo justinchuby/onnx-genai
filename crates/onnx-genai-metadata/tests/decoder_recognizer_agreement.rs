@@ -426,13 +426,24 @@ const MATRIX: &[Row] = &[
         true,
         Some("decoder"),
     ),
+    // #1832 hand-authored these two with ten auxiliary policy components whose
+    // `policies/*.onnx` artifacts were never committed. #1723 made package
+    // loading resolve every declared component eagerly, so #1883 re-emitted both
+    // documents with `migrate_model_io --reemit` -- the same remedy #1723 applied
+    // to the fourteen fixtures it found stale. The re-emission is the fix, and it
+    // is what these rows now record: a single `decoder` component, not eleven,
+    // and named `decoder` rather than the hand-written `model`.
+    //
+    // The eleven-component `Composite`/`Some("model")` shape these rows used to
+    // pin is still covered, by `onnx_genai_workflows/decoder` below, so nothing
+    // was lost by following the fixtures here.
     row(
         "tests/fixtures/tiny-deepseek-v4-qmoe/inference_metadata.yaml",
-        11,
-        Composite,
-        Some("model"),
-        false,
-        None,
+        1,
+        SingleGraph,
+        Some("decoder"),
+        true,
+        Some("decoder"),
     ),
     row(
         "tests/fixtures/tiny-gemma4-assistant/inference_metadata.yaml",
@@ -452,11 +463,11 @@ const MATRIX: &[Row] = &[
     ),
     row(
         "tests/fixtures/tiny-glm52-full-attention/inference_metadata.yaml",
-        11,
-        Composite,
-        Some("model"),
-        false,
-        None,
+        1,
+        SingleGraph,
+        Some("decoder"),
+        true,
+        Some("decoder"),
     ),
     row(
         "tests/fixtures/tiny-glm52-qmoe-indexshare/inference_metadata.yaml",
@@ -468,6 +479,19 @@ const MATRIX: &[Row] = &[
     ),
     row(
         "tests/fixtures/tiny-llm/inference_metadata.yaml",
+        1,
+        SingleGraph,
+        Some("decoder"),
+        true,
+        Some("decoder"),
+    ),
+    // Its sibling's graph exactly; the one declaration that differs
+    // (`aliasing: permitted`) is a state-service property, not a structural
+    // one, so it must classify identically. A row that drifted from
+    // `tiny-llm-sharedbuffer`'s would mean `aliasing` had leaked into
+    // recognition.
+    row(
+        "tests/fixtures/tiny-llm-batched/inference_metadata.yaml",
         1,
         SingleGraph,
         Some("decoder"),

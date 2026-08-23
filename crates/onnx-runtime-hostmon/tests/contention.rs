@@ -22,7 +22,7 @@ use onnx_runtime_hostmon::{ThreadStatus, off_mask_from_statuses, parse_cpu_list}
 use host_contention::{AllowedCpus, snapshot, threads_off_mask};
 use host_contention::{
     Contention, ContentionSnapshot, busy_jiffies_of_cpu_line, clock_tick_hz, contention,
-    foreign_column, own_jiffies_of_self_stat,
+    foreign_column, own_jiffies_of_self_stat, sibling_column, siblings_outside,
 };
 use std::time::{Duration, Instant};
 
@@ -264,6 +264,12 @@ fn an_unmeasured_repetition_can_never_be_printed_as_a_clean_zero() {
         total_pct: pct,
         measured: true,
         own_time_complete: true,
+        // Pinned quiet so this test keeps asserting a property of `foreign_pct`
+        // alone. Leaving the sibling axis at its default would make the reading
+        // "topology unknown", which is a different thing than the clean sample
+        // this test needs.
+        sibling_peak_pct: 0.0,
+        siblings_known: true,
     };
     let unmeasured = Contention::default();
 
@@ -396,6 +402,8 @@ fn a_lower_bound_can_prove_contention_but_never_cleanliness() {
         total_pct: pct,
         measured: true,
         own_time_complete: false,
+        sibling_peak_pct: 0.0,
+        siblings_known: true,
     };
     let exact = |pct: f64| Contention {
         own_time_complete: true,
@@ -431,6 +439,8 @@ fn a_bounded_cell_is_printed_as_a_bound() {
         total_pct: pct,
         measured: true,
         own_time_complete: complete,
+        sibling_peak_pct: 0.0,
+        siblings_known: true,
     };
     assert_eq!(foreign_column(&[mk(3.0, true); 3]), "3.0");
     assert_eq!(foreign_column(&[mk(3.0, false); 3]), "3.0!");
@@ -462,6 +472,8 @@ fn a_qualifier_never_leads_the_cell_where_a_parser_would_read_it_as_zero() {
         total_pct: pct,
         measured: true,
         own_time_complete: complete,
+        sibling_peak_pct: 0.0,
+        siblings_known: true,
     };
     for cell in [
         foreign_column(&[mk(9.0, false); 3]),
@@ -580,4 +592,330 @@ fn the_cpu_list_cap_covers_the_real_affinity_mask() {
             "the parser must accept the highest CPU this host actually has"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// SMT siblings of the confined set.
+//
+// The set arithmetic is tested against fabricated topologies rather than the
+// host's, because the cases that matter -- SMT disabled, a mask that already
+// owns both threads of its cores, more than two threads per core, an
+// unreadable list -- cannot all be conjured on whatever machine runs the test.
+// ---------------------------------------------------------------------------
+
+/// A topology reader over an explicit `cpu -> siblings list` table.
+fn topology<'t>(table: &'t [(usize, &'t str)]) -> impl Fn(usize) -> Option<String> + use<'t> {
+    move |cpu| {
+        table
+            .iter()
+            .find(|(c, _)| *c == cpu)
+            .map(|(_, list)| (*list).to_string())
+    }
+}
+
+/// The set that matters is "shares a core with us but we cannot run there".
+///
+/// A CPU already inside the mask is not a blind spot -- its busy time is
+/// already counted by `foreign_pct` -- so including it would double-count the
+/// one case the column is not needed for, and would make a fully-subscribed
+/// SMT mask look permanently contended.
+#[test]
+fn a_sibling_already_inside_the_mask_is_not_a_blind_spot() {
+    let smt = [(0, "0-1"), (1, "0-1"), (2, "2-3"), (3, "2-3")];
+
+    // One thread per core: the partner of each is outside, and both are blind.
+    assert_eq!(
+        siblings_outside(&[0, 2], topology(&smt)),
+        Some(vec![1, 3]),
+        "one logical CPU per core leaves every partner outside the mask"
+    );
+
+    // Both threads of core 0 are in the mask, so core 0 contributes nothing.
+    assert_eq!(
+        siblings_outside(&[0, 1, 2], topology(&smt)),
+        Some(vec![3]),
+        "a CPU inside the mask is already covered by foreign_pct"
+    );
+
+    // SMT off: each CPU is its own only sibling.
+    assert_eq!(
+        siblings_outside(&[0, 1], topology(&[(0, "0"), (1, "1")])),
+        Some(vec![]),
+        "no SMT means no blind spot, which is an answer and not a failure"
+    );
+
+    // Four threads per core, deduplicated and sorted across allowed CPUs.
+    assert_eq!(
+        siblings_outside(&[0, 4], topology(&[(0, "0-3"), (4, "4-7")])),
+        Some(vec![1, 2, 3, 5, 6, 7])
+    );
+}
+
+/// An unreadable list must poison the whole set, not shrink it.
+///
+/// A partial sibling set reports a quiet peak whenever the CPU that failed to
+/// parse is the loaded one -- turning "topology unknown" into "topology known
+/// and clean", which is the substitution this crate exists to prevent.
+#[test]
+fn an_unreadable_sibling_list_is_unknown_rather_than_a_smaller_set() {
+    let partial = [(0, "0-1"), (2, "2-3")];
+    assert_eq!(
+        siblings_outside(&[0, 2, 4], topology(&partial)),
+        None,
+        "cpu 4's list is missing, so the set is unknown"
+    );
+    // Malformed is treated exactly like missing.
+    assert_eq!(
+        siblings_outside(&[0], topology(&[(0, "not-a-cpu-list")])),
+        None
+    );
+}
+
+/// The headline property: a saturated sibling condemns a window whose allowed
+/// set is perfectly quiet.
+///
+/// This is the case `foreign_pct` cannot see. The allowed CPUs carry only our
+/// own work, so foreign CPU is zero and the old column reads a clean 0.0 --
+/// while a co-runner on the partner core halves a decode worker and, because a
+/// dispatch is a barrier, the whole dispatch with it.
+#[test]
+fn a_saturated_sibling_condemns_a_window_whose_allowed_set_looks_idle() {
+    let start = Instant::now();
+    let window = Duration::from_secs(1);
+    let before = ContentionSnapshot::from_parts_with_siblings(
+        start,
+        vec![0, 2],
+        vec![0, 0],
+        0,
+        Some(vec![1, 3]),
+        vec![0, 0],
+    );
+    // Our own two cores are fully busy with our own work; sibling 1 is saturated
+    // by somebody else and sibling 3 is idle.
+    let after = ContentionSnapshot::from_parts_with_siblings(
+        start + window,
+        vec![0, 2],
+        vec![jiffies(1.0), jiffies(1.0)],
+        jiffies(2.0),
+        Some(vec![1, 3]),
+        vec![jiffies(1.0), 0],
+    );
+
+    let reading = contention(Some(&before), Some(&after));
+    assert!(
+        reading.foreign_pct < 1.0,
+        "the allowed set carries only our own work: {}",
+        reading.foreign_pct
+    );
+    assert!(
+        (reading.sibling_peak_pct - 100.0).abs() < 1.0,
+        "one sibling was saturated for the whole window: {}",
+        reading.sibling_peak_pct
+    );
+    assert!(
+        reading.is_contended(),
+        "a saturated sibling is contention even when foreign_pct is zero"
+    );
+    assert!(
+        !reading.is_clean(),
+        "and such a window must never be certified clean"
+    );
+}
+
+/// Peak over siblings, never a sum.
+///
+/// A barrier is gated by the one core that is actually being shared, so summing
+/// would let a wide set of lightly-loaded siblings outvote it -- and would make
+/// the column's threshold depend on the pool width, which is the same dilution
+/// `foreign_pct` avoids by normalising to one core.
+#[test]
+fn the_sibling_figure_is_a_peak_and_not_a_sum() {
+    let start = Instant::now();
+    let window = Duration::from_secs(1);
+    let siblings = Some(vec![1, 3, 5, 7]);
+    let before = ContentionSnapshot::from_parts_with_siblings(
+        start,
+        vec![0, 2, 4, 6],
+        vec![0; 4],
+        0,
+        siblings.clone(),
+        vec![0; 4],
+    );
+    // Four siblings at 30% each. A sum would be 120 and would trip both
+    // thresholds; the peak is 30, which is contended-by-nobody and
+    // clean-by-nobody -- the deliberate middle band.
+    let after = ContentionSnapshot::from_parts_with_siblings(
+        start + window,
+        vec![0, 2, 4, 6],
+        vec![0; 4],
+        0,
+        siblings,
+        vec![jiffies(0.3); 4],
+    );
+
+    let reading = contention(Some(&before), Some(&after));
+    assert!(
+        (reading.sibling_peak_pct - 30.0).abs() < 1.0,
+        "expected the peak of 30%, got {}",
+        reading.sibling_peak_pct
+    );
+    assert!(
+        !reading.is_contended(),
+        "four lukewarm siblings are not one shared core"
+    );
+    assert!(
+        !reading.is_clean(),
+        "but 30% is inside the band that is not certifiable as quiet either"
+    );
+}
+
+/// Unknown topology is never clean, and never contended either.
+///
+/// Same asymmetry the crate already applies to an incomplete own-time
+/// subtraction: not knowing cannot certify quiet, and equally cannot condemn.
+#[test]
+fn an_unknown_sibling_topology_certifies_nothing_in_either_direction() {
+    let start = Instant::now();
+    let window = Duration::from_secs(1);
+    // `from_parts` leaves the topology unknown.
+    let before = ContentionSnapshot::from_parts(start, vec![0, 2], vec![0, 0], 0);
+    let after = ContentionSnapshot::from_parts(start + window, vec![0, 2], vec![0, 0], 0);
+
+    let reading = contention(Some(&before), Some(&after));
+    assert!(reading.measured, "the CPU-time reads succeeded");
+    assert!(!reading.siblings_known);
+    assert!(
+        !reading.is_clean(),
+        "a window whose siblings were never looked at is not a quiet window"
+    );
+    assert!(
+        !reading.is_contended(),
+        "and it is not evidence of contention either"
+    );
+}
+
+/// A sibling set that moved under the window cannot be differenced.
+///
+/// Exactly the rule already applied to the allowed set: per-CPU counters
+/// differenced across a set that relocated compare different CPUs.
+#[test]
+fn a_sibling_set_that_moved_under_the_window_is_not_measured() {
+    let start = Instant::now();
+    let window = Duration::from_secs(1);
+    let before = ContentionSnapshot::from_parts_with_siblings(
+        start,
+        vec![0, 2],
+        vec![0, 0],
+        0,
+        Some(vec![1, 3]),
+        vec![0, 0],
+    );
+    let after = ContentionSnapshot::from_parts_with_siblings(
+        start + window,
+        vec![0, 2],
+        vec![0, 0],
+        0,
+        Some(vec![5, 7]),
+        vec![jiffies(1.0), jiffies(1.0)],
+    );
+
+    let reading = contention(Some(&before), Some(&after));
+    assert!(
+        !reading.siblings_known,
+        "a relocated sibling set is incomparable, not quiet"
+    );
+    assert_eq!(reading.sibling_peak_pct, 0.0);
+    assert!(!reading.is_clean());
+}
+
+/// The rendered cell takes the max across repetitions, unlike `foreign_%`.
+///
+/// A co-tenant that saturated a sibling for one repetition of three invalidates
+/// that repetition; a median would discard it as the odd sample out. The two
+/// columns summarise differently on purpose and the difference is load-bearing.
+#[test]
+fn the_sibling_cell_keeps_the_worst_repetition_rather_than_the_median() {
+    let quiet = Contention {
+        measured: true,
+        own_time_complete: true,
+        sibling_peak_pct: 2.0,
+        siblings_known: true,
+        ..Contention::default()
+    };
+    let spike = Contention {
+        sibling_peak_pct: 97.5,
+        ..quiet
+    };
+    let unknown = Contention::default();
+
+    assert_eq!(sibling_column(&[quiet; 3]), "2.0");
+    assert_eq!(
+        sibling_column(&[quiet, quiet, spike]),
+        "97.5",
+        "one saturated repetition must survive the summary"
+    );
+    assert_eq!(sibling_column(&[unknown; 3]), "n/a");
+    assert_eq!(
+        sibling_column(&[unknown, quiet, spike]),
+        "97.5*",
+        "a cell backed by fewer samples than its neighbours has to say so"
+    );
+}
+
+/// The real sysfs reader, against the topology of whatever host runs this.
+///
+/// Every test above injects the reader, which is what makes the awkward
+/// topologies testable at all -- but it leaves `smt_siblings_outside`'s own
+/// path (the sysfs filename, and `read_to_string().ok()`) asserted by nothing.
+/// A typo in the path would make it return `None` on every host, which reads as
+/// "topology unknown" and would quietly disable the entire column rather than
+/// failing anything.
+///
+/// The assertions are structural rather than numeric, because the answer
+/// depends on the machine: the returned set must be disjoint from the input,
+/// must contain no duplicates, must be sorted, and every member must be a real
+/// CPU that names one of the input CPUs as its own sibling. An empty result is
+/// a legitimate answer (SMT off, or a container with one CPU per core), so the
+/// test asserts the *relationship* holds rather than that the set is non-empty.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_sysfs_reader_finds_siblings_that_agree_the_relationship_is_mutual() {
+    let allowed = AllowedCpus::current().expect("this process has an affinity mask");
+    let cpu = allowed.cpus[0];
+
+    let siblings = host_contention::smt_siblings_outside(&[cpu])
+        .expect("a Linux host exposes thread_siblings_list for a CPU it just told us we may use");
+
+    assert!(
+        !siblings.contains(&cpu),
+        "the CPU we asked about is not a blind spot for itself: {siblings:?}"
+    );
+    assert!(
+        siblings.windows(2).all(|w| w[0] < w[1]),
+        "sorted and deduplicated: {siblings:?}"
+    );
+
+    // The relationship must be mutual, read back through the same sysfs files.
+    // This is what a wrong path or a mis-parsed list cannot fake: it would have
+    // to produce a set that independently names us back.
+    for &sibling in &siblings {
+        let back = host_contention::smt_siblings_outside(&[sibling])
+            .expect("a CPU named as a sibling exists and has its own topology");
+        assert!(
+            back.contains(&cpu),
+            "cpu {sibling} was reported as a sibling of cpu {cpu}, but its own list is {back:?}"
+        );
+    }
+
+    // Asking about a whole core's worth of threads must yield nothing outside
+    // it -- the property that keeps a fully-subscribed SMT mask from reading as
+    // permanently contended on a real host rather than only on a fabricated one.
+    let mut whole_core = siblings.clone();
+    whole_core.push(cpu);
+    whole_core.sort_unstable();
+    assert_eq!(
+        host_contention::smt_siblings_outside(&whole_core),
+        Some(vec![]),
+        "a set containing every thread of a core has no sibling outside it"
+    );
 }
