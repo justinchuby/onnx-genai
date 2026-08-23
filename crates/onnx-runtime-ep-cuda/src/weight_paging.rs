@@ -3232,6 +3232,240 @@ impl CudaWeightResidency {
         Ok(granted)
     }
 
+    /// Current [`onnx_runtime_ep_api::ResizeSafePoint`] snapshot for this
+    /// cache: capture state comes from `runtime`, pending-deferred-release
+    /// count comes from the installed provider queue (`0` when none is
+    /// installed, matching `reclaim_mapped`'s own "no queue" refusal path),
+    /// and in-flight admission comes from the existing bookkeeping this
+    /// residency already tracks for the quarantine/no-progress paths.
+    /// `multi_device` is always `true` when `device_count` is more than one:
+    /// no existing barrier/authority in this codebase coordinates a resize
+    /// across devices/TP, so a caller running under TP must pass its own
+    /// device count and this fails closed rather than invent one.
+    pub fn resize_safe_point(&self, device_count: usize) -> onnx_runtime_ep_api::ResizeSafePoint {
+        let capturing = self.runtime.is_capturing().unwrap_or(true);
+        let pending_deferred_releases = self
+            .queue
+            .as_ref()
+            .map_or(0, |queue| queue.pending() as u64);
+        let admission_in_flight = !in_flight_fill_quarantine()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty();
+        onnx_runtime_ep_api::ResizeSafePoint {
+            capturing,
+            pending_deferred_releases,
+            admission_in_flight,
+            multi_device: device_count > 1,
+        }
+    }
+
+    /// Execute an accepted [`onnx_runtime_ep_api::ResidencyResizePlan`].
+    ///
+    /// This is the *only* place a resize plan turns into bytes actually
+    /// moved: a grow calls the existing `MemoryLease::grow` path (the same
+    /// one `admit_committed_span`'s over-budget handling already uses); a
+    /// shrink calls the existing `ReclaimableMappedHolder::reclaim_mapped`
+    /// (the same governor-driven LRU-eviction-and-wait-for-idle mechanism)
+    /// when a mapped allowance is installed, or the equivalent plain-lease
+    /// evict-then-shrink otherwise. Neither mechanism is reimplemented here —
+    /// this method only re-validates the safe point immediately before
+    /// committing (in case time passed between planning and execution) and
+    /// reports what happened.
+    ///
+    /// Fails closed rather than shrinking without a lease: an ungoverned
+    /// cache (no `lease`, no `mapped_allowance`) has nothing a shrink could
+    /// safely return bytes to, mirroring `set_ungoverned_budget`'s existing
+    /// refusal to shrink once nothing governs the budget.
+    pub fn execute_resize(
+        &self,
+        plan: onnx_runtime_ep_api::ResidencyResizePlan,
+        device_count: usize,
+    ) -> onnx_runtime_ep_api::ResidencyResizeOutcome {
+        use onnx_runtime_ep_api::{ResidencyResizeOutcome, ResidencyResizePlan, ResizeRejection};
+
+        let safe_point = self.resize_safe_point(device_count);
+        let request = match plan {
+            ResidencyResizePlan::Rejected { request, reason } => {
+                let (before, _) = self.budget();
+                return ResidencyResizeOutcome {
+                    direction: request.direction,
+                    requested_bytes: request.target_bytes,
+                    accepted_bytes: 0,
+                    before_bytes: before,
+                    after_bytes: before,
+                    rejection: Some(reason),
+                    rollback_count: 0,
+                    safe_point,
+                };
+            }
+            ResidencyResizePlan::Accepted(request) => request,
+        };
+
+        let (before, governed) = self.budget();
+        // Re-check the safe point right before committing: planning and
+        // execution can be separated in time by the caller, and nothing
+        // about a `ResidencyResizePlan::Accepted` promises the world hasn't
+        // moved since it was built.
+        if let Some(reason) = safe_point.blocking_reason() {
+            return ResidencyResizeOutcome {
+                direction: request.direction,
+                requested_bytes: request.target_bytes,
+                accepted_bytes: 0,
+                before_bytes: before,
+                after_bytes: before,
+                rejection: Some(ResizeRejection::NotSafePoint(reason)),
+                rollback_count: 0,
+                safe_point,
+            };
+        }
+
+        match request.direction {
+            onnx_runtime_ep_api::ResizeDirection::Grow => {
+                let mut inner = self.inner.lock().expect("residency lock poisoned");
+                match inner.lease.as_mut() {
+                    Some(lease) => match lease.grow(request.target_bytes) {
+                        Ok(()) => {
+                            inner.policy.budget =
+                                inner.policy.budget.saturating_add(request.target_bytes);
+                            let after = inner.policy.budget;
+                            replace_global_budget(before, after);
+                            ResidencyResizeOutcome {
+                                direction: request.direction,
+                                requested_bytes: request.target_bytes,
+                                accepted_bytes: request.target_bytes,
+                                before_bytes: before,
+                                after_bytes: after,
+                                rejection: None,
+                                rollback_count: 0,
+                                safe_point,
+                            }
+                        }
+                        Err(error) => ResidencyResizeOutcome {
+                            direction: request.direction,
+                            requested_bytes: request.target_bytes,
+                            accepted_bytes: 0,
+                            before_bytes: before,
+                            after_bytes: before,
+                            rejection: Some(ResizeRejection::ExecutionFailed(error.to_string())),
+                            rollback_count: 1,
+                            safe_point,
+                        },
+                    },
+                    None => ResidencyResizeOutcome {
+                        direction: request.direction,
+                        requested_bytes: request.target_bytes,
+                        accepted_bytes: 0,
+                        before_bytes: before,
+                        after_bytes: before,
+                        rejection: Some(ResizeRejection::ExecutionFailed(
+                            "growing an ungoverned budget has no lease to grow; adopt a governed \
+                             budget first"
+                                .into(),
+                        )),
+                        rollback_count: 0,
+                        safe_point,
+                    },
+                }
+            }
+            onnx_runtime_ep_api::ResizeDirection::Shrink => {
+                if !governed {
+                    // Mirrors `set_ungoverned_budget`'s existing refusal to
+                    // shrink once nothing governs the budget: shrinking here
+                    // would return bytes no lease is tracking.
+                    return ResidencyResizeOutcome {
+                        direction: request.direction,
+                        requested_bytes: request.target_bytes,
+                        accepted_bytes: 0,
+                        before_bytes: before,
+                        after_bytes: before,
+                        rejection: Some(ResizeRejection::ExecutionFailed(
+                            "shrinking an ungoverned budget has no lease/allowance to release \
+                             into; refusing rather than silently shrinking a resident cache"
+                                .into(),
+                        )),
+                        rollback_count: 0,
+                        safe_point,
+                    };
+                }
+                let has_mapped_allowance = self
+                    .inner
+                    .lock()
+                    .expect("residency lock poisoned")
+                    .mapped_allowance
+                    .is_some();
+                if has_mapped_allowance {
+                    use onnx_runtime_memory_governor::ReclaimableMappedHolder as _;
+                    match self.reclaim_mapped(request.target_bytes) {
+                        Ok(report) => {
+                            let after = before.saturating_sub(report.reclaimed_bytes);
+                            ResidencyResizeOutcome {
+                                direction: request.direction,
+                                requested_bytes: request.target_bytes,
+                                accepted_bytes: report.reclaimed_bytes,
+                                before_bytes: before,
+                                after_bytes: after,
+                                rejection: None,
+                                rollback_count: 0,
+                                safe_point,
+                            }
+                        }
+                        Err(error) => ResidencyResizeOutcome {
+                            direction: request.direction,
+                            requested_bytes: request.target_bytes,
+                            accepted_bytes: 0,
+                            before_bytes: before,
+                            after_bytes: before,
+                            rejection: Some(ResizeRejection::ExecutionFailed(error.to_string())),
+                            rollback_count: 1,
+                            safe_point,
+                        },
+                    }
+                } else {
+                    // Governed by a plain `MemoryLease` (no mapped-allowance
+                    // VMM path installed): evict LRU pages directly and shrink
+                    // the lease by exactly what was freed, same population
+                    // `reclaim_mapped` uses for the VMM path.
+                    let mut inner = self.inner.lock().expect("residency lock poisoned");
+                    let mut reclaimed = 0u64;
+                    let max_attempts = inner.pages.len();
+                    let mut attempts = 0usize;
+                    while reclaimed < request.target_bytes && attempts < max_attempts {
+                        let Some(key) = inner.next_evictable_key(WeightEvictionPolicy::Lru) else {
+                            break;
+                        };
+                        let bytes = inner.policy.bytes_by_key.get(&key).copied().unwrap_or(0);
+                        // Use the same helper every other eviction call site
+                        // uses so the process-global resident-byte/eviction
+                        // gauges stay in lockstep with this instance's own
+                        // accounting, instead of drifting stale.
+                        inner.remove_page(key);
+                        reclaimed = reclaimed.saturating_add(bytes);
+                        attempts += 1;
+                    }
+                    let returned = match inner.lease.as_mut() {
+                        Some(lease) => lease.shrink(reclaimed),
+                        None => 0,
+                    };
+                    inner.policy.budget = inner.policy.budget.saturating_sub(returned);
+                    let after = inner.policy.budget;
+                    drop(inner);
+                    replace_global_budget(before, after);
+                    ResidencyResizeOutcome {
+                        direction: request.direction,
+                        requested_bytes: request.target_bytes,
+                        accepted_bytes: returned,
+                        before_bytes: before,
+                        after_bytes: after,
+                        rejection: None,
+                        rollback_count: 0,
+                        safe_point,
+                    }
+                }
+            }
+        }
+    }
+
     /// Select the asynchronous (default `true`) vs synchronous page-in path.
     /// Install the provider/context-owned deferred release queue.
     ///
@@ -7135,5 +7369,228 @@ mod tests {
             policy.decide(&input),
             ResidencyDecision::WholeBankResident { reason: None }
         );
+    }
+
+    // -- ResidencyResizeRequest / ResizeSafePoint / execute_resize --
+
+    fn grow_request(bytes: u64) -> onnx_runtime_ep_api::ResidencyResizeRequest {
+        onnx_runtime_ep_api::ResidencyResizeRequest {
+            direction: onnx_runtime_ep_api::ResizeDirection::Grow,
+            target_bytes: bytes,
+            priority: 0,
+        }
+    }
+
+    fn shrink_request(bytes: u64) -> onnx_runtime_ep_api::ResidencyResizeRequest {
+        onnx_runtime_ep_api::ResidencyResizeRequest {
+            direction: onnx_runtime_ep_api::ResizeDirection::Shrink,
+            target_bytes: bytes,
+            priority: 0,
+        }
+    }
+
+    /// Default behavior stays unchanged: an ungoverned cache's budget is
+    /// untouched by a resize request, and the request is refused explicitly
+    /// rather than silently doing nothing.
+    #[test]
+    fn ungoverned_cache_refuses_grow_and_shrink_leaving_budget_untouched() {
+        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
+            eprintln!(
+                "SKIPPED (no CUDA runtime): the ungoverned resize refusal check did NOT run."
+            );
+            return;
+        };
+        let residency = CudaWeightResidency::new(runtime, 500);
+        assert_eq!(residency.budget(), (500, false));
+
+        let plan =
+            onnx_runtime_ep_api::plan_resize(grow_request(100), residency.resize_safe_point(1));
+        let outcome = residency.execute_resize(plan, 1);
+        assert!(!outcome.is_success());
+        assert_eq!(residency.budget(), (500, false));
+
+        let plan =
+            onnx_runtime_ep_api::plan_resize(shrink_request(100), residency.resize_safe_point(1));
+        let outcome = residency.execute_resize(plan, 1);
+        assert!(!outcome.is_success());
+        assert_eq!(residency.budget(), (500, false));
+    }
+
+    /// Growing a governed budget moves exactly the requested bytes through
+    /// the existing `MemoryLease::grow` primitive and updates the visible
+    /// budget/ledger accounting to match.
+    #[test]
+    fn governed_grow_moves_exactly_the_requested_bytes() {
+        use onnx_runtime_memory_governor::{
+            HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, Tier,
+        };
+
+        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
+            eprintln!("SKIPPED (no CUDA runtime): the governed grow check did NOT run.");
+            return;
+        };
+        let residency = CudaWeightResidency::new(runtime, 400);
+        let governor = LedgerGovernor::new(LeaseLedger::new(1000, 0, 0));
+        residency
+            .adopt_governed_budget(&governor, Tier::Device, HolderId::new(9))
+            .expect("400 of 1000 is affordable");
+        assert_eq!(residency.budget(), (400, true));
+
+        let plan =
+            onnx_runtime_ep_api::plan_resize(grow_request(200), residency.resize_safe_point(1));
+        let outcome = residency.execute_resize(plan, 1);
+        assert!(outcome.is_success(), "{outcome:?}");
+        assert_eq!(outcome.before_bytes, 400);
+        assert_eq!(outcome.after_bytes, 600);
+        assert_eq!(outcome.accepted_bytes, 200);
+        assert_eq!(residency.budget(), (600, true));
+        assert_eq!(governor.available(Tier::Device), 400);
+    }
+
+    /// Growing beyond what the governor can afford fails the request and
+    /// leaves the budget exactly as it was -- a rejected grow leaves no
+    /// partial-success-shaped state.
+    #[test]
+    fn governed_grow_beyond_capacity_fails_and_leaves_budget_unchanged() {
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, Tier};
+
+        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
+            eprintln!("SKIPPED (no CUDA runtime): the over-capacity grow check did NOT run.");
+            return;
+        };
+        let residency = CudaWeightResidency::new(runtime, 400);
+        let governor = LedgerGovernor::new(LeaseLedger::new(1000, 0, 0));
+        residency
+            .adopt_governed_budget(&governor, Tier::Device, HolderId::new(9))
+            .expect("400 of 1000 is affordable");
+
+        let plan = onnx_runtime_ep_api::plan_resize(
+            grow_request(1_000_000),
+            residency.resize_safe_point(1),
+        );
+        let outcome = residency.execute_resize(plan, 1);
+        assert!(!outcome.is_success());
+        assert_eq!(outcome.before_bytes, 400);
+        assert_eq!(outcome.after_bytes, 400);
+        assert_eq!(outcome.accepted_bytes, 0);
+        assert_eq!(residency.budget(), (400, true));
+    }
+
+    /// A no-op (zero-byte) resize request is rejected before it reaches the
+    /// executor, and never mutates the budget.
+    #[test]
+    fn zero_byte_resize_is_a_rejected_noop() {
+        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
+            eprintln!("SKIPPED (no CUDA runtime): the no-op resize check did NOT run.");
+            return;
+        };
+        let residency = CudaWeightResidency::new(runtime, 400);
+        let plan =
+            onnx_runtime_ep_api::plan_resize(grow_request(0), residency.resize_safe_point(1));
+        assert!(matches!(
+            plan,
+            onnx_runtime_ep_api::ResidencyResizePlan::Rejected {
+                reason: onnx_runtime_ep_api::ResizeRejection::NoOp,
+                ..
+            }
+        ));
+        let outcome = residency.execute_resize(plan, 1);
+        assert!(!outcome.is_success());
+        assert_eq!(residency.budget(), (400, false));
+    }
+
+    /// A plan-time rejection preserves the original request's direction and
+    /// byte count in the outcome, so telemetry inspecting a rejected shrink
+    /// never reports it as a grow (or vice versa).
+    #[test]
+    fn rejected_plan_outcome_preserves_the_original_shrink_direction() {
+        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
+            eprintln!(
+                "SKIPPED (no CUDA runtime): the rejected-shrink-direction check did NOT run."
+            );
+            return;
+        };
+        let residency = CudaWeightResidency::new(runtime, 400);
+        let unsafe_point = onnx_runtime_ep_api::ResizeSafePoint {
+            multi_device: true,
+            ..Default::default()
+        };
+        let plan = onnx_runtime_ep_api::plan_resize(shrink_request(64), unsafe_point);
+        let outcome = residency.execute_resize(plan, 2);
+        assert!(!outcome.is_success());
+        assert_eq!(
+            outcome.direction,
+            onnx_runtime_ep_api::ResizeDirection::Shrink
+        );
+        assert_eq!(outcome.requested_bytes, 64);
+        assert_eq!(outcome.accepted_bytes, 0);
+    }
+
+    /// `resize_safe_point` reports `multi_device: true` whenever more than
+    /// one device is in play, and any resize built from that snapshot fails
+    /// closed rather than attempting cross-device coordination that does not
+    /// exist yet.
+    #[test]
+    fn resize_safe_point_fails_closed_for_multi_device() {
+        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
+            eprintln!("SKIPPED (no CUDA runtime): the multi-device fail-closed check did NOT run.");
+            return;
+        };
+        let residency = CudaWeightResidency::new(runtime, 400);
+        let point = residency.resize_safe_point(2);
+        assert!(point.multi_device);
+        assert!(!point.is_safe());
+        let plan = onnx_runtime_ep_api::plan_resize(grow_request(1), point);
+        assert!(matches!(
+            plan,
+            onnx_runtime_ep_api::ResidencyResizePlan::Rejected {
+                reason: onnx_runtime_ep_api::ResizeRejection::NotSafePoint(_),
+                ..
+            }
+        ));
+    }
+
+    /// Repeated grow-then-shrink oscillation returns the budget to exactly
+    /// where it started, proving the accounting has no drift across cycles.
+    #[test]
+    fn repeated_grow_shrink_oscillation_returns_to_the_starting_budget() {
+        use onnx_runtime_memory_governor::{
+            HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, Tier,
+        };
+
+        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
+            eprintln!("SKIPPED (no CUDA runtime): the oscillation check did NOT run.");
+            return;
+        };
+        let residency = CudaWeightResidency::new(runtime, 400);
+        let governor = LedgerGovernor::new(LeaseLedger::new(1000, 0, 0));
+        residency
+            .adopt_governed_budget(&governor, Tier::Device, HolderId::new(9))
+            .expect("400 of 1000 is affordable");
+
+        for _ in 0..5 {
+            let grow_plan =
+                onnx_runtime_ep_api::plan_resize(grow_request(100), residency.resize_safe_point(1));
+            let grow_outcome = residency.execute_resize(grow_plan, 1);
+            assert!(grow_outcome.is_success(), "{grow_outcome:?}");
+
+            // Nothing is resident (no pages paged in), so a shrink has no
+            // evictable population and its own lease-side `.shrink()` still
+            // returns exactly what the eviction loop reclaimed (0 here) --
+            // asserting the loop always terminates rather than looping
+            // forever with nothing left to evict.
+            let shrink_plan = onnx_runtime_ep_api::plan_resize(
+                shrink_request(100),
+                residency.resize_safe_point(1),
+            );
+            let shrink_outcome = residency.execute_resize(shrink_plan, 1);
+            assert!(shrink_outcome.is_success(), "{shrink_outcome:?}");
+        }
+        assert_eq!(
+            residency.budget(),
+            (900, true),
+            "5 grows of 100 with nothing evictable to shrink net +500 over the 400 byte start"
+        );
+        assert_eq!(governor.available(Tier::Device), 100);
     }
 }

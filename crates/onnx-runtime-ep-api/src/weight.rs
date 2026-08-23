@@ -678,6 +678,184 @@ impl ResidencyPolicy for WholeBankResidentPolicy {
     }
 }
 
+/// Direction of a policy-issued elastic resize request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResizeDirection {
+    /// Ask the executing residency cache to make more bytes available
+    /// (mirrors the existing over-budget `MemoryLease::grow` path).
+    Grow,
+    /// Ask the executing residency cache to give bytes back (mirrors the
+    /// existing `ReclaimableMappedHolder::reclaim_mapped` path).
+    Shrink,
+}
+
+/// A policy-issued elastic resize *intent*: "I would like the budget to move
+/// by this many bytes, in this direction." This type never allocates, frees,
+/// copies, or relocates a virtual address — it is pure data describing a
+/// desired outcome. Only the existing Resource Governor / PMM / VMM / weight
+/// paging authorities (`MemoryLease::grow`/`shrink`,
+/// `ReclaimableMappedHolder::reclaim_mapped`) execute a resize; this type is
+/// the seam a [`ResidencyPolicy`] uses to ask for one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidencyResizeRequest {
+    pub direction: ResizeDirection,
+    /// Byte delta requested, always measured as a magnitude regardless of
+    /// direction (i.e. never negative-encoded).
+    pub target_bytes: u64,
+    /// Higher priority requests may preempt lower ones when several policies
+    /// or callers contend for one resize opportunity; opaque to the executor
+    /// beyond ordering. `0` is the default/lowest priority.
+    pub priority: u32,
+}
+
+/// Everything a resize commit must be true about before any state mutates.
+/// Constructed by the caller from the *existing* signals this slice reuses
+/// rather than duplicates: [`CudaRuntime::is_capturing`]-equivalent capture
+/// state, the provider deferred-release queue's pending count, and whether a
+/// page admission is currently in flight. A resize may only be validated
+/// against a snapshot that reports every field `false`/`0`.
+///
+/// [`CudaRuntime::is_capturing`]: <../onnx_runtime_ep_cuda/struct.CudaRuntime.html#method.is_capturing>
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ResizeSafePoint {
+    /// `true` if any graph slot in use is mid-capture/replay.
+    pub capturing: bool,
+    /// Count of deferred releases the provider's queue has not yet settled.
+    pub pending_deferred_releases: u64,
+    /// `true` if a page admission (page-in) is currently in flight and has
+    /// not yet reached a terminal state.
+    pub admission_in_flight: bool,
+    /// `true` when this call is running under multi-device/tensor-parallel
+    /// execution. No existing barrier/authority coordinates a resize across
+    /// devices, so a resize under TP must fail closed rather than invent
+    /// distributed synchronization.
+    pub multi_device: bool,
+}
+
+impl ResizeSafePoint {
+    /// `true` only when every unsafe condition is absent.
+    pub fn is_safe(&self) -> bool {
+        !self.capturing
+            && self.pending_deferred_releases == 0
+            && !self.admission_in_flight
+            && !self.multi_device
+    }
+
+    /// Human-readable reason the current snapshot is not a safe point, or
+    /// `None` when [`Self::is_safe`] is `true`. Checked in a fixed priority
+    /// order so the reason reported is deterministic across otherwise-tied
+    /// snapshots.
+    pub fn blocking_reason(&self) -> Option<&'static str> {
+        if self.capturing {
+            return Some("a CUDA graph is currently capturing or replaying");
+        }
+        if self.pending_deferred_releases > 0 {
+            return Some("deferred weight-page releases have not settled");
+        }
+        if self.admission_in_flight {
+            return Some("a page admission is currently in flight");
+        }
+        if self.multi_device {
+            return Some(
+                "no existing barrier/authority coordinates a resize across devices/TP; \
+                 failing closed rather than inventing distributed synchronization",
+            );
+        }
+        None
+    }
+}
+
+/// Why a [`ResidencyResizeRequest`] was rejected before any state mutated, or
+/// why a resize that began committing had to roll back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResizeRejection {
+    /// [`ResizeSafePoint::is_safe`] was `false`; see the wrapped reason.
+    NotSafePoint(&'static str),
+    /// The request would relocate or expose a currently cold/unmapped
+    /// (potentially routed) expert; refused rather than risk correctness.
+    WouldExposeColdExpert,
+    /// The executor tried to commit and the underlying governor/lease/reclaim
+    /// primitive refused or could not fully satisfy the request; the message
+    /// is that primitive's own error text.
+    ExecutionFailed(String),
+    /// `target_bytes` was zero — nothing to do; not an error, but not a plan
+    /// either.
+    NoOp,
+}
+
+/// A validated, *not-yet-executed* resize decision: pure data naming what
+/// would happen, produced by [`plan_resize`]. Executing it (calling
+/// `reclaim_mapped`/`lease.grow`/`lease.shrink`) is a distinct later step
+/// owned entirely by `onnx-runtime-ep-cuda::weight_paging` /
+/// `onnx-runtime-memory-governor`, exactly like [`ResidencyPlan`] vs its
+/// execution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResidencyResizePlan {
+    /// Safe to attempt; not yet committed.
+    Accepted(ResidencyResizeRequest),
+    /// Rejected before any state mutated. Keeps the original `request` (not
+    /// just the reason) so an execution/telemetry layer can still report
+    /// which direction/byte count was asked for, even though nothing
+    /// happened.
+    Rejected {
+        request: ResidencyResizeRequest,
+        reason: ResizeRejection,
+    },
+}
+
+/// Outcome of executing an accepted [`ResidencyResizePlan`]. Always reports
+/// what actually happened, even a partial grow/shrink or an outright failure,
+/// so telemetry and tests can observe exact before/after state rather than
+/// trusting the request was fully honored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResidencyResizeOutcome {
+    pub direction: ResizeDirection,
+    pub requested_bytes: u64,
+    /// Bytes the executor actually moved the budget by. May be less than
+    /// `requested_bytes` on a best-effort partial shrink/grow, or `0` on
+    /// rejection.
+    pub accepted_bytes: u64,
+    pub before_bytes: u64,
+    pub after_bytes: u64,
+    /// `None` on full success; `Some(reason)` on rejection or a failed
+    /// commit that rolled back.
+    pub rejection: Option<ResizeRejection>,
+    /// How many times the commit attempt rolled back before returning.
+    pub rollback_count: u32,
+    pub safe_point: ResizeSafePoint,
+}
+
+impl ResidencyResizeOutcome {
+    pub fn is_success(&self) -> bool {
+        self.rejection.is_none()
+    }
+}
+
+/// Validate a [`ResidencyResizeRequest`] against a [`ResizeSafePoint`]
+/// snapshot before any state mutates. This is the one place a resize
+/// *request* becomes a resize *plan*; nothing here allocates, copies,
+/// synchronizes, or touches a lease/allowance/VA. The executor (CUDA weight
+/// paging + governor) is solely responsible for turning an
+/// [`ResidencyResizePlan::Accepted`] into bytes actually moved.
+pub fn plan_resize(
+    request: ResidencyResizeRequest,
+    safe_point: ResizeSafePoint,
+) -> ResidencyResizePlan {
+    if request.target_bytes == 0 {
+        return ResidencyResizePlan::Rejected {
+            request,
+            reason: ResizeRejection::NoOp,
+        };
+    }
+    if let Some(reason) = safe_point.blocking_reason() {
+        return ResidencyResizePlan::Rejected {
+            request,
+            reason: ResizeRejection::NotSafePoint(reason),
+        };
+    }
+    ResidencyResizePlan::Accepted(request)
+}
+
 /// Build a validated [`ResidencyPlan`] from the per-expert region candidates
 /// gathered at build time, running `policy` over each and validating its
 /// output before accepting it.
@@ -1102,5 +1280,143 @@ mod tests {
         );
         let ordered: Vec<u32> = plan.ordered_values().map(|v| v.0).collect();
         assert_eq!(ordered, vec![1, 3, 5]);
+    }
+
+    // -- ResidencyResizeRequest / ResizeSafePoint / plan_resize --
+
+    fn grow_request(bytes: u64) -> ResidencyResizeRequest {
+        ResidencyResizeRequest {
+            direction: ResizeDirection::Grow,
+            target_bytes: bytes,
+            priority: 0,
+        }
+    }
+
+    fn shrink_request(bytes: u64) -> ResidencyResizeRequest {
+        ResidencyResizeRequest {
+            direction: ResizeDirection::Shrink,
+            target_bytes: bytes,
+            priority: 0,
+        }
+    }
+
+    #[test]
+    fn plan_resize_accepts_at_a_safe_point() {
+        let plan = plan_resize(grow_request(1024), ResizeSafePoint::default());
+        assert_eq!(plan, ResidencyResizePlan::Accepted(grow_request(1024)));
+    }
+
+    #[test]
+    fn plan_resize_rejects_zero_byte_request_as_noop() {
+        let plan = plan_resize(grow_request(0), ResizeSafePoint::default());
+        assert_eq!(
+            plan,
+            ResidencyResizePlan::Rejected {
+                request: grow_request(0),
+                reason: ResizeRejection::NoOp,
+            }
+        );
+    }
+
+    #[test]
+    fn plan_resize_rejects_during_capture() {
+        let unsafe_point = ResizeSafePoint {
+            capturing: true,
+            ..Default::default()
+        };
+        let plan = plan_resize(shrink_request(512), unsafe_point);
+        assert!(matches!(
+            plan,
+            ResidencyResizePlan::Rejected {
+                reason: ResizeRejection::NotSafePoint(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn plan_resize_rejects_with_pending_deferred_releases() {
+        let unsafe_point = ResizeSafePoint {
+            pending_deferred_releases: 3,
+            ..Default::default()
+        };
+        let plan = plan_resize(shrink_request(512), unsafe_point);
+        assert!(matches!(
+            plan,
+            ResidencyResizePlan::Rejected {
+                reason: ResizeRejection::NotSafePoint(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn plan_resize_rejects_with_admission_in_flight() {
+        let unsafe_point = ResizeSafePoint {
+            admission_in_flight: true,
+            ..Default::default()
+        };
+        let plan = plan_resize(grow_request(512), unsafe_point);
+        assert!(matches!(
+            plan,
+            ResidencyResizePlan::Rejected {
+                reason: ResizeRejection::NotSafePoint(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn plan_resize_fails_closed_under_multi_device() {
+        let unsafe_point = ResizeSafePoint {
+            multi_device: true,
+            ..Default::default()
+        };
+        let plan = plan_resize(shrink_request(512), unsafe_point);
+        let ResidencyResizePlan::Rejected {
+            reason: ResizeRejection::NotSafePoint(reason),
+            ..
+        } = plan
+        else {
+            panic!("multi-device must fail closed, not silently coordinate a resize");
+        };
+        assert!(reason.contains("barrier"));
+    }
+
+    #[test]
+    fn safe_point_blocking_reason_is_deterministic_when_several_conditions_hold() {
+        // Capture always wins first, regardless of what else is also unsafe.
+        let point = ResizeSafePoint {
+            capturing: true,
+            pending_deferred_releases: 5,
+            admission_in_flight: true,
+            multi_device: true,
+        };
+        assert!(!point.is_safe());
+        assert_eq!(
+            point.blocking_reason(),
+            Some("a CUDA graph is currently capturing or replaying")
+        );
+    }
+
+    #[test]
+    fn resize_outcome_reports_success_only_without_rejection() {
+        let success = ResidencyResizeOutcome {
+            direction: ResizeDirection::Grow,
+            requested_bytes: 100,
+            accepted_bytes: 100,
+            before_bytes: 0,
+            after_bytes: 100,
+            rejection: None,
+            rollback_count: 0,
+            safe_point: ResizeSafePoint::default(),
+        };
+        assert!(success.is_success());
+
+        let failure = ResidencyResizeOutcome {
+            rejection: Some(ResizeRejection::WouldExposeColdExpert),
+            ..success
+        };
+        assert!(!failure.is_success());
     }
 }
