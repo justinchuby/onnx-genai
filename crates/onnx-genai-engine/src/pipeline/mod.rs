@@ -9,6 +9,7 @@ use crate::engine::{
 use crate::memory_authority::{MemoryAuthorityProvider, SharedMemoryAuthorityProvider};
 use crate::{EngineDecodeBackend, GeneratePrompt, GenerateRequest, MemoryStrategyPlan, TokenId};
 use anyhow::Context;
+use onnx_genai_metadata::decoder_workflow::IterationPolicy;
 use onnx_genai_metadata::{
     CompiledWorkflow, ComponentImplementation, DeviceKind, LiteralValue, PreprocessingSpec,
     RuntimeInputRole, ScalarValue, TensorContract, TensorDimension, WorkflowEmitMode,
@@ -20,6 +21,7 @@ use onnx_genai_ort::{
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Arc;
 
 mod adapters;
@@ -45,7 +47,7 @@ pub use workflow::{
     MISSING_REQUIRED_INPUT, WorkflowExecutionPlan, WorkflowPerformanceDiagnostic,
     is_missing_required_input,
 };
-pub(crate) use workflow::{WorkflowGenerationCursor, WorkflowNodeHost};
+pub(crate) use workflow::{WorkflowGenerationCursor, WorkflowNodeHost, WorkflowNodeRequest};
 
 pub fn has_buffered_pcm16_wav_output(workflow: &WorkflowSpec) -> bool {
     audio::has_buffered_pcm16_wav_output(workflow)
@@ -212,6 +214,23 @@ pub(crate) struct WorkflowRuntime {
     /// statement about the interpreter's dispatch rather than about which
     /// function a caller happened to call.
     contract_executions: RefCell<std::collections::BTreeMap<String, u64>>,
+    /// Sibling interpreters over this package's loop re-authored for another
+    /// iteration policy, built on first use and keyed by the policy.
+    ///
+    /// A continuous batch and a speculative block are *different iteration
+    /// algorithms over the same declared generation*, and which one runs is
+    /// answered by the contract the loop body's node names. The bodies that
+    /// name them are authored by
+    /// [`onnx_genai_metadata::decoder_workflow::iteration_variant`] from this
+    /// package's own declaration — the same module that authored the
+    /// single-token body — so the three cannot become three different
+    /// statements of one loop.
+    ///
+    /// A variant's body invokes binding components only: the executor
+    /// registered for its contract owns the session, the cache and the
+    /// sampling. So a variant interpreter holds no models, no allocators and no
+    /// governor, and building one costs a workflow compile rather than a load.
+    iteration_runtimes: RefCell<std::collections::BTreeMap<IterationPolicy, Rc<WorkflowRuntime>>>,
     adapter_service: Option<onnx_genai_metadata::AdapterServiceContract>,
     adapter_cache: RefCell<adapters::AdapterCache>,
     active_adapter_context: RefCell<Option<adapters::AdapterRunContext>>,
@@ -413,6 +432,7 @@ impl WorkflowRuntime {
             embedding_tables: RefCell::new(HashMap::new()),
             embedding_table_loads: std::cell::Cell::new(0),
             contract_executions: RefCell::new(std::collections::BTreeMap::new()),
+            iteration_runtimes: RefCell::new(std::collections::BTreeMap::new()),
             adapter_service: None,
             adapter_cache: RefCell::new(adapters::AdapterCache::default()),
             active_adapter_context: RefCell::new(None),
@@ -765,6 +785,7 @@ impl WorkflowRuntime {
                 embedding_tables: RefCell::new(HashMap::new()),
                 embedding_table_loads: std::cell::Cell::new(0),
                 contract_executions: RefCell::new(std::collections::BTreeMap::new()),
+                iteration_runtimes: RefCell::new(std::collections::BTreeMap::new()),
                 adapter_service: directory.adapters,
                 adapter_cache: RefCell::new(adapters::AdapterCache::default()),
                 active_adapter_context: RefCell::new(None),
@@ -844,18 +865,119 @@ impl WorkflowRuntime {
     }
 
     /// How many device→host materializations this runtime has performed.
+    ///
+    /// Summed over the iteration variants this runtime authored, for the same
+    /// reason the counter lives on the runtime rather than at its call sites: a
+    /// copy is counted without the copier having to remember to count itself.
+    /// A variant is a second interpreter over the same package, so a copy it
+    /// performs is a copy this package performed — and a residency ratchet that
+    /// read only the parent would pass while a variant staged a tensor down.
     pub fn host_staging_count(&self) -> u64 {
-        self.host_staging_count.get()
+        self.fold_counter(WorkflowRuntime::own_host_staging_count)
     }
 
     /// How many bytes this runtime has deliberately read back off a device.
     pub fn device_readback_bytes(&self) -> u64 {
+        self.fold_counter(WorkflowRuntime::own_device_readback_bytes)
+    }
+
+    fn own_host_staging_count(&self) -> u64 {
+        self.host_staging_count.get()
+    }
+
+    fn own_device_readback_bytes(&self) -> u64 {
         self.device_readback_bytes.get()
     }
 
+    /// This runtime's own count plus every iteration variant's.
+    ///
+    /// One level deep is exhaustive: a variant's body declares one iteration
+    /// step and `iteration_variant` refuses to re-author a body that has none,
+    /// so a variant can never hold variants of its own.
+    fn fold_counter(&self, counter: fn(&WorkflowRuntime) -> u64) -> u64 {
+        counter(self)
+            + self
+                .iteration_runtimes
+                .borrow()
+                .values()
+                .map(|variant| counter(variant))
+                .sum::<u64>()
+    }
+
     /// How many nodes this runtime executed per declared contract.
+    ///
+    /// Aggregated across the iteration variants this runtime authored, because
+    /// they are the same package's loop expressed with a different body: a
+    /// caller asking what this package executed wants one answer, not one per
+    /// algorithm it happened to run.
     pub fn contract_executions(&self) -> std::collections::BTreeMap<String, u64> {
-        self.contract_executions.borrow().clone()
+        let mut executed = self.contract_executions.borrow().clone();
+        for variant in self.iteration_runtimes.borrow().values() {
+            for (contract, count) in variant.contract_executions() {
+                *executed.entry(contract).or_default() += count;
+            }
+        }
+        executed
+    }
+
+    /// This package's generation loop, re-authored to declare `policy`.
+    ///
+    /// The selection of an iteration algorithm happens *here and only here*:
+    /// the caller names the policy it is serving — a row-major batch, a
+    /// speculative block — and gets an interpreter over a body whose node
+    /// declares that policy's contract. Nothing downstream inspects the package
+    /// to decide which executor advances the loop; the interpreter dispatches on
+    /// the contract the authored node names, exactly as it does for the
+    /// single-token body.
+    pub(crate) fn iteration_runtime(
+        &self,
+        policy: IterationPolicy,
+    ) -> anyhow::Result<Rc<WorkflowRuntime>> {
+        if let Some(existing) = self.iteration_runtimes.borrow().get(&policy) {
+            return Ok(Rc::clone(existing));
+        }
+        let variant =
+            onnx_genai_metadata::decoder_workflow::iteration_variant(&self.workflow, policy)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "this package's declared generation loop cannot be re-authored as \
+                         {policy:?}: {error}"
+                    )
+                })?;
+        generation::validate_generation_workflow(&variant)?;
+        // A variant body invokes bindings only, so the directory it is built
+        // over names no artifacts. Declaring that explicitly — rather than
+        // handing it the package's model paths — is what makes "the executor
+        // owns the session" a checked property: an ONNX node reaching this
+        // interpreter would fail to resolve, instead of quietly loading a
+        // second copy of the decoder.
+        let directory = PipelineModelDirectory {
+            root: self.package_root.clone(),
+            metadata_path: None,
+            spec: onnx_genai_metadata::PipelineSpec {
+                workflow: variant.clone(),
+            },
+            adapters: None,
+            metadata: None,
+            preprocessing: None,
+            model_paths: BTreeMap::new(),
+            tokenizer_paths: onnx_genai_ort::PipelineTokenizerPaths {
+                shared: None,
+                per_component: BTreeMap::new(),
+            },
+        };
+        let runtime = Rc::new(WorkflowRuntime::hosted(
+            self.package_root.clone(),
+            variant,
+            self.decode_backend,
+            self.memory_strategy_plan.clone(),
+            PipelineModels::hosted(directory, SessionOptions::default(), None),
+            self.speculative.clone(),
+        )?);
+        self.iteration_runtimes
+            .borrow_mut()
+            .insert(policy, Rc::clone(&runtime));
+        Ok(runtime)
     }
 
     /// Record one node executed through a declared contract.
@@ -1659,5 +1781,59 @@ pipeline:
                 "PMM and engine snapshots must report the same canonical device charge"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod iteration_runtime_tests {
+    use super::*;
+
+    /// A variant interpreter's device→host copies are the package's copies.
+    ///
+    /// The residency ratchets read `Engine::host_staging_count()` and assert
+    /// zero. Once a package can hold more than one interpreter, a counter that
+    /// reported only the parent would let a copy performed by a batch or block
+    /// body pass the ratchet unseen — the counter would still be honest about
+    /// the runtime it names, and wrong about the question the test is asking.
+    #[test]
+    fn a_variant_runtimes_transfers_are_counted_as_the_packages() -> anyhow::Result<()> {
+        let runtime = generation::test_decoder_runtime()?;
+        let variant = runtime.iteration_runtime(IterationPolicy::ContinuousBatch)?;
+        assert_eq!(runtime.host_staging_count(), 0);
+        assert_eq!(runtime.device_readback_bytes(), 0);
+
+        variant.host_staging_count.set(3);
+        variant.device_readback_bytes.set(12);
+        assert_eq!(
+            runtime.host_staging_count(),
+            3,
+            "a copy a variant performed is a copy this package performed"
+        );
+        assert_eq!(runtime.device_readback_bytes(), 12);
+
+        runtime.host_staging_count.set(1);
+        assert_eq!(
+            runtime.host_staging_count(),
+            4,
+            "the parent's own transfers are still counted beside the variants'"
+        );
+
+        // A variant holds no variants, so the fold is exhaustive one level deep.
+        assert!(variant.iteration_runtimes.borrow().is_empty());
+        Ok(())
+    }
+
+    /// Two policies are two interpreters, and both are counted.
+    #[test]
+    fn every_authored_variant_is_folded_in() -> anyhow::Result<()> {
+        let runtime = generation::test_decoder_runtime()?;
+        for policy in [
+            IterationPolicy::ContinuousBatch,
+            IterationPolicy::SpeculativeBlock,
+        ] {
+            runtime.iteration_runtime(policy)?.host_staging_count.set(2);
+        }
+        assert_eq!(runtime.host_staging_count(), 4);
+        Ok(())
     }
 }

@@ -36,7 +36,8 @@ use std::collections::{BTreeMap, HashSet};
 
 use anyhow::Context as _;
 use onnx_genai_metadata::decoder_workflow::{
-    AUTOREGRESSIVE_DECODE_CONTRACT, TOKEN_POLICY_CONTRACT,
+    AUTOREGRESSIVE_DECODE_CONTRACT, CONTINUOUS_BATCH_CONTRACT, SPECULATIVE_BLOCK_CONTRACT,
+    TOKEN_POLICY_CONTRACT,
 };
 use onnx_genai_metadata::{WorkflowSpec, WorkflowStep};
 use onnx_genai_ort::{DataType, Tokenizer, Value};
@@ -61,6 +62,24 @@ use super::{PipelineGenerateRequest, WorkflowRuntime};
 /// it.
 pub(crate) const DECODE_CORE_CONTRACTS: &[&str] =
     &[AUTOREGRESSIVE_DECODE_CONTRACT, TOKEN_POLICY_CONTRACT];
+
+/// The contract a row-major batch executor implements.
+pub(crate) const CONTINUOUS_BATCH_CONTRACTS: &[&str] = &[CONTINUOUS_BATCH_CONTRACT];
+
+/// The contract a propose-verify-accept executor implements.
+pub(crate) const SPECULATIVE_BLOCK_CONTRACTS: &[&str] = &[SPECULATIVE_BLOCK_CONTRACT];
+
+/// Every contract a declared generation body may name one iteration step with.
+///
+/// One list, so a body naming a step this build has no executor for is refused
+/// with the contract's own name rather than reaching the interpreter and
+/// failing as an unimplemented node mid-generation.
+const ITERATION_CONTRACTS: &[&str] = &[
+    AUTOREGRESSIVE_DECODE_CONTRACT,
+    TOKEN_POLICY_CONTRACT,
+    CONTINUOUS_BATCH_CONTRACT,
+    SPECULATIVE_BLOCK_CONTRACT,
+];
 
 /// Refuse a generation workflow this runtime cannot execute as declared.
 ///
@@ -137,6 +156,8 @@ pub(crate) fn validate_generation_workflow(workflow: &WorkflowSpec) -> anyhow::R
 
     let mut decode_nodes = 0usize;
     let mut policy_nodes = 0usize;
+    let mut batch_nodes = 0usize;
+    let mut block_nodes = 0usize;
     let mut emits_tokens = false;
     for step in body {
         match step {
@@ -148,6 +169,8 @@ pub(crate) fn validate_generation_workflow(workflow: &WorkflowSpec) -> anyhow::R
                 match contract {
                     Some(AUTOREGRESSIVE_DECODE_CONTRACT) => decode_nodes += 1,
                     Some(TOKEN_POLICY_CONTRACT) => policy_nodes += 1,
+                    Some(CONTINUOUS_BATCH_CONTRACT) => batch_nodes += 1,
+                    Some(SPECULATIVE_BLOCK_CONTRACT) => block_nodes += 1,
                     Some(other) => anyhow::bail!(
                         "the generation loop invokes component '{component}' with contract \
                          '{other}', which no registered executor implements"
@@ -171,16 +194,7 @@ pub(crate) fn validate_generation_workflow(workflow: &WorkflowSpec) -> anyhow::R
             ),
         }
     }
-    anyhow::ensure!(
-        decode_nodes == 1,
-        "the generation loop runs {decode_nodes} autoregressive-decode steps; the decode core \
-         executes exactly one forward pass per iteration"
-    );
-    anyhow::ensure!(
-        policy_nodes == 1,
-        "the generation loop applies {policy_nodes} token policies, so nothing would select or \
-         stop exactly once per iteration"
-    );
+    validate_iteration_body(decode_nodes, policy_nodes, batch_nodes, block_nodes)?;
     anyhow::ensure!(
         emits_tokens,
         "the generation loop never emits '{}', so it would decode without producing the token \
@@ -190,6 +204,42 @@ pub(crate) fn validate_generation_workflow(workflow: &WorkflowSpec) -> anyhow::R
 
     validate_runtime_managed_values(workflow, body)?;
     Ok(())
+}
+
+/// Refuse a loop body that does not declare exactly one iteration algorithm.
+///
+/// The three bodies are alternatives, not a menu to mix: a body that declared a
+/// row-major batch *and* a single-token policy would have two things selecting
+/// and stopping in one iteration, and nothing could say which one the emit
+/// published. Counting them here — rather than at each executor — is what lets
+/// the interpreter dispatch on the contract without ever asking what kind of
+/// package it holds.
+fn validate_iteration_body(
+    decode_nodes: usize,
+    policy_nodes: usize,
+    batch_nodes: usize,
+    block_nodes: usize,
+) -> anyhow::Result<()> {
+    match (decode_nodes, policy_nodes, batch_nodes, block_nodes) {
+        (1, 1, 0, 0) | (0, 0, 1, 0) | (0, 0, 0, 1) => Ok(()),
+        (decode, policy, 0, 0) => {
+            anyhow::ensure!(
+                decode == 1,
+                "the generation loop runs {decode} autoregressive-decode steps; the decode core \
+                 executes exactly one forward pass per iteration"
+            );
+            anyhow::bail!(
+                "the generation loop applies {policy} token policies, so nothing would select or \
+                 stop exactly once per iteration"
+            )
+        }
+        (decode, policy, batch, block) => anyhow::bail!(
+            "the generation loop declares {} iteration steps ({decode} decode, {policy} policy, \
+             {batch} continuous-batch, {block} speculative-block); a body declares exactly one \
+             iteration algorithm, and the registered executors are {ITERATION_CONTRACTS:?}",
+            decode + policy + batch + block
+        ),
+    }
 }
 
 /// Refuse a workflow that reads a value the decode executors keep internal.
@@ -251,7 +301,7 @@ fn validate_runtime_managed_values(
         let hosted = declaration
             .contract
             .as_ref()
-            .is_some_and(|contract| DECODE_CORE_CONTRACTS.contains(&contract.id.as_str()));
+            .is_some_and(|contract| ITERATION_CONTRACTS.contains(&contract.id.as_str()));
         if hosted {
             continue;
         }

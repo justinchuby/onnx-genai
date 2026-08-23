@@ -474,6 +474,19 @@ const MATRIX: &[Row] = &[
         true,
         Some("decoder"),
     ),
+    // Its sibling's graph exactly; the one declaration that differs
+    // (`aliasing: permitted`) is a state-service property, not a structural
+    // one, so it must classify identically. A row that drifted from
+    // `tiny-llm-sharedbuffer`'s would mean `aliasing` had leaked into
+    // recognition.
+    row(
+        "tests/fixtures/tiny-llm-batched/inference_metadata.yaml",
+        1,
+        SingleGraph,
+        Some("decoder"),
+        true,
+        Some("decoder"),
+    ),
     row(
         "tests/fixtures/tiny-llm-explicit-io/inference_metadata.yaml",
         1,
