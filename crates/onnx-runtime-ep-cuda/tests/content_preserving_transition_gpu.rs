@@ -41,6 +41,7 @@ use std::time::Instant;
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_cuda_memory::capability::{CapabilityGateFailure, host_numa_capability};
+use onnx_runtime_cuda_memory::release::{DriverFaultPlan, DriverOperation};
 use onnx_runtime_cuda_memory::virtual_memory::{
     CudaVirtualBacking, PhysicalHandlePool, PhysicalLocation,
 };
@@ -48,7 +49,7 @@ use onnx_runtime_ep_api::ResizeSafePoint;
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::granule_transition::{
     TransitionOutcome, TransitionTimings, transition_granule_range, transition_granule_range_timed,
-    verify_safe_point,
+    transition_granule_range_with_phase8_faults, verify_safe_point,
 };
 use onnx_runtime_memory_governor::{DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryRole};
 use onnx_runtime_virtual_memory::VirtualBacking;
@@ -630,7 +631,13 @@ fn safe_point_rejects_pending_deferred_releases() {
 
 #[test]
 #[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
-fn drop_after_partial_transition_does_not_panic() {
+fn drop_after_fully_committed_transition_does_not_panic() {
+    // NOTE: this test was previously misnamed `drop_after_partial_transition_does_not_panic`
+    // despite asserting `outcome.is_committed()` on a single-granule, fully-committed
+    // transition (Roy's post-merge audit, bug #5). It is renamed here to describe what
+    // it actually exercises; a genuinely partial/`Fatal` drop scenario is covered
+    // separately by `drop_after_fault_injected_fatal_transition_does_not_panic` below,
+    // which uses deterministic fault injection to produce a real partial commit.
     assert_gpu_idle_or_warn("test8");
 
     let provider = provider_or_skip("test8: drop safety").unwrap();
@@ -686,7 +693,471 @@ fn drop_after_partial_transition_does_not_panic() {
 
     // Drop — must not panic.
     drop(reservation);
-    println!("test8 PASSED: Drop after transition does not panic");
+    println!("test8 PASSED: Drop after fully-committed transition does not panic");
+}
+
+// ---------------------------------------------------------------------------
+// Test 8b: Phase-8 fault injection matrix (Roy audit bugs #1-#5)
+// ---------------------------------------------------------------------------
+//
+// Helper that builds a 3-granule stable VA reservation fully committed on
+// device, with distinct byte patterns per granule, ready for a Phase-8
+// fault-injected transition to HostNuma.
+struct FaultMatrixSetup<'a> {
+    reservation: onnx_runtime_cuda_memory::virtual_memory::CudaReservation,
+    stable_base: cudarc::driver::sys::CUdeviceptr,
+    gran: usize,
+    n_granules: usize,
+    #[allow(dead_code)]
+    pools: &'a TestPools,
+}
+
+fn setup_fault_matrix<'a>(
+    runtime: &CudaExecutionProvider,
+    pools: &'a TestPools,
+    n_granules: usize,
+) -> FaultMatrixSetup<'a> {
+    let gran = pools.granularity;
+    let rt = runtime.runtime();
+    let mut reservation =
+        <CudaVirtualBacking as VirtualBacking>::reserve(&pools.device_backing, n_granules * gran)
+            .expect("reserve stable VA");
+    let stable_base = reservation.base_ptr();
+    for i in 0..n_granules {
+        pools
+            .device_backing
+            .commit_at_location(
+                &mut reservation,
+                i * gran,
+                PhysicalLocation::Device { ordinal: 0 },
+                &pools.device_pool,
+            )
+            .expect("commit device granule");
+        let pattern: Vec<u8> = (0..gran).map(|j| ((i * 11 + j) & 0xFF) as u8).collect();
+        unsafe {
+            rt.htod(&pattern, stable_base + (i * gran) as u64)
+                .expect("htod granule");
+        }
+    }
+    FaultMatrixSetup {
+        reservation,
+        stable_base,
+        gran,
+        n_granules,
+        pools,
+    }
+}
+
+fn assert_granule_readable_on_device(
+    runtime: &CudaExecutionProvider,
+    stable_base: cudarc::driver::sys::CUdeviceptr,
+    gran: usize,
+    i: usize,
+) {
+    let rt = runtime.runtime();
+    let expected: Vec<u8> = (0..gran).map(|j| ((i * 11 + j) & 0xFF) as u8).collect();
+    let mut got = vec![0u8; gran];
+    unsafe {
+        rt.dtoh(&mut got, stable_base + (i * gran) as u64)
+            .expect("dtoh: granule must remain readable on its original backing");
+    }
+    assert_eq!(
+        expected, got,
+        "granule {i} content diverged though it was supposed to remain untouched/readable"
+    );
+}
+
+#[test]
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn unmap_old_fails_at_granule_zero_is_rolled_back() {
+    assert_gpu_idle_or_warn("test8c-unmap-g0");
+    let provider = provider_or_skip("unmap-g0").unwrap();
+    let runtime = provider.runtime();
+    let pools = match make_pools(&provider, 128 << 20) {
+        Some(p) => p,
+        None => return,
+    };
+    let mut setup = setup_fault_matrix(&provider, &pools, 2);
+    let gran = setup.gran;
+
+    let plan = Arc::new(DriverFaultPlan::new().fail_nth(DriverOperation::Unmap, 1));
+    let sp = verify_safe_point(safe()).expect("safe point");
+    let outcome = transition_granule_range_with_phase8_faults(
+        runtime,
+        &mut setup.reservation,
+        &pools.device_backing,
+        0,
+        setup.n_granules * gran,
+        PhysicalLocation::HostNuma {
+            node: pools.host_numa_node,
+        },
+        &pools.device_pool,
+        &pools.host_pool,
+        &sp,
+        safe,
+        plan,
+    );
+
+    match outcome {
+        TransitionOutcome::RolledBack { .. } => {}
+        other => panic!("expected RolledBack for unmap-old failure at granule 0, got {other:?}"),
+    }
+    assert!(outcome.stable_va_intact());
+    for i in 0..setup.n_granules {
+        assert_granule_readable_on_device(&provider, setup.stable_base, gran, i);
+    }
+    assert!(
+        setup.reservation.quarantined_blocks().is_empty(),
+        "zero-side-effect rollback must not quarantine anything"
+    );
+    println!("PASSED: unmap-old fails at granule 0 -> RolledBack, nothing quarantined");
+}
+
+#[test]
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn unmap_old_fails_at_later_granule_is_fatal_with_exact_committed_count() {
+    assert_gpu_idle_or_warn("test8c-unmap-g1");
+    let provider = provider_or_skip("unmap-g1").unwrap();
+    let runtime = provider.runtime();
+    let pools = match make_pools(&provider, 128 << 20) {
+        Some(p) => p,
+        None => return,
+    };
+    let mut setup = setup_fault_matrix(&provider, &pools, 3);
+    let gran = setup.gran;
+
+    // Fail the 2nd cuMemUnmap call in Phase 8, i.e. granule index 1.
+    let plan = Arc::new(DriverFaultPlan::new().fail_nth(DriverOperation::Unmap, 2));
+    let sp = verify_safe_point(safe()).expect("safe point");
+    let outcome = transition_granule_range_with_phase8_faults(
+        runtime,
+        &mut setup.reservation,
+        &pools.device_backing,
+        0,
+        setup.n_granules * gran,
+        PhysicalLocation::HostNuma {
+            node: pools.host_numa_node,
+        },
+        &pools.device_pool,
+        &pools.host_pool,
+        &sp,
+        safe,
+        plan,
+    );
+
+    match outcome {
+        TransitionOutcome::Fatal {
+            committed_count,
+            poisoned_range,
+            quarantined,
+            ..
+        } => {
+            assert_eq!(committed_count, 1, "granule 0 must have committed");
+            assert_eq!(
+                poisoned_range, None,
+                "unmap-old failing before any mutation leaves the granule readable, not poisoned"
+            );
+            assert!(
+                quarantined.is_empty(),
+                "no handle ambiguity in this branch: nothing should be quarantined"
+            );
+        }
+        other => panic!("expected Fatal with committed_count=1, got {other:?}"),
+    }
+    // Granule 2 (never reached) must remain readable on the old (device) backing.
+    assert_granule_readable_on_device(&provider, setup.stable_base, gran, 2);
+    println!("PASSED: unmap-old fails at granule 1 -> Fatal{{committed_count:1}}, suffix readable");
+}
+
+#[test]
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn map_new_fails_restore_succeeds_at_granule_zero_is_rolled_back() {
+    assert_gpu_idle_or_warn("test8c-map-restore-ok");
+    let provider = provider_or_skip("map-restore-ok").unwrap();
+    let runtime = provider.runtime();
+    let pools = match make_pools(&provider, 128 << 20) {
+        Some(p) => p,
+        None => return,
+    };
+    let mut setup = setup_fault_matrix(&provider, &pools, 2);
+    let gran = setup.gran;
+
+    // First Remap call (map new at stable VA for granule 0) fails; the restore
+    // map (2nd Remap call, restoring old at stable VA) is left to succeed.
+    let plan = Arc::new(DriverFaultPlan::new().fail_nth(DriverOperation::Remap, 1));
+    let sp = verify_safe_point(safe()).expect("safe point");
+    let outcome = transition_granule_range_with_phase8_faults(
+        runtime,
+        &mut setup.reservation,
+        &pools.device_backing,
+        0,
+        setup.n_granules * gran,
+        PhysicalLocation::HostNuma {
+            node: pools.host_numa_node,
+        },
+        &pools.device_pool,
+        &pools.host_pool,
+        &sp,
+        safe,
+        plan,
+    );
+
+    match outcome {
+        TransitionOutcome::RolledBack { .. } => {}
+        other => panic!("expected RolledBack: map-new failed but restore succeeded, got {other:?}"),
+    }
+    for i in 0..setup.n_granules {
+        assert_granule_readable_on_device(&provider, setup.stable_base, gran, i);
+    }
+    assert!(setup.reservation.quarantined_blocks().is_empty());
+    println!("PASSED: map-new fails + restore succeeds at granule 0 -> RolledBack");
+}
+
+#[test]
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn map_new_fails_and_restore_also_fails_quarantines_and_poisons() {
+    assert_gpu_idle_or_warn("test8c-map-restore-fail");
+    let provider = provider_or_skip("map-restore-fail").unwrap();
+    let runtime = provider.runtime();
+    let pools = match make_pools(&provider, 128 << 20) {
+        Some(p) => p,
+        None => return,
+    };
+    let mut setup = setup_fault_matrix(&provider, &pools, 2);
+    let gran = setup.gran;
+
+    // Fail BOTH the primary map-new (1st Remap) and the restore-old map
+    // (2nd Remap) at granule 0 -- this is the true ambiguous-handle case
+    // (Roy audit bug #4): the fix must quarantine `old_handle` and report
+    // an exact `poisoned_range`, never silently drop it.
+    let plan = Arc::new(
+        DriverFaultPlan::new()
+            .fail_nth(DriverOperation::Remap, 1)
+            .fail_nth(DriverOperation::Remap, 2),
+    );
+    let sp = verify_safe_point(safe()).expect("safe point");
+    let outcome = transition_granule_range_with_phase8_faults(
+        runtime,
+        &mut setup.reservation,
+        &pools.device_backing,
+        0,
+        setup.n_granules * gran,
+        PhysicalLocation::HostNuma {
+            node: pools.host_numa_node,
+        },
+        &pools.device_pool,
+        &pools.host_pool,
+        &sp,
+        safe,
+        plan,
+    );
+
+    match outcome {
+        TransitionOutcome::Fatal {
+            committed_count,
+            poisoned_range,
+            quarantined,
+            rollback_fault,
+            ..
+        } => {
+            assert_eq!(committed_count, 0);
+            assert!(
+                rollback_fault.is_some(),
+                "a restore was attempted and failed"
+            );
+            let (poff, plen) = poisoned_range.expect("granule 0 must be poisoned");
+            assert_eq!(poff, 0);
+            assert_eq!(plen, gran);
+            assert_eq!(
+                quarantined.len(),
+                1,
+                "exactly the one ambiguous old handle must be quarantined, no leak"
+            );
+            // Cross-check against the reservation's own quarantine authority
+            // (Roy audit bug #1: quarantined must not be reported empty when
+            // the reservation itself does hold a quarantined block).
+            assert_eq!(setup.reservation.quarantined_blocks().len(), 1);
+            assert_eq!(
+                setup.reservation.quarantined_blocks()[0].offset,
+                quarantined[0].offset
+            );
+        }
+        other => panic!("expected Fatal with poisoned_range+quarantine, got {other:?}"),
+    }
+    // Granule 1 was never touched; must remain readable.
+    assert_granule_readable_on_device(&provider, setup.stable_base, gran, 1);
+    println!(
+        "PASSED: map-new + restore both fail -> Fatal{{poisoned_range:Some, quarantined.len()==1}}"
+    );
+}
+
+#[test]
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn set_access_fails_restore_succeeds_is_rolled_back() {
+    assert_gpu_idle_or_warn("test8c-setaccess-restore-ok");
+    let provider = provider_or_skip("setaccess-restore-ok").unwrap();
+    let runtime = provider.runtime();
+    let pools = match make_pools(&provider, 128 << 20) {
+        Some(p) => p,
+        None => return,
+    };
+    let mut setup = setup_fault_matrix(&provider, &pools, 2);
+    let gran = setup.gran;
+
+    let plan = Arc::new(DriverFaultPlan::new().fail_nth(DriverOperation::SetAccess, 1));
+    let sp = verify_safe_point(safe()).expect("safe point");
+    let outcome = transition_granule_range_with_phase8_faults(
+        runtime,
+        &mut setup.reservation,
+        &pools.device_backing,
+        0,
+        setup.n_granules * gran,
+        PhysicalLocation::HostNuma {
+            node: pools.host_numa_node,
+        },
+        &pools.device_pool,
+        &pools.host_pool,
+        &sp,
+        safe,
+        plan,
+    );
+
+    match outcome {
+        TransitionOutcome::RolledBack { .. } => {}
+        other => panic!(
+            "expected RolledBack: set-access(new) failed but restore succeeded, got {other:?}"
+        ),
+    }
+    for i in 0..setup.n_granules {
+        assert_granule_readable_on_device(&provider, setup.stable_base, gran, i);
+    }
+    assert!(setup.reservation.quarantined_blocks().is_empty());
+    println!("PASSED: set-access(new) fails + restore succeeds -> RolledBack");
+}
+
+#[test]
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn set_access_fails_and_restore_also_fails_quarantines_and_poisons() {
+    assert_gpu_idle_or_warn("test8c-setaccess-restore-fail");
+    let provider = provider_or_skip("setaccess-restore-fail").unwrap();
+    let runtime = provider.runtime();
+    let pools = match make_pools(&provider, 128 << 20) {
+        Some(p) => p,
+        None => return,
+    };
+    let mut setup = setup_fault_matrix(&provider, &pools, 3);
+    let gran = setup.gran;
+
+    // Let granule 0 fully commit; fail set-access(new) at granule 1, and its
+    // restore (2nd SetAccess call). Note: the restore map itself (Remap) is
+    // left to succeed, so this exercises the "map succeeded but the mapping
+    // must be torn down before the handle can be returned" branch of the fix.
+    let plan = Arc::new(
+        DriverFaultPlan::new()
+            .fail_nth(DriverOperation::SetAccess, 2)
+            .fail_nth(DriverOperation::SetAccess, 3),
+    );
+    let sp = verify_safe_point(safe()).expect("safe point");
+    let outcome = transition_granule_range_with_phase8_faults(
+        runtime,
+        &mut setup.reservation,
+        &pools.device_backing,
+        0,
+        setup.n_granules * gran,
+        PhysicalLocation::HostNuma {
+            node: pools.host_numa_node,
+        },
+        &pools.device_pool,
+        &pools.host_pool,
+        &sp,
+        safe,
+        plan,
+    );
+
+    match outcome {
+        TransitionOutcome::Fatal {
+            committed_count,
+            poisoned_range,
+            quarantined,
+            ..
+        } => {
+            assert_eq!(
+                committed_count, 1,
+                "granule 0 committed before granule 1 failed"
+            );
+            let (poff, plen) = poisoned_range.expect("granule 1 must be poisoned");
+            assert_eq!(
+                poff, gran,
+                "poisoned range must be scoped to granule 1 only"
+            );
+            assert_eq!(plen, gran);
+            assert_eq!(quarantined.len(), 1);
+            assert_eq!(setup.reservation.quarantined_blocks().len(), 1);
+        }
+        other => panic!("expected Fatal, got {other:?}"),
+    }
+    // Granule 2 was never reached; must remain readable on device.
+    assert_granule_readable_on_device(&provider, setup.stable_base, gran, 2);
+    println!(
+        "PASSED: set-access(new) + restore both fail at granule 1 -> Fatal, poisoned_range scoped to granule 1 only, granule 2 untouched"
+    );
+}
+
+#[test]
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn drop_after_fault_injected_fatal_transition_does_not_panic() {
+    // Genuinely partial/`Fatal` Drop coverage (Roy audit bug #5): the
+    // previous `drop_after_partial_transition_does_not_panic` test actually
+    // exercised a fully-committed transition. This test deterministically
+    // forces a real Fatal outcome with committed_count > 0 and a quarantined
+    // handle, then drops the reservation, proving Drop does not panic even
+    // when a poisoned range and a quarantined handle are present.
+    assert_gpu_idle_or_warn("test8d-drop-fatal");
+    let provider = provider_or_skip("drop-fatal").unwrap();
+    let runtime = provider.runtime();
+    let pools = match make_pools(&provider, 128 << 20) {
+        Some(p) => p,
+        None => return,
+    };
+    let mut setup = setup_fault_matrix(&provider, &pools, 2);
+    let gran = setup.gran;
+
+    let plan = Arc::new(
+        DriverFaultPlan::new()
+            .fail_nth(DriverOperation::Remap, 1)
+            .fail_nth(DriverOperation::Remap, 2),
+    );
+    let sp = verify_safe_point(safe()).expect("safe point");
+    let outcome = transition_granule_range_with_phase8_faults(
+        runtime,
+        &mut setup.reservation,
+        &pools.device_backing,
+        0,
+        setup.n_granules * gran,
+        PhysicalLocation::HostNuma {
+            node: pools.host_numa_node,
+        },
+        &pools.device_pool,
+        &pools.host_pool,
+        &sp,
+        safe,
+        plan,
+    );
+    assert!(
+        matches!(outcome, TransitionOutcome::Fatal { .. }),
+        "expected Fatal: {outcome:?}"
+    );
+
+    // Release the still-live (non-quarantined) mappings before drop, mirroring
+    // production teardown; the quarantined handle is intentionally left for
+    // the reservation's own Drop path to handle without panicking.
+    let n = setup.n_granules;
+    pools
+        .device_backing
+        .release_range_reporting(&mut setup.reservation, 0, n * gran);
+
+    drop(setup.reservation);
+    println!("PASSED: Drop after a real fault-injected Fatal transition does not panic");
 }
 
 // ---------------------------------------------------------------------------

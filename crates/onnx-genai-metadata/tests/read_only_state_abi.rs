@@ -85,7 +85,19 @@ fn read_only_static_cache_aliases_are_dropped() {
         baseline.static_cache.is_some(),
         "a writable fixed-capacity cache derives a static-cache ABI"
     );
-    assert!(baseline.kv_inputs.is_some());
+    // A fixed-capacity cache is described by the static-cache ABI and by
+    // nothing else. Reporting the same buffers *also* as growing past/present
+    // pairs would be two answers for one cache, and the paged KV bridge reads
+    // exactly this absence as "no growing cache to page" — so a decoder that
+    // reported both would have a paged bridge built over a buffer that never
+    // grows and addressed with the wrong discipline.
+    assert_eq!(baseline.kv_inputs, None);
+    assert_eq!(baseline.kv_outputs, None);
+    assert_eq!(
+        baseline.kv_ownership,
+        Some(KvOwnership::Owned),
+        "a fixed-capacity decoder still owns the cache it scatters into"
+    );
 
     // Frozen: no key or value half survives the read-only filter, so neither the
     // scatter ABI nor any KV transition is derived.

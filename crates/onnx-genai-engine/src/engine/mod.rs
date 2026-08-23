@@ -7,9 +7,7 @@ pub(crate) use crate::decode::{
     DecodeState, ModelDecodePath, detect_model_decode_path, next_session_token_argmax,
     next_session_token_logits, next_session_token_sampled,
 };
-pub(crate) use crate::decode_loop::{
-    DecodeLoopBackend, DecodeLoopState, exceeded_context_limit, run_decode_loop, step_decode_loop,
-};
+pub(crate) use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, exceeded_context_limit};
 pub(crate) use crate::kv_bridge::{
     KvModelInfo, PlacedPayload, RewindRequest, RewindRunnerPolicy, attach_pages_to_sequence,
     chunk_payload_from_exported, common_prefix_len, exported_layers_from_runner,
@@ -32,7 +30,7 @@ pub(crate) use onnx_genai_kv::{
 pub(crate) use onnx_genai_metadata::InferenceMetadata;
 pub(crate) use onnx_genai_ort::{
     DataType, Eagle3DecodeSession, Environment, ModelDirectory, MtpDecodeSession, Session,
-    SessionOptions, SharedKvProposerSession, Tokenizer,
+    SessionOptions, Tokenizer,
 };
 pub(crate) use onnx_genai_scheduler::{
     CapacityProvider, CapacityProviders, FixedCapacity, GovernorReconfigureOutcome,
@@ -54,9 +52,9 @@ pub use crate::config::{
     MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
     PrioritizedGenerateRequest, PrioritizedGenerateResult, RecurrentPrefixCacheStats,
     RewindTokenCount, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint,
-    SessionForkCapability, SessionId, SessionPosition, SharedKvBinding, SharedKvProposerConfig,
-    SpeculativeMode, TokenLogprob, WeightAccessPattern, WeightPlacementReport, XtcConfig,
-    parse_device_policy, parse_resource_limit,
+    SessionForkCapability, SessionId, SessionPosition, SpeculativeMode, TokenLogprob,
+    WeightAccessPattern, WeightPlacementReport, XtcConfig, parse_device_policy,
+    parse_resource_limit,
 };
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub(crate) use crate::speculative::{
@@ -79,8 +77,11 @@ mod model;
 #[cfg(feature = "native-backend")]
 mod placement;
 mod runtime;
+pub(crate) use runtime::apply_eos_policy;
 pub(crate) mod session_state;
 mod speculative_load;
+mod workflow_api;
+pub use metadata::graph_port_contracts;
 
 pub(crate) use decode_backend::*;
 pub(crate) use governor::*;
@@ -107,7 +108,7 @@ mod tests {
     };
     use crate::sampling::Sampler;
     #[cfg(feature = "native-backend")]
-    use onnx_genai_metadata::{KvOwnership, ModelIoSpec, SequenceInputKind};
+    use onnx_genai_metadata::{DecoderAbi, KvOwnership, SequenceInputKind};
     #[cfg(feature = "native-backend")]
     use onnx_runtime_ir::{Attribute, DataType as IrDataType, Graph, Node, NodeId, Shape};
     use proptest::prelude::*;
@@ -192,6 +193,7 @@ mod tests {
         )?;
 
         Ok(Engine {
+            workflow: Box::new(crate::pipeline::generation::test_decoder_runtime()?),
             decode_backend: EngineDecodeBackend::Ort,
             metadata: InferenceMetadata::default(),
             metadata_hints: MetadataHints::default(),
@@ -203,6 +205,8 @@ mod tests {
             scheduler: Scheduler::new(onnx_genai_scheduler::SchedulerConfig::default()),
             governor,
             sessions,
+            workflow_sessions: HashMap::new(),
+            workflow_session_counter: 0,
             session: None,
             #[cfg(feature = "native-backend")]
             native_session: None,
@@ -222,14 +226,12 @@ mod tests {
             #[cfg(feature = "native-backend")]
             native_max_sessions: 8,
             #[cfg(feature = "native-backend")]
-            native_shared_kv_proposer: None,
             #[cfg(feature = "native-backend")]
             native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
             draft: None,
             mtp: None,
             eagle3: None,
-            shared_kv_proposer: None,
-            tokenizer,
+            tokenizer: Some(tokenizer),
             fim_config: None,
             num_speculative_tokens: 1,
             speculative_mode: SpeculativeMode::None,
@@ -580,8 +582,8 @@ mod tests {
     }
 
     #[cfg(feature = "native-backend")]
-    fn tiny_dense_decoder_io() -> ModelIoSpec {
-        ModelIoSpec {
+    fn tiny_dense_decoder_io() -> DecoderAbi {
+        DecoderAbi {
             sequence_source: Some(SequenceInputKind::TokenIds),
             kv_ownership: Some(KvOwnership::Owned),
             kv_layout: None,

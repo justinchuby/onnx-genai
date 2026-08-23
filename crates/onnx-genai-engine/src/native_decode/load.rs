@@ -9,7 +9,7 @@ pub(crate) struct NativeDecodeLoadOptions<'a> {
         Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
     #[cfg(feature = "native-cuda")]
     pub(crate) process_memory_manager: onnx_runtime_memory_governor::ProcessMemoryManager,
-    pub(crate) io: Option<&'a ModelIoSpec>,
+    pub(crate) io: Option<&'a DecoderAbi>,
     pub(crate) metadata_max_len: Option<usize>,
     pub(crate) key_sequence_lengths_policy: crate::decode::KeySequenceLengthsPolicy,
     pub(crate) decode_precision: DecodePrecision,
@@ -54,7 +54,7 @@ fn resolve_io_metadata_from_model_path(
 }
 
 impl NativeDecodeSession {
-    /// Load a decoder-with-past model, resolving its [`ModelIoSpec`] from an
+    /// Load a decoder-with-past model, resolving its [`DecoderAbi`] from an
     /// adjacent `inference_metadata.{yaml,yml,json}` sidecar or (for
     /// onnxruntime-genai packages) `genai_config.json`, so genai_config decoders
     /// bind their token input from metadata instead of guessing from ambiguous
@@ -260,7 +260,7 @@ impl NativeDecodeSession {
     }
 
     /// Load a decoder-with-past model, threading the pipeline-declared
-    /// [`ModelIoSpec`] so `sequence_source` (e.g. `inputs_embeds`), the KV pairs,
+    /// [`DecoderAbi`] so `sequence_source` (e.g. `inputs_embeds`), the KV pairs,
     /// and routed step inputs are bound from metadata rather than guessed from
     /// tensor shapes. The pipeline's native device-KV decoder (inc2b) uses this so
     /// an `inputs_embeds` decoder with no token input loads correctly.
@@ -269,7 +269,7 @@ impl NativeDecodeSession {
     pub(crate) fn load_with_io(
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
-        io: Option<&ModelIoSpec>,
+        io: Option<&DecoderAbi>,
         metadata_max_len: Option<usize>,
     ) -> anyhow::Result<Self> {
         Self::load_with_cuda_options_and_io(
@@ -286,7 +286,7 @@ impl NativeDecodeSession {
         )
     }
 
-    /// Test-support (leverb-phase0): load with an explicit [`ModelIoSpec`] and
+    /// Test-support (leverb-phase0): load with an explicit [`DecoderAbi`] and
     /// custom CUDA options but no offload governor. Lets the `#[ignore]`d Lever-B
     /// probe drive a real metadata-declared decoder (e.g. glm-4-9b, whose two
     /// rank-2 int64 inputs are ambiguous under shape-only autoderive) directly at
@@ -296,7 +296,7 @@ impl NativeDecodeSession {
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
         options: NativeDecodeCudaOptions,
-        io: Option<&ModelIoSpec>,
+        io: Option<&DecoderAbi>,
     ) -> anyhow::Result<Self> {
         Self::load_with_cuda_options_and_io(path, device, options, io, None, None, None)
     }
@@ -305,7 +305,7 @@ impl NativeDecodeSession {
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
         mut options: NativeDecodeCudaOptions,
-        io: Option<&ModelIoSpec>,
+        io: Option<&DecoderAbi>,
         #[cfg(feature = "native-cuda")] cuda_governor: Option<
             Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
         >,
@@ -397,14 +397,14 @@ impl NativeDecodeSession {
         Self::from_session_with_cuda_options(session, NativeDecodeCudaOptions::default())
     }
 
-    /// Wrap an already-built native session with an explicit [`ModelIoSpec`],
+    /// Wrap an already-built native session with an explicit [`DecoderAbi`],
     /// used when the graph's ports cannot be disambiguated by shape/dtype alone
     /// (e.g. the synthetic decoder whose `input_ids`/`attention_mask`/
     /// `position_ids` are all `[-1, -1]` Int64). The declared spec is
     /// authoritative.
     pub fn from_session_with_io(
         session: InferenceSession,
-        io: &ModelIoSpec,
+        io: &DecoderAbi,
     ) -> anyhow::Result<Self> {
         Self::from_session_with_cuda_options_and_io(
             session,
@@ -417,7 +417,7 @@ impl NativeDecodeSession {
     pub(crate) fn from_session_with_cuda_kv_max_len_and_io(
         session: InferenceSession,
         cuda_kv_max_len: Option<usize>,
-        io: Option<&ModelIoSpec>,
+        io: Option<&DecoderAbi>,
     ) -> anyhow::Result<Self> {
         Self::from_session_with_cuda_options_and_io(
             session,
@@ -440,7 +440,7 @@ impl NativeDecodeSession {
         Self::from_session_with_cuda_options_and_io(session, cuda_options, None)
     }
 
-    /// Best-effort auto-derived [`ModelIoSpec`] for a stock export whose sidecar
+    /// Best-effort auto-derived [`DecoderAbi`] for a stock export whose sidecar
     /// declares no `io` block, built purely from the session's graph ports.
     ///
     /// Reuses the guarded genai-config derivation
@@ -462,7 +462,7 @@ impl NativeDecodeSession {
     /// silently auto-bound roles that this path is supposed to refuse, so a
     /// decoder with genuinely ambiguous ports loaded against guessed bindings
     /// instead of demanding a declared port name.
-    fn derive_fallback_io(session: &InferenceSession) -> Option<ModelIoSpec> {
+    fn derive_fallback_io(session: &InferenceSession) -> Option<DecoderAbi> {
         let to_graph_tensor =
             |meta: &onnx_runtime_session::IoMeta| onnx_genai_genai_config::GraphTensorInfo {
                 name: meta.name.clone(),
@@ -480,7 +480,7 @@ impl NativeDecodeSession {
             inputs: session.inputs().iter().map(to_graph_tensor).collect(),
             outputs: session.outputs().iter().map(to_graph_tensor).collect(),
         };
-        onnx_genai_genai_config::GenAiConfig::derive_model_io_spec_from_graph(&graph).filter(
+        onnx_genai_genai_config::GenAiConfig::derive_decoder_abi_from_graph(&graph).filter(
             |derived| {
                 derived
                     .state_pairs
@@ -493,7 +493,7 @@ impl NativeDecodeSession {
     pub(crate) fn from_session_with_cuda_options_and_io(
         mut session: InferenceSession,
         cuda_options: NativeDecodeCudaOptions,
-        io: Option<&ModelIoSpec>,
+        io: Option<&DecoderAbi>,
     ) -> anyhow::Result<Self> {
         // Auto-derive a decoder I/O spec from the graph ports when the model
         // package declares none. Declared `io` always wins; this fallback is
@@ -502,7 +502,7 @@ impl NativeDecodeSession {
         // shape-inference path cannot classify). Pure-dense decoders derive no
         // state pairs and keep their existing `io = None` load path unchanged, so
         // no currently-loadable model changes behavior. See #384.
-        let derived_io: Option<ModelIoSpec> = if io.is_none() {
+        let derived_io: Option<DecoderAbi> = if io.is_none() {
             Self::derive_fallback_io(&session)
         } else {
             None

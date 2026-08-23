@@ -8374,6 +8374,7 @@ mod weight_cache_accounting {
             "Swish",
             "Tan",
             "Tanh",
+            "TensorScatter",
             "ThresholdedRelu",
             "Tile",
             "TopK",

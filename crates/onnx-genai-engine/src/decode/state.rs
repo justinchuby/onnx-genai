@@ -42,7 +42,7 @@ impl DecodeState {
     /// Construct decode state from metadata or unambiguous tensor shapes.
     pub(crate) fn new_with_io(
         session: &dyn GraphIo,
-        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
     ) -> anyhow::Result<Self> {
         Self::new_with_io_and_positions(session, io, None)
     }
@@ -51,7 +51,7 @@ impl DecodeState {
     /// declared position program.
     pub(crate) fn new_with_io_and_positions(
         session: &dyn GraphIo,
-        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
         positions: Option<&PositionProgram>,
     ) -> anyhow::Result<Self> {
         Self::new_with_io_positions_and_state_budget(session, io, positions, u64::MAX)
@@ -59,7 +59,7 @@ impl DecodeState {
 
     pub(crate) fn new_with_io_positions_and_state_budget(
         session: &dyn GraphIo,
-        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
         positions: Option<&PositionProgram>,
         fixed_state_budget_bytes: u64,
     ) -> anyhow::Result<Self> {
@@ -107,7 +107,7 @@ impl DecodeState {
     pub(crate) fn new_for_path_with_io(
         session: &Session,
         path: &ModelDecodePath,
-        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
     ) -> anyhow::Result<Self> {
         Self::new_for_path_with_io_positions_and_state_budget(session, path, io, None, u64::MAX)
     }
@@ -115,7 +115,7 @@ impl DecodeState {
     pub(crate) fn new_for_path_with_io_positions_and_state_budget(
         session: &Session,
         path: &ModelDecodePath,
-        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
         positions: Option<&PositionProgram>,
         fixed_state_budget_bytes: u64,
     ) -> anyhow::Result<Self> {

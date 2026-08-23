@@ -85,13 +85,6 @@ pipeline:
       filename: decoder.onnx.textproto
       type: decoder
       tokenizer: tokenizer.json
-      io:
-        inputs_embeds_input: inputs_embeds
-        attention_mask_input: attention_mask
-        logits_output: logits
-        kv_inputs: [past.0.key, past.0.value]
-        kv_outputs: [present.0.key, present.0.value]
-        kv_update: append
   dataflow:
     - from: vision_encoder.image_features
       to: embedding.image_features

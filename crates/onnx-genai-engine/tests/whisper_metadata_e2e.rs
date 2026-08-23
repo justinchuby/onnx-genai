@@ -21,7 +21,7 @@
 
 use std::path::PathBuf;
 
-use onnx_genai_engine::pipeline::{PipelineEngine, PipelineGenerateRequest, WorkflowOutputRole};
+use onnx_genai_engine::pipeline::{PipelineGenerateRequest, WorkflowOutputRole};
 use onnx_genai_engine::{Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest};
 use onnx_genai_ort::{DataType, Value};
 use onnx_genai_preprocess::audio::{LogMelExtractor, WHISPER_SAMPLE_RATE, decode_wav_pcm16};
@@ -168,7 +168,7 @@ fn transcribe_request(
 
 /// Read the emitted token rows, one vector per submitted request row.
 fn rows_of(
-    engine: &PipelineEngine,
+    engine: &Engine,
     outputs: &onnx_genai_engine::pipeline::PipelineOutputs,
 ) -> anyhow::Result<Vec<Vec<i64>>> {
     engine
@@ -186,7 +186,7 @@ fn imported_whisper_workflow_transcribes_audio() -> anyhow::Result<()> {
         return Ok(());
     };
     let features = log_mel(&wav)?;
-    let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&dir, EngineConfig::default())?;
     let output = engine.run_pipeline_outputs(transcribe_request(&features, 1, 64)?)?;
     let tokens = engine
         .structured_output_for_role(&output, WorkflowOutputRole::Tokens)
@@ -215,7 +215,7 @@ fn imported_whisper_workflow_keeps_rows_aligned_across_lengths() -> anyhow::Resu
     };
     let long = log_mel(&long_wav)?;
     let short = log_mel(&short_wav)?;
-    let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&dir, EngineConfig::default())?;
 
     let short_output = engine.run_pipeline_outputs(transcribe_request(&short, 1, 64)?)?;
     let short_alone = rows_of(&engine, &short_output)?;

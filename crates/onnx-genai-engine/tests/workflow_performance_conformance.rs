@@ -412,7 +412,7 @@ fn benchmark_case(
     maximum_ttft_overhead_ms: f64,
 ) -> anyhow::Result<()> {
     let logits = logits_bytes();
-    let mut engine = Engine::from_pipeline_dir(root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(root, EngineConfig::default())?;
     let environment_name = format!("workflow-performance-{label}");
     let env = Environment::new(&environment_name)?;
     let options = SessionOptions::default();
@@ -566,7 +566,7 @@ fn prepared_workflow_refreshes_replaced_input_slots() -> anyhow::Result<()> {
         first[(row * VOCAB + 3) * 4..(row * VOCAB + 3) * 4 + 4]
             .copy_from_slice(&10_f32.to_le_bytes());
     }
-    let engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let engine = Engine::from_dir(&root, EngineConfig::default())?;
     let mut plan = engine.prepare_workflow_execution(workflow_request(first)?)?;
     let first_outputs = plan.execute()?;
     assert_eq!(first_outputs["token"].to_vec_i64()?, vec![3; BATCH]);
@@ -693,7 +693,7 @@ fn real_muse_policy_chain_matches_direct_ort() -> anyhow::Result<()> {
         .as_f64()
         .context("native benchmark has no TTFT")?;
 
-    let mut engine = Engine::from_pipeline_dir(root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(root, EngineConfig::default())?;
     println!(
         "real Muse planned islands: {:?}",
         engine.workflow_performance_diagnostic().islands

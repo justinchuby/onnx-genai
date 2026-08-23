@@ -23,8 +23,7 @@
 //! dtype recorded in `<outputs_dir>/outputs.json`.
 
 use onnx_genai_engine::{
-    Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest,
-    PipelineGenerateRequest, pipeline::PipelineEngine,
+    Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest, PipelineGenerateRequest,
 };
 use onnx_genai_ort::{DataType, Value};
 use serde::Deserialize;
@@ -87,7 +86,7 @@ fn load_value(base: &Path, spec: &InputSpec) -> anyhow::Result<Value> {
     Ok(value)
 }
 
-fn run_spec(engine: &mut PipelineEngine, spec_path: &Path, load_ms: f64) -> anyhow::Result<()> {
+fn run_spec(engine: &mut Engine, spec_path: &Path, load_ms: f64) -> anyhow::Result<()> {
     let spec: Spec = serde_json::from_slice(&std::fs::read(spec_path)?)?;
     let spec_base = spec_path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
@@ -146,7 +145,7 @@ fn main() -> anyhow::Result<()> {
     anyhow::ensure!(!spec_paths.is_empty(), "at least one spec is required");
 
     let started = std::time::Instant::now();
-    let mut engine = Engine::from_pipeline_dir(&package_dir, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&package_dir, EngineConfig::default())?;
     let load_ms = started.elapsed().as_secs_f64() * 1000.0;
     for spec_path in &spec_paths {
         run_spec(&mut engine, spec_path, load_ms)?;

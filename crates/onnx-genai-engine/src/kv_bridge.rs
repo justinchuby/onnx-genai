@@ -75,7 +75,7 @@ struct ResolvedKvLayer {
 
 pub(crate) fn infer_kv_model_info(
     graph: &dyn GraphIo,
-    io: Option<&onnx_genai_metadata::ModelIoSpec>,
+    io: Option<&onnx_genai_metadata::DecoderAbi>,
     page_size: usize,
     dtype: KvDType,
 ) -> anyhow::Result<Option<KvModelInfo>> {
@@ -177,7 +177,7 @@ fn native_kv_tensor_spec(info: &TensorInfo) -> anyhow::Result<KvTensorSpec> {
 /// carries unpaired KV state without an explicit declaration.
 fn resolve_kv_layers(
     graph: &dyn GraphIo,
-    io: Option<&onnx_genai_metadata::ModelIoSpec>,
+    io: Option<&onnx_genai_metadata::DecoderAbi>,
 ) -> anyhow::Result<Option<Vec<ResolvedKvLayer>>> {
     let (kv_inputs, kv_outputs) = match io.map(|io| (io.kv_inputs.as_ref(), io.kv_outputs.as_ref()))
     {
@@ -1062,7 +1062,7 @@ pub(crate) fn past_kv_from_payloads(
 /// [`has_recurrent_state`]: crate::native_decode
 pub(crate) fn ort_session_has_recurrent_state(
     session: &Session,
-    io: Option<&onnx_genai_metadata::ModelIoSpec>,
+    io: Option<&onnx_genai_metadata::DecoderAbi>,
 ) -> bool {
     let Some(state_pairs) = io.and_then(|io| io.state_pairs.as_ref()) else {
         return false;
@@ -1135,7 +1135,7 @@ mod tests {
         Ok((environment, session))
     }
 
-    fn fixture_io(name: &str) -> anyhow::Result<onnx_genai_metadata::ModelIoSpec> {
+    fn fixture_io(name: &str) -> anyhow::Result<onnx_genai_metadata::DecoderAbi> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures")
             .join(name)
@@ -1197,7 +1197,7 @@ mod tests {
         // `has_recurrent_state` gate (#700).
         let (_environment, session) =
             load_named_session("tiny-multiaxis-state-decoder", "decoder.onnx.textproto")?;
-        let io: onnx_genai_metadata::ModelIoSpec = serde_json::from_value(serde_json::json!({
+        let io: onnx_genai_metadata::DecoderAbi = serde_json::from_value(serde_json::json!({
             "kv_inputs": ["past.3.key", "past.3.value", "past.11.key", "past.11.value"],
             "state_pairs": [
                 {"input": "state_a.in", "output": "state_a.out"},

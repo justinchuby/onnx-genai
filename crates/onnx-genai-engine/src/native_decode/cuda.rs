@@ -4,7 +4,7 @@ use super::kv_commit::{self, KvBindingGeometry, KvCommitLayout};
 
 /// Resolve the physical KV-cache layout for the native CUDA binding layer.
 ///
-/// The authoritative source is the model's [`ModelIoSpec::kv_layout`] descriptor
+/// The authoritative source is the model's [`DecoderAbi::kv_layout`] descriptor
 /// (a seq-major descriptor selects [`KvCommitLayout::SeqMajor`]). Absent metadata
 /// means head-major, preserving the historical behavior exactly. The
 /// `ONNX_GENAI_CUDA_KV_LAYOUT` environment variable (`seq_major` / `bsnh` vs
@@ -763,7 +763,7 @@ pub(crate) struct DecodeCudaState {
     /// VMM allocator maps only the token stripes reached so far.
     kv_commits_on_demand: bool,
     /// The physical KV-cache layout this session's bindings are stored in,
-    /// resolved from [`ModelIoSpec::kv_layout`] (absent = head-major, exactly
+    /// resolved from [`DecoderAbi::kv_layout`] (absent = head-major, exactly
     /// the historical behavior). Consumed by the residency accounting and the
     /// commit-geometry decision so the binding layer is no longer layout-blind:
     /// seq-major's live prefix is one dense contiguous run, so its committed

@@ -91,7 +91,7 @@ pub(crate) fn build_processor_chain(
                 chain.add(Box::new(ConstraintProcessor::new(
                     Box::new(JsonConstraint),
                     token_texts,
-                    options.eos_token_id,
+                    terminal_token_ids(options),
                 )));
             }
             GenerateConstraint::JsonSchema(schema) => {
@@ -104,7 +104,7 @@ pub(crate) fn build_processor_chain(
                         options.eos_token_id,
                     )?,
                     token_texts,
-                    options.eos_token_id,
+                    terminal_token_ids(options),
                 )));
             }
             GenerateConstraint::Regex(regex) => {
@@ -117,7 +117,7 @@ pub(crate) fn build_processor_chain(
                         options.eos_token_id,
                     )?,
                     token_texts,
-                    options.eos_token_id,
+                    terminal_token_ids(options),
                 )));
             }
             GenerateConstraint::Lark(grammar) => {
@@ -130,7 +130,7 @@ pub(crate) fn build_processor_chain(
                         options.eos_token_id,
                     )?,
                     token_texts,
-                    options.eos_token_id,
+                    terminal_token_ids(options),
                 )));
             }
         }
@@ -412,7 +412,7 @@ pub(crate) fn finish_reason_after_token(
     chain: &ProcessorChain,
     context: &ProcessorContext,
 ) -> Option<FinishReason> {
-    if options.stop_on_eos && options.eos_token_id == Some(token_id) {
+    if options.terminates(token_id) {
         return Some(FinishReason::EosToken);
     }
 
@@ -831,4 +831,21 @@ mod device_sampling_plan_tests {
             DeviceSamplingPlan::Host
         );
     }
+}
+
+/// Every token id that ends generation for this request.
+///
+/// A constrained decode asks "may this candidate finish the output?", which is
+/// the same question [`GenerateOptions::terminates`] answers for the committed
+/// token. Deriving both from one set is what keeps a grammar from treating a
+/// model's second end token as ordinary text while the loop treats it as
+/// terminal.
+fn terminal_token_ids(options: &GenerateOptions) -> Vec<TokenId> {
+    let mut ids = options.eos_token_ids.clone();
+    if let Some(id) = options.eos_token_id
+        && !ids.contains(&id)
+    {
+        ids.push(id);
+    }
+    ids
 }

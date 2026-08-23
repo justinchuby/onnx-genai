@@ -7,8 +7,7 @@
 
 use onnx_genai_engine::{
     AdapterActivation, AdapterSelection, Engine, EngineConfig, GenerateOptions, GeneratePrompt,
-    GenerateRequest, PipelineGenerateRequest,
-    pipeline::{PipelineEngine, WorkflowOutputRole},
+    GenerateRequest, PipelineGenerateRequest, pipeline::WorkflowOutputRole,
 };
 use onnx_genai_ort::{DataType, Value};
 use std::path::PathBuf;
@@ -107,7 +106,7 @@ fn adapter_request(
 
 #[test]
 fn mobius_parameter_adapters_preserve_order_rows_and_compaction() -> anyhow::Result<()> {
-    let mut engine = Engine::from_pipeline_dir(&root("adapter")?, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root("adapter")?, EngineConfig::default())?;
     let red = [AdapterActivation::new("red", 1.0)];
     let blue = [AdapterActivation::new("blue", 1.0)];
     let green = [AdapterActivation::new("green", 1.0)];
@@ -185,7 +184,7 @@ fn mobius_parameter_adapters_preserve_order_rows_and_compaction() -> anyhow::Res
     Ok(())
 }
 
-fn assert_batched_policy_super_island(engine: &PipelineEngine) {
+fn assert_batched_policy_super_island(engine: &Engine) {
     let diagnostics = engine.execution_island_diagnostics();
     let island = diagnostics
         .iter()
@@ -299,7 +298,7 @@ fn decoder_batch_request(
 
 #[test]
 fn mobius_decoder_workflow_executes() -> anyhow::Result<()> {
-    let mut engine = Engine::from_pipeline_dir(&root("decoder")?, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root("decoder")?, EngineConfig::default())?;
     let output = engine.run_pipeline_outputs(PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![4, 5]),
         options: options(3),
@@ -318,7 +317,7 @@ fn mobius_decoder_workflow_executes() -> anyhow::Result<()> {
 
 #[test]
 fn mobius_decoder_rows_match_independent_runs_and_dynamic_batch_replay() -> anyhow::Result<()> {
-    let mut engine = Engine::from_pipeline_dir(&root("decoder")?, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root("decoder")?, EngineConfig::default())?;
     let generated = engine.generate_with_pipeline_request(decoder_batch_request(
         &[4, 5],
         1,
@@ -360,7 +359,7 @@ fn mobius_decoder_rows_match_independent_runs_and_dynamic_batch_replay() -> anyh
     assert_eq!(rows[0].0, 0);
     assert_eq!(rows[0].1.to_vec_i64()?, first_tokens);
 
-    let mut independent = Engine::from_pipeline_dir(&root("decoder")?, EngineConfig::default())?;
+    let mut independent = Engine::from_dir(&root("decoder")?, EngineConfig::default())?;
     let second = decoder_batch_request(&[6, 0], 1, 2, &[1], &[true], 3)?;
     let second_output = independent.run_pipeline_outputs(second)?;
     let second_tokens = independent
@@ -437,7 +436,7 @@ fn mobius_decoder_rows_match_independent_runs_and_dynamic_batch_replay() -> anyh
 
 #[test]
 fn mobius_vlm_workflow_executes_complete_image_path() -> anyhow::Result<()> {
-    let mut engine = Engine::from_pipeline_dir(&root("vlm")?, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root("vlm")?, EngineConfig::default())?;
     let png = vec![
         137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 2,
         0, 0, 0, 144, 119, 83, 222, 0, 0, 0, 12, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 0, 0,
@@ -527,7 +526,7 @@ fn mobius_shared_state_pixel_flow_executes_text_and_generation_paths() -> anyhow
     let Some(package) = optional_producer_package("shared_state_pixel_flow")? else {
         return Ok(());
     };
-    let mut engine = Engine::from_pipeline_dir(&package, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&package, EngineConfig::default())?;
 
     let text = engine.run_pipeline_outputs(shared_state_pixel_flow_request(2, true, None, 7)?)?;
     assert_eq!(text["logits"].shape(), [1, 2, 64]);
@@ -558,7 +557,7 @@ fn mobius_shared_state_pixel_flow_executes_reference_image_edit() -> anyhow::Res
     let Some(package) = optional_producer_package("shared_state_pixel_flow")? else {
         return Ok(());
     };
-    let mut engine = Engine::from_pipeline_dir(&package, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&package, EngineConfig::default())?;
     let png = vec![
         137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 2,
         0, 0, 0, 144, 119, 83, 222, 0, 0, 0, 12, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 0, 0,
@@ -580,7 +579,7 @@ fn mobius_shared_state_pixel_flow_executes_reference_image_edit() -> anyhow::Res
 
 #[test]
 fn mobius_euler_diffusion_workflow_executes_complete_path() -> anyhow::Result<()> {
-    let mut engine = Engine::from_pipeline_dir(&root("diffusion")?, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root("diffusion")?, EngineConfig::default())?;
     let noise = deterministic_noise(1);
     let request = PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![1, 2]),
@@ -607,7 +606,7 @@ fn mobius_euler_diffusion_workflow_executes_complete_path() -> anyhow::Result<()
 /// request's own tensors would reject every batch larger than one.
 #[test]
 fn mobius_euler_diffusion_workflow_executes_batched() -> anyhow::Result<()> {
-    let mut engine = Engine::from_pipeline_dir(&root("diffusion")?, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root("diffusion")?, EngineConfig::default())?;
     let noise = deterministic_noise(2);
     let request = PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![1, 2]),
@@ -650,8 +649,7 @@ fn mobius_euler_diffusion_workflow_executes_batched() -> anyhow::Result<()> {
 /// latent the workflow draws itself from a seed, and a scaled VAE input.
 #[test]
 fn mobius_guided_diffusion_workflow_executes_complete_path() -> anyhow::Result<()> {
-    let mut engine =
-        Engine::from_pipeline_dir(&root("diffusion_guided")?, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root("diffusion_guided")?, EngineConfig::default())?;
     let request = |seeds: &[i64], prompts: &[i64]| -> anyhow::Result<PipelineGenerateRequest> {
         let rows = i64::try_from(seeds.len())?;
         Ok(PipelineGenerateRequest::new(GenerateRequest {
@@ -728,7 +726,7 @@ fn mobius_guided_diffusion_workflow_executes_complete_path() -> anyhow::Result<(
 
 #[test]
 fn mobius_masked_diffusion_workflow_executes() -> anyhow::Result<()> {
-    let mut engine = Engine::from_pipeline_dir(&root("masked")?, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root("masked")?, EngineConfig::default())?;
     let request = PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![0, 0]),
         options: options(3),
@@ -745,7 +743,7 @@ fn mobius_masked_diffusion_workflow_executes() -> anyhow::Result<()> {
 
 #[test]
 fn mobius_codec_workflow_executes() -> anyhow::Result<()> {
-    let mut engine = Engine::from_pipeline_dir(&root("codec")?, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root("codec")?, EngineConfig::default())?;
     let request =
         PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
             .with_input(
@@ -788,13 +786,13 @@ fn tts_request(prompt_tokens: &[i64], batch: i64) -> anyhow::Result<PipelineGene
 
 #[test]
 fn mobius_tts_workflow_executes_real_producer_graphs() -> anyhow::Result<()> {
-    let mut engine = Engine::from_pipeline_dir(&root("tts")?, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root("tts")?, EngineConfig::default())?;
     let output = engine.run_pipeline_outputs(tts_request(&[1, 2], 1)?)?;
     assert_eq!(output["waveform"].shape()[..2], [1, 1]);
     let first = output["waveform"].to_vec_f32()?;
     assert!(!first.is_empty());
 
-    let mut independent = Engine::from_pipeline_dir(&root("tts")?, EngineConfig::default())?;
+    let mut independent = Engine::from_dir(&root("tts")?, EngineConfig::default())?;
     let second_output = independent.run_pipeline_outputs(tts_request(&[3, 4], 1)?)?;
     let second = second_output["waveform"].to_vec_f32()?;
 
@@ -835,7 +833,7 @@ fn mobius_speculative_workflow_executes_rejection_and_correction() -> anyhow::Re
     let has_asymmetric_value_cache =
         std::fs::read_to_string(package.join("inference_metadata.yaml"))?
             .contains("name: verifier.past_key_values.0.value");
-    let mut engine = Engine::from_pipeline_dir(&package, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&package, EngineConfig::default())?;
     let mut request = PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![1, 2, 3, 4]),
         options: options(1),
@@ -877,7 +875,7 @@ fn mobius_hierarchical_audio_executes_nested_generation() -> anyhow::Result<()> 
     if !package.is_dir() {
         return Ok(());
     }
-    let mut engine = Engine::from_pipeline_dir(&package, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&package, EngineConfig::default())?;
     let request = PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![1, 2, 3]),
         options: options(2),
@@ -928,7 +926,7 @@ fn video_request(latent_frames: i64, batch: i64) -> anyhow::Result<PipelineGener
 
 #[test]
 fn mobius_video_diffusion_workflow_publishes_causal_temporal_chunks() -> anyhow::Result<()> {
-    let mut engine = Engine::from_pipeline_dir(&root("video")?, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root("video")?, EngineConfig::default())?;
 
     // Three latent frames decode as a single chunk and expand 2x in time.
     let short = engine.run_pipeline_outputs(video_request(3, 1)?)?;

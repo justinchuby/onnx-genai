@@ -101,7 +101,7 @@ fn imported_comfyui_workflow_produces_the_referenced_image() -> anyhow::Result<(
     // applied after the solver — moves these values by order 0.1, not 1e-3.
     let tolerance = reference["tolerance"].as_f64().expect("tolerance") as f32;
 
-    let mut engine = Engine::from_pipeline_dir(&package(), EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&package(), EngineConfig::default())?;
     let outputs =
         engine.run_pipeline_outputs(request(&prompt, &negative, seed, guidance, steps)?)?;
 
@@ -138,7 +138,7 @@ fn guidance_scale_reaches_the_converted_loop() -> anyhow::Result<()> {
     let prompt = tokens(&reference, "prompt_tokens");
     let negative = tokens(&reference, "negative_tokens");
     let steps = reference["steps"].as_u64().expect("steps") as usize;
-    let mut engine = Engine::from_pipeline_dir(&package(), EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&package(), EngineConfig::default())?;
 
     let guided = engine
         .run_pipeline_outputs(request(&prompt, &negative, 7, 7.5, steps)?)?
@@ -181,7 +181,7 @@ fn the_converted_workflow_is_seed_deterministic() -> anyhow::Result<()> {
     let prompt = tokens(&reference, "prompt_tokens");
     let negative = tokens(&reference, "negative_tokens");
     let steps = reference["steps"].as_u64().expect("steps") as usize;
-    let mut engine = Engine::from_pipeline_dir(&package(), EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&package(), EngineConfig::default())?;
 
     let first = engine
         .run_pipeline_outputs(request(&prompt, &negative, 11, 7.5, steps)?)?
@@ -216,7 +216,7 @@ fn the_converted_loop_honours_the_requested_step_count() -> anyhow::Result<()> {
     let reference = reference();
     let prompt = tokens(&reference, "prompt_tokens");
     let negative = tokens(&reference, "negative_tokens");
-    let mut engine = Engine::from_pipeline_dir(&package(), EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&package(), EngineConfig::default())?;
 
     let full = engine
         .run_pipeline_outputs(request(&prompt, &negative, 5, 7.5, 4)?)?
@@ -243,7 +243,7 @@ fn the_image_output_is_reachable_by_role() -> anyhow::Result<()> {
     let reference = reference();
     let prompt = tokens(&reference, "prompt_tokens");
     let negative = tokens(&reference, "negative_tokens");
-    let engine = Engine::from_pipeline_dir(&package(), EngineConfig::default())?;
+    let engine = Engine::from_dir(&package(), EngineConfig::default())?;
     let mut engine = engine;
     let outputs = engine.run_pipeline_outputs(request(&prompt, &negative, 3, 7.5, 4)?)?;
     let by_role = engine

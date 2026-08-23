@@ -1,6 +1,6 @@
 //! A workflow-only package drives the static-cache decoder.
 //!
-//! The scatter driver takes a [`ModelIoSpec`], and that type shares its name
+//! The scatter driver takes a [`DecoderAbi`], and that type shares its name
 //! with the serialized `model.io` block this branch retired. The two are not
 //! the same thing: the parameter is the *resolved* decode ABI that
 //! [`InferenceMetadata::decoder_io`] returns, and a workflow package
@@ -74,8 +74,8 @@ fn a_package_with_no_model_block_still_binds_the_scatter_abi() {
     assert_eq!(cache.key_cache_outputs, ["updated_key_cache.0"]);
     assert_eq!(cache.value_cache_outputs, ["updated_value_cache.0"]);
     assert!(
-        !metadata.decoder_io_is_legacy(),
-        "the ABI must come from the workflow, not from a legacy fallback"
+        metadata.pipeline.is_some(),
+        "the ABI must come from the workflow, which is the only place it can come from"
     );
 }
 

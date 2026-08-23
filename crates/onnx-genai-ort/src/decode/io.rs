@@ -9,7 +9,7 @@ pub(super) struct KvPair {
 }
 pub(super) fn infer_kv_pairs(
     session: &Session,
-    io: Option<&onnx_genai_metadata::ModelIoSpec>,
+    io: Option<&onnx_genai_metadata::DecoderAbi>,
 ) -> Result<Vec<KvPair>> {
     if let Some(io) = io {
         return match (&io.kv_inputs, &io.kv_outputs) {
@@ -122,7 +122,7 @@ impl StaticCacheAbi {
 
 pub(super) fn detect_static_cache(
     session: &Session,
-    io: Option<&onnx_genai_metadata::ModelIoSpec>,
+    io: Option<&onnx_genai_metadata::DecoderAbi>,
 ) -> Result<Option<(StaticCacheSignature, Vec<StaticCachePair>, StaticCacheAbi)>> {
     // Explicit metadata is authoritative and fully name-agnostic: the graph's
     // scatter-ABI ports are exactly those declared, never inferred from names.
@@ -135,7 +135,7 @@ pub(super) fn detect_static_cache(
 /// Resolve the static-cache ABI from the package's declared scatter discipline.
 fn detect_static_cache_from_spec(
     session: &Session,
-    io: Option<&onnx_genai_metadata::ModelIoSpec>,
+    io: Option<&onnx_genai_metadata::DecoderAbi>,
     spec: &onnx_genai_metadata::StaticCacheIoSpec,
 ) -> Result<(StaticCacheSignature, Vec<StaticCachePair>, StaticCacheAbi)> {
     let layer_count = validate_static_cache_spec_lengths(spec)?;
@@ -219,7 +219,7 @@ fn reject_undeclared_static_cache(
 
 /// Resolve the token-sequence input: the declared `token_input` role, else the
 /// historical `input_ids` port.
-fn token_input_name(_session: &Session, io: Option<&onnx_genai_metadata::ModelIoSpec>) -> String {
+fn token_input_name(_session: &Session, io: Option<&onnx_genai_metadata::DecoderAbi>) -> String {
     io.and_then(|io| io.token_input.clone())
         .unwrap_or_else(|| "input_ids".to_string())
 }
@@ -228,7 +228,7 @@ fn token_input_name(_session: &Session, io: Option<&onnx_genai_metadata::ModelIo
 /// the historical `position_ids` port when the graph exposes one.
 fn position_ids_input_name(
     session: &Session,
-    io: Option<&onnx_genai_metadata::ModelIoSpec>,
+    io: Option<&onnx_genai_metadata::DecoderAbi>,
 ) -> Option<String> {
     if let Some(declared) = io.and_then(|io| io.position_ids_input.clone()) {
         return Some(declared);

@@ -2,16 +2,12 @@
 
 use crate::decode::clone_value;
 use crate::engine::{
-    Engine, EngineConfig, EngineResourceGovernor, Holder, MemoryStrategyPlanInput,
-    analyze_model_memory, build_memory_strategy_plan, combine_graph_memory, component_governor,
-    log_memory_strategy_plan, requested_decode_backend, resolve_memory_strategy_hot_tier_bytes,
-    resolve_vram_limit_bytes,
+    EngineConfig, EngineResourceGovernor, Holder, MemoryStrategyPlanInput, analyze_model_memory,
+    build_memory_strategy_plan, combine_graph_memory, component_governor, log_memory_strategy_plan,
+    requested_decode_backend, resolve_memory_strategy_hot_tier_bytes, resolve_vram_limit_bytes,
 };
 use crate::memory_authority::{MemoryAuthorityProvider, SharedMemoryAuthorityProvider};
-use crate::{
-    EngineDecodeBackend, FinishReason, GeneratePrompt, GenerateRequest, GenerateResult,
-    GenerateToken, GenerateTokenCallback, MemoryStrategyPlan, TokenId,
-};
+use crate::{EngineDecodeBackend, GeneratePrompt, GenerateRequest, MemoryStrategyPlan, TokenId};
 use anyhow::Context;
 use onnx_genai_metadata::{
     CompiledWorkflow, ComponentImplementation, DeviceKind, LiteralValue, PreprocessingSpec,
@@ -29,13 +25,19 @@ use std::sync::Arc;
 mod adapters;
 mod arg_reduce;
 mod audio;
+mod device_ops;
+pub(crate) mod generation;
 mod islands;
+#[cfg(feature = "native-backend")]
+mod native_component;
 mod row_state;
+pub mod speculative;
 mod workflow;
 
 pub use adapters::{AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection};
 pub use arg_reduce::{ArgReduceRewrites, WideArgReduceLowering, lower_degenerate_arg_reductions};
 pub use audio::{EncodedAudio, encode_pcm16_wav, resample_planar};
+pub(crate) use generation::validate_generation_workflow;
 pub use islands::ExecutionIslandDiagnostic;
 pub use onnx_genai_metadata::WorkflowOutputRole;
 pub use row_state::{RowScopedState, RowTable, check_selection, gather_rows};
@@ -43,6 +45,7 @@ pub use workflow::{
     MISSING_REQUIRED_INPUT, WorkflowExecutionPlan, WorkflowPerformanceDiagnostic,
     is_missing_required_input,
 };
+pub(crate) use workflow::{WorkflowGenerationCursor, WorkflowNodeHost};
 
 pub fn has_buffered_pcm16_wav_output(workflow: &WorkflowSpec) -> bool {
     audio::has_buffered_pcm16_wav_output(workflow)
@@ -150,10 +153,9 @@ impl From<GenerateRequest> for PipelineGenerateRequest {
 }
 
 /// Engine for packages expressed exclusively with `pipeline.workflow`.
-pub struct PipelineEngine {
+pub(crate) struct WorkflowRuntime {
     package_root: std::path::PathBuf,
     models: PipelineModels,
-    resource_governor: EngineResourceGovernor,
     memory_strategy_plan: MemoryStrategyPlan,
     decode_backend: EngineDecodeBackend,
     workflow: WorkflowSpec,
@@ -171,17 +173,52 @@ pub struct PipelineEngine {
     workflow_performance: RefCell<workflow::WorkflowPerformanceCounters>,
     workflow_execution_generation: Cell<u64>,
     workflow_session_state: RefCell<HashMap<(String, String), Value>>,
+    /// Device→host materializations this runtime performed.
+    ///
+    /// A proposal chain's whole point is that its per-token work stays on the
+    /// device that produced it, and "stays on the device" is not something a
+    /// throughput number diagnoses: a reintroduced copy shows up as a slower
+    /// run months later, attributed to anything but the line that caused it.
+    /// Counting the transfers makes it a property a test can hold.
+    host_staging_count: std::cell::Cell<u64>,
+    /// Embedding tables read out of a component's artifact, cached for the
+    /// runtime's life.
+    ///
+    /// Re-reading a `[vocab, hidden]` initializer off disk once per proposal is
+    /// pure waste — the file cannot change under a loaded package — and at real
+    /// vocabularies it is the dominant cost of starting a proposal.
+    embedding_tables: RefCell<HashMap<(String, String), std::rc::Rc<speculative::EmbeddingTable>>>,
+    /// Nodes this runtime executed through a declared contract, by contract id.
+    ///
+    /// Selection of an algorithmic executor is supposed to come from what the
+    /// workflow *authors*, and a claim like that is worth nothing unless
+    /// something counts it. A test can assert that a package whose body names
+    /// one contract routed its nodes there and nowhere else, which is a
+    /// statement about the interpreter's dispatch rather than about which
+    /// function a caller happened to call.
+    contract_executions: RefCell<std::collections::BTreeMap<String, u64>>,
     adapter_service: Option<onnx_genai_metadata::AdapterServiceContract>,
     adapter_cache: RefCell<adapters::AdapterCache>,
     active_adapter_context: RefCell<Option<adapters::AdapterRunContext>>,
     preprocessing: Option<PreprocessingSpec>,
+    /// The package's speculative compatibility contract, when it declares one.
+    /// The chained proposal driver in [`speculative`] reads every field it needs
+    /// from here, so proposal execution is metadata-driven rather than keyed on
+    /// a model name.
+    speculative: Option<onnx_genai_metadata::SpeculativeContract>,
+    /// Native (pure-Rust) component sessions, present only when the engine was
+    /// built for `EngineDecodeBackend::Native`. The universal interpreter drives
+    /// these through the same seam it uses for ORT sessions; see
+    /// `docs/architecture/NATIVE_WORKFLOW_BACKEND.md`.
+    #[cfg(feature = "native-backend")]
+    native_components: Option<RefCell<native_component::NativeComponentSet>>,
     /// Kept last so the ORT environment, its registered allocator bridge, and
     /// their plugin/provider teardown outlive every component and execution-island
     /// session that may still call back into them.
     _ort_environment: Option<Arc<onnx_genai_ort::Environment>>,
 }
 
-impl Drop for PipelineEngine {
+impl Drop for WorkflowRuntime {
     fn drop(&mut self) {
         for island in &mut self.execution_islands {
             island.clear_bindings();
@@ -193,15 +230,25 @@ impl Drop for PipelineEngine {
 }
 
 /// Validate an explicit pipeline backend request without touching model files.
+///
+/// The universal workflow interpreter is backend-neutral: it drives every
+/// declared component through a seam that either an ORT `Session` or a native
+/// `InferenceSession` fulfills (see `docs/architecture/NATIVE_WORKFLOW_BACKEND.md`).
+/// `EngineDecodeBackend::Native` is therefore accepted whenever the native
+/// backend is compiled in. A build without the `native-backend` feature has no
+/// native sessions to run, so a native request fails closed here (Rule 4: no
+/// silent ORT fallback) rather than pretending to honor it.
 pub fn validate_pipeline_backend_request(
     requested: EngineDecodeBackend,
 ) -> anyhow::Result<EngineDecodeBackend> {
     let backend = requested_decode_backend(requested)?;
+    #[cfg(not(feature = "native-backend"))]
     if backend == EngineDecodeBackend::Native {
         anyhow::bail!(
-            "pipeline.workflow executes through generic ONNX component invocations; select the \
-             ORT backend and configure its execution provider instead of the legacy native \
-             decoder backend"
+            "pipeline.workflow native execution requires the `native-backend` feature, but this \
+             build was compiled without it. Rebuild with --features native-backend (or \
+             --features native-cuda for the native CUDA EP), or select the ORT backend \
+             (decode_backend = EngineDecodeBackend::Ort / ONNX_GENAI_BACKEND=ort)."
         );
     }
     Ok(backend)
@@ -273,65 +320,20 @@ fn shared_cuda_allocator_config(
     )?))
 }
 
-impl Engine {
-    pub fn from_pipeline_dir(
-        pipeline_dir: &Path,
-        config: EngineConfig,
-    ) -> anyhow::Result<PipelineEngine> {
-        PipelineEngine::from_dir_with_config(pipeline_dir, config)
-    }
-
-    pub fn from_pipeline_dir_with_memory_authority_provider(
-        pipeline_dir: &Path,
-        config: EngineConfig,
-        provider: Arc<dyn MemoryAuthorityProvider>,
-    ) -> anyhow::Result<PipelineEngine> {
-        PipelineEngine::from_dir_with_memory_authority_provider(pipeline_dir, config, provider)
-    }
-
-    pub fn from_pipeline_dir_with_session_options_and_memory_authority_provider(
-        pipeline_dir: &Path,
-        config: EngineConfig,
-        session_options: SessionOptions,
-        provider: Arc<dyn MemoryAuthorityProvider>,
-    ) -> anyhow::Result<PipelineEngine> {
-        PipelineEngine::from_dir_with_session_options_and_memory_authority_provider(
-            pipeline_dir,
-            config,
-            session_options,
-            provider,
-        )
-    }
-}
-
-impl PipelineEngine {
-    pub fn from_dir(pipeline_dir: &Path) -> anyhow::Result<Self> {
-        Self::from_dir_with_config(pipeline_dir, EngineConfig::default())
-    }
-
-    pub fn from_dir_with_config(pipeline_dir: &Path, config: EngineConfig) -> anyhow::Result<Self> {
-        Self::build(pipeline_dir, config, SessionOptions::default(), None)
-    }
-
+impl WorkflowRuntime {
+    /// Load a workflow package.
+    ///
+    /// Returns the interpreter and the one resource governor built for it. The
+    /// governor is handed back rather than kept because exactly one exists per
+    /// engine: a runtime holding its own beside the engine's would let each
+    /// believe it had the whole tier to itself, and every reservation would be
+    /// counted twice.
     pub fn from_dir_with_session_options(
         pipeline_dir: &Path,
         config: EngineConfig,
         session_options: SessionOptions,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<(Self, EngineResourceGovernor)> {
         Self::build(pipeline_dir, config, session_options, None)
-    }
-
-    pub fn from_dir_with_memory_authority_provider(
-        pipeline_dir: &Path,
-        config: EngineConfig,
-        provider: Arc<dyn MemoryAuthorityProvider>,
-    ) -> anyhow::Result<Self> {
-        Self::build(
-            pipeline_dir,
-            config,
-            SessionOptions::default(),
-            Some(provider),
-        )
     }
 
     pub fn from_dir_with_session_options_and_memory_authority_provider(
@@ -339,8 +341,70 @@ impl PipelineEngine {
         config: EngineConfig,
         session_options: SessionOptions,
         provider: Arc<dyn MemoryAuthorityProvider>,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<(Self, EngineResourceGovernor)> {
         Self::build(pipeline_dir, config, session_options, Some(provider))
+    }
+
+    /// An interpreter over a workflow whose graph components the caller runs.
+    ///
+    /// A single-decoder package's decoder is executed by the engine's fused
+    /// decode session — the executor registered for
+    /// `onnx-genai.autoregressive-decode`, which owns paged KV, the device fast
+    /// paths and the CUDA graph — so this runtime builds no ORT session for it,
+    /// plans no execution islands, and holds no resource governor: the decode
+    /// core it belongs to already owns all three, and a second of any of them
+    /// would double-count the same bytes.
+    ///
+    /// What it does own is the interpreter, which is the point. The loop bound,
+    /// the liveness predicate, the carries, the emits and the token stream come
+    /// from the workflow the package declares, executed by the same
+    /// `run_workflow_node` that executes a composite pipeline. There is one
+    /// execution machinery; what differs between packages is which executor
+    /// implements a declared step, and that is answered by the step's contract.
+    pub(crate) fn hosted(
+        package_root: std::path::PathBuf,
+        workflow: WorkflowSpec,
+        decode_backend: EngineDecodeBackend,
+        memory_strategy_plan: MemoryStrategyPlan,
+        models: PipelineModels,
+        speculative: Option<onnx_genai_metadata::SpeculativeContract>,
+    ) -> anyhow::Result<Self> {
+        let compiled_workflow = onnx_genai_metadata::compile_workflow(&workflow)
+            .map_err(|error| anyhow::anyhow!("Failed to lower workflow metadata: {error}"))?;
+        let row_wise_outputs = workflow::workflow_row_wise_outputs(&compiled_workflow.graph);
+        let movable_emit_values =
+            workflow::compile_movable_emit_values(&compiled_workflow.graph, &workflow);
+        let device_bridge_components =
+            workflow::compile_device_bridge_components(&compiled_workflow.graph, &HashSet::new());
+        Ok(Self {
+            package_root,
+            models,
+            memory_strategy_plan,
+            decode_backend,
+            workflow,
+            compiled_workflow,
+            row_wise_outputs,
+            movable_emit_values,
+            execution_islands: Vec::new(),
+            device_bridge_components,
+            component_bindings: RefCell::new(HashMap::new()),
+            component_allocators: RefCell::new(HashMap::new()),
+            component_outputs: RefCell::new(HashMap::new()),
+            workflow_performance: RefCell::new(workflow::WorkflowPerformanceCounters::default()),
+            workflow_execution_generation: Cell::new(0),
+            workflow_session_state: RefCell::new(HashMap::new()),
+            host_staging_count: std::cell::Cell::new(0),
+            embedding_tables: RefCell::new(HashMap::new()),
+            contract_executions: RefCell::new(std::collections::BTreeMap::new()),
+            adapter_service: None,
+            adapter_cache: RefCell::new(adapters::AdapterCache::default()),
+            active_adapter_context: RefCell::new(None),
+            preprocessing: None,
+            speculative,
+            #[cfg(feature = "native-backend")]
+            native_components: None,
+            _ort_environment: None,
+        })
     }
 
     fn build(
@@ -348,7 +412,7 @@ impl PipelineEngine {
         config: EngineConfig,
         session_options: SessionOptions,
         authority_provider: Option<SharedMemoryAuthorityProvider>,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<(Self, EngineResourceGovernor)> {
         let decode_backend = validate_pipeline_backend_request(config.decode_backend)?;
         let authority_domain = crate::engine::session_device_domain(&session_options)?;
         crate::engine::validate_shared_authority_limit(
@@ -493,13 +557,42 @@ impl PipelineEngine {
             session_options.use_managed_cuda_allocator(allocator_config);
         }
         component_session_options.graph_capture = false;
-        let models = PipelineModels::load_with_component_options(
-            pipeline_dir,
-            component_session_options,
-            session_options,
-        )
+        // Under Native, every component executes on a native `InferenceSession`
+        // (see `native_component`), so building an ORT `Session` for each one is
+        // redundant, pulls in the ORT runtime unnecessarily, double-loads
+        // weights, and misreports the execution provider — and a native-only
+        // operator would make ORT reject the graph at load. Build ORT sessions
+        // only for the ORT backend; under Native, load backend-neutral graph I/O
+        // only (`PipelineModels::graph_io_metadata`) so the package's I/O
+        // contract stays available without an ORT session.
+        #[cfg(feature = "native-backend")]
+        let native_device = if decode_backend == EngineDecodeBackend::Native {
+            Some(crate::engine::resolve_native_decode_device(
+                config.native_device.clone(),
+                &session_options,
+            )?)
+        } else {
+            None
+        };
+        let models = if decode_backend == EngineDecodeBackend::Native {
+            PipelineModels::load_with_ort_session_filter(
+                pipeline_dir,
+                component_session_options,
+                |_| false,
+            )
+        } else {
+            PipelineModels::load_with_component_options(
+                pipeline_dir,
+                component_session_options,
+                session_options,
+            )
+        }
         .map_err(|error| anyhow::anyhow!("Failed to load workflow components: {error}"))?;
 
+        let speculative = directory
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.speculative.clone());
         let workflow = directory.spec.workflow;
         let mut compiled_workflow = onnx_genai_metadata::compile_workflow(&workflow)
             .map_err(|error| anyhow::anyhow!("Failed to lower workflow metadata: {error}"))?;
@@ -515,10 +608,16 @@ impl PipelineEngine {
         // session creation. This is a topology-derived maximum: a component
         // invoked in two different islands contributes twice, while a candidate
         // the linker rejects contributes nothing.
+        // Values a speculative proposal driver consumes after a pass are real
+        // consumers island fusion cannot see; keep them live in both the
+        // reservation dry-run and the plan so the two agree.
+        let speculative_live_values =
+            speculative::externally_used_values(speculative.as_ref(), &workflow);
         let maximum_island_initializer_bytes = islands::maximum_execution_island_initializer_bytes(
             &compiled_workflow.graph,
             &workflow,
             &models,
+            &speculative_live_values,
         )?;
         let maximum_initializer_reservation = workflow_initializer_reservation_bytes(
             model_weights_bytes,
@@ -561,19 +660,25 @@ impl PipelineEngine {
                 }
             }
         };
-        let execution_islands = if island_reservation_admitted {
-            islands::plan_execution_islands(
-                &mut compiled_workflow.graph,
-                &workflow,
-                &models,
-                &aliasable_output_values,
-            )
-            .map_err(|error| {
-                anyhow::anyhow!("Failed to plan workflow execution islands: {error}")
-            })?
-        } else {
-            Vec::new()
-        };
+        let execution_islands =
+            if island_reservation_admitted && decode_backend != EngineDecodeBackend::Native {
+                // Execution islands are the ORT `IoBinding` / CUDA-graph optimization.
+                // The native backend has no equivalent yet (follow-up boundary A), so
+                // under Native we keep the compiled graph's individual component nodes
+                // and drive each through the native seam — correct, just unfused.
+                islands::plan_execution_islands(
+                    &mut compiled_workflow.graph,
+                    &workflow,
+                    &models,
+                    &aliasable_output_values,
+                    &speculative_live_values,
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!("Failed to plan workflow execution islands: {error}")
+                })?
+            } else {
+                Vec::new()
+            };
         let live_island_initializer_bytes =
             islands::execution_island_initializer_bytes(&execution_islands)?;
         let live_initializer_reservation = workflow_initializer_reservation_bytes(
@@ -603,39 +708,117 @@ impl PipelineEngine {
             .collect::<HashSet<_>>();
         let device_bridge_components =
             workflow::compile_device_bridge_components(&bridge_graph, &island_components);
+        // Load a native session per component only when the native backend was
+        // requested, bound to the resolved native device/EP. The ORT
+        // `PipelineModels` above holds only backend-neutral graph I/O in that
+        // case (no ORT sessions were built).
+        #[cfg(feature = "native-backend")]
+        let native_components = if decode_backend == EngineDecodeBackend::Native {
+            let device = native_device
+                .as_ref()
+                .expect("native device is resolved when the decode backend is Native");
+            Some(RefCell::new(native_component::NativeComponentSet::load(
+                &directory.model_paths,
+                device,
+            )?))
+        } else {
+            None
+        };
         let ort_environment = models.environment_handle();
-        Ok(Self {
-            package_root: directory.root.clone(),
-            models,
+        Ok((
+            Self {
+                package_root: directory.root.clone(),
+                models,
+                memory_strategy_plan,
+                decode_backend,
+                workflow,
+                compiled_workflow,
+                row_wise_outputs,
+                movable_emit_values,
+                execution_islands,
+                device_bridge_components,
+                component_bindings: RefCell::new(HashMap::new()),
+                component_allocators: RefCell::new(HashMap::new()),
+                component_outputs: RefCell::new(HashMap::new()),
+                workflow_performance: RefCell::new(workflow::WorkflowPerformanceCounters::default()),
+                workflow_execution_generation: Cell::new(0),
+                workflow_session_state: RefCell::new(HashMap::new()),
+                host_staging_count: std::cell::Cell::new(0),
+                embedding_tables: RefCell::new(HashMap::new()),
+                contract_executions: RefCell::new(std::collections::BTreeMap::new()),
+                adapter_service: directory.adapters,
+                adapter_cache: RefCell::new(adapters::AdapterCache::default()),
+                active_adapter_context: RefCell::new(None),
+                preprocessing: directory.preprocessing,
+                speculative,
+                #[cfg(feature = "native-backend")]
+                native_components,
+                _ort_environment: ort_environment,
+            },
             resource_governor,
-            memory_strategy_plan,
-            decode_backend,
-            workflow,
-            compiled_workflow,
-            row_wise_outputs,
-            movable_emit_values,
-            execution_islands,
-            device_bridge_components,
-            component_bindings: RefCell::new(HashMap::new()),
-            component_allocators: RefCell::new(HashMap::new()),
-            component_outputs: RefCell::new(HashMap::new()),
-            workflow_performance: RefCell::new(workflow::WorkflowPerformanceCounters::default()),
-            workflow_execution_generation: Cell::new(0),
-            workflow_session_state: RefCell::new(HashMap::new()),
-            adapter_service: directory.adapters,
-            adapter_cache: RefCell::new(adapters::AdapterCache::default()),
-            active_adapter_context: RefCell::new(None),
-            preprocessing: directory.preprocessing,
-            _ort_environment: ort_environment,
-        })
+        ))
     }
 
     pub fn decode_backend(&self) -> EngineDecodeBackend {
         self.decode_backend
     }
 
-    pub fn resource_snapshot(&self) -> onnx_genai_scheduler::GovernorSnapshot {
-        self.resource_governor.snapshot()
+    /// Number of native component invocations performed by this engine so far,
+    /// or `None` when it is not running the native backend. Lets tests prove the
+    /// native sessions — not an ORT fallback — executed a workflow.
+    #[cfg(feature = "native-backend")]
+    pub fn native_component_run_count(&self) -> Option<u64> {
+        self.native_components
+            .as_ref()
+            .map(|set| set.borrow().run_count())
+    }
+
+    /// `(device_input_bindings, device_outputs)` accumulated by the native
+    /// backend, or `None` when not running the native backend. Non-zero
+    /// `device_input_bindings` proves an intermediate or recurring/state tensor
+    /// entered a component still device-resident (bound zero-copy, no host
+    /// round-trip); both are always zero on the CPU native device. Lets a CUDA
+    /// test prove end-to-end device residency rather than a host round-trip.
+    #[cfg(feature = "native-backend")]
+    pub fn native_device_residency_counts(&self) -> Option<(u64, u64)> {
+        self.native_components
+            .as_ref()
+            .map(|set| set.borrow().device_residency_counts())
+    }
+
+    /// The workflow this runtime executes.
+    pub(crate) fn workflow_spec(&self) -> &onnx_genai_metadata::WorkflowSpec {
+        &self.workflow
+    }
+
+    /// How many device→host materializations this runtime has performed.
+    pub fn host_staging_count(&self) -> u64 {
+        self.host_staging_count.get()
+    }
+
+    /// How many nodes this runtime executed per declared contract.
+    pub fn contract_executions(&self) -> std::collections::BTreeMap<String, u64> {
+        self.contract_executions.borrow().clone()
+    }
+
+    /// Record one node executed through a declared contract.
+    pub(crate) fn record_contract_execution(&self, contract: &str) {
+        *self
+            .contract_executions
+            .borrow_mut()
+            .entry(contract.to_string())
+            .or_default() += 1;
+    }
+
+    /// Drop every session-scoped cell a conversation accumulated.
+    ///
+    /// Closing a session must actually release what it held; leaving the cells
+    /// behind would grow the map for the process's life and let a re-used id
+    /// resume a conversation the caller ended.
+    pub(crate) fn forget_session(&self, session_id: &str) {
+        self.workflow_session_state
+            .borrow_mut()
+            .retain(|(session, _), _| session != session_id);
     }
 
     pub fn memory_strategy_plan(&self) -> &MemoryStrategyPlan {
@@ -646,21 +829,15 @@ impl PipelineEngine {
         &self.models
     }
 
-    /// Effective context limit for a request, combining the package metadata
-    /// with an explicit per-request override.
-    pub fn effective_max_context(&self, options: &crate::GenerateOptions) -> Option<usize> {
-        options.max_context.or_else(|| {
-            self.models
-                .directory
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.model.as_ref())
-                .and_then(|model| model.max_sequence_length)
-        })
-    }
-
     /// Execution-provider placement reported by the loaded component sessions.
     pub fn execution_provider_status(&self) -> String {
+        // Under the native backend no ORT sessions exist; report the native
+        // device the components actually run on instead of an empty/"native"
+        // placeholder derived from an absent ORT session set.
+        #[cfg(feature = "native-backend")]
+        if let Some(native) = self.native_components.as_ref() {
+            return native.borrow().device_label().to_string();
+        }
         let mut summaries = self
             .models
             .sessions
@@ -680,18 +857,6 @@ impl PipelineEngine {
         self.adapter_cache.borrow().diagnostic()
     }
 
-    pub fn device_authority(&self) -> crate::memory_authority::DeviceMemoryAuthority {
-        self.resource_governor.device_authority()
-    }
-
-    pub fn set_vram_limit(
-        &self,
-        limit: onnx_genai_scheduler::ResourceLimit,
-    ) -> Result<onnx_genai_scheduler::GovernorReconfigureOutcome, crate::engine::EngineGovernorError>
-    {
-        self.resource_governor.set_vram_limit(limit)
-    }
-
     pub fn run_pipeline(
         &mut self,
         request: PipelineGenerateRequest,
@@ -699,22 +864,20 @@ impl PipelineEngine {
         self.run_workflow(request)
     }
 
-    /// Drop every reusable execution result this pipeline is holding, so the
-    /// next generation recomputes its workflow from scratch. Returns how many
-    /// memoized entries were dropped.
+    /// Run the workflow and keep every value the pass bound, not only the
+    /// package's declared outputs.
     ///
-    /// The workflow engine reuses work through two caches: memoized component
-    /// outputs (deterministic components replayed across requests) and
-    /// session-scoped workflow state. Benchmarks need to drop both. A harness
-    /// that replays one prompt — which is what warmup runs do — otherwise
-    /// answers each measured generation almost entirely out of retained state,
-    /// and reports a "prefill" that does not vary with prompt length (#1529).
-    pub fn clear_prefix_cache(&mut self) -> usize {
-        let dropped =
-            self.component_outputs.get_mut().len() + self.workflow_session_state.get_mut().len();
-        self.component_outputs.get_mut().clear();
-        self.workflow_session_state.get_mut().clear();
-        dropped
+    /// This is the seam interpreter-level constructs consume: a chained
+    /// speculative proposal reads its `folded_carry_seed` from the target output
+    /// the pass produced and binds the proposer's borrowed read-only KV from the
+    /// same values the workflow itself bound, so the proposal chain sees exactly
+    /// the tensors the package declared rather than a caller's reconstruction of
+    /// them.
+    pub fn run_pipeline_retained(
+        &mut self,
+        request: PipelineGenerateRequest,
+    ) -> anyhow::Result<PipelineTensors> {
+        self.run_workflow_retained(request)
     }
 
     /// Encode text with the same tokenizer this pipeline uses for prompts.
@@ -732,12 +895,13 @@ impl PipelineEngine {
         })
     }
 
-    /// Decode token ids back to text with this pipeline's tokenizer, the
-    /// inverse seam of [`PipelineEngine::tokenize`].
-    pub fn detokenize(&self, tokens: &[TokenId]) -> anyhow::Result<String> {
-        self.tokenizer()?
-            .decode(tokens)
-            .map_err(|e| anyhow::anyhow!("failed to detokenize token ids: {e}"))
+    /// The tokenizer this package ships, when it ships one.
+    ///
+    /// A workflow package need not: an image-generation pipeline has no text to
+    /// encode, and inventing an empty tokenizer for it would turn a load-time
+    /// fact into a runtime surprise.
+    pub(crate) fn package_tokenizer(&self) -> Option<&Tokenizer> {
+        self.models.tokenizer_for("")
     }
 
     fn tokenizer(&self) -> anyhow::Result<&Tokenizer> {
@@ -898,86 +1062,6 @@ impl PipelineEngine {
         }
         Ok(())
     }
-
-    /// Convenience text API lowered through the generic tokens package output.
-    pub fn generate(&mut self, request: GenerateRequest) -> anyhow::Result<GenerateResult> {
-        self.generate_with_callbacks(request.into(), None, None)
-    }
-
-    pub fn generate_with_pipeline_request(
-        &mut self,
-        request: PipelineGenerateRequest,
-    ) -> anyhow::Result<GenerateResult> {
-        self.generate_with_callbacks(request, None, None)
-    }
-
-    pub fn generate_with_callback(
-        &mut self,
-        request: PipelineGenerateRequest,
-        callback: Option<&mut GenerateTokenCallback<'_>>,
-    ) -> anyhow::Result<GenerateResult> {
-        self.generate_with_callbacks(request, None, callback)
-    }
-
-    pub fn generate_with_callbacks(
-        &mut self,
-        request: PipelineGenerateRequest,
-        mut on_admitted: Option<&mut dyn FnMut()>,
-        mut callback: Option<&mut GenerateTokenCallback<'_>>,
-    ) -> anyhow::Result<GenerateResult> {
-        if let Some(on_admitted) = on_admitted.as_mut() {
-            on_admitted();
-        }
-        let values = self.run_workflow_outputs(request)?;
-        let output = self
-            .workflow
-            .outputs
-            .iter()
-            .find(|(_, output)| output.role == WorkflowOutputRole::Tokens)
-            .map(|(name, _)| name)
-            .context("workflow generate() requires one package output with role: tokens")?;
-        let rows = values.rows(output);
-        if rows.len() > 1 {
-            anyhow::bail!(
-                "workflow generate() cannot flatten multi-row ragged output '{output}'; use \
-                 run_pipeline_outputs() to consume semantic row streams"
-            );
-        }
-        let tokens = values
-            .aggregate(output)
-            .or_else(|| rows.first().map(|(_, value)| *value))
-            .with_context(|| format!("workflow did not emit tokens output '{output}'"))?
-            .to_vec_i64()?
-            .into_iter()
-            .map(|token| u32::try_from(token).context("workflow emitted token outside uint32"))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let tokenizer = self.models.tokenizer_for("");
-        let text = tokenizer
-            .map(|tokenizer| tokenizer.decode(&tokens))
-            .transpose()?
-            .unwrap_or_default();
-        if let Some(callback) = callback.as_mut() {
-            for (index, token_id) in tokens.iter().copied().enumerate() {
-                let token_text = tokenizer
-                    .map(|tokenizer| tokenizer.decode(&[token_id]))
-                    .transpose()?
-                    .unwrap_or_default();
-                callback(GenerateToken {
-                    token_id,
-                    text: token_text,
-                    finish_reason: (index + 1 == tokens.len()).then_some(FinishReason::MaxTokens),
-                })?;
-            }
-        }
-        Ok(GenerateResult {
-            text,
-            token_ids: tokens,
-            finish_reason: FinishReason::MaxTokens,
-            prefix_cache_hit_len: 0,
-            logprobs: None,
-            budget_cap: None,
-        })
-    }
 }
 
 #[cfg(test)]
@@ -1011,7 +1095,7 @@ mod tests {
 
     #[cfg(feature = "ort-cuda")]
     mod cuda_managed_bridge {
-        use super::super::PipelineEngine;
+        use super::super::WorkflowRuntime;
         use crate::{
             DeviceCompatibilityDomain, DeviceMemoryAuthority, EngineConfig, GeneratePrompt,
             GenerateRequest, MemoryAuthorityProvider, ProcessMemoryManager, ResourceLimit,
@@ -1249,15 +1333,13 @@ pipeline:
         }
 
         fn wait_for_allocator_idle(
-            engine: &PipelineEngine,
+            engine: &WorkflowRuntime,
+            governor: &crate::engine::EngineResourceGovernor,
             expected_live_allocations: usize,
         ) -> anyhow::Result<()> {
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
-                let snapshot = engine
-                    .resource_governor
-                    .process_memory_manager()
-                    .snapshot()?;
+                let snapshot = governor.process_memory_manager().snapshot()?;
                 let stats = engine
                     .models
                     .environment()?
@@ -1291,8 +1373,8 @@ pipeline:
             let provider = Arc::new(FixedAuthorityProvider::new(0));
             let options = SessionOptions::with_execution_provider(ep_selection("cuda"))
                 .with_intra_op_threads(1);
-            let mut engine =
-                PipelineEngine::from_dir_with_session_options_and_memory_authority_provider(
+            let (mut engine, engine_governor) =
+                WorkflowRuntime::from_dir_with_session_options_and_memory_authority_provider(
                     &root,
                     EngineConfig::default(),
                     options,
@@ -1338,8 +1420,8 @@ pipeline:
             );
             wait_for_allocator_idle(
                 &engine,
-                engine
-                    .resource_governor
+                &engine_governor,
+                engine_governor
                     .process_memory_manager()
                     .snapshot()
                     .expect("baseline snapshot")
@@ -1348,8 +1430,7 @@ pipeline:
             )
             .expect("idle after run");
 
-            let baseline_live_allocations = engine
-                .resource_governor
+            let baseline_live_allocations = engine_governor
                 .process_memory_manager()
                 .snapshot()
                 .expect("baseline snapshot")
@@ -1375,8 +1456,7 @@ pipeline:
                 .expect("CUDA island allocator");
             let island_value = Value::empty_in(&[BATCH as i64], DataType::Int64, &island_allocator)
                 .expect("island-managed device allocation");
-            let live_snapshot = engine
-                .resource_governor
+            let live_snapshot = engine_governor
                 .process_memory_manager()
                 .snapshot()
                 .expect("live snapshot");
@@ -1389,7 +1469,7 @@ pipeline:
 
             drop(component_value);
             drop(island_value);
-            wait_for_allocator_idle(&engine, baseline_live_allocations)
+            wait_for_allocator_idle(&engine, &engine_governor, baseline_live_allocations)
                 .expect("component and island frees must settle");
         }
 
@@ -1407,8 +1487,8 @@ pipeline:
             let mut options = SessionOptions::with_execution_provider(ep_selection("cuda"))
                 .with_intra_op_threads(1);
             options.graph_capture = true;
-            let mut engine =
-                PipelineEngine::from_dir_with_session_options_and_memory_authority_provider(
+            let (mut engine, _engine_governor) =
+                WorkflowRuntime::from_dir_with_session_options_and_memory_authority_provider(
                     &root,
                     EngineConfig::default(),
                     options,
@@ -1461,16 +1541,15 @@ pipeline:
             let options = SessionOptions::with_execution_provider(ep_selection("cuda"))
                 .with_intra_op_threads(1);
             let calibration_provider = Arc::new(FixedAuthorityProvider::new(0));
-            let calibration =
-                PipelineEngine::from_dir_with_session_options_and_memory_authority_provider(
+            let (calibration, calibration_governor) =
+                WorkflowRuntime::from_dir_with_session_options_and_memory_authority_provider(
                     &root,
                     EngineConfig::default(),
                     options.clone(),
                     calibration_provider,
                 )
                 .expect("calibration pipeline engine");
-            let calibration_snapshot = calibration
-                .resource_governor
+            let calibration_snapshot = calibration_governor
                 .process_memory_manager()
                 .snapshot()
                 .expect("calibration PMM snapshot");
@@ -1496,13 +1575,12 @@ pipeline:
             let provider = Arc::new(FixedAuthorityProvider::with_capacity(0, limit));
             let mut config = EngineConfig::default();
             config.limits.vram_limit = ResourceLimit::Bytes(limit);
-            let engine =
-                PipelineEngine::from_dir_with_session_options_and_memory_authority_provider(
+            let (_engine, engine_governor) =
+                WorkflowRuntime::from_dir_with_session_options_and_memory_authority_provider(
                     &root, config, options, provider,
                 )
                 .expect("a model that fits once must not fail from a duplicate fixed reservation");
-            let snapshot = engine
-                .resource_governor
+            let snapshot = engine_governor
                 .process_memory_manager()
                 .snapshot()
                 .expect("near-budget PMM snapshot");
@@ -1511,8 +1589,7 @@ pipeline:
                 "managed initializer charges exceeded the shared authority limit: {snapshot:?}"
             );
             assert!(
-                engine
-                    .resource_governor
+                engine_governor
                     .plan()
                     .breakdown()
                     .iter()
@@ -1521,7 +1598,7 @@ pipeline:
             );
             assert_eq!(
                 snapshot.authority_snapshots[0].used[0],
-                engine.resource_snapshot().vram.used,
+                engine_governor.snapshot().vram.used,
                 "PMM and engine snapshots must report the same canonical device charge"
             );
         }

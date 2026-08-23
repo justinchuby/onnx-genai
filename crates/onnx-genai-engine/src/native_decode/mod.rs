@@ -2,11 +2,12 @@
 
 use crate::config::{GenerateOptions, GenerateResult, GenerateTokenCallback};
 use crate::decode::DecodeBackend;
-use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
+use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState};
 use crate::logits::{ProcessorChain, TokenId};
+use crate::pipeline::generation::{GenerationRequest, generate_with_decode_core};
 use crate::sampling::sample_greedy;
 use anyhow::{Context, bail};
-use onnx_genai_metadata::{KvOwnership, ModelIoSpec, SequenceInputKind, SharedKvGroup};
+use onnx_genai_metadata::{DecoderAbi, KvOwnership, SequenceInputKind};
 use onnx_genai_ort::Tokenizer;
 use onnx_runtime_ir::{DataType, DeviceType, Dim, SymbolId};
 use onnx_runtime_session::{
@@ -27,7 +28,6 @@ mod io;
 mod kv_commit;
 mod load;
 mod paged_gqa;
-mod proposer;
 mod tensor;
 #[cfg(feature = "native-cuda")]
 pub(crate) use tensor::recurrent_state_bytes_from_graph;
@@ -54,7 +54,6 @@ pub use paged_gqa::{
     GQA_PRESENT_ALLOCATIONS, PagedGqaConfig, flat_gqa_decode_step, gqa_present_allocations,
     paged_gqa_decode_step,
 };
-pub(crate) use proposer::NativeProposerSession;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use tensor::*;
 
@@ -826,62 +825,6 @@ impl NativeDecodeSession {
         self.last_hidden.as_deref()
     }
 
-    /// Materialize metadata-declared shared-KV references from the target's
-    /// current host cache. Native CUDA keeps KV device-resident and is not yet
-    /// exposed through this CPU tensor contract.
-    pub(crate) fn shared_kv_inputs(
-        &self,
-        groups: &[SharedKvGroup],
-    ) -> anyhow::Result<Vec<(String, Tensor)>> {
-        if self.cuda.is_some() {
-            bail!(
-                "native shared-KV proposer execution currently requires a CPU target session; CUDA target KV references need device-binding alias support"
-            );
-        }
-        let mut inputs = Vec::with_capacity(groups.len() * 2);
-        for group in groups {
-            let key_target = group.target_key_input.as_deref().with_context(|| {
-                format!(
-                    "shared_kv group '{}' is missing target_key_input; declare the exact target decoder KV input name",
-                    group.name
-                )
-            })?;
-            let value_target = group.target_value_input.as_deref().with_context(|| {
-                format!(
-                    "shared_kv group '{}' is missing target_value_input; declare the exact target decoder KV input name",
-                    group.name
-                )
-            })?;
-            let key_input = group.key_input.as_deref().with_context(|| {
-                format!(
-                    "shared_kv group '{}' is missing key_input; declare the exact proposer input name",
-                    group.name
-                )
-            })?;
-            let value_input = group.value_input.as_deref().with_context(|| {
-                format!(
-                    "shared_kv group '{}' is missing value_input; declare the exact proposer input name",
-                    group.name
-                )
-            })?;
-            let key = self.past.get(key_target).with_context(|| {
-                format!(
-                    "target shared-KV key '{}' for group '{}' is unavailable; run the target decoder before invoking the proposer and ensure io.kv_inputs names this cache",
-                    key_target, group.name
-                )
-            })?;
-            let value = self.past.get(value_target).with_context(|| {
-                format!(
-                    "target shared-KV value '{}' for group '{}' is unavailable; run the target decoder before invoking the proposer and ensure io.kv_inputs names this cache",
-                    value_target, group.name
-                )
-            })?;
-            inputs.push((key_input.to_owned(), key.clone()));
-            inputs.push((value_input.to_owned(), value.clone()));
-        }
-        Ok(inputs)
-    }
-
     pub fn cuda_kv_debug_stats(&self) -> Option<CudaKvDebugStats> {
         self.cuda
             .as_ref()
@@ -1277,7 +1220,7 @@ impl NativeDecodeSession {
 
     /// Run one target step with arbitrary named tensors supplied by pipeline
     /// routing. Generated roles (token ids, attention mask, and position ids)
-    /// come from `ModelIoSpec`; every other non-KV graph input is resolved by its
+    /// come from `DecoderAbi`; every other non-KV graph input is resolved by its
     /// exact graph port name from `step_inputs`.
     pub(crate) fn decode_with_step_inputs(
         &mut self,
@@ -1423,14 +1366,15 @@ impl NativeDecodeSession {
     }
 
     /// Generate through the engine's shared token loop, not a backend-local loop.
-    pub fn generate(
+    pub(crate) fn generate(
         &mut self,
         prompt_tokens: &[TokenId],
         options: &GenerateOptions,
         chain: &ProcessorChain,
         tokenizer: &Tokenizer,
+        runtime: &crate::pipeline::WorkflowRuntime,
     ) -> anyhow::Result<GenerateResult> {
-        self.generate_with_callback(prompt_tokens, options, chain, tokenizer, None)
+        self.generate_with_callback(prompt_tokens, options, chain, tokenizer, runtime, None)
     }
 
     /// Generate through the shared loop and optionally stream generated tokens.
@@ -1440,6 +1384,7 @@ impl NativeDecodeSession {
         options: &GenerateOptions,
         chain: &ProcessorChain,
         tokenizer: &Tokenizer,
+        runtime: &crate::pipeline::WorkflowRuntime,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         if prompt_tokens.is_empty() {
@@ -1455,13 +1400,17 @@ impl NativeDecodeSession {
             lookahead: std::collections::VecDeque::new(),
         };
         let mut state = DecodeLoopState::new(0, options.seed, options.top_logprobs);
-        run_decode_loop(
+        generate_with_decode_core(
+            runtime,
             &mut backend,
             &mut state,
-            options,
-            chain,
-            tokenizer,
-            options.max_context,
+            prompt_tokens,
+            GenerationRequest {
+                options,
+                chain,
+                tokenizer,
+                max_context: options.max_context,
+            },
             callback,
         )
     }
@@ -1530,6 +1479,7 @@ impl NativeDecodeSession {
     ///
     /// If `resume_from > current_len`, behaves like full generation from 0.
     /// If `resume_from < current_len`, rewinds the KV cache to `resume_from`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn generate_incremental_with_callback(
         &mut self,
         prompt_tokens: &[TokenId],
@@ -1537,6 +1487,7 @@ impl NativeDecodeSession {
         options: &GenerateOptions,
         chain: &ProcessorChain,
         tokenizer: &Tokenizer,
+        runtime: &crate::pipeline::WorkflowRuntime,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         if prompt_tokens.is_empty() {
@@ -1545,7 +1496,14 @@ impl NativeDecodeSession {
         let resume_from = resume_from.min(prompt_tokens.len());
         if resume_from == 0 || resume_from > self.current_len {
             // Full reset path — no valid KV prefix to reuse.
-            return self.generate_with_callback(prompt_tokens, options, chain, tokenizer, callback);
+            return self.generate_with_callback(
+                prompt_tokens,
+                options,
+                chain,
+                tokenizer,
+                runtime,
+                callback,
+            );
         }
         // Rewind KV to resume_from if we've advanced beyond it (e.g. diverged prefix).
         if self.current_len > resume_from {
@@ -1568,13 +1526,17 @@ impl NativeDecodeSession {
             lookahead: std::collections::VecDeque::new(),
         };
         let mut state = DecodeLoopState::new(resume_from, options.seed, options.top_logprobs);
-        run_decode_loop(
+        generate_with_decode_core(
+            runtime,
             &mut backend,
             &mut state,
-            options,
-            chain,
-            tokenizer,
-            options.max_context,
+            prompt_tokens,
+            GenerationRequest {
+                options,
+                chain,
+                tokenizer,
+                max_context: options.max_context,
+            },
             callback,
         )
     }

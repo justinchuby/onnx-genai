@@ -17,7 +17,7 @@ use onnx_runtime_loader::proto::onnx::{
 };
 use prost::Message;
 
-use super::{PipelineEngine, PipelineTensors};
+use super::{PipelineTensors, WorkflowRuntime};
 use crate::decode::clone_value;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -753,7 +753,7 @@ impl Drop for ExecutionIsland {
     }
 }
 
-impl PipelineEngine {
+impl WorkflowRuntime {
     pub fn execution_island_diagnostics(&self) -> Vec<ExecutionIslandDiagnostic> {
         self.execution_islands
             .iter()
@@ -767,9 +767,11 @@ pub(crate) fn plan_execution_islands(
     workflow: &WorkflowSpec,
     models: &onnx_genai_ort::PipelineModels,
     aliasable_output_values: &HashSet<String>,
+    externally_used_values: &HashSet<String>,
 ) -> anyhow::Result<Vec<ExecutionIsland>> {
     let mut uses = HashMap::<String, usize>::new();
     collect_value_uses(graph, &mut uses);
+    external_uses(externally_used_values, &mut uses);
     let mut islands = Vec::new();
     lower_node(
         graph,
@@ -786,9 +788,11 @@ pub(crate) fn maximum_execution_island_initializer_bytes(
     graph: &WorkflowNode,
     workflow: &WorkflowSpec,
     models: &onnx_genai_ort::PipelineModels,
+    externally_used_values: &HashSet<String>,
 ) -> anyhow::Result<u64> {
     let mut uses = HashMap::<String, usize>::new();
     collect_value_uses(graph, &mut uses);
+    external_uses(externally_used_values, &mut uses);
     let mut next_island_id = 0;
     maximum_node_initializer_bytes(graph, workflow, models, &uses, &mut next_island_id)
 }
@@ -1309,6 +1313,21 @@ fn island_invocation(node: &WorkflowNode) -> anyhow::Result<IslandInvocation> {
             outputs: outputs.clone(),
         }),
         _ => bail!("execution island contains a non-invoke node"),
+    }
+}
+
+/// Count values consumed *outside* the step graph as live.
+///
+/// Island fusion elides a value no later node reads. That is correct for the
+/// step list alone, but an interpreter construct driven from a completed pass —
+/// the chained speculative proposal reading its `folded_carry_seed` and the
+/// proposer's borrowed shared-KV bindings — is a real consumer the graph does
+/// not spell. Counting those uses here is what keeps a fused island from
+/// swallowing the tensors a proposal needs, instead of the driver having to
+/// reconstruct them.
+fn external_uses(values: &HashSet<String>, uses: &mut HashMap<String, usize>) {
+    for value in values {
+        *uses.entry(value.clone()).or_default() += 1;
     }
 }
 

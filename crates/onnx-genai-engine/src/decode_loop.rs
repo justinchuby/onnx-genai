@@ -1,13 +1,15 @@
 //! Shared token-generation loop used by direct, session, priority, pipeline, and speculative paths.
 
+use anyhow::Context as _;
+
 use crate::config::{
     FinishReason, GenerateOptions, GenerateResult, GenerateToken, GenerateTokenCallback,
     TokenLogprob,
 };
 use crate::logits::{ProcessorChain, ProcessorContext, TokenId};
 use crate::processors::{
-    ensure_constrained_finish, finish_reason_after_token, select_next_token,
-    select_next_token_with_rng, select_next_token_with_sampler,
+    finish_reason_after_token, select_next_token, select_next_token_with_rng,
+    select_next_token_with_sampler,
 };
 use crate::sampling::{Sampler, SamplingRng};
 use onnx_genai_ort::Tokenizer;
@@ -93,82 +95,32 @@ pub(crate) trait DecodeLoopBackend {
     fn sampled_fastpath_failed(&mut self) {}
 }
 
-pub(crate) fn run_decode_loop<B: DecodeLoopBackend>(
-    backend: &mut B,
-    state: &mut DecodeLoopState,
-    options: &GenerateOptions,
-    chain: &ProcessorChain,
-    tokenizer: &Tokenizer,
-    max_context: Option<usize>,
-    mut callback: Option<&mut GenerateTokenCallback<'_>>,
-) -> anyhow::Result<GenerateResult> {
-    state.generated_tokens.reserve(
-        options
-            .max_new_tokens
-            .saturating_sub(state.generated_tokens.len()),
-    );
-    if let Some(logprobs) = state.logprobs.as_mut() {
-        logprobs.reserve(options.max_new_tokens.saturating_sub(logprobs.len()));
-    }
-    while state.generated_tokens.len() < options.max_new_tokens {
-        if let Some(result) = step_decode_loop(
-            backend,
-            state,
-            options,
-            chain,
-            tokenizer,
-            max_context,
-            callback.as_deref_mut(),
-        )? {
-            return Ok(result);
-        }
-    }
-
-    ensure_constrained_finish(options, &state.generated_text, FinishReason::MaxTokens)?;
-    finish_result(
-        tokenizer,
-        &state.generated_tokens,
-        FinishReason::MaxTokens,
-        state.prefix_cache_hit_len,
-        state.logprobs.as_deref(),
-    )
+/// What one decoder forward pass produced.
+///
+/// Either the backend selected the token itself on the device (the greedy-argmax
+/// and device-sampling fast paths, which never materialize host logits) or it
+/// returned host logits for the policy to score. Splitting the step here is what
+/// lets the workflow interpreter own the token loop while
+/// [`select_and_commit_step`] stays the single implementation of sampling,
+/// stopping, and commit — a second copy of that policy is exactly what this
+/// split exists to avoid.
+pub(crate) struct ForwardOutcome {
+    /// Token the device picked, when a fast path applied.
+    pub(crate) device_token: Option<TokenId>,
+    /// Host logits, when no fast path applied. Moved into the caller.
+    pub(crate) logits: Option<Vec<f32>>,
+    /// RNG draw already consumed by an attempted device sample, reused by the
+    /// host fallback so a seeded run samples identically either way.
+    pub(crate) rng_value: Option<f32>,
 }
 
-pub(crate) fn step_decode_loop<B: DecodeLoopBackend>(
+/// Run one decoder forward pass, taking the device fast path when it applies.
+pub(crate) fn forward_step<B: DecodeLoopBackend + ?Sized>(
     backend: &mut B,
     state: &mut DecodeLoopState,
     options: &GenerateOptions,
     chain: &ProcessorChain,
-    tokenizer: &Tokenizer,
-    max_context: Option<usize>,
-    callback: Option<&mut GenerateTokenCallback<'_>>,
-) -> anyhow::Result<Option<GenerateResult>> {
-    // Name the first step differently. It is the one that runs the prompt
-    // through the model, and prefill costs orders of magnitude more than a
-    // decode step, so averaging the two together produced a per-call mean that
-    // described neither — the aggregate table showed 28.9 ms/step for a run
-    // that decoded at 14.8 ms/token. Separate names keep both the timeline and
-    // the aggregate table honest.
-    let _step_span = if state.generated_tokens.is_empty() {
-        onnx_genai_ort::prof_span!("loop.prefill")
-    } else {
-        onnx_genai_ort::prof_span!("loop.step")
-    };
-    if reached_context_limit(backend.context_len(), max_context) {
-        ensure_constrained_finish(options, &state.generated_text, FinishReason::Length)?;
-        return finish_result(
-            tokenizer,
-            &state.generated_tokens,
-            FinishReason::Length,
-            state.prefix_cache_hit_len,
-            state.logprobs.as_deref(),
-        )
-        .map(Some);
-    }
-
-    // The device-sampling verdict for this request. Lifting it into
-    // `device_sampling_plan` keeps this loop and the continuous-batch per-row
-    // router reading one predicate instead of two drifting inline copies.
+) -> anyhow::Result<ForwardOutcome> {
     let plan = crate::processors::device_sampling_plan(
         chain,
         options,
@@ -176,83 +128,117 @@ pub(crate) fn step_decode_loop<B: DecodeLoopBackend>(
         backend.greedy_fastpath_supported(),
         backend.sampled_fastpath_supported(),
     );
-    let greedy_fastpath = matches!(plan, crate::processors::DeviceSamplingPlan::Greedy);
-    let sampled_fastpath = matches!(plan, crate::processors::DeviceSamplingPlan::Sampled);
-
-    let sampled_params = sampled_fastpath.then(|| onnx_genai_ort::DeviceSampleParams {
-        temperature: options.temperature,
-        top_k: options.top_k,
-        top_p: options.top_p,
-        min_p: options.min_p,
-        greedy: false,
-        // Draw from the same request RNG as host categorical sampling. If the
-        // device call fails, this value is reused by the host fallback.
-        rng_value: state.rng.value_for(options),
-    });
-
-    let sampled_result = sampled_params.as_ref().map(|params| {
+    if matches!(plan, crate::processors::DeviceSamplingPlan::Greedy) {
         let _span = onnx_genai_ort::prof_span!("loop.next_logits");
-        backend.next_token_sampled(params)
-    });
-
-    // Only a hard error latches the device fast path off. `Ok(None)` means the
-    // fast path did not apply to this step (the multi-token prefill has no
-    // captured graph and returns host logits); it must keep the fast path armed
-    // for the subsequent single-token decode steps that *can* device-sample.
-    if sampled_result.as_ref().is_some_and(Result::is_err) {
-        backend.sampled_fastpath_failed();
+        return Ok(ForwardOutcome {
+            device_token: Some(backend.next_token_greedy()?),
+            logits: None,
+            rng_value: None,
+        });
     }
-
-    let mut host_token = |rng_value: Option<f32>| -> anyhow::Result<TokenId> {
-        let context = if chain.is_empty() && state.custom_sampler.is_none() {
-            ProcessorContext::default()
-        } else {
-            ProcessorContext {
-                prompt_tokens: backend.processor_prompt_tokens().to_vec(),
-                generated_tokens: state.generated_tokens.clone(),
-                generated_text: state.generated_text.clone(),
-                step: state.step,
+    let sampled_params =
+        matches!(plan, crate::processors::DeviceSamplingPlan::Sampled).then(|| {
+            onnx_genai_ort::DeviceSampleParams {
+                temperature: options.temperature,
+                top_k: options.top_k,
+                top_p: options.top_p,
+                min_p: options.min_p,
+                greedy: false,
+                rng_value: state.rng.value_for(options),
             }
-        };
-        let mut logits = {
+        });
+    if let Some(params) = sampled_params.as_ref() {
+        let result = {
             let _span = onnx_genai_ort::prof_span!("loop.next_logits");
-            backend.next_logits()?
+            backend.next_token_sampled(params)
         };
-        let token_id = {
-            let _span = onnx_genai_ort::prof_span!("loop.sampling");
-            if let Some(sampler) = state.custom_sampler.as_deref_mut() {
-                select_next_token_with_sampler(&mut logits, &context, chain, sampler)
-            } else if let Some(rng_value) = rng_value {
-                select_next_token(&mut logits, &context, options, chain, rng_value)
-            } else {
-                select_next_token_with_rng(&mut logits, &context, options, chain, &mut state.rng)
+        // Only a hard error latches the fast path off. `Ok(None)` means it did
+        // not apply to this step (multi-token prefill has no captured graph) and
+        // must stay armed for the single-token steps that can device-sample.
+        match result {
+            Ok(Some(token)) => {
+                return Ok(ForwardOutcome {
+                    device_token: Some(token),
+                    logits: None,
+                    rng_value: Some(params.rng_value),
+                });
             }
-        };
-        if let (Some(top_logprobs), Some(logprobs)) =
-            (options.top_logprobs, state.logprobs.as_mut())
-        {
-            logprobs.push(logprob_for_token(&logits, token_id, top_logprobs));
+            Ok(None) => {}
+            Err(_) => backend.sampled_fastpath_failed(),
         }
-        Ok(token_id)
-    };
-
-    let token_id = if greedy_fastpath {
+    }
+    let logits = {
         let _span = onnx_genai_ort::prof_span!("loop.next_logits");
-        backend.next_token_greedy()?
-    } else if let Some(Ok(Some(token_id))) = sampled_result {
-        token_id
-    } else {
-        // `step_sampled` is allowed to report that the device sampler is not
-        // available. Reuse its draw to preserve seeded host sampling behavior.
-        host_token(sampled_params.as_ref().map(|params| params.rng_value))?
+        backend.next_logits()?
+    };
+    Ok(ForwardOutcome {
+        device_token: None,
+        logits: Some(logits),
+        rng_value: sampled_params.as_ref().map(|params| params.rng_value),
+    })
+}
+
+/// Score, commit, and stop-check one step's forward outcome.
+///
+/// The single implementation of the next-token policy: the logit-processor
+/// chain, the sampler, logprob capture, KV commit, and stop/EOS detection. Both
+/// the run-to-completion canonical loop and the scheduler's per-step drive call
+/// it, so there is one policy no matter who owns the iteration.
+pub(crate) fn select_and_commit_step<B: DecodeLoopBackend + ?Sized>(
+    backend: &mut B,
+    state: &mut DecodeLoopState,
+    options: &GenerateOptions,
+    chain: &ProcessorChain,
+    tokenizer: &Tokenizer,
+    forward: ForwardOutcome,
+    callback: Option<&mut GenerateTokenCallback<'_>>,
+) -> anyhow::Result<(TokenId, Option<FinishReason>)> {
+    let token_id = match forward.device_token {
+        Some(token_id) => token_id,
+        None => {
+            let context = if chain.is_empty() && state.custom_sampler.is_none() {
+                ProcessorContext::default()
+            } else {
+                ProcessorContext {
+                    prompt_tokens: backend.processor_prompt_tokens().to_vec(),
+                    generated_tokens: state.generated_tokens.clone(),
+                    generated_text: state.generated_text.clone(),
+                    step: state.step,
+                }
+            };
+            let mut logits = forward
+                .logits
+                .context("a forward pass produced neither a device token nor host logits")?;
+            let token_id = {
+                let _span = onnx_genai_ort::prof_span!("loop.sampling");
+                if let Some(sampler) = state.custom_sampler.as_deref_mut() {
+                    select_next_token_with_sampler(&mut logits, &context, chain, sampler)
+                } else if let Some(rng_value) = forward.rng_value {
+                    select_next_token(&mut logits, &context, options, chain, rng_value)
+                } else {
+                    select_next_token_with_rng(
+                        &mut logits,
+                        &context,
+                        options,
+                        chain,
+                        &mut state.rng,
+                    )
+                }
+            };
+            if let (Some(top_logprobs), Some(logprobs)) =
+                (options.top_logprobs, state.logprobs.as_mut())
+            {
+                logprobs.push(logprob_for_token(&logits, token_id, top_logprobs));
+            }
+            token_id
+        }
     };
     {
         let _span = onnx_genai_ort::prof_span!("loop.commit_token");
         backend.commit_token(token_id)?;
     }
-
     let _commit_span = onnx_genai_ort::prof_span!("loop.commit_selected");
-    if let Some(finish_reason) = commit_selected_token(
+    let finish = commit_selected_token(
         state,
         backend.processor_prompt_tokens(),
         token_id,
@@ -260,17 +246,8 @@ pub(crate) fn step_decode_loop<B: DecodeLoopBackend>(
         chain,
         tokenizer,
         callback,
-    )? {
-        return finish_result(
-            tokenizer,
-            &state.generated_tokens,
-            finish_reason,
-            state.prefix_cache_hit_len,
-            state.logprobs.as_deref(),
-        )
-        .map(Some);
-    }
-    Ok(None)
+    )?;
+    Ok((token_id, finish))
 }
 
 pub(crate) fn commit_selected_token(
@@ -305,7 +282,11 @@ pub(crate) fn commit_selected_token(
         state.generated_text.push_str(&token_text);
     }
     let finish_reason = if chain.is_empty() {
-        (options.stop_on_eos && options.eos_token_id == Some(token_id))
+        // Same question, same answer as the processor path below: a model with
+        // several end tokens must stop on any of them whether or not a
+        // processor chain happens to be configured.
+        options
+            .terminates(token_id)
             .then_some(FinishReason::EosToken)
     } else {
         let context = ProcessorContext {
@@ -407,6 +388,16 @@ pub(crate) fn exceeded_context_limit(
 
 #[cfg(test)]
 mod tests {
+    /// The interpreter these loop tests drive.
+    ///
+    /// The loop is the workflow's, so a unit test must supply one; using the
+    /// same emitter a minimal real decoder goes through keeps the test on the
+    /// production path instead of a bespoke shape.
+    fn canonical_runtime() -> crate::pipeline::WorkflowRuntime {
+        crate::pipeline::generation::test_decoder_runtime()
+            .expect("a minimal decoder workflow builds a hosted interpreter")
+    }
+
     use super::*;
     use crate::processors::build_processor_chain;
     use std::path::Path;
@@ -513,6 +504,7 @@ mod tests {
 
     #[test]
     fn sampled_fastpath_error_falls_back_to_seeded_host_sampling() -> anyhow::Result<()> {
+        let canonical = canonical_runtime();
         let options = GenerateOptions {
             max_new_tokens: 3,
             greedy: false,
@@ -528,25 +520,33 @@ mod tests {
 
         let mut fallback_backend = MockBackend::new(true);
         let mut fallback_state = DecodeLoopState::new(0, options.seed, None);
-        let fallback = run_decode_loop(
+        let fallback = crate::pipeline::generation::generate_with_decode_core(
+            &canonical,
             &mut fallback_backend,
             &mut fallback_state,
-            &options,
-            &chain,
-            &tokenizer,
-            None,
+            &[],
+            crate::pipeline::generation::GenerationRequest {
+                options: &options,
+                chain: &chain,
+                tokenizer: &tokenizer,
+                max_context: None,
+            },
             None,
         )?;
 
         let mut host_backend = MockBackend::new(false);
         let mut host_state = DecodeLoopState::new(0, options.seed, None);
-        let host = run_decode_loop(
+        let host = crate::pipeline::generation::generate_with_decode_core(
+            &canonical,
             &mut host_backend,
             &mut host_state,
-            &options,
-            &chain,
-            &tokenizer,
-            None,
+            &[],
+            crate::pipeline::generation::GenerationRequest {
+                options: &options,
+                chain: &chain,
+                tokenizer: &tokenizer,
+                max_context: None,
+            },
             None,
         )?;
 
@@ -574,13 +574,17 @@ mod tests {
                 vec![vec![0.0; 8]; options.max_new_tokens],
             );
             let mut state = DecodeLoopState::new(0, options.seed, None);
-            Ok(run_decode_loop(
+            Ok(crate::pipeline::generation::generate_with_decode_core(
+                &canonical_runtime(),
                 &mut backend,
                 &mut state,
-                &options,
-                &chain,
-                &tokenizer,
-                None,
+                &[],
+                crate::pipeline::generation::GenerationRequest {
+                    options: &options,
+                    chain: &chain,
+                    tokenizer: &tokenizer,
+                    max_context: None,
+                },
                 None,
             )?
             .token_ids)
@@ -595,6 +599,7 @@ mod tests {
 
     #[test]
     fn sampled_fastpath_not_applicable_does_not_latch_off() -> anyhow::Result<()> {
+        let canonical = canonical_runtime();
         // `Ok(None)` (e.g. the multi-token prefill step) must fall back to host
         // sampling for that step WITHOUT disabling the device fast path, so the
         // backend keeps being asked on every subsequent step.
@@ -613,25 +618,33 @@ mod tests {
 
         let mut na_backend = MockBackend::with_outcome(true, SampledOutcome::NotApplicable);
         let mut na_state = DecodeLoopState::new(0, options.seed, None);
-        let na = run_decode_loop(
+        let na = crate::pipeline::generation::generate_with_decode_core(
+            &canonical,
             &mut na_backend,
             &mut na_state,
-            &options,
-            &chain,
-            &tokenizer,
-            None,
+            &[],
+            crate::pipeline::generation::GenerationRequest {
+                options: &options,
+                chain: &chain,
+                tokenizer: &tokenizer,
+                max_context: None,
+            },
             None,
         )?;
 
         let mut host_backend = MockBackend::new(false);
         let mut host_state = DecodeLoopState::new(0, options.seed, None);
-        let host = run_decode_loop(
+        let host = crate::pipeline::generation::generate_with_decode_core(
+            &canonical,
             &mut host_backend,
             &mut host_state,
-            &options,
-            &chain,
-            &tokenizer,
-            None,
+            &[],
+            crate::pipeline::generation::GenerationRequest {
+                options: &options,
+                chain: &chain,
+                tokenizer: &tokenizer,
+                max_context: None,
+            },
             None,
         )?;
 
@@ -646,6 +659,7 @@ mod tests {
 
     #[test]
     fn unsupported_sampled_runner_never_runs_device_step() -> anyhow::Result<()> {
+        let canonical = canonical_runtime();
         // A backend that cannot sample on the device (`sampled_fastpath_supported`
         // is false) must never have `next_token_sampled` invoked. That method runs
         // a model step which advances KV state; if it were called and then failed,
@@ -668,13 +682,17 @@ mod tests {
         // `HardError` outcome would panic-latch if ever reached; assert it isn't.
         let mut backend = MockBackend::with_outcome(false, SampledOutcome::HardError);
         let mut state = DecodeLoopState::new(0, options.seed, None);
-        let result = run_decode_loop(
+        let result = crate::pipeline::generation::generate_with_decode_core(
+            &canonical,
             &mut backend,
             &mut state,
-            &options,
-            &chain,
-            &tokenizer,
-            None,
+            &[],
+            crate::pipeline::generation::GenerationRequest {
+                options: &options,
+                chain: &chain,
+                tokenizer: &tokenizer,
+                max_context: None,
+            },
             None,
         )?;
 
@@ -697,15 +715,20 @@ mod tests {
         assert!(chain.is_empty());
         let tokenizer = tokenizer()?;
 
+        let canonical = canonical_runtime();
         let mut plain_backend = MockBackend::new(false);
         let mut plain_state = DecodeLoopState::new(0, options.seed, None);
-        let plain = run_decode_loop(
+        let plain = crate::pipeline::generation::generate_with_decode_core(
+            &canonical,
             &mut plain_backend,
             &mut plain_state,
-            &options,
-            &chain,
-            &tokenizer,
-            None,
+            &[],
+            crate::pipeline::generation::GenerationRequest {
+                options: &options,
+                chain: &chain,
+                tokenizer: &tokenizer,
+                max_context: None,
+            },
             None,
         )?;
 
@@ -715,15 +738,20 @@ mod tests {
             assert!(!token.text.is_empty());
             Ok(())
         };
+        let canonical = canonical_runtime();
         let mut streamed_backend = MockBackend::new(false);
         let mut streamed_state = DecodeLoopState::new(0, options.seed, None);
-        let streamed = run_decode_loop(
+        let streamed = crate::pipeline::generation::generate_with_decode_core(
+            &canonical,
             &mut streamed_backend,
             &mut streamed_state,
-            &options,
-            &chain,
-            &tokenizer,
-            None,
+            &[],
+            crate::pipeline::generation::GenerationRequest {
+                options: &options,
+                chain: &chain,
+                tokenizer: &tokenizer,
+                max_context: None,
+            },
             Some(&mut callback),
         )?;
 

@@ -331,8 +331,9 @@ pub enum ResourceError {
 
     #[error(
         "cannot derive the KV memory budget because per-layer KV page geometry is unknown \
-         ({tokens_per_page} token(s) per page but no byte size); fix by declaring model.io.kv_inputs \
-         and model.io.kv_outputs so the runtime can inspect the model's real KV head geometry"
+         ({tokens_per_page} token(s) per page but no byte size); fix by declaring the decoder's \
+         KV ports at pipeline.workflow.serving.state_service.groups so the runtime can inspect \
+         the model's real KV head geometry"
     )]
     UnknownKvGeometry { tokens_per_page: u64 },
 
@@ -970,8 +971,11 @@ mod tests {
         ));
         let message = error.to_string();
         assert!(message.contains("per-layer KV page geometry is unknown"));
-        assert!(message.contains("model.io.kv_inputs"));
-        assert!(message.contains("model.io.kv_outputs"));
+        // The remedy must name a place a package can actually declare KV ports.
+        // Naming the retired `model.io` block would send an operator to write
+        // metadata the loader refuses.
+        assert!(message.contains("pipeline.workflow.serving.state_service.groups"));
+        assert!(!message.contains("model.io"));
     }
 
     #[test]

@@ -52,7 +52,6 @@ pub(crate) struct ModelHandle {
     /// default instead of being forced greedy, matching the CLI.
     pub(crate) generation_defaults: Option<GenerationDefaults>,
     pub(crate) fim_config: Option<FimConfig>,
-    pub(crate) pipeline: bool,
     /// Declared image/audio input contracts, or `None` for a single decoder
     /// graph. Shared with the CLI so both front ends admit the same inputs.
     pub(crate) multimodal: Option<MultimodalSpecs>,
@@ -86,7 +85,6 @@ pub(crate) struct ModelHandleParts {
     pub(crate) model_max_context: Option<usize>,
     pub(crate) generation_defaults: Option<GenerationDefaults>,
     pub(crate) fim_config: Option<FimConfig>,
-    pub(crate) pipeline: bool,
     pub(crate) multimodal: Option<MultimodalSpecs>,
     pub(crate) speech: Option<crate::speech::SpeechCapability>,
     pub(crate) image_pipeline: Option<ImagePipelineSpec>,
@@ -103,7 +101,6 @@ impl ModelHandle {
             model_max_context,
             generation_defaults,
             fim_config,
-            pipeline,
             multimodal,
             speech,
             image_pipeline,
@@ -117,7 +114,6 @@ impl ModelHandle {
             model_max_context,
             generation_defaults,
             fim_config,
-            pipeline,
             multimodal,
             speech,
             image_pipeline,
@@ -150,17 +146,14 @@ impl ModelHandle {
                 .tokenizer
                 .encode("warmup")
                 .context("failed to tokenize warmup prompt")?;
-            self.engine.warmup(
-                GenerateRequest {
-                    prompt: GeneratePrompt::TokenIds(prompt),
-                    options: GenerateOptions {
-                        max_new_tokens: 1,
-                        max_context: self.model_max_context,
-                        ..GenerateOptions::default()
-                    },
+            self.engine.warmup(GenerateRequest {
+                prompt: GeneratePrompt::TokenIds(prompt),
+                options: GenerateOptions {
+                    max_new_tokens: 1,
+                    max_context: self.model_max_context,
+                    ..GenerateOptions::default()
                 },
-                self.pipeline,
-            )?;
+            })?;
         }
         self.warmed.store(true, Ordering::Release);
         Ok(started.elapsed())
@@ -861,7 +854,6 @@ mod tests {
             model_max_context: None,
             generation_defaults: None,
             fim_config: None,
-            pipeline: false,
             multimodal: None,
             speech: None,
             image_pipeline: None,
@@ -875,6 +867,11 @@ mod tests {
     fn stub_engine_driver() -> EngineDriver {
         let (tx, _rx) = mpsc::channel(1);
         EngineDriver {
+            workflow_facts: crate::driver::WorkflowFacts {
+                components: 0,
+                graph_components: 0,
+                declares_generation_loop: false,
+            },
             commands: tx,
             generation_capacity: Arc::new(Semaphore::new(0)),
             generation_capacity_size: 0,
@@ -919,7 +916,6 @@ mod tests {
             model_max_context: None,
             generation_defaults: None,
             fim_config: None,
-            pipeline: true,
             multimodal: None,
             speech: None,
             image_pipeline: None,

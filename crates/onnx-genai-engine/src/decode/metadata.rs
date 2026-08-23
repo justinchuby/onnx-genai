@@ -168,7 +168,7 @@ pub(crate) fn graph_uses_explicit_kv_length_attention(graph: &onnx_runtime_ir::G
 }
 
 pub(crate) fn detect_model_decode_path(
-    io: Option<&onnx_genai_metadata::ModelIoSpec>,
+    io: Option<&onnx_genai_metadata::DecoderAbi>,
     sliding_window: Option<usize>,
     sink_tokens: usize,
     shared_kv: SharedKvOffer,
@@ -270,12 +270,12 @@ pub(crate) fn sink_tokens_from_metadata(metadata: &InferenceMetadata) -> usize {
 
 #[cfg(test)]
 mod aliasing_tests {
-    use onnx_genai_metadata::{ModelIoSpec, StateAliasing};
+    use onnx_genai_metadata::{DecoderAbi, StateAliasing};
 
     use super::{ModelDecodePath, SharedKvOffer, detect_model_decode_path};
 
     /// A minimal past/present port contract, optionally declaring alias legality.
-    fn kv_io(aliasing: Option<StateAliasing>) -> ModelIoSpec {
+    fn kv_io(aliasing: Option<StateAliasing>) -> DecoderAbi {
         let mut declared = serde_json::json!({
             "kv_inputs": ["past_key_values.0.key"],
             "kv_outputs": ["present.0.key"],

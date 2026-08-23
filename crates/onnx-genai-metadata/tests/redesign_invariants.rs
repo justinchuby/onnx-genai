@@ -650,12 +650,13 @@ fn graph_visible_state_representation_is_separate_from_runtime_storage() {
     assert_eq!(group.sequence_axis, Some(2));
     assert_eq!(group.layout, "bnsh");
 
-    // Runtime-private cache representation cannot be declared anywhere: neither
-    // the retired top-level section nor the retired per-model section parses.
+    // Runtime-private cache representation cannot be declared anywhere. The
+    // `model.io` spellings are absent from this list because the whole block is
+    // retired: a document carrying it is refused at the loader with an error
+    // naming the conversion, which is a stronger rejection than an unknown
+    // field inside a block that no longer exists.
     for retired in [
         "kv_cache: { native_dtype: float16 }\n",
-        "model:\n  io:\n    kv_cache: { native_dtype: float16 }\n",
-        "model:\n  io:\n    kv_quantization: { mode: fp8 }\n",
         "model:\n  runtime_configurable:\n    kv_cache: { dtype: [float16] }\n",
     ] {
         assert!(
