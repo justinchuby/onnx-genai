@@ -292,6 +292,34 @@ struct Job {
     call: unsafe fn(*const (), usize),
 }
 
+/// A node's two dispatcher-to-worker words, deliberately on one cache line.
+///
+/// `wake` is the word workers park on, so it has to advance for both a new op
+/// and for shutdown -- shutdown must break a parked worker out, and bumping the
+/// parked-on word is the only way to do that without a lost wakeup. That makes
+/// `wake` ambiguous on its own: an advance means "wake up and look", not "there
+/// is work", and *both* ways of resolving that ambiguity from a single word are
+/// unsafe. Treat a shutdown bump as an op and the worker re-runs the previous
+/// op's `Job`, whose closure lives on a stack frame that has already returned --
+/// a use-after-free. Decide instead from the shutdown flag, and a dispatch that
+/// lands just before a concurrent shutdown is abandoned unacknowledged, which
+/// strands the dispatcher waiting on it forever.
+///
+/// So the two questions get two words: `wake` answers "should I wake up", `ops`
+/// answers "is there an op I have not run yet". Only `ops` gates the `Job` read,
+/// and only `publish` bumps it.
+///
+/// They share a `Padded` block rather than taking a line each because the
+/// dispatcher writes both back to back and each woken worker reads both back to
+/// back, so splitting them would add a second coherency miss per worker per op
+/// -- at roughly 400 barriers per token that is a cost worth not paying for a
+/// word that is only ever read beside its neighbour.
+#[derive(Default)]
+struct NodeSense {
+    wake: AtomicU32,
+    ops: AtomicU32,
+}
+
 /// Observable scheduling behaviour of the persistent SPMD decode pool.
 ///
 /// Every field is monotonic since process start and is read as a *delta* across
@@ -405,7 +433,7 @@ struct SharedState {
     /// **per node** is the key locality fix: every worker spins on / futex-waits
     /// on its own node's line, so there is no single shared cache line ping-ponging
     /// across the UPI link between sockets.
-    node_sense: Vec<Padded<AtomicU32>>,
+    node_sense: Vec<Padded<NodeSense>>,
     /// The current op, published before the sense counters bump and read after the
     /// bump is observed (release/acquire pairing on `node_sense`).
     job: UnsafeCell<Option<Job>>,
@@ -509,8 +537,11 @@ impl SharedState {
             if counts.get(node).copied().unwrap_or(0) == 0 {
                 continue;
             }
-            sense.0.fetch_add(1, Ordering::Release);
-            atomic_wait::wake_all(&sense.0);
+            // Ordered before the wake bump so a worker that observes the wake
+            // (Acquire) also observes this.
+            sense.0.ops.fetch_add(1, Ordering::Release);
+            sense.0.wake.fetch_add(1, Ordering::Release);
+            atomic_wait::wake_all(&sense.0.wake);
         }
     }
 
@@ -672,7 +703,7 @@ impl SharedState {
         blocktime: Duration,
     ) -> u32 {
         let counters = &self.worker_counters[global_index].0;
-        let sense = &self.node_sense[node].0;
+        let sense = &self.node_sense[node].0.wake;
         // Phase 1: bounded active spin (blocktime), spin_loop ramping into yield.
         let mut spins = 0u32;
         let start = Instant::now();
@@ -741,6 +772,56 @@ impl SharedState {
         }
     }
 
+    /// Block until no dispatch holds the pool's single publish slot, so a
+    /// teardown cannot land in the middle of one.
+    ///
+    /// `publish` commits each node's pending count *before* it bumps that node's
+    /// `ops`, so there is a window inside `publish` where a shard is already
+    /// outstanding but no worker can yet see that it exists. A shutdown landing
+    /// in that window is invisible to the `ops` gate in `worker_loop`: the
+    /// worker correctly concludes it has no op to run, sees the flag, and
+    /// leaves -- while the count it never decremented keeps the dispatcher in
+    /// `wait` forever. Splitting the sense words cannot close this one, because
+    /// the whole point is that the op has not been announced yet.
+    ///
+    /// Waiting for the claim closes it instead: `dispatch` holds it from before
+    /// `publish` until after `wait` returns, so once it is free every committed
+    /// count has already been retired. This cannot deadlock against a dispatcher
+    /// blocked in `wait`, because that dispatcher is waiting on *workers*, which
+    /// are still running -- the stop flag is not set until after this returns.
+    ///
+    /// Returns whether the pool actually went quiet within the bound.
+    fn await_quiescent_dispatch(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(claim) = DispatchClaim::try_claim(self) {
+                // Dropped immediately: holding it across the flag store would
+                // deadlock any dispatcher that is about to claim it, and the
+                // flag alone is enough once the pool is quiet.
+                drop(claim);
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::yield_now();
+        }
+    }
+
+    /// Flag shutdown, but not while a dispatch is mid-`publish`.
+    ///
+    /// The wait is what makes the flag safe to set; the two belong together, so
+    /// they live in one function rather than as two statements a later edit can
+    /// separate or reorder. Bounded, so a wedged dispatcher degrades teardown to
+    /// the pre-existing behaviour with a warning instead of hanging it.
+    ///
+    /// Returns whether the pool went quiet before the flag went up.
+    fn begin_shutdown(&self, timeout: Duration) -> bool {
+        let quiet = self.await_quiescent_dispatch(timeout);
+        self.shutdown.store(true, Ordering::SeqCst);
+        quiet
+    }
+
     fn counters(&self) -> SpmdCounters {
         let dispatch = &self.dispatch_counters.0;
         let mut counters = SpmdCounters {
@@ -779,6 +860,15 @@ impl SharedState {
 struct DispatchClaim<'a> {
     shared: &'a SharedState,
 }
+
+/// How long [`SharedState::await_quiescent_dispatch`] waits for an in-flight
+/// dispatch before giving up and tearing down anyway.
+///
+/// Bounded rather than unbounded on purpose: a dispatcher wedged for an
+/// unrelated reason must not convert into a teardown that never returns. Giving
+/// up degrades to the pre-existing behaviour (a possibly stranded dispatcher),
+/// which is strictly better than hanging every shutdown behind one bad op.
+const SHUTDOWN_DISPATCH_QUIESCE: Duration = Duration::from_secs(5);
 
 impl<'a> DispatchClaim<'a> {
     /// Take exclusive ownership, or `None` if another thread already holds it.
@@ -950,7 +1040,9 @@ impl SpmdDecodePools {
         }
 
         let shared = Arc::new(SharedState {
-            node_sense: (0..node_count).map(|_| Padded(AtomicU32::new(0))).collect(),
+            node_sense: (0..node_count)
+                .map(|_| Padded(NodeSense::default()))
+                .collect(),
             job: UnsafeCell::new(None),
             node_pending: (0..node_count)
                 .map(|_| Padded(AtomicUsize::new(0)))
@@ -1248,15 +1340,40 @@ impl SpmdDecodePools {
         if handles.is_empty() {
             return;
         }
-        // Publish the stop flag, then bump every node's sense so spinning workers
-        // observe the change and re-check `shutdown`, and futex-wake any parked
-        // worker so it leaves the park. The bump-then-wake ordering (mirroring the
-        // dispatch path) wakes a worker that raced into parking: it either sees
-        // the advanced sense under the futex guard or is woken by `wake_all`.
-        shared.shutdown.store(true, Ordering::SeqCst);
+        // Let any in-flight dispatch finish publishing and draining, then publish
+        // the stop flag; see `await_quiescent_dispatch` for why the `ops` split
+        // alone cannot cover a shutdown that lands *inside* `publish`.
+        if !shared.begin_shutdown(SHUTDOWN_DISPATCH_QUIESCE) {
+            // Deliberately not `report_spmd_fallback`: that latches the decode
+            // path label to "flat", which would be a false statement about how
+            // the pool ran, emitted at teardown purely to carry a warning.
+            //
+            // `warn` rather than `debug`, and ungated: reaching this means a
+            // dispatcher is probably about to hang, and per #1812 the lesson of
+            // this campaign is that a debug-gated diagnostic is one nobody reads.
+            #[cfg(feature = "tracing")]
+            tracing_crate::warn!(
+                timeout = ?SHUTDOWN_DISPATCH_QUIESCE,
+                "cpu decode pool shutdown proceeded with a dispatch still in flight; a \
+                 dispatcher may be left waiting on a shard that will not be retired"
+            );
+            #[cfg(not(feature = "tracing"))]
+            eprintln!(
+                "onnx-genai: persistent SPMD decode pool: shutdown proceeded with a \
+                 dispatch still in flight after {SHUTDOWN_DISPATCH_QUIESCE:?}; a dispatcher \
+                 may be left waiting on a shard that will not be retired"
+            );
+        }
+        // Bump every node's sense so spinning workers observe the change and
+        // re-check `shutdown`, and futex-wake any parked worker so it leaves the
+        // park. The bump-then-wake ordering (mirroring the dispatch path) wakes a
+        // worker that raced into parking: it either sees the advanced sense under
+        // the futex guard or is woken by `wake_all`.
         for sense in &shared.node_sense {
-            sense.0.fetch_add(1, Ordering::Release);
-            atomic_wait::wake_all(&sense.0);
+            // Only the wake word: `ops` stays put, so a woken worker can tell
+            // this from a published op and will not re-run a retired `Job`.
+            sense.0.wake.fetch_add(1, Ordering::Release);
+            atomic_wait::wake_all(&sense.0.wake);
         }
         for handle in handles {
             let _ = handle.join();
@@ -1903,6 +2020,7 @@ fn worker_loop(shared: Arc<SharedState>, global_index: usize) {
     // `build` until every worker has done this, so no op can be published before
     // this worker is waiting for it.
     let mut last_seen: u32 = 0;
+    let mut last_op: u32 = 0;
     let blocktime = decode_blocktime();
     // The `Release` half is load-bearing: it orders this worker's pre-readiness
     // stores -- notably `pin_failed[i]`, which the builder reads `Relaxed`
@@ -1923,31 +2041,40 @@ fn worker_loop(shared: Arc<SharedState>, global_index: usize) {
     loop {
         // Bounded active spin (blocktime) then futex park; returns the observed
         // sense, or an unchanged value if shutdown was seen (re-checked below).
-        let current = shared.worker_wait(node, global_index, last_seen, blocktime);
+        last_seen = shared.worker_wait(node, global_index, last_seen, blocktime);
+        // Whether there is an op to run is asked of the node's `ops` word, not
+        // of its wake word and not of the shutdown flag. Shutdown advances the
+        // wake word to break parked workers out, so an advance does not imply work;
+        // and a dispatch that lands just before a concurrent shutdown *is* work,
+        // even though the flag is set by the time this worker looks. Answering
+        // from the flag drops that shard and strands the dispatcher, which since
+        // it parks rather than spins is a silent hang at zero CPU.
+        let op = shared.node_sense[node].0.ops.load(Ordering::Acquire);
+        if op != last_op {
+            last_op = op;
+            // Read and run the published op. The acquire above, paired with the
+            // Release bump in `publish`, established visibility of the job
+            // pointer and the pending counts.
+            // SAFETY: the dispatcher keeps the pointee alive until every node
+            // counter reaches zero, i.e. until after this worker acknowledges
+            // below -- including when it is shutting down, because `wait` runs
+            // before `shutdown` can join this thread.
+            let job = unsafe { (*shared.job.get()).expect("published SPMD job") };
+            let completion = WorkerCompletion {
+                shared: &shared,
+                node,
+                global_index,
+            };
+            // SAFETY: `dispatch` keeps the closure alive until this worker
+            // acknowledges through `completion`.
+            unsafe { (job.call)(job.data, global_index) };
+            completion.complete();
+        }
+        // Checked *after* retiring any outstanding shard, so a dispatch racing
+        // shutdown is completed rather than abandoned.
         if shared.shutdown.load(Ordering::Acquire) {
             return;
         }
-        if current == last_seen {
-            // Woken without a new op and not shutting down (spurious futex wake);
-            // resume waiting on the same sense.
-            continue;
-        }
-        last_seen = current;
-        // Read and run the published op. The acquire on the node sense in
-        // `worker_wait` established visibility of the job pointer and the pending
-        // counts.
-        // SAFETY: the dispatcher keeps the pointee alive until every node
-        // counter reaches zero, i.e. until after this worker acknowledges below.
-        let job = unsafe { (*shared.job.get()).expect("published SPMD job") };
-        let completion = WorkerCompletion {
-            shared: &shared,
-            node,
-            global_index,
-        };
-        // SAFETY: `dispatch` keeps the closure alive until this worker
-        // acknowledges through `completion`.
-        unsafe { (job.call)(job.data, global_index) };
-        completion.complete();
     }
 }
 
@@ -4597,7 +4724,7 @@ mod tests {
             .shared
             .as_ref()
             .expect("the fixed schedule keeps state");
-        atomic_wait::wake_all(&shared.node_sense[0].0);
+        atomic_wait::wake_all(&shared.node_sense[0].0.wake);
         thread::sleep(settle);
 
         let woken = pool.counters();
@@ -5673,7 +5800,10 @@ mod dispatch_claim_tests {
     /// degenerate shape the `DispatchClaim` tests want.
     fn barrier_only_shared_state(pending: &[usize]) -> SharedState {
         SharedState {
-            node_sense: pending.iter().map(|_| Padded(AtomicU32::new(0))).collect(),
+            node_sense: pending
+                .iter()
+                .map(|_| Padded(NodeSense::default()))
+                .collect(),
             job: UnsafeCell::new(None),
             node_pending: pending
                 .iter()
@@ -5689,6 +5819,205 @@ mod dispatch_claim_tests {
             completion_sense: Padded(AtomicU32::new(0)),
             dispatcher_parked: Padded(AtomicBool::new(false)),
         }
+    }
+
+    /// A one-worker, one-node pool running the real `worker_loop`.
+    fn one_worker_shared_state() -> Arc<SharedState> {
+        Arc::new(SharedState {
+            node_sense: vec![Padded(NodeSense::default())],
+            job: UnsafeCell::new(None),
+            node_pending: vec![Padded(AtomicUsize::new(0))],
+            worker_node: vec![0],
+            ready: AtomicUsize::new(0),
+            poisoned_worker: AtomicUsize::new(0),
+            dispatching: Padded(AtomicBool::new(false)),
+            shutdown: AtomicBool::new(false),
+            worker_counters: vec![Padded(WorkerCounters::default())],
+            dispatch_counters: Padded(DispatchCounters::default()),
+            completion_sense: Padded(AtomicU32::new(0)),
+            dispatcher_parked: Padded(AtomicBool::new(false)),
+        })
+    }
+
+    /// Counts calls so a re-run of a retired op is visible.
+    ///
+    /// The count is carried through the `Job`'s own `data` pointer rather than a
+    /// static, so the two tests below cannot see each other's calls. They run
+    /// concurrently in one process, and a shared counter made each one fail
+    /// depending on the other's timing while both passed in isolation.
+    ///
+    /// SAFETY: `data` is the `&AtomicUsize` published alongside this fn pointer,
+    /// which outlives the worker that reads it.
+    unsafe fn counting_call(data: *const (), _global_index: usize) {
+        unsafe { &*data.cast::<AtomicUsize>() }.fetch_add(1, Ordering::Release);
+    }
+
+    fn wait_for_ready(shared: &SharedState) {
+        while shared.ready.load(Ordering::Acquire) < 1 {
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Past the spin window, so the worker is genuinely parked on the futex
+        // rather than still spinning -- the park is the case that matters.
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    /// Publish one op through the *real* `SharedState::publish`.
+    ///
+    /// Deliberately not a local copy of it. A mirrored version would keep
+    /// passing if `publish` itself regressed -- swapping its `ops` and `wake`
+    /// bumps, for instance, lets a worker observe the wake with `ops` still
+    /// stale, skip the op, and strand the dispatcher again -- which is exactly
+    /// the class of bug these tests exist to catch.
+    fn publish_one(shared: &SharedState, calls: &AtomicUsize) {
+        shared.publish(
+            Job {
+                data: std::ptr::from_ref(calls).cast(),
+                call: counting_call,
+            },
+            &[1],
+        );
+    }
+
+    /// Shut down the way `SpmdDecodePools::shutdown` does once the pool is
+    /// quiet: flag, then bump and wake every node's sense. Notably it does *not*
+    /// touch `ops`.
+    ///
+    /// Mirrored rather than called because the real one needs a whole
+    /// `SpmdDecodePools`. Its quiescence wait is covered separately by
+    /// `shutdown_waits_for_an_in_flight_dispatch_before_stopping_workers`.
+    fn shutdown_like_the_pool(shared: &SharedState) {
+        shared.shutdown.store(true, Ordering::SeqCst);
+        shared.node_sense[0].0.wake.fetch_add(1, Ordering::Release);
+        atomic_wait::wake_all(&shared.node_sense[0].0.wake);
+    }
+
+    /// A shard published just before a concurrent shutdown must still be
+    /// retired, because a dispatcher is already blocked waiting for it.
+    ///
+    /// The dispatcher holds the job closure on its own stack frame and does not
+    /// return until every node's pending count reaches zero, so a worker that
+    /// leaves without acknowledging does not merely lose work -- it strands that
+    /// dispatcher permanently. Since #1801 the dispatcher *parks* rather than
+    /// spins, so the symptom is a hang at zero CPU with no thread to attribute
+    /// it to, which is materially harder to diagnose than a spin.
+    ///
+    /// Asserted on the pending count with a timeout rather than by joining the
+    /// dispatcher, because the failure is a hang: joining would hang the suite
+    /// instead of failing this test.
+    #[test]
+    fn a_dispatch_racing_shutdown_is_retired_not_abandoned() {
+        let calls = AtomicUsize::new(0);
+        let shared = one_worker_shared_state();
+        let worker = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || worker_loop(shared, 0))
+        };
+        wait_for_ready(&shared);
+
+        // The interleaving: a dispatcher publishes, then a shutdown on another
+        // thread lands before this worker has observed the op.
+        publish_one(&shared, &calls);
+        shutdown_like_the_pool(&shared);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while shared.node_pending[0].0.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let outstanding = shared.node_pending[0].0.load(Ordering::Acquire);
+        let _ = worker.join();
+
+        assert_eq!(
+            outstanding, 0,
+            "worker left without retiring a published shard, so a dispatcher \
+             waiting on it can never make progress"
+        );
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            1,
+            "the published op must actually run, not just be acknowledged"
+        );
+    }
+
+    /// The shutdown bump on its own must never be mistaken for a new op.
+    ///
+    /// This is the hazard the old shutdown-first check existed to prevent, and
+    /// it is the more dangerous of the two directions: re-running a retired
+    /// `Job` dereferences a closure whose stack frame has already returned, so
+    /// it is a use-after-free rather than a hang. Keeping both properties is the
+    /// whole reason waking and having-work are two separate words.
+    #[test]
+    fn a_shutdown_bump_alone_never_re_runs_the_previous_op() {
+        let calls = AtomicUsize::new(0);
+        let shared = one_worker_shared_state();
+        let worker = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || worker_loop(shared, 0))
+        };
+        wait_for_ready(&shared);
+
+        publish_one(&shared, &calls);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while shared.node_pending[0].0.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(calls.load(Ordering::Acquire), 1, "first op must run");
+
+        // Now shut down. The wake word advances, `ops` does not.
+        shutdown_like_the_pool(&shared);
+        let _ = worker.join();
+
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            1,
+            "the shutdown bump re-ran a retired op, whose closure no longer exists"
+        );
+    }
+
+    /// Teardown must not begin while a dispatch holds the publish slot.
+    ///
+    /// `publish` commits each node's pending count before it bumps that node's
+    /// `ops`, so inside that window a shard is outstanding but no worker can yet
+    /// see it exists. A shutdown landing there is invisible to the `ops` gate --
+    /// the worker correctly concludes it has nothing to run, sees the flag, and
+    /// leaves without retiring a count the dispatcher is still waiting on.
+    /// Splitting the sense words cannot close that, because the op has not been
+    /// announced yet; waiting for the pool to go quiet is what closes it.
+    #[test]
+    fn shutdown_waits_for_an_in_flight_dispatch_before_stopping_workers() {
+        let shared = one_worker_shared_state();
+
+        // No dispatch in flight: quiescence is immediate.
+        assert!(shared.await_quiescent_dispatch(Duration::from_millis(50)));
+
+        let claim = DispatchClaim::try_claim(&shared).expect("uncontended claim");
+        // With the slot held, it must refuse to report quiet rather than let a
+        // teardown proceed into the middle of a publish.
+        assert!(
+            !shared.await_quiescent_dispatch(Duration::from_millis(50)),
+            "reported quiet while a dispatch still held the publish slot"
+        );
+
+        // The property that matters is not that the helper exists but that the
+        // stop flag stays down until the dispatch is done, so assert on the flag
+        // through `begin_shutdown` -- the function the pool actually calls.
+        let stopper = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || shared.begin_shutdown(Duration::from_secs(5)))
+        };
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !shared.shutdown.load(Ordering::SeqCst),
+            "raised the stop flag while a dispatch was still in flight"
+        );
+
+        // And it must proceed once the dispatch releases, rather than block
+        // teardown for the whole bound.
+        drop(claim);
+        assert!(
+            stopper.join().expect("shutdown thread"),
+            "did not observe the dispatch releasing the slot"
+        );
+        assert!(shared.shutdown.load(Ordering::SeqCst), "never stopped");
     }
 
     /// The dispatcher must be woken by the worker that retires the last shard.

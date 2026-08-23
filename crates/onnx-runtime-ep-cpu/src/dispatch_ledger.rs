@@ -299,10 +299,12 @@ pub const PLAN: &[PlanEntry] = &[
         threads: "MLAS partitions; tiles run on the mlas-sys work-stealing pool under the EP \
                   thread budget",
         shape_gate: "all shapes on x86-64; NXRT_CPU_GEMM_BACKEND=generic|simd|mlas overrides. \
-                     The native SimdX86 route additionally gates M=1 on \
-                     ONNX_GENAI_CPU_MM_SIMD_M1_GEMV (default off, #1116): on, it streams B in \
-                     place instead of packing panels reused zero times, which is 2.4x faster \
-                     native at 1x2048x2048 but still short of MLAS",
+                     The native SimdX86 route sends M=1 to a dedicated GEMV that streams B \
+                     in place instead of packing panels that are reused zero times (#1091, \
+                     ported in #1116, shipped on by default in #1183). It is a compile-time \
+                     route, not an env toggle: sgemm_simd always passes use_m1_gemv=true, \
+                     and only the in-process A/B harness passes false to measure the packed \
+                     path it replaced",
         graduation: Graduation::MlasBaseline,
     },
     PlanEntry {
@@ -958,6 +960,106 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Every environment variable the ledger's prose names must still be read
+    /// somewhere in this crate's sources.
+    ///
+    /// This exists because it caught a real defect in this file. The
+    /// `MatMulF32` entry advertised `ONNX_GENAI_CPU_MM_SIMD_M1_GEMV
+    /// (default off)` long after #1183 had shipped that route on by default and
+    /// deleted the probe, so the ledger — whose entire purpose is to describe
+    /// where dispatch actually goes — was describing a knob that did not exist.
+    /// `docs/performance/CPU_MATMUL_ASSIGNMENT.md` had recorded the correct
+    /// fact the whole time; nothing compared the two.
+    ///
+    /// Prose cannot be type-checked, so this is a cheap falsifier rather than a
+    /// complete one. Two limits are deliberate and worth stating, because an
+    /// overclaimed guarantee is the thing this test exists to punish:
+    ///
+    /// * It checks that the named knob is still **read**, not that the
+    ///   surrounding description of its behaviour is correct. Requiring the
+    ///   name to appear in an `env::var` call or an `_ENV` constant — rather
+    ///   than merely somewhere in the sources — is what keeps a name that
+    ///   survives only inside a test's `EnvVarGuard` from passing as live.
+    /// * It does not catch the inverse defect: a variable that genuinely gates
+    ///   dispatch but that no `PlanEntry` mentions. Nothing here enumerates the
+    ///   gates, so that direction needs a reader, not a test.
+    #[test]
+    fn ledger_prose_only_names_environment_variables_that_still_exist() {
+        let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources = String::new();
+        collect_rust_sources(&source_root, &mut sources);
+        assert!(
+            sources.len() > 10_000,
+            "expected to have read the crate sources, got {} bytes -- if the \
+             layout moved, fix this test rather than deleting it",
+            sources.len()
+        );
+
+        for entry in PLAN {
+            for text in [entry.dtypes, entry.isa, entry.threads, entry.shape_gate] {
+                for name in environment_variable_names(text) {
+                    let quoted = format!("\"{name}\"");
+                    let read_sites: Vec<&str> = sources
+                        .lines()
+                        .filter(|line| line.contains(&quoted) && is_env_read_site(line))
+                        .collect();
+                    assert!(
+                        !read_sites.is_empty(),
+                        "{}: ledger prose names environment variable `{name}`, but no \
+                         source file in this crate passes {quoted} to `env::var`/`var_os` \
+                         or binds it to an `_ENV` constant. Occurrences in test guards do \
+                         not count -- a name that only a test sets is not a live knob. \
+                         Either the variable was retired (update the prose) or it moved \
+                         crates (widen this test deliberately).",
+                        entry.family
+                    );
+                }
+            }
+        }
+    }
+
+    /// Does this line actually wire the literal it contains up to the process
+    /// environment? `env::set_var` is deliberately excluded: a test or bench
+    /// that *sets* a variable is not evidence that anything reads it.
+    fn is_env_read_site(line: &str) -> bool {
+        line.contains("env::var(") || line.contains("env::var_os(") || line.contains(": &str =")
+    }
+
+    /// Concatenate every `.rs` file under `dir`, recursively.
+    fn collect_rust_sources(dir: &std::path::Path, out: &mut String) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rust_sources(&path, out);
+                continue;
+            }
+            if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+            }
+        }
+    }
+
+    /// Pull `SHOUTY_SNAKE_CASE` tokens that look like environment variables out
+    /// of prose.
+    ///
+    /// The prefix list is the checked surface, not the crate's full set of
+    /// knobs: the EP also reads `ONNX_RUNTIME_EP_CPU_*`, `EP_INTRA_OP` and
+    /// `GEMM_AB_*`, none of which any `PlanEntry` currently names. Add a prefix
+    /// here when a ledger entry starts naming one, rather than widening to all
+    /// shouty words — ISA names like `AVX2` and `NEON` are not knobs.
+    fn environment_variable_names(text: &str) -> Vec<String> {
+        const CHECKED_PREFIXES: [&str; 3] = ["NXRT_", "ONNX_GENAI_", "ONNX_RUNTIME_EP_"];
+        text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|token| {
+                CHECKED_PREFIXES.iter().any(|p| token.starts_with(p)) && token.len() > 5
+            })
+            .map(str::to_owned)
+            .collect()
     }
 
     #[test]

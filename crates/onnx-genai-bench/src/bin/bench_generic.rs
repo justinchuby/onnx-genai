@@ -8,6 +8,7 @@ use clap::Parser;
 use onnx_genai_ort::{
     DataType as OrtDataType, Environment, Session, SessionOptions, Value, ep_selection,
 };
+use onnx_runtime_ep_cpu::decode_spmd::DecodeWidth;
 use onnx_runtime_ir::{DataType as NativeDataType, Dim};
 use onnx_runtime_session::{InferenceSession, Tensor};
 
@@ -628,6 +629,181 @@ impl Stats {
 /// feature, which meant every ratio ever published from it came from the
 /// research arm while being read as a production number. Labelling the arm in
 /// the output makes that impossible to do again by accident.
+/// What a row needs in order to carry a width label honestly.
+///
+/// Two independent mechanisms answer to `ONNX_GENAI_CPU_DECODE_THREADS`, and a
+/// row is only mislabelled if *neither* delivered what was asked for:
+///
+/// - the **persistent SPMD decode pool**, entered only through
+///   `with_decode_pool_scope` -- from the engine's generation loop
+///   (`native_decode/cpu.rs`), speculative decode (`native_decode/proposer.rs`)
+///   and the `roofline_gemv` bench, none of which a single-inference run
+///   through `InferenceSession::run` reaches, so in *this* binary it never
+///   resolves and its two fields read `none` / `unresolved`; and
+/// - the **task runtime**, whose width falls back to the same budget
+///   (`task_runtime::resolve_width`) and which parallelises kernels everywhere
+///   else -- including this binary's path.
+///
+/// Reporting only the first is what made the earlier draft of this change claim
+/// "no decode pool was resolved, this row does not measure decode width at all"
+/// on a run whose width demonstrably *was* in effect: 4096x4096 int4 M=1
+/// measured 3.098 / 1.415 / 0.598 ms at requested widths 1 / 2 / 16, with the
+/// pool unresolved throughout. The task runtime was doing the work.
+#[derive(Clone, Copy, Debug)]
+struct WidthReport {
+    /// The width the harness asked for, as it appears in the row. `None` when
+    /// nothing was asked for, so no row is claiming a width.
+    requested: Option<usize>,
+    /// The persistent decode pool's view.
+    spmd: DecodeWidth,
+    /// The task runtime's realized width. Note this is post-`smt_cap`, so it is
+    /// itself a place a request can be silently reduced.
+    task_width: usize,
+    /// CPUs the process is actually allowed to run on, as the denominator for
+    /// the two widths above.
+    ///
+    /// Without it `native_width_as_requested=yes` is ambiguous in the one case
+    /// that most deserves a second look: confined to 2 CPUs, a request for 8
+    /// lanes *is* honoured -- the runtime really does build 8 -- but they share
+    /// two cores. That is oversubscription, not a reduction, and the two must not
+    /// be conflated; printing the denominator lets a reader tell them apart
+    /// without this field having to guess which one they care about.
+    ///
+    /// Sampled at report time, so it reflects any narrowing the EP itself
+    /// applied while building -- observed reading 16 at `--native-threads 16`
+    /// and 32 at `--native-threads 32` on the same 32-vCPU host. That is the
+    /// denominator the run actually had rather than the machine's, which is the
+    /// useful one, but it means this field is a property of the run and not of
+    /// the box, and two rows from the same host may legitimately differ.
+    cpus: usize,
+}
+
+impl WidthReport {
+    /// Whether every mechanism that ran actually delivered the requested lane
+    /// count.
+    ///
+    /// A conjunction, not "either one matched". Under the looser rule a
+    /// satisfied decode pool would launder a capped task runtime into a clean
+    /// `yes` -- `requested=16, pool=16, task=8` would report honoured while half
+    /// the lanes were missing from every kernel the pool does not serve. A
+    /// mechanism that never ran cannot contradict the label, so it does not
+    /// count against it; one that ran and fell short always does.
+    ///
+    /// Compared against the *harness's* request rather than
+    /// `DecodeWidth::is_as_requested`, because the number on trial is the one
+    /// the row is labelled with. The EP records its own copy only when a pool
+    /// resolves, so relying on it would silently skip the comparison in exactly
+    /// the case where it never did.
+    fn is_satisfied(&self) -> bool {
+        let Some(requested) = self.requested else {
+            return true;
+        };
+        let pool_delivered = match self.spmd.realized {
+            None => true,
+            Some(realized) => realized == requested,
+        };
+        pool_delivered && self.task_width == requested
+    }
+}
+
+/// The realized widths, as fields for the result row.
+///
+/// `--native-threads` reports only what was *asked for*: it is read back out of
+/// the environment variable this binary just wrote. So a `native_threads=8` row
+/// has been a *label* asserting what the harness wanted, not a measurement of
+/// what it got.
+///
+/// Four mechanisms can hand back fewer lanes than requested and none logs at
+/// default verbosity, but they are **not equally observable from here**. The
+/// pre-clamp to `available_parallelism`, the NUMA split reserve and the
+/// single-CPU-cpuset fallback all live on the persistent-pool path, which a
+/// single-inference run never reaches; only the task runtime's `smt_cap` is
+/// reachable in this binary today. The pool fields are still reported rather
+/// than dropped, because they are what makes that statement checkable in the
+/// row instead of a claim in a comment -- and because a harness that later
+/// drives the engine needs them.
+///
+/// Pure in its argument so the rendering can be tested without building a pool.
+fn width_fields(report: WidthReport) -> String {
+    let spmd = report
+        .spmd
+        .realized
+        .map_or_else(|| "none".to_string(), |value| value.to_string());
+    format!(
+        "native_pool_width={spmd} native_path={} native_task_width={} native_cpus={} \
+         native_width_as_requested={}",
+        report.spmd.path,
+        report.task_width,
+        report.cpus,
+        match (report.requested, report.is_satisfied()) {
+            // Distinguished from `yes` so an aggregator cannot count rows that
+            // never claimed a width as rows whose claim was honoured.
+            (None, _) => "n/a",
+            (Some(_), true) => "yes",
+            (Some(_), false) => "no",
+        }
+    )
+}
+
+/// The warning to print when a row cannot honestly carry the width it is
+/// labelled with, or `None` when it can.
+///
+/// Only fires when a width was *explicitly* requested. Without that guard it
+/// would fire on every model that never decodes -- `bench_generic` runs
+/// arbitrary ONNX graphs, and most never touch the decode pool -- and a warning
+/// that is noise on the common case gets filtered out, which leaves it exactly
+/// as useful as the debug-gated reports it exists to replace.
+///
+/// Not debug-gated, for the same reason.
+fn width_reduction_warning(report: WidthReport) -> Option<String> {
+    let requested = report.requested?;
+    if report.is_satisfied() {
+        return None;
+    }
+    let spmd = report
+        .spmd
+        .realized
+        .map_or_else(|| "none".to_string(), |value| value.to_string());
+    // Name a single lane count only when there is a single answer. If the pool
+    // also ran and realized something different, claiming the row "measures
+    // {task_width} lanes" would contradict the `native_pool_width` printed
+    // beside it, and a warning that argues with its own row teaches people to
+    // ignore both.
+    let measured = match report.spmd.realized {
+        None => format!(
+            "this row measures {} compute lanes, not {requested}",
+            report.task_width
+        ),
+        Some(_) => format!("this row does not measure {requested} compute lanes on every path"),
+    };
+    Some(format!(
+        "WARNING: decode width requested={requested}, but the persistent decode pool \
+         realized {spmd} (path={}) and the task runtime realized {}; {measured}",
+        report.spmd.path, report.task_width
+    ))
+}
+
+/// Read the realized widths after the measured runs, never before.
+///
+/// `decode_width` peeks at already-initialized statics rather than forcing the
+/// pool, so asking early would report `unresolved` and asking cannot change
+/// which path the process takes. `task_runtime::width` *does* build its pool if
+/// nothing has yet, which is why it is also read here rather than up front.
+fn report_native_width(requested: Option<usize>) -> String {
+    let report = WidthReport {
+        requested,
+        spmd: onnx_runtime_ep_cpu::decode_spmd::decode_width(),
+        task_width: onnx_runtime_ep_cpu::task_runtime::width(),
+        // Respects the affinity mask, so under `taskset` or a cpuset this is the
+        // confined count rather than the machine's.
+        cpus: std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get),
+    };
+    if let Some(warning) = width_reduction_warning(report) {
+        eprintln!("{warning}");
+    }
+    width_fields(report)
+}
+
 fn build_arm() -> &'static str {
     if cfg!(feature = "mlas") {
         "mlas-reference"
@@ -676,6 +852,15 @@ fn main() -> Result<()> {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "default".to_string());
+    // Covers `--native-threads` and a pre-set environment variable alike: either
+    // way the row is about to be labelled with a width somebody chose. `None`
+    // means nothing was asked for -- including an explicit `=0`, which opts out
+    // of the bounded pool rather than requesting zero lanes -- so no row is
+    // claiming a width.
+    let requested_width = native_threads
+        .parse::<usize>()
+        .ok()
+        .filter(|width| *width > 0);
 
     let environment = Environment::new("bench-generic")?;
     let ort_intra_threads = if args.ort_intra_threads > 0 {
@@ -813,13 +998,14 @@ fn main() -> Result<()> {
     if args.native_only {
         println!(
             "result: native={:.3} ms ({:.2} infer/s) native_p90={:.3} ms native_min={:.3} ms \
-             native_spread={:.2} native_threads={native_threads} ort=skipped native-only=true \
-             arm={} parity={}",
+             native_spread={:.2} native_threads={native_threads} {} ort=skipped \
+             native-only=true arm={} parity={}",
             native.p50,
             1_000.0 / native.p50,
             native.p90,
             native.min,
             native.spread(),
+            report_native_width(requested_width),
             build_arm(),
             if parity_pass { "PASS" } else { "FAIL" }
         );
@@ -832,7 +1018,7 @@ fn main() -> Result<()> {
     println!(
         "result: native={:.3} ms ({:.2} infer/s) ort={:.3} ms ({:.2} infer/s) \
          native/ort={:.3} native_p90={:.3} ort_p90={:.3} native_min={:.3} ort_min={:.3} \
-         native_spread={:.2} ort_spread={:.2} native_threads={native_threads} \
+         native_spread={:.2} ort_spread={:.2} native_threads={native_threads} {} \
          ort_intra_threads={ort_intra_threads} arm={} parity={}",
         native.p50,
         1_000.0 / native.p50,
@@ -845,6 +1031,7 @@ fn main() -> Result<()> {
         ort.min,
         native.spread(),
         ort.spread(),
+        report_native_width(requested_width),
         build_arm(),
         if parity_pass { "PASS" } else { "FAIL" }
     );
@@ -947,5 +1134,180 @@ mod tests {
         assert!(validate_tolerance("rel-tolerance", f32::INFINITY).is_err());
         assert!(validate_tolerance("abs-tolerance", f32::NAN).is_err());
         assert!(validate_tolerance("abs-tolerance", -1.0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod width_report_tests {
+    use super::{DecodeWidth, WidthReport, width_fields, width_reduction_warning};
+
+    fn report(
+        requested: Option<usize>,
+        pool: Option<usize>,
+        path: &'static str,
+        task_width: usize,
+    ) -> WidthReport {
+        WidthReport {
+            requested,
+            spmd: DecodeWidth {
+                requested,
+                realized: pool,
+                path,
+            },
+            task_width,
+            cpus: 32,
+        }
+    }
+
+    /// Every shape below with `pool = None` is what this binary actually
+    /// produces: `InferenceSession::run` never enters `with_decode_pool_scope`,
+    /// so the pool never resolves here and `native_pool_width` always reads
+    /// `none`. The `Some(..)` shapes are reachable only if this report is reused
+    /// from a harness that drives the engine, and are marked where they appear.
+    #[test]
+    fn a_row_reports_the_width_that_was_built_not_the_one_asked_for() {
+        let fields = width_fields(report(Some(8), None, "unresolved", 2));
+        assert!(
+            fields.contains("native_task_width=2"),
+            "must carry the realized width: {fields}"
+        );
+        assert!(
+            fields.contains("native_width_as_requested=no"),
+            "must mark the row as not matching its label: {fields}"
+        );
+    }
+
+    #[test]
+    fn a_satisfied_request_is_marked_as_requested_and_warns_about_nothing() {
+        let satisfied = report(Some(8), None, "unresolved", 8);
+        assert!(width_fields(satisfied).contains("native_width_as_requested=yes"));
+        assert!(width_reduction_warning(satisfied).is_none());
+    }
+
+    #[test]
+    fn a_silently_reduced_width_warns_and_names_every_number() {
+        let warning = width_reduction_warning(report(Some(16), None, "unresolved", 15))
+            .expect("a reduced width must warn");
+        for expected in ["requested=16", "realized 15", "15 compute lanes, not 16"] {
+            assert!(
+                warning.contains(expected),
+                "must name {expected} so the row can be corrected: {warning}"
+            );
+        }
+    }
+
+    /// Not reachable from this binary today, and guarded anyway: under an
+    /// "either mechanism matched" rule a satisfied pool would launder a capped
+    /// task runtime into a clean `yes`, hiding eight missing lanes on every
+    /// kernel the pool does not serve.
+    #[test]
+    fn a_satisfied_pool_does_not_launder_a_capped_task_runtime() {
+        let laundered = report(Some(16), Some(16), "spmd", 8);
+        assert!(
+            width_fields(laundered).contains("native_width_as_requested=no"),
+            "one mechanism delivering is not the row's claim being honoured"
+        );
+        assert!(width_reduction_warning(laundered).is_some());
+    }
+
+    /// The warning must never argue with the fields printed beside it: when both
+    /// mechanisms ran and realized different counts there is no single lane
+    /// count to name, and naming one would contradict the other field.
+    #[test]
+    fn a_warning_never_claims_a_lane_count_its_own_row_contradicts() {
+        let disagreeing = report(Some(16), Some(15), "spmd", 8);
+        let fields = width_fields(disagreeing);
+        let warning = width_reduction_warning(disagreeing).expect("nothing delivered 16");
+        assert!(
+            fields.contains("native_pool_width=15") && fields.contains("native_task_width=8"),
+            "{fields}"
+        );
+        assert!(
+            !warning.contains("measures 8 compute lanes")
+                && !warning.contains("measures 15 compute lanes"),
+            "must not pick one of two disagreeing counts: {warning}"
+        );
+        assert!(
+            warning.contains("does not measure 16 compute lanes"),
+            "must still say the label is wrong: {warning}"
+        );
+    }
+
+    /// The bug this whole report exists to avoid, and one an earlier draft of it
+    /// committed: the persistent pool is only entered from the engine's
+    /// generation loop, so a single-inference run never resolves it -- while the
+    /// task runtime, seeded from the same budget, really does deliver the width.
+    /// Measured: 3.098 / 1.415 / 0.598 ms at widths 1 / 2 / 16 with the pool
+    /// unresolved throughout. Warning there would call a correct row a lie.
+    #[test]
+    fn a_width_delivered_by_the_task_runtime_alone_is_not_reported_as_missing() {
+        let via_task_runtime = report(Some(16), None, "unresolved", 16);
+        assert!(
+            width_reduction_warning(via_task_runtime).is_none(),
+            "the task runtime delivered the requested width; the row is honest"
+        );
+        assert!(
+            width_fields(via_task_runtime).contains("native_width_as_requested=yes"),
+            "must credit the mechanism that actually did the work"
+        );
+        assert!(
+            width_fields(via_task_runtime).contains("native_pool_width=none"),
+            "and must still show the pool never ran, which is what makes that checkable"
+        );
+    }
+
+    /// The complement: no pool *and* a capped task runtime is a genuinely
+    /// mislabelled row, and must still be caught.
+    #[test]
+    fn a_width_no_mechanism_delivered_is_reported_as_missing() {
+        let capped = report(Some(16), None, "unresolved", 8);
+        let warning =
+            width_reduction_warning(capped).expect("nothing delivered 16; this row must warn");
+        assert!(warning.contains("requested=16"), "{warning}");
+        assert!(
+            warning.contains("8 compute lanes, not 16"),
+            "must say what the row actually measures: {warning}"
+        );
+        assert!(
+            warning.contains("realized none"),
+            "must distinguish an absent pool from a narrow one: {warning}"
+        );
+    }
+
+    /// Honoured but oversubscribed is not the same as reduced, and the row has
+    /// to let a reader tell them apart: confined to 2 CPUs, a request for 8
+    /// lanes really does build 8 -- verified by running it -- so warning would be
+    /// wrong, but printing no denominator would make `as_requested=yes` read as
+    /// "all is well".
+    #[test]
+    fn an_oversubscribed_but_honoured_width_is_reported_with_its_cpu_denominator() {
+        let oversubscribed = WidthReport {
+            cpus: 2,
+            ..report(Some(8), None, "unresolved", 8)
+        };
+        assert!(
+            width_reduction_warning(oversubscribed).is_none(),
+            "8 lanes were built; the request was honoured"
+        );
+        let fields = width_fields(oversubscribed);
+        assert!(
+            fields.contains("native_task_width=8") && fields.contains("native_cpus=2"),
+            "must show both the lanes and the cores they share: {fields}"
+        );
+    }
+
+    /// Most models `bench_generic` runs never decode. Warning on those would be
+    /// noise on the common case, and a noisy warning is filtered out -- leaving
+    /// it exactly as useful as the debug-gated reports it replaces.
+    #[test]
+    fn a_run_that_requested_no_particular_width_never_warns() {
+        assert!(width_reduction_warning(report(None, None, "unresolved", 32)).is_none());
+        assert!(width_reduction_warning(report(None, Some(32), "flat", 32)).is_none());
+        // `n/a`, not `yes`: an aggregator must not count a row that claimed no
+        // width as a row whose claim was honoured.
+        assert!(
+            width_fields(report(None, None, "unresolved", 32))
+                .contains("native_width_as_requested=n/a")
+        );
     }
 }

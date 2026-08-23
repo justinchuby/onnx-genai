@@ -220,7 +220,7 @@ for trial in 1 2 3; do
     cleanup
     log="$LOCK.racea.log"
     race 40 a "$log"
-    chk "trial $trial: exactly one winner" "$(grep -c 'acquired by' "$log")" "1"
+    chk "trial $trial: exactly one winner" "$(grep -cE 'outcome=acquired( |_after_reap )' "$log")" "1"
     rm -f "$log"
 done
 
@@ -229,7 +229,7 @@ for trial in 1 2 3; do
     forge_stale_lock
     log="$LOCK.raceb.log"
     race 40 b "$log"
-    chk "trial $trial: exactly one winner" "$(grep -c 'acquired by' "$log")" "1"
+    chk "trial $trial: exactly one winner" "$(grep -cE 'outcome=acquired( |_after_reap )' "$log")" "1"
     chk "trial $trial: reaped exactly once" "$(grep -c 'reaping stale' "$log")" "1"
     rm -f "$log"
 done
@@ -385,10 +385,273 @@ echo "== gate =="
 cleanup
 $HL acquire --owner leon --gate 10000 --ttl 600 >/dev/null 2>&1
 chk "a trivially satisfied gate does not block" "$(st state)" "HELD"
+chk "a satisfied gate is recorded" "$($HL provenance | sed -n 's/^gate=//p' | cut -d: -f1)" "satisfied"
 cleanup
-out=$($HL acquire --owner leon --gate 0 --gate-timeout 3 --ttl 600 2>&1)
-chk "an unsatisfiable gate proceeds and warns" "$(echo "$out" | grep -c 'gate timed out')" "1"
+
+# The gate must FAIL CLOSED. A gate that warns and proceeds returns success
+# for a satisfied precondition and for an abandoned one, so every row emitted
+# afterwards is labelled gated either way -- it converts contamination into a
+# label, which is worse than not gating. This is a real defect observed in a
+# hand-rolled gate on this host, whose `for ... sleep 10; done; return 0`
+# proceeded on expiry.
+rc=$($HL acquire --owner leon --gate 0 --gate-timeout 3 --ttl 600 >/dev/null 2>&1; echo $?)
+chk "an unsatisfiable gate fails closed (5)" "$rc" "5"
+chk "a failed gate leaves no lock behind" "$(st state)" "FREE"
 cleanup
+
+# NOT `out=$(...)`: command substitution runs the acquirer in a subshell that
+# exits immediately, so $PPID -- the liveness anchor -- is dead on arrival and
+# the lock reads STALE rather than HELD. Redirect to a file so the anchor is
+# this script's own shell, which is what a real caller has.
+$HL acquire --owner leon --gate 0 --gate-timeout 3 --ttl 600 --on-gate-timeout proceed >"$LOCK.out" 2>&1
+chk "proceeding past the gate requires asking for it" "$(grep -c 'gate timed out' "$LOCK.out")" "1"
+chk "and still acquires" "$(st state)" "HELD"
+rm -f "$LOCK.out"
+chk "and is recorded as timed_out_proceeded" "$($HL provenance | sed -n 's/^gate=//p' | cut -d: -f1)" "timed_out_proceeded"
+cleanup
+
+chk "--on-gate-timeout rejects a bogus value" \
+    "$($HL acquire --owner leon --on-gate-timeout maybe >/dev/null 2>&1; echo $?)" "1"
+cleanup
+
+echo "== a reaped acquire is not the same event as a clean one =="
+# Reclaiming a lock does not stop the dead holder's benchmark, so "somebody
+# died holding this" has to be distinguishable from "the box was free".
+cleanup
+$HL acquire --owner leon --ttl 600 >/dev/null 2>&1
+chk "a clean acquire records takeover=none" "$($HL provenance | sed -n 's/^takeover=//p')" "none"
+cleanup
+
+forge_stale_lock
+out=$($HL acquire --owner leon --ttl 600 2>&1)
+chk "a reaping acquire says so on stdout" "$(echo "$out" | grep -c 'outcome=acquired_after_reap')" "1"
+chk "and records which kind of takeover" "$($HL provenance | sed -n 's/^takeover=//p')" "stale_pid"
+cleanup
+
+forge_stale_lock
+rc=$($HL acquire --owner leon --ttl 600 --strict-reap >/dev/null 2>&1; echo $?)
+chk "--strict-reap refuses a takeover (4)" "$rc" "4"
+chk "and does not hold the lock it refused" "$(st state)" "FREE"
+cleanup
+
+echo "== provenance =="
+cleanup
+chk "provenance on a free host reports no claim" \
+    "$($HL provenance | sed -n 's/^declared=//p')" "no"
+$HL acquire --owner leon --reason "moe matrix" --ttl 600 >/dev/null 2>&1
+chk "provenance names the holder" "$($HL provenance | sed -n 's/^held_by=//p')" "leon"
+chk "provenance carries the reason into the row" \
+    "$($HL provenance | sed -n 's/^reason=//p')" "moe matrix"
+chk "provenance marks a held lock as declared" \
+    "$($HL provenance | sed -n 's/^declared=//p')" "yes"
+# No universal threshold is honest, so absent an expectation the answer is
+# "unknown" rather than a guess.
+chk "contended is unknown without an expectation" \
+    "$($HL provenance | sed -n 's/^contended=//p')" "unknown"
+chk "contended is answerable when the caller supplies one" \
+    "$($HL provenance --expect-runnable 100000 | sed -n 's/^contended=//p')" "no"
+chk "and reports contention when the expectation is not met" \
+    "$($HL provenance --expect-runnable 0 | sed -n 's/^contended=//p')" "yes"
+chk "--oneline emits exactly one line" "$($HL provenance --oneline | wc -l)" "1"
+chk "--oneline carries the same fields" \
+    "$($HL provenance --oneline | tr ' ' '\n' | grep -c '^held_by=leon$')" "1"
+chk "--expect-runnable rejects a non-integer" \
+    "$($HL provenance --expect-runnable two >/dev/null 2>&1; echo $?)" "1"
+cleanup
+
+echo "== a released-then-reacquired lock belongs to its new owner =="
+# Both new release paths (gate failure, strict-reap refusal) must release only
+# a lock we still own. `remove_lock` unconditionally satisfies "the lock is
+# FREE afterwards", so an assertion on FREE has no power over the anti-theft
+# guard: a successor has to exist for the guard to be tested at all.
+cleanup
+sleep 60 &
+succ=$!
+(
+    # alice's TTL lapses during her own gate, so bob legitimately takes over
+    # while alice is still waiting -- then alice's gate fails.
+    $HL acquire --owner alice --pid $succ --ttl 2 --gate 0 --gate-timeout 12 >/dev/null 2>&1
+    echo "alice_rc=$?" >"$LOCK.alice"
+) &
+alice=$!
+sleep 5
+$HL acquire --owner bob --wait --timeout 20 --ttl 600 >"$LOCK.bob" 2>&1
+chk "a successor can take over a TTL-expired lock" "$(st owner)" "bob"
+wait_bounded "$alice" 25
+chk "the loser's failing gate returns 5" "$(sed -n 's/^alice_rc=//p' "$LOCK.alice")" "5"
+chk "and does NOT release the successor's lock" "$(st state)" "HELD"
+chk "which is still the successor's" "$(st owner)" "bob"
+sig "$succ" 9
+wait "$succ" 2>/dev/null
+rm -f "$LOCK.alice" "$LOCK.bob"
+cleanup
+
+# The same shape, but with the loser PROCEEDING past its gate, so it reaches
+# meta_set while a successor owns the lock. Without the anchor guard the loser
+# stamps its own abandoned-gate result onto the successor's live lock, and the
+# successor's rows then carry a gate outcome from somebody else's run.
+sleep 60 &
+succ=$!
+(
+    $HL acquire --owner alice --pid $succ --ttl 2 --gate 0 --gate-timeout 12 \
+        --on-gate-timeout proceed >/dev/null 2>&1
+    echo "alice_rc=$?" >"$LOCK.alice"
+) &
+alice=$!
+sleep 5
+$HL acquire --owner bob --wait --timeout 20 --ttl 600 >/dev/null 2>&1
+chk "successor holds it while the loser is still gating" "$(st owner)" "bob"
+wait_bounded "$alice" 25
+chk "the loser proceeds past its own gate (0)" "$(sed -n 's/^alice_rc=//p' "$LOCK.alice")" "0"
+chk "but cannot stamp its gate result on the successor's lock" \
+    "$($HL provenance | sed -n 's/^gate=//p')" "none"
+chk "and the successor still owns it" "$(st owner)" "bob"
+sig "$succ" 9
+wait "$succ" 2>/dev/null
+rm -f "$LOCK.alice"
+cleanup
+
+# The anchor guard is NOT what makes meta_set safe against a concurrent reap:
+# staging inside $LOCK_DIR is. remove_lock renames the whole directory away,
+# so a staged file inside it goes with the corpse and the final mv fails
+# harmlessly. Every other temp path in the script is a sibling of $LOCK_DIR,
+# so "normalising" this one for consistency is a plausible future edit -- and
+# it would land our metadata on the successor's live lock, which is theft plus
+# a leak, since their remove_lock_if_mine would then refuse to release. That
+# safety is positional and invisible, so assert it structurally.
+# shellcheck disable=SC2016  # matching the literal source text, not expanding it
+chk "meta_set stages inside the lock directory, not beside it" \
+    "$(sed -n '/^meta_set()/,/^}/p' "$HL" | grep -c 'tmp="\${LOCK_DIR}/')" "1"
+
+echo "== strict-reap =="
+# The refusal must beat the gate. The other order sits on the very lock it was
+# told to refuse for the whole gate timeout, blocking everyone, and then
+# reports the gate failure instead -- and the dead holder's orphaned load is
+# the likeliest reason that gate could not be met in the first place.
+forge_stale_lock
+out=$($HL acquire --owner rv --ttl 600 --strict-reap --gate 0 --gate-timeout 20 2>/dev/null; echo "rc=$?")
+chk "strict-reap beats the gate (4, not 5)" "$(echo "$out" | sed -n 's/^rc=//p')" "4"
+chk "and does not linger on the lock it refused" "$(st state)" "FREE"
+# The machine-readable channel must not report a success for a refused
+# acquire: a harness grepping outcome= is the consumer this PR exists for.
+chk "stdout says reap_refused, not acquired" \
+    "$(echo "$out" | grep -c 'outcome=reap_refused (stale_pid)')" "1"
+chk "and never says acquired_after_reap" \
+    "$(echo "$out" | grep -c 'outcome=acquired_after_reap')" "0"
+cleanup
+
+# TTL expiry is the other takeover kind, and was asserted nowhere.
+sleep 60 &
+victim=$!
+$HL acquire --owner alice --pid $victim --ttl 1 >/dev/null 2>&1
+sleep 2
+out=$($HL acquire --owner leon --ttl 600 2>&1; echo "rc=$?")
+chk "a TTL takeover is reported as its own kind" \
+    "$(echo "$out" | grep -c 'outcome=acquired_after_reap (ttl_expired)')" "1"
+chk "and recorded as ttl_expired" "$($HL provenance | sed -n 's/^takeover=//p')" "ttl_expired"
+sig "$victim" 9
+wait "$victim" 2>/dev/null
+cleanup
+
+sleep 60 &
+victim=$!
+$HL acquire --owner alice --pid $victim --ttl 1 >/dev/null 2>&1
+sleep 2
+chk "strict-reap also refuses a TTL takeover" \
+    "$($HL acquire --owner leon --ttl 600 --strict-reap >/dev/null 2>&1; echo $?)" "4"
+sig "$victim" 9
+wait "$victim" 2>/dev/null
+cleanup
+
+echo "== metadata is only writable by the lock's own holder =="
+# meta_set's anchor guard: a peer must not be able to stamp its own takeover
+# or gate result onto a lock somebody else holds.
+cleanup
+sleep 60 &
+holder=$!
+$HL acquire --owner alice --pid $holder --ttl 600 >/dev/null 2>&1
+chk "the holder's gate result is recorded" "$($HL provenance | sed -n 's/^gate=//p')" "none"
+# A second acquirer with a different anchor loses the mkdir and must leave the
+# metadata alone; assert the owner survives a failed acquire attempt.
+$HL acquire --owner mallory --ttl 600 >/dev/null 2>&1
+chk "a losing acquirer does not rewrite the holder's owner" "$(st owner)" "alice"
+chk "nor its takeover field" "$($HL provenance | sed -n 's/^takeover=//p')" "none"
+sig "$holder" 9
+wait "$holder" 2>/dev/null
+cleanup
+
+echo "== value-taking options require values =="
+# `${2:-default}` + a silently-failing `shift 2` spins this loop on one core
+# forever, on the box whose contention the script exists to control.
+for flag in --gate --gate-timeout --ttl --timeout --pid --owner --reason --on-gate-timeout --expect-runnable; do
+    rc=$(timeout 5 $HL acquire --owner leon "$flag" >/dev/null 2>&1; echo $?)
+    chk "$flag with no value fails fast" "$rc" "1"
+done
+chk "--gate rejects a non-integer" \
+    "$(timeout 5 $HL acquire --owner leon --gate abc >/dev/null 2>&1; echo $?)" "1"
+chk "--gate-timeout rejects a non-integer" \
+    "$(timeout 5 $HL acquire --owner leon --gate 0 --gate-timeout abc >/dev/null 2>&1; echo $?)" "1"
+cleanup
+
+echo "== provenance does not assert facts it does not have =="
+# A lock written by an older revision of this script has no takeover/gate
+# keys. Reporting `none` for them asserts "no takeover, no gate" about a run
+# that may have reaped a corpse and abandoned its gate -- the same
+# mislabelling this subcommand exists to prevent, relocated into the data.
+cleanup
+mkdir -p "$LOCK"
+printf 'owner=oldagent\nanchor_pid=%s\nstart_time=%s\nacquired_epoch=%s\nttl=600\nreason=oldrun\n' \
+    "$$" "$(sed 's/.*) //' "/proc/$$/stat" | awk '{print $20}')" "$(date +%s)" >"$LOCK/meta"
+chk "an old lock reports takeover=unknown, not none" \
+    "$($HL provenance | sed -n 's/^takeover=//p')" "unknown"
+chk "and gate=unknown, not none" "$($HL provenance | sed -n 's/^gate=//p')" "unknown"
+cleanup
+
+# A live holder past its TTL is this design's steady state, not an edge case.
+sleep 60 &
+holder=$!
+$HL acquire --owner alice --pid $holder --ttl 1 --reason "long sweep" >/dev/null 2>&1
+sleep 2
+chk "an expired-but-live lock is still EXPIRED" "$(st state)" "EXPIRED"
+chk "and is still declared -- the box IS claimed" \
+    "$($HL provenance | sed -n 's/^declared=//p')" "yes"
+sig "$holder" 9
+wait "$holder" 2>/dev/null
+cleanup
+
+# lock_age defaults a missing epoch to 0, making held_secs the current epoch.
+mkdir -p "$LOCK"
+: >"$LOCK/meta"
+chk "an unparseable lock has no age rather than a 56-year one" \
+    "$($HL provenance | sed -n 's/^held_secs=//p')" "unknown"
+cleanup
+
+echo "== a peer's free text cannot travel in the one-line form =="
+# `reason` is unquoted, unterminated among space-separated fields, and written
+# by whoever holds this shared fixed-path lock. A two-word reason truncates
+# the field; anything shell-active is worse.
+cleanup
+# SC2016 is the point: the text must reach the metadata unexpanded, so that
+# the assertions below are about what the SCRIPT does with it, not the shell.
+# shellcheck disable=SC2016
+$HL acquire --owner leon --ttl 600 --reason 'gemm $(touch '"$LOCK"'.pwned) sweep' >/dev/null 2>&1
+chk "--oneline omits reason entirely" \
+    "$($HL provenance --oneline | grep -c 'reason=')" "0"
+chk "--oneline is still exactly one line with a multi-word reason" \
+    "$($HL provenance --oneline | wc -l)" "1"
+# shellcheck disable=SC2016
+chk "the multi-line form carries the reason whole" \
+    "$($HL provenance | sed -n 's/^reason=//p')" 'gemm $(touch '"$LOCK"'.pwned) sweep'
+chk "and nothing executed it" "$([ -e "$LOCK.pwned" ] && echo yes || echo no)" "no"
+cleanup
+
+echo "== the no-argument help covers the options it documents =="
+# `sed -n '3,50p'` silently stopped covering the header as it grew, so the
+# flags added by a change were never in the help text of that change.
+help=$($HL 2>&1)
+for flag in --strict-reap --on-gate-timeout --expect-runnable --oneline --ttl --pid; do
+    chk "help mentions $flag" "$(echo "$help" | grep -c -- "$flag" | head -1 | awk '{print ($1>0)?1:0}')" "1"
+done
 
 echo
 echo "passed=${pass} failed=${fail}"

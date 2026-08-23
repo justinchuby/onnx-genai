@@ -196,6 +196,27 @@ impl PinnedStagingPool {
     pub fn reuses(&self) -> u64 {
         self.reuses.load(Ordering::Relaxed)
     }
+
+    /// Whether this pool's retention bounds can hold `count` concurrently
+    /// live buffers of `len` bytes each without evicting one of them on
+    /// release.
+    ///
+    /// A look-ahead prefetch (issue #82 BlockQuantizedMoE prefill prefetch)
+    /// genuinely needs **two** same-size buffers alive at once in steady
+    /// state: the buffer backing the just-issued prefetch for the next
+    /// boundary, and the buffer the current boundary's own promoted prefetch
+    /// releases moments later (see
+    /// `weight_paging.rs::prefetch_block_quantized_moe`'s call-order note).
+    /// If the pool cannot retain both, one of the two is always evicted on
+    /// release, so every steady-state cycle pays a fresh
+    /// `cuMemHostAlloc`/`cuMemFreeHost` pair for whichever buffer the pool
+    /// drops -- reintroducing issue #837's exact cost for a path meant to
+    /// avoid it, and potentially costing more than the transfer it hides.
+    /// Callers use this to decline a prefetch up front rather than discover
+    /// the regression empirically.
+    pub fn can_retain_concurrent(&self, len: usize, count: usize) -> bool {
+        count <= self.max_buffers && len.saturating_mul(count) <= self.max_bytes
+    }
 }
 
 /// A pinned staging buffer borrowed from a [`PinnedStagingPool`].
