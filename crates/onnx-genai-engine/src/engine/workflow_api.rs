@@ -169,10 +169,8 @@ impl Engine {
         // fused executor when this runtime has one. Sending it down the
         // tensor-binding path instead would quietly give up all three for a
         // request that asked for none of it.
-        if request.inputs.is_empty()
-            && request.component_overrides.is_empty()
-            && self.holds_decode_core()
-        {
+        let prompt_only = request.inputs.is_empty() && request.component_overrides.is_empty();
+        if prompt_only && self.holds_decode_core() {
             return match request.session_id.as_deref().and_then(|id| id.parse().ok()) {
                 Some(session) if self.sessions.contains_key(&session) => self
                     .generate_in_session_with_callbacks(
@@ -184,16 +182,64 @@ impl Engine {
                 _ => self.generate_with_callbacks(request.request, on_admitted, callback),
             };
         }
+        if !prompt_only {
+            if let Some(on_admitted) = on_admitted.as_mut() {
+                on_admitted();
+            }
+            return self.run_declared_workflow_generation(request, callback);
+        }
+        // A no-decode-core prompt still shares this runtime's scheduler, and —
+        // when the process configured one — its KV byte budget: components own
+        // their own caches, but the byte accounting a shared budget protects is
+        // shared regardless of which executor a step names. Admitting here,
+        // under whichever id already names this request's conversation (a
+        // continuing workflow session) or a fresh one minted for a cold call,
+        // gives this branch the same "reject at the door" guarantee the
+        // decode-core branch above already has instead of letting the request
+        // fail deep inside node execution once a value the loop needed never
+        // arrives.
+        let scheduler_session_id = match request
+            .session_id
+            .as_deref()
+            .and_then(|id| id.parse::<crate::config::SessionId>().ok())
+        {
+            Some(session_id) if self.workflow_sessions.contains_key(&session_id) => session_id,
+            _ => {
+                self.workflow_session_counter += 1;
+                self.workflow_session_counter
+            }
+        };
+        let (budget_cap, max_new_tokens) = self.admit_interpreted_generate_request(
+            scheduler_session_id,
+            &request.request.prompt,
+            request.request.options.max_new_tokens,
+        )?;
+        let mut request = request;
+        request.request.options.max_new_tokens = max_new_tokens;
         if let Some(on_admitted) = on_admitted.as_mut() {
             on_admitted();
         }
+        let result = self.run_declared_workflow_generation(request, callback);
+        self.scheduler.complete(scheduler_session_id);
+        let mut result = result?;
+        result.budget_cap = budget_cap;
+        Ok(result)
+    }
+
+    /// Tokenize a text prompt with the package's own tokenizer and run its
+    /// declared workflow.
+    ///
+    /// A prompt is text; a workflow input declaring the `prompt_tokens` role
+    /// wants ids. Encoding it here is what lets `generate("hello")` work on a
+    /// package whose components the interpreter invokes — the alternative was
+    /// refusing the request and telling the caller to tokenize, which is the
+    /// runtime declining to do the one thing it has the tokenizer for.
+    fn run_declared_workflow_generation(
+        &mut self,
+        request: PipelineGenerateRequest,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
         let runtime = &*self.workflow;
-        // A prompt is text; a workflow input declaring the `prompt_tokens` role
-        // wants ids. Encoding it here, with the package's own tokenizer, is
-        // what lets `generate("hello")` work on a package whose components the
-        // interpreter invokes — the alternative was refusing the request and
-        // telling the caller to tokenize, which is the runtime declining to do
-        // the one thing it has the tokenizer for.
         let mut request = request;
         if let crate::config::GeneratePrompt::Text(text) = &request.request.prompt {
             let tokenizer = runtime.package_tokenizer().context(
