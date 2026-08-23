@@ -350,11 +350,22 @@ def main():
     args = ap.parse_args()
 
     # `--tokens 192` or `--tokens 1:64,4:192,8:384`.
+    threads = [int(x) for x in args.threads.split(",")]
     if ":" in args.tokens:
         tokens_for = {}
         for pair in args.tokens.split(","):
             key, value = pair.split(":")
             tokens_for[int(key)] = int(value)
+        # A per-width map that is missing a width would otherwise die with a
+        # bare KeyError partway through a matrix that has already spent
+        # minutes in `wait_quiet`. Fail before any measurement starts.
+        missing = sorted(set(threads) - set(tokens_for))
+        if missing:
+            ap.error(
+                f"--tokens map has no entry for width(s) {missing}; it must "
+                f"cover every --threads value. Got {sorted(tokens_for)}, need "
+                f"{sorted(threads)}. Use a scalar (--tokens 192) for one "
+                f"token count at every width.")
     else:
         fixed = int(args.tokens)
         tokens_for = collections.defaultdict(lambda: fixed)
@@ -369,7 +380,7 @@ def main():
     for launch in range(args.launches):
       for model in args.models.split(","):
         wb = weight_bytes(model, args.block)
-        for t in [int(x) for x in args.threads.split(",")]:
+        for t in threads:
             tokens = tokens_for[t]
             for s in [int(x) for x in args.sessions.split(",")]:
                 load, busy = wait_quiet()
@@ -451,7 +462,7 @@ def main():
         print(f"{'model':>6} {'t':>3} {'s':>2} {'gap_med':>8} {'gap_min':>8} "
               f"{'gap_max':>8} {'cells':>6} {'aa_min':>7} {'aa_max':>7}")
         for model in args.models.split(","):
-            for t in [int(x) for x in args.threads.split(",")]:
+            for t in threads:
                 for s in [int(x) for x in args.sessions.split(",")]:
                     kept = [r for r in rows
                             if r["model"] == model and r["threads"] == t

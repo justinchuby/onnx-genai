@@ -16,23 +16,37 @@ medianed across launches. It is a paired statistic on purpose: the two arms run
 seconds apart on the same machine, so pairing cancels drift that a ratio of
 two independently-medianed columns would keep.
 
-| width | native tok/s | ORT tok/s | **gap** | gap range | trusted cells | A/A range |
+| width | native tok/s | ORT tok/s | **gap** | gap range | cells (trusted/taken) | A/A range |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 27.9 | 31.2 | **1.120x** | 1.112–1.128 | 2 of 3 | 1.025–1.036 |
-| 4 | 107.2 | 122.3 | **~1.15x** | 1.087–1.284 | 4 of 5 | 0.868–1.150 |
-| 8 | 211.0 | 238.0 | **1.120x** | 1.089–1.145 | 3 of 3 | 0.997–1.028 |
-| 16 | — | — | **not resolvable** | — | 0 of 3 | — |
+| 1 | 27.9 | 31.2 | **1.120x** | 1.112–1.128 | 3/3, **2 retained** | 1.025–1.036 |
+| 4 | 107.2 | 122.3 | ~1.15x | 1.087–1.284 | 4/6 | **0.868–1.150** |
+| 8 | 211.0 | 238.0 | **1.120x** | 1.089–1.145 | 3/3 | 0.997–1.028 |
+| 16 | — | — | ~1.64x, **does not resolve** | 1.456–1.831 | 2/3 | **0.969–1.295** |
 
-**Read the `t=4` row as "about the same as its neighbours", not as a distinct
-1.15x.** Its A/A null — two identical native arms in the same launch — spans
-0.868 to 1.150, so the whole gap sits inside its own noise floor at that width.
-Quoting it to four digits would be false precision, and an earlier draft of this
-document did exactly that. Only `t=1` and `t=8`, whose A/A nulls are within
-3.6% and 2.8% of unity, resolve the gap at all.
+Two columns of that table are doing different jobs and must not be read the same
+way. *Trusted/taken* is the harness's own verdict — it refuses a cell whose peak
+runnable count exceeded `width + slack`. *Retained* is editorial: all three `t=1`
+cells passed the harness, and one was dropped afterwards by me, which is
+[disclosed and costed below](#the-t1-discard-is-post-hoc-and-here-is-what-it-costs).
 
-Counts are cells, not launches: `t=4` pools five cells across two script
-invocations, of which four are trusted. `t=1` is discussed under
-[the discard](#the-t1-discard-is-post-hoc-and-here-is-what-it-costs).
+**Only `t=1` and `t=8` resolve the gap.** The others fail on their own A/A null —
+two identical native arms in the same launch, which is the noise floor any real
+effect has to clear:
+
+- **`t=4`** reads ~1.15x against an A/A of 0.868–1.150. The gap is inside its own
+  noise floor. Read it as "about the same as its neighbours", not as a distinct
+  1.15x; an earlier draft of this document quoted `1.148x` to four digits.
+- **`t=16`** reads 1.64x against an A/A of 0.969–1.295 — ±30%, an order of
+  magnitude worse than at `t=8`. **This is the row that matters most and it is
+  the row we cannot measure**, because `t=16` is the closest cell to an
+  unconfined production process. See [below](#what-is-still-unresolved); an
+  earlier draft of this document wrongly wrote it off as contaminated.
+
+`t=1` and `t=8` clear their nulls by 3.6% and 2.8% respectively.
+
+**So "the gap is ~1.12x" is a statement about `t=1` and `t=8` only.** It is not
+established at `t=16`, where the two cells that did pass the guard both point
+higher.
 
 **On statistics, because these columns are not interchangeable.** tok/s above is
 `tokens_s_total` on both arms — wall-derived over every measured token — and the
@@ -123,7 +137,7 @@ corrections both turn out to land elsewhere:
 
 | width | factor | measured | what it is |
 |---:|---|---:|---|
-| 1 | old unpinned vs old pinned | pinned is **1.7% slower** | placement, negligible |
+| 1 | old unpinned vs old pinned | pinned is **1.9% slower** | placement, negligible |
 | 1 | **old → new, paired, 12 interleaved cells** | **1.64x** [1.61–1.88] | **kernel** |
 | 1 | end-to-end, unpinned both | 1.60x (56.519 → 35.361) | — |
 | 8 | old unpinned → old pinned to 8 physical cores | **1.67x** (14.115 → 8.430) | **benchmark defect** |
@@ -133,6 +147,25 @@ corrections both turn out to land elsewhere:
 **At `t=1` the apparent movement is kernel.** Measured old-vs-new is 1.60–1.64x
 against the 1.59x the published pair implies. The ruler question was worth
 asking and the answer is that it does not bite at this width.
+
+The `t=1` placement row above is a four-arm probe of its own, and its samples
+are given here rather than summarised, because one of them is an outlier that
+matters:
+
+| arm | median | samples |
+|---|---:|---|
+| old, pinned `taskset -c 0` | 57.703 | 57.306 / 57.703 / **114.94** |
+| old, unpinned | 56.651 | 56.454 / 56.651 / 56.784 |
+| new, pinned | 35.007 | 34.965 / 35.007 / 35.556 |
+| new, unpinned | 35.383 | 35.057 / 35.383 / 35.414 |
+
+Placement is worth 1.9% at this width in either binary — nothing like the 1.67x
+it is worth at `t=8` — which is the expected result: a single-threaded process
+has no SMT sibling to collide with. **The `114.94` is the old binary's
+bimodality**, a 2.0x excursion on one pinned rep of three with the other two
+within 0.7% of each other, and it is the reason the `t=1` A/B range extends to
+1.88x. It is reported, not dropped; the median is unaffected by it, which is
+why the median is what the table quotes.
 
 **At `t=8` it is not, and I am retracting the `3.08x` this document previously
 claimed.** 1.67x of it is a defect in the *old benchmark*, and the mechanism is
@@ -239,10 +272,18 @@ worker". Sebastian measured the same thing from the other side on the acc4 path
 (#1740): at `total_workers <= 1`, `dispatch_output_rows` short-circuits and the
 spawned worker receives no dispatch at all, 0% busy over a six-second window.
 
-So the gap is flat at ~1.12x at the two widths that resolve it: it is **not** a
-scaling problem, and there is no width at which acc0 collapses. The remaining
-~11–12% is a kernel efficiency difference, and it is small enough that it now
-sits below several other open items rather than above them.
+So the gap is flat at ~1.12x at the two widths that resolve it, and across those
+widths acc0 is **not** a scaling problem. The remaining ~11–12% is a kernel
+efficiency difference small enough to sit below several other open items rather
+than above them.
+
+**That re-ranking is conditional on `t=16`, and `t=16` is not in the table
+above.** Its two guard-passing cells read ~1.64x — the width closest to an
+unconfined production process is also the only one pointing at a large gap, and
+its A/A null is too wide to call it either way. If a quiet-host study confirms
+1.64x there, acc0 goes back to the top of the list. "acc0 is no longer the top
+target" is therefore a claim about `t=1` and `t=8`, held provisionally, with the
+`t=16` study as the thing that settles it.
 
 ### The `t=1` discard is post-hoc, and here is what it costs
 
@@ -360,18 +401,48 @@ and it is the one every speedup is quoted against.
 
 ## What is still unresolved
 
-**Width 16 could not be measured, again.** Six cells at that width span native
-5.719–12.486 ms/token with A/A ratios from 0.969 to 1.295, all taken while the
-sibling `cargo test` was running. This is the same width whose launch
-distribution spans 1.476–9.064 ms (514%) with no identified mechanism — see
-[2026-08-23-acc4-decode-width-remeasurement.md](2026-08-23-acc4-decode-width-remeasurement.md).
+**Width 16, and it is the row that matters.** `t=16` is the closest cell in this
+matrix to an unconfined production process, and it is the one width where the gap
+does not resolve.
 
-The contaminated cells do put ORT at 2.29–3.17 ms against native 5.72–6.00 at
-that width, which would be a ~1.6x gap if it survived, and native was in its
-slow mode for all of them. **That is a hypothesis, not a result**, and it is
-the one cell that would matter most: `t=16` is closest to an unconfined
-production process. It needs a dedicated quiet-host study with the launch
-distribution treatment, not another row in a matrix.
+An earlier draft of this document dismissed it as contaminated — "every cell taken
+against a sibling `cargo test`". **That was wrong, and it was wrong in the
+direction that flattered us.** Two of the three `t=16` cells passed the load guard
+cleanly (runnable 6, no competitor recorded), and those two cells read:
+
+| `t=16` | gap | A/A | native spread | ORT spread |
+|---|---:|---:|---:|---:|
+| launch 1 (runnable 6) | 1.831 | 1.295 | 17.8% | **55.4%** |
+| launch 2 (runnable 6) | 1.456 | 0.969 | 27.7% | **19.6%** |
+| **median** | **1.643** | — | — | — |
+
+So the honest statement is **~1.64x at `t=16`, from two cells the harness
+accepted** — not "no data". The reason it still does not resolve is the A/A null,
+not contamination: two *identical* native arms in the same launch differ by up to
+29.5%, against 3.6% at `t=1` and 2.8% at `t=8`. A 1.64x gap measured on an
+instrument with a ±30% null is not a 1.64x result. The intra-run spreads say the
+same thing from inside each cell, and **both arms are unstable at this width** —
+the ORT arm's own rep-to-rep spread reaches 55.4%, so the denominator is no
+better behaved than the numerator.
+
+This is the same width whose launch distribution spans 1.476–9.064 ms/token
+(514%) with no identified mechanism — see
+[2026-08-23-acc4-decode-width-remeasurement.md](2026-08-23-acc4-decode-width-remeasurement.md)
+— and the two cells above sit in different modes of it, which is the obvious
+candidate for why the null is so wide.
+
+The third `t=16` cell — the one the guard *did* refuse, at runnable 9 against a
+sibling `resch-dispatch` debug build — reads 1.585, i.e. **between** the two
+retained cells. So the refusal is not load-bearing for the ~1.6x figure either
+way; it is the null, not the discard, that stops this width resolving.
+
+**What this costs the headline.** "The gap is ~1.12x and flat" is established at
+`t=1` and `t=8` and **is not established at `t=16`**, where the available
+evidence points to roughly 1.6x. The re-ranking conclusion — that acc0 is no
+longer the top CPU MatMulNBits target — rests on the two widths that resolve, and
+**a confirmed 1.64x at `t=16` would overturn it.** That makes a dedicated
+quiet-host study of `t=16`, with launch distributions and a pre-registered A/A
+acceptance threshold, the first thing to do next rather than a footnote.
 
 ## Reproduce
 
@@ -379,11 +450,23 @@ The gap matrix:
 
 ```bash
 cargo build --release -p onnx-runtime-ep-cpu --bench int4_decode_loop_ab
-python3 crates/onnx-runtime-ep-cpu/benches/acc0_gap_matrix.py \
-    --binary target/release/deps/int4_decode_loop_ab-<hash> \
+BIN=target/release/deps/int4_decode_loop_ab-<hash>
+
+# invocation 1 — widths 1, 4, 8
+python3 crates/onnx-runtime-ep-cpu/benches/acc0_gap_matrix.py --binary "$BIN" \
     --models llama --threads 1,4,8 --sessions 1 --acc 0 --block 32 \
     --tokens 1:64,4:192,8:384 --reps 2 --launches 3 --aa --ort-pin both
+
+# invocation 2 — widths 4, 16
+python3 crates/onnx-runtime-ep-cpu/benches/acc0_gap_matrix.py --binary "$BIN" \
+    --models llama --threads 4,16 --sessions 1 --acc 0 --block 32 \
+    --tokens 4:192,16:384 --reps 2 --launches 3 --aa --ort-pin both
 ```
+
+The `--tokens` map must name every width in `--threads`; the script refuses the
+run up front if it does not, rather than dying with a `KeyError` after the first
+cell has already waited out the load guard. Pass a scalar (`--tokens 192`) for
+one token count at every width.
 
 `--ort-pin matched` is the default and is the only setting that compares like
 with like; `both` adds the wide-pin arm, which costs one extra ORT run per cell
@@ -393,10 +476,10 @@ launch-to-launch spread, which is the larger of the two. The per-width token
 map exists because a flat count spends the most wall time on the narrowest
 width and still gives it the fewest samples relative to its variance.
 
-The published table came from three invocations of this script rather than one
-(`t=4` pools two of them), which is why its cell counts are 3 / 5 / 3 rather
-than a uniform `--launches 3`. The `gap` column it prints is the one quoted
-here; `ratio` beside it is the reciprocal, native/ORT.
+The published table came from **two** invocations of this script rather than one
+(widths 1/4/8, then widths 4/16), which is why its cell counts are 3 / 6 / 3 / 3
+rather than a uniform `--launches 3`. The `gap` column it prints is the one
+quoted here; `ratio` beside it is the reciprocal, native/ORT.
 
 The old-versus-new kernel A/B:
 
@@ -419,3 +502,7 @@ To reproduce the placement finding, run the *old* binary at `t=8` three ways —
 `taskset -c 0,2,4,6,8,10,12,14` (eight physical cores), `taskset -c 0-7` (four
 cores plus SMT siblings), and unpinned. The unpinned run is the one that
 returns 14.09 ms.
+
+The `t=1` placement probe (the four-arm table above) alternates old/new x
+pinned/unpinned at `ONNX_GENAI_CPU_DECODE_THREADS=1`, three reps, with the pinned
+arms under `taskset -c 0`.

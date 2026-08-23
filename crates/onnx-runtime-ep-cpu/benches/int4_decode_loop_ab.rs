@@ -36,8 +36,13 @@
 //!   not a multiple of 32, so at `m = 1` the GEBP gate is already satisfied
 //!   and block 16 runs the *fused prefill* kernel `quant_prefill_gebp`.
 //!   Falsifier: `ONNX_GENAI_CPU_MM_INT4_GEBP=0` changes the block-16 checksum
-//!   (844.702358 -> 844.714874) and its time, and leaves block 32 untouched
-//!   (979.199155 either way). Any block-16 row taken here is a GEBP row.
+//!   (844.536810 -> 844.551163) and its time, and leaves block 32 untouched
+//!   (978.949310 either way). Any block-16 row taken here is a GEBP row.
+//!   These constants are numerics-sensitive and drift whenever a kernel
+//!   reassociates its reduction (#1667, #1783 both moved them in the fourth
+//!   decimal place); it is the *pattern* -- block 16 moves, block 32 does not
+//!   -- that is the route evidence, so re-derive them rather than reading a
+//!   mismatch as a route change.
 //!   Set `ONNX_GENAI_CPU_MM_INT4_GEBP=0` to reach the decode kernel at 16.
 //! - `PROBE_ACCURACY` -- `accuracy_level` (default 0). **4 is the only value
 //!   that reaches the packed-nibble kernel**, so without this axis that route

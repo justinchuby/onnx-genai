@@ -1951,7 +1951,8 @@ time. That figure is now stale; the re-measurement replaces it.
 > **t=8 1.120x** (range 1.089–1.145, 3 cells), **t=4 ~1.15x but unresolved** —
 > its A/A null spans 0.868–1.150, so the gap sits inside its own noise floor at
 > that width. Flat across the measurable range, so acc0 is neither a scaling
-> problem nor the top target any more.
+> problem nor the top target any more — **conditional on t=16**, which does not
+> resolve and points at ~1.6x (see below).
 >
 > The old figure was **not mislabelled — it was a correct measurement of a tree
 > that no longer exists.** An earlier draft argued this from the ORT arm alone
@@ -2008,12 +2009,18 @@ time. That figure is now stale; the re-measurement replaces it.
 > Still true and unchanged: at t=1 the native side runs `path=flat`, confined by
 > the decode budget to a single CPU with no pool built at all (§20), so that row
 > compares native-serial against ORT-single-thread and every scaling figure
-> quoted against it is "vs serial", not "vs a one-worker pool". **t=16 remains
-> unresolved** — every cell at that width was taken against a sibling
-> `cargo test` and discarded; the contaminated cells hint at ~1.6x and native
-> was in the slow mode of its 514% bimodality for all of them, so it is a
-> hypothesis, not a result, and it is the cell closest to an unconfined
-> production process. Full record:
+> quoted against it is "vs serial", not "vs a one-worker pool". **t=16 does not
+> resolve, and it is the row that matters** — two of its three cells passed the
+> load guard cleanly and read 1.831x and 1.456x (median **1.643x**), but the
+> width's A/A null spans 0.969–1.295 (±30%, against 3.6% at t=1 and 2.8% at t=8)
+> and native sits in different modes of its 514% launch bimodality across the two
+> cells. So it is ~1.6x on an instrument too loose to call it, not "no data" —
+> an earlier draft wrote the width off as wholly contaminated, which was wrong in
+> the direction that flattered us. **The re-ranking below is conditional on
+> that**: a confirmed 1.64x at t=16, the width closest to an unconfined
+> production process, would put acc0 back at the top. A dedicated quiet-host
+> study of t=16 with launch distributions and a pre-registered A/A threshold is
+> the next action. Full record:
 > [`docs/benchmarks/2026-08-23-acc0-gap-vs-ort-by-width.md`](../benchmarks/2026-08-23-acc0-gap-vs-ort-by-width.md).
 
 Full record for the acc4 table above:
