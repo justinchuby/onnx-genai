@@ -4713,13 +4713,13 @@ What survives that, and why:
 - **Ratios, but only against a *symmetric* tax.** The arms are interleaved, so
   an occupancy tax that falls on both equally cancels in `native/ort`. It does
   **not** cancel when the tax falls on one arm only, which is the case here --
-  see 45.9. The `concat_cache` before/after figures in 45.6 are native-vs-native
+  see 45.10. The `concat_cache` before/after figures in 45.6 are native-vs-native
   and keep their footing; the native-vs-ORT ratios do not.
 - **The scaling shape in 45.8** rests on the code, not on the timings:
   `sdpa_f32_simd` contains no fan-out at all, so the native arm cannot scale
   with thread count whatever the host is doing. **The timing-based version of
   this argument, which appeared here and claimed ORT was a positive control for
-  core availability, was wrong and is retracted in 45.9.**
+  core availability, was wrong and is retracted in 45.10.**
 
 What does not survive: the **absolute** millisecond columns below. A steady
 occupancy tax is invisible in the spread *and* invisible in the ratio, and it
@@ -4823,7 +4823,7 @@ unclaimed parallelism, but it does not size the prize. Profile the cell before
 quoting a headroom multiple — otherwise you are asserting that the kernel you
 happened to be reading is the whole critical path.
 
-### 45.9 Retraction: ORT was not a positive control, it was the tax
+### 45.10 Retraction: ORT was not a positive control, it was the tax
 
 The caveat in 45.7 argued that the native-vs-ORT ratios survived host
 contention because the arms are interleaved and because ORT scaling 2.9x in the
@@ -4856,10 +4856,10 @@ additionally carries a permanent external competitor -- a pinned scalar probe
 gets 0.503 of the throughput there that it gets on any other CPU. ORT's pool is
 not pinned and roams all 32 logical CPUs.
 
-**Resolved, and narrower than stated: this leg does not apply to these rows.**
-It was left as "not yet verified", pending a `/proc` read against a live bench
-process. It did not need one -- it is answerable from the routing code, with no
-timing at all, and the answer is no:
+**Half resolved, and the other half is worse than the version I retracted.**
+This leg was left as "not yet verified", pending a `/proc` read against a live
+bench process. The *first* mechanism did not need one -- it is answerable from
+the routing code, with no timing at all, and the answer is no:
 
 * The production SDPA route forks on `decode_pool_active()` (`sdpa.rs:1287`).
   Only the true arm reaches `decode_parallel_output_row_blocks`, i.e. the SPMD
@@ -4870,32 +4870,81 @@ timing at all, and the answer is no:
   `IN_SPMD_SCOPE` (`:4901`) and `IN_NUMA_SCOPE` (`:4891`), each set only inside
   `with_decode_pool_scope`. Neither is a process-global, so no other thread's
   decode loop can turn this on for the benchmark's engine thread.
-* The only production caller of that scope is the generation loop in
-  `onnx-genai-engine/src/native_decode/cpu.rs`. `bench_generic` never mentions
-  `native_decode`; it drives graphs through `onnx-runtime-session`.
+* The only production callers of that scope are under
+  `onnx-genai-engine/src/native_decode/` -- the generation loop in `cpu.rs`
+  (445, 578, 584) and the speculative proposer (`proposer.rs:325`).
+  `bench_generic` never mentions `native_decode`; it drives graphs through
+  `onnx-runtime-session`.
 
-So on a single-node SDPA/MHA graph the flag is false, the SPMD pool is never
-entered, and the cpus 0-15 mask never governed these measurements. The width
-knob still bites -- `task_runtime::resolve_width` honours
-`ONNX_GENAI_CPU_DECODE_THREADS` deliberately, so `--native-threads T` does size
-the fan-out -- but that pool is **capped to physical cores and never pinned**
-(`cap_spinning_workers`), which is the opposite of the compact mask. The
-inference in the previous paragraph -- "same knob, so it cannot be assumed
-away" -- was sound as caution and wrong as fact: the knob sizes two different
-pools, and only one of them is placed.
+So on a single-node SDPA/MHA graph the flag is false and **the SPMD pool is
+never entered**, which means the per-worker cpus 0-15 assignment `#1729` fixed
+could not have reached these rows.
+
+**That is not the same as "placement did not reach these rows", and I published
+the stronger claim.** A review of the draft caught it. There is a *second*,
+independent mechanism that confines CPUs, it is keyed on the same
+`ONNX_GENAI_CPU_DECODE_THREADS` value, and it **did** apply here:
+
+* `CpuExecutionProvider::initialize` (`provider.rs:340`) calls
+  `bound_process_to_decode_budget()` (`matmul_nbits.rs:4354`). With a budget
+  set and no explicit `ONNX_GENAI_CPU_DECODE_AFFINITY`, it calls
+  `set_current_thread_affinity` -- a real `sched_setaffinity` on the calling
+  thread. Its own doc comment states the reach: "threads spawned afterwards
+  ... inherit the mask".
+* `bench_generic` reaches it. `InferenceSession::load` selects the CPU EP via
+  `executor/platform.rs:8`, which calls `ep.initialize(...)`. And
+  `bench_generic` sets `ONNX_GENAI_CPU_DECODE_THREADS` from `--native-threads`
+  before any session is built (`:670-673`), so on every row where `ab.py`
+  passed a width, **the benchmark process confined itself**.
+
+This is documented in-tree, by Sebastian, in the `#1746` addendum to
+`2026-08-22-decode-width-scaling.md` -- including the observation that his
+`int4_decode_loop_ab` bench is *unaffected* because it never calls
+`initialize()` and enters the decode scope directly. Mine is the opposite case:
+it goes through the production session-load path, so it gets the mask. I read
+that addendum as being about his harness and did not check mine against it.
+
+**What follows without needing the mask's value.** `scatter_across_cores`
+(`decode_affinity.rs:560`) ranks physical-core leaders ahead of SMT siblings,
+so the budget mask is *shaped* to avoid the doubling-up that `#1729` fixed --
+the recorded production line for a budget of 2 is `[0, 2]`, two distinct cores,
+not `[0, 1]`. I have **not** observed the mask at `T = 16` on an unrestricted
+host, so I am not asserting it is benign. The settled part is only that the two
+mechanisms are different code with different placement rules.
+
+**And a third asymmetry, which is the real find here.** Affinity is inherited
+at thread creation, and the two arms are built on opposite sides of the mask:
+`bench_generic` constructs `ort_session` at `:691` and *then*
+`InferenceSession::load` at `:703`, and it is that load which applies the
+confinement. So ORT's intra-op pool is spawned **before** the process is
+confined and the native EP's threads **after** it. If ORT's pool is created at
+session construction, the paired runs gave ORT the full 32 logical CPUs while
+the native arm ran on `T`. That is the same direction as reason 1 and it also
+grows with `T`. **Suspected, not observed** -- it is settled by reading
+`Cpus_allowed_list` per thread from `/proc/<pid>/task/*/status` on a live
+paired run, grouped by thread name, which needs a quiet host and is queued.
 
 **Consequence for the re-measurement queue.** Decode rows taken before
-`6e8c31ebd` were on 8 physical cores and do need re-taking. The single-node
-SDPA/MHA rows in 45.7-45.9 are **not** in that set and should not be re-taken on
-placement grounds. They still need re-taking for reason 1 above, which is
-sufficient on its own and unaffected by any of this.
+`6e8c31ebd` were on 8 physical cores and do need re-taking. For the single-node
+SDPA/MHA rows in 45.7-45.10, the `#1729` mechanism specifically is excluded, but
+**they are not placement-clean and nobody should treat them as such** -- they
+were taken inside a self-imposed `T`-CPU mask whose interaction with the ORT arm
+is an open question. They need re-taking regardless, for reason 1, which is
+sufficient on its own.
+
+**Rule.** Disproving one mechanism is not disproving the class. I traced the
+knob to the pool I already suspected, found it did not reach me, and wrote
+"placement did not reach these rows" -- when what I had shown was "*that* pool
+did not reach these rows". The second mechanism was one `grep` for
+`sched_setaffinity` away, in a file I had already opened, described in a
+teammate's document I had already read.
 
 **Rule.** A confound is a claim like any other and needs the same standard of
-proof in both directions. "It shares a knob with something that was broken" is a
-reason to check, not a finding; leaving it recorded as an open confound when it
-was decidable from three lines of routing code let it sit as though it were
-evidence, and would have sent somebody re-measuring rows that were never
-affected.
+proof in both directions. "It shares a knob with something that was broken" is
+a reason to check, not a finding -- and neither is "I checked the obvious place
+and it was clean". The direction that says *your data is fine* is the one that
+propagates: an over-stated confound costs a re-measurement, an under-stated one
+ships a wrong number under somebody else's name.
 
 **What still stands.** The finding of 45.8 -- the shipped SDPA route claims no
 parallelism -- is a statement about code: `sdpa_f32_simd` is a plain
