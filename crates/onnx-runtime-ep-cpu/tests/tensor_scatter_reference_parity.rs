@@ -9,7 +9,7 @@
 mod common;
 
 use common::{FloatDType, Tensor, assert_close, make_kernel};
-use onnx_runtime_ir::Attribute;
+use onnx_runtime_ir::{Attribute, DataType};
 
 /// Cache shaped (batch=2, heads=1, max_sequence_length=4, head_size=2) with the
 /// sequence axis at -2 — the layout the op was standardized for.
@@ -139,6 +139,68 @@ fn circular_does_not_wrap_the_batch_coordinate() {
 
     let slot_zero_per_batch: Vec<f32> = present.to_f32().chunks(4).map(|row| row[0]).collect();
     assert_close(&slot_zero_per_batch, &[1.0, 2.0, 3.0, 4.0, 5.0], 0.0);
+}
+
+#[test]
+fn the_advertised_dtypes_admit_a_real_kv_cache_node() {
+    // The claim path this test guards is NOT the one the golden-value tests
+    // above exercise: they call the kernel directly, while a real session goes
+    // through the dtype filter, which requires EVERY input and output dtype --
+    // including the Int64 `write_indices` -- to be in the advertised set. An
+    // f32-only advertisement silently declines every realistic node: an f16
+    // cache fails on the cache dtype, and even an f32 cache fails on Int64
+    // indices.
+    let advertised = onnx_runtime_ep_cpu::supported_dtypes_for_op("TensorScatter", "");
+    for required in [
+        DataType::Float16,
+        DataType::BFloat16,
+        DataType::Float32,
+        DataType::Int64,
+    ] {
+        assert!(
+            advertised.contains(&required),
+            "TensorScatter must advertise {required:?}; advertised = {advertised:?}"
+        );
+    }
+}
+
+#[test]
+fn a_float16_cache_produces_the_same_placement_as_f32() {
+    // f16 is the normal KV-cache dtype, and the golden cases above only cover
+    // f32. Values here are exactly representable in f16, so this is still an
+    // exact comparison.
+    let past = Tensor::floats(FloatDType::F16, &CACHE_SHAPE, &[-1.0; 16]);
+    let update = Tensor::floats(
+        FloatDType::F16,
+        &UPDATE_SHAPE,
+        &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+    );
+    let mut present = Tensor::zeros(FloatDType::F16, &CACHE_SHAPE);
+    let indices = Tensor::i64(&[2], &[0, 2]);
+
+    make_kernel(
+        "TensorScatter",
+        [
+            ("axis", Attribute::Int(-2)),
+            ("mode", Attribute::String("linear".to_string().into_bytes())),
+        ],
+        &[CACHE_SHAPE.to_vec(), UPDATE_SHAPE.to_vec(), vec![2]],
+        24,
+    )
+    .execute(
+        &[past.view(), update.view(), indices.view()],
+        &mut [present.view_mut()],
+    )
+    .expect("TensorScatter executes on f16");
+
+    assert_close(
+        &present.to_f32(),
+        &[
+            1.0, 2.0, 3.0, 4.0, -1.0, -1.0, -1.0, -1.0, // batch 0
+            -1.0, -1.0, -1.0, -1.0, 5.0, 6.0, 7.0, 8.0, // batch 1
+        ],
+        0.0,
+    );
 }
 
 #[test]

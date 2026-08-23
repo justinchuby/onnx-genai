@@ -310,6 +310,14 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         | ("Sum", "")
         | ("Mean", "") => ARITH_DTYPES,
 
+        // TensorScatter moves bytes rather than computing, but it is dispatched
+        // through `dispatch_arith!`, so it claims exactly that set instead of
+        // `ALL_DTYPES`. The claim has to be honest in both directions: the
+        // plugin dtype filter requires *every* input and output dtype to be in
+        // this set, and `write_indices` is Int64 — which ARITH_DTYPES covers, so
+        // a real KV-cache node with an f16 cache and Int64 indices passes.
+        ("TensorScatter", "") => ARITH_DTYPES,
+
         // MatMul supports f32 natively + f16/bf16 via half_gemm.
         ("MatMul", "") | ("Gemm", "") => FLOAT_DTYPES,
 

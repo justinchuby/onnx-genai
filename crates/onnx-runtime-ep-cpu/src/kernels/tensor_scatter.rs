@@ -83,6 +83,16 @@ pub(crate) fn tensor_scatter_unsupported_reason(input_dtypes: &[DataType]) -> Op
             input_dtypes.len()
         ));
     }
+    // The ONNX type constraint `T` is wider than `dispatch_arith!` (it also
+    // admits bool and the float8 variants). Declining here keeps the claim
+    // honest: a dtype this kernel cannot dispatch must not be accepted and then
+    // fail at execute, which is a hard session failure rather than a fallback.
+    if !ARITH_DISPATCHABLE.contains(&input_dtypes[0]) {
+        return Some(format!(
+            "TensorScatter: cache dtype {:?} is not implemented by the CPU kernel",
+            input_dtypes[0]
+        ));
+    }
     if input_dtypes[1] != input_dtypes[0] {
         return Some(format!(
             "TensorScatter: update dtype {:?} must match past_cache dtype {:?}",
@@ -97,6 +107,23 @@ pub(crate) fn tensor_scatter_unsupported_reason(input_dtypes: &[DataType]) -> Op
     }
     None
 }
+
+/// The dtypes `dispatch_arith!` can actually route, mirrored here so the claim
+/// gate and the execute path cannot drift apart.
+const ARITH_DISPATCHABLE: &[DataType] = &[
+    DataType::Float32,
+    DataType::Float16,
+    DataType::BFloat16,
+    DataType::Float64,
+    DataType::Int8,
+    DataType::Int16,
+    DataType::Int32,
+    DataType::Int64,
+    DataType::Uint8,
+    DataType::Uint16,
+    DataType::Uint32,
+    DataType::Uint64,
+];
 
 impl Kernel for TensorScatterKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
@@ -314,5 +341,35 @@ mod tests {
     fn a_negative_write_index_is_rejected() {
         assert!(resolve_write_position(-1, 0, 8, WriteMode::Linear).is_err());
         assert!(resolve_write_position(-1, 0, 8, WriteMode::Circular).is_err());
+    }
+
+    #[test]
+    fn a_cache_dtype_the_kernel_cannot_dispatch_declines_at_claim_time() {
+        // ONNX's `T` constraint is wider than `dispatch_arith!` (it also admits
+        // bool and the float8 variants). Claiming one of those and then failing
+        // inside `execute` is a hard session failure rather than a fallback, so
+        // the claim gate has to reject it.
+        let reason =
+            tensor_scatter_unsupported_reason(&[DataType::Bool, DataType::Bool, DataType::Int64])
+                .expect("a non-dispatchable cache dtype must decline");
+        assert!(reason.contains("not implemented"), "{reason}");
+    }
+
+    #[test]
+    fn an_ordinary_kv_cache_node_is_claimed() {
+        // f16 cache with Int64 write_indices is the realistic decode-phase node
+        // and must not decline.
+        assert!(
+            tensor_scatter_unsupported_reason(&[
+                DataType::Float16,
+                DataType::Float16,
+                DataType::Int64,
+            ])
+            .is_none()
+        );
+        // Prefill omits write_indices entirely.
+        assert!(
+            tensor_scatter_unsupported_reason(&[DataType::Float16, DataType::Float16]).is_none()
+        );
     }
 }
