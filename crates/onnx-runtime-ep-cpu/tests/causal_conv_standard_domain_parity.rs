@@ -55,8 +55,7 @@ fn run(
     }
     if let Some(past) = past_state {
         if bias.is_none() {
-            // `bias` is optional but positional; the past state is input 3.
-            panic!("this harness passes past_state only alongside bias");
+            panic!("use `run_with_absent_bias` for the omitted-bias form");
         }
         views.push(past.view());
         shapes.push(STATE_SHAPE.to_vec());
@@ -171,4 +170,49 @@ fn swish_is_the_same_function_as_silu() {
         outputs.push(output.to_f32());
     }
     assert_eq!(outputs[0], outputs[1]);
+}
+
+#[test]
+fn an_omitted_bias_before_a_present_past_state_is_not_read_as_the_bias() {
+    // The standard opset-27 decode form is `(input, weight, "", past_state)`:
+    // bias omitted, past state present. Optional inputs are positional, so the
+    // omitted bias arrives as a null-backed placeholder in slot 2 rather than
+    // shortening the list. A kernel that detects optionals by arity alone reads
+    // that placeholder as the bias and fails — this is the case that check
+    // exists for, and the harness above deliberately refuses to build it.
+    use onnx_runtime_ep_api::TensorView;
+    use onnx_runtime_ir::DataType;
+
+    let input = input();
+    let weight = weight();
+    let past = Tensor::floats(FloatDType::F32, &STATE_SHAPE, &[7.0, 8.0, 9.0, 11.0]);
+    let mut output = Tensor::zeros(FloatDType::F32, &INPUT_SHAPE);
+    let mut present = Tensor::zeros(FloatDType::F32, &STATE_SHAPE);
+
+    let absent_bias = TensorView::absent(DataType::Undefined);
+    make_kernel(
+        "CausalConvWithState",
+        Vec::<(&'static str, Attribute)>::new(),
+        &[
+            INPUT_SHAPE.to_vec(),
+            WEIGHT_SHAPE.to_vec(),
+            vec![],
+            STATE_SHAPE.to_vec(),
+        ],
+        27,
+    )
+    .execute(
+        &[input.view(), weight.view(), absent_bias, past.view()],
+        &mut [output.view_mut(), present.view_mut()],
+    )
+    .expect("an omitted bias must not be mistaken for the past state slot");
+
+    // Identical to the zero-bias golden values: omitting the bias must mean
+    // "no bias", not "read the placeholder".
+    assert_close(
+        &output.to_f32(),
+        &[187.0, 218.0, 321.0, 432.0, 1238.0, 1322.0, 1530.0, 1752.0],
+        0.0,
+    );
+    assert_close(&present.to_f32(), &[3.0, 4.0, 7.0, 8.0], 0.0);
 }

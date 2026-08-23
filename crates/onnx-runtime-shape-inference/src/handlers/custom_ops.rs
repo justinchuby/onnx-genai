@@ -332,18 +332,28 @@ fn c(value: i64) -> DimExpr {
     DimExpr::constant(value)
 }
 
-/// `com.microsoft::CausalConvWithState`: output 0 preserves the `[B, C, L]`
-/// input activation; output 1 (present conv state) preserves the past-state
-/// `[B, C, K-1]` cache shape supplied as input 3.
+/// `CausalConvWithState` (both the `com.microsoft` contrib spelling and the
+/// standard `ai.onnx` opset-27 one): output 0 preserves the `[B, C, L]` input
+/// activation; output 1 is the present conv state `[B, C, K-1]`.
 pub fn causal_conv_with_state(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     if let Some(input) = ctx.input_type(0).cloned() {
         ctx.set_output_type(0, input);
     }
-    if ctx.num_outputs() >= 2
-        && ctx.has_input(3)
-        && let Some(state) = ctx.input_type(3).cloned()
-    {
-        ctx.set_output_type(1, state);
+    if ctx.num_outputs() >= 2 {
+        // `present_state` is a required output and is produced on every step,
+        // so its type must not depend on `past_state` being supplied — prefill
+        // omits the past state but still emits a carry. Prefer the past state's
+        // type when it is there (it already carries the exact cache shape) and
+        // fall back to the activation's element type otherwise, rather than
+        // leaving output 1 untyped for downstream consumers.
+        let state_type = ctx
+            .has_input(3)
+            .then(|| ctx.input_type(3).cloned())
+            .flatten()
+            .or_else(|| ctx.input_type(0).cloned());
+        if let Some(state) = state_type {
+            ctx.set_output_type(1, state);
+        }
     }
     Ok(())
 }
