@@ -299,10 +299,12 @@ pub const PLAN: &[PlanEntry] = &[
         threads: "MLAS partitions; tiles run on the mlas-sys work-stealing pool under the EP \
                   thread budget",
         shape_gate: "all shapes on x86-64; NXRT_CPU_GEMM_BACKEND=generic|simd|mlas overrides. \
-                     The native SimdX86 route additionally gates M=1 on \
-                     ONNX_GENAI_CPU_MM_SIMD_M1_GEMV (default off, #1116): on, it streams B in \
-                     place instead of packing panels reused zero times, which is 2.4x faster \
-                     native at 1x2048x2048 but still short of MLAS",
+                     The native SimdX86 route sends M=1 to a dedicated GEMV that streams B \
+                     in place instead of packing panels that are reused zero times (#1091, \
+                     ported in #1116, shipped on by default in #1183). It is a compile-time \
+                     route, not an env toggle: sgemm_simd always passes use_m1_gemv=true, \
+                     and only the in-process A/B harness passes false to measure the packed \
+                     path it replaced",
         graduation: Graduation::MlasBaseline,
     },
     PlanEntry {
@@ -958,6 +960,80 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Every environment variable the ledger's prose names must still be read
+    /// somewhere in this crate's sources.
+    ///
+    /// This exists because it caught a real defect in this file. The
+    /// `MatMulF32` entry advertised `ONNX_GENAI_CPU_MM_SIMD_M1_GEMV
+    /// (default off)` long after #1183 had shipped that route on by default and
+    /// deleted the probe, so the ledger — whose entire purpose is to describe
+    /// where dispatch actually goes — was describing a knob that did not exist.
+    /// `docs/performance/CPU_MATMUL_ASSIGNMENT.md` had recorded the correct
+    /// fact the whole time; nothing compared the two.
+    ///
+    /// Prose cannot be type-checked, so this is the cheapest available
+    /// falsifier: it does not verify that the description is *right*, only that
+    /// the knob it names is still real. That is the half that goes stale
+    /// silently.
+    #[test]
+    fn ledger_prose_only_names_environment_variables_that_still_exist() {
+        let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources = String::new();
+        collect_rust_sources(&source_root, &mut sources);
+        assert!(
+            sources.len() > 10_000,
+            "expected to have read the crate sources, got {} bytes -- if the \
+             layout moved, fix this test rather than deleting it",
+            sources.len()
+        );
+
+        for entry in PLAN {
+            for text in [entry.dtypes, entry.isa, entry.threads, entry.shape_gate] {
+                for name in environment_variable_names(text) {
+                    let quoted = format!("\"{name}\"");
+                    assert!(
+                        sources.contains(&quoted),
+                        "{}: ledger prose names environment variable `{name}`, but no \
+                         source file in this crate contains the literal {quoted}. Either \
+                         the variable was removed (update the prose) or it moved crates \
+                         (widen this test deliberately).",
+                        entry.family
+                    );
+                }
+            }
+        }
+    }
+
+    /// Concatenate every `.rs` file under `dir`, recursively.
+    fn collect_rust_sources(dir: &std::path::Path, out: &mut String) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rust_sources(&path, out);
+                continue;
+            }
+            if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+            }
+        }
+    }
+
+    /// Pull `SHOUTY_SNAKE_CASE` tokens that look like environment variables out
+    /// of prose. Restricted to the two prefixes the EP actually uses so that
+    /// ordinary shouty words (ISA names like `AVX2`, `NEON`) are not mistaken
+    /// for knobs.
+    fn environment_variable_names(text: &str) -> Vec<String> {
+        text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|token| {
+                (token.starts_with("NXRT_") || token.starts_with("ONNX_GENAI_")) && token.len() > 5
+            })
+            .map(str::to_owned)
+            .collect()
     }
 
     #[test]
