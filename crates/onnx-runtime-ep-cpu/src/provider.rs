@@ -452,6 +452,13 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "TensorScatter"
+            && op.domain.is_empty()
+            && let Some(reason) =
+                crate::kernels::tensor_scatter::tensor_scatter_unsupported_reason(input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         // Attribute-level capability limits for the attention and MoE family.
         //
         // Every one of these mirrors a rejection its kernel factory raises, and
