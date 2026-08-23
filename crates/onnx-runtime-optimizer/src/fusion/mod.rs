@@ -1296,36 +1296,45 @@ fn read_scalar_f32(graph: &Graph, value: ValueId) -> Option<f32> {
     }
 }
 
-/// Read an int64 vector from an inline int64 initializer, if `value` is backed
-/// by one. Used to resolve the opset-24 `axes`-as-input of a `ReduceMean` (the
-/// axis moved from an attribute to an input in opset 18).
-/// Resolve a 1-D int64 axes vector for the value `value`, whether it is an
-/// inline initializer or is still produced by a `Constant` node (the fusion pass
-/// may run before `ConstantFolding` materializes it — see the module-level pass
-/// order). Returns `None` for a non-int64 dtype, a byte length that is not a
-/// whole number of int64 elements, or a higher-than-1-D (malformed) axes tensor.
+/// Resolve a 1-D int64 `axes` vector for the value `value`. Supports an inline
+/// int64 initializer and a not-yet-folded standard-domain `Constant` producer
+/// (the fusion pass may run before `ConstantFolding` materializes it — see the
+/// module-level pass order), covering both the `value` tensor and the
+/// `value_ints` attribute spellings. Any malformed encoding (non-int64 dtype,
+/// non-whole int64 byte length, wrong rank, dims/data mismatch, or a
+/// non-standard-domain `Constant`) yields `None` so the caller declines rather
+/// than mis-reading the axes.
 fn read_i64_vector(graph: &Graph, value: ValueId) -> Option<Vec<i64>> {
     if let Some(WeightRef::Inline(tensor)) = graph.initializers.get(&value) {
         return i64_axes_from_tensor(tensor);
     }
-    // Fall back to a not-yet-folded `Constant` producer.
+    // A not-yet-folded `Constant` producer must be a standard-domain op.
     let producer = graph.value(value).producer?;
     let node = graph.node(producer);
-    if node.op_type == "Constant"
-        && let Some(Attribute::Tensor(tensor)) = node.attr("value")
-    {
+    if node.op_type != "Constant" || !(node.domain.is_empty() || node.domain == "ai.onnx") {
+        return None;
+    }
+    if let Some(Attribute::Tensor(tensor)) = node.attr("value") {
         return i64_axes_from_tensor(tensor);
+    }
+    // `Constant(value_ints=...)` carries an inherently 1-D int64 list.
+    if let Some(ints) = node.attr("value_ints").and_then(Attribute::as_ints) {
+        return Some(ints.to_vec());
     }
     None
 }
 
-/// Decode a 1-D int64 axes tensor, rejecting a non-int64 dtype, a byte length
-/// that is not a whole number of int64 elements, or a rank > 1 buffer.
+/// Decode a strictly 1-D int64 `axes` tensor. Rejects a non-int64 dtype, a byte
+/// length that is not a whole number of int64 elements, a rank other than 1, or
+/// dims inconsistent with the element count. A rank-0 scalar is intentionally
+/// declined: its raw-byte equivalence to a rank-1 `[axis]` is ambiguous, so the
+/// fusion declines rather than guess.
 fn i64_axes_from_tensor(tensor: &TensorData) -> Option<Vec<i64>> {
-    if tensor.dtype != DataType::Int64
-        || !tensor.data.len().is_multiple_of(8)
-        || tensor.dims.len() > 1
-    {
+    if tensor.dtype != DataType::Int64 || !tensor.data.len().is_multiple_of(8) {
+        return None;
+    }
+    let numel = tensor.data.len() / 8;
+    if tensor.dims.len() != 1 || tensor.dims[0] != numel {
         return None;
     }
     tensor

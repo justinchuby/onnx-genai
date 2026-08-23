@@ -703,6 +703,118 @@ fn fuses_layernorm_when_axes_is_unfolded_constant_node() {
         0,
         "both ReduceMean ops must fuse away"
     );
+    assert!(
+        g.validate().is_ok(),
+        "graph must remain valid after fusing Constant-node axes"
+    );
+}
+
+#[test]
+fn i64_axes_decoder_rejects_malformed_tensors() {
+    let bytes = |vals: &[i64]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    // Valid rank-1 int64 axes decode.
+    assert_eq!(
+        i64_axes_from_tensor(&TensorData::from_raw(
+            DataType::Int64,
+            vec![1],
+            bytes(&[-1])
+        )),
+        Some(vec![-1])
+    );
+    assert_eq!(
+        i64_axes_from_tensor(&TensorData::from_raw(
+            DataType::Int64,
+            vec![2],
+            bytes(&[0, 1])
+        )),
+        Some(vec![0, 1])
+    );
+    // Non-int64 dtype.
+    assert_eq!(
+        i64_axes_from_tensor(&TensorData::from_raw(
+            DataType::Float32,
+            vec![1],
+            vec![0u8; 4]
+        )),
+        None
+    );
+    // Byte length not a whole number of int64 elements.
+    assert_eq!(
+        i64_axes_from_tensor(&TensorData::from_raw(
+            DataType::Int64,
+            vec![1],
+            vec![0u8; 4]
+        )),
+        None
+    );
+    // Rank-0 scalar is intentionally declined.
+    assert_eq!(
+        i64_axes_from_tensor(&TensorData::from_raw(DataType::Int64, vec![], bytes(&[-1]))),
+        None
+    );
+    // Rank > 1.
+    assert_eq!(
+        i64_axes_from_tensor(&TensorData::from_raw(
+            DataType::Int64,
+            vec![1, 1],
+            bytes(&[-1])
+        )),
+        None
+    );
+    // dims inconsistent with the element count (dims say 2, data holds 1).
+    assert_eq!(
+        i64_axes_from_tensor(&TensorData::from_raw(
+            DataType::Int64,
+            vec![2],
+            bytes(&[-1])
+        )),
+        None
+    );
+}
+
+#[test]
+fn read_i64_vector_constant_producer_rules() {
+    // A non-standard-domain `Constant` producing the axes is rejected.
+    let mut g = Graph::new();
+    let axes = g.create_named_value("axes", DataType::Int64, static_shape([1]));
+    let mut c = Node::new(NodeId(0), "Constant", vec![], vec![axes]);
+    c.domain = "com.microsoft".to_string();
+    c.attributes.insert(
+        "value".into(),
+        Attribute::Tensor(TensorData::from_raw(
+            DataType::Int64,
+            vec![1],
+            (-1i64).to_le_bytes().to_vec(),
+        )),
+    );
+    g.insert_node(c);
+    assert_eq!(
+        read_i64_vector(&g, axes),
+        None,
+        "non-standard Constant must be declined"
+    );
+
+    // A standard-domain `Constant(value_ints=[-1])` is supported.
+    let mut g2 = Graph::new();
+    let axes2 = g2.create_named_value("axes2", DataType::Int64, static_shape([1]));
+    let mut c2 = Node::new(NodeId(0), "Constant", vec![], vec![axes2]);
+    c2.attributes
+        .insert("value_ints".into(), Attribute::Ints(vec![-1]));
+    g2.insert_node(c2);
+    assert_eq!(read_i64_vector(&g2, axes2), Some(vec![-1]));
+
+    // An inline int64 initializer is still supported.
+    let mut g3 = Graph::new();
+    let axes3 = g3.create_named_value("axes3", DataType::Int64, static_shape([1]));
+    g3.set_initializer(
+        axes3,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Int64,
+            vec![1],
+            (-1i64).to_le_bytes().to_vec(),
+        )),
+    );
+    assert_eq!(read_i64_vector(&g3, axes3), Some(vec![-1]));
 }
 
 #[test]
