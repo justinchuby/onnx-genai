@@ -184,10 +184,6 @@ impl Engine {
                 _ => self.generate_with_callbacks(request.request, on_admitted, callback),
             };
         }
-        if let Some(on_admitted) = on_admitted.as_mut() {
-            on_admitted();
-        }
-        let runtime = &*self.workflow;
         // A prompt is text; a workflow input declaring the `prompt_tokens` role
         // wants ids. Encoding it here, with the package's own tokenizer, is
         // what lets `generate("hello")` work on a package whose components the
@@ -196,7 +192,7 @@ impl Engine {
         // the one thing it has the tokenizer for.
         let mut request = request;
         if let crate::config::GeneratePrompt::Text(text) = &request.request.prompt {
-            let tokenizer = runtime.package_tokenizer().context(
+            let tokenizer = self.workflow.package_tokenizer().context(
                 "this package declares a prompt_tokens input but ships no tokenizer, so a text                  prompt cannot be encoded for it; supply token ids instead",
             )?;
             let encoded = tokenizer
@@ -204,11 +200,55 @@ impl Engine {
                 .map_err(|error| anyhow::anyhow!("failed to encode the prompt: {error}"))?;
             request.request.prompt = crate::config::GeneratePrompt::TokenIds(encoded);
         }
+
+        // Admission is the interpreter's too.
+        //
+        // #1723 routed every package without a fused decode core through this
+        // drive, and this drive ran the declared components without ever asking
+        // the scheduler. Two things followed: the KV byte budget stopped
+        // applying to those packages at all, so an over-budget request did its
+        // work and then failed somewhere downstream for an unrelated reason;
+        // and `on_admitted` fired unconditionally, so a caller counting
+        // admissions counted requests that nothing had admitted.
+        //
+        // This sits *after* the prompt is encoded so the scheduler sizes the
+        // request it is actually going to run, and *before* any component is
+        // invoked, which is the ordering the guarantee is about.
+        let scheduler_seq = request
+            .session_id
+            .as_deref()
+            .and_then(|id| id.parse::<crate::config::SessionId>().ok())
+            .unwrap_or(0);
+        let prompt_tokens = match &request.request.prompt {
+            crate::config::GeneratePrompt::TokenIds(ids) => ids.len(),
+            crate::config::GeneratePrompt::TokenRows(rows) => {
+                rows.iter().map(Vec::len).max().unwrap_or(0)
+            }
+            crate::config::GeneratePrompt::Text(_) => 0,
+        };
+        let scheduled = self.admit_generate_request_with_scheduler(
+            scheduler_seq,
+            prompt_tokens,
+            request.request.options.max_new_tokens,
+            crate::engine::Priority::Normal,
+        )?;
+        request.request.options.max_new_tokens = scheduled.max_tokens;
+        if let Some(on_admitted) = on_admitted.as_mut() {
+            on_admitted();
+        }
+
         let options = request.request.options.clone();
+        let runtime = &*self.workflow;
         let tokenizer = runtime.package_tokenizer();
-        crate::pipeline::generation::run_declared_generation(
+        let result = crate::pipeline::generation::run_declared_generation(
             runtime, &options, tokenizer, request, None, callback,
-        )
+        );
+        // Releases the sequence's hot-tier reservation. Without it the budget
+        // and the running-batch slot leak on every interpreted request, and the
+        // second request on a tight budget is refused because the first never
+        // let go.
+        self.scheduler.complete(scheduler_seq);
+        result
     }
 
     /// Encode a workflow's declared buffered-PCM16 audio output for serving.

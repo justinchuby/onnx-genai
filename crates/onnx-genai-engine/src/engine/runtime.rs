@@ -276,7 +276,7 @@ fn native_workspace_query_rows(
 }
 
 impl Engine {
-    fn admit_generate_request_with_scheduler(
+    pub(crate) fn admit_generate_request_with_scheduler(
         &mut self,
         session_id: SessionId,
         prompt_tokens: usize,
@@ -2730,9 +2730,14 @@ mod tests {
         assert_eq!(native_workspace_query_rows(3, None, 8, None), 3);
     }
 
+    /// An engine whose package the interpreter drives.
+    ///
+    /// No fused decode core, so `holds_decode_core()` is false and generation
+    /// takes the interpreted path — the one #1723 introduced and left without
+    /// scheduler admission. `budget_bytes` is the scheduler's whole KV byte
+    /// budget, which is what decides whether a request is admitted at all.
     #[cfg(feature = "native-backend")]
-    #[test]
-    fn native_generate_rejects_over_kv_byte_budget_before_backend_run() -> anyhow::Result<()> {
+    fn interpreted_engine_with_byte_budget(budget_bytes: u64) -> anyhow::Result<Engine> {
         let tokenizer_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm/tokenizer.json")
             .canonicalize()?;
@@ -2748,7 +2753,7 @@ mod tests {
             ModelKvConfig::known(10, 1),
             0,
         )?;
-        let mut engine = Engine {
+        Ok(Engine {
             workflow: Box::new(crate::pipeline::generation::test_decoder_runtime()?),
             workflow_sessions: HashMap::new(),
             workflow_session_counter: 0,
@@ -2762,7 +2767,7 @@ mod tests {
             decode_path: ModelDecodePath::Generic,
             scheduler: Scheduler::with_byte_budget(
                 scheduler_config,
-                onnx_genai_scheduler::ByteBudget::new(10),
+                onnx_genai_scheduler::ByteBudget::new(budget_bytes),
             ),
             governor,
             sessions: HashMap::new(),
@@ -2787,7 +2792,13 @@ mod tests {
             last_speculative_stats: SpeculativeStats::default(),
             connector: ConnectorBridge::null(),
             _environment: None,
-        };
+        })
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_generate_rejects_over_kv_byte_budget_before_backend_run() -> anyhow::Result<()> {
+        let mut engine = interpreted_engine_with_byte_budget(10)?;
         let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![1]));
         request.options.max_new_tokens = 1;
         request.options.stop_on_eos = false;
@@ -2808,6 +2819,53 @@ mod tests {
             "native backend was touched before scheduler admission rejected: {error}"
         );
         assert!(!admitted, "refused requests must not signal admission");
+        Ok(())
+    }
+
+    /// The positive half of #1891, which the rejection test above cannot reach.
+    ///
+    /// A rejection test can pass on an engine that never admits anything --
+    /// including the pre-fix engine, whose interpreted path had no admission
+    /// wired in at all and simply fired `on_admitted()` unconditionally. This
+    /// asserts the two facts that distinguish a real admission from no
+    /// admission: the callback fires only *after* the scheduler accepted the
+    /// request, and the reservation it took is handed back afterwards.
+    ///
+    /// The fixture cannot finish a generation (the interpreted decoder wants a
+    /// KV value no component produces), so the observable is scheduler state,
+    /// not success. `complete()` runs on the error path too, which is the point
+    /// -- a request that admits and then fails must not leak its bytes or its
+    /// running-batch slot.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn admitted_interpreted_request_signals_admission_and_releases_its_reservation()
+    -> anyhow::Result<()> {
+        let mut engine = interpreted_engine_with_byte_budget(1 << 20)?;
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![1]));
+        request.options.max_new_tokens = 1;
+        request.options.stop_on_eos = false;
+
+        let mut admitted = false;
+        let mut on_admitted = || admitted = true;
+        let outcome = engine.generate_with_callbacks(request, Some(&mut on_admitted), None);
+
+        if let Err(error) = &outcome {
+            let error = error.to_string();
+            assert!(
+                !error.contains("scheduler admission failed"),
+                "a generous budget must admit; instead: {error}"
+            );
+        }
+        assert!(
+            admitted,
+            "admission callback must fire once the scheduler accepts the request"
+        );
+        assert_eq!(
+            engine.scheduler.running_count(),
+            0,
+            "the admitted request's scheduler slot must be released once it finishes, \
+             success or failure"
+        );
         Ok(())
     }
 
