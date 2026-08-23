@@ -35,7 +35,7 @@ use onnx_runtime_memory_governor::{AllocationReleaseState, Tier, VirtualBacking}
 use crate::deferred_release::{
     CudaDeferredReleaseQueue, DeferredActionOutcome, DeferredReleaseAction, RetainedOwnership,
 };
-use crate::pinned_pool::PinnedStagingPool;
+use crate::pinned_pool::{PinnedStagingPool, PooledStaging};
 use crate::runtime::{CopyCompleted, CudaRuntime, FailedHtodCompletion, PinnedStaging, raw_ptr};
 
 /// Alignment for stable-VA weight slots (issue #716). The VMM arena rounds
@@ -139,6 +139,35 @@ static GLOBAL_HOST_REGISTERED_BYTES: AtomicU64 = AtomicU64::new(0);
 // bind, not per read). This is the per-step host-mapped read footprint, which
 // the safety budget caps — see `ZERO_COPY_SAFE_BUDGET_BYTES`.
 static GLOBAL_ZERO_COPY_BOUND_BYTES: AtomicU64 = AtomicU64::new(0);
+// `BlockQuantizedMoE` prefill ahead-of-need prefetch (issue #82 cycle 7). A
+// prefetch that is issued but never promoted (a different key was already
+// pending, or it lost a race) still adds to `GLOBAL_HTOD_BYTES` -- real DMA
+// bytes were streamed either way -- but never touches `GLOBAL_PAGE_INS`
+// (content only becomes resident on promotion). These counters are the only
+// additional observability this feature needs and are what its tests assert
+// against.
+static GLOBAL_PREFETCH_ISSUED: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_PREFETCH_ISSUED_BYTES: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_PREFETCH_PROMOTED: AtomicU64 = AtomicU64::new(0);
+// Host time spent in `resolve_prefetch_fence` during promotion: zero when the
+// intervening compute fully hid the transfer, and the whole remaining DMA time
+// otherwise. This is the direct measurement of whether overlap actually
+// happened, not an assumption that prefetching helps.
+static GLOBAL_PREFETCH_PROMOTE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_PREFETCH_DECLINED_BUDGET: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_PREFETCH_DECLINED_BUSY: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_PREFETCH_DECLINED_UNSUPPORTED: AtomicU64 = AtomicU64::new(0);
+// The requested key is already resident -- correct steady state once a
+// pipeline has cycled through every layer once; not an error, just nothing
+// left to do.
+static GLOBAL_PREFETCH_DECLINED_RESIDENT: AtomicU64 = AtomicU64::new(0);
+// The shared pinned staging pool cannot retain two concurrently-live buffers
+// of this boundary's byte size (see `PinnedStagingPool::can_retain_concurrent`)
+// -- issuing the prefetch anyway would evict one on every steady-state cycle
+// and pay a fresh `cuMemHostAlloc`/`cuMemFreeHost` pair per turn, potentially
+// costing more than the transfer it hides. Declined up front instead of
+// discovered as a regression.
+static GLOBAL_PREFETCH_DECLINED_POOL_CAPACITY: AtomicU64 = AtomicU64::new(0);
 
 fn add_duration(counter: &AtomicU64, elapsed: Duration) {
     let nanos = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
@@ -253,6 +282,41 @@ pub struct GlobalOffloadStats {
     pub zero_copy_bytes: u64,
     /// Page-locked host RAM claimed by zero-copy registrations (a live gauge).
     pub host_registered_bytes: u64,
+    /// `BlockQuantizedMoE` ahead-of-need prefetches actually started (issue
+    /// #82 cycle 7). Zero means the executor never named a `BlockQuantizedMoE`
+    /// boundary as a look-ahead candidate, or every attempt was declined --
+    /// see the `prefetch_declined_*` fields to distinguish those.
+    pub prefetch_issued: u64,
+    /// Bytes covered by [`Self::prefetch_issued`] transfers.
+    pub prefetch_issued_bytes: u64,
+    /// Prefetches promoted into the resident set by a later
+    /// [`CudaWeightResidency::resident_mapped`]/[`CudaWeightResidency::resident`]
+    /// call for the same key -- i.e. actually used before being discarded.
+    pub prefetch_promoted: u64,
+    /// Host time blocked in fence resolution during promotion. Zero (or near
+    /// it) means the transfer was fully hidden behind intervening compute;
+    /// close to the full transfer time means the prefetch was issued too late
+    /// (or too close) to overlap anything.
+    pub prefetch_promote_wait_ns: u64,
+    /// Prefetch attempts declined because admitting the bytes would require
+    /// evicting a resident page (the core "never evict to prefetch" gate).
+    pub prefetch_declined_budget: u64,
+    /// Prefetch attempts declined because the single `pending_prefetch` slot
+    /// already held a different (or the same) in-flight key.
+    pub prefetch_declined_busy: u64,
+    /// Prefetch attempts declined because VMM stable-VA admission or the
+    /// zero-copy hybrid is installed (out of scope for this increment).
+    pub prefetch_declined_unsupported: u64,
+    /// Prefetch attempts declined because the requested key was already
+    /// resident. The correct steady state once a pipeline has already cycled
+    /// through every layer once -- not an error.
+    pub prefetch_declined_resident: u64,
+    /// Prefetch attempts declined because the shared pinned staging pool
+    /// cannot retain two concurrently-live buffers of this boundary's byte
+    /// size (see `PinnedStagingPool::can_retain_concurrent`). Issuing anyway
+    /// would evict one on every steady-state cycle and pay a fresh
+    /// `cuMemHostAlloc`/`cuMemFreeHost` pair per turn.
+    pub prefetch_declined_pool_capacity: u64,
 }
 
 impl GlobalOffloadStats {
@@ -337,6 +401,16 @@ pub fn global_offload_stats() -> GlobalOffloadStats {
         zero_copy_reads: GLOBAL_ZERO_COPY_READS.load(Ordering::Relaxed),
         zero_copy_bytes: GLOBAL_ZERO_COPY_BYTES.load(Ordering::Relaxed),
         host_registered_bytes: GLOBAL_HOST_REGISTERED_BYTES.load(Ordering::Relaxed),
+        prefetch_issued: GLOBAL_PREFETCH_ISSUED.load(Ordering::Relaxed),
+        prefetch_issued_bytes: GLOBAL_PREFETCH_ISSUED_BYTES.load(Ordering::Relaxed),
+        prefetch_promoted: GLOBAL_PREFETCH_PROMOTED.load(Ordering::Relaxed),
+        prefetch_promote_wait_ns: GLOBAL_PREFETCH_PROMOTE_WAIT_NS.load(Ordering::Relaxed),
+        prefetch_declined_budget: GLOBAL_PREFETCH_DECLINED_BUDGET.load(Ordering::Relaxed),
+        prefetch_declined_busy: GLOBAL_PREFETCH_DECLINED_BUSY.load(Ordering::Relaxed),
+        prefetch_declined_unsupported: GLOBAL_PREFETCH_DECLINED_UNSUPPORTED.load(Ordering::Relaxed),
+        prefetch_declined_resident: GLOBAL_PREFETCH_DECLINED_RESIDENT.load(Ordering::Relaxed),
+        prefetch_declined_pool_capacity: GLOBAL_PREFETCH_DECLINED_POOL_CAPACITY
+            .load(Ordering::Relaxed),
     }
 }
 
@@ -370,6 +444,15 @@ pub fn reset_global_offload_stats() {
     // window reset), so they are preserved exactly like the residency gauges.
     GLOBAL_ZERO_COPY_READS.store(0, Ordering::Relaxed);
     GLOBAL_ZERO_COPY_BYTES.store(0, Ordering::Relaxed);
+    GLOBAL_PREFETCH_ISSUED.store(0, Ordering::Relaxed);
+    GLOBAL_PREFETCH_ISSUED_BYTES.store(0, Ordering::Relaxed);
+    GLOBAL_PREFETCH_PROMOTED.store(0, Ordering::Relaxed);
+    GLOBAL_PREFETCH_PROMOTE_WAIT_NS.store(0, Ordering::Relaxed);
+    GLOBAL_PREFETCH_DECLINED_BUDGET.store(0, Ordering::Relaxed);
+    GLOBAL_PREFETCH_DECLINED_BUSY.store(0, Ordering::Relaxed);
+    GLOBAL_PREFETCH_DECLINED_UNSUPPORTED.store(0, Ordering::Relaxed);
+    GLOBAL_PREFETCH_DECLINED_RESIDENT.store(0, Ordering::Relaxed);
+    GLOBAL_PREFETCH_DECLINED_POOL_CAPACITY.store(0, Ordering::Relaxed);
     reset_key_trace();
     crate::pinned_pool::reset_pinned_pool_counters();
 }
@@ -1332,6 +1415,47 @@ pub struct CudaResidencyStats {
     /// Admission passes that stopped because eviction made no physical or
     /// reusable-pool progress.
     pub admission_no_progress: u64,
+    /// This residency's own ahead-of-need `BlockQuantizedMoE` prefetch
+    /// attempts that were issued (H2D copy enqueued on the copy stream),
+    /// whether or not they were later promoted. Scoped to this instance, so
+    /// unlike `global_offload_stats()` it is safe to assert exactly even when
+    /// other tests run in parallel in the same process.
+    pub prefetch_issued: u64,
+    /// Bytes across every `prefetch_issued` attempt.
+    pub prefetch_issued_bytes: u64,
+    /// Pending prefetches this instance promoted into the resident set (each
+    /// promotion also counts toward `page_ins`, via the same [`Self::admit`]
+    /// path an on-demand page-in uses).
+    pub prefetch_promoted: u64,
+    /// Total host time spent in `resolve_prefetch_fence` across every
+    /// promotion on this instance: near-zero means the transfer was fully
+    /// hidden behind intervening compute.
+    pub prefetch_promote_wait_ns: u64,
+    /// Prefetch attempts this instance declined because admitting the bytes
+    /// would require evicting a resident page.
+    pub prefetch_declined_budget: u64,
+    /// Prefetch attempts this instance declined because the single pending
+    /// slot already held a different (or the same) in-flight key.
+    pub prefetch_declined_busy: u64,
+    /// Prefetch attempts this instance declined because VMM stable-VA
+    /// admission or the zero-copy hybrid is installed.
+    pub prefetch_declined_unsupported: u64,
+    /// Prefetch attempts this instance declined because the requested key was
+    /// already resident.
+    pub prefetch_declined_resident: u64,
+    /// Prefetch attempts this instance declined because the shared pinned
+    /// staging pool cannot retain two concurrently-live buffers of this
+    /// boundary's byte size.
+    pub prefetch_declined_pool_capacity: u64,
+    /// This instance's [`PinnedStagingPool::alloc_calls`] (real
+    /// `cuMemHostAlloc` page-locks), scoped to this residency so tests can
+    /// assert exact counts under parallel execution the same way
+    /// `prefetch_issued`/etc. do -- the process-global
+    /// `crate::pinned_pool::global_pinned_alloc_calls()` is shared across
+    /// every residency in the binary.
+    pub pinned_pool_alloc_calls: u64,
+    /// This instance's [`PinnedStagingPool::reuses`].
+    pub pinned_pool_reuses: u64,
 }
 
 /// A live VRAM residency page for one offloaded weight tensor.
@@ -2752,6 +2876,62 @@ struct ResidencyInner {
     /// device copy captured on admission, compared against on every later hit to
     /// detect retained-page staleness.
     pin_granule_hashes: HashMap<u64, Vec<u64>>,
+    /// At most one in-flight ahead-of-need `BlockQuantizedMoE` prefill prefetch
+    /// (issue #82). A single slot matches the "provably known next boundary"
+    /// invariant: the executor's look-ahead only ever names *one* upcoming
+    /// node's lazy weight at a time, so there is never more than one legitimate
+    /// candidate in flight, and no second admission/eviction authority is
+    /// needed to arbitrate between several.
+    pending_prefetch: Option<PendingPrefetch>,
+    /// Per-instance mirror of the `GLOBAL_PREFETCH_*` process counters (issue
+    /// #82 cycle 7). The global atomics are shared across every residency in
+    /// the process, so they can only be asserted with `>=` in a test binary
+    /// that runs tests in parallel; these fields are scoped to one
+    /// [`CudaWeightResidency`], so tests can assert exact counts the same way
+    /// `page_ins`/`hits`/`evictions` already do.
+    prefetch_stats: PrefetchStats,
+}
+
+/// Per-residency-instance prefetch activity, exposed read-only via
+/// [`CudaResidencyStats`]. See [`ResidencyInner::prefetch_stats`] for why this
+/// exists alongside the process-global counters.
+#[derive(Debug, Default, Clone, Copy)]
+struct PrefetchStats {
+    issued: u64,
+    issued_bytes: u64,
+    promoted: u64,
+    promote_wait_ns: u64,
+    declined_budget: u64,
+    declined_busy: u64,
+    declined_unsupported: u64,
+    declined_resident: u64,
+    declined_pool_capacity: u64,
+}
+
+/// An asynchronously-started `BlockQuantizedMoE` weight page-in that has not
+/// yet been promoted into [`ResidencyInner::pages`].
+///
+/// The destination page's device bytes are not yet valid — the transfer named
+/// by `fence_id` may still be in flight on the copy stream — until a consumer
+/// resolves the fence (see [`CudaWeightResidency::promote_pending_prefetch`]).
+/// Until that happens the page must never be handed to a kernel, counted as
+/// resident, or considered for eviction.
+struct PendingPrefetch {
+    key: u64,
+    page: Arc<CudaWeightPage>,
+    /// A [`CudaRuntime::record_copy_fence`] id naming the transfer's
+    /// completion event on the copy stream.
+    fence_id: u64,
+    /// The pinned staging buffer backing the transfer, drawn from the same
+    /// [`PinnedStagingPool`] every on-demand page-in uses (not a dedicated
+    /// `cuMemHostAlloc`/`cuMemFreeHost` pair per prefetch — that would
+    /// recreate issue #837's exact steady-state cost for this path). Returned
+    /// to the pool via [`PooledStaging::retire`] once
+    /// [`CudaRuntime::resolve_prefetch_fence`] mints the
+    /// [`crate::runtime::CopyCompleted`] witness proving the transfer's read
+    /// of it complete.
+    staging: PooledStaging,
+    bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3114,6 +3294,8 @@ impl CudaWeightResidency {
                 pinned_bytes: 0,
                 pin_hit_step: HashMap::new(),
                 pin_granule_hashes: HashMap::new(),
+                pending_prefetch: None,
+                prefetch_stats: PrefetchStats::default(),
             }),
             routed_guards_active: AtomicU64::new(0),
         }
@@ -3177,6 +3359,8 @@ impl CudaWeightResidency {
                 pinned_bytes: 0,
                 pin_hit_step: HashMap::new(),
                 pin_granule_hashes: HashMap::new(),
+                pending_prefetch: None,
+                prefetch_stats: PrefetchStats::default(),
             }),
             routed_guards_active: AtomicU64::new(0),
         })
@@ -3708,6 +3892,284 @@ impl CudaWeightResidency {
             })
     }
 
+    /// Ahead-of-need `BlockQuantizedMoE` prefill prefetch (issue #82 cycle 7):
+    /// start copying `key`'s device page before the node that needs it
+    /// actually dispatches.
+    ///
+    /// Called from the executor's generic look-ahead
+    /// (`prefetch_lazy_weights_after`), strictly before the dispatch that will
+    /// call [`Self::resident_mapped`] (or [`Self::resident`]) for the same
+    /// `key`. Returns `Ok(true)` only when a transfer was genuinely started
+    /// asynchronously; the caller uses that to attribute a launch gap to
+    /// prefetch overlap. `Ok(false)` always means "no transfer started,
+    /// on-demand paging will run at its normal rate" -- never an error, and
+    /// indistinguishable from this method not existing, which is what keeps
+    /// every dense/`QMoE` boundary's behaviour byte-for-byte unchanged.
+    ///
+    /// Declines whenever the invariant this increment can prove is not met
+    /// (see the overlap invariant documented on [`PendingPrefetch`]):
+    /// - `weight.boundary != BlockQuantizedMoe` -- out of scope for this
+    ///   cycle; dense/`QMoE` weights are untouched.
+    /// - VMM stable-VA admission or the zero-copy hybrid is installed -- both
+    ///   have their own admission/eviction state machines this increment does
+    ///   not touch or duplicate.
+    /// - `key` is already resident (nothing to prefetch), or a prefetch is
+    ///   already in flight for `key` or for a different key -- the single
+    ///   `pending_prefetch` slot is the entire "one provably-known next
+    ///   boundary" safety story; see [`PendingPrefetch`].
+    /// - `!can_fit(bytes)` -- never evict a resident page to make room for a
+    ///   prefetch: the page a prefetch would have to evict may be the very one
+    ///   an in-flight kernel is reading right now.
+    pub fn prefetch_block_quantized_moe(
+        &self,
+        key: u64,
+        weight: &LazyWeight,
+        source: &dyn MmapRegionSource,
+    ) -> Result<bool, WeightHandleError> {
+        if weight.boundary != LazyWeightBoundary::BlockQuantizedMoe {
+            return Ok(false);
+        }
+        if self.physical.get().is_some() || self.zero_copy_hybrid {
+            GLOBAL_PREFETCH_DECLINED_UNSUPPORTED.fetch_add(1, Ordering::Relaxed);
+            self.lock().prefetch_stats.declined_unsupported += 1;
+            return Ok(false);
+        }
+        let bytes = weight.region_bytes_len() as u64;
+        if bytes == 0 {
+            return Ok(false);
+        }
+        {
+            let mut inner = self.lock();
+            if inner.pages.contains_key(&key) {
+                GLOBAL_PREFETCH_DECLINED_RESIDENT.fetch_add(1, Ordering::Relaxed);
+                inner.prefetch_stats.declined_resident += 1;
+                return Ok(false);
+            }
+            if inner.pending_prefetch.is_some() {
+                // Either this exact key is already being prefetched (nothing
+                // further to do) or a different one is in flight -- the
+                // single-slot invariant means a second candidate cannot
+                // preempt or queue behind the first, so both cases decline
+                // identically.
+                GLOBAL_PREFETCH_DECLINED_BUSY.fetch_add(1, Ordering::Relaxed);
+                inner.prefetch_stats.declined_busy += 1;
+                return Ok(false);
+            }
+            if !inner.policy.can_fit(bytes) {
+                GLOBAL_PREFETCH_DECLINED_BUDGET.fetch_add(1, Ordering::Relaxed);
+                inner.prefetch_stats.declined_budget += 1;
+                return Ok(false);
+            }
+        }
+        // Soundness gate (issue #82): a look-ahead prefetch needs the pinned
+        // staging pool to retain *two* concurrently-live buffers of this
+        // boundary's byte size in steady state -- the buffer this call is
+        // about to acquire for `key`, and the buffer the *previous* turn's
+        // promoted prefetch releases moments later (see
+        // `PinnedStagingPool::can_retain_concurrent`'s doc for the exact
+        // call-order argument). If the pool's retention bounds cannot hold
+        // both, every steady-state cycle would evict one on release and pay a
+        // fresh `cuMemHostAlloc`/`cuMemFreeHost` pair -- reintroducing issue
+        // #837's cost for a path meant to avoid it, and potentially costing
+        // more than the transfer this prefetch is trying to hide. Decline up
+        // front rather than land a silently self-defeating "optimization".
+        if !self.staging_pool.can_retain_concurrent(bytes as usize, 2) {
+            let mut inner = self.lock();
+            GLOBAL_PREFETCH_DECLINED_POOL_CAPACITY.fetch_add(1, Ordering::Relaxed);
+            inner.prefetch_stats.declined_pool_capacity += 1;
+            return Ok(false);
+        }
+        // Do the actual work with the lock released: filling the staging
+        // buffer from mmap and enqueuing the H2D copy must not block a
+        // concurrent on-demand page-in for a different key.
+        let mut staging = self
+            .staging_pool
+            .acquire(bytes as usize)
+            .map_err(|error| WeightHandleError::DeviceBinding(format!("pinned alloc: {error}")))?;
+        fill_staging_from_regions(weight, source, staging.staging_mut())?;
+        let ptr = self
+            .runtime
+            .alloc_raw(bytes as usize)
+            .map_err(|error| WeightHandleError::DeviceBinding(format!("VRAM alloc: {error}")))?;
+        let page = Arc::new(CudaWeightPage {
+            runtime: Arc::clone(&self.runtime),
+            queue: self.queue.clone(),
+            allocation: WeightAllocation::Runtime,
+            ptr,
+            len: bytes as usize,
+            dtype: weight.dtype,
+            shape: weight.shape.clone(),
+        });
+        // SAFETY: `ptr` is a fresh `bytes`-byte device allocation `page` now
+        // owns exclusively; `staging` holds exactly `bytes` valid bytes and is
+        // kept alive (stored in `pending_prefetch`, not dropped/released)
+        // until `promote_pending_prefetch` proves the transfer stream's read
+        // of it has completed via `resolve_prefetch_fence` and returns it to
+        // the pool with that witness.
+        if let Err(error) = unsafe { self.runtime.htod_async(staging.as_slice(), ptr) } {
+            // Nothing was published to `pending_prefetch`; `page`'s Drop
+            // returns its VRAM through the deferred-release queue, and
+            // `staging`'s Drop (leak-safe fallback, never reuse-while-in-
+            // flight) frees its pinned host pages -- no accounting needs
+            // undoing.
+            return Err(WeightHandleError::DeviceBinding(format!(
+                "H2D prefetch enqueue: {error}"
+            )));
+        }
+        // Real DMA bytes were enqueued regardless of whether this prefetch is
+        // later promoted or lost a race and is discarded -- `GLOBAL_HTOD_BYTES`
+        // is "bytes actually streamed H2D", and a discarded prefetch still
+        // streamed them (wasted, like a bypassed page-in re-streaming the same
+        // bytes; see `GLOBAL_BYPASSED_PAGE_IN_BYTES`).
+        GLOBAL_HTOD_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        let fence_id = self
+            .runtime
+            .record_copy_fence()
+            .map_err(|error| WeightHandleError::DeviceBinding(format!("record fence: {error}")))?;
+        let mut inner = self.lock();
+        if inner.pages.contains_key(&key) || inner.pending_prefetch.is_some() {
+            // Lost the race to an on-demand page-in (or a different prefetch)
+            // that ran while the lock above was released. Resolve the fence
+            // (minting the completion witness) so returning `staging` to the
+            // pool cannot race the DMA read, then discard everything just
+            // built; there is nothing to admit.
+            drop(inner);
+            match self.runtime.resolve_prefetch_fence(fence_id) {
+                Ok(completed) => staging.retire(completed),
+                Err(error) => {
+                    let (detail, completion) = error.into_parts();
+                    if matches!(completion, FailedHtodCompletion::MayBeInFlight) {
+                        // Neither the fence-specific wait nor the fallback
+                        // copy-stream sync could prove the DMA read of
+                        // `staging` (and write into `page`, discarded here)
+                        // has ended. Quarantine both for process lifetime
+                        // rather than free memory a driver-level transfer
+                        // might still be touching -- the same rule
+                        // `handle_pinned_refill_failure` and
+                        // `upload_staged_async_inner` already apply to this
+                        // exact hazard.
+                        quarantine_in_flight_fill(Box::new((page, staging)));
+                    } else {
+                        // `Completed`: the fallback copy-stream sync proved
+                        // the read ended, so it is safe to let `staging`'s
+                        // ordinary `Drop` free its pinned pages -- this
+                        // doomed attempt never entered the pool's own reuse
+                        // bookkeeping.
+                        eprintln!(
+                            "cuda_ep: note: prefetch fence resolution recovered via a fallback \
+                             copy-stream sync while discarding a lost-race prefetch: {detail}"
+                        );
+                    }
+                }
+            }
+            return Ok(false);
+        }
+        inner.pending_prefetch = Some(PendingPrefetch {
+            key,
+            page,
+            fence_id,
+            staging,
+            bytes,
+        });
+        inner.prefetch_stats.issued += 1;
+        inner.prefetch_stats.issued_bytes += bytes;
+        drop(inner);
+        GLOBAL_PREFETCH_ISSUED.fetch_add(1, Ordering::Relaxed);
+        GLOBAL_PREFETCH_ISSUED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        Ok(true)
+    }
+
+    /// Promote `key`'s pending prefetch (if any) into the resident set:
+    /// resolve its transfer fence (ordering the compute stream after the copy
+    /// and host-verifying the source staging buffer's read is complete), then
+    /// run it through the same [`Self::admit`] every on-demand page-in uses,
+    /// so accounting, eviction bookkeeping, and hit stats are identical
+    /// whichever way the page arrived.
+    ///
+    /// Returns `None` when there is no pending prefetch for `key` (including
+    /// when a *different* key's prefetch is pending -- it is left untouched
+    /// and is promoted when its own key is next requested, or, per
+    /// [`PendingPrefetch`], blocks further prefetch issuance until then: a
+    /// known, documented limitation of the single-slot design, not a
+    /// correctness gap).
+    fn promote_pending_prefetch(
+        &self,
+        key: u64,
+    ) -> Option<Result<Arc<CudaWeightPage>, WeightHandleError>> {
+        let pending = {
+            let mut inner = self.lock();
+            match inner.pending_prefetch.as_ref() {
+                Some(pending) if pending.key == key => inner.pending_prefetch.take(),
+                _ => None,
+            }
+        }?;
+        let wait_start = std::time::Instant::now();
+        let resolved = self.runtime.resolve_prefetch_fence(pending.fence_id);
+        let wait_elapsed = wait_start.elapsed();
+        add_duration(&GLOBAL_PREFETCH_PROMOTE_WAIT_NS, wait_elapsed);
+        let completed = match resolved {
+            Ok(completed) => completed,
+            Err(error) => {
+                let (detail, completion) = error.into_parts();
+                let error =
+                    WeightHandleError::DeviceBinding(format!("resolving prefetch fence: {detail}"));
+                if matches!(completion, FailedHtodCompletion::MayBeInFlight) {
+                    // Neither the fence-specific wait nor the fallback
+                    // copy-stream sync could prove the DMA read of
+                    // `pending.staging` (writing into `pending.page`) has
+                    // ended. Quarantine both for process lifetime instead of
+                    // letting this pending prefetch's ordinary `Drop` free
+                    // memory a transfer might still be touching -- the same
+                    // rule applied to the identical hazard in
+                    // `handle_pinned_refill_failure` and
+                    // `upload_staged_async_inner`.
+                    quarantine_in_flight_fill(Box::new((pending.page, pending.staging)));
+                    return Some(Err(WeightHandleError::DeviceBinding(format!(
+                        "{error}; the pending prefetch's destination page and staging source \
+                         were quarantined because copy-stream completion could not be \
+                         established"
+                    ))));
+                }
+                // `Completed`: the fallback copy-stream sync proved the read
+                // ended, so it is safe to let `pending`'s ordinary `Drop`
+                // (still holding `page`/`staging` at this point) release both
+                // the usual way.
+                return Some(Err(error));
+            }
+        };
+        // Both the destination page and the source staging buffer must agree
+        // with the byte count recorded when the prefetch was issued -- a
+        // mismatch here would mean a short/truncated copy went unnoticed.
+        debug_assert_eq!(
+            pending.bytes,
+            pending.page.len() as u64,
+            "pending prefetch byte count does not match its device allocation"
+        );
+        debug_assert_eq!(
+            pending.bytes,
+            pending.staging.as_slice().len() as u64,
+            "pending prefetch byte count does not match its staging buffer"
+        );
+        // Return the staging buffer to the shared pinned-staging pool now that
+        // `completed` proves the transfer stream's read of it is complete --
+        // the same pool an on-demand page-in draws from, so a steady-state
+        // prefetch pipeline pays the page-lock cost a handful of times, not
+        // once per turn (issue #837's fix, extended to this path).
+        pending.staging.retire(completed);
+        GLOBAL_PREFETCH_PROMOTED.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut inner = self.lock();
+            inner.prefetch_stats.promoted += 1;
+            inner.prefetch_stats.promote_wait_ns +=
+                wait_elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
+        }
+        Some(self.admit(
+            pending.key,
+            pending.page,
+            self.eviction_for(LazyWeightBoundary::BlockQuantizedMoe),
+        ))
+    }
+
     /// Return the device page for `key`, paging it in from `source` on a miss and
     /// evicting LRU pages to respect the budget. The returned [`Arc`] keeps the
     /// page resident for as long as the caller holds it.
@@ -3720,6 +4182,9 @@ impl CudaWeightResidency {
         let _context_operation = self.enter_context_operation()?;
         if let Some(hit) = self.get_hit(key) {
             return Ok(hit);
+        }
+        if let Some(promoted) = self.promote_pending_prefetch(key) {
+            return promoted;
         }
         if self.physical.get().is_some() {
             let resident = weight.materialize()?;
@@ -3792,6 +4257,14 @@ impl CudaWeightResidency {
     ) -> Result<VmmAdmit, WeightHandleError> {
         if let Some(hit) = self.get_hit(key) {
             return Ok(VmmAdmit::Page(hit));
+        }
+        // A look-ahead prefetch (issue #82 cycle 7) may already be holding this
+        // key's device bytes on the transfer stream. Promote it (resolve the
+        // fence, run the normal `admit` accounting) instead of paging in again
+        // -- this is the actual overlap payoff: the compute this dispatch is
+        // about to launch may have to wait on the fence, but never re-copies.
+        if let Some(promoted) = self.promote_pending_prefetch(key) {
+            return promoted.map(VmmAdmit::Page);
         }
         let len = weight.region_bytes_len();
         // Draw a reusable pinned staging buffer from the bounded pool instead of
@@ -5157,6 +5630,17 @@ impl CudaWeightResidency {
             physical_owned_bytes,
             mapped_physical_bytes,
             admission_no_progress: inner.admission_no_progress,
+            prefetch_issued: inner.prefetch_stats.issued,
+            prefetch_issued_bytes: inner.prefetch_stats.issued_bytes,
+            prefetch_promoted: inner.prefetch_stats.promoted,
+            prefetch_promote_wait_ns: inner.prefetch_stats.promote_wait_ns,
+            prefetch_declined_budget: inner.prefetch_stats.declined_budget,
+            prefetch_declined_busy: inner.prefetch_stats.declined_busy,
+            prefetch_declined_unsupported: inner.prefetch_stats.declined_unsupported,
+            prefetch_declined_resident: inner.prefetch_stats.declined_resident,
+            prefetch_declined_pool_capacity: inner.prefetch_stats.declined_pool_capacity,
+            pinned_pool_alloc_calls: self.staging_pool.alloc_calls(),
+            pinned_pool_reuses: self.staging_pool.reuses(),
         }
     }
 
