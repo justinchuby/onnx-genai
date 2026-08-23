@@ -453,7 +453,9 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         | ("LinearAttention", "com.microsoft")
         | ("GatherBlockQuantized", "com.microsoft") => FLOAT_DTYPES,
 
-        ("SimplifiedLayerNormalization", "") | ("LinearAttention", "") => FLOAT_DTYPES,
+        ("SimplifiedLayerNormalization", "")
+        | ("LinearAttention", "")
+        | ("CausalConvWithState", "") => FLOAT_DTYPES,
 
         ("MatMulNBits", "com.microsoft") => MATMUL_NBITS_DTYPES,
         // `moe.rs` widens f16/bf16 to f32, computes, and narrows on the way
@@ -1071,6 +1073,14 @@ fn build_cpu_registry_recorded_inner(
     // Qwen3-Next. Shape-driven and gate-configurable (no model-specific dims).
     rec.register(
         OpKey::new("CausalConvWithState", "com.microsoft", 1),
+        Box::new(causal_conv::CausalConvWithStateFactory),
+    );
+    // Standard ONNX-domain spelling, opset 27. Same contract as the contrib op
+    // (rank-3 `[B, C, L]`, depthwise `[C, 1, k]` weight, `k-1` carry state,
+    // `none`/`silu`/`swish` activation), so it reuses the same kernel rather
+    // than growing a second implementation to keep in step.
+    rec.register(
+        OpKey::new("CausalConvWithState", "", 27),
         Box::new(causal_conv::CausalConvWithStateFactory),
     );
     rec.register(
@@ -2525,9 +2535,11 @@ mod tests {
         // Conv is always registered, using the pure-Rust reference kernel without
         // `mlas` and the optimized implementation with it.
         // `IsNaN` (opset-9 float NaN predicate) adds one default-domain entry.
-        // `TensorScatter` (opset-24 KV-cache update) adds one more.
+        // `TensorScatter` (opset-24 KV-cache update) adds one more, and the
+        // standard-domain `CausalConvWithState` (opset 27) adds one alongside
+        // its `com.microsoft` spelling.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 103 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 104 + mlas_registrations);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
