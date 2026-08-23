@@ -30,9 +30,16 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: onnxruntime/mobius
-          # Exact producer revision from Mobius PR #537. Keep CI reproducible
-          # until that commit is reachable from the upstream default branch.
-          ref: f0e2acfd56b2b62d1e04be15a6cb54bddf24e08a
+          # Exact producer revision reachable from the Mobius default branch.
+          # Must be >= Mobius PR #545 (96036366), which makes the pixel-flow
+          # `request.latent` seed-drawable (`required: false` with a
+          # `standard_normal` seed fallback). The previous pin
+          # (f0e2acfd..., pre-#545) emitted `request.latent` as required with no
+          # seed producer, so the conformance suite failed with
+          # "required workflow package input 'request.latent' was not supplied".
+          # The assertion step below fails loudly if this pin ever regresses to
+          # the pre-#545 shape.
+          ref: 4f7e5c84c1ca27653d1bb961012ec2ef830cb81b
           path: validation/mobius
       - uses: actions/setup-python@v5
         with:
@@ -71,6 +78,39 @@ jobs:
                       yaml.safe_dump(document, sort_keys=False),
                       encoding="utf-8",
                   )
+          PY
+      - name: Assert pixel-flow latent stays seed-drawable
+        # Regression guard for the pre-#545 producer shape. The pinned Mobius
+        # producer must emit `request.latent` as seed-drawable (not required),
+        # otherwise the conformance suite fails with
+        # "required workflow package input 'request.latent' was not supplied".
+        # This step fails deterministically under the CI-broken metadata shape,
+        # before the (heavier) conformance test runs.
+        run: |
+          python - <<'PY'
+          import sys
+          from pathlib import Path
+
+          import yaml
+
+          path = Path("validation/generated/shared_state_pixel_flow/inference_metadata.yaml")
+          document = yaml.safe_load(path.read_text(encoding="utf-8"))
+          inputs = (
+              document.get("pipeline", {})
+              .get("workflow", {})
+              .get("inputs", {})
+          )
+          latent = inputs.get("request.latent")
+          if latent is None:
+              sys.exit("shared_state_pixel_flow is missing the request.latent input")
+          # `required` defaults to True when omitted; the pre-#545 producer
+          # emitted it as required with no seed fallback, which broke CI.
+          if latent.get("required", True):
+              sys.exit(
+                  "request.latent must be seed-drawable (required: false); the "
+                  "pinned Mobius producer regressed to the pre-#545 required shape"
+              )
+          print("request.latent is seed-drawable (required: false) as expected")
           PY
       - name: Validate package semantics
         run: |
