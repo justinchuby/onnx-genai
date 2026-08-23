@@ -228,11 +228,37 @@ fn cache_dir() -> Option<&'static Path> {
     .as_deref()
 }
 
+/// The platform's per-user cache root.
+///
+/// `XDG_CACHE_HOME` and `HOME` are the Unix answer, and they are the only ones
+/// this consulted — so on Windows, where neither is normally set, `cache_dir`
+/// returned `None` and the kernel cache silently did nothing. Every process
+/// recompiled every NVRTC module from source, which is exactly the cost the
+/// cache exists to remove, and nothing said so: a disabled cache and an absent
+/// one are handled identically by design.
+///
+/// Windows keeps per-user caches under `LOCALAPPDATA` (roaming ones under
+/// `APPDATA`; a compiled-code cache is machine-specific and must not roam), and
+/// falls back to `USERPROFILE\AppData\Local` when the variable is unset.
 fn base_cache_dir() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
         let xdg = PathBuf::from(xdg);
         if xdg.is_absolute() {
             return Some(xdg);
+        }
+    }
+    if cfg!(windows) {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let local = PathBuf::from(local);
+            if local.is_absolute() {
+                return Some(local);
+            }
+        }
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            let profile = PathBuf::from(profile);
+            if profile.is_absolute() {
+                return Some(profile.join("AppData").join("Local"));
+            }
         }
     }
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache"))
@@ -620,5 +646,45 @@ mod tests {
 
         assert_eq!(load_in(&dir.0, &key), None);
         assert!(!dir.0.join(key.file_name()).exists());
+    }
+
+    /// The cache must have a home on every platform we ship.
+    ///
+    /// `base_cache_dir` originally consulted only `XDG_CACHE_HOME` and `HOME`,
+    /// neither of which Windows normally sets, so `cache_dir()` returned `None`
+    /// and the cache silently did nothing: every process recompiled every NVRTC
+    /// module. Nothing reported it, because "disabled" and "unavailable" are
+    /// deliberately handled the same way -- which is why this needs a test
+    /// rather than trusting the absence of complaints.
+    #[test]
+    fn the_cache_has_a_base_directory_on_this_platform() {
+        let base = base_cache_dir().expect(
+            "every supported platform must yield a cache root; without one the kernel cache \
+             is silently disabled and every run recompiles from source",
+        );
+        assert!(
+            base.is_absolute(),
+            "a relative cache root would place the cache against the process CWD: {}",
+            base.display()
+        );
+    }
+
+    /// On Windows the root must be the machine-local cache, not the roaming one.
+    ///
+    /// PTX is compiled for a specific driver and architecture, so a roaming
+    /// profile would carry artifacts to machines they are invalid on.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_cache_root_is_machine_local() {
+        let base = base_cache_dir().expect("a cache root on Windows");
+        let text = base.to_string_lossy().replace('/', "\\");
+        assert!(
+            text.contains("\\AppData\\Local"),
+            "expected a machine-local cache root, got {text}"
+        );
+        assert!(
+            !text.contains("\\AppData\\Roaming"),
+            "compiled PTX must not roam between machines: {text}"
+        );
     }
 }
