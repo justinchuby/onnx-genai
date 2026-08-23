@@ -36,7 +36,7 @@ HL=scripts/hostlock.sh
 pass=0
 fail=0
 
-cleanup() { rm -rf "$LOCK" "$LOCK".reaper "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid 2>/dev/null; }
+cleanup() { rm -rf "$LOCK" "$LOCK".reaper "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker 2>/dev/null; }
 trap cleanup EXIT
 
 chk() {
@@ -1315,13 +1315,46 @@ chk "cmd_run installs all three traps before it reads the child's start time" \
     "$([ -n "$trap_last" ] && [ -n "$start_at" ] && [ "$trap_last" -lt "$start_at" ] && echo yes || echo no)" "yes"
 chk "and there are three of them" "$(echo "$run_body" | grep -c '^trap .*run_teardown')" "3"
 
+# --- `run --ttl` is refused -------------------------------------------------
+#
+# Ratified policy: a finite TTL must not be used to bound a live benchmark or
+# qemu job. TTL expiry fires on a holder that is verifiably STILL RUNNING --
+# the takeover path says so itself -- so it contaminates the reaped run and
+# the reaping one alike, and `--strict-reap` protects only the acquirer, never
+# the victim. Refused rather than warned, on the same reasoning that makes
+# `--on-gate-timeout` default to `fail`: a warning that proceeds still emits
+# rows, and six weeks later those rows are indistinguishable from clean ones.
+echo
+echo "TTL: run refuses a finite TTL"
+out=$($HL run --ttl 60 -- true 2>&1)
+rc=$?
+chk "run --ttl is refused" "$rc" "1"
+# Asserting the lock is FREE afterwards proves nothing -- a `run` that took
+# the lock and released it also ends FREE, so that form passes against the
+# refusal removed and is decoration. Prove the command never STARTED instead.
+rm -f "$LOCK.ttlmarker"
+$HL run --ttl 60 -- touch "$LOCK.ttlmarker" >/dev/null 2>&1
+chk "and it refuses before running the command" \
+    "$([ -e "$LOCK.ttlmarker" ] && echo ran || echo refused)" "refused"
+chk "and the refusal names the process-tree remedy, so it is actionable" \
+    "$(echo "$out" | grep -qE 'setsid.*timeout' && echo yes || echo no)" "yes"
+
+# Controls. Without these, a change that rejected --ttl everywhere -- or one
+# that broke `run` outright -- passes all three assertions above. The refusal
+# has to be scoped to exactly `run`, and `run` itself has to still work.
+ttl_seen=$($HL run -- $HL status --porcelain 2>/dev/null | sed -n 's/^ttl=//p')
+chk "run without --ttl still runs, and records ttl=0" "$ttl_seen" "0"
+$HL acquire --owner pris --ttl 600 >/dev/null 2>&1
+chk "acquire --ttl is still accepted" "$(st ttl)" "600"
+$HL release >/dev/null 2>&1
+
 # Finally, pin the assertion count itself. Two of the checks in this file sit
 # behind environment probes, and an assertion that quietly stops running is
 # indistinguishable from one that passes -- which is the same failure mode as
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Both probe branches now assert something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "208"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "213"
 
 echo
 echo "passed=${pass} failed=${fail}"
