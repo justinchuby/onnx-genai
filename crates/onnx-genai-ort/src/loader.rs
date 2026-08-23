@@ -1155,8 +1155,7 @@ mod tests {
 
     /// Guards the premise of the two tests below: if this fails, they are
     /// vacuous rather than wrong, and the fixture is what needs fixing.
-    #[test]
-    fn the_non_dense_fixture_really_does_declare_a_non_dense_output() {
+    fn assert_fixture_logits_is_non_dense() {
         let error = graph_io_from_model_path_for_names(
             &non_dense_logits_fixture(),
             &[],
@@ -1167,12 +1166,17 @@ mod tests {
 
         assert!(
             error.contains("not a dense tensor type"),
-            "fixture no longer carries a non-dense `logits`: {error}"
+            "fixture no longer declares a non-dense `logits`, so this test is vacuous: {error}"
         );
     }
 
     #[test]
     fn selected_dense_kv_ignores_unrelated_non_dense_logits() {
+        // Without this the test passes just as happily against a fixture with no
+        // non-dense output at all, which is exactly how it went vacuous after
+        // #1832 while its sibling failed loudly.
+        assert_fixture_logits_is_non_dense();
+
         let inputs = vec![
             "past_key_values.0.key".to_string(),
             "past_key_values.0.value".to_string(),

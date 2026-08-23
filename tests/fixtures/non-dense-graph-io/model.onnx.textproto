@@ -1,6 +1,10 @@
 ir_version: 11
 producer_name: "onnx-genai-tests"
 producer_version: "0.1.0"
+opset_import {
+  domain: ""
+  version: 24
+}
 # A deliberately tiny graph whose only purpose is to carry ONE non-dense graph
 # output alongside an ordinary dense KV pair.
 #
