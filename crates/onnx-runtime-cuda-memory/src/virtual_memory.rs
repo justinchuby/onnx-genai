@@ -89,6 +89,26 @@ use crate::release::{
 };
 use cudarc::driver::CudaContext;
 
+/// Where the physical granules of a handle pool live.
+///
+/// Two pools that differ in `PhysicalLocation` have incompatible pool keys and
+/// can never share handles: a `HostNuma` handle must never be mapped into a
+/// caller that expects `Device`-backed memory, and vice versa. NUMA node
+/// identity is part of the key, so two `HostNuma` pools for different nodes are
+/// also incompatible.
+///
+/// For host-NUMA backed bytes the governor charges `Tier::Host` rather than
+/// `Tier::Device`, so the oversubscription accounting stays separate from VRAM.
+/// See [`PhysicalHandlePool::get_or_create_at_location`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PhysicalLocation {
+    /// VRAM on the numbered device.
+    Device { ordinal: i32 },
+    /// Host RAM on the given NUMA node, mapped into device address space via
+    /// `CU_MEM_LOCATION_TYPE_HOST_NUMA`.
+    HostNuma { node: i32 },
+}
+
 /// Device address space, backed by CUDA physical allocations.
 ///
 /// Holds the runtime so the CUDA context is bound before every driver call —
@@ -694,6 +714,114 @@ impl CudaVirtualBacking {
             committed.push(offset);
         }
         Ok(required)
+    }
+
+    /// Map one granule at `offset` inside `reservation` from a specific
+    /// `PhysicalLocation`-backed pool into this reservation's VA.
+    ///
+    /// This is the production entry point for mixed device+host-NUMA arenas:
+    /// one [`CudaReservation`] (one stable VA) can have some granules committed
+    /// from a `Device`-backed pool and others from a `HostNuma`-backed pool.
+    /// Each pool is a **separate** [`PhysicalHandlePool`] instance keyed by its
+    /// own `PoolKey` (which includes the `AllocationCompatibility` derived from
+    /// `location`), so a `HostNuma` handle can never escape into a `Device`
+    /// pool and vice versa.
+    ///
+    /// The `pool` argument must have been created for `location`: this is
+    /// checked before anything else happens (before the capture-gate section
+    /// is even meaningfully used, before any lease charge, handle acquisition,
+    /// `cuMemMap`/`cuMemSetAccess`, or accounting mutation). A mismatch
+    /// returns `Err(CommitFailure { error: VirtualMemoryError::LocationMismatch, .. })`
+    /// with `residual_mapped` empty — nothing about `pool` or `reservation` is
+    /// touched. This one runtime check is the single authority over whether a
+    /// requested location matches its pool; do not add a second one.
+    ///
+    /// Every driver call (`cuMemCreate`, `cuMemMap`, `cuMemSetAccess`) is
+    /// wrapped in `capture_gate::synchronizing_section()` exactly as the
+    /// existing [`VirtualBacking::commit`] path is. The failure/rollback
+    /// contract matches `commit_offsets_with_owned_limit_and_capacity`:
+    /// on any failure the granule just attempted is unwound (create/map/access)
+    /// and any granules already mapped via earlier calls to this function for
+    /// the *same* multi-granule request must be unwound by the caller — this
+    /// function operates on one granule at a time for composability; a
+    /// multi-granule rollback loop is the caller's responsibility.
+    ///
+    /// On success returns the number of new physical bytes charged to `pool`'s
+    /// governor lease (0 if a pooled handle was reused, or `granularity` if a
+    /// new handle was created).
+    pub fn commit_at_location(
+        &self,
+        reservation: &mut CudaReservation,
+        offset: usize,
+        location: PhysicalLocation,
+        pool: &Arc<PhysicalHandlePool>,
+    ) -> Result<u64, CommitFailure> {
+        // Validated first, before the capture-gate section, before `bind`,
+        // before any lease charge/handle acquisition/mapping/accounting
+        // mutation: a location/pool mismatch is a caller-programming-error,
+        // not a driver refusal, and must have zero side effects on `pool` or
+        // `reservation` when rejected.
+        if location != pool.location() {
+            return Err(CommitFailure::clean(VirtualMemoryError::LocationMismatch {
+                requested: format!("{location:?}"),
+                actual: format!("{:?}", pool.location()),
+            }));
+        }
+
+        let _section = crate::capture_gate::synchronizing_section();
+        self.bind("committing CUDA memory at location")
+            .map_err(CommitFailure::clean)?;
+
+        let granularity = pool.granularity;
+        let (checkout, created_bytes) = match pool.acquire_with_owned_limit(u64::MAX, None) {
+            Ok(acquired) => acquired,
+            Err(error) => return Err(CommitFailure::clean(error)),
+        };
+
+        let address = reservation.base + offset as u64;
+        if let Err(error) = Self::check("cuMemMap", unsafe {
+            cu::cuMemMap(address, granularity, 0, checkout.handle, 0)
+        }) {
+            pool.rollback_checkout(checkout, false);
+            return Err(CommitFailure::clean(error));
+        }
+        pool.note_mapped();
+
+        // The access descriptor always grants DEVICE read/write, regardless of
+        // backing: the GPU must be able to read host-NUMA granules, and
+        // `CU_MEM_LOCATION_TYPE_DEVICE` in the access descriptor refers to the
+        // accessor (the GPU), not the allocator (the NUMA node). This is the
+        // same access descriptor the spike file and the existing commit path
+        // use.
+        let mut access: cu::CUmemAccessDesc = unsafe { std::mem::zeroed() };
+        access.location.type_ = cu::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
+        access.location.id = self.device_ordinal;
+        access.flags = cu::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        if let Err(error) = Self::check("cuMemSetAccess", unsafe {
+            cu::cuMemSetAccess(address, granularity, &access, 1)
+        }) {
+            // Unmap the granule we just mapped so the caller's rollback loop
+            // sees a clean slate for this offset.
+            if unsafe { cu::cuMemUnmap(address, granularity) } == cu::CUresult::CUDA_SUCCESS {
+                pool.rollback_checkout(checkout, true);
+                return Err(CommitFailure::clean(error));
+            }
+            // Unmap also failed: the granule stays mapped. Record it on the
+            // reservation so the reservation's Drop retains the address range
+            // rather than freeing it under a live mapping.
+            reservation
+                .blocks
+                .push(MappedBlock::new(offset, granularity, checkout.handle));
+            return Err(CommitFailure {
+                error,
+                residual_mapped: vec![MappedBlock::new(offset, granularity, checkout.handle)],
+            });
+        }
+
+        reservation
+            .blocks
+            .push(MappedBlock::new(offset, granularity, checkout.handle));
+        Ok(created_bytes)
     }
 
     pub(crate) fn incremental_owned_bytes_for_handles(&self, handles: usize) -> u64 {
@@ -1443,6 +1571,12 @@ pub struct PhysicalHandlePool {
     context: Arc<CudaContext>,
     context_identity: usize,
     device_ordinal: i32,
+    /// The physical memory location all handles in this pool are allocated at.
+    ///
+    /// Stored so `acquire_with_owned_limit` can build the correct
+    /// `CUmemAllocationProp` for `cuMemCreate` without re-deriving it from
+    /// the pool key.
+    location: PhysicalLocation,
     granularity: usize,
     authority: MemoryAuthorityId,
     max_retained_bytes: usize,
@@ -1515,6 +1649,122 @@ impl PhysicalHandlePool {
             context_identity: context_id,
             context,
             device_ordinal,
+            location: PhysicalLocation::Device {
+                ordinal: device_ordinal,
+            },
+            granularity,
+            authority,
+            max_retained_bytes: retained_granules * granularity,
+            authority_gate,
+            state: Mutex::new(PoolState {
+                available: Vec::new(),
+                quarantined: Vec::new(),
+                lease: Some(lease),
+                pending_lease_shrink: 0,
+                shared: HashMap::new(),
+            }),
+            lease_checkout: Mutex::new(()),
+            counters: Arc::new(PoolCounters::default()),
+            context_terminated: AtomicBool::new(false),
+        });
+        registry.insert(key, Arc::downgrade(&pool));
+        Ok(pool)
+    }
+
+    /// Get or create a physical-handle pool for the given `PhysicalLocation`.
+    ///
+    /// This is the typed, location-aware sibling of [`get_or_create`]. Use it
+    /// when you need a pool backed by `HostNuma` memory (or explicitly a
+    /// `Device` pool without relying on the `device_ordinal` shorthand).
+    ///
+    /// **Pool-key isolation**: a `Device { ordinal }` pool and a
+    /// `HostNuma { node }` pool (or two `HostNuma` pools for different nodes)
+    /// will always be distinct entries in the registry — their
+    /// `AllocationCompatibility` fields differ, so the `PoolKey` hash differs,
+    /// and a handle from one can never be handed to a caller holding the other.
+    ///
+    /// **Governor tier**:
+    /// - `PhysicalLocation::Device` → `Tier::Device` (VRAM limit)
+    /// - `PhysicalLocation::HostNuma` → `Tier::Host` (host-RAM limit)
+    ///
+    /// This means host-NUMA-backed bytes are never silently charged against the
+    /// VRAM budget, and the VRAM budget is never silent about them.
+    ///
+    /// [`get_or_create`]: Self::get_or_create
+    pub fn get_or_create_at_location(
+        context: Arc<CudaContext>,
+        device_ordinal: i32,
+        location: PhysicalLocation,
+        max_retained_bytes: usize,
+        governor: &dyn MemoryGovernor,
+        holder: HolderId,
+        role: MemoryRole,
+    ) -> Result<Arc<Self>, MemoryError> {
+        let authority = governor.authority_id();
+        let authority_gate = physical_pool_authority_gate(authority);
+
+        // For Device locations the authority must match the device. For
+        // HostNuma locations the authority is on the *device* context (the GPU
+        // that will read through this pool) — same check applies.
+        if authority.device()
+            != onnx_runtime_memory_governor::DeviceKey::device(device_ordinal as u32)
+        {
+            return Err(MemoryError::InvalidRequest {
+                tier: Tier::Device.name(),
+                requested: 0,
+                reason: "the physical-handle pool governor authority names a different device",
+            });
+        }
+
+        let granularity = allocation_granularity_for_location(location);
+        let allocation = allocation_compatibility_for_location(location);
+        let context_id = physical_pool_context_identity(&context).map_err(|reason| {
+            MemoryError::AllocationFailed {
+                tier: Tier::Device.name(),
+                requested: 0,
+                reason,
+            }
+        })?;
+        let key = PoolKey {
+            context: context_id,
+            device_ordinal,
+            allocation,
+            granularity,
+            authority,
+        };
+
+        // Charge the correct tier: host-NUMA bytes come from host RAM, not
+        // VRAM; charging them to Tier::Device would silently block real device
+        // allocations and misreport both limits.
+        let tier = match location {
+            PhysicalLocation::Device { .. } => Tier::Device,
+            PhysicalLocation::HostNuma { .. } => Tier::Host,
+        };
+
+        let lease = governor.reserve(tier, 0, role, holder)?;
+        let registry = PHYSICAL_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut registry = registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.retain(|_, pool| pool.strong_count() > 0);
+        if let Some(pool) = registry.get(&key).and_then(Weak::upgrade) {
+            let requested_bound = (max_retained_bytes / granularity) * granularity;
+            if pool.max_retained_bytes != requested_bound {
+                return Err(MemoryError::InvalidRequest {
+                    tier: tier.name(),
+                    requested: max_retained_bytes as u64,
+                    reason: "the compatible physical-handle pool already has a different \
+                             retained-byte bound",
+                });
+            }
+            return Ok(pool);
+        }
+        let retained_granules = max_retained_bytes / granularity;
+        let pool = Arc::new(Self {
+            context_identity: context_id,
+            context,
+            device_ordinal,
+            location,
             granularity,
             authority,
             max_retained_bytes: retained_granules * granularity,
@@ -1566,6 +1816,11 @@ impl PhysicalHandlePool {
     /// Allocation granularity shared by every handle in this pool.
     pub fn granularity(&self) -> usize {
         self.granularity
+    }
+
+    /// The physical location all handles in this pool are backed by.
+    pub fn location(&self) -> PhysicalLocation {
+        self.location
     }
 
     /// Maximum bytes retained after unmap.
@@ -1706,7 +1961,7 @@ impl PhysicalHandlePool {
             self.refund_lease_growth(capacity, self.granularity as u64);
             return Err(error);
         }
-        let prop = allocation_prop(self.device_ordinal);
+        let prop = allocation_prop_for_location(self.location);
         let mut handle: cu::CUmemGenericAllocationHandle = 0;
         let result = unsafe { cu::cuMemCreate(&mut handle, self.granularity, &prop, 0) };
         if let Err(error) = CudaVirtualBacking::check("cuMemCreate", result) {
@@ -2163,19 +2418,71 @@ impl Drop for PhysicalHandlePool {
 }
 
 fn allocation_prop(device_ordinal: i32) -> cu::CUmemAllocationProp {
-    let mut prop: cu::CUmemAllocationProp = unsafe { std::mem::zeroed() };
-    prop.type_ = cu::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
-    prop.location.type_ = cu::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
-    prop.location.id = device_ordinal;
-    prop
+    allocation_prop_for_location(PhysicalLocation::Device {
+        ordinal: device_ordinal,
+    })
 }
 
 fn allocation_compatibility(device_ordinal: i32) -> AllocationCompatibility {
-    let prop = allocation_prop(device_ordinal);
+    allocation_compatibility_for_location(PhysicalLocation::Device {
+        ordinal: device_ordinal,
+    })
+}
+
+/// Build a `CUmemAllocationProp` for the given `PhysicalLocation`.
+///
+/// For `Device` this produces the same prop as the existing `allocation_prop`
+/// free function (device-pinned, `CU_MEM_LOCATION_TYPE_DEVICE`). For
+/// `HostNuma` it produces a host-pinned prop with
+/// `CU_MEM_LOCATION_TYPE_HOST_NUMA` and the given NUMA node id. The access
+/// descriptor passed to `cuMemSetAccess` is always device-scoped regardless of
+/// backing (the GPU still needs read/write access to host-NUMA granules); only
+/// the allocation prop changes.
+fn allocation_prop_for_location(location: PhysicalLocation) -> cu::CUmemAllocationProp {
+    let mut prop: cu::CUmemAllocationProp = unsafe { std::mem::zeroed() };
+    prop.type_ = cu::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
+    match location {
+        PhysicalLocation::Device { ordinal } => {
+            prop.location.type_ = cu::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
+            prop.location.id = ordinal;
+        }
+        PhysicalLocation::HostNuma { node } => {
+            prop.location.type_ = cu::CUmemLocationType::CU_MEM_LOCATION_TYPE_HOST_NUMA;
+            prop.location.id = node;
+        }
+    }
+    prop
+}
+
+fn allocation_compatibility_for_location(location: PhysicalLocation) -> AllocationCompatibility {
+    let prop = allocation_prop_for_location(location);
     AllocationCompatibility {
         allocation_type: prop.type_ as i32,
         location_type: prop.location.type_ as i32,
         location_id: prop.location.id,
+    }
+}
+
+/// The driver's recommended granularity for the given `PhysicalLocation`, or
+/// 2 MiB if the driver will not say.
+///
+/// Same semantics as `allocation_granularity` (not a capability probe; driver
+/// refusals and zero results both become 2 MiB). For `Device` this is
+/// identical to `allocation_granularity(ordinal)`.
+pub fn allocation_granularity_for_location(location: PhysicalLocation) -> usize {
+    let prop = allocation_prop_for_location(location);
+    let mut granularity = 0usize;
+    let result = unsafe {
+        cu::cuMemGetAllocationGranularity(
+            &mut granularity,
+            &prop,
+            cu::CUmemAllocationGranularity_flags::CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
+        )
+    };
+    if result == cu::CUresult::CUDA_SUCCESS && granularity > 0 {
+        granularity
+    } else {
+        2 << 20
     }
 }
 
@@ -2203,20 +2510,9 @@ pub fn physical_pool_context_identity(context: &CudaContext) -> Result<usize, St
 /// callers of this function come through here, a zero can never reach the
 /// arena builder's `granularity == 0` guard from the CUDA provider.
 fn allocation_granularity(device_ordinal: i32) -> usize {
-    let prop = allocation_prop(device_ordinal);
-    let mut granularity = 0usize;
-    let result = unsafe {
-        cu::cuMemGetAllocationGranularity(
-            &mut granularity,
-            &prop,
-            cu::CUmemAllocationGranularity_flags::CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
-        )
-    };
-    if result == cu::CUresult::CUDA_SUCCESS && granularity > 0 {
-        granularity
-    } else {
-        2 << 20
-    }
+    allocation_granularity_for_location(PhysicalLocation::Device {
+        ordinal: device_ordinal,
+    })
 }
 
 /// One reserved device address range and the physical handles mapped into it.

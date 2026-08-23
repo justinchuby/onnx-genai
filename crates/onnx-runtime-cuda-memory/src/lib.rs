@@ -69,6 +69,7 @@
 //! a machine with no GPU. The `cuda` feature exists to match the execution
 //! provider's, not to hide the source.
 
+pub mod capability;
 pub mod capture_gate;
 pub mod release;
 pub mod virtual_memory;
