@@ -97,7 +97,7 @@ impl<'a> StaticCacheDecodeSession<'a> {
     /// Detect a STATIC-CACHE/TensorScatter signature from ONNX graph I/O.
     pub fn detect(
         session: &Session,
-        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
     ) -> Result<Option<StaticCacheSignature>> {
         Ok(detect_static_cache(session, io)?.map(|(signature, ..)| signature))
     }
@@ -106,7 +106,7 @@ impl<'a> StaticCacheDecodeSession<'a> {
     pub fn new(
         session: &'a Session,
         options: StaticCacheDecodeOptions,
-        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
     ) -> Result<Self> {
         let (signature, pairs, abi) = detect_static_cache(session, io)?.ok_or_else(|| {
             OrtError::InvalidArgument(
@@ -384,7 +384,7 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
     /// Detect a STATIC-CACHE/TensorScatter signature from ONNX graph I/O.
     pub fn detect(
         session: &Session,
-        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
     ) -> Result<Option<StaticCacheSignature>> {
         StaticCacheDecodeSession::detect(session, io)
     }
@@ -394,7 +394,7 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
     pub fn new(
         session: &'a Session,
         options: StaticCacheDecodeOptions,
-        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
     ) -> Result<Self> {
         let (signature, pairs, abi) = detect_static_cache(session, io)?.ok_or_else(|| {
             OrtError::InvalidArgument(

@@ -189,6 +189,12 @@ impl BatchingCapability {
 pub struct ContinuousBatchManager<'a> {
     decode: Box<dyn BatchedDecodeSession<'a> + 'a>,
     tokenizer: &'a Tokenizer,
+    /// Every token id this model ends on, resolved once when the manager is
+    /// built. Held here because the manager cannot reach the package's workflow
+    /// itself, and reading only the tokenizer's first id is what made a
+    /// multi-EOS model run past its end on the batched route while stopping
+    /// correctly on the single-row one.
+    eos_token_ids: Vec<TokenId>,
     metadata_max_context: Option<usize>,
     static_max_len: usize,
     queue: VecDeque<PendingContinuousRequest>,
@@ -259,6 +265,7 @@ impl<'a> ContinuousBatchManager<'a> {
     fn new(
         mut decode: Box<dyn BatchedDecodeSession<'a> + 'a>,
         tokenizer: &'a Tokenizer,
+        eos_token_ids: Vec<TokenId>,
         metadata_max_context: Option<usize>,
         max_batch: usize,
     ) -> anyhow::Result<Self> {
@@ -274,6 +281,7 @@ impl<'a> ContinuousBatchManager<'a> {
         Ok(Self {
             decode,
             tokenizer,
+            eos_token_ids,
             metadata_max_context,
             static_max_len,
             queue: VecDeque::new(),
@@ -298,9 +306,7 @@ impl<'a> ContinuousBatchManager<'a> {
         self.next_handle += 1;
         request.options.validate()?;
         let mut options = request.options;
-        if options.eos_token_id.is_none() {
-            options.eos_token_id = self.tokenizer.eos_token_id();
-        }
+        crate::engine::apply_eos_policy(&mut options, &self.eos_token_ids);
         let prompt_tokens = match request.prompt {
             GeneratePrompt::TokenIds(tokens) => tokens,
             GeneratePrompt::TokenRows(_) => {
@@ -750,6 +756,25 @@ impl<'a> ContinuousBatchManager<'a> {
 }
 
 impl Engine {
+    /// Refuse a package whose declared workflow the batched routes cannot run.
+    ///
+    /// Batching advances N rows through *one* decoder forward pass, so it needs
+    /// a package whose declared graph is that decoder and whose stop policy is
+    /// the runtime's. A package that declares an in-graph sampler or several
+    /// components has a loop of its own shape, and the row-major batch would be
+    /// executing something other than what it declared.
+    ///
+    /// Checked at the routes' single admission point, before a slot is taken.
+    fn assert_batched_generation_declared(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.holds_decode_core(),
+            "batched generation runs N rows through one decoder forward pass, which requires the \
+             package's declared decode step to be one this runtime has a fused executor for; \
+             this package declares a workflow whose components the interpreter invokes \
+             individually, so its declared loop is not a row-major batch"
+        );
+        crate::pipeline::validate_generation_workflow(self.workflow.workflow_spec())
+    }
     /// Generate a fixed batch of independent requests on a STATIC-CACHE model.
     ///
     /// Each request owns its processor chain, sampling options, stop conditions,
@@ -765,27 +790,39 @@ impl Engine {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
+        // Batched decode advances N rows per forward pass rather than one, so
+        // it is a different *iteration shape* from the canonical single-row
+        // body — but it is still this runtime generating tokens, so it is held
+        // to the same precondition: a package with no canonical workflow cannot
+        // decode by any route.
+        //
+        // Checked before the capability question, because "this package is not
+        // executable at all" is a different and prior answer to "this package
+        // cannot batch" — reporting the capability first would tell a caller to
+        // go find a static-cache model when the real problem is the package.
+        self.assert_batched_generation_declared()?;
         if !matches!(self.decode_path, ModelDecodePath::StaticCache { .. }) {
             anyhow::bail!(
                 "batched static generation requires a STATIC-CACHE model; past/present batching is deferred"
             );
         }
+        // Resolved once, from the same source the single-row path uses, so a
+        // batched request stops on exactly the tokens a single-row one does.
+        let eos_token_ids = self.default_eos_token_ids()?;
 
         let mut results = vec![None; requests.len()];
         let mut rows = Vec::new();
         for (result_index, request) in requests.into_iter().enumerate() {
             request.options.validate()?;
             let mut options = request.options;
-            if options.eos_token_id.is_none() {
-                options.eos_token_id = self.tokenizer.eos_token_id();
-            }
+            crate::engine::apply_eos_policy(&mut options, &eos_token_ids);
             let prompt_tokens = match request.prompt {
                 GeneratePrompt::TokenIds(tokens) => tokens,
                 GeneratePrompt::TokenRows(_) => {
                     anyhow::bail!("multi-row prompts are supported only by workflow pipelines")
                 }
                 GeneratePrompt::Text(text) => self
-                    .tokenizer
+                    .require_tokenizer()?
                     .encode(&text)
                     .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}"))?,
             };
@@ -793,11 +830,11 @@ impl Engine {
                 anyhow::bail!("prompt must contain at least one token");
             }
             let max_context = self.batched_max_context_for_request(&options);
-            let chain = build_processor_chain(&options, Some(&self.tokenizer), false)?;
+            let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
             if reached_context_limit(prompt_tokens.len(), max_context) {
                 ensure_constrained_finish(&options, "", FinishReason::Length)?;
                 results[result_index] = Some(finish_result(
-                    &self.tokenizer,
+                    self.require_tokenizer()?,
                     &[],
                     FinishReason::Length,
                     0,
@@ -866,7 +903,7 @@ impl Engine {
                     token_id,
                     &row.options,
                     &row.chain,
-                    &self.tokenizer,
+                    self.require_tokenizer()?,
                     None,
                 )?;
 
@@ -893,7 +930,7 @@ impl Engine {
 
                 if let Some(reason) = finish_reason {
                     results[row.result_index] = Some(finish_result(
-                        &self.tokenizer,
+                        self.require_tokenizer()?,
                         &row.state.generated_tokens,
                         reason,
                         row.state.prefix_cache_hit_len,
@@ -1016,6 +1053,14 @@ impl Engine {
         if max_batch == 0 {
             anyhow::bail!("continuous batch max_batch must be greater than zero");
         }
+        // The single admission point for both continuous-batch entry points, so
+        // the precondition is checked once, here, rather than once per caller
+        // where a new caller could forget it.
+        self.assert_batched_generation_declared()?;
+        // Resolved before the session borrows below, and from the same source
+        // the single-row path uses: the manager cannot reach the package's
+        // workflow once it holds a mutable session borrow.
+        let eos_token_ids = self.default_eos_token_ids()?;
         // Native backend (#750 stage 4): wire the manager onto the native CUDA
         // persistent batch path. Stage 3a made the fused forward ragged (per-row
         // `row_lens`/`position_ids`/mask window) and stage 3b built the two seams
@@ -1038,14 +1083,22 @@ impl Engine {
                 .model
                 .as_ref()
                 .and_then(|model| model.max_sequence_length);
-            let tokenizer = &self.tokenizer;
+            let tokenizer = self.tokenizer.as_ref().context(
+                "continuous batching requires a tokenizer, which this package does not declare",
+            )?;
             let session = self.native_session.as_mut().context(
                 "continuous batching on the native backend requires an engine-owned native \
                  decode session; none is loaded",
             )?;
             let decode: Box<dyn BatchedDecodeSession<'_> + '_> =
                 Box::new(NativeBatchedDecodeSession::new(session, max_batch)?);
-            return ContinuousBatchManager::new(decode, tokenizer, metadata_max_context, max_batch);
+            return ContinuousBatchManager::new(
+                decode,
+                tokenizer,
+                eos_token_ids,
+                metadata_max_context,
+                max_batch,
+            );
         }
         #[cfg(not(feature = "native-backend"))]
         if self.decode_backend == EngineDecodeBackend::Native {
@@ -1132,7 +1185,15 @@ impl Engine {
             .model
             .as_ref()
             .and_then(|model| model.max_sequence_length);
-        ContinuousBatchManager::new(decode, &self.tokenizer, metadata_max_context, max_batch)
+        ContinuousBatchManager::new(
+            decode,
+            self.tokenizer.as_ref().context(
+                "continuous batching requires a tokenizer, which this package does not declare",
+            )?,
+            eos_token_ids,
+            metadata_max_context,
+            max_batch,
+        )
     }
 
     /// Run requests to completion through a dynamic continuous batch.
@@ -1210,7 +1271,7 @@ impl Engine {
                     anyhow::bail!("multi-row prompts are supported only by workflow pipelines")
                 }
                 GeneratePrompt::Text(text) => self
-                    .tokenizer
+                    .require_tokenizer()?
                     .encode(text)
                     .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}"))?,
             };
@@ -1870,8 +1931,14 @@ mod tests {
     #[test]
     fn row_assignment_failure_is_reported_for_the_submitted_handle() {
         let tokenizer = test_tokenizer();
-        let mut manager =
-            ContinuousBatchManager::new(Box::new(RejectAssignDecode), &tokenizer, None, 1).unwrap();
+        let mut manager = ContinuousBatchManager::new(
+            Box::new(RejectAssignDecode),
+            &tokenizer,
+            Vec::new(),
+            None,
+            1,
+        )
+        .unwrap();
         let handle = manager
             .submit(GenerateRequest::new(GeneratePrompt::TokenIds(vec![1])))
             .unwrap();
@@ -1900,8 +1967,14 @@ mod tests {
     #[test]
     fn successful_row_admission_is_observable_before_backend_generation() {
         let tokenizer = test_tokenizer();
-        let mut manager =
-            ContinuousBatchManager::new(Box::new(AcceptAssignDecode), &tokenizer, None, 1).unwrap();
+        let mut manager = ContinuousBatchManager::new(
+            Box::new(AcceptAssignDecode),
+            &tokenizer,
+            Vec::new(),
+            None,
+            1,
+        )
+        .unwrap();
         let handle = manager
             .submit(GenerateRequest::new(GeneratePrompt::TokenIds(vec![1])))
             .unwrap();
@@ -1917,8 +1990,14 @@ mod tests {
     #[test]
     fn pending_request_can_be_cancelled_without_an_admission_event() {
         let tokenizer = test_tokenizer();
-        let mut manager =
-            ContinuousBatchManager::new(Box::new(RejectAssignDecode), &tokenizer, None, 1).unwrap();
+        let mut manager = ContinuousBatchManager::new(
+            Box::new(RejectAssignDecode),
+            &tokenizer,
+            Vec::new(),
+            None,
+            1,
+        )
+        .unwrap();
         let handle = manager
             .submit(GenerateRequest::new(GeneratePrompt::TokenIds(vec![1])))
             .unwrap();
@@ -2111,7 +2190,7 @@ mod tests {
         ];
         let decode = ScriptedBatchDecode::new(row_logits, vocab, true);
         let mut manager =
-            ContinuousBatchManager::new(Box::new(decode), &tokenizer, None, 4).unwrap();
+            ContinuousBatchManager::new(Box::new(decode), &tokenizer, Vec::new(), None, 4).unwrap();
 
         // Rows 0,1: greedy → device-portable. Row 2: repetition penalty (a
         // history-dependent processor) → host-required. Row 3: top_logprobs →
@@ -2159,7 +2238,7 @@ mod tests {
         let decode =
             ScriptedBatchDecode::new(vec![one_hot(vocab, 1), one_hot(vocab, 2)], vocab, true);
         let mut manager =
-            ContinuousBatchManager::new(Box::new(decode), &tokenizer, None, 2).unwrap();
+            ContinuousBatchManager::new(Box::new(decode), &tokenizer, Vec::new(), None, 2).unwrap();
         for _ in 0..2 {
             let mut req = greedy_req(1);
             req.options.repetition_penalty = 1.2; // forces host for every row
@@ -2186,6 +2265,50 @@ mod tests {
             assert!(guard < 1000, "runaway decode loop");
         }
         tokens
+    }
+
+    /// A continuous-batch row stops on a declared end token that is not the
+    /// first.
+    ///
+    /// No CPU fixture can batch — a shared KV buffer needs an execution provider
+    /// that reports fixed-capacity present binding — so an end-to-end batched
+    /// test on this machine would skip, and a skipped test that reports success
+    /// is exactly the evidence this must not be. The scripted decode gives the
+    /// manager a real row loop with a known token stream, so the assertion is
+    /// about the manager's own stop policy rather than about a backend.
+    ///
+    /// The unreachable id is declared *first*: a manager that kept only `ids[0]`
+    /// would never stop and would run to the budget.
+    #[test]
+    fn a_continuous_row_stops_on_a_non_first_declared_end_token() {
+        let vocab = 8;
+        let tokenizer = test_tokenizer();
+        let stop = 3u32;
+        let unreachable = 7u32;
+
+        let mut manager = ContinuousBatchManager::new(
+            Box::new(ScriptedBatchDecode::new(
+                vec![one_hot(vocab, 3)],
+                vocab,
+                false,
+            )),
+            &tokenizer,
+            vec![unreachable, stop],
+            None,
+            1,
+        )
+        .unwrap();
+
+        let mut request = greedy_req(16);
+        request.options.stop_on_eos = true;
+        manager.submit(request).unwrap();
+        let tokens = drive_to_completion(&mut manager);
+
+        assert_eq!(
+            tokens.values().cloned().collect::<Vec<_>>(),
+            vec![vec![stop]],
+            "the row must end at the declared end token rather than at the budget"
+        );
     }
 
     /// Device-routed rows must produce the SAME token stream as the pure-host
@@ -2228,6 +2351,7 @@ mod tests {
         let mut device_manager = ContinuousBatchManager::new(
             Box::new(ScriptedBatchDecode::new(logits(), vocab, true)),
             &tokenizer,
+            Vec::new(),
             None,
             3,
         )
@@ -2235,6 +2359,7 @@ mod tests {
         let mut host_manager = ContinuousBatchManager::new(
             Box::new(ScriptedBatchDecode::new(logits(), vocab, false)),
             &tokenizer,
+            Vec::new(),
             None,
             3,
         )
@@ -2305,7 +2430,7 @@ mod tests {
             false,
         );
         let mut manager =
-            ContinuousBatchManager::new(Box::new(decode), &tokenizer, None, 3).unwrap();
+            ContinuousBatchManager::new(Box::new(decode), &tokenizer, Vec::new(), None, 3).unwrap();
         for _ in 0..3 {
             manager.submit(capped_greedy_req(1, 4)).unwrap();
         }
@@ -2339,7 +2464,7 @@ mod tests {
         let vocab = 8usize;
         let decode = ScriptedBatchDecode::new(vec![one_hot(vocab, 1); 8], vocab, false);
         let mut manager =
-            ContinuousBatchManager::new(Box::new(decode), &tokenizer, None, 8).unwrap();
+            ContinuousBatchManager::new(Box::new(decode), &tokenizer, Vec::new(), None, 8).unwrap();
         manager.submit(capped_greedy_req(1, 3)).unwrap();
 
         drive_recording_rows(&mut manager, |_| {});
@@ -2362,7 +2487,7 @@ mod tests {
             false,
         );
         let mut manager =
-            ContinuousBatchManager::new(Box::new(decode), &tokenizer, None, 3).unwrap();
+            ContinuousBatchManager::new(Box::new(decode), &tokenizer, Vec::new(), None, 3).unwrap();
         manager.submit(capped_greedy_req(1, 1)).unwrap();
         manager.submit(capped_greedy_req(1, 2)).unwrap();
         manager.submit(capped_greedy_req(1, 9)).unwrap();
@@ -2392,7 +2517,7 @@ mod tests {
         let decode =
             ScriptedBatchDecode::new(vec![one_hot(vocab, 1), one_hot(vocab, 2)], vocab, false);
         let mut manager =
-            ContinuousBatchManager::new(Box::new(decode), &tokenizer, None, 2).unwrap();
+            ContinuousBatchManager::new(Box::new(decode), &tokenizer, Vec::new(), None, 2).unwrap();
         let short = manager.submit(capped_greedy_req(1, 1)).unwrap();
         let long = manager.submit(capped_greedy_req(1, 6)).unwrap();
         // Third request cannot be assigned: both physical rows are taken.
@@ -2428,8 +2553,14 @@ mod tests {
     #[test]
     fn occupancy_is_empty_before_the_first_forward() {
         let tokenizer = test_tokenizer();
-        let manager =
-            ContinuousBatchManager::new(Box::new(AcceptAssignDecode), &tokenizer, None, 1).unwrap();
+        let manager = ContinuousBatchManager::new(
+            Box::new(AcceptAssignDecode),
+            &tokenizer,
+            Vec::new(),
+            None,
+            1,
+        )
+        .unwrap();
         let occupancy = manager.occupancy();
         assert_eq!(occupancy.steps, 0);
         assert_eq!(occupancy.mean_rows_per_step(), None);

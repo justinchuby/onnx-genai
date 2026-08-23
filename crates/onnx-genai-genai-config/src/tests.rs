@@ -82,13 +82,13 @@ fn derive_decoder_io_from_graph_dense_has_no_state_pairs() {
 }
 
 #[test]
-fn derive_model_io_spec_from_graph_dense_binds_kv_ports() {
+fn derive_decoder_abi_from_graph_dense_binds_kv_ports() {
     // A pure-dense decoder now DOES auto-derive, because the only caller runs
     // after a declared or pattern-expanded `io` block failed to materialise —
     // so returning None there does not preserve a working path, it leaves the
     // model with no KV geometry and fails the load (#1012, DeepSeek-V2 MLA).
     // The gate moved from "has recurrent state pairs" to "yielded KV ports".
-    let io = GenAiConfig::derive_model_io_spec_from_graph(&qwen06b_dense_graph())
+    let io = GenAiConfig::derive_decoder_abi_from_graph(&qwen06b_dense_graph())
         .expect("a dense decoder with KV ports must auto-derive an io spec");
     assert!(
         io.kv_inputs.as_ref().is_some_and(|v| !v.is_empty()),

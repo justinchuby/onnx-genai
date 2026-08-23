@@ -242,6 +242,18 @@ pub fn load(model_dir: &Path) -> anyhow::Result<Option<PipelineSetup>> {
     let Some(directory) = PipelineModelDirectory::load_if_declared(model_dir)? else {
         return Ok(None);
     };
+    // A single decoder declares a workflow like every other package, but it is
+    // not a composed pipeline: it has no components to feed and no multimodal
+    // inputs to describe. Asking the one shared recognizer keeps this from
+    // drifting apart from the executor choice the engine makes.
+    if directory
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pipeline.as_ref())
+        .is_some_and(|pipeline| onnx_genai_metadata::is_single_decoder_workflow(&pipeline.workflow))
+    {
+        return Ok(None);
+    }
     let models = PipelineModels::load_with_ort_session_filter(
         model_dir,
         onnx_genai_ort::SessionOptions::default(),

@@ -916,26 +916,29 @@ fn the_canonical_static_cache_package_needs_no_model_io() {
     );
 }
 
-/// A second serialized ABI beside the workflow is refused.
+/// A second serialized ABI beside the workflow is refused — at the loader,
+/// before it can become a value.
 ///
 /// Two declarations of the same graph are not redundancy but a fork: the moment
 /// they disagree, which one a runtime obeys is decided by whichever code path
-/// reached it first. The refusal has to name where the facts belong, because
-/// "remove this" is not an actionable error on its own.
+/// reached it first. There is now no schema field for the second one at all, so
+/// the refusal happens where the document is read.
 #[test]
 fn model_io_beside_a_workflow_is_refused() {
     let document = format!(
         "{}model:\n  io:\n    token_input: input_ids\n",
         MOBIUS_STATIC_CACHE.replace("DTYPE", "float16")
     );
-    let reported = errors(&document);
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("inference_metadata.yaml");
+    std::fs::write(&path, &document).expect("write");
+
+    let error =
+        onnx_genai_metadata::load_metadata(&path).expect_err("the retired block must not load");
+    let message = error.to_string();
     assert!(
-        reported.iter().any(|error| {
-            error.contains("model.io and pipeline.workflow")
-                && error.contains("pipeline.workflow.components")
-                && error.contains("state_service")
-        }),
-        "the refusal must name the canonical location of every fact it rejects: {reported:?}"
+        message.contains("retired `model.io` block") && message.contains("migrate_model_io"),
+        "the refusal must name what is wrong and how to fix it: {message}"
     );
 }
 
@@ -956,11 +959,12 @@ fn the_decode_abi_is_recognized_from_the_workflow_alone() {
         io.kv_ownership,
         Some(onnx_genai_metadata::KvOwnership::Owned)
     );
-    assert_eq!(
-        io.kv_inputs.as_deref(),
-        Some(["key_cache.0".to_string(), "value_cache.0".to_string()].as_slice()),
-        "the cache pairs come from the group that binds them"
-    );
+    // A fixed-capacity cache is described by the static-cache ABI below and by
+    // nothing else: reporting the same buffers as growing past/present pairs
+    // would be two answers for one cache, and the paged KV bridge reads their
+    // absence as "this cache does not grow".
+    assert_eq!(io.kv_inputs, None);
+    assert_eq!(io.kv_outputs, None);
 
     let static_cache = io
         .static_cache
@@ -1267,8 +1271,8 @@ fn loading_a_package_rejects_a_second_serialized_abi() {
         .expect_err("a package carrying both a model.io block and a workflow is rejected");
     let rendered = error.to_string();
     assert!(
-        rendered.contains("both declare this package's executable graph ABI"),
-        "the rejection must name the conflict, got: {rendered}"
+        rendered.contains("retired `model.io` block") && rendered.contains("migrate_model_io"),
+        "the rejection must name the retired block and the conversion, got: {rendered}"
     );
 
     // The same package without the second ABI is the canonical form and loads.

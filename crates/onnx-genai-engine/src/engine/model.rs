@@ -7,8 +7,27 @@ use super::*;
 /// that must borrow the session field disjointly from other mutable fields.
 pub(crate) const MISSING_ORT_SESSION: &str = "ORT backend must own a decoder session";
 
-/// The generation engine.
+/// The one generation runtime.
+///
+/// Every package declares `pipeline.workflow`, and every package executes it
+/// through the interpreter held in [`Self::workflow`]. What differs between a
+/// bare decoder and a composite pipeline is not *which runtime* executes it but
+/// *which executor implements a declared step*: a component naming a contract
+/// this runtime registered — `onnx-genai.autoregressive-decode`, above all — is
+/// run by the fused decode session in the fields below, which owns paged KV,
+/// the device sampling fast paths and the captured CUDA graph. A component
+/// naming none is invoked generically from its artifact.
+///
+/// Callers (server, CLI, C ABI, benchmarks) hold one handle and never branch on
+/// which kind of package they loaded, which is what the old
+/// `Engine` / `PipelineEngine` split forced them to do.
 pub struct Engine {
+    /// The interpreter that executes this package's declared workflow.
+    ///
+    /// Not optional: a package that declares no workflow does not load, so
+    /// there is no state in which a request could reach a path that no longer
+    /// exists.
+    pub(crate) workflow: Box<crate::pipeline::WorkflowRuntime>,
     /// Resolved decoder execution backend.
     pub(crate) decode_backend: EngineDecodeBackend,
     /// Model inference metadata.
@@ -28,9 +47,23 @@ pub struct Engine {
     /// Batch scheduler.
     pub(crate) scheduler: Scheduler,
     /// Per-device resource ceilings and shared scheduler byte budget.
+    ///
+    /// Exactly one exists per runtime — a second would double-count every
+    /// reservation — which is why the workflow interpreter beside it holds
+    /// none and this is not an `Option`.
     pub(crate) governor: EngineResourceGovernor,
     /// Persistent multi-turn session state, keyed by session id.
     pub(crate) sessions: HashMap<SessionId, EngineSession>,
+    /// Conversations continued through the interpreter's session-scoped state.
+    ///
+    /// A package whose components the interpreter invokes has no decode core to
+    /// hold a paged KV sequence, but it still has sessions: its workflow may
+    /// declare `scope: session` state, and the runtime keys that state by the
+    /// id handed out here. The value is the logical token count so far, which
+    /// is what a caller asking about a session wants to know.
+    pub(crate) workflow_sessions: HashMap<SessionId, usize>,
+    /// Monotonic counter for interpreter session ids.
+    pub(crate) workflow_session_counter: u64,
     /// ORT session for decoder execution.
     pub(crate) session: Option<Box<Session>>,
     /// Native decoder session. Native execution is single-request and serialized
@@ -67,7 +100,6 @@ pub struct Engine {
     pub(crate) native_max_sessions: usize,
     /// Native shared-KV proposer loaded from the same metadata contract.
     #[cfg(feature = "native-backend")]
-    pub(crate) native_shared_kv_proposer: Option<NativeSharedKvProposerModel>,
     /// Native recurrent/past snapshots keyed by semantic token prefixes.
     #[cfg(feature = "native-backend")]
     pub(crate) native_recurrent_prefix_stats: RecurrentPrefixCacheStats,
@@ -78,9 +110,13 @@ pub struct Engine {
     /// Optional EAGLE-3 head and target-side embedding.
     pub(crate) eagle3: Option<Eagle3Model>,
     /// Optional shared-KV draft proposer.
-    pub(crate) shared_kv_proposer: Option<SharedKvProposerModel>,
     /// Tokenizer loaded from the model directory.
-    pub(crate) tokenizer: Tokenizer,
+    ///
+    /// Absent for a workflow package that ships none (an image-generation
+    /// pipeline, for instance): such a package never reaches the token decode
+    /// path, and inventing an empty tokenizer would make that a runtime
+    /// surprise instead of a load-time fact.
+    pub(crate) tokenizer: Option<Tokenizer>,
     /// Auto-detected fill-in-the-middle token configuration.
     pub(crate) fim_config: Option<FimConfig>,
     /// Default speculative draft width K.
@@ -101,6 +137,79 @@ pub struct Engine {
     /// Tests that exercise pre-session validation may set this to `None` so they
     /// stay model-free and do not touch the local ORT library.
     pub(crate) _environment: Option<Environment>,
+}
+
+impl Engine {
+    /// Build the one runtime around an already-constructed workflow interpreter.
+    ///
+    /// The decode-core fields below it are inert for a workflow package: it owns
+    /// no paged KV, no decoder session, and no scheduler of its own — its
+    /// components own their caches and the interpreter drives them. They are
+    /// real (not `Option`) values so the decode core needs no null checks on a
+    /// path it never runs; the governor, memory plan, and backend are read back
+    /// from the workflow so a caller sees one authoritative answer.
+    pub(crate) fn from_workflow(
+        workflow: crate::pipeline::WorkflowRuntime,
+        governor: EngineResourceGovernor,
+    ) -> anyhow::Result<Self> {
+        let decode_backend = workflow.decode_backend();
+        let memory_strategy_plan = workflow.memory_strategy_plan().clone();
+        let metadata = workflow
+            .models()
+            .directory
+            .metadata
+            .clone()
+            .unwrap_or_default();
+        // The package's tokenizer stays owned by `PipelineModels`; text
+        // tokenization for a workflow package is served from there rather than
+        // duplicated into the decode core.
+        Ok(Engine {
+            workflow: Box::new(workflow),
+            decode_backend,
+            metadata,
+            metadata_hints: MetadataHints::default(),
+            kv_cache: PagedKvCache::new(1, 1),
+            prefix_cache: PrefixCache::new(),
+            token_prefix_cache: Vec::new(),
+            kv_model: None,
+            decode_path: ModelDecodePath::Generic,
+            scheduler: Scheduler::new(onnx_genai_scheduler::SchedulerConfig::default()),
+            governor,
+            sessions: HashMap::new(),
+            workflow_sessions: HashMap::new(),
+            workflow_session_counter: 0,
+            session: None,
+            #[cfg(feature = "native-backend")]
+            native_session: None,
+            #[cfg(feature = "native-backend")]
+            weight_placement: None,
+            memory_strategy_plan,
+            #[cfg(feature = "native-backend")]
+            native_sessions: HashMap::new(),
+            #[cfg(feature = "native-backend")]
+            native_active_session: None,
+            #[cfg(feature = "native-backend")]
+            native_session_counter: 0,
+            #[cfg(feature = "native-backend")]
+            native_access_counter: 0,
+            #[cfg(feature = "native-backend")]
+            native_default_session: None,
+            #[cfg(feature = "native-backend")]
+            native_max_sessions: 0,
+            #[cfg(feature = "native-backend")]
+            native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
+            draft: None,
+            mtp: None,
+            eagle3: None,
+            tokenizer: None,
+            fim_config: None,
+            num_speculative_tokens: 1,
+            speculative_mode: SpeculativeMode::None,
+            last_speculative_stats: SpeculativeStats::default(),
+            connector: ConnectorBridge::null(),
+            _environment: None,
+        })
+    }
 }
 
 #[cfg(feature = "native-backend")]
@@ -149,21 +258,4 @@ pub(crate) struct Eagle3Model {
     pub(crate) hidden_outputs: Vec<String>,
     pub(crate) kv_mode: onnx_genai_ort::Eagle3DraftKvMode,
     pub(crate) num_speculative_tokens: usize,
-}
-
-pub(crate) struct SharedKvProposerModel {
-    pub(crate) config: SharedKvProposerConfig,
-    pub(crate) session: Box<Session>,
-    /// Target input-token embedding table, used to build the token-embedding
-    /// half of each draft step's `inputs_embeds`.
-    pub(crate) embedder: LinearEmbedder,
-    pub(crate) num_speculative_tokens: usize,
-}
-
-#[cfg(feature = "native-backend")]
-pub(crate) struct NativeSharedKvProposerModel {
-    pub(crate) session: crate::native_decode::NativeProposerSession,
-    pub(crate) embedder: LinearEmbedder,
-    pub(crate) groups: Vec<onnx_genai_metadata::SharedKvGroup>,
-    pub(crate) hidden_size: usize,
 }

@@ -78,7 +78,7 @@ fn generate_tokens_capturing(
     let before = NATIVE_DECODER_CAPTURED_STEP_INPUT_DECODES.load(Ordering::Relaxed);
 
     let result = (|| {
-        let mut engine = Engine::from_pipeline_dir(&fixture_dir(), EngineConfig::default())?;
+        let mut engine = Engine::from_dir(&fixture_dir(), EngineConfig::default())?;
         let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![3, 7]));
         request.options = GenerateOptions {
             max_new_tokens: 4,

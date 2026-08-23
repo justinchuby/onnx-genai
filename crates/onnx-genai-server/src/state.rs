@@ -550,7 +550,6 @@ impl AppState {
             model_max_context,
             generation_defaults: None,
             fim_config,
-            pipeline: false,
             multimodal: None,
             speech: None,
             image_pipeline: None,
@@ -667,8 +666,23 @@ pub(crate) fn build_handle_with_authorities(
     let model_dir = spec.path.as_path();
     let model_id = spec.id.clone();
     let chat_template = load_chat_template(model_dir)?;
+    // Every package declares a workflow, including a single decoder — so
+    // "declares a workflow" no longer distinguishes a composed pipeline. The
+    // shared role-structural recognizer answers "does this package need
+    // multimodal input specs". The engine's executor choice asks a different
+    // question — whether the sole graph component declares the decode contract
+    // — so these are related but not the same predicate.
     if let Some(directory) = PipelineModelDirectory::load_if_declared(model_dir)
         .map_err(|e| anyhow::anyhow!("Failed to discover pipeline directory: {e}"))?
+        .filter(|directory| {
+            !directory
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.pipeline.as_ref())
+                .is_some_and(|pipeline| {
+                    onnx_genai_metadata::is_single_decoder_workflow(&pipeline.workflow)
+                })
+        })
     {
         onnx_genai_engine::validate_pipeline_backend_request(config.engine_config.decode_backend)?;
         // The directory already parsed this package's metadata; re-reading it
@@ -716,7 +730,6 @@ pub(crate) fn build_handle_with_authorities(
         model_max_context,
         generation_defaults,
         fim_config,
-        pipeline: false,
         multimodal: None,
         speech: None,
         image_pipeline: None,
@@ -737,12 +750,12 @@ fn build_pipeline_handle(
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Failed to load pipeline tokenizer: {e}"))?;
 
-    let engine = Engine::from_pipeline_dir_with_memory_authority_provider(
+    let engine = Engine::from_dir_with_memory_authority_provider(
         model_dir,
         config.engine_config.clone(),
         authorities,
     )?;
-    let multimodal = crate::multimodal::build(&directory, engine.models())?;
+    let multimodal = crate::multimodal::build(&directory, engine.models()?)?;
     // Resolve one exact speech capability at load time: bind the single
     // text-assembly processor to the single compatible buffered PCM16 WAV audio
     // output that serving will encode. Fail closed on zero, ambiguous, or
@@ -776,16 +789,19 @@ fn build_pipeline_handle(
     // superseded generation metadata surfaces, so the pipeline path resolves
     // sampling from request options only — same as the non-pipeline path above.
     let generation_defaults = None;
+    // The same admission the decoder path applies: an explicit `--max-batch`
+    // the decode path cannot honor is refused rather than silently ignored.
+    enforce_requested_max_batch(&engine, config.max_batch)?;
+    let requested_max_batch = config.max_batch.unwrap_or(DEFAULT_MAX_BATCH);
     ModelHandle::new(ModelHandleParts {
         id: model_id,
         model_dir: model_dir.to_path_buf(),
-        engine: EngineDriver::start_pipeline(engine, config.max_queue_depth),
+        engine: EngineDriver::start(engine, requested_max_batch, config.max_queue_depth),
         tokenizer: Arc::new(tokenizer),
         chat_template: chat_template.map(Arc::new),
         model_max_context,
         generation_defaults,
         fim_config: None,
-        pipeline: true,
         multimodal: Some(multimodal),
         speech,
         image_pipeline,

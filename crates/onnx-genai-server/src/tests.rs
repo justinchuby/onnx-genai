@@ -1647,7 +1647,11 @@ async fn debug_endpoints_expose_config_sessions_cache_and_trace_state() {
         serde_json::from_slice(&to_bytes(config.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(config["model_id"], "tiny-llm");
     assert_eq!(config["max_queue_depth"], 256);
-    assert_eq!(config["pipeline"], false);
+    // Facts about the package's serialized workflow, not about which executor
+    // the runtime chose for a declared step.
+    assert_eq!(config["workflow_components"], 2);
+    assert_eq!(config["workflow_graph_components"], 1);
+    assert_eq!(config["workflow_declares_generation_loop"], true);
 
     let created = router
         .clone()
@@ -2371,7 +2375,17 @@ async fn fim_stream_returns_headers_before_generation_finishes() {
         ))
         .unwrap();
 
-    let response = timeout(Duration::from_millis(100), app(state).oneshot(request))
+    // The property is that headers follow *admission* rather than a completed
+    // generation — the bug this guards against withheld them until the whole
+    // FIM response was decoded, which is seconds on a real request.
+    //
+    // The budget is deliberately far wider than the thing being measured. At
+    // 100 ms it was measuring the machine: on a saturated box under
+    // `--test-threads=$(nproc)` it fails while the request itself takes
+    // milliseconds. A whole probe run — load plus six 64-token generations —
+    // measures 115 ms, so two seconds separates "after admission" from "after
+    // generation" with room the scheduler cannot eat.
+    let response = timeout(Duration::from_secs(2), app(state).oneshot(request))
         .await
         .expect("SSE headers must follow admission, not completed FIM generation")
         .unwrap();
@@ -2533,6 +2547,7 @@ async fn stalled_output_route_does_not_block_another_completion() {
     driver
         .commands
         .send(DriverCommand::Generate {
+            input: None,
             session_id: None,
             request: Box::new(build_generate_request(&slow_request)),
             admission: slow_admission,
@@ -2542,7 +2557,7 @@ async fn stalled_output_route_does_not_block_another_completion() {
         .await
         .unwrap();
     let fast_rx = driver
-        .generate(None, build_generate_request(&fast_request))
+        .generate(None, build_generate_request(&fast_request), None)
         .await
         .unwrap();
 
@@ -3808,4 +3823,51 @@ async fn mutating_commands_are_still_deferred() {
         ),
         "a command requiring &mut Engine must stay deferred"
     );
+}
+
+/// Sessions work for a package whose components the interpreter invokes.
+///
+/// `/v1/sessions` used to reject these outright, on the grounds that they own
+/// no decode-core KV sequence. That conflated two different things: a session
+/// is the conversation a client is having, and where the runtime keeps it —
+/// a paged KV sequence, or the `scope: session` cells the workflow declares —
+/// is not something a client can act on. A client that opened a session against
+/// one package and got a 400 against another would have to know which kind it
+/// was talking to, which is exactly the caller-side split this removes.
+#[tokio::test]
+async fn sessions_open_and_close_for_an_interpreted_package() {
+    let state = speech_state_from("speech_wav", "workflow-sessions");
+    let router = app(state);
+
+    let created = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        created.status(),
+        StatusCode::OK,
+        "a package the interpreter drives still has conversations"
+    );
+    let created: Value =
+        serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let id = created["id"].as_str().expect("session id").to_string();
+
+    let deleted = router
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/sessions/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
 }

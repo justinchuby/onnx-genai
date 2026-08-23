@@ -14,7 +14,7 @@ boundary, component registry, state declarations, serving contract, and recursiv
 control-flow graph are the only orchestration source of truth — and, through
 component ports and state groups, the only serialized graph ABI. A bare
 single-graph decoder is not an exception: the optimized single-model decode path
-recognizes that same workflow rather than reading a separate `model.io` block,
+recognizes that same workflow, which is the only place a graph ABI is stated,
 which survives as an import-only legacy input.
 
 The workflow interpreter executes SSA nodes (`invoke`, `sequence`, `loop`, `branch`,

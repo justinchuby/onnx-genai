@@ -49,7 +49,9 @@
 
 #![cfg(feature = "native-cuda")]
 
-use onnx_genai_engine::{GenerateOptions, NativeDecodeDevice, NativeDecodeSession, ProcessorChain};
+use onnx_genai_engine::{
+    Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, NativeDecodeDevice, ProcessorChain,
+};
 use onnx_genai_ort::Tokenizer;
 
 /// Raw teacher-forced prefix: the 14 prompt tokens plus the four generated
@@ -85,7 +87,18 @@ fn qwen3_0_6b_int4_native_decode_keeps_high_precision_argmax() -> anyhow::Result
         return Ok(());
     }
 
-    let mut session = NativeDecodeSession::load(dir.join("model.onnx"), NativeDecodeDevice::Cpu)?;
+    // Loaded through the ordinary entry point rather than by opening the raw
+    // graph: the teacher-forced step still has to run the loop the package
+    // declares, and building the session directly would measure a decode that
+    // no request can reach.
+    let mut engine = Engine::from_dir(
+        &dir,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            native_device: Some(NativeDecodeDevice::Cpu),
+            ..EngineConfig::default()
+        },
+    )?;
     let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
 
     // Teacher-forced single greedy step: feed the exact agreed prefix, emit one
@@ -100,7 +113,7 @@ fn qwen3_0_6b_int4_native_decode_keeps_high_precision_argmax() -> anyhow::Result
         ..GenerateOptions::default()
     };
 
-    let result = session.generate(
+    let result = engine.generate_native_from_token_ids(
         &DIVERGENCE_PREFIX,
         &options,
         &ProcessorChain::new(),
@@ -213,7 +226,18 @@ fn qwen3_0_6b_int4_native_token0_keeps_high_precision_argmax() -> anyhow::Result
         return Ok(());
     }
 
-    let mut session = NativeDecodeSession::load(dir.join("model.onnx"), NativeDecodeDevice::Cpu)?;
+    // Loaded through the ordinary entry point rather than by opening the raw
+    // graph: the teacher-forced step still has to run the loop the package
+    // declares, and building the session directly would measure a decode that
+    // no request can reach.
+    let mut engine = Engine::from_dir(
+        &dir,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            native_device: Some(NativeDecodeDevice::Cpu),
+            ..EngineConfig::default()
+        },
+    )?;
     let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
 
     let options = GenerateOptions {
@@ -224,7 +248,7 @@ fn qwen3_0_6b_int4_native_token0_keeps_high_precision_argmax() -> anyhow::Result
         top_logprobs: Some(8),
         ..GenerateOptions::default()
     };
-    let result = session.generate(
+    let result = engine.generate_native_from_token_ids(
         &HELLO_PROMPT_IDS,
         &options,
         &ProcessorChain::new(),

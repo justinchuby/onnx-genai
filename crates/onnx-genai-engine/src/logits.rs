@@ -161,12 +161,12 @@ impl ProcessorChain {
         &mut self,
         constraint: Box<dyn Constraint>,
         token_texts: Vec<Option<String>>,
-        eos_token_id: Option<TokenId>,
+        eos_token_ids: Vec<TokenId>,
     ) {
         self.add(Box::new(ConstraintProcessor::new(
             constraint,
             token_texts,
-            eos_token_id,
+            eos_token_ids,
         )));
     }
 
@@ -210,10 +210,10 @@ impl ProcessorChainBuilder {
         mut self,
         constraint: Box<dyn Constraint>,
         token_texts: Vec<Option<String>>,
-        eos_token_id: Option<TokenId>,
+        eos_token_ids: Vec<TokenId>,
     ) -> Self {
         self.chain
-            .add_constraint(constraint, token_texts, eos_token_id);
+            .add_constraint(constraint, token_texts, eos_token_ids);
         self
     }
 
@@ -227,19 +227,21 @@ impl ProcessorChainBuilder {
 pub struct ConstraintProcessor {
     constraint: Box<dyn Constraint>,
     token_texts: Vec<Option<String>>,
-    eos_token_id: Option<TokenId>,
+    /// Every id the model ends on, so a constrained decode treats each of them
+    /// as terminal rather than only the one a caller happened to name.
+    eos_token_ids: Vec<TokenId>,
 }
 
 impl ConstraintProcessor {
     pub fn new(
         constraint: Box<dyn Constraint>,
         token_texts: Vec<Option<String>>,
-        eos_token_id: Option<TokenId>,
+        eos_token_ids: Vec<TokenId>,
     ) -> Self {
         Self {
             constraint,
             token_texts,
-            eos_token_id,
+            eos_token_ids,
         }
     }
 }
@@ -256,7 +258,7 @@ impl LogitProcessor for ConstraintProcessor {
                         .get(idx)
                         .and_then(|text| text.clone())
                         .unwrap_or_default(),
-                    is_eos: self.eos_token_id == Some(token_id),
+                    is_eos: self.eos_token_ids.contains(&token_id),
                 }
             })
             .collect();
@@ -2662,7 +2664,7 @@ mod tests {
         let processor = ConstraintProcessor::new(
             Box::new(JsonConstraint),
             json_token_texts(),
-            Some(eos_token_id),
+            vec![eos_token_id],
         );
         let mut generated_text = String::new();
         let mut generated_tokens = Vec::new();
@@ -2696,7 +2698,7 @@ mod tests {
     #[test]
     fn json_constraint_masks_invalid_tokens_and_allows_eos_only_when_complete() {
         let processor =
-            ConstraintProcessor::new(Box::new(JsonConstraint), json_token_texts(), Some(14));
+            ConstraintProcessor::new(Box::new(JsonConstraint), json_token_texts(), vec![14]);
 
         let mut logits = vec![0.0; json_token_texts().len()];
         logits[6] = 10.0;
@@ -2770,7 +2772,7 @@ mod tests {
                 Some(eos_token_id),
             )?),
             token_texts.clone(),
-            Some(eos_token_id),
+            vec![eos_token_id],
         );
         let mut generated_text = String::new();
         let mut generated_tokens = Vec::new();
@@ -2908,7 +2910,7 @@ mod tests {
                     Some("2".into()),
                     Some("3".into()),
                 ],
-                None,
+                Vec::new(),
             )
             .build();
         let mut logits = vec![1.0, 1.0, 1.0, 1.0];

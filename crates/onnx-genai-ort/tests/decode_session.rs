@@ -25,7 +25,7 @@ fn tiny_orphan_output_decoder() -> PathBuf {
 /// Explicit `static_cache` ABI matching the `tiny-llm-scatter` fixture
 /// graph's actual port names. The scatter control ports are shape-indistinguish-
 /// able integers, so they must be declared rather than name-guessed.
-fn scatter_io() -> onnx_genai_metadata::ModelIoSpec {
+fn scatter_io() -> onnx_genai_metadata::DecoderAbi {
     serde_json::from_str(
         r#"{
             "token_input": "input_ids",
@@ -56,7 +56,7 @@ fn tiny_sharedbuffer_llm() -> PathBuf {
 /// since #380 and #412 it refuses to guess between them rather than picking by
 /// name. Declaring the roles is what those changes asked callers to do; these
 /// tests were simply never updated, because this crate's tests do not run in CI.
-fn declared_io(fixture: &str) -> onnx_genai_metadata::ModelIoSpec {
+fn declared_io(fixture: &str) -> onnx_genai_metadata::DecoderAbi {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures")
         .join(fixture)
@@ -69,7 +69,7 @@ fn declared_io(fixture: &str) -> onnx_genai_metadata::ModelIoSpec {
         .unwrap_or_else(|| panic!("{fixture} declares no decode ABI"))
 }
 
-fn tiny_llm_io() -> onnx_genai_metadata::ModelIoSpec {
+fn tiny_llm_io() -> onnx_genai_metadata::DecoderAbi {
     declared_io("tiny-llm")
 }
 
@@ -389,7 +389,7 @@ fn undeclared_rank3_output_is_rejected_as_unpaired_state() {
     .expect("session");
     // Declares logits but leaves the graph's rank-3 `orphan_state` output
     // unaccounted for.
-    let io: onnx_genai_metadata::ModelIoSpec =
+    let io: onnx_genai_metadata::DecoderAbi =
         serde_json::from_str(r#"{"token_input": "input_ids", "logits_output": "logits"}"#)
             .expect("io spec");
     let err = match DecodeSession::new_with_io(&session, DecodeSessionOptions::default(), Some(&io))
@@ -416,7 +416,7 @@ fn a_designated_hidden_output_is_not_rejected() {
         deterministic_session_options(),
     )
     .expect("session");
-    let io: onnx_genai_metadata::ModelIoSpec = serde_json::from_str(
+    let io: onnx_genai_metadata::DecoderAbi = serde_json::from_str(
         r#"{"token_input": "input_ids", "logits_output": "logits", "hidden_output": "orphan_state"}"#,
     )
     .expect("io spec");

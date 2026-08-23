@@ -42,6 +42,7 @@ pub use batched::{
 };
 pub use connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub use embedding::{EmbeddingOptions, EmbeddingPooling};
+pub use engine::graph_port_contracts;
 pub use engine::{
     DecisionSource, DevicePolicy, DevicePolicyParseError, DryConfig, Eagle3Config, Engine,
     EngineConfig, EngineConfigError, EngineDecodeBackend, EngineGovernorError,
@@ -52,9 +53,8 @@ pub use engine::{
     MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
     PrioritizedGenerateRequest, PrioritizedGenerateResult, RewindTokenCount, SamplingOverrides,
     ScheduledGenerateArrival, SessionCheckpoint, SessionForkCapability, SessionId, SessionPosition,
-    SharedKvBinding, SharedKvProposerConfig, SpeculativeMode, TokenLogprob, WeightAccessPattern,
-    WeightPlacementReport, XtcConfig, parse_device_policy, parse_resource_limit,
-    resolve_device_vram_limit_bytes,
+    SpeculativeMode, TokenLogprob, WeightAccessPattern, WeightPlacementReport, XtcConfig,
+    parse_device_policy, parse_resource_limit, resolve_device_vram_limit_bytes,
 };
 pub use fim::{FimConfig, FimFormat};
 pub use logits::{
@@ -75,6 +75,9 @@ pub use onnx_genai_kv::{
     LocalTieredConfig,
 };
 pub use onnx_genai_metadata::GenerationDefaults;
+/// Re-exported so every caller asks one recognizer whether a package is a
+/// composed pipeline or a single decoder.
+pub use onnx_genai_metadata::is_single_decoder_workflow;
 pub use onnx_genai_scheduler::{
     FixedCapacity, GovernorReconfigureOutcome, GovernorSnapshot, ResourceLimit, ResourceLimits,
     resolve_limit,
@@ -166,7 +169,7 @@ pub struct VmmArenaStats {
 #[cfg(feature = "native-backend")]
 pub use onnx_runtime_session::DecodePrecision;
 pub use pipeline::{
-    AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection, EncodedAudio, PipelineEngine,
+    AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection, EncodedAudio,
     PipelineGenerateRequest, PipelineTensors, RowScopedState, RowTable, WorkflowSessionCheckpoint,
     is_missing_required_input, validate_pipeline_backend_request,
 };

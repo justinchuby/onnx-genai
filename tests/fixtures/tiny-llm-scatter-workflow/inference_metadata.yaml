@@ -2,8 +2,9 @@
 #
 # It declares no `model:` block: the scatter ABI a driver binds is derived
 # from the state_service group's indexed_scatter update and the decoder
-# component's port roles. The sibling directory keeps the retired legacy
-# `model.io` form so the import-only path stays covered.
+# component's port roles. Its sibling `tiny-llm-scatter/` is the same graph as
+# converted by `migrate_model_io`, so this hand-authored form and the generated
+# one are both exercised against the same driver.
 schema_version: v1
 pipeline:
   workflow:
@@ -97,7 +98,7 @@ pipeline:
         contract:
           dtype: float32
           rank: 3
-          shape: [batch, cache_capacity, 4]
+          shape: [batch, cache_capacity, 16]
           batch_layout: {kind: request_aligned, axis: 0}
         role: {kind: opaque}
         source: {kind: literal}
@@ -125,12 +126,12 @@ pipeline:
             key_cache.0:
               dtype: float32
               rank: 3
-              shape: [batch, cache_capacity, 4]
+              shape: [batch, cache_capacity, 16]
               batch_layout: {kind: request_aligned, axis: 0}
             value_cache.0:
               dtype: float32
               rank: 3
-              shape: [batch, cache_capacity, 4]
+              shape: [batch, cache_capacity, 16]
               batch_layout: {kind: request_aligned, axis: 0}
             write_indices:
               dtype: int64
@@ -151,12 +152,12 @@ pipeline:
             updated_key_cache.0:
               dtype: float32
               rank: 3
-              shape: [batch, cache_capacity, 4]
+              shape: [batch, cache_capacity, 16]
               batch_layout: {kind: request_aligned, axis: 0}
             updated_value_cache.0:
               dtype: float32
               rank: 3
-              shape: [batch, cache_capacity, 4]
+              shape: [batch, cache_capacity, 16]
               batch_layout: {kind: request_aligned, axis: 0}
             next_write_indices:
               dtype: int64
@@ -258,7 +259,7 @@ pipeline:
         contract:
           dtype: float32
           rank: 3
-          shape: [batch, cache_capacity, 4]
+          shape: [batch, cache_capacity, 16]
           batch_layout: {kind: request_aligned, axis: 0}
         scope: invocation
         initializer: package.cache
@@ -270,7 +271,7 @@ pipeline:
         contract:
           dtype: float32
           rank: 3
-          shape: [batch, cache_capacity, 4]
+          shape: [batch, cache_capacity, 16]
           batch_layout: {kind: request_aligned, axis: 0}
         scope: invocation
         initializer: package.cache

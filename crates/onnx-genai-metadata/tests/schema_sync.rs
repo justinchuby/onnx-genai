@@ -33,10 +33,19 @@ fn generated_schema_preserves_all_root_constraints() {
             .expect("generated schema is JSON");
     let constraints = schema["allOf"].as_array().expect("root allOf array");
 
-    assert!(constraints.iter().any(|constraint| {
-        constraint["not"]["required"] == serde_json::json!(["pipeline", "model"])
-            && constraint["not"]["properties"]["model"]["required"] == serde_json::json!(["io"])
-    }));
+    // The published schema must forbid the retired `model.io` key outright, not
+    // merely beside a `pipeline`. `ModelCapabilities` does not deny unknown
+    // fields, so a producer validating against the schema alone would otherwise
+    // be told its package is valid and then find the loader refuses it — the
+    // schema and `parser::reject_retired_model_io` have to agree on what is
+    // loadable.
+    assert!(
+        constraints.iter().any(|constraint| {
+            constraint["not"]["required"] == serde_json::json!(["model"])
+                && constraint["not"]["properties"]["model"]["required"] == serde_json::json!(["io"])
+        }),
+        "the schema must reject model.io wherever it appears: {constraints:#?}"
+    );
 
     let serialized = serde_json::to_string(&schema).expect("schema serializes");
     for removed in [

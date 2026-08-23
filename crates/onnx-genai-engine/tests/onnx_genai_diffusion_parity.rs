@@ -265,7 +265,7 @@ fn run_parity(package: &str, baseline: &str, batch: i64) -> anyhow::Result<()> {
     let guidance_scale = reference.index["config"]["guidance_scale"]
         .as_f64()
         .unwrap_or(7.5) as f32;
-    let mut engine = Engine::from_pipeline_dir(&root.join(package), EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root.join(package), EngineConfig::default())?;
     let output =
         engine.run_pipeline_outputs(guided_request(&reference, batch, guidance_scale, steps)?)?;
 
@@ -326,7 +326,7 @@ fn real_stable_diffusion_batched_rows_are_independent() -> anyhow::Result<()> {
     ] {
         let reference = Reference::load(&root, baseline)?;
         let steps = reference.shape("timesteps")?[0] as usize;
-        let mut engine = Engine::from_pipeline_dir(&root.join(package), EngineConfig::default())?;
+        let mut engine = Engine::from_dir(&root.join(package), EngineConfig::default())?;
         let batched =
             engine.run_pipeline_outputs(guided_request(&reference, 2, 7.5, steps)?)?["latent"]
                 .to_vec_f32()?;
@@ -373,8 +373,7 @@ fn real_stable_diffusion_seeded_latents_are_deterministic_per_row() -> anyhow::R
         eprintln!("skipping: {PACKAGE_ENV} is not set");
         return Ok(());
     };
-    let mut engine =
-        Engine::from_pipeline_dir(&root.join("package_euler_seeded"), EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root.join("package_euler_seeded"), EngineConfig::default())?;
     let reference = Reference::load(&root, "baseline_euler_b2")?;
     let recorded_cond = reference.i64("cond_input_ids")?;
     let recorded_uncond = reference.i64("uncond_input_ids")?;

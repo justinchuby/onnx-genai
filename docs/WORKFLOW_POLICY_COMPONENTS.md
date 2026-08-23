@@ -837,7 +837,7 @@ Metadata does NOT select a storage mode. `paging`, `allocation`, `storage`, `sha
 slot-allocation policy are runtime deployment decisions and are rejected if serialized. `aliasing`
 replaces `shared_buffer`: it states whether the graph is correct when past and present share
 memory — a property of the graph, not a request to use one buffer — and defaults to `forbidden`.
-Legacy top-level `kv_cache`, `model.runtime_configurable.kv_cache`, and `model.io.kv_update` hints
+Legacy top-level `kv_cache` and `model.runtime_configurable.kv_cache` hints
 are rejected. See
 [INFERENCE_METADATA_DECISIONS.md](genai/INFERENCE_METADATA_DECISIONS.md#12-state).
 Bare decoder documents use ordinary functional past/present dataflow; metadata attention family,

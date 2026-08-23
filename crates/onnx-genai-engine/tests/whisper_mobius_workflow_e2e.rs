@@ -22,7 +22,7 @@
 
 use std::path::PathBuf;
 
-use onnx_genai_engine::pipeline::{PipelineEngine, PipelineGenerateRequest, WorkflowOutputRole};
+use onnx_genai_engine::pipeline::{PipelineGenerateRequest, WorkflowOutputRole};
 use onnx_genai_engine::{Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest};
 use onnx_genai_ort::{DataType, Value};
 use onnx_genai_preprocess::audio::{LogMelExtractor, WHISPER_SAMPLE_RATE, decode_wav_pcm16};
@@ -225,7 +225,7 @@ fn transcribe_request(
 }
 
 fn rows_of(
-    engine: &PipelineEngine,
+    engine: &Engine,
     outputs: &onnx_genai_engine::pipeline::PipelineOutputs,
 ) -> anyhow::Result<Vec<Vec<i64>>> {
     engine
@@ -243,7 +243,7 @@ fn exported_whisper_workflow_transcribes_encoded_audio() -> anyhow::Result<()> {
         return Ok(());
     };
     let bytes = std::fs::read(&wav)?;
-    let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&dir, EngineConfig::default())?;
     let output = engine.run_pipeline_outputs(transcribe_request(bytes, 64)?)?;
     let tokens = engine
         .structured_output_for_role(&output, WorkflowOutputRole::Tokens)
@@ -277,7 +277,7 @@ fn exported_whisper_workflow_separates_clips_of_different_length() -> anyhow::Re
     };
     let long = std::fs::read(&long_wav)?;
     let short = std::fs::read(&short_wav)?;
-    let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&dir, EngineConfig::default())?;
 
     // Both clips pad to the same declared analysis window, so the difference in
     // duration must survive only through the encoder states and the per-row
@@ -325,7 +325,7 @@ fn exported_whisper_workflow_keeps_rows_aligned_across_lengths() -> anyhow::Resu
     };
     let long = log_mel(&long_wav)?;
     let short = log_mel(&short_wav)?;
-    let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&dir, EngineConfig::default())?;
 
     let short_alone_output =
         engine.run_pipeline_outputs(batched_features_request(&short, 1, 96)?)?;

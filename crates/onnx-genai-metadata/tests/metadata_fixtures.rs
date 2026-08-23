@@ -548,9 +548,12 @@ fn removed_top_level_execution_surfaces_are_rejected() {
 
 #[test]
 fn removed_legacy_kv_selection_surfaces_are_rejected() {
+    // `model.io` is no longer among these: the whole block is retired, so it is
+    // refused at the loader with an error naming the conversion rather than as
+    // an unknown field inside a block that no longer exists. See
+    // `canonical_graph_abi::a_package_declaring_the_retired_block_is_refused`.
     for document in [
         "kv_cache: { native_dtype: float16 }\n",
-        "model:\n  io:\n    kv_update: shared_buffer\n",
         "model:\n  runtime_configurable:\n    kv_cache: { dtype: [float16] }\n",
     ] {
         let error = serde_yaml::from_str::<InferenceMetadata>(document)

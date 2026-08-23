@@ -15,15 +15,15 @@
 
 use onnx_genai_bench::synthetic_decoder;
 use onnx_genai_engine::NativeDecodeSession;
-use onnx_genai_metadata::{KvOwnership, ModelIoSpec, SequenceInputKind};
+use onnx_genai_metadata::{DecoderAbi, KvOwnership, SequenceInputKind};
 use onnx_runtime_session::InferenceSession;
 use std::collections::BTreeMap;
 
 /// Explicit I/O contract for the synthetic decoder. Its `input_ids`,
 /// `attention_mask`, and `position_ids` ports are all `[-1, -1]` Int64, so the
 /// shape/dtype auto-resolution is ambiguous and a declared spec is required.
-fn synthetic_io() -> ModelIoSpec {
-    ModelIoSpec {
+fn synthetic_io() -> DecoderAbi {
+    DecoderAbi {
         sequence_source: Some(SequenceInputKind::TokenIds),
         kv_ownership: Some(KvOwnership::Owned),
         kv_layout: None,

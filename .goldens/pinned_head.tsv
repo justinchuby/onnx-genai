@@ -1,0 +1,36 @@
+gemma4_e2b	eos.finish_reason	ERROR required workflow package input 'request.accepted_len' was not supplied
+gemma4_e2b	greedy.finish_reason	ERROR required workflow package input 'request.accepted_len' was not supplied
+gemma4_e2b	greedy.repeat	ERROR required workflow package input 'request.accepted_len' was not supplied
+gemma4_e2b	greedy.tokens	ERROR required workflow package input 'request.accepted_len' was not supplied
+gemma4_e2b	load	ok
+gemma4_e2b	seeded.repeat	ERROR required workflow package input 'request.accepted_len' was not supplied
+gemma4_e2b	seeded.tokens	ERROR required workflow package input 'request.accepted_len' was not supplied
+gemma4_e2b	session.close	ok
+gemma4_e2b	session.open	ok
+gemma4_e2b	session.tokens	0
+gemma4_e2b	session.turn1	ERROR required workflow package input 'request.accepted_len' was not supplied
+gemma4_e2b	session.turn2	ERROR required workflow package input 'request.accepted_len' was not supplied
+gemma4_e2b_speculative	eos.finish_reason	ERROR required workflow package input 'request.accepted_len' was not supplied
+gemma4_e2b_speculative	greedy.finish_reason	ERROR required workflow package input 'request.accepted_len' was not supplied
+gemma4_e2b_speculative	greedy.repeat	ERROR required workflow package input 'request.accepted_len' was not supplied
+gemma4_e2b_speculative	greedy.tokens	ERROR required workflow package input 'request.accepted_len' was not supplied
+gemma4_e2b_speculative	load	ok
+gemma4_e2b_speculative	seeded.repeat	ERROR required workflow package input 'request.accepted_len' was not supplied
+gemma4_e2b_speculative	seeded.tokens	ERROR required workflow package input 'request.accepted_len' was not supplied
+gemma4_e2b_speculative	session.close	ok
+gemma4_e2b_speculative	session.open	ok
+gemma4_e2b_speculative	session.tokens	0
+gemma4_e2b_speculative	session.turn1	ERROR required workflow package input 'request.accepted_len' was not supplied
+gemma4_e2b_speculative	session.turn2	ERROR required workflow package input 'request.accepted_len' was not supplied
+qwen3_0_6b	eos.finish_reason	MaxTokens/64
+qwen3_0_6b	greedy.finish_reason	MaxTokens
+qwen3_0_6b	greedy.repeat	3988,0,358,2776,773,12035,311,387,1588,0,358,2776,773,12035,311,387
+qwen3_0_6b	greedy.tokens	3988,0,358,2776,773,12035,311,387,1588,0,358,2776,773,12035,311,387
+qwen3_0_6b	load	ok
+qwen3_0_6b	seeded.repeat	3988,0,2585,525,498,3351,1939,1986,374,279,11657,1616,311,40786,4325,323
+qwen3_0_6b	seeded.tokens	3988,0,2585,525,498,3351,1939,1986,374,279,11657,1616,311,40786,4325,323
+qwen3_0_6b	session.close	ok
+qwen3_0_6b	session.open	ok
+qwen3_0_6b	session.tokens	32
+qwen3_0_6b	session.turn1	3988,0,358,2776,773,12035,311,387,1588,0,358,2776,773,12035,311,387|prefix=0
+qwen3_0_6b	session.turn2	3988,0,358,2776,773,12035,311,387,1588,0,358,2776,773,12035,311,387|prefix=0

@@ -16,17 +16,17 @@ where
     Ok(value)
 }
 
+mod decoder_abi;
 mod generation;
 mod hardware;
 mod ir;
-mod model_io;
 mod package;
 mod pipeline;
 
+pub use decoder_abi::*;
 pub use generation::*;
 pub use hardware::*;
 pub use ir::*;
-pub use model_io::*;
 pub use package::*;
 pub use pipeline::*;
 
@@ -129,62 +129,35 @@ pub struct InferenceMetadata {
     /// could write an answer that disagrees.
     #[serde(skip)]
     #[schemars(skip)]
-    decoder_io: std::sync::OnceLock<Option<ModelIoSpec>>,
+    decoder_io: std::sync::OnceLock<Option<DecoderAbi>>,
 }
 
 impl InferenceMetadata {
     /// The resolved decode-step graph ABI for this package's decoder.
     ///
-    /// Recognized from `pipeline.workflow` when the package carries one, and
-    /// otherwise read from the deprecated import-only `model.io` block. Every
-    /// runtime reads the ABI through here, so a bare single ONNX decoder and a
-    /// composite package are driven from the same representation.
-    pub fn decoder_io(&self) -> Option<&ModelIoSpec> {
+    /// Derived from `pipeline.workflow` and nowhere else. There is no second
+    /// place a producer can state a different answer, because there is no
+    /// second place a producer can state one at all.
+    pub fn decoder_io(&self) -> Option<&DecoderAbi> {
         self.decoder_io
             .get_or_init(|| {
-                self.pipeline
-                    .as_ref()
-                    .and_then(|pipeline| {
-                        let workflow = &pipeline.workflow;
-                        let component = crate::decoder_abi::sole_decoder_component(workflow)?;
-                        crate::decoder_abi::decoder_abi(workflow, component)
-                    })
-                    .or_else(|| {
-                        self.model
-                            .as_ref()
-                            .and_then(ModelCapabilities::legacy_io)
-                            .cloned()
-                    })
+                let workflow = &self.pipeline.as_ref()?.workflow;
+                let component = crate::decoder_abi::sole_decoder_component(workflow)?;
+                crate::decoder_abi::decoder_abi(workflow, component)
             })
             .as_ref()
     }
 
-    /// Whether the resolved ABI came from the deprecated serialized block.
-    ///
-    /// Callers use this to attribute an ABI error to the right source: a port
-    /// the legacy block names is a different fix from one the workflow
-    /// recognized.
-    pub fn decoder_io_is_legacy(&self) -> bool {
-        self.decoder_io().is_some()
-            && self
-                .pipeline
-                .as_ref()
-                .and_then(|pipeline| crate::decoder_abi::sole_decoder_component(&pipeline.workflow))
-                .is_none()
-    }
-
     /// Install a decode ABI a loader recovered from the graph itself.
     ///
-    /// A package imported from `genai_config.json` may name neither a workflow
-    /// nor a port ABI, leaving a loader to recover the ports from the ONNX
-    /// graph's own inventory. That result is derived exactly like a recognized
-    /// one, so it belongs in the resolved slot; writing it back into the
-    /// deprecated serialized block would manufacture the second authoritative
-    /// declaration this type exists to prevent.
+    /// A package imported from the foreign `genai_config.json` format carries no
+    /// workflow of ours, so its importer builds one and resolves the ABI from
+    /// it. That result is derived exactly like a recognized one, so it belongs
+    /// in the resolved slot.
     ///
     /// Replaces any previously resolved ABI, which is why it takes `&mut self`:
     /// a loader derives an ABI before the package is shared.
-    pub fn set_derived_decoder_io(&mut self, io: ModelIoSpec) {
+    pub fn set_derived_decoder_io(&mut self, io: DecoderAbi) {
         self.decoder_io = std::sync::OnceLock::from(Some(io));
     }
 }
@@ -468,6 +441,19 @@ mod schema_helpers {
     use schemars::Schema;
     use serde_json::json;
 
+    /// Publish the retired `model.io` block's rejection in the JSON schema.
+    ///
+    /// `ModelCapabilities` does not deny unknown fields, so a validator working
+    /// from the schema alone would silently accept `model.io` and a producer
+    /// would not learn it had published an unloadable package until a runtime
+    /// refused it. The constraint therefore forbids the key outright — the same
+    /// rule `parser::reject_retired_model_io` enforces, so the published schema
+    /// and the loader cannot disagree about what is valid.
+    ///
+    /// An earlier revision forbade `model.io` only *beside* a `pipeline`, from
+    /// when the block was still an import-only source. It is not a source at
+    /// all now, so the narrower rule would accept exactly the documents the
+    /// loader rejects.
     pub(super) fn inference_metadata_constraints(schema: &mut Schema) {
         schema
             .ensure_object()
@@ -477,7 +463,7 @@ mod schema_helpers {
             .expect("allOf inserted as an array")
             .push(json!({
                 "not": {
-                    "required": ["pipeline", "model"],
+                    "required": ["model"],
                     "properties": {
                         "model": {
                             "required": ["io"]
@@ -638,7 +624,7 @@ mod tests {
 
     #[derive(Debug, Deserialize, Serialize)]
     struct OptionalModalityDocument {
-        io: ModelIoSpec,
+        io: DecoderAbi,
     }
 
     #[test]

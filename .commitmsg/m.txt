@@ -1,0 +1,18 @@
+Merge remote-tracking branch 'origin/main' into feat/native-workflow-backend
+
+Taken to pick up `b9217fafc`, which gates the Linux-only import in
+`onnx-runtime-hostmon`'s contention test. That crate landed on `main` after the
+previous merge here and broke the macOS coverage job on this PR — a failure in a
+crate this branch does not touch, fixed upstream rather than worked around.
+
+Clean merge, no conflicts.
+
+Note: `onnx-runtime-ep-cuda`'s `content_preserving_transition_gpu` test does not
+compile against `origin/main` either (`transition_granule_range_with_phase8_faults`
+is configured out of the non-GPU build), verified in a clean worktree at the same
+commit. Not from this branch.
+
+Verified: engine and server suites; workspace check.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+Signed-off-by: Copilot <223556219+Copilot@users.noreply.github.com>

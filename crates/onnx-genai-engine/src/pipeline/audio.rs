@@ -4,7 +4,7 @@ use onnx_genai_metadata::{
     WorkflowSpec,
 };
 
-use super::{PipelineEngine, PipelineOutputs};
+use super::{PipelineOutputs, WorkflowRuntime};
 
 const RESAMPLE_RADIUS: isize = 16;
 
@@ -55,7 +55,7 @@ pub struct EncodedAudio {
     pub channels: u16,
 }
 
-impl PipelineEngine {
+impl WorkflowRuntime {
     /// Encode the named workflow audio output into a buffered WAV.
     ///
     /// The caller passes the exact output name that admission resolved and
