@@ -3721,6 +3721,7 @@ pub fn configured_persistent_decode_threads() -> Option<usize> {
         decode_threads_override(),
         value.as_deref(),
         available,
+        crate::core_topology::allowed_physical_cores(),
     );
     // Snapdragon/X Elite style ARM64 hosts have measured their decode roofline
     // at 6--8 workers, and the KAI-style packed SDOT path still scales from the
@@ -4399,10 +4400,34 @@ fn prefill_worker_name(index: usize) -> String {
 /// *spin* before parking, a fully-subscribed pool starves the dispatcher and
 /// collapses throughput (measured 1.4 tok/s at 96 workers vs 28.7 at 48 on a
 /// 96-logical-CPU host); half sits at the measured plateau while avoiding that
-/// cliff, and on SMT hosts it maps to roughly the physical-core count.
-fn default_persistent_threads(available: usize) -> Option<usize> {
+/// cliff.
+///
+/// # Why `available / 2` is only a proxy
+///
+/// The rule the measurements actually support is *one worker per physical
+/// core*. Halving the CPU count is a stand-in that agrees with it only when the
+/// process can see every logical CPU on an SMT host. It disagrees badly the
+/// moment the allowed set is already one CPU per core: `taskset -c 0,2,...,30`
+/// on a 16-core/32-thread host leaves `available == 16`, all of them distinct
+/// cores, and halving builds an **8**-worker pool on 16 reserved cores. The
+/// operator asked for the machine and got half of it, silently, because the
+/// proxy cannot tell a 16-CPU SMT-free set from half of a 32-CPU SMT set.
+///
+/// So take the real answer when the topology is discoverable and the allowed
+/// set is known ([`crate::core_topology::allowed_physical_cores`]), and fall
+/// back to the halving proxy only when it is not. `None` from the topology
+/// means "unknown", never "one" — capping on a guess is how a 32-thread host
+/// silently becomes a 1-thread host.
+fn default_persistent_threads(
+    available: usize,
+    allowed_physical_cores: Option<usize>,
+) -> Option<usize> {
     let available = std::num::NonZeroUsize::new(available)?.get();
-    Some((available / 2).max(1))
+    let default = match allowed_physical_cores {
+        Some(cores) if cores > 0 => cores,
+        _ => available / 2,
+    };
+    Some(default.clamp(1, available))
 }
 
 /// Query the performance-core count on Apple Silicon via sysctl.
@@ -4436,16 +4461,17 @@ fn performance_core_count() -> Option<usize> {
 /// unparseable value falls back to [`default_persistent_threads`].
 #[cfg(test)]
 fn resolve_persistent_decode_threads(raw: Option<&str>, available: usize) -> Option<usize> {
-    resolve_persistent_decode_threads_with_override(None, raw, available)
+    resolve_persistent_decode_threads_with_override(None, raw, available, None)
 }
 
 fn resolve_persistent_decode_threads_with_override(
     override_threads: Option<usize>,
     raw: Option<&str>,
     available: usize,
+    allowed_physical_cores: Option<usize>,
 ) -> Option<usize> {
     let available = std::num::NonZeroUsize::new(available)?.get();
-    let default = default_persistent_threads(available)?;
+    let default = default_persistent_threads(available, allowed_physical_cores)?;
     let threads = match override_threads {
         Some(threads) => threads,
         None => match raw {
@@ -16920,15 +16946,42 @@ mod tests {
     fn persistent_decode_thread_default_is_half_the_logical_cpus() {
         // The persistent pool scales past the flat pool's 8-worker ceiling: unset
         // -> half the logical CPUs (topology-derived, rule 2), not the flat cap.
-        assert_eq!(default_persistent_threads(96), Some(48));
-        assert_eq!(default_persistent_threads(8), Some(4));
-        assert_eq!(default_persistent_threads(4), Some(2));
-        assert_eq!(default_persistent_threads(2), Some(1));
-        assert_eq!(default_persistent_threads(1), Some(1));
-        assert_eq!(default_persistent_threads(0), None);
+        // With no discoverable core count the halving proxy still applies.
+        assert_eq!(default_persistent_threads(96, None), Some(48));
+        assert_eq!(default_persistent_threads(8, None), Some(4));
+        assert_eq!(default_persistent_threads(4, None), Some(2));
+        assert_eq!(default_persistent_threads(2, None), Some(1));
+        assert_eq!(default_persistent_threads(1, None), Some(1));
+        assert_eq!(default_persistent_threads(0, None), None);
         // Distinct from the flat default on a big host (48 vs 8) -- proving the
         // persistent path does not inherit the fork/join-bound cap.
-        assert_ne!(default_persistent_threads(96), default_decode_threads(96));
+        assert_ne!(
+            default_persistent_threads(96, None),
+            default_decode_threads(96)
+        );
+    }
+
+    /// The halving proxy is wrong whenever the allowed set is *already* one CPU
+    /// per physical core, which is what `taskset -c 0,2,...` produces on an SMT
+    /// host and what every careful benchmark on such a host uses.
+    #[test]
+    fn persistent_decode_default_uses_physical_cores_not_half_the_cpuset() {
+        // 16 CPUs that are 16 distinct cores: the whole point of the pin is to
+        // get 16 workers. Halving would build 8 and report nothing.
+        assert_eq!(default_persistent_threads(16, Some(16)), Some(16));
+        // The unpinned SMT case must be unchanged: 32 CPUs, 16 cores -> 16,
+        // which is exactly what the halving proxy used to produce.
+        assert_eq!(default_persistent_threads(32, Some(16)), Some(16));
+        assert_eq!(default_persistent_threads(96, Some(48)), Some(48));
+        // A core count can never exceed the CPUs actually available, and can
+        // never round down to zero.
+        assert_eq!(default_persistent_threads(4, Some(9)), Some(4));
+        assert_eq!(default_persistent_threads(1, Some(1)), Some(1));
+        // `Some(0)` is nonsense from the topology layer; treat it as unknown
+        // rather than building a zero-worker pool.
+        assert_eq!(default_persistent_threads(8, Some(0)), Some(4));
+        // Unknown topology keeps the historical behaviour exactly.
+        assert_eq!(default_persistent_threads(16, None), Some(8));
     }
 
     #[test]
@@ -17012,7 +17065,7 @@ mod tests {
             Some(6)
         );
         assert_eq!(
-            resolve_persistent_decode_threads_with_override(Some(8), Some("32"), 96),
+            resolve_persistent_decode_threads_with_override(Some(8), Some("32"), 96, None),
             Some(8)
         );
         assert_eq!(
@@ -17020,7 +17073,7 @@ mod tests {
             Some(12)
         );
         assert_eq!(
-            resolve_persistent_decode_threads_with_override(None, None, 96),
+            resolve_persistent_decode_threads_with_override(None, None, 96, None),
             Some(48),
             "the uncapped automatic default must remain unchanged"
         );
@@ -17045,7 +17098,7 @@ mod tests {
         assert_ne!(default_dense_decode_threads(96), default_decode_threads(96));
         assert_ne!(
             default_dense_decode_threads(96),
-            default_persistent_threads(96)
+            default_persistent_threads(96, None)
         );
     }
 
