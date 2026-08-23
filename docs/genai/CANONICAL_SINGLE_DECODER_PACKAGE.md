@@ -173,7 +173,13 @@ session restarts from its own prompt.
 That is not hypothetical: it is what every migrated eleven-component decoder
 package on the hub looked like. `Engine::create_session` now refuses a package
 that publishes a token stream and declares no session state, so the omission
-surfaces at the call that cannot be honoured rather than at the third turn.
+surfaces at the call that cannot be honoured rather than at the third turn — and
+the refusal is typed, so a server answers it 409 rather than 500.
+
+A `prompt_prefix` conversation is carried as tokens, so turn *N* re-prefills
+every earlier turn: O(N²) over the conversation, against O(N) for a decode core
+whose paged KV survives the turn. §12.5b of the metadata decisions states why a
+package whose prefill starts from an empty cache has no cheaper option.
 
 ## End-of-generation tokens
 

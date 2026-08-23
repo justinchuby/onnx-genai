@@ -44,8 +44,9 @@ pub use islands::ExecutionIslandDiagnostic;
 pub use onnx_genai_metadata::WorkflowOutputRole;
 pub use row_state::{RowScopedState, RowTable, check_selection, gather_rows};
 pub use workflow::{
-    MISSING_REQUIRED_INPUT, WorkflowExecutionPlan, WorkflowPerformanceDiagnostic,
-    is_missing_required_input, workflow_carries_session_state,
+    CONVERSATION_OVER_BOUND, MISSING_REQUIRED_INPUT, WorkflowExecutionPlan,
+    WorkflowPerformanceDiagnostic, is_conversation_over_bound, is_missing_required_input,
+    workflow_carries_session_state,
 };
 pub(crate) use workflow::{WorkflowGenerationCursor, WorkflowNodeHost, WorkflowNodeRequest};
 
@@ -181,6 +182,14 @@ pub(crate) struct WorkflowRuntime {
     workflow_performance: RefCell<workflow::WorkflowPerformanceCounters>,
     workflow_execution_generation: Cell<u64>,
     workflow_session_state: RefCell<HashMap<(String, String), Value>>,
+    /// Sessions with a pass in flight, for leases declared `policy: exclusive`.
+    ///
+    /// Two turns of one conversation that both read the history before either
+    /// writes it produce a last-write-wins conversation: the first turn's
+    /// prompt and generation vanish. The declaration says the lease is
+    /// exclusive, so this is what makes that true rather than assumed — a
+    /// second concurrent turn is refused with a name, not silently lost.
+    workflow_session_leases: RefCell<std::collections::HashSet<String>>,
     /// Device→host materializations this runtime performed.
     ///
     /// A proposal chain's whole point is that its per-token work stays on the
@@ -434,6 +443,7 @@ impl WorkflowRuntime {
             workflow_performance: RefCell::new(workflow::WorkflowPerformanceCounters::default()),
             workflow_execution_generation: Cell::new(0),
             workflow_session_state: RefCell::new(HashMap::new()),
+            workflow_session_leases: RefCell::new(std::collections::HashSet::new()),
             host_staging_count: std::cell::Cell::new(0),
             device_readback_bytes: std::cell::Cell::new(0),
             embedding_tables: RefCell::new(HashMap::new()),
@@ -787,6 +797,7 @@ impl WorkflowRuntime {
                 workflow_performance: RefCell::new(workflow::WorkflowPerformanceCounters::default()),
                 workflow_execution_generation: Cell::new(0),
                 workflow_session_state: RefCell::new(HashMap::new()),
+                workflow_session_leases: RefCell::new(std::collections::HashSet::new()),
                 host_staging_count: std::cell::Cell::new(0),
                 device_readback_bytes: std::cell::Cell::new(0),
                 embedding_tables: RefCell::new(HashMap::new()),

@@ -1024,12 +1024,19 @@ adds no network-aware `receive` or `await` operation.
 Scope says *keep this*. It does not say how the next invocation reaches what was
 kept, and a package that leaves that unanswered advertises a continuity it does
 not have — every turn restarts and the failure reaches a caller as a model that
-forgot what it was told. The runtime hands a lease back through exactly two
-mechanisms, and a document uses one of them:
+forgot what it was told. A lease is reached through exactly three mechanisms, and
+a document uses one of them. Which one each session cell uses is answered once,
+by `classify_session_state`, and read by both the validator and the runtime —
+computing it twice is how they came to disagree.
 
 - **A loop carries the cell.** Its lease is what seeds the carry when the pass
   enters the loop, in place of the initializer the document names. This is what a
   full-duplex or streaming package does.
+- **A state service group holds it.** The group's alias names the `input` port
+  the graph reads and the `output` port that advances it, so the lease replaces
+  the value the cell's initializer names and the alias's output is what the next
+  lease holds. An alias with no output port is refused: the lease could be read
+  and never advanced, so every turn would replay the first.
 - **The request binding rejoins it**, declared on the lease:
 
   ```yaml
@@ -1079,10 +1086,34 @@ would be two answers about the same value; and a workflow declares at most one,
 because a package has one conversation. A session-scoped cell binding a
 `service_group` must resolve to a declared group that aliases it.
 
-A package that publishes a token stream and declares no session state the
-interpreter can carry — no loop-carried session cell and no continuation — is
+A **semantic** session-scoped cell with none of the three is refused at load:
+nothing in the document says how the next invocation reaches it. Advisory state
+is exempt, because it is droppable by declaration.
+
+A package that publishes a token stream and declares no session state at all is
 refused a session at `create_session` rather than handed one whose turns silently
-restart. A package that publishes no token stream has no
+restart. That refusal is typed — `PackageCapabilityError` — so a front end
+answers it as a request/package mismatch (HTTP 409) rather than as a server
+fault. A package that publishes no token stream has no conversation to lose and
+keeps its session handle.
+
+A lease declared `policy: exclusive` is single-flight: a second turn that starts
+while one is in flight is refused by name rather than allowed to read a
+conversation the first is about to replace.
+
+### 12.5b What a prompt-prefix conversation costs
+
+A `prompt_prefix` continuation carries the conversation as **tokens**, not as a
+cache: the package's own cache cells are invocation-scoped and released when the
+invocation ends, so turn *N* re-prefills every earlier turn. Over a conversation
+of *N* tokens that is O(N²) prefill work, against O(N) for a decode core whose
+paged KV survives the turn.
+
+That is the cost of continuing a conversation a package can *express*. A decoder
+whose prefill accepts only an empty cache has no port for a prior session length,
+so a runtime handing it the previous turn's cache would produce a mask and a
+cache that disagree. A package that wants the linear cost declares its cache
+session-scoped and is executed by a core that keeps it. A package that publishes no token stream has no
 conversation to lose, and its session is an ordinary handle.
 
 ### 12.6 Private state and checkpoints

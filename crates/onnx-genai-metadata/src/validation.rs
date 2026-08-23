@@ -2428,7 +2428,8 @@ fn validate_state_lifetimes(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
 /// turn. That is the failure this rejects, at the document rather than at the
 /// third turn of a conversation.
 fn validate_session_continuity(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
-    let carried = loop_carried_cells(&workflow.steps);
+    let facts = crate::session_state::classify_session_state(workflow);
+    let carried = crate::session_state::loop_carried_cells(&workflow.steps);
     let groups = workflow
         .serving
         .as_ref()
@@ -2453,7 +2454,8 @@ fn validate_session_continuity(workflow: &WorkflowSpec, errors: &mut Vec<String>
         // A session-scoped cell that binds a state service group is that
         // group's storage. Naming a group the document does not declare, or one
         // whose aliases never reach this cell, leaves the lease with nothing to
-        // hold.
+        // hold — and is why `classify_session_state` does not count such a
+        // group as a carrier either.
         if let Some(group_name) = cell.service_group.as_deref() {
             match groups.and_then(|groups| groups.get(group_name)) {
                 None => errors.push(format!(
@@ -2470,6 +2472,28 @@ fn validate_session_continuity(workflow: &WorkflowSpec, errors: &mut Vec<String>
                             "{path} is session-scoped and binds state service group \
                              '{group_name}', but no component alias in that group names it; a \
                              leased cell with no graph port cannot be carried"
+                        ));
+                    }
+                    // A group-backed lease is read where the cell's initializer
+                    // is read and written from the alias's `output` port. An
+                    // alias with no output names a port the runtime could read
+                    // but never advance, so the second turn would replay the
+                    // first.
+                    if cell
+                        .session
+                        .as_ref()
+                        .is_none_or(|lease| lease.continuation.is_none())
+                        && !carried.contains(name)
+                        && group
+                            .ports
+                            .values()
+                            .filter_map(|component| component.get(name))
+                            .any(|alias| alias.output.is_none())
+                    {
+                        errors.push(format!(
+                            "{path} is carried only by state service group '{group_name}', but \
+                             an alias for it declares no output port; the lease could be read \
+                             and never advanced, so every turn would replay the first"
                         ));
                     }
                 }
@@ -2615,6 +2639,23 @@ fn validate_session_continuity(workflow: &WorkflowSpec, errors: &mut Vec<String>
         }
     }
 
+    for cell in facts.uncarried() {
+        // Advisory state is droppable by declaration, so a lease nothing reads
+        // costs correctness nothing. Semantic state is the conversation.
+        if workflow
+            .state
+            .get(cell)
+            .is_some_and(|state| state.class == crate::schema::WorkflowStateClass::Semantic)
+        {
+            errors.push(format!(
+                "pipeline.workflow.state.{cell} is session-scoped and semantic, but no loop \
+                 carries it, no state service group holds it, and its lease names no \
+                 continuation; nothing in this document says how the next invocation reaches \
+                 the value the lease keeps"
+            ));
+        }
+    }
+
     if continuations.len() > 1 {
         errors.push(format!(
             "pipeline.workflow.state declares {} session continuations ({}); a package has one \
@@ -2624,35 +2665,6 @@ fn validate_session_continuity(workflow: &WorkflowSpec, errors: &mut Vec<String>
             continuations.join(", ")
         ));
     }
-}
-
-/// Cells a loop carries, at any nesting depth.
-fn loop_carried_cells(steps: &[WorkflowStep]) -> BTreeSet<String> {
-    fn walk(step: &WorkflowStep, cells: &mut BTreeSet<String>) {
-        match step {
-            WorkflowStep::Sequence { steps } => steps.iter().for_each(|step| walk(step, cells)),
-            WorkflowStep::Loop {
-                setup,
-                steps,
-                carried,
-                ..
-            } => {
-                cells.extend(carried.iter().map(|carry| carry.cell.clone()));
-                setup.iter().for_each(|step| walk(step, cells));
-                steps.iter().for_each(|step| walk(step, cells));
-            }
-            WorkflowStep::Branch { cases, default, .. } => {
-                cases.values().for_each(|step| walk(step, cells));
-                if let Some(default) = default {
-                    walk(default, cells);
-                }
-            }
-            WorkflowStep::Invoke { .. } | WorkflowStep::Emit { .. } => {}
-        }
-    }
-    let mut cells = BTreeSet::new();
-    steps.iter().for_each(|step| walk(step, &mut cells));
-    cells
 }
 
 /// Speculative regions may only contain effects and state that can be undone to

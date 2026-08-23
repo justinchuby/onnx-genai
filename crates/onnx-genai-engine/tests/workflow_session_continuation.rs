@@ -354,16 +354,15 @@ fn a_conversation_is_refused_past_the_bound_it_declares() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// A lease nothing reads is not a conversation, and is refused as one.
+/// A lease nothing carries is refused before a caller can hold the package.
 ///
-/// A session-scoped cell that no loop carries and whose lease names no
-/// continuation is written back on every pass and read by nothing: the runtime
-/// hands a lease back only to a loop carry or to a continuation. Reporting such
-/// a package as session-capable because some step happens to name the cell's
-/// initializer would be the fail-open version of exactly this regression — the
-/// step reads the value the pass computed, never the lease.
+/// The runtime hands a lease back through a loop carry, a state service group
+/// whose alias names the cell, or a declared continuation — and
+/// `classify_session_state` is the one place that says which. A cell with none
+/// of them is written back on every pass and read by nothing, so the document is
+/// refused at load rather than at the third turn of a conversation.
 #[test]
-fn a_session_cell_no_loop_carries_is_not_a_conversation() -> anyhow::Result<()> {
+fn a_session_cell_nothing_carries_is_refused_at_load() -> anyhow::Result<()> {
     let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("unread_lease_package");
     let _ = std::fs::remove_dir_all(&scratch);
     copy_package(&scratch)?;
@@ -379,13 +378,115 @@ fn a_session_cell_no_loop_carries_is_not_a_conversation() -> anyhow::Result<()> 
         .expect("the conversation declares a continuation");
     std::fs::write(&metadata, serde_yaml::to_string(&document)?)?;
 
-    let mut engine = Engine::from_dir(&scratch, EngineConfig::default())?;
-    let refused = engine
-        .create_session()
-        .expect_err("a lease no loop carries cannot continue a conversation");
+    let refused = match Engine::from_dir(&scratch, EngineConfig::default()) {
+        Ok(_) => panic!("a lease nothing carries cannot continue a conversation"),
+        Err(error) => error,
+    };
+    let message = format!("{refused:#}");
     assert!(
-        format!("{refused:#}").contains("scope: session"),
-        "the refusal names what the package has to declare: {refused:#}"
+        message.contains("nothing in this document says how the next invocation reaches"),
+        "the refusal names what is missing: {message}"
+    );
+    Ok(())
+}
+
+/// The runtime and the validator agree about what carries a lease.
+///
+/// They used to disagree: the validator blessed a session-scoped cell held by a
+/// state service group, and the runtime refused to open a session for the same
+/// package because its own predicate only knew about loop carries. A caller
+/// then held a package that validated and could not have a conversation. Both
+/// now read `classify_session_state`, so this asserts the classification the
+/// package declares and that a session opens on the strength of it.
+#[test]
+fn a_state_service_group_carries_a_lease_the_validator_blessed() -> anyhow::Result<()> {
+    let metadata = onnx_genai_metadata::load_metadata_from_dir(&decoder_package())?
+        .expect("the fixture ships metadata");
+    let workflow = &metadata
+        .pipeline
+        .as_ref()
+        .expect("the fixture declares a pipeline")
+        .workflow;
+    let facts = onnx_genai_metadata::classify_session_state(workflow);
+    assert_eq!(
+        facts.carrier("conversation"),
+        Some(onnx_genai_metadata::SessionStateCarrier::PromptContinuation)
+    );
+    assert_eq!(facts.prompt_continuation(), Some("conversation"));
+    assert_eq!(facts.uncarried().count(), 0);
+
+    // The same fixture with its cache group declared session-scoped: the group
+    // holds the storage, the alias names the ports, and that is a carrier.
+    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("group_carried_package");
+    let _ = std::fs::remove_dir_all(&scratch);
+    copy_package(&scratch)?;
+    let path = scratch.join("inference_metadata.yaml");
+    let mut document: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(&path)?)?;
+    let state = document["pipeline"]["workflow"]["state"]
+        .as_mapping_mut()
+        .expect("workflow declares state");
+    state
+        .remove(serde_yaml::Value::String("conversation".into()))
+        .expect("the fixture declares a conversation");
+    let cache = state
+        .get_mut(serde_yaml::Value::String("cache_0".into()))
+        .expect("the fixture declares a cache cell");
+    cache["scope"] = serde_yaml::Value::String("session".into());
+    cache["release_boundary"] = serde_yaml::Value::String("session".into());
+    std::fs::write(&path, serde_yaml::to_string(&document)?)?;
+
+    let metadata =
+        onnx_genai_metadata::load_metadata_from_dir(&scratch)?.expect("the fixture ships metadata");
+    onnx_genai_metadata::validate_metadata(&metadata)
+        .map_err(|errors| anyhow::anyhow!("{errors:?}"))?;
+    let workflow = &metadata.pipeline.as_ref().expect("pipeline").workflow;
+    let facts = onnx_genai_metadata::classify_session_state(workflow);
+    // The cache is both group-backed and loop-carried, and the loop carry is
+    // the mechanism a pass actually reaches first.
+    assert_eq!(
+        facts.carrier("cache_0"),
+        Some(onnx_genai_metadata::SessionStateCarrier::LoopCarry)
+    );
+    assert_eq!(facts.uncarried().count(), 0);
+
+    // And a session opens, because something carries the lease.
+    let mut engine = Engine::from_dir(&scratch, EngineConfig::default())?;
+    let session = engine.create_session()?;
+    assert_eq!(engine.session_token_count(session)?, 0);
+    // This package declares no prompt continuation, so it holds no conversation
+    // of tokens to report — and says so rather than inventing a number.
+    assert_eq!(engine.session_conversation(session)?, None);
+    engine.close_session(session)?;
+    Ok(())
+}
+
+/// A group named but never aliased for the cell carries nothing, and the
+/// document is refused before a caller can open a session against it.
+#[test]
+fn a_session_cell_whose_group_does_not_alias_it_is_refused_at_load() -> anyhow::Result<()> {
+    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("unaliased_group_package");
+    let _ = std::fs::remove_dir_all(&scratch);
+    copy_package(&scratch)?;
+    let path = scratch.join("inference_metadata.yaml");
+    let mut document: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(&path)?)?;
+    let conversation = document["pipeline"]["workflow"]["state"]["conversation"]
+        .as_mapping_mut()
+        .expect("the fixture declares a conversation");
+    conversation.remove(serde_yaml::Value::String("session".into()));
+    conversation.insert(
+        serde_yaml::Value::String("service_group".into()),
+        serde_yaml::Value::String("decoder_cache".into()),
+    );
+    std::fs::write(&path, serde_yaml::to_string(&document)?)?;
+
+    let refused = match Engine::from_dir(&scratch, EngineConfig::default()) {
+        Ok(_) => panic!("a lease bound to a group that never names it must not load"),
+        Err(error) => error,
+    };
+    let message = format!("{refused:#}");
+    assert!(
+        message.contains("no component alias in that group names it"),
+        "the refusal names the group that holds nothing: {message}"
     );
     Ok(())
 }

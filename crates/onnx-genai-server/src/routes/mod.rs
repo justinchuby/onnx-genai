@@ -478,6 +478,20 @@ impl ApiError {
     }
 }
 
+/// Turn a session-creation failure into the status it actually is.
+///
+/// A package that declares no conversation is not a server fault and not a
+/// malformed request: the caller asked this package for something it does not
+/// support, which is what 409 says. Reporting it as a 500 told a client to retry
+/// something that will never succeed, and hid a package defect behind an
+/// operational one.
+pub(crate) fn session_create_failure(error: anyhow::Error) -> ApiError {
+    match onnx_genai_engine::package_capability_error(&error) {
+        Some(capability) => ApiError::conflict(capability.to_string()),
+        None => ApiError::internal(format!("session create failed: {error}")),
+    }
+}
+
 fn generation_failure(error: DriverFailure) -> ApiError {
     match error.kind {
         DriverFailureKind::MemoryOverload => {

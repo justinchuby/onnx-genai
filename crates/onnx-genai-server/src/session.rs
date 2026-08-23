@@ -18,6 +18,16 @@ struct SessionRegistryInner {
     access_clock: u64,
 }
 
+/// The outcome of binding a client id to an engine session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionClaim {
+    /// Another request bound this client id first; use its session and release
+    /// the one this caller opened.
+    Existing(SessionId),
+    /// This caller's session is now the client id's session.
+    Claimed { evicted: Option<SessionId> },
+}
+
 #[derive(Debug)]
 struct SessionEntry {
     engine_session_id: SessionId,
@@ -73,6 +83,64 @@ impl SessionRegistry {
             crate::metrics::active_sessions_added(1);
         }
         Ok(evicted)
+    }
+
+    /// Bind a client id to an engine session, atomically.
+    ///
+    /// Two requests carrying the same session id race to open it. Reading and
+    /// then inserting lets both miss, both open an engine session, and the
+    /// second insert orphan the first — so the two turns run in different
+    /// conversations and one of them is silently lost. The decision is made
+    /// under one lock instead, and the caller that loses closes the session it
+    /// had already opened.
+    pub(crate) fn claim(
+        &self,
+        client_id: String,
+        engine_session_id: SessionId,
+    ) -> anyhow::Result<SessionClaim> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session registry mutex poisoned"))?;
+        if inner.sessions.contains_key(&client_id) {
+            inner.access_clock = inner.access_clock.saturating_add(1);
+            let last_access = inner.access_clock;
+            let entry = inner
+                .sessions
+                .get_mut(&client_id)
+                .expect("entry checked above");
+            entry.last_access = last_access;
+            return Ok(SessionClaim::Existing(entry.engine_session_id));
+        }
+        let previous_len = inner.sessions.len();
+        let evicted = if previous_len >= self.max_sessions {
+            inner
+                .sessions
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_access)
+                .map(|(id, _)| id.clone())
+                .and_then(|id| {
+                    inner
+                        .sessions
+                        .remove(&id)
+                        .map(|entry| entry.engine_session_id)
+                })
+        } else {
+            None
+        };
+        inner.access_clock = inner.access_clock.saturating_add(1);
+        let last_access = inner.access_clock;
+        inner.sessions.insert(
+            client_id,
+            SessionEntry {
+                engine_session_id,
+                last_access,
+            },
+        );
+        if inner.sessions.len() > previous_len {
+            crate::metrics::active_sessions_added(1);
+        }
+        Ok(SessionClaim::Claimed { evicted })
     }
 
     pub(crate) fn get(&self, client_id: &str) -> anyhow::Result<Option<SessionId>> {

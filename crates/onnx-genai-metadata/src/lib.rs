@@ -106,6 +106,7 @@ pub mod identity;
 mod lowering;
 pub mod parser;
 pub mod schema;
+pub mod session_state;
 pub mod validation;
 
 pub use cache::{CacheDependencies, cache_dependencies};
@@ -123,6 +124,9 @@ pub use parser::{
     resolve_package_artifact,
 };
 pub use schema::*;
+pub use session_state::{
+    SessionStateCarrier, SessionStateFacts, classify_session_state, session_group_aliases,
+};
 pub use validation::{
     CapabilityReport, PipelineValidationError, RuntimeCapabilities, derived_capabilities, validate,
     validate_metadata, validate_pipeline_spec, validate_structure_and_capabilities,

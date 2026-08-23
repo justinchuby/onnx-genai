@@ -3907,6 +3907,31 @@ fn workflow_session_package(scratch: &tempfile::TempDir) -> PathBuf {
     destination
 }
 
+/// The same package with its declared conversation removed — what every
+/// migrated interpreted decoder package looked like before this.
+fn workflow_package_without_conversation(scratch: &tempfile::TempDir) -> PathBuf {
+    let destination = workflow_session_package(scratch);
+    let metadata = destination.join("inference_metadata.yaml");
+    let mut document: Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&metadata).expect("read metadata"))
+            .expect("parse metadata");
+    document["pipeline"]["workflow"]["state"]
+        .as_object_mut()
+        .expect("workflow declares state")
+        .remove("conversation")
+        .expect("the fixture declares a conversation");
+    let capabilities = document["pipeline"]["workflow"]["manifest"]["capabilities"]
+        .as_array_mut()
+        .expect("the manifest declares capabilities");
+    capabilities.retain(|capability| capability.as_str() != Some("session_state_lease"));
+    std::fs::write(
+        &metadata,
+        serde_yaml::to_string(&document).expect("serialize metadata"),
+    )
+    .expect("write metadata");
+    destination
+}
+
 async fn chat_turn(
     router: axum::Router,
     session: Option<&str>,
@@ -3947,23 +3972,15 @@ fn session_tokens(body: &Value) -> u64 {
         .unwrap_or_else(|| panic!("a session response reports its token count: {body}"))
 }
 
-fn turn_tokens(body: &Value) -> u64 {
-    body["usage"]["prompt_tokens"]
-        .as_u64()
-        .expect("prompt tokens")
-        + body["usage"]["completion_tokens"]
-            .as_u64()
-            .expect("completion tokens")
-}
-
 /// Three turns in one session accumulate one conversation; a fourth id does not
 /// see it; deleting the session releases it.
 ///
-/// The arithmetic is what makes this non-vacuous. `usage` reports the *turn* —
-/// the tokens this request sent and this request produced — while
-/// `session_token_count` reports the conversation. If a turn restarted, the
-/// conversation would grow by the turn's generation alone and the equality
-/// below would be short by exactly the turn's prompt.
+/// The arithmetic is what makes this non-vacuous. `usage.prompt_tokens` is what
+/// this turn was actually prefilled with — the conversation plus the request —
+/// and `session_token_count` is what the session holds afterwards, so the two
+/// differ by exactly this turn's generation. A turn that restarted would be
+/// prefilled with its own request alone, and both numbers would be short by
+/// everything said before it.
 #[tokio::test]
 async fn chat_completions_continue_a_conversation_across_requests() {
     let scratch = tempfile::tempdir().expect("scratch directory");
@@ -3973,35 +3990,47 @@ async fn chat_completions_continue_a_conversation_across_requests() {
     let router = app(state);
 
     let session = "sess-multi-turn";
-    let mut conversation = 0u64;
     let mut turns = Vec::new();
-    for prompt in ["hello world", "the quick", "brown fox"] {
+    let mut previous = 0u64;
+    for (index, prompt) in ["hello world", "the quick", "brown fox"].iter().enumerate() {
         let (status, body) = chat_turn(router.clone(), Some(session), prompt).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        conversation += turn_tokens(&body);
+        let prefill = body["usage"]["prompt_tokens"]
+            .as_u64()
+            .expect("prompt tokens");
+        let generated = body["usage"]["completion_tokens"]
+            .as_u64()
+            .expect("completion tokens");
+        assert!(
+            prefill > previous,
+            "turn {} is prefilled with the conversation ({previous}) and its own request: {body}",
+            index + 1
+        );
         assert_eq!(
             session_tokens(&body),
-            conversation,
-            "after {} turn(s) the conversation is every turn's prompt and generation: {body}",
-            turns.len() + 1
+            prefill + generated,
+            "the conversation after turn {} is what it was prefilled with plus what it \
+             generated: {body}",
+            index + 1
         );
+        previous = prefill + generated;
         turns.push(body);
     }
     let third = turns.pop().expect("three turns");
-    let after_third = session_tokens(&third);
-    assert!(
-        after_third > turn_tokens(&third),
-        "the third turn was decoded from more than its own request"
-    );
     assert_eq!(third["session_id"].as_str(), Some(session));
 
     // A different id is a different conversation, from its first turn.
     let (status, isolated) = chat_turn(router.clone(), Some("sess-other"), "brown fox").await;
     assert_eq!(status, StatusCode::OK, "{isolated}");
+    assert!(
+        session_tokens(&isolated) < session_tokens(&third),
+        "an independent session starts its own conversation"
+    );
     assert_eq!(
         session_tokens(&isolated),
-        turn_tokens(&isolated),
-        "an independent session's first turn is its own request and nothing else"
+        isolated["usage"]["prompt_tokens"].as_u64().unwrap()
+            + isolated["usage"]["completion_tokens"].as_u64().unwrap(),
+        "a first turn is prefilled with its own request and nothing else"
     );
 
     // And the session the server handed out is released when it is deleted.
@@ -4070,5 +4099,148 @@ async fn chat_completions_without_a_session_stay_stateless() {
     assert_eq!(
         first["choices"][0]["message"]["content"],
         second["choices"][0]["message"]["content"]
+    );
+}
+
+/// A package that cannot continue a conversation says so with a status a client
+/// can act on.
+///
+/// 500 told a caller the server had failed and to retry something that will
+/// never succeed. 409 says the request and the loaded package disagree, which
+/// is what happened.
+#[tokio::test]
+async fn sessions_are_refused_with_a_conflict_for_a_package_that_cannot_continue_one() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let package = workflow_package_without_conversation(&scratch);
+    let state = AppState::load(&package, Some("workflow-multi-turn".to_string()))
+        .expect("load interpreted package");
+    let router = app(state);
+
+    // The direct session endpoint.
+    let created = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CONFLICT);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("scope: session"),
+        "the refusal names what the package has to declare: {body}"
+    );
+
+    // And a completion that carries a session id, which creates one implicitly.
+    let (status, chat) = chat_turn(router.clone(), Some("sess-refused"), "hello world").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{chat}");
+
+    let completion = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-session-id", "sess-refused")
+                .body(Body::from(
+                    json!({
+                        "model": "workflow-multi-turn",
+                        "prompt": "hello world",
+                        "max_tokens": 3,
+                        "temperature": 0.0
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(completion.status(), StatusCode::CONFLICT);
+
+    // Stateless generation against the same package is unaffected: a package
+    // with no conversation answers one question at a time, which is a fact
+    // about it rather than a fault.
+    let (status, stateless) = chat_turn(router, None, "hello world").await;
+    assert_eq!(status, StatusCode::OK, "{stateless}");
+}
+
+/// A non-token workflow keeps its session handle.
+///
+/// A speech package has no conversation to lose, so refusing it a session would
+/// make "sessions" a property of which package shape was loaded — which is the
+/// caller-side split this runtime does not have.
+#[tokio::test]
+async fn sessions_still_open_for_a_package_that_publishes_no_tokens() {
+    let router = app(speech_state_from("speech_wav", "workflow-sessions-speech"));
+    let created = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+}
+
+/// Concurrent turns of one conversation cannot lose an update.
+///
+/// Two turns that both read the conversation before either writes it would
+/// leave the loser's prompt and generation nowhere, and nothing would report
+/// that they were lost. The conversation after N turns is therefore checked to
+/// be exactly what N serialized turns produce, whatever order the server ran
+/// them in.
+#[tokio::test]
+async fn concurrent_turns_on_one_session_do_not_lose_a_conversation() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let package = workflow_session_package(&scratch);
+    let state = AppState::load(&package, Some("workflow-multi-turn".to_string()))
+        .expect("load interpreted package");
+    let router = app(state);
+    let session = "sess-concurrent";
+
+    // The same prompt every time, so each turn contributes an identical number
+    // of request tokens and the expected total is exact arithmetic rather than
+    // a bound.
+    const TURNS: usize = 4;
+    let mut inflight = Vec::new();
+    for _ in 0..TURNS {
+        inflight.push(tokio::spawn(chat_turn(
+            router.clone(),
+            Some(session),
+            "hello world",
+        )));
+    }
+    let mut generated = 0u64;
+    let mut first_turn_prefill = u64::MAX;
+    let mut conversation = 0u64;
+    for handle in inflight {
+        let (status, body) = handle.await.expect("turn completed");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        generated += body["usage"]["completion_tokens"]
+            .as_u64()
+            .expect("generated");
+        // Whichever turn ran first was prefilled with its own request alone.
+        first_turn_prefill =
+            first_turn_prefill.min(body["usage"]["prompt_tokens"].as_u64().expect("prefill"));
+        conversation = conversation.max(session_tokens(&body));
+    }
+
+    // Every turn's request is in the conversation exactly once, and so is every
+    // token any of them generated. A lost update leaves the total short by the
+    // turn whose write was overwritten.
+    assert_eq!(
+        conversation,
+        first_turn_prefill * TURNS as u64 + generated,
+        "the conversation is every turn's request and every turn's generation, once each"
     );
 }

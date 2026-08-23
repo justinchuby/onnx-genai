@@ -33,6 +33,21 @@ impl Drop for ActiveAdapterContextGuard<'_> {
 /// constant.
 pub const MISSING_REQUIRED_INPUT: &str = "required workflow package input ";
 
+/// Prefix of the error a workflow raises when a session's conversation would
+/// exceed the bound the package declares for it.
+///
+/// A front end turns this into a request-level refusal rather than a server
+/// fault: the caller can shorten the turn, ask for fewer tokens, or start a new
+/// session, and none of those are things the server did wrong.
+pub const CONVERSATION_OVER_BOUND: &str = "session conversation exceeds its declared bound";
+
+/// True when `error`, or anything it wraps, is a conversation over its bound.
+pub fn is_conversation_over_bound(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains(CONVERSATION_OVER_BOUND))
+}
+
 /// True when `error`, or anything it wraps, is a required package input the
 /// request never supplied.
 pub fn is_missing_required_input(error: &anyhow::Error) -> bool {
@@ -595,13 +610,125 @@ fn continuation_tokens(value: &Value) -> anyhow::Result<Vec<i64>> {
     Ok(value.to_vec_i64()?)
 }
 
-/// Tokens a pass published to one declared output, however it published them.
+/// Holds a session's exclusive lease for the length of one pass.
 ///
-/// An emit lands under the output's own name, under `output.row.N` when the
-/// package publishes request-aligned rows, or under `output.<n>` when it
-/// streams events. All three are the same generation seen from a different
-/// publication mode, and a conversation accumulates what was generated — so
-/// this reads whichever the pass produced instead of assuming one.
+/// A lease declared `policy: exclusive` means one writer. Two turns that both
+/// read the conversation before either writes it would leave the loser's prompt
+/// and generation nowhere, and nothing would report that they were lost. The
+/// guard is released on drop, so a pass that fails or panics does not strand the
+/// session.
+struct SessionLeaseGuard<'a> {
+    leases: &'a RefCell<std::collections::HashSet<String>>,
+    session: String,
+}
+
+impl<'a> SessionLeaseGuard<'a> {
+    fn acquire(
+        leases: &'a RefCell<std::collections::HashSet<String>>,
+        session: &str,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            leases.borrow_mut().insert(session.to_string()),
+            "session {session} already has a turn in flight, and its workflow declares the \
+             conversation an exclusive lease; run the turns one after another so neither reads a \
+             conversation the other is about to replace"
+        );
+        Ok(Self {
+            leases,
+            session: session.to_string(),
+        })
+    }
+}
+
+impl Drop for SessionLeaseGuard<'_> {
+    fn drop(&mut self) {
+        self.leases.borrow_mut().remove(&self.session);
+    }
+}
+
+/// The SSA value a pass left in a group-backed session cell.
+///
+/// The group's alias names the `output` port that advances the state; the step
+/// that invoked the component names the value that port was bound to. Reading
+/// the port through the step is what keeps this independent of how any
+/// particular package spells its values.
+///
+/// The last binding wins: a component invoked several times in one pass has
+/// advanced the state each time, and the lease keeps where it ended.
+fn session_group_output_value(
+    workflow: &WorkflowSpec,
+    cell: &str,
+    values: &PipelineTensors,
+) -> Option<String> {
+    fn walk(
+        step: &onnx_genai_metadata::WorkflowStep,
+        component: &str,
+        port: &str,
+        values: &PipelineTensors,
+        found: &mut Option<String>,
+    ) {
+        use onnx_genai_metadata::WorkflowStep as Step;
+        match step {
+            Step::Sequence { steps } => {
+                steps
+                    .iter()
+                    .for_each(|step| walk(step, component, port, values, found));
+            }
+            Step::Invoke {
+                component: invoked,
+                outputs,
+                ..
+            } => {
+                if invoked == component
+                    && let Some(value) = outputs.get(port)
+                    && values.contains_key(value)
+                {
+                    *found = Some(value.clone());
+                }
+            }
+            Step::Loop { setup, steps, .. } => {
+                setup
+                    .iter()
+                    .chain(steps)
+                    .for_each(|step| walk(step, component, port, values, found));
+            }
+            Step::Branch { cases, default, .. } => {
+                cases
+                    .values()
+                    .for_each(|step| walk(step, component, port, values, found));
+                if let Some(default) = default {
+                    walk(default, component, port, values, found);
+                }
+            }
+            Step::Emit { .. } => {}
+        }
+    }
+    for (component, alias) in onnx_genai_metadata::session_group_aliases(workflow, cell) {
+        let Some(port) = alias.output.as_deref() else {
+            continue;
+        };
+        let mut found = None;
+        for step in &workflow.steps {
+            walk(step, component, port, values, &mut found);
+        }
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+/// Tokens a pass published to one declared output.
+///
+/// This is the same selection [`super::PipelineOutputs`] makes and that the
+/// generate path reads — the aggregate value when the pass published one,
+/// otherwise the single request row. A conversation accumulates what a turn
+/// generated, and reading it by a second rule would let the session and the
+/// caller disagree about what was said.
+///
+/// A tokens output published as `mode: event` has no aggregate and no row, and
+/// the generate path already refuses such a package; there is nothing to
+/// accumulate here that a caller ever received.
 fn published_conversation_tokens(
     values: &PipelineTensors,
     row_outputs: &BTreeMap<String, Vec<String>>,
@@ -610,94 +737,27 @@ fn published_conversation_tokens(
     if let Some(value) = values.get(output) {
         return continuation_tokens(value);
     }
-    if let Some(rows) = row_outputs.get(output) {
-        anyhow::ensure!(
-            rows.len() <= 1,
-            "a session continues one conversation, but this pass published {} request rows to \
-             '{output}'",
-            rows.len()
-        );
-        if let Some(value) = rows.first().and_then(|name| values.get(name)) {
-            return continuation_tokens(value);
-        }
+    let rows = row_outputs.get(output).map(Vec::as_slice).unwrap_or(&[]);
+    anyhow::ensure!(
+        rows.len() <= 1,
+        "a session continues one conversation, but this pass published {} request rows to \
+         '{output}'",
+        rows.len()
+    );
+    match rows.first().and_then(|name| values.get(name)) {
+        Some(value) => continuation_tokens(value),
+        None => Ok(Vec::new()),
     }
-    // Streamed events, in publication order rather than the lexicographic order
-    // their names would sort in.
-    let prefix = format!("{output}.");
-    let mut events = values
-        .keys()
-        .filter_map(|name| {
-            let suffix = name.strip_prefix(&prefix)?;
-            suffix.parse::<usize>().ok().map(|index| (index, name))
-        })
-        .collect::<Vec<_>>();
-    events.sort_by_key(|(index, _)| *index);
-    let mut tokens = Vec::new();
-    for (_, name) in events {
-        let value = values
-            .get(name)
-            .with_context(|| format!("workflow output event '{name}' disappeared"))?;
-        tokens.extend(continuation_tokens(value)?);
-    }
-    Ok(tokens)
 }
 
 /// Whether this workflow declares state a session can actually carry.
 ///
-/// Two mechanisms carry a lease, and only two. A **loop-carried** cell is seeded
-/// from the lease when the pass enters its loop. A **continuation** rejoins the
-/// request binding before the pass starts. Anything else — a session-scoped cell
-/// that no loop carries and whose lease no contract names — is written back
-/// every pass and read by nothing, so a session over it restarts every turn.
-///
-/// Reporting that honestly is what lets `create_session` refuse instead of
-/// handing out a conversation the runtime cannot continue. It deliberately
-/// mirrors what the interpreter does rather than what a document might have
-/// meant: a cell whose `initializer` some step happens to name is *not* carried,
-/// because that step reads the value this pass computed, never the lease.
+/// Answered by [`onnx_genai_metadata::classify_session_state`], which is also
+/// what the validator reads, so a package the document blesses and a package
+/// this runtime will open a session for are the same set. Computing it twice is
+/// how they came to disagree about state service groups.
 pub fn workflow_carries_session_state(workflow: &WorkflowSpec) -> bool {
-    let mut carried = std::collections::HashSet::new();
-    fn walk(
-        step: &onnx_genai_metadata::WorkflowStep,
-        carried: &mut std::collections::HashSet<String>,
-    ) {
-        use onnx_genai_metadata::WorkflowStep as Step;
-        match step {
-            Step::Sequence { steps } => steps.iter().for_each(|step| walk(step, carried)),
-            Step::Loop {
-                setup,
-                steps,
-                carried: carries,
-                ..
-            } => {
-                carried.extend(carries.iter().map(|carry| carry.cell.clone()));
-                setup.iter().for_each(|step| walk(step, carried));
-                steps.iter().for_each(|step| walk(step, carried));
-            }
-            Step::Branch { cases, default, .. } => {
-                cases.values().for_each(|step| walk(step, carried));
-                if let Some(default) = default {
-                    walk(default, carried);
-                }
-            }
-            Step::Invoke { .. } | Step::Emit { .. } => {}
-        }
-    }
-    workflow
-        .steps
-        .iter()
-        .for_each(|step| walk(step, &mut carried));
-    workflow
-        .state
-        .iter()
-        .filter(|(_, state)| state.scope == onnx_genai_metadata::WorkflowStateScope::Session)
-        .any(|(cell, state)| {
-            state
-                .session
-                .as_ref()
-                .is_some_and(|lease| lease.continuation.is_some())
-                || carried.contains(cell)
-        })
+    onnx_genai_metadata::classify_session_state(workflow).carries_any()
 }
 
 impl WorkflowRuntime {
@@ -1068,17 +1128,23 @@ impl<'a> WorkflowExecutionPlan<'a> {
         // The bound the continuation cell declares is the package's own context
         // limit, and this is the only place it can be checked: a continuation is
         // deliberately not loop-carried, so it never reaches the carry path's
-        // recurrence check. Refusing here means the turn that would overflow is
-        // refused before it runs, naming the conversation rather than failing
-        // somewhere inside the decoder graph with a shape nobody can attribute.
+        // recurrence check.
+        //
+        // It is checked against the conversation *and the budget this turn was
+        // admitted with*, because a turn refused after it has generated is a
+        // turn whose work and whose stream are thrown away. Admission is the
+        // last moment at which refusing costs nothing.
         if let Some(conversation) = continued_prompt.as_deref()
             && let Some((cell, _, _, state)) = workflow_prompt_continuation(workflow)
         {
             let bound = continuation_bound(cell, state, &values)?;
+            let budget = request.options.max_new_tokens;
             anyhow::ensure!(
-                conversation.len() <= bound,
-                "this session's conversation is {} tokens and '{cell}' declares a bound of \
-                 {bound}; reset or close the session to start a new one, or send a shorter turn",
+                conversation.len().saturating_add(budget) <= bound,
+                "{CONVERSATION_OVER_BOUND}: this turn would leave {} tokens ({} of conversation \
+                 and up to {budget} generated) and '{cell}' declares a bound of {bound}; reset or \
+                 close the session to start a new one, or ask for fewer tokens",
+                conversation.len() + budget,
                 conversation.len()
             );
         }
@@ -1251,17 +1317,52 @@ impl<'a> WorkflowExecutionPlan<'a> {
         // no lease to read, so each cell starts from the initializer it
         // declares; refusing here would make declaring a conversation cost a
         // package the ability to answer one question.
-        if let Some(session_id) = self.session_id.as_ref() {
-            for (cell, state) in &workflow.state {
-                if state.scope != onnx_genai_metadata::WorkflowStateScope::Session {
-                    continue;
+        let session_state = onnx_genai_metadata::classify_session_state(workflow);
+        // Taken before the lease is read and released when the pass ends,
+        // whichever way it ends.
+        let _session_lease = match (self.session_id.as_deref(), session_state.carries_any()) {
+            (Some(session_id), true) => {
+                match SessionLeaseGuard::acquire(&engine.workflow_session_leases, session_id) {
+                    Ok(guard) => Some(guard),
+                    Err(error) => {
+                        self.retain_inputs(&mut values);
+                        return Err(error);
+                    }
                 }
-                if let Some(value) = engine
+            }
+            _ => None,
+        };
+        if let Some(session_id) = self.session_id.as_ref() {
+            for (cell, carrier) in session_state.carried() {
+                let Some(value) = engine
                     .workflow_session_state
                     .borrow()
-                    .get(&(session_id.clone(), cell.clone()))
-                {
-                    values.insert(session_state_value_name(cell), clone_value(value)?);
+                    .get(&(session_id.to_string(), cell.to_string()))
+                    .map(clone_value)
+                    .transpose()?
+                else {
+                    continue;
+                };
+                match carrier {
+                    // A loop reads its lease where it seeds the carry.
+                    onnx_genai_metadata::SessionStateCarrier::LoopCarry => {
+                        values.insert(session_state_value_name(cell), value);
+                    }
+                    // A group holds the storage, and the graph reaches it
+                    // through the value the cell's initializer names — which is
+                    // the port the group's alias declares. Replacing it for the
+                    // pass is what makes the lease the `past` the component
+                    // reads, rather than the seed the caller sent.
+                    onnx_genai_metadata::SessionStateCarrier::StateServiceGroup => {
+                        let initializer = &workflow
+                            .state
+                            .get(cell)
+                            .expect("a classified cell is declared")
+                            .initializer;
+                        values.insert(initializer.clone(), value);
+                    }
+                    // Bound into the prompt before this plan was built.
+                    onnx_genai_metadata::SessionStateCarrier::PromptContinuation => {}
                 }
             }
         }
@@ -1305,10 +1406,11 @@ impl<'a> WorkflowExecutionPlan<'a> {
             let continuation = workflow_prompt_continuation(workflow)
                 .map(|(cell, _, tokens_output, _)| (cell.to_string(), tokens_output.to_string()));
             let mut updates = Vec::new();
-            for (cell, state) in &workflow.state {
-                if state.scope != onnx_genai_metadata::WorkflowStateScope::Session {
-                    continue;
-                }
+            for (cell, carrier) in session_state.carried() {
+                let state = workflow
+                    .state
+                    .get(cell)
+                    .expect("a classified cell is declared");
                 // The conversation this pass leaves behind is the prompt it ran
                 // — which already carried every earlier turn — followed by what
                 // it published. Reading it off the emitted stream alone would
@@ -1326,16 +1428,19 @@ impl<'a> WorkflowExecutionPlan<'a> {
                         tokens_output,
                     )?);
                     let length = conversation.len() as i64;
-                    // A turn's own generation can be what carries the
-                    // conversation past the bound. Storing it anyway would leave
-                    // the session in a state its own declaration forbids, and
-                    // every later turn would fail with the same overflow and no
-                    // way back.
+                    // Admission already refused a turn whose conversation plus
+                    // budget exceeds the bound, so reaching this means the pass
+                    // published more tokens than it was admitted for. Storing it
+                    // would leave the session in a state its own declaration
+                    // forbids and every later turn would fail the same way with
+                    // no way back, so this refuses — and names the package,
+                    // because a caller cannot cause it.
                     let bound = continuation_bound(cell, state, &values)?;
                     if conversation.len() > bound {
                         anyhow::bail!(
-                            "this turn leaves a conversation of {} tokens and '{cell}' declares a \
-                             bound of {bound}; reset or close the session to start a new one",
+                            "{CONVERSATION_OVER_BOUND}: this package published more tokens than \
+                             the turn was admitted for, leaving a conversation of {} tokens \
+                             against a declared bound of {bound} on '{cell}'",
                             conversation.len()
                         );
                     }
@@ -1347,21 +1452,33 @@ impl<'a> WorkflowExecutionPlan<'a> {
                         ),
                     };
                     updates.push((
-                        (session_id.clone(), cell.clone()),
+                        (session_id.clone(), cell.to_string()),
                         Value::from_slice_i64(&conversation, &shape)?,
                     ));
                     continue;
                 }
-                let value_ref = final_state_refs
-                    .get(cell)
-                    .map(String::as_str)
-                    .unwrap_or(&state.initializer);
+                // What the next lease holds is what this pass left in the
+                // cell. A loop carry records that in `final_state_refs`. A
+                // group-backed cell is advanced by the graph writing the
+                // alias's `output` port, so the value bound to that port is the
+                // one to keep — reading the initializer instead would store the
+                // value the pass *started* from and replay it forever.
+                let group_output = (carrier
+                    == onnx_genai_metadata::SessionStateCarrier::StateServiceGroup)
+                    .then(|| session_group_output_value(workflow, cell, &values))
+                    .flatten();
+                let value_ref = group_output.as_deref().unwrap_or_else(|| {
+                    final_state_refs
+                        .get(cell)
+                        .map(String::as_str)
+                        .unwrap_or(&state.initializer)
+                });
                 let value = values.get(value_ref).with_context(|| {
                     format!(
                         "session-scoped workflow state '{cell}' has no final value '{value_ref}'"
                     )
                 })?;
-                updates.push(((session_id.clone(), cell.clone()), clone_value(value)?));
+                updates.push(((session_id.clone(), cell.to_string()), clone_value(value)?));
             }
             let mut session_state = engine.workflow_session_state.borrow_mut();
             for (key, value) in updates {

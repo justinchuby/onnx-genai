@@ -280,3 +280,164 @@ fn a_continuations_bound_must_have_a_value_by_the_time_a_turn_is_admitted() {
     );
     rejects(&no_default, "declares no default");
 }
+
+/// The storage a continuation names is the runtime's.
+#[test]
+fn a_continuation_must_be_runtime_managed() {
+    rejects(
+        &document(
+            &conversation_cell(&[("management", "workflow"), ("release_boundary", "session")]),
+            "session_state_lease, bounded_state_recurrence",
+        ),
+        "management: runtime",
+    );
+}
+
+/// A cell cannot be both leased into the prompt and carried by a loop.
+#[test]
+fn a_continuation_cannot_also_be_loop_carried() {
+    const LOOPING_INPUT: &str = r#"      package.looping:
+        contract: { dtype: bool, rank: 1, shape: [1] }
+        role: { kind: opaque }
+        source: { kind: literal }
+        required: false
+        default: true
+      package.max_context:
+"#;
+    const LOOP_STEPS: &str = r#"    steps:
+      - kind: loop
+        continue_when: package.looping
+        max_iterations: package.max_context
+        carried:
+          - cell: conversation
+            next: decoder.tokens
+        steps:
+          - kind: invoke
+            component: decoder
+            inputs: { input_ids: request.input_ids }
+            outputs: { next_tokens: decoder.tokens }
+          - kind: emit
+            value: decoder.tokens
+            output: tokens
+            mode: replace
+"#;
+    let looping = document(
+        &conversation_cell(&[]),
+        "session_state_lease, bounded_state_recurrence, nested_control_flow",
+    )
+    .replace("      package.max_context:\n", LOOPING_INPUT);
+    let looping = looping[..looping.find("    steps:").expect("steps")].to_string() + LOOP_STEPS;
+    let reported = errors(&looping);
+    assert!(
+        reported
+            .iter()
+            .any(|error| error.contains("two answers about the same value")),
+        "expected the carry/continuation contradiction, got {reported:?}"
+    );
+}
+
+/// A conversation accumulates along its final axis.
+#[test]
+fn a_continuation_grows_on_the_axis_tokens_accumulate_on() {
+    rejects(
+        &document(
+            &conversation_cell(&[(
+                "recurrence",
+                "{ kind: bounded, axis: 0, max: package.max_context }",
+            )]),
+            "session_state_lease, bounded_state_recurrence",
+        ),
+        "tokens accumulate",
+    );
+}
+
+/// A prefix has to be the same kind of tensor as what it prefixes.
+#[test]
+fn a_continuation_contract_must_match_the_prompt_it_prefixes() {
+    let wrong_dtype = document(
+        &conversation_cell(&[]),
+        "session_state_lease, bounded_state_recurrence",
+    )
+    .replace(
+        "conversation:\n        contract: { dtype: int64, rank: 2",
+        "conversation:\n        contract: { dtype: int32, rank: 2",
+    );
+    rejects(&wrong_dtype, "same kind of tensor as what it prefixes");
+
+    let wrong_rank = document(
+        &conversation_cell(&[(
+            "recurrence",
+            "{ kind: bounded, axis: 0, max: package.max_context }",
+        )]),
+        "session_state_lease, bounded_state_recurrence",
+    )
+    .replace(
+        "conversation:\n        contract: { dtype: int64, rank: 2, shape: [batch, \
+         conversation_length]",
+        "conversation:\n        contract: { dtype: int64, rank: 1, shape: [conversation_length]",
+    );
+    rejects(&wrong_rank, "same kind of tensor as what it prefixes");
+}
+
+/// The tokens a conversation accumulates must be the tokens the package
+/// publishes.
+#[test]
+fn a_continuation_output_dtype_must_match_the_cell() {
+    let wrong = document(
+        &conversation_cell(&[]),
+        "session_state_lease, bounded_state_recurrence",
+    )
+    .replace(
+        "      tokens:\n        contract: { dtype: int64, rank: 2, shape: [batch, generated]",
+        "      tokens:\n        contract: { dtype: int32, rank: 2, shape: [batch, generated]",
+    );
+    rejects(&wrong, "publishes");
+}
+
+/// A group that exists but never names the cell holds nothing.
+#[test]
+fn a_session_cell_whose_group_has_no_alias_for_it_is_refused() {
+    const SERVING_INPUTS: &str = r#"      package.active_rows:
+        contract: { dtype: bool, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: literal }
+        required: false
+        default: true
+      package.done_rows:
+        contract: { dtype: bool, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: literal }
+        required: false
+        default: false
+      package.accepted:
+        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: literal }
+        required: false
+        default: 0
+      package.max_context:
+"#;
+    const EMPTY_GROUP: &str = r#"    serving:
+      active: package.active_rows
+      done: package.done_rows
+      accepted_len: package.accepted
+      state_service:
+        groups:
+          decoder_cache:
+            kind: full_attention
+            sequence_axis: 2
+            layout: bnsh
+            ports: {}
+    state:
+"#;
+    let group_without_alias = document(
+        &conversation_cell(&[("service_group", "decoder_cache")]),
+        "session_state_lease, bounded_state_recurrence, serving_service_contract",
+    )
+    .replace("      package.max_context:\n", SERVING_INPUTS)
+    .replace("    state:\n", EMPTY_GROUP);
+    rejects(
+        &group_without_alias,
+        "no component alias in that group names it",
+    );
+}

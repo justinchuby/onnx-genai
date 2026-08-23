@@ -785,6 +785,16 @@ impl Engine {
         // it is what keeps `session_token_count` the same number a decode-core
         // session reports — prompt and generated tokens both — rather than the
         // generated ones alone.
+        //
+        // The cost of that conversation is stated rather than hidden: a package
+        // whose lease is a prompt prefix re-prefills every earlier turn on each
+        // new one, because its invocation-scoped cache is released when the
+        // invocation ends. Over a conversation of N tokens that is O(N²) prefill
+        // work, against O(N) for a decode core whose paged KV survives the turn.
+        // It is the cost of continuing a conversation a package can express
+        // rather than one it cannot, and a package that wants the linear cost
+        // declares its cache session-scoped and is executed by a core that keeps
+        // it.
         let declared = self
             .workflow
             .session_conversation_len(&session_id.to_string());
@@ -1490,16 +1500,14 @@ impl Engine {
                 .outputs
                 .values()
                 .any(|output| output.role == onnx_genai_metadata::WorkflowOutputRole::Tokens);
-            anyhow::ensure!(
-                !publishes_tokens || crate::pipeline::workflow_carries_session_state(workflow),
-                "this package publishes a token stream but declares no session-scoped workflow \
-                 state, so a session could not continue a conversation: every turn would restart \
-                 from its own prompt. Declare the conversation in `pipeline.workflow.state` with \
-                 `scope: session` — either as a cell the loop carries, or with a \
-                 `session.continuation` naming the prompt input it rejoins — and re-validate the \
-                 package. Until then, use stateless generation and send the conversation in the \
-                 prompt."
-            );
+            if publishes_tokens && !crate::pipeline::workflow_carries_session_state(workflow) {
+                // A typed refusal, not a formatted string: what a front end has
+                // to decide is whether the caller asked for something this
+                // package cannot do, or whether the server failed. Matching on
+                // prose would make that a guess, and it was being reported as a
+                // 500 for a package that is simply stateless.
+                return Err(PackageCapabilityError::NoSessionState.into());
+            }
             self.workflow_session_counter += 1;
             let id = self.workflow_session_counter;
             self.workflow_sessions.insert(id, 0);
@@ -1705,7 +1713,15 @@ impl Engine {
         session_state::close(&mut OrtSessions(self), session_id)
     }
 
-    /// Number of logical tokens retained in a persistent session.
+    /// Logical tokens this session's conversation holds — prompts and
+    /// generations alike, oldest turn first.
+    ///
+    /// One meaning for every backend. A decode core reports the tokens its KV
+    /// sequence covers; an interpreted package reports the length of the
+    /// conversation its workflow declares, or, for a package whose session state
+    /// is not a token conversation, the tokens its turns have generated. In
+    /// every case it is "how much has this session heard", never "how much did
+    /// the last turn produce".
     pub fn session_token_count(&self, session_id: SessionId) -> anyhow::Result<usize> {
         if !self.holds_decode_core() {
             return self
