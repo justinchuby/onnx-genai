@@ -1181,9 +1181,13 @@ fn admit_inference_metadata(metadata: &InferenceMetadata) -> anyhow::Result<()> 
         anyhow::bail!("Invalid inference metadata: {:?}", report.structural);
     }
 
-    // Capabilities that prescribe computation this path cannot perform. Listed
-    // explicitly rather than inferred from `metadata.adapters` so that adding a
-    // future overlay-style capability is a deliberate edit here.
+    // Capabilities that prescribe computation this path cannot perform. Keyed
+    // on the derived capability name rather than on `metadata.adapters`,
+    // because these are also derived from the workflow spec: a component whose
+    // adapter ABI or contract id is `onnx-genai.parameter-overlay`, or an input
+    // carrying an adapter-segment/count/scale role, yields them with
+    // `metadata.adapters` unset. Checking the service would miss exactly those
+    // workflow-declared overlays, which carry the identical wrong-output risk.
     const PRESCRIPTIVE: &[&str] = &[
         capability::PARAMETER_ADAPTERS,
         capability::HETEROGENEOUS_ADAPTER_BATCHING,
@@ -2792,6 +2796,57 @@ adapters:
         );
         assert!(
             error.contains("cannot perform") && error.contains("base-model output"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn workflow_declared_parameter_overlay_also_fails_closed_without_an_adapter_service() {
+        // The prescriptive capabilities are ALSO derived from the workflow spec
+        // (`workflow_required_capabilities`: a component whose adapter ABI or
+        // contract id is `onnx-genai.parameter-overlay` yields
+        // `parameter_adapters`), with `metadata.adapters` unset. This is the
+        // case that makes the explicit capability list correct and a
+        // `metadata.adapters.is_some()` check wrong -- keying off the service
+        // would let a workflow-declared overlay through with only a warning.
+        let metadata: InferenceMetadata = serde_yaml::from_str(
+            r#"
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      capabilities: [workflow_ssa, parameter_adapters]
+      adapter_abis:
+        onnx-genai.parameter-overlay: "1"
+    components:
+      overlay:
+        implementation:
+          kind: adapter
+          abi: onnx-genai.parameter-overlay
+          version: "1"
+        ports: {}
+    steps:
+      - kind: invoke
+        component: overlay
+"#,
+        )
+        .expect("metadata parses");
+
+        assert!(
+            metadata.adapters.is_none(),
+            "this fixture must exercise the workflow-derived path, not the adapter service"
+        );
+
+        let error = admit_inference_metadata(&metadata)
+            .expect_err("a workflow-declared parameter overlay must not decode as the base model")
+            .to_string();
+        assert!(
+            !error.contains("Invalid inference metadata"),
+            "the fixture must be structurally valid so the overlay guard is what rejects it: \
+             {error}"
+        );
+        assert!(
+            error.contains("parameter_adapters") && error.contains("base-model output"),
             "{error}"
         );
     }
