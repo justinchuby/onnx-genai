@@ -100,6 +100,7 @@ mod trace;
 // a caller with no interest in kernels may need to answer. Re-exported so the
 // move is not a breaking change for anyone already reaching for these paths.
 pub use onnx_runtime_cuda_memory::{virtual_memory, vmm_allocator};
+pub mod granule_transition;
 pub mod weight_paging;
 
 pub use capture::{require_subgraph_graph_capturable, subgraph_graph_capturable};
