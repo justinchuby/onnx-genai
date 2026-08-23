@@ -1,84 +1,24 @@
-feat(engine): one interpreter executes every package's declared loop
+Merge remote-tracking branch 'origin/main' into feat/native-workflow-backend
 
-This is checkpoints C through F of the convergence: the fused decode session
-stops being a *second runtime* and becomes an executor for one declared step.
+Two conflicts, both resolved in the direction the branch already established.
 
-**What actually changed.** `Engine` now holds one non-optional
-`WorkflowRuntime`. Every request — a bare decoder, a composite pipeline, a
-prioritized scheduler step — runs `run_workflow_node` over the workflow the
-package shipped. The loop bound, the liveness predicate, the carried state, the
-emit that publishes tokens and the stop are read from that document, by the
-interpreter, in all cases. What differs between packages is which executor
-implements a declared *node*, and that is answered by the contract the node
-names: a component declaring `onnx-genai.autoregressive-decode` is run by the
-decode core when this runtime has one, and invoked from its own artifact when it
-does not. There is no third path and no `if is_workflow()`.
+`native_decode/proposer.rs` was deleted here when the shared-KV proposer surface
+went (Rule 3); main gave it an `optimization=basic` session option for
+quantized-MoE relayouts. The file stays deleted: the option belongs to sessions
+that still exist, and `native_decode/load.rs` already carries it.
 
-`pipeline/canonical_decode.rs` is deleted (771 lines), along with
-`Engine::lowered_workflow`, `canonical_workflow()` and its nine guard call
-sites, `WorkflowShape`/`declared_workflow_shape`, `is_workflow()`,
-`workflow_shape()`, `WorkflowShapeReport`, `from_pipeline_dir*`,
-`generate_pipeline_with_callback(s)`, `workflow_generate`,
-`forget_canonical_workflow_for_test`, the server's `start_pipeline` /
-`run_pipeline_driver` / `run_pipeline_generation` / `GeneratePipeline`, and the
-CLI's `Backend::{Text,Pipeline}` enum. The shape-dispatch ledger, which was 23
-files, is now empty but for the gate itself.
+`tiny-glm52-qmoe-indexshare` was rewritten on both sides — main regenerated the
+fixture for the GLM-5.2 / DeepSeek-V4 native decode work, and this branch
+re-emitted every converted package so its decoder declares
+`onnx-genai.autoregressive-decode`. Main's version is taken and re-emitted
+through `migrate_model_io --reemit`, so the fixture is main's content stated in
+the current emitter's form rather than a hand-merged hybrid of the two.
 
-**Three things this surfaced that were not visible before.**
+Checked afterwards that all fourteen packages declaring the runtime token policy
+also declare the decode contract, so no fixture main added or changed slipped
+through without the step it executes being named.
 
-*The decoder component declared no contract.* The emitter had gained
-`AUTOREGRESSIVE_DECODE_CONTRACT`, but the fourteen converted fixtures predate
-it, so nothing in the tree actually declared the step it was executing. They are
-re-emitted here through a new `migrate_model_io --reemit`, which reads the ABI
-back out of the workflow the package already declares — the direction
-`decoder_workflow_roundtrip` pins as exact — so a rebuild states the ports the
-package always stated.
-
-*The `sequence` cell's recurrence was wrong.* It said `invariant` while
-carrying the prompt on the first iteration and one token on every later one.
-Nothing could honour that, and nothing had to, because no interpreter was
-walking the loop. It now declares `bounded` against a package-declared sequence
-capacity, which is what is actually true.
-
-*The liveness read was being skipped for host-written predicates.*
-`max_iterations_only` exists so a caller that disabled EOS stopping does not pay
-a device→host sync for a predicate that cannot go false. A predicate a *runtime*
-executor writes carries more than EOS — the context bound, stop strings, a
-constraint reaching its end — so the optimization does not apply there. Without
-this the context-limit stop was silently ignored and generation ran into a model
-window overflow.
-
-**Real finish reasons, and a check that the emit is load-bearing.** The
-composite drive no longer fabricates `MaxTokens`, `prefix_cache_hit_len: 0` and
-`logprobs: None`. It reports the core's stop when a core reached one, the
-interpreter's own record of whether the predicate ended the loop otherwise, and
-the prefix/logprob facts of whoever scored the tokens — `None` for a package
-whose sampler is an ONNX component, which is a fact about the package rather
-than a missing feature. The emitted stream and the committed one are compared
-and a mismatch refuses: an emit that dropped or duplicated a token would
-otherwise be invisible.
-
-**The scheduler's per-token drive runs the same loop.** It cannot call a
-function that loops to completion, so the loop's phases are now
-`begin_workflow_loop` / `advance_workflow_loop` / `end_workflow_loop`, driven in
-a `for` by the interpreter and one-at-a-time by `WorkflowGenerationCursor`. One
-statement of the semantics, two ways to drive it — rather than a second walker
-that could disagree.
-
-**Sessions work for every package.** A session is a conversation, not a
-decode-core feature. A package whose components the interpreter invokes keeps
-its conversation in the `scope: session` cells its workflow declares, so
-`create_session` / `session_token_count` / `close_session` and the HTTP session
-header mean the same thing for it. `/v1/completions` and `/v1/sessions` no
-longer reject workflow packages.
-
-**Debug fields report the document, not the executor.** `/v1/debug/config`
-replaces `pipeline` and `workflow_shape` with the package's declared component
-counts and whether it declares a generation loop.
-
-Verified: 465 engine lib tests; every engine integration test; 280 server tests;
-metadata, CLI and C API suites; fmt; clippy `-D warnings` on every crate this
-touches.
+Verified: engine, server and metadata suites; fmt; clippy `-D warnings`.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 Signed-off-by: Copilot <223556219+Copilot@users.noreply.github.com>

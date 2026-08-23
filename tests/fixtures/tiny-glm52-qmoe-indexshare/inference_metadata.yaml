@@ -4,16 +4,7 @@
 # component ports and roles, and the state_service group that owns the KV
 # cache. A single decoder is not a special package shape — it is a workflow
 # with one ONNX component and one runtime-bound token policy.
-required_capabilities:
-- kv_cache
-- multi_head_attention
-model:
-  attention:
-    type: multi_head
-    num_attention_heads: 4
-    num_kv_heads: 4
-    head_dim: 16
-  max_sequence_length: 128
+schema_version: '1.0'
 pipeline:
   workflow:
     manifest:
@@ -118,7 +109,7 @@ pipeline:
         source:
           kind: literal
         required: false
-        default: 128
+        default: 4096
       package.state_seed:
         contract:
           dtype: float32
@@ -165,7 +156,7 @@ pipeline:
         source:
           kind: request
         required: false
-        default: 128
+        default: 4096
     outputs:
       tokens:
         contract:

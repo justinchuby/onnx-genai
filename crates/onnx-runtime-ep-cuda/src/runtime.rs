@@ -1950,6 +1950,75 @@ impl CudaRuntime {
         self.wait_fence_on(&self.copy_stream, fence_id)
     }
 
+    /// Resolve a transfer-stream fence for a genuinely ahead-of-need prefetch
+    /// (issue #82 BlockQuantizedMoE prefill prefetch): order the compute stream
+    /// after it exactly like [`CudaRuntime::compute_wait_fence`] (cheap,
+    /// non-host-blocking), and additionally host-synchronize the same event
+    /// before returning.
+    ///
+    /// The host wait is what proves — to the caller and to the type system —
+    /// that the transfer stream's DMA read of the prefetch's pinned source
+    /// buffer has *completed*, not merely been enqueued: the returned
+    /// [`CopyCompleted`] witness is exactly the token
+    /// [`crate::pinned_pool::PinnedStagingPool::release`] /
+    /// [`crate::pinned_pool::PooledStaging::retire`] require before a pooled
+    /// staging buffer may be reused, so a prefetch's staging buffer returns to
+    /// the same shared pool an on-demand page-in uses instead of paying a
+    /// fresh `cuMemHostAlloc`/`cuMemFreeHost` pair every time (the exact
+    /// steady-state cost issue #837 already fixed for the page-in path).
+    /// Because the prefetch was issued strictly before the consumer that
+    /// resolves it — while unrelated compute was free to run in between —
+    /// this wait blocks only for whatever transfer time genuinely remains,
+    /// zero once that intervening compute has already hidden it. Fence id `0`
+    /// (already-signalled) and an unknown id (already resolved by an earlier
+    /// call) are no-ops that still mint a witness: by definition nothing is
+    /// left in flight in either case, so the completion guarantee already
+    /// holds.
+    ///
+    /// A DMA was already submitted by the caller before this fence id was
+    /// handed out (it is the whole reason a fence exists to resolve), so
+    /// every failure path below reuses [`CudaRuntime::settle_submitted_htod_failure`]
+    /// — the same fallback-synchronize-then-classify machinery
+    /// [`CudaRuntime::htod_async_elapsed_ms`] uses — instead of returning a
+    /// bare driver error: it either proves completion through a coarser
+    /// `copy_stream` sync ([`FailedHtodCompletion::Completed`]) or reports
+    /// that the source/destination may still be touched by an in-flight read
+    /// ([`FailedHtodCompletion::MayBeInFlight`]), so a caller can quarantine
+    /// the staging buffer and destination page instead of freeing or reusing
+    /// either while a DMA might still be reading/writing them.
+    pub fn resolve_prefetch_fence(
+        &self,
+        fence_id: u64,
+    ) -> std::result::Result<CopyCompleted, HtodAsyncElapsedError> {
+        if fence_id == 0 {
+            return Ok(CopyCompleted::new());
+        }
+        let event = self
+            .fences
+            .lock()
+            .expect("cuda fence registry poisoned")
+            .remove(&fence_id);
+        let Some(event) = event else {
+            return Ok(CopyCompleted::new());
+        };
+        if let Err(error) = self.bind() {
+            return Err(self.settle_submitted_htod_failure(error));
+        }
+        // Cross-stream order first (cheap, enqueue-only): any kernel the
+        // compute stream launches after this point observes the transfer, even
+        // before the host wait below completes.
+        if let Err(error) = self.stream.wait(&event) {
+            return Err(self.settle_submitted_htod_failure(driver_err("cuStreamWaitEvent", error)));
+        }
+        // Host-blocking: proves the transfer stream's read of the prefetch's
+        // source buffer has finished, so it is safe to free or, preferably,
+        // return to the pinned staging pool for reuse.
+        if let Err(error) = event.synchronize() {
+            return Err(self.settle_submitted_htod_failure(driver_err("cuEventSynchronize", error)));
+        }
+        Ok(CopyCompleted::new())
+    }
+
     fn wait_fence_on(&self, waiter: &CudaStream, fence_id: u64) -> Result<()> {
         if fence_id == 0 {
             return Ok(());

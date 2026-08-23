@@ -50,6 +50,7 @@
 //! | `dy/tok` | dispatcher yields per token. Strongly **width-dependent**: the dispatcher publishes, computes its own shard, then spins ~10 us before yielding once, so a yield means the last worker lagged the dispatcher's own arrival by more than that. Measured at zero gap on an idle host: 0.004/dispatch at width 4, ~0.9 at width 16, non-monotonic between. Straggler spread, not contention, and only comparable at a fixed width |
 //! | `vcsw` / `ivcsw` | voluntary / involuntary context switches per token. `vcsw` is the kernel's independent view of parking and should track `park/tok` |
 //! | `rss_mb` | `ru_maxrss`, a process **high-water mark**. Absolute, never a delta -- a high-water mark cannot be differenced, and doing so prints noise that looks like a leak |
+//! | `foreign_%` | CPU consumed by *other processes* on this process's confined core set, as a percentage of one core, median over the reps that were measurable. Read this **before** `ms_tok`: a dispatch is a barrier, so foreign work on the confined set costs the whole dispatch and `ms_tok` is not comparable across rows with different values here. `cpu_ms` is. Prints `n/a` if no rep could be measured and suffixes `*` if only some could -- never a clean `0.0` for an unmeasured window |
 //! | `spread%` | `(max - min) / median` of `ms_tok` across repetitions |
 //!
 //! # Controls
@@ -162,7 +163,7 @@
 //! running it. Anything that shortens the window -- or replaces the yield ramp
 //! with a park -- moves that column; adding or removing wakes does not.
 //!
-//! # Second result, and a warning: the pool is bimodal per process launch
+//! # Second result: launches were bimodal, and the cause was off-process
 //!
 //! Read the table above as a distribution, not as four numbers. At width 16 and
 //! zero gap, repeated launches of the *same* binary with the *same* environment
@@ -176,10 +177,20 @@
 //! Twelve launches across three configurations: every configuration produced
 //! both regimes. This matters more than any single row here, for two reasons.
 //!
-//! **It is not (only) cache placement.** The regimes differ by 14x in `park%`,
-//! which is a scheduling state, and the slow regime burns *less* CPU while
-//! taking 4.6x longer -- the workers are asleep, not thrashing. A placement
-//! explanation predicts more CPU per token, not less.
+//! **Resolved: it is foreign CPU on the confined core set.** See the
+//! `foreign_%` column and `common::host_contention`. `ONNX_GENAI_CPU_DECODE_THREADS=N`
+//! confines the process to N CPUs, and a dispatch is a *barrier*, so one
+//! unrelated thread on one of those N cores costs the whole dispatch rather than
+//! a share of it -- every other worker finishes and idles waiting. The workers
+//! really are asleep rather than thrashing, which is why the slow regime burns
+//! less CPU; they are asleep waiting on a shard whose core is being timeshared
+//! with somebody else. Injecting one `taskset`-pinned spinner reproduces the
+//! slow regime on demand and removing it restores the fast one, while the same
+//! spinner placed *outside* the confined set changes nothing.
+//!
+//! The two paragraphs below are kept because their methodological point stands
+//! on its own and is what led here -- but the cause is no longer unknown, and a
+//! run is no longer un-diagnosable: read `foreign_%` before reading `ms_tok`.
 //!
 //! **A small sample will hand you a confident wrong answer.** Three launches of
 //! an explicit `ONNX_GENAI_CPU_DECODE_THREADS=16` arm against three of the
@@ -199,8 +210,13 @@
 //! monotonically across four points with a mechanism, and on the latency column
 //! being *indistinguishable*; bimodality can only widen that latter claim.
 //!
-//! Chasing which regime a launch lands in, and why the counters can see it, is
-//! the next piece of scheduler work rather than something this harness settles.
+//! What made this so durable is worth recording. The slow regime is internally
+//! *stable* (in-run `spread_%` of 0.1--0.5), it persists for a whole run and
+//! across consecutive runs while the foreign process lives, and it presents at
+//! unchanged CPU per token. Every one of those reads as a property of the code
+//! under test rather than as a stranger on one of two cores. The flat
+//! `cpu_ms/tok` beside a doubled `ms_tok` is the fingerprint: same work, twice
+//! the wall, which no code change of ours produces.
 
 mod common;
 
@@ -208,6 +224,7 @@ use std::time::{Duration, Instant};
 
 use common::Tensor;
 use common::decode_workload::{Weight, asymmetric_zero_points, build_kernel, floats, weights};
+use common::host_contention::{self, Contention};
 use onnx_runtime_ep_api::Kernel;
 use onnx_runtime_ep_cpu::{decode_spmd, with_decode_pool_scope};
 
@@ -398,6 +415,11 @@ struct Pass {
     vcsw_tok: f64,
     ivcsw_tok: f64,
     rss_mb: f64,
+    /// Foreign CPU on the *confined* core set over this pass's window. See
+    /// `common::host_contention`: a decode dispatch is a barrier, so foreign
+    /// work on the confined set costs the whole dispatch rather than a share of
+    /// it, and a host-wide load gate cannot see it.
+    contention: Contention,
     /// Observations per dispatch: `(spin_hits + parks) / dispatches`. Derived,
     /// not measured, and its job is to be *boring* -- it must be integral and
     /// identical in every cell. A cell where it moves dispatched to a different
@@ -625,16 +647,25 @@ fn main() {
                 })
                 .collect();
             barrier.wait();
-            let before = (usage(), decode_spmd::counters().unwrap_or_default());
+            let before = (
+                usage(),
+                decode_spmd::counters().unwrap_or_default(),
+                host_contention::snapshot(),
+            );
             barrier.wait();
             let out: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-            let after = (usage(), decode_spmd::counters().unwrap_or_default());
+            let after = (
+                usage(),
+                decode_spmd::counters().unwrap_or_default(),
+                host_contention::snapshot(),
+            );
             (out, before, after)
         });
 
         let total_tokens = (sessions * tokens) as f64;
-        let (ru0, c0) = before;
-        let (ru1, c1) = after;
+        let (ru0, c0, cn0) = before;
+        let (ru1, c1, cn1) = after;
+        let contention = host_contention::contention(cn0.as_ref(), cn1.as_ref());
         let per = |a: u64, b: u64| (b.saturating_sub(a)) as f64 / total_tokens;
         let spin = per(c0.spin_hits, c1.spin_hits);
         let park = per(c0.parks, c1.parks);
@@ -663,6 +694,7 @@ fn main() {
             vcsw_tok: per(ru0.vcsw, ru1.vcsw),
             ivcsw_tok: per(ru0.ivcsw, ru1.ivcsw),
             rss_mb: ru1.maxrss_mb,
+            contention,
             obs_disp: {
                 let disp = per(c0.dispatches, c1.dispatches);
                 if disp > 0.0 {
@@ -708,7 +740,7 @@ fn main() {
     common::report_decode_width();
 
     println!(
-        "{:>6} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>9} {:>9} {:>7} {:>8} {:>8} {:>7} {:>9} {:>9} {:>7} {:>8}",
+        "{:>6} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>9} {:>9} {:>7} {:>8} {:>8} {:>7} {:>9} {:>9} {:>7} {:>8} {:>9}",
         "kind",
         "gap_us",
         "gap_act",
@@ -727,6 +759,7 @@ fn main() {
         "ivcsw/tok",
         "rss_mb",
         "spread_%",
+        "foreign_%",
     );
 
     let mut decode_hashes: Vec<(String, u64)> = Vec::new();
@@ -743,7 +776,7 @@ fn main() {
             0.0
         };
         println!(
-            "{:>6} {:>7.0} {:>8.1} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>8.1} {:>9.1} {:>9.1} {:>7.1} {:>8.2} {:>8.2} {:>7.2} {:>9.1} {:>9.1} {:>7.1} {:>8.1}",
+            "{:>6} {:>7.0} {:>8.1} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>8.1} {:>9.1} {:>9.1} {:>7.1} {:>8.2} {:>8.2} {:>7.2} {:>9.1} {:>9.1} {:>7.1} {:>8.1} {:>9}",
             cell.label(),
             gap,
             pick(|p| p.gap_act_us),
@@ -762,7 +795,20 @@ fn main() {
             pick(|p| p.ivcsw_tok),
             pick(|p| p.rss_mb),
             spread,
+            host_contention::foreign_column(&rows.iter().map(|p| p.contention).collect::<Vec<_>>(),),
         );
+
+        if rows.iter().any(|p| p.contention.is_contended()) {
+            let worst = rows
+                .iter()
+                .map(|p| p.contention.foreign_pct)
+                .fold(0.0_f64, f64::max);
+            println!(
+                "  CONTENDED foreign_%={worst:.1} of one CPU on this process's confined core \
+                 set -- a dispatch is a barrier, so this row's wall time is not comparable to a \
+                 clean one (cpu_ms is)"
+            );
+        }
 
         if !cell.decode {
             // Control 1: the generator must not itself dispatch. If it does,

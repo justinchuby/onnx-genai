@@ -96,7 +96,20 @@ impl NativeDecodeSession {
         let mut builder = InferenceSession::builder()
             .model(path)
             .device(preference)
-            .decode_precision(options.decode_precision);
+            .decode_precision(options.decode_precision)
+            // Constant-fold before weight-placement analysis runs: quantized
+            // MoE exporters (e.g. mobius's QMoE gate/up-row interleave) emit
+            // Reshape/Transpose chains over literal weight initializers,
+            // relying on the runtime to fold them into a single initializer
+            // at load time — exactly what stock ORT's own graph optimizer
+            // does. `Basic` is structure-preserving (ConstantFolding +
+            // DeadNodeElimination only), so this never changes model outputs.
+            //
+            // This is unconditional on this (production) load path with no
+            // load-time cost budget attached — see the tracked follow-up on
+            // `MAX_WEIGHT_FOLD_ELEMS` in
+            // `onnx-runtime-optimizer::constant_folding` for the tradeoff.
+            .option("optimization", "basic");
         if device == NativeDecodeDevice::Cpu {
             let ep =
                 onnx_runtime_ep_cpu::CpuExecutionProvider::initialized_with_weight_offload_host_cache(
@@ -325,7 +338,12 @@ impl NativeDecodeSession {
             NativeDecodeDevice::Plugin { .. } => DevicePreference::Cpu,
         };
         let path = path.as_ref();
-        let mut builder = InferenceSession::builder().model(path).device(preference);
+        let mut builder = InferenceSession::builder()
+            .model(path)
+            .device(preference)
+            // See the identical `.option("optimization", "basic")` rationale
+            // in `load_with_weight_offload_host_cache` above.
+            .option("optimization", "basic");
         #[cfg(feature = "native-cuda")]
         if let (NativeDecodeDevice::Cuda { index }, Some(governor)) = (&device, cuda_governor) {
             let policy = cuda_offload_policy

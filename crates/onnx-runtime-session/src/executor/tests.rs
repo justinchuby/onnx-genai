@@ -7288,6 +7288,82 @@ fn an_external_buffer_can_be_bound_as_an_output_only() {
     );
 }
 
+/// A producer-less graph output (an initializer wired straight to an output,
+/// same shape as `zero_copy_output_move_reallocates_and_preserves_producer_less_output`
+/// above) bound as an **external device I/O output** must still be seeded with
+/// the correct bytes on *every* run, not just the first.
+///
+/// This is the sibling of `an_external_buffer_can_be_bound_as_an_output_only`
+/// for a value no node ever produces: node dispatch never visits it, so
+/// nothing refills the caller's external buffer unless `collect_run_outputs`
+/// explicitly copies from the resident initializer buffer each time. The
+/// per-run buffer wipe must also not deallocate that resident copy out from
+/// under a producer-less external output, or the second run would seed from
+/// freed memory.
+#[test]
+fn an_external_output_binding_for_a_producer_less_value_is_seeded_every_run() {
+    use onnx_runtime_ir::{TensorData, static_shape};
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let x = graph.create_named_value("x", DataType::Float32, static_shape([3]));
+    graph.add_input(x);
+
+    // Producer-less graph output: an initializer wired straight to an output,
+    // with no node consuming or producing it.
+    let k = graph.create_named_value("k", DataType::Float32, static_shape([3]));
+    graph.set_initializer(
+        k,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Float32,
+            vec![3],
+            [100.0f32, 200.0, 300.0]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect(),
+        )),
+    );
+    graph.add_output(k);
+
+    let mut exec = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+    )
+    .unwrap();
+
+    let x_val = Tensor::from_f32(&[3], &[0.0, 0.0, 0.0]).unwrap();
+    for run in 0..3 {
+        // A fresh, poisoned buffer each run: only a real seed-copy can make
+        // this read back correctly, never a stale leftover from a prior run.
+        let mut owned: Vec<f32> = vec![-1.0; 3];
+        let ptr = owned.as_mut_ptr().cast::<core::ffi::c_void>();
+        let len_bytes = std::mem::size_of_val(owned.as_slice());
+        let mut binding = unsafe {
+            exec.device_binding_from_external_memory(crate::tensor::ExternalMemorySpec::output(
+                "k",
+                DataType::Float32,
+                vec![3],
+                vec![3],
+                ptr,
+                len_bytes,
+            ))
+        }
+        .unwrap();
+
+        exec.run_with_device_bindings(&[("x", &x_val)], std::slice::from_mut(&mut binding))
+            .unwrap_or_else(|e| panic!("run {run} must succeed: {e}"));
+        drop(binding);
+
+        assert_eq!(
+            owned,
+            vec![100.0, 200.0, 300.0],
+            "run {run}: producer-less external output must be seeded from the \
+             resident initializer buffer, not left at its poisoned value"
+        );
+    }
+}
+
 /// A spec that binds neither an input nor an output is refused rather than
 /// producing a binding nothing ever touches.
 #[test]

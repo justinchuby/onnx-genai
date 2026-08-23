@@ -149,6 +149,24 @@ pub enum VirtualMemoryError {
         /// The offset in question.
         offset: usize,
     },
+    /// A caller-supplied `PhysicalLocation` (or platform-specific stand-in for
+    /// it) did not match the physical backing a pool/handle actually holds.
+    ///
+    /// Rejected before any lease charge, handle acquisition, mapping, or
+    /// accounting mutation happens: this is a caller-programming-error check,
+    /// not a driver refusal, and must not have any side effect on the pool it
+    /// was refused against.
+    #[error(
+        "requested location {requested} does not match this pool's backing location {actual}; \
+         a mismatched location must never be silently accepted, ask the pool for its own \
+         `location()` instead of asserting one"
+    )]
+    LocationMismatch {
+        /// What the caller asked to commit against.
+        requested: String,
+        /// What the pool is actually backed by.
+        actual: String,
+    },
 }
 
 /// This platform's minimum mapping granularity, in bytes.
