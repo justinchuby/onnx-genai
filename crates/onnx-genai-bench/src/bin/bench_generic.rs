@@ -804,6 +804,113 @@ fn report_native_width(requested: Option<usize>) -> String {
     width_fields(report)
 }
 
+/// Renders the host-contention cell for a measured window.
+///
+/// Separate from the width report because they answer different questions about
+/// the same row: width says *how many lanes ran*, contention says *whether the
+/// cores those lanes had were actually theirs*. A row can be correctly labelled
+/// t=16 and still be worthless because a co-tenant owned two of the sixteen.
+///
+/// Why this belongs in the shared binary rather than only in the decode bench:
+/// `ONNX_GENAI_CPU_DECODE_THREADS=N` confines the process to N CPUs, and a
+/// dispatch is a barrier, so one foreign thread on one of those N CPUs costs the
+/// whole dispatch rather than `1/N` of it. Measured reversibly at width 2: a
+/// single pinned spinner inside the set was a clean 2x wall regression at
+/// unchanged CPU per token, and the same spinner pinned *outside* the set
+/// changed nothing. Neither `/proc/loadavg`'s EMA nor its instantaneous runnable
+/// count moves for one runnable thread out of 32, so every host-quiet gate we
+/// have passes that contaminated run.
+///
+/// Four verdicts rather than a bare number, because "not measured" and
+/// "measured, and quiet" must not render the same way -- and because an
+/// incomplete own-time subtraction makes the figure a lower bound, which can
+/// prove the row dirty but never prove it clean. This binary is the case that
+/// motivates carrying that distinction: it runs an ORT session whose intra-op
+/// threads need not share the native EP's confinement, so `BOUNDED` is an
+/// expected outcome here rather than a pathology.
+fn host_fields(host: &onnx_runtime_hostmon::Contention) -> String {
+    let verdict = if !host.measured {
+        return "host_foreign=n/a host=unmeasured".to_string();
+    } else if host.is_contended() {
+        "CONTENDED"
+    } else if host.is_clean() {
+        "CLEAN"
+    } else {
+        "BOUNDED"
+    };
+    format!(
+        "host_foreign={} host_busy={:.1} host={verdict}",
+        onnx_runtime_hostmon::foreign_column(std::slice::from_ref(host)),
+        host.total_pct,
+    )
+}
+
+/// Warns when the native arm is confined to fewer CPUs than the ORT arm's pool
+/// spans.
+///
+/// `--native-threads N` confines the *whole process* to N CPUs, but ORT's
+/// intra-op pool is sized from the machine and spins between runs. In an
+/// interleaved A/B those spinning threads land on the same N CPUs the native arm
+/// is confined to, so the native arm is timed against an oversubscribed core set
+/// while the ORT arm is not. The bias is one-directional: it inflates native and
+/// leaves ORT alone, which is indistinguishable in the row from "native does not
+/// scale".
+///
+/// Measured on this model (4096x4096 int4, M=1) at `--native-threads 4`, 20 runs:
+///
+/// | arm | native p50 |
+/// |---|---|
+/// | `--native-only` | 0.760 ms |
+/// | A/B, ORT pool unconstrained | 7.642 ms |
+/// | A/B, `--ort-intra-threads 1` | 1.111 ms |
+/// | A/B, `--ort-intra-threads 4` | 1.242 ms |
+///
+/// A 10x inflation of the native number, removed by constraining the ORT pool --
+/// so it is the pool and not the model. `--native-only` already documents this
+/// on its own help text, but nothing says anything when it is *omitted*, which
+/// is the case that publishes the wrong number.
+///
+/// Note this is invisible to `host_foreign`: ORT's threads belong to this
+/// process, so their CPU is subtracted as own time. `host_busy` is where it
+/// shows -- 403% of a 4-CPU set above -- which is why that field is printed
+/// beside the verdict rather than folded into it.
+///
+/// Keyed on the realized mask rather than on `--native-threads` being present,
+/// for two reasons. `taskset -c 0-3 bench_generic ...` with no flag is confined
+/// just as hard and would otherwise go unwarned -- the external case is if
+/// anything more likely to catch someone out, since nothing in the command line
+/// mentions threads. And `--native-threads 4 --ort-intra-threads 4` has already
+/// applied the fix, so warning there would be advice to do what the user just
+/// did, which is how a warning gets tuned out before it reaches the run that
+/// needed it.
+fn ort_pool_bias_warning(
+    native_only: bool,
+    native_cpus: Option<usize>,
+    ort_intra_threads: usize,
+    online_cpus: Option<usize>,
+) -> Option<String> {
+    if native_only {
+        return None;
+    }
+    let native_cpus = native_cpus?;
+    // An unset `--ort-intra-threads` means ORT sizes the pool from the machine.
+    let ort_width = if ort_intra_threads == 0 {
+        online_cpus?
+    } else {
+        ort_intra_threads
+    };
+    if ort_width <= native_cpus {
+        return None;
+    }
+    Some(format!(
+        "WARNING: the native arm is confined to {native_cpus} CPUs but the interleaved ORT arm's \
+         intra-op pool spans {ort_width}, and it spins between runs, so it oversubscribes exactly \
+         the cores the native arm is confined to. This inflates the native number only (measured \
+         10x at width 4) and reads as a native scaling loss. Use --native-only for the native \
+         timing, or --ort-intra-threads {native_cpus} to compare at equal width."
+    ))
+}
+
 fn build_arm() -> &'static str {
     if cfg!(feature = "mlas") {
         "mlas-reference"
@@ -968,6 +1075,19 @@ fn main() -> Result<()> {
     }
     let mut native_samples = Vec::with_capacity(args.runs);
     let mut ort_samples = Vec::with_capacity(args.runs);
+    // Spans the measured runs only. Warmups are excluded deliberately: they are
+    // not part of any published number, and including them would let first-touch
+    // faults and plan construction dilute the foreign fraction of the window
+    // that is.
+    if let Some(warning) = ort_pool_bias_warning(
+        args.native_only,
+        onnx_runtime_hostmon::AllowedCpus::current().map(|a| a.len()),
+        ort_intra_threads.max(0) as usize,
+        onnx_runtime_hostmon::online_cpus(),
+    ) {
+        eprintln!("{warning}");
+    }
+    let host_before = onnx_runtime_hostmon::snapshot();
     for run in 0..args.runs {
         let mut measure_native = || -> Result<f64> {
             let start = Instant::now();
@@ -993,12 +1113,15 @@ fn main() -> Result<()> {
             native_samples.push(measure_native()?);
         }
     }
+    let host_after = onnx_runtime_hostmon::snapshot();
+
+    let host = onnx_runtime_hostmon::contention(host_before.as_ref(), host_after.as_ref());
 
     let native = Stats::from(native_samples);
     if args.native_only {
         println!(
             "result: native={:.3} ms ({:.2} infer/s) native_p90={:.3} ms native_min={:.3} ms \
-             native_spread={:.2} native_threads={native_threads} {} ort=skipped \
+             native_spread={:.2} native_threads={native_threads} {} {} ort=skipped \
              native-only=true arm={} parity={}",
             native.p50,
             1_000.0 / native.p50,
@@ -1006,6 +1129,7 @@ fn main() -> Result<()> {
             native.min,
             native.spread(),
             report_native_width(requested_width),
+            host_fields(&host),
             build_arm(),
             if parity_pass { "PASS" } else { "FAIL" }
         );
@@ -1018,7 +1142,7 @@ fn main() -> Result<()> {
     println!(
         "result: native={:.3} ms ({:.2} infer/s) ort={:.3} ms ({:.2} infer/s) \
          native/ort={:.3} native_p90={:.3} ort_p90={:.3} native_min={:.3} ort_min={:.3} \
-         native_spread={:.2} ort_spread={:.2} native_threads={native_threads} {} \
+         native_spread={:.2} ort_spread={:.2} native_threads={native_threads} {} {} \
          ort_intra_threads={ort_intra_threads} arm={} parity={}",
         native.p50,
         1_000.0 / native.p50,
@@ -1032,6 +1156,7 @@ fn main() -> Result<()> {
         native.spread(),
         ort.spread(),
         report_native_width(requested_width),
+        host_fields(&host),
         build_arm(),
         if parity_pass { "PASS" } else { "FAIL" }
     );
@@ -1309,5 +1434,135 @@ mod width_report_tests {
             width_fields(report(None, None, "unresolved", 32))
                 .contains("native_width_as_requested=n/a")
         );
+    }
+}
+
+/// Tests for the host-contention cell.
+///
+/// The rendering is pure so that the four verdicts can be asserted directly. The
+/// measurement itself is tested in `onnx-runtime-hostmon`; what is at stake here
+/// is that a row never *reads* clean when it was not measured clean, which is a
+/// property of this formatting and not of the measurement.
+#[cfg(test)]
+mod host_fields_tests {
+    use super::*;
+    use onnx_runtime_hostmon::Contention;
+
+    fn reading(foreign_pct: f64, own_time_complete: bool) -> Contention {
+        Contention {
+            foreign_pct,
+            total_pct: 100.0,
+            measured: true,
+            own_time_complete,
+        }
+    }
+
+    #[test]
+    fn an_unmeasured_window_says_so_instead_of_printing_a_zero() {
+        let cell = host_fields(&Contention::default());
+        assert!(cell.contains("host=unmeasured"), "{cell}");
+        assert!(
+            !cell.contains("0.0"),
+            "an unmeasured window must not emit a number a reader could take as quiet: {cell}"
+        );
+    }
+
+    #[test]
+    fn a_quiet_window_with_a_complete_subtraction_is_the_only_clean_verdict() {
+        let cell = host_fields(&reading(0.4, true));
+        assert!(cell.contains("host=CLEAN"), "{cell}");
+        assert!(cell.contains("host_foreign=0.4"), "{cell}");
+        assert!(
+            !cell.contains("0.4!"),
+            "a complete subtraction is an estimate, not a bound: {cell}"
+        );
+    }
+
+    #[test]
+    fn a_quiet_looking_lower_bound_is_never_reported_as_clean() {
+        let cell = host_fields(&reading(0.4, false));
+        assert!(
+            cell.contains("host=BOUNDED"),
+            "an incomplete own-time subtraction under-reports, so a low figure \
+             proves nothing and must not read as CLEAN: {cell}"
+        );
+        assert!(cell.contains("host_foreign=0.4!"), "{cell}");
+    }
+
+    /// The asymmetry that makes the bound worth printing at all: it cannot
+    /// certify quiet, but it can still condemn a row.
+    #[test]
+    fn a_lower_bound_above_the_threshold_still_condemns_the_row() {
+        let cell = host_fields(&reading(60.0, false));
+        assert!(cell.contains("host=CONTENDED"), "{cell}");
+        assert!(cell.contains("host_foreign=60.0!"), "{cell}");
+    }
+
+    #[test]
+    fn a_contended_window_is_flagged_regardless_of_completeness() {
+        for complete in [true, false] {
+            let cell = host_fields(&reading(60.0, complete));
+            assert!(
+                cell.contains("host=CONTENDED"),
+                "complete={complete}: {cell}"
+            );
+        }
+    }
+}
+
+/// Tests for the ORT-pool bias warning.
+#[cfg(test)]
+mod ort_pool_bias_tests {
+    use super::*;
+
+    /// The mechanism is "ORT's pool spans more CPUs than the native arm may
+    /// use", so the trigger is the realized mask -- which is what catches an
+    /// external `taskset` that never passed `--native-threads` at all.
+    #[test]
+    fn a_confined_native_arm_against_a_machine_sized_ort_pool_is_warned_about() {
+        let warning = ort_pool_bias_warning(false, Some(4), 0, Some(32))
+            .expect("a 4-CPU native arm against a 32-CPU ORT pool is the biased case");
+        assert!(warning.contains("--native-only"), "{warning}");
+        assert!(
+            warning.contains("--ort-intra-threads 4"),
+            "the suggested equal-width setting must match the realized mask: {warning}"
+        );
+        assert!(
+            warning.contains("spans 32"),
+            "the warning must name the width it is comparing against: {warning}"
+        );
+    }
+
+    /// The configurations that are *not* biased must stay silent, or the warning
+    /// becomes noise and gets tuned out before the run that needed it.
+    #[test]
+    fn the_unbiased_configurations_are_silent() {
+        assert!(
+            ort_pool_bias_warning(true, Some(4), 0, Some(32)).is_none(),
+            "--native-only does not interleave, which is the whole point of the flag"
+        );
+        assert!(
+            ort_pool_bias_warning(false, Some(4), 4, Some(32)).is_none(),
+            "an equal-width ORT pool is the fix the warning recommends; advising \
+             someone to do what they already did is how a warning gets ignored"
+        );
+        assert!(
+            ort_pool_bias_warning(false, Some(4), 2, Some(32)).is_none(),
+            "a narrower ORT pool cannot oversubscribe the native arm's cores"
+        );
+        assert!(
+            ort_pool_bias_warning(false, Some(32), 0, Some(32)).is_none(),
+            "an unconfined native arm competes with ORT symmetrically"
+        );
+    }
+
+    /// Unknown widths must not synthesise a warning naming a width nobody
+    /// requested.
+    #[test]
+    fn an_unreadable_mask_or_cpu_count_is_silent_rather_than_guessed() {
+        assert!(ort_pool_bias_warning(false, None, 0, Some(32)).is_none());
+        assert!(ort_pool_bias_warning(false, Some(4), 0, None).is_none());
+        // ...but an explicit ORT width needs no host count to be comparable.
+        assert!(ort_pool_bias_warning(false, Some(4), 16, None).is_some());
     }
 }

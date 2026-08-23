@@ -1662,10 +1662,48 @@ Two cheaper hypotheses were tested and **both are closed negative**:
 
 - *"The kernel does not thread-scale."* An artifact: `RAYON_NUM_THREADS` does
   not size the decode pool (`configured_decode_threads` reads
-  `available_parallelism` and `ONNX_GENAI_CPU_DECODE_THREADS`). The real knob
-  gives 22.949/22.893/11.584/5.866/3.302 ms/token at 1/2/4/8/16 threads —
-  8→16 is **1.77x, ±0.7% over three interleaved repetitions**. (t=1≡t=2 is
-  unexplained and recorded as an open question, not an explanation.)
+  `available_parallelism` and `ONNX_GENAI_CPU_DECODE_THREADS`). That much
+  stands. **The width curve originally recorded here does not, and has been
+  re-measured (2026-08-23);** the numbers below replace
+  `22.949/22.893/11.584/5.866/3.302 ms/token at 1/2/4/8/16`.
+  - **`t=1` ≡ `t=2` was wrong, not unexplained.** It was recorded here as "an
+    open question, not an explanation"; the honest disposition is that it is
+    **false**. On a re-measurement with one process per cell, `t=2` is
+    **1.96x** faster than `t=1` (7.278 vs 14.300 ms/token) against a **0.00%
+    A/A null** over five reps per arm. The 1.96x is not itself a surprise —
+    the budget confines the process to `w` CPUs, so `t=2` has twice the
+    hardware of `t=1` and ~2x is the *expected* result. That is the point: the
+    recorded curve reported no speedup where the ordinary one was, and the
+    cause is harness-side and mechanical (#1771), not a property of the pool.
+  - **`t=1` does not build a pool at all, so ratios against it are "vs
+    serial".** At width 1 the decode budget confines the process to a single
+    CPU, and `build_from_env` then *declines* to construct the SPMD pool —
+    with one CPU there is no core to run the inline dispatcher alongside a
+    spinning worker, so it would starve itself (`decode_spmd.rs`, the
+    `allowed.len() == 1` fallback; the crate's own test notes "the smallest
+    budget that builds a pool is 2"). Decode runs on the flat path and the
+    bench reports `path=flat`. Note this is a *different* mechanism from the
+    `total_workers <= 1` serial short-circuit in `dispatch_output_rows`, which
+    is not what fires here: at width 1 there is no pool and no worker to
+    short-circuit. Either way `t=1` is a different code path from every other
+    column, so "1.96x over `t=1`" means "over the serial flat path".
+  - **The `8→16 = 1.77x ±0.7%` error bar is withdrawn as unverifiable.** Over
+    six independent launches `w=16` spans **1.476–9.064 ms/token (514%)**
+    while `w=8` spans 3.195–3.509 (9.8%). At `w=16` the run holds all 16
+    physical cores and has no headroom, so any co-tenant takes throughput
+    straight out of the measurement; at `w=8` there is slack. Note the
+    absolute level also moved between builds — the 2026-08-21 `t=8` of 5.87
+    against today's 3.31 — so this is **not** a claim that those three
+    repetitions were secretly bimodal; it is that a ±0.7% interval on `w=16`
+    is not something this host can support, and the original cannot now be
+    re-checked because the build has moved. **`8→16` is left unquoted** rather
+    than given an interval the measurement cannot carry.
+  - Trustworthy cells, five reps each, `realized=`/`as_requested` verified per
+    cell: **14.300 / 7.278 / 3.784 ms/token at t=1/2/4** — 1.00x / 1.96x /
+    3.78x, spreads 2.25% / 1.73% / 2.60%. **`w=8` is the widest measurable
+    cell on a shared host** (9.8% over six launches); `w=16` is not. Full
+    record:
+    [`docs/benchmarks/2026-08-23-acc4-decode-width-remeasurement.md`](../benchmarks/2026-08-23-acc4-decode-width-remeasurement.md).
 - *"Production is stuck on the narrow flat pool, so 1.77x is free."* False.
   `default_persistent_threads(32)` is 16 and `PERSISTENT_POOL_DEFAULT` is
   `true`, so `is_forced()` holds; every pool configuration reachable from this
@@ -1674,6 +1712,9 @@ Two cheaper hypotheses were tested and **both are closed negative**:
   *not* a persistent-vs-flat A/B: `PROBE_SPMD` does not move the pool under the
   default policy, an earlier draft wrongly labelled an arm "flat", and
   adversarial review caught it — a 6-wide pool cannot produce a 16-wide time.
+  (The `1.77x` in the hypothesis is the figure withdrawn above; the refutation
+  does not depend on it, since it rests on which pool width is reachable at
+  all, not on the ratio between two widths.)
 
 **Shipped:** `PROBE_ACCURACY` in `int4_decode_loop_ab`. The bench hard-coded
 `accuracy_level = 0`, and 4 is the only value reaching the packed-nibble route,
@@ -1888,11 +1929,31 @@ which is ORT's fastest configuration (they cost ORT ~26%: 9.885 vs 7.816 ms,
 min over three windows each)
 and therefore the harder comparison.
 
+A fourth qualification, added 2026-08-23: **the t=16 row should not be relied
+on at all on a shared host.** Six independent launches at that width span
+1.476–9.064 ms/token (514%) against 3.195–3.509 (9.8%) at t=8 — see §20. The
+native before/after cells there are 1.804 and 1.452, a 1.24x improvement, and
+both sit inside the launch-to-launch spread of a *single* arm at that width;
+the 1.18x gap figure inherits the same problem, since it is 1.452 divided by
+an ORT number. Neither is resolvable by the measurement that produced it. The
+t=1 and t=4 rows have headroom and are unaffected; **t=8 is the widest row
+worth arguing from.**
+
 **The default path did not move and is now the bigger target.** This kernel is
 gated to `accuracy_level = 4`; production default is 0, where native is 56.307
-ms/token against ORT's 30.632 — **1.84x**, unchanged. That it nearly equals the
-new acc4 gap is a coincidence of this shape, not a shared cause. Nothing here is
-progress on acc0.
+ms/token against ORT's 30.632 — **1.84x**, unchanged. **That figure is
+`threads = 1` only.** It is the sole acc0 cell with an ORT baseline: the source
+table has one further acc0 row (t=8, native 14.091) with no ORT number beside
+it, so **the acc0 gap at production width is unmeasured**. That matters more
+than a missing label usually would, because the acc4 table immediately above
+shows the gap moving from 3.01x at t=1 to 1.47x at t=16 on the same shape —
+width is one of the largest effects in this section. Do not quote 1.84x as
+"the acc0 gap" without the `t=1` qualifier, and do not assume it survives to
+t=8/16. Note also that at t=1 the native side runs `path=flat`, confined by
+the decode budget to a single CPU with no pool built at all (§20), so this is
+a serial-vs-ORT-single-thread comparison specifically. That it nearly equals
+the new acc4 gap is a coincidence of this shape and this width, not a shared
+cause. Nothing here is progress on acc0.
 
 Full record:
 [`docs/benchmarks/2026-08-21-int4-acc4-execution-regime.md`](../benchmarks/2026-08-21-int4-acc4-execution-regime.md).

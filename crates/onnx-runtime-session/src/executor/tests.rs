@@ -2690,6 +2690,302 @@ fn glm_indexer_add_mask_keeps_logical_width() {
     );
 }
 
+/// Build the minimized DeepSeek-V4-shaped decomposed-attention skeleton: a
+/// `past_key` graph input grown by a KV-cache-growth `Concat` into a
+/// `present_key` graph output, then read as `MatMul`'s *rhs* to produce a score
+/// (matching ONNX's trailing-axis semantics, exactly as `derives_from_kv_cache_
+/// growth`'s `MatMul` rule expects). Returns `(graph, mask, score)` so each test
+/// below only has to wire the mask-combining tail differently.
+fn decomposed_kv_growth_score_graph() -> (Graph, ValueId, ValueId) {
+    use onnx_runtime_ir::static_shape;
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let sh = || static_shape([1]);
+    let mask = graph.create_named_value("attention_mask", DataType::Float32, sh());
+    graph.add_input(mask);
+    let past_key = graph.create_named_value("past_key", DataType::Float32, sh());
+    graph.add_input(past_key);
+    let current_key = graph.create_named_value("current_key", DataType::Float32, sh());
+    let present_key = graph.create_named_value("present_key", DataType::Float32, sh());
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Concat",
+        vec![Some(past_key), Some(current_key)],
+        vec![present_key],
+    ));
+    graph.add_output(present_key);
+    let q = graph.create_named_value("q", DataType::Float32, sh());
+    let score = graph.create_named_value("score", DataType::Float32, sh());
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "MatMul",
+        vec![Some(q), Some(present_key)],
+        vec![score],
+    ));
+    (graph, mask, score)
+}
+
+/// The safe case the generalized classifier exists for: DeepSeek-V4's
+/// decomposed `score = Q @ present_keyᵀ`; `Add(score, mask)`; last-axis
+/// `Softmax` -- the decomposed-attention analogue of a fused `Attention`'s
+/// internal padding neutralization. `score`'s length axis structurally derives
+/// from the KV-cache-growth `Concat` above, so the mask may be frozen to
+/// physical capacity: this must classify as capacity-safe under BOTH policies
+/// (no `Shape(mask)` is consumed here, so static and decode-freeze predicates
+/// agree).
+#[test]
+fn decomposed_add_over_kv_cache_growth_score_then_softmax_is_capacity_safe() {
+    let (mut graph, mask, score) = decomposed_kv_growth_score_graph();
+    let add = graph.create_named_value("add", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(2),
+        "Add",
+        vec![Some(score), Some(mask)],
+        vec![add],
+    ));
+    let softmax = graph.create_named_value("softmax", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(3),
+        "Softmax",
+        vec![Some(add)],
+        vec![softmax],
+    ));
+    graph.add_output(softmax);
+    assert!(
+        mask_binding_feeds_capacity_form_attention(&graph, mask),
+        "a decomposed Add(score, mask) whose score derives from a KV-cache-growth \
+         Concat, normalized by a last-axis Softmax, must be capacity-safe"
+    );
+    assert!(
+        mask_binding_feeds_additive_causal_builder(&graph, mask),
+        "the same graph must also hold under the weaker decode-freeze-safe policy"
+    );
+}
+
+/// Opset-gating for the `Softmax` "axis absent" default: opset <= 12 defaults
+/// `axis` to `1` with "coerce to 2D" semantics (merging every dim from `axis`
+/// onward into one normalization group), not `-1`/last-axis-only. The exact
+/// same graph as the safe case above, but pinned to opset 12 with no explicit
+/// `axis` attribute, must therefore be rejected: this call site has no tensor
+/// rank to confirm the coerced group is only the length axis.
+#[test]
+fn decomposed_add_then_softmax_with_absent_axis_at_old_opset_is_rejected() {
+    let (mut graph, mask, score) = decomposed_kv_growth_score_graph();
+    graph.opset_imports.insert(String::new(), 12);
+    let add = graph.create_named_value("add", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(2),
+        "Add",
+        vec![Some(score), Some(mask)],
+        vec![add],
+    ));
+    let softmax = graph.create_named_value("softmax", DataType::Float32, static_shape([1]));
+    // No `axis` attribute set -- opset 12's implicit default is `1`, not `-1`.
+    graph.insert_node(Node::new(
+        NodeId(3),
+        "Softmax",
+        vec![Some(add)],
+        vec![softmax],
+    ));
+    graph.add_output(softmax);
+    assert!(
+        !mask_binding_feeds_capacity_form_attention(&graph, mask),
+        "a Softmax with no explicit axis attribute at opset <= 12 must NOT be treated as \
+         last-axis-only neutralization (its default coerces to 2D at axis=1 instead)"
+    );
+}
+
+/// Unsafe counterexample: "external width" — the `Add`'s other operand does
+/// NOT derive from the KV-cache-growth `Concat` (it is an unrelated value with
+/// no producer at all), even though the tail still normalizes with a last-axis
+/// `Softmax`. Freezing the mask here would compare `max_len` against a value
+/// still at its own, unrelated logical length, so this must be rejected.
+#[test]
+fn decomposed_add_over_foreign_width_score_is_rejected() {
+    let (mut graph, mask, _kv_growth_score) = decomposed_kv_growth_score_graph();
+    // A second, unrelated score with no KV-cache-growth provenance at all.
+    let foreign_score =
+        graph.create_named_value("foreign_score", DataType::Float32, static_shape([1]));
+    let add = graph.create_named_value("add", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(2),
+        "Add",
+        vec![Some(foreign_score), Some(mask)],
+        vec![add],
+    ));
+    let softmax = graph.create_named_value("softmax", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(3),
+        "Softmax",
+        vec![Some(add)],
+        vec![softmax],
+    ));
+    graph.add_output(softmax);
+    assert!(
+        !mask_binding_feeds_capacity_form_attention(&graph, mask),
+        "an Add whose other operand does not derive from a KV-cache-growth Concat \
+         must NOT be classified capacity-safe, even with a trailing last-axis Softmax"
+    );
+}
+
+/// Unsafe counterexample: "non-neutralized padded lanes" — the `Add`'s score
+/// does correctly derive from the KV-cache-growth `Concat`, but the result
+/// reaches a `MatMul` directly instead of a neutralizing `Softmax`. The
+/// substitution's padded lanes are never forced to a neutral value before a
+/// non-padding-aware consumer, so this must be rejected even though the `Add`
+/// step itself would have been sound in isolation.
+#[test]
+fn decomposed_add_without_softmax_neutralization_is_rejected() {
+    let (mut graph, mask, score) = decomposed_kv_growth_score_graph();
+    let add = graph.create_named_value("add", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(2),
+        "Add",
+        vec![Some(score), Some(mask)],
+        vec![add],
+    ));
+    // No Softmax: the additive bias feeds straight into another MatMul, so the
+    // padded lanes are never neutralized before a non-padding-aware consumer.
+    let w = graph.create_named_value("w", DataType::Float32, static_shape([1]));
+    let out = graph.create_named_value("out", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(3),
+        "MatMul",
+        vec![Some(add), Some(w)],
+        vec![out],
+    ));
+    graph.add_output(out);
+    assert!(
+        !mask_binding_feeds_capacity_form_attention(&graph, mask),
+        "an Add(score, mask) that reaches a MatMul instead of a neutralizing Softmax \
+         must NOT be classified capacity-safe"
+    );
+}
+
+/// Unsafe counterexample: "wrong axis" — the same safe `Add`→`Softmax` shape as
+/// [`decomposed_add_over_kv_cache_growth_score_then_softmax_is_capacity_safe`],
+/// but `Softmax`'s `axis` attribute normalizes over axis `0` instead of the
+/// last axis. Padding neutralization only happens along the length axis, so a
+/// `Softmax` over any other axis must not be treated as a neutralizing sink.
+#[test]
+fn decomposed_add_then_softmax_over_wrong_axis_is_rejected() {
+    let (mut graph, mask, score) = decomposed_kv_growth_score_graph();
+    let add = graph.create_named_value("add", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(2),
+        "Add",
+        vec![Some(score), Some(mask)],
+        vec![add],
+    ));
+    let softmax = graph.create_named_value("softmax", DataType::Float32, static_shape([1]));
+    let mut softmax_node = Node::new(NodeId(3), "Softmax", vec![Some(add)], vec![softmax]);
+    softmax_node
+        .attributes
+        .insert("axis".into(), Attribute::Int(0));
+    graph.insert_node(softmax_node);
+    graph.add_output(softmax);
+    assert!(
+        !mask_binding_feeds_capacity_form_attention(&graph, mask),
+        "a Softmax normalizing over axis 0 (not the last axis) must NOT neutralize \
+         the mask's padded lanes, so the binding must not be classified capacity-safe"
+    );
+}
+
+/// Unsafe counterexample: "mixed consumer" via `Concat` — DeepSeek-V4's real
+/// attention-sink pattern appends a fixed-size bias column onto the masked
+/// score via `Concat` before `Softmax`. This poisons that pattern by making the
+/// *other* `Concat` operand ALSO derive from the KV-cache-growth `Concat`
+/// (instead of a structurally-independent initializer-derived bias), so the
+/// two operands would not stay the same size once the mask is frozen — this
+/// must be rejected.
+#[test]
+fn decomposed_concat_with_kv_growth_derived_other_operand_is_rejected() {
+    let (mut graph, mask, score) = decomposed_kv_growth_score_graph();
+    let add = graph.create_named_value("add", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(2),
+        "Add",
+        vec![Some(score), Some(mask)],
+        vec![add],
+    ));
+    // The "sink bias" operand is poisoned: instead of an independent
+    // initializer-derived value, it is itself read straight from `score`
+    // (via a plain `Identity`, still reachable by `derives_from_kv_cache_
+    // growth`'s unconditional-descent op set), so it is NOT structurally
+    // independent of the mask-derived operand.
+    let poisoned_bias =
+        graph.create_named_value("poisoned_bias", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(4),
+        "Cast",
+        vec![Some(score)],
+        vec![poisoned_bias],
+    ));
+    let concat = graph.create_named_value("concat", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(3),
+        "Concat",
+        vec![Some(add), Some(poisoned_bias)],
+        vec![concat],
+    ));
+    let softmax = graph.create_named_value("softmax", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(5),
+        "Softmax",
+        vec![Some(concat)],
+        vec![softmax],
+    ));
+    graph.add_output(softmax);
+    assert!(
+        !mask_binding_feeds_capacity_form_attention(&graph, mask),
+        "a Concat whose other operand also derives from a KV-cache-growth Concat \
+         must NOT be classified capacity-safe: the two operands would not stay the \
+         same size once the mask is frozen"
+    );
+}
+
+/// Safe counterpart to the previous test: the attention-sink `Concat`'s other
+/// operand is a genuinely independent value (no producer at all, standing in
+/// for an initializer-derived learned bias, as DeepSeek-V4's real `attn_sink`
+/// is). This must remain capacity-safe -- proving the generalized `Concat` rule
+/// still accepts the legitimate pattern it was designed for, not just reject
+/// the poisoned one above.
+#[test]
+fn decomposed_concat_with_independent_sink_bias_is_capacity_safe() {
+    let (mut graph, mask, score) = decomposed_kv_growth_score_graph();
+    let add = graph.create_named_value("add", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(2),
+        "Add",
+        vec![Some(score), Some(mask)],
+        vec![add],
+    ));
+    // A genuinely independent sink-bias operand: no producer node at all,
+    // standing in for a value traced back to a graph initializer.
+    let sink_bias = graph.create_named_value("attn_sink", DataType::Float32, static_shape([1]));
+    let concat = graph.create_named_value("concat", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(3),
+        "Concat",
+        vec![Some(add), Some(sink_bias)],
+        vec![concat],
+    ));
+    let softmax = graph.create_named_value("softmax", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(4),
+        "Softmax",
+        vec![Some(concat)],
+        vec![softmax],
+    ));
+    graph.add_output(softmax);
+    assert!(
+        mask_binding_feeds_capacity_form_attention(&graph, mask),
+        "a Concat whose other operand is structurally independent of any \
+         KV-cache-growth Concat (e.g. an initializer-derived sink bias) must \
+         remain capacity-safe"
+    );
+}
+
 #[test]
 fn mask_builder_without_capacity_attention_is_rejected() {
     use onnx_runtime_ir::static_shape;

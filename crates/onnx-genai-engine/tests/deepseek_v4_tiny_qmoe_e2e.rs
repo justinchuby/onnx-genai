@@ -199,16 +199,17 @@ fn deepseek_v4_tiny_native_cpu_eager_decode_locks_anchor_ids() -> anyhow::Result
     Ok(())
 }
 
-/// Native CUDA decode currently diverges from native CPU / stock ORT for this
-/// fixture. This is a real, reproduced runtime gap, not a flaky test -- do not
-/// remove `#[ignore]` without first landing the fix described below.
+/// Native CUDA decode for DeepSeek-V4's decomposed (non-fused-`Attention`)
+/// attention export. Previously a real, reproduced runtime gap; now fixed by
+/// generalizing the capacity-substitution invariant instead of adding a
+/// DeepSeek-specific allowlist branch. History kept below for context.
 ///
 /// Root cause: DeepSeek-V4's smallest (dense CSA) config exports fully
 /// **decomposed/manual** attention -- plain `MatMul`/`Softmax`/`Concat`/
 /// `Unsqueeze`/`Expand`, no fused `Attention`/`GroupQueryAttention` op and no
 /// native-only kernel (confirmed: `model.onnx.textproto` has zero `Attention`-
-/// family nodes). Every other model this native CUDA decoder currently
-/// supports (GLM-5.2 full-attention, GLM-5.2 IndexShare, DeepSeek-V2/V3-Lite)
+/// family nodes). Every other model this native CUDA decoder previously
+/// supported (GLM-5.2 full-attention, GLM-5.2 IndexShare, DeepSeek-V2/V3-Lite)
 /// instead terminates its KV-consuming subgraph at a single kernel (a fused
 /// `Attention` op, or the native `pkg.nxrt::IndexShare` op) that has its own
 /// internal logic for reconciling a physically-wider capacity KV buffer
@@ -218,7 +219,7 @@ fn deepseek_v4_tiny_native_cpu_eager_decode_locks_anchor_ids() -> anyhow::Result
 /// combined (via `MatMul`+`Add`) with a causal-mask bias built from the
 /// *separate* `attention_mask` input.
 ///
-/// Reproduced failure (this binary, `CUDA_VISIBLE_DEVICES=1`):
+/// Originally reproduced failure (this binary, `CUDA_VISIBLE_DEVICES=1`):
 /// ```text
 /// node 90 ("model/layers.0/self_attn/Unsqueeze_node_94", op '::Unsqueeze',
 /// inputs ["present.0.key", "const_1d_4"] [Float32, Int64]
@@ -226,43 +227,73 @@ fn deepseek_v4_tiny_native_cpu_eager_decode_locks_anchor_ids() -> anyhow::Result
 /// [[1, 1, 1, 1, 16]]) failed: kernel execution failed:
 /// cuda_ep Unsqueeze: input/output dtype and element count must match
 /// ```
-/// `present.0.key`'s declared shape is already the physical KV capacity
-/// (256) by the time `Unsqueeze` reads it in-graph, but `Unsqueeze`'s own
+/// `present.0.key`'s declared shape was already the physical KV capacity
+/// (256) by the time `Unsqueeze` read it in-graph, but `Unsqueeze`'s own
 /// output was sized from the *logical* (small) value, so their element
-/// counts disagree.
+/// counts disagreed.
 ///
-/// A prior attempt widened `Unsqueeze`'s (and its producer `Concat`'s) shape
-/// bookkeeping to the physical capacity uniformly (`dispatch.rs` +
-/// `onnx-runtime-ep-cuda/src/kernels/movement.rs::ConcatKernel`). That fixed
-/// *this* crash but only moved it one hop downstream: the widened,
-/// physical-width attention score (`Mul_115`, derived from the now-physical
-/// K) then mismatched the causal-mask bias (`Unsqueeze_20`), which
-/// deliberately stays at *logical* width -- `geometry.rs`'s
-/// `is_additive_mask_builder_op`/`mask_binding_feeds_capacity_form_attention`
-/// classifier only recognizes a fused `Attention`-op mask input (its input
-/// slot 3) as a capacity-safe sink, by design (see that module's doc
-/// comments); a plain `Add` combining the mask with a decomposed score is
-/// never classified as a safe sink today, so the mask correctly never
-/// freezes to physical width for this graph, and reconciling it needed a
-/// wider architectural change than one file. That attempt was reverted
-/// rather than landing a two-file partial fix that swaps one crash for
-/// another.
+/// A first fix attempt widened the `Concat`'s own `output_shapes[0]` (mirroring
+/// `Attention`'s widening block in `dispatch.rs`) so `Unsqueeze` would see a
+/// consistent physical shape. That traded one crash for another: a plain
+/// `Concat` *kernel* independently validates `output.shape[axis] ==
+/// past.shape[axis] + current.shape[axis]`, and correctly writes only that
+/// (small) delta relying on present==past device buffer aliasing for the
+/// append -- widening its own declared output shape made that arithmetic
+/// check fail (`cuda_ep Concat: output dtype or shape mismatch`).
 ///
-/// **Fix requires either:** (a) teaching the mask-freeze classifier in
-/// `crates/onnx-runtime-session/src/executor/geometry.rs` to recognize a
-/// decomposed elementwise sink (`Add(capacity-consistent score, mask)`) as
-/// capacity-safe when its other operand is itself proven capacity-bound, or
-/// (b) having Mobius's DeepSeek-V4 ONNX export emit a fused `Attention`
-/// (or `GroupQueryAttention`) op for its decomposed attention block, matching
-/// the pattern GLM-5.2/DeepSeek-V2/V3-Lite already use, which the native CUDA
-/// decoder already correctly supports end-to-end.
+/// **Actual fix** (`onnx-runtime-session/src/executor/{geometry,dispatch}.rs`):
+/// decouple the two concerns the first attempt conflated. `geometry.rs` gained
+/// `is_kv_cache_growth_concat`/`derives_from_kv_cache_growth` -- a structural
+/// (not model-specific) recognizer for "a plain `Concat` whose input 0 is a
+/// graph input and output 0 is a graph output" (a decomposed KV-cache append),
+/// and used it to extend `classify_mask_consumer`'s existing invariant (an
+/// axis may be substituted with physical capacity iff every consumer either
+/// sources that axis from the same substitution or is neutralized before a
+/// non-padding-aware sink) to a decomposed `Add(score, mask)` -> `Softmax`
+/// chain, exactly mirroring the fused-`Attention` case it already handled.
+/// `dispatch.rs`'s widening block gained an `is_kv_cache_growth_concat` branch
+/// that -- unlike `Attention`'s, which needs its physical shape for its own
+/// kernel's in-place-append addressing -- leaves this node's own
+/// `output_shapes[0]` naive (so the `Concat` kernel's arithmetic check keeps
+/// passing) and instead corrects only `resolved`, the map same-step downstream
+/// consumers (`Shape`/`Unsqueeze` reading via `refill_input_shapes`) actually
+/// read from -- which is what was stale before this fix.
 ///
 /// CPU decode and stock ORT (both exercised by the other tests in this file)
-/// already execute this exact fixture correctly end-to-end, so this is
-/// strictly a native-CUDA-decode-engine gap, not a fixture, export, or
-/// numerics bug.
+/// already executed this exact fixture correctly end-to-end throughout, so
+/// this was strictly a native-CUDA-decode-engine gap, not a fixture, export,
+/// or numerics bug.
+///
+/// **CUDA-graph capture stays declined for this fixture, correctly and by a
+/// separate mechanism than the crash above.** Whole-step capture requires the
+/// persistent `past_key_values.*` **input** bindings to be pinned at physical
+/// capacity from the very first (empty) prefill step
+/// (`GraphCaptureDecision`'s `persistent_inputs_have_fixed_logical_shapes`
+/// predicate, `native_decode/cuda.rs`); that in turn requires every *direct*
+/// consumer of that input to be capacity-aware
+/// (`build.rs::binding_consumers_use_physical_capacity`,
+/// `geometry.rs::kernel_input_uses_physical_capacity`), which today only
+/// recognizes `Attention`/`GroupQueryAttention`/`pkg.nxrt::IndexShare` --
+/// kernels deliberately designed with an auxiliary total-length signal so a
+/// physical/padded cache extent never corrupts their arithmetic. A plain
+/// `Concat` (this fixture's cache-growth op) has no such duality: its kernel
+/// computes `output.shape[axis] = past.shape[axis] + current.shape[axis]`
+/// literally, so feeding it a physical-capacity past shape would silently
+/// reproduce a variant of the original crash (an ever-growing, wrong output
+/// length) rather than becoming capture-safe. Reaching `captures>0` for a
+/// `Concat`-based cache append therefore needs a genuinely different decode-
+/// time write mechanism (e.g. a fixed-slot copy/scatter op in place of
+/// `Concat`) -- a substantial new capability, not a classifier generalization
+/// -- matching the same conclusion `glm_tiny_qmoe_native_cuda_e2e.rs`'s
+/// `..._declines_capture` test already documents for GLM-5.2's own
+/// concat/logical form ("must remain eager before S3 capacity emission").
+/// Building that write mechanism is out of scope here (explicit user
+/// direction: extend the existing classifier, do not modify the Mobius
+/// exporter or invent a DeepSeek-specific path) and is the concrete follow-up
+/// tracked for whole-step capture on this fixture. This test instead asserts
+/// what the fix actually delivers: correct, eager, non-fallback CUDA decode
+/// that is token-identical to CPU.
 #[test]
-#[ignore = "native CUDA decode gap for decomposed (non-fused-Attention) attention graphs -- see doc comment"]
 fn deepseek_v4_tiny_native_cuda_matches_cpu() -> anyhow::Result<()> {
     let Some(dir) = fixture_dir() else {
         return Ok(());
@@ -287,10 +318,45 @@ fn deepseek_v4_tiny_native_cuda_matches_cpu() -> anyhow::Result<()> {
         Some(NativeDecodeDevice::Cuda { index: Some(0) }),
     )?;
     let cuda_tokens = generate(&mut cuda)?;
-    eprintln!("deepseek-v4 tiny native CUDA tokens: {cuda_tokens:?}");
+    let stats = cuda
+        .native_cuda_debug_stats()
+        .expect("native CUDA engine exposes decode diagnostics");
+    eprintln!(
+        "deepseek-v4 tiny native CUDA tokens: {cuda_tokens:?}; \
+         captures={} replays={} fallbacks={} decline_reason={:?}",
+        stats.graph.captures,
+        stats.graph.replays,
+        stats.graph.fallbacks,
+        stats.graph.decline_reason
+    );
     assert_eq!(
         cuda_tokens, cpu_tokens,
         "native CUDA diverged from native CPU"
+    );
+    assert_eq!(
+        stats.graph.fallbacks, 0,
+        "eager decode on a capacity-ineligible fixture must not additionally suffer runtime \
+         capture-attempt fallbacks"
+    );
+    // Whole-step capture is not expected here -- see the doc comment above --
+    // but the reason must be exactly the known, pre-existing structural one
+    // (a `past_key_values.*` input consumed by a plain `Concat`), not some new
+    // regression the classifier fix introduced.
+    assert_eq!(
+        stats.graph.captures, 0,
+        "unexpected CUDA graph capture for a Concat-cache-growth fixture -- \
+         if a capacity-write mechanism now makes this fixture capture-eligible, \
+         update this assertion and the doc comment above deliberately"
+    );
+    assert!(
+        stats
+            .graph
+            .decline_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("persistent_inputs_have_fixed_logical_shapes")),
+        "expected capture to be declined specifically by the persistent-input capacity \
+         predicate, got: {:?}",
+        stats.graph.decline_reason
     );
     Ok(())
 }

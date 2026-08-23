@@ -85,6 +85,7 @@ cuda-13000 = [
 ]
 
 [dependencies]
+onnx-runtime-hostmon = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 # Pure-Rust CUDA bindings for the `roofline_transfer` H2D/D2H probe (behind the

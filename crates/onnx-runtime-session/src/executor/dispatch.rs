@@ -891,16 +891,19 @@ impl Executor {
         }
         let mut output_shapes: Vec<Vec<usize>> =
             outputs.iter().map(|v| resolved[v].clone()).collect();
-        // Fixed-capacity KV for the default-domain Attention op. Its present
-        // K/V outputs (slots 1..) are consumer-less graph outputs bound to a
-        // growing device cache. Expose them to the kernel at the binding's
-        // physical capacity so the kernel can append the new token into a fixed
-        // per-head slot (constant stride, no per-step restride) instead of
-        // repacking the whole cache densely. The valid attended length is still
-        // derived from the logical past+current extent, so this only widens the
-        // *storage* stride and never changes what the kernel attends over. Only
-        // present slots that are bound sub-shape (logical != physical) capacity
-        // buffers are widened; a dense/unbound present keeps its inferred shape.
+        // Fixed-capacity KV for the default-domain Attention op, and for a
+        // decomposed attention's plain-`Concat` KV-cache append (see
+        // `geometry::is_kv_cache_growth_concat`). Both present outputs are
+        // consumer-less graph outputs bound to a growing device cache; the two
+        // branches below correct for that binding, but via different targets
+        // (`output_shapes` for `Attention`, `resolved` for the `Concat` case —
+        // see the `Concat` branch's comment for why) since only `Attention`'s
+        // own kernel needs the widened shape to place the new token correctly.
+        // Either way, the valid attended length is still derived from the
+        // logical past+current extent, so this only widens the *storage*
+        // stride/tracked shape and never changes what is attended over. Only
+        // present values bound sub-shape (logical != physical) capacity buffers
+        // are corrected; a dense/unbound present keeps its inferred shape.
         {
             let node = self.graph.node(node_id);
             if node.is_default_domain() && node.op_type == "Attention" {
@@ -937,6 +940,58 @@ impl Executor {
                                 .is_some_and(|(&physical, &logical)| physical >= logical))
                     {
                         output_shapes[oi] = value.shape.clone();
+                    }
+                }
+            } else if is_kv_cache_growth_concat(&self.graph, node)
+                && let Some(axis) = node.attr("axis").and_then(Attribute::as_int)
+            {
+                // Decomposed attention grows its KV cache with a plain `Concat`
+                // (`present.* = Concat(past.*, current, axis)`) instead of an
+                // in-op cache. `is_kv_cache_growth_concat` recognizes this by
+                // input/output role alone (see its doc comment) — the same
+                // predicate `geometry::classify_mask_consumer` uses to decide
+                // whether a mask combined with a value derived from this append
+                // can also be frozen to physical width; the two are two sides
+                // of one invariant.
+                //
+                // Unlike `Attention`, whose kernel is *designed* to receive a
+                // physical-capacity output shape (it derives the true attended
+                // length from the mask/cache extent instead, so widening tells
+                // it where to place the new token without repacking), a plain
+                // `Concat` kernel independently validates that its declared
+                // output shape equals `past.shape[axis] + current.shape[axis]`
+                // and correctly writes only that (small) delta — relying on the
+                // present==past device aliasing for the append to land in
+                // place. Widening `output_shapes` here would make the node's
+                // *own* dispatch shape lie about that arithmetic and the kernel
+                // would (rightly) reject it. So only `resolved` is corrected —
+                // it is what a same-step downstream consumer (a decomposed
+                // attention's `Shape(present.*)` / `Unsqueeze` chain) reads via
+                // `refill_input_shapes`, and it is what was stale before this
+                // fix (the original crash). This node's own `output_shapes`
+                // stays the naive, arithmetically-correct value below.
+                let rank = output_shapes[0].len();
+                let axis = if axis < 0 { axis + rank as i64 } else { axis };
+                if let Ok(axis) = usize::try_from(axis)
+                    && axis < rank
+                {
+                    let ovid = outputs[0];
+                    if let Some(value) = external.outputs.get(&ovid)
+                        && value.accepts_subshape
+                        && value.shape.len() == output_shapes[0].len()
+                        && value
+                            .shape
+                            .iter()
+                            .zip(&output_shapes[0])
+                            .enumerate()
+                            .all(|(a, (&physical, &logical))| a == axis || physical == logical)
+                        && value
+                            .shape
+                            .get(axis)
+                            .zip(output_shapes[0].get(axis))
+                            .is_some_and(|(&physical, &logical)| physical >= logical)
+                    {
+                        resolved.insert(ovid, value.shape.clone());
                     }
                 }
             }

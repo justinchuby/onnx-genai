@@ -1159,6 +1159,18 @@ impl CudaVirtualBacking {
             .collect()
     }
 
+    /// Public wrapper around [`blocks_in_range`] for use by the
+    /// `granule_transition` module (and tests) without exposing the internal
+    /// `CudaReservation::blocks` field directly.
+    pub fn blocks_in_range_pub(
+        &self,
+        reservation: &CudaReservation,
+        offset: usize,
+        requested_len: usize,
+    ) -> Vec<MappedBlock> {
+        Self::blocks_in_range(reservation, offset, requested_len)
+    }
+
     /// Release every mapping in `[offset, offset + requested_len)`, reporting
     /// exactly what each block did.
     ///
@@ -1838,6 +1850,59 @@ impl PhysicalHandlePool {
         PhysicalHandlePoolStats {
             counters: Arc::clone(&self.counters),
         }
+    }
+
+    /// The CUDA device ordinal for all handles in this pool.
+    pub fn device_ordinal_pub(&self) -> i32 {
+        self.device_ordinal
+    }
+
+    /// Acquire one physical handle from this pool without mapping it anywhere.
+    ///
+    /// Returns the raw handle and the incremental physical bytes charged
+    /// (`granularity` for a newly created handle, `0` for a pool warm-hit).
+    ///
+    /// The caller is responsible for:
+    ///  - Calling [`return_handle_unmapped`](Self::return_handle_unmapped) on
+    ///    the handle if no mapping is ever made (pool accounting correction).
+    ///  - Calling [`return_after_unmap_pub`](Self::return_after_unmap_pub) after
+    ///    the handle is unmapped, to return it to the pool for reuse.
+    ///
+    /// This is the raw-driver transition API used by `granule_transition`; do not
+    /// use it in other callers without reviewing the pool accounting contract.
+    pub fn acquire_handle_raw(
+        &self,
+    ) -> Result<(cu::CUmemGenericAllocationHandle, u64), VirtualMemoryError> {
+        let (checkout, created) = self.acquire_with_owned_limit(u64::MAX, None)?;
+        Ok((checkout.handle, created))
+    }
+
+    /// Return a handle to the pool WITHOUT calling `cuMemUnmap` on it.
+    ///
+    /// Used to roll back a handle acquired via [`acquire_handle_raw`] when the
+    /// caller never mapped it. Equivalent to `rollback_checkout(checkout, false)`.
+    pub fn return_handle_unmapped(&self, handle: cu::CUmemGenericAllocationHandle) {
+        // We don't know if it was created or was a pool hit (we don't have the
+        // CheckedOutHandle wrapper). Use return_after_unmap with was_mapped=false,
+        // which is correct for either case: if created, it stays owned; if pool-hit,
+        // the pooled_unmapped gauge is restored.
+        //
+        // For a newly-created handle, this means it goes into `available`
+        // (if pool not full) or is released. This is the correct behavior:
+        // a created handle that was never mapped can be re-used by the next
+        // caller. The governor lease adjustment matches.
+        let _ = self.return_after_unmap(handle, false);
+    }
+
+    /// Return a handle to the pool after its mapping at some VA was removed.
+    ///
+    /// Equivalent to the private `return_after_unmap(handle, true)` call used
+    /// internally in disposal paths.
+    pub fn return_after_unmap_pub(
+        &self,
+        handle: cu::CUmemGenericAllocationHandle,
+    ) -> crate::release::HandleDisposition {
+        self.return_after_unmap(handle, true)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, PoolState> {
@@ -2606,10 +2671,52 @@ impl std::fmt::Debug for CudaReservation {
 }
 
 impl CudaReservation {
+    /// Device address of the start of this reservation's virtual address range.
+    pub fn base_ptr(&self) -> u64 {
+        self.base
+    }
+
+    /// Replace `old_block` in this reservation's block list with `new_block`.
+    ///
+    /// Used by the granule-transition primitive to update the block list when
+    /// a granule's physical backing is swapped (old handle removed, new handle
+    /// mapped at the same offset).
+    ///
+    /// # Panics
+    ///
+    /// Does not panic if `old_block` is not found; the replace is a no-op in
+    /// that case (the block may already have been swapped by a prior call).
+    pub fn swap_block(
+        &mut self,
+        old_block: crate::release::MappedBlock,
+        new_block: crate::release::MappedBlock,
+    ) {
+        if let Some(pos) = self.blocks.iter().position(|b| *b == old_block) {
+            self.blocks[pos] = new_block;
+        }
+    }
+
     /// Blocks that are unmapped but whose physical handle this reservation
     /// still owns because releasing it failed. Never reusable.
     pub fn quarantined_blocks(&self) -> &[MappedBlock] {
         &self.quarantined
+    }
+
+    /// Record `block` as quarantined: its handle is no longer trusted to be
+    /// mapped or unmapped cleanly, so it is retained here rather than either
+    /// reused or dropped on the floor.
+    ///
+    /// Used by the granule-transition primitive when a driver operation
+    /// leaves a handle's mapping state ambiguous (e.g. a new-map failure
+    /// whose old-mapping restore also fails): the handle must never re-enter
+    /// a reuse pool, and this reservation's own `Drop`/accounting must be
+    /// told about it so it is not silently lost.
+    ///
+    /// Also removes `block` from the mapped-blocks list if present, since a
+    /// quarantined block is by definition no longer trusted as mapped.
+    pub fn push_quarantined_block(&mut self, block: crate::release::MappedBlock) {
+        self.blocks.retain(|b| *b != block);
+        self.quarantined.push(block);
     }
 
     /// Blocks mapped right now.
