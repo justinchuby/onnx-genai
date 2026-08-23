@@ -2925,6 +2925,23 @@ mod tests {
                 "the first pin targets must be one per physical core"
             );
         }
+
+        // Fully subscribed (4 workers, 4 CPUs), so the inline dispatcher still
+        // gets headroom on the explicit path exactly as on the default one.
+        // Every topology branch of `reserve_single_group_headroom` agrees on 3
+        // here, whether the four CPUs are two SMT pairs, four cores, or a host
+        // with no discoverable core topology at all.
+        assert_eq!(
+            shards[0].workers, 3,
+            "an explicit request must not starve the dispatcher"
+        );
+
+        // With genuine headroom the requested count is untouched.
+        let roomy = explicit_affinity_shards_for(ExplicitAffinity::FromPlan, 2, || {
+            Some(vec![0, 1, 2, 3, 4, 5, 6, 7])
+        })
+        .expect("a planned request is honored");
+        assert_eq!(roomy[0].workers, 2);
     }
 
     /// If the planner cannot produce a CPU set -- no topology, an empty
