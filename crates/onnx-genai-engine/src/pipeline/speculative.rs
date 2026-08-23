@@ -1053,6 +1053,12 @@ fn truncate_state_cell(value: &Value, axis: usize, length: usize) -> anyhow::Res
     }
     let mut truncated = shape.clone();
     truncated[axis] = length as i64;
+    // `alias_with_shape` takes an `Arc` to tie the view's lifetime to the buffer
+    // it borrows, which is the whole point: the view must not outlive what it
+    // points into. `Value` is not `Send`/`Sync` and this one never leaves the
+    // calling thread, so the atomic refcount is the API's price rather than a
+    // sharing claim.
+    #[allow(clippy::arc_with_non_send_sync)]
     let owner = std::sync::Arc::new(clone_value(value)?);
     Value::alias_with_shape(owner, &truncated)
         .map(Some)
