@@ -210,6 +210,17 @@ jobs:
           -p onnx-runtime-dlpack
           -p onnx-runtime-comm
           -p onnx-std-python
+      # `profile_native` is the tool every decode benchmark in docs/benchmarks
+      # is produced with, and nothing else in CI compiles it: the `-p` list
+      # above does not reach a bin that needs `--features bench-native`, and
+      # `benchmark.yml` only runs `--bench no_model` / `--bench model`. So an
+      # engine API change breaks it silently and it is discovered by hand, which
+      # is exactly what happened in #1878. Building (not running) it is cheap
+      # and closes that gap.
+      - name: Build the native profiling bin
+        run: >-
+          cargo build --locked
+          -p onnx-genai-bench --features bench-native --bin profile_native
       - name: Test Linux offline crates
         run: >-
           cargo test --locked

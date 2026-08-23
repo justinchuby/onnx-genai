@@ -1968,9 +1968,46 @@ time. That figure is now stale; the re-measurement replaces it.
 > **not** the host bandwidth knee (`2026-08-22-decode-width-scaling.md`): a DRAM
 > ceiling is a property of the host and would have flattened both arms, and ORT
 > scales 1.76x across the same doubling on the same host in the same launch.
-> Next step is to localise the wall to pool dispatch versus kernel, for which
-> #1859's per-worker straggler attribution exists. Full record:
-> [`docs/benchmarks/2026-08-23-acc0-gap-at-width-16.md`](../benchmarks/2026-08-23-acc0-gap-at-width-16.md).
+> **The wall has since been split.** CPU-seconds attribution on both arms
+> (`acc0_w8_w16_cpu_split.py`, identity-checked per cell) finds it is **two
+> causes, not one**: at t=16 native burns **~30% more CPU per token** than at
+> t=8 *and* leaves **~40% of the sixteen cores idle** (`busy` 0.938 -> 0.595),
+> while ORT holds `busy = 0.999` and pays 11%. A first pass scored this
+> BURN-DOMINATED with `R_busy = 1.057` — "the workers are not idle" — and that
+> reading was an **instrument artifact**: `decode_spmd`'s wait spins and
+> `sched_yield`s for up to 500 us before parking, and a yielding thread accrues
+> CPU time exactly like a working one, so `busy` at t=16 reads 0.966 at the
+> shipped default and 0.595 with the ramp off, at statistically identical
+> throughput. **Any `busy`/occupancy reading of the decode pool taken at the
+> default blocktime over-reads by tens of points.** The ramp itself costs ~20%
+> of process CPU at t=16 on top of an unchanged `user_s`, and removing it is
+> throughput-neutral here (ratio 0.9960 against a 5.24% A/A null) -- but this is
+> a **zero-gap** decode loop, exactly where parking looks falsely free, so
+> nothing here licenses changing the shipped default; that needs #1395's
+> gap-aware harness. Next step is unchanged in target and sharper in aim:
+> localise the *idle* half with #1859's per-worker straggler attribution.
+> **That is now done** (`acc0_w16_worker_split.py`, 10/10 trusted): the idle is
+> **not** a wake problem -- `wake_frac` is only 0.051 at t=16 and the
+> pre-registered WAKE-BOUND condition did not fire -- it is a **barrier wait**.
+> The mean worker spends **22.2%** of the window waiting for a straggler doing
+> ~45% more work than the mean and holding **72%** of last-arrivals against a
+> 6.7% chance share, while an Amdahl calibration shows 20.4 of the remaining
+> points are constant-serial scaling and **not** a defect. So the recoverable
+> figure at t=16 is ~25 points, not the 46% residual. The straggler's identity
+> *moves between launches*, which excludes a static mis-partition, and
+> dispatcher/worker CPU collision was tested and excluded (one partial match in
+> four launches). Nothing can help it today: `DEFAULT_STEAL_TILES_PER_WORKER
+> = 1` makes `target == total_workers`, so `work_stealing_segments_aligned`
+> always falls back to static equal segments. Setting it to 2 measures
+> **+23% at t=16** with the predicted mechanism (`sys_frac` 0.280 -> 0.192) and
+> **no t=8 regression** -- but it is **REJECTED** by the pre-registered rule
+> and not proposed, because the t=16 A/A null in the same run is **+-21.5%**.
+> **The binding constraint at t=16 is now the measurement, not the kernel:**
+> until the A/A instability is understood no improvement of realistic size can
+> clear a pre-registered bar there. Full records:
+> [`docs/benchmarks/2026-08-23-acc0-gap-at-width-16.md`](../benchmarks/2026-08-23-acc0-gap-at-width-16.md),
+> [`docs/benchmarks/2026-08-23-acc0-width-16-cpu-attribution.md`](../benchmarks/2026-08-23-acc0-width-16-cpu-attribution.md),
+> [`docs/benchmarks/2026-08-23-acc0-width-16-worker-attribution.md`](../benchmarks/2026-08-23-acc0-width-16-worker-attribution.md).
 >
 > The old figure was **not mislabelled — it was a correct measurement of a tree
 > that no longer exists.** An earlier draft argued this from the ORT arm alone

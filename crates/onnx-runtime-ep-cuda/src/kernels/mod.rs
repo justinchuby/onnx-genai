@@ -238,6 +238,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Sin",
     "Cos",
     "Softplus",
+    "Mish",
     "Tan",
     "Sinh",
     "Cosh",
@@ -1021,6 +1022,18 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
+    // Standard ONNX-domain spelling, opset 27. Same contract as the contrib op
+    // (rank-3 `[B, C, L]`, depthwise `[C, 1, k]` weight, `k-1` carry state,
+    // `none`/`silu`/`swish` activation), so it reuses the same kernel rather
+    // than growing a second implementation to keep in step — matching what the
+    // CPU EP does for this op and what both EPs already do for
+    // `LinearAttention`.
+    reg.register(
+        OpKey::new("CausalConvWithState", "", 27),
+        Box::new(causal_conv_with_state::CausalConvWithStateFactory {
+            runtime: runtime.clone(),
+        }),
+    );
     reg.register(
         OpKey::new("LinearAttention", "com.microsoft", 1),
         Box::new(linear_attention::LinearAttentionFactory {
@@ -1447,6 +1460,9 @@ pub fn build_cuda_registry_with_metrics(
         ("Sin", UnaryMathOp::Sin),
         ("Cos", UnaryMathOp::Cos),
         ("Softplus", UnaryMathOp::Softplus),
+        // Mish (opset 22) is attribute-free and shape-preserving, so it rides
+        // the same channel rather than needing its own factory.
+        ("Mish", UnaryMathOp::Mish),
         ("Tan", UnaryMathOp::Tan),
         ("Sinh", UnaryMathOp::Sinh),
         ("Cosh", UnaryMathOp::Cosh),

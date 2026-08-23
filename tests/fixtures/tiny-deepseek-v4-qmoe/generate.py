@@ -32,6 +32,25 @@ ORT alike, unlike the GLM-5.2 DSA/IndexShare fixture.
 Both variants of the sibling GLM fixture use the same self-contained
 ``model.onnx.textproto`` inlining approach; this fixture reuses it verbatim
 (see that script's docstring for the stock-ORT external-data rationale).
+
+Regenerating (required two-step recipe -- this script alone is NOT enough):
+``write_onnx_genai_config`` reproduces ``model.onnx.textproto``/
+``tokenizer.json`` byte-for-byte, but its ``inference_metadata.yaml`` is the
+pre-canonicalization document Mobius commit MOBIUS_COMMIT emits -- not the
+canonical single-``decoder``-component shape actually committed in this
+directory. After running this script, canonicalize with:
+
+    cargo run -p onnx-genai-engine --bin migrate_model_io -- --reemit \\
+        <output-dir>
+
+Skipping this reintroduces the ten hand-authored, never-real auxiliary
+policy components #1883 removed (each referencing a ``policies/*.onnx``
+artifact that was never committed), which fails
+``decoder_recognizer_agreement.rs``'s classification matrix and package
+loading itself (`crates/onnx-genai-ort/src/loader.rs` eagerly resolves every
+declared workflow component's artifact at load time). Verified (2026-08-23):
+``generate.py`` + ``migrate_model_io --reemit`` reproduces
+``inference_metadata.yaml`` byte-identically to the committed file.
 """
 
 from __future__ import annotations

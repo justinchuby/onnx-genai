@@ -31,8 +31,8 @@ use std::collections::BTreeMap;
 
 use anyhow::Context as _;
 use onnx_genai_metadata::{
-    SpeculativeContract, SpeculativeProposalExecution, SpeculativeRecurrenceBinding, WorkflowSpec,
-    WorkflowStep,
+    SpeculativeContract, SpeculativeProposalExecution, SpeculativeRecurrenceBinding,
+    StatePortAccess, WorkflowSpec, WorkflowStep,
 };
 use onnx_genai_ort::{DataType, Value};
 
@@ -97,12 +97,99 @@ struct ChainedPlan<'a> {
     folded_carry_output: Option<&'a str>,
     /// SSA value the target's `folded_carry_seed` output is bound to.
     folded_carry_seed_value: Option<String>,
-    /// Embedding table `{component, table}`, when a folded carry is declared.
-    token_embedding: Option<(&'a str, &'a str)>,
+    /// The declared token-embedding source, when a folded carry is declared.
+    token_embedding: Option<&'a onnx_genai_metadata::TokenEmbeddingSource>,
     /// Proposer port -> SSA value, from the workflow's own invocation of it.
     proposer_bindings: BTreeMap<String, String>,
     /// Proposer port -> SSA value for its outputs, from the same invocation.
     proposer_outputs: BTreeMap<String, String>,
+    /// Proposer port -> SSA value the state cell it borrows currently holds.
+    ///
+    /// Overrides `proposer_bindings` for exactly those ports: see
+    /// [`borrowed_state_bindings`].
+    borrowed_state: BTreeMap<String, String>,
+}
+
+/// Proposer ports that are read-only views of another component's state.
+///
+/// `serving.state_service.groups[*].ports.<proposer>` declares an alias with
+/// `access: read_only`: the port is not an input of the proposer's own, it *is*
+/// the cell some other component owns. Binding it from the value the pass
+/// started with hands a drafter the cache as it stood *before* the owner ran —
+/// for a pass over a fresh context, an empty one — so every token it drafts is
+/// conditioned on nothing and the target contradicts all of them. The borrow is
+/// silent, too: the proposal is well formed, the tally is plausible, and the
+/// only symptom is an acceptance rate of zero.
+///
+/// The owner's alias names the `output` port its current contents leave by, and
+/// the workflow's own invocation binds that port to an SSA value. That value is
+/// what the cell holds now, so that is what the borrowing port binds.
+fn borrowed_state_bindings(
+    workflow: &WorkflowSpec,
+    proposer: &str,
+    target: &str,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let Some(serving) = workflow.serving.as_ref() else {
+        return Ok(BTreeMap::new());
+    };
+    let mut bound = BTreeMap::new();
+    for group in serving.state_service.groups.values() {
+        let Some(borrowed) = group.ports.get(proposer) else {
+            continue;
+        };
+        for (cell, alias) in borrowed {
+            if alias.access != StatePortAccess::ReadOnly {
+                continue;
+            }
+            let port = &alias.input;
+            // Only the cell's read-write owner publishes its contents. A
+            // read-only alias may name a present output the artifact emits for
+            // kernel-ABI reasons, and the schema is explicit that such a value
+            // is not a state transition — binding a drafter to another
+            // drafter's discarded output would be the same silent wrong answer
+            // this function exists to remove.
+            let mut owners = group.ports.iter().filter_map(|(component, aliases)| {
+                if component == proposer {
+                    return None;
+                }
+                let alias = aliases.get(cell)?;
+                if alias.access != StatePortAccess::ReadWrite {
+                    return None;
+                }
+                Some((component.as_str(), alias.output.as_ref()?.as_str()))
+            });
+            // The speculative target is the owner a proposer borrows from when
+            // more than one component advances the cell; picking whichever
+            // component sorted first would reintroduce a stale borrow by a
+            // different route.
+            let owner = owners
+                .clone()
+                .find(|(component, _)| *component == target)
+                .or_else(|| owners.next());
+            let Some((owner, output)) = owner else {
+                anyhow::bail!(
+                    "component '{proposer}' borrows state cell '{cell}' read-only, but no other \
+                     component in its service group owns that cell read-write and publishes it; \
+                     a borrowed cache with no owner would be read as the seed the pass began \
+                     with, which is not what the package declared"
+                );
+            };
+            let (_, outputs) = component_invocation(workflow, owner).with_context(|| {
+                format!(
+                    "state cell '{cell}' is owned by component '{owner}', which the workflow \
+                     never invokes, so '{proposer}' has nothing to borrow"
+                )
+            })?;
+            let value = outputs.get(output).with_context(|| {
+                format!(
+                    "component '{owner}' owns state cell '{cell}' through output port \
+                     '{output}', which its invocation does not bind to a value"
+                )
+            })?;
+            bound.insert(port.clone(), value.clone());
+        }
+    }
+    Ok(bound)
 }
 
 impl WorkflowRuntime {
@@ -165,6 +252,10 @@ impl WorkflowRuntime {
             if plan.recurrent.iter().any(|binding| &binding.input == port) {
                 continue;
             }
+            // A port declared as a read-only view of another component's state
+            // binds what that cell holds *now*, not the seed the pass began
+            // with.
+            let value_name = plan.borrowed_state.get(port).unwrap_or(value_name);
             let value = run.get(value_name).with_context(|| {
                 format!(
                     "chained proposer '{}' input '{port}' references unavailable workflow value \
@@ -246,11 +337,12 @@ impl WorkflowRuntime {
                     })?,
             )
             .context("the workflow's fused proposer input value is unavailable")?;
-        anyhow::ensure!(
-            fused_template.dtype() == DataType::Float32,
-            "chained proposal driving requires a float32 fused input, found {:?}",
-            fused_template.dtype()
-        );
+        // The chain's arithmetic currency is whatever the package declared for
+        // its fused proposer input: an fp16 export's embeddings, carry and
+        // fused buffer are fp16, and widening them here would both cost a
+        // conversion per draft token and feed the proposer a tensor its own
+        // port contract does not describe.
+        let fused_dtype = fused_template.dtype();
         // Where the chain does its tensor algebra: where the proposer executes.
         // That is configured, not discovered, so the fused input is built in the
         // proposer's own memory from the first step rather than assembled on the
@@ -276,8 +368,22 @@ impl WorkflowRuntime {
         };
 
         let embedding = match plan.token_embedding {
-            Some((component, table)) => {
-                Some(self.embedding_table_resident(component, table, residency)?)
+            Some(source) => {
+                let (component, table) = (source.component.as_str(), source.table.as_str());
+                let loaded = self.embedding_table_resident(source, residency)?;
+                // Both halves are written into one buffer, so the table the
+                // package names must speak the fused input's element type.
+                // Naming both sides is what makes a mismatched export
+                // actionable instead of a wrong-looking draft.
+                anyhow::ensure!(
+                    loaded.dtype() == fused_dtype,
+                    "token_embedding.table '{table}' of component '{component}' is {:?}, but the \
+                     proposer's declared fused input '{}' is {fused_dtype:?}; the gathered \
+                     embedding is written into that buffer, so the two must agree",
+                    loaded.dtype(),
+                    plan.token_embedding_input
+                );
+                Some(loaded)
             }
             None => None,
         };
@@ -333,7 +439,7 @@ impl WorkflowRuntime {
         // Rebuilding it per step would allocate — and on a device, upload — the
         // concatenation the scatters below write in place.
         let fused = ops
-            .zeros(&fused_shape, DataType::Float32)
+            .zeros(&fused_shape, fused_dtype)
             .context("failed to allocate the fused proposer input")?;
 
         let outputs = self.proposer_output_bindings(&plan);
@@ -694,19 +800,23 @@ impl WorkflowRuntime {
     /// answering the same question.
     pub fn embedding_table_resident(
         &self,
-        component: &str,
-        table: &str,
+        source: &onnx_genai_metadata::TokenEmbeddingSource,
         residency: super::device_ops::Residency,
     ) -> anyhow::Result<std::rc::Rc<EmbeddingTable>> {
+        let (component, table) = (source.component.as_str(), source.table.as_str());
+        // The declared normalizer is part of what the cached rows *are*, so it
+        // is part of what identifies them. Keyed on the bits rather than the
+        // value because a cache key has to be hashable and total.
         let key = (
             component.to_string(),
             table.to_string(),
             residency.cache_key(),
+            source.scale.map(f32::to_bits),
         );
         if let Some(cached) = self.embedding_tables.borrow().get(&key) {
             return Ok(std::rc::Rc::clone(cached));
         }
-        let loaded = std::rc::Rc::new(self.embedding_table(component, table)?.into_residency(
+        let loaded = std::rc::Rc::new(self.embedding_table(source)?.into_residency(
             residency,
         ).with_context(|| {
             format!("failed to make embedding table '{table}' of component '{component}' resident on {residency}")
@@ -727,7 +837,11 @@ impl WorkflowRuntime {
         self.embedding_table_loads.get()
     }
 
-    pub fn embedding_table(&self, component: &str, table: &str) -> anyhow::Result<EmbeddingTable> {
+    pub fn embedding_table(
+        &self,
+        source: &onnx_genai_metadata::TokenEmbeddingSource,
+    ) -> anyhow::Result<EmbeddingTable> {
+        let (component, table) = (source.component.as_str(), source.table.as_str());
         let path = self
             .models
             .directory
@@ -762,40 +876,92 @@ impl WorkflowRuntime {
             shape.len()
         );
         let (vocab, hidden) = (shape[0], shape[1]);
-        anyhow::ensure!(
-            info.dtype == onnx_runtime_ir::DataType::Float32,
-            "token_embedding.table '{table}' must be float32, found {:?}",
-            info.dtype
-        );
+        let dtype = super::device_ops::value_dtype_from_ir(info.dtype).with_context(|| {
+            format!(
+                "token_embedding.table '{table}' of component '{component}' has element type {:?} \
+                 ({}), which the workflow value currency does not carry",
+                info.dtype,
+                path.display()
+            )
+        })?;
         let bytes = weights
             .bytes(weight)
             .with_context(|| format!("token_embedding.table '{table}' has no weight bytes"))?;
         anyhow::ensure!(
-            bytes.len() == vocab * hidden * std::mem::size_of::<f32>(),
-            "token_embedding.table '{table}' holds {} bytes for a [{vocab}, {hidden}] f32 matrix",
-            bytes.len()
+            bytes.len() == vocab * hidden * dtype.size_of(),
+            "token_embedding.table '{table}' holds {} bytes for a [{vocab}, {hidden}] {dtype:?} \
+             matrix, which needs {}",
+            bytes.len(),
+            vocab * hidden * dtype.size_of()
         );
-        let rows = bytes
-            .chunks_exact(std::mem::size_of::<f32>())
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect::<Vec<_>>();
+        // The declared normalizer is applied once, to the table, rather than
+        // per gathered row: the proposer consumes the target's *scaled*
+        // embedding at every step, and a real vocabulary would otherwise pay
+        // the conversion per draft token.
+        let rows = match source.scale {
+            None => bytes.to_vec(),
+            Some(scale) => scaled_rows(bytes, dtype, scale).with_context(|| {
+                format!(
+                    "failed to apply the declared token_embedding.scale {scale} to \
+                     '{table}' of component '{component}'"
+                )
+            })?,
+        };
         self.embedding_table_loads
             .set(self.embedding_table_loads.get().saturating_add(1));
         Ok(EmbeddingTable {
             vocab,
             hidden,
-            value: Value::from_vec_f32(
+            value: Value::from_raw_bytes(
                 rows,
                 &[
                     i64::try_from(vocab).context("embedding vocabulary exceeds i64")?,
                     i64::try_from(hidden).context("embedding width exceeds i64")?,
                 ],
+                dtype,
             )
             .map_err(|error| {
                 anyhow::anyhow!("failed to materialize embedding table '{table}': {error}")
             })?,
         })
     }
+}
+
+/// `bytes`, reinterpreted as `dtype` elements and multiplied by `scale`.
+///
+/// The multiply is done in `f32` and rounded back, which is what a graph
+/// constant folded into a half-precision model computes. Only the float types
+/// a table can hold are supported: scaling an integer table would quantize the
+/// factor away silently, so it is refused with a diagnostic instead.
+fn scaled_rows(bytes: &[u8], dtype: DataType, scale: f32) -> anyhow::Result<Vec<u8>> {
+    Ok(match dtype {
+        DataType::Float32 => bytes
+            .chunks_exact(4)
+            .flat_map(|chunk| {
+                (f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) * scale).to_le_bytes()
+            })
+            .collect(),
+        DataType::Float16 => bytes
+            .chunks_exact(2)
+            .flat_map(|chunk| {
+                half::f16::from_f32(half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32() * scale)
+                    .to_le_bytes()
+            })
+            .collect(),
+        DataType::BFloat16 => bytes
+            .chunks_exact(2)
+            .flat_map(|chunk| {
+                half::bf16::from_f32(
+                    half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32() * scale,
+                )
+                .to_le_bytes()
+            })
+            .collect(),
+        other => anyhow::bail!(
+            "token_embedding.scale is declared for a {other:?} table; a normalizer is only \
+             meaningful on a float table, so either drop the scale or export the table scaled"
+        ),
+    })
 }
 
 /// A dense `[vocab, hidden]` row-major embedding table read from a component,
@@ -830,6 +996,15 @@ impl EmbeddingTable {
 
     pub fn hidden_size(&self) -> usize {
         self.hidden
+    }
+
+    /// The element type this table's rows are held in.
+    ///
+    /// A table is read out of the artifact in the type the export wrote, so
+    /// this is the package's answer, not a runtime preference. The chain
+    /// checks it against the fused proposer input it is written into.
+    pub fn dtype(&self) -> DataType {
+        self.value.dtype()
     }
 
     /// The table as a `[vocab, hidden]` tensor, for a residency-preserving
@@ -875,13 +1050,17 @@ impl EmbeddingTable {
         })
     }
 
-    /// The embedding row for `token`.
+    /// The embedding row for `token`, widened to `f32`.
     ///
     /// An out-of-range id is an error rather than a clamp: a proposer that
     /// drafted an id the table cannot embed has left the declared vocabulary,
     /// and silently embedding row 0 would hide that. A device-resident table
     /// has no host rows to borrow and says so.
-    pub fn row(&self, token: i64) -> anyhow::Result<&[f32]> {
+    ///
+    /// One row is widened, never the table: at a real vocabulary a whole-table
+    /// conversion is gigabytes to answer a question about 1536 numbers. The
+    /// gather the chain actually runs stays in the table's own element type.
+    pub fn row(&self, token: i64) -> anyhow::Result<Vec<f32>> {
         let index = usize::try_from(token)
             .ok()
             .filter(|index| *index < self.vocab)
@@ -891,10 +1070,30 @@ impl EmbeddingTable {
                     self.vocab, self.hidden
                 )
             })?;
-        let rows = self.value.as_slice_f32().map_err(|error| {
+        let dtype = self.value.dtype();
+        let element = dtype.size_of();
+        let bytes = self.value.as_raw_bytes().map_err(|error| {
             anyhow::anyhow!("this embedding table's rows cannot be read from the host: {error}")
         })?;
-        Ok(&rows[index * self.hidden..(index + 1) * self.hidden])
+        let row = &bytes[index * self.hidden * element..(index + 1) * self.hidden * element];
+        match dtype {
+            DataType::Float32 => Ok(row
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect()),
+            DataType::Float16 => Ok(row
+                .chunks_exact(2)
+                .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+                .collect()),
+            DataType::BFloat16 => Ok(row
+                .chunks_exact(2)
+                .map(|chunk| half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+                .collect()),
+            other => anyhow::bail!(
+                "an embedding row of a {other:?} table has no lossless f32 widening; gather it \
+                 in its own element type instead of reading rows"
+            ),
+        }
     }
 }
 
@@ -986,11 +1185,14 @@ impl<'a> ChainedPlan<'a> {
             recurrent,
             folded_carry_output: folded_carry_output.as_deref(),
             folded_carry_seed_value,
-            token_embedding: token_embedding
-                .as_ref()
-                .map(|source| (source.component.as_str(), source.table.as_str())),
+            token_embedding: token_embedding.as_ref(),
             proposer_bindings,
             proposer_outputs,
+            borrowed_state: borrowed_state_bindings(
+                workflow,
+                &contract.proposer,
+                &contract.target,
+            )?,
         })
     }
 }
@@ -1024,6 +1226,13 @@ pub(super) fn externally_used_values(
         && let Some(value) = outputs.get(&seed.output)
     {
         live.insert(value.clone());
+    }
+    // A read-only borrow reads the value its owner published, so that value has
+    // a consumer no graph can see. Without this a package whose borrowed cell is
+    // not also a rollback cell would have it elided and the chain would fail
+    // looking for it.
+    if let Ok(borrowed) = borrowed_state_bindings(workflow, &contract.proposer, &contract.target) {
+        live.extend(borrowed.into_values());
     }
     // A rejected proposal restores the declared rollback cells, so the values a
     // pass leaves in them must survive fusion too.
@@ -1353,6 +1562,7 @@ steps:
             token_embedding: Some(onnx_genai_metadata::TokenEmbeddingSource {
                 component: "target".to_string(),
                 table: "hidden_table".to_string(),
+                scale: None,
             }),
         });
         let live = externally_used_values(Some(&contract), &workflow());

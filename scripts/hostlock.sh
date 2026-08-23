@@ -177,8 +177,20 @@
 # reaped automatically by the next acquirer. The start time is what makes
 # that safe: pids are recycled, so "is there a process with pid 12345" is not
 # the same question as "is the process that took this lock still alive".
-# Reaping is guarded by a second mkdir lock, so two acquirers racing on the
-# same dead lock cannot both reap and both believe they won.
+# Reaping is guarded by a second lock, so two acquirers racing on the same
+# dead lock cannot both reap and both believe they won. That guard is built
+# the same way as the lock -- published atomically by rename, owned by pid +
+# start time, reclaimed from a dead owner immediately and never taken from a
+# live one -- because a guard without liveness is just a smaller wedge in a
+# place nobody looks. See "The reaper guard" below.
+#
+# PORTABILITY: Linux only, deliberately and unavoidably. Every liveness claim
+# here comes from /proc/<pid>/stat and /proc/<pid>/status; the atomic publish
+# needs `mv -T` (GNU coreutils), the age backstop needs `stat -c %Y`, and the
+# occupancy field needs /proc/loadavg. There is no BSD/macOS fallback and no
+# attempt at one: a fallback that silently degrades liveness to `kill -0`
+# would reap live holders on the platform that took it, which is the one
+# error this script must never make.
 #
 # The anchor cannot be this script's own pid for `acquire`, because that pid
 # dies the moment the script returns to your shell -- the lock would be stale
@@ -204,6 +216,7 @@ LOCK_DIR="${HOSTLOCK_DIR:-/tmp/onnx-genai-hostlock}"
 UNPARSEABLE_GRACE=300
 REAPER_GRACE=60
 REAP_DIR="${LOCK_DIR}.reaper"
+REAP_META="${REAP_DIR}/meta"
 META="${LOCK_DIR}/meta"
 
 die() {
@@ -414,10 +427,13 @@ unverifiable_live_anchor() {
     pid_is_live "$a"
 }
 
-holder_alive() {
-    local pid start info now
-    pid=$(meta_get anchor_pid) || return 1
-    start=$(meta_get start_time) || return 1
+# Is the process identified by (pid, start_time) still running?
+#
+# One predicate, used for the lock's holder AND for the reaper guard's holder.
+# The last time two call sites each decided this question for themselves, the
+# answers disagreed and two of the four defects in #1830 came out of the gap.
+anchor_alive() {
+    local pid=$1 start=$2 info now
     [ -n "$pid" ] && [ -n "$start" ] || return 1
     pid_is_live "$pid" || return 1
     info=$(proc_state_and_start "$pid") || return 1
@@ -425,6 +441,13 @@ holder_alive() {
     # A recycled pid has a different start time, so this is not just "does
     # some process with this number exist".
     [ "$now" = "$start" ]
+}
+
+holder_alive() {
+    local pid start
+    pid=$(meta_get anchor_pid) || return 1
+    start=$(meta_get start_time) || return 1
+    anchor_alive "$pid" "$start"
 }
 
 lock_age() {
@@ -504,22 +527,134 @@ reap_was_unverifiable() {
     [ ! -s "$META" ] || [ -z "$a" ] || [ -z "$s" ]
 }
 
-# Remove a reapable lock. Guarded so that two acquirers racing on the same
-# dead lock cannot both conclude they reaped it.
-reap_if_dead() {
-    # The reaper guard is the one directory here with no anchor and no owner,
-    # so a crash inside the critical section below would leak it and make
-    # every genuinely dead lock permanently un-reapable -- acquirers would be
-    # told BUSY forever with nothing holding anything. Bound it by age.
-    if [ -d "$REAP_DIR" ]; then
-        local rm_age rm_now
-        rm_age=$(stat -c %Y "$REAP_DIR" 2>/dev/null || echo 0)
-        rm_now=$(date +%s)
-        if [ "$((rm_now - rm_age))" -gt "$REAPER_GRACE" ]; then
-            rmdir "$REAP_DIR" 2>/dev/null
+# ---------------------------------------------------------------------------
+# The reaper guard
+#
+# `reap_if_dead` must be mutually exclusive: two acquirers racing on the same
+# dead lock must not both conclude they reaped it and both start benchmarking.
+# The guard that provides that exclusion used to be a bare `mkdir` with no
+# anchor and no owner, which put the wedge this whole script exists to prevent
+# INSIDE the mechanism that prevents it. One SIGKILL between the mkdir and the
+# rmdir orphaned a directory that nothing could ever attribute, after which
+# every genuinely dead lock was permanently un-reapable and `acquire` reported
+# BUSY forever -- indistinguishable, to the operator, from legitimate
+# occupancy. A benchmark box that can only be unwedged by hand is not a
+# coordination mechanism, it is a second thing to page someone about.
+#
+# It is now the same construction as the lock itself, for the same reasons:
+#
+#   * PUBLISHED ATOMICALLY, complete with metadata, by staging a populated
+#     directory and `mv -T`. There is no instant at which the guard exists
+#     but is unattributable, so a kill cannot create one. rename(2) onto a
+#     NON-EMPTY directory fails with ENOTEMPTY, which is what makes this a
+#     test-and-set rather than a "last writer wins".
+#   * OWNED, by pid + start_time, checked through the one `anchor_alive`
+#     predicate. A dead owner's guard is reclaimed IMMEDIATELY by the next
+#     contender -- no grace, no waiting, nothing to wedge behind.
+#   * NEVER STOLEN FROM A LIVE OWNER. Age is not evidence of death. The old
+#     rule cleared any guard older than REAPER_GRACE, so a reaper merely slow
+#     -- a loaded box, a qemu run, a stalled NFS stat -- could have its guard
+#     taken while it was still inside the critical section, producing exactly
+#     the double reap the guard exists to prevent.
+#   * RELEASED ONLY BY ITS OWNER, so a process whose guard was reclaimed
+#     while it was descheduled cannot delete its successor's guard on the way
+#     out.
+#
+# REAPER_GRACE survives as a backstop for one residual class only: a guard
+# that exists but carries no readable anchor. Staging makes that unreachable
+# for guards this script writes; it remains reachable for a stray directory
+# at that path from an older version or another hand. For that class there is
+# no liveness evidence at all, and age is the only instrument left.
+# ---------------------------------------------------------------------------
+
+reap_meta_get() {
+    [ -f "$REAP_META" ] || return 1
+    grep -q "^$1=" "$REAP_META" 2>/dev/null || return 1
+    sed -n "s/^$1=//p" "$REAP_META" | head -1
+}
+
+# Clear the guard if -- and only if -- nothing is holding it.
+# Returns 0 when the path is free to claim, 1 when someone else holds it.
+reaper_clear_if_dead() {
+    [ -d "$REAP_DIR" ] || return 0
+    local pid start age now dead
+    pid=$(reap_meta_get anchor_pid) || pid=""
+    start=$(reap_meta_get start_time) || start=""
+    if [ -n "$pid" ] && [ -n "$start" ]; then
+        # Attributable. Liveness decides, and it decides both ways: a live
+        # owner is never disturbed, a dead one is reclaimed on the spot.
+        if anchor_alive "$pid" "$start"; then
+            return 1
         fi
+    else
+        # Unattributable. No liveness evidence exists, so age is all there is.
+        age=$(stat -c %Y "$REAP_DIR" 2>/dev/null || echo 0)
+        now=$(date +%s)
+        [ "$((now - age))" -gt "$REAPER_GRACE" ] || return 1
     fi
-    mkdir "$REAP_DIR" 2>/dev/null || return 1
+    # Rename before removing, so that two contenders reclaiming the same
+    # abandoned guard cannot delete each other's pieces: the loser's rename
+    # fails and it simply retries the claim below.
+    dead="${REAP_DIR}.dead.$$"
+    if mv -T "$REAP_DIR" "$dead" 2>/dev/null; then
+        rm -rf "$dead"
+    fi
+    return 0
+}
+
+reaper_claim() {
+    local start stage
+    start=$(proc_start_time "$$") || return 1
+    stage="${REAP_DIR}.stage.$$"
+    rm -rf "$stage"
+    mkdir -p "$stage" 2>/dev/null || return 1
+    {
+        echo "anchor_pid=$$"
+        echo "start_time=${start}"
+        echo "owner=${OWNER:-?}"
+        echo "claimed_epoch=$(date +%s)"
+    } >"${stage}/meta" 2>/dev/null || { rm -rf "$stage"; return 1; }
+    if mv -T "$stage" "$REAP_DIR" 2>/dev/null; then
+        return 0
+    fi
+    rm -rf "$stage"
+    return 1
+}
+
+# Release only what we still own. If our guard was reclaimed while we were
+# descheduled, the directory at that path now belongs to a successor who may
+# be mid-reap; deleting it would hand the box to two agents at once.
+#
+# Ownership is pid AND start time, not pid alone, for the same reason the
+# lock's is: this box is at ~1.5M pids after four days, so a successor that
+# happens to land on our number is a recycled pid, not us. Checking only $$
+# here while `reaper_clear_if_dead` checks both would leave the asymmetry
+# exactly where the consequence is worst -- deleting a live successor's
+# guard rather than merely failing to clean up our own.
+reaper_release() {
+    local pid start dead
+    pid=$(reap_meta_get anchor_pid) || return 0
+    [ "$pid" = "$$" ] || return 0
+    start=$(reap_meta_get start_time) || return 0
+    [ "$start" = "$(proc_start_time "$$")" ] || return 0
+    dead="${REAP_DIR}.rel.$$"
+    if mv -T "$REAP_DIR" "$dead" 2>/dev/null; then
+        rm -rf "$dead"
+    fi
+}
+
+# Remove a reapable lock, under the guard above.
+reap_if_dead() {
+    reaper_clear_if_dead || return 1
+    reaper_claim || return 1
+    # Test seam, inert unless set: hold the critical section open so the
+    # conformance suite can kill this process INSIDE it deterministically,
+    # which is the only way to test that an orphaned guard is recoverable
+    # without waiting REAPER_GRACE for a class that no longer uses it.
+    if [ -n "${HOSTLOCK_REAPER_STALL:-}" ]; then
+        echo "$$" >"${REAP_DIR}/stalled_pid" 2>/dev/null
+        sleep "$HOSTLOCK_REAPER_STALL"
+    fi
     local reaped=1
     if [ -d "$LOCK_DIR" ] && reapable; then
         local pid owner
@@ -534,7 +669,7 @@ reap_if_dead() {
         remove_lock
         reaped=0
     fi
-    rmdir "$REAP_DIR" 2>/dev/null
+    reaper_release
     return $reaped
 }
 

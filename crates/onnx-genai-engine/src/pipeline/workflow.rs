@@ -742,12 +742,14 @@ impl<'a> WorkflowExecutionPlan<'a> {
             super::generation::host_supplied_inputs(workflow, hosted)
         };
         let runtime_managed_seeds = super::generation::runtime_managed_seeds(workflow);
+        let serving_controls = super::generation::serving_control_seeds(workflow);
         let (mut values, from_literal) = engine.bind_workflow_inputs(
             workflow,
             &request,
             inputs,
             &host_supplied,
             &runtime_managed_seeds,
+            &serving_controls,
         )?;
         let dynamic_symbols = workflow
             .state
@@ -773,7 +775,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
         // singleton for a symbolic axis, so binding literals first would pin a
         // shared symbol such as `batch` to 1 and reject every batched request.
         for (name, input) in &workflow.inputs {
-            if from_literal.contains(name) {
+            if from_literal.contains_key(name) {
                 continue;
             }
             if let Some(value) = values.get(name) {
@@ -787,17 +789,15 @@ impl<'a> WorkflowExecutionPlan<'a> {
             }
         }
         for (name, input) in &workflow.inputs {
-            if !from_literal.contains(name) {
+            let Some(literal) = from_literal.get(name) else {
                 continue;
-            }
+            };
             let Some(value) = values.get(name) else {
                 continue;
             };
             let resolved = resolve_workflow_shape(&input.contract, &initial_symbols)
                 .unwrap_or_else(|_| value.shape().to_vec());
-            if resolved != value.shape()
-                && let Some(literal) = input.default.as_ref()
-            {
+            if resolved != value.shape() {
                 let rebuilt =
                     workflow_literal_value_with_shape(literal, &input.contract, &resolved)?;
                 values.insert(name.clone(), rebuilt);
@@ -2954,9 +2954,19 @@ impl WorkflowRuntime {
         mut provided: PipelineTensors,
         host_supplied: &std::collections::HashSet<String>,
         runtime_managed_seeds: &std::collections::HashSet<String>,
-    ) -> anyhow::Result<(PipelineTensors, std::collections::HashSet<String>)> {
+        serving_controls: &std::collections::BTreeMap<String, super::generation::ServingControl>,
+    ) -> anyhow::Result<(
+        PipelineTensors,
+        std::collections::BTreeMap<String, onnx_genai_metadata::LiteralValue>,
+    )> {
         let mut values = HashMap::new();
-        let mut from_literal = std::collections::HashSet::new();
+        // The literal each materialized value was built from, not merely that
+        // one was: a literal whose contract has symbolic axes is first
+        // materialized at `literal_shape`'s singleton guess and must be rebuilt
+        // once the request's own values have bound those symbols. Keeping the
+        // literal here is what lets a *derived* seed be rebuilt too — it has no
+        // declared default to go back to.
+        let mut from_literal = std::collections::BTreeMap::new();
         for (name, input) in &workflow.inputs {
             let supplied = provided.remove(name).or_else(|| match &input.source {
                 WorkflowInputSource::Application { name } => provided.remove(name),
@@ -2985,7 +2995,9 @@ impl WorkflowRuntime {
                         }
                     },
                     WorkflowInputSource::Literal => {
-                        from_literal.insert(name.clone());
+                        if let Some(literal) = input.default.as_ref() {
+                            from_literal.insert(name.clone(), literal.clone());
+                        }
                         input
                             .default
                             .as_ref()
@@ -2993,7 +3005,9 @@ impl WorkflowRuntime {
                             .transpose()?
                     }
                     WorkflowInputSource::Application { .. } => {
-                        from_literal.insert(name.clone());
+                        if let Some(literal) = input.default.as_ref() {
+                            from_literal.insert(name.clone(), literal.clone());
+                        }
                         input
                             .default
                             .as_ref()
@@ -3007,6 +3021,25 @@ impl WorkflowRuntime {
                         )
                     }
                 }
+            };
+            // The serving service owns its own control signals. If neither the
+            // caller nor the package supplied one, seed it from the role the
+            // serving contract declared rather than refusing a package whose
+            // only "missing" inputs are the runtime's own.
+            let value = match (value, serving_controls.get(name)) {
+                (None, Some(role)) => {
+                    let seed = role.admission_seed();
+                    let value =
+                        workflow_literal_value(&seed, &input.contract).with_context(|| {
+                            format!(
+                                "failed to seed serving control '{name}' from its declared \
+                                 contract"
+                            )
+                        })?;
+                    from_literal.insert(name.clone(), seed);
+                    Some(value)
+                }
+                (value, _) => value,
             };
             let is_present = value.is_some();
             if let Some(present_as) = &input.present_as {

@@ -360,7 +360,8 @@ pub struct ExpertShardFacts {
 ///
 /// Proposal width, tree shape, scheduling, kernels, and whether speculation is
 /// enabled at all are runtime decisions.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+// Not `Eq`: a chained proposer's declared embedding normalizer is a real number.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SpeculativeContract {
     /// Workflow component that proposes tokens.
@@ -407,7 +408,8 @@ pub struct SpeculativeContract {
 }
 
 /// Execution shape of a speculative proposer.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+// Not `Eq`: a chained proposer's declared embedding normalizer is a real number.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SpeculativeProposalExecution {
     /// One proposer invocation returns the complete token block.
@@ -495,7 +497,9 @@ pub struct SpeculativeValueRef {
 /// the component whose embedding the runtime reuses and the initializer that
 /// holds it, so gathering `embed(last_token)` is a declared contract rather than
 /// a per-model heuristic.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+// Not `Eq`: `scale` is a real number, and a package that declares 39.19 is not
+// meaningfully "equal" to one that declares 39.190000000000005.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TokenEmbeddingSource {
     /// The workflow component whose token-embedding table is reused. For a
@@ -508,6 +512,27 @@ pub struct TokenEmbeddingSource {
     /// must name a real initializer in the target model/artifact.
     #[schemars(length(min = 1))]
     pub table: String,
+    /// Normalizer the target applies to a looked-up row before its backbone
+    /// reads it.
+    ///
+    /// A gathered row is not always the tensor a graph feeds its first block:
+    /// several architectures scale the embedding by a constant folded into the
+    /// graph (`sqrt(hidden_size)` is the common one), so the initializer alone
+    /// is not what a proposer's fused input needs. The proposer stands in for
+    /// the target's own embedding step, so it must see the *scaled* row — and
+    /// the factor has to be declared rather than guessed: nothing in a
+    /// `[vocab, hidden]` initializer says whether one was applied, and a
+    /// proposer fed the unscaled row drafts fluent, plausible, uniformly
+    /// rejected tokens. It is the acceptance rate that collapses, not the
+    /// output, so the failure is invisible to a token-parity check.
+    ///
+    /// Absent means 1.0: a package whose graph gathers and feeds directly.
+    ///
+    /// Single precision because that is the precision it is *used* in: the
+    /// factor multiplies a float16 or float32 table, so declaring more would
+    /// promise an accuracy the application of it discards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<f32>,
 }
 
 /// One loop-carried proposer value in a chained proposal.
