@@ -19765,10 +19765,10 @@ mod tests {
         // there is no way to ask it to lie, and an assertion never seen to fail
         // is an assertion nobody has shown is connected to anything. This makes
         // the child claim a CPU it is not on, which is exactly the #1792 shape.
-        if std::env::var_os(PLACEMENT_DISHONEST_ENV).is_some() {
-            if let Some(slot) = reported.iter_mut().flatten().next() {
-                *slot = slot.wrapping_add(1);
-            }
+        if std::env::var_os(PLACEMENT_DISHONEST_ENV).is_some()
+            && let Some(slot) = reported.iter_mut().flatten().next()
+        {
+            *slot = slot.wrapping_add(1);
         }
         placement_verdict(&reported, observed_worker_affinities())
     }
