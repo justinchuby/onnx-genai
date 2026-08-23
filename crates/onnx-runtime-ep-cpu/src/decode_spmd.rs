@@ -1969,15 +1969,23 @@ enum ExplicitAffinity {
     /// `compact` / `node:<index>`: the CPU set comes from the shared planner,
     /// which owns topology detection and the allowed-set intersection.
     FromPlan,
+    /// A value that is not a selector at all. Placement defers exactly as for
+    /// `DeferToDefault`, but the caller reports it: a typo is precisely the
+    /// case a user needs told about, and silence here is how this knob went
+    /// unnoticed for so long.
+    Malformed,
 }
 
 /// Map a raw [`DECODE_AFFINITY_ENV`] value to its meaning for this path.
 ///
 /// `numa-split` defers because [`node_shards`]'s multi-node branch *is* the
 /// numa-split layout; deferring keeps one implementation rather than two that
-/// can drift. An unparseable value also defers: rejecting it here would change
-/// a bad env var from "diagnosed on the flat path" into "decode silently
-/// unpinned", and the flat path already reports it with the full accepted menu.
+/// can drift.
+///
+/// An unparseable value defers too, rather than being rejected: turning a bad
+/// env var into "decode silently unpinned" would be worse than ignoring it.
+/// It is reported as [`ExplicitAffinity::Malformed`] rather than folded into
+/// `DeferToDefault` so the caller can still say so out loud.
 fn explicit_affinity_request(raw: Option<&str>) -> ExplicitAffinity {
     let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
         return ExplicitAffinity::DeferToDefault;
@@ -1986,9 +1994,8 @@ fn explicit_affinity_request(raw: Option<&str>) -> ExplicitAffinity {
         Ok(crate::decode_affinity::DecodeAffinity::Off) => ExplicitAffinity::Unpinned,
         Ok(crate::decode_affinity::DecodeAffinity::Compact)
         | Ok(crate::decode_affinity::DecodeAffinity::Node(_)) => ExplicitAffinity::FromPlan,
-        Ok(crate::decode_affinity::DecodeAffinity::NumaSplit) | Err(_) => {
-            ExplicitAffinity::DeferToDefault
-        }
+        Ok(crate::decode_affinity::DecodeAffinity::NumaSplit) => ExplicitAffinity::DeferToDefault,
+        Err(_) => ExplicitAffinity::Malformed,
     }
 }
 
@@ -2003,10 +2010,35 @@ fn explicit_affinity_request(raw: Option<&str>) -> ExplicitAffinity {
 /// concerns do not have to know about each other.
 fn explicit_affinity_shards(total: usize) -> Option<Vec<NodeShard>> {
     let raw = std::env::var(crate::decode_affinity::DECODE_AFFINITY_ENV).ok();
-    explicit_affinity_shards_for(explicit_affinity_request(raw.as_deref()), total, || {
-        crate::decode_affinity::plan_decode_affinity(total)
-            .ok()
-            .and_then(|plan| plan.cpus)
+    let request = explicit_affinity_request(raw.as_deref());
+    if request == ExplicitAffinity::Malformed {
+        // Re-parse purely for the message, so the accepted-modes menu stays
+        // owned by `decode_affinity` rather than restated here.
+        if let Err(message) = crate::decode_affinity::DecodeAffinity::parse(raw.as_deref()) {
+            crate::kernels::matmul_nbits::report_decode_affinity_policy(&format!(
+                "{message}; the persistent decode pool is using default placement instead"
+            ));
+        }
+    }
+    explicit_affinity_shards_for(request, total, || {
+        match crate::decode_affinity::plan_decode_affinity(total) {
+            Ok(plan) => {
+                if let Some(message) = plan.log {
+                    crate::kernels::matmul_nbits::report_decode_affinity_policy(&message);
+                }
+                plan.cpus
+            }
+            // The flat path propagates this as a hard error. Here the request is
+            // still reported -- deferring silently is how this knob went inert
+            // in the first place -- but the pool falls back to default placement
+            // rather than refusing to start decode over a placement preference.
+            Err(message) => {
+                crate::kernels::matmul_nbits::report_decode_affinity_policy(&format!(
+                    "{message}; the persistent decode pool is using default placement instead"
+                ));
+                None
+            }
+        }
     })
 }
 
@@ -2022,7 +2054,7 @@ fn explicit_affinity_shards_for(
     planned_cpus: impl FnOnce() -> Option<Vec<usize>>,
 ) -> Option<Vec<NodeShard>> {
     match request {
-        ExplicitAffinity::DeferToDefault => None,
+        ExplicitAffinity::DeferToDefault | ExplicitAffinity::Malformed => None,
         // No CPUs means no pinning (see `SpmdDecodePools::build_with_schedule`),
         // and unpinned workers cannot pin the dispatcher out of a core, so the
         // headroom reservation has nothing to reserve against.
@@ -2859,13 +2891,22 @@ mod tests {
             explicit_affinity_request(Some("   ")),
             ExplicitAffinity::DeferToDefault
         );
+        // A typo defers like the rest, but is distinguishable so the caller can
+        // report it instead of leaving the user with a silently ignored knob.
         assert_eq!(
             explicit_affinity_request(Some("node:notanumber")),
-            ExplicitAffinity::DeferToDefault
+            ExplicitAffinity::Malformed
         );
         assert_eq!(
             explicit_affinity_request(Some("sideways")),
-            ExplicitAffinity::DeferToDefault
+            ExplicitAffinity::Malformed
+        );
+        assert!(
+            explicit_affinity_shards_for(ExplicitAffinity::Malformed, 4, || {
+                panic!("a malformed value must not consult topology")
+            })
+            .is_none(),
+            "a malformed value must leave default placement in charge"
         );
     }
 
