@@ -386,16 +386,27 @@ fn discover_site_packages(prefix: &Path, roots: &mut Vec<PathBuf>) {
 }
 
 fn push_pip_cupti_candidates(site_packages: &Path, os: TargetOs, candidates: &mut Vec<PathBuf>) {
-    let library_subdir = if os == TargetOs::Windows {
-        "bin"
-    } else {
-        "lib"
+    // Layout comes from `onnx-genai-cuda-version-guard`, shared with the CUDA
+    // EP's loader. NVIDIA republished these wheels under a consolidated layout
+    // (`nvidia/cu13/{bin,lib}/<arch>`), and this crate and the EP each held a
+    // hand-written copy of the older `nvidia/<component>/{bin,lib}` shape — so
+    // both went stale at once, and fixing one would have left the other silently
+    // failing to find a CUPTI that is installed.
+    let host_os = match os {
+        TargetOs::Windows => onnx_genai_cuda_version_guard::HostOs::Windows,
+        TargetOs::Linux => onnx_genai_cuda_version_guard::HostOs::Linux,
+        TargetOs::Macos => onnx_genai_cuda_version_guard::HostOs::Macos,
+        TargetOs::Other => onnx_genai_cuda_version_guard::HostOs::Other,
     };
-    let library_dir = site_packages.join("nvidia/cuda_cupti").join(library_subdir);
-    for soname in libcupti_names_for(os) {
-        let candidate = library_dir.join(soname);
-        if !candidates.contains(&candidate) {
-            candidates.push(candidate);
+    for relative in
+        onnx_genai_cuda_version_guard::wheel_component_directories("cuda_cupti", host_os)
+    {
+        let library_dir = site_packages.join(relative);
+        for soname in libcupti_names_for(os) {
+            let candidate = library_dir.join(soname);
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
         }
     }
 }
@@ -1209,21 +1220,36 @@ mod tests {
         let site_packages = Path::new("/venv/lib/python3.12/site-packages");
         let mut linux = Vec::new();
         push_pip_cupti_candidates(site_packages, TargetOs::Linux, &mut linux);
+        // The consolidated layout is searched first, since it is what current
+        // wheels publish...
         assert_eq!(
             linux[0],
-            PathBuf::from(
-                "/venv/lib/python3.12/site-packages/nvidia/cuda_cupti/lib/libcupti.so.13"
-            )
+            site_packages.join("nvidia/cu13/lib/x86_64/libcupti.so.13")
         );
+        // ...and the older per-component layout stays reachable, so a machine
+        // holding either is served.
+        assert!(linux.contains(&site_packages.join("nvidia/cuda_cupti/lib/libcupti.so.13")));
 
         let mut windows = Vec::new();
         push_pip_cupti_candidates(site_packages, TargetOs::Windows, &mut windows);
         assert_eq!(
             windows[0],
-            PathBuf::from(
-                "/venv/lib/python3.12/site-packages/nvidia/cuda_cupti/bin/cupti64_13.dll"
-            )
+            site_packages.join("nvidia/cu13/bin/x86_64/cupti64_13.dll")
         );
+        assert!(windows.contains(&site_packages.join("nvidia/cuda_cupti/bin/cupti64_13.dll")));
+        // Windows keeps DLLs in `bin`, the Unix platforms in `lib` -- the
+        // per-OS distinction this test is named for. Checked on the layout
+        // suffix only: the site-packages prefix itself contains "lib".
+        for path in &windows {
+            let tail = path
+                .strip_prefix(site_packages)
+                .expect("candidate is under site-packages");
+            assert!(
+                !tail.to_string_lossy().replace('\\', "/").contains("/lib"),
+                "windows candidate used a lib directory: {}",
+                tail.display()
+            );
+        }
     }
 
     #[test]
