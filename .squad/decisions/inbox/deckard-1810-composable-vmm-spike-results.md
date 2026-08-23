@@ -123,18 +123,26 @@ residual granules).
 Qwen1.5-MoE-A2.7B (60 experts, top_k=4), decode-shaped (rows=1), 5-rep
 median GPU event time per arm, one-time map+upload cost reported separately:
 
+**Labeling note (post-review correction):** every arm in this table only
+varies fc1's residency — `bind_arenas` is called with fc2/fc3's cold-range
+plans always empty, so fc2/fc3 stay 100% device-resident in every row.
+Arms are named `fc1_*` accordingly. This is **not** the same as the
+correctness matrix's `all_host_numa` control above, which genuinely puts
+all of fc1/fc2/fc3 under `HostNuma` backing (whole-bank cold). No row below
+should be read as whole-bank cold.
+
 | shape | arm | one-time map+upload (µs) | median exec (µs) | achieved cold GB/s* |
 |---|---|---|---|---|
 | deepseek-v2-lite | all_device | ~185–211k | 156.7 | n/a (0 cold touched) |
-| deepseek-v2-lite | all_host_numa | ~212–252k | 430–432 | 20.0–20.1 |
-| deepseek-v2-lite | mixed_25pct | ~188–202k | 198–200.7 | 43.1–43.3 |
-| deepseek-v2-lite | mixed_50pct | ~187–232k | 288.8 | 30.0 |
-| deepseek-v2-lite | mixed_75pct | ~196–247k | 382–384 | 22.5–22.6 |
+| deepseek-v2-lite | fc1_all_host_numa | ~212–252k | 430–432 | 20.0–20.1 |
+| deepseek-v2-lite | fc1_mixed_25pct_cold | ~188–202k | 198–200.7 | 43.1–43.3 |
+| deepseek-v2-lite | fc1_mixed_50pct_cold | ~187–232k | 288.8 | 30.0 |
+| deepseek-v2-lite | fc1_mixed_75pct_cold | ~196–247k | 382–384 | 22.5–22.6 |
 | qwen1.5-moe-a2.7b | all_device | ~167–183k | 110.6–111.6 | n/a |
-| qwen1.5-moe-a2.7b | all_host_numa | ~178–236k | 294.9–295.9 | 19.5–19.6 |
-| qwen1.5-moe-a2.7b | mixed_25pct | ~178–204k | 157.7 | 36.6 |
-| qwen1.5-moe-a2.7b | mixed_50pct | ~180–221k | 200.7–201.7 | 28.6–28.7 |
-| qwen1.5-moe-a2.7b | mixed_75pct | ~183–229k | 245.8–246.8 | 23.4–23.5 |
+| qwen1.5-moe-a2.7b | fc1_all_host_numa | ~178–236k | 294.9–295.9 | 19.5–19.6 |
+| qwen1.5-moe-a2.7b | fc1_mixed_25pct_cold | ~178–204k | 157.7 | 36.6 |
+| qwen1.5-moe-a2.7b | fc1_mixed_50pct_cold | ~180–221k | 200.7–201.7 | 28.6–28.7 |
+| qwen1.5-moe-a2.7b | fc1_mixed_75pct_cold | ~183–229k | 245.8–246.8 | 23.4–23.5 |
 
 *achieved_cold_GBps = touched-expert cold bytes / median exec time; touched
 experts are capped at `top_k`, so the "achieved GB/s" figure reflects only

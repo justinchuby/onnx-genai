@@ -1659,9 +1659,21 @@ fn graph_capture_replay_stable_va_and_remap_requires_cooperative_gate() {
     ep.deallocate(scratch).unwrap();
 }
 
-/// Performance sweep: all-device / all-host-NUMA / mixed 25/50/75% cold,
-/// at least 3 idle-A100 reps, real kernel/event timing, one-time mapping
-/// cost separated from steady-state compute, achieved GB/s, no tok/s claim.
+/// Performance sweep: all-device / fc1-all-host-NUMA / fc1-mixed 25/50/75%
+/// cold, at least 3 idle-A100 reps, real kernel/event timing, one-time
+/// mapping cost separated from steady-state compute, achieved GB/s, no
+/// tok/s claim.
+///
+/// IMPORTANT labeling note: every arm below only varies fc1's residency
+/// (`cold_range` is passed as fc1's cold-byte-range plan to `bind_arenas`,
+/// while fc2/fc3 are always given `&[]` and therefore stay 100%
+/// device-resident in every arm). This is intentionally different from
+/// `run_correctness_matrix`'s genuinely whole-bank `all_host_numa` control
+/// (which puts all of fc1/fc2/fc3 under `HostNuma` backing). Arm names here
+/// are prefixed `fc1_*` to make this explicit and prevent any result from
+/// being misread as whole-bank cold. `achieved_cold_GBps` below is computed
+/// from `per_expert_bytes` derived from `fixture.fc1.packed.len()`, i.e. it
+/// is already fc1-only bandwidth, consistent with these labels.
 fn run_performance_sweep(shape: QmoeShape) {
     print_platform_conditions();
     assert_gpu_idle_or_warn();
@@ -1892,10 +1904,10 @@ fn run_performance_sweep(shape: QmoeShape) {
         shape.name
     );
     run_arm("all_device", 0);
-    run_arm("all_host_numa", shape.experts);
-    run_arm("mixed_25pct_cold", shape.experts / 4);
-    run_arm("mixed_50pct_cold", shape.experts / 2);
-    run_arm("mixed_75pct_cold", (shape.experts * 3) / 4);
+    run_arm("fc1_all_host_numa", shape.experts);
+    run_arm("fc1_mixed_25pct_cold", shape.experts / 4);
+    run_arm("fc1_mixed_50pct_cold", shape.experts / 2);
+    run_arm("fc1_mixed_75pct_cold", (shape.experts * 3) / 4);
     println!(
         "theoretical PCIe Gen4 x16 ceiling ~= 25 GB/s (host->device read); A100-SXM4-80GB HBM2e \
          peak = 2039 GB/s. No end-to-end tok/s claim is made by this spike."
