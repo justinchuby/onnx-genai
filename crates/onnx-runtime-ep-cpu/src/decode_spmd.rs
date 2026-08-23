@@ -3226,6 +3226,24 @@ mod tests {
         assert_eq!(node_cpus, vec![16, 17, 18, 19]);
     }
 
+    /// Whether this environment can pin a thread at all.
+    ///
+    /// Probes the pinning primitive *directly* rather than through the pool, so
+    /// it stays independent of the bookkeeping under test: a defect that made
+    /// `worker_cpus` report nothing must not also switch these tests off. Miri
+    /// and some sandboxes reject the affinity syscall, where a placement
+    /// assertion would be testing the sandbox, not the pool.
+    fn environment_can_pin() -> bool {
+        let Some(cpu) =
+            crate::decode_affinity::allowed_cpus().and_then(|cpus| cpus.first().copied())
+        else {
+            return false;
+        };
+        std::thread::spawn(move || crate::decode_affinity::pin_current_thread_to_cpu(cpu).is_ok())
+            .join()
+            .unwrap_or(false)
+    }
+
     /// A pool that reports its width honestly must also *place* honestly.
     ///
     /// #1792's lesson: `decode_width()` said `realized=16 as_requested` while
@@ -3233,6 +3251,9 @@ mod tests {
     /// never the thing that was wrong. This asserts the half that was missing.
     #[test]
     fn a_pinned_pool_places_one_worker_per_physical_core() {
+        if !environment_can_pin() {
+            return;
+        }
         let cpus: Vec<usize> = match crate::core_topology::host() {
             // Two full physical cores' worth of CPUs, spread the way the
             // placement policy spreads them.
@@ -3270,6 +3291,9 @@ mod tests {
     /// The same predicate must be able to say *no*, or it is decoration.
     #[test]
     fn placement_reports_a_shared_core_as_a_defect() {
+        if !environment_can_pin() {
+            return;
+        }
         let Some(cores) = crate::core_topology::host() else {
             return;
         };
@@ -3304,6 +3328,9 @@ mod tests {
     /// count honest, placement unexamined, the exact shape of #1729.
     #[test]
     fn a_partially_pinned_pool_is_not_scored_on_its_pinned_half() {
+        if !environment_can_pin() {
+            return;
+        }
         let Some(cores) = crate::core_topology::host() else {
             return;
         };
@@ -3331,14 +3358,19 @@ mod tests {
             DecodeSchedule::Fixed,
             false,
         );
-        assert_eq!(
-            pools
-                .worker_cpus()
-                .iter()
-                .filter(|cpu| cpu.is_some())
-                .count(),
-            2,
-            "exactly the pinned shard's workers should carry a target"
+        // The property under test needs a *mixed* pool. Assert that premise
+        // rather than an exact pinned count: how many pins the kernel grants is
+        // an environment fact, and encoding it here would make the test report
+        // on the sandbox instead of on the predicate.
+        let placed = pools
+            .worker_cpus()
+            .iter()
+            .filter(|cpu| cpu.is_some())
+            .count();
+        assert!(
+            placed > 0 && placed < pools.worker_cpus().len(),
+            "this test needs a partially pinned pool, but got {:?}",
+            pools.worker_cpus()
         );
         assert_eq!(
             pools.placement_is_one_worker_per_physical_core(),
