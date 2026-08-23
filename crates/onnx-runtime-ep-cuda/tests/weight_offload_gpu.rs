@@ -29,7 +29,8 @@
 
 use onnx_runtime_ep_api::{
     DevicePtr, DevicePtrMut, ExecutionProvider, ExternalMmapRegion, LazyDeviceWeightBinder,
-    LazyWeight, MmapRegionSource, ResidentWeight, TensorMut, TensorView, WeightHandleError,
+    LazyWeight, LazyWeightBoundary, MmapRegionSource, ResidentWeight, TensorMut, TensorView,
+    WeightHandleError,
 };
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
@@ -147,6 +148,20 @@ fn run_matmul_with_b_ptr(
 /// Build a `pkg.nxrt::BlockQuantizedMoE`-boundary lazy weight for `b` placed at
 /// `offset` inside a fresh host mmap, plus that mmap.
 fn lazy_weight_for(b: &[f32], k: usize, n: usize, offset: usize) -> (LazyWeight, HostMmap) {
+    lazy_weight_with_boundary(LazyWeightBoundary::BlockQuantizedMoe, b, k, n, offset)
+}
+
+/// Same as [`lazy_weight_for`] but for an arbitrary offload `boundary` — used
+/// by the prefetch scope-containment test to prove a dense `MatMul`-boundary
+/// weight (which never goes through the executor's ahead-of-need prefetch
+/// path) is correctly declined by `prefetch_block_quantized_moe`.
+fn lazy_weight_with_boundary(
+    boundary: LazyWeightBoundary,
+    b: &[f32],
+    k: usize,
+    n: usize,
+    offset: usize,
+) -> (LazyWeight, HostMmap) {
     let mapping_id = 42;
     let b_bytes = f32_bytes(b).to_vec();
     let len = b_bytes.len();
@@ -163,7 +178,7 @@ fn lazy_weight_for(b: &[f32], k: usize, n: usize, offset: usize) -> (LazyWeight,
     };
     let shape = vec![k, n];
     let resident_bytes = b_bytes.clone();
-    let lazy = LazyWeight::block_quantized_moe(DataType::Float32, shape.clone(), vec![region], {
+    let lazy = LazyWeight::new(boundary, DataType::Float32, shape.clone(), vec![region], {
         let shape = shape.clone();
         move || ResidentWeight::new(DataType::Float32, shape.clone(), resident_bytes.clone())
     })
@@ -506,5 +521,685 @@ fn residency_materialized_pages_evicts_and_matches_resident() {
     assert!(
         global.page_ins >= 2 && global.evictions >= 1,
         "process-global counters must observe paging: {global:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// BlockQuantizedMoE prefill ahead-of-need prefetch (issue #82 cycle 7).
+//
+// `residency.stats()` (a per-`CudaWeightResidency`-instance snapshot) is used
+// for every exact-count assertion below, exactly like the pre-existing tests
+// above use it for `page_ins`/`hits`/`evictions`. The process-global
+// `GLOBAL_PREFETCH_*` counters this feature also updates are shared across
+// every test in this binary (which `cargo test` runs in parallel by default),
+// so they are only ever safe to assert with `>=`; the per-instance mirror in
+// `CudaResidencyStats` is scoped to one residency and is what makes exact
+// assertions here trustworthy under parallel test execution.
+// ---------------------------------------------------------------------------
+
+/// Basic correctness: issuing a prefetch enqueues the H2D copy but must not
+/// yet be visible as resident; promoting it (via the ordinary `resident_mapped`
+/// entry point a real dispatch uses) must resolve the fence, admit exactly
+/// like an on-demand page-in, and produce output byte-identical to the
+/// resident-upload reference.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn prefetch_then_promote_matches_resident_and_is_byte_identical() {
+    let ep = match CudaExecutionProvider::new_default() {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("skip: no CUDA GPU available ({e})");
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
+        }
+    };
+
+    let (m, k, n) = (3usize, 4usize, 2usize);
+    let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.5 - 1.0).collect();
+    let b: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.25 + 0.125).collect();
+    let page_bytes = (k * n * 4) as u64;
+
+    let rt = ep.runtime();
+    let b_resident = ep.allocate(std::mem::size_of_val(&b[..]), 256).unwrap();
+    // SAFETY: buffer sized for b's bytes.
+    unsafe { rt.htod(f32_bytes(&b), cuptr(b_resident.as_ptr())).unwrap() }
+    let resident_out = run_matmul_with_b_ptr(&ep, &a, b_resident.as_ptr(), m, k, n);
+    ep.deallocate(b_resident).unwrap();
+
+    let (lazy, host) = lazy_weight_for(&b, k, n, 512);
+    let residency = ep.weight_residency(page_bytes);
+    let key = 7u64;
+
+    let issued = residency
+        .prefetch_block_quantized_moe(key, &lazy, &host)
+        .expect("prefetch must not error");
+    assert!(issued, "an empty single slot must accept the prefetch");
+    let s = residency.stats();
+    assert_eq!(s.prefetch_issued, 1);
+    assert_eq!(s.prefetch_issued_bytes, page_bytes);
+    assert_eq!(
+        s.pages_resident, 0,
+        "an issued-but-not-yet-promoted prefetch must not appear resident"
+    );
+    assert_eq!(s.page_ins, 0, "issuing must not itself count as a page-in");
+
+    // The real dispatch entry point: promotes the pending prefetch instead of
+    // re-copying.
+    let page = residency
+        .resident_mapped(key, &lazy, &host)
+        .expect("promotion must succeed");
+    assert_eq!(page.len(), page_bytes as usize);
+    assert_eq!(page.dtype(), DataType::Float32);
+    assert_eq!(page.shape(), &[k, n]);
+
+    let s = residency.stats();
+    assert_eq!(s.prefetch_promoted, 1);
+    assert_eq!(
+        s.page_ins, 1,
+        "promotion must go through the same admit() accounting as an on-demand page-in"
+    );
+    assert_eq!(s.hits, 0);
+    assert_eq!(s.pages_resident, 1);
+    assert_eq!(s.resident_bytes, page_bytes);
+
+    let offloaded_out = run_matmul_with_b_ptr(&ep, &a, page.device_ptr(), m, k, n);
+    assert_eq!(
+        offloaded_out, resident_out,
+        "prefetched-then-promoted weight output must be byte-identical to the resident path"
+    );
+}
+
+/// Budget gate: a prefetch that would need to evict a resident page to fit
+/// must decline rather than ever evicting to make room for a look-ahead guess.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn prefetch_declines_when_a_resident_page_would_have_to_be_evicted() {
+    let ep = match CudaExecutionProvider::new_default() {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("skip: no CUDA GPU available ({e})");
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
+        }
+    };
+
+    let (k, n) = (4usize, 2usize);
+    let b0: Vec<f32> = (0..k * n).map(|i| (i as f32) + 1.0).collect();
+    let b1: Vec<f32> = (0..k * n).map(|i| (i as f32) * 2.0).collect();
+    let page_bytes = (k * n * 4) as u64;
+
+    let (host, lazies) = combined_weights(&[b0, b1], k, n);
+    // Budget for exactly one page: admitting weight 0 leaves zero headroom.
+    let residency = ep.weight_residency(page_bytes);
+    let _page0 = residency
+        .resident_mapped(0, &lazies[0], &host)
+        .expect("first admission must fit the budget exactly");
+    assert_eq!(residency.stats().pages_resident, 1);
+
+    let issued = residency
+        .prefetch_block_quantized_moe(1, &lazies[1], &host)
+        .expect("decline must not error");
+    assert!(
+        !issued,
+        "a prefetch that would require evicting a resident page must decline"
+    );
+    let s = residency.stats();
+    assert_eq!(s.prefetch_declined_budget, 1);
+    assert_eq!(s.prefetch_issued, 0);
+    assert_eq!(
+        s.pages_resident, 1,
+        "the declined prefetch must not have touched the resident set"
+    );
+}
+
+/// Single-slot busy gate, isolated from the budget gate: a second candidate
+/// cannot preempt or queue behind a first still-pending prefetch, and the slot
+/// frees up the instant the first is promoted.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn prefetch_single_slot_declines_a_second_key_until_the_first_is_promoted() {
+    let ep = match CudaExecutionProvider::new_default() {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("skip: no CUDA GPU available ({e})");
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
+        }
+    };
+
+    let (k, n) = (4usize, 2usize);
+    let b0: Vec<f32> = (0..k * n).map(|i| (i as f32) + 1.0).collect();
+    let b1: Vec<f32> = (0..k * n).map(|i| (i as f32) * 2.0).collect();
+    let page_bytes = (k * n * 4) as u64;
+    // Budget for both pages: this test isolates the *slot* invariant from the
+    // budget gate covered separately above.
+    let (host, lazies) = combined_weights(&[b0, b1], k, n);
+    let residency = ep.weight_residency(2 * page_bytes);
+
+    assert!(
+        residency
+            .prefetch_block_quantized_moe(0, &lazies[0], &host)
+            .unwrap(),
+        "an empty slot must accept the first prefetch"
+    );
+    assert!(
+        !residency
+            .prefetch_block_quantized_moe(1, &lazies[1], &host)
+            .unwrap(),
+        "a second key must not preempt or queue behind the first"
+    );
+    let s = residency.stats();
+    assert_eq!(s.prefetch_issued, 1);
+    assert_eq!(s.prefetch_declined_busy, 1);
+
+    // Promote the first: the slot is now free.
+    let _page0 = residency.resident_mapped(0, &lazies[0], &host).unwrap();
+    assert_eq!(residency.stats().prefetch_promoted, 1);
+
+    assert!(
+        residency
+            .prefetch_block_quantized_moe(1, &lazies[1], &host)
+            .unwrap(),
+        "the slot must accept a new prefetch once the previous one is promoted"
+    );
+    let s = residency.stats();
+    assert_eq!(s.prefetch_issued, 2);
+    assert_eq!(s.prefetch_declined_busy, 1, "must not grow further");
+}
+
+/// Already-resident gate: prefetching a key that is already in the resident
+/// set is declined (there is nothing to prefetch), not silently accepted or
+/// treated as a slot conflict.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn prefetch_declines_when_already_resident() {
+    let ep = match CudaExecutionProvider::new_default() {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("skip: no CUDA GPU available ({e})");
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
+        }
+    };
+
+    let (k, n) = (4usize, 2usize);
+    let b: Vec<f32> = (0..k * n).map(|i| (i as f32) + 1.0).collect();
+    let page_bytes = (k * n * 4) as u64;
+    let (lazy, host) = lazy_weight_for(&b, k, n, 512);
+    let residency = ep.weight_residency(page_bytes);
+
+    let _page = residency
+        .resident_mapped(0, &lazy, &host)
+        .expect("ordinary on-demand admission");
+    assert_eq!(residency.stats().pages_resident, 1);
+
+    let issued = residency
+        .prefetch_block_quantized_moe(0, &lazy, &host)
+        .expect("decline must not error");
+    assert!(!issued, "prefetching an already-resident key is a no-op");
+    let s = residency.stats();
+    assert_eq!(s.prefetch_declined_resident, 1);
+    assert_eq!(s.prefetch_issued, 0);
+}
+
+/// Scope containment: the prefetch path is `BlockQuantizedMoE`-only. A dense
+/// `MatMul`-boundary weight (or any other boundary) must always decline, and
+/// must decline *silently* — no counter fires, because there was never a
+/// legitimate candidate to begin with (unlike the other decline reasons, which
+/// all fire a counter).
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn prefetch_declines_for_non_block_quantized_moe_boundary() {
+    let ep = match CudaExecutionProvider::new_default() {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("skip: no CUDA GPU available ({e})");
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
+        }
+    };
+
+    let (k, n) = (4usize, 2usize);
+    let b: Vec<f32> = (0..k * n).map(|i| (i as f32) + 1.0).collect();
+    let page_bytes = (k * n * 4) as u64;
+    let (lazy, host) = lazy_weight_with_boundary(LazyWeightBoundary::MatMul, &b, k, n, 512);
+    let residency = ep.weight_residency(page_bytes);
+
+    let issued = residency
+        .prefetch_block_quantized_moe(0, &lazy, &host)
+        .expect("boundary rejection must not error");
+    assert!(!issued, "a MatMul-boundary weight is out of scope");
+    let s = residency.stats();
+    assert_eq!(s.prefetch_issued, 0);
+    assert_eq!(s.prefetch_declined_budget, 0);
+    assert_eq!(s.prefetch_declined_busy, 0);
+    assert_eq!(s.prefetch_declined_unsupported, 0);
+    assert_eq!(s.prefetch_declined_resident, 0);
+}
+
+/// The zero-copy hybrid (#864) and this prefetch increment are independent,
+/// out-of-scope-for-each-other features (#82's directive: no interaction with
+/// residency mechanisms this cycle does not own). When the hybrid is active,
+/// prefetch must decline through the same "unsupported" reason VMM stable-VA
+/// admission uses, not silently do the wrong thing.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn prefetch_declines_when_zero_copy_hybrid_is_active() {
+    let ep = match CudaExecutionProvider::new_default() {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("skip: no CUDA GPU available ({e})");
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
+        }
+    };
+
+    let (k, n) = (4usize, 2usize);
+    let b: Vec<f32> = (0..k * n).map(|i| (i as f32) + 1.0).collect();
+    let page_bytes = (k * n * 4) as u64;
+    let (lazy, host) = lazy_weight_for(&b, k, n, 512);
+    let residency = ep.weight_residency(page_bytes).with_zero_copy_hybrid(true);
+
+    let issued = residency
+        .prefetch_block_quantized_moe(0, &lazy, &host)
+        .expect("decline must not error");
+    assert!(!issued);
+    let s = residency.stats();
+    assert_eq!(s.prefetch_declined_unsupported, 1);
+    assert_eq!(s.prefetch_issued, 0);
+}
+
+/// Copy-failure rollback: a source read failure inside prefetch issuance
+/// (region bytes cannot be resolved) must surface as an `Err`, must not touch
+/// any success counter, and must not leave the single slot stuck — the very
+/// next prefetch for a different, valid key must succeed normally.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn prefetch_source_error_rolls_back_cleanly() {
+    let ep = match CudaExecutionProvider::new_default() {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("skip: no CUDA GPU available ({e})");
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
+        }
+    };
+
+    let (m, k, n) = (3usize, 4usize, 2usize);
+    let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.5 - 1.0).collect();
+    let b_bad: Vec<f32> = (0..k * n).map(|i| (i as f32) + 1.0).collect();
+    let b_good: Vec<f32> = (0..k * n).map(|i| (i as f32) * 3.0 - 1.0).collect();
+    let page_bytes = (k * n * 4) as u64;
+
+    let (mut lazy_bad, host_bad) = lazy_weight_for(&b_bad, k, n, 512);
+    // Point the region at a mapping the host mmap does not recognize, forcing
+    // `fill_staging_from_regions` to fail inside prefetch issuance.
+    lazy_bad.regions[0].mapping_id = 999;
+
+    let residency = ep.weight_residency(2 * page_bytes);
+    let result = residency.prefetch_block_quantized_moe(0, &lazy_bad, &host_bad);
+    assert!(
+        result.is_err(),
+        "an unresolvable region must surface as an error, not a silent Ok(false)"
+    );
+    let s = residency.stats();
+    assert_eq!(
+        s.prefetch_issued, 0,
+        "a failed fill must never reach the enqueue/publish step"
+    );
+    assert_eq!(s.pages_resident, 0);
+
+    // The slot must not be stuck: a subsequent, valid prefetch for a different
+    // key must succeed and promote correctly.
+    let (lazy_good, host_good) = lazy_weight_for(&b_good, k, n, 512);
+    assert!(
+        residency
+            .prefetch_block_quantized_moe(1, &lazy_good, &host_good)
+            .expect("a valid prefetch after a failed one must not error"),
+        "the slot must not be stuck busy after a failed prefetch"
+    );
+    let page = residency
+        .resident_mapped(1, &lazy_good, &host_good)
+        .expect("promotion of the valid prefetch must succeed");
+    let out = run_matmul_with_b_ptr(&ep, &a, page.device_ptr(), m, k, n);
+    let reference = cpu_matmul(&a, &b_good, m, k, n);
+    let gpu: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    assert!(
+        gpu.iter()
+            .zip(&reference)
+            .all(|(x, y)| (x - y).abs() <= 1e-4),
+        "gpu {gpu:?} vs reference {reference:?}"
+    );
+}
+
+/// The single-slot, lookahead-1 design's central, honestly-documented
+/// limitation: under the executor's real per-node call order —
+/// `prefetch_lazy_weights_after(pi)` (which issues a prefetch for node
+/// `pi + 1`'s weight) runs *before* `exec_plan_node(pi)` (which needs node
+/// `pi`'s own weight, promoting *its* prefetch if one is pending) — at most
+/// every other layer transition can benefit from prefetch. Node 0's own
+/// weight is never itself prefetched (nothing runs before it); node 1's
+/// prefetch (issued during node 0's turn, into an empty slot) wins; node 2's
+/// attempt finds node 1's own promotion has not happened yet and is declined
+/// busy; node 3 then wins because node 1's promotion freed the slot; and so
+/// on. This is traced exactly here, including a second and third pass over
+/// the same 5-layer pipeline (as a decode loop would repeat it), where every
+/// key is already resident and the whole pipeline degrades to ordinary cache
+/// hits plus `declined_resident` on the now-redundant look-ahead prefetch
+/// attempts.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn prefetch_pipeline_alternates_wins_under_single_slot_and_repeats_correctly() {
+    let ep = match CudaExecutionProvider::new_default() {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("skip: no CUDA GPU available ({e})");
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
+        }
+    };
+
+    let (m, k, n) = (3usize, 4usize, 2usize);
+    let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.5 - 1.0).collect();
+    let layers: usize = 5;
+    let bs: Vec<Vec<f32>> = (0..layers)
+        .map(|layer| {
+            (0..k * n)
+                .map(|i| (i as f32) * 0.1 + layer as f32)
+                .collect()
+        })
+        .collect();
+    let page_bytes = (k * n * 4) as u64;
+
+    // Independent CPU-free GPU reference for every layer, computed once
+    // up-front via a direct resident upload (never touches the residency
+    // under test).
+    let rt = ep.runtime();
+    let resident_outs: Vec<Vec<u8>> = bs
+        .iter()
+        .map(|b| {
+            let buf = ep.allocate(std::mem::size_of_val(&b[..]), 256).unwrap();
+            // SAFETY: buffer sized for b's bytes.
+            unsafe { rt.htod(f32_bytes(b), cuptr(buf.as_ptr())).unwrap() }
+            let out = run_matmul_with_b_ptr(&ep, &a, buf.as_ptr(), m, k, n);
+            ep.deallocate(buf).unwrap();
+            out
+        })
+        .collect();
+
+    let (host, lazies) = combined_weights(&bs, k, n);
+    // Budget for all five layers resident at once: this test's point is the
+    // prefetch/promote/decline bookkeeping, not eviction, which the other
+    // tests above already cover in isolation.
+    let residency = ep.weight_residency(layers as u64 * page_bytes);
+
+    // Expected cumulative per-instance counters after each of 3 passes, hand-
+    // traced from the single-slot + lookahead-1 interleaving documented above.
+    struct Expected {
+        prefetch_issued: u64,
+        prefetch_declined_busy: u64,
+        prefetch_declined_resident: u64,
+        prefetch_promoted: u64,
+        page_ins: u64,
+        hits: u64,
+    }
+    let expected_after_pass = [
+        Expected {
+            prefetch_issued: 2,
+            prefetch_declined_busy: 2,
+            prefetch_declined_resident: 0,
+            prefetch_promoted: 2,
+            page_ins: 5,
+            hits: 0,
+        },
+        Expected {
+            prefetch_issued: 2,
+            prefetch_declined_busy: 2,
+            prefetch_declined_resident: 4,
+            prefetch_promoted: 2,
+            page_ins: 5,
+            hits: 5,
+        },
+        Expected {
+            prefetch_issued: 2,
+            prefetch_declined_busy: 2,
+            prefetch_declined_resident: 8,
+            prefetch_promoted: 2,
+            page_ins: 5,
+            hits: 10,
+        },
+    ];
+
+    for (pass, expect) in expected_after_pass.iter().enumerate() {
+        for pi in 0..layers {
+            if pi + 1 < layers {
+                // Models `prefetch_lazy_weights_after(pi)`: look one node ahead.
+                residency
+                    .prefetch_block_quantized_moe((pi + 1) as u64, &lazies[pi + 1], &host)
+                    .unwrap_or_else(|e| panic!("pass {pass} node {pi} prefetch(+1) error: {e}"));
+            }
+            // Models `exec_plan_node(pi)`: needs node pi's own weight now.
+            let page = residency
+                .resident_mapped(pi as u64, &lazies[pi], &host)
+                .unwrap_or_else(|e| panic!("pass {pass} node {pi} resident_mapped error: {e}"));
+            let out = run_matmul_with_b_ptr(&ep, &a, page.device_ptr(), m, k, n);
+            assert_eq!(
+                out, resident_outs[pi],
+                "pass {pass} layer {pi} output diverged from the resident reference"
+            );
+        }
+
+        let s = residency.stats();
+        assert_eq!(
+            s.prefetch_issued, expect.prefetch_issued,
+            "pass {pass}: prefetch_issued"
+        );
+        assert_eq!(
+            s.prefetch_declined_busy, expect.prefetch_declined_busy,
+            "pass {pass}: prefetch_declined_busy"
+        );
+        assert_eq!(
+            s.prefetch_declined_resident, expect.prefetch_declined_resident,
+            "pass {pass}: prefetch_declined_resident"
+        );
+        assert_eq!(
+            s.prefetch_promoted, expect.prefetch_promoted,
+            "pass {pass}: prefetch_promoted"
+        );
+        assert_eq!(s.page_ins, expect.page_ins, "pass {pass}: page_ins");
+        assert_eq!(s.hits, expect.hits, "pass {pass}: hits");
+        assert_eq!(
+            s.pages_resident, layers as u64,
+            "pass {pass}: pages_resident"
+        );
+        assert_eq!(
+            s.evictions, 0,
+            "pass {pass}: a big-enough budget must never evict"
+        );
+    }
+}
+
+/// Regression guard for issue #82's pool-capacity soundness gate
+/// (`PinnedStagingPool::can_retain_concurrent`): a look-ahead prefetch whose
+/// byte size the *shared* pinned-staging pool cannot retain two
+/// concurrently-live copies of must decline up front via
+/// `prefetch_declined_pool_capacity` -- not silently accept and pay a fresh
+/// `cuMemHostAlloc`/`cuMemFreeHost` pair every steady-state cycle, which would
+/// reintroduce issue #837's exact regression for this specific path. The
+/// oversized region's length only needs to be *declared*, never backed by
+/// real data, because the guard must fire strictly before `source` is ever
+/// read (proven here by a materializer/host buffer that would panic or be too
+/// short if touched).
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn prefetch_declines_when_the_pinned_pool_cannot_retain_two_concurrent_buffers() {
+    let ep = match CudaExecutionProvider::new_default() {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("skip: no CUDA GPU available ({e})");
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
+        }
+    };
+
+    // Bigger than half the pinned pool's default 512 MiB retention cap, so
+    // `can_retain_concurrent(len, 2)` is false regardless of the pool's
+    // buffer-count bound. Order-of-magnitude matches DeepSeek-V2-Lite's real
+    // ~294 MiB BlockQuantizedMoE per-layer bank (see the issue #82
+    // bqmoe-prefetch-overlap benchmark), rounded for the assertion.
+    let oversized_bytes: usize = 300 * 1024 * 1024;
+    let mapping_id = 99;
+    let host = HostMmap {
+        mapping_id,
+        bytes: vec![0u8; 16], // deliberately far short of `oversized_bytes`
+    };
+    let region = ExternalMmapRegion {
+        mapping_id,
+        offset: 0,
+        len: oversized_bytes,
+    };
+    let lazy = LazyWeight::block_quantized_moe(
+        DataType::Uint8,
+        vec![oversized_bytes],
+        vec![region],
+        || {
+            panic!(
+                "resident materializer must never run: the pool-capacity guard must decline before eager admission"
+            )
+        },
+    )
+    .unwrap();
+
+    // Budget large enough that the decline is attributable to the pool guard
+    // alone, not the (already-covered) budget gate.
+    let residency = ep.weight_residency(oversized_bytes as u64);
+    let issued = residency
+        .prefetch_block_quantized_moe(1, &lazy, &host)
+        .expect("decline must not error");
+    assert!(
+        !issued,
+        "a boundary the shared pinned pool cannot retain two concurrent copies of must decline"
+    );
+    let s = residency.stats();
+    assert_eq!(s.prefetch_declined_pool_capacity, 1);
+    assert_eq!(s.prefetch_issued, 0);
+    assert_eq!(
+        s.pages_resident, 0,
+        "the declined prefetch must not have touched the resident set"
+    );
+    assert_eq!(
+        s.pinned_pool_alloc_calls, 0,
+        "the pool-capacity guard must decline before ever touching the pinned pool"
+    );
+}
+
+/// Regression guard for the pool-routing fix itself (issue #82): once a
+/// prefetch's staging buffer is promoted, it must return to the *shared*
+/// [`PinnedStagingPool`] for reuse -- not be dropped and freed, which would
+/// silently reintroduce issue #837's per-page-in `cuMemHostAlloc` cost for
+/// this path (the bug this cycle found and fixed: the prefetch path used to
+/// call `alloc_pinned` directly and drop the buffer on promotion, bypassing
+/// the pool entirely). Two same-size prefetch+promote cycles, back to back,
+/// must therefore show exactly one real pinned allocation and one reuse.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn prefetch_promote_returns_the_staging_buffer_to_the_shared_pinned_pool_for_reuse() {
+    let ep = match CudaExecutionProvider::new_default() {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("skip: no CUDA GPU available ({e})");
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
+        }
+    };
+
+    let (k, n) = (4usize, 2usize);
+    let b0: Vec<f32> = (0..k * n).map(|i| (i as f32) + 1.0).collect();
+    let b1: Vec<f32> = (0..k * n).map(|i| (i as f32) * 3.0 - 2.0).collect();
+    let page_bytes = (k * n * 4) as u64;
+
+    let (host, lazies) = combined_weights(&[b0, b1], k, n);
+    // Budget for both pages resident at once, so the second cycle's admission
+    // needs no eviction of the first -- isolates pool-reuse behavior from the
+    // (already-covered) eviction/budget gates.
+    let residency = ep.weight_residency(page_bytes * 2);
+
+    // Cycle 1: key 0. The first-ever prefetch of this size must page-lock
+    // exactly one buffer.
+    assert!(
+        residency
+            .prefetch_block_quantized_moe(0, &lazies[0], &host)
+            .expect("cycle 1 prefetch must not error"),
+        "an empty single slot must accept the prefetch"
+    );
+    residency
+        .resident_mapped(0, &lazies[0], &host)
+        .expect("cycle 1 promotion must succeed");
+    let s1 = residency.stats();
+    assert_eq!(s1.pinned_pool_alloc_calls, 1);
+    assert_eq!(s1.pinned_pool_reuses, 0);
+
+    // Cycle 2: key 1, same size -- must be served by the buffer cycle 1's
+    // promotion retired to the pool, not a fresh `cuMemHostAlloc`.
+    assert!(
+        residency
+            .prefetch_block_quantized_moe(1, &lazies[1], &host)
+            .expect("cycle 2 prefetch must not error"),
+        "the freed single slot must accept the second prefetch"
+    );
+    residency
+        .resident_mapped(1, &lazies[1], &host)
+        .expect("cycle 2 promotion must succeed");
+    let s2 = residency.stats();
+    assert_eq!(
+        s2.pinned_pool_alloc_calls, 1,
+        "a same-size second cycle must not page-lock a second buffer"
+    );
+    assert_eq!(
+        s2.pinned_pool_reuses, 1,
+        "the second cycle must be served by the buffer the first cycle's promotion retired"
     );
 }
