@@ -260,6 +260,19 @@ fn the_legacy_direct_decode_path_cannot_be_selected() -> anyhow::Result<()> {
         },
         "generate_with_sampler",
     );
+    refuses(
+        &|engine| {
+            let session = engine.create_session()?;
+            engine
+                .drive_prioritized_requests(vec![onnx_genai_engine::PrioritizedGenerateRequest {
+                    session_id: session,
+                    request: greedy(2),
+                    priority: onnx_genai_scheduler::Priority::Normal,
+                }])
+                .map(|_| ())
+        },
+        "drive_prioritized_requests",
+    );
     Ok(())
 }
 

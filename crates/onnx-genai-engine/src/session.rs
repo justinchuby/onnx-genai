@@ -24,6 +24,12 @@ pub(crate) struct EngineSession {
 }
 
 pub(crate) struct ActiveGenerate {
+    /// The canonical loop body this request executes.
+    ///
+    /// Resolved once when the request is prepared rather than per scheduler
+    /// step, so the prioritized drive runs the same workflow-dispatched body as
+    /// the run-to-completion loop without re-reading the spec every token.
+    pub(crate) body: crate::pipeline::canonical_decode::CanonicalBody,
     pub(crate) session_id: SessionId,
     pub(crate) state: EngineSession,
     pub(crate) options: GenerateOptions,

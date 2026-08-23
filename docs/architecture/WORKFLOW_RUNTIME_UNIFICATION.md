@@ -6,8 +6,9 @@ dispatches on package shape; a bare decoder is lowered at load into a canonical
 single-row autoregressive request executes that workflow** through
 `pipeline::canonical_decode::run_canonical_decode`, which reads its loop body
 from the spec and dispatches by contract id. The second token loop
-(`run_decode_loop`) is deleted. §7 records what landed, and the two loops that
-remain because they are different algorithms rather than duplicates. The parent ratified REPLACE + DELETE (no
+(`run_decode_loop`) and its per-step twin (`step_decode_loop`) are deleted. §6
+and §7 record what landed, and the two loops that remain because they are
+different algorithms rather than duplicates. The parent ratified REPLACE + DELETE (no
 compatibility facade, no permanent delegator) and assigned this consolidation to
 the owner of PR #1723. Its two gate conditions are both satisfied: `#1716` is on
 `main` (`7b79b3f5`), merged here (never rebased), and the hermetic executable
@@ -63,9 +64,11 @@ and independently proven, because a half-finished collapse that regresses
 production text generation is *not* the "correctness first" outcome this
 refactor demands.
 
-## 1. Where the duplication actually is (measured)
+## 1. Where the duplication actually was (measured)
 
-Two facts from the current tree shape the whole plan:
+Two facts measured on the pre-change tree shape the whole plan. They describe
+the *starting* state; symbols named here may since have been deleted, and §6
+records what replaced them.
 
 1. **The `Engine` session/decode model is already unified across ORT and
    native.** The `*_native_*` session methods
@@ -75,7 +78,7 @@ Two facts from the current tree shape the whole plan:
    backend-dispatched `create_session` / `close_session` /
    `generate_in_session` / `rewind_session_by`
    (`engine/runtime.rs:2102-2361`). ORT vs native is a `DecodeLoopBackend`
-   choice *beneath* one loop (`decode_loop.rs::run_decode_loop`,
+   choice *beneath* one loop (`decode_loop.rs::run_decode_loop`, since deleted,
    `SessionDecodeLoopBackend` = ORT, `native_decode::NativeLoopAdapter` =
    native). **One decode policy already exists**
    (`decode_loop.rs` + `processors.rs::select_next_token*` /
@@ -114,8 +117,8 @@ Two facts from the current tree shape the whole plan:
                     (single pass,    │               │node (Phase 1)
                      diffusion, VLM) │               ▼
                                      │   ┌───────────────────────────────┐
-                                     │   │ ONE decode policy              │  decode_loop.rs + processors.rs
-                                     │   │ run_decode_loop / sampling /   │
+                                     │   │ ONE decode policy              │  canonical_decode.rs + decode_loop.rs
+                                     │   │ canonical body / sampling /    │  + processors.rs
                                      │   │ stopping / KV commit           │
                                      │   └───────────┬─────────────────────┘
                                      ▼               ▼
@@ -201,39 +204,36 @@ that constructs and runs a canonical workflow.
   identical proposals, identical accept/reject/rollback paths, and identical
   tokens on ORT, native-CPU, and device-resident native-CUDA (H200).
 
-- **Phase 1b — autoregressive-decode node beneath the interpreter — REMAINING.**
-  Add a specialized component executor that runs `run_decode_loop` against a
-  decoder component, so an AR loop expressed in a workflow reuses the *one*
-  decode policy (rich Rust sampling, KV, speculative) instead of the fixture's
-  ONNX policy graphs. Backend executors stay `DecodeLoopBackend` (ORT) / native.
-  Concretely: recognize a canonical single-decoder `WorkflowNode::Loop` in
-  `pipeline/workflow.rs::run_workflow_node`, and delegate it to
-  `decode_loop.rs::run_decode_loop` with a `DecodeLoopBackend` built over
-  `invoke_component_values`. Proven by parity: the `decoder` fixture output via
-  the AR node equals the direct `Engine` output. This is independent of the
-  chained lift above (which drives proposal, not the token loop) and is the
-  prerequisite for Phase 2.
+- **Phase 1b — autoregressive decode beneath the interpreter — LANDED.**
+  The decode loop no longer hard-codes its own iteration: `canonical_decode.rs`
+  reads the loop body out of the `WorkflowSpec` and dispatches each step by
+  contract id (`onnx-genai.autoregressive-decode`,
+  `onnx-genai.token-policy`), so the *spec* decides what runs and in what order,
+  while the rich Rust policy (sampling, stopping, KV commit, speculative)
+  stays the single implementation. Backend executors stay `DecodeLoopBackend`
+  (ORT) / native. §7 records the landed shape.
 
-- **Phase 2 — canonical single-decoder workflow synthesis.** Add a Rust
-  synthesizer that turns a plain `model.io`/introspected decoder into a minimal
-  canonical `WorkflowSpec` (a `Loop` over the decode node with token/length/KV
-  state cells and a tokens emit). `Engine::from_pretrained` builds it and runs
-  it through the interpreter. Proven by text-gen parity (greedy + sampled) for a
-  real tiny decoder, ORT and native.
+- **Phase 2 — canonical single-decoder workflow lowering — LANDED (option A).**
+  `onnx-genai-metadata::canonical` compiles a plain `model.io` decoder into a
+  canonical `WorkflowSpec` **in memory at load**; nothing is serialized, so
+  `model.io` remains the sole on-disk answer and existing packages keep working
+  untouched. `Engine::install_canonical_workflow` runs it for every decoder
+  package and fails closed. §7 records the landed shape.
 
-- **Phase 3 — migrate callers to the sole runtime.** Point server, CLI, bench,
+- **Phase 3 — migrate callers to the sole runtime — LANDED.** Point server, CLI, bench,
   C ABI (`onnx-genai-capi`), and Python (`onnx-genai-python`) at the workflow
   runtime (directly for workflow packages, via the synthesized workflow for
   plain decoders). Collapse the server's `if handle.pipeline { … } else { … }`
   dispatch (`routes/completions.rs`) into one path. Prove server text-gen and
   pipeline behavior unchanged.
 
-- **Phase 4 — collapse `Engine` to a zero-logic delegator and delete the
-  superseded orchestration.** Fold speculative, FIM, sessions, connector, and
-  batching into the workflow runtime (or its shared infra), then reduce `Engine`
-  to construction + delegation, deleting the parallel generate/session routing.
-  Remove now-dead config flags/branches and the tests that pinned the deleted
-  legacy paths.
+- **Phase 4 — delete the superseded orchestration — LANDED.** There is one
+  runtime type, one session/state model, and one sampling/stopping/commit
+  policy. The second single-row token loop (`run_decode_loop`) and its
+  per-step twin (`step_decode_loop`) are **deleted**, not delegated: every
+  single-row autoregressive request — run-to-completion, in-session, and the
+  scheduler's prioritized drive — executes the canonical body. §7 records what
+  remains and why.
 
 ## 4. Migration notes for callers
 
@@ -256,39 +256,45 @@ regressed in the interim. That trades the one thing this refactor must not
 trade: correctness with full tests. The phases above each keep the tree green
 and each carry their proof.
 
-## 6. Remaining code, by symbol
+## 6. Landed code, by symbol
 
-Phases 1b-4 are code, not a plan. This is the exact surface each one has to
-touch, so the next change starts from a list rather than a survey.
+Phases 1b-4 were code, not a plan. This is the surface each one actually
+touched, so a reviewer can check the claim rather than take it.
 
-**Phase 1b — AR decode node.**
-- `crates/onnx-genai-engine/src/pipeline/workflow.rs`: recognize a canonical
-  single-decoder `WorkflowNode::Loop` in `run_workflow_node` and delegate it.
-- `crates/onnx-genai-engine/src/decode_loop.rs`: `run_decode_loop`,
-  `DecodeLoopBackend`, `SessionDecodeLoopBackend` — the decode core to lift. It
-  is tied to `Engine` state (`session` / `kv_cache` / `scheduler` / `session_id`
-  / `state`), so the lift means moving that core, not calling it in place.
+**Phase 1b — canonical decode body.**
+- `crates/onnx-genai-engine/src/pipeline/canonical_decode.rs`: `resolve_body`
+  reads the loop body out of the `WorkflowSpec`; `BodyStep` is the resolved
+  form; `CanonicalBody::resolve` binds it once per request;
+  `step_canonical_body` runs one iteration; `run_canonical_decode` runs to
+  completion. Both drives call the same body, so there is no "run" versus
+  "step" policy.
+- `crates/onnx-genai-engine/src/decode_loop.rs`: `run_decode_loop` and
+  `step_decode_loop` are **deleted**. What is left is the per-step split the
+  canonical body is built from — `forward_step` (one forward pass, including
+  the device greedy/sampling fast paths) and `select_and_commit_step` (the
+  processor chain, sampler, logprobs, KV commit, stop/EOS) — plus
+  `DecodeLoopBackend` / `SessionDecodeLoopBackend`, which are now purely
+  *backend executors*, not loop owners.
 - `crates/onnx-genai-engine/src/processors.rs`: `select_next_token*`,
   `finish_reason_after_token`, `commit_selected_token` — the one sampling /
-  stopping / commit policy, already shared; it must stay the only one.
-- Proof: the `decoder` fixture through the AR node equals the direct `Engine`
-  output, on ORT and native.
+  stopping / commit policy, unchanged and still the only one.
 
-**Phase 2 — canonical single-decoder workflow synthesis.**
-- New: a `WorkflowSpec` synthesizer over `decode/metadata.rs::ModelIoSpec` /
-  `engine/metadata.rs` introspection. Today only `decoder_abi` /
-  `compile_workflow` exist, and both *lower an existing* workflow; nothing
-  synthesizes one.
-- `crates/onnx-genai-engine/src/engine/load.rs::Engine::from_pretrained` builds
-  it and runs it through the interpreter.
-- Capability gap to close first: `pipeline.workflow` has no representation for
-  paged KV, the batch scheduler, multi-turn sessions, FIM, connector KV, or the
-  rich Rust sampler (DRY, Mirostat, XTC, penalties, grammar). The workflow
-  decoder fixture expresses sampling as ONNX policy graphs, which are strictly
-  less capable. Phase 1b's AR node is what lets the synthesized workflow reuse
-  the Rust sampler instead of needing an ONNX one.
+**Phase 2 — canonical lowering (option A: in memory, never serialized).**
+- New: `crates/onnx-genai-metadata/src/canonical.rs` — lowers
+  `decode/metadata.rs::ModelIoSpec` / `engine/metadata.rs` introspection into a
+  canonical `WorkflowSpec`. It emits canonical YAML and re-parses it through
+  the *unrelaxed* schema, so a lowering that the schema would reject fails at
+  load rather than producing a second, weaker answer.
+- `crates/onnx-genai-engine/src/engine/load.rs`: `install_canonical_workflow`
+  runs at load for every decoder package and asserts the lowered spec declares
+  the contracts this runtime implements.
+- The capability gap that made a *serialized* synthesis unworkable — no
+  workflow representation for paged KV, the batch scheduler, sessions, FIM,
+  connector KV, or the rich Rust sampler — is what option A avoids: the
+  canonical spec names the decode and policy contracts, and the Rust
+  implementations behind those contracts keep every capability.
 
-**Phase 3 — migrate callers — DONE.**
+**Phase 3 — migrate callers.**
 - One public runtime type. `PipelineEngine` is deleted; the workflow interpreter
   is `pub(crate) pipeline::WorkflowRuntime`, held by `Engine`.
 - `Engine::from_dir` resolves the package shape itself, so no caller runs
@@ -305,20 +311,32 @@ touch, so the next change starts from a list rather than a survey.
   through `Engine` and inherit the collapse with no migration of their own.
 - Pinned by `crates/onnx-genai-engine/tests/one_runtime_e2e.rs` (5 cases).
 
-**Phase 4 — collapse `Engine`.**
-- `crates/onnx-genai-engine/src/engine/runtime.rs`: the parallel generate /
-  session routing, `native_speculation_plan` dispatch, and the FIM / connector /
-  batching entry points fold into the workflow runtime or its shared infra.
-- `crates/onnx-genai-engine/src/native_speculative.rs`: `NativeSpeculativeDriver`
-  is the last native-side token loop that is not `run_decode_loop`; after
-  Phase 1b it should be a `DecodeLoopBackend`, not a peer loop.
-- `crates/onnx-genai-engine/src/speculative/mod.rs`: `SpeculativeProposer` and
-  its remaining implementations (`MtpProposer`, `Eagle3Proposer`,
-  `DraftModelProposer`, `NgramProposer`) become interpreter constructs keyed by
-  contract, the way `Chained` already is.
-- Then delete the now-dead config flags/branches and the tests pinning them.
+**Phase 4 — delete the superseded orchestration.**
+- `crates/onnx-genai-engine/src/engine/runtime.rs`: every decode entry point —
+  `generate_with_callbacks`, `generate_in_session_with_priority_and_callback`,
+  and `prepare_active_generate` / `step_active_generate` (the scheduler's
+  prioritized drive) — resolves the canonical workflow through the shared
+  `canonical_workflow` accessor before it can decode, and then runs the
+  canonical body. There is no declaration switch left to choose a legacy path
+  with; `canonical_execution_parity.rs` pins the refusal for all four.
+- `crates/onnx-genai-engine/src/session.rs`: `ActiveGenerate` carries the
+  resolved `CanonicalBody`, so the prioritized drive is the same body as the
+  run-to-completion loop rather than a parallel implementation of it.
 
-Shared infrastructure both engines already use — `engine/load.rs`,
+**Two loops remain, and they are not duplicates.**
+`batched.rs` (N rows advancing together) and the speculative
+propose/verify/rollback block are *different algorithms*, not second copies of
+the single-row loop. Both call the same policy primitives
+(`select_next_token_with_rng`, `logprob_for_token`, `commit_selected_token`),
+so there is still exactly one sampling/stopping/commit implementation; what
+differs is the shape of the iteration, which is the thing that genuinely
+differs. `native_speculative.rs::NativeSpeculativeDriver` and the
+`SpeculativeProposer` implementations (`MtpProposer`, `Eagle3Proposer`,
+`DraftModelProposer`, `NgramProposer`) are proposal sources beneath that block;
+`Chained` is already interpreter-driven and is the template if the others are
+moved behind contracts later.
+
+Shared infrastructure both engines already used — `engine/load.rs`,
 `governor.rs`, `memory_strategy.rs`, `memory_plan.rs`, `metadata.rs`,
 `placement.rs`, `session_state.rs` — is **kept**; it is not duplicated
 orchestration.
@@ -358,7 +376,10 @@ the model:
 * `decode_loop::select_and_commit_step` — the logit-processor chain, sampler,
   logprobs, KV commit, and stop/EOS detection.
 
-Both are the only implementations; `step_decode_loop` is written on them.
+Both are the only implementations. `step_canonical_body` runs one iteration of
+the spec's body on them, and `run_canonical_decode` runs that same body to
+completion — so the scheduler's per-step drive and the run-to-completion path
+are one implementation, not two.
 
 **Fail-closed, not mode-switched.** `install_canonical_workflow` runs at load for
 every decoder package and asserts the lowered workflow declares the two contracts

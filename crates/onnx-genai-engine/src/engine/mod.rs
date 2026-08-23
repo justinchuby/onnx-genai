@@ -7,9 +7,7 @@ pub(crate) use crate::decode::{
     DecodeState, ModelDecodePath, detect_model_decode_path, next_session_token_argmax,
     next_session_token_logits, next_session_token_sampled,
 };
-pub(crate) use crate::decode_loop::{
-    DecodeLoopBackend, DecodeLoopState, exceeded_context_limit, step_decode_loop,
-};
+pub(crate) use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, exceeded_context_limit};
 pub(crate) use crate::kv_bridge::{
     KvModelInfo, PlacedPayload, RewindRequest, RewindRunnerPolicy, attach_pages_to_sequence,
     chunk_payload_from_exported, common_prefix_len, exported_layers_from_runner,

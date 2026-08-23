@@ -8,8 +8,8 @@ use crate::config::{
 };
 use crate::logits::{ProcessorChain, ProcessorContext, TokenId};
 use crate::processors::{
-    ensure_constrained_finish, finish_reason_after_token, select_next_token,
-    select_next_token_with_rng, select_next_token_with_sampler,
+    finish_reason_after_token, select_next_token, select_next_token_with_rng,
+    select_next_token_with_sampler,
 };
 use crate::sampling::{Sampler, SamplingRng};
 use onnx_genai_ort::Tokenizer;
@@ -182,8 +182,8 @@ pub(crate) fn forward_step<B: DecodeLoopBackend + ?Sized>(
 ///
 /// The single implementation of the next-token policy: the logit-processor
 /// chain, the sampler, logprob capture, KV commit, and stop/EOS detection. Both
-/// the workflow interpreter's canonical decode loop and [`step_decode_loop`]
-/// call it, so there is one policy no matter who owns the loop.
+/// the run-to-completion canonical loop and the scheduler's per-step drive call
+/// it, so there is one policy no matter who owns the iteration.
 pub(crate) fn select_and_commit_step<B: DecodeLoopBackend + ?Sized>(
     backend: &mut B,
     state: &mut DecodeLoopState,
@@ -248,53 +248,6 @@ pub(crate) fn select_and_commit_step<B: DecodeLoopBackend + ?Sized>(
         callback,
     )?;
     Ok((token_id, finish))
-}
-
-pub(crate) fn step_decode_loop<B: DecodeLoopBackend>(
-    backend: &mut B,
-    state: &mut DecodeLoopState,
-    options: &GenerateOptions,
-    chain: &ProcessorChain,
-    tokenizer: &Tokenizer,
-    max_context: Option<usize>,
-    callback: Option<&mut GenerateTokenCallback<'_>>,
-) -> anyhow::Result<Option<GenerateResult>> {
-    // Name the first step differently. It is the one that runs the prompt
-    // through the model, and prefill costs orders of magnitude more than a
-    // decode step, so averaging the two together produced a per-call mean that
-    // described neither — the aggregate table showed 28.9 ms/step for a run
-    // that decoded at 14.8 ms/token. Separate names keep both the timeline and
-    // the aggregate table honest.
-    let _step_span = if state.generated_tokens.is_empty() {
-        onnx_genai_ort::prof_span!("loop.prefill")
-    } else {
-        onnx_genai_ort::prof_span!("loop.step")
-    };
-    if reached_context_limit(backend.context_len(), max_context) {
-        ensure_constrained_finish(options, &state.generated_text, FinishReason::Length)?;
-        return finish_result(
-            tokenizer,
-            &state.generated_tokens,
-            FinishReason::Length,
-            state.prefix_cache_hit_len,
-            state.logprobs.as_deref(),
-        )
-        .map(Some);
-    }
-    let forward = forward_step(backend, state, options, chain)?;
-    let (_token, finish) =
-        select_and_commit_step(backend, state, options, chain, tokenizer, forward, callback)?;
-    let Some(finish_reason) = finish else {
-        return Ok(None);
-    };
-    finish_result(
-        tokenizer,
-        &state.generated_tokens,
-        finish_reason,
-        state.prefix_cache_hit_len,
-        state.logprobs.as_deref(),
-    )
-    .map(Some)
 }
 
 pub(crate) fn commit_selected_token(

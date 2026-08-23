@@ -1016,6 +1016,10 @@ impl Engine {
         }
 
         let max_context = self.max_context_for_request(&options);
+        // Resolved before scheduler admission, before any KV work, and before
+        // the speculative branch below: a runtime with no canonical workflow
+        // refuses without having admitted or mutated anything.
+        canonical_workflow(self.workflow.as_deref(), self.lowered_workflow.as_ref())?;
         let chain = build_processor_chain(
             &options,
             Some(self.require_tokenizer()?),
@@ -1806,6 +1810,12 @@ impl Engine {
         }
 
         let max_context = self.max_context_for_request(&options);
+        // Resolved before scheduler admission, before any KV work, and before
+        // the speculative branch below: a runtime with no canonical workflow
+        // refuses without having admitted or mutated anything.
+        let canonical = crate::pipeline::canonical_decode::CanonicalBody::resolve(
+            canonical_workflow(self.workflow.as_deref(), self.lowered_workflow.as_ref())?,
+        )?;
         let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
         let mut state = self
             .sessions
@@ -1822,6 +1832,7 @@ impl Engine {
             request.priority,
         );
         Ok(ActiveGenerate {
+            body: canonical,
             session_id: request.session_id,
             state,
             options,
@@ -1857,6 +1868,7 @@ impl Engine {
                 .tokenizer
                 .as_ref()
                 .context("this package declares no tokenizer, so it cannot decode text")?;
+            let body = &active.body;
             let mut backend = SessionDecodeLoopBackend {
                 session: self
                     .session
@@ -1868,15 +1880,44 @@ impl Engine {
                 session_id: active.session_id,
                 state: &mut active.state,
             };
-            step_decode_loop(
-                &mut backend,
-                &mut loop_state,
-                &active.options,
-                &active.chain,
-                tokenizer,
-                active.max_context,
-                None,
-            )?
+            // The scheduler advances one row per call, so this owns the
+            // iteration while the canonical body owns the step. Same workflow,
+            // same policy, same executor as the run-to-completion loop.
+            if crate::decode_loop::reached_context_limit(backend.context_len(), active.max_context)
+            {
+                ensure_constrained_finish(
+                    &active.options,
+                    &loop_state.generated_text,
+                    FinishReason::Length,
+                )?;
+                Some(crate::decode_loop::finish_result(
+                    tokenizer,
+                    &loop_state.generated_tokens,
+                    FinishReason::Length,
+                    loop_state.prefix_cache_hit_len,
+                    loop_state.logprobs.as_deref(),
+                )?)
+            } else {
+                let finish = crate::pipeline::canonical_decode::step_canonical_body(
+                    &mut backend,
+                    &mut loop_state,
+                    body,
+                    &active.options,
+                    &active.chain,
+                    tokenizer,
+                    None,
+                )?;
+                match finish {
+                    Some(finish_reason) => Some(crate::decode_loop::finish_result(
+                        tokenizer,
+                        &loop_state.generated_tokens,
+                        finish_reason,
+                        loop_state.prefix_cache_hit_len,
+                        loop_state.logprobs.as_deref(),
+                    )?),
+                    None => None,
+                }
+            }
         };
         active.generated_tokens = loop_state.generated_tokens;
         active.generated_text = loop_state.generated_text;
