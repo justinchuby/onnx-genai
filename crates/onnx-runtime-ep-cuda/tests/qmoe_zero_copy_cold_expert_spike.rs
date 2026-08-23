@@ -87,7 +87,7 @@
 )]
 
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use cudarc::driver::sys::{self, CUdeviceptr};
 use onnx_runtime_ep_api::{
@@ -200,6 +200,23 @@ const DEEPSEEK_V2_LITE_WIDE: QmoeShape = QmoeShape {
     hidden: 2048,
     inter: 1408,
     top_k: 6,
+};
+
+/// `hidden_size=2048`, `moe_intermediate_size=1408`, `num_experts=60`,
+/// `num_experts_per_tok=4` -- Qwen1.5-MoE-A2.7B `config.json`
+/// (https://huggingface.co/Qwen/Qwen1.5-MoE-A2.7B/blob/main/config.json).
+/// This is the exact fixture repo docs refer to as `qwen15-moe-qmoe` (see
+/// `docs/benchmarks/2026-08-18-moe-per-expert-dispatch-seam-design.md`,
+/// `.squad/decisions/inbox/roy-a-prime-downgraded-provisional-cycle7.md`);
+/// per Fact Checker review this shape must be measured explicitly rather
+/// than only its DeepSeek-V2-Lite-shaped cousin, since it is the specific
+/// fixture prior architecture notes cite by name.
+const QWEN15_MOE_A27B: QmoeShape = QmoeShape {
+    name: "qwen1.5-moe-a2.7b",
+    experts: 60,
+    hidden: 2048,
+    inter: 1408,
+    top_k: 4,
 };
 
 const BITS: usize = 4;
@@ -1065,6 +1082,31 @@ fn run_correctness_and_bandwidth_matrix(shape: QmoeShape) {
         (fc1_bytes + fc2_bytes + fc3_bytes) as f64 / (1u64 << 20) as f64,
     );
 
+    // Deterministic byte-accounting FIRST, before any control run or timing
+    // number (measurement-discipline: "measure real cold bytes/step before
+    // building production binder extensions"). This is the real per-step
+    // cold-byte traffic a genuine per-expert A' cold path would touch at
+    // this shape's top_k -- computed from the actual fixture byte counts,
+    // not assumed/estimated.
+    let touched_experts_preview = shape.top_k.min(shape.experts);
+    let per_expert_gate_bytes_preview =
+        fixture.fc1.packed.len() / shape.experts + fixture.fc1.scales.len() * 4 / shape.experts;
+    let per_expert_up_bytes_preview =
+        fixture.fc3.packed.len() / shape.experts + fixture.fc3.scales.len() * 4 / shape.experts;
+    let per_expert_down_bytes_preview =
+        fixture.fc2.packed.len() / shape.experts + fixture.fc2.scales.len() * 4 / shape.experts;
+    let real_cold_bytes_per_step_all_experts_touched = (per_expert_gate_bytes_preview
+        + per_expert_up_bytes_preview
+        + per_expert_down_bytes_preview)
+        * touched_experts_preview;
+    println!(
+        "[real cold bytes/step, measured from fixture, NOT modeled] per-expert gate={per_expert_gate_bytes_preview}B \
+         up={per_expert_up_bytes_preview}B down={per_expert_down_bytes_preview}B; touched_experts(top_k)={touched_experts_preview}; \
+         total cold bytes/decode-step if ALL touched experts were cold = {real_cold_bytes_per_step_all_experts_touched} \
+         ({:.3} MiB)",
+        real_cold_bytes_per_step_all_experts_touched as f64 / (1u64 << 20) as f64,
+    );
+
     // ---- Control 1: all_vram (correctness oracle) ----
     let oracle = run_arm(
         &ep,
@@ -1230,4 +1272,220 @@ fn qmoe_cold_expert_spike_deepseek_v2_lite_shape() {
 #[ignore]
 fn qmoe_cold_expert_spike_wide_256_expert_shape() {
     run_correctness_and_bandwidth_matrix(DEEPSEEK_V2_LITE_WIDE);
+}
+
+#[test]
+#[ignore]
+fn qmoe_cold_expert_spike_qwen15_moe_a27b_shape() {
+    run_correctness_and_bandwidth_matrix(QWEN15_MOE_A27B);
+}
+
+// ---------------------------------------------------------------------------
+// Resize-starvation stress (Fact Checker gate #3): stress
+// `acquire_routed_residency`/`resize_safe_point`/`execute_resize` under
+// back-to-back QMoE dispatch guards. This spike does NOT bind the guard
+// into this file's own zero-copy arms above (those never touch
+// `CudaWeightResidency`'s dispatch path at all, by design -- see module
+// doc); this test instead exercises the REAL guard machinery directly,
+// standing in for "a QMoE dispatch loop that must acquire/release a
+// routed-residency proof every decode step while a resize is concurrently
+// attempted", which is exactly the starvation scenario Roy's cycle-7 note
+// flagged as spike #3 and still open. This is the bounded piece of spike
+// #3 answerable without building new sub-weight VMM/host-map composition:
+// does a decode-cadence acquire/release loop ever leave a resize
+// permanently blocked (starved) or leave the guard counter corrupted?
+// ---------------------------------------------------------------------------
+
+fn resize_starvation_stress(iterations: usize) {
+    print_platform_conditions();
+    assert_gpu_idle_or_warn();
+    let (ep, _guard) = require_cuda();
+    let runtime = ep.runtime();
+
+    let residency = std::sync::Arc::new(crate_residency_for_stress(runtime.clone()));
+    let catalog = qmoe_style_catalog();
+
+    let mut resize_attempts = 0usize;
+    let mut resize_accepted = 0usize;
+    let mut resize_blocked_by_guard = 0usize;
+    let mut max_concurrent_guards_observed = 0u64;
+
+    for step in 0..iterations {
+        // Simulate one decode step's dispatch: acquire the routed-residency
+        // proof exactly as `execute_kernel` would immediately before a real
+        // QMoE launch, hold it for the (simulated) duration of the launch,
+        // then release -- back to back, no gaps, the worst case for
+        // starving a concurrent resize attempt.
+        let guard = residency.acquire_routed_residency(
+            onnx_runtime_ep_api::RoutedResidencyRequirement::FusedRoutingUnknown,
+            &catalog,
+        );
+
+        let point = residency.resize_safe_point(1);
+        max_concurrent_guards_observed =
+            max_concurrent_guards_observed.max(point.routed_guards_active);
+        assert_eq!(
+            point.routed_guards_active, 1,
+            "step {step}: exactly one guard should be live at a time in this \
+             single-threaded back-to-back simulation -- a count other than 1 \
+             here means the guard counter is drifting"
+        );
+
+        // Attempt a resize WHILE the guard is held -- this must always be
+        // rejected (NotSafePoint), never silently succeed and never panic.
+        resize_attempts += 1;
+        let plan = onnx_runtime_ep_api::plan_resize(
+            onnx_runtime_ep_api::ResidencyResizeRequest {
+                direction: onnx_runtime_ep_api::ResizeDirection::Grow,
+                target_bytes: 4096,
+                priority: 0,
+            },
+            point,
+        );
+        match plan {
+            onnx_runtime_ep_api::ResidencyResizePlan::Rejected {
+                reason: onnx_runtime_ep_api::ResizeRejection::NotSafePoint(_),
+                ..
+            } => {
+                resize_blocked_by_guard += 1;
+            }
+            other => panic!(
+                "step {step}: a resize attempted while a routed-residency guard is \
+                 held must be rejected as NotSafePoint -- got {other:?} instead, which \
+                 would mean a concurrent resize could relocate memory a live QMoE \
+                 dispatch was just promised is resident (a correctness hazard, not \
+                 just a starvation one)"
+            ),
+        }
+
+        drop(guard);
+
+        // Immediately after release (the gap between decode steps), the
+        // safe point must open back up and a real resize must be able to
+        // go through -- this is the actual starvation check: back-to-back
+        // acquire/release at decode cadence must NOT permanently starve a
+        // resize that only needs the brief inter-step gap to land.
+        let post_release_point = residency.resize_safe_point(1);
+        assert_eq!(post_release_point.routed_guards_active, 0);
+        let post_release_plan = onnx_runtime_ep_api::plan_resize(
+            onnx_runtime_ep_api::ResidencyResizeRequest {
+                direction: onnx_runtime_ep_api::ResizeDirection::Grow,
+                target_bytes: 4096,
+                priority: 0,
+            },
+            post_release_point,
+        );
+        assert!(
+            matches!(
+                post_release_plan,
+                onnx_runtime_ep_api::ResidencyResizePlan::Accepted(_)
+            ),
+            "step {step}: a resize attempted in the inter-step gap (no guard held) \
+             must be accepted -- if this ever fails, back-to-back dispatch is \
+             starving every resize opportunity, not just the ones overlapping a guard"
+        );
+        if let onnx_runtime_ep_api::ResidencyResizePlan::Accepted(_) = post_release_plan {
+            let outcome = residency.execute_resize(post_release_plan, 1);
+            assert!(outcome.is_success(), "step {step}: {outcome:?}");
+            resize_accepted += 1;
+            // Shrink back down immediately so the budget does not drift
+            // across `iterations` steps and mask a real starvation trend
+            // behind an ever-growing budget.
+            let shrink_point = residency.resize_safe_point(1);
+            let shrink_plan = onnx_runtime_ep_api::plan_resize(
+                onnx_runtime_ep_api::ResidencyResizeRequest {
+                    direction: onnx_runtime_ep_api::ResizeDirection::Shrink,
+                    target_bytes: 4096,
+                    priority: 0,
+                },
+                shrink_point,
+            );
+            if let onnx_runtime_ep_api::ResidencyResizePlan::Accepted(_) = shrink_plan {
+                let shrink_outcome = residency.execute_resize(shrink_plan, 1);
+                assert!(
+                    shrink_outcome.is_success(),
+                    "step {step}: {shrink_outcome:?}"
+                );
+            }
+        }
+    }
+
+    println!(
+        "\n=== resize-starvation stress: {iterations} back-to-back acquire/release cycles ===\n\
+         resize_attempts_while_guard_held={resize_attempts} (100% must be NotSafePoint-rejected)\n\
+         resize_blocked_by_guard={resize_blocked_by_guard} (must equal resize_attempts)\n\
+         resize_accepted_in_inter_step_gap={resize_accepted} (must equal {iterations}: every \
+         inter-step gap let a resize through -- NO starvation observed under this back-to-back \
+         acquire/release cadence)\n\
+         max_concurrent_guards_observed={max_concurrent_guards_observed} (expected 1 -- this is a \
+         single-threaded simulation of sequential decode steps, not concurrent-stream dispatch; \
+         a true multi-stream starvation test needs a separate, larger follow-up spike)"
+    );
+    assert_eq!(resize_blocked_by_guard, resize_attempts);
+    assert_eq!(resize_accepted, iterations);
+}
+
+fn crate_residency_for_stress(
+    runtime: Arc<onnx_runtime_ep_cuda::runtime::CudaRuntime>,
+) -> onnx_runtime_ep_cuda::weight_paging::CudaWeightResidency {
+    // A governed budget is required for `execute_resize` to actually grow/
+    // shrink (an ungoverned cache has no lease to grow against -- see
+    // `ungoverned_cache_refuses_grow_and_shrink_leaving_budget_untouched`
+    // in `weight_paging.rs`). Use the same `LedgerGovernor` pattern the
+    // existing `repeated_grow_shrink_oscillation_returns_to_the_starting_budget`
+    // unit test uses, so this stress test proves a real resize actually
+    // executing (grow+shrink bytes moved), not just a safe-point check.
+    use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor};
+    let residency = onnx_runtime_ep_cuda::weight_paging::CudaWeightResidency::new(runtime, 1 << 20);
+    let governor = Box::leak(Box::new(LedgerGovernor::new(LeaseLedger::new(
+        1 << 30,
+        0,
+        0,
+    ))));
+    residency
+        .adopt_governed_budget(
+            governor,
+            onnx_runtime_memory_governor::Tier::Device,
+            HolderId::new(42),
+        )
+        .expect("1 MiB of a 1 GiB ledger is affordable");
+    residency
+}
+
+/// A minimal expert-bank-shaped `WeightRegionCatalog` matching the same
+/// construction the existing `acquired_guard_reports_whole_bank_and_blocks_resize_until_dropped`
+/// unit test in `weight_paging.rs` uses -- reused here rather than
+/// reinvented so this stress test proves the SAME catalog/guard code path,
+/// not a bespoke stand-in.
+fn qmoe_style_catalog() -> onnx_runtime_loader::WeightRegionCatalog {
+    let layout = onnx_runtime_loader::ExpertTensorLayout {
+        version: 1,
+        experts: QWEN15_MOE_A27B.experts,
+        rows_per_expert: 2,
+        storage_elements_per_row: 4,
+        order: onnx_runtime_loader::ExpertStorageOrder::ExpertMajor,
+        quantization: Some(onnx_runtime_loader::ExpertQuantization {
+            bits: 4,
+            block_size: 16,
+            blocks_per_row: 1,
+        }),
+    };
+    let weight = onnx_runtime_ir::WeightRef::External {
+        path: std::path::PathBuf::from("/nonexistent/weights.bin"),
+        offset: 16,
+        length: layout.experts * layout.rows_per_expert * layout.storage_elements_per_row,
+        dtype: DataType::Uint8,
+        dims: vec![
+            layout.experts,
+            layout.rows_per_expert,
+            layout.storage_elements_per_row,
+        ],
+    };
+    onnx_runtime_loader::WeightRegionCatalog::classify(&weight, layout)
+}
+
+#[test]
+#[ignore]
+fn qmoe_routed_residency_guard_resize_starvation_stress_1000_steps() {
+    resize_starvation_stress(1000);
 }
