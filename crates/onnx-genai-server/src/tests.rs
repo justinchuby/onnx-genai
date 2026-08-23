@@ -3871,3 +3871,197 @@ async fn sessions_open_and_close_for_an_interpreted_package() {
         .unwrap();
     assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
 }
+
+/// An interpreted package's conversation survives the HTTP boundary.
+///
+/// A session is what a client holds across requests, so the property has to be
+/// checked where a client actually is: three `POST /v1/completions` carrying the
+/// same `X-Session-Id`, compared against one request carrying the whole
+/// conversation. The engine-level test pins the same property; this one pins
+/// that nothing between the socket and the interpreter drops the session.
+fn workflow_session_package(scratch: &tempfile::TempDir) -> PathBuf {
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+    let source = fixtures.join("onnx_genai_workflows/decoder");
+    let destination = scratch.path().join("package");
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).expect("create package directory");
+        for entry in std::fs::read_dir(from).expect("read fixture") {
+            let entry = entry.expect("fixture entry");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("file type").is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).expect("copy fixture file");
+            }
+        }
+    }
+    copy_tree(&source, &destination);
+    // The conformance fixture ships no tokenizer because its conformance is
+    // about the workflow. An HTTP completion is text, so this borrows the tiny
+    // decoder's tokenizer — 32 ids, all inside the fixture's 128-wide vocab.
+    std::fs::copy(
+        fixtures.join("tiny-llm/tokenizer.json"),
+        destination.join("tokenizer.json"),
+    )
+    .expect("copy tokenizer");
+    destination
+}
+
+async fn chat_turn(
+    router: axum::Router,
+    session: Option<&str>,
+    prompt: &str,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(session) = session {
+        builder = builder.header("x-session-id", session);
+    }
+    let response = router
+        .oneshot(
+            builder
+                .body(Body::from(
+                    json!({
+                        "model": "workflow-multi-turn",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": 3,
+                        "temperature": 0.0
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    (status, body)
+}
+
+fn session_tokens(body: &Value) -> u64 {
+    body["session_token_count"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("a session response reports its token count: {body}"))
+}
+
+/// Three turns in one session accumulate one conversation; a fourth id does not
+/// see it; deleting the session releases it.
+#[tokio::test]
+async fn chat_completions_continue_a_conversation_across_requests() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let package = workflow_session_package(&scratch);
+    let state = AppState::load(&package, Some("workflow-multi-turn".to_string()))
+        .expect("load interpreted package");
+    let router = app(state);
+
+    let session = "sess-multi-turn";
+    let (status, first) = chat_turn(router.clone(), Some(session), "hello world").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let after_first = session_tokens(&first);
+    assert!(
+        after_first > 0,
+        "the first turn leaves its prompt and generation behind"
+    );
+
+    let (status, second) = chat_turn(router.clone(), Some(session), "the quick").await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    let after_second = session_tokens(&second);
+    assert!(
+        after_second > after_first,
+        "the second turn extends the conversation: {after_first} -> {after_second}"
+    );
+
+    let (status, third) = chat_turn(router.clone(), Some(session), "brown fox").await;
+    assert_eq!(status, StatusCode::OK, "{third}");
+    let after_third = session_tokens(&third);
+    assert!(
+        after_third > after_second,
+        "the third turn continues turns one and two: {after_second} -> {after_third}"
+    );
+    // The third turn was decoded from the whole conversation: everything the
+    // first two turns sent and published is still in front of it.
+    assert!(
+        after_third >= after_first * 3,
+        "turn 3's context is the conversation, not its own prompt: {after_third} against a first          turn of {after_first}"
+    );
+    assert_eq!(third["session_id"].as_str(), Some(session));
+
+    // A different id is a different conversation, from its first turn.
+    let (status, isolated) = chat_turn(router.clone(), Some("sess-other"), "brown fox").await;
+    assert_eq!(status, StatusCode::OK, "{isolated}");
+    assert!(
+        session_tokens(&isolated) < after_third,
+        "an independent session starts its own conversation"
+    );
+
+    // And the session the server handed out is released when it is deleted.
+    let created = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created: Value =
+        serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let id = created["id"].as_str().expect("session id").to_string();
+    let deleted = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/sessions/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    let missing = router
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/sessions/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        missing.status(),
+        StatusCode::NOT_FOUND,
+        "a deleted session is gone, not emptied"
+    );
+}
+
+/// A request with no session is unchanged by the package declaring one.
+#[tokio::test]
+async fn chat_completions_without_a_session_stay_stateless() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let package = workflow_session_package(&scratch);
+    let state = AppState::load(&package, Some("workflow-multi-turn".to_string()))
+        .expect("load interpreted package");
+    let router = app(state);
+
+    let (first_status, first) = chat_turn(router.clone(), None, "hello world").await;
+    let (second_status, second) = chat_turn(router.clone(), None, "hello world").await;
+    assert_eq!(first_status, StatusCode::OK, "{first}");
+    assert_eq!(second_status, StatusCode::OK, "{second}");
+    assert!(first["session_token_count"].is_null());
+    assert_eq!(
+        first["usage"], second["usage"],
+        "a stateless request leaves nothing behind for the next one"
+    );
+    assert_eq!(
+        first["choices"][0]["message"]["content"],
+        second["choices"][0]["message"]["content"]
+    );
+}

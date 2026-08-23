@@ -1019,6 +1019,63 @@ Interactive world-model, robotics, and streaming-observation workloads enter as
 separate workflow invocations with session state in between; the portable IR
 adds no network-aware `receive` or `await` operation.
 
+#### 12.5a How the next invocation reaches leased state
+
+Scope says *keep this*. It does not say how the next invocation reaches what was
+kept, and a package that leaves that unanswered advertises a continuity it does
+not have — every turn restarts and the failure reaches a caller as a model that
+forgot what it was told. There are exactly two answers, and a document gives one
+of them:
+
+- **The graph reads it.** A loop carries the cell, or a step consumes the value
+  its `initializer` names. The lease is then opaque: the runtime hands the kept
+  value back where the document already reads it. This is what a full-duplex or
+  streaming package does.
+- **The request binding rejoins it**, declared on the lease:
+
+  ```yaml
+  conversation:
+    contract: { dtype: int64, rank: 2, shape: [batch, conversation_length],
+                batch_layout: { kind: request_aligned, axis: 0 } }
+    class: semantic
+    scope: session
+    initializer: request.input_ids
+    recurrence: { kind: bounded, axis: 1, max: package.max_context }
+    management: runtime
+    release_boundary: session
+    session:
+      policy: exclusive
+      continuation:
+        kind: prompt_prefix
+        prompt_input: request.input_ids   # must carry role prompt_tokens
+        tokens_output: tokens             # must carry role tokens
+  ```
+
+  The value bound to `prompt_input` becomes the cell's value followed by the
+  caller's tokens; when the invocation completes the cell becomes that
+  concatenation followed by what was published to `tokens_output`. A session
+  holding nothing contributes nothing, so a conversation's first turn and a
+  request with no session are the same execution — declaring a conversation
+  costs a package nothing when nobody asks for one.
+
+  This is what a decoder whose prefill starts from empty state declares. Such a
+  package's cache is rebuilt from the conversation on each turn; nothing in the
+  document asks the prefill to accept a cache it was never authored to take, and
+  no runtime has to invent that it should.
+
+The validator enforces the corollaries. A continuation must be `scope: session`,
+`class: semantic`, `management: runtime`, `release_boundary: session`, and must
+grow; it must name a declared `prompt_tokens` input and a declared `tokens`
+output whose contracts match the cell's; it must not also be loop-carried, which
+would be two answers about the same value; and a workflow declares at most one,
+because a package has one conversation. A session-scoped cell binding a
+`service_group` must resolve to a declared group that aliases it.
+
+A package that publishes a token stream and declares no session state the
+interpreter can carry is refused a session at `create_session` rather than handed
+one whose turns silently restart. A package that publishes no token stream has no
+conversation to lose, and its session is an ordinary handle.
+
 ### 12.6 Private state and checkpoints
 
 Internal state is private by default. An internal state cell is **not**

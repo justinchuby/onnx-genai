@@ -2092,6 +2092,7 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
     validate_effect_declarations(workflow, errors);
     validate_row_scoped_components(workflow, errors);
     validate_state_lifetimes(workflow, errors);
+    validate_session_continuity(workflow, errors);
     if let Some(serving) = &workflow.serving {
         if serving.state_service.groups.is_empty() {
             errors.push(
@@ -2414,6 +2415,218 @@ fn validate_state_lifetimes(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
             ));
         }
     }
+}
+
+/// A package that claims a conversation survives its invocations must declare
+/// what carries it.
+///
+/// Session scope on its own says only "keep this"; it says nothing about how
+/// the next invocation reaches the kept value. Where the document does answer
+/// that — a `service_group` naming the runtime's storage, a `continuation`
+/// naming the request binding the conversation rejoins — the answer has to
+/// resolve, or a package advertises continuity that silently restarts on every
+/// turn. That is the failure this rejects, at the document rather than at the
+/// third turn of a conversation.
+fn validate_session_continuity(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
+    let carried = loop_carried_cells(&workflow.steps);
+    let groups = workflow
+        .serving
+        .as_ref()
+        .map(|serving| &serving.state_service.groups);
+
+    let mut continuations = Vec::new();
+    for (name, cell) in &workflow.state {
+        let path = format!("pipeline.workflow.state.{name}");
+        if cell.scope != crate::schema::WorkflowStateScope::Session {
+            if cell
+                .session
+                .as_ref()
+                .is_some_and(|lease| lease.continuation.is_some())
+            {
+                errors.push(format!(
+                    "{path} declares a session continuation but is not session-scoped"
+                ));
+            }
+            continue;
+        }
+
+        // A session-scoped cell that binds a state service group is that
+        // group's storage. Naming a group the document does not declare, or one
+        // whose aliases never reach this cell, leaves the lease with nothing to
+        // hold.
+        if let Some(group_name) = cell.service_group.as_deref() {
+            match groups.and_then(|groups| groups.get(group_name)) {
+                None => errors.push(format!(
+                    "{path} is session-scoped and binds state service group '{group_name}', \
+                     which pipeline.workflow.serving.state_service.groups does not declare"
+                )),
+                Some(group) => {
+                    let aliased = group
+                        .ports
+                        .values()
+                        .any(|component| component.contains_key(name));
+                    if !aliased {
+                        errors.push(format!(
+                            "{path} is session-scoped and binds state service group \
+                             '{group_name}', but no component alias in that group names it; a \
+                             leased cell with no graph port cannot be carried"
+                        ));
+                    }
+                }
+            }
+        }
+
+        let Some(continuation) = cell
+            .session
+            .as_ref()
+            .and_then(|lease| lease.continuation.as_ref())
+        else {
+            continue;
+        };
+        continuations.push(name.clone());
+
+        let crate::schema::SessionContinuation::PromptPrefix {
+            prompt_input,
+            tokens_output,
+        } = continuation;
+
+        if cell.class != crate::schema::WorkflowStateClass::Semantic {
+            errors.push(format!(
+                "{path} continues a conversation and must be class: semantic; advisory state may \
+                 be dropped, and a dropped conversation is a wrong answer rather than a slower one"
+            ));
+        }
+        if cell.management != crate::schema::StateManagement::Runtime {
+            errors.push(format!(
+                "{path} continues a conversation across invocations, so its storage is the \
+                 runtime's and it must declare management: runtime"
+            ));
+        }
+        if cell.release_boundary != Some(crate::schema::StateReleaseBoundary::Session) {
+            errors.push(format!(
+                "{path} continues a conversation and must declare release_boundary: session; a \
+                 conversation released at the invocation it was created in is not one"
+            ));
+        }
+        if carried.contains(name) {
+            errors.push(format!(
+                "{path} declares a session continuation and is also loop-carried; the lease and \
+                 an SSA carry are two answers about the same value"
+            ));
+        }
+        match &cell.recurrence {
+            crate::schema::ShapeRecurrence::Bounded { axis, .. }
+            | crate::schema::ShapeRecurrence::Growing { axis, .. } => {
+                if *axis != cell.contract.rank.saturating_sub(1) {
+                    errors.push(format!(
+                        "{path} continues a conversation along axis {axis}, but tokens accumulate \
+                         on the final axis of a rank-{} contract",
+                        cell.contract.rank
+                    ));
+                }
+            }
+            crate::schema::ShapeRecurrence::Invariant => errors.push(format!(
+                "{path} continues a conversation but declares recurrence invariant; a \
+                 conversation grows with every turn"
+            )),
+        }
+
+        match workflow.inputs.get(prompt_input) {
+            None => errors.push(format!(
+                "{path}.session.continuation.prompt_input names '{prompt_input}', which is not a \
+                 declared workflow input"
+            )),
+            Some(input) => {
+                let is_prompt_tokens = matches!(
+                    &input.role,
+                    crate::schema::SemanticInputRole::Runtime { role, .. }
+                        if *role == crate::schema::RuntimeInputRole::PromptTokens
+                );
+                if !is_prompt_tokens {
+                    errors.push(format!(
+                        "{path}.session.continuation.prompt_input '{prompt_input}' does not carry \
+                         the prompt_tokens runtime role, so prefixing it would change an input \
+                         whose meaning this document never stated"
+                    ));
+                }
+                if input.contract.dtype != cell.contract.dtype
+                    || input.contract.rank != cell.contract.rank
+                {
+                    errors.push(format!(
+                        "{path}.session.continuation.prompt_input '{prompt_input}' has contract \
+                         {:?}/rank {} but the cell holds {:?}/rank {}; a prefix must be the same \
+                         kind of tensor as what it prefixes",
+                        input.contract.dtype,
+                        input.contract.rank,
+                        cell.contract.dtype,
+                        cell.contract.rank
+                    ));
+                }
+            }
+        }
+
+        match workflow.outputs.get(tokens_output) {
+            None => errors.push(format!(
+                "{path}.session.continuation.tokens_output names '{tokens_output}', which is not \
+                 a declared workflow output"
+            )),
+            Some(output) => {
+                if output.role != crate::schema::WorkflowOutputRole::Tokens {
+                    errors.push(format!(
+                        "{path}.session.continuation.tokens_output '{tokens_output}' does not \
+                         carry the tokens output role, so what it publishes is not what a \
+                         conversation accumulates"
+                    ));
+                }
+                if output.contract.dtype != cell.contract.dtype {
+                    errors.push(format!(
+                        "{path}.session.continuation.tokens_output '{tokens_output}' publishes \
+                         {:?} but the cell holds {:?}",
+                        output.contract.dtype, cell.contract.dtype
+                    ));
+                }
+            }
+        }
+    }
+
+    if continuations.len() > 1 {
+        errors.push(format!(
+            "pipeline.workflow.state declares {} session continuations ({}); a package has one \
+             conversation, and two cells claiming it leaves no answer about which one a turn \
+             continues",
+            continuations.len(),
+            continuations.join(", ")
+        ));
+    }
+}
+
+/// Cells a loop carries, at any nesting depth.
+fn loop_carried_cells(steps: &[WorkflowStep]) -> BTreeSet<String> {
+    fn walk(step: &WorkflowStep, cells: &mut BTreeSet<String>) {
+        match step {
+            WorkflowStep::Sequence { steps } => steps.iter().for_each(|step| walk(step, cells)),
+            WorkflowStep::Loop {
+                setup,
+                steps,
+                carried,
+                ..
+            } => {
+                cells.extend(carried.iter().map(|carry| carry.cell.clone()));
+                setup.iter().for_each(|step| walk(step, cells));
+                steps.iter().for_each(|step| walk(step, cells));
+            }
+            WorkflowStep::Branch { cases, default, .. } => {
+                cases.values().for_each(|step| walk(step, cells));
+                if let Some(default) = default {
+                    walk(default, cells);
+                }
+            }
+            WorkflowStep::Invoke { .. } | WorkflowStep::Emit { .. } => {}
+        }
+    }
+    let mut cells = BTreeSet::new();
+    steps.iter().for_each(|step| walk(step, &mut cells));
+    cells
 }
 
 /// Speculative regions may only contain effects and state that can be undone to

@@ -781,8 +781,18 @@ impl Engine {
             on_admitted,
             callback,
         )?;
+        // A package that declares its conversation knows how long it is; asking
+        // it is what keeps `session_token_count` the same number a decode-core
+        // session reports — prompt and generated tokens both — rather than the
+        // generated ones alone.
+        let declared = self
+            .workflow
+            .session_conversation_len(&session_id.to_string());
         if let Some(count) = self.workflow_sessions.get_mut(&session_id) {
-            *count += result.token_ids.len();
+            match declared {
+                Some(length) => *count = length,
+                None => *count += result.token_ids.len(),
+            }
         }
         Ok(result)
     }
@@ -1468,6 +1478,28 @@ impl Engine {
         // Refusing here would have made "sessions" a property of which executor
         // runs the decode step, which is not what a caller is asking about.
         if !self.holds_decode_core() {
+            // What a caller opening a session asks for is that the next turn
+            // continue this one. A package that publishes a token stream is one
+            // whose turns are a conversation, so a session over it that carries
+            // nothing would silently restart every turn — a wrong answer that
+            // reads like a forgetful model. Say so instead, and name what the
+            // package has to declare. A package that publishes no tokens has no
+            // conversation to lose, and its session is an ordinary handle.
+            let workflow = self.workflow.workflow_spec();
+            let publishes_tokens = workflow
+                .outputs
+                .values()
+                .any(|output| output.role == onnx_genai_metadata::WorkflowOutputRole::Tokens);
+            anyhow::ensure!(
+                !publishes_tokens || crate::pipeline::workflow_carries_session_state(workflow),
+                "this package publishes a token stream but declares no session-scoped workflow \
+                 state, so a session could not continue a conversation: every turn would restart \
+                 from its own prompt. Declare the conversation in `pipeline.workflow.state` with \
+                 `scope: session` — either as a cell the loop carries, or with a \
+                 `session.continuation` naming the prompt input it rejoins — and re-validate the \
+                 package. Until then, use stateless generation and send the conversation in the \
+                 prompt."
+            );
             self.workflow_session_counter += 1;
             let id = self.workflow_session_counter;
             self.workflow_sessions.insert(id, 0);
@@ -1603,6 +1635,21 @@ impl Engine {
 
     /// Reset a persistent session, freeing its current state while keeping the id usable.
     pub fn reset_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
+        // Resetting is the same promise for every package: the id stays usable
+        // and everything the conversation accumulated is gone. For an
+        // interpreted package that is exactly its session-scoped cells, so the
+        // lease is dropped and the token count returns to zero.
+        if !self.holds_decode_core() {
+            anyhow::ensure!(
+                self.workflow_sessions.contains_key(&session_id),
+                "session {session_id} not found"
+            );
+            self.workflow.forget_session(&session_id.to_string());
+            if let Some(count) = self.workflow_sessions.get_mut(&session_id) {
+                *count = 0;
+            }
+            return Ok(());
+        }
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
             return session_state::reset(&mut NativeSessions(self), session_id);
@@ -1673,6 +1720,38 @@ impl Engine {
         }
         self.require_ort_backend("persistent sessions")?;
         session_state::token_count(&OrtSessionsRef(self), session_id)
+    }
+
+    /// The tokens a session's conversation holds, oldest first.
+    ///
+    /// `None` when the package carries its conversation somewhere a token list
+    /// cannot describe — a decode core's KV sequence, or a workflow whose
+    /// session state is not a declared prompt continuation. A caller reads this
+    /// to see what a session has heard without keeping a second copy of it,
+    /// which is the copy that drifts.
+    pub fn session_conversation(
+        &self,
+        session_id: SessionId,
+    ) -> anyhow::Result<Option<Vec<TokenId>>> {
+        if self.holds_decode_core() {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            self.workflow_sessions.contains_key(&session_id),
+            "session {session_id} not found"
+        );
+        self.workflow
+            .session_conversation(&session_id.to_string())
+            .map(|conversation| {
+                conversation
+                    .into_iter()
+                    .map(|token| {
+                        TokenId::try_from(token)
+                            .context("a conversation token id does not fit the token type")
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()
+            })
+            .transpose()
     }
 
     /// Get the loaded metadata.

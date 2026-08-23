@@ -258,6 +258,12 @@ pub struct WorkflowExecutionPlan<'a> {
     session_id: Option<String>,
     component_overrides: HashMap<String, String>,
     max_iterations_only: bool,
+    /// Tokens this pass's prompt input carries, when a declared continuation
+    /// made them the conversation rather than just this turn's request.
+    ///
+    /// Kept because the cell this pass publishes is the whole conversation, and
+    /// the emitted stream alone is only its last turn.
+    continued_prompt: Option<Vec<i64>>,
 }
 
 #[derive(Default)]
@@ -520,6 +526,145 @@ fn session_state_value_name(cell: &str) -> String {
     format!("__session_state.{cell}")
 }
 
+/// The one cell whose lease says a conversation rejoins the next invocation
+/// through the prompt binding.
+///
+/// Validation admits at most one, so this returns the first rather than
+/// choosing between two: a package with two conversations was refused before it
+/// ever loaded.
+pub(crate) fn workflow_prompt_continuation(
+    workflow: &WorkflowSpec,
+) -> Option<(&str, &str, &str, &onnx_genai_metadata::WorkflowStateCell)> {
+    workflow.state.iter().find_map(|(cell, state)| {
+        let onnx_genai_metadata::SessionContinuation::PromptPrefix {
+            prompt_input,
+            tokens_output,
+        } = state.session.as_ref()?.continuation.as_ref()?;
+        Some((
+            cell.as_str(),
+            prompt_input.as_str(),
+            tokens_output.as_str(),
+            state,
+        ))
+    })
+}
+
+/// Read the tokens a session-scoped continuation cell holds, as a flat row.
+fn continuation_tokens(value: &Value) -> anyhow::Result<Vec<i64>> {
+    let shape = value.shape();
+    let rows = if shape.len() >= 2 { shape[0] } else { 1 };
+    anyhow::ensure!(
+        rows == 1,
+        "a session continues one conversation, but its state holds {rows} batch rows"
+    );
+    Ok(value.to_vec_i64()?)
+}
+
+/// Tokens a pass published to one declared output, however it published them.
+///
+/// An emit lands under the output's own name, under `output.row.N` when the
+/// package publishes request-aligned rows, or under `output.<n>` when it
+/// streams events. All three are the same generation seen from a different
+/// publication mode, and a conversation accumulates what was generated — so
+/// this reads whichever the pass produced instead of assuming one.
+fn published_conversation_tokens(
+    values: &PipelineTensors,
+    row_outputs: &BTreeMap<String, Vec<String>>,
+    output: &str,
+) -> anyhow::Result<Vec<i64>> {
+    if let Some(value) = values.get(output) {
+        return continuation_tokens(value);
+    }
+    if let Some(rows) = row_outputs.get(output) {
+        anyhow::ensure!(
+            rows.len() <= 1,
+            "a session continues one conversation, but this pass published {} request rows to \
+             '{output}'",
+            rows.len()
+        );
+        if let Some(value) = rows.first().and_then(|name| values.get(name)) {
+            return continuation_tokens(value);
+        }
+    }
+    // Streamed events, in publication order rather than the lexicographic order
+    // their names would sort in.
+    let prefix = format!("{output}.");
+    let mut events = values
+        .keys()
+        .filter_map(|name| {
+            let suffix = name.strip_prefix(&prefix)?;
+            suffix.parse::<usize>().ok().map(|index| (index, name))
+        })
+        .collect::<Vec<_>>();
+    events.sort_by_key(|(index, _)| *index);
+    let mut tokens = Vec::new();
+    for (_, name) in events {
+        let value = values
+            .get(name)
+            .with_context(|| format!("workflow output event '{name}' disappeared"))?;
+        tokens.extend(continuation_tokens(value)?);
+    }
+    Ok(tokens)
+}
+
+/// Whether this workflow declares state a session can actually carry.
+///
+/// A session-scoped cell is carried when the loop carries it, when a step
+/// reaches it through the value its initializer names, or when its lease states
+/// the request binding it rejoins. A package with none of those has nothing to
+/// continue a conversation with, and saying so is what stops a caller opening a
+/// session whose every turn silently restarts.
+pub fn workflow_carries_session_state(workflow: &WorkflowSpec) -> bool {
+    let mut carried = std::collections::HashSet::new();
+    let mut read = std::collections::HashSet::new();
+    fn walk(
+        step: &onnx_genai_metadata::WorkflowStep,
+        carried: &mut std::collections::HashSet<String>,
+        read: &mut std::collections::HashSet<String>,
+    ) {
+        use onnx_genai_metadata::WorkflowStep as Step;
+        match step {
+            Step::Sequence { steps } => steps.iter().for_each(|step| walk(step, carried, read)),
+            Step::Invoke { inputs, .. } => read.extend(inputs.values().cloned()),
+            Step::Loop {
+                setup,
+                steps,
+                carried: carries,
+                ..
+            } => {
+                carried.extend(carries.iter().map(|carry| carry.cell.clone()));
+                setup.iter().for_each(|step| walk(step, carried, read));
+                steps.iter().for_each(|step| walk(step, carried, read));
+            }
+            Step::Branch { cases, default, .. } => {
+                cases.values().for_each(|step| walk(step, carried, read));
+                if let Some(default) = default {
+                    walk(default, carried, read);
+                }
+            }
+            Step::Emit { value, .. } => {
+                read.insert(value.clone());
+            }
+        }
+    }
+    workflow
+        .steps
+        .iter()
+        .for_each(|step| walk(step, &mut carried, &mut read));
+    workflow
+        .state
+        .iter()
+        .filter(|(_, state)| state.scope == onnx_genai_metadata::WorkflowStateScope::Session)
+        .any(|(cell, state)| {
+            state
+                .session
+                .as_ref()
+                .is_some_and(|lease| lease.continuation.is_some())
+                || carried.contains(cell)
+                || read.contains(&state.initializer)
+        })
+}
+
 impl WorkflowRuntime {
     fn materialize_workflow_value_copy(&self, value: &Value) -> anyhow::Result<Value> {
         if value.is_host_resident()? {
@@ -707,6 +852,69 @@ impl WorkflowRuntime {
     }
 }
 
+impl WorkflowRuntime {
+    /// Rejoin a session's conversation to this turn's prompt.
+    ///
+    /// Returns the request the pass actually runs and, when a continuation
+    /// applies, the token row the prompt input now carries. A request with no
+    /// session, or a package declaring no continuation, is returned untouched —
+    /// stateless generation is the same execution it always was, and this is
+    /// where that is guaranteed rather than in each caller.
+    fn continue_session_prompt(
+        &self,
+        request: GenerateRequest,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<(GenerateRequest, Option<Vec<i64>>)> {
+        let Some((cell, _, _, _)) = workflow_prompt_continuation(&self.workflow) else {
+            return Ok((request, None));
+        };
+        let Some(session_id) = session_id else {
+            return Ok((request, None));
+        };
+        let history = match self
+            .workflow_session_state
+            .borrow()
+            .get(&(session_id.to_string(), cell.to_string()))
+        {
+            Some(value) => continuation_tokens(value)
+                .with_context(|| format!("session state '{cell}' is not a conversation"))?,
+            None => Vec::new(),
+        };
+        let turn: Vec<i64> = match &request.prompt {
+            GeneratePrompt::TokenIds(tokens) => {
+                tokens.iter().map(|token| i64::from(*token)).collect()
+            }
+            GeneratePrompt::TokenRows(rows) => {
+                anyhow::ensure!(
+                    rows.len() == 1,
+                    "a session continues one conversation, but this request carries {} prompt \
+                     rows; batch several requests instead of several rows in a session",
+                    rows.len()
+                );
+                rows[0].iter().map(|token| i64::from(*token)).collect()
+            }
+            GeneratePrompt::Text(_) => anyhow::bail!(
+                "a session-continued prompt must reach the workflow as token ids; this request \
+                 still carries text"
+            ),
+        };
+        let mut conversation: Vec<i64> = history;
+        conversation.extend_from_slice(&turn);
+        let tokens = conversation
+            .iter()
+            .map(|token| u32::try_from(*token))
+            .collect::<Result<Vec<_>, _>>()
+            .context("a conversation token id does not fit the prompt token type")?;
+        Ok((
+            GenerateRequest {
+                prompt: GeneratePrompt::TokenIds(tokens),
+                options: request.options,
+            },
+            Some(conversation),
+        ))
+    }
+}
+
 impl<'a> WorkflowExecutionPlan<'a> {
     pub(crate) fn new(
         engine: &'a WorkflowRuntime,
@@ -736,6 +944,14 @@ impl<'a> WorkflowExecutionPlan<'a> {
         } = request;
         let workflow = &engine.workflow;
         validate_component_overrides(workflow, &component_overrides)?;
+        // A conversation the package declares as a prompt prefix rejoins here,
+        // before anything is bound: every input derived from the prompt — the
+        // token tensor, its length, the mask the initializer builds from it —
+        // is then derived from the *whole* conversation, exactly as it would be
+        // for a caller who sent it in one request. Rewriting the bound tensors
+        // afterwards would leave the derived ones describing only this turn.
+        let (request, continued_prompt) =
+            engine.continue_session_prompt(request, session_id.as_deref())?;
         let host_supplied = if hosted.is_empty() {
             std::collections::HashSet::new()
         } else {
@@ -840,6 +1056,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             session_id,
             component_overrides,
             max_iterations_only: !request.options.stop_on_eos,
+            continued_prompt,
         })
     }
 
@@ -976,19 +1193,24 @@ impl<'a> WorkflowExecutionPlan<'a> {
             return Err(error);
         }
         let _adapter_context_guard = ActiveAdapterContextGuard(&engine.active_adapter_context);
-        for (cell, state) in &workflow.state {
-            if state.scope != onnx_genai_metadata::WorkflowStateScope::Session {
-                continue;
-            }
-            let session_id = self.session_id.as_ref().with_context(|| {
-                format!("session-scoped workflow state '{cell}' requires a session id")
-            })?;
-            if let Some(value) = engine
-                .workflow_session_state
-                .borrow()
-                .get(&(session_id.clone(), cell.clone()))
-            {
-                values.insert(session_state_value_name(cell), clone_value(value)?);
+        // A package may declare session state and still be asked for a single
+        // stateless generation — that is the first turn of every conversation,
+        // and it is also what `Engine::generate` is. Without a session there is
+        // no lease to read, so each cell starts from the initializer it
+        // declares; refusing here would make declaring a conversation cost a
+        // package the ability to answer one question.
+        if let Some(session_id) = self.session_id.as_ref() {
+            for (cell, state) in &workflow.state {
+                if state.scope != onnx_genai_metadata::WorkflowStateScope::Session {
+                    continue;
+                }
+                if let Some(value) = engine
+                    .workflow_session_state
+                    .borrow()
+                    .get(&(session_id.clone(), cell.clone()))
+                {
+                    values.insert(session_state_value_name(cell), clone_value(value)?);
+                }
             }
         }
         let mut symbols = self.initial_symbols.clone();
@@ -1028,9 +1250,41 @@ impl<'a> WorkflowExecutionPlan<'a> {
             )?;
         }
         if let Some(session_id) = &self.session_id {
+            let continuation = workflow_prompt_continuation(workflow)
+                .map(|(cell, _, tokens_output, _)| (cell.to_string(), tokens_output.to_string()));
             let mut updates = Vec::new();
             for (cell, state) in &workflow.state {
                 if state.scope != onnx_genai_metadata::WorkflowStateScope::Session {
+                    continue;
+                }
+                // The conversation this pass leaves behind is the prompt it ran
+                // — which already carried every earlier turn — followed by what
+                // it published. Reading it off the emitted stream alone would
+                // drop everything before this turn; reading it off the cell's
+                // final SSA value would drop the turn, because no step in the
+                // workflow writes the conversation.
+                if let Some((continued_cell, tokens_output)) = &continuation
+                    && continued_cell == cell
+                {
+                    let prompt = self.continued_prompt.as_deref().unwrap_or_default();
+                    let mut conversation = prompt.to_vec();
+                    conversation.extend(published_conversation_tokens(
+                        &values,
+                        &telemetry.row_outputs,
+                        tokens_output,
+                    )?);
+                    let length = conversation.len() as i64;
+                    let shape = match state.contract.rank {
+                        1 => vec![length],
+                        2 => vec![1, length],
+                        rank => anyhow::bail!(
+                            "session continuation state '{cell}' must have rank 1 or 2, got {rank}"
+                        ),
+                    };
+                    updates.push((
+                        (session_id.clone(), cell.clone()),
+                        Value::from_slice_i64(&conversation, &shape)?,
+                    ));
                     continue;
                 }
                 let value_ref = final_state_refs

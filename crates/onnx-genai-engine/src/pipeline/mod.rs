@@ -45,7 +45,7 @@ pub use onnx_genai_metadata::WorkflowOutputRole;
 pub use row_state::{RowScopedState, RowTable, check_selection, gather_rows};
 pub use workflow::{
     MISSING_REQUIRED_INPUT, WorkflowExecutionPlan, WorkflowPerformanceDiagnostic,
-    is_missing_required_input,
+    is_missing_required_input, workflow_carries_session_state,
 };
 pub(crate) use workflow::{WorkflowGenerationCursor, WorkflowNodeHost, WorkflowNodeRequest};
 
@@ -1005,6 +1005,32 @@ impl WorkflowRuntime {
         self.workflow_session_state
             .borrow_mut()
             .retain(|(session, _), _| session != session_id);
+    }
+
+    /// Length of the conversation this session has accumulated, when the
+    /// package declares one.
+    ///
+    /// `None` means the package declares no prompt continuation, so there is no
+    /// conversation length to report and the caller keeps its own count.
+    pub(crate) fn session_conversation_len(&self, session_id: &str) -> Option<usize> {
+        self.session_conversation(session_id)
+            .map(|conversation| conversation.len())
+    }
+
+    /// The tokens a session's declared conversation holds, oldest first.
+    ///
+    /// This is the value the next turn's prompt input is built from, so it is
+    /// also the answer to "what has this session heard" — reported from the
+    /// lease itself rather than from a count kept beside it.
+    pub(crate) fn session_conversation(&self, session_id: &str) -> Option<Vec<i64>> {
+        let (cell, _, _, _) = workflow::workflow_prompt_continuation(self.workflow_spec())?;
+        Some(
+            self.workflow_session_state
+                .borrow()
+                .get(&(session_id.to_string(), cell.to_string()))
+                .map(|value| value.to_vec_i64().unwrap_or_default())
+                .unwrap_or_default(),
+        )
     }
 
     pub fn memory_strategy_plan(&self) -> &MemoryStrategyPlan {

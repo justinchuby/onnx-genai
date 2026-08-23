@@ -127,6 +127,52 @@ Do not hand-write this. See [Converting a package](#converting-a-package).
    your structure requires and rejects a manifest that omits one, so the list
    is checkable rather than decorative.
 
+## Conversations
+
+A package's turns are a conversation only if the package says so. Declare it
+once, in `pipeline.workflow.state`:
+
+```yaml
+    state:
+      conversation:
+        contract: {dtype: int64, rank: 2, shape: [batch, conversation_length],
+                   batch_layout: {kind: request_aligned, axis: 0}}
+        class: semantic
+        scope: session
+        initializer: request.input_ids
+        recurrence: {kind: bounded, axis: 1, max: package.max_context}
+        management: runtime
+        release_boundary: session
+        session:
+          policy: exclusive
+          continuation:
+            kind: prompt_prefix
+            prompt_input: request.input_ids
+            tokens_output: tokens
+```
+
+Each turn's prompt becomes the conversation followed by the caller's tokens, and
+the conversation then absorbs both that prompt and what the turn published. Every
+input derived from the prompt — its length, the mask the state initializer builds
+from it — is derived from the whole conversation, so a package whose prefill
+starts from empty state needs no new graph to continue one. `session_state_lease`
+belongs in the manifest; §12.5a of
+[the metadata decisions](INFERENCE_METADATA_DECISIONS.md) states the rules the
+validator enforces.
+
+**Which packages need it.** Only those the interpreter drives. A package
+declaring the `binding` token policy of rule 4 is executed by the fused decode
+core, whose paged KV sequence *is* the conversation — `migrate_model_io` and the
+`genai_config.json` importer both emit that shape, so a package they produce
+continues a conversation without declaring one. A package that ships ONNX policy
+graphs instead has no such core, and without this declaration every turn of a
+session restarts from its own prompt.
+
+That is not hypothetical: it is what every migrated eleven-component decoder
+package on the hub looked like. `Engine::create_session` now refuses a package
+that publishes a token stream and declares no session state, so the omission
+surfaces at the call that cannot be honoured rather than at the third turn.
+
 ## End-of-generation tokens
 
 A model may end a turn with one token and a message with another. Both stop it,

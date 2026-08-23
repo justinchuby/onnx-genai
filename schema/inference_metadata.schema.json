@@ -3183,9 +3183,49 @@
       ],
       "type": "object"
     },
+    "SessionContinuation": {
+      "description": "How a session-scoped cell rejoins the next invocation.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The cell holds every token this session has seen, and each invocation's\nprompt continues it.\n\nThe value bound to `prompt_input` is the cell's value followed by the\ncaller's tokens; when the invocation completes, the cell becomes that\nconcatenation followed by the tokens published to `tokens_output`. A\nsession that holds no value yet contributes nothing, so the first turn\nof a conversation and a request with no session are the same execution.\n\nThis is what a package whose prefill starts from empty state declares:\nthe conversation is carried as tokens the next prefill consumes, not as\na cache the next prefill would have to be re-authored to accept.",
+          "properties": {
+            "kind": {
+              "const": "prompt_prefix",
+              "type": "string"
+            },
+            "prompt_input": {
+              "description": "Workflow input carrying the `prompt_tokens` runtime role.",
+              "type": "string"
+            },
+            "tokens_output": {
+              "description": "Workflow output carrying the `tokens` role this cell accumulates.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "prompt_input",
+            "tokens_output"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "SessionLeaseContract": {
       "additionalProperties": false,
       "properties": {
+        "continuation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionContinuation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How this cell continues one invocation's work into the next.\n\nAbsent means the lease is opaque: the runtime keeps the cell's value for\nthe session and hands it back as the cell's value, which is all a cell\nconsumed by the workflow's own steps needs. A cell the workflow never\nreads — a conversation the *request binding* has to carry — has no such\nreader, so it states which binding continues it here rather than leaving\na runtime to guess."
+        },
         "optimistic_metadata_version": {
           "default": false,
           "type": "boolean"
