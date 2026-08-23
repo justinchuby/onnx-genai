@@ -126,9 +126,11 @@ impl fmt::Display for TracerError {
                     "GPU kernel tracing was requested but the CUPTI runtime could not \
                      be loaded or used: {cause}. GPU tracing requires the CUDA-13 \
                      CUPTI runtime library (libcupti.so.13), which nxrt dlopen's at \
-                     run time. Install it with `pip install nvidia-cuda-cupti-cu13` \
-                     (the CUPTI major version must match your CUDA major version and \
-                     NVIDIA driver — cu13 pairs with CUDA 13); on a system CUDA \
+                     run time. Install it with `pip install nvidia-cuda-cupti` \
+                     (NVIDIA now publishes one unsuffixed wheel per component, where \
+                     the version pin selects the CUDA major, so pin a 13.x release to \
+                     match CUDA 13 — the older `-cu13` spelling is a placeholder with \
+                     no real release and installs nothing usable); on a system CUDA \
                      toolkit make sure its `libcupti.so.13` is on the loader path. \
                      Searched: {searched}. GPU tracing is optional — omit the CUPTI \
                      tracing request to run without it."

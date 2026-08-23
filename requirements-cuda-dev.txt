@@ -32,6 +32,25 @@
 # `-cu12` / `-cu13` spellings still exist, but `-cu13` is a placeholder with no
 # real release, so do not reach for it.
 #
+# ---------------------------------------------------------------------------
+# Pin to the CUDA line your *driver* supports, not to the newest release.
+# ---------------------------------------------------------------------------
+#
+# NVRTC emits PTX for its own toolchain version, and the driver refuses PTX
+# newer than it understands:
+#
+#     CUDA_ERROR_UNSUPPORTED_PTX_VERSION
+#     "the provided PTX was compiled with an unsupported toolchain"
+#
+# It fails at module load, well after the library resolved, so it does not look
+# like a version problem. `nvidia-smi` reports the highest CUDA version the
+# installed driver accepts ("CUDA Version: 13.1" in the header); pin at or below
+# that. These pins target 13.1 — raise them only alongside a driver that
+# advertises the newer line.
+#
+# The kernel cache keys on the NVRTC version, so a downgrade invalidates cached
+# PTX rather than serving artifacts the driver will reject.
+#
 # Nothing here needs to be on PATH. Point the loader at the install root:
 #
 #   NXRT_CUDA_WHEEL_ROOTS=<the --target directory, or your site-packages>
@@ -40,15 +59,15 @@
 # loader path.
 
 # NVRTC — runtime compilation of the EP's fused kernels. Required.
-nvidia-cuda-nvrtc==13.3.33
+nvidia-cuda-nvrtc==13.1.115
 
 # cuBLAS / cuBLASLt — the GEMM backend. Required.
-nvidia-cublas==13.6.0.2
+nvidia-cublas==13.1.1.3
 
 # CUDA runtime (cudart) and, importantly, the headers NVRTC #includes
 # (`cuda_fp16.h`, `cuda_bf16.h`). Without these the f16/bf16 kernels fail to
 # compile at runtime with "require cuda_fp16.h and cuda_bf16.h". Required.
-nvidia-cuda-runtime==13.3.29
+nvidia-cuda-runtime==13.1.80
 
 # cuDNN — only needed for the cuDNN-backed softmax/reduce/conv/pool path. The
 # EP dlopens it lazily and runs without it, so this is optional; uncomment if
