@@ -2036,7 +2036,14 @@ fn explicit_affinity_shards_for(
             if cpus.is_empty() {
                 return None;
             }
-            let workers = reserve_single_group_headroom(total, cpus.len());
+            // Order through the same spread the default path uses. An explicit
+            // request selects *which* CPUs, never how workers are laid out
+            // across them; without this, `compact` would pin two workers per
+            // physical core and quietly reintroduce the defect #1729 fixed.
+            let cores = crate::core_topology::host();
+            let cpus = crate::decode_affinity::order_pin_targets(&cpus, cores);
+            let core_count = cores.map_or(0, |cores| cores.leaders_within(&cpus).len());
+            let workers = reserve_single_group_headroom(total, cpus.len(), core_count);
             Some(vec![NodeShard {
                 index: 0,
                 cpus,
@@ -2883,24 +2890,41 @@ mod tests {
 
     /// A `compact` / `node:<index>` request takes its CPU set from the shared
     /// planner -- the one that owns topology detection and the allowed-set
-    /// intersection -- and the dispatcher reservation still applies to it.
+    /// intersection -- and is then laid out by the *same* spread the default
+    /// path uses, so an explicit request cannot pin two workers onto one
+    /// physical core (the defect #1729 fixed).
     #[test]
     fn a_planned_affinity_request_pins_to_the_planned_cpus() {
-        let shards = explicit_affinity_shards_for(ExplicitAffinity::FromPlan, 4, || {
-            Some(vec![8, 9, 10, 11])
-        })
-        .expect("a planned request is honored");
+        let planned = vec![8, 9, 10, 11];
+        let shards =
+            explicit_affinity_shards_for(ExplicitAffinity::FromPlan, 4, || Some(planned.clone()))
+                .expect("a planned request is honored");
         assert_eq!(shards.len(), 1);
-        assert_eq!(shards[0].cpus, vec![8, 9, 10, 11]);
-        // Fully subscribed (4 workers, 4 CPUs), so one CPU is kept for the
-        // inline dispatcher exactly as on the default path.
-        assert_eq!(shards[0].workers, 3);
-        // With headroom the count is untouched.
-        let roomy = explicit_affinity_shards_for(ExplicitAffinity::FromPlan, 4, || {
-            Some(vec![0, 1, 2, 3, 4])
-        })
-        .expect("a planned request is honored");
-        assert_eq!(roomy[0].workers, 4);
+
+        // The request decides *which* CPUs: exactly the planned set, nothing
+        // invented and nothing dropped.
+        let mut got = shards[0].cpus.clone();
+        got.sort_unstable();
+        assert_eq!(got, planned, "the planned CPU set must be honored exactly");
+
+        // ...and the placement policy decides the order. Dropping the spread
+        // from this arm fails here on any host with core topology.
+        let cores = crate::core_topology::host();
+        assert_eq!(
+            shards[0].cpus,
+            crate::decode_affinity::order_pin_targets(&planned, cores),
+            "an explicit request must use the shared physical-core spread"
+        );
+        if let Some(cores) = cores {
+            // What the spread is actually for: the leading pin targets are one
+            // per physical core, so the first workers never share a front end.
+            let leaders = cores.leaders_within(&planned);
+            assert_eq!(
+                shards[0].cpus[..leaders.len()],
+                leaders[..],
+                "the first pin targets must be one per physical core"
+            );
+        }
     }
 
     /// If the planner cannot produce a CPU set -- no topology, an empty
@@ -2938,7 +2962,9 @@ mod tests {
             "`off` and `node:<index>` must not resolve to the same CPU set"
         );
         assert!(off[0].cpus.is_empty());
-        assert_eq!(node[0].cpus, vec![16, 17, 18, 19]);
+        let mut node_cpus = node[0].cpus.clone();
+        node_cpus.sort_unstable();
+        assert_eq!(node_cpus, vec![16, 17, 18, 19]);
     }
 
     /// `node_shards` must *consult* the explicit request, not merely have a
