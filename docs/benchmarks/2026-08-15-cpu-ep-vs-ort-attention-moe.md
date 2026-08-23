@@ -4998,9 +4998,9 @@ claims a millisecond.
 SDPA/MHA rows in 45.7-45.10, both placement mechanisms are now settled and they
 land on opposite sides: the `#1729` per-worker mask never reached these rows,
 and the process budget mask that *did* reach them spreads one thread per
-physical core, which for these rows is harmless (see the 26.2 caveat above). **The rows are
-still not clean, but the reason is no longer placement -- it is that the ORT arm
-escaped the mask entirely.** They need re-taking for that and for reason 1;
+physical core, which for these rows is harmless (see the 26.2 caveat above).
+**The rows are still not clean, but the reason is no longer placement -- it is
+that the ORT arm escaped the mask entirely.** They need re-taking for that and for reason 1;
 re-take with `ONNX_GENAI_CPU_DECODE_AFFINITY=off` and a `--native-only` or
 `--ort-intra-threads 1` arm, which removes both.
 
