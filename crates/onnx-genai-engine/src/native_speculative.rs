@@ -3,7 +3,8 @@
 //! This is the outer token loop used ONLY when a native-backend request opts
 //! into an *implemented* speculative mode (prompt-lookup / n-gram, greedy). The
 //! plain M=1 captured-graph greedy path
-//! ([`NativeDecodeSession::generate_with_callback`] -> `run_canonical_decode` ->
+//! ([`NativeDecodeSession::generate_with_callback`] -> the interpreter's
+//! declared generation loop ->
 //! `NativeLoopAdapter`) is never reached from here, so the 762 tok/s
 //! non-regression guarantee holds structurally: speculation-off control never
 //! enters this file.
@@ -53,7 +54,8 @@ pub(crate) fn verification_width(
 /// Outer speculative token loop bound to a single [`NativeDecodeSession`].
 ///
 /// Peer to the plain [`NativeDecodeSession::generate_with_callback`] loop; it
-/// owns the token loop itself because it cannot use `run_canonical_decode`, whose
+/// owns the token loop itself because it cannot use the single-token declared
+/// loop, whose
 /// backend contract is one token per step.
 pub(crate) struct NativeSpeculativeDriver<'a> {
     session: &'a mut NativeDecodeSession,

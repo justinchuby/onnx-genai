@@ -11,6 +11,7 @@ pipeline:
     manifest:
       adapter_abis: {}
       capabilities:
+      - bounded_state_recurrence
       - linear_effects
       - loop_induction_values
       - nested_control_flow
@@ -96,6 +97,19 @@ pipeline:
           kind: literal
         required: false
         default: false
+      package.sequence_capacity:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+          optional: false
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 16
       package.state_seed:
         contract:
           dtype: float32
@@ -228,6 +242,12 @@ pipeline:
           roles:
             input_ids: token_ids
             logits: logits
+        contract:
+          id: onnx-genai.autoregressive-decode
+          version: '1.0'
+          equivalence: semantic
+          bindings: {}
+          parameters: {}
         application_overridable: false
         effects: []
       token_policy:
@@ -409,7 +429,9 @@ pipeline:
         scope: invocation
         initializer: request.input_ids
         recurrence:
-          kind: invariant
+          kind: bounded
+          axis: 1
+          max: package.sequence_capacity
         management: workflow
     effects: {}
     serving:

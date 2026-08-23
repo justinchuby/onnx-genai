@@ -31,7 +31,7 @@ fn package() -> PathBuf {
 }
 
 fn engine() -> anyhow::Result<Engine> {
-    Engine::from_pipeline_dir(&package(), EngineConfig::default())
+    Engine::from_dir(&package(), EngineConfig::default())
 }
 
 fn request(

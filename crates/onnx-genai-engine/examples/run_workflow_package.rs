@@ -145,7 +145,7 @@ fn main() -> anyhow::Result<()> {
     anyhow::ensure!(!spec_paths.is_empty(), "at least one spec is required");
 
     let started = std::time::Instant::now();
-    let mut engine = Engine::from_pipeline_dir(&package_dir, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&package_dir, EngineConfig::default())?;
     let load_ms = started.elapsed().as_secs_f64() * 1000.0;
     for spec_path in &spec_paths {
         run_spec(&mut engine, spec_path, load_ms)?;

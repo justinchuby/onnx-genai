@@ -352,19 +352,16 @@ pub(super) struct TurnInput {
     pub(super) context_limit: Option<usize>,
 }
 
-/// The loaded model, which is either a single decoder graph or a declared
-/// multi-component pipeline. Only pipeline packages can accept image or audio
-/// input, and only when their metadata declares the corresponding contract.
-pub(super) enum Backend {
-    Text(Box<Engine>),
-    Pipeline(Box<PipelineBackend>),
-}
-
-/// A loaded pipeline package plus the contracts needed to feed it.
-pub(super) struct PipelineBackend {
+/// The loaded model, and the contracts needed to feed it.
+///
+/// One backend, because there is one runtime. What varies between packages is
+/// what they *declare*: a package whose metadata declares image or audio input
+/// carries [`Self::multimodal`], and a turn with an attachment is bound
+/// against those contracts. Nothing here asks which executor runs the model.
+pub(super) struct Backend {
     engine: Engine,
-    tokenizer: Tokenizer,
-    multimodal: MultimodalSpecs,
+    tokenizer: Option<Tokenizer>,
+    multimodal: Option<MultimodalSpecs>,
     generation_defaults: Option<GenerationDefaults>,
 }
 
@@ -575,27 +572,25 @@ impl Backend {
                 })?;
                 let engine =
                     Engine::from_dir_with_session_options(model_dir, config, session_options)?;
-                Ok(Self::Pipeline(Box::new(PipelineBackend {
+                Ok(Self {
                     engine,
-                    tokenizer,
-                    multimodal: setup.multimodal,
+                    tokenizer: Some(tokenizer),
+                    multimodal: Some(setup.multimodal),
                     generation_defaults: setup.generation_defaults,
-                })))
+                })
             }
-            None => Ok(Self::Text(Box::new(Engine::from_dir_with_session_options(
-                model_dir,
-                config,
-                session_options,
-            )?))),
+            None => Ok(Self {
+                engine: Engine::from_dir_with_session_options(model_dir, config, session_options)?,
+                tokenizer: None,
+                multimodal: None,
+                generation_defaults: None,
+            }),
         }
     }
 
-    /// Declared input contracts, or `None` for a single decoder graph.
+    /// Declared non-text input contracts, when the package declares any.
     pub(super) fn multimodal(&self) -> Option<&MultimodalSpecs> {
-        match self {
-            Self::Text(_) => None,
-            Self::Pipeline(pipeline) => Some(&pipeline.multimodal),
-        }
+        self.multimodal.as_ref()
     }
 
     /// Human-readable summary of the modalities this model accepts.
@@ -626,35 +621,23 @@ impl Backend {
 
     /// What the KV page pool holds right now, when the backend pages its KV.
     pub(super) fn page_usage(&self) -> Option<onnx_genai::kv::PageUsage> {
-        match self {
-            Self::Text(engine) => Some(engine.page_usage()),
-            Self::Pipeline(_) => None,
-        }
+        self.engine.pages_kv().then(|| self.engine.page_usage())
     }
 
     /// Cumulative KV page counters, when the backend keeps a page pool.
     pub(super) fn page_stats(&self) -> Option<onnx_genai::kv::PageStats> {
-        match self {
-            Self::Text(engine) => Some(engine.page_stats()),
-            Self::Pipeline(_) => None,
-        }
+        self.engine.pages_kv().then(|| self.engine.page_stats())
     }
 
     /// Concrete decoder backend selected for the loaded model.
     pub(super) fn decode_backend(&self) -> EngineDecodeBackend {
-        match self {
-            Self::Text(engine) => engine.decode_backend(),
-            Self::Pipeline(pipeline) => pipeline.engine.decode_backend(),
-        }
+        self.engine.decode_backend()
     }
 
     /// Execution-provider placement reported by the loaded model, not by the
     /// requested settings.
     pub(super) fn execution_provider_status(&self) -> String {
-        match self {
-            Self::Text(engine) => engine.execution_provider_status(),
-            Self::Pipeline(pipeline) => pipeline.engine.execution_provider_status(),
-        }
+        self.engine.execution_provider_status()
     }
 
     /// KV-cache accounting from the engine's resource governor.
@@ -662,8 +645,15 @@ impl Backend {
     /// Only a single-model engine runs a governor; a pipeline reports nothing
     /// rather than a zero that would read as "no KV cache".
     pub(super) fn kv_usage(&self) -> Option<profile::MemoryUsage> {
-        match self {
-            Self::Text(engine) => {
+        {
+            let engine = &self.engine;
+            if !engine.pages_kv() {
+                return Some(profile::MemoryUsage {
+                    memory_strategy_plan: Some(engine.memory_strategy_plan().clone()),
+                    ..profile::MemoryUsage::default()
+                });
+            }
+            {
                 let snapshot = engine.resource_snapshot();
                 let budget = snapshot.derived_budget;
                 let breakdown = snapshot.breakdown;
@@ -720,31 +710,26 @@ impl Backend {
                     }),
                 })
             }
-            Self::Pipeline(pipeline) => Some(profile::MemoryUsage {
-                memory_strategy_plan: Some(pipeline.engine.memory_strategy_plan().clone()),
-                ..profile::MemoryUsage::default()
-            }),
         }
     }
 
     /// Number of tokens the prompt occupies, when the backend can tell.
     pub(super) fn prompt_tokens(&self, prompt: &str) -> Option<usize> {
-        match self {
-            Self::Text(engine) => engine.tokenize(prompt).ok().map(|ids| ids.len()),
-            Self::Pipeline(pipeline) => pipeline.tokenizer.encode(prompt).ok().map(|ids| ids.len()),
+        match self.tokenizer.as_ref() {
+            Some(tokenizer) => tokenizer.encode(prompt).ok().map(|ids| ids.len()),
+            None => self.engine.tokenize(prompt).ok().map(|ids| ids.len()),
         }
     }
 
     /// Token id for an exact one-token marker string, when the loaded tokenizer
     /// represents it as one token.
     pub(super) fn single_token_id(&self, token: &str) -> Option<u32> {
-        let ids = match self {
-            Self::Text(engine) => engine.tokenize(token).ok()?,
-            Self::Pipeline(pipeline) => pipeline
-                .tokenizer
+        let ids = match self.tokenizer.as_ref() {
+            Some(tokenizer) => tokenizer
                 .token_id(token)
                 .map(|id| vec![id])
-                .or_else(|| pipeline.tokenizer.encode(token).ok())?,
+                .or_else(|| tokenizer.encode(token).ok())?,
+            None => self.engine.tokenize(token).ok()?,
         };
         match ids.as_slice() {
             [id] => Some(*id),
@@ -764,10 +749,7 @@ impl Backend {
     }
 
     pub(super) fn effective_max_context(&self, options: &GenerateOptions) -> Option<usize> {
-        match self {
-            Self::Text(engine) => engine.effective_max_context(options),
-            Self::Pipeline(pipeline) => pipeline.engine.effective_max_context(options),
-        }
+        self.engine.effective_max_context(options)
     }
 
     /// The package's declared generation defaults, when it declared any.
@@ -780,14 +762,13 @@ impl Backend {
     /// under argmax. Explicit CLI flags still win — this only supplies the
     /// values the caller left unstated.
     pub(super) fn generation_defaults(&self) -> Option<&GenerationDefaults> {
-        match self {
-            Self::Text(engine) => engine
+        self.generation_defaults.as_ref().or_else(|| {
+            self.engine
                 .metadata()
                 .generation
                 .as_ref()
-                .and_then(|generation| generation.defaults.as_ref()),
-            Self::Pipeline(pipeline) => pipeline.generation_defaults.as_ref(),
-        }
+                .and_then(|generation| generation.defaults.as_ref())
+        })
     }
 
     pub(super) fn generate(
@@ -801,37 +782,30 @@ impl Backend {
             turn.images.len(),
             turn.audio.len(),
         )?;
-        match self {
-            Self::Text(engine) => {
-                let request = GenerateRequest {
-                    prompt: GeneratePrompt::Text(turn.prompt),
-                    options: turn.options,
-                };
-                engine.generate_with_callback(request, Some(callback))
-            }
-            Self::Pipeline(pipeline) => {
-                let attachments = turn.images.len() + turn.audio.len();
-                let required = pipeline.multimodal.sole_modality();
-                let request =
-                    build_pipeline_request(&pipeline.tokenizer, &pipeline.multimodal, turn)?;
-                pipeline
-                    .engine
-                    .generate_pipeline_with_callback(request, Some(callback))
-                    .map_err(|error| match required {
-                        // A multimodal package can require its non-text input;
-                        // say so rather than leaving a bare "missing input".
-                        Some(modality)
-                            if attachments == 0 && is_missing_required_input(&error) =>
-                        {
-                            error.context(format!(
-                                "the turn carried no attachment, but this model declares {modality} input. \
-                                 How: attach one with `/{modality} <path>` in the REPL, or `--{modality} <path>` on the command line."
-                            ))
-                        }
-                        _ => error,
-                    })
-            }
-        }
+        let (Some(tokenizer), Some(multimodal)) =
+            (self.tokenizer.as_ref(), self.multimodal.as_ref())
+        else {
+            let request = GenerateRequest {
+                prompt: GeneratePrompt::Text(turn.prompt),
+                options: turn.options,
+            };
+            return self.engine.generate_with_callback(request, Some(callback));
+        };
+        let attachments = turn.images.len() + turn.audio.len();
+        let required = multimodal.sole_modality();
+        let request = build_pipeline_request(tokenizer, multimodal, turn)?;
+        self.engine
+            .generate_with_pipeline_callbacks(request, None, Some(callback))
+            .map_err(|error| match required {
+                // A multimodal package can require its non-text input; say so
+                // rather than leaving a bare "missing input".
+                Some(modality) if attachments == 0 && is_missing_required_input(&error) => error
+                    .context(format!(
+                        "the turn carried no attachment, but this model declares {modality} input. \
+                         How: attach one with `/{modality} <path>` in the REPL, or `--{modality} <path>` on the command line."
+                    )),
+                _ => error,
+            })
     }
 }
 

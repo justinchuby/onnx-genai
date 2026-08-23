@@ -745,7 +745,7 @@ pipeline:
             ("decoder.onnx.textproto", FEATURE_IDENTITY),
         ],
     )?;
-    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
     let png = vec![
         137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 2,
         0, 0, 0, 144, 119, 83, 222, 0, 0, 0, 12, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 0, 0,
@@ -827,7 +827,7 @@ pipeline:
             ("empty.onnx.textproto", EMPTY_FEATURES),
         ],
     )?;
-    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
 
     let absent = engine.run_pipeline(PipelineGenerateRequest::new(GenerateRequest::new(
         GeneratePrompt::TokenIds(vec![]),
@@ -953,7 +953,7 @@ pipeline:
             ("incompatible-sampler.onnx.textproto", ARGMIN_SAMPLER),
         ],
     )?;
-    let error = Engine::from_pipeline_dir(&invalid_root, EngineConfig::default())
+    let error = Engine::from_dir(&invalid_root, EngineConfig::default())
         .err()
         .expect("unknown inferred ONNX port must fail at load");
     assert!(
@@ -972,7 +972,7 @@ pipeline:
             ("incompatible-sampler.onnx.textproto", ARGMIN_SAMPLER),
         ],
     )?;
-    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
     let logits = || Value::from_slice_f32(&[0.1, 0.7, 0.2, 2.0, 1.0, 3.0], &[2, 3]);
     let mask = || Value::from_raw_bytes(vec![1; 6], &[2, 3], DataType::Bool);
     let mut generate = GenerateRequest::new(GeneratePrompt::TokenIds(vec![]));
@@ -1087,7 +1087,7 @@ pipeline:
         metadata,
         &[("decoder.onnx.textproto", CACHE_DECODER)],
     )?;
-    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
     let output = engine.run_pipeline(
         PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
             .with_input("initial_cache", Value::from_slice_f32(&[1.0], &[1, 1])?)
@@ -1205,7 +1205,7 @@ pipeline:
             ("eos.onnx.textproto", EOS_PREDICATE),
         ],
     )?;
-    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
     let run = |engine: &mut onnx_genai_engine::Engine, min_p: f32| {
         let mut generate = GenerateRequest::new(GeneratePrompt::TokenIds(vec![]));
         generate.options.min_p = min_p;
@@ -1336,7 +1336,7 @@ pipeline:
         onnx_runtime_loader::read_model_binary(root.join("bias.onnx.textproto"))?,
     )?;
 
-    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
     // Warm the largest bucket first, then interleave B=1/2/4. Each shape keeps
     // a distinct fixed-address binding and graph id.
     for batch in [4_i64, 1, 2, 4, 1, 2, 4, 1, 2] {
@@ -1420,7 +1420,7 @@ pipeline:
             ("sampler.onnx.textproto", SIMPLE_GREEDY),
         ],
     )?;
-    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
     let output = engine.run_pipeline(
         PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
             .with_input(
@@ -1465,7 +1465,7 @@ pipeline:
         mode: replace
 "#;
     let root = package("symbolic-literal", metadata, &[])?;
-    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
     let output = engine.run_pipeline(PipelineGenerateRequest::new(GenerateRequest::new(
         GeneratePrompt::TokenIds(vec![]),
     )))?;
@@ -1525,7 +1525,7 @@ pipeline:
         metadata,
         &[("identity.onnx.textproto", INT64_MATRIX_IDENTITY)],
     )?;
-    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
     let request =
         PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
             .with_input("prompt", Value::from_slice_i64(&[1, 2], &[1, 2])?)
@@ -1601,7 +1601,7 @@ pipeline:
         metadata,
         &[("pair.onnx.textproto", INT64_MATRIX_ADD)],
     )?;
-    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
     let request =
         PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
             .with_input("prompt", Value::from_slice_i64(&[1, 2], &[1, 2])?)
@@ -1752,7 +1752,7 @@ pipeline:
             ("not.onnx.textproto", NOT),
         ],
     )?;
-    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
     let options = onnx_genai_engine::GenerateOptions {
         max_new_tokens: 3,
         seed: Some(7),
@@ -1888,7 +1888,7 @@ pipeline:
           mode: replace
 "#;
     let root = package("solver", metadata, &[("solver.onnx.textproto", EULER)])?;
-    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
     let request =
         PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
             .with_input("sample", Value::from_slice_f32(&[1.0, 2.0], &[1, 2])?)
@@ -1970,7 +1970,7 @@ pipeline:
         carried: []
 "#;
     let root = package("nested-induction", metadata, &[])?;
-    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
     let request =
         PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
             .with_input("outer_count", Value::from_slice_i64(&[2], &[])?)
@@ -2041,7 +2041,7 @@ pipeline:
         masked_metadata,
         &[("update.onnx.textproto", MASKED_UPDATE)],
     )?;
-    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
     let request =
         PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
             .with_input("current", Value::from_slice_i64(&[1, 99, 99], &[1, 3])?)
@@ -2113,7 +2113,7 @@ pipeline:
         speculative_metadata,
         &[("verifier.onnx.textproto", SPECULATIVE_ACCEPTANCE)],
     )?;
-    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
     let request =
         PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
             .with_input(
@@ -2251,7 +2251,7 @@ pipeline:
             ("prefix.onnx.textproto", INT64_PREFIX),
         ],
     )?;
-    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
     let request =
         PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
             .with_input(
@@ -2615,7 +2615,7 @@ pipeline:
             ("guided.onnx.textproto", GUIDED_SAMPLER),
         ],
     )?;
-    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
     let target = [
         0.0, 1.0, 0.0, 0.0, 0.0, // token 1
         0.0, 0.0, 1.0, 0.0, 0.0, // token 2
@@ -2763,7 +2763,7 @@ pipeline:
           mode: replace
 "#;
     let root = package("telemetry-adapter", metadata, &[])?;
-    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
     let request =
         PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])));
     let output = engine.run_pipeline(request)?;
@@ -2911,7 +2911,7 @@ pipeline:
             ("less.onnx.textproto", LESS),
         ],
     )?;
-    let error = Engine::from_pipeline_dir(&invalid_root, EngineConfig::default())
+    let error = Engine::from_dir(&invalid_root, EngineConfig::default())
         .err()
         .expect("branch-local session state must escape through a phi output");
     assert!(
@@ -2929,7 +2929,7 @@ pipeline:
             ("less.onnx.textproto", LESS),
         ],
     )?;
-    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
     let first_options = onnx_genai_engine::GenerateOptions {
         max_new_tokens: 4,
         ..Default::default()
@@ -3176,7 +3176,7 @@ pipeline:
             ("advisory-counter.onnx.textproto", ADD_STATE),
         ],
     )?;
-    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
 
     let request = |iterations, observation| {
         let options = onnx_genai_engine::GenerateOptions {
@@ -3383,7 +3383,7 @@ pipeline:
           mode: replace
 "#;
     let root = package("speculative-branch", metadata, &[])?;
-    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
 
     for (accept, tokens) in [(true, vec![11]), (false, vec![22])] {
         let request = PipelineGenerateRequest::new(GenerateRequest {

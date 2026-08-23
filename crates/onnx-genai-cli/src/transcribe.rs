@@ -170,9 +170,9 @@ impl Transcriber {
             text.push_str(&token.text);
             Ok(())
         };
-        let result = self
-            .engine
-            .generate_pipeline_with_callback(request, Some(&mut callback));
+        let result =
+            self.engine
+                .generate_with_pipeline_callbacks(request, None, Some(&mut callback));
         GENERATING.store(false, Ordering::SeqCst);
         crate::flush_deferred_tracing()?;
         result?;

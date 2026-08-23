@@ -46,16 +46,23 @@ fn text_request(prompt: &str, tokens: usize) -> GenerateRequest {
 /// benchmarks each used to do separately (and could each get wrong).
 #[test]
 fn one_constructor_loads_both_package_shapes() -> anyhow::Result<()> {
+    // Both report the workflow they declare, from the package. Neither reports
+    // a *kind*: there is no question a caller could ask that would tell them
+    // which executor implements a declared step, because a caller has nothing
+    // to do differently either way.
     let decoder = Engine::from_dir(&decoder_package(), EngineConfig::default())?;
+    let decoder_workflow = decoder
+        .package_workflow()
+        .expect("a loaded package declares a workflow");
     assert!(
-        !decoder.is_workflow(),
-        "a bare-decoder package must not report itself as a workflow"
+        onnx_genai_metadata::sole_decoder_component(decoder_workflow).is_some(),
+        "the bare-decoder package declares one decoder component"
     );
 
     let workflow = Engine::from_dir(&workflow_package(), EngineConfig::default())?;
     assert!(
-        workflow.is_workflow(),
-        "a package declaring pipeline.workflow must report itself as one"
+        workflow.package_workflow().is_some(),
+        "a package declaring pipeline.workflow reports it verbatim"
     );
     Ok(())
 }
@@ -69,7 +76,6 @@ fn decoder_text_generation_runs_through_the_one_runtime() -> anyhow::Result<()> 
     let mut engine = Engine::from_dir(&decoder_package(), EngineConfig::default())?;
     let first = engine.generate(text_request("hello world", 6))?;
     assert_eq!(first.token_ids.len(), 6, "{first:?}");
-    assert!(!engine.is_workflow());
 
     // Deterministic: the same request through the same entry point twice.
     let second = engine.generate(text_request("hello world", 6))?;
@@ -100,22 +106,27 @@ fn session_lifecycle_is_one_api() -> anyhow::Result<()> {
         "a closed session must no longer resolve"
     );
 
-    // A workflow package owns no engine sessions. It must say so, not silently
-    // hand back a session that nothing backs.
+    // A session is a conversation, not a decode-core feature. A package whose
+    // components the interpreter invokes keeps its conversation in the
+    // session-scoped cells its workflow declares, so the same three calls work
+    // and mean the same thing.
     let mut workflow = Engine::from_dir(&workflow_package(), EngineConfig::default())?;
-    let error = workflow
-        .create_session()
-        .expect_err("a workflow package must refuse to open an engine session");
-    let message = format!("{error:#}");
+    let session = workflow.create_session()?;
+    assert_eq!(workflow.session_token_count(session)?, 0);
+    workflow.close_session(session)?;
     assert!(
-        !message.is_empty(),
-        "a workflow package must explain why it has no engine sessions"
+        workflow.session_token_count(session).is_err(),
+        "a closed session must no longer resolve, whichever runtime state held it"
     );
     Ok(())
 }
 
-/// Diagnostics that only one shape can answer degrade to an empty answer rather
-/// than an error or a panic, so a caller can report uniformly.
+/// Every diagnostic answers for every package, with a fact rather than an
+/// error.
+///
+/// A diagnostic that failed for one kind of package would be a package kind by
+/// another name: a caller would learn which it held by seeing which question
+/// errored, and would start branching on that.
 #[test]
 fn shape_specific_diagnostics_are_uniform() -> anyhow::Result<()> {
     let decoder = Engine::from_dir(&decoder_package(), EngineConfig::default())?;
@@ -133,10 +144,16 @@ fn shape_specific_diagnostics_are_uniform() -> anyhow::Result<()> {
     let workflow = Engine::from_dir(&workflow_package(), EngineConfig::default())?;
     assert!(!workflow.execution_provider_status().is_empty());
     let _ = workflow.resource_snapshot();
-    // A workflow package can be asked for its component models; a decoder one
-    // says so rather than pretending to have none.
-    assert!(workflow.models().is_ok());
-    assert!(decoder.models().is_err());
+    // Both answer the same question about their component models. A package
+    // whose one graph the decode core executes has no interpreter component
+    // sessions, and reports exactly that — an empty set is the honest answer,
+    // where an error would have been a caller-visible package kind.
+    assert!(!workflow.models()?.sessions.is_empty());
+    assert!(
+        decoder.models()?.sessions.is_empty(),
+        "the decode core holds this package's one graph, so the interpreter builds no component \
+         session for it"
+    );
     Ok(())
 }
 

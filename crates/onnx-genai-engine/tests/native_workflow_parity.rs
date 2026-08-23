@@ -47,7 +47,7 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn ort_engine(root: &Path) -> anyhow::Result<Engine> {
-    Engine::from_pipeline_dir(
+    Engine::from_dir(
         root,
         EngineConfig {
             decode_backend: EngineDecodeBackend::Ort,
@@ -60,7 +60,7 @@ fn native_engine(root: &Path) -> anyhow::Result<Engine> {
     // Pin the CPU native device so the backend-agnostic parity scenarios are
     // deterministic regardless of build features or a GPU being present — only
     // the `native-cuda` device-residency test drives the CUDA device.
-    Engine::from_pipeline_dir(
+    Engine::from_dir(
         root,
         EngineConfig {
             decode_backend: EngineDecodeBackend::Native,
@@ -73,7 +73,7 @@ fn native_engine(root: &Path) -> anyhow::Result<Engine> {
 /// A native engine pinned to CUDA device 0, for the device-residency test.
 #[cfg(feature = "native-cuda")]
 fn native_cuda_engine(root: &Path) -> anyhow::Result<Engine> {
-    Engine::from_pipeline_dir(
+    Engine::from_dir(
         root,
         EngineConfig {
             decode_backend: EngineDecodeBackend::Native,

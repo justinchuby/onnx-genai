@@ -1,38 +1,84 @@
-perf(speculative): a rejected proposal no longer copies the whole KV cache
+feat(engine): one interpreter executes every package's declared loop
 
-First residency fix from the CUDA plan, taking its ordering: rollback before
-`propose_chained`, because it is both the largest transfer and the smallest
-change.
+This is checkpoints C through F of the convergence: the fused decode session
+stops being a *second runtime* and becomes an executor for one declared step.
 
-Rolling back a rejected proposal called `host_copy_of` on every
-`rollback_state` cell — the entire KV cache, device to host, to drop a few
-positions — then uploaded it again on the next bind. Per rejection. The report
-identifies it as the single worst copy in the workflow, and it is: the other
-sites move a logits row or a carry, this one moves the cache.
+**What actually changed.** `Engine` now holds one non-optional
+`WorkflowRuntime`. Every request — a bare decoder, a composite pipeline, a
+prioritized scheduler step — runs `run_workflow_node` over the workflow the
+package shipped. The loop bound, the liveness predicate, the carried state, the
+emit that publishes tokens and the stop are read from that document, by the
+interpreter, in all cases. What differs between packages is which executor
+implements a declared *node*, and that is answered by the contract the node
+names: a component declaring `onnx-genai.autoregressive-decode` is run by the
+decode core when this runtime has one, and invoked from its own artifact when it
+does not. There is no third path and no `if is_workflow()`.
 
-`truncate_state_cell` avoids it where the shape allows. A rollback keeps a
-*prefix* along the sequence axis; when every axis before that one has extent 1 —
-a batch-1 seq-major cache, which is what the native backend declares — the kept
-elements are already a contiguous prefix of the same buffer. The truncation is
-then a smaller view of it: `alias_with_shape`, no copy, and a device tensor
-stays on the device.
+`pipeline/canonical_decode.rs` is deleted (771 lines), along with
+`Engine::lowered_workflow`, `canonical_workflow()` and its nine guard call
+sites, `WorkflowShape`/`declared_workflow_shape`, `is_workflow()`,
+`workflow_shape()`, `WorkflowShapeReport`, `from_pipeline_dir*`,
+`generate_pipeline_with_callback(s)`, `workflow_generate`,
+`forget_canonical_workflow_for_test`, the server's `start_pipeline` /
+`run_pipeline_driver` / `run_pipeline_generation` / `GeneratePipeline`, and the
+CLI's `Backend::{Text,Pipeline}` enum. The shape-dispatch ledger, which was 23
+files, is now empty but for the gate itself.
 
-It returns `None` rather than guessing when the kept elements are strided. A
-head-major `[batch, heads, sequence, head_dim]` cache interleaves its sequence
-across heads, so a prefix of the axis is not a prefix of the buffer; returning a
-view there would hand back the wrong elements, which is worse than the copy it
-would have avoided. Those cells fall back to the host path, and the fallback now
-says at its call site that this is where the large transfer happens rather than
-leaving it implicit inside `host_copy_of`. A strided device truncate needs an
-execution-provider copy and is the remaining work.
+**Three things this surfaced that were not visible before.**
 
-Five tests, including the one that makes the fast path safe at all: the view and
-the host truncation must agree element for element across every length. Two
-implementations of one operation are only trustworthy as a pair.
+*The decoder component declared no contract.* The emitter had gained
+`AUTOREGRESSIVE_DECODE_CONTRACT`, but the fourteen converted fixtures predate
+it, so nothing in the tree actually declared the step it was executing. They are
+re-emitted here through a new `migrate_model_io --reemit`, which reads the ABI
+back out of the workflow the package already declares — the direction
+`decoder_workflow_roundtrip` pins as exact — so a rebuild states the ports the
+package always stated.
 
-Verified: engine speculative suites (gemma4_chained_workflow, chained_proposer_real,
-native_workflow_parity, tree_speculative, speculative_speedup) green on CPU;
-**H200 CUDA — gemma4_chained_workflow 8, native_workflow_parity 12 including the
-device-resident multicomponent case**; fmt; clippy `-D warnings`.
+*The `sequence` cell's recurrence was wrong.* It said `invariant` while
+carrying the prompt on the first iteration and one token on every later one.
+Nothing could honour that, and nothing had to, because no interpreter was
+walking the loop. It now declares `bounded` against a package-declared sequence
+capacity, which is what is actually true.
+
+*The liveness read was being skipped for host-written predicates.*
+`max_iterations_only` exists so a caller that disabled EOS stopping does not pay
+a device→host sync for a predicate that cannot go false. A predicate a *runtime*
+executor writes carries more than EOS — the context bound, stop strings, a
+constraint reaching its end — so the optimization does not apply there. Without
+this the context-limit stop was silently ignored and generation ran into a model
+window overflow.
+
+**Real finish reasons, and a check that the emit is load-bearing.** The
+composite drive no longer fabricates `MaxTokens`, `prefix_cache_hit_len: 0` and
+`logprobs: None`. It reports the core's stop when a core reached one, the
+interpreter's own record of whether the predicate ended the loop otherwise, and
+the prefix/logprob facts of whoever scored the tokens — `None` for a package
+whose sampler is an ONNX component, which is a fact about the package rather
+than a missing feature. The emitted stream and the committed one are compared
+and a mismatch refuses: an emit that dropped or duplicated a token would
+otherwise be invisible.
+
+**The scheduler's per-token drive runs the same loop.** It cannot call a
+function that loops to completion, so the loop's phases are now
+`begin_workflow_loop` / `advance_workflow_loop` / `end_workflow_loop`, driven in
+a `for` by the interpreter and one-at-a-time by `WorkflowGenerationCursor`. One
+statement of the semantics, two ways to drive it — rather than a second walker
+that could disagree.
+
+**Sessions work for every package.** A session is a conversation, not a
+decode-core feature. A package whose components the interpreter invokes keeps
+its conversation in the `scope: session` cells its workflow declares, so
+`create_session` / `session_token_count` / `close_session` and the HTTP session
+header mean the same thing for it. `/v1/completions` and `/v1/sessions` no
+longer reject workflow packages.
+
+**Debug fields report the document, not the executor.** `/v1/debug/config`
+replaces `pipeline` and `workflow_shape` with the package's declared component
+counts and whether it declares a generation loop.
+
+Verified: 465 engine lib tests; every engine integration test; 280 server tests;
+metadata, CLI and C API suites; fmt; clippy `-D warnings` on every crate this
+touches.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+Signed-off-by: Copilot <223556219+Copilot@users.noreply.github.com>

@@ -110,7 +110,7 @@ fn run() -> anyhow::Result<()> {
     }
 
     let iterations = args.steps.unwrap_or(report.plan.iterations() as usize);
-    let mut engine = Engine::from_pipeline_dir(&args.package, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&args.package, EngineConfig::default())?;
 
     let options = GenerateOptions {
         max_new_tokens: iterations,

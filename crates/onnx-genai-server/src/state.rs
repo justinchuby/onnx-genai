@@ -748,7 +748,7 @@ fn build_pipeline_handle(
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Failed to load pipeline tokenizer: {e}"))?;
 
-    let engine = Engine::from_pipeline_dir_with_memory_authority_provider(
+    let engine = Engine::from_dir_with_memory_authority_provider(
         model_dir,
         config.engine_config.clone(),
         authorities,
@@ -787,10 +787,14 @@ fn build_pipeline_handle(
     // superseded generation metadata surfaces, so the pipeline path resolves
     // sampling from request options only — same as the non-pipeline path above.
     let generation_defaults = None;
+    // The same admission the decoder path applies: an explicit `--max-batch`
+    // the decode path cannot honor is refused rather than silently ignored.
+    enforce_requested_max_batch(&engine, config.max_batch)?;
+    let requested_max_batch = config.max_batch.unwrap_or(DEFAULT_MAX_BATCH);
     ModelHandle::new(ModelHandleParts {
         id: model_id,
         model_dir: model_dir.to_path_buf(),
-        engine: EngineDriver::start_pipeline(engine, config.max_queue_depth),
+        engine: EngineDriver::start(engine, requested_max_batch, config.max_queue_depth),
         tokenizer: Arc::new(tokenizer),
         chat_template: chat_template.map(Arc::new),
         model_max_context,

@@ -867,8 +867,11 @@ mod tests {
     fn stub_engine_driver() -> EngineDriver {
         let (tx, _rx) = mpsc::channel(1);
         EngineDriver {
-            is_workflow: false,
-            workflow_shape: "none",
+            workflow_facts: crate::driver::WorkflowFacts {
+                components: 0,
+                graph_components: 0,
+                declares_generation_loop: false,
+            },
             commands: tx,
             generation_capacity: Arc::new(Semaphore::new(0)),
             generation_capacity_size: 0,

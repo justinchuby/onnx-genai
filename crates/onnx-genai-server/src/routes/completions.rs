@@ -6,11 +6,6 @@ pub(crate) async fn completions(
     ApiJson(request): ApiJson<CompletionRequest>,
 ) -> Result<Response, ApiError> {
     let handle = resolve_model(&state.registry, &request.model).await?;
-    if handle.engine.is_workflow() {
-        return Err(ApiError::bad_request(
-            "/v1/completions is not supported by pipeline models",
-        ));
-    }
     validate_completion_request(&request, &state.config)?;
     let session_id = session_id_from_headers(&headers)?;
     if request.suffix.is_some() && handle.fim_config.is_none() {
@@ -334,16 +329,10 @@ pub(crate) async fn chat_completions(
     let handle = resolve_model(&state.registry, &request.model).await?;
     validate_request(&request, &state.config)?;
     let requested_session_id = session_id_from_headers(&headers)?;
-    // OpenAI-compatible clients such as OpenCode attach their own session key
-    // while still resending the complete message history. Pipeline engines
-    // already retain and rewind their one device-resident context internally,
-    // so ignore the transport hint instead of rejecting an otherwise valid
-    // stateless request.
-    // A workflow package owns no engine sessions, so a client session header is
-    // not an engine session for it.
-    let session_id = (!handle.engine.is_workflow())
-        .then_some(requested_session_id)
-        .flatten();
+    // The session header names a conversation. Which runtime state continues it
+    // — a decode core's paged KV sequence, or the interpreter's session-scoped
+    // cells — is the engine's business, and it resolves that itself.
+    let session_id = requested_session_id;
     let image_urls = request.image_urls();
     let input_audio = request.input_audio();
     // One admission policy, shared with the CLI, so both front ends accept and
@@ -1353,7 +1342,7 @@ async fn submit_completion(
             };
             handle
                 .engine
-                .generate(session_id, request)
+                .generate(session_id, request, None)
                 .await
                 .map_err(map_generate_submit_error)
         }

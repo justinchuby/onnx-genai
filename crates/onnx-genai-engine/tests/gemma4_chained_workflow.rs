@@ -23,7 +23,7 @@ use chained::{
 };
 
 fn engine(root: &Path) -> anyhow::Result<Engine> {
-    Engine::from_pipeline_dir(root, EngineConfig::default())
+    Engine::from_dir(root, EngineConfig::default())
 }
 
 #[test]

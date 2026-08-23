@@ -77,12 +77,11 @@ mod model;
 #[cfg(feature = "native-backend")]
 mod placement;
 mod runtime;
-pub(crate) use runtime::{apply_eos_policy, canonical_workflow};
+pub(crate) use runtime::apply_eos_policy;
 pub(crate) mod session_state;
 mod speculative_load;
 mod workflow_api;
 pub use metadata::graph_port_contracts;
-pub use workflow_api::WorkflowShapeReport;
 
 pub(crate) use decode_backend::*;
 pub(crate) use governor::*;
@@ -194,8 +193,7 @@ mod tests {
         )?;
 
         Ok(Engine {
-            workflow: None,
-            lowered_workflow: Some(crate::pipeline::canonical_decode::test_canonical_workflow()),
+            workflow: Box::new(crate::pipeline::generation::test_decoder_runtime()?),
             decode_backend: EngineDecodeBackend::Ort,
             metadata: InferenceMetadata::default(),
             metadata_hints: MetadataHints::default(),
@@ -205,8 +203,10 @@ mod tests {
             kv_model: None,
             decode_path: ModelDecodePath::Generic,
             scheduler: Scheduler::new(onnx_genai_scheduler::SchedulerConfig::default()),
-            governor: Some(governor),
+            governor,
             sessions,
+            workflow_sessions: HashMap::new(),
+            workflow_session_counter: 0,
             session: None,
             #[cfg(feature = "native-backend")]
             native_session: None,

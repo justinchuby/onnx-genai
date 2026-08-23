@@ -91,7 +91,7 @@ fn dummy_vision() -> anyhow::Result<(Value, Value)> {
 }
 
 fn build_engine(dir: &Path) -> anyhow::Result<Engine> {
-    Engine::from_pipeline_dir(
+    Engine::from_dir(
         dir,
         EngineConfig {
             pipeline_cache_bytes: 0,

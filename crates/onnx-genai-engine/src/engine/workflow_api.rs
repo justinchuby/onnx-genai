@@ -12,58 +12,47 @@
 //! constructor family, and one method per operation that resolves the package's
 //! own declaration internally.
 
-use std::path::Path;
-use std::sync::Arc;
-
 use anyhow::Context as _;
-use onnx_genai_ort::{PipelineModels, SessionOptions};
+use onnx_genai_ort::PipelineModels;
 
-use crate::config::{EngineConfig, GenerateRequest, GenerateResult, GenerateTokenCallback};
+use crate::config::{GenerateResult, GenerateTokenCallback};
 use crate::engine::Engine;
-/// What kind of workflow a runtime executes.
-///
-/// Every package declares a workflow; this reports its *shape*, which is the
-/// thing an operator can act on. It never implies the runtime built the
-/// workflow — nothing does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkflowShapeReport {
-    /// One ONNX component consuming the sequence and producing logits.
-    SingleDecoder,
-    /// Several components, driven step by step by the generic interpreter.
-    Composite,
-    /// No workflow at all, which no loaded package can be.
-    None,
-}
-
-impl WorkflowShapeReport {
-    /// Stable operator-facing label.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::SingleDecoder => "single_decoder",
-            Self::Composite => "composite",
-            Self::None => "none",
-        }
-    }
-}
-
 use crate::pipeline::{
     PipelineGenerateRequest, PipelineOutputs, PipelineTensors, WorkflowPerformanceDiagnostic,
     WorkflowRuntime,
 };
 
 impl Engine {
-    /// The shape of the workflow this runtime executes.
-    pub fn workflow_shape(&self) -> WorkflowShapeReport {
-        match self.package_workflow() {
-            Some(workflow) => {
-                if onnx_genai_metadata::sole_decoder_component(workflow).is_some() {
-                    WorkflowShapeReport::SingleDecoder
-                } else {
-                    WorkflowShapeReport::Composite
-                }
-            }
-            None => WorkflowShapeReport::None,
-        }
+    /// How many components the package's declared workflow names.
+    ///
+    /// A fact about the serialized document, for diagnostics. Nothing branches
+    /// on it: a caller has the same operations available whatever it says.
+    pub fn workflow_component_count(&self) -> usize {
+        self.workflow.workflow_spec().components.len()
+    }
+
+    /// How many of those components name an ONNX graph.
+    pub fn workflow_graph_component_count(&self) -> usize {
+        self.workflow
+            .workflow_spec()
+            .components
+            .values()
+            .filter(|component| {
+                !matches!(
+                    component.implementation,
+                    onnx_genai_metadata::ComponentImplementation::Binding
+                )
+            })
+            .count()
+    }
+
+    /// Whether the declared workflow contains a generation loop.
+    pub fn workflow_declares_generation_loop(&self) -> bool {
+        self.workflow
+            .workflow_spec()
+            .steps
+            .iter()
+            .any(|step| matches!(step, onnx_genai_metadata::WorkflowStep::Loop { .. }))
     }
 
     /// The workflow this package declares, exactly as authored.
@@ -72,8 +61,7 @@ impl Engine {
     /// synthesized, so a diagnostic that prints this is printing what the
     /// package on disk says, not a runtime reconstruction of it.
     pub fn package_workflow(&self) -> Option<&onnx_genai_metadata::WorkflowSpec> {
-        crate::engine::canonical_workflow(self.workflow.as_deref(), self.lowered_workflow.as_ref())
-            .ok()
+        Some(self.workflow.workflow_spec())
     }
 
     /// The package's workflow rendered as the document it was read from.
@@ -84,68 +72,12 @@ impl Engine {
         serde_yaml::to_string(workflow).map_err(Into::into)
     }
 
-    /// Drop the canonical workflow, so the next request has no path to take.
-    ///
-    /// Test-only, and **not** public: nothing outside this crate may produce a
-    /// runtime with no workflow, because that state is precisely what the
-    /// loader exists to prevent. Exposing it would make the unreachable state
-    /// reachable, which is the opposite of what the refusal it supports is
-    /// asserting.
-    #[cfg(test)]
-    pub(crate) fn forget_canonical_workflow_for_test(&mut self) {
-        self.workflow = None;
-        self.lowered_workflow = None;
+    pub(crate) fn workflow_runtime(&self) -> &WorkflowRuntime {
+        &self.workflow
     }
 
-    /// Whether this package is executed by the workflow interpreter.
-    ///
-    /// Callers should rarely need this: every operation below already resolves
-    /// the right execution path. It exists for diagnostics and for the few
-    /// capability reports (batching, KV telemetry) whose *answer* genuinely
-    /// differs between a composed workflow and a single decoder.
-    pub fn is_workflow(&self) -> bool {
-        self.workflow.is_some()
-    }
-
-    pub(crate) fn workflow_runtime(&self) -> anyhow::Result<&WorkflowRuntime> {
-        self.workflow.as_deref().context(
-            "this package declares no pipeline.workflow, so it has no workflow runtime state",
-        )
-    }
-
-    pub(crate) fn workflow_runtime_mut(&mut self) -> anyhow::Result<&mut WorkflowRuntime> {
-        self.workflow.as_deref_mut().context(
-            "this package declares no pipeline.workflow, so it has no workflow runtime state",
-        )
-    }
-
-    /// Load a package that declares `pipeline.workflow`.
-    pub fn from_pipeline_dir(pipeline_dir: &Path, config: EngineConfig) -> anyhow::Result<Self> {
-        WorkflowRuntime::from_dir_with_config(pipeline_dir, config).and_then(Self::from_workflow)
-    }
-
-    pub fn from_pipeline_dir_with_memory_authority_provider(
-        pipeline_dir: &Path,
-        config: EngineConfig,
-        provider: Arc<dyn crate::MemoryAuthorityProvider>,
-    ) -> anyhow::Result<Self> {
-        WorkflowRuntime::from_dir_with_memory_authority_provider(pipeline_dir, config, provider)
-            .and_then(Self::from_workflow)
-    }
-
-    pub fn from_pipeline_dir_with_session_options_and_memory_authority_provider(
-        pipeline_dir: &Path,
-        config: EngineConfig,
-        session_options: SessionOptions,
-        provider: Arc<dyn crate::MemoryAuthorityProvider>,
-    ) -> anyhow::Result<Self> {
-        WorkflowRuntime::from_dir_with_session_options_and_memory_authority_provider(
-            pipeline_dir,
-            config,
-            session_options,
-            provider,
-        )
-        .and_then(Self::from_workflow)
+    pub(crate) fn workflow_runtime_mut(&mut self) -> &mut WorkflowRuntime {
+        &mut self.workflow
     }
 
     /// Run this package's workflow and return its declared outputs.
@@ -153,49 +85,71 @@ impl Engine {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
-        self.workflow_runtime_mut()?.run_pipeline(request)
+        self.workflow_runtime_mut().run_pipeline(request)
     }
 
     pub fn run_pipeline_outputs(
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineOutputs> {
-        self.workflow_runtime_mut()?.run_pipeline_outputs(request)
+        self.workflow_runtime_mut().run_pipeline_outputs(request)
     }
 
     pub fn run_pipeline_retained(
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
-        self.workflow_runtime_mut()?.run_pipeline_retained(request)
+        self.workflow_runtime_mut().run_pipeline_retained(request)
     }
 
     /// Generate from an explicit workflow request (application-supplied tensors).
+    ///
+    /// The same drive `generate` uses. A caller reaches for this when it has
+    /// tensors to bind that no prompt can express — an image, an audio window,
+    /// a caller-built mask — not because the package is a different kind.
     pub fn generate_with_pipeline_request(
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<GenerateResult> {
-        self.workflow_runtime_mut()?
-            .generate_with_pipeline_request(request)
+        self.generate_with_pipeline_callbacks(request, None, None)
     }
 
-    pub fn generate_pipeline_with_callback(
+    pub fn generate_with_pipeline_callbacks(
         &mut self,
         request: PipelineGenerateRequest,
+        mut on_admitted: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
-        self.workflow_runtime_mut()?
-            .generate_with_callback(request, callback)
-    }
-
-    pub fn generate_pipeline_with_callbacks(
-        &mut self,
-        request: PipelineGenerateRequest,
-        on_admitted: Option<&mut dyn FnMut()>,
-        callback: Option<&mut GenerateTokenCallback<'_>>,
-    ) -> anyhow::Result<GenerateResult> {
-        self.workflow_runtime_mut()?
-            .generate_with_callbacks(request, on_admitted, callback)
+        // A request that binds no tensors is a prompt, and a prompt is served
+        // by the ordinary entry point — which admits through the scheduler,
+        // reuses a cached prefix, and routes the declared decode step to the
+        // fused executor when this runtime has one. Sending it down the
+        // tensor-binding path instead would quietly give up all three for a
+        // request that asked for none of it.
+        if request.inputs.is_empty()
+            && request.component_overrides.is_empty()
+            && self.holds_decode_core()
+        {
+            return match request.session_id.as_deref().and_then(|id| id.parse().ok()) {
+                Some(session) if self.sessions.contains_key(&session) => self
+                    .generate_in_session_with_callbacks(
+                        session,
+                        request.request,
+                        on_admitted,
+                        callback,
+                    ),
+                _ => self.generate_with_callbacks(request.request, on_admitted, callback),
+            };
+        }
+        if let Some(on_admitted) = on_admitted.as_mut() {
+            on_admitted();
+        }
+        let runtime = &*self.workflow;
+        let options = request.request.options.clone();
+        let tokenizer = runtime.models().tokenizer_for("");
+        crate::pipeline::generation::run_declared_generation(
+            runtime, &options, tokenizer, request, None, callback,
+        )
     }
 
     /// Encode a workflow's declared buffered-PCM16 audio output for serving.
@@ -204,12 +158,12 @@ impl Engine {
         outputs: &PipelineOutputs,
         output_name: &str,
     ) -> anyhow::Result<crate::pipeline::EncodedAudio> {
-        self.workflow_runtime()?
+        self.workflow_runtime()
             .encode_audio_output(outputs, output_name)
     }
 
     pub fn models(&self) -> anyhow::Result<&PipelineModels> {
-        Ok(self.workflow_runtime()?.models())
+        Ok(self.workflow_runtime().models())
     }
 
     pub fn output_for_role<'a>(
@@ -217,9 +171,7 @@ impl Engine {
         outputs: &'a PipelineTensors,
         role: onnx_genai_metadata::WorkflowOutputRole,
     ) -> Option<&'a onnx_genai_ort::Value> {
-        self.workflow
-            .as_deref()
-            .and_then(|workflow| workflow.output_for_role(outputs, role))
+        self.workflow.output_for_role(outputs, role)
     }
 
     pub fn structured_output_for_role<'a>(
@@ -227,9 +179,7 @@ impl Engine {
         outputs: &'a PipelineOutputs,
         role: onnx_genai_metadata::WorkflowOutputRole,
     ) -> Option<&'a onnx_genai_ort::Value> {
-        self.workflow
-            .as_deref()
-            .and_then(|workflow| workflow.structured_output_for_role(outputs, role))
+        self.workflow.structured_output_for_role(outputs, role)
     }
 
     pub fn output_rows_for_role<'a>(
@@ -237,39 +187,27 @@ impl Engine {
         outputs: &'a PipelineOutputs,
         role: onnx_genai_metadata::WorkflowOutputRole,
     ) -> Vec<(usize, &'a onnx_genai_ort::Value)> {
-        self.workflow
-            .as_deref()
-            .map(|workflow| workflow.output_rows_for_role(outputs, role))
-            .unwrap_or_default()
+        self.workflow.output_rows_for_role(outputs, role)
     }
 
     pub fn prepare_workflow_execution(
         &self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<crate::pipeline::WorkflowExecutionPlan<'_>> {
-        self.workflow_runtime()?.prepare_workflow_execution(request)
+        self.workflow_runtime().prepare_workflow_execution(request)
     }
 
     pub fn workflow_performance_diagnostic(&self) -> WorkflowPerformanceDiagnostic {
-        self.workflow
-            .as_deref()
-            .map(WorkflowRuntime::workflow_performance_diagnostic)
-            .unwrap_or_default()
+        WorkflowRuntime::workflow_performance_diagnostic(&self.workflow)
     }
 
     pub fn adapter_lifecycle_diagnostic(&self) -> crate::pipeline::AdapterLifecycleDiagnostic {
-        self.workflow
-            .as_deref()
-            .map(WorkflowRuntime::adapter_lifecycle_diagnostic)
-            .unwrap_or_default()
+        WorkflowRuntime::adapter_lifecycle_diagnostic(&self.workflow)
     }
 
     /// Execution-island diagnostics for a workflow package, empty otherwise.
     pub fn execution_island_diagnostics(&self) -> Vec<crate::pipeline::ExecutionIslandDiagnostic> {
-        self.workflow
-            .as_deref()
-            .map(WorkflowRuntime::execution_island_diagnostics)
-            .unwrap_or_default()
+        WorkflowRuntime::execution_island_diagnostics(&self.workflow)
     }
 
     /// Restore a workflow session checkpoint.
@@ -278,7 +216,7 @@ impl Engine {
         session_id: &str,
         checkpoint: &crate::pipeline::WorkflowSessionCheckpoint,
     ) -> anyhow::Result<()> {
-        self.workflow_runtime_mut()?
+        self.workflow_runtime_mut()
             .restore_session_checkpoint(session_id, checkpoint)
     }
 
@@ -287,14 +225,12 @@ impl Engine {
         &self,
         session_id: &str,
     ) -> anyhow::Result<crate::pipeline::WorkflowSessionCheckpoint> {
-        self.workflow_runtime()?.checkpoint_session(session_id)
+        self.workflow_runtime().checkpoint_session(session_id)
     }
 
     /// The package's speculative compatibility contract, when it declares one.
     pub fn speculative_contract(&self) -> Option<&onnx_genai_metadata::SpeculativeContract> {
-        self.workflow
-            .as_deref()
-            .and_then(WorkflowRuntime::speculative_contract)
+        Some(&*self.workflow).and_then(WorkflowRuntime::speculative_contract)
     }
 
     pub fn propose_chained(
@@ -302,7 +238,7 @@ impl Engine {
         run: &PipelineTensors,
         options: crate::pipeline::speculative::ChainedProposalOptions,
     ) -> anyhow::Result<crate::pipeline::speculative::ChainedProposal> {
-        self.workflow_runtime()?.propose_chained(run, options)
+        self.workflow_runtime().propose_chained(run, options)
     }
 
     pub fn accept_chained_proposal(
@@ -310,7 +246,7 @@ impl Engine {
         proposal: &crate::pipeline::speculative::ChainedProposal,
         target_tokens: &[i64],
     ) -> anyhow::Result<crate::pipeline::speculative::ProposalAcceptance> {
-        self.workflow_runtime()?
+        self.workflow_runtime()
             .accept_chained_proposal(proposal, target_tokens)
     }
 
@@ -318,7 +254,7 @@ impl Engine {
         &self,
         run: &PipelineTensors,
     ) -> anyhow::Result<PipelineTensors> {
-        self.workflow_runtime()?.speculative_rollback_state(run)
+        self.workflow_runtime().speculative_rollback_state(run)
     }
 
     pub fn rollback_speculative_state(
@@ -326,7 +262,7 @@ impl Engine {
         state: &mut PipelineTensors,
         length: usize,
     ) -> anyhow::Result<()> {
-        self.workflow_runtime()?
+        self.workflow_runtime()
             .rollback_speculative_state(state, length)
     }
 
@@ -335,37 +271,18 @@ impl Engine {
         component: &str,
         table: &str,
     ) -> anyhow::Result<crate::pipeline::speculative::EmbeddingTable> {
-        self.workflow_runtime()?.embedding_table(component, table)
+        self.workflow_runtime().embedding_table(component, table)
     }
 
     /// Native component invocations performed by this package's workflow, or
     /// `None` when it is not running the native backend.
     #[cfg(feature = "native-backend")]
     pub fn native_component_run_count(&self) -> Option<u64> {
-        self.workflow
-            .as_deref()
-            .and_then(WorkflowRuntime::native_component_run_count)
+        Some(&*self.workflow).and_then(WorkflowRuntime::native_component_run_count)
     }
 
     #[cfg(feature = "native-backend")]
     pub fn native_device_residency_counts(&self) -> Option<(u64, u64)> {
-        self.workflow
-            .as_deref()
-            .and_then(WorkflowRuntime::native_device_residency_counts)
-    }
-
-    /// Text generation, resolved from the package's own declaration.
-    ///
-    /// This is the single entry point: a workflow package is driven by the
-    /// interpreter over its declared `tokens` output, a decoder package by the
-    /// decode core. A caller never chooses.
-    pub(crate) fn workflow_generate(
-        &mut self,
-        request: GenerateRequest,
-        on_admitted: Option<&mut dyn FnMut()>,
-        callback: Option<&mut GenerateTokenCallback<'_>>,
-    ) -> anyhow::Result<GenerateResult> {
-        self.workflow_runtime_mut()?
-            .generate_with_callbacks(request.into(), on_admitted, callback)
+        Some(&*self.workflow).and_then(WorkflowRuntime::native_device_residency_counts)
     }
 }

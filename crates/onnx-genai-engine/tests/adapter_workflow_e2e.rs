@@ -172,7 +172,7 @@ pipeline:
         mode: replace
 "#;
     let root = package(metadata, red, blue)?;
-    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
     let red_only = [AdapterActivation::new("red", 1.0)];
     let none: [AdapterActivation; 0] = [];
     let composed = [

@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 
 use onnx_genai_engine::{
     Engine, EngineConfig, FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest,
-    WorkflowShapeReport,
 };
 
 fn decoder_package() -> PathBuf {
@@ -52,8 +51,6 @@ fn greedy(tokens: usize) -> GenerateRequest {
 #[test]
 fn a_single_decoder_is_an_authored_workflow() -> anyhow::Result<()> {
     let engine = engine()?;
-    assert_eq!(engine.workflow_shape(), WorkflowShapeReport::SingleDecoder);
-
     let workflow = engine
         .package_workflow()
         .expect("a loaded package always declares a workflow");
@@ -205,11 +202,31 @@ fn batched_generation_is_held_to_the_canonical_precondition() -> anyhow::Result<
     Ok(())
 }
 
-/// A composite workflow package is driven by the generic interpreter.
+/// A composite workflow package is driven by the same interpreter, and says so
+/// in the only terms that exist: the workflow it declares.
+///
+/// There is deliberately nothing here that reports a package *kind*. A caller
+/// has nothing to do differently for a composite package, so a question whose
+/// answer distinguished one would only exist to be branched on.
 #[test]
 fn a_composite_workflow_is_executed_by_the_interpreter() -> anyhow::Result<()> {
     let engine = Engine::from_dir(&workflow_package(), EngineConfig::default())?;
-    assert_eq!(engine.workflow_shape(), WorkflowShapeReport::Composite);
-    assert!(engine.is_workflow());
+    let workflow = engine
+        .package_workflow()
+        .expect("a loaded package always declares a workflow");
+    let graph_components = workflow
+        .components
+        .values()
+        .filter(|component| {
+            !matches!(
+                component.implementation,
+                onnx_genai_metadata::ComponentImplementation::Binding
+            )
+        })
+        .count();
+    assert!(
+        graph_components > 1,
+        "the composite fixture declares several graph components"
+    );
     Ok(())
 }

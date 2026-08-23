@@ -1647,7 +1647,11 @@ async fn debug_endpoints_expose_config_sessions_cache_and_trace_state() {
         serde_json::from_slice(&to_bytes(config.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(config["model_id"], "tiny-llm");
     assert_eq!(config["max_queue_depth"], 256);
-    assert_eq!(config["pipeline"], false);
+    // Facts about the package's serialized workflow, not about which executor
+    // the runtime chose for a declared step.
+    assert_eq!(config["workflow_components"], 2);
+    assert_eq!(config["workflow_graph_components"], 1);
+    assert_eq!(config["workflow_declares_generation_loop"], true);
 
     let created = router
         .clone()
@@ -2533,6 +2537,7 @@ async fn stalled_output_route_does_not_block_another_completion() {
     driver
         .commands
         .send(DriverCommand::Generate {
+            input: None,
             session_id: None,
             request: Box::new(build_generate_request(&slow_request)),
             admission: slow_admission,
@@ -2542,7 +2547,7 @@ async fn stalled_output_route_does_not_block_another_completion() {
         .await
         .unwrap();
     let fast_rx = driver
-        .generate(None, build_generate_request(&fast_request))
+        .generate(None, build_generate_request(&fast_request), None)
         .await
         .unwrap();
 

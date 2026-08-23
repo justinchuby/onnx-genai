@@ -150,19 +150,19 @@ pub(crate) struct SessionStatus {
 #[derive(Debug, Serialize)]
 pub(crate) struct DebugConfigResponse {
     model_id: String,
-    /// Whether the package *serializes* `pipeline.workflow`.
+    /// How many components the package's serialized `pipeline.workflow`
+    /// declares.
     ///
-    /// Deliberately unchanged in meaning: it answers a question about the file
-    /// on disk. A decoder package whose workflow the runtime compiled in memory
-    /// reports `false` here and says so through `workflow_shape`, because
-    /// claiming otherwise would assert the package contains something it does
-    /// not.
-    pipeline: bool,
-    /// How the runtime obtained the canonical workflow it executes:
-    /// `authored` (serialized in the package), `lowered` (compiled in memory
-    /// from the package's own `model.io`, which remains the sole serialized
-    /// answer), or `none`.
-    workflow_shape: &'static str,
+    /// Every loaded package serializes one, so this is a fact about the file on
+    /// disk rather than a report of which executor the runtime chose. An
+    /// operator debugging a package wants to know what it *says*; what runs it
+    /// is visible in the execution-provider and island diagnostics beside it.
+    workflow_components: usize,
+    /// How many of those components name an ONNX graph, as opposed to a step
+    /// the runtime implements.
+    workflow_graph_components: usize,
+    /// Whether that workflow declares a generation loop.
+    workflow_declares_generation_loop: bool,
     max_output_tokens: usize,
     max_sessions: usize,
     max_queue_depth: usize,

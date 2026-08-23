@@ -31,81 +31,22 @@ const BANNED: &[&str] = &[
     "is_workflow",
 ];
 
-/// Files still permitted to mention each symbol, with the count they may use.
+/// Files still permitted to mention each symbol.
 ///
-/// This is the B2 remaining-work ledger. Every entry is a caller the
-/// interpreter-convergence work removes; the counts exist so a file cannot
-/// quietly grow new uses while it waits its turn.
+/// This was the convergence work's remaining-work ledger, and it is now empty
+/// but for the gate itself: none of these symbols exists any more. It stays
+/// because the failure mode it guards against does not need the old code to
+/// come back — one `if engine.is_workflow()` on a fresh accessor would restore
+/// the split without touching a single assertion elsewhere.
 ///
-/// A file dropping to zero should be deleted from this table, not left at 0.
+/// A file dropping to zero is deleted from this table, not left at 0.
 fn allowance() -> BTreeMap<&'static str, usize> {
     BTreeMap::from([
-        // The executor itself, and the body walker that will move into the
-        // interpreter's loop.
-        (
-            "crates/onnx-genai-engine/src/pipeline/canonical_decode.rs",
-            usize::MAX,
-        ),
-        // Holds `lowered_workflow` until every package loads one non-optional
-        // runtime.
-        ("crates/onnx-genai-engine/src/engine/model.rs", usize::MAX),
-        ("crates/onnx-genai-engine/src/engine/load.rs", usize::MAX),
-        ("crates/onnx-genai-engine/src/engine/runtime.rs", usize::MAX),
-        (
-            "crates/onnx-genai-engine/src/engine/workflow_api.rs",
-            usize::MAX,
-        ),
-        ("crates/onnx-genai-engine/src/engine/mod.rs", usize::MAX),
-        ("crates/onnx-genai-engine/src/batched.rs", usize::MAX),
-        ("crates/onnx-genai-engine/src/pipeline/mod.rs", usize::MAX),
-        // Callers still dispatching on shape.
-        ("crates/onnx-genai-server/src/driver.rs", usize::MAX),
-        ("crates/onnx-genai-server/src/state.rs", usize::MAX),
-        ("crates/onnx-genai-server/src/routes/admin.rs", usize::MAX),
-        ("crates/onnx-genai-server/src/routes/mod.rs", usize::MAX),
-        ("crates/onnx-genai-server/src/registry.rs", usize::MAX),
-        ("crates/onnx-genai-cli/src/interactive.rs", usize::MAX),
-        ("crates/onnx-genai-cli/src/model_inspection.rs", usize::MAX),
-        // Tests that assert on the split while it exists.
-        (
-            "crates/onnx-genai-engine/tests/canonical_execution_parity.rs",
-            usize::MAX,
-        ),
-        (
-            "crates/onnx-genai-engine/tests/one_runtime_e2e.rs",
-            usize::MAX,
-        ),
-        (
-            "crates/onnx-genai-engine/tests/real_model_workflow_corpus.rs",
-            usize::MAX,
-        ),
         // This gate names them by construction.
         (
             "crates/onnx-genai-engine/tests/shape_dispatch_gate.rs",
             usize::MAX,
         ),
-        // Found by this gate rather than by inspection — which is the point of
-        // having it. Each is a caller the convergence work still has to move.
-        ("crates/onnx-genai-engine/src/decode_loop.rs", usize::MAX),
-        ("crates/onnx-genai-engine/src/lib.rs", usize::MAX),
-        (
-            "crates/onnx-genai-engine/src/native_decode/mod.rs",
-            usize::MAX,
-        ),
-        (
-            "crates/onnx-genai-engine/src/native_speculative.rs",
-            usize::MAX,
-        ),
-        ("crates/onnx-genai-engine/src/session.rs", usize::MAX),
-        (
-            "crates/onnx-genai-server/src/routes/completions.rs",
-            usize::MAX,
-        ),
-        (
-            "crates/onnx-genai-server/src/routes/sessions.rs",
-            usize::MAX,
-        ),
-        ("crates/onnx-genai-server/src/routes/speech.rs", usize::MAX),
     ])
 }
 

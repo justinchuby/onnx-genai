@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
-use onnx_genai_engine::{Engine, EngineConfig, WorkflowShapeReport};
+use onnx_genai_engine::{Engine, EngineConfig};
 
 /// Candidate real packages, labelled by the cache/ABI shape each one covers.
 fn corpus() -> Vec<(&'static str, PathBuf)> {
@@ -153,15 +153,16 @@ fn real_packages_present_a_workflow_deterministically() {
                 "{label}: the workflow this package presents is not stable"
             );
         }
-        assert_ne!(
-            engine.workflow_shape(),
-            WorkflowShapeReport::None,
+        assert!(
+            engine.package_workflow().is_some(),
             "{label}: a loaded package must present a workflow"
         );
         covered += 1;
         eprintln!(
-            "CORPUS_WORKFLOW {label} shape={}",
-            engine.workflow_shape().as_str()
+            "CORPUS_WORKFLOW {label} components={} graphs={} loop={}",
+            engine.workflow_component_count(),
+            engine.workflow_graph_component_count(),
+            engine.workflow_declares_generation_loop()
         );
     }
     eprintln!("CORPUS_DETERMINISM covered={covered}");
@@ -182,7 +183,9 @@ fn decoder_ports_mirror_the_resolved_abi() {
     let mut covered = 0usize;
     for (label, dir) in corpus() {
         let Some(engine) = open(&dir) else { continue };
-        if engine.workflow_shape() != WorkflowShapeReport::SingleDecoder {
+        // Only a package whose whole graph is one decoder has a single ABI to
+        // mirror; a composite one addresses its components explicitly.
+        if engine.workflow_graph_component_count() != 1 {
             continue;
         }
         let workflow = engine.package_workflow().expect("loaded package").clone();
@@ -255,12 +258,12 @@ fn no_real_package_declares_the_retired_block() {
     eprintln!("CORPUS_NO_RETIRED_BLOCK covered={covered}");
 }
 
-/// A composite workflow package is driven by the generic interpreter.
+/// A composite workflow package presents the workflow it serialized.
 #[test]
-fn a_composite_workflow_package_is_composite() -> anyhow::Result<()> {
+fn a_composite_workflow_package_presents_its_components() -> anyhow::Result<()> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/onnx_genai_workflows/gemma4_chained");
     let engine = Engine::from_dir(&root, EngineConfig::default())?;
-    assert_eq!(engine.workflow_shape(), WorkflowShapeReport::Composite);
+    assert!(engine.workflow_graph_component_count() > 1);
     Ok(())
 }

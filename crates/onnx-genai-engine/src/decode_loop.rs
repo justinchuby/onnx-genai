@@ -388,13 +388,14 @@ pub(crate) fn exceeded_context_limit(
 
 #[cfg(test)]
 mod tests {
-    /// The canonical workflow these loop tests execute.
+    /// The interpreter these loop tests drive.
     ///
-    /// The loop reads its body from a workflow, so a unit test must supply one;
-    /// using the same lowering a minimal real decoder gets keeps the test on the
+    /// The loop is the workflow's, so a unit test must supply one; using the
+    /// same emitter a minimal real decoder goes through keeps the test on the
     /// production path instead of a bespoke shape.
-    fn canonical_workflow() -> onnx_genai_metadata::WorkflowSpec {
-        crate::pipeline::canonical_decode::test_canonical_workflow()
+    fn canonical_runtime() -> crate::pipeline::WorkflowRuntime {
+        crate::pipeline::generation::test_decoder_runtime()
+            .expect("a minimal decoder workflow builds a hosted interpreter")
     }
 
     use super::*;
@@ -503,7 +504,7 @@ mod tests {
 
     #[test]
     fn sampled_fastpath_error_falls_back_to_seeded_host_sampling() -> anyhow::Result<()> {
-        let canonical = canonical_workflow();
+        let canonical = canonical_runtime();
         let options = GenerateOptions {
             max_new_tokens: 3,
             greedy: false,
@@ -519,30 +520,32 @@ mod tests {
 
         let mut fallback_backend = MockBackend::new(true);
         let mut fallback_state = DecodeLoopState::new(0, options.seed, None);
-        let fallback = crate::pipeline::canonical_decode::run_canonical_decode(
+        let fallback = crate::pipeline::generation::generate_with_decode_core(
+            &canonical,
             &mut fallback_backend,
             &mut fallback_state,
-            crate::pipeline::canonical_decode::CanonicalDecodeRequest {
+            &[],
+            crate::pipeline::generation::GenerationRequest {
                 options: &options,
                 chain: &chain,
                 tokenizer: &tokenizer,
                 max_context: None,
-                workflow: &canonical,
             },
             None,
         )?;
 
         let mut host_backend = MockBackend::new(false);
         let mut host_state = DecodeLoopState::new(0, options.seed, None);
-        let host = crate::pipeline::canonical_decode::run_canonical_decode(
+        let host = crate::pipeline::generation::generate_with_decode_core(
+            &canonical,
             &mut host_backend,
             &mut host_state,
-            crate::pipeline::canonical_decode::CanonicalDecodeRequest {
+            &[],
+            crate::pipeline::generation::GenerationRequest {
                 options: &options,
                 chain: &chain,
                 tokenizer: &tokenizer,
                 max_context: None,
-                workflow: &canonical,
             },
             None,
         )?;
@@ -571,15 +574,16 @@ mod tests {
                 vec![vec![0.0; 8]; options.max_new_tokens],
             );
             let mut state = DecodeLoopState::new(0, options.seed, None);
-            Ok(crate::pipeline::canonical_decode::run_canonical_decode(
+            Ok(crate::pipeline::generation::generate_with_decode_core(
+                &canonical_runtime(),
                 &mut backend,
                 &mut state,
-                crate::pipeline::canonical_decode::CanonicalDecodeRequest {
+                &[],
+                crate::pipeline::generation::GenerationRequest {
                     options: &options,
                     chain: &chain,
                     tokenizer: &tokenizer,
                     max_context: None,
-                    workflow: &canonical_workflow(),
                 },
                 None,
             )?
@@ -595,7 +599,7 @@ mod tests {
 
     #[test]
     fn sampled_fastpath_not_applicable_does_not_latch_off() -> anyhow::Result<()> {
-        let canonical = canonical_workflow();
+        let canonical = canonical_runtime();
         // `Ok(None)` (e.g. the multi-token prefill step) must fall back to host
         // sampling for that step WITHOUT disabling the device fast path, so the
         // backend keeps being asked on every subsequent step.
@@ -614,30 +618,32 @@ mod tests {
 
         let mut na_backend = MockBackend::with_outcome(true, SampledOutcome::NotApplicable);
         let mut na_state = DecodeLoopState::new(0, options.seed, None);
-        let na = crate::pipeline::canonical_decode::run_canonical_decode(
+        let na = crate::pipeline::generation::generate_with_decode_core(
+            &canonical,
             &mut na_backend,
             &mut na_state,
-            crate::pipeline::canonical_decode::CanonicalDecodeRequest {
+            &[],
+            crate::pipeline::generation::GenerationRequest {
                 options: &options,
                 chain: &chain,
                 tokenizer: &tokenizer,
                 max_context: None,
-                workflow: &canonical,
             },
             None,
         )?;
 
         let mut host_backend = MockBackend::new(false);
         let mut host_state = DecodeLoopState::new(0, options.seed, None);
-        let host = crate::pipeline::canonical_decode::run_canonical_decode(
+        let host = crate::pipeline::generation::generate_with_decode_core(
+            &canonical,
             &mut host_backend,
             &mut host_state,
-            crate::pipeline::canonical_decode::CanonicalDecodeRequest {
+            &[],
+            crate::pipeline::generation::GenerationRequest {
                 options: &options,
                 chain: &chain,
                 tokenizer: &tokenizer,
                 max_context: None,
-                workflow: &canonical,
             },
             None,
         )?;
@@ -653,7 +659,7 @@ mod tests {
 
     #[test]
     fn unsupported_sampled_runner_never_runs_device_step() -> anyhow::Result<()> {
-        let canonical = canonical_workflow();
+        let canonical = canonical_runtime();
         // A backend that cannot sample on the device (`sampled_fastpath_supported`
         // is false) must never have `next_token_sampled` invoked. That method runs
         // a model step which advances KV state; if it were called and then failed,
@@ -676,15 +682,16 @@ mod tests {
         // `HardError` outcome would panic-latch if ever reached; assert it isn't.
         let mut backend = MockBackend::with_outcome(false, SampledOutcome::HardError);
         let mut state = DecodeLoopState::new(0, options.seed, None);
-        let result = crate::pipeline::canonical_decode::run_canonical_decode(
+        let result = crate::pipeline::generation::generate_with_decode_core(
+            &canonical,
             &mut backend,
             &mut state,
-            crate::pipeline::canonical_decode::CanonicalDecodeRequest {
+            &[],
+            crate::pipeline::generation::GenerationRequest {
                 options: &options,
                 chain: &chain,
                 tokenizer: &tokenizer,
                 max_context: None,
-                workflow: &canonical,
             },
             None,
         )?;
@@ -708,18 +715,19 @@ mod tests {
         assert!(chain.is_empty());
         let tokenizer = tokenizer()?;
 
-        let canonical = canonical_workflow();
+        let canonical = canonical_runtime();
         let mut plain_backend = MockBackend::new(false);
         let mut plain_state = DecodeLoopState::new(0, options.seed, None);
-        let plain = crate::pipeline::canonical_decode::run_canonical_decode(
+        let plain = crate::pipeline::generation::generate_with_decode_core(
+            &canonical,
             &mut plain_backend,
             &mut plain_state,
-            crate::pipeline::canonical_decode::CanonicalDecodeRequest {
+            &[],
+            crate::pipeline::generation::GenerationRequest {
                 options: &options,
                 chain: &chain,
                 tokenizer: &tokenizer,
                 max_context: None,
-                workflow: &canonical,
             },
             None,
         )?;
@@ -730,18 +738,19 @@ mod tests {
             assert!(!token.text.is_empty());
             Ok(())
         };
-        let canonical = canonical_workflow();
+        let canonical = canonical_runtime();
         let mut streamed_backend = MockBackend::new(false);
         let mut streamed_state = DecodeLoopState::new(0, options.seed, None);
-        let streamed = crate::pipeline::canonical_decode::run_canonical_decode(
+        let streamed = crate::pipeline::generation::generate_with_decode_core(
+            &canonical,
             &mut streamed_backend,
             &mut streamed_state,
-            crate::pipeline::canonical_decode::CanonicalDecodeRequest {
+            &[],
+            crate::pipeline::generation::GenerationRequest {
                 options: &options,
                 chain: &chain,
                 tokenizer: &tokenizer,
                 max_context: None,
-                workflow: &canonical,
             },
             Some(&mut callback),
         )?;

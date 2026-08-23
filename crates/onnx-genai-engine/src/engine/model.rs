@@ -9,27 +9,25 @@ pub(crate) const MISSING_ORT_SESSION: &str = "ORT backend must own a decoder ses
 
 /// The one generation runtime.
 ///
-/// There is exactly one runtime type. A package that declares
-/// `pipeline.workflow` is executed by the workflow interpreter held in
-/// [`Self::workflow`]; a package that declares a bare decoder is executed by the
-/// decode core in the fields below. Both live on this type on purpose: callers
-/// (server, CLI, C ABI, benchmarks) hold one handle and never branch on which
-/// kind of package they loaded, which is what the old
+/// Every package declares `pipeline.workflow`, and every package executes it
+/// through the interpreter held in [`Self::workflow`]. What differs between a
+/// bare decoder and a composite pipeline is not *which runtime* executes it but
+/// *which executor implements a declared step*: a component naming a contract
+/// this runtime registered — `onnx-genai.autoregressive-decode`, above all — is
+/// run by the fused decode session in the fields below, which owns paged KV,
+/// the device sampling fast paths and the captured CUDA graph. A component
+/// naming none is invoked generically from its artifact.
+///
+/// Callers (server, CLI, C ABI, benchmarks) hold one handle and never branch on
+/// which kind of package they loaded, which is what the old
 /// `Engine` / `PipelineEngine` split forced them to do.
 pub struct Engine {
-    /// Workflow interpreter state, present when the package declares
-    /// `pipeline.workflow`.
-    pub(crate) workflow: Option<Box<crate::pipeline::WorkflowRuntime>>,
-    /// The workflow a single-decoder package declares.
+    /// The interpreter that executes this package's declared workflow.
     ///
-    /// Read from the package, never synthesized. It is held separately from
-    /// [`Self::workflow`] because a single decoder is driven by the fused decode
-    /// executor rather than the generic interpreter — a backend choice beneath
-    /// one representation, not a second one. Its presence is what makes "every
-    /// generated request runs a declared workflow" a load-time fact rather than
-    /// a hope: a package that declares none fails to load instead of quietly
-    /// taking a direct path that no longer exists.
-    pub(crate) lowered_workflow: Option<onnx_genai_metadata::WorkflowSpec>,
+    /// Not optional: a package that declares no workflow does not load, so
+    /// there is no state in which a request could reach a path that no longer
+    /// exists.
+    pub(crate) workflow: Box<crate::pipeline::WorkflowRuntime>,
     /// Resolved decoder execution backend.
     pub(crate) decode_backend: EngineDecodeBackend,
     /// Model inference metadata.
@@ -50,13 +48,22 @@ pub struct Engine {
     pub(crate) scheduler: Scheduler,
     /// Per-device resource ceilings and shared scheduler byte budget.
     ///
-    /// Absent for a workflow package, whose governor is owned by the interpreter
-    /// state in [`Self::workflow`]. Exactly one governor exists per runtime
-    /// either way — a second would double-count every reservation — which is why
-    /// this is an `Option` rather than a fresh inert instance.
-    pub(crate) governor: Option<EngineResourceGovernor>,
+    /// Exactly one exists per runtime — a second would double-count every
+    /// reservation — which is why the workflow interpreter beside it holds
+    /// none and this is not an `Option`.
+    pub(crate) governor: EngineResourceGovernor,
     /// Persistent multi-turn session state, keyed by session id.
     pub(crate) sessions: HashMap<SessionId, EngineSession>,
+    /// Conversations continued through the interpreter's session-scoped state.
+    ///
+    /// A package whose components the interpreter invokes has no decode core to
+    /// hold a paged KV sequence, but it still has sessions: its workflow may
+    /// declare `scope: session` state, and the runtime keys that state by the
+    /// id handed out here. The value is the logical token count so far, which
+    /// is what a caller asking about a session wants to know.
+    pub(crate) workflow_sessions: HashMap<SessionId, usize>,
+    /// Monotonic counter for interpreter session ids.
+    pub(crate) workflow_session_counter: u64,
     /// ORT session for decoder execution.
     pub(crate) session: Option<Box<Session>>,
     /// Native decoder session. Native execution is single-request and serialized
@@ -143,6 +150,7 @@ impl Engine {
     /// from the workflow so a caller sees one authoritative answer.
     pub(crate) fn from_workflow(
         workflow: crate::pipeline::WorkflowRuntime,
+        governor: EngineResourceGovernor,
     ) -> anyhow::Result<Self> {
         let decode_backend = workflow.decode_backend();
         let memory_strategy_plan = workflow.memory_strategy_plan().clone();
@@ -156,8 +164,7 @@ impl Engine {
         // tokenization for a workflow package is served from there rather than
         // duplicated into the decode core.
         Ok(Engine {
-            workflow: Some(Box::new(workflow)),
-            lowered_workflow: None,
+            workflow: Box::new(workflow),
             decode_backend,
             metadata,
             metadata_hints: MetadataHints::default(),
@@ -167,8 +174,10 @@ impl Engine {
             kv_model: None,
             decode_path: ModelDecodePath::Generic,
             scheduler: Scheduler::new(onnx_genai_scheduler::SchedulerConfig::default()),
-            governor: None,
+            governor,
             sessions: HashMap::new(),
+            workflow_sessions: HashMap::new(),
+            workflow_session_counter: 0,
             session: None,
             #[cfg(feature = "native-backend")]
             native_session: None,

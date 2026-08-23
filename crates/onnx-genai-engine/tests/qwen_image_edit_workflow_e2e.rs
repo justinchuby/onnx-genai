@@ -62,7 +62,7 @@ fn qwen_image_edit_workflow_executes_complete_edit_path() -> anyhow::Result<()> 
         serde_json::from_slice(&std::fs::read(input_dir.join("manifest.json"))?)?;
 
     let load_start = std::time::Instant::now();
-    let mut engine = Engine::from_pipeline_dir(&package_dir, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&package_dir, EngineConfig::default())?;
     eprintln!(
         "engine loaded in {:.1}s",
         load_start.elapsed().as_secs_f64()

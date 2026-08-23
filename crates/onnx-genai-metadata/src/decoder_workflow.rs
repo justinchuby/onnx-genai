@@ -466,6 +466,17 @@ pub fn decoder_workflow(
         initial: None,
         next: TOKEN_VALUE.to_string(),
     });
+    // The sequence the decoder consumes is the prompt on the first iteration
+    // and one token on every later one, so its length genuinely changes. Saying
+    // `invariant` would declare a shape the loop does not keep — a statement no
+    // reader could check and no executor could honour, because the first carry
+    // already breaks it. `bounded` states what is actually true: the length
+    // varies, up to the sequence capacity the package declares.
+    builder.package_literal(
+        SEQUENCE_CAPACITY,
+        scalar_contract(),
+        int_literal(facts.max_sequence_length.unwrap_or(DEFAULT_MAX_ITERATIONS) as i64),
+    );
     builder.state.insert(
         SEQUENCE_CELL.to_string(),
         WorkflowStateCell {
@@ -473,7 +484,10 @@ pub fn decoder_workflow(
             class: crate::schema::WorkflowStateClass::Semantic,
             scope: WorkflowStateScope::Invocation,
             initializer: REQUEST_TOKENS.to_string(),
-            recurrence: ShapeRecurrence::Invariant,
+            recurrence: ShapeRecurrence::Bounded {
+                axis: 1,
+                max: format!("package.{SEQUENCE_CAPACITY}"),
+            },
             management: crate::schema::StateManagement::Workflow,
             release_boundary: None,
             service_group: None,
@@ -487,6 +501,7 @@ pub fn decoder_workflow(
         manifest: WorkflowManifest {
             adapter_abis: BTreeMap::new(),
             capabilities: BTreeSet::from([
+                "bounded_state_recurrence".to_string(),
                 "workflow_ssa".to_string(),
                 "linear_effects".to_string(),
                 "typed_emit".to_string(),
@@ -969,6 +984,8 @@ const LOOP_ITERATION: &str = "loop.iteration";
 const CAPACITY_INPUT: &str = "capacity";
 /// Semantic cell naming each row's logical cache length.
 const LENGTHS_CELL: &str = "cache_lengths";
+/// Package literal bounding how long the loop's sequence cell may grow.
+const SEQUENCE_CAPACITY: &str = "sequence_capacity";
 
 fn body_value(cell: &str) -> String {
     format!("body.{cell}")

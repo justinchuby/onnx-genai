@@ -42,10 +42,17 @@ pub(crate) struct EngineDriver {
     /// sees `batch_supported=false` / effective max batch = 1 directly instead of
     /// inferring it from a debug-level "using per-request engine path" log line.
     pub(crate) batching: Arc<BatchingReport>,
-    /// Resolved from the loaded runtime, not from a caller-supplied flag.
-    pub(crate) is_workflow: bool,
-    /// Where the canonical workflow came from: `authored`, `lowered`, `none`.
-    pub(crate) workflow_shape: &'static str,
+    /// What the loaded package's serialized workflow says, read once at
+    /// startup. Facts about the document, not about which executor runs it.
+    pub(crate) workflow_facts: WorkflowFacts,
+}
+
+/// The serialized workflow, as an operator-facing summary.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WorkflowFacts {
+    pub(crate) components: usize,
+    pub(crate) graph_components: usize,
+    pub(crate) declares_generation_loop: bool,
 }
 
 /// Server-facing summary of an engine's batching capability, combining the
@@ -74,20 +81,6 @@ impl BatchingReport {
         }
     }
 
-    /// The report for a pipeline engine, which always serves one request at a
-    /// time (its components own their own caches rather than one batched pass).
-    fn pipeline() -> Self {
-        Self {
-            supported: false,
-            requested_max_batch: 1,
-            effective_max_batch: 1,
-            reason: "pipeline engines serve one request at a time; their \
-                     components own separate caches rather than a shared batched \
-                     forward pass"
-                .to_string(),
-        }
-    }
-
     /// A placeholder report for registry test doubles that drive no engine.
     #[cfg(test)]
     pub(crate) fn single_sequence_stub() -> Self {
@@ -110,14 +103,15 @@ pub(crate) enum DriverCommand {
         session_id: SessionId,
         response: tokio::sync::oneshot::Sender<anyhow::Result<usize>>,
     },
+    /// Generate, from whatever the request carried.
+    ///
+    /// One command, because there is one runtime beneath it. A session id is
+    /// the conversation this request continues; `input` is the application
+    /// tensors it arrived with (an image, an audio window). Either may be
+    /// absent, and neither says anything about what kind of package is loaded —
+    /// which is the point: a route no longer has to know.
     Generate {
         session_id: Option<SessionId>,
-        request: Box<GenerateRequest>,
-        admission: oneshot::Sender<Result<(), DriverFailure>>,
-        events: mpsc::Sender<DriverEvent>,
-        permit: OwnedSemaphorePermit,
-    },
-    GeneratePipeline {
         request: Box<GenerateRequest>,
         input: Option<MultimodalInput>,
         admission: oneshot::Sender<Result<(), DriverFailure>>,
@@ -299,8 +293,11 @@ impl EngineDriver {
         }
         let memory_strategy_plan = Arc::new(engine.memory_strategy_plan().clone());
         let owner = EngineOwner(Box::new(engine));
-        let is_workflow = owner.0.is_workflow();
-        let workflow_shape = owner.0.workflow_shape().as_str();
+        let workflow_facts = WorkflowFacts {
+            components: owner.0.workflow_component_count(),
+            graph_components: owner.0.workflow_graph_component_count(),
+            declares_generation_loop: owner.0.workflow_declares_generation_loop(),
+        };
         let resource_snapshot = Arc::new(Mutex::new(Some(owner.0.resource_snapshot())));
         let driver_snapshot = Arc::clone(&resource_snapshot);
         thread::Builder::new()
@@ -325,53 +322,13 @@ impl EngineDriver {
             memory_strategy_plan,
             device_authority,
             batching,
-            is_workflow,
-            workflow_shape,
+            workflow_facts,
         }
     }
 
-    pub(crate) fn start_pipeline(engine: Engine, max_queue_depth: usize) -> Self {
-        let (commands, rx) = mpsc::channel(max_queue_depth);
-        let generation_capacity = Arc::new(Semaphore::new(max_queue_depth));
-        let driver_capacity = generation_capacity.clone();
-        let device_authority = Some(engine.governor().device_authority());
-        let memory_strategy_plan = Arc::new(engine.memory_strategy_plan().clone());
-        let owner = EngineOwner(Box::new(engine));
-        let is_workflow = owner.0.is_workflow();
-        let workflow_shape = owner.0.workflow_shape().as_str();
-        let resource_snapshot = Arc::new(Mutex::new(Some(owner.0.resource_snapshot())));
-        let driver_snapshot = Arc::clone(&resource_snapshot);
-        // A pipeline engine owns its components' caches rather than one page
-        // table, so there is nothing here to mirror. Reported as an explicit
-        // not-applicable rather than an all-zero pool, which would read as an
-        // idle paged cache instead of an absent one.
-        let kv_telemetry = Arc::new(KvTelemetry::default());
-        kv_telemetry.set_not_applicable(KvNotApplicable::CacheCannotPage);
-        thread::Builder::new()
-            .name("onnx-genai-pipeline-driver".to_string())
-            .spawn(move || {
-                run_engine_driver(
-                    owner,
-                    rx,
-                    1,
-                    max_queue_depth,
-                    driver_capacity,
-                    driver_snapshot,
-                )
-            })
-            .expect("failed to spawn onnx-genai pipeline driver");
-        Self {
-            commands,
-            generation_capacity,
-            generation_capacity_size: u32::try_from(max_queue_depth).unwrap_or(u32::MAX),
-            kv_telemetry,
-            resource_snapshot,
-            memory_strategy_plan,
-            device_authority,
-            batching: Arc::new(BatchingReport::pipeline()),
-            is_workflow,
-            workflow_shape,
-        }
+    /// What the loaded package's serialized workflow declares.
+    pub(crate) fn workflow_facts(&self) -> WorkflowFacts {
+        self.workflow_facts
     }
 
     /// The KV page pool mirror.
@@ -438,33 +395,14 @@ impl EngineDriver {
         request: GenerateRequest,
         input: Option<MultimodalInput>,
     ) -> Result<DriverGeneration, GenerateSubmitError> {
-        if self.is_workflow {
-            return self.generate_pipeline(request, input).await;
-        }
-        self.generate(session_id, request).await
-    }
-
-    /// Whether the runtime behind this driver executes a workflow package.
-    ///
-    /// Read from the engine at startup, never supplied by a caller, so a route
-    /// and the driver can never disagree about which package was loaded.
-    pub(crate) fn is_workflow(&self) -> bool {
-        self.is_workflow
-    }
-
-    /// The shape of the workflow this runtime executes.
-    ///
-    /// Distinct from [`Self::is_workflow`] on purpose: that answers "which
-    /// executor drives the decoder step", this answers "what does the package's
-    /// workflow look like". Every loaded package has one.
-    pub(crate) fn workflow_shape(&self) -> &'static str {
-        self.workflow_shape
+        self.generate(session_id, request, input).await
     }
 
     pub(crate) async fn generate(
         &self,
         session_id: Option<SessionId>,
         request: GenerateRequest,
+        input: Option<MultimodalInput>,
     ) -> Result<DriverGeneration, GenerateSubmitError> {
         let permit = self
             .generation_capacity
@@ -479,6 +417,7 @@ impl EngineDriver {
             .send(DriverCommand::Generate {
                 session_id,
                 request: Box::new(request),
+                input,
                 admission,
                 events,
                 permit,
@@ -505,22 +444,13 @@ impl EngineDriver {
             .map_err(|_| anyhow::anyhow!("generation capacity exceeded"))?;
         let (events, mut receiver) = mpsc::channel(DRIVER_OUTPUT_BUFFER);
         let (admission, _admission_rx) = oneshot::channel();
-        let command = if self.is_workflow {
-            DriverCommand::GeneratePipeline {
-                request: Box::new(request),
-                input: None,
-                admission,
-                events,
-                permit,
-            }
-        } else {
-            DriverCommand::Generate {
-                session_id: None,
-                request: Box::new(request),
-                admission,
-                events,
-                permit,
-            }
+        let command = DriverCommand::Generate {
+            session_id: None,
+            request: Box::new(request),
+            input: None,
+            admission,
+            events,
+            permit,
         };
         self.commands
             .blocking_send(command)
@@ -533,41 +463,6 @@ impl EngineDriver {
             }
         }
         anyhow::bail!("generation stream ended before result")
-    }
-
-    pub(crate) async fn generate_pipeline(
-        &self,
-        request: GenerateRequest,
-        input: Option<MultimodalInput>,
-    ) -> Result<DriverGeneration, GenerateSubmitError> {
-        let permit = self
-            .generation_capacity
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| GenerateSubmitError::Overloaded)?;
-        let (events, rx) = mpsc::channel(DRIVER_OUTPUT_BUFFER);
-        let (admission, admission_rx) = oneshot::channel();
-        crate::metrics::generation_queued();
-        if self
-            .commands
-            .send(DriverCommand::GeneratePipeline {
-                request: Box::new(request),
-                input,
-                admission,
-                events,
-                permit,
-            })
-            .await
-            .is_err()
-        {
-            crate::metrics::generation_queue_cancelled();
-            return Err(GenerateSubmitError::DriverStopped);
-        }
-
-        Ok(DriverGeneration {
-            admission: admission_rx,
-            events: rx,
-        })
     }
 
     pub(crate) async fn synthesize_speech(
@@ -767,14 +662,11 @@ fn run_engine_driver(
     resource_snapshot: Arc<Mutex<Option<GovernorSnapshot>>>,
 ) {
     let mut engine = *owner.0;
-    // A workflow package serves one request at a time: its components own
-    // separate caches rather than one batched forward pass. Asking the runtime
-    // rather than a caller-supplied flag is what lets both package shapes share
-    // this one driver.
-    if engine.is_workflow() {
-        run_pipeline_driver(&mut engine, rx, &resource_snapshot);
-        return;
-    }
+    // Which driver runs is a capability question the engine answers: a package
+    // whose decode path can advance several rows per forward pass gets the
+    // continuous-batch driver, and everything else — including a package whose
+    // components own separate caches — gets the per-request one. Neither driver
+    // asks what kind of package it holds.
     let continuous_batch_supported = engine.continuous_batch_manager(max_batch).is_ok();
     if continuous_batch_supported {
         tracing::info!(max_batch, "continuous batch driver enabled");
@@ -793,107 +685,6 @@ fn run_engine_driver(
             "continuous batch driver disabled; using per-request engine path (single-sequence decode)"
         );
         run_fallback_engine_driver(&mut engine, rx, &resource_snapshot);
-    }
-}
-
-fn run_pipeline_driver(
-    engine: &mut Engine,
-    mut rx: mpsc::Receiver<DriverCommand>,
-    resource_snapshot: &Mutex<Option<GovernorSnapshot>>,
-) {
-    while let Some(command) = rx.blocking_recv() {
-        match command {
-            DriverCommand::GeneratePipeline {
-                request,
-                input,
-                admission,
-                events,
-                permit,
-            } => run_pipeline_generation(engine, *request, input, admission, events, permit),
-            DriverCommand::SynthesizeSpeech {
-                request,
-                audio_output,
-                reply,
-                permit,
-            } => {
-                let _permit = permit;
-                let result = engine
-                    .run_pipeline_outputs(PipelineGenerateRequest::new(*request))
-                    .and_then(|outputs| engine.encode_audio_output(&outputs, &audio_output));
-                let _ = reply.send(result);
-            }
-            DriverCommand::GenerateImage {
-                request,
-                reply,
-                permit: _permit,
-                track_metrics,
-            } => {
-                let _metrics = track_metrics.then(GenerationMetrics::start);
-                let result = (|| {
-                    let outputs = engine.run_pipeline_outputs(request.into_pipeline()?)?;
-                    let image = engine
-                        .structured_output_for_role(
-                            &outputs,
-                            onnx_genai_engine::pipeline::WorkflowOutputRole::Image,
-                        )
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "workflow completed without emitting its declared image output"
-                            )
-                        })?;
-                    Ok(ProducedImage {
-                        values: image.to_vec_f32_lossy()?,
-                        shape: image.shape().to_vec(),
-                    })
-                })();
-                let _ = reply.send(result);
-            }
-            DriverCommand::CreateSession(response) => {
-                let _ = response.send(Err(anyhow::anyhow!(
-                    "sessions are not supported by pipeline models"
-                )));
-            }
-            DriverCommand::CloseSession { response, .. } => {
-                let _ = response.send(Err(anyhow::anyhow!(
-                    "sessions are not supported by pipeline models"
-                )));
-            }
-            DriverCommand::SessionTokenCount { response, .. } => {
-                let _ = response.send(Err(anyhow::anyhow!(
-                    "sessions are not supported by pipeline models"
-                )));
-            }
-            DriverCommand::Generate {
-                admission, events, ..
-            }
-            | DriverCommand::GenerateFim {
-                admission, events, ..
-            } => {
-                crate::metrics::generation_queue_cancelled();
-                let failure =
-                    DriverFailure::internal("invalid generation route for pipeline model");
-                let _ = admission.send(Err(failure.clone()));
-                let _ = events.try_send(DriverEvent::Error(failure));
-            }
-            DriverCommand::Embed { reply, .. } => {
-                let _ = reply.send(Err(anyhow::anyhow!(
-                    "embeddings are not supported by pipeline models"
-                )));
-            }
-            #[cfg(test)]
-            DriverCommand::ResourceSnapshot(reply) => {
-                let _ = reply.send(Ok(engine.resource_snapshot()));
-            }
-            DriverCommand::SetVramLimit { limit, reply } => {
-                let result = engine
-                    .set_vram_limit(limit)
-                    .map(|_| engine.resource_snapshot());
-                let _ = reply.send(Ok(result));
-            }
-        }
-        if let Ok(mut snapshot) = resource_snapshot.lock() {
-            *snapshot = Some(engine.resource_snapshot());
-        }
     }
 }
 
@@ -925,7 +716,9 @@ fn run_static_engine_driver(
         while let Ok(command) = rx.try_recv() {
             match command {
                 command @ DriverCommand::Generate {
-                    session_id: None, ..
+                    session_id: None,
+                    input: None,
+                    ..
                 } => deferred.push_back(command),
                 command => deferred.push_back(command),
             }
@@ -939,6 +732,7 @@ fn run_static_engine_driver(
             DriverCommand::Generate {
                 session_id: None,
                 request,
+                input: None,
                 admission,
                 events,
                 permit,
@@ -998,6 +792,7 @@ fn run_static_batch_until_idle(
                 Some(DriverCommand::Generate {
                     session_id: None,
                     request,
+                    input: None,
                     admission,
                     events,
                     permit,
@@ -1022,6 +817,7 @@ fn run_static_batch_until_idle(
                 Ok(DriverCommand::Generate {
                     session_id: None,
                     request,
+                    input: None,
                     admission,
                     events,
                     permit,
@@ -1096,10 +892,11 @@ fn run_static_batch_until_idle(
         let pending = initial
             .pop()
             .expect("the first generation request was queued");
-        run_fallback_generation(
+        run_generation(
             engine,
             None,
             pending.request,
+            None,
             pending.admission,
             pending.events,
             pending.permit,
@@ -1146,6 +943,7 @@ fn run_static_batch_until_idle(
                 Some(DriverCommand::Generate {
                     session_id: None,
                     request,
+                    input: None,
                     admission,
                     events,
                     permit,
@@ -1172,6 +970,7 @@ fn run_static_batch_until_idle(
                 DriverCommand::Generate {
                     session_id: None,
                     request,
+                    input: None,
                     admission,
                     events,
                     permit,
@@ -1190,6 +989,7 @@ fn run_static_batch_until_idle(
                         deferred.push_back(DriverCommand::Generate {
                             session_id: None,
                             request,
+                            input: None,
                             admission,
                             events,
                             permit,
@@ -1324,7 +1124,6 @@ fn deferred_permit_holder_count(deferred: &VecDeque<DriverCommand>) -> usize {
             matches!(
                 command,
                 DriverCommand::Generate { .. }
-                    | DriverCommand::GeneratePipeline { .. }
                     | DriverCommand::GenerateImage { .. }
                     | DriverCommand::GenerateFim { .. }
                     | DriverCommand::SynthesizeSpeech { .. }
@@ -1524,10 +1323,13 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
         DriverCommand::Generate {
             session_id,
             request,
+            input,
             admission,
             events,
             permit,
-        } => run_fallback_generation(engine, session_id, *request, admission, events, permit),
+        } => run_generation(
+            engine, session_id, *request, input, admission, events, permit,
+        ),
         DriverCommand::GenerateFim {
             prefix,
             suffix,
@@ -1544,25 +1346,47 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             *options,
             (admission, events, permit),
         ),
-        DriverCommand::GeneratePipeline {
-            admission, events, ..
+        // Speech and image are workflow outputs: the package either declares
+        // one with the right role or it does not, and the runtime says which.
+        // Refusing them up front by package kind would have been a guess about
+        // the same question the workflow already answers.
+        DriverCommand::SynthesizeSpeech {
+            request,
+            audio_output,
+            reply,
+            permit,
         } => {
-            crate::metrics::generation_queue_cancelled();
-            let failure =
-                DriverFailure::internal("invalid pipeline generation route for single model");
-            let _ = admission.send(Err(failure.clone()));
-            let _ = events.try_send(DriverEvent::Error(failure));
+            let _permit = permit;
+            let result = engine
+                .run_pipeline_outputs(PipelineGenerateRequest::new(*request))
+                .and_then(|outputs| engine.encode_audio_output(&outputs, &audio_output));
+            let _ = reply.send(result);
         }
-        DriverCommand::SynthesizeSpeech { reply, .. } => {
-            let _ = reply.send(Err(anyhow::anyhow!(
-                "speech synthesis requires a workflow pipeline model"
-            )));
-        }
-        DriverCommand::GenerateImage { reply, .. } => {
-            crate::metrics::generation_queue_cancelled();
-            let _ = reply.send(Err(anyhow::anyhow!(
-                "image generation requires a metadata-declared pipeline model"
-            )));
+        DriverCommand::GenerateImage {
+            request,
+            reply,
+            permit: _permit,
+            track_metrics,
+        } => {
+            let _metrics = track_metrics.then(GenerationMetrics::start);
+            let result = (|| {
+                let outputs = engine.run_pipeline_outputs(request.into_pipeline()?)?;
+                let image = engine
+                    .structured_output_for_role(
+                        &outputs,
+                        onnx_genai_engine::pipeline::WorkflowOutputRole::Image,
+                    )
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "workflow completed without emitting its declared image output"
+                        )
+                    })?;
+                Ok(ProducedImage {
+                    values: image.to_vec_f32_lossy()?,
+                    shape: image.shape().to_vec(),
+                })
+            })();
+            let _ = reply.send(result);
         }
         DriverCommand::Embed {
             input_ids,
@@ -1718,8 +1542,16 @@ impl std::fmt::Display for DriverDeliveryError {
 
 impl std::error::Error for DriverDeliveryError {}
 
-fn run_pipeline_generation(
+/// Run one generation, from whatever the request carried.
+///
+/// One function, because there is one runtime beneath it. A session id names
+/// the conversation to continue and the engine resolves what continues it; the
+/// bound tensors are what the request arrived with, and a request carrying them
+/// is bound as a workflow request because that is the only way to deliver them.
+/// Neither branch asks what kind of package is loaded.
+fn run_generation(
     engine: &mut Engine,
+    session_id: Option<SessionId>,
     request: GenerateRequest,
     input: Option<MultimodalInput>,
     admission: oneshot::Sender<Result<(), DriverFailure>>,
@@ -1727,12 +1559,11 @@ fn run_pipeline_generation(
     _permit: OwnedSemaphorePermit,
 ) {
     let mut metrics = GenerationMetrics::start();
-    let pipeline_request = match input
+    let bound = match input
         .map(|input| input.bind(PipelineGenerateRequest::new(request.clone())))
         .transpose()
     {
-        Ok(Some(bound)) => bound,
-        Ok(None) => PipelineGenerateRequest::new(request),
+        Ok(bound) => bound,
         Err(error) => {
             let failure = DriverFailure::internal(format!("{error:#}"));
             let _ = admission.send(Err(failure.clone()));
@@ -1751,55 +1582,19 @@ fn run_pipeline_generation(
                 let _ = sender.send(Ok(()));
             }
         };
-        engine.generate_pipeline_with_callbacks(
-            pipeline_request,
-            Some(&mut admitted),
-            Some(&mut callback),
-        )
-    };
-    match result {
-        Ok(result) => {
-            metrics.result(result.token_ids.len(), result.prefix_cache_hit_len);
-            let _ = deliver_event(&events, DriverEvent::Finished(result));
-        }
-        Err(err) => {
-            let failure = DriverFailure::from_engine_error(&err);
-            if let Some(sender) = admission.take() {
-                let _ = sender.send(Err(failure.clone()));
-            }
-            let _ = deliver_event(&events, DriverEvent::Error(failure));
-        }
-    }
-}
-
-fn run_fallback_generation(
-    engine: &mut Engine,
-    session_id: Option<SessionId>,
-    request: GenerateRequest,
-    admission: oneshot::Sender<Result<(), DriverFailure>>,
-    events: mpsc::Sender<DriverEvent>,
-    _permit: OwnedSemaphorePermit,
-) {
-    let mut metrics = GenerationMetrics::start();
-    let mut admission = Some(admission);
-    let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
-        metrics.token();
-        deliver_event(&events, DriverEvent::Token(token))
-    };
-    let result = {
-        let mut admitted = || {
-            if let Some(sender) = admission.take() {
-                let _ = sender.send(Ok(()));
-            }
-        };
-        match session_id {
-            Some(session_id) => engine.generate_in_session_with_callbacks(
+        match (bound, session_id) {
+            (Some(bound), _) => engine.generate_with_pipeline_callbacks(
+                bound,
+                Some(&mut admitted),
+                Some(&mut callback),
+            ),
+            (None, Some(session_id)) => engine.generate_in_session_with_callbacks(
                 session_id,
                 request,
                 Some(&mut admitted),
                 Some(&mut callback),
             ),
-            None => {
+            (None, None) => {
                 engine.generate_with_callbacks(request, Some(&mut admitted), Some(&mut callback))
             }
         }
@@ -2035,8 +1830,11 @@ mod admission_tests {
             .try_send(DriverCommand::ResourceSnapshot(reply))
             .expect("fill command queue");
         let driver = EngineDriver {
-            is_workflow: false,
-            workflow_shape: "none",
+            workflow_facts: crate::driver::WorkflowFacts {
+                components: 0,
+                graph_components: 0,
+                declares_generation_loop: false,
+            },
             commands,
             generation_capacity: Arc::new(Semaphore::new(1)),
             generation_capacity_size: 1,

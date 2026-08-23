@@ -130,7 +130,7 @@ fn real_chained_workflow_package_drives_through_the_interpreter() -> anyhow::Res
         return Ok(());
     };
 
-    let engine = Engine::from_pipeline_dir(&package, EngineConfig::default())?;
+    let engine = Engine::from_dir(&package, EngineConfig::default())?;
     let contract = engine
         .speculative_contract()
         .context("the package declares no speculative contract")?;

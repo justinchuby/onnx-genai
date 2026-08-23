@@ -4,7 +4,7 @@ use crate::config::{GenerateOptions, GenerateResult, GenerateTokenCallback};
 use crate::decode::DecodeBackend;
 use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState};
 use crate::logits::{ProcessorChain, TokenId};
-use crate::pipeline::canonical_decode::{CanonicalDecodeRequest, run_canonical_decode};
+use crate::pipeline::generation::{GenerationRequest, generate_with_decode_core};
 use crate::sampling::sample_greedy;
 use anyhow::{Context, bail};
 use onnx_genai_metadata::{DecoderAbi, KvOwnership, SequenceInputKind};
@@ -1372,9 +1372,9 @@ impl NativeDecodeSession {
         options: &GenerateOptions,
         chain: &ProcessorChain,
         tokenizer: &Tokenizer,
-        workflow: &onnx_genai_metadata::WorkflowSpec,
+        runtime: &crate::pipeline::WorkflowRuntime,
     ) -> anyhow::Result<GenerateResult> {
-        self.generate_with_callback(prompt_tokens, options, chain, tokenizer, workflow, None)
+        self.generate_with_callback(prompt_tokens, options, chain, tokenizer, runtime, None)
     }
 
     /// Generate through the shared loop and optionally stream generated tokens.
@@ -1384,7 +1384,7 @@ impl NativeDecodeSession {
         options: &GenerateOptions,
         chain: &ProcessorChain,
         tokenizer: &Tokenizer,
-        workflow: &onnx_genai_metadata::WorkflowSpec,
+        runtime: &crate::pipeline::WorkflowRuntime,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         if prompt_tokens.is_empty() {
@@ -1400,15 +1400,16 @@ impl NativeDecodeSession {
             lookahead: std::collections::VecDeque::new(),
         };
         let mut state = DecodeLoopState::new(0, options.seed, options.top_logprobs);
-        run_canonical_decode(
+        generate_with_decode_core(
+            runtime,
             &mut backend,
             &mut state,
-            CanonicalDecodeRequest {
+            prompt_tokens,
+            GenerationRequest {
                 options,
                 chain,
                 tokenizer,
                 max_context: options.max_context,
-                workflow,
             },
             callback,
         )
@@ -1485,7 +1486,7 @@ impl NativeDecodeSession {
         options: &GenerateOptions,
         chain: &ProcessorChain,
         tokenizer: &Tokenizer,
-        workflow: &onnx_genai_metadata::WorkflowSpec,
+        runtime: &crate::pipeline::WorkflowRuntime,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         if prompt_tokens.is_empty() {
@@ -1499,7 +1500,7 @@ impl NativeDecodeSession {
                 options,
                 chain,
                 tokenizer,
-                workflow,
+                runtime,
                 callback,
             );
         }
@@ -1524,15 +1525,16 @@ impl NativeDecodeSession {
             lookahead: std::collections::VecDeque::new(),
         };
         let mut state = DecodeLoopState::new(resume_from, options.seed, options.top_logprobs);
-        run_canonical_decode(
+        generate_with_decode_core(
+            runtime,
             &mut backend,
             &mut state,
-            CanonicalDecodeRequest {
+            prompt_tokens,
+            GenerationRequest {
                 options,
                 chain,
                 tokenizer,
                 max_context: options.max_context,
-                workflow,
             },
             callback,
         )

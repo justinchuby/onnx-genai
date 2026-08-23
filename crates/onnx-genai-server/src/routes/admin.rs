@@ -93,10 +93,12 @@ pub(crate) async fn debug_config(
         .resolve("")
         .map_err(map_registry_error)?
         .ok_or_else(|| ApiError::internal("no model loaded"))?;
+    let facts = handle.engine.workflow_facts();
     Ok(Json(DebugConfigResponse {
         model_id: handle.id.clone(),
-        pipeline: handle.engine.is_workflow(),
-        workflow_shape: handle.engine.workflow_shape(),
+        workflow_components: facts.components,
+        workflow_graph_components: facts.graph_components,
+        workflow_declares_generation_loop: facts.declares_generation_loop,
         max_output_tokens: state.config.max_output_tokens,
         max_sessions: state.config.max_sessions,
         max_queue_depth: state.config.max_queue_depth,

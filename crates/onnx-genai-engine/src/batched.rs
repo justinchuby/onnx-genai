@@ -756,6 +756,25 @@ impl<'a> ContinuousBatchManager<'a> {
 }
 
 impl Engine {
+    /// Refuse a package whose declared workflow the batched routes cannot run.
+    ///
+    /// Batching advances N rows through *one* decoder forward pass, so it needs
+    /// a package whose declared graph is that decoder and whose stop policy is
+    /// the runtime's. A package that declares an in-graph sampler or several
+    /// components has a loop of its own shape, and the row-major batch would be
+    /// executing something other than what it declared.
+    ///
+    /// Checked at the routes' single admission point, before a slot is taken.
+    fn assert_batched_generation_declared(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.holds_decode_core(),
+            "batched generation runs N rows through one decoder forward pass, which requires the \
+             package's declared decode step to be one this runtime has a fused executor for; \
+             this package declares a workflow whose components the interpreter invokes \
+             individually, so its declared loop is not a row-major batch"
+        );
+        crate::pipeline::validate_generation_workflow(self.workflow.workflow_spec())
+    }
     /// Generate a fixed batch of independent requests on a STATIC-CACHE model.
     ///
     /// Each request owns its processor chain, sampling options, stop conditions,
@@ -781,10 +800,7 @@ impl Engine {
         // executable at all" is a different and prior answer to "this package
         // cannot batch" — reporting the capability first would tell a caller to
         // go find a static-cache model when the real problem is the package.
-        crate::engine::canonical_workflow(
-            self.workflow.as_deref(),
-            self.lowered_workflow.as_ref(),
-        )?;
+        self.assert_batched_generation_declared()?;
         if !matches!(self.decode_path, ModelDecodePath::StaticCache { .. }) {
             anyhow::bail!(
                 "batched static generation requires a STATIC-CACHE model; past/present batching is deferred"
@@ -1038,12 +1054,9 @@ impl Engine {
             anyhow::bail!("continuous batch max_batch must be greater than zero");
         }
         // The single admission point for both continuous-batch entry points, so
-        // the canonical precondition is checked once, here, rather than once per
-        // caller where a new caller could forget it.
-        crate::engine::canonical_workflow(
-            self.workflow.as_deref(),
-            self.lowered_workflow.as_ref(),
-        )?;
+        // the precondition is checked once, here, rather than once per caller
+        // where a new caller could forget it.
+        self.assert_batched_generation_declared()?;
         // Resolved before the session borrows below, and from the same source
         // the single-row path uses: the manager cannot reach the package's
         // workflow once it holds a mutable session borrow.

@@ -349,11 +349,7 @@ impl Engine {
     /// inputs and never reach the runtime's stop policy, which is what "declared
     /// but dead" meant.
     fn declared_eos_token_ids(&self) -> anyhow::Result<Vec<TokenId>> {
-        let Ok(workflow) =
-            canonical_workflow(self.workflow.as_deref(), self.lowered_workflow.as_ref())
-        else {
-            return Ok(Vec::new());
-        };
+        let workflow = self.workflow.workflow_spec();
         workflow
             .inputs
             .values()
@@ -402,9 +398,6 @@ impl Engine {
     }
 
     pub fn effective_max_context(&self, options: &GenerateOptions) -> Option<usize> {
-        if let Some(workflow) = self.workflow.as_deref() {
-            return workflow.effective_max_context(options);
-        }
         self.max_context_for_request(options)
     }
 
@@ -430,10 +423,6 @@ impl Engine {
         options.max_context = self.max_context_for_request(&options);
         let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
         let speculation_plan = native_speculation_plan(&options, &chain);
-        // Resolved before admission: a package with no canonical workflow must
-        // be refused before it can take a scheduler slot or touch the decode
-        // workspace, so a refusal never leaves state behind to unwind.
-        canonical_workflow(self.workflow.as_deref(), self.lowered_workflow.as_ref())?;
         let scheduler_session_id = self.next_native_session_id();
         let scheduled = self.admit_generate_request_with_scheduler(
             scheduler_session_id,
@@ -470,8 +459,7 @@ impl Engine {
             .tokenizer
             .as_ref()
             .context("this package declares no tokenizer, so it cannot decode text")?;
-        let workflow =
-            canonical_workflow(self.workflow.as_deref(), self.lowered_workflow.as_ref())?;
+        let runtime = &*self.workflow;
         let result = if let Some(plan) = speculation_plan {
             let mut stats = SpeculativeStats::default();
             let result = (|| {
@@ -546,7 +534,7 @@ impl Engine {
                 &options,
                 &chain,
                 tokenizer,
-                workflow,
+                runtime,
                 callback,
             )
         };
@@ -723,12 +711,71 @@ impl Engine {
         self.native_session.as_mut()
     }
 
+    /// Whether this runtime holds the fused decode session that implements the
+    /// declared `onnx-genai.autoregressive-decode` step.
+    ///
+    /// A question about which executor exists, not about what kind of package
+    /// was loaded: a package whose decode step this runtime has no fused
+    /// session for still runs the same declared loop, with the interpreter
+    /// invoking the component from its own artifact.
+    pub(crate) fn holds_decode_core(&self) -> bool {
+        #[cfg(feature = "native-backend")]
+        if self.native_session.is_some() {
+            return true;
+        }
+        self.session.is_some()
+    }
+
+    /// Continue a conversation the interpreter keeps in session-scoped state.
+    ///
+    /// The session id is bound into the request rather than looked up in a
+    /// decode core: a workflow's `scope: session` cells are keyed by it, and
+    /// that is where this package's conversation lives.
+    pub(crate) fn generate_in_workflow_session(
+        &mut self,
+        session_id: SessionId,
+        request: crate::pipeline::PipelineGenerateRequest,
+        on_admitted: Option<&mut dyn FnMut()>,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        anyhow::ensure!(
+            self.workflow_sessions.contains_key(&session_id),
+            "session {session_id} not found"
+        );
+        let result = self.generate_with_pipeline_callbacks(
+            request.with_session_id(session_id.to_string()),
+            on_admitted,
+            callback,
+        )?;
+        if let Some(count) = self.workflow_sessions.get_mut(&session_id) {
+            *count += result.token_ids.len();
+        }
+        Ok(result)
+    }
+
+    /// Generate by interpreting every declared component from its artifact.
+    ///
+    /// The same drive the decode-core path uses, with no core: the interpreter
+    /// walks the same declared loop, honours the same bound and predicate, and
+    /// publishes the same `tokens` output. What it does not have is a fused
+    /// session to route the decode step to, so it invokes the component the
+    /// package names.
+    fn generate_interpreted(
+        &mut self,
+        request: GenerateRequest,
+        on_admitted: Option<&mut dyn FnMut()>,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        self.generate_with_pipeline_callbacks(
+            crate::pipeline::PipelineGenerateRequest::new(request),
+            on_admitted,
+            callback,
+        )
+    }
+
     /// Access the engine-owned Resource Governor handle.
     pub fn governor(&self) -> &EngineResourceGovernor {
-        self.governor
-            .as_ref()
-            .or_else(|| self.workflow.as_deref().map(|workflow| workflow.governor()))
-            .expect("every runtime owns exactly one resource governor")
+        &self.governor
     }
 
     /// Convenience snapshot of configured and live resource state.
@@ -888,15 +935,13 @@ impl Engine {
         admission_callback: Option<&mut dyn FnMut()>,
         token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
-        // One entry point, and one representation beneath it. A composite
-        // `pipeline.workflow` is driven by the interpreter over its declared
-        // `tokens` output; a single-decoder workflow is driven by the fused
-        // decode executor over the same declared loop. There is no third path:
-        // a package that reached here without a canonical form is a load bug,
-        // and saying so is what keeps "every request runs a canonical workflow"
-        // checkable rather than asserted.
-        if self.workflow.is_some() {
-            return self.workflow_generate(request, admission_callback, token_callback);
+        // One entry point, one interpreter, one declared loop. What varies is
+        // whether this runtime holds the fused decode session that implements
+        // the package's declared `autoregressive-decode` step. Without one, the
+        // interpreter invokes every declared component from the artifact the
+        // package names — the same loop, the same emits, the same stop.
+        if !self.holds_decode_core() {
+            return self.generate_interpreted(request, admission_callback, token_callback);
         }
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
@@ -997,6 +1042,14 @@ impl Engine {
         admission_callback: Option<&mut dyn FnMut()>,
         token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        if !self.holds_decode_core() {
+            return self.generate_in_workflow_session(
+                session_id,
+                crate::pipeline::PipelineGenerateRequest::new(request),
+                admission_callback,
+                token_callback,
+            );
+        }
         self.generate_in_session_with_priority_and_callback(
             session_id,
             request,
@@ -1068,10 +1121,6 @@ impl Engine {
         }
 
         let max_context = self.max_context_for_request(&options);
-        // Resolved before scheduler admission, before any KV work, and before
-        // the speculative branch below: a runtime with no canonical workflow
-        // refuses without having admitted or mutated anything.
-        canonical_workflow(self.workflow.as_deref(), self.lowered_workflow.as_ref())?;
         let chain = build_processor_chain(
             &options,
             Some(self.require_tokenizer()?),
@@ -1127,8 +1176,7 @@ impl Engine {
                 .tokenizer
                 .as_ref()
                 .context("this package declares no tokenizer, so it cannot decode text")?;
-            let workflow =
-                canonical_workflow(self.workflow.as_deref(), self.lowered_workflow.as_ref())?;
+            let runtime = &*self.workflow;
             let mut backend = SessionDecodeLoopBackend {
                 session: self
                     .session
@@ -1140,20 +1188,22 @@ impl Engine {
                 session_id,
                 state: &mut state,
             };
-            // Every generated token goes through the interpreter's canonical
-            // decode loop. The backend below is the `autoregressive-decode`
-            // executor -- one forward pass, KV stays its business -- and the
-            // policy inside the loop is the single sampling/stopping
-            // implementation, shared with authored workflows.
-            crate::pipeline::canonical_decode::run_canonical_decode(
+            // Every generated token comes out of the interpreter walking the
+            // package's declared loop. The backend below is the executor the
+            // interpreter routes the declared `autoregressive-decode` step to
+            // -- one forward pass, KV stays its business -- and the token
+            // policy beside it is the single sampling/stopping implementation,
+            // shared with every other package.
+            crate::pipeline::generation::generate_with_decode_core(
+                runtime,
                 &mut backend,
                 &mut loop_state,
-                crate::pipeline::canonical_decode::CanonicalDecodeRequest {
+                &prompt_tokens,
+                crate::pipeline::generation::GenerationRequest {
                     options: &options,
                     chain: &chain,
                     tokenizer,
                     max_context,
-                    workflow,
                 },
                 callback.as_deref_mut(),
             )
@@ -1301,6 +1351,17 @@ impl Engine {
 
     /// Create a new generation session.
     pub fn create_session(&mut self) -> anyhow::Result<SessionId> {
+        // A package whose components the interpreter invokes has no paged KV
+        // sequence to open, but it does have sessions: its workflow may declare
+        // `scope: session` state, and this is the id that state is keyed by.
+        // Refusing here would have made "sessions" a property of which executor
+        // runs the decode step, which is not what a caller is asking about.
+        if !self.holds_decode_core() {
+            self.workflow_session_counter += 1;
+            let id = self.workflow_session_counter;
+            self.workflow_sessions.insert(id, 0);
+            return Ok(id);
+        }
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
             return self.create_native_session_state();
@@ -1470,6 +1531,14 @@ impl Engine {
 
     /// Close a persistent session and free its associated state.
     pub fn close_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
+        if !self.holds_decode_core() {
+            anyhow::ensure!(
+                self.workflow_sessions.remove(&session_id).is_some(),
+                "session {session_id} not found"
+            );
+            self.workflow.forget_session(&session_id.to_string());
+            return Ok(());
+        }
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
             return session_state::close(&mut NativeSessions(self), session_id);
@@ -1480,6 +1549,13 @@ impl Engine {
 
     /// Number of logical tokens retained in a persistent session.
     pub fn session_token_count(&self, session_id: SessionId) -> anyhow::Result<usize> {
+        if !self.holds_decode_core() {
+            return self
+                .workflow_sessions
+                .get(&session_id)
+                .copied()
+                .with_context(|| format!("session {session_id} not found"));
+        }
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
             return session_state::token_count(&NativeSessionsRef(self), session_id);
@@ -1509,13 +1585,12 @@ impl Engine {
     /// it from requested settings, so explicit CPU fallbacks and skipped
     /// providers are visible to status/profile output.
     pub fn execution_provider_status(&self) -> String {
-        if let Some(workflow) = self.workflow.as_deref() {
-            return workflow.execution_provider_status();
+        // Reported by whoever owns the sessions: the decode core when it holds
+        // the package's one graph, the interpreter's components otherwise.
+        match self.session.as_deref() {
+            Some(session) => session.execution_provider_status().summary(),
+            None => self.workflow.execution_provider_status(),
         }
-        self.session.as_deref().map_or_else(
-            || "native".to_string(),
-            |session| session.execution_provider_status().summary(),
-        )
     }
     /// Latest native activation-memory planner measurement, if the current
     /// backend is native and has executed far enough to resolve concrete shapes.
@@ -1634,10 +1709,13 @@ impl Engine {
     /// `max_length`, or to feed [`Engine::embed`] and the generation APIs). It
     /// uses the same tokenizer path as the engine's internal prompt handling.
     pub fn tokenize(&self, text: &str) -> anyhow::Result<Vec<TokenId>> {
-        if let Some(workflow) = self.workflow.as_deref() {
-            return workflow.tokenize(text);
-        }
-        self.require_tokenizer()?.encode(text).map_err(|e| {
+        // Whoever owns the package's tokenizer answers. The decode core opens
+        // one when it holds the package's graph; a package whose components the
+        // interpreter invokes keeps its tokenizer with those components.
+        let Some(tokenizer) = self.tokenizer.as_ref() else {
+            return self.workflow.tokenize(text);
+        };
+        tokenizer.encode(text).map_err(|e| {
             anyhow::anyhow!(
                 "failed to tokenize input text with the model's tokenizer: {e}; \
                  verify the model directory contains a valid tokenizer.json"
@@ -1866,13 +1944,19 @@ impl Engine {
         }
 
         let max_context = self.max_context_for_request(&options);
-        // Resolved before scheduler admission, before any KV work, and before
-        // the speculative branch below: a runtime with no canonical workflow
-        // refuses without having admitted or mutated anything.
-        let canonical = crate::pipeline::canonical_decode::CanonicalBody::resolve(
-            canonical_workflow(self.workflow.as_deref(), self.lowered_workflow.as_ref())?,
-        )?;
         let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
+        // The declared loop is bound and its setup run before scheduler
+        // admission: a package this drive cannot advance is refused without
+        // having admitted the request or touched its session state.
+        let cursor = crate::pipeline::WorkflowGenerationCursor::start(
+            &self.workflow,
+            crate::pipeline::PipelineGenerateRequest::new(GenerateRequest {
+                prompt: crate::GeneratePrompt::TokenIds(prompt_tokens.clone()),
+                options: options.clone(),
+            }),
+            crate::pipeline::generation::DECODE_CORE_CONTRACTS,
+            &mut None,
+        )?;
         let mut state = self
             .sessions
             .remove(&request.session_id)
@@ -1888,7 +1972,7 @@ impl Engine {
             request.priority,
         );
         Ok(ActiveGenerate {
-            body: canonical,
+            cursor,
             session_id: request.session_id,
             state,
             options,
@@ -1924,7 +2008,8 @@ impl Engine {
                 .tokenizer
                 .as_ref()
                 .context("this package declares no tokenizer, so it cannot decode text")?;
-            let body = &active.body;
+            let runtime = &*self.workflow;
+            let cursor = &mut active.cursor;
             let mut backend = SessionDecodeLoopBackend {
                 session: self
                     .session
@@ -1936,43 +2021,50 @@ impl Engine {
                 session_id: active.session_id,
                 state: &mut active.state,
             };
-            // The scheduler advances one row per call, so this owns the
-            // iteration while the canonical body owns the step. Same workflow,
-            // same policy, same executor as the run-to-completion loop.
-            if crate::decode_loop::reached_context_limit(backend.context_len(), active.max_context)
-            {
-                ensure_constrained_finish(
-                    &active.options,
-                    &loop_state.generated_text,
-                    FinishReason::Length,
-                )?;
-                Some(crate::decode_loop::finish_result(
+            // One iteration of the *declared* loop, advanced through the same
+            // interpreter method the run-to-completion path drives in a `for`.
+            // The scheduler owns which request runs next; the workflow owns
+            // what one step of that request is.
+            let mut host = crate::pipeline::generation::GenerationNodeHost::new(
+                &mut backend,
+                &mut loop_state,
+                &crate::pipeline::generation::GenerationRequest {
+                    options: &active.options,
+                    chain: &active.chain,
                     tokenizer,
-                    &loop_state.generated_tokens,
-                    FinishReason::Length,
-                    loop_state.prefix_cache_hit_len,
-                    loop_state.logprobs.as_deref(),
-                )?)
-            } else {
-                let finish = crate::pipeline::canonical_decode::step_canonical_body(
-                    &mut backend,
-                    &mut loop_state,
-                    body,
-                    &active.options,
-                    &active.chain,
-                    tokenizer,
-                    None,
-                )?;
-                match finish {
-                    Some(finish_reason) => Some(crate::decode_loop::finish_result(
+                    max_context: active.max_context,
+                },
+                None,
+            );
+            let (ran, finish) = {
+                let mut host_ref: Option<&mut dyn crate::pipeline::WorkflowNodeHost> =
+                    Some(&mut host);
+                let ran = cursor.advance(runtime, &mut host_ref)?;
+                (ran, host.reached_finish())
+            };
+            let finish = match (ran, finish) {
+                (_, Some(reason)) => Some(reason),
+                // The predicate ended the loop without this iteration running a
+                // step, which means the previous one already reported why.
+                (false, None) => Some(FinishReason::MaxTokens),
+                (true, None) => None,
+            };
+            match finish {
+                Some(finish_reason) => {
+                    ensure_constrained_finish(
+                        &active.options,
+                        &loop_state.generated_text,
+                        finish_reason.clone(),
+                    )?;
+                    Some(crate::decode_loop::finish_result(
                         tokenizer,
                         &loop_state.generated_tokens,
                         finish_reason,
                         loop_state.prefix_cache_hit_len,
                         loop_state.logprobs.as_deref(),
-                    )?),
-                    None => None,
+                    )?)
                 }
+                None => None,
             }
         };
         active.generated_tokens = loop_state.generated_tokens;
@@ -2007,6 +2099,15 @@ impl Engine {
     }
 
     fn finish_active_generate(&mut self, mut active: ActiveGenerate) -> anyhow::Result<()> {
+        // The workflow's own emit and the tokens this drive committed describe
+        // the same generation; if they disagree, one is wrong and nothing
+        // outside can tell which.
+        crate::pipeline::generation::verify_emitted_tokens(
+            &self.workflow,
+            &active.cursor,
+            &active.generated_tokens,
+        )?;
+        active.cursor.finish(&self.workflow)?;
         if !exceeded_context_limit(active.state.tokens.len(), active.max_context) {
             self.ensure_session_kv_current(active.session_id, &mut active.state)?;
             self.insert_cached_prefixes(active.session_id, &active.state, active.prompt_len)?;
@@ -2179,26 +2280,6 @@ impl Engine {
     }
 }
 
-/// Resolve the canonical workflow from the two fields that can hold one.
-///
-/// Written as a free function over the fields rather than a `&self` method so it
-/// stays disjoint from the mutable borrows of `native_session` / `kv_cache` that
-/// surround every decode call site.
-pub(crate) fn canonical_workflow<'a>(
-    workflow: Option<&'a crate::pipeline::WorkflowRuntime>,
-    lowered: Option<&'a onnx_genai_metadata::WorkflowSpec>,
-) -> anyhow::Result<&'a onnx_genai_metadata::WorkflowSpec> {
-    if let Some(workflow) = workflow {
-        return Ok(workflow.workflow_spec());
-    }
-    lowered.context(
-        "this package has no canonical workflow: it declares no pipeline.workflow. The direct \
-         decode path it would once have taken no longer exists, and the loader refuses a \
-         package that declares no workflow, so reaching here is a loader bug rather than a \
-         package problem",
-    )
-}
-
 struct SessionDecodeLoopBackend<'a> {
     session: &'a Session,
     kv_model: Option<&'a KvModelInfo>,
@@ -2303,9 +2384,6 @@ impl Engine {
         if !self.native_sessions.contains_key(&session_id) {
             anyhow::bail!("session {session_id} not found");
         }
-        // Resolved before admission, for the same reason as the cold path: a
-        // refusal must not consume a scheduler slot or disturb session state.
-        canonical_workflow(self.workflow.as_deref(), self.lowered_workflow.as_ref())?;
         let scheduled = self.admit_generate_request_with_scheduler(
             session_id,
             prompt_tokens.len(),
@@ -2404,14 +2482,8 @@ impl Engine {
                         // Borrow the governor field directly, not through
                         // `governor()`: the closure below runs while
                         // `self.prefix_cache` is mutably borrowed, and a
-                        // whole-`self` accessor borrow would conflict. The native
-                        // decode path only exists for a decoder package, which
-                        // always owns its governor.
-                        let governor_memory = self
-                            .governor
-                            .as_ref()
-                            .context("the native decode path requires a decoder-owned governor")?
-                            .memory();
+                        // whole-`self` accessor borrow would conflict.
+                        let governor_memory = self.governor.memory();
                         let reserve_snapshot = || {
                             onnx_runtime_memory_governor::MemoryGovernor::reserve(
                                 governor_memory,
@@ -2473,8 +2545,7 @@ impl Engine {
                     .tokenizer
                     .as_ref()
                     .context("this package declares no tokenizer, so it cannot decode text")?;
-                let workflow =
-                    canonical_workflow(self.workflow.as_deref(), self.lowered_workflow.as_ref())?;
+                let runtime = &*self.workflow;
                 let native = self
                     .native_session
                     .as_mut()
@@ -2497,7 +2568,7 @@ impl Engine {
                     &options,
                     &chain,
                     tokenizer,
-                    workflow,
+                    runtime,
                     callback,
                 )?
             };
@@ -2634,8 +2705,9 @@ mod tests {
             0,
         )?;
         let mut engine = Engine {
-            workflow: None,
-            lowered_workflow: Some(crate::pipeline::canonical_decode::test_canonical_workflow()),
+            workflow: Box::new(crate::pipeline::generation::test_decoder_runtime()?),
+            workflow_sessions: HashMap::new(),
+            workflow_session_counter: 0,
             decode_backend: EngineDecodeBackend::Native,
             metadata: InferenceMetadata::default(),
             metadata_hints: MetadataHints::default(),
@@ -2648,7 +2720,7 @@ mod tests {
                 scheduler_config,
                 onnx_genai_scheduler::ByteBudget::new(10),
             ),
-            governor: Some(governor),
+            governor,
             sessions: HashMap::new(),
             session: None,
             native_session: None,
@@ -2715,8 +2787,9 @@ mod tests {
         // model. This is the honesty guarantee -- capability is not read off the
         // decode_path alone.
         let mut engine = Engine {
-            workflow: None,
-            lowered_workflow: Some(crate::pipeline::canonical_decode::test_canonical_workflow()),
+            workflow: Box::new(crate::pipeline::generation::test_decoder_runtime()?),
+            workflow_sessions: HashMap::new(),
+            workflow_session_counter: 0,
             decode_backend: EngineDecodeBackend::Native,
             metadata: InferenceMetadata::default(),
             metadata_hints: MetadataHints::default(),
@@ -2729,7 +2802,7 @@ mod tests {
                 onnx_genai_scheduler::SchedulerConfig::default(),
                 onnx_genai_scheduler::ByteBudget::new(10),
             ),
-            governor: Some(governor),
+            governor,
             sessions: HashMap::new(),
             session: None,
             native_session: None,
@@ -2803,15 +2876,16 @@ pub(crate) fn apply_eos_policy(options: &mut GenerateOptions, ids: &[TokenId]) {
 /// The legacy direct decode path cannot be selected.
 ///
 /// There is no flag, mode, or constructor that reaches generation without a
-/// canonical workflow: the loader installs one for every package it accepts, and
-/// a runtime that somehow lacks one refuses rather than falling back.
+/// declared workflow. That used to be a runtime guard on every decode entry
+/// point; it is now a property of the type — [`Engine`] holds one
+/// non-optional interpreter, and the loader refuses a package that declares no
+/// workflow before an engine exists at all.
 ///
-/// These live in-crate because they need `forget_canonical_workflow_for_test`,
-/// which produces a state no public API can reach. Exposing that seam would make
-/// the unreachable state reachable — the opposite of what these assert.
+/// These cases pin the two halves that remain checkable: a package with no
+/// workflow does not load, and every constructor presents the workflow the
+/// package shipped.
 #[cfg(test)]
 mod canonical_refusal_tests {
-    use crate::config::{GenerateOptions, GeneratePrompt, GenerateRequest};
     use crate::{Engine, EngineConfig};
     use std::path::PathBuf;
 
@@ -2819,85 +2893,33 @@ mod canonical_refusal_tests {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm")
     }
 
-    fn engine() -> anyhow::Result<Engine> {
-        Engine::from_dir(&decoder_package(), EngineConfig::default())
-    }
-
-    fn greedy(tokens: usize) -> GenerateRequest {
-        GenerateRequest {
-            prompt: GeneratePrompt::Text("hello world".to_string()),
-            options: GenerateOptions {
-                max_new_tokens: tokens,
-                greedy: true,
-                temperature: 0.0,
-                stop_on_eos: false,
-                ..GenerateOptions::default()
-            },
-        }
-    }
-
-    /// Every entry point refuses, not just the stateless one.
+    /// A package declaring no workflow is refused at load, naming the fix.
     ///
-    /// The refusal lives where the loop resolves its workflow, so `generate`,
-    /// the session path the server actually uses, the sampler path, the
-    /// scheduler's prioritized drive, and batching all reach it. A guard that
-    /// covered only one of them would leave the others able to decode with no
-    /// declared workflow.
+    /// This is what makes the missing-workflow state unreachable rather than
+    /// merely guarded: nothing downstream has to check, because no engine with
+    /// that state is ever constructed.
     #[test]
-    fn every_decode_entry_point_refuses_without_a_canonical_workflow() {
-        let refuses = |call: &dyn Fn(&mut Engine) -> anyhow::Result<()>, label: &str| {
-            let mut engine = engine().expect("engine");
-            engine.forget_canonical_workflow_for_test();
-            let error = call(&mut engine)
-                .expect_err(&format!("{label} must refuse without a canonical workflow"));
-            let message = format!("{error:#}");
-            assert!(
-                message.contains("no canonical workflow"),
-                "{label}: the refusal must name the missing canonical workflow: {message}"
-            );
-            assert!(
-                message.contains("no longer exists"),
-                "{label}: the refusal must say the direct path is gone: {message}"
-            );
+    fn a_package_without_a_workflow_does_not_load() -> anyhow::Result<()> {
+        let staging = std::env::current_dir()?.join("target/no-workflow-package");
+        let _ = std::fs::remove_dir_all(&staging);
+        std::fs::create_dir_all(&staging)?;
+        for name in ["model.onnx.textproto", "tokenizer.json"] {
+            std::fs::copy(decoder_package().join(name), staging.join(name))?;
+        }
+        let Err(error) = Engine::from_dir(&staging, EngineConfig::default()) else {
+            panic!("a package declaring no pipeline.workflow must not load");
         };
-
-        refuses(&|engine| engine.generate(greedy(2)).map(|_| ()), "generate");
-        refuses(
-            &|engine| {
-                let session = engine.create_session()?;
-                engine.generate_in_session(session, greedy(2)).map(|_| ())
-            },
-            "generate_in_session",
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("declares no pipeline.workflow"),
+            "the refusal must name what is missing: {message}"
         );
-        refuses(
-            &|engine| {
-                engine
-                    .generate_with_sampler(greedy(2), Box::new(crate::GreedySampler))
-                    .map(|_| ())
-            },
-            "generate_with_sampler",
+        assert!(
+            message.contains("migrate_model_io"),
+            "the refusal must name the offline conversion: {message}"
         );
-        refuses(
-            &|engine| {
-                let session = engine.create_session()?;
-                engine
-                    .drive_prioritized_requests(vec![crate::PrioritizedGenerateRequest {
-                        session_id: session,
-                        request: greedy(2),
-                        priority: onnx_genai_scheduler::Priority::Normal,
-                    }])
-                    .map(|_| ())
-            },
-            "drive_prioritized_requests",
-        );
-        refuses(
-            &|engine| {
-                engine
-                    .generate_batched_static(vec![greedy(2), greedy(2)])
-                    .map(|_| ())
-            },
-            "generate_batched_static",
-        );
+        std::fs::remove_dir_all(&staging)?;
+        Ok(())
     }
 
     /// No public constructor skips the workflow.
@@ -2911,10 +2933,12 @@ mod canonical_refusal_tests {
                 onnx_genai_ort::SessionOptions::default(),
             )?,
         ] {
+            let workflow = engine
+                .package_workflow()
+                .expect("a decoder package always presents its declared workflow");
             assert_eq!(
-                engine.workflow_shape(),
-                crate::WorkflowShapeReport::SingleDecoder,
-                "a decoder package must always present its declared workflow"
+                onnx_genai_metadata::sole_decoder_component(workflow),
+                Some(onnx_genai_metadata::decoder_workflow::DECODER_COMPONENT)
             );
         }
         Ok(())

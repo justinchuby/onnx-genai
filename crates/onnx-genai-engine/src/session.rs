@@ -24,12 +24,13 @@ pub(crate) struct EngineSession {
 }
 
 pub(crate) struct ActiveGenerate {
-    /// The canonical loop body this request executes.
+    /// The in-flight interpretation of this request's declared generation loop.
     ///
-    /// Resolved once when the request is prepared rather than per scheduler
-    /// step, so the prioritized drive runs the same workflow-dispatched body as
-    /// the run-to-completion loop without re-reading the spec every token.
-    pub(crate) body: crate::pipeline::canonical_decode::CanonicalBody,
+    /// Held across scheduler steps because the loop is the workflow's: the
+    /// prioritized drive advances it one iteration at a time through the same
+    /// interpreter method the run-to-completion path drives in a `for`, rather
+    /// than running a second loop that would have to restate the semantics.
+    pub(crate) cursor: crate::pipeline::WorkflowGenerationCursor,
     pub(crate) session_id: SessionId,
     pub(crate) state: EngineSession,
     pub(crate) options: GenerateOptions,

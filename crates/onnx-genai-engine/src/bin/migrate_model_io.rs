@@ -26,6 +26,7 @@ use onnx_genai_metadata::schema::DecoderAbi;
 
 fn main() -> std::process::ExitCode {
     let mut check_only = false;
+    let mut reemit = false;
     let mut abi_path: Option<PathBuf> = None;
     let mut packages: Vec<PathBuf> = Vec::new();
     let mut arguments = std::env::args().skip(1);
@@ -39,6 +40,7 @@ fn main() -> std::process::ExitCode {
                 }
             }
             "--check" => check_only = true,
+            "--reemit" => reemit = true,
             "-h" | "--help" => {
                 eprintln!("{USAGE}");
                 return std::process::ExitCode::SUCCESS;
@@ -53,7 +55,7 @@ fn main() -> std::process::ExitCode {
 
     let mut failures = 0;
     for package in &packages {
-        match migrate(package, check_only, abi_path.as_deref()) {
+        match migrate(package, check_only, reemit, abi_path.as_deref()) {
             Ok(Outcome::Converted) => println!("converted {}", package.display()),
             Ok(Outcome::NeedsConversion) => {
                 println!("needs conversion: {}", package.display());
@@ -81,6 +83,7 @@ migrate_model_io — rewrite a retired `model.io` block as `pipeline.workflow`
     migrate_model_io <package-dir>...            rewrite each package in place
     migrate_model_io --check <package-dir>       report what would change, write nothing
     migrate_model_io --abi <ports.yaml> <dir>    convert a package that never declared ports
+    migrate_model_io --reemit <package-dir>      rebuild an already-converted package's workflow
 ";
 
 enum Outcome {
@@ -89,15 +92,20 @@ enum Outcome {
     AlreadyCanonical,
 }
 
-fn migrate(package: &Path, check_only: bool, abi_path: Option<&Path>) -> Fallible<Outcome> {
+fn migrate(
+    package: &Path,
+    check_only: bool,
+    reemit: bool,
+    abi_path: Option<&Path>,
+) -> Fallible<Outcome> {
     let path = metadata_path(package)?;
     let text = std::fs::read_to_string(&path)?;
     let mut document: serde_yaml::Value = serde_yaml::from_str(&text)?;
 
-    if document
+    let already_converted = document
         .get("pipeline")
-        .is_some_and(|value| !value.is_null())
-    {
+        .is_some_and(|value| !value.is_null());
+    if already_converted && !reemit {
         return Ok(Outcome::AlreadyCanonical);
     }
     // A package that never carried the retired block still needs a workflow —
@@ -108,10 +116,26 @@ fn migrate(package: &Path, check_only: bool, abi_path: Option<&Path>) -> Fallibl
         .get("model")
         .and_then(|model| model.get("io"))
         .cloned();
-    let abi: DecoderAbi = match (io, abi_path) {
-        (Some(io), _) => serde_yaml::from_value(io)?,
-        (None, Some(path)) => serde_yaml::from_str(&std::fs::read_to_string(path)?)?,
-        (None, None) => {
+    // Re-emitting reads the ABI back out of the workflow the package already
+    // declares. That direction is the same one the runtime uses to resolve a
+    // package's ports, and `decoder_workflow_roundtrip` pins the pair as exact,
+    // so a rebuild states the ports the package always stated — only in
+    // whatever form the current emitter produces.
+    let reemit_abi = already_converted
+        .then(|| -> Fallible<DecoderAbi> {
+            let metadata = onnx_genai_metadata::load_metadata(&path)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            metadata
+                .decoder_io()
+                .cloned()
+                .ok_or_else(|| "this package's workflow resolves no decoder ABI".into())
+        })
+        .transpose()?;
+    let abi: DecoderAbi = match (reemit_abi, io, abi_path) {
+        (Some(abi), _, _) => abi,
+        (None, Some(io), _) => serde_yaml::from_value(io)?,
+        (None, None, Some(path)) => serde_yaml::from_str(&std::fs::read_to_string(path)?)?,
+        (None, None, None) => {
             return Err(
                 "this package declares neither pipeline.workflow nor a retired \
                         model.io block. If its ports were previously guessed from the ONNX \
@@ -144,6 +168,7 @@ fn migrate(package: &Path, check_only: bool, abi_path: Option<&Path>) -> Fallibl
             .and_then(|defaults| defaults.get("eos_token_ids"))
             .and_then(serde_yaml::Value::as_sequence)
             .map(|ids| ids.iter().filter_map(serde_yaml::Value::as_i64).collect())
+            .or_else(|| declared_eos_token_ids(&document))
             .unwrap_or_default(),
         port_contracts: onnx_genai_engine::graph_port_contracts(
             &package_directory(package).join(&artifact),
@@ -184,6 +209,28 @@ fn migrate(package: &Path, check_only: bool, abi_path: Option<&Path>) -> Fallibl
         .map_err(|errors| format!("converted package does not validate: {errors:#?}"))?;
     std::fs::write(&path, rendered)?;
     Ok(Outcome::Converted)
+}
+
+/// End tokens an already-converted package states in its workflow.
+///
+/// A re-emit must not lose them: the ids live on the workflow's own
+/// `eos_token_ids` literal input once a package has been converted, and reading
+/// them back is what keeps a rebuild a rebuild rather than a quiet reset to
+/// "this model has no end token".
+fn declared_eos_token_ids(document: &serde_yaml::Value) -> Option<Vec<i64>> {
+    let elements = document
+        .get("pipeline")?
+        .get("workflow")?
+        .get("inputs")?
+        .get(onnx_genai_metadata::decoder_workflow::PACKAGE_EOS_TOKEN_IDS)?
+        .get("default")?
+        .as_sequence()?;
+    Some(
+        elements
+            .iter()
+            .filter_map(serde_yaml::Value::as_i64)
+            .collect(),
+    )
 }
 
 const HEADER: &str = "\
