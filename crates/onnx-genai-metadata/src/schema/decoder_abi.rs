@@ -18,27 +18,6 @@ pub struct ModelCapabilities {
     /// Features that a serving runtime may configure at load time.
     pub runtime_configurable: Option<RuntimeConfigurable>,
 
-    /// DEPRECATED, import-only: legacy explicit graph I/O for a bare
-    /// single-decoder package.
-    ///
-    /// The canonical, and only authoritative, expression of a package's
-    /// executable graph ABI is the workflow:
-    /// `pipeline.workflow.components.<component>.ports` (with `ports.roles`),
-    /// the invoke bindings that connect them, and the `state_service` groups
-    /// that declare model state. A composite package and a bare one-file
-    /// decoder use that same representation.
-    ///
-    /// This block remains only so packages written before the workflow existed
-    /// still load. It is never read directly: [`ModelCapabilities::io`] resolves
-    /// the workflow first and falls back here, and a document carrying both is
-    /// rejected so the two can never disagree. New producers must not emit it.
-    #[serde(default, rename = "io")]
-    #[deprecated(
-        note = "declare the graph ABI in pipeline.workflow.components.<component>.ports; \
-                read the resolved ABI through ModelCapabilities::io()"
-    )]
-    pub legacy_io: Option<ModelIoSpec>,
-
     /// Explicit sparse mixture-of-experts graph and routing contract.
     ///
     /// This describes graph structure, never a model family. Runtimes use the
@@ -56,20 +35,6 @@ pub struct ModelCapabilities {
     pub sharding: Option<ShardingContract>,
 }
 
-impl ModelCapabilities {
-    /// The deprecated serialized ABI block, for callers that hold only
-    /// capabilities.
-    ///
-    /// Prefer [`crate::InferenceMetadata::decoder_io`], which resolves the
-    /// canonical workflow first. This accessor exists for the packages that
-    /// have no workflow at all, and returns `None` for every package that does.
-    pub fn legacy_io(&self) -> Option<&ModelIoSpec> {
-        #[allow(deprecated)]
-        let legacy = self.legacy_io.as_ref();
-        legacy
-    }
-}
-
 /// Explicit binding of the graph ports the decode step reads and writes.
 ///
 /// Every field is optional so a model package can declare only the ports its
@@ -77,9 +42,9 @@ impl ModelCapabilities {
 /// dtype/shape signal; when the shape cannot disambiguate the port, the runtime
 /// fails with an actionable error naming the key to declare rather than
 /// interpreting a tensor name. A declared port is always authoritative.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ModelIoSpec {
+pub struct DecoderAbi {
     /// Which declared sequence port drives autoregressive execution.
     ///
     /// Absent preserves the historical `token_ids` behavior. Declaring

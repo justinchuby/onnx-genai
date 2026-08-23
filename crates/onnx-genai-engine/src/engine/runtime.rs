@@ -318,25 +318,85 @@ impl Engine {
         Ok(scheduled)
     }
 
-    fn default_eos_token_ids(&self) -> Vec<TokenId> {
-        self.tokenizer.eos_token_ids()
+    /// Every token id this model ends generation on.
+    ///
+    /// A model may end a turn with one token and a message with another; both
+    /// stop it. The package's own declaration comes first because it is the
+    /// package speaking about itself — a package that ships no tokenizer
+    /// side-files still states its EOS — and the tokenizer's ids extend it
+    /// rather than replacing it, so neither source can silently drop the
+    /// other's.
+    pub(crate) fn default_eos_token_ids(&self) -> anyhow::Result<Vec<TokenId>> {
+        let mut ids = self.declared_eos_token_ids()?;
+        for id in self
+            .tokenizer
+            .as_ref()
+            .map(Tokenizer::eos_token_ids)
+            .unwrap_or_default()
+        {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
     }
 
-    fn apply_eos_defaults(&self, options: &mut GenerateOptions) {
-        if !options.stop_on_eos || options.eos_token_id.is_some() {
-            return;
-        }
-        let ids = self.default_eos_token_ids();
-        if let Some(&id) = ids.first() {
-            options.eos_token_id = Some(id);
-        }
-        for id in ids {
-            push_unique_stop_sequence(&mut options.stop_sequences, StopSequence::Tokens(vec![id]));
-        }
+    /// EOS ids the package's workflow declares, via the `eos_token_ids` role.
+    ///
+    /// Read from the workflow's own literal default, so a package states its
+    /// stop condition in the one place it states everything else. Without this
+    /// the declaration is inert: it would be materialized into the graph's
+    /// inputs and never reach the runtime's stop policy, which is what "declared
+    /// but dead" meant.
+    fn declared_eos_token_ids(&self) -> anyhow::Result<Vec<TokenId>> {
+        let workflow = self.workflow.workflow_spec();
+        workflow
+            .inputs
+            .values()
+            .filter(|input| {
+                matches!(
+                    &input.role,
+                    onnx_genai_metadata::SemanticInputRole::Runtime { role, .. }
+                        if *role == onnx_genai_metadata::RuntimeInputRole::EosTokenIds
+                )
+            })
+            .filter_map(|input| input.default.as_ref())
+            .map(literal_token_ids)
+            .collect::<anyhow::Result<Vec<_>>>()
+            .map(|groups| groups.concat())
+    }
+
+    /// Apply the model's stop condition to a request.
+    ///
+    /// Every declared EOS id becomes a stop sequence, not just the first. A
+    /// model with two end tokens is stopped by either, which a single
+    /// `eos_token_id` field cannot express — and silently dropping the rest
+    /// means generation runs past its end and emits control tokens as text.
+    ///
+    /// A caller's explicit `eos_token_id` selects which id is *reported* as the
+    /// EOS, and does not suppress the others: the model's end tokens are facts
+    /// about the model, and a request narrowing them would make the runtime emit
+    /// tokens the model meant as terminal.
+    fn apply_eos_defaults(&self, options: &mut GenerateOptions) -> anyhow::Result<()> {
+        apply_eos_policy(options, &self.default_eos_token_ids()?);
+        Ok(())
     }
 
     /// Effective context limit for a request, combining model metadata,
     /// per-request override, and decode-path capacity.
+    /// The package's tokenizer, or an error naming why text decode is
+    /// unavailable.
+    ///
+    /// A workflow package may ship no tokenizer at all (an image-generation
+    /// pipeline, for instance). Making that an explicit error here keeps the
+    /// absence a diagnosable load-time fact rather than a panic deep in the
+    /// decode loop.
+    pub(crate) fn require_tokenizer(&self) -> anyhow::Result<&Tokenizer> {
+        self.tokenizer
+            .as_ref()
+            .context("this package declares no tokenizer, so it cannot tokenize or decode text")
+    }
+
     pub fn effective_max_context(&self, options: &GenerateOptions) -> Option<usize> {
         self.max_context_for_request(options)
     }
@@ -349,21 +409,19 @@ impl Engine {
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         self.last_speculative_stats = SpeculativeStats::default();
-        if request.options.speculative_mode.is_none()
-            && (self.native_shared_kv_proposer.is_some() || self.mtp.is_some())
-        {
+        if request.options.speculative_mode.is_none() && self.mtp.is_some() {
             request.options.speculative_mode = Some(self.speculative_mode.clone());
         }
         reject_native_request_speculation(&request.options)?;
         request.options.validate()?;
         let mut options = request.options;
-        self.apply_eos_defaults(&mut options);
+        self.apply_eos_defaults(&mut options)?;
         let prompt_tokens = self.tokenize_prompt(&request.prompt)?;
         if prompt_tokens.is_empty() {
             anyhow::bail!("prompt must contain at least one token");
         }
         options.max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(&self.tokenizer), false)?;
+        let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
         let speculation_plan = native_speculation_plan(&options, &chain);
         let scheduler_session_id = self.next_native_session_id();
         let scheduled = self.admit_generate_request_with_scheduler(
@@ -396,6 +454,12 @@ impl Engine {
         // Speculation ON (implemented greedy prompt-lookup) → the native
         // speculative driver. Every other request stays on the untouched plain
         // M=1 fast path below, preserving the 762 tok/s non-regression guarantee.
+        // Borrowed before the mutable native-session borrows below.
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .context("this package declares no tokenizer, so it cannot decode text")?;
+        let runtime = &*self.workflow;
         let result = if let Some(plan) = speculation_plan {
             let mut stats = SpeculativeStats::default();
             let result = (|| {
@@ -409,19 +473,6 @@ impl Engine {
                             native_session,
                             ngram,
                             max_tokens,
-                            plan.width,
-                        )?
-                    }
-                    NativeSpeculationKind::SharedKv => {
-                        let proposer = self.native_shared_kv_proposer.as_mut().context(
-                            "native shared-KV speculation requested without a loaded proposer session",
-                        )?;
-                        crate::native_speculative::NativeSpeculativeDriver::new_shared_kv(
-                            native_session,
-                            &mut proposer.session,
-                            &proposer.embedder,
-                            &proposer.groups,
-                            proposer.hidden_size,
                             plan.width,
                         )?
                     }
@@ -466,7 +517,7 @@ impl Engine {
                     &prompt_tokens,
                     &options,
                     &chain,
-                    &self.tokenizer,
+                    tokenizer,
                     &mut stats,
                     callback,
                 )
@@ -482,7 +533,8 @@ impl Engine {
                 &prompt_tokens,
                 &options,
                 &chain,
-                &self.tokenizer,
+                tokenizer,
+                runtime,
                 callback,
             )
         };
@@ -659,6 +711,91 @@ impl Engine {
         self.native_session.as_mut()
     }
 
+    /// Teacher-forced native generation over an exact token prefix.
+    ///
+    /// Divergence and decode-lock audits feed a fixed prefix and read the top
+    /// log-probabilities of the single next token, which the ordinary text
+    /// entry points cannot express: they tokenize a prompt, and the whole point
+    /// is to pin the *exact* ids an oracle agreed on. Exposed here rather than
+    /// on the native session so a caller never needs the interpreter type.
+    #[cfg(feature = "native-backend")]
+    pub fn generate_native_from_token_ids(
+        &mut self,
+        prompt_tokens: &[TokenId],
+        options: &GenerateOptions,
+        chain: &crate::logits::ProcessorChain,
+        tokenizer: &Tokenizer,
+    ) -> anyhow::Result<GenerateResult> {
+        let runtime = &*self.workflow;
+        let session = self
+            .native_session
+            .as_mut()
+            .context("native decoder session is unavailable")?;
+        session.generate(prompt_tokens, options, chain, tokenizer, runtime)
+    }
+
+    /// Whether this runtime holds the fused decode session that implements the
+    /// declared `onnx-genai.autoregressive-decode` step.
+    ///
+    /// A question about which executor exists, not about what kind of package
+    /// was loaded: a package whose decode step this runtime has no fused
+    /// session for still runs the same declared loop, with the interpreter
+    /// invoking the component from its own artifact.
+    pub(crate) fn holds_decode_core(&self) -> bool {
+        #[cfg(feature = "native-backend")]
+        if self.native_session.is_some() {
+            return true;
+        }
+        self.session.is_some()
+    }
+
+    /// Continue a conversation the interpreter keeps in session-scoped state.
+    ///
+    /// The session id is bound into the request rather than looked up in a
+    /// decode core: a workflow's `scope: session` cells are keyed by it, and
+    /// that is where this package's conversation lives.
+    pub(crate) fn generate_in_workflow_session(
+        &mut self,
+        session_id: SessionId,
+        request: crate::pipeline::PipelineGenerateRequest,
+        on_admitted: Option<&mut dyn FnMut()>,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        anyhow::ensure!(
+            self.workflow_sessions.contains_key(&session_id),
+            "session {session_id} not found"
+        );
+        let result = self.generate_with_pipeline_callbacks(
+            request.with_session_id(session_id.to_string()),
+            on_admitted,
+            callback,
+        )?;
+        if let Some(count) = self.workflow_sessions.get_mut(&session_id) {
+            *count += result.token_ids.len();
+        }
+        Ok(result)
+    }
+
+    /// Generate by interpreting every declared component from its artifact.
+    ///
+    /// The same drive the decode-core path uses, with no core: the interpreter
+    /// walks the same declared loop, honours the same bound and predicate, and
+    /// publishes the same `tokens` output. What it does not have is a fused
+    /// session to route the decode step to, so it invokes the component the
+    /// package names.
+    fn generate_interpreted(
+        &mut self,
+        request: GenerateRequest,
+        on_admitted: Option<&mut dyn FnMut()>,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        self.generate_with_pipeline_callbacks(
+            crate::pipeline::PipelineGenerateRequest::new(request),
+            on_admitted,
+            callback,
+        )
+    }
+
     /// Access the engine-owned Resource Governor handle.
     pub fn governor(&self) -> &EngineResourceGovernor {
         &self.governor
@@ -666,12 +803,12 @@ impl Engine {
 
     /// Convenience snapshot of configured and live resource state.
     pub fn resource_snapshot(&self) -> GovernorSnapshot {
-        self.governor.snapshot()
+        self.governor().snapshot()
     }
 
     /// Bytes by which the device memory ledger exceeds its live ceiling.
     pub fn device_oversubscribed_bytes(&self) -> u64 {
-        self.governor.device_oversubscribed_bytes()
+        self.governor().device_oversubscribed_bytes()
     }
 
     /// Static weight placement computed from `device_policy` at model load.
@@ -695,7 +832,7 @@ impl Engine {
         &self,
         limit: ResourceLimit,
     ) -> Result<GovernorReconfigureOutcome, EngineGovernorError> {
-        self.governor.set_vram_limit(limit)
+        self.governor().set_vram_limit(limit)
     }
 
     /// Cumulative KV page activity: allocations, frees, and evictions.
@@ -800,7 +937,7 @@ impl Engine {
     ) -> anyhow::Result<GenerateResult> {
         let prompt = fim_config.format_prompt(prefix.as_ref(), suffix.as_ref());
         let mut request = GenerateRequest::new(prompt);
-        request.options = self.fim_options(fim_config, options);
+        request.options = self.fim_options(fim_config, options)?;
         self.generate_with_callbacks(request, admission_callback, token_callback)
     }
 
@@ -821,6 +958,14 @@ impl Engine {
         admission_callback: Option<&mut dyn FnMut()>,
         token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        // One entry point, one interpreter, one declared loop. What varies is
+        // whether this runtime holds the fused decode session that implements
+        // the package's declared `autoregressive-decode` step. Without one, the
+        // interpreter invokes every declared component from the artifact the
+        // package names — the same loop, the same emits, the same stop.
+        if !self.holds_decode_core() {
+            return self.generate_interpreted(request, admission_callback, token_callback);
+        }
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
             // Speculation still runs cold: the native speculative paths own
@@ -829,8 +974,7 @@ impl Engine {
             // before touching the native backend.
             let native_spec_requested = request.options.speculative_mode.is_some()
                 || request.options.num_speculative_tokens.is_some()
-                || self.mtp.is_some()
-                || self.native_shared_kv_proposer.is_some();
+                || self.mtp.is_some();
             if request.options.cold_start || native_spec_requested {
                 let result = self.generate_native_cold_with_callback(
                     request,
@@ -964,6 +1108,24 @@ impl Engine {
         mut admission_callback: Option<&mut dyn FnMut()>,
         mut callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        // A package with no decode core keeps its conversation in the
+        // session-scoped cells its workflow declares. Routing here rather than
+        // in one of the wrappers above is what makes every `generate_in_session`
+        // variant reach it — a caller that picked the priority form should not
+        // get a different answer about whether sessions exist.
+        if !self.holds_decode_core() {
+            anyhow::ensure!(
+                custom_sampler.is_none(),
+                "a package whose components the interpreter invokes declares its sampler; a \
+                 caller-supplied one would replace a step the package states in its own graph"
+            );
+            return self.generate_in_workflow_session(
+                session_id,
+                crate::pipeline::PipelineGenerateRequest::new(request),
+                admission_callback,
+                callback,
+            );
+        }
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
             if priority != Priority::Normal {
@@ -982,7 +1144,7 @@ impl Engine {
         self.last_speculative_stats = SpeculativeStats::default();
         request.options.validate()?;
         let mut options = request.options.clone();
-        self.apply_eos_defaults(&mut options);
+        self.apply_eos_defaults(&mut options)?;
         let prompt_tokens = self.tokenize_prompt(&request.prompt)?;
         if prompt_tokens.is_empty() {
             anyhow::bail!("prompt must contain at least one token");
@@ -992,8 +1154,11 @@ impl Engine {
         }
 
         let max_context = self.max_context_for_request(&options);
-        let chain =
-            build_processor_chain(&options, Some(&self.tokenizer), custom_sampler.is_some())?;
+        let chain = build_processor_chain(
+            &options,
+            Some(self.require_tokenizer()?),
+            custom_sampler.is_some(),
+        )?;
 
         let scheduled = self.admit_generate_request_with_scheduler(
             session_id,
@@ -1036,6 +1201,15 @@ impl Engine {
                 });
             }
 
+            // Borrow the tokenizer and the canonical workflow before the
+            // disjoint mutable borrows below: the decode backend takes
+            // `&mut self.kv_cache` / `&mut self.scheduler`, so a later `&self`
+            // accessor call would overlap.
+            let tokenizer = self
+                .tokenizer
+                .as_ref()
+                .context("this package declares no tokenizer, so it cannot decode text")?;
+            let runtime = &*self.workflow;
             let mut backend = SessionDecodeLoopBackend {
                 session: self
                     .session
@@ -1047,13 +1221,23 @@ impl Engine {
                 session_id,
                 state: &mut state,
             };
-            run_decode_loop(
+            // Every generated token comes out of the interpreter walking the
+            // package's declared loop. The backend below is the executor the
+            // interpreter routes the declared `autoregressive-decode` step to
+            // -- one forward pass, KV stays its business -- and the token
+            // policy beside it is the single sampling/stopping implementation,
+            // shared with every other package.
+            crate::pipeline::generation::generate_with_decode_core(
+                runtime,
                 &mut backend,
                 &mut loop_state,
-                &options,
-                &chain,
-                &self.tokenizer,
-                max_context,
+                &prompt_tokens,
+                crate::pipeline::generation::GenerationRequest {
+                    options: &options,
+                    chain: &chain,
+                    tokenizer,
+                    max_context,
+                },
                 callback.as_deref_mut(),
             )
         })()
@@ -1200,6 +1384,17 @@ impl Engine {
 
     /// Create a new generation session.
     pub fn create_session(&mut self) -> anyhow::Result<SessionId> {
+        // A package whose components the interpreter invokes has no paged KV
+        // sequence to open, but it does have sessions: its workflow may declare
+        // `scope: session` state, and this is the id that state is keyed by.
+        // Refusing here would have made "sessions" a property of which executor
+        // runs the decode step, which is not what a caller is asking about.
+        if !self.holds_decode_core() {
+            self.workflow_session_counter += 1;
+            let id = self.workflow_session_counter;
+            self.workflow_sessions.insert(id, 0);
+            return Ok(id);
+        }
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
             return self.create_native_session_state();
@@ -1345,10 +1540,10 @@ impl Engine {
             .context("ORT decoder session is unavailable")?;
         // Bind ports from explicit metadata or unambiguous tensor shapes.
         let io = self.metadata.decoder_io();
-        let fixed_state_budget_bytes = self.governor.snapshot().resolved_limits.host_ram_bytes;
+        let fixed_state_budget_bytes = self.governor().snapshot().resolved_limits.host_ram_bytes;
         if matches!(
             &self.speculative_mode,
-            SpeculativeMode::Mtp(_) | SpeculativeMode::Eagle3(_) | SpeculativeMode::SharedKv(_)
+            SpeculativeMode::Mtp(_) | SpeculativeMode::Eagle3(_)
         ) {
             DecodeState::new_with_io_positions_and_state_budget(
                 session,
@@ -1369,6 +1564,14 @@ impl Engine {
 
     /// Close a persistent session and free its associated state.
     pub fn close_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
+        if !self.holds_decode_core() {
+            anyhow::ensure!(
+                self.workflow_sessions.remove(&session_id).is_some(),
+                "session {session_id} not found"
+            );
+            self.workflow.forget_session(&session_id.to_string());
+            return Ok(());
+        }
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
             return session_state::close(&mut NativeSessions(self), session_id);
@@ -1379,6 +1582,13 @@ impl Engine {
 
     /// Number of logical tokens retained in a persistent session.
     pub fn session_token_count(&self, session_id: SessionId) -> anyhow::Result<usize> {
+        if !self.holds_decode_core() {
+            return self
+                .workflow_sessions
+                .get(&session_id)
+                .copied()
+                .with_context(|| format!("session {session_id} not found"));
+        }
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
             return session_state::token_count(&NativeSessionsRef(self), session_id);
@@ -1408,10 +1618,12 @@ impl Engine {
     /// it from requested settings, so explicit CPU fallbacks and skipped
     /// providers are visible to status/profile output.
     pub fn execution_provider_status(&self) -> String {
-        self.session.as_deref().map_or_else(
-            || "native".to_string(),
-            |session| session.execution_provider_status().summary(),
-        )
+        // Reported by whoever owns the sessions: the decode core when it holds
+        // the package's one graph, the interpreter's components otherwise.
+        match self.session.as_deref() {
+            Some(session) => session.execution_provider_status().summary(),
+            None => self.workflow.execution_provider_status(),
+        }
     }
     /// Latest native activation-memory planner measurement, if the current
     /// backend is native and has executed far enough to resolve concrete shapes.
@@ -1468,8 +1680,12 @@ impl Engine {
         self.fim_config.as_ref()
     }
 
-    fn fim_options(&self, fim_config: &FimConfig, mut options: GenerateOptions) -> GenerateOptions {
-        self.apply_eos_defaults(&mut options);
+    fn fim_options(
+        &self,
+        fim_config: &FimConfig,
+        mut options: GenerateOptions,
+    ) -> anyhow::Result<GenerateOptions> {
+        self.apply_eos_defaults(&mut options)?;
         for token in [
             fim_config.prefix_token.as_str(),
             fim_config.middle_token.as_str(),
@@ -1478,14 +1694,18 @@ impl Engine {
             "<|endoftext|>",
             "<|file_sep|>",
         ] {
-            if let Some(token_id) = self.tokenizer.token_id(token) {
+            if let Some(token_id) = self
+                .tokenizer
+                .as_ref()
+                .and_then(|tokenizer| tokenizer.token_id(token))
+            {
                 push_unique_stop_sequence(
                     &mut options.stop_sequences,
                     StopSequence::Tokens(vec![token_id]),
                 );
             }
         }
-        options
+        Ok(options)
     }
 
     fn max_context_for_request(&self, options: &GenerateOptions) -> Option<usize> {
@@ -1522,7 +1742,13 @@ impl Engine {
     /// `max_length`, or to feed [`Engine::embed`] and the generation APIs). It
     /// uses the same tokenizer path as the engine's internal prompt handling.
     pub fn tokenize(&self, text: &str) -> anyhow::Result<Vec<TokenId>> {
-        self.tokenizer.encode(text).map_err(|e| {
+        // Whoever owns the package's tokenizer answers. The decode core opens
+        // one when it holds the package's graph; a package whose components the
+        // interpreter invokes keeps its tokenizer with those components.
+        let Some(tokenizer) = self.tokenizer.as_ref() else {
+            return self.workflow.tokenize(text);
+        };
+        tokenizer.encode(text).map_err(|e| {
             anyhow::anyhow!(
                 "failed to tokenize input text with the model's tokenizer: {e}; \
                  verify the model directory contains a valid tokenizer.json"
@@ -1537,7 +1763,7 @@ impl Engine {
                 anyhow::bail!("multi-row prompts are supported only by workflow pipelines")
             }
             GeneratePrompt::Text(text) => self
-                .tokenizer
+                .require_tokenizer()?
                 .encode(text)
                 .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}")),
         }
@@ -1736,7 +1962,7 @@ impl Engine {
     ) -> anyhow::Result<ActiveGenerate> {
         request.request.options.validate()?;
         let mut options = request.request.options.clone();
-        self.apply_eos_defaults(&mut options);
+        self.apply_eos_defaults(&mut options)?;
         let prompt_tokens = self.tokenize_prompt(&request.request.prompt)?;
         if prompt_tokens.is_empty() {
             anyhow::bail!("prompt must contain at least one token");
@@ -1751,7 +1977,19 @@ impl Engine {
         }
 
         let max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(&self.tokenizer), false)?;
+        let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
+        // The declared loop is bound and its setup run before scheduler
+        // admission: a package this drive cannot advance is refused without
+        // having admitted the request or touched its session state.
+        let cursor = crate::pipeline::WorkflowGenerationCursor::start(
+            &self.workflow,
+            crate::pipeline::PipelineGenerateRequest::new(GenerateRequest {
+                prompt: crate::GeneratePrompt::TokenIds(prompt_tokens.clone()),
+                options: options.clone(),
+            }),
+            crate::pipeline::generation::DECODE_CORE_CONTRACTS,
+            &mut None,
+        )?;
         let mut state = self
             .sessions
             .remove(&request.session_id)
@@ -1767,6 +2005,7 @@ impl Engine {
             request.priority,
         );
         Ok(ActiveGenerate {
+            cursor,
             session_id: request.session_id,
             state,
             options,
@@ -1797,6 +2036,13 @@ impl Engine {
             custom_sampler: None,
         };
         let step_result = {
+            // Borrowed before the disjoint mutable borrows the backend takes.
+            let tokenizer = self
+                .tokenizer
+                .as_ref()
+                .context("this package declares no tokenizer, so it cannot decode text")?;
+            let runtime = &*self.workflow;
+            let cursor = &mut active.cursor;
             let mut backend = SessionDecodeLoopBackend {
                 session: self
                     .session
@@ -1808,15 +2054,51 @@ impl Engine {
                 session_id: active.session_id,
                 state: &mut active.state,
             };
-            step_decode_loop(
+            // One iteration of the *declared* loop, advanced through the same
+            // interpreter method the run-to-completion path drives in a `for`.
+            // The scheduler owns which request runs next; the workflow owns
+            // what one step of that request is.
+            let mut host = crate::pipeline::generation::GenerationNodeHost::new(
                 &mut backend,
                 &mut loop_state,
-                &active.options,
-                &active.chain,
-                &self.tokenizer,
-                active.max_context,
+                &crate::pipeline::generation::GenerationRequest {
+                    options: &active.options,
+                    chain: &active.chain,
+                    tokenizer,
+                    max_context: active.max_context,
+                },
                 None,
-            )?
+            );
+            let (ran, finish) = {
+                let mut host_ref: Option<&mut dyn crate::pipeline::WorkflowNodeHost> =
+                    Some(&mut host);
+                let ran = cursor.advance(runtime, &mut host_ref)?;
+                (ran, host.reached_finish())
+            };
+            let finish = match (ran, finish) {
+                (_, Some(reason)) => Some(reason),
+                // The predicate ended the loop without this iteration running a
+                // step, which means the previous one already reported why.
+                (false, None) => Some(FinishReason::MaxTokens),
+                (true, None) => None,
+            };
+            match finish {
+                Some(finish_reason) => {
+                    ensure_constrained_finish(
+                        &active.options,
+                        &loop_state.generated_text,
+                        finish_reason.clone(),
+                    )?;
+                    Some(crate::decode_loop::finish_result(
+                        tokenizer,
+                        &loop_state.generated_tokens,
+                        finish_reason,
+                        loop_state.prefix_cache_hit_len,
+                        loop_state.logprobs.as_deref(),
+                    )?)
+                }
+                None => None,
+            }
         };
         active.generated_tokens = loop_state.generated_tokens;
         active.generated_text = loop_state.generated_text;
@@ -1850,6 +2132,15 @@ impl Engine {
     }
 
     fn finish_active_generate(&mut self, mut active: ActiveGenerate) -> anyhow::Result<()> {
+        // The workflow's own emit and the tokens this drive committed describe
+        // the same generation; if they disagree, one is wrong and nothing
+        // outside can tell which.
+        crate::pipeline::generation::verify_emitted_tokens(
+            &self.workflow,
+            &active.cursor,
+            &active.generated_tokens,
+        )?;
+        active.cursor.finish(&self.workflow)?;
         if !exceeded_context_limit(active.state.tokens.len(), active.max_context) {
             self.ensure_session_kv_current(active.session_id, &mut active.state)?;
             self.insert_cached_prefixes(active.session_id, &active.state, active.prompt_len)?;
@@ -2010,7 +2301,7 @@ impl Engine {
     ) -> anyhow::Result<GenerateResult> {
         Ok(GenerateResult {
             text: self
-                .tokenizer
+                .require_tokenizer()?
                 .decode(generated_tokens)
                 .map_err(|e| anyhow::anyhow!("Failed to detokenize generated tokens: {e}"))?,
             token_ids: generated_tokens.to_vec(),
@@ -2100,39 +2391,6 @@ impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
 
 #[cfg(feature = "native-backend")]
 impl Engine {
-    /// Deprecated native-only shim. Use [`Engine::create_session`] for both ORT
-    /// and native backends.
-    pub fn create_native_session(&mut self) -> anyhow::Result<SessionId> {
-        if self.decode_backend != EngineDecodeBackend::Native {
-            anyhow::bail!("create_native_session requires the native decode backend");
-        }
-        self.create_session()
-    }
-
-    /// Deprecated native-only shim. Use [`Engine::close_session`].
-    pub fn close_native_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
-        self.close_session(session_id)
-    }
-
-    /// Deprecated native-only shim. Use [`Engine::generate_in_session`].
-    pub fn generate_native_in_session(
-        &mut self,
-        session_id: SessionId,
-        request: GenerateRequest,
-    ) -> anyhow::Result<GenerateResult> {
-        self.generate_in_session(session_id, request)
-    }
-
-    /// Deprecated native-only shim. Use [`Engine::generate_in_session_with_callback`].
-    pub fn generate_native_in_session_with_callback(
-        &mut self,
-        session_id: SessionId,
-        request: GenerateRequest,
-        callback: Option<&mut GenerateTokenCallback<'_>>,
-    ) -> anyhow::Result<GenerateResult> {
-        self.generate_native_in_session_with_callbacks(session_id, request, None, callback)
-    }
-
     fn generate_native_in_session_with_callbacks(
         &mut self,
         session_id: SessionId,
@@ -2144,13 +2402,13 @@ impl Engine {
         request.options.validate()?;
         let mut options = request.options;
         reject_native_request_speculation(&options)?;
-        self.apply_eos_defaults(&mut options);
+        self.apply_eos_defaults(&mut options)?;
         let prompt_tokens = self.tokenize_prompt(&request.prompt)?;
         if prompt_tokens.is_empty() {
             anyhow::bail!("prompt must contain at least one token");
         }
         options.max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(&self.tokenizer), false)?;
+        let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
         if native_speculation_plan(&options, &chain).is_some() {
             anyhow::bail!(
                 "native session generation does not support speculative decoding; use stateless generate() for native prompt-lookup/shared-KV speculation"
@@ -2254,9 +2512,14 @@ impl Engine {
                 };
                 match snapshot {
                     Ok(snapshot) => {
+                        // Borrow the governor field directly, not through
+                        // `governor()`: the closure below runs while
+                        // `self.prefix_cache` is mutably borrowed, and a
+                        // whole-`self` accessor borrow would conflict.
+                        let governor_memory = self.governor.memory();
                         let reserve_snapshot = || {
                             onnx_runtime_memory_governor::MemoryGovernor::reserve(
-                                self.governor.memory(),
+                                governor_memory,
                                 onnx_runtime_memory_governor::Tier::Host,
                                 snapshot.bytes(),
                                 Holder::RecurrentPrefixSnapshot.role(),
@@ -2310,6 +2573,12 @@ impl Engine {
             }
 
             let mut result = {
+                // Borrowed before the mutable native-session borrow below.
+                let tokenizer = self
+                    .tokenizer
+                    .as_ref()
+                    .context("this package declares no tokenizer, so it cannot decode text")?;
+                let runtime = &*self.workflow;
                 let native = self
                     .native_session
                     .as_mut()
@@ -2331,7 +2600,8 @@ impl Engine {
                     resume_from,
                     &options,
                     &chain,
-                    &self.tokenizer,
+                    tokenizer,
+                    runtime,
                     callback,
                 )?
             };
@@ -2353,15 +2623,36 @@ impl Engine {
         self.scheduler.complete(session_id);
         result
     }
+}
 
-    /// Deprecated native-only shim. Use [`Engine::rewind_session_by`].
-    pub fn rewind_native_session(
-        &mut self,
-        session_id: SessionId,
-        token_count: RewindTokenCount,
-    ) -> anyhow::Result<SessionPosition> {
-        self.rewind_session_by(session_id, token_count)
-    }
+/// Token ids carried by a workflow literal, scalar or list.
+///
+/// A package may declare one end token or several with the same field; reading
+/// both shapes here is what keeps "declare your EOS" from having two spellings.
+fn literal_token_ids(literal: &onnx_genai_metadata::LiteralValue) -> anyhow::Result<Vec<TokenId>> {
+    use onnx_genai_metadata::{LiteralValue, ScalarValue};
+    let scalars = match literal {
+        LiteralValue::Scalar(scalar) => std::slice::from_ref(scalar),
+        LiteralValue::Elements(elements) => elements.as_slice(),
+    };
+    scalars
+        .iter()
+        .map(|scalar| match scalar {
+            // Dropping a malformed id would be the worst outcome: the package
+            // says "these tokens end me", the runtime silently keeps a subset,
+            // and generation runs past an end token the author declared. A
+            // package that cannot state its stop condition must fail to load,
+            // not load with a quietly smaller one.
+            ScalarValue::Integer(value) => TokenId::try_from(*value).map_err(|_| {
+                anyhow::anyhow!(
+                    "declared end-of-generation token id {value} is not a valid token id"
+                )
+            }),
+            other => anyhow::bail!(
+                "declared end-of-generation token ids must be integers; found {other:?}"
+            ),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2411,20 +2702,19 @@ mod tests {
         );
 
         options.num_speculative_tokens = None;
-        options.speculative_mode = Some(SpeculativeMode::SharedKv(
-            crate::config::SharedKvProposerConfig {
-                assistant_model: PathBuf::from("assistant.onnx"),
-                target_hidden_output: "hidden".to_string(),
-                input_embedding_weights: PathBuf::from("embedding.bin"),
-                backbone_hidden_size: 1,
-                vocab_size: 1,
-                num_speculative_tokens: 3,
-                shared_kv: Vec::new(),
-            },
-        ));
-        let shared_kv = native_speculation_plan(&options, &chain).unwrap();
-        assert_eq!(shared_kv.width, 4);
-        assert_eq!(native_workspace_query_rows(1, Some(&shared_kv), 8, None), 4);
+        options.speculative_mode = Some(SpeculativeMode::Mtp(crate::config::MtpConfig {
+            head_model: PathBuf::from("mtp.onnx"),
+            target_hidden_output: "hidden".to_string(),
+            embedding_weights: PathBuf::from("embedding.bin"),
+            lm_head_weights: PathBuf::from("lm_head.bin"),
+            vocab_size: 1,
+            hidden_size: 1,
+            kv_mode: onnx_genai_ort::MtpDraftKvMode::GrowCache,
+            num_speculative_tokens: 3,
+        }));
+        let mtp = native_speculation_plan(&options, &chain).unwrap();
+        assert_eq!(mtp.width, 4);
+        assert_eq!(native_workspace_query_rows(1, Some(&mtp), 8, None), 4);
 
         assert_eq!(native_workspace_query_rows(3, None, 8, None), 3);
     }
@@ -2448,6 +2738,9 @@ mod tests {
             0,
         )?;
         let mut engine = Engine {
+            workflow: Box::new(crate::pipeline::generation::test_decoder_runtime()?),
+            workflow_sessions: HashMap::new(),
+            workflow_session_counter: 0,
             decode_backend: EngineDecodeBackend::Native,
             metadata: InferenceMetadata::default(),
             metadata_hints: MetadataHints::default(),
@@ -2472,13 +2765,11 @@ mod tests {
             native_access_counter: 0,
             native_default_session: None,
             native_max_sessions: 8,
-            native_shared_kv_proposer: None,
             native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
             draft: None,
             mtp: None,
             eagle3: None,
-            shared_kv_proposer: None,
-            tokenizer,
+            tokenizer: Some(tokenizer),
             fim_config: None,
             num_speculative_tokens: 1,
             speculative_mode: SpeculativeMode::None,
@@ -2529,6 +2820,9 @@ mod tests {
         // model. This is the honesty guarantee -- capability is not read off the
         // decode_path alone.
         let mut engine = Engine {
+            workflow: Box::new(crate::pipeline::generation::test_decoder_runtime()?),
+            workflow_sessions: HashMap::new(),
+            workflow_session_counter: 0,
             decode_backend: EngineDecodeBackend::Native,
             metadata: InferenceMetadata::default(),
             metadata_hints: MetadataHints::default(),
@@ -2553,13 +2847,11 @@ mod tests {
             native_access_counter: 0,
             native_default_session: None,
             native_max_sessions: 8,
-            native_shared_kv_proposer: None,
             native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
             draft: None,
             mtp: None,
             eagle3: None,
-            shared_kv_proposer: None,
-            tokenizer,
+            tokenizer: Some(tokenizer),
             fim_config: None,
             num_speculative_tokens: 1,
             speculative_mode: SpeculativeMode::None,
@@ -2589,5 +2881,127 @@ mod tests {
             "native backend must not build a >1 continuous batch manager"
         );
         Ok(())
+    }
+}
+
+/// Apply a model's end tokens to a request.
+///
+/// The one implementation, shared by the single-row path, the continuous batch
+/// manager and static batching. Three copies of this is how a model stops
+/// correctly on one route and runs past its end on another — which is
+/// unobservable from the API and shows up as a serving-only bug.
+pub(crate) fn apply_eos_policy(options: &mut GenerateOptions, ids: &[TokenId]) {
+    if !options.stop_on_eos {
+        return;
+    }
+    if options.eos_token_id.is_none()
+        && let Some(&id) = ids.first()
+    {
+        options.eos_token_id = Some(id);
+    }
+    for &id in ids {
+        if !options.eos_token_ids.contains(&id) {
+            options.eos_token_ids.push(id);
+        }
+    }
+}
+
+/// The legacy direct decode path cannot be selected.
+///
+/// There is no flag, mode, or constructor that reaches generation without a
+/// declared workflow. That used to be a runtime guard on every decode entry
+/// point; it is now a property of the type — [`Engine`] holds one
+/// non-optional interpreter, and the loader refuses a package that declares no
+/// workflow before an engine exists at all.
+///
+/// These cases pin the two halves that remain checkable: a package with no
+/// workflow does not load, and every constructor presents the workflow the
+/// package shipped.
+#[cfg(test)]
+mod canonical_refusal_tests {
+    use crate::{Engine, EngineConfig};
+    use std::path::PathBuf;
+
+    fn decoder_package() -> PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm")
+    }
+
+    /// A package declaring no workflow is refused at load, naming the fix.
+    ///
+    /// This is what makes the missing-workflow state unreachable rather than
+    /// merely guarded: nothing downstream has to check, because no engine with
+    /// that state is ever constructed.
+    #[test]
+    fn a_package_without_a_workflow_does_not_load() -> anyhow::Result<()> {
+        let staging = std::env::current_dir()?.join("target/no-workflow-package");
+        let _ = std::fs::remove_dir_all(&staging);
+        std::fs::create_dir_all(&staging)?;
+        for name in ["model.onnx.textproto", "tokenizer.json"] {
+            std::fs::copy(decoder_package().join(name), staging.join(name))?;
+        }
+        let Err(error) = Engine::from_dir(&staging, EngineConfig::default()) else {
+            panic!("a package declaring no pipeline.workflow must not load");
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("declares no pipeline.workflow"),
+            "the refusal must name what is missing: {message}"
+        );
+        assert!(
+            message.contains("migrate_model_io"),
+            "the refusal must name the offline conversion: {message}"
+        );
+        std::fs::remove_dir_all(&staging)?;
+        Ok(())
+    }
+
+    /// No public constructor skips the workflow.
+    #[test]
+    fn every_constructor_presents_the_declared_workflow() -> anyhow::Result<()> {
+        for engine in [
+            Engine::from_dir(&decoder_package(), EngineConfig::default())?,
+            Engine::from_dir_with_session_options(
+                &decoder_package(),
+                EngineConfig::default(),
+                onnx_genai_ort::SessionOptions::default(),
+            )?,
+        ] {
+            let workflow = engine
+                .package_workflow()
+                .expect("a decoder package always presents its declared workflow");
+            assert_eq!(
+                onnx_genai_metadata::sole_decoder_component(workflow),
+                Some(onnx_genai_metadata::decoder_workflow::DECODER_COMPONENT)
+            );
+        }
+        Ok(())
+    }
+
+    /// A package whose declared end tokens are malformed fails loudly.
+    ///
+    /// Filtering them out would mean the package says "these tokens end me" and
+    /// the runtime silently keeps a subset — generation then runs past an end
+    /// token its author declared, which is invisible from the API.
+    #[test]
+    fn a_malformed_end_token_declaration_is_an_error() {
+        use onnx_genai_metadata::{LiteralValue, ScalarValue};
+        let error = super::literal_token_ids(&LiteralValue::Elements(vec![
+            ScalarValue::Integer(2),
+            ScalarValue::Integer(-1),
+        ]))
+        .expect_err("a negative token id is not a token id");
+        assert!(
+            format!("{error:#}").contains("not a valid token id"),
+            "{error:#}"
+        );
+
+        let error = super::literal_token_ids(&LiteralValue::Scalar(ScalarValue::String(
+            "eos".to_string(),
+        )))
+        .expect_err("a string is not a token id");
+        assert!(
+            format!("{error:#}").contains("must be integers"),
+            "{error:#}"
+        );
     }
 }

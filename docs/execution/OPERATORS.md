@@ -53,7 +53,8 @@ plugin EPs (via C ABI bridge) handle them.
 | Expand | 8 | Broadcasting. |
 | Shape | 1 | Dynamic shape queries. |
 | ConstantOfShape | 9 | Mask/padding creation. |
-| ScatterND | 11 | KV cache update (opset 24 style). |
+| ScatterND | 11 | KV cache update, pre-opset-24 spelling. |
+| TensorScatter | 24 | KV cache update, standardized. Fixed-capacity buffer written at a per-sample `write_indices` offset; `linear` (append) and `circular` (ring) modes. Prefill omits `write_indices`; decode supplies it. |
 | GatherElements | 11 | Top-k/sampling. |
 | TopK | 11 | Sampling. |
 | ReduceMean | 18 | LayerNorm (when not fused). |

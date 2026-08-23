@@ -8,7 +8,22 @@ use super::resolve_model_dir;
 
 pub(super) fn show(model: &Path) -> anyhow::Result<()> {
     let model_dir = resolve_model_dir(model);
-    if let Some(directory) = PipelineModelDirectory::load_if_declared(&model_dir)? {
+    // Every package declares a workflow, so "declares a workflow" no longer means
+    // "is a composed pipeline". Asking the one shared recognizer keeps what this
+    // command *prints* consistent with what the engine actually loads — a report
+    // that called every decoder a one-component pipeline would be accurate about
+    // the metadata and misleading about the model.
+    if let Some(directory) =
+        PipelineModelDirectory::load_if_declared(&model_dir)?.filter(|directory| {
+            !directory
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.pipeline.as_ref())
+                .is_some_and(|pipeline| {
+                    onnx_genai_engine::is_single_decoder_workflow(&pipeline.workflow)
+                })
+        })
+    {
         println!("model directory: {}", directory.root.display());
         println!(
             "pipeline:        {} component(s)",

@@ -1035,8 +1035,8 @@ fn governor_tokens_per_page(config: &EngineConfig) -> anyhow::Result<u64> {
     Ok(tokens_per_page)
 }
 
-pub(crate) fn model_io_declares_only_fixed_state(
-    io: Option<&onnx_genai_metadata::ModelIoSpec>,
+pub(crate) fn decoder_abi_declares_only_fixed_state(
+    io: Option<&onnx_genai_metadata::DecoderAbi>,
 ) -> bool {
     let Some(io) = io else {
         return false;
@@ -1530,14 +1530,14 @@ mod tests {
 
     #[test]
     fn state_only_metadata_is_a_valid_non_paged_cache_not_unknown_geometry() {
-        let io: onnx_genai_metadata::ModelIoSpec = serde_json::from_value(serde_json::json!({
+        let io: onnx_genai_metadata::DecoderAbi = serde_json::from_value(serde_json::json!({
             "state_pairs": [
                 { "input": "conv_state_in", "output": "conv_state_out" }
             ]
         }))
         .unwrap();
 
-        assert!(model_io_declares_only_fixed_state(Some(&io)));
+        assert!(decoder_abi_declares_only_fixed_state(Some(&io)));
         let kv_config = governor_no_paged_kv_config(&EngineConfig::default()).unwrap();
         assert_eq!(kv_config.page_size_bytes, None);
         assert!(!kv_config.page_geometry_required);

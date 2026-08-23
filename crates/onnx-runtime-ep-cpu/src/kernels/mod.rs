@@ -310,6 +310,14 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         | ("Sum", "")
         | ("Mean", "") => ARITH_DTYPES,
 
+        // TensorScatter moves bytes rather than computing, but it is dispatched
+        // through `dispatch_arith!`, so it claims exactly that set instead of
+        // `ALL_DTYPES`. The claim has to be honest in both directions: the
+        // plugin dtype filter requires *every* input and output dtype to be in
+        // this set, and `write_indices` is Int64 — which ARITH_DTYPES covers, so
+        // a real KV-cache node with an f16 cache and Int64 indices passes.
+        ("TensorScatter", "") => ARITH_DTYPES,
+
         // MatMul supports f32 natively + f16/bf16 via half_gemm.
         ("MatMul", "") | ("Gemm", "") => FLOAT_DTYPES,
 
@@ -575,6 +583,7 @@ pub mod slice;
 pub mod softmax;
 pub mod sparse_kv_gather;
 pub mod split;
+pub mod tensor_scatter;
 pub mod transpose;
 pub mod unary_math;
 pub mod unique;
@@ -1480,6 +1489,11 @@ fn build_cpu_registry_recorded_inner(
     rec.register(
         OpKey::new("OneHot", "", 9),
         Box::new(indexing::OneHotFactory),
+    ); // TensorScatter (opset 24) standardizes the KV-cache update that GenAI
+    // decoders previously expressed as ScatterND or a contrib op.
+    rec.register(
+        OpKey::new("TensorScatter", "", 24),
+        Box::new(tensor_scatter::TensorScatterFactory),
     );
     rec.register(
         OpKey::new("OneHot", "", 11),
@@ -1934,13 +1948,6 @@ pub(crate) mod testutil {
     }
 
     impl Owned {
-        fn evict_stale_half_transpose(bytes: &[u8], shape: &[usize], tag: u16) {
-            let [k, n] = shape else {
-                return;
-            };
-            super::weight_transpose::half_cache_evict(bytes.as_ptr().cast(), *k, *n, tag);
-        }
-
         pub fn f32(shape: &[usize], data: &[f32]) -> Self {
             let strides = compute_contiguous_strides(shape);
             let mut bytes = Vec::with_capacity(data.len() * 4);
@@ -2004,7 +2011,6 @@ pub(crate) mod testutil {
             for &v in data {
                 bytes.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
             }
-            Self::evict_stale_half_transpose(&bytes, shape, 0);
             Self {
                 bytes,
                 shape: shape.to_vec(),
@@ -2021,7 +2027,6 @@ pub(crate) mod testutil {
             for &b in bits {
                 bytes.extend_from_slice(&b.to_le_bytes());
             }
-            Self::evict_stale_half_transpose(&bytes, shape, 0);
             Self {
                 bytes,
                 shape: shape.to_vec(),
@@ -2037,7 +2042,6 @@ pub(crate) mod testutil {
             for &v in data {
                 bytes.extend_from_slice(&half::bf16::from_f32(v).to_le_bytes());
             }
-            Self::evict_stale_half_transpose(&bytes, shape, 1);
             Self {
                 bytes,
                 shape: shape.to_vec(),
@@ -2053,7 +2057,6 @@ pub(crate) mod testutil {
             for &b in bits {
                 bytes.extend_from_slice(&b.to_le_bytes());
             }
-            Self::evict_stale_half_transpose(&bytes, shape, 1);
             Self {
                 bytes,
                 shape: shape.to_vec(),
@@ -2522,8 +2525,9 @@ mod tests {
         // Conv is always registered, using the pure-Rust reference kernel without
         // `mlas` and the optimized implementation with it.
         // `IsNaN` (opset-9 float NaN predicate) adds one default-domain entry.
+        // `TensorScatter` (opset-24 KV-cache update) adds one more.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 102 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 103 + mlas_registrations);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }

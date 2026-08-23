@@ -532,6 +532,35 @@ impl PipelineModels {
         })
     }
 
+    /// A component set for a workflow whose graphs the caller executes itself.
+    ///
+    /// Some workflows name a component that this process already runs through a
+    /// different executor — a decoder driven by a fused decode session that owns
+    /// its paged KV, above all. Building a second ORT session for that graph
+    /// would load the same weights twice and give the package two answers about
+    /// what its decoder is. The caller supplies the resolved directory and the
+    /// tokenizer it already opened; no ONNX file is read and no ORT environment
+    /// is created.
+    ///
+    /// The declared graph I/O of every component is still exposed, so decode
+    /// resolution and diagnostics see the same contracts a loaded package would
+    /// present.
+    pub fn hosted(
+        directory: PipelineModelDirectory,
+        session_options: SessionOptions,
+        shared_tokenizer: Option<Tokenizer>,
+    ) -> Self {
+        Self {
+            sessions: BTreeMap::new(),
+            graph_io_metadata: BTreeMap::new(),
+            tokenizers: BTreeMap::new(),
+            shared_tokenizer,
+            directory,
+            session_options,
+            environment: OnceLock::new(),
+        }
+    }
+
     /// Return a component-specific tokenizer, falling back to the shared tokenizer.
     pub fn tokenizer_for(&self, component: &str) -> Option<&Tokenizer> {
         self.tokenizers

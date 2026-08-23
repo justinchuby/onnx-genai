@@ -157,10 +157,12 @@ A package must not be able to say what its decode step looks like twice.
 
 Component ports, `Invoke` input/output bindings, workflow state cells and
 `state_service` groups already describe every port a runtime touches, because
-they are what the workflow engine executes. A serialized `model.io` beside them
-is a second writable answer to the same question, and nothing forces the two to
-agree: a runtime reading one never learns that the other said something else.
-Two accepted representations is a defect independent of their contents.
+they are what the workflow engine executes. A second serialized block beside them
+would be a second writable answer to the same question, and nothing forces the
+two to agree: a runtime reading one never learns that the other said something
+else. Two accepted representations is a defect independent of their contents —
+which is why there is now exactly one, for every package shape including a bare
+decoder.
 
 So the ABI is written once, in the workflow, and **derived** where a runtime
 needs it flattened:
@@ -200,12 +202,13 @@ layers may expose different KV head counts, and the key and value aliases of
 one layer may themselves have different head counts or head dimensions without
 requiring a different metadata vocabulary.
 
-**`model.io` is import-only and non-authoritative.** It is deserialized under
-its historical key, marked deprecated in the Rust API as `legacy_io`, and read
-only when a document carries no workflow — which is exactly the legacy
-`genai_config.json` import path (§17). Declaring it *beside* a workflow is
-rejected, so no document can hold two conflicting answers. Its removal path is
-in §18.
+**`model.io` is removed.** There is no schema field for it and no code path
+that reads one. A single decoder declares its graph ABI exactly where every
+other package does: `pipeline.workflow.components.<c>.ports` with `ports.roles`,
+and the `state_service` group that owns its cache. A document still carrying the
+retired block is refused at load with an error naming the offline conversion, so
+the failure is actionable rather than a puzzled "declares no workflow". §18.1
+records the completed removal.
 
 ### 4.2 Strictness
 
@@ -904,7 +907,7 @@ name the control inputs, the group's `ports` name the per-layer buffers, and
 directly reads the same declaration the workflow engine executes, resolved
 through `decoder_io()` (§4.1a).
 
-An earlier revision permitted a `model.io.static_cache` block beside the
+An earlier revision permitted a retired `static_cache` block beside the
 workflow, on the reasoning that a direct-drive runtime needs the port ABI while
 the group supplies the bindings. That was the wrong repair. The problem it
 solved was real — a workflow package genuinely had nowhere to name control ports
@@ -1319,44 +1322,56 @@ Packages written against the previous contract migrate as follows:
 | native stateful components | add `row_scope` and `cache_affects_state` |
 | contracts | add `equivalence` (defaults to `semantic`) |
 | state cells bound to a group | add `management: runtime` + `release_boundary` |
-| top-level `model.io` beside a `pipeline.workflow` | delete `model.io`; declare port roles in `components.<c>.ports.roles` and cache ports in the owning `state_service` group |
+| top-level `model.io` (with or without a `pipeline.workflow`) | run `migrate_model_io <package-dir>`; it declares port roles in `components.<c>.ports.roles` and cache ports in the owning `state_service` group |
 | `model.io.static_cache` | `state_service.groups.<g>.update` (`indexed_scatter`, `write_indices_ports`, `kv_length_ports`) plus `role`/`layer` on the group's port pairs |
 | `pipeline.models.<c>.io` | deleted with the composite IR; use `components.<c>.ports` |
 
 Every removed field is rejected by name, so migration failures are precise rather
 than mysterious.
 
-### 18.1 Removal path for `model.io`
+### 18.1 Removal of `model.io` — complete
 
-`model.io` still deserializes, so packages produced by the legacy importer keep
-working. It is not a supported way to *author* a package, and it is not a second
-source of truth: it is read only when a document carries no workflow, and
-declaring it beside one is an error today.
+The staged path this section used to describe has been carried out. What landed:
 
-The remaining steps, in order, each independently shippable:
+1. `model.io` was deserialize-only, reachable through one deprecated accessor,
+   and rejected beside a workflow. *(done)*
+2. The `genai_config.json` importer states its result as a `pipeline.workflow`
+   rather than a `model.io` block. Import remains one-way and fail-closed
+   (§17); a *foreign* producer's format is converted into this project's one
+   representation, which is the whole point of an importer. *(done)*
+3. The staged warning step was skipped: with the field deleted there is nothing
+   left to warn *about*, and a warning that still loaded the package would have
+   kept the second answer alive for another release. *(superseded)*
+4. The field and its accessor are deleted, and the key is rejected by name.
+   `DecoderAbi` (formerly `ModelIoSpec`) survives as the *resolved* result of
+   `decoder_io()`: a derived value with no serialized form, now living beside
+   the recognizer that produces it rather than in the serialized schema. *(done)*
 
-1. **Now** — `model.io` is deserialize-only. The Rust field is `legacy_io`,
-   marked `#[deprecated]`, and reachable through one accessor. No consumer reads
-   it directly; every runtime path goes through `decoder_io()`. Coexistence with
-   a workflow is rejected. *(done)*
-2. **Next** — the `genai_config.json` importer synthesizes a canonical workflow
-   instead of a `model.io` block. Import is already one-way and fail-closed
-   (§17), so this changes only what the converter writes, and the deprecated
-   deserialization stays to read packages already on disk.
-3. **Then** — deserializing `model.io` emits a validation warning naming the
-   canonical replacement for each key it carries.
-4. **Finally** — the field is deleted and the key is rejected by name, joining
-   the table above. The `ModelIoSpec` type survives as the *resolved* result of
-   `decoder_io()`, which is a derived value with no serialized form.
+**Converting a package.** `migrate_model_io <package-dir>` rewrites a retired
+block as the canonical workflow. It is deliberately an offline tool rather than
+a load-time step: a runtime that repaired packages in memory would mean the
+package on disk said one thing and the runtime executed another, which is the
+second authoritative answer this rule exists to prevent. A package whose ports
+were previously guessed from its ONNX graph states them once with
+`--abi <ports.yaml>`.
+
+**Why a single decoder is not a special case.** It is a workflow with one ONNX
+component and one runtime-bound token policy. Its generation loop, cache
+aliases, and token emit use the same constructs a multi-component workflow uses,
+so there is no decoder-shaped branch anywhere in the runtime — the decoder is
+recognized structurally, as the sole component that consumes the autoregressive
+sequence and produces logits.
 
 `generation.speculative_decoding.io` is the same class of debt for a proposer
 graph and is unchanged here: it describes a model with no workflow component of
 its own, so it needs a canonical component before it can follow this path.
 
-#### The `ModelIoSpec` type is not the `model.io` key
+#### The `DecoderAbi` type is not a serialized block
 
-These two share a name and are routinely mistaken for each other, including by
-a downstream producer who read `StaticCacheDecodeSession::new(.., io: Option<&ModelIoSpec>)`
+The resolved decode ABI and the retired `model.io` key were routinely mistaken
+for each other — enough that the type has been renamed `DecoderAbi` and moved
+beside the recognizer that produces it. A downstream producer once read
+`StaticCacheDecodeSession::new(.., io: Option<&DecoderAbi>)`
 as proof that the scatter driver *requires* a serialized `model.io.static_cache`
 block, and concluded that the driver and the coexistence rule were jointly
 unsatisfiable. They are not. The parameter is the **resolved** decode ABI —
@@ -1369,9 +1384,10 @@ A type signature cannot show this, so it is pinned against a real graph instead.
 `tests/fixtures/tiny-llm-scatter-workflow/`, a package with **no `model:` block
 at all**, resolves its ABI through `decoder_io()`, and drives the ONNX scatter
 fixture through `StaticCacheDecodeSession`: the graph classifies, prefill runs,
-and a decode step advances the write cursor by exactly one row position. The
-sibling `tests/fixtures/tiny-llm-scatter/` keeps the legacy `model.io` form so
-the import-only path stays covered, and the two are exercised separately.
+and a decode step advances the write cursor by exactly one row position. Its
+sibling `tests/fixtures/tiny-llm-scatter/` is the same graph converted by
+`migrate_model_io`, so the generated form and the hand-authored one are both
+exercised against the same driver.
 
 #### Declare roles; do not transcribe the graph
 

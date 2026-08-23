@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use anyhow::Context as _;
-use onnx_genai::engine::{PipelineEngine, PipelineGenerateRequest};
+use onnx_genai::Engine;
+use onnx_genai::engine::PipelineGenerateRequest;
 use onnx_genai::ort::Tokenizer;
 use onnx_genai::preprocess::audio::{
     AudioSegment, SegmentConfig, StreamSegmenter, decode_wav_pcm16,
@@ -94,7 +95,7 @@ fn srt_timestamp(seconds: f32) -> String {
 
 /// A loaded speech package plus everything needed to transcribe segments.
 struct Transcriber {
-    engine: PipelineEngine,
+    engine: Engine,
     tokenizer: Tokenizer,
     spec: multimodal::AudioInputSpec,
     language: Option<String>,
@@ -127,7 +128,7 @@ impl Transcriber {
                 setup.tokenizer_path.display()
             )
         })?;
-        let engine = PipelineEngine::from_dir_with_config(model_dir, args.engine.to_config())?;
+        let engine = Engine::from_dir(model_dir, args.engine.to_config())?;
         Ok(Self {
             engine,
             tokenizer,
@@ -169,9 +170,9 @@ impl Transcriber {
             text.push_str(&token.text);
             Ok(())
         };
-        let result = self
-            .engine
-            .generate_with_callback(request, Some(&mut callback));
+        let result =
+            self.engine
+                .generate_with_pipeline_callbacks(request, None, Some(&mut callback));
         GENERATING.store(false, Ordering::SeqCst);
         crate::flush_deferred_tracing()?;
         result?;

@@ -51,7 +51,7 @@ fn header_u32(bytes: &[u8], offset: usize) -> u32 {
 /// contract (24 kHz, two channels, 16-bit).
 #[test]
 fn onnx_owned_speech_workflow_encodes_buffered_pcm16_wav() -> anyhow::Result<()> {
-    let mut engine = Engine::from_pipeline_dir(&fixture("speech_wav"), EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&fixture("speech_wav"), EngineConfig::default())?;
     let request = PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenRows(vec![vec![2, 6, 7, 8, 9, 3]]),
         options: options(8),
@@ -117,7 +117,7 @@ fn onnx_owned_nested_audio_workflow_executes_nested_generation() -> anyhow::Resu
         "the nested-audio package must drive a generation loop"
     );
 
-    let mut engine = Engine::from_pipeline_dir(&package, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&package, EngineConfig::default())?;
     let request = PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![0]),
         options: options(1),

@@ -7,17 +7,164 @@ use crate::memory_authority::{
 };
 
 impl Engine {
-    /// Load a model from a directory.
+    /// Whether the decode core can execute every graph step this package
+    /// declares.
+    ///
+    /// This is a question about *executors*, not about package kinds. The
+    /// decode core is the registered executor for
+    /// `onnx-genai.autoregressive-decode`: one fused session that owns paged
+    /// KV, the device sampling fast paths and a captured graph. It can stand in
+    /// for a declared decode step only when that step is the package's *whole*
+    /// graph, because it loads one model directory and holds one session.
+    ///
+    /// A package it cannot cover loses nothing: the same interpreter executes
+    /// the same declared workflow, invoking each component from the artifact
+    /// the package names. There is no second generation path either way — only
+    /// a faster executor for one declared step, when that step is one this
+    /// runtime registered an executor for.
+    fn decode_core_covers(workflow: &onnx_genai_metadata::WorkflowSpec) -> bool {
+        let graph_components = workflow
+            .components
+            .iter()
+            .filter(|(_, component)| {
+                !matches!(
+                    component.implementation,
+                    onnx_genai_metadata::ComponentImplementation::Binding
+                )
+            })
+            .collect::<Vec<_>>();
+        let [(_, only)] = graph_components.as_slice() else {
+            return false;
+        };
+        only.contract.as_ref().is_some_and(|contract| {
+            contract.id == onnx_genai_metadata::decoder_workflow::AUTOREGRESSIVE_DECODE_CONTRACT
+        })
+    }
+
+    /// The workflow a package declares, read from the package.
+    ///
+    /// Nothing is synthesized: a package from before the workflow existed is
+    /// refused rather than repaired, because inventing one at load would mean
+    /// the package on disk says one thing and the runtime executes another.
+    pub(crate) fn declared_workflow(
+        model_dir: &Path,
+    ) -> anyhow::Result<onnx_genai_metadata::WorkflowSpec> {
+        // An authored package answers from its own metadata. Only a package
+        // that ships none needs the `genai_config.json` importer, which converts
+        // that foreign format into this project's one representation — and which
+        // needs a resolvable model directory, something a composite workflow
+        // package (components in subdirectories) deliberately does not present.
+        let metadata = match onnx_genai_metadata::parser::load_metadata_from_dir(model_dir)
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+        {
+            Some(metadata) => Some(metadata),
+            None => onnx_genai_ort::ModelDirectory::load(model_dir)
+                .ok()
+                .and_then(|directory| load_inference_metadata(&directory).ok()),
+        };
+        metadata
+            .as_ref()
+            .and_then(|metadata| metadata.pipeline.as_ref())
+            .map(|pipeline| pipeline.workflow.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{}: this package declares no pipeline.workflow.\n\n\
+                     A single decoder is declared exactly like every other pipeline: a workflow \
+                     with one ONNX component whose ports carry roles, a state_service group \
+                     owning its KV cache, and a generation loop. Packages carrying the retired \
+                     `model.io` block are no longer loadable.\n\n\
+                     Convert the package once, offline:\n    \
+                     migrate_model_io {}\n",
+                    model_dir.display(),
+                    model_dir.display()
+                )
+            })
+    }
+
+    /// Adopt the package's declared workflow as the one this runtime executes.
+    ///
+    /// Nothing is synthesized and nothing is written back: this is the document
+    /// the package ships, and it is what the interpreter walks. The runtime
+    /// built here holds no ORT session for the decoder — the decode core beside
+    /// it already owns that graph, its paged KV and its device fast paths, and
+    /// supplies it as the executor registered for the decode contract.
+    pub(crate) fn hosted_workflow_runtime(
+        model_directory: &ModelDirectory,
+        metadata: &InferenceMetadata,
+        decode_backend: EngineDecodeBackend,
+        memory_strategy_plan: &MemoryStrategyPlan,
+    ) -> anyhow::Result<Box<crate::pipeline::WorkflowRuntime>> {
+        let workflow = metadata
+            .pipeline
+            .as_ref()
+            .map(|pipeline| pipeline.workflow.clone())
+            .context(
+                "this package declares no pipeline.workflow, so there is no workflow to execute",
+            )?;
+        crate::pipeline::validate_generation_workflow(&workflow)?;
+        let spec = onnx_genai_metadata::PipelineSpec {
+            workflow: workflow.clone(),
+        };
+        let directory = onnx_genai_ort::PipelineModelDirectory {
+            root: model_directory.root.clone(),
+            metadata_path: model_directory.metadata_path.clone(),
+            spec,
+            adapters: None,
+            metadata: Some(metadata.clone()),
+            preprocessing: None,
+            model_paths: std::collections::BTreeMap::from([(
+                onnx_genai_metadata::decoder_workflow::DECODER_COMPONENT.to_string(),
+                model_directory.model_path.clone(),
+            )]),
+            tokenizer_paths: onnx_genai_ort::PipelineTokenizerPaths {
+                shared: Some(model_directory.tokenizer_path.clone()),
+                per_component: std::collections::BTreeMap::new(),
+            },
+        };
+        // The decode core owns the package's tokenizer; handing this runtime a
+        // second copy would decode the same ids through a different object.
+        let models =
+            onnx_genai_ort::PipelineModels::hosted(directory, SessionOptions::default(), None);
+        Ok(Box::new(crate::pipeline::WorkflowRuntime::hosted(
+            model_directory.root.clone(),
+            workflow,
+            decode_backend,
+            memory_strategy_plan.clone(),
+            models,
+            metadata.speculative.clone(),
+        )?))
+    }
+
+    /// Load a package from a directory.
+    ///
+    /// One entry point, one representation. Every package declares
+    /// `pipeline.workflow` and every package executes it through the
+    /// interpreter; what this decides is only whether the decode core is the
+    /// executor for the package's declared decode step, which is a question
+    /// about the contract that step names.
     pub fn from_dir(model_dir: &Path, config: EngineConfig) -> anyhow::Result<Self> {
+        let workflow = Self::declared_workflow(model_dir)?;
+        if !Self::decode_core_covers(&workflow) {
+            return Self::from_interpreted_dir(model_dir, config, SessionOptions::default(), None);
+        }
         Self::from_dir_impl(model_dir, config, SessionOptions::default(), false, None)
     }
 
-    /// Load a model using a caller-owned device authority provider.
+    /// Load a package using a caller-owned device authority provider.
     pub fn from_dir_with_memory_authority_provider(
         model_dir: &Path,
         config: EngineConfig,
         provider: Arc<dyn MemoryAuthorityProvider>,
     ) -> anyhow::Result<Self> {
+        let workflow = Self::declared_workflow(model_dir)?;
+        if !Self::decode_core_covers(&workflow) {
+            return Self::from_interpreted_dir(
+                model_dir,
+                config,
+                SessionOptions::default(),
+                Some(provider),
+            );
+        }
         Self::from_dir_impl(
             model_dir,
             config,
@@ -27,13 +174,43 @@ impl Engine {
         )
     }
 
-    /// Load a model from a directory with explicit ORT session options.
+    /// Load a package from a directory with explicit ORT session options.
     pub fn from_dir_with_session_options(
         model_dir: &Path,
         config: EngineConfig,
         session_options: SessionOptions,
     ) -> anyhow::Result<Self> {
+        let workflow = Self::declared_workflow(model_dir)?;
+        if !Self::decode_core_covers(&workflow) {
+            return Self::from_interpreted_dir(model_dir, config, session_options, None);
+        }
         Self::from_dir_impl(model_dir, config, session_options, true, None)
+    }
+
+    /// Load a package whose every declared component the interpreter invokes
+    /// from its own artifact.
+    fn from_interpreted_dir(
+        model_dir: &Path,
+        config: EngineConfig,
+        session_options: SessionOptions,
+        provider: Option<Arc<dyn MemoryAuthorityProvider>>,
+    ) -> anyhow::Result<Self> {
+        let (runtime, governor) = match provider {
+            Some(provider) => {
+                crate::pipeline::WorkflowRuntime::from_dir_with_session_options_and_memory_authority_provider(
+                    model_dir,
+                    config,
+                    session_options,
+                    provider,
+                )?
+            }
+            None => crate::pipeline::WorkflowRuntime::from_dir_with_session_options(
+                model_dir,
+                config,
+                session_options,
+            )?,
+        };
+        Self::from_workflow(runtime, governor)
     }
 
     fn from_dir_impl(
@@ -118,12 +295,12 @@ impl Engine {
             config.limits.vram_limit,
         )?;
         let metadata = load_inference_metadata(&model_directory)?;
-        let model_io = metadata.decoder_io();
-        let kv_inputs = model_io
-            .and_then(|io| io.kv_inputs.clone())
+        let decoder_abi = metadata.decoder_io();
+        let kv_inputs = decoder_abi
+            .and_then(|abi| abi.kv_inputs.clone())
             .unwrap_or_default();
-        let kv_outputs = model_io
-            .and_then(|io| io.kv_outputs.clone())
+        let kv_outputs = decoder_abi
+            .and_then(|abi| abi.kv_outputs.clone())
             .unwrap_or_default();
         let graph_io = onnx_genai_ort::graph_io_from_model_path_for_kv_pairs(
             &model_directory.model_path,
@@ -131,11 +308,15 @@ impl Engine {
             &kv_outputs,
         )
         .map_err(|e| anyhow::anyhow!("Failed to read decoder graph I/O for KV geometry: {e}"))?;
-        let kv_model =
-            infer_kv_model_info(&graph_io, model_io, config.page_size, config.kv_cache_dtype)?;
+        let kv_model = infer_kv_model_info(
+            &graph_io,
+            decoder_abi,
+            config.page_size,
+            config.kv_cache_dtype,
+        )?;
         let plan_kv_config = match kv_model.as_ref() {
             Some(kv_model) => governor_kv_config(Some(kv_model), &config)?,
-            None if model_io_declares_only_fixed_state(model_io) => {
+            None if decoder_abi_declares_only_fixed_state(decoder_abi) => {
                 governor_no_paged_kv_config(&config)?
             }
             None => governor_kv_config(None, &config)?,
@@ -259,15 +440,24 @@ impl Engine {
         )?;
         let eagle3 =
             load_eagle3_model(&speculative_mode, &session, &environment, &session_options)?;
-        let shared_kv_proposer =
-            load_shared_kv_proposer(&speculative_mode, &session, &environment, &session_options)?;
 
         let connector = {
             let _span = onnx_genai_ort::prof_span!("engine.connector_bridge");
             build_connector_bridge(&config.kv_connector, &model_directory, kv_model.as_ref())?
         };
 
+        // The interpreter that executes this package's declared workflow, with
+        // the decode core above it as the executor for the declared decode
+        // step. Built after the core so a package this runtime cannot execute
+        // as declared is refused before it is handed back as loaded.
+        let workflow = Self::hosted_workflow_runtime(
+            &model_directory,
+            &metadata,
+            decode_backend,
+            &memory_strategy_plan,
+        )?;
         Ok(Self {
+            workflow,
             decode_backend,
             metadata,
             metadata_hints,
@@ -279,6 +469,8 @@ impl Engine {
             scheduler,
             governor,
             sessions: HashMap::new(),
+            workflow_sessions: HashMap::new(),
+            workflow_session_counter: 0,
             _environment: Some(environment),
             session: Some(Box::new(session)),
             #[cfg(feature = "native-backend")]
@@ -299,14 +491,12 @@ impl Engine {
             #[cfg(feature = "native-backend")]
             native_max_sessions: config.native_max_sessions,
             #[cfg(feature = "native-backend")]
-            native_shared_kv_proposer: None,
             #[cfg(feature = "native-backend")]
             native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
             draft,
             mtp,
             eagle3,
-            shared_kv_proposer,
-            tokenizer,
+            tokenizer: Some(tokenizer),
             fim_config,
             num_speculative_tokens: config.num_speculative_tokens.max(1),
             speculative_mode,
@@ -387,11 +577,11 @@ impl Engine {
         let fim_config = load_fim_config_from_model_dir(&model_directory.root)?;
         let kv_model = {
             let _span = onnx_genai_ort::prof_span!("engine.native_kv_model_info");
-            let model_io = metadata.decoder_io();
-            let kv_inputs = model_io
+            let decoder_abi = metadata.decoder_io();
+            let kv_inputs = decoder_abi
                 .and_then(|io| io.kv_inputs.clone())
                 .unwrap_or_default();
-            let kv_outputs = model_io
+            let kv_outputs = decoder_abi
                 .and_then(|io| io.kv_outputs.clone())
                 .unwrap_or_default();
             let graph_io = onnx_genai_ort::graph_io_from_model_path_for_kv_pairs(
@@ -402,13 +592,18 @@ impl Engine {
             .map_err(|e| {
                 anyhow::anyhow!("Failed to read native decoder graph I/O for KV geometry: {e}")
             })?;
-            infer_kv_model_info(&graph_io, model_io, config.page_size, config.kv_cache_dtype)
-                .context("failed to infer native decoder KV geometry from model graph I/O")?
+            infer_kv_model_info(
+                &graph_io,
+                decoder_abi,
+                config.page_size,
+                config.kv_cache_dtype,
+            )
+            .context("failed to infer native decoder KV geometry from model graph I/O")?
         };
-        let model_io = metadata.decoder_io();
+        let decoder_abi = metadata.decoder_io();
         let governor_kv_config = match kv_model.as_ref() {
             Some(kv_model) => governor_native_kv_config(Some(kv_model), &config)?,
-            None if model_io_declares_only_fixed_state(model_io) => {
+            None if decoder_abi_declares_only_fixed_state(decoder_abi) => {
                 governor_no_paged_kv_config(&config)?
             }
             None => governor_kv_config(None, &config)?,
@@ -457,7 +652,7 @@ impl Engine {
             let graph = onnx_runtime_loader::load_model(&model_directory.model_path)
                 .context("loading native graph for recurrent-state memory planning")?;
             let recurrent_bytes =
-                crate::native_decode::recurrent_state_bytes_from_graph(&graph, model_io)?;
+                crate::native_decode::recurrent_state_bytes_from_graph(&graph, decoder_abi)?;
             kv_bytes.saturating_add(recurrent_bytes)
         } else {
             0
@@ -933,11 +1128,8 @@ impl Engine {
         if let Some(trace) = trace {
             native_session.set_trace_context(trace);
         }
-        let native_shared_kv_proposer = None;
-        // Shared-KV drafting is no longer resolved from the package, so this
-        // path never offers a shared-KV proposer. MTP remains the one native
-        // proposer kind, and the effective mode is decided below once the MTP
-        // loader has reported.
+        // MTP is the one native proposer kind; the effective mode is decided
+        // below once the MTP loader has reported.
         let shared_kv_mode = SpeculativeMode::None;
         let environment = {
             let _span = onnx_genai_ort::prof_span!("engine.ort_environment");
@@ -972,7 +1164,14 @@ impl Engine {
         let scheduler =
             Scheduler::with_byte_budget(scheduler_config, governor.byte_budget_after_native_load());
 
+        let workflow = Self::hosted_workflow_runtime(
+            &model_directory,
+            &metadata,
+            EngineDecodeBackend::Native,
+            &memory_strategy_plan,
+        )?;
         Ok(Self {
+            workflow,
             decode_backend: EngineDecodeBackend::Native,
             metadata,
             metadata_hints,
@@ -984,6 +1183,8 @@ impl Engine {
             scheduler,
             governor,
             sessions: HashMap::new(),
+            workflow_sessions: HashMap::new(),
+            workflow_session_counter: 0,
             session: None,
             native_session: Some(native_session),
             weight_placement,
@@ -994,13 +1195,11 @@ impl Engine {
             native_access_counter: 0,
             native_default_session: None,
             native_max_sessions: config.native_max_sessions,
-            native_shared_kv_proposer,
             native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
             draft: None,
             mtp,
             eagle3: None,
-            shared_kv_proposer: None,
-            tokenizer,
+            tokenizer: Some(tokenizer),
             fim_config,
             num_speculative_tokens: config.num_speculative_tokens.max(1),
             speculative_mode,
@@ -1054,8 +1253,7 @@ fn maybe_fill_hybrid_io_from_graph(metadata: &mut InferenceMetadata, model_path:
     let Some(graph_info) = crate::engine::decoder_graph_info_from_model_path(model_path) else {
         return;
     };
-    let Some(io) =
-        onnx_genai_genai_config::GenAiConfig::derive_model_io_spec_from_graph(&graph_info)
+    let Some(io) = onnx_genai_genai_config::GenAiConfig::derive_decoder_abi_from_graph(&graph_info)
     else {
         return;
     };
@@ -1071,7 +1269,7 @@ fn maybe_fill_hybrid_io_from_graph(metadata: &mut InferenceMetadata, model_path:
 fn mtp_seeded_decoder_io(
     metadata: &InferenceMetadata,
     model_root: &Path,
-) -> Option<onnx_genai_metadata::ModelIoSpec> {
+) -> Option<onnx_genai_metadata::DecoderAbi> {
     let io = metadata.decoder_io()?;
     let descriptor = onnx_genai_metadata::detect_speculator(model_root)?;
     let onnx_genai_metadata::SpeculatorProposerStatus::Mtp(spec) = descriptor.proposer else {
@@ -1088,9 +1286,9 @@ fn mtp_seeded_decoder_io(
 /// reads as "declared" everywhere downstream.
 #[cfg(feature = "native-backend")]
 fn decoder_io_seeded_with(
-    io: &onnx_genai_metadata::ModelIoSpec,
+    io: &onnx_genai_metadata::DecoderAbi,
     target_hidden_output: &str,
-) -> Option<onnx_genai_metadata::ModelIoSpec> {
+) -> Option<onnx_genai_metadata::DecoderAbi> {
     if !io.hidden_output.as_deref().unwrap_or_default().is_empty() {
         return None;
     }
@@ -2568,99 +2766,6 @@ fn load_eagle3_model(
     Ok(eagle3)
 }
 
-fn load_shared_kv_proposer(
-    speculative_mode: &SpeculativeMode,
-    session: &Session,
-    environment: &Environment,
-    session_options: &SessionOptions,
-) -> anyhow::Result<Option<SharedKvProposerModel>> {
-    let shared_kv_proposer = if let SpeculativeMode::SharedKv(assistant_config) = speculative_mode {
-        crate::config::validate_shared_kv_proposer_config(assistant_config)?;
-        let hidden_output = session
-            .outputs()
-            .iter()
-            .find(|output| output.name == assistant_config.target_hidden_output)
-            .with_context(|| {
-                format!(
-                    "shared-KV proposer target model must expose hidden-state output '{}'",
-                    assistant_config.target_hidden_output
-                )
-            })?;
-        if hidden_output.dtype != DataType::Float32 {
-            anyhow::bail!(
-                "shared-KV proposer target hidden-state output '{}' must be Float32, got {:?}",
-                hidden_output.name,
-                hidden_output.dtype
-            );
-        }
-        if hidden_output.shape.last().copied().filter(|dim| *dim > 0)
-            != Some(assistant_config.backbone_hidden_size as i64)
-        {
-            anyhow::bail!(
-                "shared-KV proposer target hidden-state output '{}' shape {:?} does not end in configured backbone hidden size {}",
-                hidden_output.name,
-                hidden_output.shape,
-                assistant_config.backbone_hidden_size
-            );
-        }
-        let assistant_session = Session::new(
-            environment,
-            &assistant_config.assistant_model,
-            session_options.clone(),
-        )
-        .map_err(|error| anyhow::anyhow!("Failed to load shared-KV proposer model: {error}"))?;
-        let signature = SharedKvProposerSession::detect(&assistant_session)
-            .map_err(|error| {
-                anyhow::anyhow!("Failed to inspect shared-KV proposer model: {error}")
-            })?
-            .context("configured shared-KV proposer model does not expose proposer I/O")?;
-        if signature.backbone_hidden_size != assistant_config.backbone_hidden_size {
-            anyhow::bail!(
-                "shared-KV proposer hidden size {} does not match configured backbone hidden size {}",
-                signature.backbone_hidden_size,
-                assistant_config.backbone_hidden_size
-            );
-        }
-        if signature.vocab_size != assistant_config.vocab_size {
-            anyhow::bail!(
-                "shared-KV proposer vocabulary {} does not match configured vocab size {}",
-                signature.vocab_size,
-                assistant_config.vocab_size
-            );
-        }
-        for group in &assistant_config.shared_kv {
-            if !signature
-                .shared_kv
-                .iter()
-                .any(|spec| spec.name == group.name)
-            {
-                anyhow::bail!(
-                    "shared-KV proposer model does not expose shared_kv group '{}'",
-                    group.name
-                );
-            }
-        }
-        let embedding = read_f32_weights(&assistant_config.input_embedding_weights)?;
-        let embedder = LinearEmbedder::new(
-            embedding,
-            assistant_config.vocab_size,
-            assistant_config.backbone_hidden_size,
-        )
-        .map_err(|error| {
-            anyhow::anyhow!("Invalid shared-KV proposer input embedding weights: {error}")
-        })?;
-        Some(SharedKvProposerModel {
-            config: assistant_config.clone(),
-            session: Box::new(assistant_session),
-            embedder,
-            num_speculative_tokens: assistant_config.num_speculative_tokens,
-        })
-    } else {
-        None
-    };
-    Ok(shared_kv_proposer)
-}
-
 #[cfg(test)]
 mod metadata_admission_tests {
     use super::*;
@@ -2856,7 +2961,7 @@ pipeline:
 mod mtp_seed_tests {
     use super::*;
 
-    fn io_with_hidden_output(hidden_output: Option<&str>) -> onnx_genai_metadata::ModelIoSpec {
+    fn io_with_hidden_output(hidden_output: Option<&str>) -> onnx_genai_metadata::DecoderAbi {
         let mut value = serde_json::json!({});
         if let Some(name) = hidden_output {
             value["hidden_output"] = serde_json::json!(name);
@@ -2930,7 +3035,7 @@ mod pool_sizing_tests {
             .canonicalize()?)
     }
 
-    fn tiny_llm_io() -> anyhow::Result<onnx_genai_metadata::ModelIoSpec> {
+    fn tiny_llm_io() -> anyhow::Result<onnx_genai_metadata::DecoderAbi> {
         let metadata_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm/inference_metadata.yaml")
             .canonicalize()?;

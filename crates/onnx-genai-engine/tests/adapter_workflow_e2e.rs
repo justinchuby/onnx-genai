@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use onnx_genai_engine::{
     AdapterActivation, AdapterSelection, Engine, EngineConfig, GeneratePrompt, GenerateRequest,
-    PipelineEngine, PipelineGenerateRequest,
+    PipelineGenerateRequest,
 };
 use onnx_genai_ort::Value;
 
@@ -19,7 +19,7 @@ fn package(metadata: &str, red: &[u8], blue: &[u8]) -> anyhow::Result<PathBuf> {
 }
 
 fn run(
-    engine: &mut PipelineEngine,
+    engine: &mut Engine,
     values: &[f32],
     selection: AdapterSelection,
 ) -> anyhow::Result<Vec<f32>> {
@@ -172,7 +172,7 @@ pipeline:
         mode: replace
 "#;
     let root = package(metadata, red, blue)?;
-    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
     let red_only = [AdapterActivation::new("red", 1.0)];
     let none: [AdapterActivation; 0] = [];
     let composed = [

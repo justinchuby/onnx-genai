@@ -240,6 +240,7 @@ pub(crate) struct WorkflowPerformanceCounters {
     last_stage_elapsed_ns: BTreeMap<String, u128>,
     last_emit_events: u64,
     last_emitted_elements: u64,
+    last_loop_ended_by_predicate: bool,
 }
 
 /// Persistent execution state for repeated runs of one compiled workflow.
@@ -248,7 +249,7 @@ pub(crate) struct WorkflowPerformanceCounters {
 /// resolution, component override validation, and the input value slots. Each
 /// execution retains those inputs while discarding transient SSA and emit values.
 pub struct WorkflowExecutionPlan<'a> {
-    engine: &'a PipelineEngine,
+    engine: &'a WorkflowRuntime,
     values: PipelineTensors,
     input_names: Vec<String>,
     input_aliases: HashMap<String, String>,
@@ -260,12 +261,20 @@ pub struct WorkflowExecutionPlan<'a> {
 }
 
 #[derive(Default)]
-struct WorkflowRunTelemetry {
+pub(crate) struct WorkflowRunTelemetry {
     started: Option<std::time::Instant>,
     first_emit_ns: Option<u128>,
     emit_timestamps_ns: Vec<u128>,
     max_iterations_only: bool,
     loop_iterations: u64,
+    /// Whether the loop that produces the package's token stream ended because
+    /// its liveness predicate went false, rather than exhausting its bound.
+    ///
+    /// This is *why generation stopped*, and it is only knowable here: the loop
+    /// is the thing that decided. Without it a caller has to guess, and the
+    /// guess that was being made was "always the bound", so a workflow that
+    /// stopped at EOS reported `MaxTokens`.
+    loop_ended_by_predicate: bool,
     component_invocations: u64,
     emit_events: u64,
     emitted_elements: u64,
@@ -283,7 +292,7 @@ impl WorkflowRunTelemetry {
 }
 
 type WorkflowAdapterExecutor = fn(
-    &PipelineEngine,
+    &WorkflowRuntime,
     &str,
     &std::collections::BTreeMap<String, String>,
     &std::collections::BTreeMap<String, String>,
@@ -301,27 +310,27 @@ fn workflow_adapter_registry()
         HashMap::from([
             (
                 ("onnx-genai.image-preprocess", "1"),
-                PipelineEngine::run_image_preprocess_adapter as WorkflowAdapterExecutor,
+                WorkflowRuntime::run_image_preprocess_adapter as WorkflowAdapterExecutor,
             ),
             (
                 ("onnx-genai.audio-preprocess", "1"),
-                PipelineEngine::run_audio_preprocess_adapter as WorkflowAdapterExecutor,
+                WorkflowRuntime::run_audio_preprocess_adapter as WorkflowAdapterExecutor,
             ),
             (
                 ("onnx-genai.grammar-guidance", "1"),
-                PipelineEngine::run_grammar_guidance_adapter as WorkflowAdapterExecutor,
+                WorkflowRuntime::run_grammar_guidance_adapter as WorkflowAdapterExecutor,
             ),
             (
                 ("onnx-genai.telemetry", "1"),
-                PipelineEngine::run_telemetry_adapter as WorkflowAdapterExecutor,
+                WorkflowRuntime::run_telemetry_adapter as WorkflowAdapterExecutor,
             ),
             (
                 ("onnx-genai.parameter-overlay", "1"),
-                PipelineEngine::run_parameter_overlay_adapter as WorkflowAdapterExecutor,
+                WorkflowRuntime::run_parameter_overlay_adapter as WorkflowAdapterExecutor,
             ),
             (
                 ("onnx-genai.text-assembly", "1"),
-                PipelineEngine::run_text_assembly_adapter as WorkflowAdapterExecutor,
+                WorkflowRuntime::run_text_assembly_adapter as WorkflowAdapterExecutor,
             ),
         ])
     });
@@ -511,23 +520,31 @@ fn session_state_value_name(cell: &str) -> String {
     format!("__session_state.{cell}")
 }
 
-impl PipelineEngine {
+impl WorkflowRuntime {
     fn materialize_workflow_value_copy(&self, value: &Value) -> anyhow::Result<Value> {
         if value.is_host_resident()? {
             return clone_value(value);
         }
+        // Every device→host copy this runtime performs goes through here, which
+        // is why the count lives here and not at the call sites: a new caller
+        // is counted without having to remember to count itself.
+        self.host_staging_count
+            .set(self.host_staging_count.get().saturating_add(1));
         let device_id = value.device_id()?;
-        let island = self
+        if let Some(island) = self
             .execution_islands
             .iter()
             .find(|island| island.cuda_device_id() == Some(device_id))
-            .with_context(|| {
-                format!(
-                    "workflow has a value on CUDA device {device_id} but no execution island for \
-                     that device"
-                )
-            })?;
-        island.materialize_host(value)
+        {
+            return island.materialize_host(value);
+        }
+        // Native backend: no execution islands exist, but a native component may
+        // still hand back a device-resident value. Materialize it to host with a
+        // standalone device→host copy (the interpreter's host-policy boundaries
+        // — branch predicates, adapters, emit — need host bytes).
+        value
+            .to_host_from_cuda(device_id)
+            .with_context(|| format!("failed to materialize CUDA device {device_id} value to host"))
     }
 
     fn materialize_workflow_value(
@@ -542,22 +559,23 @@ impl PipelineEngine {
             return Ok(());
         }
         let device_id = value.device_id()?;
-        let island = self
+        let host = if let Some(island) = self
             .execution_islands
             .iter()
             .find(|island| island.cuda_device_id() == Some(device_id))
-            .with_context(|| {
-                format!(
-                    "workflow has a value on CUDA device {device_id} but no execution island for \
-                     that device"
-                )
-            })?;
-        let host = island.materialize_host(value)?;
+        {
+            island.materialize_host(value)?
+        } else {
+            // Native backend: no islands; standalone device→host copy.
+            value.to_host_from_cuda(device_id).with_context(|| {
+                format!("failed to materialize CUDA device {device_id} value '{name}' to host")
+            })?
+        };
         values.insert(name.to_string(), host);
         Ok(())
     }
 
-    fn package_outputs(
+    pub(crate) fn package_outputs(
         &self,
         mut values: PipelineTensors,
         row_outputs: BTreeMap<String, Vec<String>>,
@@ -593,6 +611,18 @@ impl PipelineEngine {
             rows: row_outputs,
         })
     }
+    /// Why the last generation stopped.
+    ///
+    /// `true` when the outermost loop's liveness predicate went false — the
+    /// model's own stop — and `false` when it exhausted its iteration bound.
+    /// Read by the generate path so a composite workflow reports the reason it
+    /// actually finished for.
+    pub(crate) fn last_generation_ended_by_predicate(&self) -> bool {
+        self.workflow_performance
+            .borrow()
+            .last_loop_ended_by_predicate
+    }
+
     pub fn workflow_performance_diagnostic(&self) -> WorkflowPerformanceDiagnostic {
         let counters = self.workflow_performance.borrow();
         let elapsed_seconds = counters.last_elapsed_ns as f64 / 1_000_000_000.0;
@@ -635,12 +665,68 @@ impl PipelineEngine {
     ) -> anyhow::Result<PipelineOutputs> {
         WorkflowExecutionPlan::new(self, request)?.execute_outputs()
     }
+
+    pub(crate) fn run_workflow_retained(
+        &self,
+        request: PipelineGenerateRequest,
+    ) -> anyhow::Result<PipelineTensors> {
+        let mut plan = WorkflowExecutionPlan::new(self, request)?;
+        let (mut values, _) = plan.execute_retained()?;
+        // `execute_retained` parks the pass's inputs back on the plan for replay.
+        // A retained run has no replay — the caller wanted the whole value map —
+        // so fold them back in; a proposal chain binds the proposer's borrowed
+        // shared KV and masks straight from these request values.
+        for (name, value) in std::mem::take(&mut plan.values) {
+            values.entry(name).or_insert(value);
+        }
+        // Declared package outputs read the same here as they do from
+        // `run_pipeline`: host-resident. Internal SSA values are deliberately
+        // left where the backend produced them, so a native-CUDA proposal chain
+        // keeps its carry and borrowed KV device-resident instead of paying a
+        // host round-trip to be observed.
+        for output in self.workflow.outputs.keys() {
+            let row_prefix = format!("{output}.row.");
+            let event_prefix = format!("{output}.");
+            let names = values
+                .keys()
+                .filter(|name| {
+                    *name == output
+                        || name.starts_with(&row_prefix)
+                        || (name.starts_with(&event_prefix)
+                            && name[event_prefix.len()..]
+                                .chars()
+                                .all(|character| character.is_ascii_digit()))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for name in names {
+                self.materialize_workflow_value(&mut values, &name)?;
+            }
+        }
+        Ok(values)
+    }
 }
 
 impl<'a> WorkflowExecutionPlan<'a> {
     pub(crate) fn new(
-        engine: &'a PipelineEngine,
+        engine: &'a WorkflowRuntime,
         request: PipelineGenerateRequest,
+    ) -> anyhow::Result<Self> {
+        Self::new_hosted(engine, request, &[])
+    }
+
+    /// Prepare a pass in which `hosted` contracts are executed by the caller.
+    ///
+    /// The contract list is the caller's statement about what it can run, and
+    /// it is the only thing that makes a declared input optional here: an input
+    /// read solely by a step the caller executes is that executor's business,
+    /// and demanding it of the request would be asking for a second answer to a
+    /// question the executor has already answered. An input any generically
+    /// executed component reads stays required.
+    pub(crate) fn new_hosted(
+        engine: &'a WorkflowRuntime,
+        request: PipelineGenerateRequest,
+        hosted: &[&str],
     ) -> anyhow::Result<Self> {
         let PipelineGenerateRequest {
             request,
@@ -650,7 +736,19 @@ impl<'a> WorkflowExecutionPlan<'a> {
         } = request;
         let workflow = &engine.workflow;
         validate_component_overrides(workflow, &component_overrides)?;
-        let (mut values, from_literal) = engine.bind_workflow_inputs(workflow, &request, inputs)?;
+        let host_supplied = if hosted.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            super::generation::host_supplied_inputs(workflow, hosted)
+        };
+        let runtime_managed_seeds = super::generation::runtime_managed_seeds(workflow);
+        let (mut values, from_literal) = engine.bind_workflow_inputs(
+            workflow,
+            &request,
+            inputs,
+            &host_supplied,
+            &runtime_managed_seeds,
+        )?;
         let dynamic_symbols = workflow
             .state
             .values()
@@ -778,6 +876,34 @@ impl<'a> WorkflowExecutionPlan<'a> {
     }
 
     pub fn execute_outputs(&mut self) -> anyhow::Result<PipelineOutputs> {
+        let (values, row_outputs) = self.execute_retained()?;
+        self.engine.package_outputs(values, row_outputs)
+    }
+
+    /// Execute the workflow and keep every SSA value the pass produced.
+    ///
+    /// [`Self::execute_outputs`] narrows this to the package's declared outputs.
+    /// Interpreter-level constructs that consume a completed pass — the chained
+    /// speculative driver reading its `folded_carry_seed` and the proposer's
+    /// borrowed shared-KV bindings, above all — need the values the workflow
+    /// bound internally, not just what it published.
+    pub fn execute_retained(
+        &mut self,
+    ) -> anyhow::Result<(PipelineTensors, BTreeMap<String, Vec<String>>)> {
+        self.execute_retained_with_host(&mut None)
+    }
+
+    /// Execute with a host supplying the runtime-implemented nodes.
+    ///
+    /// A workflow may declare steps the package ships no graph for — an
+    /// autoregressive decoder driven by a fused session, or the token policy.
+    /// The host implements those; the interpreter still owns the loop, the
+    /// carries and the emits, so there is one execution machinery rather than a
+    /// second loop beside it.
+    pub(crate) fn execute_retained_with_host(
+        &mut self,
+        host: &mut Option<&mut dyn WorkflowNodeHost>,
+    ) -> anyhow::Result<(PipelineTensors, BTreeMap<String, Vec<String>>)> {
         let started = std::time::Instant::now();
         let mut telemetry = WorkflowRunTelemetry {
             started: Some(started),
@@ -878,6 +1004,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             &mut final_state_refs,
             &self.component_overrides,
             &mut telemetry,
+            host,
         );
         if let Err(error) = result {
             self.retain_inputs(&mut values);
@@ -922,24 +1049,11 @@ impl<'a> WorkflowExecutionPlan<'a> {
                 session_state.insert(key, value);
             }
         }
-        let elapsed_ns = started.elapsed().as_nanos();
-        let mut counters = engine.workflow_performance.borrow_mut();
-        counters.runs += 1;
-        counters.total_elapsed_ns += elapsed_ns;
-        counters.last_elapsed_ns = elapsed_ns;
-        counters.last_ttft_ns = telemetry.first_emit_ns;
-        counters.last_emit_timestamps_ns = telemetry.emit_timestamps_ns;
-        counters.last_loop_iterations = telemetry.loop_iterations;
-        counters.last_component_invocations = telemetry.component_invocations;
-        counters.last_stage_runs = telemetry.stage_runs;
-        counters.last_stage_elapsed_ns = telemetry.stage_elapsed_ns;
-        counters.last_emit_events = telemetry.emit_events;
-        counters.last_emitted_elements = telemetry.emitted_elements;
-        drop(counters);
+        let row_outputs = std::mem::take(&mut telemetry.row_outputs);
+        engine.publish_workflow_telemetry(telemetry);
         let inputs = self.take_inputs(&mut values);
-        let outputs = engine.package_outputs(values, telemetry.row_outputs);
         self.values = inputs;
-        outputs
+        Ok((values, row_outputs))
     }
 
     fn retain_inputs(&mut self, values: &mut PipelineTensors) {
@@ -954,7 +1068,111 @@ impl<'a> WorkflowExecutionPlan<'a> {
     }
 }
 
-impl PipelineEngine {
+impl WorkflowRuntime {
+    /// Fold one pass's telemetry into this runtime's performance counters.
+    ///
+    /// One place, so a pass driven a token at a time reports the same counters
+    /// as one driven to completion — including `loop_ended_by_predicate`, which
+    /// is how a caller learns whether generation stopped at its own EOS or ran
+    /// out of budget.
+    fn publish_workflow_telemetry(&self, telemetry: WorkflowRunTelemetry) {
+        let elapsed_ns = telemetry
+            .started
+            .map_or(0, |started| started.elapsed().as_nanos());
+        let mut counters = self.workflow_performance.borrow_mut();
+        counters.runs += 1;
+        counters.total_elapsed_ns += elapsed_ns;
+        counters.last_elapsed_ns = elapsed_ns;
+        counters.last_ttft_ns = telemetry.first_emit_ns;
+        counters.last_emit_timestamps_ns = telemetry.emit_timestamps_ns;
+        counters.last_loop_iterations = telemetry.loop_iterations;
+        counters.last_loop_ended_by_predicate = telemetry.loop_ended_by_predicate;
+        counters.last_component_invocations = telemetry.component_invocations;
+        counters.last_stage_runs = telemetry.stage_runs;
+        counters.last_stage_elapsed_ns = telemetry.stage_elapsed_ns;
+        counters.last_emit_events = telemetry.emit_events;
+        counters.last_emitted_elements = telemetry.emitted_elements;
+    }
+}
+
+/// Contracts this runtime supplies an executor for.
+///
+/// Mirrors [`workflow_adapter_registry`]: a workflow names a contract, and the
+/// runtime either has an executor for it or the package declares something this
+/// build cannot run. Keeping the set in one place is what makes "which steps can
+/// this runtime implement?" a question with a single answer, rather than a
+/// property of whichever `match` arm a reader happens to find.
+///
+/// Membership here is *necessary but not sufficient*: a host still declines a
+/// contract it holds no resources for (no decode session, say), and the
+/// interpreter reports that as an unimplemented contract rather than silently
+/// continuing.
+pub(crate) fn runtime_contract_registry() -> &'static std::collections::HashSet<&'static str> {
+    static REGISTRY: std::sync::LazyLock<std::collections::HashSet<&'static str>> =
+        std::sync::LazyLock::new(|| {
+            std::collections::HashSet::from([
+                onnx_genai_metadata::decoder_workflow::AUTOREGRESSIVE_DECODE_CONTRACT,
+                onnx_genai_metadata::decoder_workflow::TOKEN_POLICY_CONTRACT,
+            ])
+        });
+    &REGISTRY
+}
+
+/// A runtime-supplied executor for a workflow node the package does not ship a
+/// graph for.
+///
+/// A workflow declares *what happens* at each step. Most steps are ONNX graphs
+/// the package ships; some are steps the runtime implements — an autoregressive
+/// decoder driven by a fused session that owns paged KV on device, or the token
+/// policy that scores logits and decides when generation ends. A package states
+/// those as `implementation: binding` with a contract id, and the runtime
+/// supplies the implementation here.
+///
+/// This is the seam that lets the interpreter own the loop while a backend owns
+/// the step. The interpreter still resolves `continue_when`, `max_iterations`,
+/// `carried`, `termination` and the emits; the host only advances one node. A
+/// host that owned the loop instead would be a second runtime, which is exactly
+/// what this replaces.
+pub(crate) trait WorkflowNodeHost {
+    /// Contracts this host implements.
+    ///
+    /// Declared rather than discovered so the interpreter can hand a node to
+    /// the host *before* resolving the node's inputs: an executor that supplies
+    /// its own mask and positions must not have them demanded of the caller
+    /// first. It is also what the execution plan reads to decide which declared
+    /// package inputs are the host's business.
+    fn hosted_contracts(&self) -> &'static [&'static str];
+
+    /// Execute one node bound to `contract`.
+    ///
+    /// Returns `Ok(false)` when this host does not implement the contract, so
+    /// the interpreter can report an unimplemented contract rather than
+    /// silently doing nothing — a declared step that no one runs is the failure
+    /// mode this signature exists to prevent.
+    fn execute_contract_node(&mut self, request: WorkflowNodeRequest<'_>) -> anyhow::Result<bool>;
+}
+
+/// Everything a host needs to advance one declared node.
+///
+/// `dead_code` is allowed only until the engine-side executors land: this
+/// checkpoint defines the seam and the interpreter's dispatch, and the first
+/// non-test implementor is the autoregressive-decode host in the next commit.
+/// The allowance is scoped to this struct so it cannot hide anything else.
+#[allow(dead_code)]
+pub(crate) struct WorkflowNodeRequest<'a> {
+    /// Contract id the component declares.
+    pub(crate) contract: &'a str,
+    /// Component name, for diagnostics only — never for dispatch.
+    pub(crate) component: &'a str,
+    /// Port name to SSA value, as the invocation bound them.
+    pub(crate) inputs: &'a BTreeMap<String, String>,
+    /// Port name to SSA value the host must define.
+    pub(crate) outputs: &'a BTreeMap<String, String>,
+    /// The invocation's value environment.
+    pub(crate) values: &'a mut PipelineTensors,
+}
+
+impl WorkflowRuntime {
     // Recursive execution threads the explicit interpreter stores and telemetry.
     #[allow(clippy::too_many_arguments)]
     fn run_workflow_node(
@@ -968,6 +1186,7 @@ impl PipelineEngine {
         final_state_refs: &mut HashMap<String, String>,
         component_overrides: &HashMap<String, String>,
         telemetry: &mut WorkflowRunTelemetry,
+        host: &mut Option<&mut dyn WorkflowNodeHost>,
     ) -> anyhow::Result<()> {
         match node {
             WorkflowNode::Sequence { nodes } => {
@@ -982,6 +1201,7 @@ impl PipelineEngine {
                         final_state_refs,
                         component_overrides,
                         telemetry,
+                        host,
                     )?;
                 }
             }
@@ -999,6 +1219,48 @@ impl PipelineEngine {
                     .with_context(|| format!("workflow component '{component}' is undeclared"))?;
                 match &declaration.implementation {
                     ComponentImplementation::Onnx { .. } => {
+                        // A component may declare *what step it is* alongside
+                        // the graph that implements it. When this runtime holds
+                        // a registered executor for that contract — a fused
+                        // decode session owning paged KV and a captured graph,
+                        // above all — it runs the declared step instead of
+                        // invoking the artifact generically. Both run the same
+                        // node; which executor does is answered by the
+                        // contract, never by inspecting the package.
+                        //
+                        // Consulted before the inputs are resolved on purpose:
+                        // such an executor supplies the ports it owns (the
+                        // attention mask it builds from the sequence it holds),
+                        // and demanding them of the caller first would ask for
+                        // a second answer to a question it has already
+                        // answered.
+                        if let Some(contract) = declaration
+                            .contract
+                            .as_ref()
+                            .map(|contract| contract.id.as_str())
+                            && let Some(host) = host.as_deref_mut()
+                            && host.hosted_contracts().contains(&contract)
+                        {
+                            let handled = host.execute_contract_node(WorkflowNodeRequest {
+                                contract,
+                                component,
+                                inputs,
+                                outputs,
+                                values,
+                            })?;
+                            anyhow::ensure!(
+                                handled,
+                                "workflow component '{component}' declares contract \
+                                 '{contract}', which the running host lists as implemented but \
+                                 then declined to execute"
+                            );
+                            self.record_contract_execution(contract);
+                            telemetry.record_stage(
+                                component.clone(),
+                                stage_started.elapsed().as_nanos(),
+                            );
+                            return Ok(());
+                        }
                         let (
                             selected_component,
                             selected_declaration,
@@ -1021,13 +1283,6 @@ impl PipelineEngine {
                             &selected_inputs,
                             values,
                         )?;
-                        let session =
-                            self.models.session(selected_component).with_context(|| {
-                                format!(
-                                    "workflow ONNX component '{selected_component}' selected for \
-                                 '{component}' was not loaded"
-                                )
-                            })?;
                         // Component dimensions are invocation-local. A decoder, for example, may
                         // bind `sequence` to the prompt length in setup and to one in the loop.
                         // Values crossing the package boundary were already checked there; the
@@ -1062,31 +1317,26 @@ impl PipelineEngine {
                                     })
                             })
                             .collect::<anyhow::Result<Vec<_>>>()?;
-                        let stable_eligible = session.cuda_device_id().is_some()
-                            && self.device_bridge_components.contains(selected_component);
-                        let produced = if stable_eligible {
-                            self.run_stable_component(
-                                workflow,
-                                selected_component,
-                                selected_declaration,
-                                &component_symbols,
-                                session,
-                                &resolved,
-                                &selected_outputs,
-                            )?
-                        } else {
-                            session
-                                .output_names()
-                                .iter()
-                                .cloned()
-                                .zip(session.run(&resolved).with_context(|| {
-                                    format!(
-                                        "workflow ONNX component '{selected_component}' execution \
-                                         failed"
-                                    )
-                                })?)
-                                .collect()
-                        };
+                        // Concrete output shapes known from the bound input
+                        // symbols, so the native CUDA seam can keep resolvable
+                        // outputs (a recurring/state tensor in particular)
+                        // device-resident. The ORT path ignores this.
+                        let component_output_shapes = resolve_component_output_shapes(
+                            selected_declaration,
+                            &selected_outputs,
+                            &component_symbols,
+                            &component_dynamic_symbols,
+                        );
+                        let produced = self.invoke_onnx_component(
+                            workflow,
+                            component,
+                            selected_component,
+                            selected_declaration,
+                            &component_symbols,
+                            &resolved,
+                            &selected_outputs,
+                            &component_output_shapes,
+                        )?;
                         for (port, tensor) in produced {
                             let Some(value) = selected_outputs.get(&port) else {
                                 continue;
@@ -1105,17 +1355,63 @@ impl PipelineEngine {
                         }
                     }
                     ComponentImplementation::Binding => {
-                        for (port, output) in outputs {
-                            let source = inputs.get(port).with_context(|| {
-                                format!(
-                                    "binding component '{component}' output '{port}' requires \
-                                     an input with the same port name"
-                                )
-                            })?;
-                            let tensor = values.get(source).with_context(|| {
-                                format!("binding source value '{source}' is unavailable")
-                            })?;
-                            values.insert(output.clone(), clone_value(tensor)?);
+                        // A binding says "a step happens here and the runtime
+                        // implements it". When it names a contract, the host is
+                        // the implementation; the interpreter still owns the
+                        // loop around it.
+                        let contract = declaration.contract.as_ref().map(|c| c.id.as_str());
+                        let handled = match (contract, host.as_deref_mut()) {
+                            (Some(contract), Some(host)) => {
+                                let handled = host.execute_contract_node(WorkflowNodeRequest {
+                                    contract,
+                                    component,
+                                    inputs,
+                                    outputs,
+                                    values,
+                                })?;
+                                if handled {
+                                    self.record_contract_execution(contract);
+                                }
+                                handled
+                            }
+                            _ => false,
+                        };
+                        if !handled {
+                            // A contract nobody implements must fail, not fall
+                            // through to a port copy that would define the
+                            // outputs with the wrong tensors and let a declared
+                            // step silently not happen.
+                            if let Some(contract) = contract {
+                                // Two different problems, and an operator can act
+                                // on only one of them: a contract this build has
+                                // no executor for is a package/runtime version
+                                // mismatch, while a registered contract that went
+                                // unhandled means the host reached this step
+                                // without the resources to run it.
+                                if runtime_contract_registry().contains(contract) {
+                                    anyhow::bail!(
+                                        "workflow component '{component}' declares contract \
+                                         '{contract}', which this runtime implements but no \
+                                         executor was available for this request"
+                                    );
+                                }
+                                anyhow::bail!(
+                                    "workflow component '{component}' declares contract \
+                                     '{contract}', which no runtime executor implements"
+                                );
+                            }
+                            for (port, output) in outputs {
+                                let source = inputs.get(port).with_context(|| {
+                                    format!(
+                                        "binding component '{component}' output '{port}' requires \
+                                         an input with the same port name"
+                                    )
+                                })?;
+                                let tensor = values.get(source).with_context(|| {
+                                    format!("binding source value '{source}' is unavailable")
+                                })?;
+                                values.insert(output.clone(), clone_value(tensor)?);
+                            }
                         }
                     }
                     ComponentImplementation::Adapter { abi, version, .. } => {
@@ -1159,8 +1455,17 @@ impl PipelineEngine {
                 carried,
                 effects: _,
             } => {
-                self.run_workflow_node(
+                let plan = WorkflowLoopPlan {
                     setup,
+                    body,
+                    continue_when,
+                    max_iterations,
+                    termination,
+                    iteration,
+                    carried,
+                };
+                let limit = self.begin_workflow_loop(
+                    &plan,
                     workflow,
                     values,
                     symbols,
@@ -1169,74 +1474,13 @@ impl PipelineEngine {
                     final_state_refs,
                     component_overrides,
                     telemetry,
+                    host,
                 )?;
-                self.materialize_workflow_value(values, max_iterations)?;
-                for carry in carried {
-                    let state = workflow.state.get(&carry.cell).with_context(|| {
-                        format!("workflow loop carries undeclared state '{}'", carry.cell)
-                    })?;
-                    let initializer = values
-                        .get(&session_state_value_name(&carry.cell))
-                        .or_else(|| values.get(&carry.current))
-                        .with_context(|| {
-                            format!(
-                                "workflow state '{}' loop initializer '{}' is unavailable after \
-                                 setup",
-                                carry.cell, carry.current
-                            )
-                        })?;
-                    validate_workflow_value(
-                        &carry.current,
-                        initializer,
-                        &state.contract,
-                        symbols,
-                        dynamic_symbols,
-                    )?;
-                    let initial_value = clone_value(initializer)?;
-                    values.insert(carry.next.clone(), initial_value);
-                    final_state_refs.insert(carry.cell.clone(), carry.next.clone());
-                }
-                let limit = workflow_scalar_usize(values, max_iterations)?;
-                if let Some(iteration) = iteration
-                    && values.contains_key(&iteration.value)
-                {
-                    anyhow::bail!(
-                        "workflow loop iteration value '{}' shadows an existing SSA value",
-                        iteration.value
-                    );
-                }
                 for index in 0..limit {
-                    let max_iterations_only = telemetry.max_iterations_only
-                        && *termination
-                            == onnx_genai_metadata::WorkflowLoopTermination::GenerationEos;
-                    let active_rows = if max_iterations_only {
-                        workflow_active_rows_without_inspection(values, continue_when)?
-                    } else {
-                        self.materialize_workflow_value(values, continue_when)?;
-                        workflow_bool_rows(values, continue_when)?
-                    };
-                    if !active_rows.iter().any(|active| *active) {
-                        break;
-                    }
-                    telemetry.loop_iterations += 1;
-                    if let Some(iteration) = iteration {
-                        values.insert(
-                            iteration.value.clone(),
-                            workflow_iteration_value(index, &iteration.contract, symbols)?,
-                        );
-                    }
-                    for carry in carried {
-                        if carry.body_input == carry.next {
-                            continue;
-                        }
-                        let current = values.get(&carry.next).with_context(|| {
-                            format!("workflow loop value '{}' is unavailable", carry.next)
-                        })?;
-                        values.insert(carry.body_input.clone(), clone_value(current)?);
-                    }
-                    self.run_workflow_node(
-                        body,
+                    if !self.advance_workflow_loop(
+                        &plan,
                         workflow,
+                        index,
                         values,
                         symbols,
                         dynamic_symbols,
@@ -1244,83 +1488,12 @@ impl PipelineEngine {
                         final_state_refs,
                         component_overrides,
                         telemetry,
-                    )?;
-                    for carry in carried {
-                        let state = workflow.state.get(&carry.cell).with_context(|| {
-                            format!("workflow loop carries undeclared state '{}'", carry.cell)
-                        })?;
-                        match &state.recurrence {
-                            onnx_genai_metadata::ShapeRecurrence::Growing {
-                                increment,
-                                max,
-                                ..
-                            } => {
-                                self.materialize_workflow_value(values, increment)?;
-                                self.materialize_workflow_value(values, max)?;
-                            }
-                            onnx_genai_metadata::ShapeRecurrence::Bounded { max, .. } => {
-                                self.materialize_workflow_value(values, max)?;
-                            }
-                            onnx_genai_metadata::ShapeRecurrence::Invariant => {}
-                        }
-                        if active_rows.len() > 1
-                            && active_rows.iter().any(|active| !*active)
-                            && state.service_group.is_none()
-                        {
-                            self.materialize_workflow_value(values, &carry.next)?;
-                            self.materialize_workflow_value(values, &carry.body_output)?;
-                        }
-                        if state.service_group.is_some() && !values.contains_key(&carry.body_output)
-                        {
-                            final_state_refs.insert(carry.cell.clone(), carry.next.clone());
-                            continue;
-                        }
-                        {
-                            let current = values.get(&carry.next).with_context(|| {
-                                format!("workflow loop value '{}' is unavailable", carry.next)
-                            })?;
-                            let next = values.get(&carry.body_output).with_context(|| {
-                                format!(
-                                    "workflow loop body did not produce '{}'",
-                                    carry.body_output
-                                )
-                            })?;
-                            validate_state_recurrence(&carry.cell, current, next, state, values)?;
-                        }
-                        let next_value = if active_rows.iter().all(|active| *active)
-                            || state.service_group.is_some()
-                        {
-                            // Service-managed state preserves inactive rows
-                            // through its logical lengths. Retain the device
-                            // value directly instead of materializing it on the
-                            // host merely to clone the same tensor.
-                            share_workflow_value(values, &carry.body_output)?
-                        } else {
-                            let current = values.get(&carry.next).with_context(|| {
-                                format!("workflow loop value '{}' is unavailable", carry.next)
-                            })?;
-                            let next = values.get(&carry.body_output).with_context(|| {
-                                format!(
-                                    "workflow loop body did not produce '{}'",
-                                    carry.body_output
-                                )
-                            })?;
-                            merge_inactive_rows(current, next, &active_rows, state).with_context(
-                                || {
-                                    format!(
-                                        "workflow loop carry '{}' cannot preserve inactive rows",
-                                        carry.cell
-                                    )
-                                },
-                            )?
-                        };
-                        values.insert(carry.next.clone(), next_value);
-                        final_state_refs.insert(carry.cell.clone(), carry.next.clone());
+                        host,
+                    )? {
+                        break;
                     }
                 }
-                if let Some(iteration) = iteration {
-                    values.remove(&iteration.value);
-                }
+                end_workflow_loop(&plan, values);
             }
             WorkflowNode::Branch {
                 predicate,
@@ -1360,6 +1533,7 @@ impl PipelineEngine {
                     &mut branch_state_refs,
                     component_overrides,
                     telemetry,
+                    host,
                 )?;
 
                 // Emits are explicit side effects at the package boundary, so selected-branch
@@ -1582,6 +1756,7 @@ impl PipelineEngine {
                         final_state_refs,
                         component_overrides,
                         telemetry,
+                        host,
                     )?;
                     return Ok(());
                 }
@@ -1751,6 +1926,177 @@ impl PipelineEngine {
             }
         }
         Ok(())
+    }
+
+    /// Invoke one declared ONNX component with caller-supplied port values.
+    ///
+    /// This is the same execution seam a `WorkflowNode::Invoke` uses — port
+    /// contract validation, symbol binding, resolvable output shapes, and
+    /// [`Self::invoke_onnx_component`] — exposed for interpreter constructs
+    /// that drive a component outside the SSA step list, such as the chained
+    /// speculative proposal loop (`pipeline::speculative`). Keeping them on one
+    /// seam is what makes those constructs backend-neutral: ORT and native both
+    /// run through the identical path, with no second "invoke a component"
+    /// implementation to keep in sync.
+    pub(crate) fn invoke_component_values(
+        &self,
+        component: &str,
+        inputs: &[(&str, &Value)],
+        outputs: &std::collections::BTreeMap<String, String>,
+    ) -> anyhow::Result<Vec<(String, Value)>> {
+        let workflow = &self.workflow;
+        let declaration = workflow
+            .components
+            .get(component)
+            .with_context(|| format!("workflow component '{component}' is undeclared"))?;
+        anyhow::ensure!(
+            matches!(
+                declaration.implementation,
+                ComponentImplementation::Onnx { .. }
+            ),
+            "workflow component '{component}' is not an ONNX component"
+        );
+        let mut component_symbols = HashMap::new();
+        let component_dynamic_symbols = std::collections::HashSet::new();
+        for (port, value) in inputs {
+            if let Some(contract) = declaration.ports.inputs.get(*port) {
+                validate_workflow_value(
+                    port,
+                    value,
+                    contract,
+                    &mut component_symbols,
+                    &component_dynamic_symbols,
+                )?;
+            }
+        }
+        let output_shapes = resolve_component_output_shapes(
+            declaration,
+            outputs,
+            &component_symbols,
+            &component_dynamic_symbols,
+        );
+        let produced = self.invoke_onnx_component(
+            workflow,
+            component,
+            component,
+            declaration,
+            &component_symbols,
+            inputs,
+            outputs,
+            &output_shapes,
+        )?;
+        for (port, tensor) in &produced {
+            if let Some(contract) = declaration.ports.outputs.get(port) {
+                validate_workflow_value(
+                    port,
+                    tensor,
+                    contract,
+                    &mut component_symbols,
+                    &component_dynamic_symbols,
+                )?;
+            }
+        }
+        Ok(produced)
+    }
+
+    /// Copy a possibly device-resident value into host memory.
+    ///
+    /// Interpreter constructs that must read tensor bytes (a proposal loop's
+    /// argmax, a folded carry it re-packs into the next fused input) go through
+    /// here so a native-CUDA run stays correct without the caller knowing where
+    /// the value lives.
+    pub(crate) fn host_copy_of(&self, value: &Value) -> anyhow::Result<Value> {
+        self.materialize_workflow_value_copy(value)
+    }
+
+    /// Backend-neutral execution seam for a declared ONNX component.
+    ///
+    /// The interpreter is universal over workflows; this is the one place it is
+    /// universal over *backends*. It threads `onnx_genai_ort::Value` either way
+    /// — the ORT branch runs the loaded `Session` (preserving the CUDA-graph /
+    /// `IoBinding` stable-island fast path), and the native branch runs the
+    /// pure-Rust `InferenceSession` through the `Value ⇄ Tensor` bridge. No
+    /// silent fallback: a Native request that reaches here is honored natively
+    /// or fails with an actionable error (Rule 4). See
+    /// `docs/architecture/NATIVE_WORKFLOW_BACKEND.md`.
+    #[allow(clippy::too_many_arguments)]
+    fn invoke_onnx_component(
+        &self,
+        workflow: &WorkflowSpec,
+        component: &str,
+        selected_component: &str,
+        selected_declaration: &onnx_genai_metadata::WorkflowComponent,
+        component_symbols: &HashMap<String, i64>,
+        resolved: &[(&str, &Value)],
+        selected_outputs: &std::collections::BTreeMap<String, String>,
+        output_shapes: &std::collections::BTreeMap<String, Vec<usize>>,
+    ) -> anyhow::Result<Vec<(String, Value)>> {
+        match self.decode_backend {
+            EngineDecodeBackend::Native => {
+                #[cfg(feature = "native-backend")]
+                {
+                    let _ = (workflow, component, selected_declaration, component_symbols);
+                    let set = self.native_components.as_ref().with_context(|| {
+                        format!(
+                            "native workflow backend selected but ONNX component \
+                             '{selected_component}' has no native session"
+                        )
+                    })?;
+                    set.borrow_mut().run_component(
+                        selected_component,
+                        resolved,
+                        selected_outputs,
+                        output_shapes,
+                    )
+                }
+                #[cfg(not(feature = "native-backend"))]
+                {
+                    let _ = (
+                        workflow,
+                        component,
+                        selected_component,
+                        selected_declaration,
+                        component_symbols,
+                        resolved,
+                        selected_outputs,
+                        output_shapes,
+                    );
+                    unreachable!(
+                        "validate_pipeline_backend_request rejects Native without the \
+                         native-backend feature"
+                    )
+                }
+            }
+            EngineDecodeBackend::Ort | EngineDecodeBackend::Auto => {
+                let _ = output_shapes;
+                let session = self.models.session(selected_component).with_context(|| {
+                    format!(
+                        "workflow ONNX component '{selected_component}' selected for '{component}' \
+                         was not loaded"
+                    )
+                })?;
+                let stable_eligible = session.cuda_device_id().is_some()
+                    && self.device_bridge_components.contains(selected_component);
+                if stable_eligible {
+                    self.run_stable_component(
+                        workflow,
+                        selected_component,
+                        selected_declaration,
+                        component_symbols,
+                        session,
+                        resolved,
+                        selected_outputs,
+                    )
+                } else {
+                    Ok(session
+                        .output_names()
+                        .iter()
+                        .cloned()
+                        .zip(session.run(resolved)?)
+                        .collect())
+                }
+            }
+        }
     }
 
     // The stable-binding cache hands out `Arc<Value>` because that is the owner
@@ -2597,6 +2943,8 @@ impl PipelineEngine {
         workflow: &WorkflowSpec,
         request: &GenerateRequest,
         mut provided: PipelineTensors,
+        host_supplied: &std::collections::HashSet<String>,
+        runtime_managed_seeds: &std::collections::HashSet<String>,
     ) -> anyhow::Result<(PipelineTensors, std::collections::HashSet<String>)> {
         let mut values = HashMap::new();
         let mut from_literal = std::collections::HashSet::new();
@@ -2605,6 +2953,14 @@ impl PipelineEngine {
                 WorkflowInputSource::Application { name } => provided.remove(name),
                 _ => None,
             });
+            // The service that owns a runtime-managed cell owns its buffer, and
+            // the declared seed for such a cell is not a tensor the interpreter
+            // can build: a growing cache declares its rank but not its extent.
+            // A caller that supplied one is honoured; nothing is invented for
+            // one that did not.
+            if supplied.is_none() && runtime_managed_seeds.contains(name) {
+                continue;
+            }
             let value = if let Some(value) = supplied {
                 Some(value)
             } else {
@@ -2654,7 +3010,7 @@ impl PipelineEngine {
                 Some(value) => {
                     values.insert(name.clone(), value);
                 }
-                None if input.required => {
+                None if input.required && !host_supplied.contains(name) => {
                     anyhow::bail!("{MISSING_REQUIRED_INPUT}'{name}' was not supplied")
                 }
                 None => {}
@@ -2777,6 +3133,13 @@ fn workflow_request_value(
         RuntimeInputRole::MaxIterations | RuntimeInputRole::MaxOutputTokens => {
             scalar_i64(request.options.max_new_tokens as i64).map(Some)
         }
+        // A request may narrow the package's EOS set; when it says nothing the
+        // package's own declared literal stands, which is why this yields
+        // `None` rather than an empty tensor that would mean "nothing stops".
+        RuntimeInputRole::EosTokenIds => match request.options.eos_token_id {
+            Some(id) => Ok(Some(Value::from_slice_i64(&[i64::from(id)], &[1])?)),
+            None => Ok(None),
+        },
         RuntimeInputRole::Seed => {
             scalar_i64(request.options.seed.unwrap_or_default() as i64).map(Some)
         }
@@ -2879,7 +3242,7 @@ fn workflow_literal_value(
     literal: &LiteralValue,
     contract: &TensorContract,
 ) -> anyhow::Result<Value> {
-    let shape = literal_shape(contract)?;
+    let shape = literal_shape(literal, contract)?;
     workflow_literal_value_with_shape(literal, contract, &shape)
 }
 
@@ -3119,26 +3482,111 @@ fn typed_image_bytes<T, const N: usize>(
     Value::from_raw_bytes(bytes, shape, dtype).map_err(Into::into)
 }
 
-fn literal_shape(contract: &TensorContract) -> anyhow::Result<Vec<i64>> {
+/// Concrete shape for a literal, given what the literal itself says.
+///
+/// A symbolic axis has no extent until something binds it. For a *scalar*
+/// literal nothing does, so the axis starts as a singleton and later
+/// request/component values unify the shared symbol.
+///
+/// An **element list is different: it carries its own extent.** A package that
+/// declares `[eos_token_ids]` and lists two ids has stated the axis is 2, and
+/// guessing 1 discards the only information available — which is why a
+/// multi-EOS package failed with "declares 2 elements but its contract holds 1"
+/// against a shape it had described correctly. When exactly one axis is
+/// symbolic, the list divides out the fixed axes to size it. With more than one
+/// unbound axis the split is genuinely ambiguous, so the singleton guess stands
+/// and the caller gets the element-count error, which names the real problem.
+fn literal_shape(literal: &LiteralValue, contract: &TensorContract) -> anyhow::Result<Vec<i64>> {
     let Some(shape) = &contract.shape else {
         if contract.rank == 0 {
             return Ok(Vec::new());
         }
         anyhow::bail!("literal workflow input requires a fully declared shape");
     };
-    shape
+    let symbolic_axes = shape
+        .iter()
+        .filter(|dimension| matches!(dimension, TensorDimension::Symbol(_)))
+        .count();
+    let fixed_extent: i64 = shape
+        .iter()
+        .filter_map(|dimension| match dimension {
+            TensorDimension::Fixed(value) => Some(*value),
+            TensorDimension::Symbol(_) => None,
+        })
+        .product();
+    let symbolic_extent = match literal {
+        LiteralValue::Elements(elements) if symbolic_axes == 1 && fixed_extent > 0 => {
+            let elements = elements.len() as i64;
+            anyhow::ensure!(
+                elements % fixed_extent == 0,
+                "workflow literal lists {elements} elements, which does not divide evenly \
+                 across the contract's fixed axes ({fixed_extent} elements per symbolic step)"
+            );
+            elements / fixed_extent
+        }
+        _ => 1,
+    };
+    Ok(shape
         .iter()
         .map(|dimension| match dimension {
-            TensorDimension::Fixed(value) => Ok(*value),
-            // A scalar literal initializes an otherwise-unbound symbolic axis as a singleton.
-            // Concrete request/component values can subsequently unify shared symbols.
-            TensorDimension::Symbol(_) => Ok(1),
+            TensorDimension::Fixed(value) => *value,
+            TensorDimension::Symbol(_) => symbolic_extent,
         })
-        .collect()
+        .collect())
 }
 
 fn shape_numel(shape: &[i64]) -> usize {
     shape.iter().map(|dimension| *dimension as usize).product()
+}
+
+/// Resolve each declared output port's contract shape to concrete dimensions
+/// using the invocation's already-bound component symbols.
+///
+/// Returns only ports whose every dimension is known now (a fixed dim, or a
+/// symbol the inputs already bound) — a genuinely dynamic output dimension is
+/// omitted, so the native CUDA seam can pre-allocate a device output buffer for
+/// the resolvable ones (keeping a recurring/state tensor device-resident) and
+/// fall back to host materialization for the rest. Backend-agnostic: the ORT
+/// path ignores it.
+fn resolve_component_output_shapes(
+    declaration: &onnx_genai_metadata::WorkflowComponent,
+    selected_outputs: &std::collections::BTreeMap<String, String>,
+    symbols: &HashMap<String, i64>,
+    dynamic_symbols: &std::collections::HashSet<String>,
+) -> std::collections::BTreeMap<String, Vec<usize>> {
+    let mut resolved = std::collections::BTreeMap::new();
+    for port in selected_outputs.keys() {
+        let Some(contract) = declaration.ports.outputs.get(port) else {
+            continue;
+        };
+        let Some(shape) = &contract.shape else {
+            continue;
+        };
+        let mut dims = Vec::with_capacity(shape.len());
+        let mut fully_known = true;
+        for dim in shape {
+            match dim {
+                TensorDimension::Fixed(value) if *value >= 0 => dims.push(*value as usize),
+                TensorDimension::Symbol(symbol) if !dynamic_symbols.contains(symbol) => {
+                    match symbols.get(symbol) {
+                        Some(value) if *value >= 0 => dims.push(*value as usize),
+                        _ => {
+                            fully_known = false;
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    fully_known = false;
+                    break;
+                }
+            }
+        }
+        if fully_known {
+            resolved.insert(port.clone(), dims);
+        }
+    }
+    resolved
 }
 
 fn validate_workflow_value(
@@ -4718,4 +5166,662 @@ mod workflow_sampling_binding_tests {
                 .expect("temperature value");
         assert_eq!(temperature.to_vec_f32().expect("f32 rows"), vec![0.0]);
     }
+}
+
+/// The node-host seam: a runtime executor runs, or the declared step fails.
+#[cfg(test)]
+mod node_host_tests {
+    use super::*;
+
+    /// A host that records what it was asked to run and defines its outputs by
+    /// copying the first input, so a test can tell "the executor ran" from
+    /// "the interpreter fell through to a port copy".
+    struct RecordingHost {
+        contract: String,
+        seen: Vec<String>,
+    }
+
+    impl WorkflowNodeHost for RecordingHost {
+        fn hosted_contracts(&self) -> &'static [&'static str] {
+            super::super::generation::DECODE_CORE_CONTRACTS
+        }
+
+        fn execute_contract_node(
+            &mut self,
+            request: WorkflowNodeRequest<'_>,
+        ) -> anyhow::Result<bool> {
+            if request.contract != self.contract {
+                return Ok(false);
+            }
+            self.seen.push(request.component.to_string());
+            let source = request
+                .inputs
+                .values()
+                .next()
+                .context("the test host expects one input")?;
+            let tensor = clone_value(
+                request
+                    .values
+                    .get(source)
+                    .context("the test host's input must be bound")?,
+            )?;
+            for output in request.outputs.values() {
+                request.values.insert(output.clone(), clone_value(&tensor)?);
+            }
+            Ok(true)
+        }
+    }
+
+    /// The registry is the single answer to "can this runtime run this step?".
+    ///
+    /// A contract absent from it is a package this build cannot execute, and
+    /// the operator's fix is a version, not a retry. A contract present in it
+    /// but unhandled at runtime is a missing resource for *this request*. The
+    /// two errors say different things because they have different fixes.
+    #[test]
+    fn the_registry_names_exactly_the_contracts_this_runtime_implements() {
+        let registry = runtime_contract_registry();
+        assert!(
+            registry
+                .contains(onnx_genai_metadata::decoder_workflow::AUTOREGRESSIVE_DECODE_CONTRACT)
+        );
+        assert!(registry.contains(onnx_genai_metadata::decoder_workflow::TOKEN_POLICY_CONTRACT));
+        assert!(
+            !registry.contains("vendor.not-a-contract-we-implement"),
+            "an unregistered contract must not be claimed; a package naming it is one this \
+             build cannot run, and saying otherwise sends an operator looking for a bug that \
+             is really a version mismatch"
+        );
+    }
+
+    /// A binding whose contract no host implements is an error.
+    ///
+    /// The alternative — falling through to the same-name port copy — would
+    /// define the outputs with the wrong tensors and let a declared step
+    /// silently not happen, which is indistinguishable from success at the API.
+    #[test]
+    fn an_unimplemented_contract_fails_closed() {
+        let mut host = RecordingHost {
+            contract: "vendor.something-else".to_string(),
+            seen: Vec::new(),
+        };
+        let request = WorkflowNodeRequest {
+            contract: "onnx-genai.token-policy",
+            component: "token_policy",
+            inputs: &BTreeMap::new(),
+            outputs: &BTreeMap::new(),
+            values: &mut PipelineTensors::default(),
+        };
+        assert!(
+            !host.execute_contract_node(request).expect("no error"),
+            "a host must decline a contract it does not implement, so the interpreter can \
+             report it rather than silently doing nothing"
+        );
+    }
+
+    /// A host that claims a contract is the implementation of that node.
+    #[test]
+    fn a_host_executor_defines_the_declared_outputs() {
+        let mut values = PipelineTensors::default();
+        values.insert(
+            "in".to_string(),
+            Value::from_slice_i64(&[7], &[1]).expect("value"),
+        );
+        let inputs = BTreeMap::from([("logits".to_string(), "in".to_string())]);
+        let outputs = BTreeMap::from([("token".to_string(), "out".to_string())]);
+        let mut host = RecordingHost {
+            contract: "onnx-genai.token-policy".to_string(),
+            seen: Vec::new(),
+        };
+
+        let handled = host
+            .execute_contract_node(WorkflowNodeRequest {
+                contract: "onnx-genai.token-policy",
+                component: "token_policy",
+                inputs: &inputs,
+                outputs: &outputs,
+                values: &mut values,
+            })
+            .expect("the host runs");
+
+        assert!(handled);
+        assert_eq!(host.seen, vec!["token_policy".to_string()]);
+        assert!(
+            values.contains_key("out"),
+            "the host must define every output the invocation declares"
+        );
+    }
+}
+
+/// The loop records why it stopped.
+#[cfg(test)]
+mod loop_stop_cause_tests {
+    use super::*;
+
+    /// A fresh run has not yet ended by predicate.
+    ///
+    /// The flag must start false, because it is read as "the model stopped
+    /// itself" and a default of true would report every bound-exhausted run as
+    /// an EOS — the exact inversion of the bug it fixes.
+    #[test]
+    fn the_stop_cause_defaults_to_the_bound() {
+        let telemetry = WorkflowRunTelemetry::default();
+        assert!(
+            !telemetry.loop_ended_by_predicate,
+            "an unstarted run must not claim the model ended it"
+        );
+    }
+
+    /// The counters carry the cause out of the run, which is the only way the
+    /// generate path can see it.
+    #[test]
+    fn the_stop_cause_reaches_the_counters() {
+        let mut counters = WorkflowPerformanceCounters::default();
+        let telemetry = WorkflowRunTelemetry {
+            loop_ended_by_predicate: true,
+            ..WorkflowRunTelemetry::default()
+        };
+        counters.last_loop_ended_by_predicate = telemetry.loop_ended_by_predicate;
+        assert!(counters.last_loop_ended_by_predicate);
+    }
+}
+
+/// The parts of a declared loop, borrowed from the compiled graph.
+///
+/// Named so the loop's phases can be driven by two callers without either
+/// restating what a loop *is*: the interpreter runs them back to back, and the
+/// scheduler's per-token drive runs one iteration per call, resuming where the
+/// last one stopped. A second statement of the semantics is exactly the thing
+/// that could disagree with this one.
+pub(crate) struct WorkflowLoopPlan<'n> {
+    pub(crate) setup: &'n WorkflowNode,
+    pub(crate) body: &'n WorkflowNode,
+    pub(crate) continue_when: &'n str,
+    pub(crate) max_iterations: &'n str,
+    pub(crate) termination: &'n onnx_genai_metadata::WorkflowLoopTermination,
+    pub(crate) iteration: &'n Option<onnx_genai_metadata::WorkflowLoopIteration>,
+    pub(crate) carried: &'n [onnx_genai_metadata::WorkflowLoopCarry],
+}
+
+/// Whether this loop body publishes the package's token stream.
+///
+/// The question is answered from the workflow: a loop is the generation loop
+/// when it emits into an output the package declares with `role: tokens`. A
+/// package with several loops has exactly one such loop, and a package with
+/// none — an image pipeline — has no generation stop to report.
+fn loop_emits_generation_tokens(body: &WorkflowNode, workflow: &WorkflowSpec) -> bool {
+    workflow_emitted_outputs(body).iter().any(|output| {
+        workflow
+            .outputs
+            .get(output)
+            .is_some_and(|declared| declared.role == WorkflowOutputRole::Tokens)
+    })
+}
+
+/// Release the loop's induction value once no iteration can read it.
+pub(crate) fn end_workflow_loop(plan: &WorkflowLoopPlan<'_>, values: &mut PipelineTensors) {
+    if let Some(iteration) = plan.iteration {
+        values.remove(&iteration.value);
+    }
+}
+
+impl WorkflowRuntime {
+    /// Run a loop's setup and seed its carried state, returning the declared
+    /// iteration bound.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin_workflow_loop(
+        &self,
+        plan: &WorkflowLoopPlan<'_>,
+        workflow: &WorkflowSpec,
+        values: &mut PipelineTensors,
+        symbols: &mut HashMap<String, i64>,
+        dynamic_symbols: &std::collections::HashSet<String>,
+        emit_counts: &mut HashMap<String, usize>,
+        final_state_refs: &mut HashMap<String, String>,
+        component_overrides: &HashMap<String, String>,
+        telemetry: &mut WorkflowRunTelemetry,
+        host: &mut Option<&mut dyn WorkflowNodeHost>,
+    ) -> anyhow::Result<usize> {
+        let WorkflowLoopPlan {
+            setup,
+            max_iterations,
+            iteration,
+            carried,
+            ..
+        } = plan;
+        let carried = *carried;
+        self.run_workflow_node(
+            setup,
+            workflow,
+            values,
+            symbols,
+            dynamic_symbols,
+            emit_counts,
+            final_state_refs,
+            component_overrides,
+            telemetry,
+            host,
+        )?;
+        self.materialize_workflow_value(values, max_iterations)?;
+        for carry in carried {
+            let state = workflow.state.get(&carry.cell).with_context(|| {
+                format!("workflow loop carries undeclared state '{}'", carry.cell)
+            })?;
+            let seeded = values
+                .get(&session_state_value_name(&carry.cell))
+                .or_else(|| values.get(&carry.current));
+            // A runtime-managed cell whose seed the package never materializes
+            // is the service's buffer, not an SSA value. Recording the
+            // reference is what the interpreter owes it; inventing a tensor
+            // would be a second answer about where that buffer lives.
+            if seeded.is_none() && state.management == onnx_genai_metadata::StateManagement::Runtime
+            {
+                final_state_refs.insert(carry.cell.clone(), carry.next.clone());
+                continue;
+            }
+            let initializer = seeded.with_context(|| {
+                format!(
+                    "workflow state '{}' loop initializer '{}' is unavailable after setup",
+                    carry.cell, carry.current
+                )
+            })?;
+            validate_workflow_value(
+                &carry.current,
+                initializer,
+                &state.contract,
+                symbols,
+                dynamic_symbols,
+            )?;
+            let initial_value = clone_value(initializer)?;
+            values.insert(carry.next.clone(), initial_value);
+            final_state_refs.insert(carry.cell.clone(), carry.next.clone());
+        }
+        let limit = workflow_scalar_usize(values, max_iterations)?;
+        if let Some(iteration) = iteration
+            && values.contains_key(&iteration.value)
+        {
+            anyhow::bail!(
+                "workflow loop iteration value '{}' shadows an existing SSA value",
+                iteration.value
+            );
+        }
+        Ok(limit)
+    }
+
+    /// Advance a loop by one iteration.
+    ///
+    /// Returns `false` when the liveness predicate ended it, which is the only
+    /// stop the loop itself decides; exhausting the declared bound is the
+    /// caller's business.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn advance_workflow_loop(
+        &self,
+        plan: &WorkflowLoopPlan<'_>,
+        workflow: &WorkflowSpec,
+        index: usize,
+        values: &mut PipelineTensors,
+        symbols: &mut HashMap<String, i64>,
+        dynamic_symbols: &std::collections::HashSet<String>,
+        emit_counts: &mut HashMap<String, usize>,
+        final_state_refs: &mut HashMap<String, String>,
+        component_overrides: &HashMap<String, String>,
+        telemetry: &mut WorkflowRunTelemetry,
+        host: &mut Option<&mut dyn WorkflowNodeHost>,
+    ) -> anyhow::Result<bool> {
+        let WorkflowLoopPlan {
+            body,
+            continue_when,
+            termination,
+            iteration,
+            carried,
+            ..
+        } = plan;
+        let carried = *carried;
+        let emits_generation_tokens = loop_emits_generation_tokens(body, workflow);
+        // Skipping the liveness read is an optimization for a predicate the
+        // caller said it does not care about: with `stop_on_eos` off, an
+        // in-graph EOS predicate cannot end the loop, so reading it every step
+        // costs a device→host sync for an answer that is always true.
+        //
+        // A predicate a *runtime executor* writes is a different thing. It is
+        // already on the host, and it carries more than EOS — the context
+        // bound, stop strings, a constraint reaching its end. Skipping it there
+        // would ignore stops the caller did ask for, so the optimization does
+        // not apply when a host implements a node in this body.
+        let max_iterations_only = telemetry.max_iterations_only
+            && host.is_none()
+            && **termination == onnx_genai_metadata::WorkflowLoopTermination::GenerationEos;
+        let active_rows = if max_iterations_only {
+            workflow_active_rows_without_inspection(values, continue_when)?
+        } else {
+            self.materialize_workflow_value(values, continue_when)?;
+            workflow_bool_rows(values, continue_when)?
+        };
+        if !active_rows.iter().any(|active| *active) {
+            // The loop stopped because the model said it was done, not because
+            // it ran out of budget. Recording which is the only way a caller
+            // can report the real reason.
+            //
+            // Recorded only for the loop that emits the token stream. A
+            // workflow may declare several — a denoise loop beside a generation
+            // loop, or an inner loop within one — and any of them ending by its
+            // own predicate would otherwise latch this and make a generation
+            // that exhausted its budget report EOS.
+            if emits_generation_tokens {
+                telemetry.loop_ended_by_predicate = true;
+            }
+            return Ok(false);
+        }
+        telemetry.loop_iterations += 1;
+        if let Some(iteration) = iteration {
+            values.insert(
+                iteration.value.clone(),
+                workflow_iteration_value(index, &iteration.contract, symbols)?,
+            );
+        }
+        for carry in carried {
+            if carry.body_input == carry.next {
+                continue;
+            }
+            let current = values
+                .get(&carry.next)
+                .with_context(|| format!("workflow loop value '{}' is unavailable", carry.next))?;
+            values.insert(carry.body_input.clone(), clone_value(current)?);
+        }
+        self.run_workflow_node(
+            body,
+            workflow,
+            values,
+            symbols,
+            dynamic_symbols,
+            emit_counts,
+            final_state_refs,
+            component_overrides,
+            telemetry,
+            host,
+        )?;
+        for carry in carried {
+            let state = workflow.state.get(&carry.cell).with_context(|| {
+                format!("workflow loop carries undeclared state '{}'", carry.cell)
+            })?;
+            match &state.recurrence {
+                onnx_genai_metadata::ShapeRecurrence::Growing { increment, max, .. } => {
+                    self.materialize_workflow_value(values, increment)?;
+                    self.materialize_workflow_value(values, max)?;
+                }
+                onnx_genai_metadata::ShapeRecurrence::Bounded { max, .. } => {
+                    self.materialize_workflow_value(values, max)?;
+                }
+                onnx_genai_metadata::ShapeRecurrence::Invariant => {}
+            }
+            if active_rows.len() > 1
+                && active_rows.iter().any(|active| !*active)
+                && state.service_group.is_none()
+            {
+                self.materialize_workflow_value(values, &carry.next)?;
+                self.materialize_workflow_value(values, &carry.body_output)?;
+            }
+            if state.service_group.is_some() && !values.contains_key(&carry.body_output) {
+                final_state_refs.insert(carry.cell.clone(), carry.next.clone());
+                continue;
+            }
+            {
+                let current = values.get(&carry.next).with_context(|| {
+                    format!("workflow loop value '{}' is unavailable", carry.next)
+                })?;
+                let next = values.get(&carry.body_output).with_context(|| {
+                    format!("workflow loop body did not produce '{}'", carry.body_output)
+                })?;
+                validate_state_recurrence(&carry.cell, current, next, state, values)?;
+            }
+            let next_value =
+                if active_rows.iter().all(|active| *active) || state.service_group.is_some() {
+                    // Service-managed state preserves inactive rows
+                    // through its logical lengths. Retain the device
+                    // value directly instead of materializing it on the
+                    // host merely to clone the same tensor.
+                    share_workflow_value(values, &carry.body_output)?
+                } else {
+                    let current = values.get(&carry.next).with_context(|| {
+                        format!("workflow loop value '{}' is unavailable", carry.next)
+                    })?;
+                    let next = values.get(&carry.body_output).with_context(|| {
+                        format!("workflow loop body did not produce '{}'", carry.body_output)
+                    })?;
+                    merge_inactive_rows(current, next, &active_rows, state).with_context(|| {
+                        format!(
+                            "workflow loop carry '{}' cannot preserve inactive rows",
+                            carry.cell
+                        )
+                    })?
+                };
+            values.insert(carry.next.clone(), next_value);
+            final_state_refs.insert(carry.cell.clone(), carry.next.clone());
+        }
+        Ok(true)
+    }
+}
+
+/// A declared generation loop, driven one iteration at a time.
+///
+/// The scheduler's prioritized drive interleaves several requests, advancing
+/// each by one token before moving on. It therefore cannot call a function that
+/// runs a loop to completion — but it must still run *the same loop*, or a
+/// prioritized request would obey different declared semantics than a
+/// standalone one.
+///
+/// This owns exactly the state an in-flight interpretation holds between
+/// iterations and drives it through [`WorkflowRuntime::advance_workflow_loop`],
+/// the same method the run-to-completion path uses. Nothing about the loop is
+/// restated here: the bound, the liveness predicate, the carries and the emits
+/// all come from the compiled graph.
+pub(crate) struct WorkflowGenerationCursor {
+    values: PipelineTensors,
+    symbols: HashMap<String, i64>,
+    dynamic_symbols: std::collections::HashSet<String>,
+    emit_counts: HashMap<String, usize>,
+    final_state_refs: HashMap<String, String>,
+    component_overrides: HashMap<String, String>,
+    telemetry: WorkflowRunTelemetry,
+    limit: usize,
+    index: usize,
+}
+
+impl WorkflowGenerationCursor {
+    /// Bind a request and run the loop's setup, stopping before its first
+    /// iteration.
+    pub(crate) fn start(
+        runtime: &WorkflowRuntime,
+        request: PipelineGenerateRequest,
+        hosted: &[&str],
+        host: &mut Option<&mut dyn WorkflowNodeHost>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            runtime.adapter_service.is_none(),
+            "the per-token drive cannot advance a package that selects adapters per request; \
+             adapter selection is prepared once for a whole pass"
+        );
+        anyhow::ensure!(
+            runtime.execution_islands.is_empty(),
+            "the per-token drive cannot advance a package with fused execution islands, whose \
+             bindings are established for a whole pass"
+        );
+        anyhow::ensure!(
+            !runtime
+                .workflow
+                .state
+                .values()
+                .any(|cell| cell.scope == onnx_genai_metadata::WorkflowStateScope::Session),
+            "the per-token drive cannot advance a package with session-scoped workflow state, \
+             which is published when a pass completes"
+        );
+        let loop_node = sole_generation_loop(&runtime.compiled_workflow.graph)?;
+        anyhow::ensure!(
+            matches!(
+                loop_plan(loop_node)?.setup,
+                WorkflowNode::Sequence { nodes } if nodes.is_empty()
+            ),
+            "the per-token drive cannot advance a loop with setup steps: setup runs once per \
+             pass, and a drive that hands out one iteration at a time has no pass to run it in"
+        );
+        let mut plan = WorkflowExecutionPlan::new_hosted(runtime, request, hosted)?;
+        let mut telemetry = WorkflowRunTelemetry {
+            started: Some(std::time::Instant::now()),
+            max_iterations_only: plan.max_iterations_only,
+            ..WorkflowRunTelemetry::default()
+        };
+        let mut values = std::mem::take(&mut plan.values);
+        let mut symbols = plan.initial_symbols.clone();
+        let dynamic_symbols = plan.dynamic_symbols.clone();
+        let component_overrides = plan.component_overrides.clone();
+        let mut emit_counts = HashMap::new();
+        let mut final_state_refs = HashMap::new();
+        let plan_parts = loop_plan(loop_node)?;
+        let limit = runtime.begin_workflow_loop(
+            &plan_parts,
+            &runtime.workflow,
+            &mut values,
+            &mut symbols,
+            &dynamic_symbols,
+            &mut emit_counts,
+            &mut final_state_refs,
+            &component_overrides,
+            &mut telemetry,
+            host,
+        )?;
+        Ok(Self {
+            values,
+            symbols,
+            dynamic_symbols,
+            emit_counts,
+            final_state_refs,
+            component_overrides,
+            telemetry,
+            limit,
+            index: 0,
+        })
+    }
+
+    /// Run one iteration. `false` means the loop ended, by predicate or bound.
+    pub(crate) fn advance(
+        &mut self,
+        runtime: &WorkflowRuntime,
+        host: &mut Option<&mut dyn WorkflowNodeHost>,
+    ) -> anyhow::Result<bool> {
+        if self.index >= self.limit {
+            return Ok(false);
+        }
+        let loop_node = sole_generation_loop(&runtime.compiled_workflow.graph)?;
+        let plan_parts = loop_plan(loop_node)?;
+        let ran = runtime.advance_workflow_loop(
+            &plan_parts,
+            &runtime.workflow,
+            self.index,
+            &mut self.values,
+            &mut self.symbols,
+            &self.dynamic_symbols,
+            &mut self.emit_counts,
+            &mut self.final_state_refs,
+            &self.component_overrides,
+            &mut self.telemetry,
+            host,
+        )?;
+        if !ran {
+            self.index = self.limit;
+            return Ok(false);
+        }
+        self.index += 1;
+        Ok(true)
+    }
+
+    /// Release the loop's induction value and report the emitted token stream.
+    pub(crate) fn finish(
+        mut self,
+        runtime: &WorkflowRuntime,
+    ) -> anyhow::Result<(PipelineTensors, bool)> {
+        let loop_node = sole_generation_loop(&runtime.compiled_workflow.graph)?;
+        end_workflow_loop(&loop_plan(loop_node)?, &mut self.values);
+        runtime.publish_workflow_telemetry(self.telemetry);
+        let ended_by_predicate = runtime.last_generation_ended_by_predicate();
+        Ok((self.values, ended_by_predicate))
+    }
+
+    /// The token stream this interpretation has emitted so far.
+    ///
+    /// Read through the package's declared outputs, exactly as a completed pass
+    /// is: an emit into a row-wise output lands on its rows, and reading the
+    /// bare name would find nothing and call that "emitted nothing".
+    pub(crate) fn emitted_tokens(&self, runtime: &WorkflowRuntime) -> anyhow::Result<Vec<i64>> {
+        let Some(output) = runtime
+            .workflow
+            .outputs
+            .iter()
+            .find(|(_, output)| output.role == onnx_genai_metadata::WorkflowOutputRole::Tokens)
+            .map(|(name, _)| name.clone())
+        else {
+            return Ok(Vec::new());
+        };
+        let values = clone_pipeline_tensors(&self.values)?;
+        let outputs = runtime.package_outputs(values, self.telemetry.row_outputs.clone())?;
+        let rows = outputs.rows(&output);
+        let Some(value) = outputs
+            .aggregate(&output)
+            .or_else(|| rows.first().map(|(_, value)| *value))
+        else {
+            return Ok(Vec::new());
+        };
+        value.to_vec_i64().map_err(Into::into)
+    }
+}
+
+/// The one generation loop a compiled graph declares.
+///
+/// A package the per-token drive can advance is a generation loop and nothing
+/// else: any node beside it would run once per pass, and a drive that advances
+/// one iteration at a time has no pass to run it in. Saying so is what keeps
+/// the prioritized path from quietly skipping a declared step.
+fn sole_generation_loop(graph: &WorkflowNode) -> anyhow::Result<&WorkflowNode> {
+    match graph {
+        WorkflowNode::Loop { .. } => Ok(graph),
+        WorkflowNode::Sequence { nodes } => {
+            let [only] = nodes.as_slice() else {
+                anyhow::bail!(
+                    "the per-token drive requires a workflow that is one generation loop; this \
+                     one declares {} top-level steps, which a per-iteration drive has no pass to \
+                     run",
+                    nodes.len()
+                )
+            };
+            sole_generation_loop(only)
+        }
+        other => anyhow::bail!(
+            "the per-token drive requires a workflow that is one generation loop; found \
+             {other:?}"
+        ),
+    }
+}
+
+fn loop_plan(node: &WorkflowNode) -> anyhow::Result<WorkflowLoopPlan<'_>> {
+    let WorkflowNode::Loop {
+        setup,
+        body,
+        continue_when,
+        max_iterations,
+        termination,
+        iteration,
+        carried,
+        ..
+    } = node
+    else {
+        anyhow::bail!("expected a loop node");
+    };
+    Ok(WorkflowLoopPlan {
+        setup,
+        body,
+        continue_when,
+        max_iterations,
+        termination,
+        iteration,
+        carried,
+    })
 }

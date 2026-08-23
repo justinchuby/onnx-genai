@@ -96,7 +96,7 @@ pub(crate) async fn audio_transcriptions(
     };
     let generation = handle
         .engine
-        .generate_pipeline(request, Some(input))
+        .submit_generation(None, request, Some(input))
         .await
         .map_err(map_generate_submit_error)?;
     let result = collect_generation_result(generation.events)

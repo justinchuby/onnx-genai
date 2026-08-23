@@ -11,9 +11,8 @@ use onnx_genai_engine::logits::{
 };
 use onnx_genai_engine::{
     DecodePrecision, Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GeneratePrompt,
-    GenerateRequest, NativeDecodeDevice, NativeDecodeSession, PipelineEngine,
-    PipelineGenerateRequest, ProcessorChain, SpeculativeMode, SpeculativeStats,
-    parse_resource_limit,
+    GenerateRequest, NativeDecodeDevice, NativeDecodeSession, PipelineGenerateRequest,
+    ProcessorChain, SpeculativeMode, SpeculativeStats, parse_resource_limit,
 };
 use onnx_genai_ort::{DataType, Tokenizer, Value, available_execution_providers, profile};
 use onnx_runtime_session::InferenceSession;
@@ -3052,7 +3051,7 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
 /// Time one generation's first token and report what it actually processed.
 fn time_first_token(
     args: &Args,
-    engine: &mut PipelineEngine,
+    engine: &mut Engine,
     prompt_tokens: &[u32],
 ) -> Result<(f64, usize)> {
     let start = Instant::now();
@@ -3080,7 +3079,7 @@ fn time_first_token(
 /// cache, reporting a prefill that does not vary with prompt length at all.
 fn run_prefill_sweep(
     args: &Args,
-    engine: &mut PipelineEngine,
+    engine: &mut Engine,
     ids: &[u32],
     lengths: &[usize],
 ) -> Result<()> {
@@ -3155,8 +3154,8 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
     }
     if args.speculative != SpeculativeArg::None {
         bail!(
-            "--speculative is not supported on the --pipeline path: PipelineEngine drives its \
-             autoregressive decode through the strict one-token-per-step run_decode_loop, which \
+            "--speculative is not supported on the --pipeline path: Engine drives its \
+             autoregressive decode through the strict one-token-per-step canonical decode loop, which \
              has no k-token verify/rewind hook. Native prompt-lookup speculation is wired only \
              into the single-model Engine path (use --steady without --pipeline). Requesting \
              speculation here would be silently ignored and report misleading (greedy) numbers."
@@ -3194,7 +3193,7 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
         ExecutionProvider::Cuda => NativeDecodeDevice::Cuda { index: None },
     });
     apply_vram_limit_env(&mut config)?;
-    let mut engine = PipelineEngine::from_dir_with_config(model_dir, config)
+    let mut engine = Engine::from_dir_with_config(model_dir, config)
         .with_context(|| format!("load pipeline engine {}", model_dir.display()))?;
     let tokenizer =
         Tokenizer::from_file(tokenizer_file(model_dir)).context("load pipeline tokenizer.json")?;

@@ -110,7 +110,7 @@ fn run() -> anyhow::Result<()> {
     }
 
     let iterations = args.steps.unwrap_or(report.plan.iterations() as usize);
-    let mut engine = Engine::from_pipeline_dir(&args.package, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&args.package, EngineConfig::default())?;
 
     let options = GenerateOptions {
         max_new_tokens: iterations,
@@ -170,7 +170,7 @@ fn run() -> anyhow::Result<()> {
 /// The role is read from the emitted metadata rather than from an output name,
 /// so nothing here depends on how the converter spelled it.
 fn image_output<'a>(
-    engine: &onnx_genai::engine::pipeline::PipelineEngine,
+    engine: &onnx_genai::Engine,
     outputs: &'a PipelineOutputs,
 ) -> anyhow::Result<&'a Value> {
     engine

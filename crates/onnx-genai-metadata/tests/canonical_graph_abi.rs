@@ -52,7 +52,7 @@ fn a_bare_single_onnx_decoder_declares_its_abi_only_in_the_workflow() {
         .decoder_io()
         .expect("the decode ABI resolves from the workflow alone");
     assert!(
-        !metadata.decoder_io_is_legacy(),
+        metadata.pipeline.is_some(),
         "the ABI must be recognized, not read from a serialized block"
     );
 
@@ -90,7 +90,7 @@ fn a_composite_package_resolves_its_decoder_abi_through_the_same_call() {
     let io = metadata
         .decoder_io()
         .expect("the composite decode ABI resolves from the workflow alone");
-    assert!(!metadata.decoder_io_is_legacy());
+    assert!(metadata.pipeline.is_some());
 
     assert_eq!(io.inputs_embeds_input.as_deref(), Some("inputs_embeds"));
     assert_eq!(io.token_input, None);
@@ -142,7 +142,7 @@ fn the_bare_and_composite_packages_share_one_representation() {
 
     for metadata in [&bare, &composite] {
         let io = metadata.decoder_io().expect("ABI resolves");
-        assert!(!metadata.decoder_io_is_legacy());
+        assert!(metadata.pipeline.is_some());
         assert!(metadata.model.is_none());
         assert!(io.sequence_source.is_some(), "sequence source is declared");
         assert_eq!(io.kv_ownership, Some(KvOwnership::Owned));
@@ -184,34 +184,64 @@ fn the_decoder_is_recognized_by_structure_not_by_component_name() {
     }
 }
 
-/// The import-only compatibility path stays readable, and stays labelled.
+/// A package declaring the retired `model.io` block is refused, with the
+/// conversion named.
 ///
-/// A package produced by the legacy `genai_config.json` importer carries a
-/// `model.io` block and no workflow. It must still resolve — dropping it would
-/// break every already-imported package — but it must resolve through the same
-/// call and announce that it came from the deprecated block, because "the port
-/// this names is wrong" and "the role you declared is wrong" are different
-/// fixes.
+/// This is the invariant, stated as a test: there is no import-only path, no
+/// silent synthesis, and no second place a producer can declare a graph ABI. A
+/// package written before the workflow existed does not load — it gets an error
+/// telling its owner exactly how to convert it, once, offline.
 #[test]
-fn a_legacy_bare_package_resolves_through_the_same_call_and_says_it_is_legacy() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/tiny-llm/inference_metadata.yaml");
-    let metadata = load_metadata(&path).expect("legacy package parses");
-    validate_metadata(&metadata).expect("legacy package validates");
+fn a_package_declaring_the_retired_block_is_refused() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("inference_metadata.yaml");
+    std::fs::write(
+        &path,
+        "model:\n  max_sequence_length: 16\n  io:\n    token_input: input_ids\n    \
+         logits_output: logits\n",
+    )
+    .expect("write");
 
+    let error = load_metadata(&path).expect_err("the retired block must not load");
+    let message = error.to_string();
     assert!(
-        metadata.pipeline.is_none(),
-        "the legacy fixture must carry no workflow, or it would be rejected"
+        message.contains("retired `model.io` block"),
+        "the refusal must name what is wrong, got: {message}"
     );
-    let io = metadata
-        .decoder_io()
-        .expect("the legacy block resolves through the same call");
     assert!(
-        metadata.decoder_io_is_legacy(),
-        "a resolved ABI with no workflow must be reported as legacy"
+        message.contains("migrate_model_io"),
+        "the refusal must name the conversion, got: {message}"
     );
-    assert_eq!(io.token_input.as_deref(), Some("input_ids"));
-    assert_eq!(io.logits_output.as_deref(), Some("logits"));
+}
+
+/// A retired block *beside* a workflow is refused too.
+///
+/// Otherwise the retired shape would survive wherever a package happened to
+/// carry both, and the two could disagree with nothing to arbitrate them.
+#[test]
+fn a_retired_block_beside_a_workflow_is_also_refused() {
+    let canonical = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/tiny-llm/inference_metadata.yaml");
+    let mut document: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&canonical).expect("read")).expect("parse");
+    document
+        .get_mut("model")
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .expect("model block")
+        .insert(
+            serde_yaml::Value::String("io".to_string()),
+            serde_yaml::from_str("token_input: input_ids\nlogits_output: logits\n").expect("abi"),
+        );
+
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("inference_metadata.yaml");
+    std::fs::write(&path, serde_yaml::to_string(&document).expect("render")).expect("write");
+
+    let error = load_metadata(&path).expect_err("a retired block beside a workflow must not load");
+    assert!(
+        error.to_string().contains("retired `model.io` block"),
+        "{error}"
+    );
 }
 
 /// A component's declared roles name ports the component actually has.

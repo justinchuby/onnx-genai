@@ -30,12 +30,6 @@ pub(crate) async fn audio_speech(
         ))
     })?;
     let processor = &capability.processor;
-    if !handle.pipeline {
-        return Err(ApiError::bad_request(format!(
-            "model '{}' is not an executable workflow package",
-            handle.id
-        )));
-    }
     let prompt = processor
         .assemble(&request.input, &request.instructions)
         .map_err(|error| ApiError::bad_request(format!("invalid speech input: {error:#}")))?;

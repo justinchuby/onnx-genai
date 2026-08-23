@@ -24,6 +24,13 @@ pub(crate) struct EngineSession {
 }
 
 pub(crate) struct ActiveGenerate {
+    /// The in-flight interpretation of this request's declared generation loop.
+    ///
+    /// Held across scheduler steps because the loop is the workflow's: the
+    /// prioritized drive advances it one iteration at a time through the same
+    /// interpreter method the run-to-completion path drives in a `for`, rather
+    /// than running a second loop that would have to restate the semantics.
+    pub(crate) cursor: crate::pipeline::WorkflowGenerationCursor,
     pub(crate) session_id: SessionId,
     pub(crate) state: EngineSession,
     pub(crate) options: GenerateOptions,
@@ -42,7 +49,7 @@ pub(crate) struct ActiveGenerate {
 pub(crate) struct DraftModel {
     pub(crate) session: Box<Session>,
     pub(crate) decode_path: ModelDecodePath,
-    pub(crate) io: Option<onnx_genai_metadata::ModelIoSpec>,
+    pub(crate) io: Option<onnx_genai_metadata::DecoderAbi>,
     pub(crate) kv_model: Option<KvModelInfo>,
     pub(crate) kv_cache: PagedKvCache,
 }

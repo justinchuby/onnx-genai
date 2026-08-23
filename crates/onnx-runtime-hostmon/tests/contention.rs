@@ -13,12 +13,13 @@
 //! working around it, which is why the include is gone.
 
 use onnx_runtime_hostmon as host_contention;
-use onnx_runtime_hostmon::{
-    ThreadStatus, off_mask_from_statuses, parse_cpu_list, threads_off_mask,
-};
+use onnx_runtime_hostmon::{ThreadStatus, off_mask_from_statuses, parse_cpu_list};
 
+// `threads_off_mask` is defined on every platform, but the only tests that call
+// it are the Linux-gated ones -- so importing it unconditionally is an unused
+// import off Linux, and CI builds these crates with `-D warnings`.
 #[cfg(target_os = "linux")]
-use host_contention::{AllowedCpus, snapshot};
+use host_contention::{AllowedCpus, snapshot, threads_off_mask};
 use host_contention::{
     Contention, ContentionSnapshot, busy_jiffies_of_cpu_line, clock_tick_hz, contention,
     foreign_column, own_jiffies_of_self_stat,

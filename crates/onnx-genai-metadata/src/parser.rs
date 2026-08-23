@@ -1,8 +1,7 @@
 //! Load inference metadata from YAML or JSON files.
 
 use crate::schema::{
-    InferenceMetadata, MtpHiddenLayout, MtpKvMode, PipelineSpec, ProposalType, SharedKvGroup,
-    SpeculatorConfig,
+    InferenceMetadata, MtpHiddenLayout, MtpKvMode, PipelineSpec, ProposalType, SpeculatorConfig,
 };
 use std::path::{Path, PathBuf};
 
@@ -19,34 +18,6 @@ pub enum SpeculatorProposerKind {
     PEagle,
     Mtp,
     DFlash,
-}
-
-/// Resolved shared-KV proposer descriptor.
-///
-/// Every field is resolved from the `speculative` metadata section, with
-/// output-name defaults applied. `model` is resolved relative to the model
-/// directory.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SharedKvProposerSpec {
-    /// Absolute path to the assistant ONNX model.
-    pub model: PathBuf,
-    /// Number of speculative tokens proposed after the guaranteed target token.
-    pub num_speculative_tokens: usize,
-    /// Target backbone hidden size `H`.
-    pub backbone_hidden_size: usize,
-    /// Vocabulary size of the assistant's own `logits` output.
-    pub vocab_size: usize,
-    /// Name of the assistant output threaded forward between steps.
-    pub projected_state_output: String,
-    /// Name of the assistant's draft-distribution output.
-    pub logits_output: String,
-    /// Absolute path to the target model's raw input-token embedding table
-    /// (`[vocab_size, backbone_hidden_size]` little-endian f32).
-    pub input_embedding: PathBuf,
-    /// Shared-KV binding groups consumed by the assistant.
-    pub shared_kv: Vec<SharedKvGroup>,
-    /// Fully resolved proposer execution contract.
-    pub io: crate::schema::ModelIoSpec,
 }
 
 /// Resolved Mobius MTP sidecar descriptor.
@@ -80,8 +51,6 @@ pub struct MtpProposerSpec {
 /// Current construction status for the engine-facing proposer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpeculatorProposerStatus {
-    /// A fully resolved shared-KV proposer.
-    SharedKv(Box<SharedKvProposerSpec>),
     /// A fully resolved Mobius MTP sidecar.
     Mtp(MtpProposerSpec),
     NotYetSupported(SpeculatorProposerKind),
@@ -116,7 +85,18 @@ impl SpeculatorDescriptor {
             ProposalType::DFlash => {
                 SpeculatorProposerStatus::NotYetSupported(SpeculatorProposerKind::DFlash)
             }
-            ProposalType::SharedKv => resolve_shared_kv(model_dir, &config),
+            // A legacy `shared_kv` speculator no longer selects a runtime path.
+            // Borrowed-KV drafting is declared by the package's
+            // `speculative.proposal_execution: {kind: chained}` contract and
+            // driven by the workflow interpreter, so a descriptor that only says
+            // `shared_kv` names no executable proposer — say so instead of
+            // resolving one nothing can run.
+            ProposalType::SharedKv => SpeculatorProposerStatus::Unknown(
+                "shared_kv speculators are declared by the package's \
+                 `speculative.proposal_execution: {kind: chained}` workflow contract, not by a \
+                 `proposal_type: shared_kv` block"
+                    .into(),
+            ),
             ProposalType::Unknown(value) => SpeculatorProposerStatus::Unknown(value.clone()),
         };
 
@@ -187,131 +167,6 @@ impl SpeculatorDescriptor {
     }
 }
 
-/// Resolve a `shared_kv` speculator into a supported proposer status.
-///
-/// Missing or malformed required fields — `model`, `backbone_hidden_size`,
-/// `vocab_size`, an empty `shared_kv` list, or any group with empty
-/// `target_layers` — degrade to [`SpeculatorProposerStatus::Unknown`] so a
-/// malformed descriptor never aborts model loading; the engine treats such
-/// descriptors as absent.
-fn resolve_shared_kv(model_dir: &Path, config: &SpeculatorConfig) -> SpeculatorProposerStatus {
-    let Some(model) = config.model.as_ref() else {
-        return SpeculatorProposerStatus::Unknown("shared_kv metadata is missing `model`".into());
-    };
-    let Some(backbone_hidden_size) = config.backbone_hidden_size else {
-        return SpeculatorProposerStatus::Unknown(
-            "shared_kv metadata is missing `backbone_hidden_size`".into(),
-        );
-    };
-    let Some(vocab_size) = config.vocab_size else {
-        return SpeculatorProposerStatus::Unknown(
-            "shared_kv metadata is missing `vocab_size`".into(),
-        );
-    };
-    let Some(input_embedding) = config.input_embedding.as_ref() else {
-        return SpeculatorProposerStatus::Unknown(
-            "shared_kv metadata is missing `input_embedding` (target input-token \
-             embedding table required to build the assistant's inputs_embeds)"
-                .into(),
-        );
-    };
-    if config.shared_kv.is_empty() {
-        return SpeculatorProposerStatus::Unknown(
-            "shared_kv metadata declares no `shared_kv` binding groups".into(),
-        );
-    }
-    if let Some(group) = config
-        .shared_kv
-        .iter()
-        .find(|group| group.target_layers.is_empty())
-    {
-        return SpeculatorProposerStatus::Unknown(format!(
-            "shared_kv group '{}' lists no `target_layers`",
-            group.name
-        ));
-    }
-    let io = config
-        .io
-        .clone()
-        .unwrap_or_else(|| crate::schema::ModelIoSpec {
-            sequence_source: Some(crate::schema::SequenceInputKind::InputsEmbeds),
-            kv_ownership: Some(crate::schema::KvOwnership::Shared),
-            kv_layout: None,
-            token_input: None,
-            inputs_embeds_input: Some("inputs_embeds".into()),
-            attention_mask_input: Some("attention_mask".into()),
-            position_ids_input: Some("position_ids".into()),
-            logits_output: Some(
-                config
-                    .logits_output
-                    .clone()
-                    .unwrap_or_else(|| "logits".into()),
-            ),
-            hidden_output: Some(
-                config
-                    .projected_state_output
-                    .clone()
-                    .unwrap_or_else(|| "projected_state".into()),
-            ),
-            kv_inputs: None,
-            kv_outputs: None,
-            aliasing: None,
-            encoder_hidden_states_input: None,
-            audio_features_input: None,
-            cross_kv_inputs: None,
-            cross_kv_outputs: None,
-            state_pairs: None,
-            optional_inputs: std::collections::BTreeMap::new(),
-            static_cache: None,
-        });
-    if io
-        .sequence_source
-        .unwrap_or(crate::schema::SequenceInputKind::TokenIds)
-        != crate::schema::SequenceInputKind::InputsEmbeds
-    {
-        return SpeculatorProposerStatus::Unknown(
-            "shared_kv metadata `io.sequence_source` must be `inputs_embeds`".into(),
-        );
-    }
-    if io.kv_ownership.unwrap_or(crate::schema::KvOwnership::Owned)
-        != crate::schema::KvOwnership::Shared
-    {
-        return SpeculatorProposerStatus::Unknown(
-            "shared_kv metadata `io.kv_ownership` must be `shared`".into(),
-        );
-    }
-    if io.inputs_embeds_input.as_deref().is_none_or(str::is_empty) {
-        return SpeculatorProposerStatus::Unknown(
-            "shared_kv metadata is missing `io.inputs_embeds_input`".into(),
-        );
-    }
-    if io.logits_output.as_deref().is_none_or(str::is_empty)
-        && io.hidden_output.as_deref().is_none_or(str::is_empty)
-    {
-        return SpeculatorProposerStatus::Unknown(
-            "shared_kv metadata must declare at least one output role: `io.logits_output` or `io.hidden_output`"
-                .into(),
-        );
-    }
-    SpeculatorProposerStatus::SharedKv(Box::new(SharedKvProposerSpec {
-        model: model_dir.join(model),
-        num_speculative_tokens: config.num_speculative_tokens,
-        backbone_hidden_size,
-        vocab_size,
-        projected_state_output: config
-            .projected_state_output
-            .clone()
-            .unwrap_or_else(|| "projected_state".to_string()),
-        logits_output: config
-            .logits_output
-            .clone()
-            .unwrap_or_else(|| "logits".to_string()),
-        input_embedding: model_dir.join(input_embedding),
-        shared_kv: config.shared_kv.clone(),
-        io,
-    }))
-}
-
 /// The inference-metadata sidecar in `model_dir`, if the package ships one.
 ///
 /// Which filenames count as inference metadata, and which wins when a package
@@ -350,6 +205,7 @@ const METADATA_FILE_NAMES: [&str; 3] = [
 /// Load inference metadata from a file (YAML or JSON based on extension).
 pub fn load_metadata(path: &Path) -> Result<InferenceMetadata, crate::MetadataError> {
     let content = std::fs::read_to_string(path).map_err(crate::MetadataError::Io)?;
+    reject_retired_model_io(&content)?;
 
     let metadata: InferenceMetadata = match path.extension().and_then(|e| e.to_str()) {
         Some("yaml" | "yml") => serde_yaml::from_str(&content)
@@ -368,6 +224,35 @@ pub fn load_metadata(path: &Path) -> Result<InferenceMetadata, crate::MetadataEr
     };
 
     Ok(metadata)
+}
+
+/// Refuse a document that still declares the retired `model.io` block.
+///
+/// The schema has no field for it, so `serde` would simply drop the key and the
+/// package would fail later with a puzzled "declares no workflow". Recognizing
+/// the retired shape here — and *only* to explain it — turns that into an
+/// actionable error naming the conversion. This is the one place the old spelling
+/// appears, and it never produces a value: it produces a refusal.
+fn reject_retired_model_io(content: &str) -> Result<(), crate::MetadataError> {
+    let Ok(document) = serde_yaml::from_str::<serde_yaml::Value>(content) else {
+        // Not parseable as YAML at all; the real parser reports why.
+        return Ok(());
+    };
+    let declares_retired_io = document
+        .get("model")
+        .and_then(|model| model.get("io"))
+        .is_some_and(|io| !io.is_null());
+    if !declares_retired_io {
+        return Ok(());
+    }
+    Err(crate::MetadataError::Parse(
+        "this package declares the retired `model.io` block, which is no longer a way to state \
+         a graph ABI. A single decoder is declared exactly like every other pipeline: a \
+         `pipeline.workflow` with one ONNX component whose ports carry roles, a state_service \
+         group owning its KV cache, and a generation loop. Convert the package once, offline, \
+         with `migrate_model_io <package-dir>`."
+            .to_string(),
+    ))
 }
 
 /// Load inference metadata together with its canonical semantic identity.
@@ -416,11 +301,10 @@ pub fn load_metadata_package(path: &Path) -> Result<InferenceMetadata, crate::Me
     crate::validation::validate_pipeline_spec(pipeline)
         .map_err(|error| crate::MetadataError::Parse(error.to_string()))?;
     // Document-level invariants are not pipeline-scoped, so `validate_pipeline_spec`
-    // cannot see them. Without this call the rule that forbids a package from
-    // carrying both `model.io` and a workflow holds only for callers who reach
-    // for `validate_metadata` directly — which is nobody loading a package from
-    // disk, including the `validate_metadata` binary. A guarantee that a
-    // producer's own validation run cannot observe is not a guarantee.
+    // cannot see them. Without this call they hold only for callers who reach for
+    // `validate_metadata` directly — which is nobody loading a package from disk,
+    // including the `validate_metadata` binary. A guarantee that a producer's own
+    // validation run cannot observe is not a guarantee.
     crate::validation::validate_metadata(&metadata)
         .map_err(|errors| crate::MetadataError::Parse(errors.join("; ")))?;
     validate_package_artifacts(
@@ -665,41 +549,31 @@ speculative:
       target_layers: [1]
 ";
 
+    /// A legacy `proposal_type: shared_kv` block still parses — third-party
+    /// configs in the wild carry it — but it no longer resolves to a runnable
+    /// proposer, because borrowed-KV drafting is declared by the package's
+    /// `speculative.proposal_execution: {kind: chained}` workflow contract and
+    /// driven by the interpreter. The diagnostic has to say so, or a package
+    /// author reading "unknown" would try to fix the wrong block.
     #[test]
-    fn shared_kv_metadata_round_trips_into_supported_descriptor() {
+    fn legacy_shared_kv_speculator_degrades_to_unknown_naming_the_workflow_contract() {
         let config = parse_legacy_speculator(SHARED_KV_YAML);
         assert_eq!(config.proposal_type, ProposalType::SharedKv);
         assert_eq!(config.num_speculative_tokens, 3);
-        assert_eq!(config.backbone_hidden_size, Some(16));
-        assert_eq!(config.vocab_size, Some(32));
         assert_eq!(config.shared_kv.len(), 2);
-        assert_eq!(config.shared_kv[0].name, "sliding_attention");
-        assert_eq!(config.shared_kv[0].target_layers, vec![0]);
-        assert_eq!(config.shared_kv[1].name, "full_attention");
-        assert_eq!(config.shared_kv[1].target_layers, vec![1]);
 
         let descriptor = SpeculatorDescriptor::from_config(
             Path::new("/models/shared-kv"),
             config,
             SpeculatorConfigSource::HuggingFaceConfig,
         );
-        let SpeculatorProposerStatus::SharedKv(spec) = descriptor.proposer else {
-            panic!("expected a supported shared_kv proposer");
+        let SpeculatorProposerStatus::Unknown(reason) = descriptor.proposer else {
+            panic!("a legacy shared_kv descriptor must not resolve to a runnable proposer");
         };
-        assert_eq!(
-            spec.model,
-            Path::new("/models/shared-kv/assistant/model.onnx")
+        assert!(
+            reason.contains("proposal_execution") && reason.contains("chained"),
+            "the diagnostic must point at the workflow contract: {reason}"
         );
-        assert_eq!(spec.num_speculative_tokens, 3);
-        assert_eq!(spec.backbone_hidden_size, 16);
-        assert_eq!(spec.vocab_size, 32);
-        assert_eq!(spec.projected_state_output, "projected_state");
-        assert_eq!(spec.logits_output, "logits");
-        assert_eq!(
-            spec.input_embedding,
-            Path::new("/models/shared-kv/input_embedding.f32")
-        );
-        assert_eq!(spec.shared_kv.len(), 2);
     }
 
     /// A legacy `gemma4_assistant` proposal_type (pre-generalization name) no
@@ -737,179 +611,5 @@ speculative:
                 "expected proposer Unknown for legacy value '{legacy}'"
             );
         }
-    }
-
-    #[test]
-    fn shared_kv_defaults_output_names() {
-        let config = parse_legacy_speculator(
-            "\
-speculative:
-  proposal_type: shared-kv
-  model: assistant/model.onnx
-  backbone_hidden_size: 8
-  vocab_size: 16
-  input_embedding: input_embedding.f32
-  shared_kv:
-    - name: sliding_attention
-      target_layers: [0]
-",
-        );
-        let descriptor = SpeculatorDescriptor::from_config(
-            Path::new("/models/shared-kv"),
-            config,
-            SpeculatorConfigSource::HuggingFaceConfig,
-        );
-        let SpeculatorProposerStatus::SharedKv(spec) = descriptor.proposer else {
-            panic!("expected a supported shared_kv proposer");
-        };
-        assert_eq!(spec.projected_state_output, "projected_state");
-        assert_eq!(spec.logits_output, "logits");
-        assert_eq!(
-            spec.input_embedding,
-            Path::new("/models/shared-kv/input_embedding.f32")
-        );
-        assert_eq!(spec.num_speculative_tokens, 4);
-        assert_eq!(spec.shared_kv.len(), 1);
-        assert_eq!(
-            spec.io.sequence_source,
-            Some(crate::schema::SequenceInputKind::InputsEmbeds)
-        );
-        assert_eq!(
-            spec.io.kv_ownership,
-            Some(crate::schema::KvOwnership::Shared)
-        );
-        assert_eq!(
-            spec.io.inputs_embeds_input.as_deref(),
-            Some("inputs_embeds")
-        );
-        assert_eq!(spec.io.logits_output.as_deref(), Some("logits"));
-        assert_eq!(spec.io.hidden_output.as_deref(), Some("projected_state"));
-    }
-
-    #[test]
-    fn shared_kv_explicit_execution_contract_and_ports_are_preserved() {
-        let config = parse_legacy_speculator(
-            "\
-speculative:
-  proposal_type: shared_kv
-  model: proposer.onnx
-  backbone_hidden_size: 6
-  vocab_size: 10
-  input_embedding: embedding.f32
-  io:
-    sequence_source: inputs_embeds
-    kv_ownership: shared
-    inputs_embeds_input: proposer_embeddings
-    logits_output: draft_scores
-    hidden_output: recurrent_projection
-  shared_kv:
-    - name: local
-      target_layers: [0]
-      key_input: proposer_cache_key
-      value_input: proposer_cache_value
-      target_key_input: target_cache_key
-      target_value_input: target_cache_value
-",
-        );
-        let descriptor = SpeculatorDescriptor::from_config(
-            Path::new("/models/explicit"),
-            config,
-            SpeculatorConfigSource::HuggingFaceConfig,
-        );
-        let SpeculatorProposerStatus::SharedKv(spec) = descriptor.proposer else {
-            panic!("expected shared-KV proposer");
-        };
-        assert_eq!(
-            spec.io.sequence_source,
-            Some(crate::schema::SequenceInputKind::InputsEmbeds)
-        );
-        assert_eq!(
-            spec.io.kv_ownership,
-            Some(crate::schema::KvOwnership::Shared)
-        );
-        assert_eq!(
-            spec.io.inputs_embeds_input.as_deref(),
-            Some("proposer_embeddings")
-        );
-        assert_eq!(spec.io.logits_output.as_deref(), Some("draft_scores"));
-        assert_eq!(
-            spec.io.hidden_output.as_deref(),
-            Some("recurrent_projection")
-        );
-        assert_eq!(
-            spec.shared_kv[0].target_key_input.as_deref(),
-            Some("target_cache_key")
-        );
-    }
-
-    #[test]
-    fn shared_kv_missing_required_field_is_unknown() {
-        let config = parse_legacy_speculator(
-            "\
-speculative:
-  proposal_type: shared_kv
-  model: assistant/model.onnx
-",
-        );
-        let descriptor = SpeculatorDescriptor::from_config(
-            Path::new("/models/shared-kv"),
-            config,
-            SpeculatorConfigSource::HuggingFaceConfig,
-        );
-        assert!(matches!(
-            descriptor.proposer,
-            SpeculatorProposerStatus::Unknown(_)
-        ));
-    }
-
-    /// A malformed shared-KV block (empty `shared_kv`, or a group with empty
-    /// `target_layers`) must degrade to `Unknown` rather than resolve, so it
-    /// never aborts model loading — the engine treats it as absent.
-    #[test]
-    fn shared_kv_empty_binding_groups_degrade_to_unknown() {
-        let config = parse_legacy_speculator(
-            "\
-speculative:
-  proposal_type: shared_kv
-  model: assistant/model.onnx
-  backbone_hidden_size: 8
-  vocab_size: 16
-",
-        );
-        assert!(config.shared_kv.is_empty());
-        let descriptor = SpeculatorDescriptor::from_config(
-            Path::new("/models/shared-kv"),
-            config,
-            SpeculatorConfigSource::HuggingFaceConfig,
-        );
-        assert!(matches!(
-            descriptor.proposer,
-            SpeculatorProposerStatus::Unknown(_)
-        ));
-    }
-
-    #[test]
-    fn shared_kv_empty_target_layers_degrade_to_unknown() {
-        let config = parse_legacy_speculator(
-            "\
-speculative:
-  proposal_type: shared_kv
-  model: assistant/model.onnx
-  backbone_hidden_size: 8
-  vocab_size: 16
-  shared_kv:
-    - name: sliding_attention
-",
-        );
-        assert!(config.shared_kv[0].target_layers.is_empty());
-        let descriptor = SpeculatorDescriptor::from_config(
-            Path::new("/models/shared-kv"),
-            config,
-            SpeculatorConfigSource::HuggingFaceConfig,
-        );
-        assert!(matches!(
-            descriptor.proposer,
-            SpeculatorProposerStatus::Unknown(_)
-        ));
     }
 }

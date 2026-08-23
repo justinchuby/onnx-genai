@@ -111,7 +111,17 @@ enum TensorBacking {
     /// the backend-neutral component-session seam, which carries host tensors as
     /// opaque bytes).
     Bytes(ElementBytes),
-    Alias(Arc<Value>),
+    /// A no-copy view over `element_offset..element_offset + numel` of an owner.
+    ///
+    /// The offset is carried rather than folded into the pointer alone, because
+    /// re-aliasing has to reproduce the *same window*. An alias that recorded
+    /// only its shape would re-alias to the owner's prefix — same shape, same
+    /// dtype, different bytes, no error — and every carried value in the
+    /// interpreter passes through `try_alias_clone`.
+    Alias {
+        owner: Arc<Value>,
+        element_offset: usize,
+    },
     /// Memory this `Value` does not own.
     ///
     /// Used when a caller hands ORT a buffer it allocated itself — typically
@@ -126,6 +136,15 @@ enum TensorBacking {
     /// consult this rather than trying and faulting.
     External {
         host_accessible: bool,
+        /// Optional shared owner kept alive for as long as this `Value` **or any
+        /// alias derived from it**: dropping the last sharer drops this after the
+        /// `OrtValue` is released, so an external allocation this `Value` wraps
+        /// (e.g. a native `Tensor`'s device memory) is freed only once ORT and
+        /// every alias are done with it. `Arc` (not `Box`) so a device value can
+        /// be alias-cloned in O(1) — [`Value::try_alias_clone`] hands out another
+        /// `External` sharing this owner instead of a host byte copy. `None` when
+        /// the caller owns the memory elsewhere (a pure borrow).
+        owner: Option<Arc<dyn core::any::Any + Send + Sync>>,
     },
     None,
 }
@@ -367,8 +386,49 @@ impl Value {
             ptr,
             shape: shape.to_vec(),
             dtype,
-            backing: TensorBacking::External { host_accessible },
+            backing: TensorBacking::External {
+                host_accessible,
+                owner: None,
+            },
         })
+    }
+
+    /// Wrap external memory whose backing allocation this `Value` should keep
+    /// alive.
+    ///
+    /// Identical to [`Value::from_external_memory`], but the returned `Value`
+    /// takes ownership of `owner` and drops it only after the underlying
+    /// `OrtValue` is released (see the [`Drop`] impl). Use this when the buffer
+    /// behind `data` is owned by a Rust object — for example a native runtime
+    /// `Tensor` holding device memory — so that ORT keeps the allocation valid
+    /// for exactly as long as the `Value` (and any alias derived from it) can
+    /// still reach it, with no early free and no leak.
+    ///
+    /// # Safety
+    ///
+    /// The same requirements as [`Value::from_external_memory`] apply to `data`,
+    /// `bytes`, `shape`, `dtype`, and `memory_info`. The one obligation this
+    /// method discharges for you is lifetime: `owner` must be the object that
+    /// actually keeps `data` allocated, so keeping it alive keeps `data` valid.
+    pub unsafe fn from_external_memory_with_owner(
+        data: *mut std::ffi::c_void,
+        bytes: usize,
+        shape: &[i64],
+        dtype: DataType,
+        memory_info: &MemoryInfo,
+        owner: Box<dyn core::any::Any + Send + Sync>,
+    ) -> Result<Self> {
+        // SAFETY: forwarded verbatim to `from_external_memory`; the caller
+        // upholds its contract, and `owner` only extends how long `data` lives.
+        let mut value =
+            unsafe { Self::from_external_memory(data, bytes, shape, dtype, memory_info)? };
+        match &mut value.backing {
+            TensorBacking::External { owner: slot, .. } => *slot = Some(Arc::from(owner)),
+            // `from_external_memory` always yields `External`; anything else is
+            // an internal contract break, not a caller error.
+            _ => unreachable!("from_external_memory produced a non-external backing"),
+        }
+        Ok(value)
     }
 
     /// Whether this value's bytes can be read or written through a host
@@ -380,7 +440,8 @@ impl Value {
         !matches!(
             self.backing,
             TensorBacking::External {
-                host_accessible: false
+                host_accessible: false,
+                ..
             }
         )
     }
@@ -1162,7 +1223,7 @@ impl Value {
                     )));
                 }
             },
-            TensorBacking::I64(_) | TensorBacking::Bytes(_) | TensorBacking::Alias(_) => {
+            TensorBacking::I64(_) | TensorBacking::Bytes(_) | TensorBacking::Alias { .. } => {
                 return Err(OrtError::InvalidArgument(
                     "cannot zero row for non-owned or non-KV tensor".into(),
                 ));
@@ -1260,7 +1321,7 @@ impl Value {
                     )));
                 }
             },
-            TensorBacking::I64(_) | TensorBacking::Bytes(_) | TensorBacking::Alias(_) => {
+            TensorBacking::I64(_) | TensorBacking::Bytes(_) | TensorBacking::Alias { .. } => {
                 return Err(OrtError::InvalidArgument(
                     "cannot pack rows for non-owned or non-KV tensor".into(),
                 ));
@@ -1284,17 +1345,52 @@ impl Value {
     /// The returned OrtValue has its own shape but points at the same underlying
     /// tensor data as `owner`. `owner` is kept alive by the alias backing.
     pub fn alias_with_shape(owner: Arc<Value>, shape: &[i64]) -> Result<Self> {
+        Self::alias_with_offset(owner, 0, shape)
+    }
+
+    /// Create a no-copy tensor view starting `element_offset` elements into
+    /// `owner`.
+    ///
+    /// The offset is in *elements*, not bytes, so a caller cannot accidentally
+    /// produce a misaligned view by forgetting the dtype width — the one class
+    /// of mistake a byte offset invites and that a device pointer will not
+    /// diagnose until a kernel reads garbage.
+    ///
+    /// The view is backed by `TensorBacking::Alias(owner)`, so the owner — and
+    /// with it any device allocation or IO binding it holds — outlives every
+    /// value derived from it. That is the same guarantee an output binding's
+    /// alias relies on, and it is what makes a device-resident slice safe to
+    /// hold across a step without copying it anywhere.
+    ///
+    /// Residency is preserved: this never moves bytes and never consults the
+    /// host, so a view of a device tensor is a device tensor. What it cannot do
+    /// is express a *strided* window — a slice along an inner axis is not a
+    /// contiguous range, and asking for one here would silently return the
+    /// wrong elements. Callers that need one must copy on whatever owns the
+    /// buffer.
+    pub fn alias_with_offset(
+        owner: Arc<Value>,
+        element_offset: usize,
+        shape: &[i64],
+    ) -> Result<Self> {
         validate_shape(shape, None)?;
         let alias_numel = shape.iter().try_fold(1usize, |acc, &dim| {
             acc.checked_mul(dim as usize).ok_or_else(|| {
                 OrtError::InvalidArgument(format!("tensor shape too large: {shape:?}"))
             })
         })?;
-        if alias_numel > owner.numel() {
+        let window_end = element_offset.checked_add(alias_numel).ok_or_else(|| {
+            OrtError::InvalidArgument(format!(
+                "alias offset {element_offset} plus {alias_numel} elements overflows"
+            ))
+        })?;
+        if window_end > owner.numel() {
             return Err(OrtError::InvalidArgument(format!(
-                "alias shape {:?} has {} elements, larger than owner shape {:?} with {} elements",
+                "alias shape {:?} at element offset {} needs {} elements, past the end of owner \
+                 shape {:?} with {} elements",
                 shape,
-                alias_numel,
+                element_offset,
+                window_end,
                 owner.shape(),
                 owner.numel()
             )));
@@ -1309,7 +1405,10 @@ impl Value {
         let data = if alias_numel == 0 {
             dangling_aligned(owner.dtype)
         } else {
-            tensor_data_ptr(owner.ptr.as_ptr())?
+            let base = tensor_data_ptr(owner.ptr.as_ptr())?;
+            // Pointer arithmetic only; the bytes are never read here, so this is
+            // valid for a device address the host cannot dereference.
+            unsafe { base.byte_add(element_offset * owner.dtype.size_of()) }
         };
         let ptr = create_tensor_with_data_at(
             memory_info,
@@ -1322,7 +1421,10 @@ impl Value {
             ptr,
             shape: shape.to_vec(),
             dtype: owner.dtype,
-            backing: TensorBacking::Alias(owner),
+            backing: TensorBacking::Alias {
+                owner,
+                element_offset,
+            },
         })
     }
 
@@ -1346,11 +1448,64 @@ impl Value {
     /// reallocating or memcpy-ing the underlying buffer.
     pub fn try_alias_clone(&self) -> Option<Result<Value>> {
         match &self.backing {
-            TensorBacking::Alias(owner) => {
-                Some(Value::alias_with_shape(Arc::clone(owner), &self.shape))
-            }
+            // Re-aliasing reproduces the *same window*, offset included: an
+            // alias that carried only its shape would silently rebase to the
+            // owner's prefix.
+            TensorBacking::Alias {
+                owner,
+                element_offset,
+            } => Some(Value::alias_with_offset(
+                Arc::clone(owner),
+                *element_offset,
+                &self.shape,
+            )),
+            // An external allocation this value *owns* (e.g. a native `Tensor`'s
+            // device memory) can be aliased in O(1): re-wrap the same allocation
+            // as another external value sharing the owner `Arc`, so both keep it
+            // alive with no byte copy. This is what lets a device-resident value
+            // flow through the interpreter's `clone_value` fast path instead of
+            // failing a host read. A pure borrow (`owner: None`) has no lifetime
+            // guarantee to share, so it is not alias-cloneable.
+            TensorBacking::External {
+                host_accessible,
+                owner: Some(owner),
+            } => Some(self.alias_external_with_owner(*host_accessible, Arc::clone(owner))),
             _ => None,
         }
+    }
+
+    /// Re-wrap this value's external allocation as another `External` value that
+    /// shares `owner`, keeping the same shape/dtype/memory. O(1), no byte copy.
+    fn alias_external_with_owner(
+        &self,
+        host_accessible: bool,
+        owner: Arc<dyn core::any::Any + Send + Sync>,
+    ) -> Result<Value> {
+        let memory_info = tensor_memory_info(self.ptr.as_ptr())?;
+        let numel = self.numel();
+        // A zero-element alias dereferences no data pointer; hand ORT an aligned
+        // address it will never read rather than the owner's (possibly null) one.
+        let data = if numel == 0 {
+            dangling_aligned(self.dtype)
+        } else {
+            tensor_data_ptr(self.ptr.as_ptr())?
+        };
+        let ptr = create_tensor_with_data_at(
+            memory_info,
+            data,
+            numel * self.dtype.size_of(),
+            &self.shape,
+            self.dtype,
+        )?;
+        Ok(Self {
+            ptr,
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+            backing: TensorBacking::External {
+                host_accessible,
+                owner: Some(owner),
+            },
+        })
     }
 
     pub(crate) unsafe fn from_raw(ptr: *mut onnx_genai_ort_sys::OrtValue) -> Result<Self> {
@@ -1372,8 +1527,10 @@ impl Drop for Value {
             TensorBacking::F16(data) => data.len(),
             TensorBacking::I64(data) => data.len(),
             TensorBacking::Bytes(data) => data.len(),
-            TensorBacking::Alias(owner) => owner.numel(),
-            // Borrowed memory: nothing here keeps it alive, by construction.
+            TensorBacking::Alias { owner, .. } => owner.numel(),
+            // Borrowed memory. Any `_owner` here is a struct field, so drop glue
+            // frees it *after* this body releases the `OrtValue` below — ORT is
+            // always done with the allocation before the owner frees it.
             TensorBacking::External { .. } => 0,
             TensorBacking::None => 0,
         };
@@ -2682,5 +2839,87 @@ mod element_alignment_tests {
             Value::from_raw_bytes(Vec::new(), &[0, 8], DataType::Float16).expect("empty fp16");
         assert!(value.as_raw_bytes().expect("borrowed bytes").is_empty());
         assert!(value.to_raw_bytes().expect("copied bytes").is_empty());
+    }
+}
+
+#[cfg(test)]
+// A `Value` is deliberately neither Send nor Sync: an OrtValue belongs to
+// the thread that created it. `Arc` is nonetheless what the alias backing
+// takes, so these cases build one exactly the way the production path does.
+#[allow(clippy::arc_with_non_send_sync)]
+mod alias_offset_tests {
+    use super::*;
+
+    /// An offset alias sees the window it named, and nothing before it.
+    #[test]
+    fn an_offset_alias_reads_from_the_offset() {
+        let owner = Arc::new(Value::from_slice_i64(&[10, 11, 12, 13, 14, 15], &[6]).unwrap());
+        let view = Value::alias_with_offset(Arc::clone(&owner), 2, &[3]).unwrap();
+        assert_eq!(view.shape(), &[3]);
+        assert_eq!(view.to_vec_i64().unwrap(), vec![12, 13, 14]);
+    }
+
+    /// A zero offset is the prefix alias, so one implementation serves both.
+    #[test]
+    fn a_zero_offset_alias_is_the_prefix() {
+        let owner = Arc::new(Value::from_slice_i64(&[1, 2, 3, 4], &[4]).unwrap());
+        let prefix = Value::alias_with_shape(Arc::clone(&owner), &[2]).unwrap();
+        let offset = Value::alias_with_offset(owner, 0, &[2]).unwrap();
+        assert_eq!(prefix.to_vec_i64().unwrap(), offset.to_vec_i64().unwrap());
+    }
+
+    /// A window running past the owner is refused, naming both extents.
+    ///
+    /// Silently clamping would hand a kernel a shorter tensor than its contract
+    /// declares; reading past the end would hand it another allocation's bytes.
+    #[test]
+    fn a_window_past_the_end_is_refused() {
+        let owner = Arc::new(Value::from_slice_i64(&[1, 2, 3, 4], &[4]).unwrap());
+        let Err(error) = Value::alias_with_offset(owner, 3, &[2]) else {
+            panic!("a window past the end of the owner must be refused");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("past the end"),
+            "the refusal must say the window leaves the allocation: {message}"
+        );
+    }
+
+    /// Re-aliasing an offset view reproduces the same window.
+    ///
+    /// Every carried value in the interpreter passes through
+    /// `try_alias_clone`. An alias that recorded only its shape would re-alias
+    /// to the owner's *prefix* — same shape, same dtype, another tensor's
+    /// bytes, and no error anywhere to notice it.
+    #[test]
+    fn re_aliasing_an_offset_view_keeps_the_offset() {
+        let owner = Arc::new(Value::from_slice_i64(&[10, 11, 12, 13, 14, 15], &[6]).unwrap());
+        let view = Value::alias_with_offset(owner, 2, &[3]).unwrap();
+        let cloned = view
+            .try_alias_clone()
+            .expect("an alias is alias-cloneable")
+            .unwrap();
+        assert_eq!(cloned.to_vec_i64().unwrap(), vec![12, 13, 14]);
+        assert_eq!(cloned.to_vec_i64().unwrap(), view.to_vec_i64().unwrap());
+    }
+
+    /// Offsets compose, so narrowing twice narrows twice.
+    #[test]
+    fn offsets_compose_through_a_re_alias() {
+        let owner = Arc::new(Value::from_slice_i64(&[0, 1, 2, 3, 4, 5, 6, 7], &[8]).unwrap());
+        let first = Value::alias_with_offset(owner, 2, &[4]).unwrap();
+        let re_aliased = Arc::new(first.try_alias_clone().expect("aliasable").unwrap());
+        let second = Value::alias_with_offset(re_aliased, 1, &[2]).unwrap();
+        assert_eq!(second.to_vec_i64().unwrap(), vec![3, 4]);
+    }
+
+    /// The owner outlives every view derived from it.
+    #[test]
+    fn a_view_keeps_its_owner_alive() {
+        let view = {
+            let owner = Arc::new(Value::from_slice_i64(&[7, 8, 9], &[3]).unwrap());
+            Value::alias_with_offset(owner, 1, &[2]).unwrap()
+        };
+        assert_eq!(view.to_vec_i64().unwrap(), vec![8, 9]);
     }
 }

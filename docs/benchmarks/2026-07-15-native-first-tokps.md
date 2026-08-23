@@ -25,7 +25,8 @@ throughput: 2111.43 tok/s, 0.474 ms/step (320 generated tokens in 151.556 ms)
 ```
 
 This is a **synthetic-model result**, not a quality-bearing pretrained model result.
-It measures the engine's shared `run_decode_loop` through `NativeDecodeSession` and
+It measures the engine's shared single-row decode loop (`run_decode_loop` at the
+time of this run; now `pipeline::canonical_decode`) through `NativeDecodeSession` and
 the native CPU executor. It must not be compared as if it were the ORT-backed
 approximately 492 tok/s H200/batch-128 result: that number used a different backend,
 hardware execution path, model/workload, and batch size.

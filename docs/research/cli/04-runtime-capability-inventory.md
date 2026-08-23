@@ -125,10 +125,14 @@ External connector stats exist but are not surfaced in CLI: `crates/onnx-genai-e
 
 Configuration APIs:
 
-- `crates/onnx-genai-engine/src/config.rs:379-400` — `SpeculativeMode::{None,DraftModel,PromptLookup,Mtp,Eagle3,SharedKv}`.
+- `crates/onnx-genai-engine/src/config.rs` — `SpeculativeMode::{None,DraftModel,PromptLookup,Mtp,Eagle3}`.
+  Borrowed-KV ("shared-KV") drafting is no longer a `SpeculativeMode`: it is
+  declared by a package's `speculative.proposal_execution: {kind: chained}`
+  contract and driven by the workflow interpreter
+  (`crates/onnx-genai-engine/src/pipeline/speculative.rs`).
 - `crates/onnx-genai-engine/src/config.rs:495-501` — `EngineConfig` has `draft_model`, `num_speculative_tokens`, default `speculative_mode`.
 - `crates/onnx-genai-engine/src/config.rs:805-808` — `GenerateOptions` has per-request `num_speculative_tokens` and `speculative_mode`.
-- `crates/onnx-genai-engine/src/config.rs:233-251`, `320-333`, `348-367` define MTP, EAGLE-3, and shared-KV configs.
+- `crates/onnx-genai-engine/src/config.rs` defines the MTP and EAGLE-3 configs.
 
 Stats:
 

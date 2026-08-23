@@ -79,7 +79,7 @@ struct Args {
     repetitions: usize,
 
     /// Use the stateless native path (full re-prefill each turn, no KV reuse).
-    /// Default is to use create_native_session + generate_native_in_session
+    /// Default is to use create_session + generate_in_session
     /// for KV persistence across turns, matching ORT's session API.
     #[arg(long)]
     native_stateless: bool,
@@ -284,11 +284,12 @@ fn run_native_session(
         "native"
     };
 
-    // Create a persistent native session for KV reuse (unless stateless mode)
+    // Create a persistent session for KV reuse (unless stateless mode). The
+    // backend (native here) is selected by the engine's decode_backend.
     let session_id = if args.native_stateless {
         None
     } else {
-        Some(engine.create_native_session()?)
+        Some(engine.create_session()?)
     };
 
     let session_start = Instant::now();
@@ -323,7 +324,7 @@ fn run_native_session(
         let result = if let Some(sid) = session_id {
             // Session API: KV state persists across turns, only new tokens prefilled
             engine
-                .generate_native_in_session_with_callback(sid, request, Some(&mut callback))
+                .generate_in_session_with_callback(sid, request, Some(&mut callback))
                 .with_context(|| format!("native session generate turn {turn_idx}"))?
         } else {
             // Stateless: full re-prefill each turn (legacy behaviour)
@@ -349,9 +350,9 @@ fn run_native_session(
         });
     }
 
-    // Close native session if we created one
+    // Close the session if we created one
     if let Some(sid) = session_id {
-        engine.close_native_session(sid)?;
+        engine.close_session(sid)?;
     }
 
     // Cache verification: check cache state after all turns
@@ -541,7 +542,7 @@ fn render_report(
         if native.backend == "native-stateless" {
             "stateless (full re-prefill each turn)"
         } else {
-            "session (KV reuse via create_native_session)"
+            "session (KV reuse via create_session)"
         },
     );
     meta(&mut report, "host load (before)", load_before);
